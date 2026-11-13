@@ -20,9 +20,13 @@
 //! loss would end it ([`Command::Lost`]); a refusal or renewal naming a grant that isn't the leg's
 //! now changes nothing.
 //!
-//! A leg whose preferences name `warm` or `affinity` (W24-R18) goes where it's expected to finish
-//! first, from what each runner holds warm ([`Input::Warm`], [`super::warm`]), and may wait a
-//! bounded while for a busy runner that would finish it sooner ([`WaitReason::Warm`]).
+//! Where a leg goes, of the runners that take it now, is the load balancer's pick
+//! ([`super::balance`], docs/lb.md "The CI engine"; W05-R23): the most room by its rank, and
+//! between runners it can't tell apart, back to where the leg's kind of work last went well. The
+//! queue decides which leg goes next; the load balancer, where. A leg whose preferences name
+//! `warm` or `affinity` (W24-R18) goes where it's expected to finish first, from what each runner
+//! holds warm ([`Input::Warm`], [`super::warm`]), the load balancer's order among equals, and may
+//! wait a bounded while for a busy runner that would finish it sooner ([`WaitReason::Warm`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -30,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use super::demand::{self, Ask, Demand, Demands, End, Fate, Next, Running, Work};
 use super::admit::{self, Admit, Held, Skipped};
+use super::balance::{Balance, Pace, Profile};
 use super::groups::{GroupAction, GroupConfig, Groups};
 use super::needs;
 use super::pools::{self, ExecState, Executor, Pool, PoolView};
@@ -39,6 +44,8 @@ use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, Runne
 use super::table::Table;
 use super::units::{self, Ms, Ppm};
 use super::warm::{self, Held as WarmHeld, Wants};
+use crate::lb;
+use crate::place::msg::How;
 
 /// What a leg asks for and a runner offers, in resource mode (W05-R03); and what an exclusive leg
 /// holds of its runner. Every amount is an integer, so they add, subtract and compare exactly, the
@@ -446,6 +453,11 @@ pub struct Config {
     /// no runner keeps room where it frees first, and only what ends before then, or fits beside
     /// it, is granted there. kiln's `[sched] backfill`: off until declared (docs/ci.md §0.3).
     pub backfill: bool,
+    /// Good places (docs/lb.md "Good places"): between runners the load balancer's rank can't tell
+    /// apart, a leg goes back to where its kind of work last went well, and passes over the one
+    /// that last let it down. kiln's `[reach] good_places`, on by default (docs/ci.md §0.3, the
+    /// person's word); off, equals take turns alone.
+    pub good_places: bool,
 }
 
 /// A level of fair share (W28-R66).
@@ -483,6 +495,7 @@ impl Default for Config {
             lease: None,
             lock_delay: 15_000,
             backfill: false,
+            good_places: true,
         }
     }
 }
@@ -628,6 +641,13 @@ pub struct LegIn {
     pub on_lease_loss: LeaseLoss,
     /// Its gang (W05-R40): it starts with the rest of its gang or not at all.
     pub gang: Option<Gang>,
+    /// Its kind of work (docs/lb.md "Good places"): the key its runner keys its runs of it by
+    /// (`sense::run::leg_key`: its repository, workflow, job and matrix), so the load balancer
+    /// sends it back to where its kind last went well. Empty: none, placed by rank and turn alone.
+    pub kind: String,
+    /// What its kind's runs taught of its work (docs/lb.md "The CI engine"): the load balancer
+    /// ranks runners for it by when it's expected to finish there. None: nothing taught yet.
+    pub profile: Option<Profile>,
 }
 
 /// Where a person's retry asked a leg to run (W05-R28): only on `runner`, or on any runner but
@@ -751,6 +771,9 @@ pub enum Input {
     /// A person paused a leg, or resumed it (W26-R22): paused, one waiting is placed nowhere until
     /// it's resumed, and one running is frozen where it runs, keeping its runner, as it was.
     LegPaused { leg: String, paused: bool },
+    /// A runner's measured pace, as its own kernel's words say it (docs/lb.md "Rank"): the load
+    /// balancer ranks its free cores at that speed from now (W05-R26).
+    RunnerPace { runner: String, pace: Pace },
 }
 
 /// What a runner has in use now, by its latest sample: what placement weighs of it besides its
@@ -1349,6 +1372,8 @@ struct Runner {
     /// leaves before the next sample stops counting as it leaves.
     since: Resources,
     counted: BTreeMap<String, Resources>,
+    /// Its measured pace ([`Input::RunnerPace`]): the reference's until it says one.
+    pace: Pace,
 }
 
 /// What an exclusive leg holds of its runner (W05-R03): asking for CPUs, those and the memory it
@@ -1629,6 +1654,16 @@ pub struct Scheduler {
     gangs: BTreeMap<String, Crew>,
     /// The time of the last input: explanations reckon waits from it.
     now: i64,
+    /// The load balancer: where a leg goes, of the runners that take it now ([`super::balance`]).
+    balance: Balance,
+    /// Moves on whenever which runners each signature's legs may go to may have changed (a runner
+    /// up, lost, draining or changed; the rules): the load balancer's members are synced again.
+    fleet_gen: u64,
+    /// The runners whose room changed since the load balancer was last told it.
+    dirty: BTreeSet<String>,
+    /// Paces said of runners not yet up ([`Input::RunnerPace`]): each runner's own when it comes
+    /// (one is said again only when it changes).
+    paces: BTreeMap<String, Pace>,
 }
 
 /// Room kept for a class's first item that fits no runner now (W05-R39), or for each member of
@@ -1879,6 +1914,17 @@ impl Scheduler {
                 self.sampled(&runner, sample, now);
                 self.try_runner(&runner, now, &mut out);
             }
+            Input::RunnerPace { runner, pace } => match self.runners.get_mut(&runner) {
+                Some(r) => {
+                    if r.pace != pace {
+                        r.pace = pace;
+                        self.touch(&runner);
+                    }
+                }
+                None => {
+                    self.paces.insert(runner, pace);
+                }
+            },
         }
         // A reservation whose item left the queue, or whose runner went, keeps nothing (W05-R39);
         // the runners whose kept room ended take what fits them, as new capacity does (W05-R04).
@@ -2304,9 +2350,10 @@ impl Scheduler {
             l.ends = ends;
         }
         // The runner may not have reconnected yet: keep what it runs until it does.
-        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, sample: None, since: Resources::default(), counted: BTreeMap::new() });
+        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, sample: None, since: Resources::default(), counted: BTreeMap::new(), pace: Pace::default() });
         r.running.push(id.clone());
         add(&mut r.used, &request);
+        self.touch(&runner);
         // W28-R42: what its runner still runs is the execution of its work. A queued duplicate
         // asked for before this was announced adopts it instead, with its adopters.
         let Some(work) = work else { return };
@@ -2411,18 +2458,16 @@ impl Scheduler {
             }
             return;
         }
-        // The runners with room, best first; none once it waits for a busy warm one (W24-R18).
-        let candidates = self.candidates(id);
-        for r in candidates {
-            if !self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
-                break;
-            }
-            if !alone {
-                self.try_runner(&r, now, out);
-            } else if self.runners.get(&r).zip(self.legs.get(id)).is_some_and(|(x, l)| self.allowed(x, l)) && !self.hold_for_warm(id, &r, now, out) {
-                // As the room kept there lets it (W05-R39).
-                self.assign(id, &r, now, out);
-            }
+        // Where the load balancer puts it (W05-R23): as the queue lets it, each runner taking the
+        // best legs it has room for; `alone`, straight there, as the room kept there lets it
+        // (W05-R39). Not once it waits for a busy warm runner (W24-R18).
+        if !alone {
+            self.place_queued(id, now, out);
+        } else if self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none())
+            && let Some(r) = self.choose(id, &BTreeSet::new())
+            && !self.hold_for_warm(id, &r, now, out)
+        {
+            self.assign(id, &r, now, out);
         }
         if let Some(pool) = self.legs.get(id).filter(|l| l.state == State::Queued).and_then(|l| l.req.pool.clone()) {
             self.scale(&pool, now, out);
@@ -2508,12 +2553,7 @@ impl Scheduler {
         self.legs.insert(id.to_owned(), moved);
         self.insert_queue(id);
         out.push(Command::Overflowed { leg: id.to_owned(), why });
-        for r in self.candidates(id) {
-            if !self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
-                break;
-            }
-            self.try_runner(&r, now, out);
-        }
+        self.place_queued(id, now, out);
         if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
             let reason = self.wait_reason(id);
             self.set_reason(id, reason, out);
@@ -2832,29 +2872,215 @@ impl Scheduler {
         [self.weight(&l.repo), 1000, 1000]
     }
 
-    /// Eligible runners with room for the leg, in the order to try them: by declared preference
-    /// (W05-R23), then those with the most headroom left after it by their live samples (W05),
-    /// then least loaded, most free slots, and name, as runners without a sample go.
-    fn candidates(&self, id: &str) -> Vec<String> {
+    // ------------------------------------------------------------------ the load balancer (W05-R23)
+
+    /// Runner `runner`'s room changed: the load balancer is told it before its next pick.
+    fn touch(&mut self, runner: &str) {
+        if !self.dirty.contains(runner) {
+            self.dirty.insert(runner.to_owned());
+        }
+    }
+
+    /// The load balancer brought up to date for a pick of signature `sig`'s legs: each runner
+    /// whose room changed told it ([`Self::word_of`]; one whose link is down leaves it), then the
+    /// signature's members as the engine's records stand: its eligible runners that aren't
+    /// draining (W05-R04).
+    fn balance_sync(&mut self, sig: &str) {
+        self.balance_told();
+        let Some(s) = self.sigs.get(sig) else { return };
+        let runners = &self.runners;
+        let members = s.eligible.iter().filter(|id| runners.get(*id).is_some_and(|r| r.connected && !r.draining));
+        self.balance.sync(sig, self.fleet_gen, members);
+    }
+
+    /// Each runner whose room changed told the load balancer ([`Self::word_of`]); one whose link
+    /// is down leaves it.
+    fn balance_told(&mut self) {
+        let told: Vec<(String, Option<(lb::Amounts, lb::Word)>)> = std::mem::take(&mut self.dirty).into_iter().map(|id| {
+            let w = self.runners.get(&id).filter(|r| r.connected).map(|r| self.word_of(r));
+            (id, w)
+        }).collect();
+        for (id, w) in told {
+            match w {
+                Some((budget, word)) => self.balance.tell(&id, budget, word),
+                None => self.balance.gone(&id),
+            }
+        }
+    }
+
+    /// What the load balancer is told of runner `r` (docs/lb.md "The CI engine"): its whole budget,
+    /// what it may ever take (its CPUs, memory, disk and GPUs, as it offers them or its facts say,
+    /// CPUs overcommitted in resource mode; its slots as CPUs when neither says), and its room for
+    /// an ordinary leg now, its CPUs the least that each of the
+    /// engine's measures leaves: its free slots' share of what no exclusive leg holds (slot mode) or
+    /// what its capacity leaves (resource mode), and, by its live sample, what it can still take
+    /// within its target use, less its CPUs' share of the time its tasks all stalled (PSI's `full`:
+    /// time lost, not used). None while an exclusive leg holds it whole. Its pace is what it last
+    /// said ([`Input::RunnerPace`]). The rank is its free cores (W05-R23): memory is a fit, and
+    /// makes no leg finish sooner until it runs short, which its stalls say.
+    fn word_of(&self, r: &Runner) -> (lb::Amounts, lb::Word) {
+        let c = self.config();
+        let size = size(r);
+        let all = cpus_of(r);
+        let most = match (c.resources, r.input.capacity) {
+            (true, Some(cap)) => u64::try_from(u128::from(cap.cpu.get()) * u128::from(c.overcommit_cpu) / 1000).unwrap_or(u64::MAX).max(all),
+            _ => all,
+        };
+        let budget = [most, size.map_or(0, |s| s.mem), size.map_or(0, |s| s.disk), size.map_or(0, |s| u64::from(s.gpu))];
+        let (held, whole, ordinary) = self.holding(r);
+        let cpu = self.room_of(r, &Holding { held, whole, ordinary, used: r.used, running: r.running.len() }, Cpus::ZERO);
+        let rest = [budget[1].saturating_sub(r.used.mem), budget[2].saturating_sub(r.used.disk), budget[3].saturating_sub(u64::from(r.used.gpu))];
+        let word = lb::Word { epoch: 1, whole: false, cpu, rest, speed: r.pace.speed, slowness: r.pace.slowness, disk: r.pace.disk, net: r.pace.net, measured: r.pace.measured, wants: false };
+        (budget, word)
+    }
+
+    /// The CPUs, in thousandths, free for an ordinary leg on runner `r` holding `h`, as the load
+    /// balancer is told them ([`Self::word_of`]): the least of its free slots' share of the CPUs no
+    /// exclusive leg holds (slot mode, its CPUs as [`cpus_of`] has them) or what its
+    /// capacity × overcommit leaves (resource mode), and, by its live sample, what it can still
+    /// take within its target use with `extra` more CPUs asked there than the sample saw, less its
+    /// CPUs' share of the time its tasks all stalled (PSI's `full`). None while a leg holds it
+    /// whole.
+    #[allow(clippy::float_arithmetic)]
+    fn room_of(&self, r: &Runner, h: &Holding, extra: Cpus) -> u64 {
+        let c = self.config();
+        let size = size(r);
+        if h.whole {
+            return 0;
+        }
+        let mut cpu = match (c.resources, r.input.capacity) {
+            (true, Some(cap)) => {
+                let limit = u128::from(cap.cpu.saturating_sub(h.held.cpu).get()) * u128::from(c.overcommit_cpu) / 1000;
+                u64::try_from(limit).unwrap_or(u64::MAX).saturating_sub(h.used.cpu.saturating_sub(h.held.cpu).get())
+            }
+            _ => {
+                let all = cpus_of(r);
+                let left = slots_left(r.input.slots, size, &h.held);
+                let free = left.saturating_sub(h.ordinary);
+                let mine = all.saturating_sub(h.held.cpu.get());
+                u64::try_from(u128::from(mine) * free as u128 / left.max(1) as u128).unwrap_or(u64::MAX)
+            }
+        };
+        if let Some(hr) = headroom_of(r) {
+            let (to_cpu, _) = c.target_use.of(&hr);
+            let of = hr.of.cpu.as_f64();
+            let stalled = (hr.mem_full.unwrap_or(0.0) + hr.io_full.unwrap_or(0.0)) / 100.0;
+            let free = hr.cpus - extra.as_f64() - (1.0 - to_cpu) * of - stalled * of;
+            cpu = cpu.min(Cpus::of_f64(free.max(0.0)).map_or(0, Cpus::get));
+        }
+        cpu
+    }
+
+    /// Whether runner `r` takes leg `l` now, as the room kept there lets it (W05-R39): what the
+    /// load balancer's picks are held to.
+    fn takes_now(&self, r: &Runner, l: &Leg) -> bool {
+        self.fits(r, l) && self.allowed(r, l)
+    }
+
+    /// Whether a leg ranks runners by its own preferences (W05-R23's fact and label terms,
+    /// W24-R18's `warm` and `affinity`) or the GPUs it asks for (W05-R22): the load balancer's
+    /// order decides only among those they leave equal.
+    fn ranked(l: &Leg) -> bool {
+        !l.req.prefer.is_empty() || !Self::terms(l).is_empty() || l.asked.gpu > 0
+    }
+
+    /// Where the load balancer puts queued leg `id` now (docs/lb.md "The CI engine"; W05-R23): of
+    /// the runners that take it now ([`Self::takes_now`]) but those in `but`, the most free by its
+    /// rank (free cores at the speed each measured), and between runners it can't tell apart, back
+    /// to where its kind of work last went well, else the next in turn, which the pick takes. A
+    /// leg with preferences or GPUs goes to the runners they rank first ([`Self::ranked_first`]),
+    /// the load balancer's pick between those: where they rank none above another, as a leg
+    /// without. `None`: no runner takes it now.
+    fn choose(&mut self, id: &str, but: &BTreeSet<String>) -> Option<String> {
+        let (sig, kind, ranked, own, taught) = {
+            let l = self.legs.get(id)?;
+            let kind = if self.cfg.good_places { l.input.kind.clone() } else { String::new() };
+            (l.sig.clone(), kind, Self::ranked(l), l.input.kind.clone(), l.input.profile)
+        };
+        self.balance_sync(&sig);
+        let first = if ranked { Some(self.ranked_first(id, but)?) } else { None };
+        // What its kind's runs taught, else what other kinds' did.
+        let profile = self.balance.profile(&own, taught);
+        // The load balancer proposes, the engine's rules dispose: a runner that doesn't take it
+        // now is set aside for this pick alone, and the next proposal is the one after it.
+        let mut aside: Vec<String> = Vec::new();
+        let picked = loop {
+            let Some(r) = self.balance.propose(&sig, &kind, profile) else { break None };
+            let ok = !but.contains(&r) && first.as_ref().is_none_or(|f| f.contains(&r)) && self.legs.get(id).zip(self.runners.get(&r)).is_some_and(|(l, x)| self.takes_now(x, l));
+            if ok {
+                break Some(r);
+            }
+            self.balance.set_aside(&sig, &r);
+            aside.push(r);
+        };
+        self.balance.restore(&sig, &aside);
+        picked
+    }
+
+    /// The runners a leg that ranks runners by its preferences or GPUs ranks first, of those that
+    /// take it now but those in `but` (W05-R23's terms, W24-R18's `warm` and `affinity`, W05-R22's
+    /// GPU fit): its preference score, then its GPUs' fit. `None`: none takes it now.
+    fn ranked_first(&self, id: &str, but: &BTreeSet<String>) -> Option<BTreeSet<String>> {
+        let l = self.legs.get(id)?;
+        let s = self.sigs.get(&l.sig)?;
+        let rooms: Vec<&Runner> = s.eligible.iter().filter(|r| !but.contains(*r)).filter_map(|r| self.runners.get(r)).filter(|r| self.takes_now(r, l)).collect();
+        let scores = self.scores(l, &rooms, None);
+        let gpu: Vec<u64> = if l.asked.gpu > 0 {
+            let need = Self::gpu_needs(l);
+            rooms.iter().map(|r| if l.req.pool.is_some() { self.pool_slots(r, l, r.used.gpu).next().map_or(0, |(_, score)| score) } else { Self::gpu_rank(r, &need, r.used.gpu).unwrap_or(0) }).collect()
+        } else {
+            Vec::new()
+        };
+        let rank = |i: usize| (scores.get(i).copied().unwrap_or(0), gpu.get(i).copied().unwrap_or(0));
+        let top = (0..rooms.len()).map(rank).max()?;
+        Some((0..rooms.len()).filter(|i| rank(*i) == top).filter_map(|i| rooms.get(i)).map(|r| r.input.id.clone()).collect())
+    }
+
+    /// The runners with room for queued leg `id` now, in the load balancer's rank: the most whole
+    /// cores free first, as the engine tells the kernel them ([`Self::word_of`]), then by id. The
+    /// order it's offered to them in (W05-R04): each takes the best legs it has room for, as the
+    /// queue orders them, and where each of those goes is the load balancer's pick
+    /// ([`Self::choose`]).
+    fn offers_for(&self, id: &str) -> Vec<String> {
         let Some(l) = self.legs.get(id) else { return Vec::new() };
         let Some(s) = self.sigs.get(&l.sig) else { return Vec::new() };
-        let rooms: Vec<&Runner> = s.eligible.iter().filter_map(|r| self.runners.get(r)).filter(|r| self.fits(r, l)).collect();
-        let scores = self.scores(l, &rooms, None);
-        let gpu_scores: Vec<u64> = if l.asked.gpu > 0 {
-            let need = Self::gpu_needs(l);
-            rooms.iter().map(|r| {
-                if l.req.pool.is_some() { self.pool_slots(r, l, r.used.gpu).next().map_or(0, |(_, score)| score) }
-                else { Self::gpu_rank(r, &need, r.used.gpu).unwrap_or(0) }
-            }).collect()
-        } else { Vec::new() };
+        let mut order: Vec<(std::cmp::Reverse<u64>, &String)> = s.eligible.iter().filter_map(|r| self.runners.get(r)).filter(|r| self.fits(r, l)).map(|r| (std::cmp::Reverse(self.word_of(r).1.cpu / 1000), &r.input.id)).collect();
+        order.sort();
+        order.into_iter().map(|(_, r)| r.clone()).collect()
+    }
 
-        let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
-        order.sort_by(|(i, a), (j, b)| {
-            let (sa, sb) = (scores.get(*i).copied().unwrap_or(0), scores.get(*j).copied().unwrap_or(0));
-            let (ha, hb) = (headroom_of(a), headroom_of(b));
-            sb.cmp(&sa).then_with(|| gpu_scores.get(*j).cmp(&gpu_scores.get(*i))).then_with(|| super::place::before(&l.input.request, ha.as_ref(), hb.as_ref())).then_with(|| lighter(a, b)).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
-        });
-        order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
+    /// Offers queued leg `id` to the runners with room for it ([`Self::offers_for`]) until it's
+    /// placed, holds out for a warm runner, or none is left: each takes the best legs it has room
+    /// for, this one or one before it in queue order, each where the load balancer puts it.
+    fn place_queued(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        for r in self.offers_for(id) {
+            if !self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
+                break;
+            }
+            self.try_runner(&r, now, out);
+        }
+    }
+
+    /// How an attempt's end judges the place it ran (docs/lb.md "Good places"): it went well; the
+    /// runner let it down (lost, its infrastructure or image, killed for memory, its disk full);
+    /// or it failed and no one knows whose fault it was (its steps failed, or ran out of time),
+    /// which the load balancer settles by comparison. A cancelled one is judged by no one.
+    fn how(outcome: &Outcome) -> How {
+        match outcome {
+            Outcome::Success => How::Well,
+            Outcome::Failed(f) => match f.class {
+                FailureClass::RunnerLost | FailureClass::Infra | FailureClass::ImagePull | FailureClass::Oom | FailureClass::DiskFull => How::LetDown,
+                FailureClass::Timeout | FailureClass::Failure => How::Unsure,
+            },
+            Outcome::Cancelled => How::Unsaid,
+        }
+    }
+
+    /// The good place of leg `id`'s kind now, by runner (`None`: none, or good places are off):
+    /// why a leg went where it did.
+    pub fn good_place(&self, id: &str) -> Option<String> {
+        let l = self.legs.get(id)?;
+        (self.cfg.good_places && !l.input.kind.is_empty()).then(|| self.balance.good(&l.input.kind).map(str::to_owned)).flatten()
     }
 
     /// Whether a runner other than `avoided` could take a leg (W05-R16, "when one can take it"):
@@ -3184,12 +3410,19 @@ impl Scheduler {
             if self.cfg.backfill && passed.iter().take(class.index() + 1).any(|p| *p) && self.reserve(runner, passed, class, now, out) {
                 continue;
             }
+            // Where it goes is the load balancer's pick (W05-R23): this runner takes it now, and
+            // another may be freer, or where its kind last went well.
+            let to = self.choose(&id, &BTreeSet::new()).unwrap_or_else(|| runner.to_owned());
             // One that would rather wait for a busy runner where it's warm holds out for it, and
             // then fits this one no more (W24-R18).
-            if self.hold_for_warm(&id, runner, now, out) {
+            if self.hold_for_warm(&id, &to, now, out) {
                 continue;
             }
-            self.assign(&id, runner, now, out);
+            self.assign(&id, &to, now, out);
+            if self.legs.get(&id).is_some_and(|l| l.state == State::Queued) {
+                // Its grant didn't take there: this runner's legs wait for its next look.
+                return;
+            }
             if let Some(left) = over {
                 self.pace(&id, left, now);
             }
@@ -3335,6 +3568,8 @@ impl Scheduler {
     /// The fleet's capacity in each dimension: what its connected runners that aren't draining
     /// offer (docs/needs.md E2.1).
     fn refresh_fleet(&mut self) {
+        // Draining or back: the load balancer's members change with it.
+        self.fleet_gen += 1;
         let (mut fleet, resources) = ([0u64; DIMS], self.config().resources);
         for r in self.runners.values().filter(|r| r.connected && !r.draining) {
             for (f, o) in fleet.iter_mut().zip(offers(&r.input, resources)) {
@@ -3391,6 +3626,7 @@ impl Scheduler {
             sub(&mut h.extra, &request);
         }
         let mut executor = None;
+        self.touch(runner);
         if let Some(r) = self.runners.get_mut(runner) {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
@@ -3424,6 +3660,7 @@ impl Scheduler {
         if let Some(n) = self.in_progress.get_mut(&repo) {
             *n = n.saturating_sub(1);
         }
+        self.touch(&runner);
         if let Some(r) = self.runners.get_mut(&runner) {
             r.running.retain(|x| x != id);
             sub(&mut r.used, &request);
@@ -3510,6 +3747,14 @@ impl Scheduler {
             self.review_admission(now, out);
             return;
         }
+        // How it went there, and how long it took from its grant, is the load balancer's to know
+        // (docs/lb.md "Good places").
+        if self.cfg.good_places
+            && let Some(r) = &runner
+            && let Some((kind, took)) = self.legs.get(id).map(|l| (l.input.kind.clone(), l.started.map(|at| u64::try_from(now.saturating_sub(at)).unwrap_or(0))))
+        {
+            self.balance.ended(r, &kind, Self::how(&outcome), took);
+        }
         let decision = match &outcome {
             Outcome::Failed(f) if retry => retry::decide(self.legs.get(id).and_then(|l| l.input.retry.as_ref()), attempt, f),
             _ => None,
@@ -3561,12 +3806,7 @@ impl Scheduler {
             return;
         }
         if !paused {
-            for r in self.candidates(id) {
-                if !self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
-                    break;
-                }
-                self.try_runner(&r, now, out);
-            }
+            self.place_queued(id, now, out);
             if let Some(pool) = self.legs.get(id).filter(|l| l.state == State::Queued).and_then(|l| l.req.pool.clone()) {
                 self.scale(&pool, now, out);
             }
@@ -3888,13 +4128,16 @@ impl Scheduler {
                 None => {}
             }
         }
-        let (running, used, sample, since, counted, was) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.sample, x.since, x.counted.clone(), x.connected)).unwrap_or_default();
+        let (running, used, sample, since, counted, was, pace) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.sample, x.since, x.counted.clone(), x.connected, x.pace)).unwrap_or_default();
+        // Its pace as last said, or as said before it was up.
+        let pace = self.paces.remove(&id).unwrap_or(pace);
         // A runner coming back on a new link: what it had in use was measured before it went, and
         // its first sample on this link says what it has now; until then it's placed by its room,
         // as before samples (W05). One already up says what it offers again and keeps its sample.
         let (sample, since, counted) = if was { (sample, since, counted) } else { (None, Resources::default(), BTreeMap::new()) };
         let draining = r.draining;
-        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining, sample, since, counted });
+        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining, sample, since, counted, pace });
+        self.touch(&id);
         self.refresh_fleet();
         self.refresh_eligibility(&id);
         self.release_holds(now, out);
@@ -3906,6 +4149,8 @@ impl Scheduler {
     }
 
     fn refresh_eligibility(&mut self, runner: &str) {
+        self.fleet_gen += 1;
+        self.touch(runner);
         let Some(r) = self.runners.get(runner) else { return };
         let ok: Vec<(String, bool)> = self.sigs.iter().map(|(k, s)| (k.clone(), self.eligible_for(&s.req, r))).collect();
         for (k, yes) in ok {
@@ -4061,6 +4306,7 @@ impl Scheduler {
     /// A runner's sample came ([`Input::RunnerSample`]): its headroom from now on, what was placed
     /// on it before now in the sample.
     fn sampled(&mut self, runner: &str, sample: Sample, now: i64) {
+        self.touch(runner);
         if let Some(r) = self.runners.get_mut(runner) {
             r.sample = Some((sample, now));
             r.since = Resources::default();
@@ -4377,12 +4623,7 @@ impl Scheduler {
         if l.hold.take().is_none() || l.state != State::Queued {
             return;
         }
-        for r in self.candidates(id) {
-            if !self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
-                break;
-            }
-            self.try_runner(&r, now, out);
-        }
+        self.place_queued(id, now, out);
         if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
             let reason = self.wait_reason(id);
             self.set_reason(id, reason, out);
@@ -4737,7 +4978,8 @@ impl Scheduler {
 
     /// Where a whole gang would start now (W05-R40), if it can: each member, in queue order, on a
     /// runner that would take it and has room for it beside the members put there before it, as
-    /// the reservations there let it, the least loaded first, then by name; where a member has
+    /// the reservations there let it, in the load balancer's rank ([`Self::gang_places`]), then by
+    /// id; where a member has
     /// no such runner, the members before it are put elsewhere, in that order, trying at most
     /// [`Self::GANG_LOOK`] places in all. A pool's member takes one of the pool's idle executors
     /// there that the members before it haven't. `None` when no way is found.
@@ -4781,10 +5023,11 @@ impl Scheduler {
     }
 
     /// The runners a gang's member could start on beside the members `plan` puts there, held to
-    /// the reservations there when `held`, best first: the least loaded, then by name.
+    /// the reservations there when `held`, best first: in the load balancer's rank (the most whole
+    /// cores free with those members there, docs/lb.md "The CI engine"), then by id.
     fn gang_places(&self, m: &str, plan: &[(String, String)], held: bool) -> Vec<String> {
         let (Some(l), Some(s)) = (self.legs.get(m), self.legs.get(m).and_then(|l| self.sigs.get(&l.sig))) else { return Vec::new() };
-        let mut places: Vec<(usize, &String)> = Vec::new();
+        let mut places: Vec<(std::cmp::Reverse<u64>, &String)> = Vec::new();
         for rid in &s.eligible {
             let Some(r) = self.runners.get(rid).filter(|r| self.admits(r, l)) else { continue };
             let mates: Vec<&Leg> = plan.iter().filter(|(_, on)| on == rid).filter_map(|(x, _)| self.legs.get(x)).collect();
@@ -4797,7 +5040,8 @@ impl Scheduler {
                 None => self.room_in(r, &holding, l),
             };
             if room && (!held || self.allowed_beside(r, l, &mates)) {
-                places.push((r.running.len() + mates.len(), rid));
+                let extra = mates.iter().fold(Cpus::ZERO, |a, x| a.saturating_add(x.input.request.cpu));
+                places.push((std::cmp::Reverse(self.room_of(r, &holding, extra) / 1000), rid));
             }
         }
         places.sort();
@@ -4978,6 +5222,7 @@ impl Scheduler {
         {
             sub(&mut r.used, &e.reserved);
             uncount(r, id);
+            self.dirty.insert(e.runner);
         }
     }
 
@@ -4986,39 +5231,57 @@ impl Scheduler {
         self.sigs.values().filter(|s| s.req.pool.as_deref() == Some(pool)).map(Sig::len).sum()
     }
 
-    /// The hosts that may run `pool`'s executors now, with room for another: connected, not
-    /// draining, eligible for its legs, under `per_host_max`, with the resources in resource
-    /// mode, and not backing off; the least loaded with the pool first.
-    fn hosts_for(&self, p: &Pool, now: i64) -> Vec<String> {
+    /// The host `pool`'s next executor starts on (W13-R09), the load balancer's pick (docs/lb.md
+    /// "The CI engine"): of the hosts that may run its executors (connected, not draining,
+    /// eligible for its legs), the most free by its rank, and between hosts as free, back to the
+    /// one its executors last started on well, past the one where one last failed to start, else
+    /// the next in turn. One that can't take another now is set aside for this pick: under
+    /// `per_host_max`, its GPUs' fit, room beside its exclusive legs in resource mode, and not
+    /// backing off. `None`: no host can.
+    fn host_for(&mut self, p: &Pool, now: i64) -> Option<String> {
         let req = Requirement { constraints: p.hosts.clone(), caps: p.caps, executors: vec![p.executor.clone()], pool: Some(p.name.clone()), ..Requirement::default() };
-        let mut hosts: Vec<(usize, String)> = self
-            .runners
-            .values()
-            .filter(|r| r.connected && !r.draining && routing::eligible(&req, &r.input.view))
-            .filter(|r| self.backoff.get(&(p.name.clone(), r.input.id.clone())).is_none_or(|(until, _)| *until <= now))
-            .filter_map(|r| {
-                let here = self.executors.values().filter(|e| e.pool == p.name && e.runner == r.input.id).count();
-                if here >= p.per_host_max {
-                    return None;
-                }
-                let c = self.config();
-                if p.request.gpu > 0 {
-                    let need = super::needs::Needs { request: p.request, requires: p.hosts.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() };
-                    Self::gpu_rank(r, &need, r.used.gpu)?;
-                }
-                if let (true, Some(cap)) = (c.resources, r.input.capacity) {
-                    // Beside what exclusive legs hold there, never in it.
-                    let q = &p.request;
-                    let (held, whole, _) = self.holding(r);
-                    if whole || !fits_beside(&r.used, &held, &cap, q, c) {
-                        return None;
-                    }
-                }
-                Some((here, r.input.id.clone()))
-            })
-            .collect();
-        hosts.sort();
-        hosts.into_iter().map(|(_, h)| h).collect()
+        let (sig, kind) = (format!("pool\0{}\0{}", p.name, p.caps), format!("pool:{}", p.name));
+        self.balance_told();
+        let hosts: Vec<String> = self.runners.values().filter(|r| r.connected && !r.draining && routing::eligible(&req, &r.input.view)).map(|r| r.input.id.clone()).collect();
+        self.balance.sync(&sig, self.fleet_gen, hosts.iter());
+        let kind = if self.cfg.good_places { kind } else { String::new() };
+        let mut aside: Vec<String> = Vec::new();
+        let picked = loop {
+            let Some(h) = self.balance.propose(&sig, &kind, None) else { break None };
+            if self.runners.get(&h).is_some_and(|r| self.takes_executor(p, r, now)) {
+                break Some(h);
+            }
+            self.balance.set_aside(&sig, &h);
+            aside.push(h);
+        };
+        self.balance.restore(&sig, &aside);
+        picked
+    }
+
+    /// Whether host `r` can take another of `pool`'s executors now: under `per_host_max`, not
+    /// backing off, its GPUs' fit, and in resource mode room beside what exclusive legs hold there.
+    fn takes_executor(&self, p: &Pool, r: &Runner, now: i64) -> bool {
+        if self.backoff.get(&(p.name.clone(), r.input.id.clone())).is_some_and(|(until, _)| *until > now) {
+            return false;
+        }
+        if self.executors.values().filter(|e| e.pool == p.name && e.runner == r.input.id).count() >= p.per_host_max {
+            return false;
+        }
+        let c = self.config();
+        if p.request.gpu > 0 {
+            let need = super::needs::Needs { request: p.request, requires: p.hosts.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() };
+            if Self::gpu_rank(r, &need, r.used.gpu).is_none() {
+                return false;
+            }
+        }
+        if let (true, Some(cap)) = (c.resources, r.input.capacity) {
+            // Beside what exclusive legs hold there, never in it.
+            let (held, whole, _) = self.holding(r);
+            if whole || !fits_beside(&r.used, &held, &cap, &p.request, c) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Starts as many of `pool`'s executors as its waiting legs and `min_idle` want.
@@ -5063,8 +5326,8 @@ impl Scheduler {
         protected.caps |= p.locked_caps;
         for (leg, _) in waiting.iter().filter(|(_, own)| *own) {
             if self.executors.values().any(|e| e.leg.as_deref() == Some(leg.as_str())) { continue; }
-            let mut host = self.hosts_for(&protected, now).into_iter().next();
-            if host.is_none() && self.retire_shared(&protected, true, out) { room += 1; host = self.hosts_for(&protected, now).into_iter().next(); }
+            let mut host = self.host_for(&protected, now);
+            if host.is_none() && self.retire_shared(&protected, true, out) { room += 1; host = self.host_for(&protected, now); }
             let Some(host) = host else { break };
             if room == 0 && self.retire_shared(&p, false, out) { room += 1; }
             if room == 0 { break; }
@@ -5076,7 +5339,7 @@ impl Scheduler {
         let others = waiting.iter().filter(|(_, own)| !*own).count();
         let mut want = pools::wanted(&p, starting, idle, busy, others).min(room);
         while want > 0 {
-            let Some(host) = self.hosts_for(&p, now).into_iter().next() else { break };
+            let Some(host) = self.host_for(&p, now) else { break };
             self.start_on_host(&p, host, None, now, out);
             want -= 1;
         }
@@ -5099,6 +5362,7 @@ impl Scheduler {
         self.seq += 1;
         let id = format!("pool-{}-{now:x}-{:x}", p.name, self.seq);
         self.executors.insert(id.clone(), Executor { id: id.clone(), pool: p.name.clone(), runner: host.clone(), state: ExecState::Starting, since: now, reserved: p.request, leg: leg.clone() });
+        self.touch(&host);
         if let Some(r) = self.runners.get_mut(&host) {
             add(&mut r.used, &p.request);
             if r.sample.is_some() {
@@ -5140,6 +5404,10 @@ impl Scheduler {
         e.since = now;
         let (pool, runner) = (e.pool.clone(), e.runner.clone());
         self.backoff.remove(&(pool.clone(), runner.clone()));
+        // Its host started it well: where the pool's executors go back to (docs/lb.md "Good places").
+        if self.cfg.good_places {
+            self.balance.ended(&runner, &format!("pool:{pool}"), How::Well, None);
+        }
         self.try_runner(&runner, now, out);
         self.scale(&pool, now, out);
         self.idle_timer(&pool, now, out);
@@ -5154,7 +5422,11 @@ impl Scheduler {
         if matches!(e.state, ExecState::Busy { .. }) {
             return;
         }
-        // The host is left alone a while, longer each time it fails.
+        // Its host let it down: passed over for the pool's executors while another is as free
+        // (docs/lb.md "Good places"), and left alone a while, longer each time it fails.
+        if self.cfg.good_places {
+            self.balance.ended(&e.runner, &format!("pool:{}", e.pool), How::LetDown, None);
+        }
         let key = (e.pool.clone(), e.runner.clone());
         let delay = self.backoff.get(&key).map_or(pools::FIRST_BACKOFF_MS, |(_, d)| *d);
         self.backoff.insert(key, (now + delay, (delay * 2).min(pools::MAX_BACKOFF_MS)));
@@ -5393,13 +5665,16 @@ impl Scheduler {
         WaitReason::Unroutable { failing }
     }
 
-    /// Why each runner can or can't take a leg (W05-R20), and for a leg with `warm` or `affinity`
-    /// terms what each one's warm state makes of it (W24-R18).
+    /// Why each runner can or can't take a leg (W05-R20), for a leg with `warm` or `affinity`
+    /// terms what each one's warm state makes of it (W24-R18), and which runner its kind of work
+    /// last went well on (docs/lb.md "Good places"): where the load balancer sends it back among
+    /// equals.
     pub fn explain(&self, id: &str) -> Vec<Explained> {
         let Some(l) = self.legs.get(id) else { return Vec::new() };
         let all: Vec<&Runner> = self.runners.values().collect();
         let scores = self.scores(l, &all, Some(self.now));
         let wants = Self::wants(l);
+        let good = self.good_place(id);
         self.runners
             .values()
             .enumerate()
@@ -5415,6 +5690,7 @@ impl Scheduler {
                     score: scores.get(i).copied().map(units::score),
                     checks,
                     warm: (!wants.is_empty()).then(|| self.seen(l, r, &wants, self.now)),
+                    good_place: good.as_deref() == Some(r.input.id.as_str()),
                 }
             })
             .collect()
@@ -5444,6 +5720,7 @@ impl Scheduler {
                     score: scores.get(i).copied().map(units::score),
                     checks,
                     warm: None,
+                    good_place: false,
                 }
             })
             .collect();
@@ -5675,6 +5952,10 @@ pub struct Explained {
     /// it's expected to finish (W24-R18).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warm: Option<Warmth>,
+    /// Its kind of work last went well here (docs/lb.md "Good places"): among runners as free,
+    /// the load balancer sends it back here. Said only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub good_place: bool,
 }
 
 /// What one runner's warm state makes of a leg (W24-R18): the workspace it would start from, how
@@ -5760,6 +6041,18 @@ fn uncount(r: &mut Runner, id: &str) {
     }
 }
 
+/// A runner's CPUs, in thousandths, as the load balancer counts them: as it offers them or its
+/// facts say ([`size`]), else as its latest sample says, else one for each of its slots.
+fn cpus_of(r: &Runner) -> u64 {
+    if let Some(s) = size(r) {
+        return s.cpu.get();
+    }
+    match &r.sample {
+        Some((s, _)) if s.cpus > 0 => u64::from(s.cpus).saturating_mul(1000),
+        _ => u64::from(r.input.slots.max(1)).saturating_mul(1000),
+    }
+}
+
 /// [`Scheduler::headroom`] of a runner. In floats, as [`Headroom`] is.
 #[allow(clippy::float_arithmetic)]
 fn headroom_of(r: &Runner) -> Option<Headroom> {
@@ -5768,13 +6061,3 @@ fn headroom_of(r: &Runner) -> Option<Headroom> {
     Some(Headroom { cpus: (h.cpus - r.since.cpu.as_f64()).max(0.0), mem: h.mem.saturating_sub(r.since.mem), ..h })
 }
 
-/// The less loaded of two runners first: the smaller share of its slots running, compared
-/// without dividing.
-fn lighter(a: &Runner, b: &Runner) -> std::cmp::Ordering {
-    let share = |r: &Runner, of: &Runner| u128::try_from(r.running.len()).unwrap_or(u128::MAX).saturating_mul(u128::from(of.input.slots.max(1)));
-    share(a, b).cmp(&share(b, a))
-}
-
-fn free(r: &Runner) -> usize {
-    (r.input.slots.max(1) as usize).saturating_sub(r.running.len())
-}

@@ -1,0 +1,18 @@
+host MINGW64_NT-10.0-26200 3.6.10-5a1665c8.x86_64 x86_64 Jupiter
+cargo 1.99.0 (5f94df478 2026-08-27)
+rustc 1.99.0 (b940084d7 2026-09-28)
+674161d08555d7eb02f8ae5867c252105d366f35d21dc7a4ae5aa04cd4548b6e *src/unpack.rs
+57608038a7c3c1e82401f3c8369997a2f32dde41cde4ca5fd69d7d1c0cc9333d *src/unpack/tests.rs
+bfda00e0826d5c0577283233440f16ec676d8dfa3b68633733a23ac65c03713e *Cargo.toml
+
+running 16 tests
+................
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+TEST_EXIT 0
+CLIPPY_EXIT 0

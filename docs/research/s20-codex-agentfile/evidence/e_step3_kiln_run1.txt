@@ -1,0 +1,162 @@
+DONE exit 0
+host Linux 7.3.3-1-cachyos x86_64 adacachy2 2026-11-12T14:44:59Z
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+HEAD ee2f681d342387a35ac919eb5281ce4cf09b8613 Pin Codex 0.167.2 and arm64's static rg for harness-codex (kiln plan 01a1c
+ M crates/kiln/src/agentfiles/mod.rs
+?? crates/kiln/src/agentfiles/unpack.rs
+?? crates/kiln/src/agentfiles/unpack/
+?? docs/research/s20-codex-agentfile/evidence/POLICY_READ-step3.json
+?? docs/research/s20-codex-agentfile/evidence/e_step3_mutants_run1.txt
+?? docs/research/s20-codex-agentfile/evidence/e_step3_scratch_run1.txt
+?? docs/research/s20-codex-agentfile/scripts/step3-mutants.py
+?? docs/research/s20-codex-agentfile/scripts/step3-run-mutants.sh
+?? docs/research/s20-codex-agentfile/scripts/step3-run-scratch.sh
+?? docs/research/s20-codex-agentfile/scripts/step3-scratch-Cargo.toml
+?? docs/research/s20-codex-agentfile/step3.md
+674161d08555d7eb02f8ae5867c252105d366f35d21dc7a4ae5aa04cd4548b6e  crates/kiln/src/agentfiles/unpack.rs
+d68fbebb0324d5a65b3cefe10d8b8ceb48e84500799462a498f63bbdcaa465bf  crates/kiln/src/agentfiles/unpack/tests.rs
+c882e23c7355c0167d74e36f818dc5dc77e2f4526b57d50fa4366e6142bab1f2  crates/kiln/src/agentfiles/mod.rs
+   Compiling cfg_block v0.1.1
+   Compiling glob v0.3.4
+   Compiling zip v9.0.5
+   Compiling portable-pty v0.9.0
+   Compiling async-tungstenite v0.35.0
+   Compiling vt100 v0.16.2
+   Compiling quiver v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/quiver/crates/quiver)
+   Compiling str0m v0.24.1
+   Compiling rpassword v7.5.4
+   Compiling async-channel v2.5.0
+   Compiling argon2 v0.6.0
+   Compiling scrypt v0.11.0
+   Compiling kiln-ci v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-ci)
+   Compiling mantle-client v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/mantle/crates/client)
+   Compiling rust-embed v8.13.0
+   Compiling crypto_secretbox v0.1.1
+   Compiling clap v4.6.7
+   Compiling kiln-http v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-http)
+   Compiling kiln-sim v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-sim)
+   Compiling kiln-search v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-search)
+   Compiling rquickjs v0.14.0
+   Compiling kiln-obs v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-obs)
+   Compiling http-body-util v0.1.5
+   Compiling kiln-bp v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-bp)
+   Compiling async-broadcast v0.7.2
+   Compiling async-lock v3.4.2
+   Compiling toml_edit v0.25.17+spec-1.1.0
+   Compiling hmac v0.13.0
+   Compiling kiln-gpu v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-gpu)
+   Compiling webpki-roots v1.0.9
+   Compiling serde_path_to_error v0.1.20
+   Compiling socket2 v0.6.5
+   Compiling sysinfo v0.39.6
+   Compiling hyper-measure v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/hyper-raft/crates/hyper-measure)
+   Compiling rusqlite v0.40.2
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9m 03s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s20-step3/target/debug/deps/kiln-5912040c812e1101)
+
+running 18 tests
+test agentfiles::unpack::tests::a_trees_skip_is_a_trees_field ... ok
+test agentfiles::unpack::tests::what_is_not_a_gzip_tar_is_refused_whole ... ok
+test agentfiles::unpack::tests::a_target_already_there_is_refused_and_left_as_it_was ... ok
+test agentfiles::unpack::tests::a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole ... ok
+test agentfiles::unpack::tests::devins_shape_unpacks_at_strip_0_with_nothing_beside_it ... ok
+test agentfiles::unpack::tests::a_tree_at_a_path_inside_appears_whole_beside_what_is_there ... ok
+test agentfiles::unpack::tests::a_strip_1_tree_appears_whole_with_its_files_directories_and_modes ... ok
+test agentfiles::unpack::tests::without_its_skip_ripgreps_rg_collides_with_the_packages_and_the_first_stays ... ok
+test agentfiles::unpack::tests::a_pi_shaped_build_unpacks_its_tree_then_picks_its_members ... ok
+test agentfiles::unpack::tests::a_skipped_file_counts_in_the_trees_totals ... ok
+test agentfiles::unpack::tests::codex_arm64s_tree_skips_its_rg_and_ripgreps_static_rg_takes_its_place ... ok
+test agentfiles::unpack::tests::the_unpack_object_is_one_form_or_refused ... ok
+test agentfiles::unpack::tests::the_per_arch_directory_appears_only_once_the_whole_archive_is_in ... ok
+test agentfiles::unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in ... ok
+test agentfiles::unpack::tests::a_member_is_one_regular_file_held_to_its_pin ... ok
+test agentfiles::unpack::tests::a_skipped_path_is_one_regular_file_the_archive_holds ... ok
+test agentfiles::unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing ... ok
+test agentfiles::unpack::tests::an_archive_cut_short_leaves_nothing_behind ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 4384 filtered out; finished in 0.09s
+
+TEST_EXIT 0 2026-11-12T14:54:04Z
+    Checking nix v0.28.0
+    Checking turso_ext v0.9.0-pre.1 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/turso/extensions/core)
+    Checking turso_parser v0.9.0-pre.1 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/turso/sqlite/parser)
+    Checking aes-gcm v0.10.3
+    Checking str0m-aws-lc-rs v0.6.0
+    Checking is v0.11.1
+    Checking branches v0.4.6
+    Checking bigdecimal v0.4.11
+    Checking uncased v0.9.10
+    Checking filedescriptor v0.8.3
+    Checking fancy-regex v0.19.2
+    Checking intrusive-collections v0.9.7
+    Checking sctp-proto v0.10.7
+    Checking roaring v0.11.5
+    Checking tempfile v3.27.0
+    Checking poly1305 v0.8.0
+    Checking lz4_flex v0.14.0
+    Checking quiver-api v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/quiver/crates/quiver-api)
+    Checking arc-swap v1.9.3
+    Checking rapidhash v4.5.1
+    Checking cms v0.2.3
+    Checking polling v3.11.0
+    Checking pack1 v1.1.0
+    Checking fastbloom v0.14.1
+    Checking sha2 v0.10.9
+    Checking blake2 v0.11.0
+    Checking vte v0.15.0
+    Checking combine v4.6.9
+    Checking serial2 v0.2.38
+    Checking rtoolbox v0.0.6
+    Checking concurrent-queue v2.5.0
+    Checking libloading v0.8.9
+    Checking fallible-streaming-iterator v0.1.9
+    Checking shell-words v1.1.1
+    Checking atomic-waker v1.1.2
+    Checking cfg_block v0.1.1
+    Checking downcast-rs v1.2.1
+    Checking base64 v0.22.1
+    Checking allocator-api2 v0.4.0
+    Checking typed-path v0.12.3
+    Checking simdutf8 v0.1.5
+    Checking unicode-width v0.2.2
+    Checking glob v0.3.4
+    Checking k8s-openapi v0.28.0
+    Checking vt100 v0.16.2
+    Checking turso_core v0.9.0-pre.1 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/turso/core)
+    Checking kiln-search v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-search)
+    Checking portable-pty v0.9.0
+    Checking async-tungstenite v0.35.0
+    Checking async-channel v2.5.0
+    Checking rusqlite v0.40.2
+    Checking zip v9.0.5
+    Checking rpassword v7.5.4
+    Checking kiln-ci v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-ci)
+    Checking scrypt v0.11.0
+    Checking argon2 v0.6.0
+    Checking quiver v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/quiver/crates/quiver)
+    Checking rust-embed v8.13.0
+    Checking crypto_secretbox v0.1.1
+    Checking clap v4.6.7
+    Checking rquickjs v0.14.0
+    Checking nix v0.31.3
+    Checking mantle-client v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/mantle/crates/client)
+    Checking kiln-http v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-http)
+    Checking str0m v0.24.1
+    Checking http-body-util v0.1.5
+    Checking kiln-bp v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-bp)
+    Checking kiln-obs v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-obs)
+    Checking async-broadcast v0.7.2
+    Checking async-lock v3.4.2
+    Checking toml_edit v0.25.17+spec-1.1.0
+    Checking hmac v0.13.0
+    Checking serde_path_to_error v0.1.20
+    Checking socket2 v0.6.5
+    Checking sysinfo v0.39.6
+    Checking kiln-gpu v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-gpu)
+    Checking webpki-roots v1.0.9
+    Checking kiln-sim v0.2.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/crates/kiln-sim)
+    Checking hyper-measure v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s20-unpack-8e02466964/vendor/hyper-raft/crates/hyper-measure)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5m 01s
+CLIPPY_EXIT 0 2026-11-12T14:59:06Z
+
+[exited with code 0]
