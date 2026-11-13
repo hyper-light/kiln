@@ -389,3 +389,34 @@ the commit messages give from before the rewrite map as follows:
 | b352ff8b6, e951b2968, 0c64ad0e8, 0aea534f2, c7bce6d2c, 4b558f733 (merges and the record) | 355f6b9ed, 33c1010b9, 8b4021fbe, 541ec016e, 24a0af22e, 95e6bf9a7 |
 | a428cdf9c, 61f284289, 943294258, 3dd57e3f1 (part 3) | d99dbff5e, 5f80c108d, 14dcdd7de, bbf4936d8 |
 | 053e79233, 027d1aacf, b8065ba0e, fdc5feff4 (part 3's merges, record and tested tip) | 8b3cba8ab, b163ae9fb, 7a0ab1aa5, 5055d8115 |
+
+## Part 3b: the runner's end of the lane, in its own process
+
+This is ROOT's (2) of D254: the runner bridges each `mcp` lane connection to kiln's MCP handler in
+its own process. It needs no Unix socket, so Windows gets kiln's MCP too. Goal 58's API
+(`evidence/part3/goal58-2026-11-13-d254-api.txt`) hands over each connection the member's harness
+makes to its bridge (`Execs::mcp(member)`) as one byte stream each way, carrying newline-delimited
+JSON-RPC as `kiln reach mcp` does. So the runner serves the same server over that stream:
+
+- `reach::local::answer` is the reach socket's dispatch, on every platform, taking its `Peer`. A
+  process at the socket (Unix) is known by its pid. An isolated session over its lane is known by
+  its session, which is its runs' asker and whom their news is for.
+- `reach::local::Here` asks this runner in its own process, one request each `ask`, as a socket
+  connection does, its sends and reads waiting as a socket client's do.
+- `reach::mcp` builds on every platform. Its server asks its runner over a `Link`: the reach socket
+  (`kiln reach mcp`, Unix) or `Here`. Its runs' signals and news follow the same link: `told`'s
+  teller is per link, and `heard` takes the peer.
+- `reach::mcp::serve_lane(here, cwd, input, output)` serves one connection until it ends. Each
+  `tools/call` over the lane is said on `kiln.mcp.lane`, naming its session and tool (what goal 65's
+  checks read). Its tools/list_changed watch ends with its stream.
+- A run from an agent's MCP still needs the runner's own launches (docs/ci.md W05-R07), which only
+  Unix runners hold. Where they don't run, a run is refused, saying so. Every other tool works
+  there.
+- R05: `Link`, `Conn` and `Signals` each have two real callers, the socket and the lane, and no new
+  wait or cache. R03: no number of its own; the watch's period is main's `REGISTRY_TTL`.
+
+Owed:
+- Each `Execs::mcp(member)` connection handed to `serve_lane` on a thread of its own, at step 17's
+  launch (`sandbox::microvm()`).
+- Kiln's vendor/shards at or after Shards e1995061f, with shards-remote linked (its owner's).
+- Real-VM MCP round trips on Linux, macOS and Windows hosts (ROOT's).
