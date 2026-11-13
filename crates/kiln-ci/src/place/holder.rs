@@ -101,7 +101,42 @@ pub struct Holding {
     stood: Option<Keeper>,
     /// The starts that asked nothing, so reserved nothing, in this process: each one's box numbered
     /// ([`BoxName::Unreserved`]).
-    unreserved: u64,
+    unreserved: Numbering,
+}
+
+/// The numbering of a runner process's boxes that reserved nothing ([`BoxName::Unreserved`]): its holding's
+/// ([`Holding::unreserved`]), shared with whatever else names a box of that process's that no start of its holding's
+/// named (a sandbox's launch: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), so no two boxes share a name.
+/// Each number once, from 0; the last one, `u64::MAX`, given again (as a count saturates).
+#[derive(Debug, Clone)]
+pub struct Numbering {
+    epoch: u64,
+    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Numbering {
+    /// The numbering of the runner process of `epoch`, from 0.
+    pub fn new(epoch: u64) -> Self {
+        Self { epoch, next: std::sync::Arc::default() }
+    }
+
+    /// The epoch its boxes are named under.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The next box's name.
+    pub fn next(&self) -> BoxName {
+        use std::sync::atomic::Ordering;
+        let mut n = self.next.load(Ordering::Acquire);
+        while let Some(after) = n.checked_add(1) {
+            match self.next.compare_exchange_weak(n, after, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
+        BoxName::Unreserved { epoch: self.epoch, n }
+    }
 }
 
 /// What a box kiln runs on its machine is named, so that its machine's keeper pairs the box with
@@ -185,8 +220,18 @@ impl Holding {
             stalled: false,
             most: u64::try_from(most).unwrap_or(u64::MAX),
             stood: None,
-            unreserved: 0,
+            unreserved: Numbering::new(epoch),
         })
+    }
+
+    /// Its boxes that reserve nothing numbered by `numbering` (shared with its process's other namers), where it
+    /// numbers its own epoch's; else by its own, as a numbering of another epoch names another process's boxes.
+    #[must_use]
+    pub fn numbered_by(mut self, numbering: Numbering) -> Self {
+        if numbering.epoch == self.core.epoch() {
+            self.unreserved = numbering;
+        }
+        self
     }
 
     /// Where its core's link stands.
@@ -202,9 +247,7 @@ impl Holding {
     /// The box of a start that asks nothing ([`Self::reserve`]'s none), which starts without a
     /// reservation: the next of this process's ([`BoxName::Unreserved`]).
     pub fn unreserved(&mut self) -> BoxName {
-        let n = self.unreserved;
-        self.unreserved = n.saturating_add(1);
-        BoxName::Unreserved { epoch: self.core.epoch(), n }
+        self.unreserved.next()
     }
 
     /// The reservations whose work may run, its starts' granted and its survivors': what its

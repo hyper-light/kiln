@@ -1030,11 +1030,10 @@ impl Host {
         self.microvm.lock().clone()
     }
 
-    /// Holds isolated agents' harnesses in `vms` from now on: a test's stand-in for the machine's
-    /// microVMs.
-    #[cfg(test)]
-    pub fn hold_isolated_in(&self, vms: crate::sandbox::Microvms) {
-        *self.microvm.lock() = Some(Arc::new(vms));
+    /// Holds isolated agents' harnesses in `vms` from now on: the machine's microVMs as its runner holds them
+    /// (`crate::sandbox::hold`, through Hex), or a test's stand-in.
+    pub fn hold_isolated_in(&self, vms: impl Into<Arc<crate::sandbox::Microvms>>) {
+        *self.microvm.lock() = Some(vms.into());
     }
 
     /// Takes no messages (`on`), or takes them again: a new build that takes its sessions over from
@@ -4027,7 +4026,7 @@ mod tests {
             let why = host.open(None, Spec { claim: Some(balancers_claim()), ..spec.clone() }).err().map(|e| format!("{e:#}")).unwrap_or_default();
             anyhow::ensure!(why == crate::sandbox::NO_MICROVM, "under its claim, with no microVM to hold it: {why}");
             let (images, _) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
-            host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::new(kiln_seams::sandbox::SimSandbox::new()), images });
+            host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::new(kiln_seams::sandbox::SimSandbox::new()), images));
             let why = host.open(None, spec).err().map(|e| format!("{e:#}")).unwrap_or_default();
             anyhow::ensure!(why.contains("kiln's balancer"), "no claim: {why}");
             anyhow::ensure!(host.inventory().sessions.is_empty(), "nothing started");
@@ -5144,7 +5143,7 @@ while True:
             let lanes = ["control", "stdin:0", "stdout:0", "stderr:0"].map(str::to_owned).to_vec();
             let link = kiln_seams::sandbox::Link { controller: end(), endpoint: end(), lanes };
             let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program).linked(link.clone()));
-            host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images });
+            host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images));
             let cwd = dir.path().to_string_lossy().into_owned();
             // Its person's volumes kept on the machine (goal 65's finding: where its conversation ran is kept beside them).
             host.keep_homes(dir.path().join("homes"));
@@ -5160,6 +5159,10 @@ while True:
             assert_eq!((launch.program.as_str(), &launch.boundary, launch.folder.as_deref()), ("claude", &Boundary::MicroVm { image: pinned.clone() }, Some(cwd.as_str())));
             assert!(pinned.starts_with("harness-claude@sha256:"), "kiln's image for Claude Code, pinned by its digest: {pinned}");
             assert!(launch.args.iter().any(|a| a == "--session-id"), "its session's own flags, past its image's: {:?}", launch.args);
+            // Step 18's launch pieces: kiln's variables as a microVM's member gets them, and kiln's MCP through its lane's bridge.
+            assert!(launch.env.contains(&("KILN_AGENT".to_owned(), "isolated".to_owned())), "its mark: {:?}", launch.env);
+            let mcp = launch.args.iter().position(|a| a == "--mcp-config").and_then(|i| launch.args.get(i + 1));
+            assert!(mcp.is_some_and(|c| c.contains(crate::harness::isolated::mcp::BRIDGE)), "kiln's MCP through its bridge: {:?}", launch.args);
             // What it sees of the machine: its project at its own path, its person's volume here as its
             // HOME, made before it started (`harness::isolated::home::Layout::prepare`), and the plugin
             // folders Claude Code loads on the machine (kiln's skills, its session's), read-only at their
@@ -5266,7 +5269,7 @@ while True:
             assert!(host.get("nowhere").is_none(), "nothing was opened");
             // The simulator holds no microVM run: the launch is refused, typed, and said as its end.
             let (images, _) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
-            host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::new(kiln_seams::sandbox::SimSandbox::new()), images });
+            host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::new(kiln_seams::sandbox::SimSandbox::new()), images));
             let s = host.open(Some("somewhere".into()), spec)?;
             let said = crate::rt::timeout(Duration::from_secs(60), async {
                 loop {
