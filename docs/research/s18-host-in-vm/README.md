@@ -465,3 +465,22 @@ embeds Google's installed-app OAuth client secrets, and its excerpt redacts them
 - Together's docs now name `api.together.ai`, where Goose and opencode still ask `api.together.xyz`.
 - MiniMax's China docs now name `api.minimax.cn`, where pi asks `api.minimaxi.com`.
 - Each stays as its harness asks; a harness's update would move it.
+
+### What ran where (part 4)
+
+The one focused test and clippy, on one Mac, through a carrier: a blobless clone of kiln from GitHub, part 4's commits
+fetched from a bundle, and a target of its own (`~/g121-tmp/s18-hosts`, removed after landing). `CARGO_INCREMENTAL=0`
+and one cargo at a time. Every vendor download went into a new empty directory, as data, and no vendor CLI ran.
+
+| Where | What | Result |
+|---|---|---|
+| macOS 26.2 arm64, adas-mac-studio-3.local (Apple M4 Max, 14 CPUs), rustc 1.99.1, at e6914a9cd (part 4 on kiln main 752ca8bbc, after parts 1, 2 and 3a) | `cargo test --locked -p kiln --lib -- step18 step23 agentfiles::` | 153 passed, 0 failed, 0 ignored (4401 filtered out). Among them: `grants_tests`' four step18 tests (each built-in's hosts, Shards' own reading of them, the hosts by use, agy's sign-ins), part 3a's `agentfiles::check` tests (no built-in grants a way to kiln), `step23_shards_checks_every_builtin` and each harness's own Agentfile tests |
+| the same | `cargo clippy --locked -p kiln --all-targets -- -D warnings` | passed, exit 0, 10 min 34 s; the only warnings are dependencies' own |
+| the same Mac, dry runs at 089b76eac and 20ba04780 (part 4 over parts 1 and 2 at c7bce6d2c, before their history was rewritten; never pushed, branch deleted) | the same test and clippy | 146, then 147 passed, 0 failed; clippy passed both times |
+| adas-macbook-pro-2 (this Mac), `rustc --test` of the two new tests' logic on its own | the tests, then the agy test with `sts` left out of the sign-ins | green; then red at "together ..., not the image's ..." |
+
+**Owed (ROOT):**
+- each built-in run in a real microVM with these grants, a signed-in turn of each harness reaching its provider and
+  nothing else, for each of agy's four sign-ins and for a provider or two each of Goose, opencode and pi;
+- opencode's 218-host grant held by Shards' network process in a real run;
+- the per-run narrowing itself, which is the launch's (goal 60, plan step 17, building on `destinations::BY_USE`).
