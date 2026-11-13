@@ -24,7 +24,7 @@
 //!
 //! Its shell's waits on the keeper's answers follow the keeper's liveness and progress alone
 //! ([`Waits`]): a wait ends, typed, when the link dies or resets, or when the keeper, alive, has
-//! answered nothing for longer than the slowest answer it has given.
+//! said nothing for a whole window of the slowest answer it has given.
 //!
 //! Every amount and count here is the keeper's or the runner's own: nothing is a number of this
 //! module's.
@@ -101,8 +101,9 @@ pub enum Unsynced {
     /// The keeper closed its session for a word it couldn't take (`Closed { Invalid }`): the
     /// runner's own defect.
     Malformed,
-    /// The keeper, its link alive, has answered nothing for longer than the slowest answer it has
-    /// given ([`Waits`]): nothing new is admitted there until it answers again.
+    /// The keeper, its link alive, has said nothing (no answer, no hint) for a whole window of the
+    /// slowest answer it has given ([`Waits`]): nothing new is admitted there until it answers
+    /// again.
     Stalled,
 }
 
@@ -114,7 +115,7 @@ impl Unsynced {
             Unsynced::NotServed => "its machine's capacity keeper doesn't serve it (not among the holders the keeper's configuration names, or as many are served as it may): the person's to fix",
             Unsynced::Superseded => "a newer process of this runner holds its place with its machine's capacity keeper",
             Unsynced::Malformed => "its machine's capacity keeper closed its session for a word it couldn't take",
-            Unsynced::Stalled => "its machine's capacity keeper, its link alive, has answered nothing for longer than the slowest answer it has given",
+            Unsynced::Stalled => "its machine's capacity keeper, its link alive, has said nothing for longer than the slowest answer it has given",
         }
     }
 }
@@ -130,29 +131,33 @@ pub enum WaitEnded {
     /// The keeper started again, or reset the link (QUIC's stateless reset, RFC 9000 §10.3; its
     /// answer `Closed { Session }`): no word said on it is answered.
     Reset,
-    /// The keeper, its link alive, has answered nothing for longer than the slowest answer it has
-    /// given ([`Waits::slowest`]).
+    /// The keeper, its link alive, has said nothing (no answer, no hint) for a whole window of the
+    /// slowest answer it has given ([`Waits::slowest`]).
     Stalled,
 }
 
-/// A holder's waits on its keeper's answers (docs/lb.md "A machine's keeper"). Its words go on one
-/// link and the keeper answers them in the order said (CV9), so the answer due is the oldest
-/// word's, and the keeper's progress is its answers. A wait follows the keeper's liveness and
-/// progress alone: no time is seeded from records, and none is multiplied (no constants: Shards'
-/// R03, as the user restated it on 2026-11-13). It ends, typed ([`WaitEnded`]), when the link dies
-/// or resets, or when the keeper, its link alive, has answered nothing for longer than the slowest
-/// answer it has given in this process: each answer timed from its word, or from the answer before
-/// it where that came later (the word waited behind it, the keeper answering in order). Until its
-/// first answer there is no such bound: a cold start waits on liveness alone, and admits nothing
-/// new there meanwhile (CV11). A word whose wait ended stays in its place, so an answer that comes
-/// late is matched to its own word, and makes the slowest answer what it took. `now` is the shell's
-/// monotonic clock, in milliseconds.
+/// A holder's waits on its keeper's answers (docs/lb.md "A machine's keeper"; Hex's holder wait
+/// contract, decision 9, as its lead restated it on 2026-11-13). Its words go on one link and the
+/// keeper answers them in the order said (CV9), so the answer due is the oldest word's. A wait
+/// follows the keeper's liveness and progress alone: no time is seeded from records, and none is
+/// multiplied (no constants: Shards' R03, as the user restated it on 2026-11-13). It ends, typed
+/// ([`WaitEnded`]), when the link dies or resets, or when the keeper, its link alive, has said
+/// nothing for a whole window of the slowest answer it has given in this process: the window runs
+/// from the word waiting, or from the keeper's last word on the link (an answer, or a hint, which
+/// answers nothing but shows it going on) where that came later. Each answer is timed from its
+/// word, or from the answer before it where that came later (the word waited behind it, the keeper
+/// answering in order); a hint times nothing. Until its first answer there is no such bound: a cold
+/// start waits on liveness alone, and admits nothing new there meanwhile (CV11). A word whose wait
+/// ended stays in its place, so an answer that comes late is matched to its own word, and makes the
+/// slowest answer what it took. `now` is the shell's monotonic clock, in milliseconds.
 #[derive(Debug, Clone, Default)]
 pub struct Waits {
     /// When each word said on the link and not yet answered was said, oldest first.
     said: VecDeque<i64>,
     /// When the keeper last answered on the link.
     answered: Option<i64>,
+    /// When the keeper last said anything on the link, an answer or a hint.
+    heard: Option<i64>,
     /// The slowest answer the keeper has given, on any link of this process.
     slowest: Option<u64>,
 }
@@ -163,9 +168,16 @@ impl Waits {
         self.said.push_back(now);
     }
 
+    /// The keeper said something on the link at `now` (an answer, or a hint): it goes on, so the
+    /// oldest word's window runs from now. It times no answer.
+    pub fn heard(&mut self, now: i64) {
+        self.heard = Some(self.heard.map_or(now, |at| at.max(now)));
+    }
+
     /// The oldest word's answer came at `now`: how long it took, the slowest answer now at least
     /// that. None where no word waited (an answer the link owed nothing for).
     pub fn answered(&mut self, now: i64) -> Option<u64> {
+        self.heard(now);
         let said = self.said.pop_front()?;
         let from = self.answered.map_or(said, |at| at.max(said));
         let took = u64::try_from(now.saturating_sub(from)).unwrap_or(0);
@@ -181,16 +193,17 @@ impl Waits {
         let waiting = self.said.len();
         self.said.clear();
         self.answered = None;
+        self.heard = None;
         waiting
     }
 
-    /// When the oldest word's wait ends as stalled: once it has waited longer than the slowest
-    /// answer, from its word or the answer before it. None while no word waits, or before the
-    /// keeper's first answer.
+    /// When the oldest word's wait ends as stalled: once a whole window of the slowest answer has
+    /// passed with nothing from the keeper, from its word or the keeper's last word after it. None
+    /// while no word waits, or before the keeper's first answer.
     pub fn due(&self) -> Option<i64> {
         let said = *self.said.front()?;
         let slowest = i64::try_from(self.slowest?).unwrap_or(i64::MAX);
-        let from = self.answered.map_or(said, |at| at.max(said));
+        let from = self.heard.map_or(said, |at| at.max(said));
         Some(from.saturating_add(slowest).saturating_add(1))
     }
 
@@ -296,7 +309,7 @@ impl NotGranted {
             NotGranted::Disagrees => "its machine's capacity keeper granted another amount than its reserve asked, given back",
             NotGranted::Unanswered(WaitEnded::Died) => "its reserve went unanswered: its link to its machine's capacity keeper ended",
             NotGranted::Unanswered(WaitEnded::Reset) => "its reserve went unanswered: its machine's capacity keeper started again",
-            NotGranted::Unanswered(WaitEnded::Stalled) => "its reserve went unanswered: its machine's capacity keeper answered nothing for longer than the slowest answer it has given",
+            NotGranted::Unanswered(WaitEnded::Stalled) => "its reserve went unanswered: its machine's capacity keeper said nothing for longer than the slowest answer it has given",
             NotGranted::Devices => "its machine's capacity keeper refused its reserve: it asks GPUs, which the keeper grants no holder by count",
             NotGranted::Empty => "its machine's capacity keeper refused its reserve as asking nothing",
             NotGranted::Exhausted => "this runner's process has numbered every reservation it can: its next process numbers them anew",

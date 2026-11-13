@@ -95,6 +95,7 @@ async fn lab3() -> anyhow::Result<Lab3> {
             place: kiln_ci::place::runner::Settings::default(),
             version: super::wire::VERSION,
             root: Vec::new(),
+            capacity: None,
         };
         let (h, out) = node::start(cfg)?;
         nodes.insert(name, h);

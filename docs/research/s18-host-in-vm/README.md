@@ -215,15 +215,13 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
 
 ## Owed
 
-- Wiring into step 17's launch seam (above), when ROOT says it has landed.
+- Wiring into step 17's launch seam (above): goal 60's launch, as it lands.
 - Steps 6 and 11's terminal lane and the microVM's key: sign-in, git signing, credential helpers
   (design above).
-- kiln's MCP over the `mcp` lane (D254, ROOT's word of 2026-11-13), this goal's next part: each
-  harness's MCP config pointed at the lane's endpoint inside the microVM, its form agreed with goal
-  58 from each harness's documented transports; the runner bridging the lane to kiln's MCP handler
-  in its own process, with no Unix socket, so Windows gets kiln's MCP too; and kiln's in-process
-  Agentfile check refusing an MCP network grant. The runner's loopback `/api/mcp` (plan step 35's
-  part 3) was the withdrawn design's.
+- kiln's MCP over the `mcp` lane (D254, ROOT's word of 2026-11-13) is built: each harness's MCP
+  config and the check's `ReachesKiln` in part 3a, the runner's end in part 3b (kiln main
+  dace992a6). The launch handing it each connection is goal 60's (part 3b's owed list). The
+  runner's loopback `/api/mcp` (plan step 35's part 3) was the withdrawn design's.
 - Real-VM runs (ROOT's): an isolated session's transcript read from its volume and resumed; kiln's
   MCP over the lane; H6's notices from a live microVM.
 
@@ -360,10 +358,9 @@ R03: no number of the rule's own. The address classes are RFCs' (loopback, RFC 3
 | the same Mac, at 027d1aacf (parts 1, 2 and 3 merged with kiln main d1f5b7f69) | step 18's whole filter set (`step18 step23 agentfiles:: wire::ts harness::homes harness::whose harness::moving harness::trouble harness::isolated harness::lineage mcp:: reach::mcp`) | 239 passed, 0 failed |
 | the same | the same clippy | passed (3 min 25 s) |
 
-Owed, this goal's part 3b:
+Owed then, as part 3b:
 - The runner's end of the lane: kiln's MCP served in the runner's own process over each
-  `McpConnection`, with no Unix socket, on every OS. `reach::mcp`, `reach::local`'s dispatch and
-  `reach::told`'s teller are Unix-only today, behind the reach socket.
+  `McpConnection`, with no Unix socket, on every OS. Built in part 3b (below).
 - Kiln's vendor/shards at or after e1995061f, with shards-remote linked (its owner's).
 - The wiring at the launch (`sandbox::microvm()`, step 17's next slice).
 - Real-VM MCP round trips on Linux, macOS and Windows hosts (ROOT's).
@@ -389,6 +386,66 @@ the commit messages give from before the rewrite map as follows:
 | b352ff8b6, e951b2968, 0c64ad0e8, 0aea534f2, c7bce6d2c, 4b558f733 (merges and the record) | 355f6b9ed, 33c1010b9, 8b4021fbe, 541ec016e, 24a0af22e, 95e6bf9a7 |
 | a428cdf9c, 61f284289, 943294258, 3dd57e3f1 (part 3) | d99dbff5e, 5f80c108d, 14dcdd7de, bbf4936d8 |
 | 053e79233, 027d1aacf, b8065ba0e, fdc5feff4 (part 3's merges, record and tested tip) | 8b3cba8ab, b163ae9fb, 7a0ab1aa5, 5055d8115 |
+
+## Part 3b: the runner's end of the lane, in its own process
+
+This is ROOT's (2) of D254: the runner bridges each `mcp` lane connection to kiln's MCP handler in
+its own process. It needs no Unix socket, so Windows gets kiln's MCP too. Goal 58's API
+(`evidence/part3/goal58-2026-11-13-d254-api.txt`) hands over each connection the member's harness
+makes to its bridge (`Execs::mcp(member)`) as one byte stream each way, carrying newline-delimited
+JSON-RPC as `kiln reach mcp` does. So the runner serves the same server over that stream:
+
+- `reach::local::answer` is the reach socket's dispatch, on every platform, taking its `Peer`. A
+  process at the socket (Unix) is known by its pid. An isolated session over its lane is known by
+  its session, which is its runs' asker and whom their news is for.
+- `reach::local::Here` asks this runner in its own process, one request each `ask`, as a socket
+  connection does, its sends and reads waiting as a socket client's do.
+- `reach::mcp` builds on every platform. Its server asks its runner over a `Link`: the reach socket
+  (`kiln reach mcp`, Unix) or `Here`. Its runs' signals and news follow the same link: `told`'s
+  teller is per link, and `heard` takes the peer.
+- `reach::mcp::serve_lane(here, cwd, input, output)` serves one connection until it ends. Each
+  `tools/call` over the lane is said on `kiln.mcp.lane`, naming its session and tool (what goal 65's
+  checks read). Its tools/list_changed watch ends with its stream.
+- A run from an agent's MCP still needs the runner's own launches (docs/ci.md W05-R07), which only
+  Unix runners hold. Where they don't run, a run is refused, saying so. Every other tool works
+  there.
+- R05: `Link`, `Conn` and `Signals` each have two real callers, the socket and the lane, and no new
+  wait or cache. R03: no number of its own; the watch's period is main's `REGISTRY_TTL`.
+
+- A lane connection that ends stops its runs, as a reach socket client that goes away stops its
+  own.
+
+| Where | What | Result |
+|---|---|---|
+| macOS 26.4 arm64, adas-mac-studio.local-2 (M3 Ultra), rustc 1.99.1, `CARGO_INCREMENTAL=0`, at 80cf5438f (part 3b on kiln main 36f46a0c2) | `cargo test --locked -p kiln --lib -- reach::mcp reach::told reach::local reach::tests::doors mcp:: step18 harness::isolated` | 91 passed, 2 failed: the new lane tests asked a lone node for its directory, which it answers "not connected to the kiln server" in its own words |
+| the same | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | `large_enum_variant` on `Conn`: its in-process request is boxed now |
+| the same Mac, at 444f15ef0 (both fixed, the tests asking what a lone node answers itself) | the same test | 93 passed, 0 failed |
+| the same | the same clippy | passed (2 min 35 s) |
+| the same Mac, at a54be7987 (merged with kiln main 8c1595f26, part 4) | the same test | 95 passed, 0 failed |
+| the same | the same clippy | passed |
+| the same Mac, at 5dfa3d24b (merged with kiln main 9d2bd5707: step 17's re-vendor, Hex 025aae6d and Shards 1389dc0b6, and step 35's tests, none of them in part 3b's files) | the same test | 95 passed, 0 failed, 4461 filtered out, among them both `reach::mcp::lane_tests` |
+| the same | the same clippy | passed (3 min 46 s; a dependency's warnings only) |
+| the same Mac, at 3382bfa73 (merged with kiln main 8d36e0d35, step 13's node holding, which gives the node's `Config` a `capacity`: the lane test's node takes a runner's usual settings now, and the test asks `tools/list` too) | the same test | 95 passed, 0 failed, 4469 filtered out, both `reach::mcp::lane_tests` among them |
+| the same | the same clippy | passed (3 min 05 s; a dependency's warnings only), run on its own after kiln's restart at 15:06Z ended the run before its clippy began |
+
+It landed merged with kiln main 13991fea1, the run-lease broker's ledger (`secrets/`, kiln-seams' `secrets.rs`, a
+store migration and docs/seams.md), none of whose files are part 3b's, and wasn't run again.
+
+Windows' build, clippy and tests of these (`reach::mcp` is built there now) are CI's on main.
+
+Owed:
+- Goal 60's, in its part 7 (agreed with its agent, 2026-11-13, on ROOT's word): each
+  `Execs::mcp(member)` connection handed to `serve_lane` on a thread of its own at step 17's launch
+  (`sandbox::microvm()`), `Here` built as agent.rs hands reach::local::serve its node, name and
+  host, `cwd` the project at its host path (D235), its `end` dropped once `serve_lane` returns. It
+  waits on goal 60's re-vendor (below), goal 75's listen half and goal 58's host pairing, which holds
+  each member connection the VM process accepts until an `Execs::mcp(member)` ask takes it, the
+  member asked for it by the daemon's annotation, the orchestrator's `MemberSpec` field.
+- Kiln's vendor/shards at or after Shards e1995061f, with shards-remote linked (its owner's). Step 17's
+  re-vendor (kiln ba75aa819) pins Shards 1389dc0b6, from before it: its shards-remote has no `Execs::mcp`.
+  Goal 60's next re-vendor, at the Hex lead's next SHA, pins Shards main at or after 237f3ebe7, which
+  holds e1995061f.
+- Real-VM MCP round trips on Linux, macOS and Windows hosts (ROOT's).
 
 ## Part 4: each built-in names exactly the provider hosts its vendor documents
 
