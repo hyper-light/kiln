@@ -159,7 +159,10 @@ pub const LIST_MAX: usize = 100;
 /// A delete's window: 7 to 30 days (Secrets Manager's).
 pub const WINDOW_MIN: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const WINDOW_MAX: Duration = Duration::from_secs(30 * 24 * 3600);
-/// The longest a lease lasts.
+/// The longest a store's lease lasts: kiln-seams' own bound for the stores held to its suite
+/// (the simulator and kiln's), which no provider gave. A holder whose hold outlives it takes a
+/// lease anew: the run-lease broker's leases to a run end at their value's own end, or at their
+/// run's, never by it (CP-T8.3).
 pub const LEASE_MAX: Duration = Duration::from_secs(24 * 3600);
 
 /// Whether `name` is a secret's name as Secrets Manager takes one: 1 to [`NAME_MAX`] of
