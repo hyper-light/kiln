@@ -18,6 +18,7 @@ pub mod autodetect;
 pub mod blobs;
 pub mod bp;
 pub mod bus;
+pub mod capacity;
 pub mod bluegreen;
 pub mod browser;
 pub mod cd;

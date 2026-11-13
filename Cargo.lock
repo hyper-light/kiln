@@ -2454,6 +2454,7 @@ dependencies = [
  "glob",
  "hex",
  "hex-node",
+ "hex-quic",
  "hmac 0.13.0",
  "http",
  "http-body",
