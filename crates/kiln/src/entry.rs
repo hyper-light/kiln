@@ -137,13 +137,15 @@ enum Cmd {
     /// A harness's hook before each of its tool calls (Codex's): kiln answers for the session.
     #[command(hide = true)]
     HarnessHook(kiln::harness::cli::HarnessHookArgs),
-    /// Run a command on a runner that has what it needs (`--needs cpus=8,mem=32g,linux/amd64`), or
-    /// on one by name (`--on <name>`): this repo is synced over first, output streams back, and the
-    /// exit code is the command's. With `--detach`, an agent that ran it is told how it ends should
+    /// Run a command where kiln's load balancer places it for what it needs (`--needs
+    /// cpus=8,mem=32g,linux/amd64`), or on a runner by name when it has to run there (`--on <name>`):
+    /// this repo is synced over first, output streams back, and the exit code is the command's. With `--detach`, an agent that ran it is told how it ends should
     /// this stop first: it ends its turn rather than wait or poll.
     Run(kiln::reach::cli::RunArgs),
-    /// The runners commands can run on, best first for what you need (`kiln runners linux`); a
-    /// runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them again).
+    /// The runners there are and what each is (`kiln runners linux`: those that suit, and why the
+    /// others don't), not for choosing where to run (`kiln run --needs` has the load balancer
+    /// choose); a runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them
+    /// again).
     Runners(kiln::reach::cli::RunnersArgs),
     /// This machine as a CI runner: `kiln runner setup docker|firecracker|shards` takes an
     /// executor's one-time privileged steps, each said first, `sudo` asked for itself.

@@ -816,7 +816,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.start",
-            summary: "Start agents to do part of the work: `kind` (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor, pi), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16), `isolation` (`microvm`: a microVM of its own, on a machine that starts them) and `image` (the Agentfile it's made from: kiln's, `harness-<harness>`, or one of yours, `agentfile:<id>`), `resume` (a conversation's id, to take it up again). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
+            summary: "Start agents to do part of the work: `kind` (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor, pi), `on` what it needs (linux/amd64, macos, +gpu, cpus>=16: kiln's load balancer places it on a machine that suits and has the harness, by room, measured speed and where such work last went well; don't pick one yourself to spread agents out) or a machine's name only when it must run there (its files, its hardware); by default your own machine, `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16), `isolation` (`microvm`: a microVM of its own, on a machine that starts them) and `image` (the Agentfile it's made from: kiln's, `harness-<harness>`, or one of yours, `agentfile:<id>`), `resume` (a conversation's id, to take it up again). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsStart>(),
@@ -1057,8 +1057,9 @@ pub mod input {
     pub struct AgentsStart {
         /// The harness: claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi.
         pub kind: String,
-        /// A machine's name (local for the server), or what it needs: linux/amd64, macos, arm64,
-        /// +gpu, cpus>=16, mem>=32g.
+        /// What it needs: linux/amd64, macos, arm64, +gpu, cpus>=16, mem>=32g (kiln's load
+        /// balancer places it); or a machine's name (local for the server), only when it must run
+        /// there.
         pub on: Option<String>,
         /// Its folder there (a path, or ~/…).
         pub cwd: Option<String>,

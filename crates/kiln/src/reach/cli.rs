@@ -3,10 +3,10 @@
 //! reach's trust.
 //!
 //! ```text
-//! kiln run --needs linux/amd64 -- cargo test           # the idlest Linux x86-64 runner, this repo synced over
-//! kiln run --needs cpus=8,mem=32g,linux/amd64 -- make  # one with 8 cores idle and 32 GiB free
-//! kiln run --on adacachy --no-sync -- uptime           # a runner by name, in its home folder
-//! kiln runners linux                                   # the Linux runners, best first
+//! kiln run --needs linux/amd64 -- cargo test           # a Linux x86-64 runner the load balancer picks, this repo synced over
+//! kiln run --needs cpus=8,mem=32g,linux/amd64 -- make  # one with 8 cores idle and 32 GiB free, likewise
+//! kiln run --on adacachy --no-sync -- uptime           # a runner by name (a step that must run there), in its home folder
+//! kiln runners linux                                   # the Linux runners and what each is
 //! ```
 
 #[cfg(unix)]
@@ -34,13 +34,15 @@ impl std::error::Error for ExitWith {}
 pub struct RunArgs {
     /// What the work needs: what the runner must be and have (`linux/amd64`, `macos`, `+gpu`,
     /// `tool:cargo`, `cpus>=16`) and the room it asks for, idle and free there now (`cpus=8`,
-    /// `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it). This machine when it has it
-    /// and room to spare, else the idlest runner that has it. Default: the best of all. The command
+    /// `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it). kiln's load balancer places
+    /// it on the runner that has it with the most room for it at its measured speed, back where that
+    /// kind of work last went well, never one under strain. Default: the best of all. The command
     /// finds them in KILN_NEEDS (`ci/gate.sh` holds itself to them).
     #[arg(long, default_value = "")]
     pub needs: String,
-    /// A runner by name, for work that has to happen on that machine (it must still meet
-    /// --needs). What it must be, as --needs says it, works here too.
+    /// A runner by name, only for work that has to happen on that machine (its files, its hardware,
+    /// a person there; it must still meet --needs), never to pick a less busy one: that's the load
+    /// balancer's. What it must be, as --needs says it, works here too.
     #[arg(long, short = 'o', default_value = "")]
     pub on: String,
     /// Copy this folder's tree (its git repository, as git sees it) over first, and run in the

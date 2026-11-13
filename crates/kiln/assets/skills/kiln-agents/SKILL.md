@@ -38,8 +38,13 @@ A child starts with nothing but your prompt. Say:
 - **What done looks like**: the tests that must pass, the behaviour to see, what not to change.
 - **What to report**: end its reply with what it did, what it found, and anything left. Its last
   reply is what you get back.
-- **Where**: `cwd` (by default yours, on your machine), `on` for another machine (a name, or
-  what it needs: `linux/amd64`, `macos`, `+gpu`, `cpus>=16`).
+- **Where**: `cwd` (by default yours, on your machine), and `on` for work that needs another
+  machine: what it needs (`linux/amd64`, `macos`, `+gpu`, `cpus>=16`). kiln's load balancer
+  places each child on the machine that suits best (room at its measured speed, where such work
+  last went well, never one under strain) and queues it, telling you, while none has room. That's
+  its work, not yours: don't look over machines' load, give children machines' names to spread
+  them out, or stop one to start it elsewhere because its machine looks busy. Name a machine only
+  when the child must work there (its checkout, its hardware, a person at it).
 
 ```js
 // code_run: two children on another machine, in two harnesses, then what they concluded
@@ -64,6 +69,9 @@ that settle together come in one message, and while your turn goes on that messa
 waits for you: a child that settles again changes its line in it, so a long turn ends with each
 child's latest news, once. What you saw yourself (`agents_wait`, `agents_result`) comes out of it.
 Then read what one concluded with `agents_result`.
+
+A child that waits for room starts by itself when there is some, and kiln says where it waits
+and why: leave it queued.
 
 Wait only when you can't go on without a result: `agents_wait` returns when each agent has
 **settled** (idle, needs a person, paused for a usage
