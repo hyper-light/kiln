@@ -700,8 +700,9 @@ default). Each: `kind`, `id` (the harness's session or thread id), `title` (Clau
 `last_prompt?` (clipped), `isolation?`.
 
 With them come the conversations kept in your own microVM volumes on that machine
-(`<kiln's state>/homes/<you>/<harness>/`, read as kiln's Agentfile for each harness lays it out),
-each with `isolation: {kind: "microvm", person}`: they ran in a microVM of yours, and go on in one.
+(`<kiln's state>/homes/<you>/<harness>/`, read where kiln's Agentfile for each harness keeps them, and
+where each Agentfile of yours that kiln ran there kept them, as kiln noted beside your volume when it
+ran), each with `isolation: {kind: "microvm", person}`: they ran in a microVM of yours, and go on in one.
 Only yours: the person is whoever asks, never what's asked. A runner from before lists its own
 conversations alone.
 
@@ -1219,7 +1220,10 @@ kiln's user alone), and reads your sessions there to show and resume them. They 
 kiln's upgrades: a runner started as a new instance keeps them in the same place, and moves there
 any that an older kiln's instance kept in its own folder (`<kiln's state>/instances/<id>/homes/`) as
 it starts, leaving one where it is, and logging why, where kiln already keeps yours for that harness
-or the move fails.
+or the move fails. An Agentfile of your own gets the same from its own lines: each `VOLUME` it gives
+its harness that holds a folder its harness's environment names (its `HOME`, `CODEX_HOME` and the
+like, as its `harness.json` sets them, read from its built image), kept for you in the same place. One
+whose harness keeps its configuration in none of them is refused, saying so.
 
 Its base is `buildpack-deps:trixie-scm`, pinned by digest: git, an ssh client, curl and CA
 certificates, for both platforms. For your project's own toolchain, copy kiln's Agentfile into one of

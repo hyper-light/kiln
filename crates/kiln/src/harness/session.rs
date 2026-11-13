@@ -150,10 +150,11 @@ pub struct Ended {
 }
 
 /// What an isolated session's run keeps beside its person's volume (kiln plan
-/// 01a1cd8e862e7169a074db3d5fa33f3d step 17, goal 65's finding): whose volume, and the Agentfile and
-/// image its conversation runs in, once its harness has said the conversation's id; none for a run of
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 17, goal 65's finding): whose volume, the Agentfile and
+/// image its conversation runs in, and where its harness keeps its conversations as its launch laid
+/// them out (`kept_in`, part 7), once its harness has said the conversation's id; none for a run of
 /// the machine's, or one that acts for no person.
-fn ran_in_of(spec: &Spec, runs: Option<&Runs>, conversation: Option<&str>) -> Option<(String, crate::harness::isolated::home::RanIn)> {
+fn ran_in_of(spec: &Spec, runs: Option<&Runs>, conversation: Option<&str>, kept_in: Option<&str>) -> Option<(String, crate::harness::isolated::home::RanIn)> {
     let Some(Runs::Microvm { image, .. }) = runs else {
         return None;
     };
@@ -168,13 +169,14 @@ fn ran_in_of(spec: &Spec, runs: Option<&Runs>, conversation: Option<&str>) -> Op
             (b.name.to_owned(), crate::util::sha256_hex(b.text.as_bytes()))
         }
     };
-    Some((person, crate::harness::isolated::home::RanIn { conversation: conversation.to_owned(), agentfile, digest, image: image.clone(), kept_in: None }))
+    Some((person, crate::harness::isolated::home::RanIn { conversation: conversation.to_owned(), agentfile, digest, image: image.clone(), kept_in: kept_in.map(str::to_owned) }))
 }
 
-/// Keeps, beside its person's volume, which image `s`'s conversation runs in ([`ran_in_of`]), off the
-/// runtime's threads, done before its run's start or end goes on, so a run that follows finds it: a
-/// pick-up goes on there (`aisessions`, a history's `isolation`).
-async fn keep_ran_in(s: &Session, files: &Files) {
+/// Keeps, beside its person's volume, which image `s`'s conversation runs in and where its harness keeps
+/// it (`kept_in`, its run's: `sandbox::held::Held::kept_in`; [`ran_in_of`]), off the runtime's threads,
+/// done before its run's start or end goes on, so a run that follows finds it: a pick-up goes on there,
+/// and a history finds it there (`aisessions`, a history's `isolation`).
+async fn keep_ran_in(s: &Session, files: &Files, kept_in: Option<&str>) {
     let Some(homes) = files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.homes().map(std::path::Path::to_path_buf)) else {
         return;
     };
@@ -183,7 +185,7 @@ async fn keep_ran_in(s: &Session, files: &Files) {
         (core.state.runs.clone(), core.state.harness_session.clone())
     };
     let spec = s.spec.lock().clone();
-    let Some((person, ran)) = ran_in_of(&spec, runs.as_ref(), conversation.as_deref()) else {
+    let Some((person, ran)) = ran_in_of(&spec, runs.as_ref(), conversation.as_deref(), kept_in) else {
         return;
     };
     let dir = match crate::harness::isolated::home::ran_in_dir(&homes, &person, &spec.kind) {
@@ -4597,7 +4599,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 // Its process here; none for a harness its boundary holds (a microVM's member).
                 *s.pid.lock() = p.host_pid();
                 s.began(&p);
-                keep_ran_in(&s, &files).await;
+                // Where its harness keeps its conversations, as its launch laid them out: in each record of
+                // where it ran.
+                let kept_in = p.boundary().and_then(|h| h.kept_in().map(str::to_owned));
+                keep_ran_in(&s, &files, kept_in.as_deref()).await;
                 ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
@@ -4943,7 +4948,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 p.terminate(Duration::from_secs(2));
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
-                                keep_ran_in(&s, &files).await;
+                                keep_ran_in(&s, &files, kept_in.as_deref()).await;
                                 s.ended_run(None);
                                 // What its adapter held goes with its record, in its queue.
                                 adapter.let_go(&mut s.core.lock());
@@ -5018,7 +5023,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
-                            keep_ran_in(&s, &files).await;
+                            keep_ran_in(&s, &files, kept_in.as_deref()).await;
                             s.ended_run(None);
                             if let Some(g) = group {
                                 end_group(g, Duration::from_millis(3500));
@@ -5162,7 +5167,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                 }
                 *s.pid.lock() = None;
-                keep_ran_in(&s, &files).await;
+                keep_ran_in(&s, &files, kept_in.as_deref()).await;
                 s.ended_run(code);
                 // A conversation carried in that it took is in its own session now, which it
                 // starts again on (Antigravity starts again for a new mode, model or effort); one
@@ -5517,15 +5522,18 @@ mod tests {
         let isolated = |image: Option<&str>, person: Option<&str>| Isolation { image: image.map(str::to_owned), person: person.map(str::to_owned), ..Isolation::microvm() };
         let own = Spec { kind: "claude".into(), isolation: Some(isolated(Some("agentfile:0123"), Some("user:u1"))), agentfile: Some("FROM x\n".into()), ..Spec::default() };
         let ran = |agentfile: &str, digest: String| RanIn { conversation: "c-1".into(), agentfile: agentfile.into(), digest, image: "agentfile-0123@sha256:00".into(), kept_in: None };
-        assert_eq!(ran_in_of(&own, Some(&run), Some("c-1")), Some(("user:u1".to_owned(), ran("agentfile:0123", crate::util::sha256_hex(b"FROM x\n")))));
+        assert_eq!(ran_in_of(&own, Some(&run), Some("c-1"), None), Some(("user:u1".to_owned(), ran("agentfile:0123", crate::util::sha256_hex(b"FROM x\n")))));
+        // Where its launch laid its harness's conversations out, kept with it.
+        let kept = ran_in_of(&own, Some(&run), Some("c-1"), Some("/data/claude")).map(|(_, r)| r.kept_in);
+        assert_eq!(kept, Some(Some("/data/claude".to_owned())));
         let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
         let kilns = Spec { kind: "claude".into(), isolation: Some(isolated(None, Some("owner"))), ..Spec::default() };
-        assert_eq!(ran_in_of(&kilns, Some(&run), Some("c-1")), Some(("owner".to_owned(), ran("harness-claude", crate::util::sha256_hex(claude.text.as_bytes())))));
-        assert_eq!(ran_in_of(&own, Some(&Runs::Host { pid: 1 }), Some("c-1")), None, "a run of the machine's");
-        assert_eq!(ran_in_of(&own, Some(&run), None), None, "no conversation said yet");
-        assert_eq!(ran_in_of(&own, Some(&run), Some("")), None);
+        assert_eq!(ran_in_of(&kilns, Some(&run), Some("c-1"), None), Some(("owner".to_owned(), ran("harness-claude", crate::util::sha256_hex(claude.text.as_bytes())))));
+        assert_eq!(ran_in_of(&own, Some(&Runs::Host { pid: 1 }), Some("c-1"), None), None, "a run of the machine's");
+        assert_eq!(ran_in_of(&own, Some(&run), None, None), None, "no conversation said yet");
+        assert_eq!(ran_in_of(&own, Some(&run), Some(""), None), None);
         let nobodys = Spec { isolation: Some(isolated(Some("agentfile:0123"), None)), ..own.clone() };
-        assert_eq!(ran_in_of(&nobodys, Some(&run), Some("c-1")), None, "no person");
+        assert_eq!(ran_in_of(&nobodys, Some(&run), Some("c-1"), None), None, "no person");
         Ok(())
     }
 

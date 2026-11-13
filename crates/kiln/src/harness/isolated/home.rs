@@ -122,6 +122,29 @@ pub fn ran_in(dir: &Path, conversation: &str) -> Option<RanIn> {
     (kept.conversation == conversation).then_some(kept)
 }
 
+/// Each folder `dir`'s records ([`ran_in_dir`]) say their harness keeps its conversations in
+/// ([`RanIn::kept_in`]), as its microVM has it, each once, in order; a record that can't be read says
+/// none.
+pub fn kept_ins(dir: &Path) -> Vec<String> {
+    let records = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path());
+    // Its records alone: a record being written is a dot file until it's in place.
+    let records = records.filter(|p| p.extension().is_some_and(|x| x == "json") && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')));
+    let read = |p: std::path::PathBuf| serde_json::from_slice::<RanIn>(&std::fs::read(p).ok()?).ok()?.kept_in;
+    let mut out: Vec<String> = records.filter_map(read).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Where `guest`, a folder in `person`'s microVM of `harness` under `root`, is on this machine, where it
+/// lies in a volume of theirs as kiln lays one out ([`Layout::mounts`]): beneath their harness's
+/// folder, at its own path. None for a path that isn't absolute and plain, which could name a folder
+/// out of theirs. Refused, typed, for a person kiln keeps nothing for.
+pub fn kept_at(root: &Path, person: &str, harness: &str, guest: &str) -> Result<Option<PathBuf>, Refusal> {
+    let base = root.join(person_dir(person)?).join(harness);
+    Ok(guest_plain(guest).then(|| under(&base, guest)))
+}
+
 /// A harness's home when its run environment names none: init's, its scratch (Shards D231,
 /// "its scratch at `/tmp` (`HOME=/tmp`, init's)").
 pub const INIT_HOME: &str = "/tmp";
@@ -156,6 +179,8 @@ pub struct Mount {
 pub struct Layout {
     /// `<root>/<person>/<harness>`.
     base: PathBuf,
+    /// Its harness (`crate::harness::kinds::Kind`'s id).
+    harness: String,
     /// The image's volumes that hold its configuration, as the microVM has them.
     volumes: Vec<String>,
     /// Its harness's run environment, as the microVM has it.
@@ -188,7 +213,7 @@ impl Layout {
             let names: Vec<String> = env.iter().filter(|(_, v)| guest_plain(v)).map(|(k, v)| format!("{k}={v}")).collect();
             return Err(Refusal::NoConfigVolume { harness: harness.to_owned(), named: if names.is_empty() { "no directory".to_owned() } else { names.join(", ") } });
         }
-        Ok(Self { base: root.join(person_dir).join(harness), volumes: held, env: env.to_vec() })
+        Ok(Self { base: root.join(person_dir).join(harness), harness: harness.to_owned(), volumes: held, env: env.to_vec() })
     }
 
     /// Each of its volumes: its directory here, and its path in the microVM.
@@ -238,10 +263,35 @@ impl Layout {
             put(k, v);
         }
         for (k, rel) in READ {
-            let guest = if rel.is_empty() { home.clone() } else { format!("{}/{rel}", home.trim_end_matches('/')) };
-            put(k, &guest);
+            put(k, &self.in_home(rel));
         }
         out
+    }
+
+    /// `rel` beneath its harness's home in the microVM (its home itself for none).
+    fn in_home(&self, rel: &str) -> String {
+        let home = self.guest_home();
+        if rel.is_empty() { home } else { format!("{}/{rel}", home.trim_end_matches('/')) }
+    }
+
+    /// Where its harness keeps its conversations, as its microVM has the folder, where that lies in one
+    /// of its volumes: Claude Code's configuration folder (`CLAUDE_CONFIG_DIR`), Codex's home
+    /// (`CODEX_HOME`) and Devin's `devin/cli` beneath XDG's data folder (`XDG_DATA_HOME`), each as its
+    /// run environment names it (the last it gives, as Shards' init gives a harness its environment),
+    /// else where its harness takes it from its home ([`READ`]). None for a harness whose conversations
+    /// no history reads (`aisessions`), or one that keeps them in the microVM's scratch, gone with it.
+    pub fn kept_in(&self) -> Option<String> {
+        let dir = |key: &str| -> Option<String> {
+            let named = self.var(key).filter(|v| guest_plain(v)).map(str::to_owned);
+            named.or_else(|| READ.iter().find(|(k, _)| *k == key).map(|(_, rel)| self.in_home(rel)))
+        };
+        let guest = match self.harness.as_str() {
+            "claude" => dir("CLAUDE_CONFIG_DIR")?,
+            "codex" => dir("CODEX_HOME")?,
+            "devin" => format!("{}/devin/cli", dir("XDG_DATA_HOME")?),
+            _ => return None,
+        };
+        self.volumes.iter().any(|v| beneath_or_at(&guest, v)).then_some(guest)
     }
 
     /// Its home on this machine, as [`Self::host_env`]'s `HOME`.
@@ -250,9 +300,10 @@ impl Layout {
     }
 
     /// Makes each volume's directory, readable by this machine's user alone, before the microVM
-    /// is given it. Blocking.
-    pub fn prepare(&self) -> std::io::Result<()> {
-        for m in self.mounts() {
+    /// is given it: its mounts, made. Blocking.
+    pub fn prepare(&self) -> std::io::Result<Vec<Mount>> {
+        let mounts = self.mounts();
+        for m in &mounts {
             std::fs::create_dir_all(&m.host)?;
             private(&m.host)?;
         }
@@ -261,7 +312,7 @@ impl Layout {
         if let Some(person) = self.base.parent() {
             private(person)?;
         }
-        Ok(())
+        Ok(mounts)
     }
 }
 
@@ -520,6 +571,43 @@ mod tests {
             let mounts = l.mounts();
             assert!(!mounts.is_empty() && mounts.iter().all(|m| m.guest != "/workspace"), "{}: {mounts:?}", b.name);
         }
+        Ok(())
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: where each harness a history reads keeps
+    /// its conversations in its microVM, as kiln's Agentfile for it lays its volume out (Claude Code's
+    /// configuration folder, Codex's home, Devin's `devin/cli` in XDG's data folder) or as a person's own
+    /// does; none for one no history reads, or one that keeps them in the microVM's scratch. Prepared,
+    /// its mounts are the ones made. The records beside a person's volume name each folder once, and
+    /// only a plain path in their volume is found on this machine.
+    #[test]
+    fn s17_where_a_harness_keeps_its_conversations() -> anyhow::Result<()> {
+        let r = Path::new("/r");
+        let kilns = |h: &str| -> anyhow::Result<Option<String>> { Ok(super::of_kilns(r, "owner", h)?.and_then(|l| l.kept_in())) };
+        assert_eq!(kilns("claude")?.as_deref(), Some("/home/claude/.claude"));
+        assert_eq!(kilns("codex")?.as_deref(), Some("/home/codex/.codex"));
+        assert_eq!(kilns("devin")?.as_deref(), Some("/home/devin/.local/share/devin/cli"));
+        assert_eq!(kilns("goose")?, None, "no history reads Goose's");
+        let own = Layout::new(r, "owner", "claude", &vols(&["/data"]), &env(&[("HOME", "/tmp"), ("CLAUDE_CONFIG_DIR", "/data/claude")]))?;
+        assert_eq!(own.kept_in().as_deref(), Some("/data/claude"));
+        let scratch = Layout::new(r, "owner", "claude", &vols(&["/data"]), &env(&[("XDG_CONFIG_HOME", "/data/x")]))?;
+        assert_eq!(scratch.kept_in(), None, "in its scratch, /tmp/.claude, gone with its microVM");
+        let t = tempfile::tempdir()?;
+        let made = Layout::new(&root(t.path()), "user:u1", "claude", &vols(&["/data"]), &env(&[("CLAUDE_CONFIG_DIR", "/data/claude")]))?;
+        assert_eq!(made.prepare()?, made.mounts());
+        assert!(made.mounts().iter().all(|m| m.host.is_dir()), "made");
+        let records = ran_in_dir(&root(t.path()), "user:u1", "claude")?;
+        let ran = |c: &str, kept_in: Option<&str>| RanIn { conversation: c.into(), agentfile: "harness-claude".into(), digest: "ab".repeat(32), image: "harness-claude@sha256:00".into(), kept_in: kept_in.map(str::to_owned) };
+        for ran in [ran("a", Some("/data/claude")), ran("b", Some("/data/claude")), ran("c", Some("/home/claude/.claude")), ran("d", None)] {
+            keep_ran_in(&records, &ran)?;
+        }
+        std::fs::write(records.join("broken.json"), "{")?;
+        assert_eq!(super::kept_ins(&records), ["/data/claude", "/home/claude/.claude"]);
+        let at = |guest: &str| super::kept_at(&root(t.path()), "user:u1", "claude", guest);
+        assert_eq!(at("/data/claude")?, Some(root(t.path()).join("user-u1").join("claude").join("data").join("claude")));
+        assert_eq!(at("/../../user-u2/claude")?, None, "no way out of their volume");
+        assert_eq!(at("data/claude")?, None);
+        assert!(super::kept_at(&root(t.path()), "nobody", "claude", "/data").is_err(), "no person, no folder");
         Ok(())
     }
 

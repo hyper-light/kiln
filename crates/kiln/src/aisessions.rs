@@ -837,7 +837,7 @@ impl Scanner {
         let mut places = vec![Folders { claude: Some(self.claude.clone()), codex: Some(self.codex.clone()), devin: Some(self.devin.clone()), isolation: None }];
         if let (Some(homes), Some(person)) = (&self.homes, person) {
             match volumes_of(homes, person) {
-                Ok(theirs) => places.push(theirs),
+                Ok(theirs) => places.extend(theirs),
                 Err(refused) => tracing::warn!(error = %refused, "a history reads no microVM volume of this person's"),
             }
         }
@@ -1067,20 +1067,35 @@ impl Folders {
 }
 
 /// `person`'s microVM volumes under `homes` (`<state>/homes/<person>/<harness>/`, kiln plan
-/// 01a1d2c16eb074f19cf7ae7f1025c0be step 5), as kiln's Agentfile for each harness lays them out
-/// (`home::of_kilns`): each harness's folder at its path on this machine, its conversations saying they
-/// ran in a microVM of that person's. Refused, typed, for a person kiln keeps no volume for.
-fn volumes_of(homes: &Path, person: &str) -> Result<Folders, Refusal> {
-    let var = |harness: &str, key: &str| -> Result<Option<PathBuf>, Refusal> {
-        Ok(home::of_kilns(homes, person, harness)?.and_then(|l| l.host_env().into_iter().find(|(k, _)| k == key)).map(|(_, v)| PathBuf::from(v)))
-    };
-    Ok(Folders {
-        claude: var("claude", "CLAUDE_CONFIG_DIR")?,
-        codex: var("codex", "CODEX_HOME")?,
-        // In its microVM Devin keeps its sessions in XDG's data folder, as on any Linux (`Scanner::new`).
-        devin: var("devin", "XDG_DATA_HOME")?.map(|d| d.join("devin").join("cli")),
-        isolation: Some(Isolation { person: Some(person.to_owned()), ..Isolation::microvm() }),
-    })
+/// 01a1d2c16eb074f19cf7ae7f1025c0be step 5): for each harness, where its conversations are kept there
+/// as kiln's Agentfile for it lays them out (`home::of_kilns`), and where the records beside them say
+/// one of theirs ran (`home::kept_ins`: a person's own Agentfile lays its volumes out as it likes; kiln
+/// plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7), each folder once, at its path on this
+/// machine, its conversations saying they ran in a microVM of that person's. Refused, typed, for a
+/// person kiln keeps no volume for.
+fn volumes_of(homes: &Path, person: &str) -> Result<Vec<Folders>, Refusal> {
+    let isolation = Some(Isolation { person: Some(person.to_owned()), ..Isolation::microvm() });
+    let mut out: Vec<Folders> = Vec::new();
+    for harness in ["claude", "codex", "devin"] {
+        let kilns = home::of_kilns(homes, person, harness)?.and_then(|l| l.kept_in());
+        let mut folders: Vec<PathBuf> = Vec::new();
+        for guest in kilns.into_iter().chain(home::kept_ins(&home::ran_in_dir(homes, person, harness)?)) {
+            if let Some(at) = home::kept_at(homes, person, harness, &guest)?
+                && !folders.contains(&at)
+            {
+                folders.push(at);
+            }
+        }
+        out.extend(folders.into_iter().map(|at| {
+            let (claude, codex, devin) = match harness {
+                "claude" => (Some(at), None, None),
+                "codex" => (None, Some(at), None),
+                _ => (None, None, Some(at)),
+            };
+            Folders { claude, codex, devin, isolation: isolation.clone() }
+        }));
+    }
+    Ok(out)
 }
 
 /// `p`, from a person's microVM volume under `homes`, goes on in the Agentfile it ran in, as kiln kept it

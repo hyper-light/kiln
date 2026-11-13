@@ -119,8 +119,13 @@ impl Images {
         Ok(plan.pinned(&digest))
     }
 
+    /// The Shards home's store, which holds what's built (`shards_image::store::Store`'s root).
+    pub fn store(&self) -> PathBuf {
+        self.home.join("images")
+    }
+
     async fn held(&self, plan: &Plan) -> Result<Option<String>, Refusal> {
-        let (root, tag) = (self.home.join("images"), plan.tag.clone());
+        let (root, tag) = (self.store(), plan.tag.clone());
         crate::rt::blocking(move || held_in(&root, &tag)).await.map_err(|e| Refusal::Store(format!("{e:#}")))?
     }
 

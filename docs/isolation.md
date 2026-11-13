@@ -157,7 +157,10 @@ Owed, each with whose it is:
   member's input, then the microVM's stop.
 - **The microVM's group, charged** (step 32): placed and charged through the balancer.
 - **Its configuration on a volume kiln reads on the host** (step 18): transcripts, resume and rewind
-  from the host's side.
+  from the host's side. The launch gives it (part 7): its shares are its project at its own path, then
+  each of its person's volumes for its harness at its path in the microVM, as kiln's Agentfile or the
+  person's own lays them out, made before it starts; and beside them kiln notes where its harness keeps
+  its conversations, where a history finds them.
 
 ## Tests
 
