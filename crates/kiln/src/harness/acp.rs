@@ -236,6 +236,10 @@ pub struct Acp {
     /// Cursor's to-dos' ids, in `state.todos`' order (`cursor/update_todos` merges by them).
     #[serde(default)]
     todo_ids: Vec<String>,
+    /// Where it sees its project, in a microVM that sees it elsewhere than this machine
+    /// (`sandbox::isolated::Seen`): its session opens there.
+    #[serde(default)]
+    seen: Option<crate::sandbox::isolated::Seen>,
 }
 
 fn ready() -> bool {
@@ -318,6 +322,7 @@ impl Acp {
             kind: String::new(),
             auth: Vec::new(),
             todo_ids: Vec::new(),
+            seen: None,
         }
     }
 
@@ -337,7 +342,13 @@ impl Acp {
             }
         }
         a.speed_start.clone_from(&spec.speed);
+        a.seen = crate::sandbox::isolated::Seen::of(spec);
         a
+    }
+
+    /// The folder it works in, as it sees it ([`Self::seen`]).
+    fn cwd(&self, core: &Core) -> String {
+        crate::sandbox::isolated::said(self.seen.as_ref(), &core.state.cwd)
     }
 
     /// The conversation so far, in words, to give with the first message it sends.
@@ -665,7 +676,7 @@ impl Acp {
         }
         self.ready = false;
         self.replaying = core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
-        let cwd = core.state.cwd.clone();
+        let cwd = self.cwd(core);
         match self.session.clone() {
             Some(s) if self.can_load => self.request(core, Pending::Refresh, "session/load", json!({"sessionId": s, "cwd": cwd, "mcpServers": self.mcp})),
             Some(_) => self.notice(core, Level::Error, "This agent cannot reload its account in an open session."),
@@ -1525,7 +1536,8 @@ impl Acp {
                     core.state.harness_session = None;
                     self.replaying = false;
                     core.touch_state();
-                    self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": core.state.cwd, "mcpServers": self.mcp}));
+                    let cwd = self.cwd(core);
+                    self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp}));
                 }
                 Pending::Refresh | Pending::RefreshNew => {
                     self.replaying = false;
@@ -1557,7 +1569,7 @@ impl Acp {
                 core.state.harness_status = status_rows(&result);
                 self.auth = result.get("authMethods").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
                 core.touch_state();
-                let cwd = core.state.cwd.clone();
+                let cwd = self.cwd(core);
                 match self.resume.clone().filter(|_| self.can_load) {
                     Some(sid) => {
                         // Its own session, loaded: the conversation in words (a crashed session's
@@ -2229,6 +2241,28 @@ mod tests {
     fn feed(a: &mut Acp, core: &mut Core, msgs: &[Value]) {
         for m in msgs {
             a.line(core, &m.to_string());
+        }
+    }
+
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: an isolated ACP agent's session is
+    /// opened, new or loaded, in its project as its microVM has it (`sandbox::isolated::guest_path`): a
+    /// Windows machine's folder at `/work/<name>`, a Unix one at its own path; an agent on its machine
+    /// opens it in the machine's.
+    #[test]
+    fn s17_an_isolated_acp_session_opens_in_its_guest_folder() {
+        use super::super::session::{Isolation, Spec};
+        for (host, told, isolation) in [(r"C:\src\app", "/work/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
+            for (resume, method) in [(None, "session/new"), (Some("s0".to_owned()), "session/load")] {
+                let spec = Spec { kind: "gemini".into(), cwd: Some(host.into()), isolation: isolation.clone(), resume, ..Spec::default() };
+                let mut core = TestCore::new();
+                core.state.cwd = host.into();
+                let mut a = Acp::from_spec(&spec);
+                a.start(&mut core);
+                feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}})]);
+                let w = written(&mut core);
+                let opened = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some(method)).and_then(|v| v.pointer("/params/cwd")).cloned();
+                assert_eq!(opened, Some(json!(told)), "{host}: {method}");
+            }
         }
     }
 

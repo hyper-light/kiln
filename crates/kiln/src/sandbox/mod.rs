@@ -45,12 +45,47 @@ pub struct Microvms {
     pub hex: Option<Arc<hexvm::HexVms>>,
     /// The carried Shards they run, written out and held as long as they are (`crate::shards::write_out`).
     shards: Option<crate::shards::Held>,
+    /// kiln's MCP lane of the runs launched here (Shards D254): Hex's, where they are Hex's; a stand-in's.
+    lanes: Option<Arc<dyn Lanes>>,
 }
+
+/// One connection a run's harness made to its MCP bridge in its microVM (Shards D254, `Execs::mcp`'s
+/// `McpConnection`): what it sends, newline-delimited JSON-RPC, and what it is sent. Each way ends on its own.
+pub struct McpConnection {
+    pub from: Box<dyn std::io::Read + Send>,
+    pub to: Box<dyn std::io::Write + Send>,
+}
+
+/// kiln's MCP lane of the runs a machine's microVMs launch (Shards D254; #75 step 3): each connection a run's
+/// harness makes to its bridge, which the runner serves kiln's MCP over in its own process
+/// (`isolated::bridge`). No network: nothing of it is an address in the microVM.
+pub trait Lanes: Send + Sync {
+    /// Whether the runs launched here have the lane, and why not where they don't.
+    fn carried(&self) -> Result<(), Refusal>;
+    /// The next connection run `run`'s harness makes to its bridge, waited for until it comes. `Ended` once its
+    /// run, its box or its link is gone; another refusal says why it has none.
+    fn next(&self, run: &str) -> Result<McpConnection, Refusal>;
+}
+
+/// Why runs launched in microVMs held with no lane have kiln's MCP.
+pub const NO_LANES: &str = "kiln's MCP in a microVM: these microVMs carry no MCP lane (Shards D254)";
 
 impl Microvms {
     /// Runs in `sandbox`, booting `images`: a stand-in's, launched as the seam launches.
     pub fn new(sandbox: Arc<dyn Sandbox>, images: image::Images) -> Self {
-        Self { sandbox, images, hex: None, shards: None }
+        Self { sandbox, images, hex: None, shards: None, lanes: None }
+    }
+
+    /// Their runs' MCP connections taken through `lanes` from now on (a stand-in's).
+    pub fn with_lanes(self, lanes: Arc<dyn Lanes>) -> Self {
+        Self { lanes: Some(lanes), ..self }
+    }
+
+    /// kiln's MCP lane of the runs launched here, or why they have none (Shards D254).
+    pub fn mcp(&self) -> Result<Arc<dyn Lanes>, Refusal> {
+        let lanes = self.lanes.clone().ok_or_else(|| Refusal::Unsupported(NO_LANES.into()))?;
+        lanes.carried()?;
+        Ok(lanes)
     }
 
     /// `launch` in a microVM of its own: in box `name` where placement named one for its run (its reservation's,
@@ -83,7 +118,7 @@ pub fn of_hex(hex: hexvm::HexVms, images: image::Images, ledger: Option<Arc<dyn 
         Some(ledger) => hex.with_ledger(ledger),
         None => hex,
     });
-    Microvms { sandbox: Arc::clone(&hex) as Arc<dyn Sandbox>, images, hex: Some(hex), shards: None }
+    Microvms { sandbox: Arc::clone(&hex) as Arc<dyn Sandbox>, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None }
 }
 
 /// The group placement reads run `run`'s use from, launched in `vms`: its VM's meter, where Hex holds it
@@ -310,6 +345,22 @@ mod tests {
         assert_eq!(with_kvm.why_not.as_deref(), Some(super::NO_MICROVM));
         assert_eq!(with_kvm.hypervisor.as_deref(), cfg!(target_os = "linux").then_some("KVM"));
         assert_eq!(super::facts(false).hypervisor, None);
+    }
+
+    /// #75 step 3 (Shards D254): a machine's microVMs say whether their runs carry kiln's MCP lane, typed: those held
+    /// with none say so; Hex's say what the Hex kiln vendors lacks; a lane that carries it is theirs.
+    #[test]
+    fn s35_mcp_microvms_say_whether_their_runs_carry_kilns_mcp_lane() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::Refusal;
+        let state = tempfile::tempdir()?;
+        let images = || super::image::Images::new(state.path().join("shards"), state.path().join("home"), state.path().join("builds"));
+        let none = super::Microvms::new(std::sync::Arc::new(kiln_seams::sandbox::SimSandbox::new()), images());
+        anyhow::ensure!(none.mcp().err() == Some(Refusal::Unsupported(super::NO_LANES.into())), "no lane");
+        let hex = super::held_in(state.path(), state.path().join("shards"), None)?;
+        anyhow::ensure!(hex.mcp().err() == Some(Refusal::Unsupported(super::hexvm::NO_MCP_LANE.into())), "the vendored Hex's");
+        let carried = super::Microvms::new(std::sync::Arc::new(kiln_seams::sandbox::SimSandbox::new()), images()).with_lanes(std::sync::Arc::new(super::fake::FakeLanes::default()));
+        anyhow::ensure!(carried.mcp().is_ok(), "a lane that carries it");
+        Ok(())
     }
 
     /// #73 part 7 slice 2 (step 17): a runner whose kiln carries Shards holds its isolated agents' harnesses in Hex's

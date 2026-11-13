@@ -311,7 +311,9 @@ impl ArchivedSession {
         let items = match kind.protocol {
             Protocol::ClaudeStreamJson => {
                 let native = uuid::Uuid::now_v7().to_string();
-                let cwd = session::resolve_cwd(spec.cwd.as_deref());
+                // Where Claude Code resumes it looks for it: under its folder as it sees it, in a microVM its project's
+                // place there (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7).
+                let cwd = crate::sandbox::isolated::harness_cwd(&spec);
                 let records = super::handoff::to_claude(&conversation, Some(note), &native, &cwd, &state.model);
                 let path = super::handoff::write_claude(&spec.env, &cwd, &native, &records).map_err(|e| format!("The retained conversation could not be installed: {e:#}. The archive is kept."))?;
                 #[cfg(unix)]
@@ -2365,6 +2367,11 @@ impl Host {
     async fn reconcile_legacy_mail(&self, s: &Session, input: &super::admission::Input, mode: LegacyReconciliation) -> Result<(), inbox::PromotionError> {
         use super::admission::{Lease, Stage};
         let invalid = |error| inbox::PromotionError::Invalid { why: format!("{error:?}") };
+        // Its opening prompt is its opener's, a person's, held to no depth (`mail::person`); what
+        // else it holds with no row is held to the depth: whose it is isn't known here (step 35).
+        let opening = session::opening_prompt_id(&s.id);
+        let opener = s.spec.lock().opener.as_deref().and_then(super::mail::opener_sender).unwrap_or_default();
+        let peer_of = |message: &str| if message == opening { opener.clone() } else { String::new() };
         let mut after: Option<String> = None;
         loop {
             let next = {
@@ -2388,7 +2395,7 @@ impl Host {
                 let item = core.state.queue.iter().map(|item| (None, item)).chain(core.state.tasks.iter().flat_map(|task| task.queue.iter().map(move |item| (Some(task.id.as_str()), item)))).find(|(_, item)| item.id == message);
                 let Some((task, item)) = item else { continue };
                 let bytes = super::admission::queued_command_bytes(item, task).map_err(invalid)?;
-                let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::Queued, token: None, handoff: None };
+                let lease = Lease { message: message.clone(), peer: peer_of(&message), epoch: core.state.epoch, bytes, stage: Stage::Queued, token: None, handoff: None };
                 {
                     let mut controller = input.controller.lock();
                     if let LegacyReconciliation::Debt { from, to } = mode {
@@ -2426,7 +2433,7 @@ impl Host {
                 let Some(flight) = core.input_legacy_flights.iter().find(|flight| flight.id == message) else { continue };
                 let bytes = core.writes.iter().filter(|wire| flight.matches(wire)).fold(std::mem::size_of::<super::admission::LegacyFlight>().checked_add(flight.id.capacity()), |bytes, wire| bytes.and_then(|bytes| bytes.checked_add(std::mem::size_of::<String>())).and_then(|bytes| bytes.checked_add(wire.capacity())));
                 let bytes = bytes.ok_or_else(|| inbox::PromotionError::Invalid { why: "legacy retained byte count overflowed".into() })?;
-                let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
+                let lease = Lease { message: message.clone(), peer: peer_of(&message), epoch: core.state.epoch, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
                 {
                     let mut controller = input.controller.lock();
                     if let LegacyReconciliation::Debt { from, to } = mode {
@@ -3932,6 +3939,52 @@ mod tests {
         assert_eq!(pipes("c"), Some((300, 301, 302, false)), "no carried descriptors: its record's, unchanged");
     }
 
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a session's opening prompt, adopted
+    /// from its queue or its provider flight with no journal row, is its opener's, a person's
+    /// (`Spec::opener`, the owner writing as `admin`), held to no depth; what else its queue holds
+    /// with no row, an agent's word among it, is still held to the depth, as before.
+    #[test]
+    fn s35_a_legacy_adopted_opening_prompt_is_its_openers_and_held_to_no_depth() -> anyhow::Result<()> {
+        use super::super::admission::{FlightProtocol, Input, LegacyFlight};
+        crate::rt::block_on(async {
+            for (flying, opener, writes_as) in [(false, "user:ada", "user:ada"), (true, "owner", "admin")] {
+                let directory = tempfile::tempdir()?;
+                let records = crate::records::open(&directory.path().join("records.db"))?;
+                let (sink, _updates) = async_channel::unbounded();
+                let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(records));
+                let spec = Spec { opener: Some(opener.into()), prompt: Some("map the repository".into()), ..no_harness(directory.path()) };
+                let session = host.open(Some(format!("s35-opening-{flying}")), spec)?;
+                host.settled(&session.id).await;
+                crate::rt::timeout(super::super::registry::ANSWER_WAIT, session.close_wait()).await.map_err(|_| anyhow::anyhow!("fixture owner did not stop"))?;
+                let inbox = host.inbox().cloned().ok_or_else(|| anyhow::anyhow!("fixture journal missing"))?;
+                let input = Input::new(0, host.input_budgets.budget(), Arc::clone(&inbox));
+                let opening = crate::util::derive_id(&["first-prompt", &session.id]);
+                let agents = "0123456789abcdef0123456789abcdef".to_owned();
+                let queued = |id: &str, text: &str| QueueItem { id: id.into(), text: text.into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None };
+                {
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.state.epoch = 0;
+                    core.state.status = Status::Running;
+                    core.state.manual_resume = false;
+                    core.writes.clear();
+                    core.state.queue = vec![queued(&agents, "a word from agent a1")];
+                    if flying { core.input_legacy_flights = vec![LegacyFlight { id: opening.clone(), protocol: FlightProtocol::Claude, request: None }]; }
+                    else { core.state.queue.push(queued(&opening, "map the repository")); }
+                }
+                host.set_input_budget(super::super::state_view::FRAME);
+                host.reconcile_legacy_mail(&session, &input, LegacyReconciliation::Journal).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                let peer = |id: &str| input.controller.lock().lease(id).map(|lease| lease.peer.clone());
+                anyhow::ensure!(peer(&opening).as_deref() == Some(writes_as), "the opening prompt is its opener's ({writes_as}), flying {flying}: {:?}", peer(&opening));
+                anyhow::ensure!(super::super::mail::person(writes_as), "{writes_as} is a person, held to no depth");
+                let kept = inbox.pending(&session.id, &opening).await?.ok_or_else(|| anyhow::anyhow!("the opening prompt has no durable row"))?;
+                anyhow::ensure!(kept.lease.peer == writes_as, "its durable row says whose it is: {:?}", kept.lease.peer);
+                anyhow::ensure!(peer(&agents).is_some_and(|p| !super::super::mail::person(&p)), "what else it held is still held to the depth: {:?}", peer(&agents));
+            }
+            Ok(())
+        })
+    }
+
     /// The journal failure is the real Host adoption path, not a synthetic consumption event.
     /// Certificate verification is covered by the isolated native upgrade proof; this fixture
     /// drives the owner/journal ordering beneath that boundary on real file-backed Records.
@@ -4238,6 +4291,37 @@ mod tests {
             assert!(!marker.exists());
             assert!(marker.with_extension("restored").exists());
             assert!(host.close("archived-chat"));
+            Ok(())
+        })
+    }
+
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: kiln's copy of an isolated Claude
+    /// Code's conversation is kept where Claude Code in its microVM looks for it, under its project's
+    /// name there (`sandbox::isolated::guest_path`): a Windows machine's folder's `/work/<name>`, a Unix
+    /// one's own path; Claude Code on its machine, the machine's.
+    #[test]
+    fn s17_an_isolated_claudes_copy_is_kept_under_its_guest_folders_name() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for (host_cwd, told, isolated) in [(r"C:\src\app", "/work/app", true), ("/Users/ada/src/app", "/Users/ada/src/app", true), (r"C:\src\app", r"C:\src\app", false)] {
+                let dir = tempfile::tempdir()?;
+                let (tx, _rx) = async_channel::unbounded();
+                let host = sim(tx, Some(dir.path().join("harness.json")), Limits::default());
+                let session = host.open(Some("copied".into()), no_harness(dir.path()))?;
+                let mut saved = host.recorded(&session);
+                assert!(host.close("copied"));
+                let config = dir.path().join("claude");
+                saved.spec.cwd = Some(host_cwd.into());
+                saved.spec.isolation = isolated.then(session::Isolation::microvm);
+                saved.spec.env.push(("CLAUDE_CONFIG_DIR".into(), config.to_string_lossy().into_owned()));
+                let events = vec![super::super::model::Event { id: "said".into(), seq: 1, at: 1_001, parent: None, by: None, body: Body::Assistant { text: "Keep this context".into(), streaming: false } }];
+                let mut archive = ArchivedSession { saved, state: Default::default(), events, phase: ArchivePhase::Archived, restore_host: None, files: None, copy_items: None, copied: false };
+                archive.prepare_copy().map_err(anyhow::Error::msg)?;
+                let native = archive.saved.spec.resume.clone().ok_or_else(|| anyhow::anyhow!("{host_cwd}: no native conversation"))?;
+                let kept = super::super::handoff::claude_project_dir(&config, told).join(format!("{native}.jsonl"));
+                anyhow::ensure!(kept.is_file(), "{host_cwd}: not at {}", kept.display());
+                let records = std::fs::read_to_string(&kept)?;
+                anyhow::ensure!(records.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter_map(|r| r.get("cwd").cloned()).all(|c| c == told), "{host_cwd}: {records}");
+            }
             Ok(())
         })
     }
@@ -5119,7 +5203,9 @@ while True:
             let lanes = ["control", "stdin:0", "stdout:0", "stderr:0"].map(str::to_owned).to_vec();
             let link = kiln_seams::sandbox::Link { controller: end(), endpoint: end(), lanes };
             let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program).linked(link.clone()));
-            host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images));
+            // They carry kiln's MCP lane (Shards D254; #75 step 3), its connections a stand-in's: none.
+            let lanes = Arc::new(crate::sandbox::fake::FakeLanes::default());
+            host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images).with_lanes(Arc::clone(&lanes) as Arc<dyn crate::sandbox::Lanes>));
             let cwd = dir.path().to_string_lossy().into_owned();
             // Its person's volumes kept on the machine (goal 65's finding: where its conversation ran is kept beside them).
             host.keep_homes(dir.path().join("homes"));
@@ -5139,6 +5225,8 @@ while True:
             assert!(launch.env.contains(&("KILN_AGENT".to_owned(), "isolated".to_owned())), "its mark: {:?}", launch.env);
             let mcp = launch.args.iter().position(|a| a == "--mcp-config").and_then(|i| launch.args.get(i + 1));
             assert!(mcp.is_some_and(|c| c.contains(crate::harness::isolated::mcp::BRIDGE)), "kiln's MCP through its bridge: {:?}", launch.args);
+            // This runner takes its run's connections to that bridge from its lane (#75 step 3).
+            until_it("its lane asked for its run's connections", 60, || lanes.asked().first().is_some_and(|r| r == "fake-vm-1")).await?;
             // What it sees of the machine: its project at its own path, its person's volume here as its
             // HOME, made before it started (`harness::isolated::home::Layout::prepare`), and the plugin
             // folders Claude Code loads on the machine (kiln's skills, its session's), read-only at their
