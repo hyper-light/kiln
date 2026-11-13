@@ -2504,6 +2504,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if let (Some(ai), Some(homes)) = (&ai, harness.as_ref().and_then(|h| h.homes())) {
         ai.read_homes(homes.to_path_buf());
     }
+    // Its isolated agents' harnesses in microVMs of their own through Hex, where this kiln carries Shards (kiln plan
+    // 01a1cd8e862e7169a074db3d5fa33f3d step 17, #73 part 7): written out and held beneath kiln's state, each run's
+    // charge kept in placement's records (slice 3), before any session it restores starts.
+    if let Some(h) = &harness {
+        let ledger = match &reach {
+            Some(r) => r.records().await,
+            None => None,
+        };
+        match crate::sandbox::hold(&o.state_dir, ledger).await {
+            Ok(Some(vms)) => h.hold_isolated_in(vms),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's microVMs couldn't be held: it holds no isolated agent"),
+        }
+    }
     // Bind the local Reach endpoint to the actual Host before restoring adapters that
     // can immediately ask it to run work (attention plan 01a199e1b177752e84dad5dc990e6a15).
     if let Some(handle)=&reach{
