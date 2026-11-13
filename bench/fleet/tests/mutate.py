@@ -40,6 +40,8 @@ MUTATIONS = [
     ("witness.py", "elif len(loose) < len(held_unnamed):", "elif False:", "unnamed asks lost, by count"),
     ("hex.py", "        if reply.get(\"refusals\"):\n            return f\"refused: {refusals(reply)}\"\n        if reply.get(\"key\") is None:", "        if reply.get(\"key\") is None:", "a Hex refusal is typed in its words"),
     ("agent.py", "        ended = [t for t in live_before if t in self.driver.ended]", "        ended = []", "a placer's kill ends the asks it says ended"),
+    ("kilnapi.py", "        if answer.get(\"queued\"):\n            return f\"queued: {str(answer['queued'])[:300]}\"", "        if answer.get(\"queued\"):\n            return None", "a queued kiln ask stops the fill, typed"),
+    ("agent.py", "        code, said = self.driver.remove(sorted(self.ledger))", "        code, said = self.driver.remove(sorted(t for t, a in self.ledger.items() if a.state != W.REFUSED))", "the drain stops a queued ask's agent too"),
     ("derive.py", "self._slowest = max(self._slowest, max(1, took_ns) / units)", "self._slowest = max(1, took_ns) / units", "waits only rise"),
     ("derive.py", "self._slowest = max(self._slowest, max(1, took_ns) / units)", "self._slowest = max(self._slowest, max(1, took_ns))", "a wait is kept per unit"),
     ("derive.py", "limits.append(max(0, have // per))", "limits.append(max(0, have // per) + 1)", "density limit"),
