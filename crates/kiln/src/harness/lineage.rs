@@ -850,15 +850,40 @@ pub fn isolation_for(asked: Option<&str>, parent: Option<&Info>) -> Result<Optio
 
 /// Whether agents on `target` (`local`, `agent:<machine>`) can be held isolated, in microVMs of
 /// their own: its runner says it starts microVMs (`virt.microvm`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
-/// step 32); else why not. The server's own kiln starts none until it carries their runtime (step 16).
+/// step 32); else why not, in its own words where it says them (`isolation.why_not`, step 17). The
+/// server's own kiln starts none until it carries their runtime (step 16).
 pub fn isolation_on(hub: &Hub, target: &str) -> Result<(), String> {
     let Some(machine) = target.strip_prefix("agent:") else {
         return Err("the server's kiln starts no microVM itself until it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16): pick a runner that does with `on` (`microvm`)".to_owned());
     };
-    match hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| f.virt.microvm)) {
-        Some(true) => Ok(()),
-        Some(false) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
+    let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| (f.virt.microvm, f.isolation.as_ref().and_then(|i| i.why_not.clone()))));
+    match said {
+        Some((true, _)) => Ok(()),
+        Some((false, Some(why))) => Err(format!("{} doesn't start microVMs: {why}", hub.shown(machine))),
+        Some((false, None)) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
         None => Err(format!("{} hasn't said yet whether it starts microVMs: try again in a minute", hub.shown(machine))),
+    }
+}
+
+/// The text of the Agentfile `isolation`'s image names where it's one of a person's own
+/// (`agentfile:<id>`): read from `person`'s Agentfiles at its latest version, for its machine to
+/// build its microVM from (`Spec::agentfile`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17).
+/// It's its owner's alone: another person's is as none, even to those who reach everyone's, and a
+/// start that acts for no person names none. Kiln's own Agentfiles, and starts that aren't isolated,
+/// read nothing.
+pub async fn kept_agentfile(hub: &Hub, isolation: Option<&Isolation>, person: Option<&str>) -> Result<Option<String>, String> {
+    let Some(name) = isolation.and_then(|i| i.image.as_deref()).map(str::trim) else {
+        return Ok(None);
+    };
+    let Some(id) = name.strip_prefix(crate::sandbox::isolated::KEPT) else {
+        return Ok(None);
+    };
+    let person = person.ok_or_else(|| format!("{name} is a person's own Agentfile, and this start acts for no person"))?;
+    let who = crate::agentfiles::Who { person: person.to_owned(), all: false };
+    match crate::agentfiles::get(hub, hub.blobs.blobs.as_ref(), &who, id).await {
+        Ok(kept) => Ok(Some(kept.text)),
+        Err(crate::agentfiles::Error::Missing) => Err(format!("{name} names no Agentfile of yours")),
+        Err(e) => Err(format!("{name}: {e}")),
     }
 }
 
@@ -1216,6 +1241,10 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // A parent's reach off holds its children to its machine.
     let on = by.parent.as_ref().filter(|p| p.reach.as_deref() == Some("off")).map(target_of).or_else(|| ask.on.clone());
     let isolation = isolation_for(ask.isolation.as_deref(), by.parent.as_ref()).map_err(bad)?;
+    // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
+    // person they act for's. A person's own Agentfile is read as theirs before anything is placed.
+    let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
+    let agentfile = kept_agentfile(hub, isolation.as_ref(), person.as_deref()).await.map_err(bad)?;
     let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.is_some(), &ask.queued).await?;
     let checked = async {
         let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
@@ -1278,6 +1307,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         helper: ask.helper.clone(),
         workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
         isolation,
+        agentfile,
         ..Spec::default()
     };
     tune(&mut spec);
@@ -1366,6 +1396,38 @@ mod tests {
         Ok(())
     }
 
+    /// Step 17: a person's own Agentfile is read for an isolated start as theirs alone: its text at its
+    /// latest version for its owner; refused to another person, to the server's owner (who reaches
+    /// everyone's Agentfiles, but starts no agent from another's) and to a start that acts for no
+    /// person. Kiln's own, and starts that aren't isolated, read nothing.
+    #[test]
+    fn s17_a_persons_agentfile_is_read_for_its_owner_alone() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            const V1: &str = "FROM ubuntu:24.04\nAGENT main FROM ./agent\nCMD [\"claude\"]\n";
+            const V2: &str = "FROM ubuntu:24.04\nAGENT main FROM ./agent\nAGENT helper FROM ./helper\nCMD [\"claude\"]\n";
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let blobs = hub.blobs.blobs.as_ref();
+            let ada = crate::agentfiles::Who { person: "user:u-ada".into(), all: false };
+            let kept = crate::agentfiles::create(&hub, blobs, &ada, "mine", V1, "user:u-ada").await?;
+            let id = kept.agentfile.id;
+            crate::agentfiles::update(&hub, blobs, &ada, &id, crate::agentfiles::Patch { name: None, text: Some(V2.into()) }, "user:u-ada").await?;
+            let named = Isolation { image: Some(format!(" agentfile:{id} ")), ..Isolation::microvm() };
+            assert_eq!(kept_agentfile(&hub, Some(&named), Some("user:u-ada")).await, Ok(Some(V2.to_owned())), "its latest version");
+            for other in ["user:u-bo", "owner"] {
+                let refused = kept_agentfile(&hub, Some(&named), Some(other)).await.err().unwrap_or_default();
+                assert_eq!(refused, format!("agentfile:{id} names no Agentfile of yours"), "{other}");
+            }
+            assert!(kept_agentfile(&hub, Some(&named), None).await.is_err(), "a start that acts for no person");
+            let gone = Isolation { image: Some(format!("agentfile:{}", crate::util::new_id())), ..Isolation::microvm() };
+            assert!(kept_agentfile(&hub, Some(&gone), Some("user:u-ada")).await.is_err(), "one there isn't");
+            let kilns = Isolation { image: Some("harness-claude".into()), ..Isolation::microvm() };
+            for isolation in [Some(&kilns), Some(&Isolation::microvm()), None] {
+                assert_eq!(kept_agentfile(&hub, isolation, Some("user:u-ada")).await, Ok(None));
+            }
+            Ok(())
+        })
+    }
+
     /// Step 32: an isolated agent goes only to a runner that says it starts microVMs; the server's
     /// kiln, a runner that says it doesn't, one that hasn't said yet and one kiln doesn't know each
     /// refuse it, saying why.
@@ -1385,6 +1447,27 @@ mod tests {
                 let why = isolation_on(&hub, target).err().unwrap_or_default();
                 anyhow::ensure!(!why.is_empty(), "{target} refuses an isolated agent, saying why");
             }
+            Ok(())
+        })
+    }
+
+    /// Step 17: a runner that says why it holds no isolated agent (its facts' `isolation.why_not`) is
+    /// refused in its own words; one from before those facts, in kiln's.
+    #[test]
+    fn s17_an_isolated_agent_refused_on_a_runner_says_the_runners_own_reason() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let why = "this runner has no hypervisor it can use";
+            let said = |name: &str, isolation: Option<kiln_ci::facts::Isolation>| crate::hub::AgentLive {
+                facts: Some(Box::new(kiln_ci::facts::RunnerFacts { isolation, ..Default::default() })),
+                ..crate::hub::tests::live_runner(name, "linux", "x86_64")
+            };
+            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()) })));
+            hub.put_agent(said("older", None));
+            let refused = isolation_on(&hub, "agent:no-hypervisor").err().unwrap_or_default();
+            anyhow::ensure!(refused.ends_with(why), "the runner's own reason: {refused}");
+            let older = isolation_on(&hub, "agent:older").err().unwrap_or_default();
+            anyhow::ensure!(older.contains("once it carries their runtime"), "kiln's reason: {older}");
             Ok(())
         })
     }

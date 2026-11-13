@@ -114,6 +114,7 @@ fn main() {
             bounds: Bounds::default(),
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         })
         .unwrap();
     }
@@ -132,6 +133,7 @@ fn main() {
             },
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         })
         .unwrap();
     }

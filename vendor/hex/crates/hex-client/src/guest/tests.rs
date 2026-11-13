@@ -28,6 +28,11 @@ impl Link for Loopback {
         };
         own_duplex(TcpStream::connect(addr).unwrap())
     }
+
+    /// TCP carries a half-close (RFC 9293 §3.6).
+    fn carries_half_close(&self) -> bool {
+        true
+    }
 }
 
 fn listeners() -> (TcpListener, TcpListener, LinkOwner) {
@@ -1970,4 +1975,399 @@ fn duplex_owner_preserves_io_and_explicit_native_clone_lifetime() {
     assert_eq!(output, *b"out");
     assert_eq!(last, *b"last");
     assert_eq!(eof.unwrap(), 0);
+}
+
+/// The relay token's read on a link with no setup bound of its own, as QUIC's bridged socket is (`hex_quic::link`),
+/// against XNU's lost half-close wakeup (joint plan step 4, 2(a); Shards M236, D175).
+#[cfg(unix)]
+mod token_end {
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use hex_core::patience::Patience;
+    use hex_testkit::waits::{answered, within};
+    use rustix::event::{PollFd, PollFlags, Timespec};
+
+    use super::*;
+
+    // Each wait is for its own fact, named for it: no census records either yet, so each measures, for the fact alone
+    // (hex-testkit's rule).
+    /// The token's first byte taken by the connect: the relay's end writable again.
+    static TAKEN: Patience = Patience::measuring("test.hex_client.guest.token_taken");
+    /// The connect's answer once the relay has ended its half.
+    static ANSWERED: Patience = Patience::measuring("test.hex_client.guest.token_end");
+
+    /// The rounds, and the spread of the half-close's spin, of Shards' race harness for its M236 (Shards
+    /// `docs/research/platform-measurements.md` M236 and `docs/research/measurements/half-close/`, at 04abb68d), as the
+    /// stdio copy's race test takes them (`copy::tests`).
+    const ROUNDS: u32 = 50_000;
+    const SPREAD: u32 = 400;
+
+    /// A link whose control port is one end of a Unix socket pair, with no setup bound of its own: the relay is the
+    /// test's end.
+    struct Paired(Mutex<Option<UnixStream>>);
+
+    impl Link for Paired {
+        fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
+            assert_eq!(port, stream::CONTROL_PORT);
+            own_duplex(self.0.lock().unwrap().take().expect("dialed once"))
+        }
+    }
+
+    /// Whether the relay's end has room to write now (poll(2)'s POLLOUT, not waiting): the connect took its byte.
+    fn writable(relay: &UnixStream) -> bool {
+        let mut ready = [PollFd::new(relay, PollFlags::OUT)];
+        let now = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        rustix::event::poll(&mut ready, Some(&now)).is_ok()
+            && ready[0].revents().contains(PollFlags::OUT)
+    }
+
+    /// AC-T7.4.1 (joint plan step 4, 2(a): HEX-QUIC-25 B3's hardening; Shards M236 and D175): a relay that ends its half
+    /// with its token half sent refuses the connect, however its end lands against the token's next read. Do, each
+    /// round: connect through a link with no setup bound and no caller deadline (`Stream::dial`, as QUIC's link is
+    /// dialed), its relay sending the token's first byte with the least send buffer its kernel keeps (a byte on macOS);
+    /// as soon as the connect has taken that byte (the relay's end writable again), so its read waits again, spin the
+    /// round's share of M236's spread and end the relay's half (SHUT_WR), keeping it open. Expect the connect refused,
+    /// typed, naming the token, every round. On macOS a read that waits in recv(2) on a Unix stream socket sleeps through
+    /// a half-close landing as XNU's `uipc_rcvd` lets go of the reader's lock (M236: 360 of 50,000 readers asleep), so
+    /// the token's read waits in poll(2), which sees it.
+    #[test]
+    fn ac_t7_4_1_a_relay_that_ends_mid_token_refuses_the_connect() {
+        for round in 0..ROUNDS {
+            let (ours, mut relay) = UnixStream::pair().unwrap();
+            rustix::net::sockopt::set_socket_send_buffer_size(&relay, 1).unwrap();
+            relay.set_nonblocking(true).unwrap();
+            let link = own_link(Paired(Mutex::new(Some(ours)))).unwrap();
+            let (told, answer) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = told.send(Stream::<Guest>::dial(link).map(drop));
+            });
+            relay.write_all(&TOKEN.to_le_bytes()[..1]).unwrap();
+            // The take is looked for without giving the CPU up, so the half-close follows the read's next wait closely.
+            let began = Instant::now();
+            while !writable(&relay) {
+                std::hint::spin_loop();
+            }
+            answered(&TAKEN, began.elapsed());
+            for _ in 0..round % SPREAD {
+                std::hint::spin_loop();
+            }
+            relay.shutdown(Shutdown::Write).unwrap();
+            let connected = within(&ANSWERED, |by| match by {
+                None => answer.recv().ok(),
+                Some(at) => answer
+                    .recv_timeout(at.saturating_duration_since(Instant::now()))
+                    .ok(),
+            });
+            assert!(
+                matches!(&connected, Some(Err(Refusal::Os { op, .. })) if op.contains("token")),
+                "round {round}: {connected:?}"
+            );
+        }
+    }
+}
+
+/// An output stream's own half (joint plan step 4: ROOT's decision of 2026-11-12, 1-2).
+mod output_end {
+    use hex_core::patience::Patience;
+    use hex_testkit::waits::until;
+
+    use super::*;
+
+    /// An output connection's End after its name, at the agent's end.
+    static ENDED: Patience = Patience::measuring("test.hex_client.guest.output_ended");
+
+    /// AC-T7.4.1 (joint plan step 4, 2(b) and the End-then-Reset item; ROOT's decision of 2026-11-12): exec a program
+    /// whose stdout is the caller's own pipe and whose stderr it asks for, through a stand-in agent that, once the exec
+    /// has started, writes a line on each. Expect each output stream's connection ended on the client's side once
+    /// named: the asked stderr's end takes no write, and the agent reads each connection's name, then its End. Then
+    /// each line reaches the caller and the program's end comes back. A peer's End then closes the connection whole,
+    /// over QUIC's bridge too, so a reader can't sleep through it (Shards M236) and the node's copier leaves no half
+    /// open behind it to reset.
+    #[test]
+    fn an_output_streams_own_half_ends_once_named() {
+        let (control, stdio, link) = listeners();
+        let (checked, check) = std::sync::mpsc::channel::<()>();
+        let agent = std::thread::spawn(move || {
+            let (mut conn, _) = control.accept().unwrap();
+            hello(&mut conn);
+            let (h, request) = next_request(&mut conn);
+            let Request::Call(Call::Exec { streams, .. }) = request else {
+                panic!("expected an exec, got {request:?}");
+            };
+            assert!(!streams.stdin && streams.stdout && streams.stderr);
+            let mut named = Vec::new();
+            for _ in 0..2 {
+                let (mut s, _) = stdio.accept().unwrap();
+                let mut name = [0u8; stream::NAME_BYTES];
+                s.read_exact(&mut name).unwrap();
+                named.push((stream::read_name(&name).unwrap().stream, s));
+            }
+            send_answer(&mut conn, h.id, &Answer::Started { pid: 9 });
+            check.recv().unwrap();
+            for (which, s) in &mut named {
+                s.set_nonblocking(true).unwrap();
+                until(&ENDED, "an output connection's End after its name", || {
+                    matches!(s.read(&mut [0u8; 1]), Ok(0))
+                })
+                .unwrap();
+                s.set_nonblocking(false).unwrap();
+                s.write_all(format!("{which:?}\n").as_bytes()).unwrap();
+            }
+            drop(named);
+            send_answer(&mut conn, h.id, &Answer::Exited(Exit::Code(0)));
+            // Held open until the client has its end, as an agent's connection is.
+            let _ = next_request(&mut conn);
+        });
+        let client = Client::connect(link).unwrap();
+        let (mut out_r, out_w) = std::io::pipe().unwrap();
+        let mut proc = client
+            .exec(
+                &BoxId::new("b").unwrap(),
+                Program::of(&["p"]),
+                Stdio {
+                    stdout: Some(out_w),
+                    ask: hex_api::Ask {
+                        stdin: false,
+                        stdout: false,
+                        stderr: true,
+                    },
+                    ..Stdio::null()
+                },
+            )
+            .unwrap();
+        let given = proc.streams().unwrap();
+        let mut err = hex_api::OwnedStream::from(given.stderr.unwrap());
+        assert!(
+            err.write(b"x").is_err(),
+            "the asked stderr's end took a write: the client's half of an output stream is still open"
+        );
+        checked.send(()).unwrap();
+        let mut out = String::new();
+        out_r.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "Out\n");
+        let mut errors = String::new();
+        err.read_to_string(&mut errors).unwrap();
+        assert_eq!(errors, "Err\n");
+        assert_eq!(proc.wait_for(Duration::MAX).unwrap(), Some(Exit::Code(0)));
+        drop(proc);
+        let _ = client.inspect(&BoxId::new("b").unwrap());
+        agent.join().unwrap();
+    }
+}
+
+/// A stream cut short (joint plan step 4, route (b): ROOT's decision of 2026-11-12, docs/design/hex-quic.md Q11).
+mod cut_short {
+    use std::net::Shutdown;
+
+    use super::*;
+
+    /// A loopback stdio connection that tells its cut as hex-quic's bridge tells a QUIC connection's
+    /// (`Duplex::cut`): the test records it.
+    struct Cuttable {
+        conn: TcpStream,
+        cut: crate::Cut,
+    }
+
+    impl Read for Cuttable {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.conn.read(buf)
+        }
+    }
+
+    impl Write for Cuttable {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.conn.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.conn.flush()
+        }
+    }
+
+    impl Duplex for Cuttable {
+        fn try_clone(&self) -> std::io::Result<DuplexOwner> {
+            own_duplex(Cuttable {
+                conn: self.conn.try_clone()?,
+                cut: self.cut.clone(),
+            })
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))
+        }
+
+        fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+            self.conn.shutdown(how)
+        }
+
+        fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+            self.conn.set_write_timeout(timeout)
+        }
+
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+            self.conn.set_read_timeout(timeout)
+        }
+
+        fn handle(&self) -> super::super::Handle<'_> {
+            Duplex::handle(&self.conn)
+        }
+
+        fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
+            self.conn.set_nonblocking(on)
+        }
+
+        fn cut(&self) -> Option<crate::Cut> {
+            Some(self.cut.clone())
+        }
+    }
+
+    /// The guest's ports as two loopback listeners, each stdio connection's cut kept for the test to record.
+    struct Cuttables {
+        control: SocketAddr,
+        stdio: SocketAddr,
+        cuts: Arc<std::sync::Mutex<Vec<crate::Cut>>>,
+    }
+
+    impl Link for Cuttables {
+        fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
+            if port == stream::CONTROL_PORT {
+                return own_duplex(TcpStream::connect(self.control).unwrap());
+            }
+            let cut = crate::Cut::default();
+            self.cuts.lock().unwrap().push(cut.clone());
+            own_duplex(Cuttable {
+                conn: TcpStream::connect(self.stdio).unwrap(),
+                cut,
+            })
+        }
+
+        fn carries_half_close(&self) -> bool {
+            true
+        }
+    }
+
+    /// AC-T7.4.1 (route (b)): exec a program whose stderr the caller asks for, over a link whose stdio connections tell
+    /// their cut (as QUIC's bridge does, its own test `hex_quic::tests::ac_t7_4_1_a_stream_cut_short_reads_as_cut`);
+    /// the stand-in agent writes part of a line, the connection is cut (the test records a reset as the bridge would),
+    /// and the agent says the program exited 0. Expect the caller to read the part, and the program's end refused
+    /// Broken, naming stderr: a stream the caller reads itself is told cut by its program's end.
+    #[test]
+    fn an_asked_stream_cut_short_ends_its_program_broken() {
+        let (control, stdio) = (
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+        );
+        let cuts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link = own_link(Cuttables {
+            control: control.local_addr().unwrap(),
+            stdio: stdio.local_addr().unwrap(),
+            cuts: Arc::clone(&cuts),
+        })
+        .unwrap();
+        let (was_cut, cut_done) = std::sync::mpsc::channel::<()>();
+        let agent = std::thread::spawn(move || {
+            let (mut conn, _) = control.accept().unwrap();
+            hello(&mut conn);
+            let (h, _) = next_request(&mut conn);
+            let (mut err, _) = stdio.accept().unwrap();
+            let mut name = [0u8; stream::NAME_BYTES];
+            err.read_exact(&mut name).unwrap();
+            send_answer(&mut conn, h.id, &Answer::Started { pid: 12 });
+            err.write_all(b"par").unwrap();
+            cut_done.recv().unwrap();
+            send_answer(&mut conn, h.id, &Answer::Exited(Exit::Code(0)));
+            // Held open until the client has its end, as an agent's connection is.
+            let _ = next_request(&mut conn);
+            drop(err);
+        });
+        let client = Client::connect(link).unwrap();
+        let mut proc = client
+            .exec(
+                &BoxId::new("b").unwrap(),
+                Program::of(&["p"]),
+                Stdio {
+                    ask: hex_api::Ask {
+                        stdin: false,
+                        stdout: false,
+                        stderr: true,
+                    },
+                    ..Stdio::null()
+                },
+            )
+            .unwrap();
+        let mut err = hex_api::OwnedStream::from(proc.streams().unwrap().stderr.unwrap());
+        let mut part = [0u8; 3];
+        err.read_exact(&mut part).unwrap();
+        assert_eq!(&part, b"par");
+        let cut = cuts.lock().unwrap().first().cloned().unwrap();
+        cut.record(&io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "the connection was reset",
+        ));
+        was_cut.send(()).unwrap();
+        let ended = proc.wait_for(Duration::MAX);
+        assert!(
+            matches!(&ended, Err(Refusal::Broken(why)) if why.contains("stderr")),
+            "{ended:?}"
+        );
+        drop((proc, err));
+        let _ = client.inspect(&BoxId::new("b").unwrap());
+        agent.join().unwrap();
+    }
+
+    /// AC-T7.4.1 (route (b)): exec a program whose stdout is the caller's own pipe, through a stand-in agent that writes
+    /// part of a line on it and, once the caller has read that part, resets the connection (an abortive close, RST),
+    /// then says the program exited 0. Expect the caller's pipe to read the part, then its end, and the program's end
+    /// to be refused Broken, naming stdout: a stream cut short is told, never read as complete.
+    #[test]
+    fn a_carried_stream_cut_short_ends_its_program_broken() {
+        let (control, stdio, link) = listeners();
+        let (read_part, part_read) = std::sync::mpsc::channel::<()>();
+        let agent = std::thread::spawn(move || {
+            let (mut conn, _) = control.accept().unwrap();
+            hello(&mut conn);
+            let (h, _) = next_request(&mut conn);
+            let (mut out, _) = stdio.accept().unwrap();
+            let mut name = [0u8; stream::NAME_BYTES];
+            out.read_exact(&mut name).unwrap();
+            send_answer(&mut conn, h.id, &Answer::Started { pid: 11 });
+            out.write_all(b"par").unwrap();
+            part_read.recv().unwrap();
+            rustix::net::sockopt::set_socket_linger(&out, Some(Duration::ZERO)).unwrap();
+            drop(out);
+            send_answer(&mut conn, h.id, &Answer::Exited(Exit::Code(0)));
+            // Held open until the client has its end, as an agent's connection is.
+            let _ = next_request(&mut conn);
+        });
+        let client = Client::connect(link).unwrap();
+        let (mut out_r, out_w) = std::io::pipe().unwrap();
+        let mut proc = client
+            .exec(
+                &BoxId::new("b").unwrap(),
+                Program::of(&["p"]),
+                Stdio {
+                    stdout: Some(out_w),
+                    ..Stdio::null()
+                },
+            )
+            .unwrap();
+        let mut part = [0u8; 3];
+        out_r.read_exact(&mut part).unwrap();
+        assert_eq!(&part, b"par");
+        read_part.send(()).unwrap();
+        let mut rest = Vec::new();
+        out_r.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        let ended = proc.wait_for(Duration::MAX);
+        assert!(
+            matches!(&ended, Err(Refusal::Broken(why)) if why.contains("stdout")),
+            "{ended:?}"
+        );
+        drop(proc);
+        let _ = client.inspect(&BoxId::new("b").unwrap());
+        agent.join().unwrap();
+    }
 }

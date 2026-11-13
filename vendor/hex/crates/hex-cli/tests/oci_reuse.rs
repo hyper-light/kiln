@@ -263,6 +263,7 @@ impl Lab {
             bounds,
             class: ClassSpec::Bundle(self.bundle(caps)),
             owner: owner.cloned(),
+            band: 0,
         }
     }
 
@@ -524,6 +525,7 @@ fn a_delete_ends_a_box_through_its_inits_pidfd(lab: &Lab, own: &Path) {
         bounds: Bounds::default(),
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .unwrap();
     let mut program = node
@@ -563,6 +565,7 @@ fn a_delete_ends_a_box_through_its_inits_pidfd(lab: &Lab, own: &Path) {
             lab.bundle_running(Caps::Docker, &["/hex", "selftest-box", "fail", "0"]),
         ),
         owner: None,
+        band: 0,
     })
     .unwrap();
     node.start(&id).unwrap();
@@ -629,6 +632,7 @@ fn a_delete_ends_a_box_through_its_inits_pidfd(lab: &Lab, own: &Path) {
                         bounds: Bounds::default(),
                         class: ClassSpec::Bundle(bundle.clone()),
                         owner: Some(o.clone()),
+                        band: 0,
                     })
                     .unwrap();
                     node.start(&id).unwrap();
@@ -1091,6 +1095,7 @@ fn a_parked_init_made_with_other_namespaces_is_ended_and_counted(lab: &Lab, own:
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle),
         owner: Some(o.clone()),
+        band: 0,
     })
     .unwrap();
     let after = node.cgroup_reuse().unwrap().parked;
@@ -1649,6 +1654,7 @@ fn a_boxs_network_namespace_is_reused_within_its_owner_when_clean(lab: &Lab, own
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(lab.bundle_with(caps, &wait, true, readonly_sys)),
         owner: owner.cloned(),
+        band: 0,
     };
     let counts = || {
         node.netns_reuse()
@@ -1959,6 +1965,7 @@ fn a_kept_namespace_holds_its_proc_net_files_and_they_close_with_it(lab: &Lab, o
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(lab.bundle_with(Caps::Docker, &wait, true, true)),
         owner: Some(o.clone()),
+        band: 0,
     };
     let counts = || {
         node.netns_reuse()
@@ -2308,6 +2315,7 @@ fn a_node_past_its_files_bound_checks_by_entering_counted(lab: &Lab, own: &Path)
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(lab.bundle_with(Caps::Docker, &wait, true, true)),
         owner: Some(o.clone()),
+        band: 0,
     };
     let counts = || {
         node.netns_reuse()
@@ -2435,6 +2443,7 @@ fn a_box_can_not_send_to_the_socket_the_check_keeps_in_its_namespace(lab: &Lab, 
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(lab.bundle_with(Caps::Docker, &wait, true, true)),
         owner: Some(o.clone()),
+        band: 0,
     };
     let counts = || {
         node.netns_reuse()

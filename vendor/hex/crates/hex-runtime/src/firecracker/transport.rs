@@ -521,13 +521,21 @@ pub(super) fn ready(
     let pid = rustix::process::Pid::from_raw(raw)
         .ok_or_else(|| invalid("readiness identity is invalid"))?;
     // Readonly event subscription only. The SAME managed receipt remains sole reaping/stopping
-    // authority; this descriptor performs no waitid, signal or native lifecycle transition.
-    let observer = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
-        .map_err(|e| Refusal::os("observing native readiness controller", e))?;
-    if crate::linux::oci::state::start_time(raw) != Some(identity.started) || identity.started == 0
-    {
-        return Err(invalid("native readiness identity changed"));
-    }
+    // authority; this descriptor performs no waitid, signal or native lifecycle transition. It is
+    // the VMM's when, once it is open, a process with the VMM's recorded start runs at its pid. A
+    // VMM that ended first leaves none (start_time reads none for a zombie; a reaped one has no
+    // pid), which says nothing against its identity: its receipt, asked below before the observer
+    // is needed, says it ended, and it is refused with what it wrote.
+    let observer = match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+        Ok(observer)
+            if identity.started != 0
+                && crate::linux::oci::state::start_time(raw) == Some(identity.started) =>
+        {
+            Some(observer)
+        }
+        Ok(_) | Err(rustix::io::Errno::SRCH) => None,
+        Err(e) => return Err(Refusal::os("observing native readiness controller", e)),
+    };
 
     listener
         .set_nonblocking(true)
@@ -546,6 +554,10 @@ pub(super) fn ready(
             }
             return Err(tail.refusal());
         }
+        // Not ended, its receipt says, yet none ran with its identity when the observer was opened.
+        let Some(observer) = &observer else {
+            return Err(invalid("native readiness identity changed"));
+        };
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let mut frame = [0u8; hex_core::stream::GUEST_READY.len()];
@@ -565,7 +577,7 @@ pub(super) fn ready(
 
                 let mut descriptors = [
                     PollFd::new(listener, PollFlags::IN),
-                    PollFd::new(&observer, PollFlags::IN),
+                    PollFd::new(observer, PollFlags::IN),
                     PollFd::new(&*output, PollFlags::IN),
                 ];
                 // An ended pipe stays readable (POLLHUP): it leaves the set once read to its end.

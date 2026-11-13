@@ -172,18 +172,26 @@ pub fn default_base(agentfile: &str) -> Option<&str> {
 /// variant), each field length-prefixed so no two sets of fields make one stream. It's the tag the image
 /// is built and found under.
 pub fn recipe(b: &Builtin, base: &str, variant: Option<&str>) -> String {
+    recipe_with(b.text, Some(b), base, variant)
+}
+
+/// [`recipe`] of a build of Agentfile `text`, with `b`'s harness's directory and files beside it where
+/// it's given one: a person's own Agentfile is built beside kiln's for its harness, so one copied from
+/// kiln's finds its harness's directory where kiln's does (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+/// step 17: `crate::sandbox::image`). `b`'s own text gives `b`'s recipe.
+pub fn recipe_with(text: &str, b: Option<&Builtin>, base: &str, variant: Option<&str>) -> String {
     let mut h = Sha256::new();
     let mut field = |bytes: &[u8]| {
         h.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
         h.update(bytes);
     };
     field(b"kiln agentfile recipe 1");
-    field(b.text.as_bytes());
-    for (name, text) in files_for(b, variant) {
+    field(text.as_bytes());
+    for (name, body) in b.map(|b| files_for(b, variant)).unwrap_or_default() {
         field(name.as_bytes());
-        field(text.as_bytes());
+        field(body.as_bytes());
     }
-    field(b.pin.as_bytes());
+    field(b.map_or("", |b| b.pin).as_bytes());
     field(base.as_bytes());
     field(variant.unwrap_or_default().as_bytes());
     hex::encode(h.finalize())
@@ -195,6 +203,12 @@ pub fn recipe(b: &Builtin, base: &str, variant: Option<&str>) -> String {
 /// that fails anywhere leaves none of itself: a part of one builds nothing. Returns the harness's
 /// directories made.
 pub async fn materialize(b: &Builtin, platforms: &[String], variant: Option<&str>, dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    materialize_with(b, b.text, platforms, variant, dir).await
+}
+
+/// [`materialize`], Agentfile `text` in place of `b`'s own: a person's, built beside kiln's harness's
+/// directory ([`recipe_with`]).
+pub async fn materialize_with(b: &Builtin, text: &str, platforms: &[String], variant: Option<&str>, dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let pin = Pin::read(b.pin)?;
     let mut chosen = Vec::new();
     for platform in platforms {
@@ -224,7 +238,7 @@ pub async fn materialize(b: &Builtin, platforms: &[String], variant: Option<&str
             filled?;
             made.push(at);
         }
-        write_new(&dir.join("Agentfile"), b.text)
+        write_new(&dir.join("Agentfile"), text)
     }
     .await;
     if let Err(e) = result {

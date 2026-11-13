@@ -11,14 +11,19 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Where the adapter reads the host's PCI functions and IOMMU groups and opens its VFIO interfaces: the host's own
-/// `/sys`, `/dev` and open, or a test's stand-ins for them.
+/// Where the adapter reads the host's PCI functions and IOMMU groups, opens its VFIO interfaces and reads what a VMM it
+/// starts may pin: the host's own `/sys`, `/dev`, open and process, or a test's stand-ins for them.
 pub(super) struct Host {
     pub(super) sys: PathBuf,
     pub(super) dev: PathBuf,
     /// Opens a VFIO interface for reading and writing, answering as the kernel does: a group another process holds
     /// answers EBUSY (vfio's group open admits one opener at a time).
     pub(super) open: fn(&Path) -> std::io::Result<fs::File>,
+    /// What a VMM this node starts pins its guest's RAM under, read as each VM given a device whole is created: this
+    /// process's ([`Memlock::process`]), or a stand-in host's, whatever the machine's own (AC-T7.4.1). Read then, not
+    /// once at the node's start: the VMM inherits the node's limit as it is at its launch, which another process may
+    /// change while the node runs (prlimit(2)).
+    pub(super) memlock: Box<dyn Fn() -> Result<Memlock, Refusal> + Send + Sync>,
 }
 
 impl Host {
@@ -27,7 +32,18 @@ impl Host {
             sys: path(Path::new("/"), "sys")?,
             dev: path(Path::new("/"), "dev")?,
             open: open_read_write,
+            memlock: Box::new(Memlock::process),
         })
+    }
+
+    /// The RLIMIT_MEMLOCK the VMM of a VM given a device whole, its guest's RAM `needed` bytes, runs under, by this
+    /// host's [`Memlock`] ([`dma_memlock`]). A VM given none maps no RAM for DMA, and its VMM runs under the node's own.
+    pub(super) fn dma_memlock(
+        &self,
+        needed: u64,
+    ) -> Result<Option<rustix::process::Rlimit>, Refusal> {
+        let Memlock { limit, ipc_lock } = (self.memlock)()?;
+        dma_memlock(needed, limit, ipc_lock)
     }
 
     /// `/sys/bus/pci/devices`: each PCI function's directory, named by its SBDF.
@@ -219,6 +235,23 @@ fn reserve<T>(items: &mut Vec<T>, more: usize) -> Result<(), Refusal> {
         .map_err(|_| exhausted("VFIO function metadata", hex_api::MAX_DEVICES))
 }
 
+/// What a VMM pins its guest's RAM for DMA under: the RLIMIT_MEMLOCK it starts with, and whether it holds
+/// CAP_IPC_LOCK, which exempts it from that limit ([`dma_memlock`]).
+pub(super) struct Memlock {
+    pub(super) limit: rustix::process::Rlimit,
+    pub(super) ipc_lock: bool,
+}
+
+impl Memlock {
+    /// This process's: the RLIMIT_MEMLOCK a VMM it starts inherits, and whether that VMM holds CAP_IPC_LOCK.
+    fn process() -> Result<Self, Refusal> {
+        Ok(Self {
+            limit: rustix::process::getrlimit(rustix::process::Resource::Memlock),
+            ipc_lock: vmm_holds_ipc_lock()?,
+        })
+    }
+}
+
 /// The RLIMIT_MEMLOCK a VMM that maps `needed` bytes of its guest's RAM for DMA runs under: vfio's type1 IOMMU charges
 /// every page it pins to the VMM's RLIMIT_MEMLOCK unless the VMM holds CAP_IPC_LOCK
 /// (drivers/vfio/vfio_iommu_type1.c, `vfio_pin_pages_remote`), and Firecracker maps all of a VM's RAM once a device is
@@ -227,7 +260,7 @@ fn reserve<T>(items: &mut Vec<T>, more: usize) -> Result<(), Refusal> {
 /// type where neither holds it and the VMM won't hold CAP_IPC_LOCK (`ipc_lock`), naming the bytes, both limits and the
 /// capability, so the create is refused before anything is launched rather than the VMM ending on its DMA map's ENOMEM
 /// (the lead, 2026-11-11, from the GPU run r690's `IommuDmaMap(Error(12))`).
-pub(super) fn dma_memlock(
+fn dma_memlock(
     needed: u64,
     limit: rustix::process::Rlimit,
     ipc_lock: bool,
@@ -260,7 +293,7 @@ pub(super) fn dma_memlock(
 /// Whether a VMM this process starts holds CAP_IPC_LOCK where vfio looks for it, the initial user namespace's
 /// (`capable(CAP_IPC_LOCK)`): a process of the initial user namespace whose child keeps it across its execve, a root
 /// one's from its bounding set (capabilities(7), the root exemption), any other's from its ambient set alone.
-pub(super) fn vmm_holds_ipc_lock() -> Result<bool, Refusal> {
+fn vmm_holds_ipc_lock() -> Result<bool, Refusal> {
     use rustix::thread::CapabilitySet;
     let map = fs::read_to_string("/proc/self/uid_map")
         .map_err(|e| Refusal::os("reading this process's user namespace map", e))?;
@@ -677,7 +710,8 @@ pub(super) fn function_id(sbdf: &str) -> Result<String, Refusal> {
 pub(super) mod stand_in {
     use super::*;
 
-    /// An empty stand-in host under `root`, opening its interfaces with `open`.
+    /// An empty stand-in host under `root`, opening its interfaces with `open`. Its memlock is refused until its test
+    /// gives one ([`memlock`]).
     pub(in super::super) fn host(
         root: &Path,
         open: fn(&Path) -> std::io::Result<fs::File>,
@@ -686,6 +720,7 @@ pub(super) mod stand_in {
             sys: root.join("sys"),
             dev: root.join("dev"),
             open,
+            memlock: Box::new(|| Err(invalid("a stand-in host's memlock is its test's to give"))),
         };
         fs::create_dir_all(host.dev.join("vfio")).unwrap();
         fs::write(host.dev.join("vfio/vfio"), "").unwrap();
@@ -695,6 +730,22 @@ pub(super) mod stand_in {
     /// The host's own way of opening an interface, for a stand-in's files.
     pub(in super::super) fn opened(path: &Path) -> std::io::Result<fs::File> {
         open_read_write(path)
+    }
+
+    /// A stand-in host's memlock: its VMMs start under an RLIMIT_MEMLOCK of `bytes`, soft and hard, holding no
+    /// CAP_IPC_LOCK.
+    pub(in super::super) fn memlock(
+        bytes: u64,
+    ) -> Box<dyn Fn() -> Result<Memlock, Refusal> + Send + Sync> {
+        Box::new(move || {
+            Ok(Memlock {
+                limit: rustix::process::Rlimit {
+                    current: Some(bytes),
+                    maximum: Some(bytes),
+                },
+                ipc_lock: false,
+            })
+        })
     }
 
     /// Adds PCI function `sbdf` to `host`: in IOMMU group `group` (its interface in `/dev/vfio`), bound to `driver`,

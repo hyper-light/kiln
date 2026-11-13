@@ -14,6 +14,7 @@ use hex_api::Upstream;
 use crate::model::Class;
 
 pub mod sim;
+pub mod trial;
 
 /// The fewest windows whose nearest-rank p99.9 is an observed sample rather than their maximum: decision 9's
 /// census rule (`SEEDABLE` in `bench/competitive/probes/waits_census.py`, held to it by a doc-truth test). A
@@ -417,7 +418,9 @@ pub fn with_mutant<T>(m: Option<Mutant>, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// One node's VMs, their charges and bookings, within its fleet's budget (C3 to C7). `K` names a VM.
+/// One node's VMs, their charges and bookings, within its fleet's budget (C3 to C7). `K` names a VM, and its order is
+/// the order the node began its VMs, which every order the rule takes among them follows (C3): a node's learners key
+/// each VM by its record's place in the node's start order (`hex-node`'s `Lifetime`), never by anything random.
 #[derive(Debug, Clone)]
 pub struct Node<K> {
     window: Duration,
@@ -652,7 +655,7 @@ impl<K: Ord + Copy> Node<K> {
 
     /// After a window's readings (C3): the fastest growth on record taken, every booking lowered to its charge,
     /// then raised toward it only into room no booking holds and, for memory and disk, no VM holds, higher bands
-    /// first.
+    /// first and, within a band, the earliest begun first (by `K`).
     pub fn settle(&mut self) -> Result<(), ChargeError> {
         self.growth = self.growth.max(self.grew);
         self.grew = 0;
@@ -959,8 +962,9 @@ impl<K: Ord + Copy> Node<K> {
     }
 
     /// The last resort (C5): where what the fleet's VMs hold and the fastest growth on record in one window pass
-    /// its budget, the VM holding most past its own budget, lowest band first; never one within its budget, so
-    /// never one within its booking, nor one held at its budget as Linux's `memory.high` holds it.
+    /// its budget, the VM holding most past its own budget, lowest band first, of VMs equally past theirs the latest
+    /// begun (by `K`, C3); never one within its budget, so never one within its booking, nor one held at its budget as
+    /// Linux's `memory.high` holds it.
     pub fn last_resort(&self) -> Result<Resort<K>, ChargeError> {
         let [_, budget, _] = self.budget;
         let held = self
@@ -1006,14 +1010,21 @@ impl<K: Ord + Copy> Node<K> {
                 let vm = self.vms.get(id)?;
                 let past = u64::try_from(budget.room.checked_neg()?).ok()?;
                 if past > 0 {
-                    Some((vm.band, std::cmp::Reverse(past), *id, budget.bytes))
+                    Some((
+                        vm.band,
+                        std::cmp::Reverse(past),
+                        std::cmp::Reverse(*id),
+                        budget.bytes,
+                    ))
                 } else {
                     None
                 }
             })
             .min();
         Ok(chosen
-            .and_then(|(_, _, id, bytes)| excess(&id, bytes).map(|why| Resort::End { vm: id, why }))
+            .and_then(|(_, _, std::cmp::Reverse(id), bytes)| {
+                excess(&id, bytes).map(|why| Resort::End { vm: id, why })
+            })
             .unwrap_or(Resort::Within(fleet)))
     }
 

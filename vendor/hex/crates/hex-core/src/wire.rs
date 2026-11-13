@@ -47,11 +47,11 @@ use hex_api::{
     BoxId, BoxInfo, BoxOwner, BoxSpec, BoxState, Capacity, CapacityResources, Class, ClassSpec,
     ConnectFailure, ConnectPhase, ConnectReply, Destination, DeviceHolder, DeviceId, DeviceInfo,
     DeviceKind, DeviceUnavailable, Execution, Exit, GpuEligibility, Grant, GuestTime, ImageArch,
-    ImageOs, ImagePlatform, IoKind, IoRates, Learned, LearnedEnd, LearnedHolding, LearnedPrior,
-    LearnedUse, LifecycleCause, MAX_DEVICES, MAX_LEARNED_HOLDINGS, MAX_LEARNED_PRIORS,
-    MAX_RUNTIME_ROUTES, Member, MemberKind, Mount, Network, OciSpec, PhysicalDevice,
-    PhysicalReport, Ports, Program, Proto, Published, Receiver, Refusal, Rootfs, RouteKey,
-    RouteOffer, RouteReceipt, RuntimeCost, ShardsImage, Signal, Upstream, Usage, User,
+    ImageMember, ImageOs, ImagePlatform, IoKind, IoRates, Learned, LearnedEnd, LearnedHolding,
+    LearnedPrior, LearnedUse, LifecycleCause, MAX_DEVICES, MAX_LEARNED_HOLDINGS,
+    MAX_LEARNED_PRIORS, MAX_RUNTIME_ROUTES, Member, MemberKind, Mount, Network, OciSpec,
+    PhysicalDevice, PhysicalReport, Ports, Program, Proto, Published, Receiver, Refusal, Rootfs,
+    RouteKey, RouteOffer, RouteReceipt, RuntimeCost, ShardsImage, Signal, Upstream, Usage, User,
     check_grants, check_published,
 };
 
@@ -1281,7 +1281,11 @@ fn put_box_spec(w: &mut Writer, spec: &BoxSpec) -> Result<(), Fault> {
         w.option(allocation.booked, put_resources);
         Ok(())
     })?;
-    put_route_option(w, spec.route)
+    put_route_option(w, spec.route)?;
+    // Joint plan step 14: its priority band follows the route, last (C5).
+    w.reserve_fixed(1)?;
+    w.u8(spec.band);
+    Ok(())
 }
 
 fn box_spec(r: &mut Reader<'_>) -> Result<BoxSpec, Fault> {
@@ -1315,6 +1319,7 @@ fn box_spec(r: &mut Reader<'_>) -> Result<BoxSpec, Fault> {
             })
         })?,
         route: r.option(route_receipt)?,
+        band: r.u8()?,
     };
     check_spec_route(&spec)?;
     spec.check_devices()
@@ -2175,14 +2180,23 @@ fn oci(r: &mut Reader<'_>) -> Result<OciSpec, Fault> {
 }
 
 /// A Shards image VM's spec: its pinned image, then its run's command, an option of a list (joint plan
-/// step 12), then its network grants (joint plan step 15). Fields a later step adds go after the grants
-/// (append-only).
+/// step 12), then its network grants (joint plan step 15), then the members its caller drives, each its member,
+/// its variables and an option of its working directory (joint plan step 17). Fields a later step adds go after
+/// the members (append-only).
 fn put_shards_image(w: &mut Writer, image: &ShardsImage) -> Result<(), Fault> {
     w.string(&image.image)?;
     w.option_with(image.command.as_deref(), |w, command| {
         w.list(command, |w, arg| w.string(arg))
     })?;
-    put_grants(w, &image.grants)
+    put_grants(w, &image.grants)?;
+    w.list(&image.members, |w, m| {
+        put_member(w, &m.member)?;
+        w.list(&m.env, |w, (k, v)| {
+            w.string(k)?;
+            w.string(v)
+        })?;
+        w.option_with(m.workdir.as_deref(), Writer::string)
+    })
 }
 
 fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
@@ -2190,6 +2204,13 @@ fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
         image: r.string("shards image")?,
         command: r.option(|r| r.list(|r| r.string("shards image command")))?,
         grants: grants(r)?,
+        members: r.list(|r| {
+            Ok(ImageMember {
+                member: member(r)?,
+                env: r.list(|r| Ok((r.string("member variable")?, r.string("member value")?)))?,
+                workdir: r.option(|r| r.string("member workdir"))?,
+            })
+        })?,
     })
 }
 
@@ -2483,9 +2504,13 @@ fn put_info(w: &mut Writer, info: &BoxInfo) -> Result<(), Fault> {
         w.u32(published.grant);
         put_address(w, published.at.ip());
         w.u16(published.at.port());
-        w.u8(match published.receiver {
-            Receiver::Declared => 0,
-        });
+        match published.receiver {
+            Receiver::Declared => w.u8(0),
+            Receiver::Named { port } => {
+                w.u8(1);
+                w.u16(port);
+            }
+        }
         Ok(())
     })?;
     // Joint plan step 14 (C5): why its node's last resort ended it, after every older field.
@@ -2526,6 +2551,7 @@ fn info(r: &mut Reader<'_>) -> Result<BoxInfo, Fault> {
                 at: SocketAddr::new(address(r)?, r.u16()?),
                 receiver: match r.u8()? {
                     0 => Receiver::Declared,
+                    1 => Receiver::Named { port: r.u16()? },
                     t => return Err(Fault::value("published receiver", format!("variant {t}"))),
                 },
             })
