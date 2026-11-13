@@ -1110,7 +1110,8 @@ such a start is refused there, saying so.
 **Agentfiles** (Agents → Agentfiles, `/agents/agentfiles`) keeps yours: each opened on its own page
 in the code editor's Agentfile mode, checked by Shards as it's typed (`POST /api/agentfiles/check`,
 what it finds marked on its lines and said under the editor), saved with a new version for each new
-text (one Shards refuses isn't kept, and its words say why), renamed (no new version), each version
+text (one Shards refuses isn't kept, and its words say why; nor is one that grants a way to kiln
+itself, below), renamed (no new version), each version
 read and any made current again (as a new version), and deleted with its versions after a question
 asked in place. A new one is written in place on the list; kiln's are read there and copied as
 yours, under a name that isn't kiln's, to change.
@@ -1216,8 +1217,16 @@ to `s28-pi-agentfile`).
   start it from your own session, or from an agent that isn't isolated.
 - **Reach what its Agentfile doesn't grant.** No other folder, port, host or device of the machine.
   kiln's own MCP isn't reached over the network at all: it comes over the link kiln drives the
-  harness by, as that link's own MCP lane (Shards D254), on every OS kiln runs on, so no Agentfile
-  grants anything for it.
+  harness by, as that link's own MCP lane (Shards D254), on every OS kiln runs on. Inside the
+  microVM each harness names the lane's bridge, `/run/shards/mcp`, as a stdio server in its own
+  form (Claude Code's `--mcp-config`, Codex's `-c mcp_servers.kiln.*`, an ACP agent's
+  `mcpServers`, one fixed entry in Antigravity's own `mcp_config.json`), with no token: the lane
+  says which session asks. So no Agentfile grants anything for it, and kiln refuses to keep one that
+  grants a way to kiln itself, at its line, typed (`ReachesKiln`: "kiln's MCP rides the
+  agent-control lane (D254)"). That covers a destination or a remote MCP server that is the machine
+  its runner is (`host.docker.internal`; a loopback, link-local or unspecified address; a network's
+  own gateway) or kiln's server (the hosts its configuration names). Other remote MCP servers, a
+  GitHub MCP for one, stay yours to grant by name.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
 - **Not yet**, as well as the start itself: a terminal into the microVM, its sign-in and exec
@@ -1237,7 +1246,7 @@ What this page describes, once an isolated agent's start goes through:
 | The Changes tab, Commits, Compare, whose a file is, a subagent's edits, change requests | Works: the project is at its own path inside, so kiln reads its diffs, HEAD and checkpoints where it always does. |
 | Continuing a past session | Works: kiln reads its transcript from your volume on the machine. |
 | Its harness's settings, sign-in and memories | Kept in your volume, yours alone; no credential leaves it. |
-| Agents that run agents, and kiln's other tools | Not yet: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane), never the network; what it starts is isolated too. Pi takes no MCP server from kiln. |
+| Agents that run agents, and kiln's other tools | Not yet: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane, through the bridge `/run/shards/mcp` each harness names), never the network, on every OS; what it starts is isolated too. The runner's end of the lane is still to come. Pi takes no MCP server from kiln. |
 | Skills kiln installs, and kiln's own | Its plugin folders are plugged in read-only at their own paths as it starts. |
 | Files in messages | A file in your project or in its home shows; one on the microVM's scratch (`/tmp`) can't, as it's nowhere on the machine. |
 | What it leaves running | Inside its microVM, and ends with it. |

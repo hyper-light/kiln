@@ -7,10 +7,9 @@
 //!   from the machine for its transcripts and resume as it reads a harness's home today.
 //! - [`env`]: kiln's own variables (`KILN_*`) as a process on its machine gets them, less those
 //!   that name what isn't in the microVM, and nothing of the machine's own environment.
-//! - kiln's MCP server isn't here, and no Agentfile grants anything for it: it rides the link kiln
-//!   drives the harness by, as that link's own `mcp` lane (Shards D254), never the network (ROOT's
-//!   decision, 2026-11-13). Its in-microVM endpoint and the runner's in-process bridge to kiln's MCP
-//!   are owed with the lane.
+//! - [`mcp`]: kiln's MCP server, over the link kiln drives the harness by, as that link's own
+//!   `mcp` lane (Shards D254), never the network (ROOT's decision, 2026-11-13): each harness's own
+//!   form naming the lane's bridge inside the microVM, and no Agentfile granting anything for it.
 //! - [`host_tools`]: a session whose project builds with its host's own tools (Xcode, MSVC) can't
 //!   run in a Linux microVM: refused, saying so, where isolation is asked for.
 //!
@@ -22,6 +21,7 @@
 pub mod env;
 pub mod home;
 pub mod host_tools;
+pub mod mcp;
 
 /// Why an isolated session can't have what a process on its machine has. Each says why in words
 /// the person reads; callers match the variant.
