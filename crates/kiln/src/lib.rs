@@ -97,6 +97,7 @@ pub mod secrets;
 pub mod sense;
 pub mod server;
 pub mod setup;
+pub mod shards;
 pub mod shard_health;
 #[cfg(test)]
 mod sim;

@@ -1,0 +1,2437 @@
+//! Messages between shards' processes over Unix-domain stream sockets, with open file
+//! descriptors passed alongside (`SCM_RIGHTS`).
+//!
+//! A message is a kind byte, a big-endian u32 payload length, then the payload. Its
+//! descriptors travel with its first byte, so a stream never splits them from their
+//! message. Received descriptors are close-on-exec: atomically where the kernel offers
+//! `MSG_CMSG_CLOEXEC` (Linux), right after receipt elsewhere.
+//!
+//! A sender keeps its own descriptor for a socket it passes until the receiver says it
+//! has it. macOS's collector of in-flight descriptors (`unp_gc`) marks as reachable only
+//! what it finds from other sockets in flight, so a socket in flight that no process
+//! holds any more is flushed, and reads end of stream from then on, if a collection runs
+//! before it is received. Every freed Unix socket starts one (docs/research/
+//! platform-measurements.md M24).
+
+use std::ffi::{CString, OsStr};
+use std::io::{self, Write};
+use std::mem::{MaybeUninit, size_of};
+use std::net::Shutdown;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use crate::{Identity, MAX_FDS, MAX_PAYLOAD};
+
+/// The signals `docker run` forwards to the container with `--sig-proxy`, its default:
+/// every one but SIGCHLD, SIGPIPE, SIGURG and those the daemon cannot name (docker/cli
+/// cli/command/container/signals.go). These are the ones other processes send, each
+/// paired with its Linux number: the guest is Linux, and Docker forwards by name.
+pub const FORWARDED: [(libc::c_int, u32); 18] = [
+    (libc::SIGHUP, 1),
+    (libc::SIGINT, 2),
+    (libc::SIGQUIT, 3),
+    (libc::SIGABRT, 6),
+    (libc::SIGUSR1, 10),
+    (libc::SIGUSR2, 12),
+    (libc::SIGALRM, 14),
+    (libc::SIGTERM, 15),
+    (libc::SIGCONT, 18),
+    (libc::SIGTSTP, 20),
+    (libc::SIGTTIN, 21),
+    (libc::SIGTTOU, 22),
+    (libc::SIGXCPU, 24),
+    (libc::SIGXFSZ, 25),
+    (libc::SIGVTALRM, 26),
+    (libc::SIGPROF, 27),
+    (libc::SIGWINCH, 28),
+    (libc::SIGIO, 29),
+];
+
+/// The signals to forward by waiting for them: all of [`FORWARDED`], and on Linux SIGSTKFLT
+/// and SIGPWR, which Docker names there too (moby/sys signal_linux.go); but SIGTTIN when
+/// this process reads its terminal. Left unblocked, SIGTTIN stops a reader in the
+/// background, as the terminal's job control stops any; blocked, the read would fail with
+/// EIO instead (POSIX.1-2024, 11.1.4 Terminal Access Control).
+pub fn forwarded(reads_terminal: bool) -> impl Iterator<Item = (libc::c_int, u32)> {
+    FORWARDED
+        .into_iter()
+        .chain(linux_only())
+        .filter(move |&(sig, _)| !(reads_terminal && sig == libc::SIGTTIN))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_only() -> impl Iterator<Item = (libc::c_int, u32)> {
+    [(libc::SIGSTKFLT, 16), (libc::SIGPWR, 30)].into_iter()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn linux_only() -> impl Iterator<Item = (libc::c_int, u32)> {
+    std::iter::empty()
+}
+
+/// Linux's real-time signals Docker names, RTMIN, 34, to RTMAX (moby/sys
+/// signal_linux.go), less those below the C library's own SIGRTMIN, which it keeps; each
+/// its own number. The client's alone ([`take_rest`]): a VM's process kicks its vCPUs
+/// with SIGRTMIN (vmm hv/kvm).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn realtime() -> impl Iterator<Item = (libc::c_int, u32)> {
+    (libc::SIGRTMIN().max(34)..=libc::SIGRTMAX())
+        .filter_map(|sig| u32::try_from(sig).ok().map(|linux| (sig, linux)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn realtime() -> impl Iterator<Item = (libc::c_int, u32)> {
+    std::iter::empty()
+}
+
+/// The signals a fault raises as well as another process may send, each with its Linux
+/// number. On Linux those another process sent are forwarded, as Go's `os/signal` delivers
+/// them to the Docker CLI (runtime sigFromUser), and one a fault of the process's own raised
+/// ends it as it would have. So they are caught ([`take_rest`]), not blocked: blocked, a
+/// fault's signal is delivered with the default action, past the one the process had, such
+/// as Rust's report of a stack overflow (kernel/signal.c force_sig_info_to_task). Not on
+/// macOS, where nothing tells them apart: XNU gives a SIGSEGV, SIGBUS or SIGILL the codes
+/// of a fault whoever sent it (bsd/dev/arm/unix_signal.c sendsig: SEGV_ACCERR, BUS_ADRALN,
+/// ILL_ILLTRP), and never `SI_USER`, which is what Go asks of a signal sent, so the Docker
+/// CLI there takes them as faults.
+pub const FAULTS: [(libc::c_int, u32); 6] = [
+    (libc::SIGILL, 4),
+    (libc::SIGTRAP, 5),
+    (libc::SIGBUS, 7),
+    (libc::SIGFPE, 8),
+    (libc::SIGSEGV, 11),
+    (libc::SIGSYS, 31),
+];
+
+/// What wakes the thread that waits for forwarded signals when one of [`FAULTS`] was sent:
+/// SIGURG, which nothing forwards, as Docker leaves it to the Go runtime
+/// (cli/command/container/signals.go, isRuntimeSig).
+pub const CARRIER: libc::c_int = libc::SIGURG;
+
+/// [`FAULTS`] sent and not yet taken, a bit each.
+static SENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The thread that waits for the carrier, once it has said so; 0 until then.
+static WAITER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The actions [`FAULTS`] had before they were caught, which a fault gets back.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static PREVIOUS: std::sync::OnceLock<[libc::sigaction; FAULTS.len()]> = std::sync::OnceLock::new();
+
+/// [`take_rest`]'s handler: a signal another process sent (`si_code` not above 0:
+/// include/uapi/asm-generic/siginfo.h, SI_FROMUSER) is marked and its waiter woken; a
+/// fault's gets back the action it had before, and the fault, raised again as its
+/// instruction runs again, is handled as it would have been (Rust's report of a stack
+/// overflow, or the default). Async-signal-safe: atomics, kill(2), pthread_kill(3),
+/// sigaction(2).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern "C" fn sent_or_fault(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    let Some(i) = FAULTS.iter().position(|&(s, _)| s == sig) else {
+        return;
+    };
+    // SAFETY: the kernel passes an SA_SIGINFO handler the signal's siginfo.
+    let code = unsafe { info.as_ref() }.map_or(1, |info| info.si_code);
+    if code <= 0 {
+        SENT.fetch_or(1 << i, std::sync::atomic::Ordering::SeqCst);
+        let waiter = WAITER.load(std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: kill(2) and pthread_kill(3) are async-signal-safe; the waiter, once
+        // set, is a thread that lives as long as the process.
+        unsafe {
+            if waiter == 0 || libc::pthread_kill(waiter as libc::pthread_t, CARRIER) != 0 {
+                libc::kill(libc::getpid(), CARRIER);
+            }
+        }
+        return;
+    }
+    if let Some(previous) = PREVIOUS.get().and_then(|p| p.get(i)) {
+        // SAFETY: sigaction(2) is async-signal-safe; `previous` is what it gave before.
+        unsafe { libc::sigaction(sig, previous, std::ptr::null_mut()) };
+    }
+}
+
+/// The rest of what `docker run` forwards, for the client to forward too, after
+/// [`take_forwarded`], on Linux: [`FAULTS`], caught, to forward those another process
+/// sends ([`sent_faults`]); and in `set`, blocked in the calling thread, whose later
+/// threads inherit the mask, the real-time signals Docker names and [`CARRIER`]. The thread
+/// that waits on `set` says so first ([`wait_here`]). Not for a VM's process: its vCPUs'
+/// kick is SIGRTMIN, and seccomp catches its SIGSYS. On macOS, nothing ([`FAULTS`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn take_rest(set: &mut libc::sigset_t) -> io::Result<()> {
+    // SAFETY: sigaction(2) reads and writes of dispositions, and sigset operations, on
+    // valid structures.
+    unsafe {
+        let mut previous: [libc::sigaction; FAULTS.len()] = std::mem::zeroed();
+        for (&(sig, _), was) in FAULTS.iter().zip(previous.iter_mut()) {
+            if libc::sigaction(sig, std::ptr::null(), was) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let _ = PREVIOUS.set(previous);
+        let mut caught: libc::sigaction = std::mem::zeroed();
+        caught.sa_sigaction = sent_or_fault
+            as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+            as libc::sighandler_t;
+        // On the thread's alternate stack, as a stack overflow's SIGSEGV needs one.
+        caught.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
+        for (sig, _) in FAULTS {
+            if libc::sigaction(sig, &caught, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let mut more: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut more);
+        libc::sigaddset(&mut more, CARRIER);
+        libc::sigaddset(set, CARRIER);
+        for (sig, _) in realtime() {
+            libc::sigaddset(&mut more, sig);
+            libc::sigaddset(set, sig);
+        }
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &more, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// [`take_rest`] on macOS: nothing ([`FAULTS`]).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn take_rest(_set: &mut libc::sigset_t) -> io::Result<()> {
+    Ok(())
+}
+
+/// Says the calling thread is the one that waits for [`CARRIER`], so that a fault signal
+/// sent wakes it, whatever other threads block.
+pub fn wait_here() {
+    // SAFETY: pthread_self(3) has no preconditions.
+    let me = unsafe { libc::pthread_self() } as usize;
+    WAITER.store(me, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The Linux numbers of the [`FAULTS`] another process sent since last asked.
+pub fn sent_faults() -> impl Iterator<Item = u32> {
+    let sent = SENT.swap(0, std::sync::atomic::Ordering::SeqCst);
+    FAULTS
+        .into_iter()
+        .enumerate()
+        .filter(move |(i, _)| sent & (1 << i) != 0)
+        .map(|(_, (_, linux))| linux)
+}
+
+/// The Linux number of `sig`, which a process forwards.
+pub fn linux_signal(sig: libc::c_int) -> Option<u32> {
+    numbered().find(|&(s, _)| s == sig).map(|(_, linux)| linux)
+}
+
+/// The signal this system numbers what Linux numbers `linux`, as [`linux_signal`] gives it:
+/// none, for one this system has not.
+pub fn local_signal(linux: u32) -> Option<libc::c_int> {
+    numbered().find(|&(_, l)| l == linux).map(|(sig, _)| sig)
+}
+
+/// The signals a process forwards, each with its Linux number.
+fn numbered() -> impl Iterator<Item = (libc::c_int, u32)> {
+    let faults = cfg!(any(target_os = "linux", target_os = "android")).then_some(FAULTS);
+    forwarded(false)
+        .chain(realtime())
+        .chain(faults.into_iter().flatten())
+}
+
+/// The handler that keeps a blocked signal pending for sigwait(3) on XNU; it never runs.
+extern "C" fn kept_for_sigwait(_: libc::c_int) {}
+
+/// Readies this process to take the signals it forwards (`forwarded(reads_terminal)`)
+/// with sigwait(3). It blocks them in the calling thread, whose later threads inherit the
+/// mask, then makes any that this process was started ignoring default again, as Go's
+/// `signal.Notify` does for the Docker CLI's signal proxy (os/signal): XNU drops an
+/// ignored signal when it is sent, even to a thread in sigwait (bsd/kern/kern_sig.c,
+/// psignal_internal), and a non-interactive shell starts `cmd &` with SIGINT and SIGQUIT
+/// ignored (POSIX.1-2024, XCU 2.9.3.1). XNU drops SIGWINCH and SIGIO at their default
+/// too, whose default is to ignore them (setsigvec adds them to p_sigignore): they get a
+/// handler, which never runs while they stay blocked, as Go gives every signal it is
+/// notified of (platform-measurements M31). Returns the set to wait on, and the signals
+/// that were ignored.
+pub fn take_forwarded(reads_terminal: bool) -> io::Result<(libc::sigset_t, Vec<libc::c_int>)> {
+    // SAFETY: sigset operations on a local set, pthread_sigmask on this thread, and
+    // sigaction(2) reads and writes of dispositions, on valid structures.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for (sig, _) in forwarded(reads_terminal) {
+            libc::sigaddset(&mut set, sig);
+        }
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut ignored = Vec::new();
+        for (sig, _) in forwarded(reads_terminal) {
+            if sig == libc::SIGWINCH || sig == libc::SIGIO {
+                let mut kept: libc::sigaction = std::mem::zeroed();
+                kept.sa_sigaction = kept_for_sigwait as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                kept.sa_flags = libc::SA_RESTART;
+                let mut was: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, &kept, &mut was) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if was.sa_sigaction == libc::SIG_IGN {
+                    ignored.push(sig);
+                }
+                continue;
+            }
+            let mut was: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut was) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if was.sa_sigaction == libc::SIG_IGN {
+                let mut default: libc::sigaction = std::mem::zeroed();
+                default.sa_sigaction = libc::SIG_DFL;
+                if libc::sigaction(sig, &default, std::ptr::null_mut()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                ignored.push(sig);
+            }
+        }
+        Ok((set, ignored))
+    }
+}
+
+impl Identity {
+    /// A file's identity: its device and inode, its size and its last change.
+    pub fn of(path: &Path) -> io::Result<Identity> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path)?;
+        Ok(Identity {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime_s: m.mtime(),
+            mtime_ns: u32::try_from(m.mtime_nsec()).unwrap_or(0),
+        })
+    }
+}
+
+const HEADER: usize = 5;
+/// Control-message room for the most descriptors a kernel passes in one message: 254 on
+/// macOS and 253 on Linux (docs/research/warm-pool-daemon.md §2.6), whose `CMSG_SPACE` is
+/// 1028 and 1032 bytes. A receiver with less room gets the rest installed all the same on
+/// macOS, where nothing closes them.
+const CONTROL: usize = 1040;
+
+/// A received message.
+#[derive(Debug)]
+pub struct Message {
+    pub kind: u8,
+    pub payload: Vec<u8>,
+    pub fds: Vec<OwnedFd>,
+}
+
+/// Room for control messages, aligned as their header requires.
+#[repr(C, align(8))]
+struct Control([MaybeUninit<u8>; CONTROL]);
+
+impl Control {
+    fn new() -> Control {
+        Control([MaybeUninit::uninit(); CONTROL])
+    }
+}
+
+fn space(fds: usize) -> usize {
+    let bytes = u32::try_from(fds * size_of::<RawFd>()).unwrap_or(u32::MAX);
+    // SAFETY: CMSG_SPACE only computes a size.
+    unsafe { libc::CMSG_SPACE(bytes) as usize }
+}
+
+/// Sends one message with `fds` attached. Blocks until all of it is written.
+pub fn send(sock: &UnixStream, kind: u8, payload: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "message payload too large",
+        ));
+    }
+    if fds.len() > MAX_FDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many descriptors for one message",
+        ));
+    }
+    let len = u32::try_from(payload.len()).map_err(|_| io::Error::other("payload length"))?;
+    let [l0, l1, l2, l3] = len.to_be_bytes();
+    let mut header = [kind, l0, l1, l2, l3];
+    let mut iov = [
+        libc::iovec {
+            iov_base: header.as_mut_ptr().cast(),
+            iov_len: HEADER,
+        },
+        libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        },
+    ];
+    let mut control = Control::new();
+    // SAFETY: an all-zero msghdr is valid; the pointers set below outlive the call.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iov.as_mut_ptr();
+    msg.msg_iovlen = 2;
+    if !fds.is_empty() {
+        let bytes = fds.len() * size_of::<RawFd>();
+        msg.msg_control = control.0.as_mut_ptr().cast();
+        msg.msg_controllen = space(fds.len()) as _;
+        // SAFETY: the control buffer is aligned and holds CMSG_SPACE(bytes) bytes, so the
+        // first header and its data fit.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if cmsg.is_null() {
+                return Err(io::Error::other("no room for descriptors"));
+            }
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(bytes as u32) as _;
+            let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+            for (i, fd) in fds.iter().enumerate() {
+                data.add(i).write_unaligned(fd.as_raw_fd());
+            }
+        }
+    }
+    let total = HEADER + payload.len();
+    let sent = loop {
+        // SAFETY: a fully initialized msghdr over live buffers.
+        let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
+        if let Ok(n) = usize::try_from(n) {
+            break n;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    // The descriptors went with the first byte; the rest follows as plain bytes.
+    if sent < total {
+        write_rest(&mut &*sock, [&header, payload], sent)?;
+    }
+    Ok(())
+}
+
+/// Writes what follows the first `sent` bytes of `parts`, from where they are, where a
+/// signal cut a `sendmsg` short (audit D10).
+fn write_rest(w: &mut impl Write, parts: [&[u8]; 2], sent: usize) -> io::Result<()> {
+    let mut skip = sent;
+    for part in parts {
+        w.write_all(part.get(skip.min(part.len())..).unwrap_or_default())?;
+        skip = skip.saturating_sub(part.len());
+    }
+    Ok(())
+}
+
+/// Receives one message. `None` if the peer closed the stream between messages.
+///
+/// Every read is a `recvmsg` with room for all the descriptors a kernel passes at once, so
+/// descriptors arriving with any part of a message become this process's to close.
+pub fn recv(sock: &UnixStream) -> io::Result<Option<Message>> {
+    recv_until(sock, None)
+}
+
+/// [`recv`], if all of the message arrives by `deadline`; `TimedOut` then otherwise. A
+/// peer that sends nothing, or a message a byte at a time, gains nothing by it: the
+/// deadline bounds the whole message, where a timeout would bound each read.
+pub fn recv_by(sock: &UnixStream, deadline: Instant) -> io::Result<Option<Message>> {
+    recv_until(sock, Some(deadline))
+}
+
+fn recv_until(sock: &UnixStream, deadline: Option<Instant>) -> io::Result<Option<Message>> {
+    let mut fds = Vec::new();
+    let mut header = [0u8; HEADER];
+    let got = recv_part(sock, &mut header, &mut fds, deadline)?;
+    if got == 0 {
+        return if fds.is_empty() {
+            Ok(None)
+        } else {
+            Err(io::ErrorKind::UnexpectedEof.into())
+        };
+    }
+    fill(
+        sock,
+        header.get_mut(got..).unwrap_or_default(),
+        &mut fds,
+        deadline,
+    )?;
+    let [kind, l0, l1, l2, l3] = header;
+    let len = u32::from_be_bytes([l0, l1, l2, l3]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message payload too large",
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    fill(sock, &mut payload, &mut fds, deadline)?;
+    if fds.len() > MAX_FDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "more descriptors than a message may carry",
+        ));
+    }
+    Ok(Some(Message { kind, payload, fds }))
+}
+
+/// Reads exactly `buf.len()` more bytes of a message.
+fn fill(
+    sock: &UnixStream,
+    mut buf: &mut [u8],
+    fds: &mut Vec<OwnedFd>,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = recv_part(sock, buf, fds, deadline)?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = buf.get_mut(n..).unwrap_or_default();
+    }
+    Ok(())
+}
+
+/// Reads what `fd` has into `buf`, as read(2) does; but a socket on macOS is waited for in
+/// poll(2), never in the read. There a read waiting on a Unix stream socket can sleep
+/// through its peer's shutdown(SHUT_WR), and then on a stream that has ended, for good
+/// where the peer waits for this side's end: XNU's soreceive lets go of the socket to take
+/// its peer's lock first (uipc_rcvd), a half-close landing then finds no reader to wake,
+/// and the reader looks only for data before it sleeps. Poll sees the end. Linux's reader
+/// looks for the end under the lock its waker takes, and missed none; a pipe or a
+/// terminal is no socket (docs/research/platform-measurements.md M236). Those are read as
+/// they are.
+///
+/// On macOS a socket is read with `MSG_DONTWAIT`, and waited for only where nothing has
+/// come, as a read waits: not at all where `fd` is set not to block, and no longer than
+/// its receive timeout, `WouldBlock` either way. A FIFO or pipe that waits is waited for in
+/// [`await_fifo`], whose select(2) sees a writer's end that a read can sleep through (PM
+/// M253). A read a signal cut short is made again.
+pub fn read(fd: impl AsFd, buf: &mut [u8]) -> io::Result<usize> {
+    let fd = fd.as_fd();
+    let mut socket = cfg!(target_os = "macos");
+    let mut fifo = false;
+    loop {
+        if fifo {
+            await_fifo(fd)?;
+        }
+        let n = if socket {
+            // SAFETY: recv(2) into `buf`, at most its length.
+            unsafe {
+                libc::recv(
+                    fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            }
+        } else {
+            // SAFETY: read(2) into `buf`, at most its length.
+            unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }
+        };
+        if let Ok(n) = usize::try_from(n) {
+            return Ok(n);
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::ENOTSOCK) if socket => {
+                socket = false;
+                fifo = waiting_fifo(fd);
+            }
+            _ if socket && e.kind() == io::ErrorKind::WouldBlock => await_readable(fd, None)?,
+            _ => return Err(e),
+        }
+    }
+}
+
+/// Whether `fd` is a FIFO or pipe whose reads wait: one that is set not to is never
+/// waited for.
+fn waiting_fifo(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: fstat(2) into a zeroed stat buffer, of a descriptor the caller holds open.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; and fcntl(2) reading its flags.
+    let (stat, flags) = unsafe {
+        (
+            libc::fstat(fd.as_raw_fd(), &mut st),
+            libc::fcntl(fd.as_raw_fd(), libc::F_GETFL),
+        )
+    };
+    stat == 0 && st.st_mode & libc::S_IFMT == libc::S_IFIFO && flags >= 0 && flags & libc::O_NONBLOCK == 0
+}
+
+/// What reads through [`read`]: a socket, a pipe or a terminal read with
+/// `BufReader::new(Polled(&conn))`, `io::copy(&mut Polled(&conn), …)` and the like.
+#[derive(Debug)]
+pub struct Polled<S>(pub S);
+
+impl<S: AsFd> io::Read for Polled<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        read(&self.0, buf)
+    }
+}
+
+/// Ends `sock` both ways, one way at a time: its peer reads its end, and what reads it
+/// here, its own. XNU shuts both at once or neither, and neither once the peer has ended
+/// its side (ENOTCONN, soshutdownlock_final), so a peer that half-closed first would never
+/// read this side's end while another copy of it stays open (PM M236).
+pub fn end(sock: &UnixStream) {
+    let _ = sock.shutdown(Shutdown::Write);
+    let _ = sock.shutdown(Shutdown::Read);
+}
+
+/// Waits in poll(2) until `fd` has something to read, or has ended: until `deadline`
+/// where there is one (`TimedOut`); else as a read would, not at all where `fd` is set
+/// not to block, and no longer than a socket's receive timeout (`WouldBlock`).
+fn await_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<()> {
+    let (deadline, expired) = match deadline {
+        Some(deadline) => (Some(deadline), io::ErrorKind::TimedOut),
+        None => {
+            // SAFETY: fcntl(2) reading the flags of a descriptor the caller holds open.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let timeout = receive_timeout(fd).and_then(|t| Instant::now().checked_add(t));
+            (timeout, io::ErrorKind::WouldBlock)
+        }
+    };
+    loop {
+        let ms = match deadline {
+            None => -1,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(expired.into());
+                }
+                // Rounded up: a wait of 0 ms would return at once, and spin.
+                libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
+            }
+        };
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll(2) on one valid pollfd.
+        match unsafe { libc::poll(&mut pfd, 1, ms) } {
+            // Data, its end or an error: the read says which.
+            n if n > 0 => return Ok(()),
+            0 => {}
+            _ => {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Waits until the FIFO or pipe `fd` has something to read, or has ended. On macOS a read(2)
+/// of a FIFO sleeping as its writer ends, just after the data it took, can sleep through
+/// that end: 6 in 224,000 such ends, raced 8 at once (PM M253), as a read of a Unix stream
+/// socket can (M236); select(2) saw all of 192,000. So its reader waits here, then
+/// reads what is there. A descriptor past `FD_SETSIZE` is waited on as one below it is
+/// (`_DARWIN_UNLIMITED_SELECT`, select(2)). Elsewhere a read sees its writer's end, and
+/// this waits for nothing.
+pub fn await_fifo(fd: BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the libSystem select(2) that takes descriptor sets of any length, its
+        // first argument a bound on the descriptors they hold.
+        unsafe extern "C" {
+            #[link_name = "select$DARWIN_EXTSN"]
+            fn select_any(
+                nfds: libc::c_int,
+                read: *mut u32,
+                write: *mut u32,
+                error: *mut u32,
+                timeout: *mut libc::timeval,
+            ) -> libc::c_int;
+        }
+        let raw = fd.as_raw_fd();
+        let at = usize::try_from(raw).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let bound = raw
+            .checked_add(1)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // An fd_set's bits, 32 to a word, as FD_SET sets them.
+        let mut set = vec![0u32; at / 32 + 1];
+        loop {
+            if let Some(word) = set.get_mut(at / 32) {
+                *word = 1 << (at % 32);
+            }
+            // SAFETY: a set of `bound` descriptors' bits, as long as that, and no timeout:
+            // select(2) waits until `fd` is readable, or a signal cuts it short.
+            let n = unsafe {
+                select_any(
+                    bound,
+                    set.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if n > 0 {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            if n < 0 && e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fd;
+        Ok(())
+    }
+}
+
+/// Waits until one of `fds`, FIFOs or pipes, has something to read or has ended, and says
+/// which, in their order: on macOS in select(2), as [`await_fifo`] waits, every descriptor
+/// however high; elsewhere in poll(2), which sees a FIFO's end there (PM M253).
+pub fn await_any(fds: &[BorrowedFd<'_>]) -> io::Result<Vec<bool>> {
+    await_any_within(fds, None)
+}
+
+/// [`await_any`], waiting no longer than `timeout` where one is given: then none is ready.
+pub fn await_any_within(fds: &[BorrowedFd<'_>], timeout: Option<Duration>) -> io::Result<Vec<bool>> {
+    // None past what an Instant holds: for ever.
+    let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+    let left = || deadline.map(|d| d.saturating_duration_since(Instant::now()));
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: as `await_fifo`'s.
+        unsafe extern "C" {
+            #[link_name = "select$DARWIN_EXTSN"]
+            fn select_any(
+                nfds: libc::c_int,
+                read: *mut u32,
+                write: *mut u32,
+                error: *mut u32,
+                timeout: *mut libc::timeval,
+            ) -> libc::c_int;
+        }
+        let at: Vec<usize> = fds
+            .iter()
+            .map(|fd| {
+                usize::try_from(fd.as_raw_fd()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+            })
+            .collect::<io::Result<_>>()?;
+        let most = at
+            .iter()
+            .copied()
+            .max()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let bound =
+            libc::c_int::try_from(most + 1).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut set = vec![0u32; most / 32 + 1];
+        loop {
+            set.iter_mut().for_each(|w| *w = 0);
+            for fd in &at {
+                if let Some(word) = set.get_mut(fd / 32) {
+                    *word |= 1 << (fd % 32);
+                }
+            }
+            let mut tv = left().map(|l| libc::timeval {
+                tv_sec: libc::time_t::try_from(l.as_secs()).unwrap_or(libc::time_t::MAX),
+                tv_usec: libc::suseconds_t::try_from(l.subsec_micros()).unwrap_or(0),
+            });
+            let tv_at = tv.as_mut().map_or(std::ptr::null_mut(), std::ptr::from_mut);
+            // SAFETY: a set of `bound` descriptors' bits, as long as that, and a timeout of
+            // our own or none.
+            let n = unsafe {
+                select_any(
+                    bound,
+                    set.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    tv_at,
+                )
+            };
+            if n > 0 {
+                return Ok(at
+                    .iter()
+                    .map(|fd| set.get(fd / 32).is_some_and(|w| w & (1 << (fd % 32)) != 0))
+                    .collect());
+            }
+            if n == 0 {
+                return Ok(vec![false; at.len()]);
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut polled: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|fd| libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let n =
+            libc::nfds_t::try_from(polled.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        loop {
+            // Whole milliseconds, rounded up, so that a wait never ends before its time.
+            let ms = left().map_or(-1, |l| {
+                libc::c_int::try_from(l.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
+            });
+            // SAFETY: poll(2) on `n` valid pollfds.
+            match unsafe { libc::poll(polled.as_mut_ptr(), n, ms) } {
+                0 => return Ok(vec![false; polled.len()]),
+                ready if ready > 0 => return Ok(polled.iter().map(|p| p.revents != 0).collect()),
+                _ => {}
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// A socket's receive timeout (SO_RCVTIMEO), the longest a read of it waits: none for
+/// anything else, or for a socket without one.
+fn receive_timeout(fd: BorrowedFd<'_>) -> Option<Duration> {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = libc::socklen_t::try_from(size_of::<libc::timeval>()).ok()?;
+    // SAFETY: getsockopt(2) into a timeval, of its length.
+    let got = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw mut tv).cast(),
+            &mut len,
+        )
+    };
+    if got != 0 {
+        return None;
+    }
+    let micros = u32::try_from(tv.tv_usec).ok()?.checked_mul(1000)?;
+    let timeout = Duration::new(u64::try_from(tv.tv_sec).ok()?, micros);
+    (!timeout.is_zero()).then_some(timeout)
+}
+
+/// One `recvmsg` into `buf`, once something arrives, by `deadline` if there is one; on
+/// macOS waited for in poll(2), as [`read`] waits. Returns the bytes read, and adds the
+/// descriptors that came with them to `fds`, owned and close-on-exec.
+fn recv_part(
+    sock: &UnixStream,
+    buf: &mut [u8],
+    fds: &mut Vec<OwnedFd>,
+    deadline: Option<Instant>,
+) -> io::Result<usize> {
+    // Elsewhere a read may wait in the kernel, where no deadline bounds it (M236).
+    if deadline.is_none() && !cfg!(target_os = "macos") {
+        return recv_msg(sock, buf, fds, 0);
+    }
+    loop {
+        match recv_msg(sock, buf, fds, libc::MSG_DONTWAIT) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => await_readable(sock.as_fd(), deadline)?,
+            got => return got,
+        }
+    }
+}
+
+/// Messages from a peer, taken as each comes in whole: what has come of one is kept until
+/// the rest does, so a reader never waits on a peer that stops partway through one, and
+/// reads nothing past it.
+#[derive(Debug, Default)]
+pub struct Incoming {
+    header: [u8; HEADER],
+    /// Bytes of the header that have come, then of the payload.
+    have: usize,
+    /// Once the header has come, the payload, as long as it says.
+    payload: Option<Vec<u8>>,
+    fds: Vec<OwnedFd>,
+}
+
+/// What [`Incoming::take`] found.
+#[derive(Debug)]
+pub enum Took {
+    Message(Message),
+    /// Some of the next message, or none of it, has come.
+    Partial,
+    /// The peer's end, with nothing of a message before it.
+    Ended,
+}
+
+impl Incoming {
+    /// The next message whole, from what `sock` has now: it waits for nothing.
+    pub fn take(&mut self, sock: &UnixStream) -> io::Result<Took> {
+        loop {
+            let (buf, whole) = match &mut self.payload {
+                None => (self.header.get_mut(self.have..).unwrap_or_default(), HEADER),
+                Some(payload) => {
+                    let len = payload.len();
+                    (payload.get_mut(self.have..).unwrap_or_default(), len)
+                }
+            };
+            if self.have < whole {
+                match recv_msg(sock, buf, &mut self.fds, libc::MSG_DONTWAIT) {
+                    Ok(0) if self.have == 0 && self.payload.is_none() && self.fds.is_empty() => {
+                        return Ok(Took::Ended);
+                    }
+                    Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    Ok(n) => self.have += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Took::Partial),
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+            if self.payload.is_none() {
+                let [_, l0, l1, l2, l3] = self.header;
+                let len = u32::from_be_bytes([l0, l1, l2, l3]) as usize;
+                if len > MAX_PAYLOAD {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "message payload too large",
+                    ));
+                }
+                self.payload = Some(vec![0u8; len]);
+                self.have = 0;
+                continue;
+            }
+            if self.fds.len() > MAX_FDS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "more descriptors than a message may carry",
+                ));
+            }
+            self.have = 0;
+            return Ok(Took::Message(Message {
+                kind: self.header[0],
+                payload: self.payload.take().unwrap_or_default(),
+                fds: std::mem::take(&mut self.fds),
+            }));
+        }
+    }
+}
+
+/// One recvmsg(2) of at most `buf.len()` bytes, with `flags`, its descriptors added to
+/// `fds`.
+fn recv_msg(
+    sock: &UnixStream,
+    buf: &mut [u8],
+    fds: &mut Vec<OwnedFd>,
+    flags: libc::c_int,
+) -> io::Result<usize> {
+    let mut control = Control::new();
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: as in `send`.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.0.as_mut_ptr().cast();
+    msg.msg_controllen = CONTROL as _;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = flags | libc::MSG_CMSG_CLOEXEC;
+    let got = loop {
+        // SAFETY: a fully initialized msghdr over live buffers.
+        let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, flags) };
+        if let Ok(n) = usize::try_from(n) {
+            break n;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    // Owned first, so that each is closed on any error below.
+    take_fds(&msg, fds)?;
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control data truncated",
+        ));
+    }
+    Ok(got)
+}
+
+/// Adds the descriptors in `msg`'s control data to `fds`, owned and close-on-exec. Only
+/// what the kernel wrote is read: a truncated header still states its full length on
+/// macOS.
+fn take_fds(msg: &libc::msghdr, fds: &mut Vec<OwnedFd>) -> io::Result<()> {
+    let first = fds.len();
+    // `msg_controllen` is a size_t on glibc and a socklen_t elsewhere.
+    #[allow(clippy::unnecessary_cast)]
+    let end = (msg.msg_control as usize).saturating_add(msg.msg_controllen as usize);
+    // SAFETY: walking the control messages the kernel wrote into our buffer, within
+    // `msg_controllen`; each SCM_RIGHTS descriptor is new to this process and owned by
+    // nothing else.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg);
+                let stated = ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+                let written = end.saturating_sub(data as usize);
+                for i in 0..stated.min(written) / size_of::<RawFd>() {
+                    fds.push(OwnedFd::from_raw_fd(data.cast::<RawFd>().add(i).read_unaligned()));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    for fd in fds.get(first..).unwrap_or_default() {
+        // SAFETY: fcntl(2) on a descriptor we own.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = first;
+    Ok(())
+}
+
+/// The socket of a daemon of a build from before request slots (D185): `daemon.sock` in
+/// shards' home, named relative to the working directory, which each process that uses it
+/// makes the home first. A client reaches such a daemon there only to have it step aside
+/// for its own build's, and a daemon starting removes one left. A relative name fits a
+/// socket address (`sun_path`: 104 bytes on macOS, 108 on Linux, NUL included) whatever
+/// the home's path (PM M26).
+pub const SOCKET: &str = "daemon.sock";
+
+/// Whether process `pid` lives: kill(2) with signal 0 asks, one of another user's among
+/// those that do (EPERM).
+pub(crate) fn alive(pid: u32) -> bool {
+    // Zero or less would name a process group, or every process.
+    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|&pid| pid > 0) else {
+        return false;
+    };
+    // SAFETY: kill(2) with signal 0 only asks whether the process exists.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    alive || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// When process `pid` started ([`crate::started`]): on Linux its `/proc/<pid>/stat`
+/// starttime, field 22, which follows the last ')' (its command, field 2, may hold any byte
+/// but NUL, a ')' too).
+#[cfg(target_os = "linux")]
+pub(crate) fn started(pid: u32) -> io::Result<u64> {
+    let at = format!("/proc/{pid}/stat");
+    let stat = std::fs::read_to_string(&at)?;
+    stat.rfind(')')
+        .and_then(|i| stat.get(i.saturating_add(1)..))
+        .and_then(|fields| fields.split_ascii_whitespace().nth(19))
+        .and_then(|f| f.parse().ok())
+        .ok_or_else(|| io::Error::other(format!("{at}: no starttime in {stat:?}")))
+}
+
+/// When process `pid` started ([`crate::started`]): on macOS `proc_pid_rusage`'s
+/// `ri_proc_start_abstime`.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn started(pid: u32) -> io::Result<u64> {
+    let pid = libc::c_int::try_from(pid).map_err(io::Error::other)?;
+    // SAFETY: a rusage_info_v0, plain data, for proc_pid_rusage to fill.
+    let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+    // SAFETY: proc_pid_rusage(3) of `pid` into a rusage_info_v0 of ours, which RUSAGE_INFO_V0
+    // names.
+    let r = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, (&raw mut info).cast()) };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.ri_proc_start_abstime)
+}
+
+/// This process's peak resident set so far, in KiB; 0 where unknown. On Linux it is the
+/// address space's own high-water mark (`VmHWM`, proc(5)): `getrusage`'s `ru_maxrss`
+/// starts from the spawner's, since exec keeps the peak of the address space it
+/// replaces, which under `posix_spawn` is the parent's (fs/exec.c `exec_mmap`). macOS's
+/// `posix_spawn` starts a new task, and `ru_maxrss` is its own (in bytes there).
+pub fn peak_rss_kib() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                let line = status.lines().find_map(|l| l.strip_prefix("VmHWM:"))?;
+                line.trim().strip_suffix("kB")?.trim().parse().ok()
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: getrusage(2) into a zeroed rusage, a valid out-parameter.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return 0;
+        }
+        let rss = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+        if cfg!(target_vendor = "apple") {
+            rss / 1024
+        } else {
+            rss
+        }
+    }
+}
+
+/// This process's peak commit charge so far, in KiB (windows.rs `peak_commit_kib`): none
+/// on Unix, which charges a process its memory as it touches it, what [`peak_rss_kib`]
+/// counts, not as it commits it; 0.
+pub fn peak_commit_kib() -> u64 {
+    0
+}
+
+/// This process's own memory now, in KiB, as memory per VM is counted (PM M30's
+/// `phys_footprint`): macOS's physical footprint, its private and copied pages, without the
+/// file pages it shares with every process mapping them, a template's among them; Linux's
+/// anonymous resident pages (`RssAnon`, proc(5)), which a written page of a private file
+/// mapping becomes. 0 where unknown.
+pub fn footprint_kib() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                let line = status.lines().find_map(|l| l.strip_prefix("RssAnon:"))?;
+                line.trim().strip_suffix("kB")?.trim().parse().ok()
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: proc_pid_rusage(2) of this process into a zeroed rusage_info_v2, the
+        // flavor it is asked for, a valid out-parameter.
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let got = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                (&raw mut info).cast::<libc::rusage_info_t>(),
+            )
+        };
+        if got != 0 {
+            return 0;
+        }
+        info.ri_phys_footprint / 1024
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    0
+}
+
+/// The effective user ID of the process at the other end of `sock`, as it connected:
+/// `SO_PEERCRED` on Linux (unix(7)), `getpeereid(3)` elsewhere.
+pub fn peer_uid(sock: &UnixStream) -> io::Result<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: an all-zero ucred is valid; getsockopt(2) fills at most `len` bytes of it.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: as above, on a socket we own.
+        let r = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(cred.uid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: getpeereid(3) into two locals, on a socket we own.
+        if unsafe { libc::getpeereid(sock.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(uid)
+    }
+}
+
+/// Apple's `POSIX_SPAWN_SETSID` (sys/spawn.h), which the libc crate does not define.
+#[cfg(target_vendor = "apple")]
+const SETSID: libc::c_int = 0x0400;
+
+/// A child started by [`spawn`]. Waiting reaps it; dropping it does not. One thread may
+/// wait while others signal it: its pid stays the child's until `wait` has marked it
+/// reaped, so a signal never reaches another process that reuses the pid. One that this
+/// process's spawner made (`by`, which of its spawners: [`start_spawner`]) is that
+/// spawner's child, which reaps it when `wait` asks, and not before; it is watched and
+/// signalled by its pid all the same.
+#[derive(Debug)]
+pub struct Child {
+    pid: libc::pid_t,
+    reaped: Mutex<bool>,
+    by: Option<u64>,
+}
+
+impl Child {
+    /// Child `pid`, made by this process or by its spawner `by`.
+    pub(crate) fn new(pid: libc::pid_t, by: Option<u64>) -> Child {
+        Child {
+            pid,
+            reaped: Mutex::new(false),
+            by,
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.pid.unsigned_abs()
+    }
+
+    /// Waits for the child to end, without reaping it (WNOWAIT): its pid stays the child's,
+    /// for `kill` to look at, until [`wait`](Self::wait) takes its status.
+    pub fn ended(&self) -> io::Result<()> {
+        self.ended_status().map(drop)
+    }
+
+    /// The status of a child that has ended, as [`wait`](Self::wait) gives it, without
+    /// reaping it: until it is reaped, its pid stays its own, and no new process's.
+    pub fn ended_status(&self) -> io::Result<i32> {
+        let status = match self.by {
+            Some(by) => crate::spawner::status(by, self.pid, true)?,
+            None => status_of(self.pid, true)?,
+        };
+        status.ok_or_else(|| io::Error::other("a child waited for was said to run"))
+    }
+
+    /// Waits for the child to end: its exit status, or 128 plus the signal that ended it.
+    pub fn wait(&self) -> io::Result<i32> {
+        self.ended()?;
+        let mut reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
+        let status = match self.by {
+            Some(by) => crate::spawner::reap(by, self.pid)?,
+            None => reap(self.pid)?,
+        };
+        *reaped = true;
+        Ok(status)
+    }
+
+    /// Whether the child has ended, without waiting: its status as [`Child::wait`] gives
+    /// it once it has, `None` while it runs. A child of this process's own is reaped
+    /// without waiting too: on macOS waitid(2) once said a running child had ended, and a
+    /// build's start waited in waitpid(2) for 23 minutes as its builder ran on, its
+    /// connection never accepted (PM M442).
+    pub fn try_wait(&self) -> Option<i32> {
+        let ended = match self.by {
+            Some(by) => crate::spawner::status(by, self.pid, false),
+            None => status_of(self.pid, false),
+        };
+        ended.ok().flatten()?;
+        if self.by.is_some() {
+            return self.wait().ok();
+        }
+        let mut reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
+        let status = reap_now(self.pid).ok().flatten()?;
+        *reaped = true;
+        Some(status)
+    }
+
+    /// Sends `signal` to the child, unless it has been reaped.
+    pub fn kill(&self, signal: libc::c_int) -> io::Result<()> {
+        let reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
+        if *reaped {
+            return Ok(());
+        }
+        // A spawner that has gone left what it made to init, which reaps it: its pid may
+        // be another process's.
+        if let Some(by) = self.by
+            && !crate::spawner::serving(by)
+        {
+            return Err(io::Error::other("the spawner that made it has gone"));
+        }
+        // SAFETY: kill(2) of our own child, or our spawner's, not reaped while we hold the
+        // lock.
+        if unsafe { libc::kill(self.pid, signal) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Sends `signal` to the process group a detached child leads ([`spawn`]'s `detach`:
+    /// its group's ID is its pid), and so to every process of that group, unless the child
+    /// has been reaped. A group that has no process left is sent nothing.
+    pub fn kill_group(&self, signal: libc::c_int) -> io::Result<()> {
+        let reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
+        if *reaped {
+            return Ok(());
+        }
+        if let Some(by) = self.by
+            && !crate::spawner::serving(by)
+        {
+            return Err(io::Error::other("the spawner that made it has gone"));
+        }
+        // SAFETY: kill(2) of the group our unreaped child leads: while it is not reaped, its
+        // pid, the group's ID, is no other process's or group's.
+        if unsafe { libc::kill(-self.pid, signal) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Whether the child has ended, neither waiting for it nor reaping it.
+    pub fn has_ended(&self) -> bool {
+        let ended = match self.by {
+            Some(by) => crate::spawner::status(by, self.pid, false),
+            None => status_of(self.pid, false),
+        };
+        matches!(ended, Ok(Some(_)))
+    }
+}
+
+/// Whether this process's child `pid` has ended, waiting for it to if `wait`: its status
+/// as [`Child::wait`] gives it, without reaping it (WNOWAIT); `None` while it runs.
+pub(crate) fn status_of(pid: libc::pid_t, wait: bool) -> io::Result<Option<i32>> {
+    let flags = libc::WEXITED | libc::WNOWAIT | if wait { 0 } else { libc::WNOHANG };
+    loop {
+        // SAFETY: an all-zero siginfo_t is valid; waitid(2) fills it for our child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; WNOHANG returns at once, with si_pid 0 if nothing ended.
+        if unsafe { libc::waitid(libc::P_PID, pid.unsigned_abs(), &mut info, flags) } == 0 {
+            // SAFETY: si_pid and si_status are set by waitid when it reports a child.
+            let (ended, status) = unsafe { (info.si_pid(), info.si_status()) };
+            if ended == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(if info.si_code == libc::CLD_EXITED {
+                status
+            } else {
+                128 + status
+            }));
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Reaps this process's child `pid`, once it has ended: its exit status, or 128 plus the
+/// signal that ended it.
+pub(crate) fn reap(pid: libc::pid_t) -> io::Result<i32> {
+    reaped(pid, 0).map(|status| status.unwrap_or_default())
+}
+
+/// Reaps this process's child `pid` if it has ended, without waiting: its status as
+/// [`reap`] gives it, `None` while it runs.
+fn reap_now(pid: libc::pid_t) -> io::Result<Option<i32>> {
+    reaped(pid, libc::WNOHANG)
+}
+
+/// waitpid(2) for child `pid` with `flags`: its status, `None` where WNOHANG found it
+/// running.
+fn reaped(pid: libc::pid_t, flags: libc::c_int) -> io::Result<Option<i32>> {
+    let mut status = 0;
+    loop {
+        // SAFETY: waitpid(2) for our own child into a local.
+        let r = unsafe { libc::waitpid(pid, &mut status, flags) };
+        if r == pid {
+            break;
+        }
+        if r == 0 {
+            return Ok(None);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    Ok(Some(if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    }))
+}
+
+/// Starts `program` with `args` and this process's environment. The child gets exactly the
+/// descriptors in `fds`, each at the number paired with it, and nothing else this process
+/// holds, whatever its close-on-exec flag says: macOS closes the rest in the child
+/// (`POSIX_SPAWN_CLOEXEC_DEFAULT`), and on Linux every descriptor shards holds, received
+/// ones included, is close-on-exec. Its signal mask is empty and every signal has its
+/// default action.
+///
+/// With `detach`, the child leads a session of its own, out of reach of the signals a
+/// terminal sends this process's group.
+pub fn spawn(
+    program: &Path,
+    args: &[&OsStr],
+    fds: &[(BorrowedFd<'_>, RawFd)],
+    detach: bool,
+) -> io::Result<Child> {
+    spawn_with(program, args, fds, detach, &[])
+}
+
+/// [`spawn`], with the variables `set` in the child's environment in place of this
+/// process's.
+pub fn spawn_with(
+    program: &Path,
+    args: &[&OsStr],
+    fds: &[(BorrowedFd<'_>, RawFd)],
+    detach: bool,
+    set: &[(&str, &OsStr)],
+) -> io::Result<Child> {
+    let inherited = std::env::vars_os().filter(|(k, _)| !set.iter().any(|(name, _)| k == *name));
+    let given = set
+        .iter()
+        .map(|(k, v)| (OsStr::new(k).to_os_string(), v.to_os_string()));
+    spawn_env(program, args, fds, detach, inherited.chain(given).collect())
+}
+
+/// [`spawn`], with the variables `env` alone for the child's environment: nothing of this
+/// process's, whose own may hold what its child must not (a client's secrets, for a
+/// process a guest could take over).
+pub fn spawn_in(
+    program: &Path,
+    args: &[&OsStr],
+    fds: &[(BorrowedFd<'_>, RawFd)],
+    detach: bool,
+    env: &[(&str, &OsStr)],
+) -> io::Result<Child> {
+    let env = env
+        .iter()
+        .map(|(k, v)| (OsStr::new(k).to_os_string(), v.to_os_string()))
+        .collect();
+    spawn_env(program, args, fds, detach, env)
+}
+
+fn spawn_env(
+    program: &Path,
+    args: &[&OsStr],
+    fds: &[(BorrowedFd<'_>, RawFd)],
+    detach: bool,
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> io::Result<Child> {
+    // A process with a spawner has its children made there (crate::spawner, PM M158).
+    if let Some(made) = crate::spawner::spawn(program, args, fds, detach, &env) {
+        return made;
+    }
+    spawn_here(program, args, fds, detach, env)
+}
+
+/// Every descriptor this process holds above stdio made close-on-exec, once, before its
+/// first child: what it was given open by whoever started it (a shell's, an IDE's, a CI
+/// runner's: adacachy's kiln runs inherit perf_event descriptors) is no child's. macOS's
+/// spawn closes all but those named (`POSIX_SPAWN_CLOEXEC_DEFAULT`); Linux's has no such
+/// flag, so its children would hold them. Each child's own are placed by dup2, which
+/// clears the flag on the copy (dup2(2)), so none it is given is lost. `close_range(2)`'s
+/// CLOSE_RANGE_CLOEXEC (Linux 5.11) marks them at once; a kernel without it has each
+/// marked as /proc/self/fd lists it.
+#[cfg(target_os = "linux")]
+fn cloexec_inherited() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: close_range(2) setting a flag on descriptors this process holds; it
+        // closes none.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if rc == 0 {
+            return;
+        }
+        let Ok(listed) = std::fs::read_dir("/proc/self/fd") else {
+            return;
+        };
+        for fd in listed
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<RawFd>().ok())
+            .filter(|&fd| fd > 2)
+        {
+            // SAFETY: fcntl(2) adding close-on-exec to a descriptor of this process's; one
+            // the listing itself held and has closed fails harmlessly.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+    });
+}
+
+/// [`spawn`]'s child, made by this process.
+pub(crate) fn spawn_here(
+    program: &Path,
+    args: &[&OsStr],
+    fds: &[(BorrowedFd<'_>, RawFd)],
+    detach: bool,
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> io::Result<Child> {
+    #[cfg(target_os = "linux")]
+    cloexec_inherited();
+    let cstring = |s: &OsStr| {
+        CString::new(s.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in an argument"))
+    };
+    let path = cstring(program.as_os_str())?;
+    let mut argv = vec![path.clone()];
+    for a in args {
+        argv.push(cstring(a)?);
+    }
+    let env: Vec<CString> = env
+        .into_iter()
+        .map(|(k, v)| {
+            let mut entry = k.as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(v.as_bytes());
+            CString::new(entry)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in the environment"))
+        })
+        .collect::<io::Result<_>>()?;
+    let mut argv_ptrs: Vec<*mut libc::c_char> = argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
+    argv_ptrs.push(std::ptr::null_mut());
+    let mut env_ptrs: Vec<*mut libc::c_char> = env.iter().map(|e| e.as_ptr().cast_mut()).collect();
+    env_ptrs.push(std::ptr::null_mut());
+    let check = |rc: libc::c_int| {
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(rc))
+        }
+    };
+    // SAFETY: the attribute and file-action objects are initialized before use and
+    // destroyed once; every pointer passed lives until posix_spawn returns.
+    unsafe {
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        check(libc::posix_spawn_file_actions_init(&mut actions))?;
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        if let Err(e) = check(libc::posix_spawnattr_init(&mut attr)) {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            return Err(e);
+        }
+        let result = (|| {
+            // The file actions run in order, so a source whose number is another's target
+            // would be overwritten before it is read; and one already at its own target
+            // would keep its close-on-exec flag, which dup2 onto itself leaves set (macOS
+            // then closes it at exec, under POSIX_SPAWN_CLOEXEC_DEFAULT). Each source whose
+            // number is any target first moves above every number in play, then
+            // everything goes where it belongs, a dup2 onto another number clearing the
+            // flag, and the moved copies are closed.
+            let targets: Vec<RawFd> = fds.iter().map(|(_, t)| *t).collect();
+            let mut spare = fds
+                .iter()
+                .flat_map(|(fd, t)| [fd.as_raw_fd(), *t])
+                .max()
+                .unwrap_or(2)
+                .saturating_add(1);
+            let mut sources = Vec::with_capacity(fds.len());
+            let mut moved = Vec::new();
+            for (fd, _) in fds {
+                let src = fd.as_raw_fd();
+                if targets.contains(&src) {
+                    check(libc::posix_spawn_file_actions_adddup2(&mut actions, src, spare))?;
+                    sources.push(spare);
+                    moved.push(spare);
+                    spare = spare.saturating_add(1);
+                } else {
+                    sources.push(src);
+                }
+            }
+            for (src, target) in sources.iter().zip(&targets) {
+                check(libc::posix_spawn_file_actions_adddup2(
+                    &mut actions,
+                    *src,
+                    *target,
+                ))?;
+            }
+            // Above every number in play, none is a target.
+            for m in moved {
+                check(libc::posix_spawn_file_actions_addclose(&mut actions, m))?;
+            }
+            let mut none: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut none);
+            check(libc::posix_spawnattr_setsigmask(&mut attr, &none))?;
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            check(libc::posix_spawnattr_setsigdefault(&mut attr, &all))?;
+            #[cfg(target_vendor = "apple")]
+            let (flags, setsid) = (
+                libc::POSIX_SPAWN_SETSIGMASK
+                    | libc::POSIX_SPAWN_SETSIGDEF
+                    | libc::POSIX_SPAWN_CLOEXEC_DEFAULT,
+                SETSID,
+            );
+            #[cfg(not(target_vendor = "apple"))]
+            let (flags, setsid) = (
+                libc::POSIX_SPAWN_SETSIGMASK | libc::POSIX_SPAWN_SETSIGDEF,
+                libc::c_int::from(libc::POSIX_SPAWN_SETSID),
+            );
+            let flags = if detach { flags | setsid } else { flags };
+            check(libc::posix_spawnattr_setflags(&mut attr, flags as libc::c_short))?;
+            let mut pid = 0;
+            check(libc::posix_spawn(
+                &mut pid,
+                path.as_ptr(),
+                &actions,
+                &attr,
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            ))?;
+            Ok(Child::new(pid, None))
+        })();
+        libc::posix_spawnattr_destroy(&mut attr);
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        result
+    }
+}
+
+/// Makes completed writes to `file` durable on stable storage, as the VMM's
+/// `platform::sync_durable` does for the processes that link it (review 1.13): on macOS
+/// `F_FULLFSYNC`, which flushes the drive's cache where `fsync` does not (fsync(2)), and
+/// `fsync` where the filesystem has no `F_FULLFSYNC`, as SQLite falls back and as Go's
+/// `File.Sync` does on an SMB mount (go.dev/issue/64215), where std's `sync_all` fails.
+pub fn sync_durable(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: fcntl(2) on a descriptor the caller holds open.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+            return Ok(());
+        }
+        // SAFETY: fsync(2) on the same descriptor.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
+    }
+    #[cfg(not(target_os = "macos"))]
+    file.sync_all()
+}
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+pub(crate) mod tests {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::AsFd;
+
+    /// What a filesystem without F_FULLFSYNC holds is made durable with fsync instead:
+    /// /dev/null refuses F_FULLFSYNC and takes fsync, as an SMB share does, where std's
+    /// sync_all fails (review 1.13).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_without_full_fsync_is_synced_still() {
+        let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+        assert!(null.sync_all().is_err(), "std's sync_all took F_FULLFSYNC here");
+        sync_durable(&null).unwrap();
+        let held = shards_testdir::TempDir::new("sync").unwrap();
+        let dir = std::fs::File::open(&held).unwrap();
+        sync_durable(&dir).unwrap();
+    }
+
+    use super::*;
+
+    /// What [`take_rest`] does to a process, done in a child of its own, this binary run
+    /// for [`signal_child`] alone, `case` naming what it does: this process keeps its
+    /// signals as they were. Its status, and what it printed, once it ends or is ended
+    /// past 30 s.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn signal_case(case: &str) -> (std::process::ExitStatus, String) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unix::tests::signal_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SHARDS_SIGNAL_CHILD", case)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let mut out = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+        (status, out)
+    }
+
+    /// [`signal_case`]'s child, which does nothing in a run of the tests. `sent`: a SIGSEGV
+    /// another process sends wakes the thread waiting on the set, which takes it as Linux's
+    /// 11. `fault`: one a fault of its own raises ends it, as it would have.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn signal_child() {
+        let Ok(case) = std::env::var("SHARDS_SIGNAL_CHILD") else {
+            return;
+        };
+        // SAFETY: an all-zero sigset_t, emptied: plain sigset operations on a local set.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe { libc::sigemptyset(&mut set) };
+        take_rest(&mut set).unwrap();
+        match case.as_str() {
+            "sent" => {
+                let (ready, waiting) = std::sync::mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    wait_here();
+                    ready.send(()).unwrap();
+                    let mut sig = 0;
+                    // SAFETY: sigwait(3) on a valid set.
+                    assert_eq!(unsafe { libc::sigwait(&set, &mut sig) }, 0);
+                    (sig, sent_faults().collect::<Vec<u32>>())
+                });
+                waiting.recv().unwrap();
+                // SAFETY: kill(2) of this process, as another would send it.
+                unsafe { libc::kill(libc::getpid(), libc::SIGSEGV) };
+                let (sig, sent) = waiter.join().unwrap();
+                println!("woken {} sent {sent:?}", sig == CARRIER);
+            }
+            "fault" => {
+                // SAFETY: an anonymous page made unreadable, then read: a fault of this
+                // process's own.
+                unsafe {
+                    let page = libc::mmap(
+                        std::ptr::null_mut(),
+                        1 << 14,
+                        libc::PROT_NONE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    );
+                    assert_ne!(page, libc::MAP_FAILED);
+                    std::ptr::read_volatile(page.cast::<u8>());
+                }
+                println!("read an unreadable page");
+            }
+            _ => {}
+        }
+    }
+
+    /// On Linux, a signal a fault raises, sent by another process, is forwarded as any
+    /// other signal is, and one a fault of the process's own raises ends it, not looping on the
+    /// fault as it would with the signal blocked (review 8.17).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn fault_signals_sent_are_forwarded_and_faults_end_the_process() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (status, out) = signal_case("sent");
+        assert!(status.success(), "{status:?} {out}");
+        assert!(out.contains("woken true sent [11]"), "{out}");
+        let (status, out) = signal_case("fault");
+        assert!(
+            matches!(status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),
+            "{status:?} {out}"
+        );
+        assert_eq!(linux_signal(libc::SIGSYS), Some(31));
+        assert_eq!(linux_signal(libc::SIGURG), None, "the carrier is forwarded");
+    }
+
+    /// On macOS, where a fault's signal sent cannot be told from a fault's own, those
+    /// signals keep their actions, and none is forwarded (review 8.17).
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn fault_signals_keep_their_actions_on_macos() {
+        let action = |sig| {
+            // SAFETY: sigaction(2) reading a disposition into a zeroed struct.
+            let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            assert_eq!(unsafe { libc::sigaction(sig, std::ptr::null(), &mut was) }, 0);
+            (was.sa_sigaction, was.sa_flags)
+        };
+        let before: Vec<_> = FAULTS.iter().map(|&(sig, _)| action(sig)).collect();
+        // SAFETY: an all-zero sigset_t: a local set.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        take_rest(&mut set).unwrap();
+        let after: Vec<_> = FAULTS.iter().map(|&(sig, _)| action(sig)).collect();
+        assert_eq!(before, after);
+        assert_eq!(linux_signal(libc::SIGSEGV), None);
+        assert_eq!(linux_signal(libc::SIGTERM), Some(15));
+    }
+
+    /// A signal forwarded by its Linux number is this system's own again at the other end:
+    /// macOS's SIGUSR1 is 30, Linux's 10.
+    #[test]
+    fn a_signals_linux_number_names_it_on_every_system() {
+        for (sig, linux) in forwarded(false) {
+            assert_eq!(local_signal(linux), Some(sig), "{sig} as {linux}");
+        }
+        assert_eq!(local_signal(10), Some(libc::SIGUSR1));
+        assert_eq!(local_signal(15), Some(libc::SIGTERM));
+        assert_eq!(local_signal(0), None);
+        assert_eq!(local_signal(9), None, "SIGKILL is no client's to send");
+    }
+
+    /// Linux's real-time signals Docker names are forwarded as their own numbers, and none
+    /// below 34, which the C library keeps; SIGPWR and SIGSTKFLT too.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_names_its_own_real_time_signals() {
+        let top = libc::SIGRTMAX();
+        assert_eq!(linux_signal(top), u32::try_from(top).ok());
+        assert_eq!(linux_signal(33), None);
+        assert_eq!(linux_signal(libc::SIGPWR), Some(30));
+        assert_eq!(linux_signal(libc::SIGSTKFLT), Some(16));
+    }
+
+    /// A pipe whose ends are close-on-exec, as every descriptor shards holds is: on Linux
+    /// `spawn` relies on that to give a child nothing it was not given.
+    fn pipe() -> (File, File) {
+        let (r, w) = io::pipe().unwrap();
+        (File::from(OwnedFd::from(r)), File::from(OwnedFd::from(w)))
+    }
+
+    /// What has come of a message waits for the rest, however it is cut; nothing past a
+    /// message is read with it; its descriptors come with it; an end is told from a
+    /// message cut short by one.
+    #[test]
+    fn messages_are_taken_whole_as_they_come() {
+        use std::io::Write as _;
+        let frame = |kind: u8, payload: &[u8]| {
+            let mut f = vec![kind];
+            f.extend((payload.len() as u32).to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        let whole = |took: Took| match took {
+            Took::Message(m) => Some(m),
+            Took::Partial | Took::Ended => None,
+        };
+        let first = frame(3, b"payload");
+        let second = frame(4, b"");
+        for cut in 0..=first.len() {
+            let (mut a, b) = UnixStream::pair().unwrap();
+            let mut incoming = Incoming::default();
+            a.write_all(&first[..cut]).unwrap();
+            if cut < first.len() {
+                assert!(
+                    matches!(incoming.take(&b).unwrap(), Took::Partial),
+                    "cut at {cut}"
+                );
+                a.write_all(&first[cut..]).unwrap();
+            }
+            a.write_all(&second).unwrap();
+            let m = whole(incoming.take(&b).unwrap());
+            assert!(m.is_some(), "cut at {cut}: not whole");
+            let m = m.unwrap();
+            assert_eq!(
+                (m.kind, m.payload.as_slice()),
+                (3, &b"payload"[..]),
+                "cut at {cut}"
+            );
+            let m = whole(incoming.take(&b).unwrap()).unwrap();
+            assert_eq!((m.kind, m.payload.len()), (4, 0));
+            assert!(matches!(incoming.take(&b).unwrap(), Took::Partial));
+            // Ended as a socket, not by closing a descriptor: a child spawned meanwhile by
+            // another test may have inherited a copy (std makes a pair close-on-exec only
+            // after making it, on macOS).
+            a.shutdown(std::net::Shutdown::Write).unwrap();
+            assert!(matches!(incoming.take(&b).unwrap(), Took::Ended));
+        }
+        // Descriptors come with their message.
+        let (a, b) = UnixStream::pair().unwrap();
+        let (mut r, w) = pipe();
+        send(&a, 5, b"fd", &[w.as_fd()]).unwrap();
+        drop(w);
+        let m = whole(Incoming::default().take(&b).unwrap()).unwrap();
+        assert_eq!((m.kind, m.fds.len()), (5, 1));
+        File::from(m.fds.into_iter().next().unwrap())
+            .write_all(b"through")
+            .unwrap();
+        let mut got = [0u8; 7];
+        r.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"through");
+        // An end partway through a message is no end of the stream.
+        let (mut a, b) = UnixStream::pair().unwrap();
+        let mut incoming = Incoming::default();
+        a.write_all(&first[..6]).unwrap();
+        a.shutdown(std::net::Shutdown::Write).unwrap();
+        let cut = incoming.take(&b).unwrap_err();
+        assert_eq!(cut.kind(), io::ErrorKind::UnexpectedEof);
+        // A length past the limit is refused before anything is allocated for it.
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.write_all(&[1, 0xff, 0xff, 0xff, 0xff]).unwrap();
+        let big = Incoming::default().take(&b).unwrap_err();
+        assert_eq!(big.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn messages_carry_payloads_and_working_descriptors() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (mut r1, w1) = pipe();
+        let (mut r2, w2) = pipe();
+        send(&a, 7, b"request", &[w1.as_fd(), w2.as_fd()]).unwrap();
+        drop((w1, w2));
+        let m = recv(&b).unwrap().unwrap();
+        assert_eq!(
+            (m.kind, m.payload.as_slice(), m.fds.len()),
+            (7, &b"request"[..], 2)
+        );
+        for (fd, (reader, text)) in m.fds.into_iter().zip([(&mut r1, "one"), (&mut r2, "two")]) {
+            // SAFETY: fcntl(2) on a descriptor we own.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(
+                flags & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "received descriptors are close-on-exec"
+            );
+            File::from(fd).write_all(text.as_bytes()).unwrap();
+            let mut got = String::new();
+            reader.read_to_string(&mut got).unwrap();
+            assert_eq!(got, text);
+        }
+    }
+
+    #[test]
+    fn empty_messages_and_clean_ends() {
+        let (a, b) = UnixStream::pair().unwrap();
+        send(&a, 1, &[], &[]).unwrap();
+        drop(a);
+        let m = recv(&b).unwrap().unwrap();
+        assert_eq!((m.kind, m.payload.len(), m.fds.len()), (1, 0, 0));
+        assert!(
+            recv(&b).unwrap().is_none(),
+            "a close between messages is a clean end"
+        );
+    }
+
+    /// A deadline bounds the whole message: a peer that says nothing, or trickles a
+    /// message out a byte at a time faster than any one read would time out, is let go at
+    /// the deadline; a message sent in time arrives whole, however it is split.
+    #[test]
+    fn a_deadline_bounds_the_whole_message() {
+        use std::time::Duration;
+        let window = Duration::from_millis(200);
+        let (_silent, b) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            recv_by(&b, start + window).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let waited = start.elapsed();
+        assert!(waited >= window && waited < 10 * window, "{waited:?}");
+
+        let (a, b) = UnixStream::pair().unwrap();
+        let trickle = std::thread::spawn(move || {
+            // The header, then a payload that would take 2 s at a byte per 20 ms.
+            for byte in [4, 0, 0, 0, 100].into_iter().chain([b'x'; 100]) {
+                if (&a).write_all(&[byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let start = Instant::now();
+        assert_eq!(
+            recv_by(&b, start + window).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let waited = start.elapsed();
+        assert!(waited >= window && waited < 10 * window, "{waited:?}");
+        drop(b);
+        trickle.join().unwrap();
+
+        let (a, b) = UnixStream::pair().unwrap();
+        let (_r, w) = pipe();
+        let split = std::thread::spawn(move || {
+            let mut whole = vec![5u8, 0, 0, 0, 3];
+            whole.extend_from_slice(b"abc");
+            send(&a, 5, b"abc", &[w.as_fd()]).unwrap();
+            // And a second, a byte at a time, well within its deadline.
+            for byte in whole {
+                (&a).write_all(&[byte]).unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            a
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let m = recv_by(&b, deadline).unwrap().unwrap();
+        assert_eq!((m.kind, m.payload.as_slice(), m.fds.len()), (5, &b"abc"[..], 1));
+        let m = recv_by(&b, deadline).unwrap().unwrap();
+        assert_eq!((m.kind, m.payload.as_slice(), m.fds.len()), (5, &b"abc"[..], 0));
+        drop(split.join().unwrap());
+        assert!(recv_by(&b, deadline).unwrap().is_none(), "a clean end");
+    }
+
+    #[test]
+    fn an_end_inside_a_message_is_an_error() {
+        let (a, b) = UnixStream::pair().unwrap();
+        (&a).write_all(&[3, 0, 0, 0, 10, b'x']).unwrap();
+        drop(a);
+        assert_eq!(recv(&b).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A send cut short anywhere, in its header or its payload, is finished byte for byte.
+    #[test]
+    fn a_send_cut_short_is_finished_from_where_it_stopped() {
+        let (header, payload) = ([9u8, 0, 0, 0, 7], b"payload".as_slice());
+        let whole = [&header[..], payload].concat();
+        for sent in 0..whole.len() {
+            let mut rest = Vec::new();
+            write_rest(&mut rest, [&header, payload], sent).unwrap();
+            assert_eq!(rest, whole[sent..], "cut at {sent}");
+        }
+    }
+
+    #[test]
+    fn large_payloads_arrive_whole_with_their_descriptors() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let payload: Vec<u8> = (0..MAX_PAYLOAD).map(|i| i as u8).collect();
+        let (mut r, w) = pipe();
+        let sent = payload.clone();
+        let writer = std::thread::spawn(move || send(&a, 9, &sent, &[w.as_fd()]).unwrap());
+        let m = recv(&b).unwrap().unwrap();
+        writer.join().unwrap();
+        assert_eq!(m.payload, payload);
+        File::from(m.fds.into_iter().next().unwrap())
+            .write_all(b"ok")
+            .unwrap();
+        let mut got = [0u8; 2];
+        r.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ok");
+    }
+
+    #[test]
+    pub(crate) fn children_get_the_descriptors_they_are_given() {
+        let (mut r, w) = pipe();
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &["-c".as_ref(), "echo given >&3".as_ref()],
+            &[(w.as_fd(), 3)],
+            false,
+        )
+        .unwrap();
+        drop(w);
+        assert_eq!(child.wait().unwrap(), 0);
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "given\n");
+    }
+
+    /// Descriptors go where they are given even when each one's number is the other's
+    /// target, a swap, which file actions run in order would get wrong, or its own, close
+    /// on exec as every descriptor of ours is; and nothing moved out of the way on the way
+    /// is left in the child.
+    #[test]
+    pub(crate) fn children_get_swapped_descriptors_each_where_it_belongs() {
+        let (mut ra, wa) = pipe();
+        let (mut rb, wb) = pipe();
+        let (a, b) = (wa.as_raw_fd(), wb.as_raw_fd());
+        // a's writer goes to b's number, and b's to a's. Written through /dev/fd: dash,
+        // Debian's sh, takes no descriptor above 9 in `>&N` ("Bad fd number"). The 64
+        // numbers above both are scanned upward by the shell itself: BSD seq counts down
+        // when its first number is the larger, which scanned the given two once the
+        // suite's other tests had them above 64.
+        let top = a.max(b);
+        let script = format!(
+            "echo A >/dev/fd/{b}; echo B >/dev/fd/{a}; fd={}; while [ $fd -le {} ]; do [ -e /dev/fd/$fd ] && echo leaked $fd >/dev/fd/{b}; fd=$((fd+1)); done; exit 0",
+            top + 1,
+            top + 64
+        );
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &["-c".as_ref(), script.as_ref()],
+            &[(wa.as_fd(), b), (wb.as_fd(), a)],
+            false,
+        )
+        .unwrap();
+        drop((wa, wb));
+        assert_eq!(child.wait().unwrap(), 0);
+        let (mut got_a, mut got_b) = (String::new(), String::new());
+        ra.read_to_string(&mut got_a).unwrap();
+        rb.read_to_string(&mut got_b).unwrap();
+        assert_eq!((got_a.as_str(), got_b.as_str()), ("A\n", "B\n"));
+    }
+
+    #[test]
+    pub(crate) fn a_descriptor_given_its_own_number_reaches_the_child() {
+        let (mut r, w) = pipe();
+        let n = w.as_raw_fd();
+        // SAFETY: fcntl(2) on a descriptor we own: close-on-exec, as ours all are.
+        unsafe { libc::fcntl(n, libc::F_SETFD, libc::FD_CLOEXEC) };
+        let script = format!("echo kept >/dev/fd/{n}");
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &["-c".as_ref(), script.as_ref()],
+            &[(w.as_fd(), n)],
+            false,
+        )
+        .unwrap();
+        drop(w);
+        assert_eq!(child.wait().unwrap(), 0);
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "kept\n");
+    }
+
+    /// Even a descriptor left inheritable stays behind (macOS: POSIX_SPAWN_CLOEXEC_DEFAULT).
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    pub(crate) fn children_get_nothing_else() {
+        let (_r, w) = pipe();
+        // SAFETY: fcntl(2) on a descriptor we own: clears close-on-exec.
+        assert_eq!(unsafe { libc::fcntl(w.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+        let script = format!("[ -e /dev/fd/{} ] && exit 1; exit 0", w.as_raw_fd());
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &["-c".as_ref(), script.as_ref()],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            child.wait().unwrap(),
+            0,
+            "the child inherited descriptor {}",
+            w.as_raw_fd()
+        );
+    }
+
+    /// A child spawned in an environment has that alone: what it is given, and nothing of
+    /// this process's (its HOME, here).
+    #[test]
+    pub(crate) fn a_child_spawned_in_an_environment_has_it_alone() {
+        assert!(
+            std::env::var_os("HOME").is_some(),
+            "the test needs a HOME to leave behind"
+        );
+        let script = r#"[ "$GIVEN" = yes ] && [ -z "$HOME" ] && exit 0; exit 1"#;
+        let child = spawn_in(
+            Path::new("/bin/sh"),
+            &["-c".as_ref(), script.as_ref()],
+            &[],
+            false,
+            &[("GIVEN", OsStr::new("yes"))],
+        )
+        .unwrap();
+        assert_eq!(
+            child.wait().unwrap(),
+            0,
+            "the child had more, or less, than it was given"
+        );
+    }
+
+    #[test]
+    pub(crate) fn statuses_and_signals() {
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &["-c".as_ref(), "exit 7".as_ref()],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(child.wait().unwrap(), 7);
+        // Not through sh: dash forks its one command, which would outlive the shell
+        // killed here, and hold this process's stdout for 30 s.
+        let child = spawn(Path::new("/bin/sleep"), &["30".as_ref()], &[], false).unwrap();
+        child.kill(libc::SIGTERM).unwrap();
+        assert_eq!(child.wait().unwrap(), 128 + libc::SIGTERM);
+    }
+
+    #[test]
+    pub(crate) fn detached_children_lead_their_own_session() {
+        // The test asks the kernel while the child waits for the pipe to close: `ps`
+        // differs between systems, and BusyBox's has no `-p`.
+        // SAFETY: getpgrp(2) and getsid(2) of this process.
+        let (group, session) = unsafe { (libc::getpgrp(), libc::getsid(0)) };
+        for detach in [false, true] {
+            let (r, w) = pipe();
+            let child = spawn(
+                Path::new("/bin/sh"),
+                &["-c".as_ref(), "read line <&3; exit 0".as_ref()],
+                &[(r.as_fd(), 3)],
+                detach,
+            )
+            .unwrap();
+            let pid = child.pid;
+            // SAFETY: getpgid(2) and getsid(2) of our own child, not yet reaped.
+            let (its_group, its_session) = unsafe { (libc::getpgid(pid), libc::getsid(pid)) };
+            drop(w);
+            assert_eq!(child.wait().unwrap(), 0);
+            if detach {
+                assert_eq!(
+                    (its_group, its_session),
+                    (pid, pid),
+                    "a detached child leads a session and a group of its own"
+                );
+            } else {
+                assert_eq!(
+                    (its_group, its_session),
+                    (group, session),
+                    "an attached child stays in ours"
+                );
+            }
+        }
+    }
+
+    /// Sends `bytes` with `fds` attached in one `sendmsg`, bypassing `send`'s limits.
+    fn send_raw(sock: &UnixStream, bytes: &[u8], fds: &[RawFd]) {
+        let mut control = vec![0u64; space(fds.len()).div_ceil(8)];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        // SAFETY: a msghdr over live buffers, the control one aligned and large enough for
+        // one header and `fds`.
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space(fds.len()) as _;
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as _;
+            let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+            for (i, fd) in fds.iter().enumerate() {
+                data.add(i).write_unaligned(*fd);
+            }
+            assert_eq!(libc::sendmsg(sock.as_raw_fd(), &msg, 0), bytes.len() as isize);
+        }
+    }
+
+    /// Whether every copy of `w`, the write end of `r`, is closed once `w` is: then `r`
+    /// reads end of file. On macOS that can lag the last close by a fraction of a
+    /// millisecond (0.36 ms at most in these tests' runs), so a copy counts as open only
+    /// if none arrives within a second.
+    fn all_closed(mut r: File, w: File) -> bool {
+        drop(w);
+        // SAFETY: fcntl(2) on a descriptor we own.
+        unsafe { libc::fcntl(r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        // The kernel closes what a message carried past the receiver's room after `recv`
+        // returns: on this Mac, with the crate's tests beside it, the end of the pipe came
+        // p50 1.2 ms, p90 1.6 ms, p99 49.8 ms after (n=60, 2026-10-14), and past 1 s while a
+        // whole workspace's tests ran (gate of 1e072493's successor). A leak is what never
+        // closes: so the wait is long.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match r.read(&mut [0u8; 1]) {
+                Ok(0) => return true,
+                _ if std::time::Instant::now() >= deadline => return false,
+                _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+    }
+
+    #[test]
+    fn peers_are_known_by_their_user() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        // SAFETY: geteuid(2) cannot fail.
+        assert_eq!(peer_uid(&a).unwrap(), unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn descriptors_past_the_limit_are_closed() {
+        // Room for its 200 beside the other tests' descriptors: a test binary keeps the
+        // soft limit it was started with, 256 from a macOS shell (launchd's), where the
+        // daemon raises its own. macOS takes no more than OPEN_MAX (setrlimit(2)).
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit(2) and setrlimit(2) of this process, into and from a local.
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim), 0);
+            lim.rlim_cur = lim.rlim_cur.max(lim.rlim_max.min(10240));
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &lim), 0);
+        }
+        let (a, b) = UnixStream::pair().unwrap();
+        let (r, w) = pipe();
+        send_raw(&a, &[1, 0, 0, 0, 0], &[w.as_raw_fd(); 200]);
+        assert_eq!(recv(&b).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(all_closed(r, w), "a received descriptor was left open");
+    }
+
+    #[test]
+    fn descriptors_anywhere_in_a_message_are_taken() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (r, w) = pipe();
+        (&a).write_all(&[1, 0, 0, 0, 3]).unwrap();
+        send_raw(&a, b"abc", &[w.as_raw_fd()]);
+        let m = recv(&b).unwrap().unwrap();
+        assert_eq!((m.payload.as_slice(), m.fds.len()), (&b"abc"[..], 1));
+        drop(m);
+        assert!(all_closed(r, w), "a received descriptor was left open");
+    }
+
+    #[test]
+    pub(crate) fn a_reaped_child_is_never_signalled() {
+        let child =
+            std::sync::Arc::new(spawn(Path::new("/bin/sleep"), &["30".as_ref()], &[], false).unwrap());
+        let waiter = {
+            let child = child.clone();
+            std::thread::spawn(move || child.wait().unwrap())
+        };
+        child.kill(libc::SIGKILL).unwrap();
+        assert_eq!(waiter.join().unwrap(), 128 + libc::SIGKILL);
+        // Its pid may be another process's by now.
+        child.kill(libc::SIGKILL).unwrap();
+    }
+
+    #[test]
+    fn limits_hold_on_both_ends() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let too_big = vec![0u8; MAX_PAYLOAD + 1];
+        assert_eq!(
+            send(&a, 1, &too_big, &[]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let (_r, w) = pipe();
+        let many: Vec<BorrowedFd<'_>> = (0..=MAX_FDS).map(|_| w.as_fd()).collect();
+        assert_eq!(
+            send(&a, 1, &[], &many).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // A forged header past the limit is refused rather than allocated.
+        let len = u32::try_from(MAX_PAYLOAD + 1).unwrap().to_be_bytes();
+        (&a).write_all(&[1, len[0], len[1], len[2], len[3]]).unwrap();
+        assert_eq!(recv(&b).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A read, or a message's, entering the kernel just as its peer ends its side sees the
+    /// end: on macOS one that waited in recv(2) missed it in 360 of 50,000 such races, and
+    /// waited on (PM M236). The two meet at points spread around the read's start, the
+    /// same each run.
+    #[test]
+    fn a_read_sees_its_peers_end_that_lands_as_it_starts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        static GO: AtomicUsize = AtomicUsize::new(usize::MAX);
+        let spin = |n: u64| {
+            for i in 0..n {
+                std::hint::black_box(i);
+            }
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % 400
+        };
+        for round in 0..20_000 {
+            let (a, b) = UnixStream::pair().unwrap();
+            let (reader_spins, peer_spins) = (next(), next());
+            let (said, heard) = std::sync::mpsc::channel();
+            // Not scoped: a reader that misses the end fails the test rather than hold it.
+            std::thread::spawn(move || {
+                while GO.load(Ordering::Acquire) != round {
+                    std::hint::spin_loop();
+                }
+                spin(reader_spins);
+                let got = if round % 2 == 0 {
+                    read(&b, &mut [0u8; 64]).map(|n| n == 0)
+                } else {
+                    recv(&b).map(|m| m.is_none())
+                };
+                let _ = said.send(got.map_err(|e| e.kind()));
+            });
+            let peer = std::thread::spawn(move || {
+                while GO.load(Ordering::Acquire) != round {
+                    std::hint::spin_loop();
+                }
+                spin(peer_spins);
+                a.shutdown(Shutdown::Write).unwrap();
+                a
+            });
+            GO.store(round, Ordering::Release);
+            let a = peer.join().unwrap();
+            assert_eq!(
+                heard.recv_timeout(Duration::from_secs(10)),
+                Ok(Ok(true)),
+                "round {round}: the reader missed its peer's end"
+            );
+            drop(a);
+        }
+    }
+
+    /// [`read`] waits as a read would: no longer than its socket's receive timeout, and
+    /// not at all where it is set not to block, as messages do; and it reads a pipe once
+    /// something comes, and a socket to its end through [`Polled`].
+    #[test]
+    fn a_read_waits_as_a_read_would() {
+        use std::time::Duration;
+        let (_a, b) = UnixStream::pair().unwrap();
+        let timeout = Duration::from_millis(100);
+        b.set_read_timeout(Some(timeout)).unwrap();
+        for message in [false, true] {
+            let start = Instant::now();
+            let failed = if message {
+                recv(&b).unwrap_err()
+            } else {
+                read(&b, &mut [0u8; 8]).unwrap_err()
+            };
+            assert_eq!(failed.kind(), io::ErrorKind::WouldBlock);
+            let waited = start.elapsed();
+            assert!(waited >= timeout && waited < 50 * timeout, "{waited:?}");
+        }
+        b.set_read_timeout(None).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            read(&b, &mut [0u8; 8]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(recv(&b).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        let (r, mut w) = pipe();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            w.write_all(b"late").unwrap();
+            w
+        });
+        let mut got = [0u8; 8];
+        assert_eq!(read(&r, &mut got).unwrap(), 4);
+        assert_eq!(&got[..4], b"late");
+        drop(writer.join().unwrap());
+
+        // Ended as a socket: a child spawned meanwhile by another test may hold a copy.
+        let (a, b) = UnixStream::pair().unwrap();
+        (&a).write_all(b"whole").unwrap();
+        a.shutdown(Shutdown::Write).unwrap();
+        let mut all = String::new();
+        Polled(&b).read_to_string(&mut all).unwrap();
+        assert_eq!(all, "whole");
+    }
+
+    /// [`end`] reaches a peer that ended its side first, where SHUT_RDWR at once says
+    /// ENOTCONN on macOS and shuts nothing (PM M236); and it ends a read waiting here.
+    #[test]
+    fn ending_a_stream_reaches_a_peer_that_ended_its_side_first() {
+        use std::time::Duration;
+        let (a, b) = UnixStream::pair().unwrap();
+        // Before the shutdowns: XNU takes no option on a socket shut both ways (EINVAL).
+        b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        b.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(read(&a, &mut [0u8; 8]).unwrap(), 0);
+        end(&a);
+        assert_eq!(
+            read(&b, &mut [0u8; 8]).map_err(|e| e.kind()),
+            Ok(0),
+            "its peer read no end"
+        );
+
+        let (a, _b) = UnixStream::pair().unwrap();
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| read(&a, &mut [0u8; 8]).map_err(|e| e.kind()));
+            std::thread::sleep(Duration::from_millis(50));
+            end(&a);
+            assert_eq!(waiting.join().unwrap(), Ok(0));
+        });
+    }
+}

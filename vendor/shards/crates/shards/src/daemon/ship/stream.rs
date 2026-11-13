@@ -1,0 +1,1558 @@
+//! The stream connections the drivers send a run's log over (D163 to D165): TCP, TLS or a
+//! unix socket. A message is delivered once its receiver has it and has not ended the
+//! connection on it: its receiver's TCP has acknowledged its last byte (PM M233), or, on a
+//! unix socket, it is written, which puts it in its receiver's buffer; and the connection
+//! is still open a while after, the kernel's RTO (RFC 6298), within which a receiver that
+//! ends connections on a message it will not take is seen to. Until then it is held, and
+//! written again, after those held before it, on the next connection should this one end
+//! first: a receiver that restarts, or a connection reset, costs a message sent twice,
+//! never one lost. An end that a write meets before the stream finds it (EPIPE, a reset)
+//! is followed as one it finds, the message being written held with the rest: a receiver
+//! that ends a connection once more than its bound has come (Fluent Bit's forward input)
+//! ends it on a message still being written, where the connection holds less than the
+//! message. A connection is ended only once nothing is held: so a
+//! receiver's end after this one's is its answer to it, and one before it, the run's last
+//! message among those held, is followed as any other is (`Stream::suspect`). Then TLS's
+//! close_notify is sent, its write side shut, what the receiver still sends (TLS 1.3's
+//! session tickets, its own close_notify) read and let go, and its socket closed once all
+//! is acknowledged. A socket closed with bytes unread resets its connection, and what was
+//! written on it and not yet sent goes with it (PM M233): srslog, go-gelf and
+//! fluent-logger-golang close theirs so, and lose that tail.
+
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, TcpStream};
+#[cfg(unix)]
+use std::os::fd::AsFd as _;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use shards_vmm::platform::UnixStream;
+
+use super::Wait;
+
+/// The least retransmission timeout (RFC 6298 §2.4), waited where a kernel gives none while
+/// bytes are unacknowledged, and the while a message a unix socket's receiver has is held
+/// for its receiver's end, a unix socket having no round trip of its own to wait.
+const LEAST_RTO: Duration = Duration::from_secs(1);
+
+/// Where a stream goes.
+pub(super) enum To {
+    Tcp(String),
+    /// Its `HOST:PORT`, and how TLS is spoken there.
+    Tls(String, Arc<rustls::ClientConfig>),
+    Unix(PathBuf),
+}
+
+pub(super) struct Stream {
+    to: To,
+    /// Each connection's write and read timeouts, where given.
+    timeouts: [Option<Duration>; 2],
+    conn: Option<Conn>,
+    /// The messages written on this connection or one before it, or waiting to be, that
+    /// their receiver may not have, oldest first.
+    held: VecDeque<Held>,
+    /// Its driver's message of nothing, which a receiver takes whatever its bound (fluentd's
+    /// Forward-mode message of no events): what shows whether its receiver ends a
+    /// connection after every message. None where its protocol has none.
+    probe: Option<Vec<u8>>,
+    /// Whether its driver reads its receiver's answers (fluentd's acks), which say what it
+    /// took: a connection's end is then asked nothing of.
+    answered: bool,
+    /// What it asks of its receiver, after a connection ended with messages held.
+    asking: Asking,
+    /// Its receiver ends a connection after each message it takes (in_forward's
+    /// `deny_keepalive`): each message goes alone on a connection of its own, and the
+    /// connection's clean end after it delivers it.
+    closes: bool,
+    /// The shortest message its receiver had and did not end its connection on: the probe,
+    /// or one delivered.
+    open_after: Option<usize>,
+    /// The probe, where it is on its connection: its last byte, and when its receiver was
+    /// first seen to have it.
+    probe_at: Option<(u64, Option<Instant>)>,
+    /// How many connections in a row ended with messages held and none delivered meanwhile.
+    ended: u32,
+    /// How long after its receiver has a message the connection is to stay open for it to
+    /// be delivered: its kernel's RTO as it was last settled, or [`LEAST_RTO`].
+    window: Duration,
+    /// Whether its receiver had sent what is not yet read as it was last settled.
+    sent: bool,
+}
+
+/// What a stream asks of its receiver once a connection ended with messages held: whether
+/// it took them, which its end alone does not say. A receiver ends a connection on a
+/// message it will not take (Graylog's GELF input past its `max_message_size`, Fluent Bit's
+/// forward input past its `buffer_max_size`), and in_forward with `deny_keepalive` ends one
+/// after every message it handles, taken or not ("conn.close", fluentd v1.19.0
+/// lib/fluent/plugin/in_forward.rb `handle_connection`). So it is asked by evidence: a
+/// message of nothing, alone, which no bound refuses; then the oldest held, alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asking {
+    /// Nothing: messages go together on a connection.
+    No,
+    /// Whether it ends a connection after the probe, alone: `head_first` says whether the
+    /// oldest held was the first message on the connection that ended, which a receiver
+    /// that ends one after every message took.
+    Probe { head_first: bool },
+    /// Whether it ends a connection on the oldest held, alone, resent unchanged on each
+    /// connection of its own: how many times it has.
+    Head(u32),
+}
+
+/// A message held: its bytes; its connection's bytes once it was written, none until it
+/// is; when its receiver was first seen to have it; and whether it was the first message
+/// written on its connection.
+struct Held {
+    message: Vec<u8>,
+    at: Option<u64>,
+    had: Option<Instant>,
+    first: bool,
+}
+
+impl Held {
+    fn new(message: Vec<u8>) -> Held {
+        Held {
+            message,
+            at: None,
+            had: None,
+            first: false,
+        }
+    }
+
+    /// Writes it on `conn`. Where the write meets the connection's end (any failure but a
+    /// timeout, [`timed_out`]) once the connection carries messages ([`Conn::handshaken`]),
+    /// it is one of the messages written on it, which its end is followed with, though not
+    /// its connection's first whole: such a write may have put any of it there, and on
+    /// macOS says nothing of what it put, write(2) returning the error alone (PM M527).
+    fn write(&mut self, conn: &mut Conn, first: bool) -> io::Result<()> {
+        let written = conn.write_all(&self.message).and_then(|()| conn.flush());
+        if let Err(e) = &written
+            && (timed_out(e) || !conn.handshaken())
+        {
+            return written;
+        }
+        self.at = Some(conn.written());
+        self.had = None;
+        self.first = first && written.is_ok();
+        written
+    }
+}
+
+/// What a stream's end of a connection with messages held says: `ConnectionAborted`, the
+/// messages kept, and the try made again after its caller's pause.
+fn aborted(held: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        format!("its receiver ended the connection with {held} messages it may not have, sent again"),
+    )
+}
+
+/// Whether a write's failure is its connection's own wait given up: the write timeout
+/// `Conn::open` sets, its receiver having taken nothing for so long. Any other is the
+/// connection's end met by the write: its receiver's reset, or a write after its end
+/// (EPIPE), which `settle` finds by looking where it comes first (`Peer::Reset`).
+fn timed_out(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
+impl Stream {
+    pub(super) fn new(to: To, timeouts: [Option<Duration>; 2]) -> Stream {
+        Stream {
+            to,
+            timeouts,
+            conn: None,
+            held: VecDeque::new(),
+            probe: None,
+            answered: false,
+            asking: Asking::No,
+            closes: false,
+            open_after: None,
+            probe_at: None,
+            ended: 0,
+            window: LEAST_RTO,
+            sent: false,
+        }
+    }
+
+    /// It, its receiver asked with `probe` whether it ends a connection after every message.
+    pub(super) fn probing(mut self, probe: Vec<u8>) -> Stream {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// It, its driver reading its receiver's answers (fluentd's acks).
+    pub(super) fn answered(mut self) -> Stream {
+        self.answered = true;
+        self
+    }
+
+    /// A stream to the unix socket at `path`, on `socket`, connected to it already: the
+    /// host's own syslog's, which Windows keeps none of.
+    #[cfg(unix)]
+    pub(super) fn unix(path: PathBuf, socket: UnixStream) -> Stream {
+        let mut stream = Stream::new(To::Unix(path), [None; 2]);
+        stream.conn = Some(Conn::Unix(socket, 0));
+        stream
+    }
+
+    /// Whether messages wait to go one at a time: while its receiver is asked, or where it
+    /// ends a connection after each.
+    fn queued(&self) -> bool {
+        self.asking != Asking::No || self.closes
+    }
+
+    /// Writes `message` whole, on a connection made where there is none, the messages held
+    /// from one before it written on it first; alone on a connection of its own where its
+    /// receiver ends one after each message. While its receiver is asked what it did with
+    /// what is held, it is waited on first, so that nothing waits in memory past what its
+    /// receiver has. Once written, or begun on a connection whose end its write met
+    /// (`Held::write`), a message is held until it is delivered, where its receiver's ends
+    /// are followed; one that is not is its caller's to give again (`ConnectionAborted`
+    /// where a connection ended with messages held). `wait` waits for the receiver, and
+    /// says when the daemon stops.
+    pub(super) fn send(&mut self, message: &[u8], wait: &Wait<'_>) -> io::Result<()> {
+        loop {
+            if self.settle() {
+                return Err(aborted(self.held.len()));
+            }
+            if !self.queued() || (self.closes && self.held.is_empty()) {
+                break;
+            }
+            self.pump()?;
+            self.await_delivery(wait)?;
+        }
+        if self.closes {
+            self.held.push_back(Held::new(message.to_vec()));
+            if let Err(e) = self.pump() {
+                self.held.pop_back();
+                return Err(e);
+            }
+            self.settle();
+            return Ok(());
+        }
+        self.pump()?;
+        if self.conn.is_none() {
+            self.conn = Some(Conn::open(&self.to, self.timeouts)?);
+            self.sent = false;
+        }
+        let Some(conn) = &mut self.conn else {
+            return Err(io::Error::from(io::ErrorKind::NotConnected));
+        };
+        let mut held = Held::new(message.to_vec());
+        let first = self.held.is_empty() && conn.written() == 0;
+        let Err(e) = held.write(conn, first) else {
+            self.held.push_back(held);
+            self.settle();
+            return Ok(());
+        };
+        // Begun on the connection whose end its write met, where its receiver's ends are
+        // followed: held, to go again in its place, and no longer its caller's to give.
+        let taken = held.at.is_some() && !self.answered;
+        if taken {
+            self.held.push_back(held);
+        }
+        let e = self.write_failed(e);
+        if taken { Ok(()) } else { Err(e) }
+    }
+
+    /// Follows a write on its connection that failed with `e`, the connection let go: an
+    /// end the write met (any failure but a timeout, [`timed_out`]) is followed as one
+    /// `settle` finds (a reset), what the connection held going again in its place, and
+    /// says so as `settle`'s does (`ConnectionAborted`) where it ended with messages held.
+    /// A write its timeout gave up is `e`, what was written before it followed so all the
+    /// same.
+    fn write_failed(&mut self, e: io::Error) -> io::Error {
+        self.conn = None;
+        self.sent = false;
+        if self.ended_with(false) && !timed_out(&e) {
+            aborted(self.held.len())
+        } else {
+            e
+        }
+    }
+
+    /// Writes what is to go now: on a connection made where there is none, the probe alone
+    /// while it is asked, the oldest held alone while that is asked or where its receiver
+    /// ends a connection after each message, else all held; on the connection there is,
+    /// what is held and not yet written, where messages go together.
+    fn pump(&mut self) -> io::Result<()> {
+        if self.conn.is_some() {
+            if self.queued() {
+                return Ok(());
+            }
+            let Some(conn) = &mut self.conn else {
+                return Ok(());
+            };
+            let mut failed = None;
+            for held in self.held.iter_mut().filter(|h| h.at.is_none()) {
+                if let Err(e) = held.write(conn, false) {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            return match failed {
+                Some(e) => Err(self.write_failed(e)),
+                None => Ok(()),
+            };
+        }
+        if let (Asking::Probe { .. }, Some(probe)) = (self.asking, &self.probe) {
+            let mut conn = Conn::open(&self.to, self.timeouts)?;
+            conn.write_all(probe)?;
+            conn.flush()?;
+            self.probe_at = Some((conn.written(), None));
+            self.sent = false;
+            self.conn = Some(conn);
+            return Ok(());
+        }
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let mut conn = Conn::open(&self.to, self.timeouts)?;
+        self.sent = false;
+        for held in &mut self.held {
+            held.at = None;
+            held.had = None;
+        }
+        let alone = self.queued();
+        let mut failed = None;
+        for (i, held) in self.held.iter_mut().enumerate() {
+            if alone && i > 0 {
+                break;
+            }
+            if let Err(e) = held.write(&mut conn, i == 0) {
+                failed = Some(e);
+                break;
+            }
+        }
+        match failed {
+            None => {
+                self.conn = Some(conn);
+                Ok(())
+            }
+            // Given up at its timeout, or ended before it carried any of what is held (its
+            // TLS handshake refused): as a connection not made, it says nothing of them.
+            Some(e) if timed_out(&e) || !self.held.iter().any(|h| h.at.is_some()) => Err(e),
+            Some(e) => Err(self.write_failed(e)),
+        }
+    }
+
+    /// Follows its connection: lets go of the messages delivered, those its receiver has had
+    /// for the connection's window, the connection not ended; and where its receiver ended
+    /// it, follows that as what is asked says (`ended_with`). True where its receiver ended
+    /// a connection with messages it is not known to have, which is tried again after its
+    /// caller's pause.
+    ///
+    /// A receiver that ends a connection as it reads a message it will not take has had
+    /// that message, its TCP acknowledging its bytes as it read them. So a message it has
+    /// is let go of only once the connection is found not ended by its receiver the window
+    /// after it was first seen to have it.
+    fn settle(&mut self) -> bool {
+        let Some(conn) = &mut self.conn else {
+            return false;
+        };
+        let peer = conn.peer();
+        if let Peer::Ended | Peer::Reset = peer {
+            self.conn = None;
+            self.sent = false;
+            return self.ended_with(matches!(peer, Peer::Ended));
+        }
+        self.sent = matches!(peer, Peer::Sent);
+        let Ok((had, rto)) = conn.had() else {
+            return false;
+        };
+        self.window = if rto.is_zero() { LEAST_RTO } else { rto };
+        let now = Instant::now();
+        for held in self
+            .held
+            .iter_mut()
+            .take_while(|h| h.at.is_some_and(|at| at <= had))
+        {
+            held.had.get_or_insert(now);
+        }
+        let window = self.window;
+        let over = |t: Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) >= window);
+        if let Asking::Probe { .. } = self.asking {
+            if let Some((at, seen)) = &mut self.probe_at
+                && *at <= had
+            {
+                seen.get_or_insert(now);
+            }
+            // Had, and its connection not ended on it: its receiver does not end one after
+            // every message; the oldest held is asked alone, on a connection of its own.
+            if over(self.probe_at.and_then(|(_, seen)| seen)) {
+                let len = self.probe.as_ref().map_or(0, Vec::len);
+                self.open_after = Some(self.open_after.map_or(len, |o| o.min(len)));
+                self.closes = false;
+                self.asking = Asking::Head(0);
+                self.probe_at = None;
+                self.conn = None;
+            }
+            return false;
+        }
+        let mut delivered = false;
+        while self.held.front().is_some_and(|h| over(h.had)) {
+            if let Some(h) = self.held.pop_front() {
+                let len = h.message.len();
+                self.open_after = Some(self.open_after.map_or(len, |o| o.min(len)));
+                delivered = true;
+            }
+        }
+        if delivered {
+            self.ended = 0;
+            // A message alone not ended on: its receiver took it, and ends no connection
+            // after each.
+            self.asking = Asking::No;
+            self.closes = false;
+        }
+        false
+    }
+
+    /// Follows its receiver's end of a connection, `clean` where it ended it (its FIN, or
+    /// TLS's close_notify) rather than reset it. True where it ended one with messages it is
+    /// not known to have.
+    fn ended_with(&mut self, clean: bool) -> bool {
+        if self.answered {
+            return false;
+        }
+        match self.asking {
+            Asking::Probe { head_first } => {
+                self.probe_at = None;
+                if !clean {
+                    self.ended = self.ended.saturating_add(1);
+                    return true;
+                }
+                // Ended, clean, after a message of nothing: its receiver ends a connection
+                // after every message; the oldest held, where it was its connection's first,
+                // it took.
+                self.closes = true;
+                self.asking = Asking::No;
+                self.ended = 0;
+                if head_first {
+                    self.held.pop_front();
+                }
+                false
+            }
+            Asking::Head(n) => {
+                self.asking = Asking::Head(n.saturating_add(1));
+                self.ended = self.ended.saturating_add(1);
+                true
+            }
+            Asking::No if self.closes => {
+                // A message alone on its connection, which a clean end after it delivers.
+                if clean && self.held.front().is_some_and(|h| h.at.is_some()) {
+                    self.held.pop_front();
+                    self.ended = 0;
+                    return false;
+                }
+                self.ended = self.ended.saturating_add(1);
+                !self.held.is_empty()
+            }
+            Asking::No => {
+                if !self.held.iter().any(|h| h.at.is_some()) {
+                    return false;
+                }
+                self.ended = self.ended.saturating_add(1);
+                let head_first = self.held.front().is_some_and(|h| h.first && h.at.is_some());
+                self.asking = match self.probe {
+                    Some(_) => Asking::Probe { head_first },
+                    None => Asking::Head(0),
+                };
+                true
+            }
+        }
+    }
+
+    /// How many messages are held, the oldest the first.
+    pub(super) fn held(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether its receiver was found to end a connection after each message.
+    #[cfg(test)]
+    pub(super) fn closes(&self) -> bool {
+        self.closes
+    }
+
+    /// Whether the message last written went first on its connection: an answer missing
+    /// on it is the receiver's, not a connection's it had ended before.
+    pub(super) fn first_on_its_connection(&self) -> bool {
+        self.held.back().is_some_and(|h| h.first)
+    }
+
+    /// The message held that its receiver refuses as too long, as shown: the oldest, ended
+    /// on alone, resent unchanged on a connection of its own, twice, longer than `took`,
+    /// the longest the destination is known to have taken (learned.rs), while a shorter
+    /// message, the probe or one delivered, was had and not ended on. Where its protocol
+    /// has no probe and nothing shorter has gone, the ends alone point at it. None where
+    /// nothing shows it: a receiver that restarts, or a network that drops, ends
+    /// connections whatever their messages, and one that ends a connection after every
+    /// message it takes ([`Stream::closes`]) never is shown to refuse one.
+    pub(super) fn suspect(&self, took: usize) -> Option<usize> {
+        let Asking::Head(n) = self.asking else {
+            return None;
+        };
+        let head = self.held.front()?.message.len();
+        if n < 2 || head <= took {
+            return None;
+        }
+        let shown = match self.open_after {
+            Some(open) => open < head,
+            None => self.probe.is_none(),
+        };
+        shown.then_some(0)
+    }
+
+    /// Puts `with` where the held message at `index` was, as its driver cut it again,
+    /// nothing asked: all held goes on the next connection.
+    pub(super) fn replace(&mut self, index: usize, with: Vec<Vec<u8>>) {
+        if index < self.held.len() {
+            let rest = self.held.split_off(index);
+            self.held.extend(with.into_iter().map(Held::new));
+            self.held.extend(rest.into_iter().skip(1));
+        }
+        self.asking = Asking::No;
+        self.ended = 0;
+        self.conn = None;
+    }
+
+    /// Puts each of `changed`'s messages in place of the held message at its index, as its
+    /// driver wrote it again: all held goes on the next connection.
+    pub(super) fn rewrite(&mut self, changed: Vec<(usize, Vec<u8>)>) {
+        for (i, message) in changed {
+            if let Some(held) = self.held.get_mut(i) {
+                held.message = message;
+            }
+        }
+        self.conn = None;
+    }
+
+    /// How many of the messages given it their receiver may not have yet: those not yet
+    /// written among them, which go as it is followed.
+    pub(super) fn undelivered(&mut self) -> usize {
+        self.settle();
+        let _ = self.pump();
+        self.held.len()
+    }
+
+    /// Lets go of what is held: its receiver has said it has it (fluentd's acks), or its
+    /// caller gives it again.
+    pub(super) fn let_go(&mut self) {
+        self.held.clear();
+    }
+
+    /// Drops its connection, whose state is not known: what is held goes on the next.
+    pub(super) fn drop_connection(&mut self) {
+        self.conn = None;
+    }
+
+    /// Ends its connection once all held is delivered and its receiver has all written on
+    /// it. What is held is written on a connection where there is none and waited on until
+    /// it is delivered, its receiver asked as [`Asking`] says: so a receiver's end that
+    /// comes after this one's is its answer to it, and one before it, found as it settles or
+    /// met by a write, is followed, and says so (`ErrorKind::ConnectionAborted`), what it
+    /// held kept for the next try, as its
+    /// driver cuts again what it is shown to refuse ([`Stream::suspect`]). Where the end
+    /// fails, what was not delivered stays held, for the next try. `wait` waits for the
+    /// receiver, and says when the daemon stops.
+    pub(super) fn close(&mut self, wait: &Wait<'_>) -> io::Result<()> {
+        loop {
+            if self.settle() {
+                return Err(aborted(self.held.len()));
+            }
+            let probing = matches!(self.asking, Asking::Probe { .. });
+            if self.held.is_empty() && !probing {
+                break;
+            }
+            if self.conn.is_none() || !self.queued() {
+                self.pump()?;
+                if self.conn.is_none() {
+                    continue;
+                }
+            }
+            self.await_delivery(wait)?;
+        }
+        let Some(conn) = self.conn.take() else {
+            return Ok(());
+        };
+        conn.finish(wait)?;
+        self.held.clear();
+        Ok(())
+    }
+
+    /// Waits for what is out on its connection to be delivered (the probe while it is
+    /// asked, else the oldest held): for its receiver to have it, which its TCP acknowledges
+    /// within the kernel's own wait for it (or the kernel sends again), then the
+    /// connection's window; either cut short as its receiver ends the connection or sends.
+    /// Where what its receiver sent is not yet read, which would wake the wait at once, the
+    /// while is waited whole.
+    fn await_delivery(&mut self, wait: &Wait<'_>) -> io::Result<()> {
+        let had = match self.asking {
+            Asking::Probe { .. } => self.probe_at.and_then(|(_, seen)| seen),
+            _ => self.held.front().and_then(|h| h.had),
+        };
+        let left = match had {
+            Some(had) => self.window.saturating_sub(had.elapsed()),
+            None => self.window,
+        };
+        let Some(conn) = &self.conn else {
+            return Ok(());
+        };
+        if left.is_zero() {
+            return Ok(());
+        }
+        if self.sent {
+            return if wait.pause(left) {
+                Err(super::stops())
+            } else {
+                Ok(())
+            };
+        }
+        conn.readable(wait, left)
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut self.conn {
+            Some(conn) => conn.read(buf),
+            None => Err(io::Error::from(io::ErrorKind::NotConnected)),
+        }
+    }
+}
+
+/// A connection: TCP's counting the bytes written on it, and a unix socket's with the
+/// bytes written on it.
+enum Conn {
+    Tcp(Counted),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, Counted>>),
+    Unix(UnixStream, u64),
+}
+
+/// What a connection's receiver was found to have done, without waiting and taking nothing
+/// its reader would read ([`Conn::peer`]).
+enum Peer {
+    /// Nothing yet.
+    Open,
+    /// It sent what is not yet read.
+    Sent,
+    /// It ended the connection: its end, a FIN, or TLS's close_notify.
+    Ended,
+    /// The connection was reset, or a TLS error ended it.
+    Reset,
+}
+
+/// A TCP socket, and how many bytes have been written on it.
+struct Counted {
+    socket: TcpStream,
+    written: u64,
+    /// What it has sent again, as Windows counts it (sockets.rs `unacknowledged`).
+    #[cfg(windows)]
+    retransmitted: super::sockets::Retransmitted,
+}
+
+impl Counted {
+    fn new(socket: TcpStream) -> Counted {
+        Counted {
+            socket,
+            written: 0,
+            #[cfg(windows)]
+            retransmitted: super::sockets::Retransmitted::default(),
+        }
+    }
+
+    /// How many of the bytes written on it its receiver has not acknowledged, and its
+    /// kernel's RTO (sockets.rs `unacknowledged`).
+    fn unacknowledged(&mut self) -> io::Result<(u64, Duration)> {
+        #[cfg(unix)]
+        return super::sockets::unacknowledged(&self.socket);
+        #[cfg(windows)]
+        return super::sockets::unacknowledged(&self.socket, self.written, &mut self.retransmitted);
+    }
+
+    /// What its receiver was found to have done, peeked at without waiting.
+    fn peer(&self) -> Peer {
+        if self.socket.set_nonblocking(true).is_err() {
+            return Peer::Open;
+        }
+        let mut byte = [0u8; 1];
+        let peer = match self.socket.peek(&mut byte) {
+            Ok(0) => Peer::Ended,
+            Ok(_) => Peer::Sent,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
+                Peer::Open
+            }
+            Err(_) => Peer::Reset,
+        };
+        let _ = self.socket.set_nonblocking(false);
+        peer
+    }
+}
+
+impl Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.read(buf)
+    }
+}
+
+impl Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.socket.write(buf)?;
+        self.written = self.written.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Conn::Tcp(c) => c.read(buf),
+            Conn::Tls(s) => s.read(buf),
+            Conn::Unix(s, _) => shards_ipc::read(&*s, buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Conn::Tcp(c) => c.write(buf),
+            Conn::Tls(s) => s.write(buf),
+            Conn::Unix(s, written) => {
+                let n = s.write(buf)?;
+                *written = written.saturating_add(n as u64);
+                Ok(n)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Conn::Tcp(c) => c.flush(),
+            Conn::Tls(s) => s.flush(),
+            Conn::Unix(s, _) => s.flush(),
+        }
+    }
+}
+
+impl Conn {
+    fn open(to: &To, [write, read]: [Option<Duration>; 2]) -> io::Result<Conn> {
+        let tcp = |address: &str| -> io::Result<Counted> {
+            let socket = TcpStream::connect(address)?;
+            socket.set_write_timeout(write)?;
+            socket.set_read_timeout(read)?;
+            Ok(Counted::new(socket))
+        };
+        Ok(match to {
+            To::Tcp(address) => Conn::Tcp(tcp(address)?),
+            To::Tls(address, config) => {
+                let host = address
+                    .rsplit_once(':')
+                    .map_or(address.as_str(), |(host, _)| host)
+                    .trim_start_matches('[')
+                    .trim_end_matches(']');
+                let name = rustls::pki_types::ServerName::try_from(host.to_string())
+                    .map_err(|e| io::Error::other(format!("{host}: {e}")))?;
+                let conn = rustls::ClientConnection::new(config.clone(), name).map_err(io::Error::other)?;
+                Conn::Tls(Box::new(rustls::StreamOwned::new(conn, tcp(address)?)))
+            }
+            // Windows' AF_UNIX streams, which std does not open: afunix's, Winsock started.
+            To::Unix(path) => {
+                #[cfg(windows)]
+                shards_vmm::platform::winsock()?;
+                let socket = UnixStream::connect(path)?;
+                socket.set_write_timeout(write)?;
+                socket.set_read_timeout(read)?;
+                Conn::Unix(socket, 0)
+            }
+        })
+    }
+
+    /// The bytes written on it.
+    fn written(&self) -> u64 {
+        match self {
+            Conn::Tcp(c) => c.written,
+            Conn::Tls(s) => s.sock.written,
+            Conn::Unix(_, written) => *written,
+        }
+    }
+
+    /// Whether what is written on it goes to its receiver: over TLS, once its handshake is
+    /// done, before which nothing of a message does.
+    fn handshaken(&self) -> bool {
+        match self {
+            Conn::Tls(s) => !s.conn.is_handshaking(),
+            Conn::Tcp(_) | Conn::Unix(..) => true,
+        }
+    }
+
+    /// How many of the bytes written on it its receiver has, and its kernel's RTO: its
+    /// TCP's acknowledged; a unix socket's, all written, which are in its receiver's buffer
+    /// as the write returns, and no RTO.
+    fn had(&mut self) -> io::Result<(u64, Duration)> {
+        match self {
+            Conn::Tcp(c) => {
+                let (unacknowledged, rto) = c.unacknowledged()?;
+                Ok((c.written.saturating_sub(unacknowledged), rto))
+            }
+            Conn::Tls(s) => {
+                let (unacknowledged, rto) = s.sock.unacknowledged()?;
+                Ok((s.sock.written.saturating_sub(unacknowledged), rto))
+            }
+            Conn::Unix(_, written) => Ok((*written, Duration::ZERO)),
+        }
+    }
+
+    /// What its receiver has done, found without waiting and taking nothing its reader
+    /// would read. Over TLS the records come first: a session ticket is taken, what the
+    /// receiver sent is its reader's, and its close_notify (RFC 8446 §6.1: it "will not
+    /// send any more messages on this connection") ends the connection as its FIN would,
+    /// which comes after it; a FIN without it, or a fatal alert, ends it too.
+    fn peer(&mut self) -> Peer {
+        match self {
+            Conn::Tcp(c) => c.peer(),
+            Conn::Tls(s) => {
+                if s.sock.socket.set_nonblocking(true).is_err() {
+                    return Peer::Open;
+                }
+                let peer = loop {
+                    match s.conn.process_new_packets() {
+                        Err(_) => break Peer::Reset,
+                        Ok(io) if io.peer_has_closed() => break Peer::Ended,
+                        Ok(io) if io.plaintext_bytes_to_read() > 0 => break Peer::Sent,
+                        Ok(_) => {}
+                    }
+                    if !s.conn.wants_read() {
+                        break Peer::Open;
+                    }
+                    match s.conn.read_tls(&mut s.sock) {
+                        Ok(0) => break Peer::Ended,
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break Peer::Open,
+                        Err(_) => break Peer::Reset,
+                    }
+                };
+                let _ = s.sock.socket.set_nonblocking(false);
+                peer
+            }
+            Conn::Unix(s, _) => unix_peer(s),
+        }
+    }
+
+    /// Waits until its socket is readable, or `d` has passed; an error where the daemon
+    /// stops first. Its socket blocks again after, as its writes and reads have it.
+    fn readable(&self, wait: &Wait<'_>, d: Duration) -> io::Result<()> {
+        let socket = match self {
+            Conn::Tcp(c) => &c.socket,
+            Conn::Tls(s) => &s.sock.socket,
+            #[cfg(unix)]
+            Conn::Unix(s, _) => return wait.readable(s.as_fd(), d),
+            // An AF_UNIX socket of afunix's, which no event is selected on here: the while.
+            #[cfg(windows)]
+            Conn::Unix(..) => {
+                return if wait.pause(d) {
+                    Err(super::stops())
+                } else {
+                    Ok(())
+                };
+            }
+        };
+        #[cfg(unix)]
+        let waited = wait.readable(socket.as_fd(), d);
+        #[cfg(windows)]
+        let waited = wait.readable(std::os::windows::io::AsSocket::as_socket(socket), d);
+        socket.set_nonblocking(false)?;
+        waited
+    }
+
+    /// Ends the connection once its receiver has all written on it, and has ended its own
+    /// side, as it does once it has read all of this one's.
+    fn finish(self, wait: &Wait<'_>) -> io::Result<()> {
+        let mut tcp = match self {
+            Conn::Unix(..) => return Ok(()),
+            Conn::Tcp(c) => c,
+            Conn::Tls(mut s) => {
+                s.conn.send_close_notify();
+                s.flush()?;
+                s.into_parts().1
+            }
+        };
+        tcp.socket.shutdown(Shutdown::Write)?;
+        tcp.socket.set_nonblocking(true)?;
+        let mut ended = false;
+        let mut scrap = [0u8; 4096];
+        loop {
+            while !ended {
+                match tcp.socket.read(&mut scrap) {
+                    Ok(0) => ended = true,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let (unacknowledged, rto) = tcp.unacknowledged()?;
+            // Closed once its receiver has ended its side too, as Winsock's graceful shutdown
+            // closes ("Graceful Shutdown, Linger Options, and Socket Closure"): its TCP's
+            // acknowledgement says its kernel has the bytes, not that it has read them, and a
+            // close before more of its bytes come, or with any unread, resets the connection,
+            // which on Windows takes from it what it had not read (CI 40900902805: a TLS
+            // receiver's session tickets came after the last read here, and it read nothing
+            // of the line its TCP had acknowledged).
+            if ended && unacknowledged == 0 {
+                return Ok(());
+            }
+            // Its acknowledgement comes within the kernel's own wait for it, or the kernel
+            // sends again; a reset or a timeout ends the connection. Its receiver's end is
+            // waited for as what it sends is read and let go.
+            let rto = if rto.is_zero() { LEAST_RTO } else { rto };
+            if ended {
+                if wait.pause(rto) {
+                    return Err(super::stops());
+                }
+            } else {
+                #[cfg(unix)]
+                wait.readable(tcp.socket.as_fd(), rto)?;
+                #[cfg(windows)]
+                wait.readable(std::os::windows::io::AsSocket::as_socket(&tcp.socket), rto)?;
+            }
+        }
+    }
+}
+
+/// What a unix socket's receiver was found to have done, peeked at without waiting: its
+/// end, at which a read takes nothing, or a reset; what it sent; or nothing yet.
+#[cfg(unix)]
+fn unix_peer(socket: &UnixStream) -> Peer {
+    use std::os::fd::AsRawFd as _;
+    let mut byte = [0u8; 1];
+    // SAFETY: recv(2) of at most a byte into `byte`, peeking, without waiting.
+    let n = unsafe {
+        libc::recv(
+            socket.as_raw_fd(),
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    match n {
+        0 => Peer::Ended,
+        n if n > 0 => Peer::Sent,
+        _ => match io::Error::last_os_error().kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Peer::Open,
+            _ => Peer::Reset,
+        },
+    }
+}
+
+/// [`unix_peer`] of afunix's socket, Winsock's recv peeking, the socket not blocking for
+/// it.
+#[cfg(windows)]
+fn unix_peer(socket: &UnixStream) -> Peer {
+    use windows_sys::Win32::Networking::WinSock::{MSG_PEEK, WSAEWOULDBLOCK, WSAGetLastError, recv};
+    if socket.set_nonblocking(true).is_err() {
+        return Peer::Open;
+    }
+    let mut byte = [0u8; 1];
+    // SAFETY: recv of at most a byte into `byte`, peeking, on a socket `socket` owns.
+    let n = unsafe { recv(socket.raw(), byte.as_mut_ptr(), 1, MSG_PEEK) };
+    let peer = match n {
+        0 => Peer::Ended,
+        n if n > 0 => Peer::Sent,
+        // SAFETY: the calling thread's last Winsock error, read at once.
+        _ if unsafe { WSAGetLastError() } == WSAEWOULDBLOCK => Peer::Open,
+        _ => Peer::Reset,
+    };
+    let _ = socket.set_nonblocking(false);
+    peer
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+pub(super) mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Sets the socket option `option` of `socket` to `value`'s ints: SO_RCVBUF's one,
+    /// SO_LINGER's two (Unix's `linger`; Windows' LINGER, two u16s).
+    #[cfg(unix)]
+    fn set(socket: &impl std::os::fd::AsRawFd, option: libc::c_int, value: &[libc::c_int]) {
+        // SAFETY: setsockopt(2) of `value`'s ints, its length theirs.
+        let set = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                value.as_ptr().cast(),
+                std::mem::size_of_val(value) as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0);
+    }
+
+    #[cfg(windows)]
+    fn set(socket: &impl std::os::windows::io::AsRawSocket, option: i32, value: &[i32]) {
+        use windows_sys::Win32::Networking::WinSock::{SO_LINGER, SOCKET, SOL_SOCKET, setsockopt};
+        let linger: Vec<u16> = value.iter().map(|&v| u16::try_from(v).unwrap()).collect();
+        let bytes: &[u8] = if option == SO_LINGER {
+            // SAFETY: the u16s' own bytes.
+            unsafe { std::slice::from_raw_parts(linger.as_ptr().cast(), linger.len() * 2) }
+        } else {
+            // SAFETY: the i32s' own bytes.
+            unsafe { std::slice::from_raw_parts(value.as_ptr().cast(), std::mem::size_of_val(value)) }
+        };
+        // SAFETY: setsockopt of `bytes`, its length theirs.
+        let set = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as SOCKET,
+                SOL_SOCKET,
+                option,
+                bytes.as_ptr(),
+                i32::try_from(bytes.len()).unwrap(),
+            )
+        };
+        assert_eq!(set, 0);
+    }
+
+    #[cfg(unix)]
+    use libc::{SO_LINGER, SO_RCVBUF};
+    #[cfg(windows)]
+    use windows_sys::Win32::Networking::WinSock::{SO_LINGER, SO_RCVBUF};
+
+    /// A TLS server's config for `localhost`, and a client's that trusts its CA.
+    pub(in crate::daemon::ship) fn tls() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca = rcgen::CertifiedIssuer::self_signed(ca, rcgen::KeyPair::generate().unwrap()).unwrap();
+        let mut leaf = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = leaf.signed_by(&key, &ca).unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        (Arc::new(server), Arc::new(client))
+    }
+
+    /// What a stream writes reaches its receiver whole however soon after it is closed,
+    /// the receiver's TLS 1.3 session tickets unread, and the receiver sees it end cleanly,
+    /// with TLS's close_notify. A socket closed with bytes unread resets its connection,
+    /// and what is not yet sent goes with it: D163's CI lost a run's last line so, a line
+    /// held back by Nagle's algorithm behind the one before it (PM M233).
+    #[test]
+    fn a_stream_closed_delivers_all_it_wrote() {
+        let (server, client) = tls();
+        let (_stop, stopped) = shards_ipc::Stream::pair().unwrap();
+        for _ in 0..20 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = format!("localhost:{}", listener.local_addr().unwrap().port());
+            let config = server.clone();
+            let reading = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                let mut tls =
+                    rustls::StreamOwned::new(rustls::ServerConnection::new(config).unwrap(), socket);
+                let mut got = Vec::new();
+                // Ok at close_notify; an error at a reset, or at an end without it.
+                let ended = tls.read_to_end(&mut got).map(|_| ()).map_err(|e| e.kind());
+                (got, ended)
+            });
+            let mut stream = Stream::new(To::Tls(address, client.clone()), [None; 2]);
+            stream.send(b"first\n", &Wait(&stopped)).unwrap();
+            // The session tickets come, unread; then two lines, the second held back
+            // until the first is acknowledged, and at once the close.
+            std::thread::sleep(Duration::from_millis(50));
+            stream.send(b"out\n", &Wait(&stopped)).unwrap();
+            stream.send(b"err\n", &Wait(&stopped)).unwrap();
+            stream.close(&Wait(&stopped)).unwrap();
+            let (got, ended) = reading.join().unwrap();
+            assert_eq!(
+                (String::from_utf8(got).unwrap(), ended),
+                ("first\nout\nerr\n".into(), Ok(()))
+            );
+            assert_eq!(stream.undelivered(), 0);
+        }
+    }
+
+    /// A stream ends once its receiver has ended its side, not once its receiver's TCP has
+    /// its bytes: a receiver that sends after this end has shut its writing, before it
+    /// reads, is answered with no reset, and reads all written, then its end.
+    #[test]
+    fn a_stream_ends_once_its_receiver_has_ended_its_side() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (closing, told) = std::sync::mpsc::channel::<()>();
+        let reading = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            told.recv().unwrap();
+            // Past the acknowledgement of all it was sent, which a close once acknowledged
+            // took for its end.
+            std::thread::sleep(Duration::from_millis(200));
+            let late = socket.write_all(b"late").map_err(|e| e.kind());
+            let mut got = Vec::new();
+            let ended = socket.read_to_end(&mut got).map(|_| ()).map_err(|e| e.kind());
+            (late, got, ended)
+        });
+        let mut stream = Stream::new(To::Tcp(address), [None; 2]);
+        let (_stop, stopped) = shards_ipc::Stream::pair().unwrap();
+        stream.send(b"line\n", &Wait(&stopped)).unwrap();
+        closing.send(()).unwrap();
+        stream.close(&Wait(&stopped)).unwrap();
+        let (late, got, ended) = reading.join().unwrap();
+        assert_eq!(
+            (late, String::from_utf8(got).unwrap(), ended),
+            (Ok(()), "line\n".into(), Ok(()))
+        );
+    }
+
+    /// A stream over TLS whose server's certificate a CA given beside the platform's roots
+    /// vouches for, as syslog's `syslog-tls-ca-cert` gives one (shards_registry's
+    /// `client_config`, the platform's verifier): what it writes reaches its server whole,
+    /// ended with TLS's close_notify, on every host.
+    #[test]
+    fn a_stream_trusts_a_ca_given_beside_the_platforms() {
+        let now = time::OffsetDateTime::now_utc();
+        let mut ca = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca.not_before = now - time::Duration::hours(1);
+        // Named apart: Windows' chain engine takes a certificate whose subject is its issuer's
+        // for one that signed itself, and checks its signature by its own key
+        // (TRUST_E_CERT_SIGNATURE), where rcgen names both alike unless told.
+        ca.distinguished_name = rcgen::DistinguishedName::new();
+        ca.distinguished_name
+            .push(rcgen::DnType::CommonName, "shards test CA");
+        ca.not_after = now + time::Duration::days(1);
+        ca.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca = rcgen::CertifiedIssuer::self_signed(ca, rcgen::KeyPair::generate().unwrap()).unwrap();
+        let mut leaf = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        leaf.not_before = now - time::Duration::hours(1);
+        leaf.distinguished_name = rcgen::DistinguishedName::new();
+        leaf.distinguished_name
+            .push(rcgen::DnType::CommonName, "localhost");
+        leaf.not_after = now + time::Duration::days(1);
+        leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = leaf.signed_by(&key, &ca).unwrap();
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("localhost:{}", listener.local_addr().unwrap().port());
+        let reading = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let mut tls = rustls::StreamOwned::new(rustls::ServerConnection::new(server).unwrap(), socket);
+            let mut got = Vec::new();
+            let ended = tls.read_to_end(&mut got).map(|_| ()).map_err(|e| e.to_string());
+            (got, ended)
+        });
+        let client = shards_registry::tls::client_config(vec![ca.der().clone()], None).unwrap();
+        let mut stream = Stream::new(To::Tls(address, client), [None; 2]);
+        let (_stop, stopped) = shards_ipc::Stream::pair().unwrap();
+        let sent = stream.send(b"line\n", &Wait(&stopped));
+        let closed = stream.close(&Wait(&stopped));
+        let (got, ended) = reading.join().unwrap();
+        assert_eq!(
+            (sent.map_err(|e| e.to_string()), closed.map_err(|e| e.to_string())),
+            (Ok(()), Ok(()))
+        );
+        assert_eq!(
+            (String::from_utf8(got).unwrap(), ended),
+            ("line\n".into(), Ok(()))
+        );
+    }
+
+    /// What its receiver had not acknowledged when its connection was dropped, a stream
+    /// writes again on its next, in order, before what comes after (PM M233). Its receiver
+    /// reads none: messages go until a write makes no progress for the stream's write
+    /// timeout, both buffers full, and the stream drops the connection, holding what was
+    /// never delivered; the receiver then resets it, as one that closes with
+    /// bytes unread does. Waiting on a receive buffer's size instead failed under load:
+    /// macOS takes some 520 KiB however small a buffer it reports (5 of 200 runs lost the
+    /// held messages to it, and one hung).
+    #[test]
+    fn what_a_dropped_connection_had_not_delivered_goes_on_the_next() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // The least receive buffer the kernel takes, so that the buffers fill soon.
+        set(&listener, SO_RCVBUF, &[1]);
+        let mut stream = Stream::new(
+            To::Tcp(listener.local_addr().unwrap().to_string()),
+            [Some(Duration::from_millis(300)), None],
+        );
+        let message = |i: u32| i.to_be_bytes().repeat(256);
+        let (_stop, stopped) = shards_ipc::Stream::pair().unwrap();
+        let mut sent = 0u32;
+        while stream.send(&message(sent), &Wait(&stopped)).is_ok() {
+            sent += 1;
+            assert!(sent < 65_536, "its receiver took 64 MiB");
+        }
+        assert!(
+            stream.conn.is_none(),
+            "a write that failed dropped its connection"
+        );
+        // Its receiver resets the connection: a close with SO_LINGER 0.
+        let (first, _) = listener.accept().unwrap();
+        set(&first, SO_LINGER, &[1, 0]);
+        drop(first);
+        let held: Vec<Vec<u8>> = stream.held.iter().map(|h| h.message.clone()).collect();
+        assert!(held.len() >= 2, "{} held", held.len());
+        let reading = std::thread::spawn(move || {
+            let (mut second, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            second.read_to_end(&mut got).unwrap();
+            got
+        });
+        stream.send(b"last", &Wait(&stopped)).unwrap();
+        stream.close(&Wait(&stopped)).unwrap();
+        // The messages held are the last sent, in order; and after them, the next.
+        let first_held = sent - u32::try_from(held.len()).unwrap();
+        assert_eq!(held, (first_held..sent).map(message).collect::<Vec<_>>());
+        let mut want: Vec<u8> = held.concat();
+        want.extend_from_slice(b"last");
+        assert_eq!(reading.join().unwrap(), want);
+    }
+
+    /// Do: a receiver of NUL-ended messages that ends its connection on reading one of more
+    /// than 100 bytes, as Graylog's GELF input ends one past its `max_message_size`; send
+    /// a short message, a long one, then short ones, each connection's end found as the
+    /// stream next settles. Expect the long one pointed at once two connections have ended
+    /// with it held, and not before; nothing pointed at that is no longer than what the
+    /// destination took; and, the long one replaced by short pieces, every message but it
+    /// received.
+    #[test]
+    fn a_receiver_that_ends_connections_on_a_message_points_at_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (got, frames) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                let mut read = std::io::BufReader::new(conn);
+                loop {
+                    let mut frame = Vec::new();
+                    match std::io::BufRead::read_until(&mut read, 0, &mut frame) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    frame.pop();
+                    if frame.len() > 100 {
+                        break;
+                    }
+                    if got.send(frame).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let mut stream = Stream::new(To::Tcp(address), [None; 2]);
+        let long = [vec![b'L'; 300], vec![0]].concat();
+        let (_stop, stopped) = shards_ipc::Stream::pair().unwrap();
+        stream.send(b"first\0", &Wait(&stopped)).unwrap();
+        stream.send(&long, &Wait(&stopped)).unwrap();
+        let started = std::time::Instant::now();
+        let mut i = 0;
+        let at = loop {
+            assert!(started.elapsed() < Duration::from_secs(20), "nothing pointed at");
+            if let Some(at) = stream.suspect(10) {
+                break at;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            stream.undelivered();
+            let _ = stream.send(format!("tick{i}\0").as_bytes(), &Wait(&stopped));
+            i += 1;
+        };
+        assert_eq!(stream.held.get(at).map(|h| h.message.len()), Some(301));
+        assert_eq!(
+            stream.suspect(301),
+            None,
+            "pointed at though no longer than taken"
+        );
+        stream.replace(at, vec![b"piece1\0".to_vec(), b"piece2\0".to_vec()]);
+        stream.close(&Wait(&stopped)).unwrap();
+        let frames: Vec<String> = frames.try_iter().map(|f| String::from_utf8(f).unwrap()).collect();
+        assert!(
+            frames.contains(&"first".to_string()) && frames.contains(&"piece2".to_string()),
+            "{frames:?}"
+        );
+        assert!(frames.iter().all(|f| f.len() <= 100));
+    }
+
+    /// The frames of `conn`, each ended by a NUL, sent on `got` until one is longer than
+    /// 100 bytes, which ends the connection as `end` does; false where `got` is gone.
+    fn frames<C: Read>(conn: C, got: &std::sync::mpsc::Sender<Vec<u8>>, end: impl FnOnce(C)) -> bool {
+        let mut read = std::io::BufReader::new(conn);
+        loop {
+            let mut frame = Vec::new();
+            match std::io::BufRead::read_until(&mut read, 0, &mut frame) {
+                Ok(0) | Err(_) => return true,
+                Ok(_) => {}
+            }
+            frame.pop();
+            if frame.len() > 100 {
+                end(read.into_inner());
+                return true;
+            }
+            if got.send(frame).is_err() {
+                return false;
+            }
+        }
+    }
+
+    /// Follows `stream` until it points at a message its receiver refuses: its receiver's
+    /// ends found as it settles, its messages written as it is followed.
+    fn until_refused(stream: &mut Stream) -> usize {
+        let started = std::time::Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "nothing pointed at: {:?}, {} ends",
+                stream.asking,
+                stream.ended
+            );
+            stream.undelivered();
+            if let Some(at) = stream.suspect(10) {
+                return at;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Do: over TLS, to a receiver of NUL-ended messages that ends its connection on reading
+    /// one of more than 100 bytes with TLS's close_notify, then shuts its TCP's writing and
+    /// holds its socket (so that nothing resets it); send a short message and a long one,
+    /// and follow the stream. Expect each end found as the stream settles (RFC 8446 §6.1's
+    /// close_notify read as its end, where a peek at its TCP reads bytes sent), the short
+    /// one delivered alone, and the long one, ended on alone twice, pointed at.
+    #[test]
+    fn a_tls_receivers_close_notify_ends_its_connection() {
+        let (server, client) = tls();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("localhost:{}", listener.local_addr().unwrap().port());
+        let (got, _frames) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                let tls =
+                    rustls::StreamOwned::new(rustls::ServerConnection::new(server.clone()).unwrap(), conn);
+                let going = frames(tls, &got, |mut tls| {
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                    let _ = tls.sock.shutdown(Shutdown::Write);
+                    kept.push(tls);
+                });
+                if !going {
+                    return;
+                }
+            }
+        });
+        let mut stream = Stream::new(To::Tls(address, client), [None; 2]);
+        let (_stop, stopped) = shards_ipc::Stream::pair().unwrap();
+        let long = [vec![b'L'; 300], vec![0]].concat();
+        stream.send(b"first\0", &Wait(&stopped)).unwrap();
+        stream.send(&long, &Wait(&stopped)).unwrap();
+        let at = until_refused(&mut stream);
+        assert_eq!(stream.held.get(at).map(|h| h.message.len()), Some(301));
+        assert_eq!(stream.held(), 1, "the short one delivered");
+    }
+
+    /// Do: over a unix socket, to a receiver of NUL-ended messages that ends its connection
+    /// on reading one of more than 100 bytes; send a short message and a long one, follow
+    /// the stream, then put short pieces in the long one's place and close. Expect what a
+    /// unix socket's receiver has held until it is delivered, as TCP's is: the long one
+    /// pointed at; and every message but it received, its pieces among them.
+    #[test]
+    fn a_unix_receiver_that_ends_connections_on_a_message_points_at_it() {
+        let dir = shards_testdir::TempDir::new("ux").unwrap();
+        let path = dir.join("r.sock");
+        let listener = shards_vmm::platform::UnixListener::bind(&path).unwrap();
+        let (got, got_frames) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            loop {
+                let Ok((conn, _)) = listener.accept() else { return };
+                if !frames(conn, &got, drop) {
+                    return;
+                }
+            }
+        });
+        let mut stream = Stream::new(To::Unix(path), [None; 2]);
+        let (_stop, stopped) = shards_ipc::Stream::pair().unwrap();
+        let long = [vec![b'L'; 300], vec![0]].concat();
+        stream.send(b"first\0", &Wait(&stopped)).unwrap();
+        stream.send(&long, &Wait(&stopped)).unwrap();
+        assert_eq!(stream.held(), 2, "a unix socket's messages held");
+        let at = until_refused(&mut stream);
+        assert_eq!(stream.held.get(at).map(|h| h.message.len()), Some(301));
+        stream.replace(at, vec![b"piece1\0".to_vec(), b"piece2\0".to_vec()]);
+        stream.close(&Wait(&stopped)).unwrap();
+        let mut frames: Vec<String> = Vec::new();
+        for want in ["first", "piece1", "piece2"] {
+            while !frames.iter().any(|f| f == want) {
+                match got_frames.recv_timeout(Duration::from_secs(20)) {
+                    Ok(f) => frames.push(String::from_utf8(f).unwrap()),
+                    Err(e) => panic!("{want}: {e}: {frames:?}"),
+                }
+            }
+        }
+    }
+
+    /// Reads `conn` by `read`, each NUL-ended frame it carries sent on `got`, until one of
+    /// more than 100 bytes, or more than 100 bytes without a NUL, has come: then ends it at
+    /// once, its socket closed with the rest unread, as Fluent Bit's forward input ends a
+    /// connection once its buffer is full at `buffer_max_size` (fluent-bit f5a3cd20,
+    /// plugins/in_forward/fw_conn.c, fw_conn_event), not waiting for the message's end.
+    /// False where `got` is gone.
+    fn ends_past_100<C>(
+        mut conn: C,
+        got: &std::sync::mpsc::Sender<Vec<u8>>,
+        read: impl Fn(&mut C, &mut [u8]) -> io::Result<usize>,
+    ) -> bool {
+        let mut held = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match read(&mut conn, &mut buf) {
+                Ok(0) | Err(_) => return true,
+                Ok(n) => held.extend_from_slice(&buf[..n]),
+            }
+            while let Some(end) = held.iter().position(|&b| b == 0) {
+                if end > 100 {
+                    return true;
+                }
+                let frame: Vec<u8> = held.drain(..=end).take(end).collect();
+                if got.send(frame).is_err() {
+                    return false;
+                }
+            }
+            if held.len() > 100 {
+                return true;
+            }
+        }
+    }
+
+    /// Do: over TCP, TLS and a unix socket, to a receiver of NUL-ended messages that ends
+    /// its connection, the rest unread, once more than 100 bytes of one have come
+    /// ([`ends_past_100`]): send a short message, then one of 16 MiB, six times the most a
+    /// connection took from its writer before the writer waited, its receiver reading 4,096
+    /// bytes and then nothing (docs/research/measurements/ci-fluentd-epipe/absorbed.py:
+    /// 2,720,256 bytes over loopback TCP on Linux, 1,465,848 on macOS, less over a unix
+    /// socket), so that its receiver ends the connection while it is written, and the write
+    /// meets that end (EPIPE, or a reset) before the stream sees it; then close as a
+    /// shipper does, again while the close says its receiver ended the connection with
+    /// messages held. Expect the end followed as one the stream sees: the long message
+    /// held, each close until it is pointed at saying `ConnectionAborted`, and it pointed
+    /// at once two connections have ended on it alone; then, put back as two short pieces,
+    /// every message received and the close ended.
+    #[test]
+    fn a_write_that_meets_its_receivers_end_is_followed_as_one_seen() {
+        let (server, client) = tls();
+        let (_stop, stopped) = shards_ipc::Stream::pair().unwrap();
+        let wait = Wait(&stopped);
+        let long = [vec![b'L'; 16 << 20], vec![0]].concat();
+        for via in ["tcp", "tls", "unix"] {
+            let dir = shards_testdir::TempDir::new("wm").unwrap();
+            let (got, got_frames) = std::sync::mpsc::channel::<Vec<u8>>();
+            let to = if via == "unix" {
+                let path = dir.join("r.sock");
+                let listener = shards_vmm::platform::UnixListener::bind(&path).unwrap();
+                std::thread::spawn(move || {
+                    while let Ok((conn, _)) = listener.accept() {
+                        if !ends_past_100(conn, &got, |c, buf| shards_ipc::read(&*c, buf)) {
+                            return;
+                        }
+                    }
+                });
+                To::Unix(path)
+            } else {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let tls = (via == "tls").then(|| server.clone());
+                let to = if tls.is_some() {
+                    To::Tls(format!("localhost:{port}"), client.clone())
+                } else {
+                    To::Tcp(format!("127.0.0.1:{port}"))
+                };
+                std::thread::spawn(move || {
+                    for conn in listener.incoming() {
+                        let Ok(conn) = conn else { return };
+                        let going = match &tls {
+                            None => ends_past_100(conn, &got, |c, buf| shards_ipc::read(&*c, buf)),
+                            Some(server) => {
+                                let tls = rustls::StreamOwned::new(
+                                    rustls::ServerConnection::new(server.clone()).unwrap(),
+                                    conn,
+                                );
+                                ends_past_100(tls, &got, |t, buf| t.read(buf))
+                            }
+                        };
+                        if !going {
+                            return;
+                        }
+                    }
+                });
+                to
+            };
+            let mut stream = Stream::new(to, [None; 2]);
+            stream.send(b"first\0", &wait).unwrap();
+            stream.send(&long, &wait).unwrap();
+            let at = loop {
+                if let Some(at) = stream.suspect(10) {
+                    break at;
+                }
+                let e = stream.close(&wait).unwrap_err();
+                assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted, "{via}: {e}");
+            };
+            assert_eq!(
+                stream.held.get(at).map(|h| h.message.len()),
+                Some(long.len()),
+                "{via}"
+            );
+            stream.replace(at, vec![b"piece1\0".to_vec(), b"piece2\0".to_vec()]);
+            stream.close(&wait).unwrap();
+            let mut frames: Vec<String> = Vec::new();
+            for want in ["first", "piece1", "piece2"] {
+                while !frames.iter().any(|f| f == want) {
+                    match got_frames.recv_timeout(Duration::from_secs(20)) {
+                        Ok(f) => frames.push(String::from_utf8(f).unwrap()),
+                        Err(e) => panic!("{via}: {want}: {e}: {frames:?}"),
+                    }
+                }
+            }
+        }
+    }
+}

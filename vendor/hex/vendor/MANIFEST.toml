@@ -1,0 +1,149 @@
+# What Hex vendors, each project at one revision (kiln's docs/vendoring.md). scripts/vendor.py
+# reads it; kiln, vendoring Hex, holds every project named here at the same revision.
+format = 1
+
+# Hex's gate, run after a re-vendor.
+gate = ["bash scripts/gates.sh"]
+
+# seccompiler (rust-vmm): compiles an OCI seccomp profile to a BPF program and loads it in the
+# container init. Vendored so Hex can profile and lean its compile path (decision: runtime.md).
+[projects.seccompiler]
+kind = "git"
+repository = "https://github.com/rust-vmm/seccompiler"
+commit = "c3cf77d65815037931ae5bc2fca010713defdc8c"
+path = "vendor/seccompiler"
+# rust-vmm-ci is the shared CI submodule, not a build dependency of the library; excluded so the
+# vendored tree is the crate's own source.
+exclude = ["rust-vmm-ci"]
+# Hex's own files in the vendored tree (not upstream's): the record of what Hex changed and why.
+own = ["UPSTREAM.md"]
+
+# hyper-raft (hyper-light), at the revision kiln vendors it (kiln's vendor/MANIFEST.toml), so kiln, Hex
+# and the fleet hold one hyper-raft: hex-sim scores placement with hyper-swim's own Vivaldi engine
+# (docs/design/hex-sim.md H20), and measures the crash class on hyper-swim's own failure detector, the
+# membership the node agent runs (docs/design/failure-isolation.md F1); and Hex's wire travels over
+# hyper-transport on hyper-quic, TLS 1.3 by hyper-tls (docs/design/hex-quic.md Q1). hyper-raft has no -api
+# crate for Hex to depend on (CLAUDE.md §9), so only what Hex compiles is taken: coordinates.rs, included
+# unchanged by path, the hyper-swim and hyper-timing crates, and the hyper-transport, hyper-quic and
+# hyper-tls crates (each manifest's named targets with it, as cargo loads a package by them), with the
+# workspace manifest their packages inherit from and its LICENSE, depended on by name and patched to this
+# copy (Cargo.toml [patch.crates-io]), as kiln patches the same names. Not hyper-rt or hyper-rt-transport:
+# Hex drives the sans-IO endpoint from a thread of its own (docs/design/hex-quic.md Q2). When hyper-raft
+# publishes these behind an -api crate, Hex depends on that by name and this entry goes.
+[projects.hyper-raft]
+kind = "git"
+repository = "https://github.com/hyper-light/hyper-raft"
+commit = "fb74b59533908472ade7e526eb08117601cede0e"
+path = "vendor/hyper-raft"
+take = [
+    "Cargo.toml",
+    "LICENSE",
+    "crates/hyper-quic/Cargo.toml",
+    "crates/hyper-quic/LICENSE-APACHE",
+    "crates/hyper-quic/LICENSE-MIT",
+    "crates/hyper-quic/VENDORED.md",
+    "crates/hyper-quic/benches",
+    "crates/hyper-quic/src",
+    "crates/hyper-quic/tests/e2e.rs",
+    "crates/hyper-swim/Cargo.toml",
+    "crates/hyper-swim/ORIGIN.md",
+    "crates/hyper-swim/benches",
+    "crates/hyper-swim/src",
+    "crates/hyper-timing/Cargo.toml",
+    "crates/hyper-timing/ORIGIN.md",
+    "crates/hyper-timing/benches",
+    "crates/hyper-timing/src",
+    "crates/hyper-tls/Cargo.toml",
+    "crates/hyper-tls/LICENSE-APACHE",
+    "crates/hyper-tls/LICENSE-ISC",
+    "crates/hyper-tls/LICENSE-MIT",
+    "crates/hyper-tls/VENDORED.md",
+    "crates/hyper-tls/benches",
+    "crates/hyper-tls/src",
+    "crates/hyper-transport/Cargo.toml",
+    "crates/hyper-transport/ORIGIN.md",
+    "crates/hyper-transport/benches",
+    "crates/hyper-transport/src",
+    "crates/hyper-transport/tests/e2e.rs",
+]
+own = ["UPSTREAM.md"]
+
+# cuda-rust (NVIDIA): hex-gpu loads NVML at run time by its CUDA driver loader's policy (library names
+# per OS, WSL's own path, the library kept for the process, a library missing told from a symbol
+# missing), adapted from cuda-bindings' dyn_load.rs and compiled from this copy by path
+# (crates/hex-gpu/src/nvml.rs; docs/design/gpu-telemetry.md G1). cuda-rust binds no NVML: the eight
+# NVML calls hex-gpu makes are declared in crates/hex-gpu/src/nvml/sys.rs from NVIDIA's NVML reference.
+# Apache-2.0, as is its LICENSE taken beside it; no NOTICE file upstream.
+[projects.cuda-rust]
+kind = "git"
+repository = "https://github.com/NVIDIA/cuda-rust"
+commit = "a0a4dc78a20e06ec90827f597e950bdc49f723e2"
+path = "vendor/cuda-rust"
+take = ["LICENSE", "cuda-bindings/src/dyn_load.rs"]
+own = ["UPSTREAM.md"]
+
+# all-smi (Lablup): hex-gpu reads AMD GPUs through amdgpu's sysfs counters on Linux, from all-smi's AMD
+# reader's gpu_busy_percent read (its fallback beside libamdgpu_top's ioctls), adapted to read each
+# counter with one pread of a file kept open (crates/hex-gpu/src/amd.rs; docs/design/gpu-telemetry.md
+# G2); and through ADL on Windows, from all-smi's transcription of AMD's ADL SDK headers (its ADL types
+# and entry points) and its PMLog sensor read, cut to what hex-gpu calls (crates/hex-gpu/src/adl.rs;
+# G3). Each is compiled from this copy by path. Apache-2.0, as is its LICENSE taken beside it; no
+# NOTICE file upstream. AMD's ADL SDK headers it transcribes are MIT (GPUOpen-LibrariesAndSDKs/
+# display-library at 84c881cb), cited, not taken.
+[projects.all-smi]
+kind = "git"
+repository = "https://github.com/lablup/all-smi"
+commit = "fe479ae675e39475a2eab1cfbb3f5432f705e12b"
+path = "vendor/all-smi"
+take = [
+    "LICENSE",
+    "crates/all-smi-amd-plugin/src/reader.rs",
+    "src/device/readers/amd_adl/ffi.rs",
+    "src/device/readers/amd_adl/sensors.rs",
+]
+own = ["UPSTREAM.md"]
+
+# Shards' public API (shards-api: the direct boot D215, launches through a client's native owner D233, GPU
+# selection by exact identity D232, and images booted under shards-init for an orchestrator D231, with D234's
+# nesting grant, D235's plugs, D236's destinations and a member's stdin), its ABI,
+# AF_UNIX transport and test-directory crates, at a Shards main with none of Hex's changes: every patch Hex
+# carried is upstream (vendor/shards/UPSTREAM.md), and the take list holds the fixtures the API's tests include.
+[projects.shards]
+kind = "git"
+repository = "https://github.com/hyper-light/shards"
+commit = "e82b9403b863718930fe9f224186d3ae862bfd61"
+path = "vendor/shards"
+take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
+own = ["Cargo.toml", "UPSTREAM.md"]
+
+# Firecracker (AWS): the VMM Hex's `firecracker` class launches (crates/hex-runtime/src/firecracker; its
+# PREBOOT_REVISION is this commit). Upstream's VFIO development chain (feature/vfio, in no release yet)
+# assigns PCI devices before boot here. Hex's recorded changes route a passthrough device's MSI/MSI-X
+# through KVM irqfds, serve GET /device-passthrough/{id} (the host/guest PCI witness the adapter reads,
+# transport.rs `attachment`), allow that MSI/MSI-X programming in the vCPU seccomp filters, give a
+# passthrough function's video BIOS image to its guest in a VFCT ACPI table, and complete Cargo.lock for a
+# --locked build. Hex compiles none of it: only the files those changes touch are
+# taken, so `check` proves each change applies to this commit, and
+# scripts/firecracker/build.sh rebuilds the VMM from this commit plus vendor/patches/firecracker.
+# Apache-2.0, as are its LICENSE and NOTICE taken beside it.
+[projects.firecracker]
+kind = "git"
+repository = "https://github.com/firecracker-microvm/firecracker"
+commit = "500efc6bb169705f5d9417cb411e3f6723e051fe"
+path = "vendor/firecracker"
+take = [
+    "LICENSE",
+    "NOTICE",
+    "Cargo.lock",
+    "resources/seccomp/aarch64-unknown-linux-musl.json",
+    "resources/seccomp/x86_64-unknown-linux-musl.json",
+    "src/firecracker/src/api_server/parsed_request.rs",
+    "src/firecracker/src/api_server/request/device_passthrough.rs",
+    "src/vmm/src/acpi/mod.rs",
+    "src/vmm/src/device_manager/pci_mngr.rs",
+    "src/vmm/src/pci/mod.rs",
+    "src/vmm/src/rpc_interface.rs",
+    "src/vmm/src/vfio.rs",
+    "src/vmm/src/vmm_config/device_passthrough.rs",
+]
+own = ["UPSTREAM.md"]
