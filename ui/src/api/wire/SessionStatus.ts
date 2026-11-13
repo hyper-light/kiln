@@ -4,4 +4,4 @@
 /**
  * Where a session is in its life.
  */
-export type SessionStatus = "starting" | "idle" | "running" | "waiting" | "exited" | "disconnected";
+export type SessionStatus = "starting" | "idle" | "running" | "waiting" | "exited" | "disconnected" | "crashed";

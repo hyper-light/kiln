@@ -10,9 +10,12 @@ the OS reused is told apart from the process that had it), its CPU time and its 
 - macOS: `proc_pid_rusage(RUSAGE_INFO_V2)` through libproc: physical footprint (what Activity
   Monitor and jetsam count, as Shards' M49 fleet measurement reads it), user and system time, and
   the start in Mach absolute time; ps(1) for the parent and the arguments.
-- Windows: Win32_Process through CIM (one PowerShell query a scan): the private working set is not
-  in it, so memory is WorkingSetSize, which counts shared pages whole; the creation time is the
-  start; kernel and user time.
+- Windows: Win32_Process through CIM (one PowerShell query a scan) for the parent, the image name
+  (without its `.exe`, as the other OSes name a process) and the command line; each process's
+  creation time (the start), kernel and user time and WorkingSetSize (memory: the private working
+  set is not kept, so shared pages count whole) from the Win32 API (GetProcessTimes,
+  K32GetProcessMemoryInfo), which `one()` reads alone for a pid, so a start read either way is the
+  same.
 
 A process another user owns may be unreadable: it is listed with `mem` None, never guessed.
 """
@@ -209,6 +212,80 @@ _WIN_QUERY = (
 )
 
 
+# winnt.h's process access rights, SYNCHRONIZE, and WaitForSingleObject's WAIT_OBJECT_0.
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROCESS_VM_READ = 0x0010
+_SYNCHRONIZE = 0x00100000
+_WAIT_OBJECT_0 = 0
+# The longest path Windows' wide-character functions take (Microsoft, "Maximum Path Length
+# Limitation": 32,767 characters), so an image name never fails for want of room.
+_WIN_PATH_MOST = 32767
+
+
+def _image(name: str) -> str:
+    """A Windows process's image name as the scan names processes: Win32_Process's Name is the
+    executable's file name, `.exe` and all."""
+    return name[:-4] if name.lower().endswith(".exe") else name
+
+
+def _win_kernel32():
+    k32 = getattr(_win_kernel32, "lib", None)
+    if k32 is None:
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(ctypes.c_uint64)] * 4
+        k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        _win_kernel32.lib = k32
+    return k32
+
+
+class _MemoryCounters(ctypes.Structure):
+    # PROCESS_MEMORY_COUNTERS (psapi.h).
+    _fields_ = [("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32)] + [
+        (f, ctypes.c_size_t)
+        for f in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")
+    ]
+
+
+def _win_one(pid: int) -> Optional[Proc]:
+    """One process through the Win32 API: its start (creation time, FILETIME units), CPU time,
+    working set and image name, and whether it has exited (`zombie`: a handle still holds it).
+    Its parent and command line are the table's (CIM): None where the process can't be opened."""
+    k32 = _win_kernel32()
+    h = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_VM_READ | _SYNCHRONIZE, False, pid)
+    with_mem = bool(h)
+    if not h:
+        h = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE, False, pid)
+    if not h:
+        return None
+    try:
+        created, exited, kernel, user = (ctypes.c_uint64() for _ in range(4))
+        if not k32.GetProcessTimes(h, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        from ctypes import wintypes
+
+        path = ctypes.create_unicode_buffer(_WIN_PATH_MOST + 1)
+        size = wintypes.DWORD(len(path))
+        name = path.value.replace("/", "\\").rsplit("\\", 1)[-1] if k32.QueryFullProcessImageNameW(h, 0, path, ctypes.byref(size)) else ""
+        mem = None
+        if with_mem:
+            pmc = _MemoryCounters()
+            pmc.cb = ctypes.sizeof(pmc)
+            if k32.K32GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                mem = int(pmc.WorkingSetSize)
+        gone = k32.WaitForSingleObject(h, 0) == _WAIT_OBJECT_0
+        return Proc(pid, 0, _image(name), [], str(created.value), mem, "working_set", (kernel.value + user.value) * 100, zombie=gone)
+    finally:
+        k32.CloseHandle(h)
+
+
 def _win_table() -> Dict[int, Proc]:
     out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _WIN_QUERY], capture_output=True, text=True, errors="replace", check=False).stdout
     try:
@@ -224,11 +301,15 @@ def _win_table() -> Dict[int, Proc]:
             ppid = int(r.get("ParentProcessId") or 0)
         except (TypeError, ValueError):
             continue
+        cmd = r.get("CommandLine") or ""
+        own = _win_one(pid)
+        if own is not None:
+            table[pid] = Proc(pid, ppid, _image(r.get("Name") or ""), cmd.split(), own.start, own.mem, "working_set", own.cpu_ns, own.zombie)
+            continue
         ws = r.get("WorkingSetSize")
         k, u = r.get("KernelModeTime"), r.get("UserModeTime")
         cpu = (int(k) + int(u)) * 100 if k is not None and u is not None else None
-        cmd = r.get("CommandLine") or ""
-        table[pid] = Proc(pid, ppid, r.get("Name") or "", cmd.split(), str(r.get("Created") or ""), int(ws) if ws is not None else None, "working_set", cpu)
+        table[pid] = Proc(pid, ppid, _image(r.get("Name") or ""), cmd.split(), str(r.get("Created") or ""), int(ws) if ws is not None else None, "working_set", cpu)
     return table
 
 
@@ -262,6 +343,8 @@ def one(pid: int) -> Optional[Proc]:
         return _linux_one(pid, 1_000_000_000 // os.sysconf("SC_CLK_TCK"))
     if sys.platform == "darwin":
         return _mac_ps("-p", str(pid)).get(pid)
+    if sys.platform == "win32":
+        return _win_one(pid)
     return table().get(pid)
 
 
@@ -285,11 +368,11 @@ def descendants(procs: Dict[int, Proc], roots: Iterable[int]) -> List[int]:
 def kill(pid: int, start: str) -> str:
     """Kills the process `pid` only if it is still the one that started at `start`.
 
-    Answers `killed`, `gone` (no such process), `reused` (another process has the pid: refused)
-    or `denied`.
+    Answers `killed`, `gone` (no such process, or one that has exited: nothing is left to kill),
+    `reused` (another process has the pid: refused) or `denied`.
     """
     now = one(pid)
-    if now is None:
+    if now is None or now.zombie:
         return "gone"
     if start and now.start != start:
         return "reused"

@@ -157,7 +157,7 @@ fn ready(u: &Item, items: &[Item], g: &Graph) -> bool {
 /// Whether kiln hands `info`'s steps and goals to subagents now: not while it's paused at a usage
 /// limit, or its machine is away, nor moments after a subagent couldn't be started for it (at `now`).
 pub(super) fn may_hand(info: &Info, now: i64) -> bool {
-    info.pause.is_none() && info.status != Status::Disconnected && !FAILED.lock().get(&info.id).is_some_and(|at| now - at < RETRY_MS)
+    info.pause.is_none() && !matches!(info.status, Status::Disconnected | Status::Crashed) && !FAILED.lock().get(&info.id).is_some_and(|at| now - at < RETRY_MS)
 }
 
 /// The room `info` has for subagents now, as the stack's graph takes it (`lineage::room_of`: its
