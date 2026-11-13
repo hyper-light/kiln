@@ -1394,6 +1394,25 @@ const UNRECEIVED: &str = "SELECT (SELECT envelope FROM custody WHERE digest = t.
                           AND NOT EXISTS (SELECT 1 FROM custody_follows f CROSS JOIN custody r ON r.digest = f.record WHERE f.follows = t.record AND r.kind = 'received')
                           ORDER BY t.taken_at";
 
+/// Whether the runner process `machine`/`instance`, holding agent session `session` at epoch `epoch`, signed a
+/// hand-on of that session (to a holder of it after it): its own word that it let the session go (docs/ci.md W27-R08).
+/// Read from the records each session takes (`custody_takers_session`), each one's signer matched whole.
+/// 2026-11-12: adacachy's runner started again, its old process signed each session's hand-on to its next epoch, and
+/// the new process held them on at the epoch it had; the mail hand-over that had bound them to the old process
+/// fenced them off for good (`harness::mail_transfer::speaks_for`).
+pub(crate) async fn handed_on_by(store: &Store, session: &str, epoch: u64, machine: &str, instance: &str) -> anyhow::Result<bool> {
+    let (s, signer) = (session.to_owned(), format!("/agent/{session}/epoch/{epoch}/machine/{machine}/instance/{instance}"));
+    store
+        .read(move |c| {
+            Ok(c.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM custody_takers t JOIN custody c ON c.digest = t.record WHERE t.session = ?1 AND t.kind = 'handed-on'
+                 AND length(c.custodian) > length(?2) AND substr(c.custodian, length(c.custodian) - length(?2) + 1) = ?2)",
+            )?
+            .query_row(params![s, signer], |r| r.get(0))?)
+        })
+        .await
+}
+
 /// The work kiln handed agent session `session` (to it at any epoch) that no receipt answers yet:
 /// the hand-ons' envelopes, oldest first ([`UNRECEIVED`]). Looked for each time an agent session
 /// opens, and for each session of every runner's inventory: read beside the writer, as no caller
