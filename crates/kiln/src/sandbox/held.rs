@@ -16,11 +16,13 @@ use std::time::Duration;
 use futures::channel::oneshot;
 use kiln_seams::sandbox::{Exit, Link, Output, Refusal, Run, Signal};
 
-/// A boundary's run, the image it runs and what it reaches of it, and whether its end has come.
+/// A boundary's run, the image it runs and what it reaches of it, where its harness keeps its
+/// conversations, and whether its end has come.
 pub struct Held {
     run: Arc<dyn Run>,
     image: String,
     reach: crate::sandbox::narrow::Reach,
+    kept_in: Option<String>,
     ended: AtomicBool,
     changed: crate::rt::Changed,
 }
@@ -35,10 +37,11 @@ pub struct Parts {
 }
 
 /// `run`'s stdio and end as a `Duplex`'s, `run` a member of `image` reaching `reach` of its
-/// destinations: one task writes what's sent to its stdin, in order, and closes its stdin once
-/// nothing more can be sent; another hands on what it says and its end.
-pub fn pump(run: Box<dyn Run>, image: String, reach: crate::sandbox::narrow::Reach) -> Parts {
-    let held = Arc::new(Held { run: Arc::from(run), image, reach, ended: AtomicBool::new(false), changed: crate::rt::Changed::new() });
+/// destinations, its harness keeping its conversations in `kept_in` (as its microVM has the folder,
+/// `harness::isolated::home::Layout::kept_in`): one task writes what's sent to its stdin, in order, and
+/// closes its stdin once nothing more can be sent; another hands on what it says and its end.
+pub fn pump(run: Box<dyn Run>, image: String, reach: crate::sandbox::narrow::Reach, kept_in: Option<String>) -> Parts {
+    let held = Arc::new(Held { run: Arc::from(run), image, reach, kept_in, ended: AtomicBool::new(false), changed: crate::rt::Changed::new() });
     let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     // A process's pipes' bounds, so its session's loop reads it as it reads a process.
     let (out_tx, stdout) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDOUT_CHUNKS);
@@ -148,6 +151,12 @@ impl Held {
     pub fn reach(&self) -> &crate::sandbox::narrow::Reach {
         &self.reach
     }
+
+    /// Where its harness keeps its conversations, as its microVM has the folder, where kiln laid it in
+    /// its person's volume as it was launched.
+    pub fn kept_in(&self) -> Option<&str> {
+        self.kept_in.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -162,7 +171,7 @@ mod tests {
 
     async fn launched(s: &SimSandbox, program: &str) -> anyhow::Result<Parts> {
         let run = s.launch(Launch::of(program, &[])).await.map_err(anyhow::Error::msg)?;
-        Ok(pump(run, "sim".to_owned(), sim_reach()))
+        Ok(pump(run, "sim".to_owned(), sim_reach(), None))
     }
 
     /// Step 17: what a session writes reaches the run in order and comes back on its stdout; the
@@ -214,7 +223,7 @@ mod tests {
     fn s17_a_held_duplex_is_no_process_hands_nothing_over_and_stops_through_its_boundary() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let run = SimSandbox::new().launch(Launch::of("wait", &[])).await.map_err(anyhow::Error::msg)?;
-            let mut p = crate::proc::duplex_of_run(run, "sim".to_owned(), sim_reach());
+            let mut p = crate::proc::duplex_of_run(run, "sim".to_owned(), sim_reach(), None);
             assert_eq!(p.host_pid(), None);
             assert!(p.detach().await.is_none(), "nothing of it is this process's to hand over");
             p.terminate(Duration::from_secs(30));
@@ -230,7 +239,7 @@ mod tests {
         crate::rt::block_on(async {
             let s = SimSandbox::new();
             let run = s.launch(Launch::of("echo", &[])).await.map_err(anyhow::Error::msg)?;
-            let p = pump(run, "sim".to_owned(), sim_reach());
+            let p = pump(run, "sim".to_owned(), sim_reach(), None);
             let held = Arc::clone(&p.held);
             let Parts { stdin, stdout, .. } = p;
             drop(stdout);

@@ -39,13 +39,28 @@ slowest answer seen."
   subagents, pause, freeze, `room_wait`, admission credit, harness session and mode. In the timeline, a
   new event, growing words, or a tool's status count. `last_activity` doesn't count, since kiln moves it
   on every state it is sent, the same one again included.
-- A message kiln holds in its custody is held, not quiet (`Verdict::Held`). R03: a host's hold is said as
-  held, and the wait goes on. As its window runs out, the wait reads the session's state: where the
-  message's delivery is `queued` (or it waits in kiln's queue), the wait says so with what kiln says
-  holds it (its admission, room, pause, freeze), and the window starts again. ROOT's runs of 2026-11-13
-  found cursor's, gemini's and goose's resumed prompts held so: idle, queued 1, admission
-  `{learning: bootstrap, target 2, admitted 1, depth 2}`, delivery `queued`. A message kiln neither
-  delivers nor holds for a whole window is refused (`Stall::Quiet`).
+- A message kiln holds for a cause it states of that message is held, not quiet (`Verdict::Held`). R03: a
+  host's hold is said as held, and the wait goes on, its window starting again. As its window runs out,
+  the wait reads the session's state, and `holds` takes only these causes:
+  - kiln's admission waiting on the message itself, with its own wait cause (`harness::admission::WaitCause`):
+    the session feed's `mail_flow` frame (`FlowEvent::Waiting`) whose publication is the message's. Each
+    session's feed is held open from its first wait until it ends (`Pace`), so the word on a message the
+    drive sent between waits is heard (`Watch::heard`, `vm_e2e::Admission`); a later word on it
+    (`accepted`, `consumed`, `disposed`) lets it go;
+  - while the message waits in kiln's queue (its delivery `queued`, or in the queue): the session's room
+    wait (`room_wait`), its pause (`pause`) or a person's freeze (`frozen`), each holding all of its queue.
+- The admission capacity kiln's word on a session carries (`Info::admission`, `harness::admission::Capacity`)
+  is no cause: every session that takes messages carries one, and it names no message and states no
+  cause. Taken for one (3c3c1ad3b), a delivery kiln never makes was waited on forever.
+- A message waiting in kiln's queue on an idle session for a whole window, with none of those causes, is
+  refused at once, typed: `Stall::DeliveryStuck`, "delivery stuck". Its evidence is the refusal's (below):
+  status, queue, delivery, admission, timeline. ROOT's five rounds at eeebb5cbd had three: resumed
+  sessions (cursor's, gemini's, goose's) idle, `queued 1`, admission `{learning: bootstrap, target 2,
+  admitted 1, depth 2}`, their opening prompt's delivery `queued`, never handed over (ACP's hand-off to a
+  resumed, idle session, cured in kiln's `harness/acp.rs` apart from this). Any other message that neither
+  moves nor is held for a whole window is quiet (`Stall::Quiet`), a running session's queued one among
+  them. No clock or constant of its own: the window is the drive's learned one, and before it has one (the
+  cold start, a steered turn) no window refuses.
 - A turn the drive asked to be long (the steered turn, `Asked::Steered`) waits as a first one does: no
   earlier answer bounds a turn asked to take longer. Bound by the slowest answer, the stand-in's steered
   turn would be refused, since it is silent for `POLL * 8` between lines by the drive's own ask. That
@@ -71,7 +86,8 @@ None of these refuse:
 - An exit kiln hasn't decided on yet.
 - Idle with a message queued, held for room, or paused.
 
-These follow progress and the window.
+These follow progress and the window: past it, a message held for a cause kiln states is held, one in
+kiln's queue on an idle session with none is delivery stuck, and the rest are quiet (above).
 
 ## The fixture's setup waits
 
@@ -112,6 +128,9 @@ next change notification (`Wake`, R05).
   window (`Watch::left`), and has no bound before a first answer.
 - The socket is opened as it's first waited on, and again after it ended. That wait returns at once,
   so a change made while it opened is looked at. An opening that fails pauses as long as it took.
+- A session's socket is held from its first wait until the drive ends the session (`Pace`'s feeds), so
+  each wait on it reads on where the one before stopped. What a wait reads, it hears: admission's word on
+  each message (`mail_flow`) is what `holds` reads of admission (above).
 - What a look reads (kiln's word and the timeline over the API), the typed refusals and the evidence
   are as before.
 
@@ -127,6 +146,6 @@ next change notification (`Wake`, R05).
 ## Owed
 
 - The stand-in's steered gap (`STEERED_GAP`, 2 s, what `POLL * 8` was) is its own pace, which no
-  wait reads: to be derived from a measured round trip through kiln.
+  wait reads: to be derived from a measured round trip through kiln (a slice of its own).
 - ROOT's runs: five of `cargo test -p kiln --test vm_harnesses -- step35::host:: host::` under load on
   a Mac Studio, and the microVM drives.

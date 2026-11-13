@@ -837,7 +837,9 @@ pub fn setup<T>(ended: impl Fn() -> Option<SetupStuck>, mut look: impl FnMut() -
 /// [`setup`] on fixture `f`'s parties, woken by kiln's events socket, refused with its runner's log.
 fn setup_on<T>(f: &Fixture, what: &str, look: impl FnMut() -> anyhow::Result<Setup<T>>) -> anyhow::Result<T> {
     let mut wake = Wake::events(f);
-    setup(|| f.ended(), look, |stuck| anyhow::Error::new(SetupRefused { what: what.to_owned(), stuck, evidence: f.runner_log() }), |took| wake.next(None, took))
+    setup(|| f.ended(), look, |stuck| anyhow::Error::new(SetupRefused { what: what.to_owned(), stuck, evidence: f.runner_log() }), |took| {
+        wake.next(None, took);
+    })
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -847,6 +849,7 @@ fn setup_on<T>(f: &Fixture, what: &str, look: impl FnMut() -> anyhow::Result<Set
 /// kiln's change notifications a wait wakes on: a socket kiln pushes its changes down, a session's
 /// own ([`Wake::session`]: what its viewers are sent, every update of its copy) or the events socket
 /// ([`Wake::events`]: the hub's events, runners' records among them), read a frame at a time.
+#[derive(Debug)]
 pub struct Wake {
     port: u16,
     admin: String,
@@ -871,25 +874,31 @@ impl Wake {
     /// bound). Frames that follow it within `settle` (how long a look takes) are read with it, so looks
     /// never outrun kiln's answers. The socket is opened as it's first waited on, and again after it
     /// ended; that wait returns at once, so a change made while it opened is looked at. An opening
-    /// that fails pauses as long as it took.
-    pub fn next(&mut self, within: Option<Duration>, settle: Duration) {
+    /// that fails pauses as long as it took. What it read, each frame's JSON, is its answer (a session's
+    /// admission's word on a message among them: [`Watch::heard`]).
+    pub fn next(&mut self, within: Option<Duration>, settle: Duration) -> Vec<Value> {
+        let mut said = Vec::new();
         if self.sock.is_none() {
             let began = Instant::now();
             match self.open() {
                 Ok(s) => self.sock = Some(s),
                 Err(_) => std::thread::sleep(began.elapsed()),
             }
-            return;
+            return said;
         }
         if within.is_some_and(|w| w.is_zero()) {
-            return;
+            return said;
         }
-        let Some(s) = self.sock.as_mut() else { return };
+        let Some(s) = self.sock.as_mut() else { return said };
         // A frame within `t` (none: no bound), each read with its own bound: a frame that began is
         // read whole, with none.
-        let read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
+        let mut read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
             s.set_read_timeout(t)?;
-            frame_or_quiet(s)
+            let Some(payload) = frame_or_quiet(s)? else { return Ok(false) };
+            if let Ok(v) = serde_json::from_slice::<Value>(&payload) {
+                said.push(v);
+            }
+            Ok(true)
         };
         let ended = match read(s, within) {
             Ok(true) => {
@@ -908,6 +917,7 @@ impl Wake {
         if ended {
             self.sock = None;
         }
+        said
     }
 
     fn open(&self) -> anyhow::Result<std::net::TcpStream> {
@@ -919,15 +929,15 @@ impl Wake {
     }
 }
 
-/// One WebSocket frame off `s`, the server's (unmasked): `true` one came; `false` none began within
-/// its read timeout, so nothing of one was read and the socket stays whole; an error: it ended or
-/// broke. A frame that began is read whole, its sender writing it whole.
-pub fn frame_or_quiet(s: &mut std::net::TcpStream) -> anyhow::Result<bool> {
+/// One WebSocket frame off `s`, the server's (unmasked): its payload where one came; none where none
+/// began within its read timeout, so nothing of one was read and the socket stays whole; an error: it
+/// ended or broke. A frame that began is read whole, its sender writing it whole.
+pub fn frame_or_quiet(s: &mut std::net::TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
     let mut first = [0u8; 1];
     match s.read(&mut first) {
         Ok(0) => anyhow::bail!("the socket ended"),
         Ok(_) => {}
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(false),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
         Err(e) => return Err(e.into()),
     }
     s.set_read_timeout(None)?;
@@ -937,8 +947,7 @@ pub fn frame_or_quiet(s: &mut std::net::TcpStream) -> anyhow::Result<bool> {
         127 => common::agents::take(s, 8)?.iter().fold(0usize, |a, b| (a << 8) | usize::from(*b)),
         n => usize::from(n),
     };
-    common::agents::take(s, len)?;
-    Ok(true)
+    Ok(Some(common::agents::take(s, len)?))
 }
 
 /// What a server's answer other than the one looked for says: a refusal at its word (a client error,
@@ -1212,6 +1221,9 @@ pub enum Stall {
     Stuck(Stuck),
     /// No progress for a whole window as long as the slowest answer its harness gave in this drive.
     Quiet { quiet: Duration, slowest: Duration },
+    /// Its message waits in kiln's queue (its delivery `queued`, or in the queue) on an idle session for
+    /// a whole window, and no cause kiln states applies to it ([`holds`]): kiln never hands it over.
+    DeliveryStuck { message: String, quiet: Duration, slowest: Duration },
 }
 
 impl std::fmt::Display for Stall {
@@ -1219,6 +1231,10 @@ impl std::fmt::Display for Stall {
         match self {
             Self::Stuck(s) => std::fmt::Display::fmt(s, f),
             Self::Quiet { quiet, slowest } => write!(f, "no progress for {quiet:?}, a whole window as long as its slowest answer in this drive ({slowest:?})"),
+            Self::DeliveryStuck { message, quiet, slowest } => write!(
+                f,
+                "delivery stuck: {message} waits in kiln's queue on an idle session, and no cause kiln states applies to it (admission's own wait on it, a room wait, a pause, a freeze), for {quiet:?}, a whole window as long as its slowest answer in this drive ({slowest:?})"
+            ),
         }
     }
 }
@@ -1243,9 +1259,12 @@ impl std::error::Error for Refused {}
 /// What a drive has learned of its harness's answers: the slowest so far, each one whole wait from the
 /// drive's ask to its answer; none before its first, the drive's cold start. The one value its waits
 /// are bounded by: nothing is picked, seeded or carried over from another run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct Pace {
     slowest: Option<Duration>,
+    /// Each session's feed ([`Wake::session`]), held from its first wait until it's ended: what kiln
+    /// says of a message the drive sends between waits (admission's word on it) is heard by the next.
+    feeds: std::collections::BTreeMap<String, Wake>,
 }
 
 /// What a look at a session tells its wait.
@@ -1255,8 +1274,9 @@ pub enum Verdict {
     Done,
     /// Its answer may still come.
     Wait,
-    /// kiln holds what it was asked in its custody (its queue), and why where kiln says: a hold, which
-    /// the window doesn't run through (R03: a host's hold is said as held, and the wait goes on).
+    /// kiln holds what it was asked in its custody for a cause it states of it ([`holds`]), said: a
+    /// hold, which the window doesn't run through (R03: a host's hold is said as held, and the wait goes
+    /// on).
     Held(String),
     /// It won't.
     Refuse(Stall),
@@ -1278,6 +1298,38 @@ const TOLD_FIELDS: [&str; 21] = [
 /// it (2026-11-13), whole where shorter.
 const TOLD: usize = 80;
 
+/// kiln's admission's word on each message it was offered, as the session's feed says it: each
+/// `mail_flow` frame (`harness::admission::FlowEvent`, `wire::ui::SessionFrame::MailFlow`) with the
+/// message's publication, whose id is the message's. The latest word on each message, by its id. The
+/// admission capacity kiln's word on a session carries names no message and states no cause.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Admission {
+    said: std::collections::BTreeMap<String, Value>,
+}
+
+impl Admission {
+    /// A frame of the session's feed: a `mail_flow` frame naming its message's publication is
+    /// admission's latest word on that message; any other frame says nothing of admission.
+    pub fn heard(&mut self, frame: &Value) {
+        if frame.get("t").and_then(Value::as_str) != Some("mail_flow") {
+            return;
+        }
+        if let (Some(id), Some(event)) = (frame.pointer("/publication/id").and_then(Value::as_str), frame.get("event")) {
+            self.said.insert(id.to_owned(), event.clone());
+        }
+    }
+
+    /// Admission's own wait cause for message `client` (`harness::admission::WaitCause`), where its
+    /// latest word on it is a wait. None: it said nothing of it, or not a wait.
+    pub fn waits(&self, client: &str) -> Option<&str> {
+        let said = self.said.get(client)?;
+        if said.get("event").and_then(Value::as_str) != Some("waiting") {
+            return None;
+        }
+        said.get("cause").and_then(Value::as_str)
+    }
+}
+
 /// One wait's memory of its looks at its session ([`Watch::look`]).
 #[derive(Debug, Clone)]
 pub struct Watch<'a> {
@@ -1290,11 +1342,19 @@ pub struct Watch<'a> {
     /// An end of its harness's that kiln had set no restart for yet: its `exit.at`, and kiln's word's
     /// time (`last_activity`) when it was seen.
     end: Option<(i64, i64)>,
+    /// kiln's admission's word on each message, from the session's feed ([`Watch::heard`]).
+    admission: Admission,
 }
 
 impl<'a> Watch<'a> {
     pub fn new(asked: Asked<'a>, window: Option<Duration>) -> Self {
-        Self { asked, window, seen: None, moved: Duration::ZERO, end: None }
+        Self { asked, window, seen: None, moved: Duration::ZERO, end: None, admission: Admission::default() }
+    }
+
+    /// A frame of the session's feed, as the wait's socket read it ([`Wake::next`]): admission's word
+    /// on a message, where it is one ([`Admission::heard`]).
+    pub fn heard(&mut self, frame: &Value) {
+        self.admission.heard(frame);
     }
 
     /// The message the wait asked for an answer to, by what [`is_message`] takes: none for a stop and
@@ -1318,7 +1378,9 @@ impl<'a> Watch<'a> {
     /// A look at kiln's word on the session (`info`), its timeline (`events`) and, where
     /// [`Watch::wants_state`] asked for it, its state (`state`), `at` after the wait began, `done` its
     /// caller's condition of them: done; refused at once where kiln's word says no answer can come;
-    /// refused where a window is known and nothing that moves moved for a whole one; else it waits on.
+    /// where a window is known and nothing that moves moved for a whole one, held where a cause kiln
+    /// states applies to its message ([`holds`]), else refused: delivery stuck where its message waits in
+    /// kiln's queue on an idle session, quiet otherwise; else it waits on.
     pub fn look(&mut self, info: &Value, events: &[Value], state: Option<&Value>, done: bool, at: Duration) -> Verdict {
         if done {
             return Verdict::Done;
@@ -1334,16 +1396,16 @@ impl<'a> Watch<'a> {
             self.seen = Some(now);
         }
         let quiet = at.saturating_sub(self.moved);
-        match self.window {
-            Some(slowest) if quiet > slowest => match self.message(info).and_then(|m| holds(info, events, state, &m)) {
-                // kiln's custody of it is kiln's progress on it: the window starts again.
-                Some(why) => {
-                    self.moved = at;
-                    Verdict::Held(why)
-                }
-                None => Verdict::Refuse(Stall::Quiet { quiet, slowest }),
-            },
-            _ => Verdict::Wait,
+        let Some(slowest) = self.window.filter(|w| quiet > *w) else { return Verdict::Wait };
+        let message = self.message(info);
+        // kiln holding it, for a cause it states of it, is kiln's progress on it: the window starts again.
+        if let Some(why) = message.as_deref().and_then(|m| holds(info, events, state, &self.admission, m)) {
+            self.moved = at;
+            return Verdict::Held(why);
+        }
+        match message.map(|m| client_of(events, &m)).filter(|client| status(info) == "idle" && state.is_some_and(|s| in_queue(s, client))) {
+            Some(message) => Verdict::Refuse(Stall::DeliveryStuck { message, quiet, slowest }),
+            None => Verdict::Refuse(Stall::Quiet { quiet, slowest }),
         }
     }
 
@@ -1451,19 +1513,34 @@ fn answered_in(state: &Value, client: &str) -> bool {
     delivery.is_some_and(|d| d.get(client).is_some_and(over) && d.values().all(over)) && state.get("queue").and_then(Value::as_array).is_none_or(Vec::is_empty)
 }
 
-/// What holds message `m` (a client id, or words its message carries) in kiln's custody, where the
-/// session's `state` says kiln holds it: its delivery `queued`, or it waits in kiln's queue. Said with
-/// what kiln says of its holding where it says (its admission, room, pause, freeze). None: not held.
-pub fn holds(info: &Value, events: &[Value], state: Option<&Value>, m: &str) -> Option<String> {
-    let state = state?;
-    let client = events.iter().find(|e| is_message(e, m)).and_then(|e| e.get("client_id")).and_then(Value::as_str).unwrap_or(m);
-    let queued = state.get("delivery").and_then(|d| d.get(client)).and_then(Value::as_str) == Some("queued");
-    let waits = state.get("queue").and_then(Value::as_array).into_iter().flatten().any(|q| q.get("id").and_then(Value::as_str) == Some(client));
-    if !(queued || waits) {
+/// The client id kiln keeps message `m` (a client id, or words its message carries) under: its
+/// timeline's, where it shows there; else `m`.
+fn client_of(events: &[Value], m: &str) -> String {
+    events.iter().find(|e| is_message(e, m)).and_then(|e| e.get("client_id")).and_then(Value::as_str).unwrap_or(m).to_owned()
+}
+
+/// Whether the session's `state` has message `client` in kiln's queue: its delivery `queued`, or it
+/// waits in the queue.
+fn in_queue(state: &Value, client: &str) -> bool {
+    state.get("delivery").and_then(|d| d.get(client)).and_then(Value::as_str) == Some("queued") || state.get("queue").and_then(Value::as_array).into_iter().flatten().any(|q| q.get("id").and_then(Value::as_str) == Some(client))
+}
+
+/// What holds message `m` (a client id, or words its message carries) in kiln's custody: a cause kiln
+/// states that applies to it, said. Admission's own wait on it with its cause, as the session's feed
+/// says it ([`Admission`]); or, where the session's `state` has it in kiln's queue ([`in_queue`]), the
+/// session's room wait, pause or freeze, each holding all its queue, as kiln's word on it (`info`) says.
+/// Never the admission capacity kiln's word carries, which names no message and states no cause. None:
+/// no cause kiln states holds it.
+pub fn holds(info: &Value, events: &[Value], state: Option<&Value>, admission: &Admission, m: &str) -> Option<String> {
+    let client = client_of(events, m);
+    if let Some(cause) = admission.waits(&client) {
+        return Some(format!("{client} held by kiln's admission: {cause}"));
+    }
+    if !in_queue(state?, &client) {
         return None;
     }
-    let why: Vec<String> = ["admission", "room_wait", "pause", "frozen"].iter().filter_map(|key| info.get(*key).filter(|v| !v.is_null()).map(|v| format!("{key} {v}"))).collect();
-    Some(if why.is_empty() { format!("{client} queued in kiln's queue") } else { format!("{client} queued in kiln's queue; {}", why.join(", ")) })
+    let why: Vec<String> = ["room_wait", "pause", "frozen"].iter().filter_map(|key| info.get(*key).filter(|v| !v.is_null()).map(|v| format!("{key} {v}"))).collect();
+    (!why.is_empty()).then(|| format!("{client} in kiln's queue; {}", why.join(", ")))
 }
 
 /// What of a session moves as its harness and kiln work on it: kiln's word on it ([`MOVES`]) and its
@@ -1557,11 +1634,12 @@ impl Pace {
     /// Waits on session `id` until `done` holds of kiln's word on it and its timeline, following its
     /// harness ([`Watch`]): the time its answer took is learned; refused, typed ([`Refused`]), where
     /// kiln's word says no answer can come, or once a whole window passes without progress where the
-    /// drive has learned one ([`Pace::window`]).
+    /// drive has learned one ([`Pace::window`]). It wakes on the session's feed, whose frames it hears
+    /// ([`Watch::heard`]), kept for the session's next wait.
     pub fn until(&mut self, f: &Fixture, id: &str, asked: Asked<'_>, what: &str, done: impl Fn(&Value, &[Value]) -> bool) -> anyhow::Result<(Value, Vec<Value>)> {
         let began = Instant::now();
         let mut watch = Watch::new(asked, self.window(asked));
-        let mut wake = Wake::session(f, id);
+        let mut wake = self.feeds.remove(id).unwrap_or_else(|| Wake::session(f, id));
         let mut said_held = String::new();
         loop {
             let looked = Instant::now();
@@ -1571,21 +1649,29 @@ impl Pace {
             // Its state read only where kiln's word says it may have answered, or its window runs out;
             // unread, it says nothing.
             let state = if !held && watch.wants_state(&i, &e, at) { state_of(f, id).ok() } else { None };
-            match watch.look(&i, &e, state.as_ref(), held, at) {
+            let verdict = watch.look(&i, &e, state.as_ref(), held, at);
+            if let Verdict::Held(why) = &verdict
+                && *why != said_held
+            {
+                // Said as held, once a hold: the wait goes on.
+                eprintln!("{what}: held by kiln, the wait going on: {why}");
+                said_held.clone_from(why);
+            }
+            match verdict {
                 Verdict::Done => {
                     self.answered(began.elapsed());
+                    self.feeds.insert(id.to_owned(), wake);
                     return Ok((i, e));
                 }
-                Verdict::Wait => wake.next(watch.left(began.elapsed()), looked.elapsed()),
-                Verdict::Held(why) => {
-                    // Said as held, once a hold: the wait goes on.
-                    if why != said_held {
-                        eprintln!("{what}: held by kiln, the wait going on: {why}");
-                        said_held = why;
+                Verdict::Wait | Verdict::Held(_) => {
+                    for frame in wake.next(watch.left(began.elapsed()), looked.elapsed()) {
+                        watch.heard(&frame);
                     }
-                    wake.next(watch.left(began.elapsed()), looked.elapsed());
                 }
-                Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &e)),
+                Verdict::Refuse(stall) => {
+                    self.feeds.insert(id.to_owned(), wake);
+                    return Err(refused(f, id, what, stall, &i, &e));
+                }
             }
         }
     }
@@ -1607,16 +1693,20 @@ impl Pace {
             let i: Value = serde_json::from_str(&body)?;
             match watch.look(&i, &[], None, false, began.elapsed()) {
                 Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &[])),
-                Verdict::Done | Verdict::Wait | Verdict::Held(_) => wake.next(watch.left(began.elapsed()), looked.elapsed()),
+                Verdict::Done | Verdict::Wait | Verdict::Held(_) => {
+                    wake.next(watch.left(began.elapsed()), looked.elapsed());
+                }
             }
         }
     }
 
-    /// Ends session `id` (the API's DELETE), and waits until kiln lists it no more ([`Pace::unlisted`]).
+    /// Ends session `id` (the API's DELETE), and waits until kiln lists it no more ([`Pace::unlisted`]);
+    /// its feed goes with it.
     pub fn stop(&mut self, f: &Fixture, id: &str) -> anyhow::Result<()> {
         // Longer than the server waits for its runner's answer (`hub::COMMAND_WITHIN`).
         let (code, body) = common::http_within(f.port, "DELETE", &format!("/api/harness/sessions/{id}"), &f.admin, None, Duration::from_secs(75))?;
         anyhow::ensure!(code == 204, "ending {id}: {code} {body}");
+        self.feeds.remove(id);
         self.unlisted(f, id, &format!("ending {id}"))
     }
 }

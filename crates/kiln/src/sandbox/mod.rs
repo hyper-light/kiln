@@ -13,12 +13,14 @@
 //!   provider's or sign-in's destinations alone, else its image's whole and why.
 //! - [`image`]: what its microVM is made from: its Agentfile's image, built by the carried `shards`
 //!   once for each content, pinned by its digest.
+//! - [`hexvm`]: the machine's microVMs through Hex: each launch a Shards image box, its harness member driven.
 //! - [`held`]: a boundary's run as the `Duplex` a session drives its harness through, so a session's
 //!   loop and its adapter treat a microVM's member as they treat a process of the machine's.
 
 #[cfg(test)]
 pub mod fake;
 pub mod held;
+pub mod hexvm;
 pub mod host;
 pub mod image;
 pub mod isolated;
