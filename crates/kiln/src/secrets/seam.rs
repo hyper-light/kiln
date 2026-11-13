@@ -155,7 +155,7 @@ impl Secrets for KilnSecrets {
         }
         let name = name.to_owned();
         self.call(move |hub, c, now| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             purge(&tx, &name, now)?;
             if tx.query_row("SELECT 1 FROM seam_secrets WHERE name = ?1", [&name], |_| Ok(())).optional()?.is_some() {
                 return Ok(Err(Refusal::Exists(name)));
@@ -176,7 +176,7 @@ impl Secrets for KilnSecrets {
         }
         let name = name.to_owned();
         self.call(move |hub, c, now| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             if let Err(e) = live(&tx, &name, now)? {
                 return Ok(Err(e));
             }
@@ -214,7 +214,7 @@ impl Secrets for KilnSecrets {
     fn promote<'a>(&'a self, name: &'a str, id: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
         let (name, id) = (name.to_owned(), id.to_owned());
         self.call(move |_, c, now| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             if let Err(e) = live(&tx, &name, now)? {
                 return Ok(Err(e));
             }
