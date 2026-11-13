@@ -163,13 +163,45 @@ Every agent session's processes are held together by the system where it can (`c
 |---|---|---|
 | Linux with cgroup v2 the runner may write (a systemd user unit, a container with its own cgroup namespace) | a cgroup of its own, `kiln-agents/<session>` under the runner's (`kiln-agents-<pid>/<session>` for a runner its supervisor didn't start, such as a test's or a lab's, which may run in another runner's cgroup) | its harness joins it between fork and exec, so nothing it starts leaves it by forking, `setsid` or a double fork; its processes are its `cgroup.procs`; whose a process is, one read of `/proc/<pid>/cgroup`; ending them all, one write to `cgroup.kill` |
 | Windows | a job object of its own, `Local\kiln-agent-<session>` | its harness is created suspended, put in the job, then let run; the job lists its processes, says whether it holds one, and ends them all; it ends with the runner, as every job kiln makes |
-| macOS | followed fork by fork | its harness is watched with kqueue; whenever one of its processes forks, the children are listed and watched too; once a minute the user's processes are looked at for the agent's mark, for one that left between a fork and its listing |
+| macOS | followed fork by fork | its harness is watched with kqueue; whenever one of its processes forks, the children are listed and watched too; once a minute, and as the agent ends, the user's processes are looked at for one that left between a fork and its listing: in a process group or session one of the agent's processes made, or carrying the agent's mark |
 
 Every harness kiln starts also carries `KILN_AGENT=<session id>` in its environment, and so does
 every process it starts, however it's parented later: where the system holds nothing together
 (cgroup v1, a read-only cgroup filesystem, a cgroup another user owns), and for sessions whose
 harness started before the runner had groups, that mark is how their processes are found, which
-takes looking at every process on the machine. The runner logs how it holds them as it starts
+takes looking at every process on the machine.
+
+On macOS that mark can't always be read. macOS 26 (measured on 26.4.1) shows no environment of
+Apple's own programs (`/bin/sh`, `/bin/zsh`, `/bin/sleep`, `/usr/bin/ssh`, `/usr/bin/ssh-agent`,
+`/usr/bin/perl`, git's helpers: `ps -E`, `KERN_PROCARGS2`), started with `KILN_AGENT` or not, while
+Homebrew's programs show theirs. So there a process is also the agent's when it is in a process
+group or session one of the agent's processes made: its harness's (kiln starts every harness as a
+process group of its own), or a tool's shell's (Claude Code makes each a session of its own). Each
+is named by the pid of the process that made it, and the process stays in both, however it's
+parented, until it calls setpgid(2) or setsid(2):
+
+- getpgid(2) and getsid(2) answer for any process, to any (XNU `bsd/kern/kern_prot.c`), and nothing
+  joins a group from another session (setpgid(2): `EPERM`) or joins another's session at all, so
+  unlike the mark, no process outside the agent's can claim it: what signs as an agent is told by it
+  too (W27-R03).
+- XNU gives no new process, group or session the id of a group or session any process is still in
+  (`bsd/kern/kern_fork.c`, its pid's allocation, which also goes up one by one to `PID_MAX`
+  before it wraps), so a group or session is the agent's while anything is in it, after its maker
+  ended. The runner forgets one once its sweep finds nothing in it.
+- After a runner restart, the groups and sessions are those its record of each session says its
+  harness and what ran under it made; one of those that runs now as another process (another
+  start) made nothing of the session's. Only a recorded process that ended and whose pid came
+  round again (past `PID_MAX`) before the runner looked could name another's.
+
+What this leaves: a process that forks and calls setsid(2) at once while its parent ends (daemon(3),
+which `ssh -f` and `ssh-agent` call; Python's `start_new_session`, Node's `detached`) before kqueue's
+fork shows it to the runner. Its group and session are its own, and on macOS 26 an Apple program's
+mark can't be read, so it's found only when the fork was seen. Nothing public says whose such a
+process is: the audit session id (`getaudit_addr(2)`) reads only one's own, and the parent's unique
+id a process records (`p_puniqueid`) is reset to launchd's as it's reparented (XNU
+`bsd/kern/kern_proc.c`). `nohup … &` and `sh -c '… &'` call neither and stay the agent's.
+
+The runner logs how it holds them as it starts
 (`agents' processes are held together by`). Only the runner and the server, which start agents,
 hold them together: a test or a tool that links kiln and starts a harness leaves its processes
 where they are, so a test run in a kiln terminal makes no groups in the runner's cgroup. Where the

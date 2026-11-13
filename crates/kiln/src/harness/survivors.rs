@@ -168,8 +168,24 @@ fn ran_of(sys: &sysinfo::System, pid: sysinfo::Pid) -> Option<Ran> {
 
 /// The environment variable every harness kiln starts carries (its session's id), and so does
 /// everything it starts, however that's parented later (a command that daemonized, a shell that
-/// exited under what it left running).
+/// exited under what it left running). macOS 26 shows no environment of Apple's own programs
+/// (`/bin/sh`, `/bin/sleep`, `/usr/bin/ssh`), so there a process is also found by the process group
+/// and session it's in ([`made_by`]).
 pub const MARK: &str = "KILN_AGENT";
+
+/// Which of `leaders` made the process group or the session process `pid` is in, where one did: on macOS, where a
+/// process's mark can't be read, it's the session's of that leader however it's parented since, until it calls
+/// setpgid(2) or setsid(2) (`crate::os::contain::groups_of`). Never the runner's own (`host`) or launchd's. Elsewhere
+/// the mark is read, and this says nothing.
+#[cfg(target_os = "macos")]
+fn made_by(pid: u32, leaders: &HashSet<u32>, host: u32) -> Option<u32> {
+    crate::os::contain::groups_of(pid).into_iter().flatten().find(|id| *id != host && leaders.contains(id))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn made_by(_pid: u32, _leaders: &HashSet<u32>, _host: u32) -> Option<u32> {
+    None
+}
 
 /// The agent session process `pid` belongs to, of `sessions` (each with its harness's process):
 /// the one whose harness is that process or one of its ancestors, else the one its environment
@@ -190,8 +206,9 @@ pub fn session_of(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String
 }
 
 /// The agent session process `pid` belongs to by the process alone: its session's group of
-/// processes, else a harness among its ancestors. Never by its environment's mark, which any
-/// process can set: what signs as an agent asks this (W27-R03). Blocking.
+/// processes, else a process group or session its harness made (macOS: [`made_by`]; no process
+/// joins one from outside it), else a harness among its ancestors. Never by its environment's mark,
+/// which any process can set: what signs as an agent asks this (W27-R03). Blocking.
 pub fn session_by_process(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String> {
     use sysinfo::Pid;
     if sessions.is_empty() {
@@ -202,6 +219,12 @@ pub fn session_by_process(pid: u32, sessions: &[(String, Option<u32>)]) -> Optio
         && sessions.iter().any(|(s, _)| *s == id)
     {
         return Some(id);
+    }
+    let harnesses: HashSet<u32> = sessions.iter().filter_map(|(_, h)| *h).collect();
+    if let Some(h) = made_by(pid, &harnesses, std::process::id())
+        && let Some((id, _)) = sessions.iter().find(|(_, s)| *s == Some(h))
+    {
+        return Some(id.clone());
     }
     let sys = system(None);
     let mut at = Pid::from_u32(pid);
@@ -240,6 +263,14 @@ pub struct Seen {
 /// (`crate::os::contain`) is what's in its group, and only those processes are looked at; one
 /// without is found by its mark, which takes looking at every process on the machine.
 pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
+    scan_known(sessions, &HashMap::new())
+}
+
+/// [`scan`], with what each session was last seen running (`known`: its harness and what ran under it, as its record
+/// keeps them): on macOS, a session without a group of processes is also what's in a process group or session its
+/// harness, a process under it, or one of those it was seen running made ([`made_by`]). One of those that runs now
+/// as another process (another start) made nothing of the session's.
+pub fn scan_known(sessions: &[(String, Option<u32>)], known: &HashMap<String, Vec<Ran>>) -> HashMap<String, Seen> {
     use sysinfo::Pid;
     if sessions.is_empty() {
         return HashMap::new();
@@ -255,6 +286,7 @@ pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
     };
     let mut kids: HashMap<Pid, Vec<Pid>> = HashMap::new();
     let mut marked: HashMap<String, Vec<Pid>> = HashMap::new();
+    let host = std::process::id();
     let wanted: HashSet<&str> = sessions.iter().map(|(id, _)| id.as_str()).filter(|id| !groups.contains_key(id)).collect();
     let prefix = format!("{MARK}=");
     for (pid, p) in sys.processes() {
@@ -300,7 +332,15 @@ pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
                 }
             }
             let me = harness.map(Pid::from_u32);
-            for pid in marked.get(id).into_iter().flatten() {
+            // Without a group, what's in a process group or session one of its processes made is its too.
+            let mut theirs: Vec<Pid> = marked.get(id).cloned().unwrap_or_default();
+            if marks && !groups.contains_key(id.as_str()) && cfg!(target_os = "macos") {
+                let then = known.get(id).into_iter().flatten().filter(|r| sys.process(Pid::from_u32(r.pid)).is_none_or(|p| p.start_time() == r.started)).map(|r| r.pid);
+                let leaders: HashSet<u32> = harness.iter().copied().chain(below.iter().map(|p| p.as_u32())).chain(then).collect();
+                let had: HashSet<Pid> = theirs.iter().copied().collect();
+                theirs.extend(sys.processes().keys().copied().filter(|p| !had.contains(p) && made_by(p.as_u32(), &leaders, host).is_some()));
+            }
+            for pid in &theirs {
                 if Some(*pid) == me || below.contains(pid) || skip(*pid) {
                     continue;
                 }
