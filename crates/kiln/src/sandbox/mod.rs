@@ -6,8 +6,9 @@
 //!   refuses them typed.
 //! - The machine's microVMs ([`microvm`]): an isolated agent's harness runs as a member of its
 //!   Agentfile's image in a microVM of its own (Shards' D231), through Hex; its stdio are the
-//!   member's streams. This kiln carries their runtime once step 16's Shards and Hex are wired in;
-//!   until then a machine holds no isolated agent, and refuses one rather than run it as a process.
+//!   member's streams. A kiln that carries Shards holds them ([`hold`]: Hex's image runtime under
+//!   kiln's state, [`hexvm`]); one that carries none holds no isolated agent, and refuses one rather
+//!   than run it as a process.
 //! - [`isolated`]: an isolated session's launch, its image, and what it can't do yet.
 //! - [`narrow`]: what its microVM reaches past it, of what its image grants: its session's own
 //!   provider's or sign-in's destinations alone, else its image's whole and why.
@@ -40,13 +41,94 @@ use kiln_seams::sandbox::{Exit, Link, Output, Refusal, Run, Signal};
 pub struct Microvms {
     pub sandbox: Arc<dyn Sandbox>,
     pub images: image::Images,
+    /// The sandbox as Hex's, where it is: what launches a run in the box placement named for it.
+    pub hex: Option<Arc<hexvm::HexVms>>,
+    /// The carried Shards they run, written out and held as long as they are (`crate::shards::write_out`).
+    shards: Option<crate::shards::Held>,
 }
 
-/// The microVMs this machine holds isolated agents' harnesses in: none until this kiln carries their
-/// runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16's Shards and Hex, wired here by step
-/// 17's next slice).
+impl Microvms {
+    /// Runs in `sandbox`, booting `images`: a stand-in's, launched as the seam launches.
+    pub fn new(sandbox: Arc<dyn Sandbox>, images: image::Images) -> Self {
+        Self { sandbox, images, hex: None, shards: None }
+    }
+
+    /// `launch` in a microVM of its own: in box `name` where placement named one for its run (its reservation's,
+    /// `Holder::box_of`) and its sandbox is Hex's; else named as its sandbox names one (placement's numbering).
+    pub async fn launch(&self, name: Option<kiln_ci::place::holder::BoxName>, launch: kiln_seams::sandbox::Launch) -> Result<Box<dyn Run>, Refusal> {
+        match (&self.hex, name) {
+            (Some(hex), Some(name)) => hex.launch_as(name, launch).await,
+            _ => self.sandbox.launch(launch).await,
+        }
+    }
+}
+
+/// The machine's microVMs held under kiln's `state` through Hex, the carried `shards` (`shards`) running them
+/// (#73 part 7): Hex's image runtime, its boxes' records in `<state>/hex-records`, Shards' home and cache beneath
+/// kiln's state ([`shards_home`], `<state>/shards-cache`), its images built there (in `<state>/shards-builds`), each
+/// launch's box named by placement's numbering ([`box_name`]), each run's charge kept in `ledger` ([`of_hex`]).
+/// Nothing boots until a launch. Blocking.
+pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Option<Arc<dyn kiln_seams::Records>>) -> anyhow::Result<Microvms> {
+    let state = std::path::absolute(state)?;
+    let paths = shards_api::RuntimePaths::new(state.join("shards-cache"), shards_home(&state)).map_err(|r| anyhow::anyhow!("Shards' home and cache beneath {}: {r:?}", state.display()))?;
+    let runtime = hex_node::images::ImageRuntime::new(shards.clone(), paths, &state.join("hex-records")).map_err(|r| anyhow::anyhow!("Hex's image runtime under {}: {r}", state.display()))?;
+    let images = image::Images::new(shards, shards_home(&state), state.join("shards-builds"));
+    Ok(of_hex(hexvm::HexVms::new(runtime, box_name), images, ledger))
+}
+
+/// The machine's microVMs as `hex` holds them, booting `images`: each run's charge kept in `ledger` as it ends (the
+/// reach node's records, `hexvm::USE`; #73 part 7 slice 3), where there are any.
+pub fn of_hex(hex: hexvm::HexVms, images: image::Images, ledger: Option<Arc<dyn kiln_seams::Records>>) -> Microvms {
+    let hex = Arc::new(match ledger {
+        Some(ledger) => hex.with_ledger(ledger),
+        None => hex,
+    });
+    Microvms { sandbox: Arc::clone(&hex) as Arc<dyn Sandbox>, images, hex: Some(hex), shards: None }
+}
+
+/// The group placement reads run `run`'s use from, launched in `vms`: its VM's meter, where Hex holds it
+/// (`reach::place::Group::Hex`, #73 part 7 slice 3); none for another sandbox's run, or one let go of.
+pub fn group_of(vms: &Microvms, run: &dyn Run) -> Option<crate::reach::place::Group> {
+    let meter = vms.hex.as_ref()?.meter(&run.id()?)?;
+    Some(crate::reach::place::Group::Hex(meter))
+}
+
+/// The name of a launch's box no start here named: placement's numbering of this process's boxes that reserve nothing
+/// (`reach::node::Handle::unreserved_box`, its holding's own where it holds through a keeper); none where placement
+/// isn't running.
+fn box_name() -> Option<kiln_ci::place::holder::BoxName> {
+    crate::reach::node::global().map(crate::reach::node::Handle::unreserved_box)
+}
+
+/// The microVMs this process holds, once [`hold`] held them.
+static HELD: std::sync::OnceLock<Arc<Microvms>> = std::sync::OnceLock::new();
+
+/// The microVMs this machine holds isolated agents' harnesses in: those [`hold`] held, where this kiln carries their
+/// runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 16 and 17); else none.
 pub fn microvm() -> Option<Arc<Microvms>> {
-    None
+    HELD.get().cloned()
+}
+
+/// This machine's microVMs, held under kiln's `state` from now on, where this kiln carries Shards: it written out
+/// beneath `state` (`crate::shards::write_out`) and held, then [`held_in`], each run's charge kept in `ledger`. None
+/// where it carries none. The first held is this process's ([`microvm`], its facts' `virt.microvm`).
+pub async fn hold(state: &std::path::Path, ledger: Option<Arc<dyn kiln_seams::Records>>) -> anyhow::Result<Option<Arc<Microvms>>> {
+    if let Some(held) = HELD.get() {
+        return Ok(Some(Arc::clone(held)));
+    }
+    if !crate::shards::carried() {
+        return Ok(None);
+    }
+    let state = state.to_path_buf();
+    let vms = crate::rt::blocking(move || -> anyhow::Result<Microvms> {
+        let shards = crate::shards::write_out(&state)?;
+        let mut vms = held_in(&state, shards.shards.clone(), ledger)?;
+        vms.shards = Some(shards);
+        Ok(vms)
+    })
+    .await??;
+    let vms = Arc::new(vms);
+    Ok(Some(Arc::clone(HELD.get_or_init(|| vms))))
 }
 
 /// Where a runner keeps its microVMs' Shards home (`SHARDS_HOME`: the store their images are built
@@ -65,8 +147,13 @@ pub type Facts = kiln_ci::facts::Isolation;
 
 /// This machine's isolation facts: whether it holds isolated agents, on what, and why not.
 pub fn facts(kvm: bool) -> Facts {
+    facts_of(kvm, microvm().as_deref())
+}
+
+/// The isolation facts of a machine holding isolated agents in `held`, or in none.
+pub fn facts_of(kvm: bool, held: Option<&Microvms>) -> Facts {
     let hypervisor = hypervisor(kvm);
-    match microvm() {
+    match held {
         Some(_) => Facts { available: true, hypervisor, why_not: None },
         None => Facts { available: false, hypervisor, why_not: Some(NO_MICROVM.to_owned()) },
     }
@@ -223,5 +310,60 @@ mod tests {
         assert_eq!(with_kvm.why_not.as_deref(), Some(super::NO_MICROVM));
         assert_eq!(with_kvm.hypervisor.as_deref(), cfg!(target_os = "linux").then_some("KVM"));
         assert_eq!(super::facts(false).hypervisor, None);
+    }
+
+    /// #73 part 7 slice 2 (step 17): a runner whose kiln carries Shards holds its isolated agents' harnesses in Hex's
+    /// microVMs, the sandbox `HexVms` over Hex's image runtime (its records, Shards' home and cache beneath kiln's
+    /// state), and its facts say it holds them (`virt.microvm` is their `available`). No VM boots.
+    #[test]
+    fn s17_p7_a_carrying_runner_holds_harnesses_in_hex_and_says_so() -> anyhow::Result<()> {
+        let state = tempfile::tempdir()?;
+        let vms = super::held_in(state.path(), state.path().join("shards"), None)?;
+        anyhow::ensure!(vms.hex.is_some(), "its sandbox isn't Hex's");
+        anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == super::hexvm::HOLDS, "its sandbox isn't HexVms");
+        anyhow::ensure!(state.path().join("hex-records").join("state").exists(), "Hex keeps no records beneath kiln's state");
+        let facts = super::facts_of(true, Some(&vms));
+        anyhow::ensure!(facts.available && facts.why_not.is_none(), "{facts:?}");
+        crate::rt::block_on(async move {
+            let (sink, _updates) = async_channel::unbounded::<(String, crate::harness::core::Update)>();
+            let host = crate::harness::host::Host::new(sink, None, crate::harness::host::Limits::default());
+            host.hold_isolated_in(vms);
+            anyhow::ensure!(host.microvm().is_some_and(|m| m.hex.is_some()), "its harness host holds them elsewhere");
+            Ok(())
+        })
+    }
+
+    /// #73 part 7 slices 2 and 3: a run launched in the box placement holds for it is grouped for placement by its
+    /// VM's meter (`Group::Hex`), and its charge is kept in the ledger the machine's microVMs were given (the reach
+    /// node's records) as it ends. Over Hex's simulator: no VM boots.
+    #[test]
+    fn s17_p7_a_started_runs_group_is_hexs_meter_and_its_charge_is_kept() -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        use kiln_ci::place::holder::BoxName;
+        use kiln_seams::Records as _;
+        use kiln_seams::sandbox::{Boundary, Egress, Launch, Limits, Refusal};
+        use super::hexvm::tests::Metered;
+        crate::rt::block_on(async {
+            let state = tempfile::tempdir()?;
+            let rt = Arc::new(Metered::default());
+            let records = Arc::new(kiln_seams::records::SimRecords::new());
+            let hex = super::hexvm::HexVms::new(Arc::<Metered>::clone(&rt), || None);
+            let images = super::image::Images::new(state.path().join("shards"), state.path().join("home"), state.path().join("builds"));
+            let vms = super::of_hex(hex, images, Some(Arc::<kiln_seams::records::SimRecords>::clone(&records) as Arc<dyn kiln_seams::Records>));
+            let launch = Launch { limits: Limits::NONE, egress: Egress::Only(Vec::new()), folder: Some("/work/project".into()), boundary: Boundary::MicroVm { image: hex_api::sim::SIM_IMAGE.to_owned() }, ..Launch::of("claude", &[]) };
+            let reserved = BoxName::Reserved(hex_api::capacity::ReservationId { epoch: 3, seq: 9 });
+            let run = vms.launch(Some(reserved), launch.clone()).await?;
+            anyhow::ensure!(run.id().as_deref() == Some("kiln-r3-9"), "its box isn't placement's: {:?}", run.id());
+            let group = super::group_of(&vms, run.as_ref());
+            anyhow::ensure!(matches!(&group, Some(crate::reach::place::Group::Hex(m)) if format!("{m:?}") == "Meter(\"kiln-r3-9\")"), "{group:?}");
+            run.kill();
+            while run.next().await.is_some() {}
+            let kept = records.get(super::hexvm::USE, b"kiln-r3-9", kiln_seams::records::Consistency::Linearizable).await?;
+            anyhow::ensure!(kept.is_some(), "its charge wasn't kept in the ledger it was given");
+            let unnamed = vms.launch(None, launch).await.err();
+            anyhow::ensure!(matches!(&unnamed, Some(Refusal::Unsupported(why)) if why == super::hexvm::UNNAMED), "no placement here names its box: {unnamed:?}");
+            Ok(())
+        })
     }
 }
