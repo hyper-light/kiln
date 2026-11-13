@@ -2134,8 +2134,9 @@ mod lane_tests {
         }
     }
 
-    /// A runner's reach node of its own, alone: no server, no peers.
-    fn node(dir: &std::path::Path) -> anyhow::Result<crate::reach::node::Handle> {
+    /// A runner's reach node of its own, alone: no server, no peers. What it would send its server
+    /// is kept, unread, as long as the test holds it.
+    fn node(dir: &std::path::Path) -> anyhow::Result<(crate::reach::node::Handle, crate::memory::queue::Receiver<crate::proto::AgentMsg>)> {
         let config = crate::reach::node::Config {
             name: "here".into(),
             dir: dir.join("reach"),
@@ -2151,7 +2152,7 @@ mod lane_tests {
             version: crate::reach::wire::VERSION,
             root: Vec::new(),
         };
-        Ok(crate::reach::node::start(config)?.0)
+        crate::reach::node::start(config)
     }
 
     /// One connection of an isolated session's lane, served in this process with no socket: its
@@ -2161,7 +2162,8 @@ mod lane_tests {
     #[test]
     fn step18_kilns_mcp_over_a_lane_is_answered_in_this_runners_process() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let here = crate::reach::local::Here { handle: node(dir.path())?, me: "here".into(), host: None, session: "lane-s1".into() };
+        let (handle, _to_server) = node(dir.path())?;
+        let here = crate::reach::local::Here { handle, me: "here".into(), host: None, session: "lane-s1".into() };
         let asked = [
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "lane", "version": "1"}}}),
             json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
@@ -2184,7 +2186,8 @@ mod lane_tests {
     #[test]
     fn step18_a_request_in_this_process_is_answered_as_the_socket_answers_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let here = crate::reach::local::Here { handle: node(dir.path())?, me: "here".into(), host: None, session: "lane-s2".into() };
+        let (handle, _to_server) = node(dir.path())?;
+        let here = crate::reach::local::Here { handle, me: "here".into(), host: None, session: "lane-s2".into() };
         let mut asked = here.ask();
         asked.send(&crate::reach::local::Req::Runners { want: None })?;
         anyhow::ensure!(matches!(asked.event()?, Some(crate::reach::local::Ev::Runners(_))), "no runners");
