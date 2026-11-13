@@ -176,12 +176,7 @@ fn step30_agentfiles_on_every_surface() -> anyhow::Result<()> {
 #[test]
 fn step35_a_start_names_only_an_agentfile_its_person_reaches() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let bin = dir.path().join("bin");
-    std::fs::create_dir_all(&bin)?;
-    std::fs::write(bin.join("shards"), SHARDS)?;
-    std::fs::set_permissions(bin.join("shards"), std::fs::Permissions::from_mode(0o755))?;
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let srv = start_env(dir.path(), &Options::default(), false, &[("PATH", &path)])?;
+    let srv = start_env(dir.path(), &Options::default(), false, &[])?;
     // Each may open agents on a runner (`runners.terminal`), which the sessions route asks first.
     let ada = person(&srv, "ada", &["developer", "runners.terminal"])?;
     let bo = person(&srv, "bo", &["developer", "runners.terminal"])?;
