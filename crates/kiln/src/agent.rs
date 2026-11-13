@@ -3766,7 +3766,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Net(None) => anyhow::bail!("transport stopped"),
-            Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
+            Ev::Net(Some(NetEvent::Connected { binding, secured, .. })) => {
                 #[cfg(unix)]
                 { feature_negotiation = FeatureNegotiation::default(); }
                 crate::harness::handing::mail_supported(false);
@@ -3867,15 +3867,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, bytes).await;
                     }
                 }
-                // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
-                // part of the fleet).
+                // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts and a job's pod aren't
+                // part of the fleet), and what its own end of this connection negotiated, which every runner says (kiln
+                // plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34): an outpost's and a pod's facts say that alone.
                 let started = Instant::now();
-                let facts = if !o.ephemeral && !o.outpost { Some(crate::updates::runner_facts().await) } else { None };
+                let fleet = !o.ephemeral && !o.outpost;
+                let link = secured.map(crate::net::Secured::said);
+                let facts = if fleet || link.is_some() { Some(crate::updates::runner_facts(fleet, link).await) } else { None };
                 let facts_took = started.elapsed();
                 if let Some(Ok(b)) = facts.as_ref().map(proto::encode) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
-                    probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
+                    if fleet {
+                        probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
+                    }
                 }
                 // The pools' executors were the last connection's: the server starts what it wants
                 // again (docs/ci.md W13-R09).

@@ -292,6 +292,9 @@ fn machine(work_dir: &Path) -> RunnerFacts {
     });
     let (kvm, nested) = kvm();
     let arch = std::env::consts::ARCH.to_owned();
+    // Whether it holds isolated agents in microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step
+    // 17): one answer, which `virt.microvm` says too.
+    let isolation = crate::sandbox::facts(kvm);
     RunnerFacts {
         os: std::env::consts::OS.to_owned(),
         os_version: System::os_version(),
@@ -304,11 +307,10 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         },
         arch,
         cpu: Cpu { model, cores, threads, flags: cpu_flags() },
-        mem: mem(sys.total_memory(), sys.available_memory(), crate::os::cgroup::memory_limit()),
+        mem: mem(sys.total_memory(), free_memory(&sys), crate::os::cgroup::memory_limit()),
         disk,
-        // It starts no microVM itself until kiln carries their runtime (kiln plan
-        // 01a1cd8e862e7169a074db3d5fa33f3d step 16).
-        virt: Virt { kvm, hvf: false, nested, microvm: false },
+        virt: Virt { kvm, hvf: false, nested, microvm: isolation.available },
+        isolation: Some(isolation),
         binfmt: binfmt(),
         // Its load, for admission (W24-R19).
         work: Some({
@@ -329,6 +331,21 @@ fn machine(work_dir: &Path) -> RunnerFacts {
 fn mem(total: u64, free: u64, limit: Option<u64>) -> Mem {
     let total = limit.map_or(total, |l| l.min(total));
     Mem { total, free: free.min(total) }
+}
+
+/// What a Mac can give new work: its free pages and the inactive ones beyond what its compressor
+/// holds (`kiln_ci::facts::VmPages::room`; `sysinfo`'s available memory there counts pages in use,
+/// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32), none while its pages can't be read.
+#[cfg(target_os = "macos")]
+fn free_memory(_sys: &sysinfo::System) -> u64 {
+    crate::os::sense::memory_room().unwrap_or(0)
+}
+
+/// What the machine can give new work, as its system says (Linux's `MemAvailable`, Windows'
+/// `ullAvailPhys`).
+#[cfg(not(target_os = "macos"))]
+fn free_memory(sys: &sysinfo::System) -> u64 {
+    sys.available_memory()
 }
 
 /// Every fact of this runner, its probes run now. `looked`: whether something asked for them that

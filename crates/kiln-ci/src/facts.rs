@@ -45,6 +45,12 @@ pub struct RunnerFacts {
     pub kiln: Option<KilnFacts>,
     /// Whether its agents can have workspaces of their own (Slates volumes), and why not.
     pub workspaces: Option<Workspaces>,
+    /// Whether it holds isolated agents in microVMs of their own, on what, and why not (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 17): [`Virt::microvm`] is its `available`. Absent from a
+    /// runner from before it.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<Isolation>,
     /// What W24's work needs to know of the machine (docs/ci.md W24, `RunnerFacts.work`).
     pub work: Option<WorkFacts>,
     /// The machine itself: a hash of the id its OS keeps for it (W13-R01). The server keeps it with
@@ -62,6 +68,22 @@ pub struct RunnerFacts {
     /// facts.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<crate::runtime::Observation>,
+    /// What its own end of its link to the server negotiated (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34):
+    /// said with the facts it sends as it connects, kept by the server with that connection, and not kept with the
+    /// facts. None from a runner from before it, and in a probe's report.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<Negotiated>,
+}
+
+/// What one end of a TLS 1.3 connection negotiated, as rustls names its cipher suite and key exchange group
+/// (`TLS13_AES_256_GCM_SHA384`, `secp384r1MLKEM1024`): a link's `secured`, as kiln's reach says its links'.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct Negotiated {
+    pub suite: String,
+    pub group: String,
 }
 
 /// The work directory's file system and the devices it is on, as found without privilege
@@ -223,6 +245,22 @@ pub struct WorkFacts {
     pub memory_level: Option<String>,
 }
 
+/// Isolated agents on a machine (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17; kiln's
+/// docs/isolation.md): each harness in a microVM of its own, a member of an Agentfile's image.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(rename = "IsolationFacts"))]
+#[serde(default)]
+pub struct Isolation {
+    /// Agents here can be held isolated: its kiln carries the microVMs' runtime, and the machine has
+    /// a hypervisor it can use.
+    pub available: bool,
+    /// The hypervisor its microVMs run on (`KVM`, `Hypervisor.framework`, `WHP`), where known.
+    pub hypervisor: Option<String>,
+    /// Why agents here can't be held isolated.
+    pub why_not: Option<String>,
+}
+
 /// Agents' workspaces of their own on a machine: Slates volumes over their folders.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -273,6 +311,38 @@ pub struct Cpu {
 pub struct Mem {
     pub total: u64,
     pub free: u64,
+}
+
+/// A macOS host's pages as `host_statistics64(HOST_VM_INFO64)` counts them (`mach/vm_statistics.h`'s
+/// `vm_statistics64`), its room for new work read from them (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 32: the balancer places by that room).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VmPages {
+    /// `free_count`: free pages, the speculative ones among them (`vm_statistics.h`; `vm_stat`
+    /// prints those apart).
+    pub free: u64,
+    /// `active_count`: pages in use, never room. XNU's `AVAILABLE_NON_COMPRESSED_MEMORY` counts them
+    /// with the free and inactive ones, and so does `sysinfo`'s available memory: by it a Mac with
+    /// 62.0 of 62.5 GB of swap in use read 25 GB free (2026-11-13).
+    pub active: u64,
+    /// `inactive_count`: pages not used of late, the first taken when memory runs short.
+    pub inactive: u64,
+    /// `compressor_page_count`: the pages holding what the compressor pressed small, memory in use
+    /// that didn't fit.
+    pub compressor: u64,
+}
+
+impl VmPages {
+    /// What the host can give new work, in bytes (`page`: the size of the pages it counts,
+    /// `host_page_size`): its free pages, and its inactive pages beyond as many as its compressor
+    /// holds. The compressor holds memory in use that didn't fit, and inactive pages are what makes
+    /// room for it as it's used again: only those beyond it are room, and a host whose compressor
+    /// holds more reads its free pages alone. The kernel's own words miss this: its available memory
+    /// counts pages in use, and its pressure level read normal on Macs with 37 and 10.7 GB of swap in
+    /// use (the recorded hosts in this module's tests; ROOT, 2026-11-13).
+    pub fn room(&self, page: u64) -> u64 {
+        self.free.saturating_add(self.inactive.saturating_sub(self.compressor)).saturating_mul(page)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -378,5 +448,34 @@ mod tests {
         let d: StorageDevice = serde_json::from_str(r#"{"name":"nvme0n1","kind":"nvme","interconnect":"pcie"}"#)?;
         assert_eq!((d.kind, d.interconnect.as_deref()), (DeviceKind::Nvme, Some("pcie")));
         Ok(())
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32 (ROOT, 2026-11-13): a Mac's room is its
+    /// free pages and its inactive pages beyond as many as its compressor holds, never pages in use.
+    /// Macs' `vm_stat` (their `vm_statistics64`, 16 KiB pages) as recorded on 2026-11-13; `free` is
+    /// "Pages free" and "Pages speculative", which the kernel's `free_count` counts together.
+    #[test]
+    fn step32_a_macs_room_is_its_free_pages_and_the_inactive_beyond_its_compressors() {
+        let page = 16_384;
+        // A 64 GiB Mac at 06:40:14Z, nine compilers at once: 61,999 of 62,464 MiB of swap in use,
+        // load 91. Its runner read 25 GB free (its free, active and inactive pages), and work was
+        // placed on it. Its speculative pages weren't kept: `free` is "Pages free" alone.
+        let swapping = VmPages { free: 3_805, active: 769_543, inactive: 750_125, compressor: 2_309_113 };
+        assert_eq!(swapping.room(page), 3_805 * page, "its compressor holds more pages than are inactive: its free pages alone");
+        // A 36 GiB Mac at 07:23:27Z, six kiln compiles at once moved onto it: 22,584 of 23,552 MiB
+        // of swap in use, load 23. Its runner said 13 GB free.
+        let crowded = VmPages { free: 3_971 + 31_637, active: 442_304, inactive: 408_933, compressor: 1_287_005 };
+        assert_eq!(crowded.room(page), 35_608 * page, "the same: its free pages alone");
+        // The same Mac at 06:55:29Z, its builds moved off: 37,347 of 38,912 MiB of swap in use, and
+        // the kernel's pressure level 1, normal.
+        let after = VmPages { free: 539_938 + 696_358, active: 1_266_849, inactive: 782_394, compressor: 564_488 };
+        assert_eq!(after.room(page), (1_236_296 + 217_906) * page);
+        // A 128 GiB desktop Mac at 06:55:25Z, load 41: 10,745 of 12,288 MiB of swap in use, its
+        // pressure level normal.
+        let desktop = VmPages { free: 337_310 + 472_318, active: 2_731_319, inactive: 2_259_298, compressor: 2_028_728 };
+        assert_eq!(desktop.room(page), (809_628 + 230_570) * page);
+        // An idle 36 GiB Mac at 06:55:39Z, load 2.4: 1,809 of 3,072 MiB of swap in use.
+        let idle = VmPages { free: 563_065 + 132_218, active: 719_425, inactive: 628_564, compressor: 95_903 };
+        assert_eq!(idle.room(page), (695_283 + 532_661) * page);
     }
 }

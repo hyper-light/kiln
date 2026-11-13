@@ -1103,9 +1103,27 @@ None is a process on its machine, as agents start without one. Its start names i
 microVM's image (`spec.isolation: {kind: "microvm", image}`, docs/api.md "Agentfiles"). It goes
 only to a runner that says it starts microVMs (its facts' `virt.microvm`), and anywhere else it's
 refused, never run as a process; where the machine picked would refuse it, the composer says so
-under the row. A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now
-(docs/shards.md), but it doesn't yet start a harness through Hex (the plan's step 17), so until then
-such a start is refused there, saying so.
+under the row. Once such a start goes through, its harness runs as its image's HARNESS member, its
+stdio the member's streams, and its session drives it through the same adapter as on the host: it
+starts, is steered, interrupted, resumed and stopped as a process is (docs/isolation.md, step 17).
+A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now (docs/shards.md), but it
+doesn't yet start a harness through Hex (the plan's step 17), so until then such a start is refused
+there, saying so (its facts' `isolation.why_not`).
+
+**Placed and charged by kiln's balancer** (step 32). An isolated agent is placed as runs are
+(docs/lb.md), or not at all: its placement asks its microVM's own vCPUs and memory, never what its
+harness would need as a process: those `on` asks (`cpus=2,mem=4g`), or `spec.isolation`'s `cpus`
+and `memory` in a start that names its machine; an agent an isolated agent starts keeps its
+parent's. It's asked only of runners that start microVMs, and its claim holds that room on the
+runner it's placed on from its start to its end. A start with no size asks no room. What its
+microVM uses is charged as it's measured, from its own group: on Linux its session's cgroup, which
+its microVM is made in; on macOS and Windows the group Shards keeps for it (`groups/kiln-<session>`
+of Shards' home: its `memory.current`, and the CPU time of the processes its `cgroup.procs` lists).
+An agent it starts (`agents.start`, from inside its microVM) is isolated and placed the same way.
+Its commands (`kiln run`, the MCP `run` tool, `kiln.machines.run` and `kiln.machines.start`) run in
+microVMs or not at all: no runner runs them in a microVM yet, so each is refused before anything of
+it starts, saying `refused (isolated): …` (the MCP answer's `refused: "isolated"`), and none runs on
+a bare host.
 
 **Agentfiles** (Agents → Agentfiles, `/agents/agentfiles`) keeps yours: each opened on its own page
 in the code editor's Agentfile mode, checked by Shards as it's typed (`POST /api/agentfiles/check`,
@@ -1203,10 +1221,14 @@ to `s28-pi-agentfile`).
   agent started as a process (no isolation). An isolated agent can't start one (above): start it
   from your own session, or from an agent that isn't isolated.
 - **Reach what its Agentfile doesn't grant.** No other folder, port, host or device of the machine.
-  kiln's own MCP is reached the same way, through a grant naming kiln's address and port, which
-  kiln's Agentfiles don't make yet.
+  kiln's own MCP takes no grant at all: it is to come over the encrypted link kiln drives the agent
+  through, as a stdio server inside its microVM that kiln answers itself, with no token of kiln's in
+  the microVM (Shards' D254). Not yet built.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
+- **Move to another machine, or switch to another harness.** Not yet: it stays where it started, in
+  the harness it started with, and says so when asked. To go on elsewhere or in another harness, end
+  it and start a new one there.
 - **Not yet**, as well as the start itself: the project at its own path; a terminal into the
   microVM, its sign-in and exec there; kiln reading its sessions from your volume to resume them;
   and the commands it asks kiln to run on other machines, which run in microVMs too or not at all,

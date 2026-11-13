@@ -1530,6 +1530,7 @@ mod tests {
             })),
             instances: Vec::new(),
             transport: None,
+            link: None,
             skew: crate::skew::Skew::default(),
             stale: false,
         }

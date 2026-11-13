@@ -20,7 +20,8 @@ fn is_zero_epoch(n: &u64) -> bool {
 }
 
 /// An isolated session's boundary (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32), as kiln's T4 isolation
-/// named it: its kind, and the image it boots once one is chosen.
+/// named it: its kind, the image it boots once one is chosen, and its microVM's size where its start
+/// gave one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Isolation {
@@ -30,16 +31,119 @@ pub struct Isolation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub image: Option<String>,
+    /// Its microVM's vCPUs, as CPUs (Shards' `--cpus`): what its placement asks and its claim holds
+    /// (step 32), never what its harness would need as a process. None: its start gave none, so its
+    /// placement asks none and it's charged what it's measured using.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(as = "Option<f64>", optional))]
+    pub cpus: Option<kiln_ci::sched::state::Cpus>,
+    /// Its microVM's memory, bytes (Shards' `--memory`), asked and held as its vCPUs are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub memory: Option<u64>,
 }
 
 impl Isolation {
     /// The kind every isolated session has today.
     pub const MICROVM: &'static str = "microvm";
 
-    /// A microVM of its own, its image not yet chosen.
+    /// A microVM of its own, its image not yet chosen and its size not given.
     pub fn microvm() -> Self {
-        Self { kind: Self::MICROVM.to_owned(), image: None }
+        Self { kind: Self::MICROVM.to_owned(), image: None, cpus: None, memory: None }
     }
+}
+
+/// Where a session's harness runs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17;
+/// docs/isolation.md): a process of its machine's, or its image's member in a microVM of its own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentRuns"))]
+#[serde(tag = "in", rename_all = "snake_case")]
+pub enum Runs {
+    /// A process of its machine's, by its pid there.
+    Host { pid: u32 },
+    /// Its image's member in a microVM of its own.
+    Microvm {
+        /// The microVM, by the name the machine's microVMs give it (Hex's), where they give one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        vm: Option<String>,
+        /// Its image, pinned by its digest (`NAME@sha256:…`).
+        image: String,
+        /// The process of its machine's that its run's handle says it is (`Duplex::host_pid`): none,
+        /// a microVM's member being no process of the machine's. Said even so, so a check reads it
+        /// rather than an absence.
+        host_pid: Option<u32>,
+        /// The agent-control link its stdio rides into the microVM, as each end says it negotiated
+        /// (Shards' `control::Link`, step 11), once it rides one: none before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        control: Option<Link>,
+    },
+}
+
+/// The link a session's harness's stdio rides into its microVM, as each end says its TLS 1.3
+/// handshake negotiated (`kiln_seams::sandbox::Link`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentLink"))]
+pub struct Link {
+    /// The controller's, on the machine.
+    pub controller: Negotiated,
+    /// The endpoint's own report, from inside the microVM.
+    pub endpoint: Negotiated,
+    /// The lanes its controller was granted on it as it dialed, by Shards' names (`control`,
+    /// `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`). Always said.
+    #[serde(default)]
+    pub lanes: Vec<String>,
+}
+
+/// One end's word on its handshake: its cipher suite and key exchange group, by rustls's names
+/// (`TLS13_AES_256_GCM_SHA384`, `X25519MLKEM768`), or by IANA code where rustls names none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentNegotiated"))]
+pub struct Negotiated {
+    pub suite: String,
+    pub group: String,
+}
+
+impl From<kiln_seams::sandbox::Link> for Link {
+    fn from(l: kiln_seams::sandbox::Link) -> Self {
+        let end = |n: kiln_seams::sandbox::Negotiated| Negotiated { suite: n.suite, group: n.group };
+        Self { controller: end(l.controller), endpoint: end(l.endpoint), lanes: l.lanes }
+    }
+}
+
+/// A start of a session's harness in kiln's record of what it started for the session (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 17): when, where it ran and how it ended, kept as long as
+/// the session is, so a harness that ran and ended between two looks at the machine's processes is
+/// still seen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentStart"))]
+pub struct Start {
+    /// Unix ms kiln started it, or took it over from its image before (an in-place upgrade).
+    pub at: i64,
+    /// Where it ran, as `runs` said as it started (the link its stdio comes to ride is `runs`').
+    pub runs: Runs,
+    /// How it ended: none while it runs, and none once it's handed on to kiln's next image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub ended: Option<Ended>,
+}
+
+/// How a start of a session's harness ended.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentEnded"))]
+pub struct Ended {
+    /// Unix ms its end was seen.
+    pub at: i64,
+    /// Its exit code: none where a signal or kiln's stop ended it, or its code wasn't seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub code: Option<i32>,
 }
 
 /// What to start.
@@ -132,6 +236,12 @@ pub struct Spec {
     /// are isolated too. A machine that can't hold it so refuses it, never running it as a process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<Isolation>,
+    /// The text of the Agentfile `isolation`'s image names where it's one of a person's own
+    /// (`agentfile:<id>`), as kiln's server read it from their Agentfiles as it started, at its
+    /// latest version (`harness::lineage::kept_agentfile`), for its machine to build its microVM
+    /// from. Set by kiln, never from what was asked (`POST /api/harness/sessions` drops it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentfile: Option<String>,
     /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +290,7 @@ impl Default for Spec {
             subagent: false,
             workspace: None,
             isolation: None,
+            agentfile: None,
             variant_of: None,
         }
     }
@@ -511,6 +622,15 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub isolation: Option<Isolation>,
+    /// Where its harness runs now (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17): a process of
+    /// its machine's, by its pid, or its image's member in a microVM of its own, which no host pid
+    /// is. None while none runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub runs: Option<Runs>,
+    /// kiln's record of each start of its harness on its machine: when, where it ran, how it ended.
+    #[serde(default)]
+    pub starts: Vec<Start>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -640,6 +760,8 @@ impl Info {
         self.move_plan.clone_from(&s.move_plan);
         self.pause_at = s.pause_at;
         self.max_subagents = s.max_subagents;
+        self.runs.clone_from(&s.runs);
+        self.starts.clone_from(&s.starts);
     }
 
     /// The parts lists care about changed (activity timestamps aside, the words of what's queued: a
@@ -648,7 +770,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace, isolation } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace, isolation, runs, starts } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -710,7 +832,9 @@ impl Info {
             && *variant_of == o.variant_of
             && *no_bypass == o.no_bypass
             && *workspace == o.workspace
-            && *isolation == o.isolation)
+            && *isolation == o.isolation
+            && *runs == o.runs
+            && *starts == o.starts)
     }
 }
 
@@ -1188,6 +1312,53 @@ impl Session {
         core.sync_owned_reach();
         i.apply(&core.state);
         i
+    }
+
+    /// Its harness started, or was taken over, as `p` holds it (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 17): where it runs now, and a start in kiln's record. A
+    /// start still open there is the same process taken over from kiln's image before (an in-place
+    /// upgrade), or one whose end went unseen, which ends now.
+    fn began(&self, p: &crate::proc::Duplex) {
+        let runs = match (p.boundary(), p.host_pid()) {
+            (Some(held), host_pid) => Runs::Microvm { vm: held.id(), image: held.image().to_owned(), host_pid, control: None },
+            (None, Some(pid)) => Runs::Host { pid },
+            // A `Duplex` is a process of the machine's or a boundary's run: there's no third.
+            (None, None) => return,
+        };
+        let now = Core::now();
+        let mut core = self.core.lock();
+        let starts = &mut core.state.starts;
+        let open = starts.last().is_some_and(|l| l.ended.is_none());
+        let taken_over = open && starts.last().is_some_and(|l| l.runs == runs);
+        if !taken_over {
+            if open && let Some(l) = starts.last_mut() {
+                l.ended = Some(Ended { at: now, code: None });
+            }
+            starts.push(Start { at: now, runs: runs.clone(), ended: None });
+        }
+        core.state.runs = Some(runs);
+        core.touch_state();
+    }
+
+    /// The link its harness's stdio rides into its microVM was made: where it runs says it.
+    fn linked(&self, link: Link) {
+        let mut core = self.core.lock();
+        if let Some(Runs::Microvm { control, .. }) = core.state.runs.as_mut() {
+            *control = Some(link);
+            core.touch_state();
+        }
+    }
+
+    /// Its harness ended, `code` its exit code where it was seen: nothing runs, and kiln's record of
+    /// its start says how it ended.
+    fn ended_run(&self, code: Option<i32>) {
+        let now = Core::now();
+        let mut core = self.core.lock();
+        if let Some(l) = core.state.starts.last_mut().filter(|l| l.ended.is_none()) {
+            l.ended = Some(Ended { at: now, code });
+        }
+        core.state.runs = None;
+        core.touch_state();
     }
 
     /// Its epoch ([`State::epoch`]): how many times it went on on another machine.
@@ -1889,6 +2060,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
+        runs: None,
+        starts: Vec::new(),
     };
     let (ctl, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let s = Arc::new(Session {
@@ -2275,9 +2448,24 @@ enum Ev {
     Preview(Option<(String, Vec<super::model::FileDiff>)>),
     Exit(Option<i32>),
     Fx(Option<Done>),
+    /// The link its harness's stdio rides into its microVM was made, or never will be.
+    Linked(Option<kiln_seams::sandbox::Link>),
     Tick,
     /// Headroom has room for work it held (docs/headroom.md).
     Room,
+}
+
+/// The link a boundary's run's stdio rides into it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+/// step 17), awaited once: said once it's made; never, for a process of the machine's.
+fn link_made(held: Option<Arc<crate::sandbox::held::Held>>) -> futures::future::Fuse<futures::future::BoxFuture<'static, Option<kiln_seams::sandbox::Link>>> {
+    async move {
+        match held {
+            Some(h) => h.linked().await,
+            None => std::future::pending().await,
+        }
+    }
+    .boxed()
+    .fuse()
 }
 
 async fn input_budget(s: &Session) {
@@ -2932,8 +3120,15 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
     let target = Kind::get(to).filter(|k| k.switchable() && from.switchable());
     let installed = target.is_some_and(Kind::available);
     // Its spec before its core: never the one lock inside the other.
-    let allow_bypass = s.spec.lock().allow_bypass;
+    let (allow_bypass, isolated) = {
+        let spec = s.spec.lock();
+        (spec.allow_bypass, spec.isolation.is_some())
+    };
     let mut core = s.core.lock();
+    if isolated {
+        core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: crate::sandbox::isolated::NO_SWITCH.to_owned() });
+        return None;
+    }
     let Some(target) = target else {
         core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("A conversation can't be carried from {} to {to}.", from.name) });
         return None;
@@ -3276,10 +3471,20 @@ struct Move {
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
-/// `now`: the turn under way isn't waited for (the caller interrupts it).
+/// `now`: the turn under way isn't waited for (the caller interrupts it). None: an isolated agent
+/// doesn't go to another machine (its microVM and what its harness keeps there are this one's, kiln
+/// plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), refused before anything of it stops, saying so.
 #[allow(clippy::too_many_arguments)]
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool) -> Move {
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool) -> Option<Move> {
+    // Its spec before its core: never the one lock inside the other.
+    let isolated = s.spec.lock().isolation.is_some();
     let mut core = s.core.lock();
+    if isolated && !local {
+        let text = format!("Couldn't move to {to}: {} — it goes on here", crate::sandbox::isolated::NO_MOVE);
+        core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+        core.touch_state();
+        return None;
+    }
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
@@ -3295,7 +3500,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local }
+    Some(Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local })
 }
 
 /// A person pauses it, or resumes it (`Command::Pause` without a task): its processes held stopped by
@@ -4248,17 +4453,25 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     adapter.seed(items.clone());
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                let isolated = spec.isolation.is_some();
                 // One the machine's own PATH lacks may be on its user's: their login shell is asked
                 // first (once, then kept ten minutes).
-                if blocked.is_none() && spec.program.is_none() && !kind.available() {
+                if blocked.is_none() && !isolated && spec.program.is_none() && !kind.available() {
                     crate::reach::serve::login_env().await;
                 }
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).
-                if blocked.is_none() {
+                if blocked.is_none() && !isolated {
                     kind.prepare(&spec).await;
                 }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
+                    // Isolated: its harness is a member of its image in a microVM of its own, through
+                    // the machine's microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), and
+                    // never a process here; a machine without them refuses it.
+                    None if isolated => match files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()) {
+                        Some(vms) => crate::sandbox::isolated::launch(kind, &spec, vms.as_ref()).await,
+                        None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
+                    },
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
                     None => match kind.launch(&spec, &s.id) {
@@ -4299,7 +4512,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         match spawned {
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
-                *s.pid.lock() = Some(p.pid);
+                // Its process here; none for a harness its boundary holds (a microVM's member).
+                *s.pid.lock() = p.host_pid();
+                s.began(&p);
                 ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
@@ -4350,6 +4565,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 let mut forcing = false;
                 // Where this machine keeps what's an agent's own: whose each file it changes is.
                 let roots = std::sync::Arc::new(super::whose::Roots::here(&spec.env));
+                // The link its stdio rides into its microVM, said once it's made.
+                let mut linking = link_made(p.boundary());
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -4386,6 +4603,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         d = pv_rx.recv().fuse() => Ev::Preview(d.ok()),
                         f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                         x = (&mut p.exit).fuse() => Ev::Exit(x.ok().flatten()),
+                        l = linking => Ev::Linked(l),
                         _ = crate::rt::sleep_until(next_tick).fuse() => Ev::Tick,
                         () = held_room(&s.core).fuse() => Ev::Room,
                     };
@@ -4482,12 +4700,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 }
                             }
                             Command::MoveTo { to, cwd, note, now, kind: into, model, local, native } => {
-                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native);
-                                // Not waiting for the turn: it stops here, and goes on there.
-                                if mv.picks_up {
-                                    adapter.command(&mut s.core.lock(), Command::Interrupt);
+                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native) {
+                                    // Not waiting for the turn: it stops here, and goes on there.
+                                    if mv.picks_up {
+                                        adapter.command(&mut s.core.lock(), Command::Interrupt);
+                                    }
+                                    moving = Some(mv);
                                 }
-                                moving = Some(mv);
                             }
                             Command::Moving { text } => moving_note(&s, &text),
                             // What it left running that kiln took back over: kiln stops it.
@@ -4641,6 +4860,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 p.terminate(Duration::from_secs(2));
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
+                                s.ended_run(None);
                                 // What its adapter held goes with its record, in its queue.
                                 adapter.let_go(&mut s.core.lock());
                                 let _ = reply.send(Ok(None));
@@ -4693,18 +4913,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 let _ = flush(&s, &sink, Some(&p.stdin)).await;
                                 crate::rt::sleep(Duration::from_millis(1500)).await;
                             }
-                            let root = p.pid;
+                            // Its process here; a microVM's member has none, and nothing of it runs here.
+                            let root = p.host_pid();
                             let left = std::mem::take(&mut *s.left.lock());
                             let group = crate::os::contain::Group::existing(&s.id);
                             let members = group.clone();
                             let _ = crate::rt::blocking(move || {
                                 // Everything in its group where it has one (what left its tree
                                 // too), else what's under it now.
-                                let pids: Vec<u32> = match &members {
-                                    Some(g) => g.pids().into_iter().filter(|p| *p != root).collect(),
-                                    None => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                let pids: Vec<u32> = match (&members, root) {
+                                    (Some(g), _) => g.pids().into_iter().filter(|p| Some(*p) != root).collect(),
+                                    (None, Some(root)) => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                    (None, None) => Vec::new(),
                                 };
-                                crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
+                                crate::os::stop_processes(&pids, root, Duration::from_secs(2));
                                 for r in &left {
                                     super::survivors::stop_tree(r);
                                 }
@@ -4712,6 +4934,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
+                            s.ended_run(None);
                             if let Some(g) = group {
                                 end_group(g, Duration::from_millis(3500));
                             }
@@ -4748,6 +4971,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         }
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
                         Ev::Fx(None) => {}
+                        Ev::Linked(Some(link)) => s.linked(link.into()),
+                        Ev::Linked(None) => {}
                         Ev::Tick => {}
                         Ev::Room => {
                             let mut core = s.core.lock();
@@ -4852,6 +5077,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                 }
                 *s.pid.lock() = None;
+                s.ended_run(code);
                 // A conversation carried in that it took is in its own session now, which it
                 // starts again on (Antigravity starts again for a new mode, model or effort); one
                 // it hasn't taken yet is given to it again.
@@ -5017,8 +5243,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     // Another runner: it goes there, now.
                     Command::MoveTo { to, cwd, note, now, kind: into, model, local, native } => {
-                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native));
-                        break;
+                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native) {
+                            moving = Some(mv);
+                            break;
+                        }
                     }
                     Command::Moving { text } => moving_note(&s, &text),
                     Command::StopTask { task } if task.starts_with(crate::reach::owned::PREFIX) => {
@@ -6756,6 +6984,8 @@ for line in sys.stdin:
             no_bypass: false,
             workspace: None,
             isolation: None,
+            runs: None,
+            starts: Vec::new(),
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };

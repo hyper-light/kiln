@@ -144,6 +144,21 @@ pub struct InstanceView {
     pub can_upgrade: bool,
 }
 
+/// What a runner's connection to the server negotiated at each of its ends (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+/// step 34), each as a link's `secured` (`TLS13_AES_256_GCM_SHA384` under a hybrid post-quantum group): `server`, what
+/// the server's own TLS took; `runner`, what the runner says its own took, in the facts it sends as it connects
+/// ([`kiln_ci::facts::RunnerFacts::link`]; none from a runner from before it, and until it says).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct RunnerLink {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub server: Option<kiln_ci::facts::Negotiated>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub runner: Option<kiln_ci::facts::Negotiated>,
+}
+
 #[derive(Default, Clone)]
 pub struct Instances {
     by_peer: HashMap<PeerId, Instance>,
@@ -152,6 +167,8 @@ pub struct Instances {
     /// Joined peers connected again that haven't said hello on the new connection yet
     /// ([`Instances::connected`]).
     rejoining: HashSet<PeerId>,
+    /// Each connection's [`RunnerLink`], from its coming up until it's lost.
+    links: HashMap<PeerId, RunnerLink>,
 }
 
 /// What happened when an instance said hello.
@@ -171,12 +188,27 @@ impl Instances {
     /// certificate's, so a runner that starts again, or connects again before its last connection
     /// is seen to close, comes back under the one it joined with: its connection says which process
     /// it is and hello again, and it joins as what it says, never as the instance the last one
-    /// joined as (docs/ci.md W27-R01: a restarted runner certified as "legacy").
-    pub fn connected(&mut self, peer: PeerId) {
+    /// joined as (docs/ci.md W27-R01: a restarted runner certified as "legacy"). `secured`: what the server's end of
+    /// this connection negotiated; its runner's end waits for the runner to say it on this one ([`Instances::said_link`]).
+    pub fn connected(&mut self, peer: PeerId, secured: Option<kiln_ci::facts::Negotiated>) {
         self.announced.remove(&peer);
         if self.by_peer.contains_key(&peer) {
             self.rejoining.insert(peer);
         }
+        self.links.insert(peer, RunnerLink { server: secured, runner: None });
+    }
+
+    /// What the runner of `peer`'s connection says its own end of it negotiated
+    /// ([`kiln_ci::facts::RunnerFacts::link`]), kept with that connection.
+    pub fn said_link(&mut self, peer: PeerId, runner: kiln_ci::facts::Negotiated) {
+        if let Some(link) = self.links.get_mut(&peer) {
+            link.runner = Some(runner);
+        }
+    }
+
+    /// What `peer`'s connection negotiated at each end, while it's up and once either end has said.
+    pub fn link(&self, peer: PeerId) -> Option<&RunnerLink> {
+        self.links.get(&peer).filter(|l| l.server.is_some() || l.runner.is_some())
     }
 
     /// [`crate::proto::AgentMsg::Instance`], which precedes Hello.
@@ -367,6 +399,7 @@ impl Instances {
     pub fn lost(&mut self, peer: PeerId) -> Option<(Instance, Vec<Owned>)> {
         self.announced.remove(&peer);
         self.rejoining.remove(&peer);
+        self.links.remove(&peer);
         let i = self.by_peer.remove(&peer)?;
         let owned = self.owned_by(peer);
         Some((i, owned))
@@ -699,21 +732,21 @@ mod tests {
             again
         }
         let mut m = Instances::default();
-        m.connected(7);
+        m.connected(7, None);
         assert_eq!(instance(&mut m, 7, ih("main", 0)), None);
         m.join(7, "box", hello("1"), 1);
         assert_eq!(m.get(7).map(Instance::label).as_deref(), Some("main"));
         // Killed and started again: the new connection comes up before the last is seen to close.
-        m.connected(7);
+        m.connected(7, None);
         assert_eq!(instance(&mut m, 7, ih("main", 0)), None, "an announcement before its hello, not a take-over");
         assert_eq!(m.join(7, "box", hello("1"), 2), Joined { stale: vec![], drain: vec![], newest: true });
         assert_eq!(m.get(7).map(Instance::label).as_deref(), Some("main"));
         // Joined on this connection, it announces again as a promoted build does: a take-over.
         assert_eq!(instance(&mut m, 7, ih("main", 0)), Some(vec![]));
         // Connected again and gone before its hello: nothing of that connection is waited for.
-        m.connected(7);
+        m.connected(7, None);
         assert!(m.lost(7).is_some());
-        m.connected(7);
+        m.connected(7, None);
         assert_eq!(instance(&mut m, 7, ih("main", 0)), None);
         m.join(7, "box", hello("1"), 3);
         assert_eq!(m.get(7).map(Instance::label).as_deref(), Some("main"));

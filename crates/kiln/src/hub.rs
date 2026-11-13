@@ -535,6 +535,11 @@ pub struct AgentLive {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub transport: Option<crate::tunnel::Transport>,
+    /// What its connection's TLS negotiated at each end, while connected: the server's, and the runner's as it says
+    /// (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub link: Option<crate::instances::RunnerLink>,
     /// How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
     /// it takes no new work.
     pub skew: crate::skew::Skew,
@@ -1645,6 +1650,7 @@ impl Hub {
                     facts: None,
                     instances: vec![],
                     transport: None,
+                    link: None,
                     skew: crate::skew::Skew::default(),
                     stale: false,
                 },
@@ -1658,8 +1664,10 @@ impl Hub {
                 out.push(AgentLive::clone(l));
             }
         }
+        let instances = self.instances.get();
         for a in &mut out {
             a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
+            a.link = a.peer.filter(|_| a.connected).and_then(|p| instances.link(p).cloned());
             a.dropped_toward = a.peer.map(|p| metrics::net().toward(p)).unwrap_or_default();
             a.refused = self.refusals.load().kept(&crate::wire::unread::Page::Runner(a.name.clone())).cloned();
             // docs/machines.md, "Records that are stale": no machine id, so no machine it's proven to be.
@@ -2961,10 +2969,12 @@ impl Hub {
     /// holds of them is a pointer (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
     async fn on_net_at(self: &Arc<Self>, ev: NetEvent, piece: Option<crate::wire::payload::Piece>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match ev {
-            NetEvent::Connected { peer, name, binding } => {
+            NetEvent::Connected { peer, name, binding, secured } => {
                 self.tunnels.connected(peer, binding);
-                // A runner connecting again comes back under the peer id it joined with.
-                self.instances.update(|i| i.connected(peer));
+                // A runner connecting again comes back under the peer id it joined with; what the server's end of this
+                // connection negotiated is kept with it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34).
+                let secured = secured.map(crate::net::Secured::said);
+                self.instances.update(|i| i.connected(peer, secured.clone()));
                 if let Some(n) = name {
                     self.pending_peers.update(|m| m.insert(peer, n.clone()));
                 }
@@ -4135,6 +4145,11 @@ impl Hub {
                         Err(e) => tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's finished runs"),
                     }
                 }
+                // What its own end of this connection negotiated, as it says as it connects: kept with the connection
+                // beside the server's end (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34), never with its facts.
+                if let Some(link) = f.link.take() {
+                    self.instances.update(|i| i.said_link(peer, link.clone()));
+                }
                 if let Some(k) = f.kiln.clone() {
                     // How far behind the server's kiln it is: to be upgraded, it takes no new work.
                     self.skew_check(agent, peer, Some(k.commit.clone()));
@@ -4347,6 +4362,14 @@ impl Hub {
                 let own = inv.sessions.clone();
                 inv.sessions.extend(others);
                 self.harness.inventory(self, agent, me.as_deref(), &present, inv).await;
+                // A session a runner process was last known to hold that this server doesn't list (its
+                // restore at the start missed it): listed again now, crashed or offline, never left out.
+                let hub = Arc::clone(self);
+                crate::rt::spawn(async move {
+                    if let Err(e) = crate::harness::registry::Registry::restore_held(&hub).await {
+                        tracing::warn!(error = %format!("{e:#}"), "sessions runner processes were last known to hold couldn't be listed again: the next report tries again");
+                    }
+                });
                 // Those it holds that still read disconnected a little later: its link dropped and
                 // came back, and they've had nothing to say since. Their snapshots bring them back
                 // as they are. Not at once: after a server restart every session reads disconnected
@@ -4519,6 +4542,7 @@ impl Hub {
             facts: None,
             instances: Vec::new(),
             transport: None,
+            link: None,
             skew: crate::skew::Skew::default(),
             stale: false,
         };
@@ -6501,6 +6525,7 @@ pub(crate) mod tests {
             facts: None,
             instances: Vec::new(),
             transport: None,
+            link: None,
             skew: crate::skew::Skew::default(),
             stale: false,
         }
@@ -7679,6 +7704,45 @@ pub(crate) mod tests {
             hear(&hub, 3, proto::LANE_CONTROL, &AgentMsg::Machine { id: OTHER.into() }).await?;
             hear(&hub, 3, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of("fedora"))).await?;
             anyhow::ensure!(hub.agent_of(3).is_none(), "refused: {:?}", hub.agent_of(3));
+            Ok(())
+        })
+    }
+
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34: kiln's API (`GET /api/agents`, which answers
+    /// `doctor::runners_for`) says what each end of a runner's link to the server negotiated, as reach's links say theirs
+    /// (rustls's names of the suite and group): the server's end from the connection's coming up, the runner's from the
+    /// facts it says as it connects (`updates::runner_facts`, here an outpost's: its link alone). Facts that say none (a
+    /// probe's report) leave it; its connection gone, the runner says none; connected again, the new connection's server
+    /// end, and the runner's only once it says it again.
+    #[test]
+    fn s34_each_end_of_a_runners_link_says_its_suite_on_the_api() -> anyhow::Result<()> {
+        use hyper_quic::rustls::{CipherSuite, NamedGroup};
+        /// fedora's `link`, as `GET /api/agents` says it.
+        async fn link(hub: &Hub) -> anyhow::Result<Option<serde_json::Value>> {
+            let listed = serde_json::to_value(crate::doctor::runners_for(hub, &crate::authz::Caller::owner()).await)?;
+            let fedora = listed.as_array().into_iter().flatten().find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some("fedora"));
+            Ok(fedora.ok_or_else(|| anyhow::anyhow!("fedora isn't listed: {listed}"))?.get("link").cloned())
+        }
+        /// fedora's connection coming up as process 1, the server's end of it `secured`, and its Hello.
+        async fn connect(hub: &Arc<Hub>, secured: crate::net::Secured) -> anyhow::Result<()> {
+            hub.on_net(NetEvent::Connected { peer: 1, name: Some("fedora".into()), binding: None, secured: Some(secured) }).await?;
+            hear(hub, 1, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of("fedora"))).await
+        }
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let aes = crate::net::Secured { suite: CipherSuite::TLS13_AES_256_GCM_SHA384, group: NamedGroup::secp384r1MLKEM1024 };
+            let said = serde_json::json!({ "suite": "TLS13_AES_256_GCM_SHA384", "group": "secp384r1MLKEM1024" });
+            connect(&hub, aes).await?;
+            assert_eq!(link(&hub).await?, Some(serde_json::json!({ "server": said })), "the server's end, before the runner says its own");
+            hear(&hub, 1, proto::LANE_CONTROL, &crate::updates::runner_facts(false, Some(aes.said())).await).await?;
+            assert_eq!(link(&hub).await?, Some(serde_json::json!({ "server": said, "runner": said })), "both ends");
+            let probed = kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), cpu: kiln_ci::facts::Cpu { cores: 8, threads: 16, ..Default::default() }, ..Default::default() };
+            hear(&hub, 1, proto::LANE_CONTROL, &AgentMsg::Facts { json: serde_json::to_string(&probed)? }).await?;
+            assert_eq!(link(&hub).await?, Some(serde_json::json!({ "server": said, "runner": said })), "a probe's report, which says none, leaves it");
+            hub.on_net(NetEvent::Closed { peer: 1, reason: "the link dropped".into() }).await?;
+            assert_eq!(link(&hub).await?, None, "a runner not connected says none");
+            connect(&hub, aes).await?;
+            assert_eq!(link(&hub).await?, Some(serde_json::json!({ "server": said })), "a new connection's runner end waits for it to say");
             Ok(())
         })
     }

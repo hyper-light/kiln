@@ -195,12 +195,15 @@ interface AgentfileListing { agentfiles: AgentfileBrief[]; reaches_all: boolean 
 | DELETE | `/api/agentfiles/:id` | `{ deleted: true }`: it and its versions |
 
 An agent starts from one in a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step
-31): `POST /api/harness/sessions` with `spec.isolation: { kind: "microvm", image }`, `image` naming
-one kiln ships by its name (`harness-claude`: an image's, so never with a `:`) or one of yours by its
-id (`agentfile:<id>`), at the version it has when the microVM is made. Such a start goes only to a
-runner that says it starts microVMs, and is refused anywhere else (400, `an agent can't run isolated
-there: …`). The console keeps them at `/agents/agentfiles` and chooses one as an agent starts
-(docs/agents.md, "From an Agentfile, in a microVM of its own").
+31): `POST /api/harness/sessions` with `spec.isolation: { kind: "microvm", image, cpus?, memory? }`,
+`image` naming one kiln ships by its name (`harness-claude`: an image's, so never with a `:`) or one
+of yours by its id (`agentfile:<id>`), at its latest version as the agent starts, and `cpus` (CPUs)
+and `memory` (bytes) its microVM's size. Another person's is refused, whoever asks (400,
+`agentfile:<id> names no Agentfile of yours`). Such a start goes only to a runner that says it
+starts microVMs, and is refused anywhere else (400, `an agent can't run isolated there: …`); there
+kiln's balancer places it, asking that size, and refuses it where it can't (step 32). The console
+keeps them at `/agents/agentfiles` and chooses one as an agent starts (docs/agents.md, "From an
+Agentfile, in a microVM of its own").
 
 ## WebSockets
 

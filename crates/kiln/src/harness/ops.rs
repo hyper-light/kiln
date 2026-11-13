@@ -816,7 +816,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.start",
-            summary: "Start agents to do part of the work: `kind` (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor, pi), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
+            summary: "Start agents to do part of the work: `kind` (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor, pi), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16), `isolation` (`microvm`: a microVM of its own, on a machine that starts them) and `image` (the Agentfile it's made from: kiln's, `harness-<harness>`, or one of yours, `agentfile:<id>`), `resume` (a conversation's id, to take it up again). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsStart>(),
@@ -1079,8 +1079,19 @@ pub mod input {
         /// has Slates.
         pub workspace: Option<AgentsStartWorkspace>,
         /// How it's held: `none`, a process on its machine (the default), or `microvm`, a microVM of
-        /// its own, on a machine that starts them. An isolated agent's agents are isolated too.
+        /// its own, on a machine that starts them. An isolated agent's agents are isolated too. An
+        /// isolated agent's `on` sizes its microVM (`cpus=2,mem=4g`: its vCPUs and memory, else its
+        /// parent's), which kiln's balancer asks and holds for it from its start to its end; its
+        /// commands are refused, never run on a bare host.
         pub isolation: Option<AgentsStartIsolation>,
+        /// The Agentfile its microVM is made from: kiln's own for its harness (`harness-<harness>`,
+        /// as agentfiles_list's `builtin` names them) or one of yours (`agentfile:<id>`). Naming one
+        /// holds it in a microVM of its own; an isolated agent's agents are made from its Agentfile
+        /// unless they name another.
+        pub image: Option<String>,
+        /// The conversation to take up again: its harness's own session id (an agent's
+        /// `harness_session`, as agents_get gives it), in its folder on its machine; one agent.
+        pub resume: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

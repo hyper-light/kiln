@@ -6386,6 +6386,8 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     body.spec.plan_run = None;
     body.spec.helper = None;
     body.spec.subagent = false;
+    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked.
+    body.spec.agentfile = None;
     // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
     // machine that can make one: one that can't would let it work in the folder itself, unasked.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
@@ -6404,13 +6406,28 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     if let Some(c) = &caller {
         may_run_on(c, &body.target, "open an agent there")?;
     }
-    match crate::harness::kinds::Kind::get(&body.spec.kind) {
+    let kind = match crate::harness::kinds::Kind::get(&body.spec.kind) {
         None => return Err(err(StatusCode::BAD_REQUEST, format!("unknown harness {:?}", body.spec.kind))),
         Some(k) if !k.structured() => {
             return Err(err(StatusCode::BAD_REQUEST, format!("{} has no structured mode: open a terminal and run `{}`", k.name, k.program)));
         }
-        Some(_) => {}
+        Some(k) => k,
+    };
+    // The Agentfile its microVM is made from is kiln's for its harness or one its person reaches
+    // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35), as `agents.start` holds it.
+    if let Some(image) = body.spec.isolation.as_mut().and_then(|i| i.image.as_mut()).filter(|i| !i.trim().is_empty()) {
+        let owner = crate::authz::Caller::owner();
+        let who = crate::agentfiles::Who::of(caller.as_ref().unwrap_or(&owner)).map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+        *image = crate::harness::lineage::image_for(hub, &who, kind, image).await.map_err(|(status, why)| err(status, why))?;
     }
+    // A person's own Agentfile for its microVM, read as the caller's (on a kiln nobody else signs in
+    // to, the owner's, as its sessions act for: `crate::mcp::acts_for`).
+    let person = match &caller {
+        Some(c) => crate::harness::lineage::person_of(c),
+        None if !crate::authz::gate::has_users(hub).await => Some("owner".to_owned()),
+        None => None,
+    };
+    body.spec.agentfile = crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?;
     let count = body.count.unwrap_or(1);
     if !body.ids.is_empty() {
         let n = count.clamp(1, 16);
@@ -7183,8 +7200,14 @@ where
                 turns = crate::rt::Turns::new();
             }
         }
-        // A flush a piece: what's left of it goes out while the next is waited for.
+        // A flush a piece: what's left of it goes out while the next is waited for, in this turn where its write fits what's
+        // left of the turn's quantum at what writes of its size cost on this shard (`kiln_http::turn::write_cost_ns`), else
+        // in a turn of its own. Goal 9, plan 01a1a87b2cec step 3: the socket writes it whole, past any answer's room, and a
+        // turn's last piece's flush held the viewer's shard past the quantum by its 128 KiB's copy into the kernel.
         if wrote.is_ok() {
+            if let Some(ns) = kiln_http::turn::write_cost_ns(n) {
+                turns.room_for(|room| kiln_http::turn::signed(ns) <= room).await;
+            }
             wrote = tx.flush().await;
         }
         first = false;
@@ -7274,6 +7297,11 @@ where
     let mut turns = crate::rt::Turns::new();
     for f in frames {
         let n = f.capacity();
+        // Sent in this turn where its write fits what's left of it, at what writes of its size cost here, else in a turn of its
+        // own (as a packed snapshot's pieces are: `send_pieces`).
+        if let Some(ns) = kiln_http::turn::write_cost_ns(f.len()) {
+            turns.room_for(|room| kiln_http::turn::signed(ns) <= room).await;
+        }
         tx.send(ws::text(f)).await?;
         held.written(n);
         turns.end().await;

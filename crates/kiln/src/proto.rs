@@ -2030,8 +2030,9 @@ mod tests {
         // needs-engine its leases (`Renew`, `Refused`, `Fenced` 64 to 66; `Renewed`, `Stop` 71 and 72); named
         // features their own (67 and 73; docs/wire.md's registry); the offers hint 68, and its room passed on to
         // owners 74; an owner's word on a session's start 69, and the ask for it 75; the keeper's rules and ask 76.
-        // W20-R01 appended Skills and SkillFile in each direction (70/71 and 77/78).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (72, 79), "each table has every variant once");
+        // W20-R01 appended Skills and SkillFile in each direction (70/71 and 77/78), and W20's retained mail its
+        // transfer, HarnessMailTransfer, in each (72 and 79).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (73, 80), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);

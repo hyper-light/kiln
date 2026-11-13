@@ -1900,6 +1900,37 @@ impl Default for Turns {
     }
 }
 
+/// `work`, a piece of its poll's turn on a shard, whose first poll (what it holds the shard for before it first waits) is
+/// learned in `costs`, a piece a unit at the dearest it has been (`kiln_http::turn::Costs`), as the hub's loop learns a
+/// runner message's (`crate::wire::payload::Piece`): where that wouldn't fit what's left of the poll's quantum, the shard
+/// goes to its other tasks first and `work` starts a poll of its own ([`Turns::room_for`]). Until one was learned no room
+/// is enough: the first goes to a poll of its own, and teaches it. Off a shard, `work` as it is, nothing learned. Goal 9,
+/// plan 01a1a87b2cec step 3: an MCP call's steps, each 5 to 70 µs (its body read, its operation found, gated and fitted,
+/// then run), took one poll of its connection to 0.49 ms on the CPU, the operation's run last.
+pub async fn piece<F: Future>(costs: &'static kiln_http::turn::Costs, work: F) -> F::Output {
+    if !on_shard() {
+        return work.await;
+    }
+    Turns::new().room_for(|room| costs.fit(room, 0).is_some_and(|n| n >= 1)).await;
+    let mut work = pin!(work);
+    let mut first = true;
+    std::future::poll_fn(move |cx| {
+        if !std::mem::take(&mut first) {
+            return work.as_mut().poll(cx);
+        }
+        // Its first poll's time on the CPU where its shard's thread says it, else on the clock.
+        let (cpu, began) = (hyper_rt::futures::thread_run_ns(), Instant::now());
+        let polled = work.as_mut().poll(cx);
+        let took = match (cpu, hyper_rt::futures::thread_run_ns()) {
+            (Some(from), Some(to)) => to.saturating_sub(from),
+            _ => nanos_since(began),
+        };
+        costs.learn(1, took);
+        polled
+    })
+    .await
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's count of the blocking pool's jobs asked for on this thread ([`blocking_in`]): what a request's polls on its
@@ -3028,6 +3059,37 @@ mod tests {
             anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(|_| false))).is_ready(), "the next turn's first piece goes whatever it takes");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a piece of its poll's turn ([`piece`]) whose learned first poll won't fit what's
+    /// left of the poll's quantum gives its shard up first and starts a poll of its own; one never learned does too, and
+    /// teaches what it took; one learned that fits goes at once, in its caller's poll. Off a shard it goes at once and
+    /// teaches nothing. An MCP call's operation ran last in one poll of its connection, 0.49 ms on the CPU.
+    #[test]
+    fn g9_s3_an_operations_run_is_a_piece_of_its_polls_turn() -> anyhow::Result<()> {
+        static NEW: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
+        static DEAR: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
+        static OFF: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
+        let poll = || hyper_rt::futures::poll_clock().map(|p| p.began_ns);
+        block_on(async move {
+            let caller = poll();
+            anyhow::ensure!(caller.is_some(), "the test's task polls on a shard");
+            let ran = piece(&NEW, async move { poll() }).await;
+            anyhow::ensure!(ran != caller, "a piece never learned starts a poll of its own");
+            anyhow::ensure!(NEW.mean().is_some(), "and teaches what its first poll took");
+            // Learned cheap (it returned a clock's reading): it fits a poll's room, and goes in its caller's.
+            let caller = poll();
+            let ran = piece(&NEW, async move { poll() }).await;
+            anyhow::ensure!(ran == caller, "a piece that fits goes at once");
+            // Learned dearer than a whole quantum: it doesn't fit what's left, and starts a poll of its own.
+            DEAR.learn(1, 10 * STEP_BUDGET_NS);
+            let caller = poll();
+            let ran = piece(&DEAR, async move { poll() }).await;
+            anyhow::ensure!(ran != caller, "a piece that won't fit gives its shard up first");
+            Ok(())
+        })?;
+        anyhow::ensure!(futures::executor::block_on(piece(&OFF, async { 7 })) == 7 && OFF.mean().is_none(), "off a shard it goes at once and teaches nothing");
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a turn made in a poll under way counts the poll's time so far against its quantum,

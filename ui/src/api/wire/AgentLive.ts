@@ -6,6 +6,7 @@ import type { InstanceView } from "./InstanceView";
 import type { NetDrop } from "./NetDrop";
 import type { RefusedMessages } from "./RefusedMessages";
 import type { RunnerFacts } from "./RunnerFacts";
+import type { RunnerLink } from "./RunnerLink";
 import type { Skew } from "./Skew";
 import type { Transport } from "./Transport";
 
@@ -47,6 +48,11 @@ instances?: Array<InstanceView>,
  * How its connection reaches the server, while connected (`GET /api/agents`).
  */
 transport?: Transport, 
+/**
+ * What its connection's TLS negotiated at each end, while connected: the server's, and the runner's as it says
+ * (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34).
+ */
+link?: RunnerLink, 
 /**
  * How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
  * it takes no new work.

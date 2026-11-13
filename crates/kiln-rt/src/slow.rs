@@ -67,7 +67,8 @@ impl Key {
 }
 
 /// One entry: a key set once, then the polls it held and for how long, those of them the host held, the time on the CPU
-/// of those whose thread could say it, and those past the step quantum.
+/// of those whose thread could say it, the time of their own of those whose thread said that too, and those past the step
+/// quantum.
 #[derive(Debug, Default)]
 struct Entry {
     key: OnceLock<Key>,
@@ -82,12 +83,18 @@ struct Entry {
     longest_cpu_ns: AtomicU64,
     past_polls: AtomicU64,
     past_cpu_polls: AtomicU64,
+    own_polls: AtomicU64,
+    own_cpu_ns: AtomicU64,
+    own_ns: AtomicU64,
+    longest_own_ns: AtomicU64,
+    past_own_polls: AtomicU64,
+    past_cpu_interrupts_polls: AtomicU64,
 }
 
 impl Entry {
-    /// Counts one poll of `ns`, `cpu` of it on the CPU where its thread said, the host's when `host`, against a step
-    /// quantum of `quantum_ns` (none: 0) (the writer's alone).
-    fn count(&self, ns: u64, cpu: Option<u64>, host: bool, quantum_ns: u64) {
+    /// Counts one poll of `ns`, `cpu` of it on the CPU where its thread said, `own` of that its thread's own where it said
+    /// that too, the host's when `host`, against a step quantum of `quantum_ns` (none: 0) (the writer's alone).
+    fn count(&self, ns: u64, cpu: Option<u64>, own: Option<u64>, host: bool, quantum_ns: u64) {
         self.total_ns.fetch_add(ns, Ordering::Relaxed);
         self.longest_ns.fetch_max(ns, Ordering::Relaxed);
         if quantum_ns > 0 && ns > quantum_ns {
@@ -105,6 +112,18 @@ impl Entry {
             self.cpu_held_ns.fetch_add(ns, Ordering::Relaxed);
             self.cpu_ns.fetch_add(cpu, Ordering::Relaxed);
             self.longest_cpu_ns.fetch_max(cpu, Ordering::Relaxed);
+            // Its own, of its time on the CPU: two clocks read a call apart, so never more than that time.
+            if let Some(own) = own.map(|o| o.min(cpu)) {
+                self.own_polls.fetch_add(1, Ordering::Relaxed);
+                self.own_cpu_ns.fetch_add(cpu, Ordering::Relaxed);
+                self.own_ns.fetch_add(own, Ordering::Relaxed);
+                self.longest_own_ns.fetch_max(own, Ordering::Relaxed);
+                if quantum_ns > 0 && own > quantum_ns {
+                    self.past_own_polls.fetch_add(1, Ordering::Relaxed);
+                } else if quantum_ns > 0 && cpu > quantum_ns {
+                    self.past_cpu_interrupts_polls.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         self.polls.fetch_add(1, Ordering::Relaxed);
     }
@@ -127,6 +146,12 @@ impl Entry {
             longest_cpu_ns: self.longest_cpu_ns.load(Ordering::Relaxed),
             past_polls: self.past_polls.load(Ordering::Relaxed),
             past_cpu_polls: self.past_cpu_polls.load(Ordering::Relaxed),
+            own_polls: self.own_polls.load(Ordering::Relaxed),
+            own_cpu_ns: self.own_cpu_ns.load(Ordering::Relaxed),
+            own_ns: self.own_ns.load(Ordering::Relaxed),
+            longest_own_ns: self.longest_own_ns.load(Ordering::Relaxed),
+            past_own_polls: self.past_own_polls.load(Ordering::Relaxed),
+            past_cpu_interrupts_polls: self.past_cpu_interrupts_polls.load(Ordering::Relaxed),
         })
     }
 }
@@ -159,17 +184,20 @@ impl SlowTable {
         ns: u64,
         host: bool,
     ) {
-        self.note_with_cpu(site, label, ns, None, host, 0);
+        self.note_with_cpu(site, label, ns, None, None, host, 0);
     }
 
     /// [`SlowTable::note`], with `cpu` of the poll's hold on the CPU where the shard's thread said (`crate::task_clock`;
-    /// kiln's goal 9, plan 01a1a87b2cec step 3), and the step quantum the shard ran it with (`quantum_ns`; none: 0).
+    /// kiln's goal 9, plan 01a1a87b2cec step 3), `own` of that its thread's own where it said that too (its CPU clock: the
+    /// interrupts its CPU served meanwhile left out), and the step quantum the shard ran it with (`quantum_ns`; none: 0).
+    #[allow(clippy::too_many_arguments, reason = "the shard's one call per slow poll, each argument a measure of it")]
     pub(crate) fn note_with_cpu(
         &self,
         site: Option<&'static Location<'static>>,
         label: Option<&'static Label>,
         ns: u64,
         cpu: Option<u64>,
+        own: Option<u64>,
         host: bool,
         quantum_ns: u64,
     ) {
@@ -183,9 +211,9 @@ impl SlowTable {
             // The shard is the table's only writer: a free entry it finds is still free as it sets the key.
             Some(entry) => {
                 let _ = entry.key.set(key);
-                entry.count(ns, cpu, host, quantum_ns);
+                entry.count(ns, cpu, own, host, quantum_ns);
             }
-            None => self.rest.count(ns, cpu, host, quantum_ns),
+            None => self.rest.count(ns, cpu, own, host, quantum_ns),
         }
     }
 
@@ -200,11 +228,13 @@ impl SlowTable {
     }
 }
 
-/// The spawn sites whose polls ran past the step quantum, as a shard learned them (kiln's goal 9, plan 01a1a87b2cec step
-/// 3): where a poll's time on the CPU costs a call to read (macOS, `crate::shard_loop::THREAD_CPU_FOR_SLOW_POLLS`), the
-/// shard reads it only for tasks spawned at one of these, from the poll after their site's first past the quantum, so a
-/// site whose polls never ran past it costs none. The shard's own, one writer and no reader: open addressing over twice
-/// [`ENTRIES`] places, taken as the first site is learned, and no more sites than [`ENTRIES`] (the slow table's bound).
+/// The spawn sites whose polls held their shard past [`SLOW_POLL_NS`], as a shard learned them (kiln's goal 9, plan
+/// 01a1a87b2cec step 3): where a poll's time on the CPU costs a call to read (macOS,
+/// `crate::shard_loop::THREAD_CPU_FOR_SLOW_POLLS`), and its own time beside its task clock's (Linux,
+/// `crate::shard_loop::OWN_CPU_FOR_SLOW_POLLS`), the shard reads it only for tasks spawned at one of these, from the poll
+/// after their site's first slow one, so a site whose polls never held their shard that long costs none. The shard's
+/// own, one writer and no reader: open addressing over twice [`ENTRIES`] places, taken as the first site is learned, and
+/// no more sites than [`ENTRIES`] (the slow table's bound).
 #[derive(Debug, Default)]
 pub(crate) struct CpuSites {
     places: Box<[Option<&'static Location<'static>>]>,
@@ -298,6 +328,23 @@ pub struct SlowPoll {
     pub past_polls: u64,
     /// Of them, the polls that ran on the CPU past the step quantum, where their thread said its time there.
     pub past_cpu_polls: u64,
+    /// Of them, the polls whose thread said its own time too (Linux: its CPU clock, read for the polls of a task whose
+    /// spawn site held its shard past [`SLOW_POLL_NS`] before, [`CpuSites`]; kiln's goal 9, plan 01a1a87b2cec step 3). The task clock
+    /// counts the interrupts and softirqs the thread's CPU served while it ran; the thread's own clock doesn't: a socket
+    /// write of 230 to 820 µs on the task clock had 8 to 24 µs of its own (kiln's lab, probe 22).
+    pub own_polls: u64,
+    /// Their time on the CPU by the task clock, added up.
+    pub own_cpu_ns: u64,
+    /// Their own time, added up: the rest of [`SlowPoll::own_cpu_ns`] was the interrupts their CPU served, the host's.
+    pub own_ns: u64,
+    /// The longest own time of any of them.
+    pub longest_own_ns: u64,
+    /// Of them, the polls whose own time passed the step quantum: kiln's code (and its calls into the kernel) ran that long.
+    pub past_own_polls: u64,
+    /// Of them, the polls past the step quantum on the CPU whose own time was within it: what their CPU served of
+    /// interrupts and softirqs took them past it, the host's. So of [`SlowPoll::past_cpu_polls`], the rest passed it by
+    /// their own time or with none read (a site's first poll past the quantum, before it was learned).
+    pub past_cpu_interrupts_polls: u64,
 }
 
 /// The slow polls of the shard `holder` names, as they stand (any thread; nothing of the shard's own is
@@ -371,10 +418,10 @@ mod tests {
     fn g9_s3_a_polls_time_on_the_cpu_is_counted_beside_its_hold() {
         let table = SlowTable::default();
         let here = Location::caller();
-        table.note_with_cpu(Some(here), Some(&ROUTE), 2_000_000, Some(150_000), false, 0);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(280_000), false, 0);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 400_000, Some(900_000), false, 0);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 500_000, None, false, 0);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 2_000_000, Some(150_000), None, false, 0);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(280_000), None, false, 0);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 400_000, Some(900_000), None, false, 0);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 500_000, None, None, false, 0);
         let read = table.read();
         let p = read[0];
         assert_eq!((p.polls, p.total_ns), (4, 3_200_000));
@@ -389,14 +436,38 @@ mod tests {
         let table = SlowTable::default();
         let here = Location::caller();
         let q = 266_666;
-        table.note_with_cpu(Some(here), Some(&ROUTE), 2_000_000, Some(150_000), false, q);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(280_000), false, q);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 260_000, Some(900_000), false, q);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 500_000, None, false, q);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 266_666, Some(266_666), false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 2_000_000, Some(150_000), None, false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(280_000), None, false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 260_000, Some(900_000), None, false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 500_000, None, None, false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 266_666, Some(266_666), None, false, q);
         let p = table.read()[0];
         assert_eq!(p.past_polls, 3, "held past the quantum: 2 ms, 300 µs and 500 µs");
         assert_eq!(p.past_cpu_polls, 1, "on the CPU past it: 280 µs (900 µs of a 260 µs hold is 260)");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: of a poll's time on the CPU (the task clock, the interrupts its CPU served while
+    /// the thread ran counted in), its thread's own (its CPU clock, those left out) is counted where read, never more than
+    /// its time on the CPU, and a poll past the quantum by its own time is counted apart from one past it on the CPU:
+    /// probe 22 had socket writes of 230 to 820 µs on the task clock with 8 to 24 µs of their own.
+    #[test]
+    fn g9_s3_a_polls_own_time_is_counted_apart_from_the_interrupts_its_cpu_served() {
+        let table = SlowTable::default();
+        let here = Location::caller();
+        let q = 266_666;
+        // On the CPU past the quantum, its own time within it: the rest the interrupts its CPU served.
+        table.note_with_cpu(Some(here), Some(&ROUTE), 850_000, Some(839_000), Some(36_000), false, q);
+        // Its own past the quantum too.
+        table.note_with_cpu(Some(here), Some(&ROUTE), 700_000, Some(690_000), Some(640_000), false, q);
+        // An own reading past the task clock's (the two clocks are read a call apart) counts as the task clock's.
+        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(150_000), Some(160_000), false, q);
+        // No own reading: counted on the CPU alone.
+        table.note_with_cpu(Some(here), Some(&ROUTE), 400_000, Some(390_000), None, false, q);
+        let p = table.read()[0];
+        assert_eq!((p.cpu_polls, p.past_cpu_polls), (4, 3), "on the CPU past the quantum: 839, 690 and 390 µs");
+        assert_eq!((p.own_polls, p.own_cpu_ns, p.own_ns, p.longest_own_ns), (3, 1_679_000, 826_000, 640_000), "{p:?}");
+        assert_eq!(p.past_own_polls, 1, "by its own time past the quantum: 640 µs alone");
+        assert_eq!(p.past_cpu_interrupts_polls, 1, "on the CPU past it, its own within it: 839 µs, 36 of its own");
     }
 
     /// One shard on this thread, its quantum `quantum_ns` (its step budget: it tracks no wake).
@@ -504,13 +575,15 @@ mod tests {
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3 (main's ask, 2026-11-06): where a slow poll's time on the CPU costs a call to read
-    /// (macOS: a Mach trap, 107 to 129 ns on Apple silicon), the polls of a site that never ran past the quantum read
-    /// nothing. A task's thousand quick polls run beside a site the shard learned (three spins, the first teaching it), and
+    /// (macOS: a Mach trap, 107 to 129 ns on Apple silicon), the polls of a site that never held its shard past the slow
+    /// table's threshold read nothing. A task's thousand quick polls run beside a site the shard learned (three spins, the
+    /// first teaching it), and
     /// the thread's clock is read four times, counted: the learned site's other two spins, at each one's start and end.
-    /// Linux is as before: its task clock (a page, no call) reads every slow poll, and the thread's clock is never read.
+    /// Linux reads every slow poll on its task clock (a page, no call), and the learned site's on the thread's clock too,
+    /// for their own time (`crate::shard_loop::OWN_CPU_FOR_SLOW_POLLS`): the same four readings.
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn g9_s3_a_site_never_past_the_quantum_reads_no_cpu_clock() {
+    fn g9_s3_a_site_never_slow_reads_no_cpu_clock() {
         // A quantum of 5 ms, which a quick poll passes only where the host holds its thread that long.
         let quantum_ns = 5_000_000;
         let mut rt = one_shard(quantum_ns);
@@ -541,8 +614,17 @@ mod tests {
         // The slow task's entry, by its site: a loaded host may hold a quick poll as long as a spin.
         let spun = polls.iter().find(|p| p.site == Some(slow_site)).copied().unwrap();
         assert_eq!(spun.polls, 3, "the slow task's three spins: {polls:?}");
+        // A loaded host that held a quick poll (or the root's) past the slow table's threshold teaches the shard that site
+        // too: its later polls are read, and the slow table shows it. Otherwise the reads are the slow site's alone.
+        let others_past = polls.iter().any(|p| p.site != spun.site);
         if crate::task_clock::TaskClock::open().is_some() {
-            assert_eq!((reads, spun.cpu_polls), (0, 3), "Linux reads every slow poll on its task clock: {spun:?}");
+            assert_eq!(spun.cpu_polls, 3, "Linux reads every slow poll on its task clock: {spun:?}");
+            assert_eq!(spun.own_polls, 2, "the first spin teaches the shard the site, the next two are read for their own time: {spun:?}");
+            if others_past {
+                assert!(reads >= 4, "{reads} reads: {polls:?}");
+            } else {
+                assert_eq!(reads, 4, "a site never past the quantum read the thread's clock: {polls:?}");
+            }
             return;
         }
         if !thread_clock_read() {
@@ -550,9 +632,6 @@ mod tests {
             return;
         }
         assert_eq!(spun.cpu_polls, 2, "the first spin teaches the shard the site, the next two are read: {spun:?}");
-        // A loaded host that held a quick poll (or the root's) past the quantum teaches the shard that site too: its
-        // later polls are read, and the slow table shows it. Otherwise the reads are the slow site's alone.
-        let others_past = polls.iter().any(|p| p.longest_ns > quantum_ns && p.site != spun.site);
         if others_past {
             assert!(reads >= 4, "{reads} reads: {polls:?}");
         } else {
@@ -563,8 +642,8 @@ mod tests {
     /// Goal 9, plan 01a1a87b2cec step 3 (main's ask, 2026-11-06): once a poll of a site ran past the quantum, the polls of
     /// every task spawned there say their time on the CPU from the next on: a task live then (installed: its first poll
     /// yielded) and one installed after. Of three tasks from one site that spin, the first spin goes unread where a
-    /// reading costs a call (macOS) and the other two are read. Linux, its task clock reading every poll, is as before:
-    /// all three, the site's first among them.
+    /// reading costs a call (macOS) and the other two are read. Linux, its task clock reading every poll, has all three on
+    /// the CPU, the site's first among them, and the other two's own time on the thread's clock.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn g9_s3_a_site_past_the_quantum_once_has_its_tasks_next_polls_on_the_cpu() {
@@ -601,6 +680,12 @@ mod tests {
         let quick_held = site.polls > 3;
         if crate::task_clock::TaskClock::open().is_some() {
             assert_eq!(site.cpu_polls, site.polls, "Linux reads every slow poll on its task clock: {site:?}");
+            if quick_held {
+                assert!(site.own_polls >= 2, "{site:?}");
+            } else {
+                assert_eq!(site.own_polls, 2, "the site's first spin teaches the shard, its tasks' next two are read for their own time: {site:?}");
+            }
+            assert!(site.longest_own_ns >= spin_ns / 2 && site.longest_own_ns <= site.longest_cpu_ns, "{site:?}");
         } else if thread_clock_read() {
             // The site's first poll past the quantum teaches the shard and its tasks' next are read: two of the spins, or
             // all three where the host held the quick poll past the quantum.
