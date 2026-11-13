@@ -31,6 +31,9 @@ use shards_api::{Identity, Refusal, connect_borrowed};
 use std::os::unix::net::UnixListener;
 
 const PORT: u32 = 1234; // A protocol input, matching the canonical echo fixture.
+/// An input: each connect's deadline, which any positive one shows kept. Shards' conformance asked an unserved port with
+/// this one (UNSERVED_PATIENCE) until its judged waits (Part B, ca7a04d0d) took that constant out.
+const CONNECT_DEADLINE: Duration = Duration::from_millis(200);
 const REQUEST: &[u8] = b"CONNECT 1234\n";
 
 #[cfg(target_os = "linux")]
@@ -172,8 +175,7 @@ fn root_borrowed_drop_preserves_target_and_socket_and_dead_target_refuses() {
     });
     for _ in 0..2 {
         // Drop, then reconnect to the same still-owned target/socket.
-        let stream =
-            connect_borrowed(&identity, PORT, shards_api::conformance::UNSERVED_PATIENCE).unwrap();
+        let stream = connect_borrowed(&identity, PORT, CONNECT_DEADLINE).unwrap();
         let clone = stream.try_clone().unwrap();
         drop(stream);
         assert!(target.0.try_wait().unwrap().is_none());
@@ -185,7 +187,7 @@ fn root_borrowed_drop_preserves_target_and_socket_and_dead_target_refuses() {
     target.0.stdin.take();
     assert!(target.0.wait().unwrap().success());
     assert!(
-        matches!(connect_borrowed(&identity, PORT, shards_api::conformance::UNSERVED_PATIENCE), Err(Refusal::Process { pid, expected_started, .. }) if pid == identity.pid && expected_started == identity.started)
+        matches!(connect_borrowed(&identity, PORT, CONNECT_DEADLINE), Err(Refusal::Process { pid, expected_started, .. }) if pid == identity.pid && expected_started == identity.started)
     );
     assert!(path.exists() && dir.path().is_dir());
     eprintln!(
@@ -246,7 +248,7 @@ fn root_borrowed_target_death_before_ok_is_refused() {
         assert!(target.0.wait().unwrap().success());
         peer.write_all(b"OK 7\n").unwrap();
     });
-    let result = connect_borrowed(&identity, PORT, shards_api::conformance::UNSERVED_PATIENCE);
+    let result = connect_borrowed(&identity, PORT, CONNECT_DEADLINE);
     server.join().unwrap();
     assert!(
         matches!(result, Err(Refusal::Process { pid, expected_started, failure: shards_api::ProcessFailure::Exited }) if pid == identity.pid && expected_started == identity.started)
@@ -310,7 +312,7 @@ fn one_handle_round(dir: &Path, bit: u32, trace: bool) -> Option<HandleStages> {
         ..id.clone()
     };
     assert!(matches!(
-        connect_borrowed(&missing, PORT, shards_api::conformance::UNSERVED_PATIENCE),
+        connect_borrowed(&missing, PORT, CONNECT_DEADLINE),
         Err(Refusal::Borrowed { .. })
     ));
     let after_missing_path = snapshot();
@@ -392,7 +394,7 @@ fn one_handle_round(dir: &Path, bit: u32, trace: bool) -> Option<HandleStages> {
     let after_success_bind = snapshot();
     let server = std::thread::spawn(move || echo_once(&listener));
     let after_thread_spawn = snapshot();
-    let stream = connect_borrowed(&id, PORT, shards_api::conformance::UNSERVED_PATIENCE).unwrap();
+    let stream = connect_borrowed(&id, PORT, CONNECT_DEADLINE).unwrap();
     let after_connect = snapshot();
     let clone = stream.try_clone().unwrap();
     let after_clone = snapshot();

@@ -27,11 +27,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 
 use hex_api::capacity::Why;
-use hex_core::patience::Patience;
 use hex_quic::Refused;
 use hex_quic::enroll::sim::SimCa;
 use hex_quic::enroll::{Ca, Request, store};
-use hex_testkit::waits::within;
 
 #[path = "capacity_view/machine.rs"]
 mod machine;
@@ -46,9 +44,6 @@ const KEEPER: &str = "scheduler.capacity-view.test";
 const HOLDER: &str = "kiln.capacity-view.test";
 /// A peer kiln's CA enrolled that the lane doesn't name.
 const STRANGER: &str = "stranger.capacity-view.test";
-
-/// A refused dial's answer: the keeper's endpoint turning a peer it doesn't name away at its handshake.
-static REFUSAL: Patience = Patience::measuring("test.hex_cli.capacity_view.refusal");
 
 /// A folder of the test's own: under ~/.cache on Unix (the hazards' rule: never /tmp), the system's temp folder on
 /// Windows, as Hex's Windows tests take.
@@ -79,10 +74,11 @@ fn enroll_holder(ca: &SimCa, dir: &Path, name: &str, grant: &[u8]) {
 }
 
 /// A dial by the peer enrolled in `dir`, which the lane at `address` doesn't name: refused at its handshake, typed
-/// Identity, as for a certificate kiln's CA didn't issue (hex-quic.md Q10).
+/// Identity, as for a certificate kiln's CA didn't issue (hex-quic.md Q10). It waits for its answer with no deadline of
+/// the test's: the driver ends a dial nothing answers once QUIC's idle timeout passes (RFC 9000 §10.1).
 fn a_stranger_is_turned_away(dir: &Path, address: SocketAddr) {
     let end = stand_in::endpoint(&stand_in::credentials(dir), address);
-    let dialed = within(&REFUSAL, |by| end.dial(KEEPER, address, by));
+    let dialed = end.dial(KEEPER, address, None);
     assert!(
         matches!(dialed, Err(Refused::Identity)),
         "a peer the lane doesn't name: {dialed:?}"
@@ -90,9 +86,9 @@ fn a_stranger_is_turned_away(dir: &Path, address: SocketAddr) {
 }
 
 /// The boxes of Hex's own HEX-CV-L1 places on the machine in `dir`, each a quarter of its CPUs: two where its scheduler
-/// places a `process` box under its `oci` placement class ([`machine::places_process_boxes`]), as on Linux; none where
-/// it doesn't, as on a Mac, which places Shards microVMs alone, or on a Windows node that runs containers, whose `oci`
-/// class places those alone. This test boots neither: there the stand-in meets the machine's room alone.
+/// places a `process` box under its `oci` placement class ([`machine::places_process_boxes`]), as on Linux and
+/// Windows; none where it doesn't, as on a Mac, which places Shards microVMs alone, which this test boots none of:
+/// there the stand-in meets the machine's room alone.
 pub fn hex_boxes(dir: &Path) -> u64 {
     if machine::places_process_boxes(dir) {
         2
@@ -272,6 +268,26 @@ fn hex_cv_l1() {
 ///    there instead (capacity-view.md's run notes).
 /// 8. On A, `touch $HEX_CV_DIR/stop`, then kill the scheduler as in 6: A3 says `HEX_CV_BOOKS` and `HEX_CV_LEFT=none`.
 /// 9. `b4`, on B, with `HEX_CV_BOOKS`.
+///
+/// HEX-CV-2K, the same with kiln's runner as the holder in the stand-in's place (the step's done-when: kiln's real
+/// holder, on two real machines): A's phases are 2H's; the holder is kiln's runner-shell holder
+/// (`hex_api::capacity::Holder` over kiln's own link to `CAPACITY_PORT`: capacity-view.md, "What kiln's runner
+/// implements as a holder"); the CA is kiln's, which enrolled the runner by its own CSR. In order:
+/// 1. `a1`, on A: says `HEX_CV_REQUEST`, the request kept as `$HEX_CV_DIR/keeper/request.pem` too.
+/// 2. kiln's CA answers that request for `HEX_CV_KEEPER`, as it answers production's `hex node enroll`: its chain and
+///    roots kept in `$HEX_CV_DIR/keeper` as `chain.pem` and `roots.pem` (A3's scheduler reads them whole before it
+///    binds and refuses an answer for another key or name), or given to `a2` as `HEX_CV_CHAIN` and `HEX_CV_ROOTS`,
+///    each certificate's DER in hex, joined by commas.
+/// 3. `a3`, on A, in the background, as in 2H, `HEX_CV_HOLDER` the runner's holder name, its certificate's DNS name.
+/// 4. On B, kiln's runner holds through the lane, configured with the keeper's endpoint (`HEX_CV_ADDR`: A's
+///    `HEX_CV_BIND`, or the relay's) and name (`HEX_CV_KEEPER`, which it checks the scheduler's certificate for);
+///    its runs reserve as kiln places them there.
+/// 5. The losses, 2H's 6 and 7 on A, with nothing done on B: kiln's runner joins again once the keeper is back, and
+///    its sync agrees (its `Event::Synced { agree: true }`).
+/// 6. kiln's work on the runner drained (no reserve or release of its in flight): on A `touch $HEX_CV_DIR/stop` and
+///    kill the scheduler, and A3 says `HEX_CV_BOOKS`; kiln's runner says its held set as `HEX_CV_HELD` (its
+///    `Holder::held()`, the serde JSON of a `Vec<hex_api::capacity::Held>` in hex, as the stand-in says it).
+/// 7. `c`, on either host, with `HEX_CV_BOOKS` and `HEX_CV_HELD`: says `HEX_CV_BOOKS_AGREE`.
 mod two_hosts {
     use std::io::Write;
     use std::net::SocketAddr;
@@ -281,7 +297,7 @@ mod two_hosts {
     use hex_core::patience::Patience;
     use hex_quic::enroll::sim::SimCa;
     use hex_quic::enroll::{Ca, Issued, Request};
-    use hex_testkit::waits::until;
+    use hex_testkit::waits::follow::{self, Party};
 
     use super::stand_in::{Rng, StandIn, workload};
     use super::{a_stranger_is_turned_away, enroll_holder, machine};
@@ -291,7 +307,8 @@ mod two_hosts {
     const HOLDER_GRANT: &[u8] = b"hex-cv-2h holder";
     const STRANGER_GRANT: &[u8] = b"hex-cv-2h stranger";
 
-    /// The operator's word that the keeper is back: what B3 waits for once its link has gone.
+    /// The operator's word that the keeper is back: what B3 waits for once its link has gone, following the operator by
+    /// their life alone (decision 9), however long the heal takes them.
     static HEALED: Patience = Patience::measuring("test.hex_cli.capacity_view.healed");
 
     /// The steps of kiln-shaped work a phase runs (`HEX_CV_STEPS`, else HEX-CV-L1's), a test generator's parameter.
@@ -547,9 +564,10 @@ mod two_hosts {
         );
         let lost = kiln.until_lost();
         say("HEX_CV_LOST", lost.0);
-        until(
+        follow::until(
             &HEALED,
             "the operator's word that the keeper is back",
+            || Party::Live,
             || healed.exists(),
         )
         .unwrap();
@@ -582,6 +600,25 @@ mod two_hosts {
             format!("{} reservations", books.len()),
         );
     }
+
+    /// HEX-CV-2K C (and 2H's, from what its stand-in said), on either host, once A3 has said `HEX_CV_BOOKS` and the
+    /// holder its held set as `HEX_CV_HELD` (kiln's runner, or the stand-in's B2 or B3). Do: compare the keeper's books
+    /// of the holder, read from its records once its scheduler ended, with the holder's, each by id. Expect: the same.
+    #[test]
+    #[ignore = "HEX-CV-2K's phase C, on either host: the lead's two-host run"]
+    fn hex_cv_2h_c_the_keepers_books_are_what_the_holder_said() {
+        let by_id = |name: &str| {
+            let mut held: Vec<Held> = serde_json::from_slice(&from_hex(&var(name))).unwrap();
+            held.sort_by_key(|h| h.id);
+            held
+        };
+        let (books, held) = (by_id("HEX_CV_BOOKS"), by_id("HEX_CV_HELD"));
+        assert_eq!(books, held, "the keeper's books and the holder's differ");
+        say(
+            "HEX_CV_BOOKS_AGREE",
+            format!("{} reservations", books.len()),
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -589,31 +626,21 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    /// This process's cgroup directory under /sys/fs/cgroup.
-    fn own_cgroup() -> PathBuf {
-        let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
-        let rel = own
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .expect("a 0:: cgroup line")
-            .trim_start_matches('/');
-        PathBuf::from("/sys/fs/cgroup").join(rel)
-    }
-
-    /// This process in a leaf of its own cgroup, which hands every controller down (process_box.rs's).
+    /// This process's own cgroup, delegated to it and prepared once for every test in this binary
+    /// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it
+    /// isn't ours to subdivide. The probe root's opening proves every controller a box uses is delegated here:
+    /// `BoxRoot::open` refuses by name otherwise (HEX-INST-1).
     fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-        let own = own_cgroup();
-        let leaf = own.join("hex-agent");
-        std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-        std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-            .map_err(|e| format!("moving self into a leaf: {e}"))?;
-        hex_runtime::linux::cgroup::BoxRoot::open(
-            &own.join("hex-probe"),
-            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-        )
-        .map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_dir(own.join("hex-probe"));
-        Ok(own)
+        hex_testkit::cgroup::delegated(|own| {
+            let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+                &own.join("hex-probe"),
+                hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+            let _ = std::fs::remove_dir(own.join("hex-probe"));
+            probe
+        })
     }
 
     /// Runs `body` with this process's cgroup, delegated: here where it is, else once more as `test` alone in a
@@ -654,16 +681,9 @@ mod linux {
                     .expect("run the test in a delegated scope");
                 assert!(status.success(), "the delegated re-run of {test} failed");
             }
-            Err(direct) => {
-                hex_testkit::skip(
-                    test,
-                    "cgroup v2 delegation",
-                    &format!(
-                        "none in the delegated scope either ({direct}); run on a cgroup-v2 host"
-                    ),
-                )
-                .expect("recording the skip");
-            }
+            // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the
+            // test, never a skip that would hide the breakage.
+            Err(direct) => panic!("{test}: its cgroup isn't delegated to it ({direct})"),
         }
     }
 

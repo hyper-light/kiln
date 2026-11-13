@@ -99,18 +99,41 @@ fn read_to_end(conn: &Conn) -> usize {
 /// on a connection (`Conn::write_all`: its frame, and the driver's wake), the slowest of [`SPREAD`] on a connection of
 /// the test's own to `peer`, each once the last has gone.
 fn step(client: &Endpoint, node: &Endpoint, peer: crate::PeerId) -> Duration {
+    step_with(client, node, peer, &ROOM)
+}
+
+/// [`step`], its waits for room on `room`.
+fn step_with(client: &Endpoint, node: &Endpoint, peer: crate::PeerId, room: &Patience) -> Duration {
     let ours = client.open(peer, STDIO_PORT).unwrap();
     let mut slowest = Duration::ZERO;
     for _ in 0..SPREAD {
-        until(&ROOM, "room for the next byte", || ours.writable()).unwrap();
+        until(room, "room for the next byte", || ours.writable()).unwrap();
         let began = Instant::now();
         ours.write_all(&[0], None).unwrap();
         slowest = slowest.max(began.elapsed());
     }
-    within(&ROOM, |by| ours.end(by)).unwrap();
+    within(room, |by| ours.end(by)).unwrap();
     let (_, there) = within(&ACCEPT, |by| node.accept(STDIO_PORT, by)).unwrap();
     assert_eq!(read_to_end(&there), usize::try_from(SPREAD).unwrap());
     slowest
+}
+
+/// R03 for the tests' waits (decision 9, the person's ruling of 2026-11-13; ROOT's gate, 2026-11-13): the testkit's
+/// `until` refused at its wait's learned W*, so a fact slower than the first answer failed its test (`Waited { what:
+/// "room for the next byte", patience: 551ns }`, on the Mac Studio at 67dc2ed8). Do: the bridge's step, its waits for
+/// room on a wait whose W* is 1 ns, which every later room outruns. Expect: the step done, every byte read.
+#[test]
+fn original_a_wait_for_room_past_its_learned_w_star_waits_for_the_room() {
+    static PAST: Patience = Patience::measuring("test.hex_quic.bridge.room_past");
+    PAST.answered(Duration::from_nanos(1));
+    let ca = SimCa::new().unwrap();
+    let node = endpoint(&ca, "node-room.test", true);
+    let client = endpoint(&ca, "client-room.test", false);
+    let peer = within(&DIAL, |by| {
+        client.dial("node-room.test", node.local_addr(), by)
+    })
+    .unwrap();
+    step_with(&client, &node, peer, &PAST);
 }
 
 /// AC-T7.4.1 (HEX-QUIC-25 B3's hardening, 2026-11-12; Shards M236 and D175): an owner's half-close of its bridged

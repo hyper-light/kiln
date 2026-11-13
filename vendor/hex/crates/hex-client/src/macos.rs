@@ -2,14 +2,13 @@
 //! socket, as macOS has no `SOCK_SEQPACKET` local socket, each message framed ([`hex_core::stream`]), an exec's stdio
 //! as `SCM_RIGHTS` descriptors at its message's first byte, on the core every transport shares (`crate::calls`): no
 //! thread of its own reads it, each message is written whole under the connection's send lock, and a call waits for
-//! its answer until its caller's deadline, or with none at most twice the slowest answer to a call of its kind
-//! ([`ANSWERS`]).
+//! its answer until its caller's deadline, or with none at most the slowest answer this process has had to a call of
+//! its kind, following the node agent before its first answer and after a run-out ([`ANSWERS`]; decision 9).
 
 use std::io::{IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::time::Duration;
 
 use hex_api::{Class, Refusal};
 use hex_core::patience::Patience;
@@ -26,86 +25,38 @@ use crate::calls::{
     class_waits,
 };
 
-/// How long a call waits for the macOS node agent's answer, and its send for room in the agent's socket, one wait a
-/// kind of call (`crate::calls::kind_of`'s order), as Linux's client waits (decision 9): twice the slowest answer this
-/// process has had to a call of that kind. Hello, scheduler operations and capacity use the exact per-profile
-/// response maxima and censored run-out lower bounds of the root-verified macOS/SSH guest census (AC-T7.4.1):
-/// `bench/sched/runtime-pools/calibration-macos-cold-extension-1bb73f74.json`. These time wire replies, not workload success.
-/// A debug build's seed is never under the release record (`Patience::by_profile`), which six scheduler rows'
-/// debug campaigns fall under. Other operations remain measuring until their own actual macOS rows are recorded. The
-/// kinds a box's class times are [`CLASS_ANSWERS`].
+/// How long a call waits for the macOS node agent's answer, and its send for room in the agent's socket, one wait a kind
+/// of call (`crate::calls::kind_of`'s order), since a list waits on its parts, so a fast hello's answer says nothing of
+/// its: the slowest answer this process has had to a call of that kind (decision 9), past which a call's run-out is
+/// recorded and its wait goes on, refusing nothing by itself (the person's ruling of 2026-11-13). A call's wait follows
+/// the node agent: it lasts while the connection stands, its reset or close the refusal, or to its caller's deadline. No record is read: the `client.answer.<kind>` rows of `bench/sched/runtime-pools/calibration-macos-cold-extension-1bb73f74.json` are the
+/// evidence the rule is held to. The kinds a box's class times are [`CLASS_ANSWERS`].
 static ANSWERS: [Patience; KINDS] = [
-    Patience::by_profile(
-        "client.answer.hello",
-        Duration::from_nanos(829_500),
-        Some(Duration::from_nanos(2_607_584)),
-    ),
+    Patience::measuring("client.answer.hello"),
     Patience::measuring("client.answer.list"),
     Patience::measuring("client.answer.netns"),
-    Patience::by_profile(
-        "client.answer.schedule.describe",
-        Duration::from_nanos(23_338_333),
-        Some(Duration::from_nanos(22_181_708)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.advertise",
-        Duration::from_nanos(88_998_417),
-        Some(Duration::from_nanos(108_619_750)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.submit",
-        Duration::from_nanos(228_296_000),
-        Some(Duration::from_nanos(401_317_333)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.hear_create",
-        Duration::from_nanos(244_933_375),
-        Some(Duration::from_nanos(392_913_792)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.hear_delete",
-        Duration::from_nanos(152_498_583),
-        Some(Duration::from_nanos(130_079_458)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.hear_control",
-        Duration::from_nanos(122_932_458),
-        Some(Duration::from_nanos(119_427_250)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.link_up",
-        Duration::from_nanos(144_625),
-        Some(Duration::from_nanos(250_209)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.retry",
-        Duration::from_nanos(18_684_542),
-        Some(Duration::from_nanos(16_694_750)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.delete",
-        Duration::from_nanos(166_381_084),
-        Some(Duration::from_nanos(125_323_459)),
-    ),
-    Patience::by_profile(
-        "client.answer.schedule.status",
-        Duration::from_nanos(7_577_917),
-        Some(Duration::from_nanos(7_264_708)),
-    ),
+    Patience::measuring("client.answer.schedule.describe"),
+    Patience::measuring("client.answer.schedule.advertise"),
+    Patience::measuring("client.answer.schedule.submit"),
+    Patience::measuring("client.answer.schedule.hear_create"),
+    Patience::measuring("client.answer.schedule.hear_delete"),
+    Patience::measuring("client.answer.schedule.hear_control"),
+    Patience::measuring("client.answer.schedule.link_up"),
+    Patience::measuring("client.answer.schedule.retry"),
+    Patience::measuring("client.answer.schedule.delete"),
+    Patience::measuring("client.answer.schedule.status"),
     Patience::measuring("client.answer.physical_report"),
     Patience::measuring("client.answer.initialize_backing"),
     Patience::measuring("client.answer.release_backing"),
     Patience::measuring("client.answer.backing_usage"),
-    // MEASURING: the waits census's next run records a capacity holder's release (joint plan step 13, CV6).
+    // A capacity holder's release (joint plan step 13, CV6), learned as every kind is.
     Patience::measuring("client.answer.schedule.forget"),
     // MEASURING until a waits census records the node's links (docs/design/hex-quic.md Q12).
     Patience::measuring("client.answer.links"),
 ];
 
-/// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`. The
-/// census above ran in its guest mode, its scheduler's backend of the `shards` class, so its capacity row is a `shards`
-/// box's: release 13.172125 ms, debug 14.254417 ms. No census has timed another kind or class here: MEASURING, each,
-/// never another class's record, until a census records it.
+/// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`,
+/// each learned as [`ANSWERS`] are.
 static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
     class_waits!("client.answer", "process", measuring),
     class_waits!("client.answer", "oci", measuring),
@@ -114,20 +65,8 @@ static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
         "client.answer",
         "shards",
         [
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            (
-                Duration::from_nanos(13_172_125),
-                Some(Duration::from_nanos(14_254_417))
-            ),
+            measuring, measuring, measuring, measuring, measuring, measuring, measuring, measuring,
+            measuring, measuring, measuring,
         ]
     ),
 ];

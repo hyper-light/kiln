@@ -1,7 +1,7 @@
 //! The initialized native owner's existing records and method/device turns. A weak
 //! reference connects this adapter to Node or Recorded without another record owner.
 
-use std::sync::Weak;
+use std::sync::{OnceLock, Weak};
 
 use hex_core::record::{BoxRecord, Phase};
 
@@ -13,12 +13,43 @@ use crate::devices::{self, Books};
 pub(super) enum Routed {
     Image(BoxRecord),
     Other(Option<BoxRecord>),
+    /// A box whose backing or VM its node retired at its start (joint plan step 14): its inspect says why from its
+    /// record, its delete removes that record, and every other call is refused `Retired`.
+    Retired(BoxRecord),
 }
 
 pub(super) fn uncertain(id: &BoxId) -> Result<Refusal, Refusal> {
     Ok(Refusal::Lifecycle {
         id: id.try_clone()?,
         cause: hex_api::LifecycleCause::Uncertain,
+    })
+}
+
+/// Binds `books` into `slot` once: refused where it is gone, and where another is bound, however the binding raced.
+pub(super) fn bind_once(
+    slot: &OnceLock<Weak<dyn Books>>,
+    books: Weak<dyn Books>,
+) -> Result<(), Refusal> {
+    if books.upgrade().is_none() {
+        return Err(Refusal::Broken("guest record authority is gone".into()));
+    }
+    if let Some(bound) = slot.get() {
+        return if Weak::ptr_eq(bound, &books) {
+            Ok(())
+        } else {
+            Err(Refusal::Broken(
+                "guest record authority cannot be rebound".into(),
+            ))
+        };
+    }
+    slot.set(books).or_else(|books| {
+        if slot.get().is_some_and(|bound| Weak::ptr_eq(bound, &books)) {
+            Ok(())
+        } else {
+            Err(Refusal::Broken(
+                "guest record authority changed during initialization".into(),
+            ))
+        }
     })
 }
 
@@ -32,31 +63,9 @@ impl GuestRuntime {
     /// Called once after the existing Arc<Node> or Arc<Recorded<WithGuest<P>>>
     /// exists. Coercing that Arc to Books and downgrading allocates no new owner.
     pub fn bind_books(&self, books: Weak<dyn Books>) -> Result<(), Refusal> {
-        if books.upgrade().is_none() {
-            return Err(Refusal::Broken("guest record authority is gone".into()));
-        }
-        if let Some(bound) = self.books.get() {
-            return if Weak::ptr_eq(bound, &books) {
-                Ok(())
-            } else {
-                Err(Refusal::Broken(
-                    "guest record authority cannot be rebound".into(),
-                ))
-            };
-        }
-        self.books.set(books).or_else(|books| {
-            if self
-                .books
-                .get()
-                .is_some_and(|bound| Weak::ptr_eq(bound, &books))
-            {
-                Ok(())
-            } else {
-                Err(Refusal::Broken(
-                    "guest record authority changed during initialization".into(),
-                ))
-            }
-        })
+        bind_once(&self.books, books.clone())?;
+        // Its image class keeps its boxes' records by the same authority.
+        self.images.bind_books(books)
     }
 
     pub fn uses_books(&self) -> bool {
@@ -177,10 +186,28 @@ impl GuestRuntime {
     /// records), and routed by its class, so no call scans them twice: each operation still rereads it under its turn.
     pub(super) fn routed(&self, id: &BoxId) -> Result<Routed, Refusal> {
         Ok(match self.recorded_box(id)? {
+            Some(record) if record.retired => Routed::Retired(record),
             Some(record) if matches!(record.spec.class, ClassSpec::ShardsImage(_)) => {
                 Routed::Image(record)
             }
             snapshot => Routed::Other(snapshot),
+        })
+    }
+
+    /// Deletes a retired box (joint plan step 14): its backing or VM went with its retirement, so its record is all
+    /// there is to remove, in its turn.
+    pub(super) fn delete_retired(&self, record: &BoxRecord) -> Result<(), Refusal> {
+        let books = self
+            .books
+            .get()
+            .ok_or_else(|| Refusal::Broken("guest has no initialized record authority".into()))?;
+        let id = &record.spec.id;
+        devices::with_transaction(books, id, &[], |transaction| {
+            match transaction.read(id)? {
+                Some(current) if current.retired => transaction.remove(id),
+                Some(_) => Err(uncertain(id)?),
+                None => Ok(()),
+            }
         })
     }
 

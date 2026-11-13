@@ -1439,9 +1439,10 @@ mod tests {
     }
 
     /// AC-T7.4.1 (original): init waited for each child's ready line with no bound, so a node or relay that never
-    /// said it was ready held the boot past its deadline. Do: start a child that says nothing and outlives the boot's
-    /// deadline (`sleep`, ten times as long), handed that deadline as init hands it. Expect: refused at the deadline,
-    /// naming it, not when the child ends.
+    /// said it was ready held the boot past its deadline. Do: start a child that says nothing and never ends on its
+    /// own (`sleep infinity`), handed the boot's deadline as init hands it. Expect: refused at the deadline, naming
+    /// it. Only the deadline can end the wait: a child that ended on its own after a chosen time (`sleep 1`, ten times
+    /// the deadline) was read to its end first once on a loaded host, and the wait refused for its silence instead.
     #[test]
     fn original_init_waits_for_a_childs_ready_line_within_the_boots_deadline() {
         let within = Duration::from_millis(100);
@@ -1449,7 +1450,7 @@ mod tests {
         let began = Instant::now();
         let started = start(
             Path::new("sleep"),
-            &[OsStr::new("1")],
+            &[OsStr::new("infinity")],
             "ready\n",
             None,
             Some(ready_by),

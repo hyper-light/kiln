@@ -312,10 +312,7 @@ impl Side for Guest {
         // exists, it waits within the suites' program-end patience, a program's end being its fact.
         let text = reader.join().unwrap();
         let after = std::time::Instant::now();
-        let exit = p
-            .wait_for(hex_api::conformance::PATIENCE)
-            .unwrap()
-            .expect("the walk ended");
+        let exit = hex_api::conformance::end_of(&mut p).unwrap();
         eprintln!(
             "{}: the walk ended {} us after its output did",
             image.name,
@@ -424,7 +421,8 @@ fn boot_guest(kernel: &Path, initrd: &Path, binary: &Path, memory_mib: u64) -> G
         .into();
     let link = hex_client::guest::own_link(hex_client::guest::shards::ShardsLink::new(
         guest.clone(),
-        2 * hex_runtime::guest::recorded_boot().expect("this host class's boot-to-ready record"),
+        // The first dial's bound as the node gives it before any boot (`first_dial_bound`, decision 9).
+        hex_runtime::guest::recorded_dial_bound().expect("this host class's boot-to-ready record"),
     ))
     .unwrap();
     let client = hex_client::guest::Client::connect(link.clone()).unwrap();
@@ -476,10 +474,7 @@ impl Guest {
             )
             .unwrap();
         let text = reader.join().unwrap();
-        let exit = p
-            .wait_for(hex_api::conformance::PATIENCE)
-            .unwrap()
-            .expect("the room read ended");
+        let exit = hex_api::conformance::end_of(&mut p).unwrap();
         self.client.delete(&id).unwrap();
         assert_eq!(exit, Exit::Code(0), "the room read: {text}");
         text.trim()

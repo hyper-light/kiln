@@ -191,10 +191,10 @@ an "Events" row of them.
 kiln vendors Quiver (`vendor/quiver`, at `1e8363b`, its `main` with CP-T2.2's persisted class,
 whose simulation ran 10,000 seeds alike in two passes and lost no acknowledged publish), Focal's bus
 (`vendor/focal-bus`, branch `bus-replicated` at `9aded7cd`) and hyper-raft (`vendor/hyper-raft`, at
-`fb74b595`, its `main` with a driver that reads what its sockets took before it judges its timers) at the revisions Quiver takes them, with Quiver's
+`045cf3ff`, its `main` with a driver that reads what its sockets took before it judges its timers, and QUIC's negotiated idle timeout Shards' agent-control link reads) at the revisions Quiver takes them, with Quiver's
 recorded changes: the bus's five and hyper-raft's three (vendor/MANIFEST.toml, docs/vendoring.md, each
 copy's `UPSTREAM.md`), and kiln's own `Kiln-only` one to hyper-raft (hyper-rt from kiln-rt). kiln's
 own transport, runtime and replicated stores (sync, CD) moved with it, from hyper-raft `767627f` to
-`25cf889`, then `0856e05` (kiln's CP-T10.2, so Mantle builds on it too), `f45fc563` and `fb74b595` (the driver fix Mantle's `87ab09e1` takes), so kiln links one
+`25cf889`, then `0856e05` (kiln's CP-T10.2, so Mantle builds on it too), `f45fc563`, `fb74b595` (the driver fix Mantle's `87ab09e1` takes) and `045cf3ff` (the revision Hex and Shards take: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), so kiln links one
 revision of each. In kiln's copy, hyper-durable's `RamStore` is compiled only for tests: kiln's sync
 tests ask for it through a dev-dependency.

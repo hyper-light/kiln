@@ -3,8 +3,11 @@
 //! docs/design/runtime-architecture.md). Whoever meets the end first removes the box: the caller's own
 //! wait, which spares the hop through the supervising thread, the supervising thread when no caller
 //! waits, or a delete. Each run is claimed once, under the supervisor's lock, and the others wait for what
-//! the claimer publishes, so a box is removed once and never after another box has taken its id. A run's
-//! pidfd is one of the supervisor's, held to its budget with the inits' ([`Supervisor::reserve`]).
+//! the claimer says, so a box is removed once and never after another box has taken its id: a claimed run
+//! stays in view until its claimer has said how the removal went, and a delete of its box waits for that
+//! word rather than remove the box beside it (runtime goal 7). The word comes on every path, the claim's
+//! drop saying the claimer stopped where it unwound. A run's pidfd is one of the supervisor's, held to its
+//! budget with the inits' ([`Supervisor::reserve`]).
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -22,11 +25,15 @@ use rustix::process::{Pid, PidfdFlags, WaitId, WaitIdOptions};
 use super::{Slot, Stat, Supervisor, exit_of, owned, poisoned};
 use crate::store::Store;
 
-/// The runs a node watches, by box and by the epoll token each program's pidfd carries.
+/// The runs a node watches, by box and by the epoll token each program's pidfd carries, and those claimed and
+/// not yet done with, by box: each claimer's removal under way, which a delete of the same box waits for
+/// ([`Supervisor::take_run`]). A run is in one of them at a time, watched, then claimed, then neither once its
+/// claimer has said how the removal went, so `claimed` holds at most the runs `by_box` held.
 #[derive(Default)]
 pub(super) struct Runs {
     by_box: BTreeMap<BoxId, Arc<Run>>,
     by_token: BTreeMap<u64, Arc<Run>>,
+    claimed: BTreeMap<BoxId, Arc<Run>>,
 }
 
 impl Runs {
@@ -44,32 +51,143 @@ impl Runs {
 /// One box made by a run, and its program.
 pub struct Run {
     id: BoxId,
-    pid: u32,
+    /// Its program, by pid and start time, as the box's record names it.
+    program: ProcId,
     token: u64,
     pidfd: OwnedFd,
     cgroup: BoxCgroup,
     /// The names of the root its cgroup is under, which its name goes from once the cgroup is removed.
     names: Names,
-    /// What the run's claimer published once the box was gone: the program's end, or why the box
-    /// couldn't be removed.
-    end: Mutex<Option<Result<Exit, Refusal>>>,
+    /// What the run's claimer said once done with the box.
+    end: Mutex<Option<Said>>,
     published: Condvar,
 }
 
-impl Run {
-    fn end(&self) -> Result<MutexGuard<'_, Option<Result<Exit, Refusal>>>, Refusal> {
-        self.end.lock().map_err(poisoned)
-    }
+/// What a run's claimer says once done with its box (R04): the box gone, with how its program ended; why the box
+/// couldn't be removed; or that the claimer stopped before it said (its thread unwound), the box as it left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Said {
+    Removed(Exit),
+    Failed(Refusal),
+    Abandoned,
+}
 
-    fn publish(&self, end: Result<Exit, Refusal>) -> Result<(), Refusal> {
-        *self.end()? = Some(end);
-        self.published.notify_all();
-        Ok(())
+impl Said {
+    /// The run's end as its [`Proc`] reports it to its caller.
+    fn end(&self, id: &BoxId) -> Result<Exit, Refusal> {
+        match self {
+            Self::Removed(exit) => Ok(*exit),
+            Self::Failed(why) => Err(why.clone()),
+            Self::Abandoned => Err(Refusal::Broken(format!(
+                "box {id}'s run's claimer stopped before it said how the box's removal went"
+            ))),
+        }
     }
 }
 
+impl Run {
+    fn end(&self) -> Result<MutexGuard<'_, Option<Said>>, Refusal> {
+        self.end.lock().map_err(poisoned)
+    }
+
+    /// Its program, by pid and start time.
+    pub fn program(&self) -> ProcId {
+        self.program
+    }
+
+    /// What its claimer said once done with the box, waited for. The claimer's removal is bounded by its own waits
+    /// (the box's kill, the node's learned emptying wait, the record's turn) and its word comes on every path, its
+    /// [`Claimed`]'s drop saying [`Said::Abandoned`] where it unwound, so the wait follows the claimer and needs no
+    /// timer (decision 9).
+    pub fn said(&self) -> Result<Said, Refusal> {
+        let end = self.end()?;
+        let end = self
+            .published
+            .wait_while(end, |end| end.is_none())
+            .map_err(poisoned)?;
+        end.clone().ok_or_else(|| {
+            Refusal::Broken(format!(
+                "box {}'s run's claimer was waited for and said nothing",
+                self.id
+            ))
+        })
+    }
+}
+
+/// A run its one claimer took out of the watched runs to remove its box: what it says goes to every waiter, and
+/// where it stops without a word (its thread unwound) its drop says [`Said::Abandoned`], so no waiter waits on a
+/// claimer gone.
+pub struct Claimed<'a> {
+    supervisor: &'a Supervisor,
+    run: Arc<Run>,
+    said: bool,
+}
+
+impl Claimed<'_> {
+    /// Says how the removal went.
+    fn say(mut self, said: Said) -> Result<(), Refusal> {
+        self.said = true;
+        self.supervisor.done_with(&self.run, said)
+    }
+
+    /// Its delete has ended the box ([`crate::Node`]'s), `removed` saying whether it removed it: the program reaped
+    /// once the delete emptied the box, and that said, or why the delete failed.
+    pub fn deleted(self, removed: Result<(), Refusal>) -> Result<(), Refusal> {
+        let said = match removed {
+            Ok(()) => match reap(&self.run, WaitIdOptions::EXITED) {
+                Ok(exit) => Said::Removed(exit),
+                Err(why) => Said::Failed(why),
+            },
+            // The program may run on in the box the delete left: no longer this run's, it's the
+            // sweep's to reap once it ends, as any box process orphaned to the agent is.
+            Err(why) => {
+                owned()?.remove(&self.run.program.pid);
+                Said::Failed(why)
+            }
+        };
+        self.say(said)
+    }
+
+    /// Removes the box once its program has ended: the program reaped, whatever it left in the box ended (as
+    /// `hex box run` ends it), the cgroup and the record removed; then says the program's end, or why the box
+    /// couldn't be removed, which it also returns.
+    fn finish(self) -> Result<(), Refusal> {
+        #[cfg(all(debug_assertions, feature = "test-controls"))]
+        self.supervisor.removals.stop_here()?;
+        let run = &self.run;
+        let removed = reap(run, WaitIdOptions::EXITED | WaitIdOptions::NOHANG).and_then(|exit| {
+            remove(&run.id, &run.cgroup, &run.names, &self.supervisor.store).map(|()| exit)
+        });
+        let failed = removed.as_ref().err().cloned();
+        self.say(match removed {
+            Ok(exit) => Said::Removed(exit),
+            Err(why) => Said::Failed(why),
+        })?;
+        failed.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for Claimed<'_> {
+    fn drop(&mut self) {
+        if !self.said {
+            let _ = self.supervisor.done_with(&self.run, Said::Abandoned);
+        }
+    }
+}
+
+/// What a delete finds of its box's run ([`Supervisor::take_run`]).
+pub enum Taken<'a> {
+    /// Watched: claimed for the delete, which removes the box and then says so ([`Claimed::deleted`]).
+    Mine(Claimed<'a>),
+    /// Claimed by another, its removal under way: the delete waits for its word ([`Run::said`]) where the box's
+    /// record still names this run's program.
+    Theirs(Arc<Run>),
+    /// No run of the box is watched or being removed.
+    NoRun,
+}
+
 impl Supervisor {
-    /// Watches box `id`'s run, its program `pid` by `pidfd`, until it ends and the box `cgroup` (under the root
+    /// Watches box `id`'s run, its program `program` by `pidfd`, until it ends and the box `cgroup` (under the root
     /// whose names `names` are) is removed with its record. Takes `slot`'s place in the budget. The program is
     /// owned from here, so no sweep reaps it first: the caller holds [`Supervisor::spawning`] from its spawn to
     /// this. A program that ended already turns its pidfd readable, which the epoll set reports at once. Refused,
@@ -78,7 +196,7 @@ impl Supervisor {
         self: &Arc<Self>,
         mut slot: Slot,
         id: &BoxId,
-        pid: u32,
+        program: ProcId,
         pidfd: OwnedFd,
         cgroup: BoxCgroup,
         names: Names,
@@ -100,7 +218,7 @@ impl Supervisor {
             return Err((Refusal::os("watching a run's program", e), pidfd));
         }
         match owned() {
-            Ok(mut owned) => owned.insert(pid),
+            Ok(mut owned) => owned.insert(program.pid),
             Err(e) => {
                 let _ = epoll::delete(self.epoll.as_fd(), pidfd.as_fd());
                 return Err((e, pidfd));
@@ -108,7 +226,7 @@ impl Supervisor {
         };
         let run = Arc::new(Run {
             id: id.clone(),
-            pid,
+            program,
             token,
             pidfd,
             cgroup,
@@ -150,69 +268,84 @@ impl Supervisor {
         };
         match pidfd.filter(same) {
             Some(pidfd) => self
-                .watch_run(slot, id, program.pid, pidfd, cgroup, names)
+                .watch_run(slot, id, program, pidfd, cgroup, names)
                 .map(drop)
                 .map_err(|(e, _)| e),
             None => remove(id, &cgroup, &names, &self.store),
         }
     }
 
-    /// Takes run `run` out of the watched runs: `true` for the one caller that does, which then removes
-    /// its box ([`Supervisor::finish_run`]); `false` when another has.
-    fn claim_run(&self, run: &Arc<Run>) -> Result<bool, Refusal> {
+    /// Takes run `run` out of the watched runs into the claimed ones, for the one caller that does, which then
+    /// removes its box ([`Claimed`]); `None` when another has.
+    fn claim_run(&self, run: &Arc<Run>) -> Result<Option<Claimed<'_>>, Refusal> {
         let mut inits = self.inits()?;
-        if !inits
-            .runs
+        self.claim_in(&mut inits.runs, run)
+    }
+
+    /// [`Supervisor::claim_run`] under the supervisor's lock. Unwatched first, so a run that can't be is still
+    /// watched rather than claimed by no one.
+    fn claim_in(&self, runs: &mut Runs, run: &Arc<Run>) -> Result<Option<Claimed<'_>>, Refusal> {
+        if !runs
             .by_box
             .get(&run.id)
             .is_some_and(|r| Arc::ptr_eq(r, run))
         {
-            return Ok(false);
+            return Ok(None);
         }
-        inits.runs.by_box.remove(&run.id);
-        inits.runs.by_token.remove(&run.token);
         epoll::delete(self.epoll.as_fd(), run.pidfd.as_fd())
             .map_err(|e| Refusal::os("unwatching a run's program", e))?;
-        Ok(true)
+        runs.by_box.remove(&run.id);
+        runs.by_token.remove(&run.token);
+        runs.claimed.insert(run.id.clone(), Arc::clone(run));
+        Ok(Some(Claimed {
+            supervisor: self,
+            run: Arc::clone(run),
+            said: false,
+        }))
     }
 
-    /// Box `id`'s run, taken for its delete, which ends the box and then [`Supervisor::ended_run`]s it.
-    /// `None` for a box no run watches, or one whose run another is removing.
-    pub fn take_run(&self, id: &BoxId) -> Result<Option<Arc<Run>>, Refusal> {
-        let Some(run) = self.inits()?.runs.by_box.get(id).cloned() else {
-            return Ok(None);
-        };
-        if self.claim_run(&run)? {
-            Ok(Some(run))
-        } else {
-            Ok(None)
+    /// What a delete of box `id` finds of its run: watched, claimed here for the delete ([`Taken::Mine`]); claimed by
+    /// another, whose removal is under way ([`Taken::Theirs`]); or none.
+    pub fn take_run(&self, id: &BoxId) -> Result<Taken<'_>, Refusal> {
+        let mut inits = self.inits()?;
+        if let Some(run) = inits.runs.by_box.get(id).cloned()
+            && let Some(claimed) = self.claim_in(&mut inits.runs, &run)?
+        {
+            return Ok(Taken::Mine(claimed));
         }
+        Ok(match inits.runs.claimed.get(id) {
+            Some(run) => Taken::Theirs(Arc::clone(run)),
+            None => Taken::NoRun,
+        })
     }
 
-    /// A run its delete has ended, `removed` saying whether it removed the box: the program reaped once
-    /// the delete emptied the box, and the end published, or why the delete failed.
-    pub fn ended_run(&self, run: &Run, removed: Result<(), Refusal>) -> Result<(), Refusal> {
-        let end = match removed {
-            Ok(()) => reap(run, WaitIdOptions::EXITED),
-            // The program may run on in the box the delete left: no longer this run's, it's the
-            // sweep's to reap once it ends, as any box process orphaned to the agent is.
-            Err(e) => {
-                owned()?.remove(&run.pid);
-                Err(e)
-            }
-        };
-        run.publish(end)
+    /// A claimer's word on its run: to every waiter, then the run out of the claimed ones, where its entry is still
+    /// this run's (a box made again under the id may have been claimed there since).
+    fn done_with(&self, run: &Arc<Run>, said: Said) -> Result<(), Refusal> {
+        *run.end()? = Some(said);
+        run.published.notify_all();
+        let mut inits = self.inits()?;
+        if inits
+            .runs
+            .claimed
+            .get(&run.id)
+            .is_some_and(|r| Arc::ptr_eq(r, run))
+        {
+            inits.runs.claimed.remove(&run.id);
+        }
+        Ok(())
     }
 
-    /// Removes a claimed run's box once its program has ended: the program reaped, whatever it left in
-    /// the box ended (as `hex box run` ends it), the cgroup and the record removed; then publishes
-    /// the program's end, or why the box couldn't be removed, which it also returns.
-    fn finish_run(&self, run: &Run) -> Result<(), Refusal> {
-        let removed = reap(run, WaitIdOptions::EXITED | WaitIdOptions::NOHANG)
-            .and_then(|exit| remove(&run.id, &run.cgroup, &run.names, &self.store).map(|()| exit));
-        let failed = removed.as_ref().err().cloned();
-        run.publish(removed)?;
-        failed.map_or(Ok(()), Err)
+    /// Holds the runs' removals at their start until the guard goes ([`Removals`]).
+    #[cfg(all(debug_assertions, feature = "test-controls"))]
+    pub fn hold_removals(&self) -> Result<RemovalHold<'_>, Refusal> {
+        self.removals.hold()
+    }
+
+    /// A delete waits on a removal another claimer has under way ([`Removals`]).
+    #[cfg(all(debug_assertions, feature = "test-controls"))]
+    pub fn waiting_on_removal(&self) -> Result<(), Refusal> {
+        self.removals.waiting()
     }
 
     /// The supervising thread's pass over the runs whose programs ended.
@@ -220,8 +353,8 @@ impl Supervisor {
         let mut first_error = None;
         for run in ready {
             let done = match self.claim_run(run) {
-                Ok(true) => self.finish_run(run),
-                Ok(false) => Ok(()),
+                Ok(Some(claimed)) => claimed.finish(),
+                Ok(None) => Ok(()),
                 Err(e) => Err(e),
             };
             if let Err(e) = done {
@@ -245,7 +378,7 @@ fn reap(run: &Run, options: WaitIdOptions) -> Result<Exit, Refusal> {
         Err(Errno::CHILD) => Ok(Exit::Unknown),
         Err(e) => Err(Refusal::os("reaping a run's program", e)),
     };
-    owned()?.remove(&run.pid);
+    owned()?.remove(&run.program.pid);
     exit
 }
 
@@ -272,6 +405,93 @@ fn remove(id: &BoxId, cgroup: &BoxCgroup, names: &Names, store: &Store) -> Resul
     store.remove(id)
 }
 
+/// A debug build's hold on the runs' removals (runtime goal 7), armed by the node's caller alone
+/// ([`crate::Node::hold_run_removals`]): while it stands, a claimer that has taken a run stops before it reaps the
+/// program or touches the box, as one descheduled there would, so a test meets a delete beside a removal under way.
+/// Absent from release builds, and from any build without the test controls.
+#[cfg(all(debug_assertions, feature = "test-controls"))]
+#[derive(Debug, Default)]
+pub(super) struct Removals {
+    state: Mutex<Holding>,
+    changed: Condvar,
+}
+
+#[cfg(all(debug_assertions, feature = "test-controls"))]
+#[derive(Debug, Default)]
+struct Holding {
+    held: bool,
+    /// Claimers stopped at the hold now.
+    stopped: u64,
+    /// Deletes that waited on a removal another claimer had under way.
+    waiting: u64,
+}
+
+#[cfg(all(debug_assertions, feature = "test-controls"))]
+impl Removals {
+    fn state(&self) -> Result<MutexGuard<'_, Holding>, Refusal> {
+        self.state.lock().map_err(poisoned)
+    }
+
+    /// The hold, standing until the guard goes.
+    pub(super) fn hold(&self) -> Result<RemovalHold<'_>, Refusal> {
+        self.state()?.held = true;
+        Ok(RemovalHold { removals: self })
+    }
+
+    /// A claimer at the start of its removal: stopped there while the hold stands.
+    fn stop_here(&self) -> Result<(), Refusal> {
+        let mut state = self.state()?;
+        if !state.held {
+            return Ok(());
+        }
+        state.stopped = state.stopped.saturating_add(1);
+        self.changed.notify_all();
+        let mut state = self
+            .changed
+            .wait_while(state, |state| state.held)
+            .map_err(poisoned)?;
+        state.stopped = state.stopped.saturating_sub(1);
+        Ok(())
+    }
+
+    /// A delete waits on a removal another claimer has under way.
+    pub(super) fn waiting(&self) -> Result<(), Refusal> {
+        let mut state = self.state()?;
+        state.waiting = state.waiting.saturating_add(1);
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+/// The hold on the runs' removals ([`Removals`]): it stands until this goes.
+#[cfg(all(debug_assertions, feature = "test-controls"))]
+pub struct RemovalHold<'a> {
+    removals: &'a Removals,
+}
+
+#[cfg(all(debug_assertions, feature = "test-controls"))]
+impl RemovalHold<'_> {
+    /// The claimers stopped at the hold now.
+    pub fn stopped(&self) -> Result<u64, Refusal> {
+        Ok(self.removals.state()?.stopped)
+    }
+
+    /// The deletes that waited on a removal another claimer had under way.
+    pub fn waiting(&self) -> Result<u64, Refusal> {
+        Ok(self.removals.state()?.waiting)
+    }
+}
+
+#[cfg(all(debug_assertions, feature = "test-controls"))]
+impl Drop for RemovalHold<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.removals.state() {
+            state.held = false;
+        }
+        self.removals.changed.notify_all();
+    }
+}
+
 /// The caller's [`Proc`] for a run: its end is reported once the box is gone. Its own wait removes the
 /// box when it meets the end first; dropped, it leaves that to the supervising thread.
 pub struct RunProc {
@@ -280,17 +500,21 @@ pub struct RunProc {
 }
 
 impl RunProc {
-    /// The published end, if there is one.
+    /// The end its claimer said, if it has.
     fn published(&self) -> Result<Option<Exit>, Refusal> {
-        self.run.end()?.clone().transpose()
+        self.run
+            .end()?
+            .as_ref()
+            .map(|said| said.end(&self.run.id))
+            .transpose()
     }
 
     /// Once the program has ended: removes the box if this caller claims it, else waits at most `left`
-    /// for the claimer to publish.
+    /// for the claimer's word.
     fn ended(&self, left: Duration) -> Result<Option<Exit>, Refusal> {
-        if self.supervisor.claim_run(&self.run)? {
-            // The removal's failure is the caller's to see, and published for any other waiter.
-            self.supervisor.finish_run(&self.run)?;
+        if let Some(claimed) = self.supervisor.claim_run(&self.run)? {
+            // The removal's failure is the caller's to see, and said to any other waiter.
+            claimed.finish()?;
             return self.published();
         }
         let end = self.run.end()?;
@@ -299,13 +523,13 @@ impl RunProc {
             .published
             .wait_timeout_while(end, left, |end| end.is_none())
             .map_err(poisoned)?;
-        end.clone().transpose()
+        end.as_ref().map(|said| said.end(&self.run.id)).transpose()
     }
 }
 
 impl Proc for RunProc {
     fn pid(&self) -> u32 {
-        self.run.pid
+        self.run.program.pid
     }
 
     fn try_wait(&mut self) -> Result<Option<Exit>, Refusal> {

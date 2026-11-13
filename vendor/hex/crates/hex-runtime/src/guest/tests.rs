@@ -1049,7 +1049,7 @@ fn original_a_shards_boot_tells_its_guest_the_boots_deadline() {
     );
 }
 
-/// HEX-GUEST-34, AC-T7.4.1 (CLAUDE.md §2, §3): learn a boot so slow that twice it is past any monotonic deadline,
+/// HEX-GUEST-34, AC-T7.4.1 (CLAUDE.md §2, §3): learn a boot so slow that it is past any monotonic deadline,
 /// then ask for the guest: expect it refused by type before anything boots or dials, never a dial handed a
 /// patience that Shards' client reads as no clock.
 #[test]
@@ -1085,8 +1085,9 @@ fn a_boot_bound_past_any_deadline_is_refused_before_a_boot() {
     );
 }
 
-/// HEX-GUEST-34 (the lead's rule for learned waits): boot a guest before any boot is seen: expect its
-/// first dial bounded by twice the record's slowest boot to ready, never unbounded.
+/// HEX-GUEST-34 (decision 9: a bound is the slowest answer on record, with no margin): boot a guest before any boot
+/// is seen: expect its first dial bounded by the record's slowest boot to ready, what is left of it after the boot
+/// call's own time, never unbounded.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
 fn the_first_boot_is_bounded_by_the_record() {
@@ -1095,16 +1096,20 @@ fn the_first_boot_is_bounded_by_the_record() {
     }
     let guests = Arc::new(Planned::new(&[Boots::Ready]));
     let rt = GuestRuntime::new(guests.clone(), config());
+    let bound = rt.first_dial_bound().unwrap();
+    assert_eq!(bound, recorded_boot().unwrap());
+    let asked = Instant::now();
     rt.guest().unwrap();
+    let spent = asked.elapsed();
     let given = guests.patience.lock().unwrap()[0];
     assert!(
-        given <= 2 * recorded_boot().unwrap() && given > recorded_boot().unwrap(),
-        "{given:?}"
+        given <= bound && given + spent >= bound,
+        "{given:?} of {bound:?}, {spent:?} spent"
     );
 }
 
 /// HEX-GUEST-34: tell the runtime of a boot slower than the record, then a faster one, and boot: expect
-/// the first dial bounded by twice the slowest seen, the bound only rising.
+/// the first dial bounded by the slowest seen, the bound only rising.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
 fn the_bound_rises_with_a_slow_boot_and_never_falls() {
@@ -1116,10 +1121,15 @@ fn the_bound_rises_with_a_slow_boot_and_never_falls() {
     let slow = 3 * recorded_boot().unwrap();
     rt.learn(slow);
     rt.learn(recorded_boot().unwrap() / 2);
-    assert_eq!(rt.first_dial_bound().unwrap(), 2 * slow);
+    assert_eq!(rt.first_dial_bound().unwrap(), slow);
+    let asked = Instant::now();
     rt.guest().unwrap();
+    let spent = asked.elapsed();
     let given = guests.patience.lock().unwrap()[0];
-    assert!(given <= 2 * slow && given > slow, "{given:?}");
+    assert!(
+        given <= slow && given + spent >= slow,
+        "{given:?} of {slow:?}, {spent:?} spent"
+    );
 }
 
 /// HEX-GUEST-34 (no caller fails where an alternative exists): boot a guest that stays alive and never
@@ -1158,14 +1168,14 @@ fn a_second_hang_is_refused_by_type() {
     assert_eq!(rt.retired(), 2);
 }
 
-/// HEX-GUEST-34 (the lead's seed rule, 2026-11-07: a host class with no record seeds from 2 × the slowest record
-/// of any class, then rises with the node's own): on Linux (KVM), whose boot-to-ready row isn't in
-/// records.tsv yet, expect the first dial's bound twice that seed (twice the margin over the slowest
-/// boot_ready of any class), never a refusal, and the recorded dial bound (AC-T7.4.1's managed patience) the
-/// same; then tell it of a boot slower than the seed: expect the bound twice that boot, risen.
+/// HEX-GUEST-34 (decision 9: a host class with no record seeds from the slowest record of any class, every class's
+/// records taken as one, then rises with the node's own): on Linux (KVM), whose boot-to-ready row isn't in
+/// records.tsv yet, expect the first dial's bound that seed, the slowest boot_ready of any class with no margin,
+/// never a refusal, and the recorded dial bound (AC-T7.4.1's managed patience) the same; then tell it of a boot slower
+/// than the seed: expect the bound that boot, risen.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_unrecorded_class_seeds_from_twice_the_slowest_of_any_class_and_rises() {
+fn an_unrecorded_class_seeds_from_the_slowest_of_any_class_and_rises() {
     let slowest_any = hex_client::guest::shards::RECORDS
         .lines()
         .filter(|l| !l.starts_with('#'))
@@ -1175,19 +1185,19 @@ fn an_unrecorded_class_seeds_from_twice_the_slowest_of_any_class_and_rises() {
         })
         .max()
         .unwrap();
-    let seed = 2 * Duration::from_micros(slowest_any);
+    let seed = Duration::from_micros(slowest_any);
     let rt = GuestRuntime::new(Arc::new(Planned::new(&[Boots::Ready])), config());
     assert_eq!(recorded_boot().unwrap(), seed);
-    assert_eq!(rt.first_dial_bound().unwrap(), 2 * seed);
-    assert_eq!(recorded_dial_bound().unwrap(), 2 * seed);
+    assert_eq!(rt.first_dial_bound().unwrap(), seed);
+    assert_eq!(recorded_dial_bound().unwrap(), seed);
     let slow = 3 * seed;
     rt.learn(slow);
-    assert_eq!(rt.first_dial_bound().unwrap(), 2 * slow);
+    assert_eq!(rt.first_dial_bound().unwrap(), slow);
 }
 
-/// HEX-GUEST-34 (the lead: the record is the input that turns a class on; the lead's seed rule, 2026-11-07): read
-/// a records table with HVF's and WHP's rows: expect HVF its own row, and KVM, with none, twice the slowest of
-/// any class (WHP's); a measure no class records has no seed. Add a KVM row: expect KVM its own, with no code
+/// HEX-GUEST-34 (the lead: the record is the input that turns a class on; decision 9's seed for a class with no
+/// record): read a records table with HVF's and WHP's rows: expect HVF its own row, and KVM, with none, the slowest of
+/// any class (WHP's), with no margin; a measure no class records has no seed. Add a KVM row: expect KVM its own, with no code
 /// between them.
 #[test]
 fn a_records_row_is_what_turns_a_class_on() {
@@ -1204,7 +1214,7 @@ fn a_records_row_is_what_turns_a_class_on() {
     );
     assert_eq!(
         seed_in(&two, "boot_ready", "Linux-KVM"),
-        Some(2 * Duration::from_micros(2_712_939))
+        Some(Duration::from_micros(2_712_939))
     );
     assert_eq!(seed_in(&two, "stop", "Linux-KVM"), None);
     let kvm = format!("{hvf}boot_ready\tLinux-KVM\t180000\tr.md\n");

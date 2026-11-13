@@ -13,11 +13,20 @@ publish.workspace = true
 hex-wait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# A credential's value wiped as it drops (lease::Value; docs/design/credential-grants.md C3).
+zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 hex-afunix.workspace = true
 
+[features]
+# `Patience::seeded`, for tests alone: only a dev-dependency turns it on (hex-core's own, and hex-testkit's through
+# hex-core's), so no production build has it (decision 9: no production wait is seeded from a record;
+# crates/hex-core/tests/test_seeds_dev_only.rs holds every manifest to it).
+test-seeds = []
+
 [dev-dependencies]
+proptest = "1.12.0"
 serde_json.workspace = true
 
 [lints]

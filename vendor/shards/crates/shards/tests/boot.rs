@@ -2175,12 +2175,13 @@ fn a_parent_that_started_after_its_child_is_not_its_parent() {
 
 /// shards-api's client of this build's `shards` conforms: every case of its conformance
 /// suite against real guests, the test guest as PID 1 (`echo` serves port 1234, `kmsg`
-/// powers off), its patience no clock (`Duration::MAX`): each wait returns at its fact,
-/// the guest's listening, however long this host takes to boot it beside the suite's other
-/// boots, or its end, which refuses the wait as it comes. Twice a boot recorded on another
-/// host was no bound for this one's (CI's x86_64 KVM at d35c4cf79: "no OK within
-/// 2.41364452s", PM M465's Linux-KVM record doubled; R03). A guest kernel's panic resets it
-/// at once (`panic=-1`), its case failing then.
+/// powers off), each wait for a guest's answer following its VM process (D215): it returns
+/// at the guest's listening, however long this host takes to boot it beside the suite's
+/// other boots, or at its end, which refuses the wait as it comes, and is refused `Stalled`
+/// only where the VM process ran nothing for as long as the slowest answer this test process
+/// has seen. Twice a boot recorded on another host was no bound for this one's (CI's x86_64
+/// KVM at d35c4cf79: "no OK within 2.41364452s", PM M465's Linux-KVM record doubled; R03). A
+/// guest kernel's panic resets it at once (`panic=-1`), its case failing then.
 #[test]
 fn shards_api_conforms_on_real_guests() {
     if cannot_run_vms() {
@@ -2193,7 +2194,6 @@ fn shards_api_conforms_on_real_guests() {
         port: 1234,
         unserved: 1236,
         powering_off: spec("kmsg"),
-        patience: Duration::MAX,
     })
     .unwrap();
 }
@@ -2225,10 +2225,7 @@ fn shards_api_shares_a_directory_and_a_read_only_one() {
         ..api_spec("console=ttyS0 quiet panic=-1 shards_test=share")
     };
     let guest = shards_api::Shards.boot(&spec).unwrap();
-    assert_eq!(
-        guest.wait_for(Duration::MAX).unwrap(),
-        Some(shards_api::End::PowerOff)
-    );
+    assert_eq!(guest.wait_while_runs().unwrap(), shards_api::End::PowerOff);
     assert_eq!(
         std::fs::read_to_string(rw.join("from-guest")).unwrap(),
         "written by a shards guest through --share\n"
@@ -2236,9 +2233,131 @@ fn shards_api_shares_a_directory_and_a_read_only_one() {
     assert!(!ro.join("from-guest").exists());
 }
 
+/// A managed guest's rate (D255): a guest booted `--host-managed`, spinning its one vCPU, is
+/// held by its VM's governor to the quarter CPU a client asks on its vsock socket (`RATE`,
+/// `shards_abi::rate`), as `ManagedGuest::rate` asks it. Its VM process uses no more of the
+/// host's CPU than a quarter of the time passing, two of its governor's periods (its share
+/// where the window and the periods do not line up, and what its vCPU overruns before the
+/// governor reads, at the window's two ends) and what its VMM's own threads used past its
+/// vCPU's whole CPU over a window unheld just before. Its vCPU's whole CPU holds nothing, and
+/// none lifts its hold; each answer says the period its build's hold holds over. A guest
+/// booted without `--host-managed` closes the ask unanswered.
+#[test]
+fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
+    use shards_abi::rate::{Answer, ask, read_answer};
+    use std::io::{Read as _, Write as _};
+    use std::num::NonZeroU64;
+    use std::time::Instant;
+    if cannot_run_vms() {
+        return;
+    }
+    let dir = common::TempDir::new("rate");
+    let boot = |socket: &std::path::Path, managed: bool| {
+        let mut cmd = common::command();
+        cmd.args(["run", "--kernel", kernel().to_str().unwrap()])
+            .args(["--init", test_guest().to_str().unwrap()])
+            .args(["--cpus", "1", "--memory", "256", "--no-console", "--vsock"])
+            .arg(socket);
+        if managed {
+            cmd.arg("--host-managed");
+        }
+        cmd.arg("--cmdline")
+            .arg("console=ttyS0 panic=-1 quiet shards_test=spin shards_spin_ms=600000 shards_idle_ms=0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    // Its socket is there once its VM process has made its device, for as long as it runs.
+    let listening = |socket: &std::path::Path, child: &mut std::process::Child| {
+        let start = Instant::now();
+        while !socket.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "its VM ended before it listened"
+            );
+            assert!(start.elapsed() < TIMEOUT, "no socket in {TIMEOUT:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // One ask, and the line its VM answers before it closes the ask: none where it closes it
+    // unanswered.
+    let asked = |socket: &std::path::Path, milli: u64| {
+        let mut s = shards_vmm::platform::UnixStream::connect(socket).unwrap();
+        s.write_all(ask(milli).as_bytes()).unwrap();
+        let mut line = String::new();
+        s.read_to_string(&mut line).unwrap();
+        (!line.is_empty()).then_some(line)
+    };
+    let socket = dir.join("v");
+    let mut child = boot(&socket, true);
+    listening(&socket, &mut child);
+    // `shards run --kernel` becomes the VM process on Unix, the same pid; on Windows it
+    // starts the VM process, its child.
+    let pid = child.id();
+    #[cfg(windows)]
+    let pid = {
+        let found = common::vm_processes(pid);
+        assert_eq!(found.len(), 1, "shards {pid}'s VM processes: {found:?}");
+        found[0]
+    };
+    let cpu = || shards_vmm::platform::process_usage(pid).unwrap().cpu_ns;
+    let window = || {
+        let (start, before) = (Instant::now(), cpu());
+        std::thread::sleep(Duration::from_secs(2));
+        (cpu() - before, u64::try_from(start.elapsed().as_nanos()).unwrap())
+    };
+    let (free, free_wall) = window();
+    let line = asked(&socket, 250).unwrap();
+    let Ok(Answer::Held { milli, period_ns }) = read_answer(line.as_bytes()) else {
+        panic!("asked a quarter CPU: {line:?}");
+    };
+    assert_eq!(milli, NonZeroU64::new(250));
+    assert_eq!(
+        Duration::from_nanos(period_ns.get()),
+        shards_vmm::vm::hold_period()
+    );
+    let (used, wall) = window();
+    let own = free.saturating_sub(free_wall);
+    let most = wall / 4 + 2 * period_ns.get() + own;
+    assert!(
+        used <= most,
+        "{used} ns of CPU in {wall} ns, held to a quarter CPU (unheld: {free} ns in {free_wall} ns)"
+    );
+    assert!(
+        used >= wall / 20,
+        "{used} ns of CPU in {wall} ns: held, and never let go"
+    );
+    for (whole_or_none, said) in [(1000, "its one vCPU's whole CPU"), (0, "none")] {
+        let line = asked(&socket, whole_or_none).unwrap();
+        assert_eq!(
+            read_answer(line.as_bytes()),
+            Ok(Answer::Held {
+                milli: None,
+                period_ns
+            }),
+            "{said}"
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let plain_socket = dir.join("u");
+    let mut plain = boot(&plain_socket, false);
+    listening(&plain_socket, &mut plain);
+    assert_eq!(
+        asked(&plain_socket, 250),
+        None,
+        "a guest not booted --host-managed"
+    );
+    let _ = plain.kill();
+    let _ = plain.wait();
+}
+
 /// Measures shards-api's boot of the test guest to its echo port answering, here, side by
-/// side with this file's other boots as the suite runs them: what such a boot costs here,
-/// `SHARDS_API_E2E_N` (default 5) boots, printed as n, p50 and max with `--nocapture`.
+/// side with this file's other boots as the suite runs them, each wait following its VM
+/// process (D215): what such a boot costs here, `SHARDS_API_E2E_N` (default 5) boots, printed
+/// as n, p50 and max with `--nocapture`.
 #[test]
 fn shards_api_boot_under_the_suites_load() {
     if cannot_run_vms() {
@@ -2254,7 +2373,7 @@ fn shards_api_boot_under_the_suites_load() {
             let guest = shards_api::Shards
                 .boot(&api_spec("console=ttyS0 quiet shards_test=echo"))
                 .unwrap();
-            drop(guest.connect(1234, Duration::MAX).unwrap());
+            drop(guest.connect_while_runs(1234).unwrap());
             start.elapsed()
         })
         .collect();
@@ -2281,10 +2400,7 @@ fn shards_api_boot_under_the_suites_load() {
             };
             let start = std::time::Instant::now();
             let guest = shards_api::Shards.boot(&spec).unwrap();
-            assert_eq!(
-                guest.wait_for(Duration::MAX).unwrap(),
-                Some(shards_api::End::PowerOff)
-            );
+            assert_eq!(guest.wait_while_runs().unwrap(), shards_api::End::PowerOff);
             start.elapsed()
         })
         .collect();
@@ -2304,7 +2420,7 @@ fn shards_api_boot_under_the_suites_load() {
 }
 
 /// This host's own time for shards-api's boot of the test guest to its echo port answering,
-/// waited for with no clock (`Duration::MAX`): a deadline learned where the test runs, as it
+/// waited for while its VM process runs (D215): a deadline learned where the test runs, as it
 /// runs, never a number of ours (R03).
 fn answered_boot() -> Duration {
     let start = std::time::Instant::now();
@@ -2313,7 +2429,7 @@ fn answered_boot() -> Duration {
         .unwrap_or_else(|e| panic!("boot: {e}"));
     drop(
         guest
-            .connect(1234, Duration::MAX)
+            .connect_while_runs(1234)
             .unwrap_or_else(|e| panic!("connect: {e}")),
     );
     let took = start.elapsed();

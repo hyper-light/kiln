@@ -211,7 +211,8 @@ pub fn scheduler(dir: &Path) -> (Process, SocketAddr) {
 /// asks, read as the scheduler reads them: the platform admits the class (`hex_sim::facts::classes`: Linux and
 /// Windows, never a Mac), and the capacity the node reports for the class's form offers a `process` route. The form
 /// is `oci` where the node runs containers and `process` where it doesn't (hex-node's `Runtimes::capacity_snapshot`);
-/// a Linux node's `oci` form offers both routes, a Windows node's its containers alone.
+/// either form offers a `process` route on Linux and Windows, the `oci` form its `oci` route beside it (hex-runtime's
+/// `devices::native_routes`).
 pub fn places_process_boxes(dir: &Path) -> bool {
     use hex_sim::model::{Class as Placed, Classes, Virt};
     let here = hex_sim::facts::platform(std::env::consts::OS, std::env::consts::ARCH);

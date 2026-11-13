@@ -16,7 +16,8 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use shards_cmdline::flags::Parsed;
 use shards_remote::frame::Request;
@@ -26,6 +27,11 @@ use crate::cli::cp::Ask;
 
 /// What a step on the other machine said: its status, its stdout and its stderr.
 type There = (u8, Vec<u8>, Vec<u8>);
+
+/// A step asked of the other machine, as `context::exec` says it: answered
+/// (`Ok(Ok)`); refused there, in its daemon's words (`Ok(Err)`); or unanswered, its
+/// connection ended first or never made (`Err`).
+type Asked = Result<Result<There, String>, String>;
 
 /// A step asked of the other machine: its arguments and what it reads, if anything.
 type AskThere<'a> = dyn Fn(Vec<String>, Option<Box<dyn Read + Send>>) -> Result<There, String> + 'a;
@@ -190,13 +196,16 @@ fn baseline_of(home: &Path, contexts: &str) -> Result<shards_vmm::arch::cpu::Id,
             env: Vec::new(),
             terminal: None,
         };
-        let (ran, _) = shards_remote::client::exec_seen(
+        let (ran, _) = crate::context::exec(
+            home,
             &identity,
-            context.remote(),
+            &context,
             request,
             None,
             Taken(out_tx),
             Taken(err_tx),
+            |_| {},
+            |_| {},
         );
         let there = match ran {
             Ok(Ok(status)) => (u8::try_from(status).unwrap_or(1), taken(&out_rx), taken(&err_rx)),
@@ -258,26 +267,53 @@ impl Times {
     }
 }
 
-/// Whether microVM `name` runs on the other machine, asked through `there` up to a minute
-/// as its answers do not come: none where none came.
-fn running_there(there: &AskThere<'_>, name: &str) -> Option<bool> {
-    let ask = || {
-        there(
-            ["inspect", "-f", "{{.State.Running}}", name]
-                .iter()
-                .map(|a| (*a).to_string())
-                .collect(),
-            None,
-        )
-    };
-    for _ in 0..12 {
-        match ask() {
-            Ok((0, out, _)) => return Some(String::from_utf8_lossy(&out).trim() == "true"),
-            Ok(_) => return Some(false),
-            Err(_) => std::thread::sleep(std::time::Duration::from_secs(5)),
+/// What a move has heard of the other machine over every connection it made there
+/// (`shards_remote::net::Seen`), from nothing as it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Heard {
+    /// The longest that machine went unheard and was heard again: its slowest answer in this
+    /// move.
+    slowest: Duration,
+    /// When it was last heard.
+    last: Option<Instant>,
+    /// The link's round trip, as the connection that heard it last estimated it (RFC 9002 §5).
+    rtt: Duration,
+}
+
+impl Heard {
+    /// What one connection there saw, taken in.
+    fn saw(&mut self, seen: &Seen) {
+        self.slowest = self.slowest.max(seen.longest_silence);
+        if seen.heard > self.last {
+            self.last = seen.heard;
+            self.rtt = seen.rtt;
         }
     }
-    None
+
+    /// Whether that machine has gone unheard longer than its slowest answer, or never was heard.
+    fn silent(&self) -> bool {
+        self.last.is_none_or(|at| at.elapsed() > self.slowest)
+    }
+}
+
+/// Whether the microVM runs on the other machine, its restore there unanswered (D176 part 6),
+/// asked through `ask` while that machine shows it is there, from what this move has `heard`
+/// of it. An answer says; a refusal leaves it not known (none). An ask that heard that
+/// machine is followed by another, as is one that heard nothing until that machine is
+/// [`Heard::silent`]: none then. Asks begin a round trip apart at least, the link's.
+fn running_there(ask: &mut dyn FnMut() -> (Asked, Seen), mut heard: Heard) -> Option<bool> {
+    loop {
+        let began = Instant::now();
+        let (asked, seen) = ask();
+        heard.saw(&seen);
+        match asked {
+            Ok(Ok((0, out, _))) => return Some(String::from_utf8_lossy(&out).trim() == "true"),
+            Ok(Ok(_)) => return Some(false),
+            Ok(Err(_)) => return None,
+            Err(_) if seen.heard.is_none() && heard.silent() => return None,
+            Err(_) => std::thread::sleep(heard.rtt.saturating_sub(began.elapsed())),
+        }
+    }
 }
 
 /// Whether microVM `name` is gone from the other machine, removed there through `there`:
@@ -289,12 +325,61 @@ fn removed_there(there: &AskThere<'_>, name: &str) -> bool {
     matches!(there(argv(&["inspect", "-f", "{{.Id}}", name]), None), Ok((s, _, _)) if s != 0)
 }
 
+/// What a move's restore on the other machine came to (step 4), as the move acts on it.
+#[derive(Debug, PartialEq, Eq)]
+enum Resumed {
+    /// It runs there.
+    There,
+    /// It runs nowhere there, what was made there of it removed: it goes on here, why said.
+    Here(String),
+    /// Whether it runs there is not known, why said: held here, saved, until it is.
+    NotKnown(String),
+}
+
+/// What step 4 came to for microVM `name` on the other machine (`to`), its restore there
+/// having come to `restore`, kept typed: refused, by its own failure or at that machine's
+/// daemon's gate, which never ran it, what was made there of it removed through `there`;
+/// unanswered, asked through `inspect` whether it runs there ([`running_there`]), from what
+/// this move has `heard` of that machine.
+fn resumed(
+    restore: Asked,
+    there: &AskThere<'_>,
+    inspect: &mut dyn FnMut() -> (Asked, Seen),
+    heard: Heard,
+    to: &str,
+    name: &str,
+) -> Resumed {
+    let argv = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<String>>();
+    match restore {
+        Ok(Ok((0, _, _))) => Resumed::There,
+        // Refused there, by its restore's own failure or at that machine's daemon's gate
+        // before it ran (a client it no longer enrolls, a command it could not start): what
+        // was made there of it goes, and it goes on here.
+        Ok(Ok(r)) => {
+            let _ = there(argv(&["rm", "-f", name]), None);
+            Resumed::Here(format!("{to}: {}", said("its restore", &r)))
+        }
+        Ok(Err(refused)) => {
+            let _ = there(argv(&["rm", "-f", name]), None);
+            Resumed::Here(refused)
+        }
+        // No answer: it may run there. Asked again until the other machine says; never
+        // run in both places, nor in neither, where it cannot.
+        Err(e) => match running_there(inspect, heard) {
+            Some(true) => Resumed::There,
+            // Not running there, and seen gone: it goes on here alone.
+            Some(false) if removed_there(there, name) => Resumed::Here(e),
+            _ => Resumed::NotKnown(e),
+        },
+    }
+}
+
 /// What a move's stream carried and what its connection saw of the link, as its log says it
 /// (docs/research/measurements/migrate/two-hosts.sh reads it): the stream's bytes as the
 /// export wrote them, and as they were sent where it was packed; the bytes of UDP the
 /// other machine acknowledged, over the import's whole time, the rate the link was seen to
 /// carry; its round trip, the packets it took for lost, and the longest its peer went
-/// unheard, which `shards_remote::tls::QUIET` bounds.
+/// unheard.
 fn sent_line(tally: Option<crate::packing::Tally>, seen: &Seen, took: std::time::Duration) -> String {
     let packed = match tally {
         Some(t) => format!(
@@ -329,31 +414,57 @@ fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result
     };
     let context = crate::context::load(home, to)?.ok_or_else(|| format!("no context named {to}"))?;
     let identity = crate::context::identity(home)?;
-    // A step on the other machine: `argv`, `stdin` sent as it comes; and what its
-    // connection saw of the link.
+    // A step on the other machine: `argv`, `stdin` sent as it comes, its handshake waiting on
+    // while `waits` says (`context::exec_with`); what it came to, and what its connection saw
+    // of the link.
+    let exec = |argv: Vec<String>,
+                stdin: Option<Box<dyn Read + Send>>,
+                waits: &mut dyn FnMut(shards_remote::client::Unanswered) -> bool|
+     -> (Asked, Seen) {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        let request = Request {
+            args: argv.into_iter().map(String::into_bytes).collect(),
+            env: Vec::new(),
+            terminal: None,
+        };
+        let (ran, seen) = crate::context::exec_with(
+            home,
+            &identity,
+            &context,
+            request,
+            stdin,
+            Taken(out_tx),
+            Taken(err_tx),
+            |_| {},
+            |_| {},
+            waits,
+        );
+        let asked = match ran {
+            Ok(Ok(status)) => Ok(Ok((
+                u8::try_from(status).unwrap_or(1),
+                taken(&out_rx),
+                taken(&err_rx),
+            ))),
+            Ok(Err(refused)) => Ok(Err(format!("{to}: {refused}"))),
+            Err(e) => Err(format!("{to}: {e}")),
+        };
+        (asked, seen)
+    };
+    // What this move has heard of the other machine, each step's connection taken in: locked,
+    // as the image's load and the import are asked on threads of their own.
+    let heard = Mutex::new(Heard::default());
+    // A step there, its answer kept typed (`Asked`), what its connection saw taken in.
+    let asked_there = |argv: Vec<String>, stdin: Option<Box<dyn Read + Send>>| -> (Asked, Seen) {
+        let (asked, seen) = exec(argv, stdin, &mut |_| true);
+        heard.lock().unwrap_or_else(PoisonError::into_inner).saw(&seen);
+        (asked, seen)
+    };
+    // A step there, a refusal and no answer alike its error.
     let there_seen =
         |argv: Vec<String>, stdin: Option<Box<dyn Read + Send>>| -> (Result<There, String>, Seen) {
-            let (out_tx, out_rx) = std::sync::mpsc::channel();
-            let (err_tx, err_rx) = std::sync::mpsc::channel();
-            let request = Request {
-                args: argv.into_iter().map(String::into_bytes).collect(),
-                env: Vec::new(),
-                terminal: None,
-            };
-            let (ran, seen) = shards_remote::client::exec_seen(
-                &identity,
-                context.remote(),
-                request,
-                stdin,
-                Taken(out_tx),
-                Taken(err_tx),
-            );
-            let ran = match ran {
-                Ok(Ok(status)) => Ok((u8::try_from(status).unwrap_or(1), taken(&out_rx), taken(&err_rx))),
-                Ok(Err(refused)) => Err(format!("{to}: {refused}")),
-                Err(e) => Err(format!("{to}: {e}")),
-            };
-            (ran, seen)
+            let (asked, seen) = asked_there(argv, stdin);
+            (asked.flatten(), seen)
         };
     let there = |argv: Vec<String>, stdin: Option<Box<dyn Read + Send>>| there_seen(argv, stdin).0;
     let step = |argv: &[&str]| argv.iter().map(|a| (*a).to_string()).collect::<Vec<String>>();
@@ -545,27 +656,24 @@ fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result
     }
 
     // 4. Resumed there, where it was saved.
-    let resumed = there(step(&["restore", name, &plan.snapshot]), None);
-    match resumed {
-        Ok((0, _, _)) => {}
-        // Refused there: what was made there of it goes, and it goes on here.
-        Ok(r) => {
-            let _ = there(step(&["rm", "-f", name]), None);
-            return Err(back_here(format!("{to}: {}", said("its restore", &r))));
+    let (restore, _) = asked_there(step(&["restore", name, &plan.snapshot]), None);
+    let so_far = *heard.lock().unwrap_or_else(PoisonError::into_inner);
+    // An ask that hears nothing gives up as that machine goes silent past this move's slowest
+    // answer ([`Heard::silent`]), as a daemon whose last wait ran out has no handshake deadline
+    // of its own (D180).
+    let mut inspect = || {
+        let argv = step(&["inspect", "-f", "{{.State.Running}}", name]);
+        exec(argv, None, &mut |_| !so_far.silent())
+    };
+    match resumed(restore, &there, &mut inspect, so_far, to, name) {
+        Resumed::There => {}
+        Resumed::Here(why) => return Err(back_here(why)),
+        Resumed::NotKnown(e) => {
+            return Err(format!(
+                "{e}; whether {name} runs on {to} is not known: {}, saved, is held here until it is (shards --context {to} ps -a; then shards rm -f {name}, here or there)",
+                if held { "it" } else { "its copy" }
+            ));
         }
-        // No answer: it may run there. Asked again until the other machine says; never
-        // run in both places, nor in neither, where it cannot.
-        Err(e) => match running_there(&there, name) {
-            Some(true) => {}
-            // Not running there, and seen gone: it goes on here alone.
-            Some(false) if removed_there(&there, name) => return Err(back_here(e)),
-            _ => {
-                return Err(format!(
-                    "{e}; whether {name} runs on {to} is not known: {}, saved, is held here until it is (shards --context {to} ps -a; then shards rm -f {name}, here or there)",
-                    if held { "it" } else { "its copy" }
-                ));
-            }
-        },
     }
     times.step("resumed there");
     // Its run's key there, made after its restore, and the one it replaced: none from a
@@ -610,6 +718,219 @@ fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result
 mod tests {
     use super::*;
 
+    /// What a connection to the other machine saw: that machine last heard at `heard`, the
+    /// longest it went unheard `longest`, the link's round trip `rtt`.
+    fn seen(heard: Option<Instant>, longest: Duration, rtt: Duration) -> Seen {
+        Seen {
+            longest_silence: longest,
+            heard,
+            rtt,
+            ..Seen::default()
+        }
+    }
+
+    /// The other machine's answer: the microVM runs there, or not.
+    fn running(yes: bool) -> Asked {
+        Ok(Ok((0, format!("{yes}\n").into_bytes(), Vec::new())))
+    }
+
+    fn unanswered() -> Asked {
+        Err("there: the connection to 192.0.2.1:3000 ended: timed out".into())
+    }
+
+    /// What a move learns of the other machine: its slowest answer the longest silence any of
+    /// its connections there lived through; when it was last heard, and the link's round
+    /// trip, the latest connection's that heard it; a connection that heard nothing changes
+    /// neither. A move that heard nothing takes it for silent.
+    #[test]
+    fn a_move_learns_the_other_machines_slowest_answer_from_every_connection() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut heard = Heard::default();
+        assert!(heard.silent());
+        // `ready`, kept alive while it fetched a kernel; the import, through a stall of 31 s;
+        // the restore; an ask that heard nothing.
+        heard.saw(&seen(Some(t0), ms(2_500), ms(4)));
+        heard.saw(&seen(Some(t0 + ms(9_000)), ms(31_000), ms(9)));
+        heard.saw(&seen(Some(t0 + ms(9_100)), ms(120), ms(5)));
+        heard.saw(&Seen::default());
+        assert_eq!(
+            heard,
+            Heard {
+                slowest: ms(31_000),
+                last: Some(t0 + ms(9_100)),
+                rtt: ms(5),
+            }
+        );
+        assert!(!heard.silent());
+    }
+
+    /// The other machine's first answer says: the microVM running there, not running, or not
+    /// there (its `inspect` failing); a refusal leaves it not known, as asking again would
+    /// only ask to be refused again. One ask each, however patient the move could be.
+    #[test]
+    fn the_other_machines_first_answer_says() {
+        let now = Instant::now();
+        let heard = Heard {
+            slowest: Duration::from_secs(3_600),
+            last: Some(now),
+            rtt: Duration::ZERO,
+        };
+        let failed: Asked = Ok(Ok((1, Vec::new(), b"shards: no such microVM: web\n".to_vec())));
+        let refused: Asked = Ok(Err("there: this machine has not enrolled this client".into()));
+        for (asked, says) in [
+            (running(true), Some(true)),
+            (running(false), Some(false)),
+            (failed, Some(false)),
+            (refused, None),
+        ] {
+            let mut asks = 0;
+            let mut ask = || {
+                asks += 1;
+                (
+                    asked.clone(),
+                    seen(Some(Instant::now()), Duration::ZERO, Duration::ZERO),
+                )
+            };
+            assert_eq!(running_there(&mut ask, heard), says);
+            assert_eq!(asks, 1);
+        }
+    }
+
+    /// A machine that shows it is there though its asks go unanswered (a connection it closed,
+    /// its daemon restarting) is asked again until it answers, however many times: forty here,
+    /// where twelve were all it was asked before; from a move that heard nothing of it before
+    /// too. One that hears nothing is asked again while its silence is within its slowest
+    /// answer in the move.
+    #[test]
+    fn a_machine_unanswered_is_asked_again_until_it_answers() {
+        let before = [
+            Heard::default(),
+            Heard {
+                slowest: Duration::from_millis(1),
+                last: Some(Instant::now()),
+                rtt: Duration::ZERO,
+            },
+        ];
+        for heard in before {
+            let mut asks = 0;
+            let mut ask = || {
+                asks += 1;
+                let asked = if asks <= 40 { unanswered() } else { running(true) };
+                (asked, seen(Some(Instant::now()), Duration::ZERO, Duration::ZERO))
+            };
+            assert_eq!(running_there(&mut ask, heard), Some(true));
+            assert_eq!(asks, 41);
+        }
+        let heard = Heard {
+            slowest: Duration::from_secs(3_600),
+            last: Some(Instant::now()),
+            rtt: Duration::ZERO,
+        };
+        let mut asks = 0;
+        let mut ask = || {
+            asks += 1;
+            let asked = if asks <= 3 { unanswered() } else { running(false) };
+            (asked, Seen::default())
+        };
+        assert_eq!(running_there(&mut ask, heard), Some(false));
+        assert_eq!(asks, 4);
+    }
+
+    /// A machine that hears nothing and has gone unheard longer than the longest it went
+    /// unheard in the move and was heard again is not known: at once where its silence had
+    /// passed that before the asking began, as a restore's connection that ended unheard
+    /// leaves it (its first ask still goes out), else as soon as its silence passes it, and
+    /// never sooner. A move that heard nothing of it ends at the first ask that hears nothing.
+    #[test]
+    fn a_machine_silent_past_its_slowest_answer_is_not_known() {
+        let slowest = Duration::from_millis(40);
+        let rtt = Duration::from_millis(1);
+        let mut asks = 0;
+        let mut ask = || {
+            asks += 1;
+            (unanswered(), Seen::default())
+        };
+        let long_ago = Instant::now().checked_sub(Duration::from_millis(100)).unwrap();
+        let heard = Heard {
+            slowest,
+            last: Some(long_ago),
+            rtt,
+        };
+        assert_eq!(running_there(&mut ask, heard), None);
+        assert_eq!(asks, 1);
+
+        // Heard at its first ask, then nothing.
+        let mut heard_at = None;
+        let mut asks = 0;
+        let mut ask = || {
+            asks += 1;
+            let at = (asks == 1).then(Instant::now);
+            heard_at = heard_at.or(at);
+            (unanswered(), seen(at, Duration::ZERO, rtt))
+        };
+        let heard = Heard {
+            slowest,
+            last: Some(long_ago),
+            rtt,
+        };
+        assert_eq!(running_there(&mut ask, heard), None);
+        assert!(asks >= 2);
+        assert!(
+            heard_at.unwrap().elapsed() > slowest,
+            "not known only past its slowest answer"
+        );
+
+        let mut asks = 0;
+        let mut ask = || {
+            asks += 1;
+            (unanswered(), Seen::default())
+        };
+        assert_eq!(running_there(&mut ask, Heard::default()), None);
+        assert_eq!(asks, 1);
+    }
+
+    /// The wait takes every figure from what the other machine showed the move: its asks begin
+    /// the link's round trip apart at least, whatever that was, and its source holds no number
+    /// of its own, the exit status that answers aside (R03).
+    #[test]
+    fn the_wait_takes_its_figures_from_the_link_alone() {
+        for rtt in [Duration::ZERO, Duration::from_millis(15)] {
+            let mut asks = 0;
+            let mut ask = || {
+                asks += 1;
+                let asked = if asks < 4 { unanswered() } else { running(true) };
+                (asked, seen(Some(Instant::now()), Duration::ZERO, rtt))
+            };
+            let began = Instant::now();
+            assert_eq!(running_there(&mut ask, Heard::default()), Some(true));
+            assert_eq!(asks, 4);
+            assert!(began.elapsed() >= rtt * 3, "four asks, a round trip apart");
+        }
+        let source = include_str!("moves.rs");
+        let body = |from: &str| {
+            source
+                .split_once(from)
+                .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                .map(|(body, _)| body)
+                .unwrap()
+        };
+        for (what, code) in [
+            ("running_there", body("fn running_there(")),
+            ("Heard", body("impl Heard {")),
+        ] {
+            let code = code.replace("Ok(Ok((0, out, _)))", "");
+            // A number's first digit follows no letter, digit or underscore (`utf8` is a name).
+            let mut before = ' ';
+            let number = code.chars().any(|c| {
+                let starts = c.is_ascii_digit() && !(before.is_alphanumeric() || before == '_');
+                before = c;
+                starts
+            });
+            assert!(!number, "{what} holds a figure of its own:\n{code}");
+        }
+    }
+
     /// A refusal the other machine answers typed is said from what it is; one of a daemon of
     /// an earlier build, or a step that failed, in the step's own words.
     #[test]
@@ -637,5 +958,87 @@ mod tests {
             unready("its check", &(1, Vec::new(), Vec::new())),
             "its check failed"
         );
+    }
+
+    /// A restore the other machine's daemon refuses at its gate (`Answer::Refused`, typed on
+    /// the wire) never ran there: what was made there of it goes, and it goes on here, as a
+    /// restore that failed there does, nothing asked of whether it runs there; never "not
+    /// known". A restore that ran is followed as before: done, it runs there; failed, it goes
+    /// on here; unanswered, it is asked about (D176 part 6). `there` is the other machine's
+    /// daemon, standing in, and records what it is asked.
+    #[test]
+    fn a_restore_refused_at_the_other_daemons_gate_goes_on_here() {
+        let words = |argv: &[&str]| argv.iter().map(|a| (*a).to_string()).collect::<Vec<String>>();
+        let asked = Mutex::new(Vec::new());
+        let there = |argv: Vec<String>, _: Option<Box<dyn Read + Send>>| -> Result<There, String> {
+            let gone = argv.first().map(String::as_str) == Some("inspect");
+            asked.lock().unwrap().push(argv);
+            // Asked of after its removal, it is gone.
+            Ok((u8::from(gone), Vec::new(), Vec::new()))
+        };
+        let refusal = "there: this machine has not enrolled you: join it by an invitation first";
+        let inspected = std::cell::Cell::new(0);
+        let mut inspect = || {
+            inspected.set(inspected.get() + 1);
+            (Ok(Err(refusal.to_string())), Seen::default())
+        };
+        let restored = resumed(
+            Ok(Err(refusal.to_string())),
+            &there,
+            &mut inspect,
+            Heard::default(),
+            "there",
+            "web",
+        );
+        assert_eq!(restored, Resumed::Here(refusal.to_string()));
+        assert_eq!(*asked.lock().unwrap(), vec![words(&["rm", "-f", "web"])]);
+        assert_eq!(
+            inspected.get(),
+            0,
+            "a refused restore asks nothing of whether it runs there"
+        );
+
+        asked.lock().unwrap().clear();
+        let failed = Ok(Ok((
+            1,
+            Vec::new(),
+            b"shards: its snapshot is not here\n".to_vec(),
+        )));
+        let restored = resumed(failed, &there, &mut inspect, Heard::default(), "there", "web");
+        assert_eq!(
+            restored,
+            Resumed::Here("there: its snapshot is not here".to_string())
+        );
+        assert_eq!(*asked.lock().unwrap(), vec![words(&["rm", "-f", "web"])]);
+
+        asked.lock().unwrap().clear();
+        let done = Ok(Ok((0, Vec::new(), Vec::new())));
+        let restored = resumed(done, &there, &mut inspect, Heard::default(), "there", "web");
+        assert_eq!(restored, Resumed::There);
+        assert!(asked.lock().unwrap().is_empty());
+
+        // Unanswered, it may run there: asked, and found not running and removed, it goes on
+        // here; found running, it runs there.
+        let mut not_running = || (running(false), Seen::default());
+        let restored = resumed(
+            unanswered(),
+            &there,
+            &mut not_running,
+            Heard::default(),
+            "there",
+            "web",
+        );
+        assert_eq!(restored, Resumed::Here(unanswered().unwrap_err()));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![
+                words(&["rm", "-f", "web"]),
+                words(&["inspect", "-f", "{{.Id}}", "web"])
+            ]
+        );
+        let mut runs = || (running(true), Seen::default());
+        let restored = resumed(unanswered(), &there, &mut runs, Heard::default(), "there", "web");
+        assert_eq!(restored, Resumed::There);
+        assert_eq!(inspected.get(), 0);
     }
 }

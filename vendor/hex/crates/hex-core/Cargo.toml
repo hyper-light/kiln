@@ -16,7 +16,15 @@ sha2.workspace = true
 thiserror.workspace = true
 triomphe.workspace = true
 
+[features]
+# `Seeds::seeded`, and hex-api's `Patience::seeded` with it, for tests alone: only hex-testkit's dependency turns it
+# on, and hex-testkit is a dev-dependency everywhere, so no production build has it (decision 9: no production wait is
+# seeded from a record; tests/test_seeds_dev_only.rs holds every manifest to it).
+test-seeds = ["hex-api/test-seeds"]
+
 [dev-dependencies]
+# hex-core's own tests seed their waits (`Patience::seeded`), a dev-dependency's feature alone.
+hex-api = { workspace = true, features = ["test-seeds"] }
 proptest = "1.12.0"
 
 # The doc-truth tests of `darwin`'s signal table against each kernel's own numbers.

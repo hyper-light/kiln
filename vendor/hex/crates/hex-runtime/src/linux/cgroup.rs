@@ -1194,16 +1194,21 @@ fn managed_limit(file: &'static str, text: &str) -> Result<u64, Refusal> {
         .map_err(|error| managed_read_error(file, error))
 }
 
+/// A VM scope's limits against its canonical bounds: its `cpu.max` at most its CPU bound, its swap off, and its
+/// `memory.max` at most its memory bound where it has one. A VM has none (joint plan step 14, ROOT's ruling B under
+/// decision 9: no per-VM hard memory cap, a chosen bound that would kill a VMM the first time it needs more than any
+/// window showed): its memory is held by its budget's memory.high, the last resort and its fleet's budget, so any
+/// `memory.max` it holds, "max" included, passes, and only its swap must be off, so all it holds is RAM.
 fn check_managed_limits(
     bounds: &Bounds,
     cpu: &str,
     memory: &str,
     swap: &str,
 ) -> Result<(), Refusal> {
-    let (Some(cpu_milli), Some(memory_max)) = (bounds.cpu_max_milli, bounds.memory_max) else {
+    let Some(cpu_milli) = bounds.cpu_max_milli else {
         return Err(managed_read_error(
             "native backing bounds",
-            "canonical CPU and memory limits are required",
+            "a canonical CPU limit is required",
         ));
     };
     let cpu = core::CpuMax::parse(cpu)
@@ -1224,12 +1229,16 @@ fn check_managed_limits(
             "the native CPU limit exceeds its canonical bound",
         ));
     }
-    let memory = managed_limit("memory.max", memory)?;
-    if memory == 0 || memory > memory_max {
-        return Err(managed_read_error(
-            "memory.max",
-            "the native memory limit exceeds its canonical bound",
-        ));
+    if let Some(memory_max) = bounds.memory_max {
+        let memory = managed_limit("memory.max", memory)?;
+        if memory == 0 || memory > memory_max {
+            return Err(managed_read_error(
+                "memory.max",
+                "the native memory limit exceeds its canonical bound",
+            ));
+        }
+    } else if memory.trim() != "max" {
+        managed_limit("memory.max", memory)?;
     }
     if managed_limit("memory.swap.max", swap)? != 0 {
         return Err(managed_read_error(
@@ -1911,6 +1920,40 @@ mod tests {
         assert!(cg.managed_procs().is_err());
         files(&old);
         fs::write(old.join("pids.max"), "5\n").unwrap();
+        assert!(cg.check_managed_bounds(&bounds).is_err());
+    }
+
+    /// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13, ruling B: no VM has a memory.max, cold or warm) with HEX-RT-15:
+    /// a VM's scope holds no canonical memory bound of its own, its memory held by its budget's memory.high, the last
+    /// resort and its fleet's budget, while its swap stays off, so all it holds is RAM. Do check, against a VM's
+    /// bounds with no memory bound, its scope with memory.max "max" (as its first window leaves it) and with the value
+    /// an earlier create wrote, each with swap off; then with swap on. Expect the first two passing and the last
+    /// refused.
+    #[test]
+    fn w14_a_vm_scope_has_no_memory_bound_of_its_own_and_no_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("managed");
+        fs::create_dir(&dir).unwrap();
+        let bounds = Bounds {
+            cpu_max_milli: Some(1000),
+            ..Bounds::default()
+        };
+        let write = |memory: &str, swap: &str| {
+            for (file, text) in [
+                ("cgroup.procs", "5\n"),
+                ("cpu.max", "100000 100000\n"),
+                ("memory.max", memory),
+                ("memory.swap.max", swap),
+            ] {
+                fs::write(dir.join(file), text).unwrap();
+            }
+        };
+        let cg = pinned_managed_cgroup(&dir);
+        write("max\n", "0\n");
+        cg.check_managed_bounds(&bounds).unwrap();
+        write(&format!("{}\n", hex_api::MIN_MEMORY), "0\n");
+        cg.check_managed_bounds(&bounds).unwrap();
+        write("max\n", "max\n");
         assert!(cg.check_managed_bounds(&bounds).is_err());
     }
 

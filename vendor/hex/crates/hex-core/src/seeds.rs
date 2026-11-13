@@ -1,6 +1,6 @@
 //! The node agent's seeds (decision 5 of docs/design/runtime-architecture.md, goal 5 plan step 3): how many it
-//! keeps, which one each create is handed, how long a create waits for one, when a seed is taken for hung and
-//! started again, and what it counts. Pure: the agent's shell starts each seed (`hex __oci-seed`, exec'd once),
+//! keeps, which one each create is handed, how long a create waits for one, when a seed that died is started again,
+//! and what it counts. Pure: the agent's shell starts each seed (`hex __oci-seed`, exec'd once),
 //! hands it a create over its socket, watches it by its pidfd and kills it; this decides which and when, and refuses
 //! by type what can't be done. `now` is the shell's monotonic clock: the time since a fixed point it chose, the same
 //! for every call.
@@ -10,23 +10,30 @@
 //!   pool ([`Seeds::growing`]) starts with fewer slots, the host's parallelism, and adds one for each create that
 //!   finds none free, up to the bound (Ada's rule, 2026-11-06).
 //! - **A create** is handed an idle seed that is up, never one starting, busy or gone. With none idle it waits in
-//!   line ([`Admit::Wait`]), and each seed that frees goes to the create that has waited longest. While
-//!   [`Limits::waiting`] creates wait, the next is refused at once ([`Refused::Busy`]); a create handed no seed
-//!   within the line's learned wait is refused ([`Refused::Waited`]). A waiting create claims once more when the
-//!   shell wakes it or its wait ends ([`Seeds::claim`]), and counts against the line until it does.
-//! - **Death and hangs**: a seed the shell reports dead, or one that has served a create for its learned hang bound
-//!   (taken for hung by [`Seeds::hung`], for the shell to kill), leaves its slot, and the create it served is refused
-//!   ([`Refused::Died`], [`Refused::Hung`]). The pool asks for the slot to be started again and counts the restart.
-//!   A report about a seed that has left is refused by type ([`Stale::Gone`]), never taken for its slot's next
-//!   seed's.
-//! - **Learned waits** (decision 9; Ada's 2026-11-06 rule, the lead's failure-bound rule): the line's wait and the
-//!   hang bound are each twice the slowest answer, recorded ([`CLONE_SLOWEST`], before the node has one) or seen by
-//!   this pool on `now`'s clock ([`crate::patience`]), and only rise. A create handed a seed after waiting is a
-//!   sample of the line's wait, a seed done with its create one of the hang bound's. A create refused at its wait's
-//!   end, and a seed that died or was taken for hung, is no sample (Karn's point).
+//!   line ([`Admit::Wait`]), and each seed that frees goes to the create that has waited longest, however long that
+//!   is. While [`Limits::waiting`] creates wait, the next is refused at once ([`Refused::Busy`]). Past the line's
+//!   learned wait a create waits on, following its seeds by their life alone, and is refused ([`Refused::Waited`])
+//!   only when no seed can come. A waiting create claims once more when the shell wakes it or the time its claim gave
+//!   it comes ([`Seeds::claim`]), and counts against the line until it does.
+//! - **Death**: a seed the shell reports dead leaves its slot, and the create it served is refused
+//!   ([`Refused::Died`]). The pool asks for the slot to be started again and counts the restart. A report about a seed
+//!   that has left is refused by type ([`Stale::Gone`]), never taken for its slot's next seed's. A seed past its
+//!   learned hang bound is never taken for hung ([`Seeds::past_hang`]): it is followed by its life, its death the only
+//!   end of its create but its answer.
+//! - **Learned waits** (decision 9; Ada's rules of 2026-11-06 and 2026-11-13, no picked constant and no record): the
+//!   line's wait and the hang bound are each the slowest answer this pool has seen on `now`'s clock
+//!   ([`crate::patience`]), and only rise. Each is a bound only while answers come within it: a wait past it is a
+//!   run-out, told to the census and no sample (Karn's point), and goes on, following its party by its life alone, as
+//!   at every local site (docs/research/runtime/learned-waits.md: a stall judged at the slowest gap seen refuses
+//!   healthy parties): the line's, the busy seeds, until one is handed to it or none can come; the hang bound's, the
+//!   seed serving the create, until it answers or dies, its death the pool's [`Seeds::died`]. Before each's first
+//!   answer, and from a run-out to the next, it follows its party from its start. A create handed a seed after
+//!   waiting, however long, is a sample of the line's wait, a seed done with its create one of the hang bound's; a
+//!   create refused in line, and a seed that died, is none.
 //! - **Restarts are bounded**: a start that fails, or a seed that dies before it serves a create, stops the starting
 //!   until the next create, so a node whose seeds can't start tries each slot once a create, never in a loop
-//!   (CLAUDE.md §2).
+//!   (CLAUDE.md §2). With the starting stopped and no seed up or starting, none can come for the creates in line, and
+//!   each is refused then ([`Refused::Waited`]).
 //!
 //! [`Counts`] is what the bench and the node's metrics read, [`Seeds::handed`] the creates each slot's seeds were
 //! handed.
@@ -37,22 +44,6 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::patience::Patience;
-
-/// The slowest answer in a seed's recorded distribution on the bench's host class (x86_64 Linux, adacachy2's AMD Ryzen
-/// 9 9950X3D2, the record host in fedora's place): a seed's answer to a create, the `seeds.hang` rows of
-/// `bench/competitive/probes/waits_census.md` run 4, the largest max of its release arms, 29.565 ms (29,564,846 ns: its
-/// tmpfs arm, measured unarmed, of 47,226). It replaces runs 1 and 3's 187.044 ms (fedora's), which replaced
-/// seed_path.md run 3's 1.918 ms, a clone timed alone that under the bar's load would have taken healthy seeds for hung.
-/// It seeds a pool's hang bound before the node has an answer of its own, and the line's wait,
-/// since a create in line waits for a busy seed's answer (decision 9: twice the slowest, recorded or seen). Another
-/// host class has no record yet; it starts from this one's and learns its own.
-pub const CLONE_SLOWEST: Duration = Duration::from_nanos(29_564_846);
-
-/// The same answer's slowest in a debug build, which a debug build's waits are seeded from (decision 9, by build
-/// profile): run 5's largest answer of the debug-build arms, the debug arm and the suites' (adacachy2), for it and the
-/// waits seeded from it (the line's, the exec seeds'), never under a bound one ran out at: 652.938 ms (652,937,547 ns,
-/// the suites' `seeds.hang`, of 493,529).
-pub const CLONE_SLOWEST_DEBUG: Duration = Duration::from_nanos(652_937_547);
 
 /// The line's wait's name, as the waits census records it.
 pub const WAIT: &str = "seeds.wait";
@@ -108,8 +99,9 @@ pub enum Admit {
     /// [`died`](Seeds::died).
     Seed(SeedId),
     /// No seed is idle: the create waits in line and claims with its ticket ([`Seeds::claim`]) when the shell wakes
-    /// it (a seed handed to it names it: [`Seeds::started`], [`Seeds::done`]) or at `until`, when its wait ends;
-    /// `None` while the line's wait is uncalibrated, when it waits for the shell's wake alone.
+    /// it (a seed handed to it names it: [`Seeds::started`], [`Seeds::done`]) or at `until`, the end of its wait
+    /// within the line's W*; `None` while it follows its seeds by their life, when it waits for the shell's wake
+    /// alone.
     Wait {
         ticket: Ticket,
         until: Option<Duration>,
@@ -123,7 +115,7 @@ pub enum Claim {
     Seed(SeedId),
     /// It waits on, until `until` (`None`: until the shell wakes it).
     Wait { until: Option<Duration> },
-    /// It waited past its bound, or the seed handed to it died or hung before it claimed it. The ticket is spent.
+    /// No seed can come, or the seed handed to it died before it claimed it. The ticket is spent.
     Refused(Refused),
 }
 
@@ -133,15 +125,13 @@ pub enum Refused {
     /// No seed is idle and the line is full.
     #[error("no seed is free and {waiting} creates already wait for one")]
     Busy { waiting: usize },
-    /// No seed was handed to it within the wait bound.
-    #[error("no seed came free within {wait:?}")]
+    /// No seed came for it in the `wait` it waited, and none can come: no seed is up or starting, and none is asked
+    /// for.
+    #[error("no seed came for it in {wait:?}, and none can come")]
     Waited { wait: Duration },
     /// The seed serving it died before it was done.
     #[error("seed {seed} died before it was done with the create")]
     Died { seed: SeedId },
-    /// The seed serving it took the hang bound over it, and was taken for hung, to be killed and replaced.
-    #[error("seed {seed} took {hang:?} over the create and was taken for hung")]
-    Hung { seed: SeedId, hang: Duration },
 }
 
 /// A report the pool can't take. A shell that reports only what it was handed meets only [`Stale::Gone`], from a
@@ -149,7 +139,7 @@ pub enum Refused {
 /// it too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Stale {
-    /// The seed isn't the pool's now: it died, was taken for hung or failed to start (or never was one of its).
+    /// The seed isn't the pool's now: it died or failed to start (or never was one of its).
     #[error("seed {0} has left the pool")]
     Gone(SeedId),
     /// The seed is the pool's but not as the report needs it to be: `expected` says how.
@@ -165,9 +155,9 @@ pub enum Stale {
 
 /// What the pool has done, as the bench and the node's metrics read it. Every create asked is handed a seed, refused
 /// at once, refused after waiting, or waits still: `asked` is `handed + refused_busy + refused_waited` plus
-/// [`Seeds::waiting`]. Every create handed one is done, refused for its seed's death or hang, or served still:
-/// `handed` is `done + refused_died + refused_hung` plus [`Seeds::busy`]. A count stops at `u64::MAX`, which at one
-/// a nanosecond takes 584 years to reach.
+/// [`Seeds::waiting`]. Every create handed one is done, refused for its seed's death, or served still: `handed` is
+/// `done + refused_died` plus [`Seeds::busy`]. A count stops at `u64::MAX`, which at one a nanosecond takes 584 years
+/// to reach.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
     /// Creates that asked for a seed.
@@ -180,22 +170,18 @@ pub struct Counts {
     pub done: u64,
     /// Creates refused at once: no seed idle and the line full.
     pub refused_busy: u64,
-    /// Creates handed no seed within the wait bound.
+    /// Creates refused in line: none could come.
     pub refused_waited: u64,
     /// Creates whose seed died before it was done.
     pub refused_died: u64,
-    /// Creates whose seed was taken for hung.
-    pub refused_hung: u64,
     /// Seeds started and up, the first in their slot or again.
     pub started: u64,
-    /// Of those, seeds started in place of one that died or hung.
+    /// Of those, seeds started in place of one that died.
     pub restarted: u64,
     /// Starts that failed.
     pub start_failed: u64,
     /// Seeds that died.
     pub died: u64,
-    /// Seeds taken for hung.
-    pub hung: u64,
     /// The most seeds serving creates at once.
     pub most_busy: u64,
 }
@@ -209,9 +195,9 @@ enum Holds {
     Starting { n: u64 },
     /// Seed `n`, up and serving no create; `served` says whether it has served one.
     Idle { n: u64, served: bool },
-    /// Seed `n`, serving a create since `since` until `until`, when it is taken for hung (`None` while the hang
-    /// bound is uncalibrated: the shell's wait for this answer is the calibration read). `unclaimed` is the waiting
-    /// create it was handed to, while that create has yet to claim it.
+    /// Seed `n`, serving a create since `since`, within the hang bound until `until`: `None` while it is followed by
+    /// its life (before the hang bound's first answer, from a run-out to the next, and once past it). `unclaimed` is
+    /// the waiting create it was handed to, while that create has yet to claim it.
     Busy {
         n: u64,
         since: Duration,
@@ -233,8 +219,34 @@ impl Holds {
 #[derive(Debug, Clone, Copy)]
 struct Slot {
     holds: Holds,
-    /// Whether a seed of this slot has been up, so the next one started replaces one that died or hung.
+    /// Whether a seed of this slot has been up, so the next one started replaces one that died.
     up_before: bool,
+}
+
+/// A create waiting in line for a seed: when it came, and how its wait goes on.
+#[derive(Debug, Clone, Copy)]
+enum Waiting {
+    /// Within the line's W* as it was when the create came: until `until`.
+    Within { since: Duration, until: Duration },
+    /// Following its seeds by their life alone: past its W*, its run-out told, or from its start where the line had
+    /// none.
+    Following { since: Duration },
+}
+
+impl Waiting {
+    fn since(self) -> Duration {
+        match self {
+            Self::Within { since, .. } | Self::Following { since } => since,
+        }
+    }
+
+    /// When its shell claims again: the end of its W*; `None` while it follows, when its shell's wake alone does.
+    fn wakes(self) -> Option<Duration> {
+        match self {
+            Self::Within { until, .. } => Some(until),
+            Self::Following { .. } => None,
+        }
+    }
 }
 
 /// The node's seeds: what each slot holds, the creates waiting, and what the pool has done. The shell keeps it behind
@@ -243,9 +255,8 @@ struct Slot {
 pub struct Seeds {
     limits: Limits,
     slots: Vec<Slot>,
-    /// Creates waiting for a seed, by ticket so in the order they came, each with when it came and the end of its
-    /// wait (`None` while the line's wait is uncalibrated).
-    line: BTreeMap<Ticket, (Duration, Option<Duration>)>,
+    /// Creates waiting for a seed, by ticket so in the order they came.
+    line: BTreeMap<Ticket, Waiting>,
     /// Creates out of line, handed a seed or refused, whose claim is yet to come.
     answered: BTreeMap<Ticket, Result<SeedId, Refused>>,
     /// False from a failed start, or a seed that died before it served a create, to the next create: the bound on
@@ -268,8 +279,9 @@ impl Seeds {
         Self::growing(limits, limits.seeds.get())
     }
 
-    /// The pool with both its waits seeded from a record whose slowest answer is `slowest` in place of
-    /// [`CLONE_SLOWEST`]: for a host class with a record of its own, or a test whose seeds answer as it chooses.
+    /// For tests alone (see [`Patience::seeded`]): the pool with both its waits as they would be once each had seen
+    /// an answer of `slowest`.
+    #[cfg(any(test, feature = "test-seeds"))]
     pub fn seeded(mut self, slowest: Duration) -> Self {
         self.wait = Patience::seeded(WAIT, slowest);
         self.hang = Patience::seeded(HANG, slowest);
@@ -298,8 +310,8 @@ impl Seeds {
             next_ticket: 0,
             counts: Counts::default(),
             handed: vec![0; slots],
-            wait: Patience::by_profile(WAIT, CLONE_SLOWEST, Some(CLONE_SLOWEST_DEBUG)),
-            hang: Patience::by_profile(HANG, CLONE_SLOWEST, Some(CLONE_SLOWEST_DEBUG)),
+            wait: Patience::measuring(WAIT),
+            hang: Patience::measuring(HANG),
         }
     }
 
@@ -334,7 +346,7 @@ impl Seeds {
     }
 
     /// Seed `seed` is up. It goes to the create that has waited longest, whose ticket is returned for the shell to
-    /// wake, or idles. Counted, and as a restart if it replaces one that died or hung. [`Stale`] if the pool isn't
+    /// wake, or idles. Counted, and as a restart if it replaces one that died. [`Stale`] if the pool isn't
     /// starting it (it was reported dead meanwhile): the shell ends it.
     pub fn started(&mut self, seed: SeedId, now: Duration) -> Result<Option<Ticket>, Stale> {
         let slot = self.slot(seed)?;
@@ -368,15 +380,7 @@ impl Seeds {
         slot.holds = Holds::Nothing;
         bump(&mut self.counts.start_failed);
         self.asking = false;
-        if self.idle() > 0 || self.busy() > 0 || self.starting() > 0 || self.line.is_empty() {
-            return Ok(false);
-        }
-        while let Some((ticket, (since, _))) = self.line.pop_first() {
-            // No seed was slow: none came, and none will. The line's wait learns nothing from it.
-            let refused = self.refused_waiting(since, now);
-            self.answered.insert(ticket, Err(refused));
-        }
-        Ok(true)
+        Ok(self.none_can_come(now))
     }
 
     /// A create asks for a seed at `now`: handed an idle one at once, put in line, or, with the line full, refused.
@@ -404,10 +408,19 @@ impl Seeds {
             (true, Some(next)) => {
                 let ticket = Ticket(self.next_ticket);
                 self.next_ticket = next;
-                let until = self.wait.deadline().map(|wait| now.saturating_add(wait));
-                self.line.insert(ticket, (now, until));
+                let waiting = match self.wait.deadline() {
+                    Some(wait) => Waiting::Within {
+                        since: now,
+                        until: now.saturating_add(wait),
+                    },
+                    None => Waiting::Following { since: now },
+                };
+                self.line.insert(ticket, waiting);
                 bump(&mut self.counts.waited);
-                Ok(Admit::Wait { ticket, until })
+                Ok(Admit::Wait {
+                    ticket,
+                    until: waiting.wakes(),
+                })
             }
             _ => {
                 bump(&mut self.counts.refused_busy);
@@ -418,13 +431,16 @@ impl Seeds {
         }
     }
 
-    /// A waiting create claims at `now`, when the shell wakes it or its wait ends: the seed handed to it, now serving
-    /// it; word to wait on; or its refusal, which spends the ticket. [`Stale::Ticket`] for a ticket no create holds.
+    /// A waiting create claims at `now`, when the shell wakes it or the time its last answer gave it comes: the seed
+    /// handed to it, now serving it; word to wait on; or its refusal, which spends the ticket. Within its W* it waits
+    /// on. Past it, its run-out is told to the census, once and with no sample, and it waits on, following its seeds by
+    /// their life alone: the shell's wake, a seed handed to it or none able to come, ends it. [`Stale::Ticket`] for a
+    /// ticket no create holds.
     pub fn claim(&mut self, ticket: Ticket, now: Duration) -> Result<Claim, Stale> {
         if let Some(answer) = self.answered.remove(&ticket) {
             return Ok(match answer {
                 Ok(seed) => {
-                    // The create holds its seed now: no longer one the seed's death or hang must answer at a claim.
+                    // The create holds its seed now: no longer one the seed's death must answer at a claim.
                     if let Some(Slot {
                         holds: Holds::Busy { n, unclaimed, .. },
                         ..
@@ -439,17 +455,22 @@ impl Seeds {
                 Err(refused) => Claim::Refused(refused),
             });
         }
-        let (since, until) = *self.line.get(&ticket).ok_or(Stale::Ticket(ticket))?;
-        let Some(ended) = until.filter(|&u| u <= now) else {
-            return Ok(Claim::Wait { until });
-        };
-        self.line.remove(&ticket);
-        Ok(Claim::Refused(self.waited_out(since, ended)))
+        let waiting = self.line.get_mut(&ticket).ok_or(Stale::Ticket(ticket))?;
+        match *waiting {
+            Waiting::Within { until, .. } if now < until => Ok(Claim::Wait { until: Some(until) }),
+            Waiting::Within { since, until } => {
+                // Past W*: no sample (Karn's point), but the census is told, once, and the create waits on.
+                *waiting = Waiting::Following { since };
+                self.wait.ran_out(until.saturating_sub(since));
+                Ok(Claim::Wait { until: None })
+            }
+            Waiting::Following { .. } => Ok(Claim::Wait { until: None }),
+        }
     }
 
     /// Seed `seed` is done with the create it served (it started the container, or refused it and is whole): it
     /// goes to the create that has waited longest, whose ticket is returned for the shell to wake, or idles.
-    /// [`Stale::Gone`] if it left meanwhile, dead or taken for hung: the pool refused that create then.
+    /// [`Stale::Gone`] if it left meanwhile, dead: the pool refused that create then.
     pub fn done(&mut self, seed: SeedId, now: Duration) -> Result<Option<Ticket>, Stale> {
         let slot = self.slot(seed)?;
         let Holds::Busy {
@@ -469,15 +490,17 @@ impl Seeds {
         Ok(self.free(seed, now, true))
     }
 
-    /// Seed `seed` died: its pidfd says so, or its socket broke. It leaves its slot, counted, and the pool asks for
-    /// the slot to be started again. The create it served, if any, is refused and the refusal returned; a waiting
-    /// create it was handed to meets the refusal at its claim. A seed that dies before serving a create (starting,
-    /// or idle since it started) stops the starting until the next create. [`Stale::Gone`] if it had left already.
-    pub fn died(&mut self, seed: SeedId) -> Result<Option<Refused>, Stale> {
+    /// Seed `seed` died at `now`: its pidfd says so, or its socket broke. It leaves its slot, counted, and the pool
+    /// asks for the slot to be started again. The create it served, if any, is refused and the refusal returned; a
+    /// waiting create it was handed to meets the refusal at its claim. A seed that dies before serving a create
+    /// (starting, or idle since it started) stops the starting until the next create; with the starting stopped and no
+    /// seed left, none can come for the creates in line, and each is refused then, to meet the refusal at its claim.
+    /// [`Stale::Gone`] if it had left already.
+    pub fn died(&mut self, seed: SeedId, now: Duration) -> Result<Option<Refused>, Stale> {
         let slot = self.slot(seed)?;
         let held = std::mem::replace(&mut slot.holds, Holds::Nothing);
         bump(&mut self.counts.died);
-        Ok(match held {
+        let refused = match held {
             Holds::Busy { unclaimed, .. } => {
                 let refused = Refused::Died { seed };
                 bump(&mut self.counts.refused_died);
@@ -491,43 +514,28 @@ impl Seeds {
                 None
             }
             Holds::Idle { served: true, .. } | Holds::Nothing => None,
-        })
+        };
+        self.none_can_come(now);
+        Ok(refused)
     }
 
-    /// The next seed that has served its create for the hang bound by `now`, taken for hung: it leaves its slot,
-    /// counted, and the pool asks for the slot to be started again. Returned with its create's refusal, for the shell
-    /// to kill it; a waiting create it was handed to meets the refusal at its claim, and a later report about the
-    /// seed is [`Stale::Gone`]. `None` once no seed is past the bound, so a shell asks at most once a slot and once
-    /// more.
-    #[must_use = "a seed taken for hung is the shell's to kill"]
-    pub fn hung(&mut self, now: Duration) -> Option<(SeedId, Refused)> {
-        let (seed, since, until, unclaimed) =
-            self.slots
-                .iter()
-                .enumerate()
-                .find_map(|(slot, s)| match s.holds {
-                    Holds::Busy {
-                        n,
-                        since,
-                        until,
-                        unclaimed,
-                    } => until
-                        .filter(|&u| u <= now)
-                        .map(|u| (SeedId { slot, n }, since, u, unclaimed)),
-                    _ => None,
-                })?;
-        self.slots.get_mut(seed.slot)?.holds = Holds::Nothing;
-        // No sample: the answer never came (Karn's point).
-        let refused = Refused::Hung {
-            seed,
-            hang: until.saturating_sub(since),
-        };
-        bump(&mut self.counts.hung);
-        bump(&mut self.counts.refused_hung);
-        if let Some(ticket) = unclaimed {
-            self.answered.insert(ticket, Err(refused));
+    /// The seeds that have served their creates past the hang bound by `now` (decision 9, the person's ruling of
+    /// 2026-11-13: W* is a bound only while answers come within it): each one's run-out told to the census, once and
+    /// with no sample, and from then followed by its life alone, waited on until it answers or dies, never taken for
+    /// hung. How many were told now.
+    pub fn past_hang(&mut self, now: Duration) -> usize {
+        let mut told = 0usize;
+        for slot in &mut self.slots {
+            if let Holds::Busy { since, until, .. } = &mut slot.holds
+                && let Some(at) = *until
+                && at <= now
+            {
+                self.hang.ran_out(at.saturating_sub(*since));
+                *until = None;
+                told = told.saturating_add(1);
+            }
         }
-        Some((seed, refused))
+        told
     }
 
     /// A create found no seed idle: a vacant slot is added for a seed to start, unless one is vacant already or the
@@ -578,8 +586,9 @@ impl Seeds {
         &self.handed
     }
 
-    /// When seed `seed`, serving a create, is taken for hung: the end of the shell's wait for its answer, `None`
-    /// while the hang bound is uncalibrated (that wait is its calibration read). [`Stale`] for a seed serving none.
+    /// When seed `seed`, serving a create, passes the hang bound: the end of the shell's wait for its answer within
+    /// it, `None` while it follows the seed by its life (before the hang bound's first answer, from a run-out to the
+    /// next, and past it: [`Seeds::past_hang`]). [`Stale`] for a seed serving none.
     pub fn until(&self, seed: SeedId) -> Result<Option<Duration>, Stale> {
         match self.slots.get(seed.slot).map(|s| s.holds) {
             Some(Holds::Busy { n, until, .. }) if n == seed.n => Ok(until),
@@ -604,19 +613,22 @@ impl Seeds {
             .ok_or(Stale::Gone(seed))
     }
 
-    /// Seed `seed`, up and free, goes to the create that has waited longest, refusing on the way those whose wait
-    /// ended by `now`, and returns its ticket; with none left waiting, it idles. Each turn takes a create out of line,
-    /// so this ends within the line's length.
+    /// Seed `seed`, up and free, goes to the create that has waited longest, however long that is, and returns its
+    /// ticket; with none waiting, it idles. Its wait is a sample, the line's W* rising to it (decision 9): a create
+    /// past its W* that has yet to claim has its run-out told first. A seed freed the instant a wait ends serves it
+    /// within W*: its wait is no longer than the slowest answer seen (a create served the instant it joined the line
+    /// teaches the line a bound of none, which an answer as quick still meets).
     fn free(&mut self, seed: SeedId, now: Duration, served: bool) -> Option<Ticket> {
-        while let Some((ticket, (since, until))) = self.line.pop_first() {
-            if until.is_none_or(|u| now < u) {
-                self.wait.answered(now.saturating_sub(since));
-                self.hand(seed, now, Some(ticket));
-                self.answered.insert(ticket, Ok(seed));
-                return Some(ticket);
+        if let Some((ticket, waiting)) = self.line.pop_first() {
+            if let Waiting::Within { since, until } = waiting
+                && until < now
+            {
+                self.wait.ran_out(until.saturating_sub(since));
             }
-            let refused = self.waited_out(since, until.unwrap_or(now));
-            self.answered.insert(ticket, Err(refused));
+            self.wait.answered(now.saturating_sub(waiting.since()));
+            self.hand(seed, now, Some(ticket));
+            self.answered.insert(ticket, Ok(seed));
+            return Some(ticket);
         }
         if let Some(slot) = self.slots.get_mut(seed.slot) {
             slot.holds = Holds::Idle { n: seed.n, served };
@@ -642,13 +654,25 @@ impl Seeds {
         self.counts.most_busy = self.counts.most_busy.max(busy);
     }
 
-    /// A create in line since `since` whose wait ran out at its bound, `until`, with no seed: refused, and no sample
-    /// (Karn's point), but the line's wait backs off past that bound and the census is told (busy seeds, not hung or
-    /// failed ones: a seed past its hang bound is [`Seeds::hung`]'s and one that failed to start
-    /// [`Seeds::start_failed`]'s, neither of which says anything of an answer's time).
-    fn waited_out(&mut self, since: Duration, until: Duration) -> Refused {
-        self.wait.ran_out(until.saturating_sub(since));
-        self.refused_waiting(since, until)
+    /// With the starting stopped (a failed start, or a seed dead before it served a create) and no seed up or starting,
+    /// none can come for the creates in line: each is refused as its wait ended `now`, rather than left to follow seeds
+    /// that are gone (decision 9: a wait that follows its party is refused at the party's end). No seed was slow: none
+    /// came, and none will, so the line's wait learns nothing from it. Says whether any create was refused, for the
+    /// shell to wake them.
+    fn none_can_come(&mut self, now: Duration) -> bool {
+        if self.asking
+            || self.line.is_empty()
+            || self.idle() > 0
+            || self.busy() > 0
+            || self.starting() > 0
+        {
+            return false;
+        }
+        while let Some((ticket, waiting)) = self.line.pop_first() {
+            let refused = self.refused_waiting(waiting.since(), now);
+            self.answered.insert(ticket, Err(refused));
+        }
+        true
     }
 
     /// A create in line since `since`, refused at `until` with no seed: counted, its wait the time it waited.

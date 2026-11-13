@@ -6,8 +6,8 @@
 //! payload is read whole or refused: a field past its end, bytes after its last field, an
 //! unknown tag or a bad UTF-8 string is a [`WireError`], never a default.
 //!
-//! Credentials ride only in [`Request`], each in a [`Secret`], whose `Debug` prints its
-//! length alone.
+//! Credentials ride only in [`Request`] and in a lease's answer ([`LeaseAnswer`]), each in a
+//! [`Secret`], whose `Debug` prints its length alone and whose bytes are wiped as it drops.
 
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU64;
@@ -35,8 +35,25 @@ pub use shards_abi::run::nesting::Ready;
 /// to before its microVM starts; 13, the CPU rate its orchestrator holds the run's vCPUs to
 /// (`RATE`, answered `RATED`; D191, D247), so that a side that holds none refuses the run as
 /// it is asked, before any rate is: a host of an earlier version ends a run at a frame it has
-/// no kind for.
-pub const VERSION: u8 = 13;
+/// no kind for; 14, why a vCPU's guest time went unread, typed ([`VcpuTime::unread`],
+/// `shards_abi::guest_time::Unread`, guest-cpu-time-v1's R04): its cause and code in their text
+/// form, which an earlier version's free words never parse as; 15, the run's agent-control
+/// endpoint ([`Request::control`], [`Started::control`]; D238, D251, D252), so that a side that
+/// binds none refuses the run as it is asked; 16, the host GPUs the run names
+/// ([`Request::gpu_devices`], D232, D234's `gpus=`), so that a side that binds none starts no
+/// run without them; 17, the period the run's governor holds its rate over
+/// ([`Started::rate_period`], D191, D247), so that its orchestrator derives its window from
+/// the run's own period, never from a number of its own; 18, each member's run-time arguments
+/// ([`MemberStage::args`], D256), so that a side that passes none starts no member without
+/// the flags its orchestrator asked; 19, how the run's microVM started ([`Started::from`],
+/// D253): from its image's template, booted saving one, or booted where its template did not
+/// restore, so that its orchestrator hears a template replaced; 20, a credential's lease, asked by the run host
+/// just in time (`LEASE`, answered `LEASED`), and the run's release of every lease
+/// (`RELEASED`; D242), so that a side that leases nothing refuses the run as it is asked,
+/// before any lease is: a client of an earlier version ends a run at a frame it has no kind
+/// for; 21, warm run hosts ([`to_host::WARM`], [`to_client::WARMED`], [`Cause::Unfit`],
+/// [`StartedFrom::Warm`]; D253's pools), so that a side that keeps none is never asked to.
+pub const VERSION: u8 = 21;
 
 /// What the orchestrator's side sends.
 pub mod to_host {
@@ -66,6 +83,13 @@ pub mod to_host {
     /// A [`RateAsk`](super::RateAsk): the CPU rate the orchestrator holds the run's vCPUs to
     /// (D191, D247).
     pub const RATE: u8 = 12;
+    /// A [`LeaseAnswer`](super::LeaseAnswer): a lease its run host asked, given or refused,
+    /// by its ask's id (D242).
+    pub const LEASED: u8 = 13;
+    /// A [`Request`](super::Request), first and once, in place of `CREATE`: a warm run host's
+    /// exemplar ([`Request::exemplar`](super::Request::exemplar), D253's pools), its microVM
+    /// started for runs of it and waiting, `WARMED`, for one, whose `CREATE` follows.
+    pub const WARM: u8 = 14;
 }
 
 /// What the run host sends.
@@ -100,6 +124,15 @@ pub mod to_client {
     pub const RESIZED: u8 = 28;
     /// [`RateAnswer`](super::RateAnswer): what the run's vCPUs are held to, by its ask's id.
     pub const RATED: u8 = 29;
+    /// A [`LeaseAsk`](super::LeaseAsk): a credential's lease, asked just in time by reference
+    /// (D242).
+    pub const LEASE: u8 = 30;
+    /// Every lease of the run released ([`released`](super::released)): the run has ended,
+    /// and nothing of any value it was leased is held (D242). Before [`ENDED`].
+    pub const RELEASED: u8 = 31;
+    /// How a warm run host's microVM started ([`StartedFrom`](super::StartedFrom), its one
+    /// byte): it is ready, and waits for its run's `CREATE` (D253's pools).
+    pub const WARMED: u8 = 32;
 }
 
 /// Why a payload could not be read or written.
@@ -119,6 +152,10 @@ pub enum WireError {
     TooLong,
     /// A list whose items come out of the order the channel keeps them in.
     Order { what: &'static str },
+    /// A vCPU's unread cause not in its text form (`shards_abi::guest_time::Unread::write`).
+    Unread,
+    /// A GPU's identity not in D232's grammar, or a selection D232 refuses (`shards_abi::gpu`).
+    Gpu,
 }
 
 impl std::fmt::Display for WireError {
@@ -131,6 +168,8 @@ impl std::fmt::Display for WireError {
             Self::Version(v) => write!(f, "channel version {v}, where this side speaks {VERSION}"),
             Self::TooLong => f.write_str("a payload past the channel's bound"),
             Self::Order { what } => write!(f, "{what} out of order"),
+            Self::Unread => f.write_str("a vCPU's unread cause this side does not parse"),
+            Self::Gpu => f.write_str("a GPU's identity D232's grammar or selection refuses"),
         }
     }
 }
@@ -138,13 +177,19 @@ impl std::fmt::Display for WireError {
 impl std::error::Error for WireError {}
 
 /// Bytes a caller would not have printed: a credential, as often as not. Its `Debug` says
-/// how many there are, never what.
+/// how many there are, never what, and its bytes are wiped as it drops (D242).
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct Secret(pub Vec<u8>);
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Secret({} bytes)", self.0.len())
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
 
@@ -200,6 +245,9 @@ pub struct MemberStage {
     /// Its stdio is a terminal of its own (D244): what it shows is its stdout channel, its
     /// stdin goes to it, and [`ResizeAsk`] sizes it.
     pub terminal: bool,
+    /// Its run-time arguments (D256), on its command line after its config's `run.command`
+    /// (its entrypoint and options), in their order; none, its command alone.
+    pub args: Vec<String>,
 }
 
 /// A guest port published on the host.
@@ -319,6 +367,50 @@ pub fn decide(grants: &[CredentialGrant], sni: &str, host: &str) -> Fill {
     Fill::Pass
 }
 
+/// A credential's lease, asked by the run's host just in time (D242): the credential its
+/// network process first needs, by reference, one of the run's grants and never a value;
+/// answered by its id ([`LeaseAnswer`]). It names the run by the channel it comes on, which
+/// the orchestrator that started the run's host alone speaks on (D231, D248).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseAsk {
+    pub id: u32,
+    pub reference: String,
+}
+
+/// A lease given (D242): the credential's value, and how long its lease lives past its
+/// answer, in nanoseconds, never none. Its holder wipes the value as it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub value: Secret,
+    pub lives: NonZeroU64,
+}
+
+/// Why no lease was given (D242), typed (R04): the run's host relays it to the network
+/// process that asked, whose asker matches it, never its words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseRefusal {
+    /// The orchestrator's broker leases the run none of it, in its words: a credential its
+    /// store does not hold, or one its policy keeps from the run.
+    Denied(String),
+    /// Asked under the key the run had before a move replaced it (D238, D176 part 6, as the
+    /// daemon's `move step key` refuses one): that key, and the run's key now where it has
+    /// one, each 64 lowercase hex digits. The broker alone says which key is current.
+    KeyReplaced { asked: String, current: Option<String> },
+    /// Its broker could not be asked, or failed, in its words: a later ask may be leased.
+    Unavailable(String),
+    /// The run has ended: nothing is leased after its release.
+    Ended,
+    /// Its lease ended before it was answered: a later ask is leased anew.
+    Lapsed,
+}
+
+/// A lease's answer, by its ask's id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseAnswer {
+    pub id: u32,
+    pub result: Result<Lease, LeaseRefusal>,
+}
+
 /// A host directory the guest sees at a path, as `-v HOST:PATH[:ro]` gives one (D109).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareAt {
@@ -354,6 +446,43 @@ pub struct Request {
     /// hosts the injector may fill it in toward. Empty for a run with none, as every run
     /// is until an orchestrator asks for one (default deny).
     pub credentials: Vec<CredentialGrant>,
+    /// The run's agent-control endpoint (D252), bound by its host for this run alone; none,
+    /// and it has none. Appended in version 15.
+    pub control: Option<ControlAsk>,
+    /// The host GPUs its VM renders on, each by its exact identity (D232), which its command
+    /// reads under the nesting grant (D234's `gpus=`); none, no GPU. Appended in version 16.
+    pub gpu_devices: Vec<shards_abi::gpu::PhysicalGpu>,
+}
+
+/// What a run's agent-control endpoint takes and serves (D252): the one key it takes, its
+/// controller's, and the lanes to the run's own command's sockets (D251).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlAsk {
+    /// The SHA-256 of the controller's key (D180's raw public key, RFC 7250): the one key the
+    /// endpoint takes.
+    pub controller: [u8; 32],
+    /// The run's socket directory and what it admits of lanes to it; none, and none.
+    pub sockets: Option<SocketGrant>,
+}
+
+/// The one directory of the run's own command's sockets its controller may reach (D251), and
+/// what the run admits of lanes to them (R03: the caller's numbers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketGrant {
+    /// Absolute and plain, in the command's root (`shards_abi::run::socket::dir_ok`).
+    pub dir: String,
+    /// The most lanes open at once.
+    pub lanes: u32,
+    /// Each lane's bytes in flight each way.
+    pub window: u32,
+}
+
+/// Where a run's agent-control endpoint is bound, and the SHA-256 of its microVM's own key,
+/// which its controller pins (D252).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlAt {
+    pub address: SocketAddr,
+    pub vm: [u8; 32],
 }
 
 /// Room for `bytes` more of member `member`'s `channel`.
@@ -420,6 +549,33 @@ pub struct Receiving {
 pub struct Started {
     pub members: Vec<MemberInfo>,
     pub published: Vec<Bound>,
+    /// Where the run's endpoint is bound, where it asked for one (D252); appended in version
+    /// 15.
+    pub control: Option<ControlAt>,
+    /// The period its VM's governor holds a rate over (D191, D247), as its host's build
+    /// holds one: on the channel in nanoseconds, never none; appended in
+    /// version 17.
+    pub rate_period: std::time::Duration,
+    /// How its microVM started (D253); appended in version 19.
+    pub from: StartedFrom,
+}
+
+/// How a run's microVM came to be ready (D253), as its run host started it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartedFrom {
+    /// Booted, with no template to restore or save: a guest its caller gave, or a host whose
+    /// hypervisor restores no snapshot.
+    Booted = 0,
+    /// Booted, saving its image's template on the way, none being saved.
+    Saved = 1,
+    /// Restored from its image's template.
+    Restored = 2,
+    /// Booted, saving another, its image's template having failed to restore: that one
+    /// removed.
+    Replaced = 3,
+    /// A warm run host's, its microVM ready before its run asked (D253's pools); appended in
+    /// version 21.
+    Warm = 4,
 }
 
 /// Why the run host will not run it, typed by what failed: the client maps each to its
@@ -442,6 +598,9 @@ pub enum Cause {
     Boot = 3,
     /// What the run host does not do yet.
     Unsupported = 4,
+    /// A warm run host's microVM is another request's than the run's (D253's pools): the run
+    /// is its orchestrator's to start on a host of its own.
+    Unfit = 5,
 }
 
 /// A member's bytes.
@@ -575,8 +734,8 @@ pub struct VcpuTime {
     pub index: u32,
     /// Nanoseconds, never less than an earlier sample of the same vCPU said.
     pub guest_ns: u64,
-    /// Why this sample did not read it: `guest_ns` is then the most it read before.
-    pub unread: Option<String>,
+    /// Why this sample did not read it, typed: `guest_ns` is then the most it read before.
+    pub unread: Option<shards_abi::guest_time::Unread>,
 }
 
 impl Stats {
@@ -768,6 +927,18 @@ pub fn frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, WireError> {
 /// Reads one frame from `from`: its kind and payload, none at a clean end before a header,
 /// an error past the bound or cut short.
 pub fn read_frame(from: &mut impl std::io::Read) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+    let mut payload = Vec::new();
+    Ok(read_frame_into(from, &mut payload)?.map(|(kind, _)| (kind, payload)))
+}
+
+/// Reads one frame from `from` as [`read_frame`] does, its payload into `buf[..length]`:
+/// its kind and length. `buf` is grown with zeros where it is shorter, and never shrunk or
+/// read past, so that a reader that wipes each payload as it lets it go of holds no frame's
+/// bytes between frames (the run host's channel, D242), and reads nothing past its frame.
+pub fn read_frame_into(
+    from: &mut impl std::io::Read,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<(u8, usize)>> {
     let mut h = [0u8; run::HEADER];
     let mut got = 0;
     while got < h.len() {
@@ -783,13 +954,18 @@ pub fn read_frame(from: &mut impl std::io::Read) -> std::io::Result<Option<(u8, 
     }
     let (kind, len) = run::parse_header(h)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, WireError::TooLong))?;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(len as usize)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::OutOfMemory, "a frame's payload"))?;
-    payload.resize(len as usize, 0);
-    from.read_exact(&mut payload)?;
-    Ok(Some((kind, payload)))
+    let len = usize::try_from(len)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, WireError::TooLong))?;
+    if let Some(more) = len.checked_sub(buf.len()).filter(|more| *more > 0) {
+        buf.try_reserve_exact(more)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::OutOfMemory, "a frame's payload"))?;
+        buf.resize(len, 0);
+    }
+    let payload = buf
+        .get_mut(..len)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::OutOfMemory, "a frame's payload"))?;
+    from.read_exact(payload)?;
+    Ok(Some((kind, len)))
 }
 
 struct Writer(Vec<u8>);
@@ -895,7 +1071,9 @@ impl Writer {
                 None => self.u8(0),
                 Some(why) => {
                     self.u8(1);
-                    self.text(why)?;
+                    let mut text = String::new();
+                    let _ = why.write(&mut text);
+                    self.text(&text)?;
                 }
             }
         }
@@ -1033,7 +1211,9 @@ impl<'a> Reader<'a> {
                     let guest_ns = self.u64()?;
                     let unread = match self.u8()? {
                         0 => None,
-                        1 => Some(self.text()?),
+                        1 => Some(
+                            shards_abi::guest_time::Unread::parse(&self.text()?).ok_or(WireError::Unread)?,
+                        ),
                         tag => {
                             return Err(WireError::Tag {
                                 what: "a vCPU's guest time",
@@ -1090,6 +1270,20 @@ fn channel(tag: u8) -> Result<Channel, WireError> {
         2 => Ok(Channel::Stderr),
         tag => Err(WireError::Tag {
             what: "a channel",
+            tag,
+        }),
+    }
+}
+
+fn started_from(tag: u8) -> Result<StartedFrom, WireError> {
+    match tag {
+        0 => Ok(StartedFrom::Booted),
+        1 => Ok(StartedFrom::Saved),
+        2 => Ok(StartedFrom::Restored),
+        3 => Ok(StartedFrom::Replaced),
+        4 => Ok(StartedFrom::Warm),
+        tag => Err(WireError::Tag {
+            what: "how a run started",
             tag,
         }),
     }
@@ -1208,6 +1402,37 @@ impl Request {
                 }
             }
         }
+        // The run's agent-control endpoint, appended in version 15 (D252): whether it asks one,
+        // its controller's key, then whether it grants sockets, their directory and admission.
+        match &self.control {
+            None => w.u8(0),
+            Some(control) => {
+                w.u8(1);
+                w.0.extend_from_slice(&control.controller);
+                match &control.sockets {
+                    None => w.u8(0),
+                    Some(grant) => {
+                        w.u8(1);
+                        w.text(&grant.dir)?;
+                        w.u32(grant.lanes);
+                        w.u32(grant.window);
+                    }
+                }
+            }
+        }
+        // The GPUs the run names, appended in version 16 (D232): each in `--gpu-device`'s text.
+        w.count(self.gpu_devices.len())?;
+        for gpu in &self.gpu_devices {
+            w.text(&gpu.to_string())?;
+        }
+        // Each member's run-time arguments, in the members' order, appended in version 18
+        // (D256): its count, then each.
+        for m in &self.members {
+            w.count(m.args.len())?;
+            for a in &m.args {
+                w.text(a)?;
+            }
+        }
         w.done()
     }
 
@@ -1231,8 +1456,8 @@ impl Request {
             None
         };
         // Each member's kind, name, env and files, and, appended last, its working
-        // directory's flag, its input's and its terminal's.
-        let n = r.count(1 + 4 + 4 + 4 + 1 + 1 + 1)?;
+        // directory's flag, its input's, its terminal's and its arguments' count.
+        let n = r.count(1 + 4 + 4 + 4 + 1 + 1 + 1 + 4)?;
         let mut members = Vec::with_capacity(n);
         for _ in 0..n {
             let kind = member_kind(r.u8()?)?;
@@ -1255,11 +1480,12 @@ impl Request {
                 name,
                 env,
                 files,
-                // Read with the members' working directories, inputs and terminals, appended
-                // last.
+                // Read with the members' working directories, inputs, terminals and arguments,
+                // appended last.
                 workdir: None,
                 input: false,
                 terminal: false,
+                args: Vec::new(),
             });
         }
         let n = r.count(2 + 1 + 1 + 2)?;
@@ -1344,6 +1570,40 @@ impl Request {
         } else {
             None
         };
+        // The run's agent-control endpoint, appended in version 15 (D252).
+        let control = if r.flag()? {
+            let controller = r.array::<32>()?;
+            let sockets = if r.flag()? {
+                Some(SocketGrant {
+                    dir: r.text()?,
+                    lanes: r.u32()?,
+                    window: r.u32()?,
+                })
+            } else {
+                None
+            };
+            Some(ControlAsk { controller, sockets })
+        } else {
+            None
+        };
+        // The GPUs the run names, appended in version 16 (D232): each at least its text's
+        // length (four bytes), parsed and the selection checked as D232 checks one.
+        let n = r.count(4)?;
+        let mut gpu_devices = Vec::with_capacity(n);
+        for _ in 0..n {
+            gpu_devices.push(r.text()?.parse().map_err(|_| WireError::Gpu)?);
+        }
+        shards_abi::gpu::check_selection(&gpu_devices).map_err(|_| WireError::Gpu)?;
+        // Each member's run-time arguments, appended in version 18 (D256): each at least its
+        // text's length (four bytes).
+        for m in &mut members {
+            let n = r.count(4)?;
+            let mut args = Vec::with_capacity(n);
+            for _ in 0..n {
+                args.push(r.text()?);
+            }
+            m.args = args;
+        }
         r.end()?;
         Ok(Request {
             image,
@@ -1357,6 +1617,8 @@ impl Request {
             nesting,
             ready_by,
             credentials,
+            control,
+            gpu_devices,
         })
     }
 }
@@ -1516,6 +1778,20 @@ impl Started {
                 w.u16(r.port);
             }
         }
+        // Where the run's endpoint is bound and its microVM's key, appended in version 15.
+        match &self.control {
+            None => w.u8(0),
+            Some(at) => {
+                w.u8(1);
+                w.ip(Some(at.address.ip()));
+                w.u16(at.address.port());
+                w.0.extend_from_slice(&at.vm);
+            }
+        }
+        // The rate's period, appended in version 17 (D247).
+        w.u64(u64::try_from(self.rate_period.as_nanos()).map_err(|_| WireError::TooLong)?);
+        // How its microVM started, appended in version 19 (D253).
+        w.u8(self.from as u8);
         w.done()
     }
 
@@ -1556,8 +1832,67 @@ impl Started {
                 to,
             });
         }
+        let control = if r.flag()? {
+            let ip = r.ip()?.ok_or(WireError::Tag {
+                what: "an endpoint's address",
+                tag: 0,
+            })?;
+            let port = r.u16()?;
+            Some(ControlAt {
+                address: SocketAddr::new(ip, port),
+                vm: r.array::<32>()?,
+            })
+        } else {
+            None
+        };
+        // A governor holds over some time: a period of none is no period.
+        let rate_period = NonZeroU64::new(r.u64()?)
+            .map(|ns| std::time::Duration::from_nanos(ns.get()))
+            .ok_or(WireError::Tag {
+                what: "a rate period",
+                tag: 0,
+            })?;
+        let from = started_from(r.u8()?)?;
         r.end()?;
-        Ok(Started { members, published })
+        Ok(Started {
+            members,
+            published,
+            control,
+            rate_period,
+            from,
+        })
+    }
+}
+
+impl Request {
+    /// What a warm run host is started with and holds each run it is handed to (D253's
+    /// pools): this request with its members' stages, its deadline and its control ask taken
+    /// out, what alone may differ between the runs of one microVM; none of a run's secrets
+    /// is in it. Everything else is the microVM's: its image, size, command, ports, network,
+    /// shares, nesting, credential grants and GPUs.
+    pub fn exemplar(&self) -> Request {
+        Request {
+            members: Vec::new(),
+            ready_by: None,
+            control: None,
+            ..self.clone()
+        }
+    }
+}
+
+/// [`to_client::WARMED`]'s payload: how the warm host's microVM started.
+pub fn warmed(from: StartedFrom) -> [u8; 1] {
+    [from as u8]
+}
+
+/// How a warm host's microVM started, as [`warmed`] wrote it.
+pub fn read_warmed(payload: &[u8]) -> Result<StartedFrom, WireError> {
+    match payload {
+        [tag] => started_from(*tag),
+        _ => Err(WireError::Tag {
+            what: "a warm host's start",
+            tag: payload.first().copied().unwrap_or(0),
+        }),
     }
 }
 
@@ -1577,6 +1912,7 @@ impl Refused {
             2 => Cause::Widening,
             3 => Cause::Boot,
             4 => Cause::Unsupported,
+            5 => Cause::Unfit,
             tag => {
                 return Err(WireError::Tag {
                     what: "a refusal's cause",
@@ -1955,6 +2291,108 @@ impl RateAnswer {
     }
 }
 
+impl LeaseAsk {
+    /// Its id, then the credential's reference.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let mut w = Writer(Vec::new());
+        w.u32(self.id);
+        w.text(&self.reference)?;
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<LeaseAsk, WireError> {
+        let mut r = Reader(payload);
+        let ask = LeaseAsk {
+            id: r.u32()?,
+            reference: r.text()?,
+        };
+        r.end()?;
+        Ok(ask)
+    }
+}
+
+impl LeaseAnswer {
+    /// Its id, then 0, how long the lease lives in nanoseconds and the value, last, so that
+    /// the buffer holding it is made once; or its refusal's tag and fields: 1 and the
+    /// broker's words, 2 and the key asked under and the run's key (0 for none, or 1 and the
+    /// key), 3 and the broker's words, 4, or 5. The caller wipes what it returns.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let mut w = Writer(Vec::new());
+        w.u32(self.id);
+        match &self.result {
+            Ok(lease) => {
+                w.u8(0);
+                w.u64(lease.lives.get());
+                w.bytes(&lease.value.0)?;
+            }
+            Err(LeaseRefusal::Denied(why)) => {
+                w.u8(1);
+                w.text(why)?;
+            }
+            Err(LeaseRefusal::KeyReplaced { asked, current }) => {
+                w.u8(2);
+                w.text(asked)?;
+                match current {
+                    None => w.u8(0),
+                    Some(current) => {
+                        w.u8(1);
+                        w.text(current)?;
+                    }
+                }
+            }
+            Err(LeaseRefusal::Unavailable(why)) => {
+                w.u8(3);
+                w.text(why)?;
+            }
+            Err(LeaseRefusal::Ended) => w.u8(4),
+            Err(LeaseRefusal::Lapsed) => w.u8(5),
+        }
+        w.done()
+    }
+
+    /// A lease that lives no time is no lease: refused, as [`Started`]'s bound address of
+    /// none is.
+    pub fn decode(payload: &[u8]) -> Result<LeaseAnswer, WireError> {
+        let mut r = Reader(payload);
+        let id = r.u32()?;
+        let result = match r.u8()? {
+            0 => {
+                let lives = NonZeroU64::new(r.u64()?).ok_or(WireError::Tag {
+                    what: "a lease's life",
+                    tag: 0,
+                })?;
+                Ok(Lease {
+                    lives,
+                    value: Secret(r.bytes()?.to_vec()),
+                })
+            }
+            1 => Err(LeaseRefusal::Denied(r.text()?)),
+            2 => {
+                let asked = r.text()?;
+                let current = if r.flag()? { Some(r.text()?) } else { None };
+                Err(LeaseRefusal::KeyReplaced { asked, current })
+            }
+            3 => Err(LeaseRefusal::Unavailable(r.text()?)),
+            4 => Err(LeaseRefusal::Ended),
+            5 => Err(LeaseRefusal::Lapsed),
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a lease's answer",
+                    tag,
+                });
+            }
+        };
+        r.end()?;
+        Ok(LeaseAnswer { id, result })
+    }
+}
+
+/// What a [`to_client::RELEASED`] says: every lease of the run released. Its payload is
+/// none; anything else is refused.
+pub fn released(payload: &[u8]) -> Result<(), WireError> {
+    Reader(payload).end()
+}
+
 impl RunEnd {
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
         let mut w = Writer(Vec::new());
@@ -2139,12 +2577,119 @@ mod tests {
             workdir: None,
             input: false,
             terminal: false,
+            args: Vec::new(),
         };
         let shown = format!("{staged:?}");
         assert!(
             !shown.contains("DEADBEEF"),
             "a staged value leaked into Debug: {shown}"
         );
+        // A lease's value is a Secret too, redacted in its answer's Debug (D242).
+        let answer = LeaseAnswer {
+            id: 1,
+            result: Ok(Lease {
+                value: Secret::from("sk-ant-lease-DEADBEEF"),
+                lives: NonZeroU64::MIN,
+            }),
+        };
+        let shown = format!("{answer:?}");
+        assert!(
+            !shown.contains("DEADBEEF"),
+            "a lease's value leaked into Debug: {shown}"
+        );
+        assert!(shown.contains("Secret(21 bytes)"), "{shown}");
+    }
+
+    /// A lease's ask and its answer read back as written, each refusal by its tag, and the
+    /// run's release as none (D242); one cut short, padded or of an unknown tag is refused,
+    /// as is a lease that lives no time, never a default.
+    #[test]
+    fn leases_round_trip_and_bad_ones_are_refused() {
+        let ask = LeaseAsk {
+            id: 3,
+            reference: "anthropic/claude-max".into(),
+        };
+        let bytes = ask.encode().unwrap();
+        assert_eq!(LeaseAsk::decode(&bytes).unwrap(), ask);
+        assert_eq!(LeaseAsk::decode(&bytes[..bytes.len() - 1]), Err(WireError::Short));
+        assert_eq!(
+            LeaseAsk::decode(&[bytes.as_slice(), &[0]].concat()),
+            Err(WireError::Trailing)
+        );
+        let given = Lease {
+            value: Secret::from("sk-ant-api03-lease"),
+            lives: NonZeroU64::new(3_600_000_000_000).unwrap(),
+        };
+        for result in [
+            Ok(given.clone()),
+            Ok(Lease {
+                value: Secret::default(),
+                lives: NonZeroU64::MIN,
+            }),
+            Err(LeaseRefusal::Denied("no such secret".into())),
+            Err(LeaseRefusal::KeyReplaced {
+                asked: "a".repeat(64),
+                current: Some("b".repeat(64)),
+            }),
+            Err(LeaseRefusal::KeyReplaced {
+                asked: "a".repeat(64),
+                current: None,
+            }),
+            Err(LeaseRefusal::Unavailable(String::new())),
+            Err(LeaseRefusal::Ended),
+            Err(LeaseRefusal::Lapsed),
+        ] {
+            let answer = LeaseAnswer { id: u32::MAX, result };
+            let bytes = answer.encode().unwrap();
+            assert_eq!(LeaseAnswer::decode(&bytes).unwrap(), answer);
+            assert_eq!(
+                LeaseAnswer::decode(&bytes[..bytes.len() - 1]),
+                Err(WireError::Short),
+                "{answer:?}"
+            );
+            assert_eq!(
+                LeaseAnswer::decode(&[bytes.as_slice(), &[0]].concat()),
+                Err(WireError::Trailing),
+                "{answer:?}"
+            );
+        }
+        assert!(matches!(
+            LeaseAnswer::decode(&[0, 0, 0, 1, 6]),
+            Err(WireError::Tag { tag: 6, .. })
+        ));
+        let mut flag = LeaseAnswer {
+            id: 1,
+            result: Err(LeaseRefusal::KeyReplaced {
+                asked: "a".into(),
+                current: None,
+            }),
+        }
+        .encode()
+        .unwrap();
+        *flag.last_mut().unwrap() = 2;
+        assert_eq!(
+            LeaseAnswer::decode(&flag),
+            Err(WireError::Tag {
+                what: "a flag",
+                tag: 2
+            })
+        );
+        let mut none = LeaseAnswer {
+            id: 1,
+            result: Ok(given),
+        }
+        .encode()
+        .unwrap();
+        none[5..13].fill(0);
+        assert_eq!(
+            LeaseAnswer::decode(&none),
+            Err(WireError::Tag {
+                what: "a lease's life",
+                tag: 0
+            })
+        );
+        assert_eq!(released(&[]), Ok(()));
+        assert_eq!(released(&[0]), Err(WireError::Trailing));
     }
 
     fn request() -> Request {
@@ -2165,6 +2710,7 @@ mod tests {
                 workdir: None,
                 input: true,
                 terminal: false,
+                args: Vec::new(),
             }],
             publish: vec![
                 Publish {
@@ -2195,6 +2741,8 @@ mod tests {
             nesting: false,
             ready_by: None,
             credentials: Vec::new(),
+            control: None,
+            gpu_devices: Vec::new(),
         }
     }
 
@@ -2217,10 +2765,12 @@ mod tests {
             },
         ];
         assert_eq!(Request::decode(&credited.encode().unwrap()).unwrap(), credited);
-        // Each member's working directory, or none, in the members' order (version 5), and
-        // whether its input is the orchestrator's (version 6).
+        // Each member's working directory, or none, in the members' order (version 5),
+        // whether its input is the orchestrator's (version 6), and its run-time arguments, none,
+        // several, or an empty one among others (version 18).
         let mut worked = request();
         worked.members[0].workdir = Some("/Users/ada/proj".into());
+        worked.members[0].args = vec!["--resume".into(), "s-1".into()];
         worked.members.push(MemberStage {
             kind: MemberKind::Agent,
             name: "helper".into(),
@@ -2229,11 +2779,13 @@ mod tests {
             workdir: None,
             input: false,
             terminal: false,
+            args: Vec::new(),
         });
         worked.members.push(MemberStage {
             workdir: Some("/".into()),
             input: true,
             terminal: true,
+            args: vec![String::new(), "two words".into(), "--model=opüs".into()],
             ..worked.members[1].clone()
         });
         assert_eq!(Request::decode(&worked.encode().unwrap()).unwrap(), worked);
@@ -2267,13 +2819,18 @@ mod tests {
         }
         .encode()
         .unwrap();
+        // ... the control ask's absence (version 15), the GPUs' count (version 16) and the
+        // member's arguments' count (version 18) last.
         assert_eq!(
-            asked.get(asked.len() - 19..).unwrap(),
-            [1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+            asked.get(asked.len() - 28..).unwrap(),
+            [
+                1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ],
             "appended: the grant's flag, the deadline's, the destinations kept (all), the one \
              member's working directory (none) and its input, the credential grants' count \
-             (zero, version 8), the member's terminal (none, version 11), then whether the \
-             members are held apart (no, version 12)"
+             (zero, version 8), the member's terminal (none, version 11), whether the members \
+             are held apart (no, version 12), the control ask (none, version 15), the GPUs' \
+             count (zero, version 16), then the member's arguments' count (zero, version 18)"
         );
         // Destinations kept by name, the host itself among them (D236), and none.
         for destinations in [
@@ -2345,6 +2902,9 @@ mod tests {
                     ],
                 },
             ],
+            control: None,
+            rate_period: std::time::Duration::from_millis(100),
+            from: StartedFrom::Saved,
         };
         assert_eq!(Started::decode(&started.encode().unwrap()).unwrap(), started);
         let bytes = started.encode().unwrap();
@@ -2439,10 +2999,11 @@ mod tests {
         ));
         // A member's input flag, before the credential grants' count (version 8), its
         // terminal's flag (version 11) and the members' reach (version 12), that is no flag.
-        // One member, so its input is the seventh byte from the end (the count's four, its
-        // terminal's one and the reach's flag follow it).
+        // One member, so its input is the sixteenth byte from the end (the count's four, its
+        // terminal's one, the reach's flag, the control ask's, the GPUs' count and its
+        // arguments' count follow it).
         let mut bad = request().encode().unwrap();
-        let at = bad.len() - 7;
+        let at = bad.len() - 16;
         assert_eq!(
             bad[at], 1,
             "the member's input flag precedes the credentials' count"
@@ -2521,9 +3082,10 @@ mod tests {
                 );
             }
         }
-        // The reach's flag, last where none is held apart.
+        // The reach's flag, before the control ask's, the GPUs' count and the member's
+        // arguments' count where none is held apart.
         let mut flag = held(None).encode().unwrap();
-        let at = flag.len() - 1;
+        let at = flag.len() - 10;
         flag[at] = 2;
         assert_eq!(
             Request::decode(&flag),
@@ -2536,7 +3098,9 @@ mod tests {
         let mut kindless = held(Some(vec![reach(MemberKind::Agent, "helper", &[])]))
             .encode()
             .unwrap();
-        let at = kindless.len() - (1 + 4 + "helper".len() + 4);
+        // ... then the control ask's absence (version 15), the GPUs' count (version 16) and
+        // the one member's arguments' count (version 18).
+        let at = kindless.len() - (1 + 4 + "helper".len() + 4 + 1 + 4 + 4);
         assert_eq!(kindless[at], MemberKind::Agent as u8);
         kindless[at] = 2;
         assert_eq!(
@@ -2546,11 +3110,75 @@ mod tests {
                 tag: 2
             })
         );
+        // Held apart, with four billion members in a few bytes, in place of the reach's flag
+        // and what follows it.
         let mut hostile = held(None).encode().unwrap();
-        hostile.pop();
+        hostile.truncate(hostile.len() - 10);
         hostile.push(1);
         hostile.extend_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(Request::decode(&hostile), Err(WireError::Short));
+    }
+
+    /// Each member's run-time arguments (version 18, D256). Do: give two members none, an
+    /// empty one, and several (a space, `=`, past ASCII). Expect: each reads back exactly, each
+    /// member's own in its order, last in the request, and one cut anywhere short refused. Do:
+    /// write an argument that is no UTF-8, and a count of four billion arguments in a few
+    /// bytes. Expect: each refused by type. Do: arguments past the channel's bound, one alone
+    /// or two halves. Expect: the request refused `TooLong` as it is written, never cut to fit.
+    #[test]
+    fn each_members_arguments_ride_the_request_last() {
+        const {
+            assert!(
+                VERSION >= 18,
+                "the channel's version 18 carries each member's arguments"
+            )
+        };
+        let with = |first: &[&str], second: &[&str]| {
+            let mut r = request();
+            let mut helper = r.members[0].clone();
+            helper.kind = MemberKind::Agent;
+            helper.name = "helper".into();
+            helper.args = second.iter().map(|a| (*a).to_string()).collect();
+            r.members[0].args = first.iter().map(|a| (*a).to_string()).collect();
+            r.members.push(helper);
+            r
+        };
+        let cases: [(&[&str], &[&str]); 3] = [
+            (&[], &[]),
+            (&[""], &[]),
+            (
+                &["--resume", "s-1", "--model", "claude-opus-4"],
+                &["--permission-mode=plan", "two words", "ü"],
+            ),
+        ];
+        for (first, second) in cases {
+            let asked = with(first, second);
+            let bytes = asked.encode().unwrap();
+            assert_eq!(Request::decode(&bytes).unwrap(), asked);
+            for cut in 0..bytes.len() {
+                assert!(
+                    Request::decode(bytes.get(..cut).unwrap()).is_err(),
+                    "cut at {cut}"
+                );
+            }
+        }
+        // The second member's one argument, "ü", last: its bytes made no UTF-8.
+        let mut bad = with(&["--resume"], &["ü"]).encode().unwrap();
+        let at = bad.len() - "ü".len();
+        bad[at] = 0xff;
+        assert_eq!(Request::decode(&bad), Err(WireError::Text));
+        // The second member's count, last, said as four billion in no bytes.
+        let mut hostile = with(&[], &[]).encode().unwrap();
+        let at = hostile.len() - 4;
+        hostile[at..].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(Request::decode(&hostile), Err(WireError::Short));
+        // Past the channel's bound, one argument alone or two halves: refused, never cut.
+        let most = run::MAX_PAYLOAD as usize;
+        let mut past = request();
+        past.members[0].args = vec!["x".repeat(most)];
+        assert_eq!(past.encode(), Err(WireError::TooLong));
+        past.members[0].args = vec!["x".repeat(most / 2), "x".repeat(most / 2)];
+        assert_eq!(past.encode(), Err(WireError::TooLong));
     }
 
     /// Unknown versions and tags are refused, never defaulted.
@@ -2562,53 +3190,90 @@ mod tests {
         // A request of version 1, without the nesting grant's fields and the destinations',
         // of version 4, without its members' working directories, or of version 5, without
         // their inputs, is no request of this one's: refused by its version, never read with
-        // them defaulted. The request's one member makes each of those one byte.
+        // them defaulted. The request's one member makes each of those one byte, and its
+        // arguments' count (version 18) four bytes, which every version before 18 lacks.
         let mut v1 = request().encode().unwrap();
-        v1.truncate(v1.len() - 11);
+        v1.truncate(v1.len() - 20);
         v1[0] = 1;
         assert_eq!(Request::decode(&v1), Err(WireError::Version(1)));
         let mut v4 = request().encode().unwrap();
-        v4.truncate(v4.len() - 8);
+        v4.truncate(v4.len() - 17);
         v4[0] = 4;
         assert_eq!(Request::decode(&v4), Err(WireError::Version(4)));
         let mut v5 = request().encode().unwrap();
-        v5.truncate(v5.len() - 7);
+        v5.truncate(v5.len() - 16);
         v5[0] = 5;
         assert_eq!(Request::decode(&v5), Err(WireError::Version(5)));
         // One of version 6 carries every field version 7 does, but its host ends the run at
         // a room: refused by its version, before any room is told (D241).
         let mut v6 = request().encode().unwrap();
-        v6.truncate(v6.len() - 6);
+        v6.truncate(v6.len() - 15);
         v6[0] = 6;
         assert_eq!(Request::decode(&v6), Err(WireError::Version(6)));
         // One of version 7, without the credential grants' count: refused by its version
         // (D242), so an older reader never reads a grant with its field defaulted.
         let mut v7 = request().encode().unwrap();
-        v7.truncate(v7.len() - 6);
+        v7.truncate(v7.len() - 15);
         v7[0] = 7;
         assert_eq!(Request::decode(&v7), Err(WireError::Version(7)));
         // One of version 8, without its members' terminals: refused by its version (D244), so
         // an older reader never starts a member with pipes where its owner asked a terminal.
         let mut v8 = request().encode().unwrap();
-        v8.truncate(v8.len() - 2);
+        v8.truncate(v8.len() - 11);
         v8[0] = 8;
         assert_eq!(Request::decode(&v8), Err(WireError::Version(8)));
         // One of version 11, without the members' reach: refused by its version (D246), so a
         // run host never takes a request that holds its members apart as one that holds none.
         let mut v11 = request().encode().unwrap();
-        v11.truncate(v11.len() - 1);
+        v11.truncate(v11.len() - 10);
         v11[0] = 11;
         assert_eq!(Request::decode(&v11), Err(WireError::Version(11)));
         // One of version 12 carries every field version 13 does, but its host ends the run at
         // a rate: refused by its version, before any rate is told (D247).
         let mut v12 = request().encode().unwrap();
+        v12.truncate(v12.len() - 9);
         v12[0] = 12;
         assert_eq!(Request::decode(&v12), Err(WireError::Version(12)));
+        // One of version 14, without the control ask: refused by its version (D252), so a run
+        // host never takes a run that asked an endpoint as one that asked none.
+        let mut v14 = request().encode().unwrap();
+        v14.truncate(v14.len() - 9);
+        v14[0] = 14;
+        assert_eq!(Request::decode(&v14), Err(WireError::Version(14)));
+        // One of version 15, without the GPUs it names: refused by its version (D232), so a run
+        // host never starts a run without the GPUs its orchestrator asked.
+        let mut v15 = request().encode().unwrap();
+        v15.truncate(v15.len() - 8);
+        v15[0] = 15;
+        assert_eq!(Request::decode(&v15), Err(WireError::Version(15)));
+        // One of version 16 asks what version 17 does, but its host tells no rate's period as
+        // the run starts: refused by its version, so no orchestrator waits on one (D247).
+        let mut v16 = request().encode().unwrap();
+        v16.truncate(v16.len() - 4);
+        v16[0] = 16;
+        assert_eq!(Request::decode(&v16), Err(WireError::Version(16)));
+        // One of version 17, without its members' arguments: refused by its version (D256), so
+        // a run host never starts a member without the flags its orchestrator asked.
+        let mut v17 = request().encode().unwrap();
+        v17.truncate(v17.len() - 4);
+        v17[0] = 17;
+        assert_eq!(Request::decode(&v17), Err(WireError::Version(17)));
+        // One of version 13 reads a vCPU's unread guest time as free words
+        // (guest-cpu-time-v1), and one of 19 carries every field version 20 does, but its
+        // client ends the run at a lease its host asks: each refused by its version, before
+        // any lease is (D242).
+        for old in [13, 19] {
+            let mut bytes = request().encode().unwrap();
+            bytes[0] = old;
+            assert_eq!(Request::decode(&bytes), Err(WireError::Version(old)));
+        }
         // The nesting flag, before the deadline's tag, the destinations', the one member's
         // working directory's and input's, the credential grants' count (version 8), the
-        // member's terminal's (version 11) and the members' reach (version 12): no flag.
+        // member's terminal's (version 11), the members' reach (version 12), the control ask
+        // (version 15), the GPUs' count (version 16) and its arguments' count (version 18): no
+        // flag.
         let mut flag = request().encode().unwrap();
-        let at = flag.len() - 11;
+        let at = flag.len() - 20;
         flag[at] = 2;
         assert_eq!(
             Request::decode(&flag),
@@ -2618,10 +3283,10 @@ mod tests {
             })
         );
         // The destinations' list, before the member's working directory and input, the
-        // credential grants' count, the member's terminal and the members' reach: no list of
-        // version 3's and on.
+        // credential grants' count, the member's terminal, the members' reach, the control ask,
+        // the GPUs' count and the member's arguments' count: no list of version 3's and on.
         let mut list = request().encode().unwrap();
-        let at = list.len() - 9;
+        let at = list.len() - 18;
         list[at] = 2;
         assert_eq!(
             Request::decode(&list),
@@ -2833,10 +3498,11 @@ mod tests {
         };
         assert_eq!(long.encode(), Err(WireError::TooLong));
         let mut bad = request().encode().unwrap();
-        let at = bad.len() - 2;
+        let at = bad.len() - 11;
         assert_eq!(
             bad[at], 0,
-            "the member's terminal flag precedes the members' reach"
+            "the member's terminal flag precedes the members' reach, the control ask, the GPUs \
+             and its arguments"
         );
         bad[at] = 2;
         assert_eq!(
@@ -2921,6 +3587,159 @@ mod tests {
         assert_eq!(long.encode(), Err(WireError::TooLong));
     }
 
+    /// The period a run's rate is held over reads back as its host said it, from a
+    /// nanosecond to the most a u64 counts (D247), its eight bytes last; a period of none, or
+    /// one past what a u64 counts in nanoseconds, is no period, refused each way.
+    #[test]
+    fn a_runs_rate_period_reads_back_as_its_host_said_it() {
+        use std::time::Duration;
+        let started = |rate_period| Started {
+            members: Vec::new(),
+            published: Vec::new(),
+            control: None,
+            rate_period,
+            from: StartedFrom::Booted,
+        };
+        for period in [
+            Duration::from_nanos(1),
+            Duration::from_millis(100),
+            Duration::from_nanos(u64::MAX),
+        ] {
+            let said = started(period);
+            let bytes = said.encode().unwrap();
+            let last = bytes.get(bytes.len() - 9..bytes.len() - 1).unwrap();
+            assert_eq!(last, u64::try_from(period.as_nanos()).unwrap().to_be_bytes());
+            assert_eq!(Started::decode(&bytes).unwrap(), said);
+        }
+        let mut none = started(Duration::from_millis(100)).encode().unwrap();
+        let at = none.len() - 9;
+        none.get_mut(at..at + 8).unwrap().fill(0);
+        assert_eq!(
+            Started::decode(&none),
+            Err(WireError::Tag {
+                what: "a rate period",
+                tag: 0
+            })
+        );
+        assert_eq!(
+            started(Duration::from_nanos(u64::MAX) + Duration::from_nanos(1)).encode(),
+            Err(WireError::TooLong)
+        );
+        assert_eq!(started(Duration::MAX).encode(), Err(WireError::TooLong));
+    }
+
+    /// How a run's microVM started (D253) reads back as its host said it, its byte last; a
+    /// byte that names no way is refused, as a host of a later version's would be read.
+    #[test]
+    fn how_a_run_started_reads_back_as_its_host_said_it() {
+        const {
+            assert!(
+                VERSION >= 19,
+                "the channel's version 19 carries how a run started"
+            )
+        };
+        for from in [
+            StartedFrom::Booted,
+            StartedFrom::Saved,
+            StartedFrom::Restored,
+            StartedFrom::Replaced,
+            StartedFrom::Warm,
+        ] {
+            let said = Started {
+                members: Vec::new(),
+                published: Vec::new(),
+                control: None,
+                rate_period: std::time::Duration::from_millis(100),
+                from,
+            };
+            let mut bytes = said.encode().unwrap();
+            assert_eq!(bytes.last(), Some(&(from as u8)));
+            assert_eq!(Started::decode(&bytes).unwrap(), said);
+            if let Some(last) = bytes.last_mut() {
+                *last = 5;
+            }
+            assert_eq!(
+                Started::decode(&bytes),
+                Err(WireError::Tag {
+                    what: "how a run started",
+                    tag: 5
+                })
+            );
+        }
+    }
+
+    /// D253's pools: a warm run host's exemplar is its request with its members' stages, its
+    /// deadline and its control ask taken out, all else kept, so that two runs alike in all
+    /// but those share it; its start's one byte reads back, and a refusal of a run of another
+    /// microVM's is `Unfit`.
+    #[test]
+    fn a_warm_hosts_exemplar_keeps_all_but_a_runs_own() {
+        const { assert!(VERSION >= 21, "the channel's version 21 carries warm run hosts") };
+        let full = Request {
+            image: "agents/codex:1".into(),
+            vcpus: 2,
+            memory_mib: 1024,
+            command: Some(vec!["node".into()]),
+            members: vec![MemberStage {
+                kind: MemberKind::Harness,
+                name: "codex".into(),
+                env: vec![Secret(b"KEY=secret".to_vec())],
+                files: Vec::new(),
+                workdir: None,
+                input: false,
+                terminal: false,
+                args: Vec::new(),
+            }],
+            publish: Vec::new(),
+            egress: Narrowing::default(),
+            shares: Vec::new(),
+            nesting: true,
+            ready_by: Some(7),
+            credentials: Vec::new(),
+            control: Some(ControlAsk {
+                controller: [1; 32],
+                sockets: None,
+            }),
+            gpu_devices: Vec::new(),
+        };
+        let exemplar = full.exemplar();
+        assert!(exemplar.members.is_empty() && exemplar.ready_by.is_none() && exemplar.control.is_none());
+        assert_eq!(
+            Request {
+                members: full.members.clone(),
+                ready_by: full.ready_by,
+                control: full.control.clone(),
+                ..exemplar.clone()
+            },
+            full
+        );
+        let other = Request {
+            members: Vec::new(),
+            ready_by: Some(9),
+            control: None,
+            ..full.clone()
+        };
+        assert_eq!(other.exemplar(), exemplar);
+        assert_ne!(
+            Request {
+                vcpus: 4,
+                ..full.clone()
+            }
+            .exemplar(),
+            exemplar
+        );
+        assert_eq!(Request::decode(&exemplar.encode().unwrap()).unwrap(), exemplar);
+        for from in [StartedFrom::Saved, StartedFrom::Restored, StartedFrom::Warm] {
+            assert_eq!(read_warmed(&warmed(from)), Ok(from));
+        }
+        assert!(read_warmed(&[]).is_err() && read_warmed(&[1, 2]).is_err() && read_warmed(&[9]).is_err());
+        let unfit = Refused {
+            cause: Cause::Unfit,
+            why: "another microVM's".into(),
+        };
+        assert_eq!(Refused::decode(&unfit.encode().unwrap()).unwrap(), unfit);
+    }
+
     /// The run's stats carry what its microVM costs its host and what its vCPUs ran of its
     /// guest (D241) as its run host read them: either part unread and why, a vCPU unread and
     /// why, the largest numbers a u64 holds. vCPUs out of index order, a part's unknown tag, a count
@@ -2938,7 +3757,7 @@ mod tests {
                 VcpuTime {
                     index: 2,
                     guest_ns: u64::MAX,
-                    unread: Some("its vCPU had left its guest".into()),
+                    unread: Some(shards_abi::guest_time::Unread::HvfExecTime(-85377023)),
                 },
             ],
             departed_ns: 1_500,
@@ -2998,6 +3817,13 @@ mod tests {
                 what: "a microVM's vCPUs"
             })
         );
+        // A vCPU's unread cause only in its text form: a code signed `+`, which no side writes,
+        // is refused, not taken as words.
+        let token = b"hvf-exec-time -85377023";
+        let at = bytes.windows(token.len()).position(|w| w == token).unwrap();
+        let mut free = bytes.clone();
+        free[at + 14] = b'+';
+        assert_eq!(StatsAnswer::decode(&free), Err(WireError::Unread));
         let microvm_tag = 4 + 1 + 4 + lines.len();
         for (at, tag, what) in [
             (microvm_tag, 2, "a microVM's cost"),
@@ -3031,5 +3857,115 @@ mod tests {
         let mut long = run::header(1, run::MAX_PAYLOAD).to_vec();
         long[4..8].copy_from_slice(&(run::MAX_PAYLOAD + 1).to_be_bytes());
         assert!(read_frame(&mut &long[..]).is_err());
+    }
+
+    /// A run asked of `control`, otherwise as Hex asks for its node VM (joint plan step 39):
+    /// its init the run's own command under the nesting grant.
+    fn asked(control: Option<ControlAsk>) -> Request {
+        Request {
+            image: "hex-node@sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            vcpus: 2,
+            memory_mib: 2048,
+            command: Some(vec!["/init".into()]),
+            members: Vec::new(),
+            publish: Vec::new(),
+            egress: Narrowing::default(),
+            shares: Vec::new(),
+            nesting: true,
+            ready_by: None,
+            credentials: Vec::new(),
+            control,
+            gpu_devices: Vec::new(),
+        }
+    }
+
+    /// Step 11 (b), D252 (Hex's acceptance): the run's control ask crosses the image channel
+    /// whole, at its next version, and a run that asks none encodes as one at v13 did but for
+    /// its version byte: control is absent, never a default. The controller's key, the socket
+    /// grant's directory and both its numbers are read back exactly.
+    #[test]
+    fn a_runs_control_ask_crosses_the_image_channel_whole() {
+        const { assert!(VERSION >= 15, "the channel's version 15 carries the control ask") };
+        for control in [
+            None,
+            Some(ControlAsk {
+                controller: [9u8; 32],
+                sockets: None,
+            }),
+            Some(ControlAsk {
+                controller: [9u8; 32],
+                sockets: Some(SocketGrant {
+                    dir: "/run/hex/channel".into(),
+                    lanes: 8,
+                    window: 65_536,
+                }),
+            }),
+        ] {
+            let request = asked(control);
+            assert_eq!(Request::decode(&request.encode().unwrap()).unwrap(), request);
+        }
+        // None asked: one byte past v13's encoding, its absence.
+        let none = asked(None).encode().unwrap();
+        assert_eq!(none.last(), Some(&0));
+    }
+
+    /// Step 11 (b), D252: a started run tells where its endpoint is bound and the microVM's own
+    /// key, which the controller pins; a run asked for no endpoint tells none.
+    #[test]
+    fn a_started_run_tells_where_its_endpoint_is_and_its_vms_key() {
+        for control in [
+            None,
+            Some(ControlAt {
+                address: "127.0.0.1:40123".parse().unwrap(),
+                vm: [3u8; 32],
+            }),
+            Some(ControlAt {
+                address: "[::1]:40123".parse().unwrap(),
+                vm: [4u8; 32],
+            }),
+        ] {
+            let started = Started {
+                members: Vec::new(),
+                published: Vec::new(),
+                control,
+                rate_period: std::time::Duration::from_millis(100),
+                from: StartedFrom::Restored,
+            };
+            assert_eq!(Started::decode(&started.encode().unwrap()).unwrap(), started);
+        }
+    }
+
+    /// D232 through D231 (D234's `gpus=`): the GPUs a run names cross the image channel in
+    /// `--gpu-device`'s grammar, whole and in order; an identity that grammar refuses, or a
+    /// selection D232 refuses (one GPU twice), is refused as the request is read.
+    #[test]
+    fn a_runs_gpus_cross_the_image_channel_in_d232s_grammar() {
+        use shards_abi::gpu::PhysicalGpu;
+        let gpus = vec![
+            PhysicalGpu::Pci {
+                domain: 0,
+                bus: 1,
+                device: 0,
+                function: 0,
+            },
+            PhysicalGpu::MetalRegistry(0x1_0000_02a1),
+        ];
+        let named = Request {
+            gpu_devices: gpus.clone(),
+            ..request()
+        };
+        let bytes = named.encode().unwrap();
+        assert_eq!(Request::decode(&bytes).unwrap().gpu_devices, gpus);
+        // The last identity's text, "metal:00000001000002a1", before the one member's arguments'
+        // count (version 18), made one D232's grammar refuses.
+        let mut unnamed = bytes.clone();
+        let at = unnamed.len() - 4 - "metal:00000001000002a1".len();
+        unnamed[at] = b'x';
+        assert_eq!(Request::decode(&unnamed), Err(WireError::Gpu));
+        let twice = Request {
+            gpu_devices: vec![gpus[1], gpus[1]],
+            ..request()
+        };
+        assert_eq!(Request::decode(&twice.encode().unwrap()), Err(WireError::Gpu));
     }
 }

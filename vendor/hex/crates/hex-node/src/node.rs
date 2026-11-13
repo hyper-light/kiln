@@ -46,7 +46,7 @@ use crate::abandoned::Abandoned;
 use crate::cgroups::{self, Cgroups, Choice, Made};
 use crate::createpool::{CreatePool, Prune};
 use crate::devfs::Devfs;
-use crate::emptying::{EMPTYING, empty_patience};
+use crate::emptying::{EMPTYING, follow_kill};
 use crate::ipcuts::IpcUtsPool;
 use crate::netns::{Netns, Pools};
 use crate::recorded::{RecoverySummary, why_text};
@@ -65,18 +65,37 @@ mod charges;
 /// keep a layered box's writable layer there, since overlayfs can't be an overlay's upper layer.
 const OVERLAYFS_SUPER_MAGIC: i128 = 0x794c_7630;
 
-/// Waits for `cg`, killed at `killed`, to empty within the learned wait ([`EMPTYING`]), which it teaches
-/// when it empties: the time from its kill. Says whether it emptied, and the wait it had from the kill.
+/// Waits for `cg`, killed at `killed`, to empty, as [`follow_kill`] waits on the learned wait ([`EMPTYING`]), which
+/// it teaches when it empties: the time from its kill. Says whether it emptied, and how long it waited from the kill.
 pub(crate) fn wait_empty(cg: &BoxCgroup, killed: Instant) -> Result<(bool, Duration), Refusal> {
-    let wait = EMPTYING.deadline();
-    let emptied = cg.wait_empty(empty_patience(killed))?;
-    if emptied {
-        EMPTYING.answered(killed.elapsed());
-    } else if let Some(after) = wait {
-        // A fault to report here, but the census is told it took longer than its bound.
-        EMPTYING.ran_out(after);
+    wait_empty_with(cg, killed, &EMPTYING)
+}
+
+/// [`wait_empty`] on any box that empties ([`crate::emptying::Emptying`]), its wait as `wait` has learned it. Past W*
+/// the census is told the run-out, once and with no sample, and the box is waited for by its life alone; its
+/// emptying, however late, is the sample W* rises to.
+fn wait_empty_with(
+    cg: &impl crate::emptying::Emptying,
+    killed: Instant,
+    wait: &Patience,
+) -> Result<(bool, Duration), Refusal> {
+    let followed = follow_kill(wait, killed, |slice| cg.empties_within(slice))?;
+    if let Some(window) = followed.past {
+        wait.ran_out(window);
     }
-    Ok((emptied, wait.unwrap_or(Duration::MAX)))
+    if followed.came {
+        wait.answered(killed.elapsed());
+    }
+    Ok((followed.came, killed.elapsed()))
+}
+
+/// Whether a program of a box killed at `killed` has ended, its pidfd `pidfd`: waited for as [`follow_kill`] waits on
+/// the learned wait for a box to empty ([`EMPTYING`]), by its life alone past it.
+fn ended_after_kill(killed: Instant, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<bool, Refusal> {
+    Ok(follow_kill(&EMPTYING, killed, |slice| {
+        supervise::pidfd_ends_within(pidfd, slice)
+    })?
+    .came)
 }
 
 /// How long [`Runtime::delete`] spends taking a box's directories apart before it refuses, leaving
@@ -87,17 +106,12 @@ pub const REMOVE_PATIENCE: Duration = Duration::from_secs(60);
 /// How long [`Node::recover`] spends on each entry of a directory it lists for the parts of boxes before it
 /// refuses: the runtime directory is shared with every node of this user on the host, so its entries are
 /// theirs as well as this node's, and a listing's time grows with them. So the sample is a listing's time per
-/// entry, and the wait for a listing's first `k` entries is `k` times twice the slowest recorded (decision 9;
-/// Ada's 2026-11-06 rule, the lead's failure-bound rule), refused by type past it (CLAUDE.md §2, §4). Seeded by
-/// build profile from the `node.listing` rows of `bench/competitive/probes/waits_census.md`: release, run 4's largest
-/// max of the release arms with a row's 1,000 samples, 7.043 us an entry (adacachy2, its disk arm, of 1,105); debug,
-/// run 5's suites', where run 3's seed ran out at 137.124 us an entry: the bound it ran out at, above every answer of
-/// the debug-build arms, so its patience doubles (decision 9).
-static LISTING: Patience = Patience::by_profile(
-    "node.listing",
-    Duration::from_nanos(7_043),
-    Some(Duration::from_nanos(137_124)),
-);
+/// entry, and the wait for a listing's first `k` entries is `k` times the slowest an entry has taken here (decision 9;
+/// Ada's rules of 2026-11-06 and 2026-11-13), refused by type past it (CLAUDE.md §2, §4). Before the first listing, and
+/// after one that ran out, the listing follows its own progress, the entries it lists, with no time bound: the
+/// `node.listing` rows of `bench/competitive/probes/waits_census.md` are the evidence the rule is held to, never a
+/// seed.
+static LISTING: Patience = Patience::measuring("node.listing");
 
 /// A point of an `oci` box's create where a debug build's node, once armed ([`Node::with_crash_point`]),
 /// ends its own process as a kill there would: T-T7.1.2's crash test kills the real agent at the points
@@ -214,8 +228,8 @@ pub struct Node {
     /// for the create under way and then finds the box made or not, rather than make or remove parts at
     /// the paths the id fixes; so neither scrubs what the other is making. At most [`MAX_BOXES`] turns
     /// at once, the node's box budget, a wait learned from how long creates and deletes held their turns
-    /// (decision 9: twice the longest held, measuring until the first is let go, a wait before it lasting
-    /// until then); past either the call is refused by type, a create past the budget as [`Refusal::Full`]
+    /// (decision 9: the longest held; before the first is let go, and after a wait that ran out, a wait follows the
+    /// holder until it lets go); past either the call is refused by type, a create past the budget as [`Refusal::Full`]
     /// ([`create_turn`]).
     turns: Turns,
     /// The debug-only crash point the caller armed ([`Node::with_crash_point`]), `None` unless one did.
@@ -424,15 +438,9 @@ impl Node {
                 "making or removing a box",
                 "creates and deletes under way",
                 MAX_BOXES,
-                // Seeded by build profile from the `node.turns` rows of `bench/competitive/probes/waits_census.md`:
-                // release, run 4's largest max of the release arms, 43.627 ms (adacachy2, its tmpfs arm, of 92,042);
-                // debug, run 5's largest answer of the debug-build arms, the debug arm and the suites' (adacachy2),
-                // 1,719.743 ms (the suites', of 398,973).
-                Patience::by_profile(
-                    "node.turns",
-                    Duration::from_nanos(43_627_499),
-                    Some(Duration::from_nanos(1_719_743_234)),
-                ),
+                // The longest a create or delete has held its turn here; before the first, and past it, a wait
+                // follows the holder until it lets go (decision 9: no record is read).
+                Patience::measuring("node.turns"),
             ),
             #[cfg(debug_assertions)]
             crash_at: None,
@@ -511,6 +519,16 @@ impl Node {
     pub fn with_init_budget(self, budget: usize) -> Result<Self, Refusal> {
         self.supervisor.set_budget(budget)?;
         Ok(self)
+    }
+
+    /// Holds each run's removal at its start until the returned guard goes (runtime goal 7): a claimer that has taken
+    /// a run stops before it reaps the program or touches the box, as one descheduled there would, so a test meets a
+    /// delete beside a removal under way; the guard counts the claimers stopped and the deletes that waited on one. A
+    /// test control of debug builds alone, armed by the node's caller alone.
+    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
+    pub fn hold_run_removals(&self) -> Result<crate::supervise::RemovalHold<'_>, Refusal> {
+        self.supervisor.hold_removals()
     }
 
     /// Arms a debug-only crash point on this node's create seeds (goal 5 plan step 2): the pruned init
@@ -1013,6 +1031,8 @@ impl Node {
                 .abandoned
                 .saturating_add(self.abandoned.unrecorded(id)?),
             last_resort: None,
+            ended: None,
+            credentials: Vec::new(),
         })
     }
 
@@ -1295,8 +1315,10 @@ impl Node {
             && init.pid_namespace
         {
             init.kill()?;
-            self.supervisor.reap_programs(id, empty_patience(killed))?;
-            if !init.ended_within(empty_patience(killed))? {
+            self.supervisor
+                .reap_programs(id, &mut |pidfd| ended_after_kill(killed, pidfd))?;
+            let ended = follow_kill(&EMPTYING, killed, |slice| init.ended_within(slice))?;
+            if !ended.came {
                 return Err(Refusal::Os {
                     op: "emptying a box",
                     why: format!(
@@ -1322,7 +1344,8 @@ impl Node {
         // The kill reaches every process in the box; now reap the exec'd programs the agent watches for
         // it, so an `oci` box's init — which the kernel holds in its pid-namespace teardown until the
         // programs in that namespace are reaped — can finish exiting and the box empty.
-        self.supervisor.reap_programs(id, empty_patience(killed))?;
+        self.supervisor
+            .reap_programs(id, &mut |pidfd| ended_after_kill(killed, pidfd))?;
         let (emptied, patience) = wait_empty(cg, killed)?;
         if !emptied {
             let op = "emptying a box";
@@ -1512,6 +1535,8 @@ impl Node {
             exit: None,
             abandoned: 0,
             last_resort: None,
+            ended: None,
+            credentials: Vec::new(),
         })
     }
 
@@ -1705,12 +1730,11 @@ impl Node {
         }
     }
 
-    /// How many claims of a parked init failed and fell back to a seed's clone since the seed pool opened, by why:
-    /// (hung, refused or broken). What a pass reads to see how often a parked init cost its create a clone.
-    pub fn parked_claims_failed(&self) -> (u64, u64) {
-        self.create_seeds
-            .get()
-            .map_or((0, 0), CreatePool::claims_failed)
+    /// How many claims of a parked init failed and fell back to a seed's clone since the seed pool opened: refused,
+    /// or broken or ended before the init's first word. What a pass reads to see how often a parked init cost its
+    /// create a clone.
+    pub fn parked_claims_failed(&self) -> u64 {
+        self.create_seeds.get().map_or(0, CreatePool::claims_failed)
     }
 
     /// How many of the node's creates were made through the shim since its seed pool opened: those a
@@ -1978,15 +2002,16 @@ impl Runtime for Node {
         // The record names the program by its start time too, so recovery never takes a later
         // process given its pid for it. A program that ended already is a zombie until reaped, its
         // start time still there.
-        let mut record = BoxRecord::new(spec, Phase::Ready, Vec::new());
-        record.run = Some(ProcId {
+        let program = ProcId {
             pid,
             start_ticks: i32::try_from(pid).ok().and_then(start_time).unwrap_or(0),
-        });
+        };
+        let mut record = BoxRecord::new(spec, Phase::Ready, Vec::new());
+        record.run = Some(program);
         let watched = match self.store.put(&record) {
             Ok(()) => self
                 .supervisor
-                .watch_run(slot, &id, pid, pidfd, cg, self.root.names()),
+                .watch_run(slot, &id, program, pidfd, cg, self.root.names()),
             Err(e) => Err((e, pidfd)),
         };
         drop(spawning);
@@ -2135,6 +2160,8 @@ impl Runtime for Node {
                         exit: None,
                         abandoned: 0,
                         last_resort: None,
+                        ended: None,
+                        credentials: Vec::new(),
                     }),
                     Err(why) => return Err(why),
                 }
@@ -2155,6 +2182,8 @@ impl Runtime for Node {
                     exit: None,
                     abandoned: 0,
                     last_resort: None,
+                    ended: None,
+                    credentials: Vec::new(),
                 });
             }
         }
@@ -2169,15 +2198,30 @@ impl Runtime for Node {
         // gone, and scrubs nothing it's doing.
         let _turn: Turn<'_> = self.turns.take(id)?;
         // A run's box is this delete's to remove once its run is taken, so the run's own removal doesn't race
-        // it; its caller is told how the delete went.
-        let run = self.supervisor.take_run(id)?;
-        let deleted = self.delete_box(id);
-        match &run {
-            Some(run) => {
-                self.supervisor.ended_run(run, deleted.clone())?;
+        // it; its caller is told how the delete went. A run another claimer took (its program's end) is that
+        // claimer's to remove: this delete waits for its word, under the box's turn so nothing else of the box
+        // moves meanwhile, and answers as the removal went, removing the box itself only where the claimer
+        // stopped without a word (runtime goal 7). A box made again under the id since names another program in
+        // its record, or none, and the old claimer touches it no more.
+        match self.supervisor.take_run(id)? {
+            supervise::Taken::Mine(run) => {
+                let deleted = self.delete_box(id);
+                run.deleted(deleted.clone())?;
                 deleted
             }
-            None => deleted,
+            supervise::Taken::Theirs(run) => {
+                if self.record(id)?.and_then(|record| record.run) != Some(run.program()) {
+                    return self.delete_box(id);
+                }
+                #[cfg(all(debug_assertions, feature = "test-controls"))]
+                self.supervisor.waiting_on_removal()?;
+                match run.said()? {
+                    supervise::Said::Removed(_) => Ok(()),
+                    supervise::Said::Failed(why) => Err(why),
+                    supervise::Said::Abandoned => self.delete_box(id),
+                }
+            }
+            supervise::Taken::NoRun => self.delete_box(id),
         }
     }
 }
@@ -2506,34 +2550,35 @@ fn outsiders(cg: &BoxCgroup, init: i32, start_ticks: Option<u64>) -> bool {
 
 /// The box ids named by the directories in `dir` whose names start with `prefix`, the rest of each name
 /// the id, or none when `dir` isn't there: a box's parts there are directories, so any other entry is no
-/// box's. The listing ends at the wait learned from the listings before it, for as many entries as it has
-/// listed ([`LISTING`]), refused past it by type.
+/// box's. Past the wait learned from the listings before it, for as many entries as it has listed ([`LISTING`]),
+/// the listing tells the census a run-out and goes on (decision 9, the person's ruling of 2026-11-13): it is in
+/// process, its entries its progress, and only the file system refuses it.
 fn ids_in(dir: &Path, prefix: &str) -> Result<BTreeSet<BoxId>, Refusal> {
+    ids_with(dir, prefix, &LISTING)
+}
+
+/// [`ids_in`], the listing's wait `learned`.
+fn ids_with(dir: &Path, prefix: &str, learned: &Patience) -> Result<BTreeSet<BoxId>, Refusal> {
     let listing = |e| Refusal::os("listing a directory for boxes' parts", e);
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
         Err(e) => return Err(listing(e)),
     };
-    let per_entry = LISTING.deadline();
+    let per_entry = learned.deadline();
     let began = Instant::now();
     let mut listed = 0u32;
+    let mut ran_out = false;
     let mut ids = BTreeSet::new();
     for entry in entries {
         listed = listed.saturating_add(1);
         if let Some(per_entry) = per_entry
+            && !ran_out
             && began.elapsed() > per_entry.saturating_mul(listed)
         {
-            // No sample (Karn's point), but the census is told an entry took longer than its bound.
-            LISTING.ran_out(per_entry);
-            return Err(Refusal::Os {
-                op: "listing a directory for boxes' parts",
-                why: format!(
-                    "{} took {:?} for {listed} entries, past twice the slowest a listing has taken an entry",
-                    dir.display(),
-                    began.elapsed()
-                ),
-            });
+            // Past W*: no sample (Karn's point), but the census is told, once, and the listing goes on.
+            learned.ran_out(per_entry);
+            ran_out = true;
         }
         let entry = entry.map_err(listing)?;
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -2548,7 +2593,7 @@ fn ids_in(dir: &Path, prefix: &str) -> Result<BTreeSet<BoxId>, Refusal> {
             ids.insert(id);
         }
     }
-    LISTING.answered(
+    learned.answered(
         began
             .elapsed()
             .checked_div(listed.max(1))
@@ -2766,6 +2811,40 @@ fn seed_prune_for(owner: &Owner, oci_root: &Path, classic_roots: bool) -> Prune 
 mod tests {
     use super::*;
 
+    /// A killed box in the test's hands, slower to empty than any wait of a time: it holds processes through every look
+    /// bounded by a time, and empties only for one that waits until it does (`Duration::MAX`), as a real box's
+    /// emptying ends that wait. It counts the looks.
+    struct Killed {
+        looks: std::cell::Cell<u32>,
+    }
+
+    impl crate::emptying::Emptying for Killed {
+        fn empties_within(&self, timeout: Duration) -> Result<bool, Refusal> {
+            self.looks.set(self.looks.get() + 1);
+            Ok(timeout == Duration::MAX)
+        }
+    }
+
+    /// Decision 9 (original; the person's ruling of 2026-11-13: W* is a bound only while answers come within it), goal
+    /// 13's find at 67dc2ed8: a box whose processes took longer to exit than every earlier emptying was refused "still
+    /// holds processes 12-19µs after cgroup.kill", its wait bounded at the slowest emptying seen and following no
+    /// party. Do: a wait whose W* is 1 ns; a killed box slower to empty than that. Expect: it emptied, waited for past
+    /// W* by its life alone (a look within W*, then one until it empties), the run-out told on the way, and its time
+    /// the sample W* rises to.
+    #[test]
+    fn original_a_box_slower_to_empty_than_any_before_is_waited_for_until_it_empties() {
+        let learned = Duration::from_nanos(1);
+        let wait = Patience::measuring("test.node.emptying.slower");
+        wait.answered(learned);
+        let killed = Killed {
+            looks: std::cell::Cell::new(0),
+        };
+        let (emptied, _) = wait_empty_with(&killed, Instant::now(), &wait).unwrap();
+        assert!(emptied, "refused at W*");
+        assert_eq!(killed.looks.get(), 2);
+        assert!(wait.slowest().is_some_and(|slowest| slowest > learned));
+    }
+
     /// AC-T7.1.3, decision 8: deleting an OCI box after its init was reaped still waits for that init's cgroup to
     /// drain. Do: choose deletion from an init+exit record with no watched init. Expect its identity retained for
     /// the same outsider check and empty wait a watched init takes, rather than a cgroup-wide kill.
@@ -2928,6 +3007,22 @@ mod tests {
         let ids = ids_in(dir.path(), "hex-").unwrap();
         assert_eq!(ids.len(), 2, "{ids:?}");
         assert!(LISTING.slowest().is_some());
+    }
+
+    /// Decision 9 (original; the person's ruling of 2026-11-13: W* is a bound only while answers come within it;
+    /// T-T7.1.2): a recovery's listing was refused once it took longer per entry than any listing before it, failing a
+    /// node's start on a slow disk. Do: list a directory holding three boxes' parts under a wait that has learned a
+    /// per-entry W* every entry outruns (1 ns). Expect: all three ids, the listing going on past W* (the listing is
+    /// in process, and its entries are its progress), never refused.
+    #[test]
+    fn original_a_listing_slower_than_any_before_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["hex-a", "hex-b", "hex-c"] {
+            fs::create_dir(dir.path().join(id)).unwrap();
+        }
+        let learned = Patience::seeded("test.node.listing", Duration::from_nanos(1));
+        let ids = ids_with(dir.path(), "hex-", &learned).unwrap();
+        assert_eq!(ids.len(), 3, "{ids:?}");
     }
 
     /// CLAUDE.md §2 (T-T7.1.2): creates under way are bounded, and past the bound a create is refused as `Full`,

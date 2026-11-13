@@ -141,6 +141,7 @@ impl PoolRecord {
             })?;
         devices.extend_from_slice(&self.devices);
         Ok(BackingOffer {
+            guest: Default::default(),
             key: self.key,
             cost: self.cost,
             phase: self.phase,

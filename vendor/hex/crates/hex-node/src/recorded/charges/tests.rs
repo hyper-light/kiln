@@ -504,6 +504,8 @@ fn w14_a_capping_nodes_inspect_says_why_its_last_resort_ended_a_vm() {
             grants: Vec::new(),
             published: Vec::new(),
             last_resort: None,
+            ended: None,
+            credentials: Vec::new(),
         })
         .unwrap();
     assert_eq!(info.last_resort, Some(end));
@@ -780,6 +782,7 @@ fn w14_a_capping_node_learns_an_image_vm_through_its_run() {
         footprint_bytes: held,
         resident_bytes: held,
         guest_ns: vec![each_ns; usize::try_from(vcpus).unwrap()],
+        window: std::time::Duration::ZERO,
     };
     io.host
         .borrow_mut()
@@ -891,6 +894,7 @@ fn w14_an_answer_carries_each_learned_vms_holding_an_image_vms_too() {
             footprint_bytes: GIB,
             resident_bytes: GIB,
             guest_ns: vec![0; 16],
+            window: std::time::Duration::ZERO,
         },
     );
     let records = vec![vm("vm-1", 1), image_vm("img-1", 2)];
@@ -980,4 +984,44 @@ fn w14_a_window_books_whole_each_vm_it_doesnt_learn() {
     assert_eq!(ids(&both), ["vm-1", "img-1"]);
     assert_eq!(both.whole, CapacityResources::default());
     assert_eq!(both.native, res(2_000, GIB));
+}
+
+/// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13: the starving case the done-when names): a running VM whose read
+/// fails counts whole, at its receipt, against the fleet's budget until a read succeeds, its learner untouched, and
+/// the failure is told. Do run a window of three Shards VMs of 16-CPU allocations, each booked at 4 CPUs, in a 24-CPU
+/// fleet budget, the third's read failing, and answer the class's capacity; then one in which it reads. Expect the first
+/// two capped at their bookings, the 16 CPUs of the third's receipt taken from the budget, the third named among the
+/// unread with its refusal and carrying no holding on the answer, so the scheduler counts it at its receipt; then none
+/// unread, the third, which has run no window, capped at its 16-CPU ceiling and the two idle at their bookings.
+#[test]
+fn w14_a_vm_whose_read_fails_counts_whole_against_the_budget_until_it_reads() {
+    let io = Record::default();
+    let vms = vec![vm("vm-1", 1), vm("vm-2", 2), vm("vm-3", 3)];
+    io.set("vm-1", 0, GIB);
+    io.set("vm-2", 0, GIB);
+    let budget = res(24_000, 64 * GIB);
+    let mut learner = Learner::new(WINDOW, res(32_000, 64 * GIB), LEARNS).unwrap();
+    let start = Instant::now();
+    learner.window(&io, &vms, budget, start).unwrap();
+    assert_eq!(
+        *io.rates.borrow(),
+        vec![("vm-1".to_owned(), 4_000), ("vm-2".to_owned(), 4_000)]
+    );
+    let unread: Vec<&str> = learner.unread().iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(unread, ["vm-3"]);
+    let learned = learner
+        .learned(Class::Shards, &[cost()], &vms)
+        .unwrap()
+        .unwrap();
+    let held: Vec<&str> = learned.holdings.iter().map(|h| h.id.as_str()).collect();
+    assert!(!held.contains(&"vm-3"), "{held:?}");
+    io.rates.borrow_mut().clear();
+    io.set("vm-3", 0, GIB);
+    learner.window(&io, &vms, budget, start + WINDOW).unwrap();
+    assert!(learner.unread().is_empty());
+    let caps: Vec<u64> = vms
+        .iter()
+        .map(|r| learner.rate(&Scope::of(r).unwrap()).unwrap())
+        .collect();
+    assert_eq!(caps, [4_000, 4_000, 16_000]);
 }

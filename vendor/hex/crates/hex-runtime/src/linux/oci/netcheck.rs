@@ -71,16 +71,14 @@ const READ_BYTES: usize = 8 << 10;
 /// [`Patience`]). `::1` is added tentative (net/ipv6/addrconf.c:1148-1149) and its DAD work is queued (:4173), which
 /// clears that once it gets RTNL (:4194, :4107-4121), then puts in its host route (:6283) and tells
 /// `RTNLGRP_IPV6_IFADDR` (:4320, :5621). So how long it takes is how long the host's RTNL is held by others: the
-/// host's, so the process's to record, not one checker's. MEASURING: no record of the settle's distribution yet
-/// (`bench/competitive/probes/input_census.md` records the dumps' sizes, not their times); the record to come is
-/// `bench/competitive/probes/waits_census.md`'s `netcheck.settles` row. Until then it is unarmed until the first
-/// settle this process sees.
+/// host's, so the process's to learn, not one checker's: the slowest settle this process has seen. Before the first,
+/// and after one that ran out, a settle is waited for on the kernel's notice alone (decision 9: no record is read;
+/// `bench/competitive/probes/waits_census.md`'s `netcheck.settles` row is evidence).
 static SETTLES: Patience = Patience::measuring("netcheck.settles");
-/// How long one read of a dump's answer takes, learned in this process ([`Patience`]). Seeded in a release build from
-/// the `netcheck.answers` row of `bench/competitive/probes/waits_census.md` run 4 (adacachy2, its owner arm, 0.454 ms
-/// of 160,192); a debug build has no record of its own yet (the census's debug arm keeps no namespaces): measuring.
-static ANSWERS: Patience =
-    Patience::by_profile("netcheck.answers", Duration::from_nanos(454_408), None);
+/// How long one read of a dump's answer takes, learned in this process ([`Patience`]): the slowest read seen; before
+/// the first, and after one that ran out, a read waits on the kernel's answer alone (decision 9: no record is read; the
+/// `netcheck.answers` row of `bench/competitive/probes/waits_census.md` is evidence, never a seed).
+static ANSWERS: Patience = Patience::measuring("netcheck.answers");
 
 /// `bound` as `SO_RCVTIMEO` takes it: in whole microseconds, a `struct timeval`, rounded up, since one of zero
 /// waits for ever (socket(7)); `None`, no bound, waits for ever.
@@ -271,7 +269,7 @@ fn settled(scratch: &mut Scratch) -> Result<Vec<Vec<Vec<u8>>>, OciError> {
             SETTLES.ran_out(bound);
             return Err(OciError::Broken(format!(
                 "a fresh network namespace's loopback IPv6 address was still tentative after {bound:?}, \
-                 twice the slowest settle recorded"
+                 the slowest settle this process has seen"
             )));
         }
         rustix::net::sockopt::set_socket_timeout(

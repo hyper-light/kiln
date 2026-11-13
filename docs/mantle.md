@@ -381,9 +381,10 @@ object store) is wise"):
 - **Mantle** at `87ab09e1` (2026-11-08), its main's head as kiln took it (`17eb8032` before), at `vendor/mantle`, in `vendor/MANIFEST.toml` with
   `vendor/mantle/UPSTREAM.md`: its crates, root manifest, `Cargo.lock`, `rust-toolchain.toml`,
   settings and scripts. Left out: its `vendor/`, `docs/`, drawings and CI (`.github/`, `.kiln/`).
-- **hyper-raft:** the one copy is kiln's, `vendor/hyper-raft`, at `fb74b59`: hyper-raft's main, which
+- **hyper-raft:** the one copy is kiln's, `vendor/hyper-raft`, at `045cf3ff`: hyper-raft's main, which
   holds what Mantle's main snapshots (`5e40eb9`: Mantle's line `0a182ae` and the driver fix main
-  landed as `fb74b59`, a driver reading what its sockets took before it judges its timers). Mantle's crates take it by path, the change kiln
+  landed as `fb74b59`, a driver reading what its sockets took before it judges its timers), and the revision Hex and
+  Shards take since (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17). Mantle's crates take it by path, the change kiln
   records to Mantle's manifests (`vendor/patches/mantle/0001-…`), and Mantle's code states the two
   limits main added as they were before them (`0002-…`). Quiver (`966ea139`, which took `fb74b59`
   for this) and Focal's bus (`9aded7cd`) build on the same copy.
@@ -423,7 +424,7 @@ object store) is wise"):
   hyper-rt, opted into with `[blobs] store = "mantle"` (docs/blobs.md, "The Mantle store"). It's a
   client of a cell kiln doesn't run: no node starts inside kiln (R1), and production's store stays
   as it is until Ada moves it.
-- **One revision:** Mantle `87ab09e1` builds on kiln's hyper-raft `fb74b59` and aws-lc-rs 1.18.2
+- **One revision:** Mantle `87ab09e1` builds on kiln's hyper-raft (`045cf3ff`) and aws-lc-rs 1.18.2
   (Vendoring, above), so the client links the hyper-rt, transport and TLS kiln already links.
 - **What it keeps where:** a key's object is a pointer, naming its content's SHA-256, its size and
   its bytes' native ETag, to bytes kept once by their SHA-256; Mantle's preconditions on the

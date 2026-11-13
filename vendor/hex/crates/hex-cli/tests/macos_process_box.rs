@@ -403,8 +403,8 @@ fn a_box_takes_a_named_signal() {
     assert_eq!(exit, Exit::Signal(15), "TERM is 15 on both kernels");
 }
 
-/// HEX-RT-5, HEX-MAC-1: do one program past its box's memory bound; expect its end and the
-/// memory kill to be visible within the contract's learned patience, without warming it up in a loop.
+/// HEX-RT-5, HEX-MAC-1: do one program past its box's memory bound; expect its end, followed to it as the contract's
+/// waits are (decision 9), and the memory kill to be visible, without warming it up in a loop.
 #[test]
 fn hex_rt_5_one_bounded_program_reports_its_memory_end() {
     let rt = runtime();
@@ -424,7 +424,7 @@ fn hex_rt_5_one_bounded_program_reports_its_memory_end() {
         band: 0,
     })
     .expect("create");
-    let end = bound_end(&rt, &id, fx.act(&Act::Hog(GIB)), conformance::patience());
+    let end = bound_end(&rt, &id, fx.act(&Act::Hog(GIB)));
     let status = rt.status(&id).expect("watcher status");
     let usage = rt.usage(&id).expect("usage");
     let deleted = rt.delete(&id);
@@ -459,23 +459,24 @@ fn hex_rt_6_one_process_tree_reports_its_bound_and_deletes() {
     let mut program = rt
         .exec(&id, fx.act(&Act::Spawn(32)), Stdio::null())
         .expect("exec");
-    let end = program.wait_for(conformance::patience());
+    let end = conformance::end_of(&mut program);
     let usage = rt.usage(&id).expect("usage");
     let deleted = rt.delete(&id);
     assert!(
-        matches!(end, Ok(Some(Exit::Signal(9)))),
+        matches!(end, Ok(Exit::Signal(9))),
         "{end:?}; {usage:?}; deleted {deleted:?}"
     );
     assert!(usage.pids_refused > 0, "{usage:?}");
     deleted.expect("delete");
 }
 
-/// HEX-RT-3, HEX-DIFF-5 (AC-T7.1.1): do 60 programs killed at their box's bound, one after another,
-/// expect each wait to return when the program ends, never at the wait's budget. XNU posts a child's
-/// `NOTE_EXIT` before it is a zombie (`bsd/kern/kern_exit.c:2594-2595`, then `p_stat = SZOMB` at :2664),
-/// so a reap made on the event can find nothing yet; the native bench saw 3 of 60 such ends reported 60 s
-/// late (bench/native/RESULT.md). Sixty runs, from that measured rate: without the fix 3/60, 7/60 and 3/60
-/// missed, at least 5%, so sixty runs see none with probability at most 0.95^60 = 4.6%.
+/// HEX-RT-3, HEX-DIFF-5 (AC-T7.1.1): do 60 programs killed at their box's bound, one after another, expect each wait
+/// to return when the program ends, its end the bound's kill. XNU posts a child's `NOTE_EXIT` before it is a zombie
+/// (`bsd/kern/kern_exit.c:2594-2595`, then `p_stat = SZOMB` at :2664), so a reap made on the event can find nothing
+/// yet; the native bench saw 3 of 60 such ends reported 60 s late (bench/native/RESULT.md). A wait now follows its
+/// program by its own events until its end (decision 9), so such a missed end leaves it waiting for an event that
+/// won't come: the test doesn't return, its own deadline the gate's. Sixty runs, from that measured rate: without the
+/// fix 3/60, 7/60 and 3/60 missed, at least 5%, so sixty runs see none with probability at most 0.95^60 = 4.6%.
 #[test]
 fn a_programs_end_is_seen_when_it_ends_not_at_the_waits_budget() {
     let rt = runtime();
@@ -497,24 +498,17 @@ fn a_programs_end_is_seen_when_it_ends_not_at_the_waits_budget() {
     })
     .expect("create");
     const RUNS: usize = 60;
-    // A missed exit event makes the wait sleep out its whole budget (XNU's exit event came before the zombie
-    // could be reaped, abdbfd0), so an end seen only at the budget is the fault. The budget is the suite's
-    // learned patience, at least twice the slowest end on macOS's record, so a legitimate end, even a rebuilt
-    // binary's first (939 ms on adas-mac-studio.local-2 at load 15-20), comes well before it. On time is the
-    // bound's kill before then: a refused exec's SIGKILL is no bound's end (bound_end).
-    let budget = hex_api::conformance::patience();
-    let late_after = budget;
-    let mut late = Vec::new();
+    // A refused exec's SIGKILL is no bound's end (bound_end): each end must be the bound's kill.
+    let mut other = Vec::new();
     for i in 0..RUNS {
-        match bound_end(&rt, &id, fx.act(&Act::Hog(GIB)), budget) {
-            Ok(took) if took < late_after => {}
-            other => late.push((i, other)),
+        if let Err(why) = bound_end(&rt, &id, fx.act(&Act::Hog(GIB))) {
+            other.push((i, why));
         }
     }
     rt.delete(&id).expect("delete");
     assert!(
-        late.is_empty(),
-        "ends not seen as the bound's kill when they happened: {late:?}"
+        other.is_empty(),
+        "ends that weren't the bound's kill: {other:?}"
     );
 }
 
@@ -1040,16 +1034,11 @@ fn measure_a_cpu_bound_members_work_rate() {
     );
 }
 
-/// Starts `program` in box `id` and waits up to `budget` for it to end; returns how long it took when its end
-/// was the box's bound's kill: a signal, with the box's memory kills risen by one. Anything else (a program
+/// Starts `program` in box `id` and follows it to its end ([`conformance::end_of`]); returns how long it took when its
+/// end was the box's bound's kill: a signal, with the box's memory kills risen by one. Anything else (a program
 /// that ended on its own, or one killed by another hand, as the kernel's AppleSystemPolicy kills a refused
 /// exec with SIGKILL before it runs) is an error saying so, so a refused spawn can't pass for a bound's kill.
-fn bound_end(
-    rt: &MacRuntime,
-    id: &BoxId,
-    program: Program,
-    budget: Duration,
-) -> Result<Duration, String> {
+fn bound_end(rt: &MacRuntime, id: &BoxId, program: Program) -> Result<Duration, String> {
     let kills = |rt: &MacRuntime| {
         rt.usage(id)
             .map(|u| u.oom_kills)
@@ -1060,11 +1049,11 @@ fn bound_end(
         .exec(id, program, Stdio::null())
         .map_err(|e| format!("exec: {e}"))?;
     let t = Instant::now();
-    let exit = p.wait_for(budget).map_err(|e| format!("wait: {e}"))?;
+    let exit = conformance::end_of(&mut p).map_err(|e| format!("wait: {e}"))?;
     let took = t.elapsed();
     let after = kills(rt)?;
     match exit {
-        Some(Exit::Signal(_)) if after == before + 1 => Ok(took),
+        Exit::Signal(_) if after == before + 1 => Ok(took),
         other => {
             let pid = i32::try_from(p.pid()).map_err(|_| "pid past i32".to_owned())?;
             let run = hex_runtime::macos::sys::run_state(pid);
@@ -1101,12 +1090,7 @@ fn a_program_killed_outside_the_bound_is_no_bounds_end() {
         band: 0,
     })
     .expect("create");
-    let killed = bound_end(
-        &rt,
-        &id,
-        Program::of(&["/bin/sh", "-c", "kill -KILL $$"]),
-        HANG_GUARD,
-    );
+    let killed = bound_end(&rt, &id, Program::of(&["/bin/sh", "-c", "kill -KILL $$"]));
     rt.delete(&id).expect("delete");
     assert!(
         killed.is_err(),

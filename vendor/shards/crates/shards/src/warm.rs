@@ -154,8 +154,10 @@ pub fn adopt_release(socket: shards_vmm::platform::UnixStream) -> Result<(), Str
 /// Has the network process close the run's published ports, and waits until it has, so
 /// that they are free once the run's end is told: a script's next run of the same port
 /// finds it free (`run --rm -p 80 …; run -p 80 …`). A network
-/// process that does not answer within a second is ended with the VM, as the daemon ends
-/// one past its grace (`netproc::GRACE`), and frees them then.
+/// process that does not answer within a second is ended with the VM, and frees them then,
+/// as the daemon follows one to its end (`netproc::reap`). That second was the one a
+/// network process was given to end (`netproc::GRACE`, until PM M546); its own basis is owed
+/// (R03).
 ///
 /// First, what the guest sent before its command ended goes into the network process's
 /// ring, which it takes before UNPUBLISH: a datagram a command sends just before it exits
@@ -793,6 +795,26 @@ fn relay_signals(conn: &UnixStream, to: &'static ToGuest, from: From<'_>) {
             kind::MANAGED_INPUT if matches!(from, From::Daemon(_)) => {
                 if let Ok(member) = <[u8; 4]>::try_from(message.payload.as_slice()) {
                     let held = input_held().remove(&u32::from_be_bytes(member));
+                    #[cfg(windows)]
+                    if let (Some(guest), Some(pipe)) = (held, message.fds.into_iter().next()) {
+                        relay_engine(guest, pipe);
+                    }
+                    #[cfg(unix)]
+                    drop(held);
+                }
+            }
+            // A lane to a socket of its run's own command (D251), its owner's ask: opened on a
+            // thread of its own, its owner answered by the lane's number.
+            kind::LANE_OPEN if matches!(from, From::Daemon(_)) => {
+                if let Some((number, name)) = message.payload.split_first_chunk::<8>() {
+                    open_lane(conn, to, *number, name.to_vec());
+                }
+            }
+            // A lane's connection its owner has, or will not take: this VM's copy goes (M24).
+            // On Windows the owner gives the socket it is relayed onto, or none.
+            kind::LANE_HELD if matches!(from, From::Daemon(_)) => {
+                if let Ok(n) = <[u8; 8]>::try_from(message.payload.as_slice()) {
+                    let held = lanes_held().remove(&u64::from_be_bytes(n));
                     #[cfg(windows)]
                     if let (Some(guest), Some(pipe)) = (held, message.fds.into_iter().next()) {
                         relay_engine(guest, pipe);
@@ -1862,6 +1884,12 @@ pub fn finish(
             (NOT_RUN, None)
         }
     };
+    // Why this VM could not serve its run, for its daemon or run host, whose `DONE` carries
+    // the status its client exits with for that, no command's.
+    let unserved = match (saved, served) {
+        (None, Err(e)) => Some(e.as_str()),
+        _ => None,
+    };
     // A command that never started: what dockerd would say, and the exit code its
     // microVM keeps (shards_cmdline::commands::start_failed).
     let failed = not_run.map(shards_cmdline::commands::start_failed);
@@ -1902,6 +1930,9 @@ pub fn finish(
         let _ = to_daemon(&link.daemon, kind::PORTS_FREE, &[], &[]);
     }
     release_host(0);
+    if let Some(why) = unserved {
+        let _ = to_daemon(&link.daemon, kind::UNSERVED, why.as_bytes(), &[]);
+    }
     let _ = to_daemon(&link.daemon, kind::DONE, &done, &[]);
     if let Some(client) = client {
         let mut payload = vec![said_status];
@@ -2182,10 +2213,109 @@ pub fn hand_input(owner: &UnixStream, member: u32, conn: GuestConn) -> io::Resul
     sent
 }
 
+/// The lanes' connections handed to the owner and not yet taken, by number: held meanwhile,
+/// as an engine connection is ([`ENGINE_HELD`], M24); on Windows until the owner gives the
+/// socket each is relayed onto.
+static LANES_HELD: std::sync::Mutex<std::collections::BTreeMap<u64, GuestConn>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn lanes_held() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, GuestConn>> {
+    LANES_HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`kind::LANE_OPEN`]'s answer for lane `number`: its status
+/// (`shards_abi::run::socket::STATUS` bytes: 0 connected, else the errno it was refused with),
+/// then, for a lane that could not be asked of its guest or whose connection never came
+/// (said as ESRCH: its command is gone as far as this VM can tell), why, in words.
+fn lane_answer(number: [u8; 8], outcome: &Result<(), workload::Unopened>) -> Vec<u8> {
+    use shards_abi::run::socket::errno::ESRCH;
+    let (errno, why) = match outcome {
+        Ok(()) => (0, ""),
+        Err(workload::Unopened::Refused(errno)) => (errno.get(), ""),
+        Err(workload::Unopened::Ended(why)) => (ESRCH, why.as_str()),
+    };
+    [&number[..], &errno.to_be_bytes(), why.as_bytes()].concat()
+}
+
+/// Opens lane `number` to socket `name` of the run's own command (D251), on a thread of
+/// its own, and answers `owner` ([`kind::LANE_OPEN`]): opened, with its connection, beside
+/// the answer on Unix and a copy held until the owner says it has it (`LANE_HELD`, M24),
+/// and on Windows held until the owner's `LANE_HELD` brings the socket it is relayed onto;
+/// else why not.
+fn open_lane(owner: &UnixStream, to: &'static ToGuest, number: [u8; 8], name: Vec<u8>) {
+    let Ok(owner) = owner.try_clone() else {
+        return;
+    };
+    let answer = move |owner: &UnixStream| {
+        let opened = workload::open_socket(to, &name);
+        let Ok(conn) = opened else {
+            let _ = to_daemon(
+                owner,
+                kind::LANE_OPEN,
+                &lane_answer(number, &opened.map(drop)),
+                &[],
+            );
+            return;
+        };
+        #[cfg(unix)]
+        let (held, handed) = match conn.try_clone() {
+            Ok(held) => (held, [std::os::fd::AsFd::as_fd(&conn)]),
+            Err(e) => {
+                let why = Err(workload::Unopened::Ended(format!(
+                    "holding the lane's connection: {e}"
+                )));
+                let _ = to_daemon(owner, kind::LANE_OPEN, &lane_answer(number, &why), &[]);
+                return;
+            }
+        };
+        #[cfg(windows)]
+        let (held, handed) = (conn, []);
+        let key = u64::from_be_bytes(number);
+        lanes_held().insert(key, held);
+        if to_daemon(owner, kind::LANE_OPEN, &lane_answer(number, &Ok(())), &handed).is_err() {
+            lanes_held().remove(&key);
+        }
+    };
+    let spawned = std::thread::Builder::new().name("lane".into()).spawn({
+        let owner = owner.try_clone();
+        move || {
+            if let Ok(owner) = owner {
+                answer(&owner);
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        let why = Err(workload::Unopened::Ended(format!("a lane's thread: {e}")));
+        let _ = to_daemon(&owner, kind::LANE_OPEN, &lane_answer(number, &why), &[]);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A lane's answer (D251) by its number: 0 for connected, the guest's errno for a refusal,
+    /// and ESRCH with why for a lane its guest could not be asked for or never answered.
+    #[test]
+    fn a_lanes_answer_says_its_status_by_its_number() {
+        let number = 7u64.to_be_bytes();
+        let errno = std::num::NonZeroU32::new(111).unwrap();
+        assert_eq!(
+            lane_answer(number, &Ok(())),
+            [&number[..], &[0, 0, 0, 0]].concat()
+        );
+        assert_eq!(
+            lane_answer(number, &Err(workload::Unopened::Refused(errno))),
+            [&number[..], &[0, 0, 0, 111]].concat()
+        );
+        assert_eq!(
+            lane_answer(number, &Err(workload::Unopened::Ended("gone".into()))),
+            [&number[..], &[0, 0, 0, 3], b"gone"].concat()
+        );
+    }
 
     /// The null device's path.
     const NULL: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };

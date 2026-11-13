@@ -172,6 +172,8 @@ pub(super) struct Learner {
     fault: Option<Refusal>,
     /// The last resort (C5), which ends a VM by killing its cgroup.
     last: LastResort,
+    /// The VMs its last window couldn't read and why, each counted whole against the fleet's budget (ROOT, 2026-11-13).
+    unread: Vec<(BoxId, Refusal)>,
 }
 
 /// A VM's vCPUs: its admitted guest's CPU in whole CPUs, rounded up.
@@ -377,7 +379,15 @@ impl Learner {
             rooms: BTreeMap::new(),
             fault: None,
             last: LastResort::new(bounds.vms.min(MAX_LEARNED_HOLDINGS)),
+            unread: Vec::new(),
         })
+    }
+
+    /// The VMs its last window couldn't read, and why: each counted whole, at its receipt, against the fleet's budget
+    /// until a read succeeds (joint plan step 14; ROOT, 2026-11-13).
+    #[cfg(test)]
+    pub(super) fn unread(&self) -> &[(BoxId, Refusal)] {
+        &self.unread
     }
 
     /// One window (C1 to C5, C7), read at `now`: the VMs `running`, each new one found by `record` (its class, receipt,
@@ -421,10 +431,52 @@ impl Learner {
             self.rooms.remove(&scope);
             self.last.gone(&scope);
         }
+        // What the VMs it couldn't read hold past their bookings, their receipts whole.
+        let mut unread = CapacityResources::default();
+        self.unread.clear();
         for (id, scope, cgroup) in running {
-            // A VM ending between the listing and its read is read no more; the next listing ends it.
-            let Ok(usage) = io.usage(&cgroup) else {
-                continue;
+            // A VM whose cgroup can't be read counts whole, at its receipt, against the fleet's budget this window, its
+            // learner untouched (ROOT, 2026-11-13: never starving its neighbours by holding nothing): no sample taken,
+            // its booking as it was, and the failure told (no holding on the capacity answers, so the scheduler counts
+            // it at its receipt). One that ended since its listing is ended by the next.
+            let usage = match io.usage(&cgroup) {
+                Ok(usage) => usage,
+                Err(why) => {
+                    if let Some(met) = record(&id)? {
+                        let booked = self
+                            .vms
+                            .get(&scope)
+                            .and_then(|vm| self.node.booking(&vm.lifetime))
+                            .unwrap_or_default();
+                        let past = CapacityResources {
+                            cpu_milli: met
+                                .allocation
+                                .resources
+                                .cpu_milli
+                                .saturating_sub(booked.cpu_milli),
+                            mem_bytes: met
+                                .allocation
+                                .resources
+                                .mem_bytes
+                                .saturating_sub(booked.mem_bytes),
+                            disk_bytes: met
+                                .allocation
+                                .resources
+                                .disk_bytes
+                                .saturating_sub(booked.disk_bytes),
+                        };
+                        unread = unread.checked_add(past).ok_or_else(|| Refusal::Invalid {
+                            what: "a microVM's learned charge",
+                            why: "the unread VMs' receipts overflow".into(),
+                        })?;
+                    }
+                    self.unread.try_reserve(1).map_err(|_| Refusal::Exhausted {
+                        what: "the charge learner's unread VMs",
+                        bound: MAX_LEARNED_HOLDINGS,
+                    })?;
+                    self.unread.push((id, why));
+                    continue;
+                }
             };
             if let Some(vm) = self.vms.get_mut(&scope) {
                 let (before, at) = vm.last;
@@ -466,7 +518,9 @@ impl Learner {
                     receipt,
                 )
                 .map_err(refused)?;
-            // Its create wrote its ceiling as its `cpu.max` and `memory.max` (`Node::managed_bounds`).
+            // Its create wrote its ceiling's CPU as its `cpu.max` (`Node::managed_bounds`); a VM made before ruling B
+            // also has a `memory.max`, taken as written so the first window lifts it. Its `memory.swap.max` stays off,
+            // never the learner's to lift (HEX-RT-15).
             let created = Bounds {
                 cpu_max_milli: Some(u32::try_from(allocation.resources.cpu_milli).map_err(
                     |_| Refusal::Invalid {
@@ -486,7 +540,10 @@ impl Learner {
                     receipt,
                     cgroup,
                     last: (usage.cpu_usec, now),
-                    written: hex_core::cgroup::writes(&created, &[])?,
+                    written: hex_core::cgroup::writes(&created, &[])?
+                        .into_iter()
+                        .filter(|write| write.file != "memory.swap.max")
+                        .collect(),
                     cap: created.cpu_max_milli.map(u64::from),
                 },
             );
@@ -505,13 +562,21 @@ impl Learner {
                 what: "a node's boxes' bookings",
                 why: "they overflow".into(),
             })?;
+        // The fleet's budget this window, less what its unread VMs hold past their bookings and the boxes' bookings.
         self.node.set_budget(CapacityResources {
             cpu_milli: budget
                 .cpu_milli
+                .saturating_sub(unread.cpu_milli)
                 .saturating_sub(booked.cpu_milli)
                 .min(scale.carried),
-            mem_bytes: budget.mem_bytes.saturating_sub(booked.mem_bytes),
-            disk_bytes: budget.disk_bytes.saturating_sub(booked.disk_bytes),
+            mem_bytes: budget
+                .mem_bytes
+                .saturating_sub(unread.mem_bytes)
+                .saturating_sub(booked.mem_bytes),
+            disk_bytes: budget
+                .disk_bytes
+                .saturating_sub(unread.disk_bytes)
+                .saturating_sub(booked.disk_bytes),
         });
         self.node.settle().map_err(refused)?;
         self.place(io, &natives, &scale)?;
@@ -647,7 +712,8 @@ impl Learner {
                 bound: self.vms.len(),
             })?;
         for vm in self.vms.values() {
-            if vm.class == class {
+            // One its last window couldn't read carries no holding, so the scheduler counts it at its receipt (C8).
+            if vm.class == class && !self.unread.iter().any(|(id, _)| *id == vm.id) {
                 vms.push((vm.lifetime, &vm.id, vm.receipt));
             }
         }

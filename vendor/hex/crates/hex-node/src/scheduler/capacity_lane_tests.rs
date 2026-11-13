@@ -13,13 +13,14 @@ use hex_core::schedule as dto;
 use hex_quic::capacity::Link;
 use hex_quic::enroll::{self, sim::SimCa, store};
 use hex_quic::{Endpoint, PeerId, Refused, Shape};
-use hex_testkit::waits::{until, within};
+use hex_testkit::waits::follow::{self, Party};
 
 use super::{CapacityHolder, CapacityLane, Config, Report, Service};
 
-// No recorded operation makes these facts over loopback: each is waited for measuring (hex_testkit::waits).
-static DIAL: Patience = Patience::measuring("test.hex_node.capacity_lane.dial");
-static SAY: Patience = Patience::measuring("test.hex_node.capacity_lane.say");
+// No recorded operation makes these facts over loopback: each is waited for measuring, following the lane's service by
+// its life alone (decision 9), so past the slowest answer seen it goes on, ending with the fact or the link's end. A
+// dial and a write wait for their answers with no deadline of the test's: the driver ends a dial nothing answers once
+// QUIC's idle timeout passes (RFC 9000 §10.1), and a write cut at a slice's end would leave half a message.
 static HEAR: Patience = Patience::measuring("test.hex_node.capacity_lane.hear");
 static AWAY: Patience = Patience::measuring("test.hex_node.capacity_lane.away");
 
@@ -76,7 +77,7 @@ fn dialed(ca: &SimCa, address: SocketAddr, name: &str) -> (Endpoint, Result<Peer
         },
     })
     .unwrap();
-    let peer = within(&DIAL, |by| end.dial(SCHEDULER, address, by));
+    let peer = end.dial(SCHEDULER, address, None);
     (end, peer)
 }
 
@@ -92,8 +93,18 @@ fn talk(link: &mut Link, holder: &mut Holder, first: Vec<ToKeeper>) -> Vec<Event
     let mut queue = VecDeque::from(first);
     let mut events = Vec::new();
     while let Some(msg) = queue.pop_front() {
-        within(&SAY, |by| link.say(&msg, by)).unwrap();
-        let answer = within(&HEAR, |by| link.hear(by)).unwrap();
+        link.say(&msg, None).unwrap();
+        let answer = follow::within(
+            &HEAR,
+            "the lane's next word",
+            || Party::Live,
+            |by| match link.hear(by) {
+                Err(Refused::Deadline { .. }) => None,
+                heard => Some(heard),
+            },
+        )
+        .unwrap()
+        .unwrap();
         let mut out = Out::default();
         holder.hear(answer, &mut out);
         queue.extend(out.send);
@@ -172,10 +183,15 @@ fn the_scheduler_serves_its_capacity_view_to_the_holders_it_names_alone() {
     assert_eq!(forget(&service, KILN), Some(dto::Forget::Connected));
     drop(link);
     let mut released = None;
-    until(&AWAY, "kiln-a's link heard ended", || {
-        released = forget(&service, KILN).filter(|f| *f != dto::Forget::Connected);
-        released.is_some()
-    })
+    follow::until(
+        &AWAY,
+        "kiln-a's link heard ended",
+        || Party::Live,
+        || {
+            released = forget(&service, KILN).filter(|f| *f != dto::Forget::Connected);
+            released.is_some()
+        },
+    )
     .unwrap();
     assert_eq!(
         released,

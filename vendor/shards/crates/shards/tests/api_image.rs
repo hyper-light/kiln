@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use common::{TempDir, cannot_run_vms, guest_init, kernel, run_shards_env, served};
 use shards_api::image::{
-    Channel, ImageGuest, ImageRefusal, ImageShards, ImageShare, ImageSpec, Images as _, Keep, MemberEnd,
-    MemberFile, MemberKind, MemberName, MemberReach, MemberSpec, Narrowing, PlugRefusal, Proto, Publish,
-    RunEnd, Secret, StatsScope,
+    Channel, ImageGuest, ImagePools, ImageRefusal, ImageShards, ImageShare, ImageSpec, Images as _, Keep,
+    MemberEnd, MemberFile, MemberKind, MemberName, MemberReach, MemberSpec, Narrowing, PlugRefusal, Proto,
+    Publish, RunEnd, Secret, StartedFrom, StatsScope,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -86,11 +86,14 @@ fn spec(home: &TempDir, image: &str) -> ImageSpec {
         publish: Vec::new(),
         egress: Narrowing::default(),
         credentials: Vec::new(),
+        lessor: None,
         shares: Vec::new(),
         nesting: false,
         ready_by: None,
         binary: Some(common::shards().to_path_buf()),
         env: host_env(home),
+        control: None,
+        gpu_devices: Vec::new(),
     }
 }
 
@@ -98,8 +101,48 @@ fn codex() -> MemberName {
     MemberName::harness("codex")
 }
 
+/// Where the diagnostics of the run hosts a test boots in `home` are kept whole
+/// (`ImageGuest::keep_diagnostics`), each appended after the last: a `.stderr` of the home's,
+/// which a failing test shows as its home goes (`common::TempDir`).
+fn diagnostics(home: &TempDir) -> std::path::PathBuf {
+    home.join("run-hosts.stderr")
+}
+
+/// `s` booted, its run host's diagnostics kept whole in [`diagnostics`] from its start.
+fn boot(home: &TempDir, s: &ImageSpec) -> Box<dyn ImageGuest> {
+    let guest = ImageShards::new().boot(s, TIMEOUT).unwrap();
+    let kept = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(diagnostics(home))
+        .unwrap();
+    guest.keep_diagnostics(kept).unwrap();
+    guest
+}
+
+/// The harness's end, held to `expected`; where it is not, the run's own end is said beside
+/// it, which tells a run that ended first (`WithRun`) as stopped, failed in its host's words or
+/// exited (CI run 43303186680: `WithRun` where `Exited(3)` was expected, its cause unsaid),
+/// and the home shows its run hosts' diagnostics, their VMs' among them, as it goes ([`boot`]:
+/// HVF at 2b89e8504, `WithRun` and `Exited(125)`, nothing more said).
+fn assert_ended(guest: &dyn ImageGuest, expected: MemberEnd) {
+    let ended = guest.wait_member(&codex(), TIMEOUT).unwrap();
+    assert_eq!(
+        ended,
+        Some(expected),
+        "the run's end: {:?}",
+        guest.wait_for(Duration::ZERO)
+    );
+}
+
 /// Reads `channel` of the harness to its end, within the test's bound.
 fn read_all(guest: &dyn ImageGuest, channel: Channel) -> Vec<u8> {
+    read_within(guest, channel).expect("the member's channel did not end")
+}
+
+/// What `channel` of the harness says to its end; none where it does not end within the
+/// test's bound.
+fn read_within(guest: &dyn ImageGuest, channel: Channel) -> Option<Vec<u8>> {
     let mut pipe = guest.take_output(&codex(), channel).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -107,8 +150,7 @@ fn read_all(guest: &dyn ImageGuest, channel: Channel) -> Vec<u8> {
         let _ = pipe.read_to_end(&mut bytes);
         let _ = tx.send(bytes);
     });
-    rx.recv_timeout(TIMEOUT)
-        .expect("the member's channel did not end")
+    rx.recv_timeout(TIMEOUT).ok()
 }
 
 /// What an orchestrator stages into its harness at create reaches it alone, exactly, never
@@ -140,8 +182,9 @@ fn staged_credentials_reach_the_harness_and_its_output_and_end_come_back() {
         workdir: None,
         stdin: false,
         terminal: false,
+        args: Vec::new(),
     }];
-    let guest = ImageShards::new().boot(&s, TIMEOUT).unwrap();
+    let guest = boot(&home, &s);
     let members: Vec<(MemberKind, &str, bool)> = guest
         .members()
         .iter()
@@ -156,10 +199,7 @@ fn staged_credentials_reach_the_harness_and_its_output_and_end_come_back() {
     );
     assert_eq!(read_all(&*guest, Channel::Stdout), b"sk-orchestrated-0");
     assert_eq!(read_all(&*guest, Channel::Stderr), token);
-    assert_eq!(
-        guest.wait_member(&codex(), TIMEOUT).unwrap(),
-        Some(MemberEnd::Exited(3))
-    );
+    assert_ended(&*guest, MemberEnd::Exited(3));
     // Nothing of the secret lies in the host's home: it went on the channel alone.
     let mut found = Vec::new();
     let mut dirs = vec![home.to_path_buf()];
@@ -202,6 +242,7 @@ fn what_the_image_does_not_grant_is_refused_before_boot() {
         workdir: None,
         stdin: false,
         terminal: false,
+        args: Vec::new(),
     };
     let refused = |s: ImageSpec| match ImageShards::new().boot(&s, TIMEOUT) {
         Err(e) => e,
@@ -311,13 +352,10 @@ fn a_share_at_a_granted_volume_reaches_the_harness() {
         at: "/work".into(),
         read_only: true,
     }];
-    let guest = ImageShards::new().boot(&s, TIMEOUT).unwrap();
+    let guest = boot(&home, &s);
     let said = String::from_utf8(read_all(&*guest, Channel::Stdout)).unwrap();
     assert_eq!(said, "== /work/hello.txt\nfrom the host\n");
-    assert_eq!(
-        guest.wait_member(&codex(), TIMEOUT).unwrap(),
-        Some(MemberEnd::Exited(0))
-    );
+    assert_ended(&*guest, MemberEnd::Exited(0));
 }
 
 /// A guest port the image gives its harness coming in, published on a host port the
@@ -530,7 +568,8 @@ fn the_orchestrators_room_holds_its_run_within_it() {
 /// host: a run spinning its one vCPU, held to a quarter of its CPU, runs its guest a quarter
 /// of the time passing, but what a period may overrun and a period's share where the window
 /// and the periods do not line up, and is let go each period; held to its vCPU's whole CPU,
-/// nothing holds it, and the answer says so; told none, its hold is lifted.
+/// nothing holds it, and the answer says so; told none, its hold is lifted. The period it is
+/// held over is the one its host said as the run started, its build's hold's.
 #[test]
 fn the_orchestrators_rate_holds_its_run_to_it() {
     if cannot_run_vms() {
@@ -541,6 +580,8 @@ fn the_orchestrators_rate_holds_its_run_to_it() {
     let guest = ImageShards::new()
         .boot(&spec(&home, "api-rate:1"), TIMEOUT)
         .unwrap();
+    let period = guest.rate_period();
+    assert_eq!(period, shards_vmm::vm::hold_period());
     let quarter = NonZeroU64::new(250).unwrap();
     assert_eq!(guest.rate(Some(quarter), TIMEOUT).unwrap(), Some(quarter));
     let ran = || {
@@ -550,9 +591,9 @@ fn the_orchestrators_rate_holds_its_run_to_it() {
     let (start, before) = (Instant::now(), ran());
     std::thread::sleep(Duration::from_secs(2));
     let (used, wall) = (ran() - before, u64::try_from(start.elapsed().as_nanos()).unwrap());
-    // D191's period, 100 ms: a quarter of it the share, and the period's whole share and
-    // what one vCPU overruns before its governor reads at the window's two ends.
-    let most = wall / 4 + 200_000_000;
+    // A quarter of each period the share, and a period's whole share and what one vCPU
+    // overruns before its governor reads at the window's two ends: two periods.
+    let most = wall / 4 + 2 * u64::try_from(period.as_nanos()).unwrap();
     assert!(
         used <= most,
         "{used} ns of guest in {wall} ns, held to a quarter CPU"
@@ -595,12 +636,176 @@ fn a_run_keeping_nothing_the_image_grants_boots_and_its_harness_runs() {
         dns: false,
         members: None,
     };
-    let guest = ImageShards::new().boot(&s, TIMEOUT).unwrap();
-    assert_eq!(
-        guest.wait_member(&codex(), TIMEOUT).unwrap(),
-        Some(MemberEnd::Exited(0))
-    );
+    let guest = boot(&home, &s);
+    assert_ended(&*guest, MemberEnd::Exited(0));
     guest.stop().unwrap();
+}
+
+/// The example harness image (docs/examples/harness-codex), built in `home` as `tag`: its
+/// Agentfile and harness.json as the repository holds them, FROM its pinned alpine, and the
+/// test guest as its `codex`, as OpenAI's binaries are no part of the repository (its
+/// .gitignore).
+fn build_example(home: &TempDir, tag: &str) {
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/harness-codex");
+    let ctx = TempDir::new("api-example-ctx");
+    std::fs::create_dir_all(ctx.join("codex/bin")).unwrap();
+    std::fs::copy(example.join("Agentfile"), ctx.join("Agentfile")).unwrap();
+    std::fs::copy(example.join("codex/harness.json"), ctx.join("codex/harness.json")).unwrap();
+    std::fs::copy(common::test_guest(), ctx.join("codex/bin/codex")).unwrap();
+    // A context's files keep their modes on a Unix host, as fsutil walks them; a Windows
+    // host's context gives every file 0755.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            ctx.join("codex/bin/codex"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+    ];
+    let built = run_shards_env(
+        &["build", "image"],
+        &["-t", tag, ctx.to_str().unwrap()],
+        &env,
+        TIMEOUT,
+    );
+    assert_eq!(built.status, Some(0), "{}", built.stderr);
+}
+
+/// Hex's HEX-IMG-3 (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 12): an orchestrator's
+/// run of the example harness image with a command of its own, keeping nothing the image
+/// grants past the microVM (D250) and holding its members apart with no reach (D246), ends
+/// with its command's status, as `shards run` of the same command does; a command that never
+/// started ends the run failed in its guest's words (D249), which the assertion says.
+#[test]
+fn an_images_own_command_ends_its_run_with_its_status() {
+    if cannot_run_vms() {
+        return;
+    }
+    let home = TempDir::new("api-own-home");
+    build_example(&home, "api-own:1");
+    let mut s = spec(&home, "api-own:1");
+    s.command = Some(["/bin/sh", "-c", "exit 3"].map(String::from).to_vec());
+    s.egress = Narrowing {
+        egress: Keep::Only(Vec::new()),
+        mcp: Keep::Only(Vec::new()),
+        destinations: Keep::Only(Vec::new()),
+        dns: false,
+        members: Some(Vec::new()),
+    };
+    let guest = ImageShards::new().boot(&s, TIMEOUT).unwrap();
+    assert_eq!(guest.wait_for(TIMEOUT).unwrap(), Some(RunEnd::Exited(3)));
+}
+
+/// D253: an orchestrator's run restores its image's template, as a daemon's run does. In a
+/// home whose guest is recorded (D28), the image's first run boots, saving its template, and
+/// says so; the next restores it, and its command ends as the first's did. A template that no
+/// longer restores (its snapshot's state emptied) is replaced, and its run told so; a run of a
+/// guest its caller gave has none. Where the host's hypervisor restores no snapshot (Windows
+/// Server 2022, PM M345), each run boots.
+#[test]
+fn an_images_next_run_restores_the_template_its_first_saved() {
+    if cannot_run_vms() {
+        return;
+    }
+    let home = common::home_with("api-tmpl-home", TIMEOUT);
+    build_example(&home, "api-tmpl:1");
+    let mut given = spec(&home, "api-tmpl:1");
+    given.command = Some(["/bin/sh", "-c", "exit 3"].map(String::from).to_vec());
+    given.egress = Narrowing {
+        egress: Keep::Only(Vec::new()),
+        mcp: Keep::Only(Vec::new()),
+        destinations: Keep::Only(Vec::new()),
+        dns: false,
+        members: Some(Vec::new()),
+    };
+    let mut stored = given.clone();
+    stored
+        .env
+        .retain(|(name, _)| name != "SHARDS_KERNEL" && name != "SHARDS_INIT");
+    let run = |s: &ImageSpec| {
+        let guest = ImageShards::new().boot(s, TIMEOUT).unwrap();
+        let from = guest.started_from();
+        assert_eq!(guest.wait_for(TIMEOUT).unwrap(), Some(RunEnd::Exited(3)));
+        from
+    };
+    if !shards_vmm::vm::restores_here() {
+        assert_eq!(run(&stored), StartedFrom::Booted);
+        return;
+    }
+    assert_eq!(run(&stored), StartedFrom::Saved);
+    assert_eq!(run(&stored), StartedFrom::Restored);
+    let templates: Vec<_> = std::fs::read_dir(home.join("templates"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(templates.len(), 1, "{templates:?}");
+    // Its snapshot's state emptied: a template that is there and no longer restores.
+    let current = std::fs::read_to_string(templates[0].join("current")).unwrap();
+    std::fs::write(templates[0].join(current.trim_end()).join("state"), b"").unwrap();
+    assert_eq!(run(&stored), StartedFrom::Replaced);
+    assert_eq!(run(&stored), StartedFrom::Restored);
+    assert_eq!(run(&given), StartedFrom::Booted);
+}
+
+/// D253's pools: an orchestrator's pools give an image's next run a warm run host, its
+/// microVM restored and ready before the run asked. The pool's first run starts a host of its
+/// own, nothing being warm; the pool then starts one ahead, which a later run takes (`Warm`),
+/// its command ending as the first's did. A run of another microVM's (another size) starts a
+/// host of its own.
+#[test]
+fn an_images_next_run_takes_a_warm_host_of_its_pool() {
+    if cannot_run_vms() {
+        return;
+    }
+    let home = common::home_with("api-pool-home", TIMEOUT);
+    build_example(&home, "api-pool:1");
+    let mut s = spec(&home, "api-pool:1");
+    s.command = Some(["/bin/sh", "-c", "exit 3"].map(String::from).to_vec());
+    s.egress = Narrowing {
+        egress: Keep::Only(Vec::new()),
+        mcp: Keep::Only(Vec::new()),
+        destinations: Keep::Only(Vec::new()),
+        dns: false,
+        members: Some(Vec::new()),
+    };
+    s.env
+        .retain(|(name, _)| name != "SHARDS_KERNEL" && name != "SHARDS_INIT");
+    let pools = ImagePools::new(2, ImagePools::KEEP).unwrap();
+    let run = |s: &ImageSpec| {
+        let guest = pools.boot(s, TIMEOUT).unwrap();
+        let from = guest.started_from();
+        assert_eq!(guest.wait_for(TIMEOUT).unwrap(), Some(RunEnd::Exited(3)));
+        from
+    };
+    assert_ne!(
+        run(&s),
+        StartedFrom::Warm,
+        "nothing is warm before a pool's first run"
+    );
+    // The warm host its first run's pool started is taken by the first run that comes once
+    // it is ready: each run before that starts a host of its own.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if run(&s) == StartedFrom::Warm {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no run took a warm host within {TIMEOUT:?}"
+        );
+    }
+    let other = ImageSpec {
+        vcpus: 2,
+        ..s.clone()
+    };
+    assert_ne!(run(&other), StartedFrom::Warm, "another microVM's first run");
 }
 
 /// Stop ends the run at once, whatever its members do, and its end says so.
@@ -643,8 +848,9 @@ fn a_harness_reads_its_orchestrators_stdin_exactly_and_its_close_is_its_end() {
         workdir: None,
         stdin: true,
         terminal: false,
+        args: Vec::new(),
     }];
-    let guest = ImageShards::new().boot(&s, TIMEOUT).unwrap();
+    let guest = boot(&home, &s);
     let mut input = Vec::new();
     input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n");
     input.extend_from_slice(b"\0\xff\x80\x1b[2Jno-newline\xc3\x28");
@@ -653,8 +859,19 @@ fn a_harness_reads_its_orchestrators_stdin_exactly_and_its_close_is_its_end() {
     assert!(guest.take_input(&codex()).is_err(), "taken once");
     let echoed = std::thread::scope(|scope| {
         let reading = scope.spawn(|| read_all(guest.as_ref(), Channel::Stdout));
-        writer.write_all(&input).unwrap();
+        let written = writer.write_all(&input);
         drop(writer);
+        // Its stdin taking no more: how far the harness read it (its stderr says so as its
+        // stdin ends), and how it and the run ended.
+        if let Err(e) = written {
+            let said = read_within(guest.as_ref(), Channel::Stderr);
+            panic!(
+                "its stdin took no more ({e}): the harness said {:?} and ended {:?}; the run's end {:?}",
+                said.as_deref().map(String::from_utf8_lossy),
+                guest.wait_member(&codex(), TIMEOUT),
+                guest.wait_for(Duration::ZERO)
+            );
+        }
         reading.join().unwrap()
     });
     assert_eq!(echoed.len(), input.len());
@@ -664,10 +881,7 @@ fn a_harness_reads_its_orchestrators_stdin_exactly_and_its_close_is_its_end() {
     );
     let said = read_all(guest.as_ref(), Channel::Stderr);
     assert_eq!(said, format!("codex\0echo-end {}", input.len()).into_bytes());
-    assert_eq!(
-        guest.wait_member(&codex(), TIMEOUT).unwrap(),
-        Some(MemberEnd::Exited(0))
-    );
+    assert_ended(&*guest, MemberEnd::Exited(0));
     guest.stop().unwrap();
     // Not asked for: no stdin.
     let home = TempDir::new("api-nostdin-home");
@@ -677,4 +891,71 @@ fn a_harness_reads_its_orchestrators_stdin_exactly_and_its_close_is_its_end() {
         .unwrap();
     assert!(guest.take_input(&codex()).is_err());
     guest.stop().unwrap();
+}
+
+/// D256: a member's run-time arguments follow its image's command on its command line, each
+/// whole and in its order. The harness, the test guest writing its command line word by word,
+/// each with its NUL, says its program as found in its own `bin`, its image's options, then its
+/// run's `--resume`, `s 1` and an empty one: none split, joined or dropped. An argument holding
+/// a NUL, which no command line exec'd holds, is refused by its place, never its bytes; and
+/// arguments past the channel's bound are refused whole, never cut; each before any run host
+/// starts.
+#[test]
+fn a_members_arguments_follow_its_images_command_in_order() {
+    if cannot_run_vms() {
+        return;
+    }
+    let home = TempDir::new("api-args-home");
+    build(&home, "api-args:1", &["argv", "--from-image"], "");
+    let given = |args: Vec<String>| {
+        let mut s = spec(&home, "api-args:1");
+        s.members = vec![MemberSpec {
+            member: codex(),
+            env: Vec::new(),
+            files: Vec::new(),
+            workdir: None,
+            stdin: false,
+            terminal: false,
+            args,
+        }];
+        s
+    };
+    let guest = ImageShards::new()
+        .boot(
+            &given(["--resume", "s 1", ""].map(String::from).to_vec()),
+            TIMEOUT,
+        )
+        .unwrap();
+    let said = read_all(&*guest, Channel::Stdout);
+    let (program, rest) = said.split_at(said.iter().position(|&b| b == 0).unwrap_or(said.len()));
+    assert!(
+        program.starts_with(b"/") && program.ends_with(b"/bin/codex"),
+        "its command line: {:?}",
+        String::from_utf8_lossy(&said)
+    );
+    assert_eq!(
+        rest,
+        b"\0argv\0--from-image\0--resume\0s 1\0\0",
+        "its command line: {:?}",
+        String::from_utf8_lossy(&said)
+    );
+    assert_ended(&*guest, MemberEnd::Exited(0));
+    guest.stop().unwrap();
+    assert_eq!(guest.wait_for(TIMEOUT).unwrap(), Some(RunEnd::Stopped));
+    let refused = |s: ImageSpec| match ImageShards::new().boot(&s, TIMEOUT) {
+        Err(e) => e,
+        Ok(_) => panic!("booted"),
+    };
+    match refused(given(["--resume", "s-1\0--model"].map(String::from).to_vec())) {
+        ImageRefusal::Spec { what, why } => {
+            assert_eq!(what, "a member's argument");
+            assert!(why.contains("argument 1") && !why.contains("s-1"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let half = shards_abi::run::MAX_PAYLOAD as usize / 2;
+    assert!(matches!(
+        refused(given(vec!["x".repeat(half), "x".repeat(half)])),
+        ImageRefusal::Spec { what: "the spec", .. }
+    ));
 }

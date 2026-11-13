@@ -44,7 +44,7 @@ impl Inputs {
         let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         let wait = Duration::from_millis(value["wait_ms"].as_u64().unwrap());
         assert!(!wait.is_zero());
-        // A VM's create boots it: the client's learned create bound (twice the recorded slowest,
+        // A VM's create boots it: the client's learned create bound (the recorded slowest,
         // an OCI box's) would refuse it first, so every wait here measures and each call that
         // makes a VM carries this test's explicit deadline instead. Only until L4 gives each
         // class its own answer patience; then this goes, and create_before alone remains.

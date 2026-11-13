@@ -342,6 +342,7 @@ fn cleanup_report(why: &Refusal) -> Result<String, Refusal> {
         hex_api::LifecycleCause::Pending => "pending",
         hex_api::LifecycleCause::Busy => "busy",
         hex_api::LifecycleCause::Uncertain => "uncertain",
+        hex_api::LifecycleCause::Retired => "retired",
     };
     let prefix = "retained native backing cleanup pool=";
     let generation = " generation=";

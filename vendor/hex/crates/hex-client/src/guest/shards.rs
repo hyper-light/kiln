@@ -15,8 +15,8 @@ use hex_api::{ConnectFailure, ConnectPhase, ConnectReply, IoKind, Refusal};
 use super::{Duplex, DuplexOwner, Link, own_duplex};
 
 /// The slowest recorded value of each wait that seeds a bound, by host class
-/// (bench/native/guest/records.tsv). A class with no row for a measure seeds from twice the slowest row of
-/// any class ([`seed_in`]); adding its own row, once its record is taken, makes that its seed, with no code
+/// (bench/native/guest/records.tsv). A class with no row for a measure seeds from the slowest row of any
+/// class ([`seed_in`]); adding its own row, once its record is taken, makes that its seed, with no code
 /// change.
 pub const RECORDS: &str = include_str!("../../../../bench/native/guest/records.tsv");
 
@@ -42,10 +42,11 @@ pub fn slowest_in(table: &str, measure: &str, class: &str) -> Option<Duration> {
         })
 }
 
-/// The seed `table` gives `measure` on host class `class`: its own slowest row where it has one; else, by the
-/// lead's seed rule (2026-11-07), twice the slowest row of any class, a class with no record of its own
-/// starting from the slowest the others have seen with room to spare, then rising with its node's own (the
-/// learned bounds take the max with what the node sees). `None` where no class records the measure.
+/// The seed `table` gives `measure` on host class `class`: its own slowest row where it has one; else the slowest
+/// row of any class, every class's records taken as one (decision 9: a bound is the slowest answer on record, with no
+/// margin past it), a class with no record of its own starting from the slowest any host has been seen to take,
+/// then rising with its node's own and backing off past each bound it runs out at (the learned bounds take the max
+/// with what the node sees). `None` where no class records the measure.
 pub fn seed_in(table: &str, measure: &str, class: &str) -> Option<Duration> {
     if let Some(own) = slowest_in(table, measure, class) {
         return Some(own);
@@ -62,7 +63,6 @@ pub fn seed_in(table: &str, measure: &str, class: &str) -> Option<Duration> {
             row.next()?.parse().ok().map(Duration::from_micros)
         })
         .max()
-        .map(|slowest| slowest.saturating_mul(2))
 }
 
 /// The seed for `measure` on this host's class ([`seed_in`] over records.tsv), or the refusal naming the
@@ -78,8 +78,8 @@ pub fn recorded(measure: &str) -> Result<Duration, Refusal> {
 }
 
 /// The seed of the first dial's bound before this node has seen a boot: the slowest boot to ready on record
-/// for this host's class, or with none, twice the slowest of any class (bench/native/guest/boot-ready/
-/// RECORD.md, its rows in records.tsv).
+/// for this host's class, or with none, the slowest of any class (bench/native/guest/boot-ready/RECORD.md, its
+/// rows in records.tsv).
 pub fn recorded_boot() -> Result<Duration, Refusal> {
     recorded("boot_ready")
 }
@@ -274,6 +274,22 @@ pub fn refusal(op: &'static str, why: &shards_api::Refusal) -> Refusal {
                 why: reason,
             }
         }
+        // The VM process refused its selection, as it said in place of a receipt (Shards 18f59d497): certain, the
+        // selection's own refusal, with its reason, the join's or the renderer's.
+        shards_api::Refusal::GpuProbe(shards_api::GpuProbeError::Refused(refused)) => {
+            Refusal::Invalid {
+                what: "physical GPU selection",
+                why: format!("its VM process refused it: {refused}"),
+            }
+        }
+        // Its report writer closed with nothing written: the VM process ended before its renderer said anything of its
+        // selection, which is left unknown; the process's own end says why.
+        shards_api::Refusal::GpuProbe(shards_api::GpuProbeError::Unreported) => Refusal::Os {
+            op,
+            why: "its VM process ended before its renderer said anything of its GPU selection: no report \
+                  was written"
+                .to_owned(),
+        },
         shards_api::Refusal::Connect { port, failure }
         | shards_api::Refusal::Borrowed {
             port,

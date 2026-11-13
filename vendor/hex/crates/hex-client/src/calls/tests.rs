@@ -1377,7 +1377,8 @@ fn backing_lifecycle_waits_append_without_reordering_old_operations() {
     ));
 }
 
-/// AC-T7.4.1: the common synchronous timing point distinguishes an actual typed wire refusal.
+/// AC-T7.4.1: the common synchronous timing point distinguishes an actual typed wire refusal, and the refusal
+/// teaches the call's wait as an answer does (decision 9: the next wait is bounded at the slowest seen).
 #[test]
 fn refusal_census_common_call_records_the_typed_wire_outcome() {
     static REFUSED: AtomicBool = AtomicBool::new(false);
@@ -1404,8 +1405,8 @@ fn refusal_census_common_call_records_the_typed_wire_outcome() {
     );
     assert_eq!(
         patience.deadline(),
-        None,
-        "a measuring wait remains measuring"
+        patience.slowest(),
+        "a refusal bounds the next wait as an answer does, at the slowest seen"
     );
 }
 

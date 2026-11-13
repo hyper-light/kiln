@@ -33,6 +33,7 @@ fn profile() -> hex_api::RuntimeCost {
 }
 fn backing() -> BackingOffer {
     BackingOffer {
+        guest: Default::default(),
         key: BackingKey {
             pool: [1; 32],
             generation: [2; 16],
@@ -397,12 +398,14 @@ fn cold_claims_reserve_unobserved_ids_before_boot_without_fabricating_devices() 
             device_routes: Vec::new(),
             backings: vec![
                 BackingOffer {
+                    guest: Default::default(),
                     key,
                     cost: profile(),
                     phase: BackingPhase::Prepared,
                     devices: vec![id],
                 },
                 BackingOffer {
+                    guest: Default::default(),
                     key: second,
                     cost: profile(),
                     phase: BackingPhase::Prepared,
@@ -514,6 +517,7 @@ fn pending_gpu_reservations_keep_original_shape_across_refresh_and_backing_hando
             }],
             device_routes: vec![1],
             backings: vec![BackingOffer {
+                guest: Default::default(),
                 key,
                 cost: profile(),
                 phase: BackingPhase::Live,
@@ -570,6 +574,7 @@ fn a_prepared_gpu_backing_does_not_hide_an_eligible_native_oci_route() {
     node.devices[0].key = Some(id.key);
     node.devices[0].classes = Classes::ALL;
     let observer = BackingOffer {
+        guest: Default::default(),
         key: BackingKey {
             pool: [31; 32],
             generation: [32; 16],
@@ -654,6 +659,7 @@ fn a_prepared_snapshot_cannot_roll_back_a_granted_backing_or_its_claims() {
     node.devices[0].key = Some(7);
     node.devices[0].classes = Classes::ALL;
     let observer = BackingOffer {
+        guest: Default::default(),
         key: BackingKey {
             pool: [41; 32],
             generation: [42; 16],
@@ -745,6 +751,7 @@ fn one_gpu_demand_can_select_an_exact_subset_of_a_two_gpu_observer() {
             }],
             device_routes: vec![1, 1],
             backings: vec![BackingOffer {
+                guest: Default::default(),
                 key,
                 cost: profile(),
                 phase: BackingPhase::Live,
@@ -860,6 +867,7 @@ fn subset_observer_fixture(native: bool) -> (NodeSpec, Demand, BackingOffer) {
         key,
     });
     let source = BackingOffer {
+        guest: Default::default(),
         key: BackingKey {
             pool: [91; 32],
             generation: [92; 16],
@@ -1124,6 +1132,7 @@ fn released_scope_keeps_selected_identity_and_charge_until_new_physical_refresh(
 fn committed_subset_recovery_keeps_released_parent_and_does_not_repick_current_remainder() {
     let (mut node, request, mut parent) = subset_observer_fixture(false);
     let current = BackingOffer {
+        guest: Default::default(),
         key: BackingKey {
             pool: [0x61; 32],
             generation: [0x62; 16],
@@ -1322,6 +1331,7 @@ fn committed_pending_recovery_keeps_receipt_charge_and_claim_bounds() {
         .allocate(crate::model::capacity_resources(request.need))
         .unwrap();
     let current = BackingOffer {
+        guest: Default::default(),
         key: BackingKey {
             pool: [0x75; 32],
             generation: [0x76; 16],

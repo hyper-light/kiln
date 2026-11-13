@@ -1,0 +1,7 @@
+# The in-tree harness image of image_real and image_record (joint plan step 12, AC-T7.4.1): one harness, cat, which
+# any arch builds. Its base is pinned by its digest, an index serving linux/amd64 and linux/arm64, which each Shards
+# home pulls its own arch's image of as a node's does; no registry serves the image itself, which `shards build image`
+# builds into the home that boots it (image_node::built). Its harness runs /bin/sh -c cat (cat/harness.json), so a run
+# of its members alone has a member, and /bin/sh and /bin/echo are the base's, which the cases' commands run.
+FROM docker.io/library/alpine@sha256:3f4d6b32e26703c6082839234f43769d5046b3ac7c910033911d1e71d8cd630a
+HARNESS cat FROM ./cat

@@ -178,10 +178,7 @@ fn run(rt: &dyn Runtime, lab: &Lab, id: &BoxId, args: &[&str]) -> (Exit, String)
             },
         )
         .expect("exec");
-    let exit = p
-        .wait_for(conformance::PATIENCE)
-        .expect("wait")
-        .expect("the program ends");
+    let exit = conformance::end_of(&mut p).expect("wait");
     let mut out = String::new();
     r.read_to_string(&mut out).unwrap();
     (exit, out)
@@ -189,11 +186,11 @@ fn run(rt: &dyn Runtime, lab: &Lab, id: &BoxId, args: &[&str]) -> (Exit, String)
 
 /// T-T7.1.2: the end of an init held by its native process handle, using the same measured program-end
 /// bound as a Proc's wait_for. The held process handle keeps the init's identity stable through the wait.
-fn exit_of(process: &hex_runtime::windows::sys::Handle, bound: std::time::Duration) {
-    let millis = u32::try_from(bound.as_millis()).unwrap();
+/// Waits for `process` to end, followed by its own event until it does (decision 9: `u32::MAX` is Win32's INFINITE).
+fn exit_of(process: &hex_runtime::windows::sys::Handle) {
     assert!(
-        hex_runtime::windows::sys::wait(process, millis).expect("waiting for the init"),
-        "the box's init still runs {bound:?} after it was ended"
+        hex_runtime::windows::sys::wait(process, u32::MAX).expect("waiting for the init"),
+        "the box's init's wait ended before it did"
     );
 }
 
@@ -571,9 +568,10 @@ fn crash_child_node() {
 /// under criterion 2's load, the idle host's one sample read at its 1 s resolution's upper bound).
 const HCS_END_RECORD: std::time::Duration = std::time::Duration::from_millis(2_000);
 
-/// The crash test's wait for HCS to end a killed node's system: Hex's learned wait, seeded from
-/// [`HCS_END_RECORD`] (the lead, 2026-11-08).
-static HCS_ENDS: conformance::LearnedWait = conformance::LearnedWait::new(HCS_END_RECORD);
+/// The crash test's wait for HCS to end a killed node's system: a test's learned wait, seeded from
+/// [`HCS_END_RECORD`] (the lead, 2026-11-08; `Patience::seeded`, for tests alone).
+static HCS_ENDS: hex_api::patience::Patience =
+    hex_api::patience::Patience::seeded("test.hex_cli.windows_oci_box.hcs_ends", HCS_END_RECORD);
 
 /// Native step 4 (the lead, 2026-11-06): a node killed with boxes made leaves no scratch behind once a
 /// node starts again on the same scratch root. Do: run a child node that creates a box (and, once, starts
@@ -619,12 +617,14 @@ fn a_killed_nodes_scratch_is_reclaimed_at_the_next_start(lab: &Lab) {
         let began = std::time::Instant::now();
         while hcs_holds(&BoxId::new(&id).unwrap()) {
             assert!(
-                began.elapsed() < HCS_ENDS.bound(),
+                HCS_ENDS
+                    .slowest()
+                    .is_some_and(|bound| began.elapsed() < bound),
                 "{phase}: HCS still holds {id} {:?} after its node was killed",
-                HCS_ENDS.bound()
+                HCS_ENDS.slowest()
             );
         }
-        HCS_ENDS.saw(began.elapsed());
+        HCS_ENDS.answered(began.elapsed());
         let scratch = root.join("bundles").join(format!("{id}-scratch"));
         assert!(
             scratch.join("sandbox.vhdx").exists(),
@@ -657,7 +657,10 @@ fn a_killed_nodes_scratch_is_reclaimed_at_the_next_start(lab: &Lab) {
 /// that bound, so one that outlives its node is still held all that while.
 fn outlived(id: &BoxId) {
     let dropped = std::time::Instant::now();
-    while dropped.elapsed() < HCS_ENDS.bound() {
+    while HCS_ENDS
+        .slowest()
+        .is_some_and(|bound| dropped.elapsed() < bound)
+    {
         assert!(
             oci::sys::open_system(id.as_str())
                 .expect("asking HCS for the box's container")
@@ -1111,7 +1114,7 @@ fn a_recorded_nodes_oci_box_whose_init_ended_with_no_node_is_removed_by_the_next
         ended.status.success(),
         "taskkill didn't end the box's init: {ended:?}"
     );
-    exit_of(&process, conformance::PATIENCE);
+    exit_of(&process);
     drop(process);
     assert!(
         oci::sys::open_system(id.as_str())
@@ -1237,10 +1240,7 @@ fn an_oci_box_outlives_a_killed_hex_node_and_the_next_takes_it_back() {
     let mut program = client
         .exec(&id, lab.program(&Act::Fail(3)), Stdio::null())
         .expect("exec");
-    let exit = program
-        .wait_for(conformance::PATIENCE)
-        .expect("wait")
-        .expect("the program ends");
+    let exit = conformance::end_of(&mut program).expect("wait");
     assert_eq!(exit, Exit::Code(3));
     client.delete(&id).expect("delete");
     assert!(!hcs_holds(&id), "HCS still holds {id} after its delete");

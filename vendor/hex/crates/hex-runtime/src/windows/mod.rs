@@ -1731,6 +1731,8 @@ impl WinRuntime {
                 abandoned: 0,
                 allocation: None,
                 last_resort: None,
+                ended: None,
+                credentials: Vec::new(),
             }),
             Held::Oci(b) => oci::info(b),
         }?;
@@ -1949,40 +1951,19 @@ fn native_encoding_upper_bound(
     Ok(())
 }
 
+/// A native form's routes, as Linux offers them (`devices::native_routes`): the `process` route, and in
+/// an initialized `oci` form the `oci` route beside it, the keys its encoding bound reserves
+/// (`native_encoding_upper_bound`), so a node that runs containers still takes `process` boxes, and so
+/// does one whose `oci` form isn't initialized (its service unavailable, or Containers off), offering its
+/// `process` route alone (joint plan step 13). Only Holding::report's Hcs-route entries enter the `oci`
+/// snapshot, each eligible for the `oci` route alone; the `process` snapshot supplies no devices.
 fn native_route_offer(
     report: &mut Capacity,
     class: Class,
     initialized: bool,
 ) -> Result<(), Refusal> {
-    if !initialized {
-        return Ok(());
-    }
-    let (process, oci) = crate::devices::native_route_keys(class, native_platform())?;
-    let key = if class == Class::Process {
-        process
-    } else {
-        oci.ok_or_else(|| pending("native OCI producer has no initialized route key"))?
-    };
-    report
-        .routes
-        .try_reserve_exact(1)
-        .map_err(|_| allocation(1))?;
-    report
-        .device_routes
-        .try_reserve_exact(report.devices.len())
-        .map_err(|_| allocation(report.devices.len()))?;
-    report.routes.push(hex_api::RouteOffer {
-        key,
-        cost: None,
-        backing: None,
-    });
-    // This is the first route in this fresh native snapshot; bit zero has no persisted identity.
-    // Only Holding::report's Hcs-route entries enter this native OCI snapshot. The ordinary
-    // Process snapshot supplies no devices; DeviceInfo no longer carries a second class list.
-    for _ in &report.devices {
-        report.device_routes.push(u64::from(class == Class::Oci));
-    }
-    Ok(())
+    let form = if initialized { class } else { Class::Process };
+    crate::devices::native_routes(report, form, native_platform())
 }
 
 impl Runtime for WinRuntime {
@@ -2370,17 +2351,74 @@ mod tests {
             learned: None,
         };
         native_route_offer(&mut report, Class::Oci, true).unwrap();
-        assert_eq!(report.routes.len(), 1);
-        let route = report.routes.first().unwrap();
+        let route = report
+            .routes
+            .iter()
+            .find(|route| route.key.class == Class::Oci)
+            .unwrap();
         assert_eq!(route.key.image.os, hex_api::ImageOs::Windows);
         assert_eq!(route.key.execution, hex_api::Execution::Native);
-        assert_eq!(route.key.class, Class::Oci);
         assert!(report.devices.is_empty() && report.device_routes.is_empty());
         report.check().unwrap();
     }
 
+    /// AC-T7.4.1 (joint plan step 13, HEX-CV-L1 on Windows): do make the `oci` form's offer of a node whose
+    /// Containers are on, as `capacity(Oci)` makes it, with its HCS devices, beside the encoding bound such a
+    /// node reserves; expect every key of the bound offered and no other, its `process` route beside its `oci`
+    /// one as Linux's `devices::native_routes` offers them, and each device eligible for the `oci` route alone:
+    /// the scheduler places a `process` box on a Windows node that runs containers.
+    #[test]
+    fn a_containers_nodes_oci_form_offers_its_process_route_beside_its_oci_one() {
+        let scratch = tempfile::tempdir().unwrap();
+        let rt = device_runtime(scratch.path());
+        let mut report = Capacity {
+            id: "containers-node".into(),
+            total: CapacityResources::default(),
+            free: CapacityResources::default(),
+            devices: rt.holding.report(&rt.catalog).unwrap(),
+            cost: None,
+            routes: Vec::new(),
+            device_routes: Vec::new(),
+            backings: Vec::new(),
+            unavailable: Vec::new(),
+            learned: None,
+        };
+        native_route_offer(&mut report, Class::Oci, true).unwrap();
+        report.check().unwrap();
+        let (process, oci) =
+            crate::devices::native_route_keys(Class::Oci, native_platform()).unwrap();
+        let oci = oci.unwrap();
+        let offered: Vec<_> = report.routes.iter().map(|route| route.key).collect();
+        let mut bound = crate::devices::RouteProjection::new();
+        native_encoding_upper_bound(Some(true), Some(&BTreeSet::new()), &mut bound).unwrap();
+        let reserved = bound.count().unwrap();
+        for key in &offered {
+            bound.retain(*key, None).unwrap();
+        }
+        assert_eq!(
+            bound.count().unwrap(),
+            reserved,
+            "{offered:?} offers a key past its bound"
+        );
+        assert_eq!(
+            offered,
+            [process, oci],
+            "the oci form offers {} of the {reserved} routes its bound reserves",
+            offered.len()
+        );
+        let at = offered.iter().position(|key| *key == oci).unwrap();
+        assert!(!report.devices.is_empty());
+        assert!(
+            report.device_routes.iter().all(|mask| *mask == 1 << at),
+            "{:?}",
+            report.device_routes
+        );
+    }
+
     /// AC-T7.4.1: reserve possible fixed encoding forms without promoting a currently unavailable
     /// service into fresh OCI eligibility. Initialization unknowns refuse before collector mutation.
+    /// An `oci` form not initialized (its service unavailable, or Containers off) still offers its
+    /// `process` route, which needs neither, so the node still takes `process` boxes (joint plan step 13).
     #[test]
     fn encoding_upper_bound_does_not_advertise_an_unavailable_oci_service() {
         let enabled = BTreeSet::new();
@@ -2405,9 +2443,13 @@ mod tests {
             learned: None,
         };
         native_route_offer(&mut unavailable, Class::Oci, false).unwrap();
-        assert!(
-            unavailable.routes.is_empty(),
-            "encoding room cannot grant fresh native OCI"
+        let (process, _) =
+            crate::devices::native_route_keys(Class::Process, native_platform()).unwrap();
+        let offered: Vec<_> = unavailable.routes.iter().map(|route| route.key).collect();
+        assert_eq!(
+            offered,
+            [process],
+            "encoding room cannot grant fresh native OCI, and the process route needs no service"
         );
         assert!(unavailable.device_routes.is_empty() && unavailable.backings.is_empty());
         let disabled = BTreeSet::from([WindowsFeature::Containers]);

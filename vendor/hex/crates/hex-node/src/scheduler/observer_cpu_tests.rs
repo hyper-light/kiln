@@ -175,6 +175,7 @@ fn failed_firecracker_observation_keeps_real_service_cpu_progress_without_gpu_fa
         }],
         device_routes: Vec::new(),
         backings: vec![BackingOffer {
+            guest: Default::default(),
             key,
             cost,
             phase: BackingPhase::Prepared,
@@ -416,6 +417,7 @@ fn uncertain_canonical_drain_keeps_cpu_progress_and_retains_original_charge() {
         }],
         device_routes: Vec::new(),
         backings: vec![BackingOffer {
+            guest: Default::default(),
             key,
             cost,
             phase: BackingPhase::Draining,
@@ -643,6 +645,7 @@ fn cleanup_diagnostics_preserve_exact_identity_and_refuse_unqualified_failures()
             LifecycleCause::Pending => "pending",
             LifecycleCause::Busy => "busy",
             LifecycleCause::Uncertain => "uncertain",
+            LifecycleCause::Retired => "retired",
         };
         assert!(text.ends_with(&format!("cause={name}")));
     }

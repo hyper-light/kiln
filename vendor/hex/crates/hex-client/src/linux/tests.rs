@@ -7,6 +7,12 @@ use hex_core::wire::{Answer, Call, Header, Limits, Request, Streams};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
+use std::time::{Duration, Instant};
+
+/// The caller's deadline the run-out tests give the call that runs out: the stand-in agent never answers that call, so
+/// it runs out at any deadline; this one keeps them short, and is far past the next call's start, which it hands its
+/// turn to.
+const CALLERS: Duration = Duration::from_millis(100);
 
 /// A stand-in agent's listening socket, in a directory of its own.
 fn agent_socket() -> (tempfile::TempDir, std::path::PathBuf, OwnedFd) {
@@ -206,9 +212,10 @@ fn many_calls_answered_out_of_order_each_get_their_own() {
 }
 
 /// A call that runs out while it holds the reader's turn hands it to a call still waiting, whose answer then comes.
-/// Do: an inspect sent first, taking the turn; then a delete, sent while the stand-in agent holds the inspect; the
-/// agent answers the delete alone, once the inspect has run out. Expect: the inspect refused for no answer in its
-/// patience, and the delete answered.
+/// Do: a delete with a caller's deadline sent first, taking the turn; then a second delete, sent while the stand-in
+/// agent holds the first; the agent answers the second alone, once the first has run out at its caller's deadline (a
+/// call with none runs out at nothing of the client's own, decision 9). Expect: the first refused for no answer by its
+/// deadline, and the second answered.
 #[test]
 fn a_call_that_runs_out_hands_the_turn_to_one_still_waiting() {
     let (_dir, path, listener) = agent_socket();
@@ -217,11 +224,8 @@ fn a_call_that_runs_out_hands_the_turn_to_one_still_waiting() {
     let agent = std::thread::spawn(move || {
         let conn = rustix::net::accept_with(&listener, SocketFlags::CLOEXEC).unwrap();
         hello(&conn, 2);
-        let (_, inspect) = next_request(&conn);
-        assert!(
-            matches!(inspect, Request::Call(Call::Inspect(_))),
-            "{inspect:?}"
-        );
+        let (_, first) = next_request(&conn);
+        assert!(matches!(first, Request::Call(Call::Delete(_))), "{first:?}");
         held.send(()).unwrap();
         let (h, delete) = next_request(&conn);
         let Request::Call(Call::Delete(id)) = delete else {
@@ -235,18 +239,18 @@ fn a_call_that_runs_out_hands_the_turn_to_one_still_waiting() {
     let a = BoxId::new("a").unwrap();
     let b = BoxId::new("b").unwrap();
     std::thread::scope(|s| {
-        let inspect = s.spawn(|| client.inspect(&a));
+        let first = s.spawn(|| client.delete_before(&a, Instant::now() + CALLERS));
         inspect_held.recv().unwrap();
         let delete = s.spawn(|| client.delete(&b));
         assert!(
             matches!(
-                inspect.join().unwrap(),
+                first.join().unwrap(),
                 Err(Refusal::Os {
                     op: "waiting for the node agent's answer",
                     ..
                 })
             ),
-            "the inspect ran out"
+            "the first delete ran out"
         );
         go.send(()).unwrap();
         assert_eq!(delete.join().unwrap(), Err(Refusal::NoSuchBox(b.clone())));
@@ -322,9 +326,10 @@ fn a_send_waiting_for_room_reads_once_the_turn_is_its() {
 }
 
 /// A call that runs out waiting for room hands on the reader's turn it holds, so the calls after it are still
-/// read. Do: as for the send waiting for room, but an inspect finds no room, and the agent sends nothing more and
-/// reads nothing until it has run out; then the agent reads the exec's request, and a delete is made. Expect: the
-/// inspect refused for want of room, and the delete answered.
+/// read. Do: as for the send waiting for room, but a delete with a caller's deadline finds no room, and the agent
+/// sends nothing more and reads nothing until it has run out at that deadline (a call with none runs out at nothing of
+/// the client's own, decision 9); then the agent reads the exec's request, and a second delete is made. Expect: the
+/// first refused for want of room, and the second answered.
 #[test]
 fn a_call_that_runs_out_waiting_for_room_hands_on_its_turn() {
     let (_dir, path, listener) = agent_socket();
@@ -376,8 +381,8 @@ fn a_call_that_runs_out_waiting_for_room_hands_on_its_turn() {
             client.exec(&b, program, Stdio::null()).err(),
             Some(Refusal::NoSuchBox(b.clone()))
         );
-        let inspect = s.spawn(|| client.inspect(&i));
-        // The inspect has its place among the calls, beside the list's.
+        let first = s.spawn(|| client.delete_before(&i, Instant::now() + CALLERS));
+        // The first delete has its place among the calls, beside the list's.
         while client.shared().calls_waiting() < 2 {
             std::thread::yield_now();
         }
@@ -385,13 +390,13 @@ fn a_call_that_runs_out_waiting_for_room_hands_on_its_turn() {
         assert_eq!(list.join().unwrap(), Ok(Vec::new()));
         assert!(
             matches!(
-                inspect.join().unwrap(),
+                first.join().unwrap(),
                 Err(Refusal::Os {
                     op: "sending to the node agent",
                     ..
                 })
             ),
-            "the inspect ran out for want of room"
+            "the first delete ran out for want of room"
         );
     });
     read_on.send(()).unwrap();
@@ -1256,48 +1261,50 @@ fn container_box(id: &str, class: Class) -> hex_api::BoxSpec {
     }
 }
 
-/// AC-T7.4.1: a box's class times its create, each (kind, class) a learned wait of its own; a class with no record
-/// yet measures, never borrowing another's. Do: through the node agent's socket, create an `oci` box the stand-in
-/// agent never answers, so the create runs out at the `oci` create's bound `b`; then create a `firecracker` box, which
-/// the agent answers only 4`b` after it reads it, a microVM's boot being slower than any OCI create recorded. Expect:
-/// the `oci` create refused as twice its slowest; the `firecracker` create answered.
+/// AC-T7.4.1, decision 9: a box's class times its create, each (kind, class) a learned wait of its own, and none of
+/// them refuses a call by itself (the person's ruling of 2026-11-13: W* is a bound only while answers come within it). Do:
+/// through the node agent's socket, create an `oci` box the stand-in agent answers at once, teaching the `oci` create's
+/// wait its answer `b`; then create a `firecracker` box, which the agent answers only 4`b` after it reads it, a microVM's
+/// boot being slower than any OCI create. Expect: both answered, the `firecracker` create waited for past the `oci`
+/// create's answer, never refused by it.
 #[test]
-fn a_vm_create_slower_than_the_oci_record_is_not_refused_by_it() {
+fn a_vm_create_slower_than_the_oci_creates_is_answered() {
     let (_dir, path, listener) = agent_socket();
-    let (measured, oci_bound) = std::sync::mpsc::channel::<Duration>();
+    let (measured, oci_answer) = std::sync::mpsc::channel::<Duration>();
     let agent = std::thread::spawn(move || {
         let conn = rustix::net::accept_with(&listener, SocketFlags::CLOEXEC).unwrap();
         hello(&conn, 1);
-        let (_, request) = next_request(&conn);
-        assert!(
-            matches!(request, Request::Call(Call::Create(_))),
-            "{request:?}"
-        );
-        let b = oci_bound.recv().unwrap();
-        let (h, request) = next_request(&conn);
-        let Request::Call(Call::Create(spec)) = request else {
-            panic!("a create, not {request:?}")
-        };
-        // Held 4b, a span the client sends nothing in: the poll ends at its timeout, or at the client's end.
-        let mut quiet = [PollFd::new(&conn, PollFlags::IN)];
-        let _ = rustix::event::poll(&mut quiet, Some(&Timespec::try_from(b * 4).unwrap()));
-        let info = hex_api::BoxInfo {
-            published: Vec::new(),
-            grants: Vec::new(),
-            id: spec.id,
-            class: Class::Firecracker,
-            state: hex_api::BoxState::Created,
-            bounds: spec.bounds,
-            allocation: None,
-            adopted: false,
-            membership: None,
-            exit: None,
-            abandoned: 0,
-            route: None,
-            last_resort: None,
-        };
-        let bytes = wire::answer(h.id, &Answer::Info(info), wire::MAX_MESSAGE).unwrap();
-        let _ = rustix::net::send(&conn, &bytes, SendFlags::NOSIGNAL);
+        for class in [Class::Oci, Class::Firecracker] {
+            let (h, request) = next_request(&conn);
+            let Request::Call(Call::Create(spec)) = request else {
+                panic!("a create, not {request:?}")
+            };
+            if class == Class::Firecracker {
+                let b = oci_answer.recv().unwrap();
+                // Held 4b, a span the client sends nothing in: the poll ends at its timeout, or at the client's end.
+                let mut quiet = [PollFd::new(&conn, PollFlags::IN)];
+                let _ = rustix::event::poll(&mut quiet, Some(&Timespec::try_from(b * 4).unwrap()));
+            }
+            let info = hex_api::BoxInfo {
+                published: Vec::new(),
+                grants: Vec::new(),
+                id: spec.id,
+                class,
+                state: hex_api::BoxState::Created,
+                bounds: spec.bounds,
+                allocation: None,
+                adopted: false,
+                membership: None,
+                exit: None,
+                abandoned: 0,
+                route: None,
+                last_resort: None,
+                ended: None,
+                credentials: Vec::new(),
+            };
+            let bytes = wire::answer(h.id, &Answer::Info(info), wire::MAX_MESSAGE).unwrap();
+            let _ = rustix::net::send(&conn, &bytes, SendFlags::NOSIGNAL);
+        }
         conn
     });
     let client = Client::connect(&path).unwrap();
@@ -1307,7 +1314,7 @@ fn a_vm_create_slower_than_the_oci_record_is_not_refused_by_it() {
     let vm = client.create(container_box("v", Class::Firecracker));
     eprintln!("client_class_waits oci={oci:?} vm={vm:?}");
     assert!(
-        matches!(&oci, Err(Refusal::Os { why, .. }) if why.contains("twice the slowest")),
+        matches!(&oci, Ok(info) if info.class == Class::Oci),
         "{oci:?}"
     );
     assert!(

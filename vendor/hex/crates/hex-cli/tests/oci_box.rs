@@ -78,8 +78,6 @@ const PROPAGATION_PASS: &str =
 /// Both entry points can move the test process between cgroups. Serialize their parent fixtures;
 /// recover the test-only lock after a failed full suite so the independent oracle still runs.
 static LAB_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-/// Remember the delegated parent before the first fixture moves this process into its agent leaf.
-static LAB_PARENT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 /// Set in the re-exec'd copy of this test that plays the agent the crash kills.
 const AGENT_ENV: &str = "HEX_OCI_BOX_AGENT";
 
@@ -96,14 +94,9 @@ fn oci_boxes_report_their_inits_exit_through_the_seam() {
         Err(direct) if std::env::var_os("HEX_DELEGATED").is_none() => {
             rerun_delegated(TEST, &direct)
         }
-        Err(direct) => {
-            hex_testkit::skip(
-                "oci_boxes_report_their_inits_exit_through_the_seam",
-                "cgroup v2 delegation",
-                &format!("none in the delegated scope either ({direct}); run on a cgroup-v2 host"),
-            )
-            .expect("recording the skip");
-        }
+        // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the test,
+        // never a skip that would hide the breakage.
+        Err(direct) => panic!("its cgroup isn't delegated to it ({direct})"),
     }
 }
 
@@ -2651,10 +2644,7 @@ fn run_in(rt: &dyn Runtime, id: &BoxId, argv: &[&str]) -> (Exit, String) {
         .expect("exec in the box");
     let mut s = String::new();
     std::io::Read::read_to_string(&mut out, &mut s).unwrap();
-    let exit = proc
-        .wait_for(conformance::PATIENCE)
-        .unwrap()
-        .expect("the program ends");
+    let exit = conformance::end_of(&mut proc).unwrap();
     (exit, s)
 }
 
@@ -3634,7 +3624,7 @@ fn a_program_past_the_kernels_bound_is_refused_by_name_and_learned(lab: &Lab, ow
     let second = node.exec(&id, program, hex_api::Stdio::null());
     let small = node
         .exec(&id, lab.program(&Act::Say("small")), hex_api::Stdio::null())
-        .map(|mut p| p.wait_for(conformance::patience()));
+        .map(|mut p| conformance::end_of(&mut p));
     let last = stack_reads();
     setrlimit(Resource::Stack, was).expect("restore this node's stack limit");
     relearn_stack();
@@ -3692,7 +3682,7 @@ fn a_program_past_the_kernels_bound_is_refused_by_name_and_learned(lab: &Lab, ow
         "the learned bound refused it with no further reading"
     );
     assert!(
-        matches!(small, Ok(Ok(Some(Exit::Code(0))))),
+        matches!(small, Ok(Ok(Exit::Code(0)))),
         "a program within the bound still runs, got {small:?}"
     );
     node.delete(&id).expect("delete");
@@ -4151,10 +4141,7 @@ fn loopback_flags(rt: &dyn Runtime, id: &BoxId) -> String {
         .expect("exec cat");
     let mut flags = String::new();
     std::io::Read::read_to_string(&mut out, &mut flags).unwrap();
-    assert_eq!(
-        proc.wait_for(conformance::PATIENCE).unwrap(),
-        Some(Exit::Code(0))
-    );
+    assert_eq!(conformance::end_of(&mut proc).unwrap(), Exit::Code(0));
     flags.trim().to_owned()
 }
 
@@ -4245,10 +4232,7 @@ fn program_alone(lab: &Lab, own: &Path) {
     // Each program was a member of the box cgroup, so delete's cgroup.kill reached it: reap it (the
     // caller's own Proc, as HEX-RT-7 does) and find it ended by a signal, no zombie left.
     for mut p in [first, second] {
-        let exit = p
-            .wait_for(conformance::PATIENCE)
-            .expect("wait for a deleted program")
-            .expect("the program ended with the box");
+        let exit = conformance::end_of(&mut p).expect("wait for a deleted program");
         assert!(
             matches!(exit, Exit::Signal(_)),
             "delete ended the program by a signal: {exit:?}"
@@ -4302,9 +4286,7 @@ fn programs_hold_their_stdio_alone(lab: &Lab, own: &Path) {
     }
     drop(stray);
     node.delete(&id).expect("delete ends the programs");
-    exec.wait_for(conformance::PATIENCE)
-        .expect("wait for a deleted program")
-        .expect("the program ended with the box");
+    conformance::end_of(&mut exec).expect("wait for a deleted program");
 }
 
 /// Goal 3 plan step 6: an exec into a running box reads nothing of the box's from disk; what it needs
@@ -4326,11 +4308,11 @@ fn exec_reads_no_state(lab: &Lab, own: &Path) {
             hex_api::Program::of(&["/usr/bin/true"]),
             hex_api::Stdio::null(),
         )
-        .and_then(|mut p| p.wait_for(conformance::PATIENCE));
+        .and_then(|mut p| conformance::end_of(&mut p));
     std::fs::rename(&aside, &file).expect("put the container's state back");
     assert_eq!(
         ran,
-        Ok(Some(Exit::Code(0))),
+        Ok(Exit::Code(0)),
         "exec ran its program with the container's state file gone"
     );
     node.delete(&id).expect("delete");
@@ -4418,10 +4400,7 @@ fn orphans_are_reaped(lab: &Lab, own: &Path) {
             },
         )
         .unwrap();
-    assert_eq!(
-        proc.wait_for(conformance::PATIENCE).unwrap(),
-        Some(Exit::Code(0))
-    );
+    assert_eq!(conformance::end_of(&mut proc).unwrap(), Exit::Code(0));
     // Read to the pipe's end on a thread of its own, within the patience: an orphan still holding the pipe
     // fails the test by name rather than hang it.
     let (got, read) = std::sync::mpsc::channel();
@@ -5782,34 +5761,21 @@ fn host_id(flag: &str) -> u32 {
         .expect("id is a number")
 }
 
-/// This process's cgroup directory under /sys/fs/cgroup.
-fn own_cgroup() -> PathBuf {
-    let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
-    let rel = own
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("a 0:: cgroup line")
-        .trim_start_matches('/');
-    PathBuf::from("/sys/fs/cgroup").join(rel)
-}
-
-/// Moves this process into a leaf of its own cgroup and confirms every controller is delegated, as
-/// oci_seccomp.rs does; returns the own cgroup dir, or why it isn't ours to subdivide.
+/// This process's own cgroup, delegated to it and prepared once for every test in this binary
+/// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it isn't
+/// ours to subdivide. The probe root's opening proves every controller a box uses is delegated here: `BoxRoot::open`
+/// refuses by name otherwise (HEX-INST-1).
 fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-    let own = LAB_PARENT.get_or_init(own_cgroup).clone();
-    let leaf = own.join("hex-agent");
-    std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-    std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-        .map_err(|e| format!("moving self into a leaf: {e}"))?;
-    // The probe root opening proves every controller a box uses is delegated here: `BoxRoot::open`
-    // refuses by name otherwise (HEX-INST-1).
-    hex_runtime::linux::cgroup::BoxRoot::open(
-        &own.join("hex-probe"),
-        hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir(own.join("hex-probe"));
-    Ok(own)
+    hex_testkit::cgroup::delegated(|own| {
+        let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+            &own.join("hex-probe"),
+            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_dir(own.join("hex-probe"));
+        probe
+    })
 }
 
 fn cache_dir() -> PathBuf {

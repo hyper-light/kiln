@@ -879,7 +879,7 @@ pub fn produce<D: Driver>(
         patience.source
     ));
     line(format!(
-        "overhead {} at RAM {} bytes (the envelope's: a cost is per envelope) (the census maximum of each ready guest's: its VMM's own CPU in one window from its readiness on, its guest's left out, rounded up; its VMM's own memory, as the memory source says; the bytes held in its own folders at a reading, there during its life and neither before it nor after it)",
+        "overhead {} at RAM {} bytes (the envelope's: a cost is per envelope) (the census maximum of each ready guest's: its VMM's own CPU in one window from its readiness on, its guest's left out, rounded up; its VMM's own memory, as the memory source says; the bytes held in its own folders at a reading, there during its life and neither before it nor after it) (evidence alone, not in the cost: a node learns a VM's overhead from its windows, decision 9)",
         resources(overhead),
         envelope.resources.mem_bytes
     ));
@@ -909,7 +909,7 @@ pub fn produce<D: Driver>(
         ));
     }
     line(format!(
-        "guest_overhead {} (the census maximum of the envelope less what the guest's agent reported free)",
+        "guest_overhead {} (the census maximum of the envelope less what the guest's agent reported free) (evidence alone, not in the cost: a node learns a guest's own from its backing's windows, decision 9)",
         resources(inside)
     ));
     line(format!(
@@ -943,13 +943,15 @@ pub fn produce<D: Driver>(
     let mut evidence = Vec::with_capacity(prefix.len().saturating_add(body.len()));
     evidence.extend_from_slice(prefix);
     evidence.extend_from_slice(body.as_bytes());
+    // The measured overhead and guest allowance are evidence alone, never a number a node starts from (joint plan step
+    // 14; ROOT, 2026-11-13, by decision 9's rule): the cost is the envelope alone, and its id names the evidence.
     let cost = RuntimeCost {
         id: Sha256::digest(&evidence).into(),
         floor: envelope.resources,
         ceiling: envelope.resources,
         quantum,
-        guest_overhead: inside,
-        overhead,
+        guest_overhead: CapacityResources::default(),
+        overhead: CapacityResources::default(),
     };
     cost.check().map_err(|e| e.to_string())?;
     cost.allocate(CapacityResources::default())
@@ -1493,7 +1495,9 @@ mod tests {
     /// AC-T7.4.1 (ROOT, the Mac window's fixed point): a window that the rate sets, over guests whose VMM uses
     /// 1 ms of its own in each window of their steady state: expect the first census at the envelope's rate,
     /// each next at the envelope's and what the one before measured, the run ending at the first census that
-    /// measures no more than its window's rate was taken at, that charged, and each census in the evidence.
+    /// measures no more than its window's rate was taken at, and each census in the evidence. What the last
+    /// measured is evidence alone (joint plan step 14; ROOT, 2026-11-13, by decision 9's rule): the cost written
+    /// carries no overhead and no guest allowance, and its evidence names the measured overhead.
     #[test]
     fn the_mac_window_settles_at_the_rate_it_charges() {
         let dir = tempfile::tempdir().unwrap();
@@ -1533,13 +1537,14 @@ mod tests {
         }
         let (rate, measured) = *censuses.last().unwrap();
         assert!(measured <= rate - 2000, "{censuses:?}");
-        let (cost, _, _) = hex_runtime::guest::load_runtime_evidence(
-            &made.cost_file,
-            made.cost_sha256,
-            &made.evidence_file,
-        )
-        .unwrap();
-        assert_eq!(cost.overhead.cpu_milli, rate - 2000);
+        let written: RuntimeCost =
+            serde_json::from_slice(&std::fs::read(&made.cost_file).unwrap()).unwrap();
+        assert_eq!(written.overhead, CapacityResources::default());
+        assert_eq!(written.guest_overhead, CapacityResources::default());
+        assert!(
+            text.contains(&format!("\noverhead cpu_milli={} ", rate - 2000)),
+            "{text}"
+        );
         assert!(text.contains("\nwindow 20000000 ns (at "), "{text}");
     }
 

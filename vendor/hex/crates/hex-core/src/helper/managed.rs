@@ -6,6 +6,7 @@ pub mod census;
 pub mod completed;
 pub mod rate;
 pub mod rejected;
+pub mod response;
 pub mod timed;
 
 use crate::record::{NativeRecord, NativeScope, OwnerKey, OwnerRef, ProcId};
@@ -18,9 +19,26 @@ use super::{ARG_MAX, BoxId, FIRST, HEADER_BYTES, MAGIC, PATH_MAX, VERSION};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuControl {
     pub cost_id: [u8; 32],
+    /// Kept for helpers older than goal 14's learning helper (main a8dc671c and before), which take it as their
+    /// control's response; a learning helper reads its own, the slowest stop it has seen ([`response`]). The node sends
+    /// [`COLD_RESPONSE`] (joint plan step 14, 2c; ROOT, 2026-11-13): wire compatibility for a persistent helper holding
+    /// live VMs across a node upgrade, never a census number.
     pub response: Duration,
 }
+
+/// The cold response a node sends in [`CpuControl::response`]: the least the field holds that a helper's check takes,
+/// a nanosecond (its unit), so an older helper reading it holds a scope at its credit's end with no burst to speak of.
+pub const COLD_RESPONSE: Duration = Duration::from_nanos(1);
 impl CpuControl {
+    /// The control a node sends for `cost_id` (joint plan step 14, 2c): the cold response, which a learning helper
+    /// ignores ([`COLD_RESPONSE`]).
+    pub fn cold(cost_id: [u8; 32]) -> Self {
+        Self {
+            cost_id,
+            response: COLD_RESPONSE,
+        }
+    }
+
     pub fn check(self) -> Result<(), Fault> {
         if self.cost_id == [0; 32]
             || self.response.is_zero()
@@ -1006,6 +1024,7 @@ fn read_usage(input: &mut Reader<'_>) -> Result<Usage, Fault> {
         io_read_bytes: input.u64()?,
         io_write_bytes: input.u64()?,
         guest: None,
+        started_from: None,
     })
 }
 pub fn read_answer(bytes: &[u8], fds: usize) -> Result<(u16, u64, Answer), Fault> {
@@ -1102,6 +1121,29 @@ mod tests {
             },
             report_scope: if report { Some([5; 16]) } else { None },
         }
+    }
+
+    /// Joint plan step 14 (2c; ROOT, 2026-11-13): the node sends a launch's CPU control with the cold value, the least
+    /// response the field holds that a helper's check takes (a nanosecond, the wire's unit). An older helper, which reads
+    /// it as its response, then holds a scope at its credit's end with no burst to speak of, never at a census number;
+    /// a learning helper reads its own. Do encode a launch with the cold control and read it back as every helper reads
+    /// it. Expect its response a nanosecond and its check passed.
+    #[test]
+    fn w14_an_older_helper_reads_a_new_launchs_cpu_control_as_the_cold_value() {
+        let cold = Launch {
+            cpu: CpuControl::cold([17; 32]),
+            ..launch(false)
+        };
+        let request = Request::Prepare {
+            key: key(),
+            launch: cold,
+        };
+        let bytes = encode_request(VERSION, 5, &request).unwrap();
+        let (_, _, Request::Prepare { launch, .. }) = read_request(&bytes, 2).unwrap() else {
+            panic!("not a prepare");
+        };
+        assert_eq!(launch.cpu.response, Duration::from_nanos(1));
+        assert!(launch.cpu.check().is_ok());
     }
 
     /// AC-T7.4.1: option-shaped values remain opaque data; only actual prepared option positions

@@ -35,7 +35,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use hex_api::{
     Bounds, BoxId, BoxSpec, ClassSpec, Exit, Mount, Network, OciSpec, Program, Rootfs, Runtime,
@@ -45,10 +44,6 @@ use hex_core::bundle::{Owner, Place, render};
 use hex_node::{Node, OCI_BOXES};
 
 const TEST: &str = "a_rootless_host_network_box_cannot_change_another_boxs_cgroup";
-/// Bounded wait for the box's program that reads its mount table: one that never ends fails rather
-/// than hangs (CLAUDE.md §4). The conformance suite's patience for a program's end, not one of its own
-/// (Ada's 2026-11-06 rule).
-const PATIENCE: Duration = hex_api::conformance::PATIENCE;
 
 #[test]
 fn a_rootless_host_network_box_cannot_change_another_boxs_cgroup() {
@@ -77,9 +72,9 @@ fn a_rootless_host_network_box_cannot_change_another_boxs_cgroup() {
                 .expect("run the test in a delegated scope");
             assert!(status.success(), "the delegated re-run failed");
         }
-        Err(direct) => {
-            eprintln!("SKIP: no usable cgroup v2 delegation ({direct}); run on a cgroup-v2 host")
-        }
+        // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the test,
+        // never a skip that would hide the breakage.
+        Err(direct) => panic!("its cgroup isn't delegated to it ({direct})"),
     }
 }
 
@@ -183,12 +178,12 @@ fn exercise(own: &Path, cache: &Path, exe: &str) {
     reader
         .env
         .push(("PATH".to_owned(), "/usr/bin:/bin".to_owned()));
-    let ended = node
-        .exec(&plain, reader, Stdio::null())
-        .expect("exec the mount table's reader")
-        .wait_for(PATIENCE)
-        .expect("wait for the reader")
-        .expect("the reader ended within its patience");
+    let ended = hex_api::conformance::end_of(
+        &mut node
+            .exec(&plain, reader, Stdio::null())
+            .expect("exec the mount table's reader"),
+    )
+    .expect("wait for the reader");
     assert_eq!(ended, Exit::Code(0), "the reader failed");
     let mountinfo = std::fs::read_to_string(out.join("mountinfo")).expect("the box's mount table");
 
@@ -226,12 +221,12 @@ fn exercise(own: &Path, cache: &Path, exe: &str) {
     unmount
         .env
         .push(("PATH".to_owned(), "/usr/bin:/bin".to_owned()));
-    let ended = node
-        .exec(&plain, unmount, Stdio::null())
-        .expect("exec the unmount")
-        .wait_for(PATIENCE)
-        .expect("wait for the unmount")
-        .expect("the unmount ended within its patience");
+    let ended = hex_api::conformance::end_of(
+        &mut node
+            .exec(&plain, unmount, Stdio::null())
+            .expect("exec the unmount"),
+    )
+    .expect("wait for the unmount");
     assert_eq!(ended, Exit::Code(0), "the unmount's script failed");
     let rc = std::fs::read_to_string(out.join("umount.rc")).unwrap();
     assert_ne!(
@@ -309,12 +304,12 @@ fn exercise(own: &Path, cache: &Path, exe: &str) {
     probe
         .env
         .push(("PATH".to_owned(), "/usr/bin:/bin".to_owned()));
-    let ended = node
-        .exec(&prober, probe, Stdio::null())
-        .expect("exec the probe")
-        .wait_for(PATIENCE)
-        .expect("wait for the probe")
-        .expect("the probe ended within its patience");
+    let ended = hex_api::conformance::end_of(
+        &mut node
+            .exec(&prober, probe, Stdio::null())
+            .expect("exec the probe"),
+    )
+    .expect("wait for the probe");
     assert_eq!(ended, Exit::Code(0), "the probe's script failed");
     let seen = |file: &str| std::fs::read_to_string(out.join(file)).unwrap_or_default();
     let (sys, cg) = (seen("probe-sys.ls"), seen("probe-cg.ls"));
@@ -449,34 +444,21 @@ fn build_rootfs(rootfs: &Path) {
     }
 }
 
-/// This process's cgroup directory under /sys/fs/cgroup.
-fn own_cgroup() -> PathBuf {
-    let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
-    let rel = own
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("a 0:: cgroup line")
-        .trim_start_matches('/');
-    PathBuf::from("/sys/fs/cgroup").join(rel)
-}
-
-/// Moves this process into a leaf of its own cgroup and confirms every controller is delegated, as
-/// oci_box.rs does; returns the own cgroup dir, or why it isn't ours to subdivide.
+/// This process's own cgroup, delegated to it and prepared once for every test in this binary
+/// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it isn't
+/// ours to subdivide. The probe root's opening proves every controller a box uses is delegated here: `BoxRoot::open`
+/// refuses by name otherwise (HEX-INST-1).
 fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-    let own = own_cgroup();
-    let leaf = own.join("hex-agent");
-    std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-    std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-        .map_err(|e| format!("moving self into a leaf: {e}"))?;
-    // The probe root opening proves every controller a box uses is delegated here: `BoxRoot::open`
-    // refuses by name otherwise (HEX-INST-1).
-    hex_runtime::linux::cgroup::BoxRoot::open(
-        &own.join("hex-probe"),
-        hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir(own.join("hex-probe"));
-    Ok(own)
+    hex_testkit::cgroup::delegated(|own| {
+        let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+            &own.join("hex-probe"),
+            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_dir(own.join("hex-probe"));
+        probe
+    })
 }
 
 fn cache_dir() -> PathBuf {

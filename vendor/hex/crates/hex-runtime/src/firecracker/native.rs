@@ -245,6 +245,10 @@ impl FirecrackerRuntime {
             {
                 return Err(lifecycle(id, LifecycleCause::Uncertain)?);
             }
+            // A box whose backing was retired has no VM to ask (joint plan step 14).
+            if record.retired {
+                return Err(record.retired_refusal()?);
+            }
             operation(&record, transaction)
         })
     }
@@ -563,26 +567,26 @@ impl FirecrackerRuntime {
         Ok(info)
     }
 
-    fn remove(&self, id: &BoxId, transaction: &dyn Transaction) -> Result<(), Refusal> {
-        let mut record = transaction
-            .read(id)?
-            .ok_or(Refusal::NoSuchBox(id.try_clone()?))?;
-        if !matches!(record.spec.class, ClassSpec::Firecracker(_)) {
-            return Err(invalid("record belongs to another backend"));
-        }
-        let paths = self.paths(&record)?;
-        record.phase = Phase::Deleting;
-        transaction.put(&record)?;
-        let identity = self.native_identity(&record)?;
+    /// Stops box `record`'s own VM and releases its scope, in `transaction` (its turn): its VMM stopped, its whole
+    /// scope seen released, its exit recorded, its controller finalized and its folder removed. Its phase is the
+    /// caller's: a delete's Deleting, a retirement's Ready (joint plan step 14).
+    pub(super) fn stop_vm(
+        &self,
+        record: &mut BoxRecord,
+        transaction: &dyn Transaction,
+    ) -> Result<(), Refusal> {
+        let id = record.spec.id.try_clone()?;
+        let paths = self.paths(record)?;
+        let identity = self.native_identity(record)?;
         let native = transaction.attach_managed(identity.as_ref())?;
-        native.stop().map_err(|_| uncertain(id))?;
+        native.stop().map_err(|_| uncertain(&id))?;
         let end = native
             .wait_for(self.config.stop_timeout)
-            .map_err(|_| uncertain(id))?
+            .map_err(|_| uncertain(&id))?
             .filter(|end| end.scope == shards_api::TerminalScope::Released)
-            .ok_or(lifecycle(id, LifecycleCause::Uncertain)?)?;
+            .ok_or(lifecycle(&id, LifecycleCause::Uncertain)?)?;
         record.exit = Some(exit(end.status));
-        transaction.put(&record)?;
+        transaction.put(record)?;
         // Persisted exit is not itself absence proof. Finalize checks the same native receipt and
         // actual empty kernel scope before removing it; the record/physical claims still live here.
         transaction.finalize_managed(identity.as_ref())?;
@@ -593,7 +597,21 @@ impl FirecrackerRuntime {
         }
         File::open(&self.config.state_dir)
             .and_then(|file| file.sync_all())
-            .map_err(|e| Refusal::os("syncing VM state removal", e))?;
+            .map_err(|e| Refusal::os("syncing VM state removal", e))
+    }
+
+    fn remove(&self, id: &BoxId, transaction: &dyn Transaction) -> Result<(), Refusal> {
+        let mut record = transaction
+            .read(id)?
+            .ok_or(Refusal::NoSuchBox(id.try_clone()?))?;
+        if !matches!(record.spec.class, ClassSpec::Firecracker(_)) {
+            return Err(invalid("record belongs to another backend"));
+        }
+        // Its state's place is known before its delete is recorded.
+        self.paths(&record)?;
+        record.phase = Phase::Deleting;
+        transaction.put(&record)?;
+        self.stop_vm(&mut record, transaction)?;
         transaction.remove(id)
     }
 
@@ -726,6 +744,10 @@ impl FirecrackerRuntime {
     pub fn preflight_record(&self, record: &BoxRecord) -> Result<(), Refusal> {
         record.spec.check()?;
         self.config.check()?;
+        // A VM recorded under the census cost, or retired, is its node start's to retire or keep (joint plan step 14).
+        if record.retired || self.census_vm(record) {
+            return Ok(());
+        }
         if record.spec.backend_class()? != Class::Firecracker
             || !matches!(record.spec.class, ClassSpec::Firecracker(_))
             || record.native_scope.is_none()
@@ -1324,6 +1346,11 @@ impl Runtime for FirecrackerRuntime {
         })
     }
     fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        // A box whose backing was retired says why from its record (joint plan step 14).
+        let record = self.record(id)?;
+        if record.retired {
+            return record.retired_info();
+        }
         self.with_record(id, |record, transaction| {
             if record.phase == Phase::Ready
                 && let Some(end) = self
@@ -1345,6 +1372,8 @@ impl Runtime for FirecrackerRuntime {
                     exit: Some(exit(end.status)),
                     abandoned: record.abandoned,
                     last_resort: None,
+                    ended: None,
+                    credentials: Vec::new(),
                 });
             }
             let mut info = self.client(record, transaction)?.inspect(id)?;
@@ -1385,6 +1414,12 @@ impl Runtime for FirecrackerRuntime {
             .map_err(|_| Refusal::Broken("the VM backend's evented lock was poisoned".to_owned()))?
             .remove(id);
         let record = self.record(id)?;
+        // A box whose backing was retired is gone with it: its delete removes its record alone (joint plan step 14).
+        if record.retired {
+            return crate::devices::with_transaction(&self.books, id, &[], |transaction| {
+                transaction.remove(id)
+            });
+        }
         if let Some(key) = record.spec.route.and_then(|route| route.backing) {
             let source = self
                 .authority()?

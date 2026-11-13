@@ -348,6 +348,30 @@ fn serve(
         )
         .map_err(frame::Failure::refusal);
     }
+    // Joint plan step 14 (2c; ROOT, 2026-11-13): the node asks the slowest stop response this helper's managed CPU
+    // control has seen in its own holds, which it derives its charge window from: none before the first.
+    if let Ok((version, id)) = protocol::response::read(&bytes, descriptors.len()) {
+        if matches!(entry, Entry::FirstPrepare(_)) {
+            return Err(super::super::configuration(
+                "first helper request must be scoped Prepare",
+            ));
+        }
+        if version != VERSION {
+            return Err(super::super::configuration(
+                "foreign native helper incarnation",
+            ));
+        }
+        let answer = protocol::response::encode_answer(VERSION, id, runtime.cpu_response()?)
+            .map_err(|_| super::super::configuration("encoding a native response answer"))?;
+        return frame::send(
+            connection.as_fd(),
+            &answer,
+            &[],
+            protocol::response::MAX_ANSWER,
+            Some(until),
+        )
+        .map_err(frame::Failure::refusal);
+    }
     let (version, id, expires, request) = protocol::timed::read(&bytes, descriptors.len())
         .map_err(|_| super::super::configuration("invalid bounded native request"))?;
     let until = deadline(expires, helper.config.rpc_budget)?.min(until);

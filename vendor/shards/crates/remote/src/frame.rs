@@ -26,6 +26,17 @@ pub enum Tag {
     /// Controller, on an agent-control endpoint's exec lane (D238): run a command in one of a
     /// microVM's members (`control::exec::Ask`).
     MemberExec = 4,
+    /// Controller, on an agent-control endpoint's socket lane (D251): connect to a socket of
+    /// the run's own command, by its name in the run's socket directory
+    /// (`control::unix::ask_frame`).
+    UnixConnect = 5,
+    /// Controller, on an agent-control endpoint (D238): open the connection's control lane,
+    /// which the endpoint first answers with what its TLS negotiated ([`Tag::Negotiated`]).
+    Control = 6,
+    /// Controller, on an agent-control endpoint (D254): take the next connection a member's
+    /// harness makes to its MCP bridge, as an exec lane takes its exec
+    /// (`control::exec::Kind::Mcp`).
+    Mcp = 7,
     /// Client: bytes of the command's stdin.
     Stdin = 16,
     /// Client: the end of the command's stdin.
@@ -41,7 +52,8 @@ pub enum Tag {
     Stderr = 33,
     /// Daemon: the command ended, with this status (four bytes, big endian).
     Exit = 34,
-    /// Daemon: the request is refused, said why (UTF-8).
+    /// Daemon: the request is refused before any command of it started, said why (UTF-8):
+    /// nothing of it ran.
     Refused = 35,
     /// Daemon: the join is done: the client is enrolled under the invitation's name.
     Joined = 36,
@@ -51,6 +63,18 @@ pub enum Tag {
     /// Agent-control endpoint, on an exec lane (D238): the exec started, its streams numbered
     /// so (four bytes, big endian).
     Started = 38,
+    /// Agent-control endpoint, on the control lane (D238): the cipher suite and key exchange
+    /// group its own TLS handshake negotiated, IANA's codes (two bytes each, big endian).
+    Negotiated = 39,
+    /// Agent-control endpoint, on a socket lane (D251): connected; the socket's bytes follow.
+    Connected = 40,
+    /// Agent-control endpoint, on a socket lane (D251): its host's connect failed, with this
+    /// errno (four bytes, big endian); the lane's end follows.
+    Unreached = 41,
+    /// Daemon: the command started, and this daemon ended its stream before its end, said
+    /// why (UTF-8): it may have run, all or some of it, as [`Refused`](Tag::Refused)'s never
+    /// did (D176 part 6).
+    Cut = 42,
 }
 
 impl Tag {
@@ -60,6 +84,9 @@ impl Tag {
             2 => Tag::Join,
             3 => Tag::Controls,
             4 => Tag::MemberExec,
+            5 => Tag::UnixConnect,
+            6 => Tag::Control,
+            7 => Tag::Mcp,
             16 => Tag::Stdin,
             17 => Tag::StdinEnd,
             18 => Tag::Resize,
@@ -71,6 +98,10 @@ impl Tag {
             36 => Tag::Joined,
             37 => Tag::Made,
             38 => Tag::Started,
+            39 => Tag::Negotiated,
+            40 => Tag::Connected,
+            41 => Tag::Unreached,
+            42 => Tag::Cut,
             _ => return None,
         })
     }
