@@ -1,4 +1,11 @@
-/** One transactional owner for browser-held originals; Zustand is its published projection. */
+/**
+ * This browser's backup of what it sent that the server hasn't taken yet (2026-11-13: it was the
+ * gate every send went through, and any failure there sent nothing). A message goes to the server
+ * first; its copy here is kept in memory at once and written to IndexedDB after, one record per
+ * message (keyed by sign-in, agent and id), never a combined set read and rewritten, and without a
+ * strict commit. The server's receipt (W20 custody, docs/wire.md "mail-flow") lets the copy go;
+ * what's still here when a page opens is offered again. Zustand is its in-memory projection.
+ */
 import { create } from "zustand";
 import type { Attachment, Command, SendMode, SessionDown } from "./wire";
 import { mailScope } from "./client";
@@ -23,10 +30,13 @@ export interface Held {
   wait?: string;
   why?: string;
 }
-const KEY = "kiln.agents.held";
-const FAILURE = "The original message and files could not be saved. Nothing new was sent; keep this page and its text and files open.";
+const DB = "kiln.agents.backup";
+/** The store W20 kept every original in, as one set: read once, into per-message records. */
+const OLD_DB = "kiln.agents.held";
+const LEGACY = "kiln.agents.held";
+const NOT_KEPT = "This browser couldn't keep a copy; keep this page open until it's sent.";
 type RecordSet = Record<string, Held[]>;
-type Change = (previous: RecordSet) => RecordSet | null;
+type Key = [string, string, string];
 interface HeldState {
   held: RecordSet;
   error: string | null;
@@ -72,8 +82,7 @@ function legacyHeld(raw: string | null): RecordSet {
     return {};
   }
 }
-// WebKit can reject IndexedDB Blob/File serialization. Persist standard ArrayBuffer data;
-// the in-memory interface remains Blob-based for upload and preview callers.
+// WebKit can reject IndexedDB Blob/File serialization: a file is written as its bytes.
 async function preparedFiles(files?: OriginalFile[]): Promise<OriginalFile[] | undefined> {
   return files ? Promise.all(files.map(async (file) => ({ ...file, bytes: file.bytes ?? (await file.blob.arrayBuffer()) }))) : undefined;
 }
@@ -112,19 +121,6 @@ export function restored(held: unknown): RecordSet {
     ),
   );
 }
-function stored(held: RecordSet) {
-  return Object.fromEntries(
-    Object.entries(held).map(([agent, rows]) => [
-      agent,
-      rows.map((message) => ({
-        ...message,
-        // Only a file's bytes can be kept; one without them (none were read) isn't written, so it
-        // never stops the rest from being kept.
-        originals: message.originals?.flatMap((file) => (file.bytes ? [{ name: file.name, mime: file.mime, bytes: file.bytes }] : [])),
-      })),
-    ]),
-  );
-}
 function sameFiles(previous?: OriginalFile[], next?: OriginalFile[]): boolean {
   if (!next || !previous) return true;
   return (
@@ -138,106 +134,152 @@ function sameFiles(previous?: OriginalFile[], next?: OriginalFile[]): boolean {
     })
   );
 }
-let opening: Promise<IDBDatabase> | undefined;
-let revision = 0;
-let channel: BroadcastChannel | undefined;
-function database(): Promise<IDBDatabase> {
-  if (opening) return opening;
-  opening = new Promise<IDBDatabase>((resolve, reject) => {
-    if (typeof indexedDB === "undefined") {
-      reject(new Error("storage unavailable"));
-      return;
+
+const keyOf = (agent: string, message: Held): Key => [message.owner ?? "", agent, message.id];
+
+function request<T>(r: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error ?? new Error("storage request failed"));
+  });
+}
+function done(tx: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error ?? new Error("storage transaction aborted"));
+    tx.onerror = () => {};
+  });
+}
+function open(name: string, version: number, upgrade: (db: IDBDatabase) => void): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") return reject(new Error("storage unavailable"));
+    let r: IDBOpenDBRequest;
+    try {
+      r = indexedDB.open(name, version);
+    } catch (error) {
+      return reject(error instanceof Error ? error : new Error("storage unavailable"));
     }
-    const request = indexedDB.open(KEY, 1);
-    request.onupgradeneeded = () => {
-      request.result.createObjectStore("held");
-      request.result.createObjectStore("legacy", { autoIncrement: true });
-    };
-    request.onerror = () => reject(new Error("storage unavailable"));
-    request.onblocked = () => reject(new Error("storage upgrade blocked"));
-    request.onsuccess = () => {
-      const db = request.result;
+    r.onupgradeneeded = () => upgrade(r.result);
+    r.onerror = () => reject(new Error("storage unavailable"));
+    r.onblocked = () => reject(new Error("storage upgrade blocked"));
+    r.onsuccess = () => resolve(r.result);
+  });
+}
+
+let opening: Promise<IDBDatabase> | undefined;
+function database(): Promise<IDBDatabase> {
+  opening ??= open(DB, 1, (db) => {
+    db.createObjectStore("messages");
+    db.createObjectStore("legacy", { autoIncrement: true });
+    db.createObjectStore("meta");
+  })
+    .then((db) => {
       db.onversionchange = () => {
         db.close();
         opening = undefined;
       };
-      resolve(db);
-    };
-  }).catch((error: unknown) => {
-    opening = undefined;
-    throw error;
-  });
+      return db;
+    })
+    .catch((error: unknown) => {
+      opening = undefined;
+      throw error;
+    });
   return opening;
 }
-/** Overlapping readwrite transactions serialize across tabs. Strict completion precedes
- * ownership transfer; raw legacy bytes are backed up without deleting the old localStorage.
- */
-async function transaction(update: Change): Promise<boolean> {
-  const db = await database();
-  let raw: string | null;
-  try {
-    raw = typeof localStorage === "undefined" ? null : localStorage.getItem(KEY);
-  } catch {
-    throw new Error("legacy originals cannot be read");
+
+/** A message as written: its files as bytes alone (a file whose bytes weren't read isn't written). */
+const written = (agent: string, message: Held) => ({
+  agent,
+  message: { ...message, originals: message.originals?.flatMap((file) => (file.bytes ? [{ name: file.name, mime: file.mime, bytes: file.bytes }] : [])) },
+});
+
+/** The records kept, read whole (on opening, and when another tab or a reload changed them). */
+async function readAll(db: IDBDatabase): Promise<RecordSet> {
+  const tx = db.transaction("messages", "readonly");
+  const rows = request(tx.objectStore("messages").getAll());
+  await done(tx);
+  const set: Record<string, unknown[]> = {};
+  for (const row of await rows) {
+    if (typeof row !== "object" || row === null || typeof (row as { agent?: unknown }).agent !== "string") continue;
+    const { agent, message } = row as { agent: string; message: unknown };
+    (set[agent] ??= []).push(message);
   }
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(["held", "legacy"], "readwrite", { durability: "strict" });
-    const store = tx.objectStore("held");
-    let changed = false;
-    let refused = false;
-    tx.onabort = () => (refused ? resolve(false) : reject(new Error("storage transaction aborted")));
-    tx.onerror = () => {};
-    tx.oncomplete = () => resolve(changed);
-    // A browser that can't promise a strict commit (no `durability`, or one it lowered) still keeps
-    // what it can: it never stops a send (the server's waiting holds the message either way).
-    const old = store.get("originals");
-    old.onsuccess = () => {
-      const previous = restored(old.result);
-      // Rows left out as unreadable are kept as they were, beside the set, never dropped unseen.
-      const repaired = rowsIn(old.result) !== rowsIn(previous);
-      if (repaired) tx.objectStore("legacy").add(old.result);
-      const migration = store.get("legacy-source");
-      migration.onsuccess = () => {
-        try {
-          let migrated = false;
-          if (raw && migration.result !== raw) {
-            tx.objectStore("legacy").add(raw);
-            for (const [agent, rows] of Object.entries(legacyHeld(raw))) {
-              const existing = previous[agent] ?? [];
-              previous[agent] = [...existing, ...rows.filter((row) => !existing.some((item) => item.id === row.id && item.owner === row.owner))];
-            }
-            store.put(raw, "legacy-source");
-            migrated = true;
-          }
-          const next = update(previous);
-          if (!next) {
-            refused = true;
-            tx.abort();
-            return;
-          }
-          if (migrated || repaired || next !== previous) store.put(stored(next), "originals");
-          changed = true;
-        } catch {
-          tx.abort();
-        }
-      };
-    };
-  });
+  return restored(set);
 }
-export async function readHeld(): Promise<RecordSet> {
-  const db = await database();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction("held", "readonly");
-    const request = tx.objectStore("held").get("originals");
-    tx.oncomplete = () => {
-      try {
-        resolve(restored(request.result));
-      } catch {
-        reject(new Error("saved originals could not be decoded"));
-      }
-    };
-    tx.onabort = () => reject(new Error("saved originals could not be read"));
+
+/** The old database's set, if it has one (opening it at its version never creates a newer one). */
+async function oldSet(): Promise<unknown> {
+  const exists = typeof indexedDB.databases === "function" ? (await indexedDB.databases()).some((d) => d.name === OLD_DB) : true;
+  if (!exists) return undefined;
+  const db = await open(OLD_DB, 1, (d) => {
+    d.createObjectStore("held");
+    d.createObjectStore("legacy", { autoIncrement: true });
   });
+  try {
+    if (!db.objectStoreNames.contains("held")) return undefined;
+    const tx = db.transaction("held", "readonly");
+    const value = request(tx.objectStore("held").get("originals"));
+    await done(tx);
+    return await value;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Once: what W20 kept as one set, and the box's localStorage before it, become one record per
+ * message. Rows that aren't messages are kept as they were in `legacy`, never dropped unseen, and
+ * never stop the rest; the old database and localStorage are left as they are.
+ */
+async function migrate(db: IDBDatabase) {
+  const tx0 = db.transaction("meta", "readonly");
+  const marked = request(tx0.objectStore("meta").get("migrated"));
+  await done(tx0);
+  if (await marked) return;
+  let raw: string | null = null;
+  try {
+    raw = typeof localStorage === "undefined" ? null : localStorage.getItem(LEGACY);
+  } catch {
+    /* no localStorage to read */
+  }
+  let old: unknown;
+  try {
+    old = await oldSet();
+  } catch {
+    old = undefined;
+  }
+  const set = restored(old);
+  for (const [agent, rows] of Object.entries(legacyHeld(raw))) {
+    const existing = set[agent] ?? [];
+    set[agent] = [...existing, ...rows.filter((row) => !existing.some((item) => item.id === row.id && item.owner === row.owner))];
+  }
+  const tx = db.transaction(["messages", "legacy", "meta"], "readwrite");
+  const messages = tx.objectStore("messages");
+  for (const [agent, rows] of Object.entries(set)) for (const message of rows) messages.put(written(agent, message), keyOf(agent, message));
+  if (old !== undefined && rowsIn(old) !== rowsIn(restored(old))) tx.objectStore("legacy").add(old);
+  if (raw) tx.objectStore("legacy").add(raw);
+  tx.objectStore("meta").put(Date.now(), "migrated");
+  await done(tx);
+}
+
+let channel: BroadcastChannel | undefined;
+/** The writes under way (`flushHeld` waits for them). */
+const writing = new Set<Promise<boolean>>();
+/** Waits until every record written so far is in IndexedDB (tests; nothing on a send waits for it). */
+export async function flushHeld(): Promise<void> {
+  while (writing.size) await Promise.all([...writing]);
+}
+/** Messages whose record is being written or deleted, by key: a reread keeps memory's word on them. */
+const pending = new Map<string, { agent: string; message: Held; gone: boolean }>();
+const keyText = (agent: string, message: Held) => keyOf(agent, message).join("\u0000");
+/** What IndexedDB has, with what's still being written taken from memory (never lost to a reread). */
+function merged(stored: RecordSet): RecordSet {
+  let held = stored;
+  for (const { agent, message, gone } of pending.values()) {
+    const rows = (held[agent] ?? []).filter((row) => !(row.id === message.id && row.owner === message.owner));
+    held = keptAs(held, agent, gone ? rows : [...rows, message]);
+  }
+  return held;
 }
 const keptAs = (held: RecordSet, agent: string, messages: Held[]): RecordSet => {
   const next = { ...held };
@@ -246,107 +288,118 @@ const keptAs = (held: RecordSet, agent: string, messages: Held[]): RecordSet => 
   return next;
 };
 const empty = (message: Held) => !message.text.trim() && !message.attachments?.length && !message.uploading?.length;
+
 export const useHeld = create<HeldState>()((set, get) => {
-  const refresh = async () => {
-    const observed = ++revision;
-    const held = await readHeld();
-    if (revision === observed) set({ held, error: null });
-  };
-  const change = async (update: Change): Promise<boolean> => {
+  let loaded: Promise<boolean> | undefined;
+  /** The records as IndexedDB has them, into memory: once, then on another tab's word. */
+  const load = async (): Promise<boolean> => {
     try {
-      if (!(await transaction(update))) return false;
-      await refresh();
-      channel?.postMessage("committed");
+      const db = await database();
+      await migrate(db);
+      set({ held: merged(await readAll(db)) });
       return true;
     } catch {
-      set({ error: FAILURE });
       return false;
     }
   };
-  const alter = (agent: string, id: string, update: (message: Held) => Held | null, settled = false, owner = mailScope()) =>
-    change((held) =>
-      keptAs(
-        held,
-        agent,
-        (held[agent] ?? []).flatMap((message) => {
-          if (message.id !== id || message.owner !== owner || (!settled && message.custody)) return [message];
-          const next = update(message);
-          return next ? [next] : [];
-        }),
-      ),
-    );
+  /** Writes one message's record, or deletes it, after memory has it: a backup, never a gate. */
+  const persist = async (agent: string, message: Held, gone = false): Promise<boolean> => {
+    const key = keyText(agent, message);
+    const mine = { agent, message, gone };
+    pending.set(key, mine);
+    try {
+      const db = await database();
+      const tx = db.transaction("messages", "readwrite");
+      const store = tx.objectStore("messages");
+      if (gone) store.delete(keyOf(agent, message));
+      else store.put(written(agent, { ...message, originals: await preparedFiles(message.originals) }), keyOf(agent, message));
+      await done(tx);
+      channel?.postMessage("changed");
+      return true;
+    } catch {
+      set({ error: NOT_KEPT });
+      return false;
+    } finally {
+      if (pending.get(key) === mine) pending.delete(key);
+    }
+  };
+  /** Writes in the background: what calls it never waits on IndexedDB. */
+  const background = (agent: string, message: Held, gone = false) => {
+    const write = persist(agent, message, gone);
+    writing.add(write);
+    void write.finally(() => writing.delete(write));
+  };
+  /** `agent`'s messages now `next`, in memory at once, and each changed one written after. */
+  const change = (agent: string, next: Held[], changed: Held[], gone: Held[]) => {
+    set({ held: keptAs(get().held, agent, next), error: null });
+    for (const m of changed) background(agent, m);
+    for (const m of gone) background(agent, m, true);
+    return Promise.resolve(true);
+  };
+  const alter = (agent: string, id: string, update: (message: Held) => Held | null, settled = false, owner = mailScope()) => {
+    const rows = get().held[agent] ?? [];
+    const target = rows.find((message) => message.id === id && message.owner === owner && (settled || !message.custody));
+    if (!target) return Promise.resolve(false);
+    const next = update(target);
+    return change(
+      agent,
+      rows.flatMap((message) => (message === target ? (next ? [next] : []) : [message])),
+      next ? [next] : [],
+      next ? [] : [target],
+    ).then(() => true);
+  };
   return {
     held: {},
     error: null,
-    ready: async () => {
-      try {
-        await transaction((held) => held);
-        await refresh();
-        return true;
-      } catch {
-        set({ error: FAILURE });
-        return false;
-      }
-    },
+    ready: () => (loaded ??= load()),
     hold: (agent, message) => get().holdMany([{ agent, message }]),
-    holdMany: async (messages) => {
+    // Memory takes it before anything is awaited (a send that follows finds it there); the
+    // records are written after, and what this browser can't write is still sent and kept here.
+    holdMany: (messages) => {
       const owner = mailScope();
       if (!owner) {
-        set({ error: "The current sign-in is not identified yet. Keep the original text and files." });
-        return false;
+        set({ error: NOT_KEPT });
+        return Promise.resolve(false);
       }
-      try {
-        messages = await Promise.all(messages.map(async (entry) => ({ ...entry, message: { ...entry.message, originals: await preparedFiles(entry.message.originals) } })));
-      } catch {
-        set({ error: FAILURE });
-        return false;
-      }
-      let conflict = false;
-      const accepted = await change((held) => {
-        for (const { agent, message: original } of messages) {
-          const message = { ...original, owner };
-          const previous = held[agent] ?? [];
-          const exists = previous.find((item) => item.id === message.id && item.owner === owner);
-          if (exists && (JSON.stringify(heldCommand(exists)) !== JSON.stringify(heldCommand(message)) || !sameFiles(exists.originals, message.originals))) {
-            conflict = true;
-            return null;
-          }
-          if (!exists && message.custody && message.custody !== "offered") return null;
-          held = keptAs(
-            held,
-            agent,
-            exists
-              ? previous.map((item) =>
-                  item.id === message.id && item.owner === owner ? { ...message, wait: item.custody ? item.wait : message.wait, originals: message.originals ?? item.originals } : item,
-                )
-              : [...previous, message],
-          );
+      const held = get().held;
+      const writes: { agent: string; message: Held }[] = [];
+      let next = held;
+      for (const { agent, message: original } of messages) {
+        const message = { ...original, owner };
+        const previous = next[agent] ?? [];
+        const exists = previous.find((item) => item.id === message.id && item.owner === owner);
+        if (exists && (JSON.stringify(heldCommand(exists)) !== JSON.stringify(heldCommand(message)) || !sameFiles(exists.originals, message.originals))) {
+          set({ error: "That saved identity already has different original words or files. Send the edit as a new message." });
+          return Promise.resolve(false);
         }
-        return held;
-      });
-      if (conflict) set({ error: "That saved identity already has different original words or files. Send the edit as a new message." });
-      return accepted;
+        if (!exists && message.custody && message.custody !== "offered") return Promise.resolve(false);
+        const kept = exists ? { ...message, wait: exists.custody ? exists.wait : message.wait, originals: message.originals ?? exists.originals } : message;
+        next = keptAs(next, agent, exists ? previous.map((item) => (item === exists ? kept : item)) : [...previous, kept]);
+        writes.push({ agent, message: kept });
+      }
+      set({ held: next, error: null });
+      for (const { agent, message } of writes) background(agent, message);
+      return Promise.resolve(true);
     },
     attempt: (agent, id, stamp) => {
       const owner = mailScope();
-      return change((held) => {
-        const previous = held[agent] ?? [];
-        const original = previous.find((message) => message.owner === owner && message.id === id);
-        if (!original || original.wait === stamp || original.custody === "failed") return null;
-        return keptAs(
-          held,
-          agent,
-          previous.map((message) => (message === original ? { ...message, wait: stamp } : message)),
-        );
-      });
+      const rows = get().held[agent] ?? [];
+      const original = rows.find((message) => message.owner === owner && message.id === id);
+      if (!original || original.wait === stamp || original.custody === "failed") return Promise.resolve(false);
+      const next = { ...original, wait: stamp };
+      return change(
+        agent,
+        rows.map((message) => (message === original ? next : message)),
+        [next],
+        [],
+      ).then(() => true);
     },
     edit: (agent, id, text) => alter(agent, id, (message) => ({ ...message, text })),
     uploaded: async (agent, id, attachments, owner, originals) => {
       try {
         originals = await preparedFiles(originals);
       } catch {
-        set({ error: FAILURE });
-        return false;
+        set({ error: NOT_KEPT });
       }
       return alter(
         agent,
@@ -377,40 +430,52 @@ export const useHeld = create<HeldState>()((set, get) => {
       }),
     drop: (agent, ...ids) => {
       const owner = mailScope();
-      return change((held) =>
-        keptAs(
-          held,
-          agent,
-          (held[agent] ?? []).filter((message) => message.owner !== owner || !ids.includes(message.id) || (message.custody !== undefined && message.custody !== "failed")),
-        ),
-      );
+      const rows = get().held[agent] ?? [];
+      const gone = rows.filter((message) => message.owner === owner && ids.includes(message.id) && (message.custody === undefined || message.custody === "failed"));
+      return change(
+        agent,
+        rows.filter((message) => !gone.includes(message)),
+        [],
+        gone,
+      ).then(() => true);
     },
     settled: (agent, ...ids) => {
       const owner = mailScope();
-      return change((held) =>
-        keptAs(
-          held,
-          agent,
-          (held[agent] ?? []).filter((message) => message.owner !== owner || !ids.includes(message.id)),
-        ),
-      );
+      const rows = get().held[agent] ?? [];
+      const gone = rows.filter((message) => message.owner === owner && ids.includes(message.id));
+      return change(
+        agent,
+        rows.filter((message) => !gone.includes(message)),
+        [],
+        gone,
+      ).then(() => true);
     },
   };
 });
-// A bodyless commit event only refreshes this tab's projection; it grants no send.
+/** What another tab wrote, into this one's memory (a word on the channel carries nothing else). */
+async function reread() {
+  try {
+    useHeld.setState({ held: merged(await readAll(await database())) });
+  } catch {
+    /* this tab keeps what it has */
+  }
+}
+// A bodyless word only rereads the records; it grants no send.
 if (typeof window !== "undefined" && typeof indexedDB !== "undefined") {
   try {
-    channel = new BroadcastChannel(KEY);
-    channel.onmessage = () => {
-      void useHeld.getState().ready();
-    };
+    channel = new BroadcastChannel(DB);
+    channel.onmessage = () => void reread();
   } catch {
-    /* Visibility and real source events also read the authoritative transaction store. */
+    /* other tabs' changes show on the next visibility change */
   }
   window.addEventListener("visibilitychange", () => {
-    void useHeld.getState().ready();
+    if (document.visibilityState === "visible") void reread();
   });
   void useHeld.getState().ready();
+}
+/** The records as IndexedDB has them now (tests; a page reads `useHeld`). */
+export async function readHeld(): Promise<RecordSet> {
+  return readAll(await database());
 }
 export function heldCommand(message: Held): SendCommand {
   return {
