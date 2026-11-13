@@ -224,8 +224,8 @@ fn fingerprint(tools: &Value) -> u64 {
     h.finish()
 }
 
-/// The tools as this binary knows them alone.
-#[cfg(test)]
+/// The tools as this binary knows them alone (for the tests, which run on Unix).
+#[cfg(all(test, unix))]
 fn tools() -> Value {
     let mut t = base_tools();
     if let Some(list) = t.as_array_mut() {
