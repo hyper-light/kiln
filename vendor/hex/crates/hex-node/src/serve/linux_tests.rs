@@ -274,6 +274,7 @@ impl Lab {
                 bounds: Bounds::default(),
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             })
             .unwrap();
         let server = Server::bind(
@@ -949,6 +950,7 @@ fn a_list_longer_than_one_message_comes_whole() {
                 bounds: Bounds::default(),
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             })
             .unwrap();
     }

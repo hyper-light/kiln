@@ -198,6 +198,7 @@ fn runs_past_the_budget_are_refused(node: &Node, hard: u64) {
             bounds: Bounds::default(),
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         };
         match node.run(spec, program.clone(), Stdio::null()) {
             Ok(proc) => ran.push((id, proc)),

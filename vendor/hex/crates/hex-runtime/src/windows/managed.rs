@@ -444,6 +444,19 @@ pub(super) fn set_rate(
         .set_cpu_cap(rate, runtime.processors)
 }
 
+/// Joint plan step 14 (C5 on Windows): the last resort ends the managed VM through its receipt, the job this node holds,
+/// terminated as the receipt's own stop terminates it; its end is observed as any other. Only a VM this node holds is
+/// ended: one it hasn't taken back is refused, uncertain.
+pub(super) fn stop(runtime: &WinRuntime, record: NativeRecord<'_>) -> Result<(), Refusal> {
+    let boxed = existing(runtime, record)?.ok_or_else(|| uncertain(record))?;
+    if !boxed.is_vm() {
+        return Err(uncertain(record));
+    }
+    boxed
+        .stop_managed()
+        .map_err(super::proc::ObserveError::refusal)
+}
+
 pub(super) fn usage(
     runtime: &WinRuntime,
     record: NativeRecord<'_>,

@@ -45,6 +45,9 @@ impl Helper {
             Ok(fd) => fd,
             Err(e) => return Err(Refusal::os("making the helper socket", e)),
         };
+        // macOS's socket takes no close-on-exec flag: marked at once, so no program the node starts holds it.
+        super::private_descriptor(&fd, false)
+            .map_err(|e| Refusal::os("making the helper socket", e))?;
         // macOS has no MSG_NOSIGNAL on send; SO_NOSIGPIPE makes a write to a closed helper an EPIPE error,
         // not a SIGPIPE that would kill the node (best-effort: a failure here only risks the signal).
         let _ = rustix::net::sockopt::set_socket_nosigpipe(&fd, true);

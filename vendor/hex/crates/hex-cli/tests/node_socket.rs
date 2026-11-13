@@ -230,6 +230,7 @@ fn nofile_seen(client: &Client, class: ClassSpec) -> String {
             bounds: Bounds::default(),
             class,
             owner: None,
+            band: 0,
         })
         .unwrap();
     if client.inspect(&id).unwrap().state == BoxState::Created {
@@ -591,6 +592,7 @@ impl Fixture for OciBoxes<'_> {
             bounds,
             class: ClassSpec::Bundle(self.0.bundle_with(&Lab::act(&Act::Wait), self.1)),
             owner: None,
+            band: 0,
         }
     }
 
@@ -603,6 +605,7 @@ impl Fixture for OciBoxes<'_> {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(self.0.bundle_with(&Lab::act(act), self.1)),
             owner: None,
+            band: 0,
         }
     }
 
@@ -627,6 +630,7 @@ impl Fixture for ProcessBoxes<'_> {
             bounds,
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         }
     }
 
@@ -1077,6 +1081,7 @@ fn example(lab: &Lab, client: &Client) -> Result<(), String> {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(lab.bundle(&Lab::act(&Act::Wait))),
         owner: None,
+        band: 0,
     });
     let info = made.map_err(|e| e.to_string())?;
     assert_eq!((info.class, info.state), (Class::Oci, BoxState::Created));
@@ -1149,6 +1154,7 @@ fn namespaces_counted(lab: &Lab, client: &Client) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(lab.bundle_with(&Lab::act(&Act::Wait), true)),
             owner: None,
+            band: 0,
         })
         .unwrap();
     client.delete(&id).unwrap();
@@ -1203,6 +1209,7 @@ fn disconnect(lab: &Lab, agent: &Agent, client: &Client) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(lab.bundle(&Lab::act(&Act::Wait))),
             owner: None,
+            band: 0,
         })
         .unwrap();
     client.start(&oci).unwrap();
@@ -1215,6 +1222,7 @@ fn disconnect(lab: &Lab, agent: &Agent, client: &Client) {
             bounds: Bounds::default(),
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         })
         .unwrap();
     let oci_cg = oci_cgroup(&agent.box_root.join(OCI_BOXES), &oci);
@@ -1591,6 +1599,7 @@ fn crash_case(
         bounds: Bounds::default(),
         class,
         owner: None,
+        band: 0,
     };
     #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     let mut agent = Agent::armed(
@@ -2084,6 +2093,7 @@ fn a_box_cannot_arm_the_agents_crash_point(lab: &Lab, own: &Path, exe: &str) {
             bounds: Bounds::default(),
             class: ClassSpec::Oci(Box::new(spec)),
             owner: None,
+            band: 0,
         })
         .expect("a box naming the crash point is made");
     assert_eq!(made.state, BoxState::Created);
@@ -2154,6 +2164,7 @@ fn a_sigterm_says_the_parked_procs_and_leaves_the_boxes_as_a_sigkill_does(
                 bounds: Bounds::default(),
                 class: ClassSpec::Bundle(lab.bundle(&wait)),
                 owner: Some(o.clone()),
+                band: 0,
             })
             .unwrap();
         client.start(&id(name)).unwrap();
@@ -2259,6 +2270,7 @@ fn a_crash_with_idle_cgroups_and_live_boxes_leaves_nothing(lab: &Lab, own: &Path
                 bounds: Bounds::default(),
                 class: ClassSpec::Bundle(lab.bundle(&wait)),
                 owner: owner.cloned(),
+                band: 0,
             })
             .unwrap();
         client.start(&id(name)).unwrap();

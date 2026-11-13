@@ -417,6 +417,7 @@ impl Lab {
             } else {
                 Vec::new()
             },
+            band: 0,
         }
     }
 

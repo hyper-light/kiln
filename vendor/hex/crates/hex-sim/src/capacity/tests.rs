@@ -19,6 +19,8 @@ fn total(all: Report, r: Report) -> Report {
         adopted_at_sync: all.adopted_at_sync + r.adopted_at_sync,
         forgotten: all.forgotten + r.forgotten,
         wrongly_forgotten: all.wrongly_forgotten + r.wrongly_forgotten,
+        samples: all.samples + r.samples,
+        moved_in_window: all.moved_in_window + r.moved_in_window,
     }
 }
 
@@ -34,10 +36,11 @@ fn seeds(runners: usize, seeds: u64, steps: u64) -> Report {
 /// keeper, for 64 seeds of 2,000 steps under the nemesis (the keeper crashing between messages and at
 /// its writes, before and after they land; runners crashing, their runs outliving them or not; links
 /// dropped with what was on them, partitioned and healed; waits run out; a runner retired and released
-/// by the person); expect the work running never past the room and every running run in the keeper's
-/// books at every step, and once settled the keeper's books, each runner's and what it runs the same;
-/// and (non-vacuity) each fault struck, both sides refused for room, syncs released what ended, and a sync
-/// adopted work the person had released while its runner was away (CV6).
+/// by the person; runs' use moving, both ways, several times, in a sample's window too); expect the work
+/// running never past the room, every running run in the keeper's books and the keeper deciding in no more room
+/// than its host measured at every step, and once settled the keeper's books, each runner's and what it runs the
+/// same; and (non-vacuity) each fault struck, both sides refused for room, syncs released what ended, a sync
+/// adopted work the person had released while its runner was away (CV6), and samples saw use move in their windows.
 #[test]
 fn no_oversubscription_and_the_books_agree_across_crash_seeds() {
     let all = seeds(2, 64, 2_000);
@@ -55,7 +58,9 @@ fn no_oversubscription_and_the_books_agree_across_crash_seeds() {
             && all.released_at_sync > 0
             && all.forgotten > 0
             && all.wrongly_forgotten > 0
-            && all.adopted_at_sync > 0,
+            && all.adopted_at_sync > 0
+            && all.samples > 0
+            && all.moved_in_window > 0,
         "{all:?}"
     );
 }
@@ -156,6 +161,21 @@ fn dropping_what_the_keeper_lacks_at_a_sync_is_caught() {
     );
 }
 
+/// Non-vacuity, CV12 (withdrawn): do plant a host that credits the room each joined runner's work, the smaller of two
+/// reads on either side of its read of free memory, up to its reservations (the withdrawn rule, for any credit); expect
+/// some seed whose keeper decides in more room than its host measured.
+#[test]
+fn crediting_any_use_is_caught() {
+    let found = caught(Mutant::Credit);
+    assert!(
+        matches!(
+            found,
+            Some(Violation::Overcredited { .. } | Violation::Oversubscribed { .. })
+        ),
+        "{found:?}"
+    );
+}
+
 /// T-T7.4.1's determinism: one seed, one run.
 #[test]
 fn a_seed_names_one_run() {
@@ -192,6 +212,7 @@ fn the_record_sweep() {
         Mutant::AnswerBeforeWrite,
         Mutant::LocalIgnoresForeign,
         Mutant::DropUnknownAtSync,
+        Mutant::Credit,
     ] {
         let caught: Vec<u64> = (0..n)
             .filter(|seed| run(*seed, 2, steps, Some(mutant)).is_err())
