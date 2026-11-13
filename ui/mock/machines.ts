@@ -35,7 +35,8 @@ const runner = (name: string, os: string, arch: string, harnesses: string[], ove
 const RUNNERS: ReachRunner[] = [
   runner("adacachy", "linux", "x86_64", ["claude", "codex", "devin", "antigravity", "gemini"]),
   runner("metal-ryzen-01", "linux", "x86_64", ["claude", "codex"]),
-  runner(MAC_MINI, "macos", "aarch64", ["claude"], { hostname: "mac-mini.lan" }),
+  // The one that starts microVMs (data.ts MICROVM_RUNNERS): two harnesses, so an Agentfile is chosen for each (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 34 and 35).
+  runner(MAC_MINI, "macos", "aarch64", ["claude", "codex"], { hostname: "mac-mini.lan" }),
   runner("metal-pi-04", "linux", "aarch64", ["codex"]),
   runner("metal-nuc-old", "linux", "x86_64", ["claude"], { connected: false }),
   runner("metal-old", "linux", "x86_64", ["claude"], { fingerprint: null }),

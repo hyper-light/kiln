@@ -327,15 +327,17 @@ picks again. A grant that comes for a claim that lapsed meanwhile starts nothing
 
 **Waits.** Every wait the holder makes on its keeper (a hello's, a sync's, a reserve's, a release's,
 and so the sync again after a lost link) follows the keeper's liveness and progress alone
-(`place::keeper::Waits`): no time is seeded from records and none is multiplied (no constants:
-Shards' R03, as the user restated it on 2026-11-13; Hex's own holders seed theirs from its waits
-census, CV6, which kiln's doesn't). Its words go on one link and are answered in the order said
+(`place::keeper::Waits`; Hex's holder wait contract, decision 9, as its lead restated it on
+2026-11-13): no time is seeded from records and none is multiplied (no constants: Shards' R03, as
+the user restated it on 2026-11-13). Its words go on one link and are answered in the order said
 (CV9), so the answer due is the oldest word's. A wait ends, typed (`WaitEnded`), when the link dies,
 by the transport's own liveness rule (QUIC's idle timeout, three probe timeouts of the measured
 round trip: RFC 9000 §10.1, RFC 9002 §6.2); when the keeper starts again or resets the link
 (`Reset`: a stateless reset, RFC 9000 §10.3, or `Closed { Session }`); or when the keeper, its link
-alive, has answered nothing for longer than the slowest answer it has given in this process
-(`Stalled`), each answer timed from its word, or from the answer before it where that came later.
+alive, has said nothing for a whole window of the slowest answer it has given in this process
+(`Stalled`): the window runs from the word, or from the keeper's last word on the link where that
+came later, an answer or a hint (which answers nothing, but shows the keeper going on). Each answer
+is timed from its word, or from the answer before it where that came later; a hint times nothing.
 Until its first answer there is no such bound: a cold start waits on liveness alone, the runner
 admitting nothing new there meanwhile (CV11). A reserve whose wait ended is not granted
 (`NotGranted::Unanswered`); a stall leaves the runner `Unsynced` (`Stalled`), taking nothing new
@@ -373,6 +375,36 @@ cuts links with what was on them, drops sessions behind live links, delays words
 stalls and gives up starts: on each of 24 seeds the work running fits the machine and is in the
 keeper's books after every step, and once healed and settled the keeper's books of each runner, its
 own, its records and what runs are the same, no sync disagreeing.
+
+**The runner's node** (`reach::place::holder`, `crate::capacity::hold`). `[capacity]` names the
+machine's keeper: `keeper`, where its capacity port is reached (`host:port`), and `keeper_name`, the
+name its certificate carries; it is off unless both are declared. Its runner's node then holds
+through it. Its placement starts a holding as its records are read, under the node's durable epoch,
+its survivors the reservations its records keep of runs that went on past its last process (agent
+sessions, whose harness continues them), each with its ask's room. Its link runs apart from the
+node's loop: the holder's credentials enrolled first (`credentials`; what it can't do yet, the
+server not reached or the keeper's address not resolving, it tries again as the server comes back,
+on no clock of its own), then one link after another (`capacity::links`), each said to the node as
+it opens, its words carried both ways and its end said (`Died`, or `Reset` where the keeper started
+again or reset it). A word for the keeper goes on the link it was made for alone. A dial waits on
+QUIC's own liveness; one refused sooner, or a link that ended sooner, is followed by the next no
+sooner than QUIC's idle timeout after it began (three of RFC 9002's initial probe timeouts, §6.2.2:
+`hex_quic::limits::initial_pto`, as RFC 9000 §10.1 bounds an idle timeout), so a keeper that
+refuses at once is asked at the pace of one that answers nothing. Every start path then reserves
+before the ledger starts its run: an owner's claim (its spec held, `Spec::Wait`, until
+`Out::SpecReady`), the kernel's start (its spec the same), this node's own runs (`Out::Started`), CI
+legs (`Out::Leg`), agent sessions (`Out::Session`) and a word the owner says itself. A start said
+again while its reserve waits joins it. A reserve granted starts its run as it would have started at
+once, its reservation kept with its record (`Record::reservation`, `(epoch, seq)`) before its
+process starts; a grant the ledger then refuses (it ran here, its claim lapsed meanwhile, no room is
+left here) is given back at once. A reserve not granted starts nothing, as above. Each run's
+reservation goes back as it ends, after its record.
+
+**Boxes.** kiln's boxes on its machine are named so its keeper pairs each with what kiln holds
+there (agreed with Hex's lead; `place::holder::BoxName`): a reservation's `kiln-r<epoch>-<seq>`, the
+box of a run that asks nothing `kiln-z<epoch>-<n>` (its runner process's epoch, numbered from 0 in
+that process), each number decimal. Pairing compares ids byte for byte: an id written any other way
+(a leading zero, a sign), or in neither namespace, pairs with nothing (`Paired::Unpaired`).
 
 Its words to owners from before it: `Unsynced` is appended to the waiting reasons under the link
 feature `place.keeper` (docs/wire.md); to an owner whose link didn't name it a runner says `Strained`,
@@ -1203,14 +1235,14 @@ however many came.
   Hex's `SimView`), kiln-seams' `Capacity` seam (its simulator Hex's own keeper, CAPACITY-1 to 7,
   and Hex's keeper suite on it), the holder's identity (`crate::capacity`: kiln's CA as Hex's
   `enroll::Ca`, passing HEX-ENROLL-1 to 5; `POST /api/agents/capacity`, the machine's proof naming
-  the holder), and its link (`capacity::Quic`: `TLS13_AES_256_GCM_SHA384` asserted, framed by
-  `hex_core::capacity`, passing CAPACITY-1 to 7 against Hex's keeper over loopback QUIC). Not yet:
-  the runner's node driving the holding over that link, so nothing names a keeper yet: `[capacity]`
-  naming the keeper (its address and its certificate's name), the holding's epoch the runner's
-  durable one and its survivors from its records (each run's reservation kept with its record
-  before its process starts), every start path (a placed run's spec, a kernel start, local runs, CI
-  legs, sessions, hand-offs) waiting on its reserve's grant, and each run's reservation released as
-  it ends.
+  the holder), its link (`capacity::Quic`: `TLS13_AES_256_GCM_SHA384` asserted, framed by
+  `hex_core::capacity`, passing CAPACITY-1 to 7 against Hex's keeper over loopback QUIC), and the
+  runner's node driving the holding over it ("The runner's node": `[capacity]`, the holding's
+  durable epoch and its survivors from its records, every start path on its reserve's grant, each
+  run's reservation released as it ends; `reach::place::holder`'s tests against the seam's
+  simulator) and its boxes' names (`BoxName`). Not yet: kiln's link to Hex's keeper on two machines
+  (`hex schedule serve` on one, a runner whose `[capacity]` names it on the other), and kiln's
+  boxes named so once kiln starts Hex's boxes (it starts none yet).
 
 ## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
 

@@ -779,6 +779,7 @@ mod tests {
             place: kiln_ci::place::runner::Settings::default(),
             version: super::super::wire::VERSION,
             root: Vec::new(),
+            capacity: None,
         })?;
         Ok(handle)
     }

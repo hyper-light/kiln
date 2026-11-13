@@ -60,6 +60,43 @@ pub struct Config {
     pub reach: Reach,
     /// What this machine's runner does on its own (docs/runners.md "Pace").
     pub runner: RunnerSettings,
+    /// The machine's capacity keeper this runner holds its runs' room through (docs/lb.md "A
+    /// machine's keeper"): none until declared.
+    pub capacity: Capacity,
+}
+
+/// `[capacity]` (docs/lb.md "A machine's keeper"; Hex's capacity-view.md; kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d, step 13): the machine's capacity keeper, Hex's node, which
+/// keeps one ledger of the machine's room for Hex's boxes and kiln's runs. Declared, each run this
+/// runner starts reserves its room through the keeper and starts only on the keeper's grant, and
+/// the runner takes nothing new while it isn't synced with it. Off unless both are declared.
+///
+/// ```toml
+/// [capacity]
+/// keeper = "10.0.0.7:4433"   # where the keeper's capacity port is reached, host:port
+/// keeper_name = "node-7"     # the name its certificate carries
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Capacity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keeper: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keeper_name: Option<String>,
+}
+
+impl Capacity {
+    /// The keeper this runner holds through, where it's reached and the name its certificate
+    /// carries: none unless both are declared; why not, where one is declared without the other.
+    pub fn keeper(&self) -> Result<Option<(String, String)>, String> {
+        let said = |v: &Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        match (said(&self.keeper), said(&self.keeper_name)) {
+            (Some(at), Some(name)) => Ok(Some((at, name))),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err("`[capacity] keeper` is declared without `keeper_name`, the name the keeper's certificate carries: no keeper is held through".to_owned()),
+            (None, Some(_)) => Err("`[capacity] keeper_name` is declared without `keeper`, where the keeper is reached (host:port): no keeper is held through".to_owned()),
+        }
+    }
 }
 
 /// `[runner]` (docs/runners.md "Pace", W05-R26).
@@ -1038,6 +1075,26 @@ mod reach_tests {
         // Said back as written: nothing undeclared is.
         let said = toml::to_string(&Reach::default())?;
         anyhow::ensure!(!said.contains("overcommit_cpu") && !said.contains("tokens") && !said.contains("backfill") && !said.contains("predicted_order") && !said.contains("good_places"), "{said}");
+        Ok(())
+    }
+
+    /// docs/lb.md "A machine's keeper": `[capacity]` names the machine's keeper, where it's reached
+    /// and the name its certificate carries. None is held through until both are declared; one
+    /// without the other is refused saying which is missing; an unknown key is an error; nothing
+    /// undeclared is said back.
+    #[test]
+    fn capacity_names_its_keeper_only_when_both_are_declared() -> anyhow::Result<()> {
+        let none: Config = toml::from_str("")?;
+        anyhow::ensure!(none.capacity.keeper() == Ok(None), "off until declared: {:?}", none.capacity.keeper());
+        let both: Config = toml::from_str("[capacity]\nkeeper = \"10.0.0.7:4433\"\nkeeper_name = \"node-7\"\n")?;
+        anyhow::ensure!(both.capacity.keeper() == Ok(Some(("10.0.0.7:4433".to_owned(), "node-7".to_owned()))), "{:?}", both.capacity.keeper());
+        let at: Config = toml::from_str("[capacity]\nkeeper = \"node-7.lan:4433\"\n")?;
+        anyhow::ensure!(at.capacity.keeper().is_err_and(|e| e.contains("keeper_name")), "{:?}", at.capacity.keeper());
+        let name: Config = toml::from_str("[capacity]\nkeeper_name = \"node-7\"\nkeeper = \" \"\n")?;
+        anyhow::ensure!(name.capacity.keeper().is_err_and(|e| e.contains("host:port")), "{:?}", name.capacity.keeper());
+        anyhow::ensure!(toml::from_str::<Config>("[capacity]\nkeeper_port = 4433\n").is_err(), "an unknown key is an error");
+        let said = toml::to_string(&Capacity::default())?;
+        anyhow::ensure!(said.trim().is_empty(), "{said}");
         Ok(())
     }
 }
