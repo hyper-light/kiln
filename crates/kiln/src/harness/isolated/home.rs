@@ -96,6 +96,11 @@ pub struct RanIn {
     pub digest: String,
     /// Its image, pinned: `NAME@sha256:…`.
     pub image: String,
+    /// Where its harness keeps its conversations, as its microVM has the folder (`/home/claude/.claude`),
+    /// in one of its person's volumes: a history reads that folder's conversations as this machine has
+    /// it, whichever Agentfile laid its volumes out. None where kiln kept none (a record from before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_in: Option<String>,
 }
 
 /// Keeps `ran` in `dir` ([`ran_in_dir`]): a file for each conversation, named by its id's SHA-256 (any
@@ -384,7 +389,7 @@ mod tests {
         let t = tempfile::tempdir()?;
         let dir = ran_in_dir(&root(t.path()), "user:u1", "codex")?;
         assert_eq!(dir, root(t.path()).join("user-u1").join("codex.ran-in"), "beside the harness's volumes, never beneath");
-        let ran = RanIn { conversation: "thread/1:a".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into() };
+        let ran = RanIn { conversation: "thread/1:a".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into(), kept_in: Some("/home/codex/.codex".into()) };
         keep_ran_in(&dir, &ran)?;
         assert_eq!(ran_in(&dir, "thread/1:a"), Some(ran.clone()));
         assert_eq!(ran_in(&dir, "thread/2"), None);

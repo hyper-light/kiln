@@ -168,7 +168,7 @@ fn ran_in_of(spec: &Spec, runs: Option<&Runs>, conversation: Option<&str>) -> Op
             (b.name.to_owned(), crate::util::sha256_hex(b.text.as_bytes()))
         }
     };
-    Some((person, crate::harness::isolated::home::RanIn { conversation: conversation.to_owned(), agentfile, digest, image: image.clone() }))
+    Some((person, crate::harness::isolated::home::RanIn { conversation: conversation.to_owned(), agentfile, digest, image: image.clone(), kept_in: None }))
 }
 
 /// Keeps, beside its person's volume, which image `s`'s conversation runs in ([`ran_in_of`]), off the
@@ -5516,7 +5516,7 @@ mod tests {
         let run = Runs::Microvm { vm: None, image: "agentfile-0123@sha256:00".into(), host_pid: None, control: None, reach: None };
         let isolated = |image: Option<&str>, person: Option<&str>| Isolation { image: image.map(str::to_owned), person: person.map(str::to_owned), ..Isolation::microvm() };
         let own = Spec { kind: "claude".into(), isolation: Some(isolated(Some("agentfile:0123"), Some("user:u1"))), agentfile: Some("FROM x\n".into()), ..Spec::default() };
-        let ran = |agentfile: &str, digest: String| RanIn { conversation: "c-1".into(), agentfile: agentfile.into(), digest, image: "agentfile-0123@sha256:00".into() };
+        let ran = |agentfile: &str, digest: String| RanIn { conversation: "c-1".into(), agentfile: agentfile.into(), digest, image: "agentfile-0123@sha256:00".into(), kept_in: None };
         assert_eq!(ran_in_of(&own, Some(&run), Some("c-1")), Some(("user:u1".to_owned(), ran("agentfile:0123", crate::util::sha256_hex(b"FROM x\n")))));
         let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
         let kilns = Spec { kind: "claude".into(), isolation: Some(isolated(None, Some("owner"))), ..Spec::default() };

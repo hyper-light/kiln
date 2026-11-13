@@ -2083,7 +2083,7 @@ mod tests {
             let said = serde_json::json!({"type": "user", "sessionId": id, "cwd": "/work/a", "timestamp": "t", "message": {"role": "user", "content": "go on"}});
             std::fs::write(projects.join(format!("{id}.jsonl")), format!("{said}\n"))?;
         }
-        let kept = home::RanIn { conversation: "ran-own".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into() };
+        let kept = home::RanIn { conversation: "ran-own".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into(), kept_in: None };
         home::keep_ran_in(&home::ran_in_dir(&homes, "user:u1", "claude")?, &kept)?;
         let mut sc = Scanner::new(dir.path().to_owned()).with_homes(homes.clone());
         let machine = dir.path().join("machine");
@@ -2093,6 +2093,44 @@ mod tests {
         let mut images: Vec<(&str, Option<&str>)> = past.iter().map(|p| (p.id.as_str(), p.isolation.as_ref().and_then(|i| i.image.as_deref()))).collect();
         images.sort_unstable();
         assert_eq!(images, [("ran-own", Some("agentfile:0123")), ("ran-unkept", None)]);
+        Ok(())
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: a conversation a person's own
+    /// Agentfile kept elsewhere than kiln's does (Claude Code's folder at `/data/claude` in its microVM,
+    /// a volume kiln's Agentfile has none of) is found where its record beside their volume says its
+    /// harness keeps them (`home::RanIn::kept_in`), and goes on in that Agentfile; never for another
+    /// person, nor at a folder a record names outside its person's volume.
+    #[test]
+    fn s17_a_history_finds_a_conversation_kept_where_a_persons_own_agentfile_keeps_them() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let homes = home::root(dir.path());
+        let said = |id: &str| serde_json::json!({"type": "user", "sessionId": id, "cwd": "/work/a", "timestamp": "t", "message": {"role": "user", "content": "go on"}});
+        let projects = homes.join("user-u1").join("claude").join("data").join("claude").join("projects").join("-work-a");
+        std::fs::create_dir_all(&projects)?;
+        std::fs::write(projects.join("own-layout.jsonl"), format!("{}\n", said("own-layout")))?;
+        let kept = home::RanIn { conversation: "own-layout".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into(), kept_in: Some("/data/claude".into()) };
+        home::keep_ran_in(&home::ran_in_dir(&homes, "user:u1", "claude")?, &kept)?;
+        // A record that names a folder out of its person's volume leads nowhere: u2's folder holds a
+        // conversation that a record of u1's would reach by climbing out of u1's.
+        let theirs = homes.join("user-u2").join("claude").join("c").join("projects").join("-work-a");
+        std::fs::create_dir_all(&theirs)?;
+        std::fs::write(theirs.join("theirs.jsonl"), format!("{}\n", said("theirs")))?;
+        let climbing = home::RanIn { conversation: "climbing".into(), kept_in: Some("/../../user-u2/claude/c".into()), ..kept.clone() };
+        home::keep_ran_in(&home::ran_in_dir(&homes, "user:u1", "claude")?, &climbing)?;
+        // The machine's own folders hold nothing.
+        let machine = dir.path().join("machine");
+        let mut sc = Scanner::new(dir.path().to_owned()).with_homes(homes.clone());
+        (sc.claude, sc.codex, sc.devin, sc.running) = (machine.join("claude"), machine.join("codex"), machine.join("devin"), Some(HashSet::new()));
+        let mut found = |person: Option<&str>| -> Vec<(String, Option<String>, Option<String>)> {
+            let past = sc.history(Some("claude"), 50, &HashSet::new(), person);
+            past.into_iter().map(|p| (p.id, p.isolation.as_ref().and_then(|i| i.person.clone()), p.isolation.and_then(|i| i.image))).collect()
+        };
+        let own = [("own-layout".to_owned(), Some("user:u1".to_owned()), Some("agentfile:0123".to_owned()))];
+        assert_eq!(found(Some("user:u1")), own);
+        assert_eq!(found(Some("user:u1")), own, "the same, asked again");
+        assert!(found(Some("user:u2")).is_empty(), "u1's records are read for u1 alone, and u2 keeps none");
+        assert!(found(None).is_empty(), "asked for nobody: the machine's own alone");
         Ok(())
     }
 
