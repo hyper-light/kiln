@@ -15,21 +15,32 @@
 //!   person's sizes reach it through placement (plan step 32). No number of kiln's.
 //! - **Its run** is the member's: stdin, stdout and stderr its streams (`Proc::streams`), its end the member's,
 //!   said once its box is gone (as Hex's own `Runtime::run` says a run's end), after all it wrote. Kill and drop
-//!   delete its box (`Runtime::delete_with_host_use`), once: a delete answering `NoSuchBox` found it ended.
+//!   delete its box (`Runtime::delete_with_host_use`). If a delete fails, it is asked again as the run's end is
+//!   said. A delete answering `NoSuchBox` found the box already ended.
+//! - **Its use** (#73 part 7 slice 3; plan step 32's charge) is read while it runs through Hex's `host_use`. Hex
+//!   answers that on no event, so kiln reads it on its own charge cadence: placement's measures read a run's
+//!   [`Meter`] as its group (`reach::place::Group::Hex`). As the run ends, what it cost is kept in kiln's records
+//!   ([`USE`], [`HexVms::with_ledger`]) before anything acts on that end. The charge is Hex's final use (its
+//!   window the whole run, read with its end), or the use last read where the delete answers none or
+//!   `NoSuchBox`. A run never read and given no final use (it never started) is charged nothing.
 //! - **What it refuses, typed:** egress to whatever its image grants (`Egress::Any`): Hex's grants are default
 //!   deny, so a run names its destinations; limits and credentials it doesn't hold ([`HOLDS`]); and what Hex
 //!   refuses, in Hex's words (`Awaits` as `Unsupported`).
 
 use std::io::{BufRead as _, Write as _};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, ImageMember, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ShardsImage};
+use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ShardsImage};
 use kiln_ci::place::holder::BoxName;
+use kiln_seams::Records;
+use kiln_seams::records::{Tx, Write};
+use serde::{Deserialize, Serialize};
 use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Refusal, Run, Sandbox, Signal};
 
 /// What a box of Hex's holds its run to: no egress, egress to named destinations (each by TCP, to its harness
@@ -50,12 +61,144 @@ pub struct HexVms {
     runtime: Arc<dyn Runtime>,
     /// Names the box of a launch the seam names none for: placement's numbering (module docs).
     names: Box<dyn Fn() -> BoxName + Send + Sync>,
+    /// Kiln's records, where each run's charge is kept as it ends ([`USE`]). With none, nothing is kept and the use
+    /// is said at debug.
+    ledger: Option<Arc<dyn Records>>,
+    /// Each live run's VM by its box's name, for its [`Meter`]. Let go of with its run.
+    vms: parking_lot::Mutex<HashMap<String, Weak<Vm>>>,
+}
+
+/// The family of kiln's records each microVM's charge is kept in as its run ends: keyed by its box's name, a
+/// [`Charged`] in JSON.
+pub const USE: &str = "hex.use";
+
+/// Which use a run was charged: Hex's final one, read with its end, its window the whole run; or the last one read
+/// while it ran, where its delete answered none or found it gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Charge {
+    Final,
+    LastRead,
+}
+
+/// A run's charge as [`USE`] keeps it: Hex's [`HostUse`], its window in nanoseconds, and which use it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Charged {
+    pub of: Charge,
+    pub cpu_ns: u64,
+    pub footprint_bytes: u64,
+    pub resident_bytes: u64,
+    pub guest_ns: Vec<u64>,
+    pub window_ns: u64,
+}
+
+impl Charged {
+    pub fn of(used: &HostUse, of: Charge) -> Self {
+        let window_ns = u64::try_from(used.window.as_nanos()).unwrap_or(u64::MAX);
+        Charged { of, cpu_ns: used.cpu_ns, footprint_bytes: used.footprint_bytes, resident_bytes: used.resident_bytes, guest_ns: used.guest_ns.clone(), window_ns }
+    }
+}
+
+/// A run's VM as kiln charges it: Hex's runtime and its box, the use last read of it (Hex's final use once its
+/// delete answered one), and the records its charge is kept in.
+struct Vm {
+    runtime: Arc<dyn Runtime>,
+    id: BoxId,
+    name: String,
+    last: parking_lot::Mutex<Option<(HostUse, Charge)>>,
+    ledger: Option<Arc<dyn Records>>,
+}
+
+/// What a run's VM uses, as one read of it says. Its CPUs are in thousandths, over the time since the read before
+/// (over its whole window from its boot, at the first read). Its memory is counted as Hex counts a VM's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Used {
+    pub cpu_milli: u64,
+    pub footprint_bytes: u64,
+}
+
+/// A live run's VM, read on its charge's cadence ([`HexVms::meter`]).
+#[derive(Clone)]
+pub struct Meter(Arc<Vm>);
+
+impl std::fmt::Debug for Meter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Meter").field(&self.0.name).finish()
+    }
+}
+
+impl Meter {
+    /// Reads what its VM costs its host now, and keeps it as the use last read. This is Hex's `host_use`, short and
+    /// synchronous as Hex's calls are. Its CPUs are its CPU time over its window's growth since the read before.
+    /// Both are counters its run host reads together, so no clock of kiln's enters it. Refused, in Hex's words,
+    /// where its box is gone or its run host read none.
+    pub fn read(&self) -> Result<Used, hex_api::Refusal> {
+        let now = self.0.runtime.host_use(&self.0.id)?;
+        let mut last = self.0.last.lock();
+        let (cpu0, window0) = match &*last {
+            Some((u, Charge::LastRead)) if u.window <= now.window => (u.cpu_ns, u.window),
+            _ => (0, Duration::ZERO),
+        };
+        let span = now.window.saturating_sub(window0).as_nanos();
+        let milli = u128::from(now.cpu_ns.saturating_sub(cpu0)).saturating_mul(1000) / span.max(1);
+        let used = Used { cpu_milli: u64::try_from(milli).unwrap_or(u64::MAX), footprint_bytes: now.footprint_bytes };
+        // Once its delete has answered a final use, that use is what the run is charged: no read replaces it.
+        if !matches!(*last, Some((_, Charge::Final))) {
+            *last = Some((now, Charge::LastRead));
+        }
+        Ok(used)
+    }
+}
+
+impl Vm {
+    /// Keeps `used` as this run's charge in kiln's records, durably, before its caller acts on its end.
+    async fn keep(&self, used: &HostUse, of: Charge) -> Result<(), String> {
+        let Some(ledger) = &self.ledger else {
+            tracing::debug!(vm = %self.name, ?of, cpu_ns = used.cpu_ns, footprint_bytes = used.footprint_bytes, window_ms = used.window.as_millis(), "its VM's cost over its run");
+            return Ok(());
+        };
+        let value = serde_json::to_vec(&Charged::of(used, of)).map_err(|e| e.to_string())?;
+        let put = Write::Put { family: USE.into(), key: self.name.as_bytes().to_vec(), value };
+        ledger.commit(Tx { conds: Vec::new(), writes: vec![put] }).await.map(drop).map_err(|e| format!("its charge wasn't kept: {e}"))
+    }
+}
+
+/// Deletes `vm`'s box and keeps what it cost before anything acts on its end (module docs).
+/// - Where its delete answers a final use, that use is charged.
+/// - Where it answers none (its end unread) or `NoSuchBox` (an earlier delete ended it and its answer was lost), the
+///   use last read is charged. Where none was ever read (a run that never started), nothing is.
+///
+/// An error where its box may still be there or its charge wasn't kept, so a later delete asks again.
+async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
+    let (runtime, id) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(|e| e.to_string())?);
+    let answered = crate::rt::blocking(move || runtime.delete_with_host_use(&id)).await.map_err(|e| format!("its delete didn't run: {e:#}"))?;
+    match answered {
+        Ok(Some(used)) => *vm.last.lock() = Some((used, Charge::Final)),
+        Ok(None) | Err(hex_api::Refusal::NoSuchBox(_)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let charge = vm.last.lock().clone();
+    match charge {
+        Some((used, of)) => vm.keep(&used, of).await,
+        None => Ok(()),
+    }
 }
 
 impl HexVms {
     /// Over Hex's runtime `runtime`, naming each launch's box with `names`.
     pub fn new(runtime: Arc<dyn Runtime>, names: impl Fn() -> BoxName + Send + Sync + 'static) -> Self {
-        Self { runtime, names: Box::new(names) }
+        Self { runtime, names: Box::new(names), ledger: None, vms: parking_lot::Mutex::new(HashMap::new()) }
+    }
+
+    /// Keeps each run's charge in `ledger`, kiln's records ([`USE`]), as it ends.
+    pub fn with_ledger(self, ledger: Arc<dyn Records>) -> Self {
+        Self { ledger: Some(ledger), ..self }
+    }
+
+    /// The meter of live run `vm` (its box's name, `Run::id`), for placement to read its use on its charge's
+    /// cadence. None once its run is let go of.
+    pub fn meter(&self, vm: &str) -> Option<Meter> {
+        self.vms.lock().get(vm).and_then(Weak::upgrade).map(Meter)
     }
 
     /// `launch` in a box named `name`: created, started and its harness member's streams taken, or refused, typed,
@@ -75,9 +218,30 @@ impl HexVms {
         let class = ShardsImage { grants, members: vec![driven], shares, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation()?), route: None, band: 0 };
-        let (runtime, at) = (Arc::clone(&self.runtime), id.try_clone().map_err(seam)?);
-        let made = crate::rt::blocking(move || boot(&*runtime, spec, &at, &member)).await.map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })??;
-        HexRun::start(Arc::clone(&self.runtime), id, made)
+        let name = id.to_string();
+        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), last: parking_lot::Mutex::new(None), ledger: self.ledger.clone() });
+        let runtime = Arc::clone(&self.runtime);
+        let made = crate::rt::blocking(move || boot(&*runtime, spec, &id, &member)).await.map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?;
+        let started = match made {
+            Ok(made) => HexRun::start(Arc::clone(&vm), made),
+            // No box was made: none to delete (the name may be another's).
+            Err((why, false)) => return Err(seam(why)),
+            Err((why, true)) => Err(seam(why)),
+        };
+        match started {
+            Ok(run) => {
+                let mut vms = self.vms.lock();
+                vms.retain(|_, v| v.strong_count() > 0);
+                vms.insert(name, Arc::downgrade(&vm));
+                Ok(Box::new(run))
+            }
+            Err(why) => {
+                if let Err(e) = finish(&vm).await {
+                    tracing::warn!(vm = %name, error = %e, "a microVM whose launch failed wasn't deleted");
+                }
+                Err(why)
+            }
+        }
     }
 }
 
@@ -134,9 +298,10 @@ fn allocation() -> Result<Allocation, Refusal> {
     cost.allocate(guest).map_err(seam)
 }
 
-/// Creates `spec`'s box, starts it and takes `member`'s run and streams: or deletes what it made and says why.
-fn boot(runtime: &dyn Runtime, spec: BoxSpec, id: &BoxId, member: &Member) -> Result<(Box<dyn Proc>, hex_api::Given), Refusal> {
-    runtime.create(spec).map_err(seam)?;
+/// Creates `spec`'s box, starts it and takes `member`'s run and streams. Otherwise says why, and whether it made the
+/// box, which its caller then deletes ([`finish`]).
+fn boot(runtime: &dyn Runtime, spec: BoxSpec, id: &BoxId, member: &Member) -> Result<(Box<dyn Proc>, hex_api::Given), (hex_api::Refusal, bool)> {
+    runtime.create(spec).map_err(|why| (why, false))?;
     // A start answering `Lifecycle { Pending }` (its boot past Hex's learned patience, decision 9) is refused with
     // the rest: Hex's `Runtime` has no call that waits on a booting box (`member` and `inspect` answer at once), and
     // kiln asks again on no clock of its own (R03). Its delete ends the boot (Hex's change (b), in its push after
@@ -145,27 +310,7 @@ fn boot(runtime: &dyn Runtime, spec: BoxSpec, id: &BoxId, member: &Member) -> Re
         let given = p.streams()?;
         Ok((p, given))
     });
-    taken.map_err(|why| {
-        if let Err(e) = delete(runtime, id) {
-            tracing::warn!(vm = %id, error = %e, "a microVM whose launch failed wasn't deleted");
-        }
-        seam(why)
-    })
-}
-
-/// Deletes box `id`, once, as kill, drop and a run's end do: gone where Hex deleted it, or found it gone
-/// (`NoSuchBox`: another delete ended it). What its VM cost its host over its run is said at debug.
-fn delete(runtime: &dyn Runtime, id: &BoxId) -> Result<(), hex_api::Refusal> {
-    match runtime.delete_with_host_use(id) {
-        Ok(used) => {
-            if let Some(u) = used {
-                tracing::debug!(vm = %id, cpu_ns = u.cpu_ns, footprint_bytes = u.footprint_bytes, window_ms = u.window.as_millis(), "its VM's cost over its run");
-            }
-            Ok(())
-        }
-        Err(hex_api::Refusal::NoSuchBox(_)) => Ok(()),
-        Err(e) => Err(e),
-    }
+    taken.map_err(|why| (why, true))
 }
 
 /// Hex's refusal as the seam's: an invalid request as it is; what Hex awaits, or its platform or configuration
@@ -198,19 +343,18 @@ impl crate::memory::queue::Weigh for Said {
     }
 }
 
-/// Where its box's delete stands: none asked, under way (its answer to come), or done.
+/// Where its box's delete stands: none asked, under way (whether it ended its box with its charge kept is still to
+/// come), or done.
 enum Life {
     Running,
-    Deleting(oneshot::Receiver<()>),
+    Deleting(oneshot::Receiver<bool>),
     Deleted,
 }
 
 /// A harness member's run in its box.
 struct HexRun {
-    /// Hex's runtime, as Hex hands it out ([`HexVms::runtime`]).
-    runtime: Arc<dyn Runtime>,
-    id: BoxId,
-    name: String,
+    /// Its VM: Hex's runtime, as Hex hands it out ([`HexVms::runtime`]), its box and its charge.
+    vm: Arc<Vm>,
     stdin: crate::memory::queue::Sender<Vec<u8>>,
     said: crate::memory::queue::Receiver<Said>,
     reading: futures::lock::Mutex<()>,
@@ -221,15 +365,10 @@ struct HexRun {
 
 impl HexRun {
     /// The run of the member [`boot`] took in box `id`: a thread writes its stdin, one reads each of its stdout and
-    /// stderr, and one waits for its end, then closes its stdin and, all it wrote read, says its end. Its box is
-    /// deleted where a thread can't start.
-    fn start(runtime: Arc<dyn Runtime>, id: BoxId, (proc, given): (Box<dyn Proc>, hex_api::Given)) -> Result<Box<dyn Run>, Refusal> {
-        let failed = |why: String| {
-            if let Err(e) = delete(&*runtime, &id) {
-                tracing::warn!(vm = %id, error = %e, "a microVM whose run couldn't start wasn't deleted");
-            }
-            Refusal::Invalid { what: "its microVM's streams", why }
-        };
+    /// stderr, and one waits for its end, then closes its stdin and, all it wrote read, says its end. Refused where a
+    /// thread can't start, and its caller deletes its box.
+    fn start(vm: Arc<Vm>, (proc, given): (Box<dyn Proc>, hex_api::Given)) -> Result<HexRun, Refusal> {
+        let failed = |why: String| Refusal::Invalid { what: "its microVM's streams", why };
         let (Some(stdin), Some(stdout), Some(stderr)) = (given.stdin, given.stdout, given.stderr) else {
             return Err(failed("Hex gave its member's streams short".into()));
         };
@@ -265,59 +404,43 @@ impl HexRun {
         if let Err(e) = threads {
             return Err(failed(format!("its threads: {e}")));
         }
-        let name = id.to_string();
-        Ok(Box::new(HexRun { runtime, id, name, stdin: in_tx, said, reading: futures::lock::Mutex::new(()), life: parking_lot::Mutex::new(Life::Running), killed: AtomicBool::new(false), given_end: AtomicBool::new(false) }))
+        Ok(HexRun { vm, stdin: in_tx, said, reading: futures::lock::Mutex::new(()), life: parking_lot::Mutex::new(Life::Running), killed: AtomicBool::new(false), given_end: AtomicBool::new(false) })
     }
 
     fn over(&self) -> bool {
         self.killed.load(Ordering::Acquire) || self.given_end.load(Ordering::Acquire)
     }
 
-    /// Deletes its box on the blocking pool, unless a delete was asked already: kill's and drop's.
+    /// Deletes its box and keeps its charge ([`finish`]), unless a delete was asked already: kill's and drop's.
     fn delete_soon(&self) {
         let mut life = self.life.lock();
         if !matches!(*life, Life::Running) {
             return;
         }
-        let id = match self.id.try_clone() {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(vm = %self.name, error = %e, "a microVM wasn't deleted");
-                return;
-            }
-        };
         let (done, wait) = oneshot::channel();
         *life = Life::Deleting(wait);
-        let runtime = Arc::clone(&self.runtime);
+        let vm = Arc::clone(&self.vm);
         drop(crate::rt::spawn(async move {
-            let deleted = crate::rt::blocking(move || delete(&*runtime, &id).map_err(|e| (id, e))).await;
-            match deleted {
-                Ok(Ok(())) => {}
-                Ok(Err((id, e))) => tracing::warn!(vm = %id, error = %e, "a microVM wasn't deleted"),
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "a microVM's delete didn't run"),
+            let finished = finish(&vm).await;
+            if let Err(e) = &finished {
+                tracing::warn!(vm = %vm.name, error = %e, "a microVM wasn't deleted, or its charge wasn't kept: asked again as its end is said");
             }
-            let _ = done.send(());
+            let _ = done.send(finished.is_ok());
         }));
     }
 
-    /// Its box gone: deleted here, or the delete under way answered.
+    /// Its box gone and its charge kept, by the delete under way or by one asked here. One is asked here again where
+    /// the one under way failed: a delete whose answer was lost finds its box gone (`NoSuchBox`) and charges the use
+    /// last read.
     async fn gone(&self) {
         let life = std::mem::replace(&mut *self.life.lock(), Life::Deleted);
-        match life {
-            Life::Running => {
-                let (runtime, id) = (Arc::clone(&self.runtime), self.id.try_clone());
-                let deleted = match id {
-                    Ok(id) => crate::rt::blocking(move || delete(&*runtime, &id).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(format!("{e:#}"))),
-                    Err(e) => Err(e.to_string()),
-                };
-                if let Err(e) = deleted {
-                    tracing::warn!(vm = %self.name, error = %e, "a microVM whose run ended wasn't deleted");
-                }
-            }
-            Life::Deleting(wait) => {
-                let _ = wait.await;
-            }
-            Life::Deleted => {}
+        let finished = match life {
+            Life::Running => false,
+            Life::Deleting(wait) => wait.await.unwrap_or(false),
+            Life::Deleted => true,
+        };
+        if !finished && let Err(e) = finish(&self.vm).await {
+            tracing::warn!(vm = %self.vm.name, error = %e, "a microVM whose run ended wasn't deleted, or its charge wasn't kept");
         }
     }
 }
@@ -400,7 +523,7 @@ impl Run for HexRun {
             Signal::Interrupt => hex_api::Signal::INT,
             Signal::Terminate => hex_api::Signal::TERM,
         };
-        self.runtime.signal(&self.id, to).map_err(seam)
+        self.vm.runtime.signal(&self.vm.id, to).map_err(seam)
     }
 
     fn kill(&self) {
@@ -412,7 +535,7 @@ impl Run for HexRun {
     }
 
     fn id(&self) -> Option<String> {
-        Some(self.name.clone())
+        Some(self.vm.name.clone())
     }
 
     // Its stdio ride the member's streams from its run host, no link of Shards' agent control.
@@ -424,60 +547,6 @@ impl Run for HexRun {
 impl Drop for HexRun {
     fn drop(&mut self) {
         self.delete_soon();
-    }
-}
-
-/// #73 part 7 slice 3's surface, its behaviour to come (red).
-pub const USE: &str = "hex.use";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Charge {
-    Final,
-    LastRead,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Charged {
-    pub of: Charge,
-    pub cpu_ns: u64,
-    pub footprint_bytes: u64,
-    pub resident_bytes: u64,
-    pub guest_ns: Vec<u64>,
-    pub window_ns: u64,
-}
-
-impl Charged {
-    pub fn of(used: &hex_api::HostUse, of: Charge) -> Self {
-        let window_ns = u64::try_from(used.window.as_nanos()).unwrap_or(u64::MAX);
-        Charged { of, cpu_ns: used.cpu_ns, footprint_bytes: used.footprint_bytes, resident_bytes: used.resident_bytes, guest_ns: used.guest_ns.clone(), window_ns }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Used {
-    pub cpu_milli: u64,
-    pub footprint_bytes: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct Meter;
-
-impl Meter {
-    pub fn read(&self) -> Result<Used, hex_api::Refusal> {
-        Err(hex_api::Refusal::Invalid { what: "host_use", why: "not read yet".into() })
-    }
-}
-
-impl HexVms {
-    pub fn with_ledger(self, ledger: Arc<dyn kiln_seams::Records>) -> Self {
-        drop(ledger);
-        self
-    }
-
-    pub fn meter(&self, vm: &str) -> Option<Meter> {
-        let _ = vm;
-        None
     }
 }
 
