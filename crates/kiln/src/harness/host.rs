@@ -5028,7 +5028,10 @@ while True:
             let host = with_inbox(tx);
             // Its image already in the store of the machine's microVMs, as its build left it: nothing is built.
             let (images, pinned) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
-            let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program));
+            // Its stdio said to ride a link whose ends each negotiated AES-256-GCM (Shards' agent control).
+            let end = || kiln_seams::sandbox::Negotiated { suite: "TLS13_AES_256_GCM_SHA384".into(), group: "X25519MLKEM768".into() };
+            let link = kiln_seams::sandbox::Link { controller: end(), endpoint: end() };
+            let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program).linked(link.clone()));
             host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images });
             let cwd = dir.path().to_string_lossy().into_owned();
             let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), isolation: Some(session::Isolation::microvm()), ..Spec::default() };
@@ -5042,6 +5045,15 @@ while True:
             assert_eq!((launch.program.as_str(), &launch.boundary, launch.folder.as_deref()), ("claude", &Boundary::MicroVm { image: pinned.clone() }, Some(cwd.as_str())));
             assert!(pinned.starts_with("harness-claude@sha256:"), "kiln's image for Claude Code, pinned by its digest: {pinned}");
             assert!(launch.args.iter().any(|a| a == "--session-id"), "its session's own flags, past its image's: {:?}", launch.args);
+            // Where it runs, on its info (step 34's checks read it): its microVM by name, its image pinned,
+            // no host pid, said so, and the link its stdio rides, both ends' words once it's made.
+            until_it("its link, said", 60, || matches!(s.info().runs, Some(session::Runs::Microvm { control: Some(_), .. }))).await?;
+            assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()) }));
+            let info = serde_json::to_value(s.info())?;
+            assert_eq!(info.pointer("/runs/in"), Some(&serde_json::json!("microvm")));
+            assert_eq!(info.pointer("/runs/host_pid"), Some(&serde_json::Value::Null), "no host pid, said rather than left out");
+            assert_eq!(info.pointer("/runs/control/endpoint/suite"), Some(&serde_json::json!("TLS13_AES_256_GCM_SHA384")));
+            assert_eq!(info.pointer("/starts/0/runs/vm"), Some(&serde_json::json!("fake-vm-1")));
             // Steered: a message is a turn, answered.
             assert!(host.command("isolated", message("m1", "hello")));
             until_it("m1's turn, over", 60, || idle() && s.core.lock().state.harness_session.is_some()).await?;
@@ -5058,6 +5070,12 @@ while True:
             let conversation_id = conversation.clone().unwrap_or_default();
             assert!(resumed.args.windows(2).any(|w| w == ["--resume", conversation_id.as_str()]), "resumed through its launch's arguments: {:?}", resumed.args);
             until_it("it back", 60, idle).await?;
+            // kiln's record: two starts, each in a microVM of its own, none on the host, the first ended.
+            let starts = s.info().starts;
+            assert_eq!(starts.len(), 2, "{starts:?}");
+            assert!(starts.first().is_some_and(|x| x.ended.is_some()), "the first ended: {starts:?}");
+            assert!(starts.iter().all(|x| matches!(&x.runs, session::Runs::Microvm { host_pid: None, .. })), "none on the host: {starts:?}");
+            assert!(matches!(starts.get(1).map(|x| &x.runs), Some(session::Runs::Microvm { vm: Some(vm), .. }) if vm == "fake-vm-2"), "{starts:?}");
             let answers = || s.core.lock().events().filter(|e| matches!(e.body, super::super::model::Body::Assistant { .. })).count();
             assert!(host.command("isolated", message("m2", "and again")));
             until_it("m2's turn, over", 60, || idle() && answers() >= 2).await?;
@@ -5079,6 +5097,8 @@ while True:
             assert!(members.len() >= 2, "two runs of its member read what it was sent: {members:?}");
             assert!(host.close("isolated"));
             until_it("every run of its member ended", 60, || members.iter().all(|p| !crate::os::pid_alive(*p))).await?;
+            until_it("kiln's record, each start ended", 60, || s.info().runs.is_none() && s.info().starts.iter().all(|x| x.ended.is_some())).await?;
+            assert_eq!(s.info().starts.len(), 2, "no start but the two");
             Ok(())
         })
     }
@@ -5143,6 +5163,13 @@ while True:
             until_it("it ending, to start again", 30, || s.core.lock().state.exit.as_ref().is_some_and(|x| x.again_at.is_some())).await?;
             assert_eq!(super::super::wait::stand(&s.info()), "working", "{:?}", s.info().exit);
             until_it("it back by itself", 60, || idle() && s.pid.lock().is_some_and(|p| p != first)).await?;
+            // kiln's record (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17): where it runs now, and each
+            // start, the first ended by the signal (no code).
+            let now = s.pid.lock().ok_or_else(|| anyhow::anyhow!("no harness"))?;
+            let info = s.info();
+            assert_eq!(info.runs, Some(session::Runs::Host { pid: now }));
+            let record: Vec<_> = info.starts.iter().map(|x| (x.runs.clone(), x.ended.as_ref().map(|e| e.code))).collect();
+            assert_eq!(record, [(session::Runs::Host { pid: first }, Some(None)), (session::Runs::Host { pid: now }, None)]);
             assert_eq!(s.core.lock().state.harness_session, conversation, "the same conversation");
             assert!(s.core.lock().state.exit.is_none(), "it runs again");
             let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));

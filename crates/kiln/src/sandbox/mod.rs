@@ -28,7 +28,7 @@ use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use kiln_seams::Sandbox;
-use kiln_seams::sandbox::{Exit, Output, Refusal, Run, Signal};
+use kiln_seams::sandbox::{Exit, Link, Output, Refusal, Run, Signal};
 
 /// A machine's microVMs: the sandbox an isolated agent's harness runs in, a microVM of its own, and
 /// the images they boot.
@@ -162,6 +162,15 @@ impl Run for ProcRun {
             return;
         }
         self.proc.terminate(Duration::ZERO);
+    }
+
+    // A process of the machine's: its pid names it, and its stdio are its pipes.
+    fn id(&self) -> Option<String> {
+        None
+    }
+
+    fn link(&self) -> BoxFuture<'_, Option<Link>> {
+        Box::pin(async { None })
     }
 }
 

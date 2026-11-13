@@ -58,6 +58,22 @@ the machine's network) is replaced by an Agentfile image's members.
 - **It's no process of the machine's**: its session has no pid (`Duplex::host_pid` is none), nothing
   of it is in the session's group of processes, and it is never handed across an in-place upgrade
   (it stops, and starts again in the next image, its conversation going on).
+- **Its session says where it runs** (`GET /api/harness/sessions/:id`, the session's state): `runs`
+  is `{"in": "host", "pid": N}` for a process of the machine's, and for a microVM's member `{"in":
+  "microvm", "vm": <the microVM's own name, as its runtime gives it>, "image": "NAME@sha256:…",
+  "host_pid": null, "control": {"controller": {"suite", "group"}, "endpoint": {"suite", "group"}}}`.
+  `host_pid` is read from its run's handle and always said, so a check reads it rather than an
+  absence. `control` is the link its stdio rides into the microVM, as each end says its TLS 1.3
+  handshake negotiated (rustls's names, or the IANA code where rustls has none): the controller's on
+  the machine and the endpoint's own report from inside (Shards' agent control, step 11). It's
+  absent until that link is made (`Run::link`, awaited once, never polled), and today's stdio are
+  Shards' run pipes, which ride no link.
+- **kiln's record of what it started for it** (`starts`): each start of its harness, when (`at`),
+  where (`runs`, as it was as it started) and how it ended (`ended`: when, and its exit code where it
+  was seen), kept with the session and handed to kiln's next image with it. A harness that ran and
+  ended between two looks at the machine's processes is still in it; a start taken over in an
+  in-place upgrade is the same start. It grows one entry a start, as kiln's restart rule paces
+  starts (`AGAIN_*`, `SOON_TRIES`): no number of its own.
 
 What a session does to its harness maps onto the member:
 

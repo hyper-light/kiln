@@ -92,7 +92,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, vms: &Microvms) -> anyhow::Result<
     let image = vms.images.pinned(source).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
     launch.boundary = Boundary::MicroVm { image: image.clone() };
     let run = vms.sandbox.launch(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
-    Ok(crate::proc::duplex_of_run(run))
+    Ok(crate::proc::duplex_of_run(run, image))
 }
 
 #[cfg(test)]
