@@ -149,7 +149,7 @@ mod checks {
             format!("NETWORK --egress={MACHINE}:{port} kiln FOR claude"),
             format!("NETWORK --egress={port}/tcp kiln FOR claude"),
             format!("NETWORK --expose={below}-{above} kiln FOR claude"),
-            format!("MCP kiln http://{MACHINE}:{port}/api/mcp"),
+            format!("MCP kiln FROM http://{MACHINE}:{port}/api/mcp FOR claude"),
         ] {
             assert_eq!(grants_to_kiln(&with(&line), &[port]).map(|found| found.len()), Ok(1), "{line}");
         }

@@ -240,10 +240,8 @@ pub fn grants_to_kiln(agentfile: &str, ports: &[u16]) -> Result<Vec<String>, Str
                     }
                 }
             }
-            Directive::Mcp(m) => {
-                if mcp_endpoint(&m.source).is_some_and(|(host, port)| at_kiln(&host, port)) {
-                    found.push(format!("MCP {} {}", words(&m.name), words(&m.source)));
-                }
+            Directive::Mcp(m) if mcp_endpoint(&m.source).is_some_and(|(host, port)| at_kiln(&host, port)) => {
+                found.push(format!("MCP {} {}", words(&m.name), words(&m.source)));
             }
             _ => {}
         }
