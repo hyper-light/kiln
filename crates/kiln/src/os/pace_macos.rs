@@ -7,8 +7,9 @@
 //!   unprivileged CPU clock (`powermetrics` needs root);
 //! - the run queue: the 1-minute load average (`vm.loadavg`, the scheduler's exponentially decayed
 //!   count of runnable threads);
-//! - swap: `vm.swapusage` and `host_statistics64`'s `HOST_VM_INFO64` `swapins` (pages swapped in
-//!   from the compressor's swap files), read with the host's pages ([`kiln_ci::facts::VmPages`]);
+//! - swap: `vm.swapusage` and the pages swapped in from the compressor's swap files, read with the
+//!   host's pages ([`kiln_ci::facts::VmPages`]): live where the host keeps the count
+//!   (`vm.compressor.swapper.swapins_total`), else `HOST_VM_INFO64`'s, none for a copy said before;
 //! - the battery: IOKit's power sources (`IOPSCopyPowerSourcesInfo`: the internal battery's `Power
 //!   Source State` and capacity);
 //! - the work device's counters ([`crate::os::sense_disk_macos`]).
@@ -26,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 
-use crate::os::sense::cf;
+use crate::os::sense::{cf, sysctl};
 use crate::sense::pace::Raw;
 
 const THERMAL: &CStr = c"com.apple.system.thermalpressurelevel";
@@ -73,19 +74,11 @@ unsafe extern "C" {
     fn CFArrayGetValueAtIndex(a: cf::CFTypeRef, i: cf::CFIndex) -> cf::CFTypeRef;
 }
 
-/// A sysctl's value by name, as `T`.
-fn sysctl<T: Default>(name: &CStr) -> Option<T> {
-    let mut v = T::default();
-    let mut len = std::mem::size_of::<T>();
-    // SAFETY: `v` is `len` bytes, written by the kernel up to that.
-    let rc = unsafe { nix::libc::sysctlbyname(name.as_ptr(), (&raw mut v).cast(), &raw mut len, std::ptr::null_mut(), 0) };
-    (rc == 0 && len == std::mem::size_of::<T>()).then_some(v)
-}
-
 /// Pages swapped in so far, from the one reading of the host's VM statistics
-/// ([`kiln_ci::facts::VmPages`], [`crate::os::sense::memory_pages`]).
-fn swapins() -> Option<u64> {
-    crate::os::sense::memory_pages().map(|(pages, _)| pages.swapins)
+/// ([`kiln_ci::facts::VmPages`], [`crate::os::sense::memory_pages`]): the host's live count where it
+/// keeps one, else the count of XNU's copy, with that copy.
+fn swapins() -> Option<(u64, Option<u64>)> {
+    crate::os::sense::memory_pages().map(|(pages, _)| (pages.swapins, (!pages.swapins_live).then_some(pages.copy)))
 }
 
 /// The internal battery: on battery or not, and how full; none without one.
@@ -114,10 +107,12 @@ fn battery() -> (Option<bool>, Option<u8>) {
     }
 }
 
-/// This machine's reads: the thermal level's token, and the work device.
+/// This machine's reads: the thermal level's token, the work device, and the copy of XNU's VM statistics
+/// its last swap-in count was of.
 pub struct Reader {
     thermal: Option<c_int>,
     device: Option<crate::os::sense_disk_macos::Device>,
+    copy: Option<u64>,
 }
 
 impl Reader {
@@ -125,7 +120,7 @@ impl Reader {
         let mut token: c_int = 0;
         // SAFETY: a NUL-terminated name, a token written on success.
         let ok = unsafe { notify_register_check(THERMAL.as_ptr(), &raw mut token) } == 0;
-        Reader { thermal: ok.then_some(token), device: crate::os::sense_disk_macos::Device::of(work_dir) }
+        Reader { thermal: ok.then_some(token), device: crate::os::sense_disk_macos::Device::of(work_dir), copy: None }
     }
 
     pub fn read(&mut self) -> Raw {
@@ -142,7 +137,12 @@ impl Reader {
             level,
             runnable,
             cpus: u32::try_from(std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1)).unwrap_or(1),
-            swapins: swapins(),
+            // A copy's count it said before says nothing of the time since: none then, never a rate of zero
+            // (`kiln_ci::facts::VmPages::copy`).
+            swapins: swapins().and_then(|(n, copy)| match copy {
+                Some(c) => (self.copy.replace(c) != Some(c)).then_some(n),
+                None => Some(n),
+            }),
             swap,
             device: self.device.as_mut().and_then(crate::os::sense_disk_macos::Device::counters),
             on_battery,
@@ -230,10 +230,101 @@ mod tests {
             t.elapsed().as_micros()
         };
         let costs = (time(&|| { let _ = std::hint::black_box(swapins()); }), time(&|| { let _ = std::hint::black_box(sysctl::<SwapUsage>(c"vm.swapusage")); }), time(&|| { let _ = std::hint::black_box(battery()); }), time(&|| { let _ = std::hint::black_box(sysctl::<LoadAvg>(c"vm.loadavg")); }));
-        assert!(b.cpus > 0 && b.level.is_some() && b.runnable.is_some() && b.swapins.is_some(), "{b:?}");
+        // A reader's first count is always said; a later one is none where it would be a copy of XNU's
+        // said before (another program, or a test beside this, read the host's VM statistics meanwhile).
+        assert!(b.cpus > 0 && b.level.is_some() && b.runnable.is_some() && a.swapins.is_some(), "{a:?} then {b:?}");
         let mut kept = crate::sense::pace::Kept::default();
         let read = crate::sense::pace::between(&a, &b, 200_000, &mut kept);
         eprintln!("macos read: {} µs, then {} µs (swapins {} µs, swapusage {} µs, battery {} µs, loadavg {} µs); level {:?}, runnable {:?}, swap {:?}, battery {:?} {:?}; {read:?}", first.as_micros(), second.as_micros(), costs.0, costs.1, costs.2, costs.3, b.level, b.runnable, b.swap, b.on_battery, b.percent);
+    }
+
+    unsafe extern "C" {
+        fn mach_host_self() -> u32;
+        fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        static mach_task_self_: u32;
+    }
+
+    /// The host's live count of pages swapped in, where it keeps one (`vm.compressor.swapper.swapins_total`:
+    /// `vm_statistics_swapins`, the counter `HOST_VM_INFO64`'s `swapins` is read from, bsd/vm/vm_unix.c and
+    /// osfmk/kern/host.c); none where it doesn't (macOS 26.2 has none).
+    fn live_swapins() -> Option<u64> {
+        sysctl::<u64>(c"vm.compressor.swapper.swapins_total")
+    }
+
+    /// Stops the other reader as it drops, however the test leaves its scope.
+    struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// W05-R26: the swap-ins a Mac's pace reads while another program reads the host's VM statistics
+    /// through `host_statistics64(HOST_VM_INFO64)`, as Macs' monitors and other kiln processes do. XNU
+    /// answers that call from one copy every process that isn't Apple's shares, fresh for the first 2 to
+    /// 10 calls of each second and that copy for the rest of it (`rate_limit_host_statistics`,
+    /// osfmk/kern/host.c, xnu-12377.121.6): a read inside the window of the read before had that copy's
+    /// count again, and the swap-ins a second between them read zero whatever the host swapped in. Each
+    /// read's count is the host's own now (its live count, where it keeps one), or a copy's the host made
+    /// since the read before (the other reader sees each copy as it's made), or none.
+    #[test]
+    fn w05_r26_a_swap_in_count_is_never_a_copy_said_again() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+        let (stop, calls) = (AtomicBool::new(false), AtomicU64::new(0));
+        let made: parking_lot::Mutex<Vec<Instant>> = parking_lot::Mutex::new(Vec::new());
+        let reads = std::thread::scope(|s| -> anyhow::Result<Vec<(Instant, Raw, Instant, Option<u64>, Option<u64>)>> {
+            let _stop = Stop(&stop);
+            std::thread::Builder::new().name("other-reader".into()).spawn_scoped(s, || {
+                // SAFETY: no arguments; a send right to this host, released below.
+                let host = unsafe { mach_host_self() };
+                let mut last = None;
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: plain integers, for which zero is a value.
+                    let mut v: nix::libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+                    let mut count = nix::libc::HOST_VM_INFO64_COUNT;
+                    // SAFETY: `v` is a whole `vm_statistics64` and `count` its length in `integer_t`s.
+                    let r = unsafe { nix::libc::host_statistics64(host, nix::libc::HOST_VM_INFO64, (&raw mut v).cast(), &raw mut count) };
+                    let counts = (v.faults, v.zero_fill_count, v.lookups, v.cow_faults, v.pageins, v.free_count, v.active_count, v.inactive_count, v.swapins);
+                    if r == 0 && last.replace(counts) != Some(counts) {
+                        made.lock().push(Instant::now());
+                    }
+                    calls.fetch_add(1, Ordering::Relaxed);
+                }
+                // SAFETY: the send right taken above, released once.
+                unsafe {
+                    mach_port_deallocate(mach_task_self_, host);
+                }
+            })?;
+            // Past the most calls one of XNU's windows answers fresh (`HOST_STATISTICS_MAX_REQUESTS`).
+            while calls.load(Ordering::Relaxed) <= 10 {
+                std::thread::yield_now();
+            }
+            // Three reads one after another: within one of XNU's one-second windows, or across one boundary
+            // at most, so one pair at least has no new copy between them.
+            let mut r = Reader::new(Path::new("/"));
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                let before = live_swapins();
+                let began = Instant::now();
+                let raw = r.read();
+                let ended = Instant::now();
+                out.push((began, raw, ended, before, live_swapins()));
+            }
+            Ok(out)
+        })?;
+        let made = made.into_inner();
+        eprintln!("macos swap-ins: the other reader called {} times and saw {} copies; live count {:?}", calls.into_inner(), made.len(), live_swapins());
+        for pair in reads.windows(2) {
+            let [(began, _, _, _, _), (_, raw, ended, before, after)] = pair else { continue };
+            let Some(n) = raw.swapins else { continue };
+            match (before, after) {
+                (Some(b), Some(a)) => assert!((*b..=*a).contains(&n), "{n} isn't the host's live count, {b} to {a}"),
+                _ => assert!(made.iter().any(|t| t > began && t <= ended), "{n}: a copy said again, none made since the read before"),
+            }
+        }
+        Ok(())
     }
 
     /// W05-R26: an idle runner's event thread sleeps: its wakes over a minute (`KILN_PACE_IDLE=1`;

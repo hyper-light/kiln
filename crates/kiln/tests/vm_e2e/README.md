@@ -205,6 +205,43 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    of each start of the session's harness, every one kept, which `check_starts` reads: a start on the
    host is found whenever it ran.
 
+## Step 17 part 6: a run's network narrowed to its person's provider (`narrowed::`)
+
+`vm_e2e/narrowed.rs` runs a Goose session of kiln's own Agentfile (`harness-goose`) in a microVM, on
+a server and a runner of its own (never ROOT's: it writes the person's home in the runner's folder).
+
+- **No vendor's CLI and no prompt off the machine.** The stand-in takes Goose's place. Before any
+  session, the test builds kiln's Goose Agentfile, its `HARNESS` line the stand-in's and every grant,
+  volume and command kiln's, into the runner's Shards home (`kiln::sandbox::shards_home`). It tags it
+  as kiln finds Goose's image (`kiln::sandbox::image::tag_of`). Each session starts with no prompt;
+  the stand-in is given its words only once `/runs/image` names that image's digest, and a session of
+  any other image is stopped unasked.
+- **Narrowed.** The person's home (`owner`: an admin's session acts for the owner) names Anthropic
+  (`GOOSE_PROVIDER: anthropic`, in `GOOSE_PATH_ROOT/config/config.yaml`, where kiln's Goose image
+  reads it). `/runs/reach` must be `{"as": "narrowed", "uses": ["anthropic"], "hosts": […]}`, the
+  hosts kiln's table keeps for it (`BY_USE`). Inside, the stand-in's `CONNECT=api.anthropic.com:443`
+  connects, and `CONNECT=api.groq.com:443` is refused by the microVM's network: its resolver answers
+  REFUSED, RCODE 5 (Shards' D236), said `CONNECT_REFUSED api.groq.com:443 dns rcode 5`. No notice
+  says it isn't narrowed.
+- **Whole, and said.** With the person's config unreadable (a folder at its path), `/runs/reach` is
+  `{"as": "whole", "why": {"unread": {"file": "<its path in the microVM>", …}}}`, a warning notice
+  says the network isn't narrowed and why, and both hosts connect: every destination the image names.
+
+The run needs the runner to reach github.com (Shards fetches the stand-in from kiln's repository at
+this checkout's commit, which must be on GitHub) and both providers' hosts on 443. The light checks
+run anywhere:
+
+```sh
+cargo test -p kiln --test vm_harnesses narrowed::checks::      # any OS
+cargo test -p kiln --test vm_harnesses stub::s17_               # Linux, macOS (python3): CONNECT's words
+```
+
+The microVM run (ROOT), on each host OS, with `VM_E2E=1` so that a runner without microVMs fails it:
+
+```sh
+VM_E2E=1 nice -n 10 cargo test -p kiln --test vm_harnesses narrowed:: -- --nocapture --test-threads 1
+```
+
 ## Step 35: every harness through kiln's UI and API (its agent's)
 
 Step 35 runs all ten harnesses (steps 19 to 28: `claude`, `codex`, `gemini`, `opencode`, `goose`,

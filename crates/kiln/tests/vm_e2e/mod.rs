@@ -737,6 +737,12 @@ pub fn up(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixtur
         let runner_pid = std::env::var("VM_E2E_RUNNER_PID").ok().and_then(|p| p.trim().parse().ok());
         return Ok(Fixture { port, admin, machine, dir: dir.to_path_buf(), runner_pid, _server: None, _runner: None, log: None });
     }
+    up_own(dir, name, env)
+}
+
+/// A server of its own under `dir` and a runner `name` of it, connected, whatever `VM_E2E_SERVER`
+/// says: a run that reads or writes what its runner keeps on the machine (its folder, `<dir>/<name>-state`).
+pub fn up_own(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixture> {
     let server = common::start(dir, &common::Options::default())?;
     let (runner, log) = runner(dir, server.port, name, env)?;
     let f = Fixture { port: server.port, admin: server.admin.clone(), machine: common::machine(name), dir: dir.to_path_buf(), runner_pid: Some(runner.0.id()), _server: Some(server), _runner: Some(runner), log: Some(log) };
@@ -757,6 +763,12 @@ pub fn up(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixtur
     }
 }
 
+/// The folder runner `name` of a fixture under `dir` keeps its state in (`--state-dir`): its own folder
+/// (`kiln::upgrade::own_dir`, no instance of its own).
+pub fn own_state(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}-state"))
+}
+
 /// `kiln agent` for the server at `port`, as `common::agents::runner_env` starts one, on any OS: a
 /// machine and a home of its own (on Windows its profile too, as `common::Fleet` gives one).
 fn runner(dir: &Path, port: u16, name: &str, env: &[(&str, &str)]) -> anyhow::Result<(Runner, PathBuf)> {
@@ -770,7 +782,7 @@ fn runner(dir: &Path, port: u16, name: &str, env: &[(&str, &str)]) -> anyhow::Re
         .arg("--work-dir")
         .arg(dir.join(format!("{name}-work")))
         .arg("--state-dir")
-        .arg(dir.join(format!("{name}-state")))
+        .arg(own_state(dir, name))
         .env("KILN_MACHINE_ID", name)
         .env("HOME", &home)
         .env_remove("GIT_CONFIG_GLOBAL")

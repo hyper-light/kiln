@@ -318,11 +318,16 @@ pub struct Mem {
 
 /// A macOS host's pages as `host_statistics64(HOST_VM_INFO64)` counts them (`mach/vm_statistics.h`'s
 /// `vm_statistics64`), its room for new work read from them (kiln plan
-/// 01a1cd8e862e7169a074db3d5fa33f3d step 32: the balancer places by that room).
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 32: the balancer places by that room). XNU answers that call,
+/// to a process that isn't Apple's, from one copy every such process shares, fresh for the first 2 to
+/// 10 calls of each second (`rate_limit_host_statistics`, osfmk/kern/host.c, xnu-12377.121.6): the
+/// counts XNU also keeps live (`free`; `swapins` where `swapins_live`) are read live, and the rest
+/// say which copy they're of and how long it had been the host's answer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VmPages {
     /// `free_count`: free pages, the speculative ones among them (`vm_statistics.h`; `vm_stat`
-    /// prints those apart).
+    /// prints those apart), read live (`vm.page_free_count` and `vm.page_speculative_count`, the
+    /// counters `free_count` is their sum of).
     pub free: u64,
     /// `active_count`: pages in use, never room. XNU's `AVAILABLE_NON_COMPRESSED_MEMORY` counts them
     /// with the free and inactive ones, and so does `sysinfo`'s available memory: by it a Mac with
@@ -336,6 +341,15 @@ pub struct VmPages {
     /// `swapins`: pages swapped in from the compressor's swap files since the host started, what its
     /// pace reads its swap-ins a second from (docs/needs.md, "Swap").
     pub swapins: u64,
+    /// `swapins` is the host's live count (`vm.compressor.swapper.swapins_total`, the counter
+    /// `HOST_VM_INFO64`'s is read from), not the copy's: a host before macOS 26.4 keeps no such sysctl.
+    pub swapins_live: bool,
+    /// Which copy of XNU's the other counts are of (two readings of one copy say the same): a count a
+    /// copy said before says nothing of the time since, which is why a rate is never read from it.
+    pub copy: u64,
+    /// How long, at least, that copy had already been XNU's answer when it was read: zero for one first
+    /// seen at this reading, and at most XNU's one-second window.
+    pub copy_age: std::time::Duration,
 }
 
 impl VmPages {

@@ -1215,7 +1215,11 @@ from run to run, yours alone. Caches that follow XDG's rule stay on the microVM'
 did before, and go with it (all but Claude Code's, Gemini CLI's and opencode's). No volume goes
 under `/tmp`, which is each harness's scratch. kiln keeps your volumes on the machine that runs
 the microVM, one for each person and harness (`<kiln's state>/homes/<you>/<harness>/`, readable by
-kiln's user alone), and reads your sessions there to show and resume them.
+kiln's user alone), and reads your sessions there to show and resume them. They stay there across
+kiln's upgrades: a runner started as a new instance keeps them in the same place, and moves there
+any that an older kiln's instance kept in its own folder (`<kiln's state>/instances/<id>/homes/`) as
+it starts, leaving one where it is, and logging why, where kiln already keeps yours for that harness
+or the move fails.
 
 Its base is `buildpack-deps:trixie-scm`, pinned by digest: git, an ssh client, curl and CA
 certificates, for both platforms. For your project's own toolchain, copy kiln's Agentfile into one of

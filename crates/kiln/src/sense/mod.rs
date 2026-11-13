@@ -191,9 +191,9 @@ pub struct Measure {
     pub cpu_idle: Option<f64>,
     pub mem_total: u64,
     /// Memory available to start new work without swapping (Linux `MemAvailable`; macOS its free
-    /// pages and the inactive ones beyond what its compressor holds,
-    /// [`kiln_ci::facts::VmPages::room`]; Windows `ullAvailPhys`), no more than the runner's cgroup
-    /// still allows.
+    /// pages, read live, and the inactive ones beyond what its compressor holds, as XNU's shared copy
+    /// of them says up to a second after, [`kiln_ci::facts::VmPages::room`]; Windows `ullAvailPhys`),
+    /// no more than the runner's cgroup still allows.
     pub mem_available: u64,
     /// The work directory's file system.
     #[serde(skip_serializing_if = "Option::is_none")]

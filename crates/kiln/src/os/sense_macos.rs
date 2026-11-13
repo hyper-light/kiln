@@ -1,5 +1,6 @@
 //! macOS's reads for [`crate::sense`]: each CPU's ticks (`host_processor_info(PROCESSOR_CPU_LOAD_INFO)`,
-//! [`cpu_loads`]), memory (`host_statistics64(HOST_VM_INFO64)`'s pages, the room in them
+//! [`cpu_loads`]), memory (the host's pages, live where XNU keeps them so and else
+//! `host_statistics64(HOST_VM_INFO64)`'s, [`pages_of`]; the room in them
 //! [`kiln_ci::facts::VmPages::room`]), the work volume's free space (`statfs`) and what APFS would
 //! make available for important use (Core Foundation's
 //! `kCFURLVolumeAvailableCapacityForImportantUsageKey`), and the memory pressure level. Nothing
@@ -180,9 +181,44 @@ fn cpu_loads(host: MachPort, into: &mut Vec<[u32; CPU_STATES]>) -> Option<()> {
     (into.len() == usize::try_from(cpus).ok()?).then_some(())
 }
 
-/// The host's pages as `host_statistics64(HOST_VM_INFO64)` counts them, and the size of each
-/// (`host_page_size`): what its room for new work is read from ([`kiln_ci::facts::VmPages::room`]).
-/// None when either can't be read.
+/// A sysctl's value by name, as `T`: macOS's reads' one reader of them (pace's too).
+pub(crate) fn sysctl<T: Default>(name: &std::ffi::CStr) -> Option<T> {
+    let mut v = T::default();
+    let mut len = std::mem::size_of::<T>();
+    // SAFETY: `v` is `len` bytes, written by the kernel up to that.
+    let rc = unsafe { nix::libc::sysctlbyname(name.as_ptr(), (&raw mut v).cast(), &raw mut len, std::ptr::null_mut(), 0) };
+    (rc == 0 && len == std::mem::size_of::<T>()).then_some(v)
+}
+
+/// The copy of XNU's this process saw last (its counts), and when it first saw it.
+static SEEN: parking_lot::Mutex<Option<([u64; 13], std::time::Instant)>> = parking_lot::Mutex::new(None);
+
+/// Which copy `v` is of, and how long at least it had been XNU's answer: one this process saw before
+/// is as old as that, one it hasn't is new now (every answer of a copy is the same, and each fresh one
+/// differs, its faults and lookups counting on).
+fn copy_of(v: &nix::libc::vm_statistics64) -> (u64, std::time::Duration) {
+    use std::hash::{Hash as _, Hasher as _};
+    let counts = [v.faults, v.zero_fill_count, v.lookups, v.hits, v.cow_faults, v.reactivations, v.pageins, v.pageouts, v.compressions, v.decompressions, v.swapins, v.swapouts, u64::from(v.free_count)];
+    let mut h = std::hash::DefaultHasher::new();
+    counts.hash(&mut h);
+    let now = std::time::Instant::now();
+    let mut seen = SEEN.lock();
+    let age = match &*seen {
+        Some((last, at)) if *last == counts => now.saturating_duration_since(*at),
+        _ => {
+            *seen = Some((counts, now));
+            std::time::Duration::ZERO
+        }
+    };
+    (h.finish(), age)
+}
+
+/// The host's pages ([`kiln_ci::facts::VmPages`]), and the size of each (`host_page_size`): what its
+/// room for new work is read from ([`kiln_ci::facts::VmPages::room`]). The counts XNU keeps live are
+/// read live: its free pages (`vm.page_free_count` and `vm.page_speculative_count`) and, where it has
+/// the sysctl, its swap-ins (`vm.compressor.swapper.swapins_total`; bsd/vm/vm_unix.c). The rest are
+/// `host_statistics64(HOST_VM_INFO64)`'s, a copy shared with every process that isn't Apple's
+/// (osfmk/kern/host.c), saying which copy and how old ([`copy_of`]). None when any can't be read.
 fn pages_of(host: MachPort) -> Option<(kiln_ci::facts::VmPages, u64)> {
     let mut page: usize = 0;
     // SAFETY: an out pointer to one live `vm_size_t`.
@@ -194,8 +230,23 @@ fn pages_of(host: MachPort) -> Option<(kiln_ci::facts::VmPages, u64)> {
     // SAFETY: `v` is a whole `vm_statistics64` and `count` its length in `integer_t`s, as
     // `HOST_VM_INFO64_COUNT` is; the kernel writes no more than that.
     let r = unsafe { nix::libc::host_statistics64(host, nix::libc::HOST_VM_INFO64, (&raw mut v).cast(), &raw mut count) };
-    let pages = kiln_ci::facts::VmPages { free: u64::from(v.free_count), active: u64::from(v.active_count), inactive: u64::from(v.inactive_count), compressor: u64::from(v.compressor_page_count), swapins: v.swapins };
-    (r == 0).then_some((pages, page))
+    if r != 0 {
+        return None;
+    }
+    let (copy, copy_age) = copy_of(&v);
+    let free = u64::from(sysctl::<u32>(c"vm.page_free_count")?) + u64::from(sysctl::<u32>(c"vm.page_speculative_count")?);
+    let live = sysctl::<u64>(c"vm.compressor.swapper.swapins_total");
+    let pages = kiln_ci::facts::VmPages {
+        free,
+        active: u64::from(v.active_count),
+        inactive: u64::from(v.inactive_count),
+        compressor: u64::from(v.compressor_page_count),
+        swapins: live.unwrap_or(v.swapins),
+        swapins_live: live.is_some(),
+        copy,
+        copy_age,
+    };
+    Some((pages, page))
 }
 
 /// This host's pages and their size now ([`pages_of`]): what its facts ([`kiln_ci::facts::Mem`])
@@ -394,6 +445,52 @@ mod tests {
             super::mach_port_deallocate(super::mach_task_self_, host);
         }
         eprintln!("sense: each CPU's ticks ({} CPUs) {:.1} µs a read over {reads} reads", loads.len(), took.as_secs_f64() * 1e6 / f64::from(reads));
+        Ok(())
+    }
+
+    /// The host's pages read while another program reads its VM statistics through
+    /// `host_statistics64(HOST_VM_INFO64)`: what XNU's shared copy says is said with that copy and how
+    /// long it had been the host's answer. Of three readings one after another (one of XNU's one-second
+    /// windows, or across one boundary at most), a reading of the copy the one before had says it's at
+    /// least as old as the time between them.
+    #[test]
+    fn w05_the_hosts_pages_say_how_old_xnus_copy_of_them_is() -> anyhow::Result<()> {
+        let (stop, calls) = (AtomicBool::new(false), AtomicU64::new(0));
+        let readings = std::thread::scope(|s| -> anyhow::Result<Vec<(std::time::Instant, kiln_ci::facts::VmPages, std::time::Instant)>> {
+            let _stop = Stop(&stop);
+            std::thread::Builder::new().name("other-reader".into()).spawn_scoped(s, || {
+                // SAFETY: no arguments; a send right to this host, released below.
+                let host = unsafe { super::mach_host_self() };
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: plain integers, for which zero is a value.
+                    let mut v: nix::libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+                    let mut count = nix::libc::HOST_VM_INFO64_COUNT;
+                    // SAFETY: `v` is a whole `vm_statistics64` and `count` its length in `integer_t`s.
+                    let _ = unsafe { nix::libc::host_statistics64(host, nix::libc::HOST_VM_INFO64, (&raw mut v).cast(), &raw mut count) };
+                    calls.fetch_add(1, Ordering::Relaxed);
+                }
+                // SAFETY: the send right taken above, released once.
+                unsafe {
+                    super::mach_port_deallocate(super::mach_task_self_, host);
+                }
+            })?;
+            while calls.load(Ordering::Relaxed) <= 10 {
+                std::thread::yield_now();
+            }
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                let began = std::time::Instant::now();
+                let (pages, _) = super::memory_pages().ok_or_else(|| anyhow::anyhow!("the host's pages weren't read"))?;
+                out.push((began, pages, std::time::Instant::now()));
+            }
+            Ok(out)
+        })?;
+        for pair in readings.windows(2) {
+            let [(_, a, a_ended), (b_began, b, _)] = pair else { continue };
+            assert!(b.copy != a.copy || b.copy_age >= b_began.saturating_duration_since(*a_ended), "{b:?} after {a:?}");
+        }
+        let held = readings.windows(2).filter(|p| p.first().map(|r| r.1.copy) == p.get(1).map(|r| r.1.copy)).count();
+        eprintln!("sense: {held} of 2 readings had the copy the one before had; ages {:?}", readings.iter().map(|r| r.1.copy_age).collect::<Vec<_>>());
         Ok(())
     }
 }
