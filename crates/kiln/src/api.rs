@@ -7159,8 +7159,14 @@ where
                 turns = crate::rt::Turns::new();
             }
         }
-        // A flush a piece: what's left of it goes out while the next is waited for.
+        // A flush a piece: what's left of it goes out while the next is waited for, in this turn where its write fits what's
+        // left of the turn's quantum at what writes of its size cost on this shard (`kiln_http::turn::write_cost_ns`), else
+        // in a turn of its own. Goal 9, plan 01a1a87b2cec step 3: the socket writes it whole, past any answer's room, and a
+        // turn's last piece's flush held the viewer's shard past the quantum by its 128 KiB's copy into the kernel.
         if wrote.is_ok() {
+            if let Some(ns) = kiln_http::turn::write_cost_ns(n) {
+                turns.room_for(|room| kiln_http::turn::signed(ns) <= room).await;
+            }
             wrote = tx.flush().await;
         }
         first = false;
@@ -7250,6 +7256,11 @@ where
     let mut turns = crate::rt::Turns::new();
     for f in frames {
         let n = f.capacity();
+        // Sent in this turn where its write fits what's left of it, at what writes of its size cost here, else in a turn of its
+        // own (as a packed snapshot's pieces are: `send_pieces`).
+        if let Some(ns) = kiln_http::turn::write_cost_ns(f.len()) {
+            turns.room_for(|room| kiln_http::turn::signed(ns) <= room).await;
+        }
         tx.send(ws::text(f)).await?;
         held.written(n);
         turns.end().await;
