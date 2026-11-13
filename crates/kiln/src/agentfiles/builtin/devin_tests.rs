@@ -83,7 +83,7 @@ fn devin_pin_problems(pin: &Value) -> Vec<String> {
             problems.push(format!("{file}: not at the harness's directory"));
         }
         let unpack = file.get("unpack").cloned().map(serde_json::from_value::<Fields>).and_then(Result::ok).map(Spec::try_from);
-        if !matches!(unpack, Some(Ok(Spec::Tree(Tree { strip: 0, unpacked_bytes: 1.., entries: 1.. })))) {
+        if !matches!(unpack, Some(Ok(Spec::Tree(Tree { strip: 0, unpacked_bytes: 1.., entries: 1.., skip }))) if skip.is_empty()) {
             problems.push(format!("{file}: not a tar.gz tree the one unpacker takes, stripped of nothing"));
         }
     }

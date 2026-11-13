@@ -1,0 +1,136 @@
+# Plan step 20 [kiln] step 1 on adacachy2, Linux 7.3.3-1-cachyos x86_64, 2026-11-12T15:15:16Z
+# pin.sh sha256 ff2d1363a5de21e997ce16475c69c0b594848879e7901fd83f74e5b9a33a6ffa
+# pin-mutations.sh sha256 85a2703b326cec445282cc8d3966b00487f8c54507e519d711ec0de9e84f7f8b
+# check-pin.sh sha256 80386668ff78be1618d72911eafc2711b55910a4271d206229027a2ebb239568
+# run-step1.sh sha256 927e9346e5b5013b49a2e1769f8d7a399a6235350fc1e5d0cc06017db25b706c
+## pin.sh fetch rust-v0.167.2
+fetched rust-v0.167.2 into /home/adalundhe/.cache/s20-step3-pin.sIM5BK/out/fetched
+## pin.sh verify (the pin)
+OK cosign v3.1.4, cosign-linux-amd64 sha256 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa as sigstore lists it (OpenAI signs with v3.1.4)
+OK codex-package_SHA256SUMS sha256 4f19652c992601851ce08ffe522412e22a17c242e580358d1150a9c98f3e1986, as GitHub says
+OK linux/amd64 codex-package-x86_64-unknown-linux-musl.tar.gz sha256 3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d, 200235673 bytes, 44 files and 8 directories: GitHub, SHA256SUMS and cosign (https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2)
+NOTE linux/amd64 codex-resources/voice/bin/codex-voice-host asks /lib64/ld-linux-x86-64.so.2: voice, built for -gnu, which kiln never starts
+OK linux/arm64 codex-package-aarch64-unknown-linux-musl.tar.gz sha256 56b08c1214e062a5b61684bacb5033c4372a01062a47c87c49a32be83af70695, 187980188 bytes, 44 files and 8 directories: GitHub, SHA256SUMS and cosign (https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2)
+NOTE linux/arm64 codex-resources/voice/bin/codex-voice-host asks /lib/ld-linux-aarch64.so.1: voice, built for -gnu, which kiln never starts
+OK linux/arm64 ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz sha256 800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915, 1982561 bytes: GitHub and ripgrep's .sha256; its rg, sha256 c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a, 4466000 bytes, is static and takes the place of the package's codex-path/rg, which needs /lib/ld-linux-aarch64.so.1
+PINNED codex 0.167.2 (rust-v0.167.2) for linux/amd64 and linux/arm64 in /home/adalundhe/.cache/s20-step3-pin.sIM5BK/out/pin.json
+## the mutations
+MUTATION control                            exit=0 pin.json=written temp=0 inspect=- PASS :: PINNED codex 0.167.2 (rust-v0.167.2) for linux/amd64 and linux/arm64 in /home/adalundhe/.cache/s20-pin-mutations.TkDL80/control/out/pin.json
+MUTATION another tag's identity             exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.1: error during command execution: none of the expected identities matched what was in the certificate, got subjects [https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2] with issuer https://token.actions.githubusercontent.com
+MUTATION the other platform's bundle        exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="56b08c1214e062a5b61684bacb5033c4372a01062a47c87c49a32be83af70695", payload="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d"
+MUTATION one flipped byte                   exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: sha256 154d8f53b4591bab4e8580a045b32aa9bca1efd7c34d1780ff79770f8034a371, GitHub says 3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d
+MUTATION one flipped byte, digests forged   exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="154d8f53b4591bab4e8580a045b32aa9bca1efd7c34d1780ff79770f8034a371"
+MUTATION a SHA256SUMS line changed          exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: codex-package_SHA256SUMS: sha256 781b23c3e54857db558ce399cde6297949da3e9ff50a0d13d363c38e7972c3e2, GitHub says 4f19652c992601851ce08ffe522412e22a17c242e580358d1150a9c98f3e1986
+MUTATION a SHA256SUMS line changed, forged  exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: sha256 3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d, codex-package_SHA256SUMS lists '56b08c1214e062a5b61684bacb5033c4372a01062a47c87c49a32be83af70695'
+MUTATION crafted: symlink                   exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="7bab36d938edc788351b157777c8b26bb86aa890b5f4ee2b5b0e7a6b6ce77591" | inspect: member 'bin/codex' is not a regular file or a directory
+MUTATION crafted: hard-link                 exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="349a89b321c338ce058697c6dd522b2d8c4e569cbffee9156b6f2b86a744d346" | inspect: member 'bin/codex' is not a regular file or a directory
+MUTATION crafted: absolute                  exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="89861d36c19575e331b58f117500b0551b153685961077ab1a3d2df7a82855f2" | inspect: member '/etc/codex-pin-test' leaves the archive
+MUTATION crafted: climbing                  exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="02f01185f50f388ccc2fc8f38975957c5505a309018c46c9aa9b37a387749a49" | inspect: member '../codex-pin-test' leaves the archive
+MUTATION crafted: set-id                    exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="00fe957d46e9fad51d7e69f65e332339bedd483568dc43f8e8f04cc342a053a6" | inspect: member 'bin/codex' has a set-ID bit (mode 4755)
+MUTATION crafted: version                   exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="6b2eea65e8557d7f2fa8fd073d49dcf484fa24421678656cfe5d404cbf7cca80" | inspect: codex-package.json says version '0.0.1', not '0.167.2'
+MUTATION crafted: target                    exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="0cc9c45f322d036d03067649aa8ee85c05425ec3d2a7912a6db0b0005136d15e" | inspect: codex-package.json says target 'aarch64-unknown-linux-musl', not 'x86_64-unknown-linux-musl'
+MUTATION crafted: layout                    exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="cb4684a0f1b4316f1908de557503649c4fcee7930e23534d72a02a4f56499dc6" | inspect: codex-package.json says layoutVersion 2, not 1
+MUTATION crafted: dynamic                   exit=1 pin.json=unchanged temp=0 inspect=1 PASS :: pin.sh: codex-package-x86_64-unknown-linux-musl.tar.gz: cosign refuses it for https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2: error during command execution: error verifying bundle: matching bundle to payload: bundle="3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d", payload="1128ef0a9f4818b543863562efe3e1bff22caa641c5d0f8285be574c6e7bcc37" | inspect: bin/codex-helper needs the ELF interpreter /lib/ld-musl-x86_64.so.1, and the Agentfile has no libc variant for it
+MUTATION a release with one platform        exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: release rust-v0.167.2 has no codex-package-aarch64-unknown-linux-musl.tar.gz (linux/arm64)
+MUTATION ripgrep's .sha256 changed          exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz: sha256 800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915, ripgrep's .sha256 says '3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d'
+MUTATION ripgrep's GitHub digest changed    exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz: sha256 800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915, GitHub says 0000000000000000000000000000000000000000000000000000000000000000
+MUTATION a ripgrep archive with no rg       exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz: no regular file ripgrep-15.2.0-aarch64-unknown-linux-musl/rg in the archive
+MUTATION a ripgrep archive, two top dirs    exit=1 pin.json=unchanged temp=0 inspect=- PASS :: pin.sh: ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz: member 'another/README.md' is outside ripgrep-15.2.0-aarch64-unknown-linux-musl/
+MUTATIONS passed=21 failed=0
+## fresh downloads of every pinned archive
+FRESH MATCH https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz sha256=800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915 bytes=1982561 (pin: 800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915, 1982561)
+FRESH MEMBER MATCH ripgrep-15.2.0-aarch64-unknown-linux-musl/rg in https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz sha256=c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a bytes=4466000 (pin: c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a, 4466000)
+FRESH MATCH https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package-aarch64-unknown-linux-musl.tar.gz sha256=56b08c1214e062a5b61684bacb5033c4372a01062a47c87c49a32be83af70695 bytes=187980188 (pin: 56b08c1214e062a5b61684bacb5033c4372a01062a47c87c49a32be83af70695, 187980188)
+FRESH TREE MATCH https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package-aarch64-unknown-linux-musl.tar.gz entries=52 unpacked_bytes=481289300 (pin: 52, 481289300)
+FRESH MATCH https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package-x86_64-unknown-linux-musl.tar.gz sha256=3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d bytes=200235673 (pin: 3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d, 200235673)
+FRESH TREE MATCH https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package-x86_64-unknown-linux-musl.tar.gz entries=52 unpacked_bytes=540223046 (pin: 52, 540223046)
+FRESH archives=3 matching=3 members=1 matching=1 trees=2 matching=2
+## pin.json
+{
+  "version": "0.167.2",
+  "tag": "rust-v0.167.2",
+  "published": "2026-11-11T22:44:46Z",
+  "read_at": "2026-11-12T15:16:47Z",
+  "verified": {
+    "cosign": {
+      "version": "v3.1.4",
+      "file": "cosign-linux-amd64",
+      "sha256": "424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa"
+    },
+    "identity": "https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "sums": {
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package_SHA256SUMS",
+      "sha256": "4f19652c992601851ce08ffe522412e22a17c242e580358d1150a9c98f3e1986"
+    },
+    "ripgrep": {
+      "version": "15.2.0",
+      "pinned_by": {
+        "url": "https://raw.githubusercontent.com/openai/codex/rust-v0.167.2/scripts/codex_package/rg",
+        "sha256": "41a10ca63365560d899a82b6f825fd7b420a18b34f660a98bffeece77eeae1f1"
+      }
+    }
+  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "smoke": {
+    "program": "bin/codex",
+    "args": [
+      "--version"
+    ],
+    "stdout": "codex-cli 0.167.2"
+  },
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package-x86_64-unknown-linux-musl.tar.gz",
+          "sha256": "3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d",
+          "size": 200235673,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz",
+            "strip": 0,
+            "unpacked_bytes": 540223046,
+            "entries": 52
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "56b08c1214e062a5b61684bacb5033c4372a01062a47c87c49a32be83af70695",
+          "size": 187980188,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz",
+            "strip": 0,
+            "unpacked_bytes": 481289300,
+            "entries": 52,
+            "skip": [
+              "codex-path/rg"
+            ]
+          }
+        },
+        {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915",
+          "size": 1982561,
+          "path": "codex-path/rg",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "ripgrep-15.2.0-aarch64-unknown-linux-musl/rg",
+            "sha256": "c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a",
+            "size": 4466000
+          }
+        }
+      ]
+    }
+  ]
+}
+# exits: fetch=0 verify=0 mutations=0 fresh=0
+# done 2026-11-12T15:17:20Z
