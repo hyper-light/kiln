@@ -300,8 +300,30 @@ fetching anything:
     skip test fail;
   - M11, a directory at a skip path taken: the same two fail;
   - restored byte for byte (RESTORED_SAME), and the control 96 passed.
-- Linux x86_64 and the live context through `kiln agentfiles context codex`: run on the landing's merge
-  with kiln main, recorded below once they're in.
+- At the landing's merge with kiln main (fb92cb64e: main d6ffa45d8, its pi, Gemini, opencode and Devin rows
+  among it, with this branch), every built-in's pin read through unpack::Spec at last:
+  - macOS arm64, adas-mac-studio.local-2, kiln run r580: `cargo test -p kiln --lib agentfiles::` 119 passed,
+    every_builtins_pinned_unpack_is_a_spec among them; clippy -D warnings exit 0
+    ([evidence/e_step3_finish_macos_land.txt](evidence/e_step3_finish_macos_land.txt)).
+  - Linux x86_64, adacachy (Linux 7.2.9-2-cachyos, rustc 1.99.1, a cold target), as a systemd user unit:
+    agentfiles:: 119 passed; clippy -D warnings exit 0
+    ([evidence/e_step3_finish_linux.txt](evidence/e_step3_finish_linux.txt)).
+  - The merge first failed to build on both (E0027): main's new Devin check matched a Tree by its three
+    fields. It names `skip` now and holds it empty, in the merge itself.
+- Live, on adacachy at the merge, from OpenAI's and ripgrep's releases (same evidence file). Codex was never
+  run:
+  - step20_a_live_codex_context_holds_the_pinned_builds: each platform's tree is 52 directories and files,
+    the pin's `entries`; amd64's 540223046 bytes, the pin's `unpacked_bytes`; arm64's 481248308, the
+    package's glibc rg left out and ripgrep's 4466000-byte rg in. arm64's codex-path/rg hashes to the pin's
+    member, c14cdb38…, at 0755. Passed in 108 s.
+  - `kiln agentfiles context codex DIR --platform linux/amd64,linux/arm64`, from a kiln built at the merge:
+    exit 0 in 17 s, printing the recipe 489e807d…. DIR holds the Agentfile, codex-amd64 and codex-arm64
+    alone, each 8 directories and 44 files beside harness.json, nothing else; the listing is in the evidence.
+  - ROOT's R09 command, `kiln agentfiles context codex DIR --platform linux/arm64`: exit 0, DIR the
+    Agentfile and codex-arm64 alone, its rg ripgrep's (c14cdb38…, 0755, 4466000 bytes).
+  - step3-live-check.py, a second reader: every pinned file downloaded again, laid out with Python's tarfile
+    as its unpack says (the skip honoured), and every file of both directories held to it: 45 of 45 on each
+    platform, no link, every directory 0755, files 0755 or 0644; PLATFORMS_MATCHING 2 of 2.
 
 ### Two things this landing found
 
