@@ -431,7 +431,8 @@ impl Handle {
     }
 
     /// An agent session placed here under `claim` reads its use from `at` from now on: its microVM's meter once its
-    /// harness is launched in one (`Group::Hex`, #73 part 7 slice 3). Its start and its room are as they were.
+    /// harness is launched in one (`Group::Hex`, #73 part 7 slice 3). Its start and its room are as they were: not
+    /// `session_started` again, whose `claim_start` would start (and, with a keeper, reserve for) a started session again.
     pub async fn session_grouped(&self, claim: super::place::Claim, at: super::place::Group) {
         let _ = self.tx.send(In::Local(Local::SessionGrouped { claim, at })).await;
     }
