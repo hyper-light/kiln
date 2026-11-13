@@ -5,18 +5,19 @@ use hex_api::{
     Destination, Grant, Member, MemberKind, Ports, Proto, Refusal, ShardsImage, Upstream,
 };
 use proptest::prelude::*;
-use shards_api::image::wire::MemberReach;
-use shards_api::image::{Keep, Narrowing};
+use shards_api::image::{Keep, MemberReach, Narrowing};
 
 use super::*;
 
+/// Nothing past the microVM kept, and every member held to reaching nothing of it (D246: a member the request names in
+/// no entry reaches nothing of the names kept).
 fn nothing_kept() -> Narrowing {
     Narrowing {
         egress: Keep::Only(Vec::new()),
         mcp: Keep::Only(Vec::new()),
         destinations: Keep::Only(Vec::new()),
         dns: false,
-        members: None,
+        members: Some(Vec::new()),
     }
 }
 
@@ -44,15 +45,17 @@ fn commanded(grants: &[Grant]) -> ShardsImage {
 }
 
 /// Joint plan step 15, T-T7.7.1: do program no grant at all; expect no publish and the image's every grant past the
-/// microVM dropped, its destinations by name (D236) among them, so its run has no network (`shards api-run`'s
-/// `network none`), never the image's own grants that `Narrowing::default()` keeps.
+/// microVM dropped, its destinations by name (D236) among them, never the image's own grants that
+/// `Narrowing::default()` keeps, and every member held apart, reaching nothing (D246: the request names every member's
+/// reach, none named reaching nothing), so nothing passes the microVM (no network, or one whose network process lets
+/// nothing past, D250).
 #[test]
 fn no_grant_is_programmed_as_no_network() {
     let made = program(&members_alone(&[])).unwrap();
     assert!(made.publish.is_empty());
     assert_eq!(made.egress, nothing_kept());
     assert_eq!(made.egress.destinations, Keep::Only(Vec::new()));
-    assert_eq!(made.egress.members, None);
+    assert_eq!(made.egress.members, Some(Vec::new()));
     assert_eq!(Narrowing::default().destinations, Keep::All);
     assert_ne!(made.egress, Narrowing::default());
 }
@@ -284,7 +287,10 @@ fn awaited(list: &[Grant]) -> Option<Upstream> {
 }
 
 /// The destinations a list names by TCP, as D236 writes each (`host:port`, every port of a grant's range), and each
-/// member's: what a program must keep, and hold each member to, by a model apart from the program's.
+/// member's: what a program must keep, and hold each member to, by a model apart from the program's. No remote MCP
+/// server is kept, so of D246's names kept (destinations and remote MCP servers alike) every one is a destination the
+/// list names; and each member has one entry, so the run host's refusal of a member's second entry (D246) never
+/// meets a program.
 fn reach_of(list: &[Grant]) -> Narrowing {
     let mut kept = BTreeSet::new();
     let mut held: BTreeMap<(MemberKind, String), BTreeSet<String>> = BTreeMap::new();
@@ -324,11 +330,7 @@ fn reach_of(list: &[Grant]) -> Narrowing {
         .collect::<Vec<_>>();
     Narrowing {
         destinations: Keep::Only(kept.into_iter().collect()),
-        members: if members.is_empty() {
-            None
-        } else {
-            Some(members)
-        },
+        members: Some(members),
         ..nothing_kept()
     }
 }
@@ -391,9 +393,9 @@ proptest! {
     /// AC-T7.7.2 (joint plan step 15): do program any well-formed list of grants of every way, for a run of the
     /// members alone and for one with a command of its own; expect either a typed `Awaits` naming what the list
     /// awaits (`awaited`, N4), or a program that keeps of the image's grants past the microVM exactly the list's
-    /// destinations, each member held to its own (`reach_of`), and publishes exactly the list's publish grants, in
-    /// order, each at the host address and port it names. So the flows a program allows that no grant names are
-    /// exactly 0.
+    /// destinations and no remote MCP server (D246's names kept), each member held to its own in one entry
+    /// (`reach_of`), and publishes exactly the list's publish grants, in order, each at the host address and port it
+    /// names. So the flows a program allows that no grant names are exactly 0.
     #[test]
     fn a_program_allows_no_flow_its_grants_do_not_name(
         list in proptest::collection::vec(any_grant(), 0..6)

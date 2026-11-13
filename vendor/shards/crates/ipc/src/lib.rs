@@ -222,7 +222,8 @@ pub mod kind {
     pub const DONE: u8 = 9;
     /// Warm VM → daemon: the command is executing: it started, where `DONE` without this
     /// means it never did. A joiner's (D119) carries its exec's id in its provider's guest
-    /// (u32, big-endian), by which another joiner may join its PID namespace.
+    /// (u32, big-endian), by which another joiner may join its PID namespace. And to the
+    /// client of an [`EXEC_TOLD`](super::EXEC_TOLD) exec, empty, as its command starts.
     pub const STARTED: u8 = 10;
     /// Client → daemon: a command of the catalog's (`ps`, `wait`, `rm`, ...) and its arguments,
     /// as a list of strings, for the daemon to run and answer with `OUT`, `ERR` and `END`.
@@ -343,6 +344,11 @@ pub mod kind {
     /// Agentfile's egress grants (D59, shards_net::Ports::encode); answered with the same
     /// kind once taken.
     pub const NET_POLICY: u8 = 40;
+    /// Run host → network process: the run's credential grants (D242), each by reference
+    /// with the hosts it may be filled in toward and never a value
+    /// (shards_net::encode_grants), after its `NET_POLICY`, once; answered with the same kind
+    /// and the run's CA's certificate (DER), made for those hosts alone.
+    pub const NET_CREDENTIALS: u8 = 97;
     /// Daemon → a running microVM's VM process: a run joins its network (D119). Its number
     /// (a big-endian u64, which `EXEC_TAKEN` answers), with the VM's end of the joiner's
     /// own connection to the daemon, on which the joiner's run goes as a warm VM's does
@@ -575,6 +581,19 @@ pub mod kind {
     /// VM → its owner: a member's input has ended, as its init told it
     /// (`shards_abi::run::managed::InputEnded`), on the independent control path.
     pub const MANAGED_INPUT_ENDED: u8 = 93;
+    /// An orchestrator's run host → its run's VM (D247): the CPU rate its vCPUs may use of
+    /// the host's together, by its number (8, big-endian), then the rate in milli-CPU (8,
+    /// big-endian), 0 for no hold; answered with [`RATED`].
+    pub const RATE: u8 = 94;
+    /// A VM → its run host: [`RATE`]'s answer, by its number (8, big-endian), then 0 and the
+    /// milli-CPU it holds its vCPUs to in decimal, nothing where it lets them be, or 1 and
+    /// why not.
+    pub const RATED: u8 = 95;
+    /// Warm VM → the client of an [`EXEC_TOLD`](super::EXEC_TOLD) exec, before its `EXIT`:
+    /// the command never started, and why, as its guest said it: the run protocol's
+    /// `exec_failed` class (a byte), then what the guest said (D238). An exec that never
+    /// started and says none of this could not be asked of its guest.
+    pub const EXEC_UNSTARTED: u8 = 96;
 
     /// Whether a network process's control message of `kind` hands it sockets: published
     /// ports' (`PUBLISH`, `NET_PUBLISHED`) and a peer's link (`NET_PEER`). Beside the
@@ -603,6 +622,10 @@ pub const EXEC_INTERACTIVE: u8 = 1;
 /// An `EXEC_RUN` flag: the client is answered once the command starts (`-d`), and its
 /// output goes nowhere.
 pub const EXEC_DETACHED: u8 = 2;
+/// An `EXEC_RUN` flag: the client is told, before anything else on its connection, that the
+/// command started (`STARTED`) or why it never did ([`kind::EXEC_UNSTARTED`]), so that it
+/// types the start as the agent-control endpoint's exec lane does (D238).
+pub const EXEC_TOLD: u8 = 4;
 
 /// `shards exec vm` as the client asks for it: the microVM, the command, and what the
 /// command line set; the client's terminal size for `-t`; and the daemon binary the client
@@ -633,6 +656,9 @@ pub struct Exec {
     /// its `exec_create`, as dockerd has it (moby daemon/exec.go); empty for `shards
     /// exec`'s, which the daemon makes as it starts it.
     pub id: String,
+    /// `--for`: the agent or harness of its image's to run it in, confined as that member
+    /// is (D243); empty for the microVM's command's namespaces.
+    pub member: String,
 }
 
 impl Exec {
@@ -658,6 +684,7 @@ impl Exec {
         w.push(u8::from(self.privileged));
         put_list(&mut w, &self.terms);
         put_str(&mut w, &self.id);
+        put_str(&mut w, &self.member);
         w
     }
 
@@ -683,6 +710,7 @@ impl Exec {
             privileged: r.flag()?,
             terms: r.list()?,
             id: r.str()?,
+            member: r.str()?,
         };
         r.0.is_empty().then_some(exec)
     }
@@ -2640,16 +2668,28 @@ mod tests {
                 "{me} {other}, this process started at {start}"
             );
         }
-        // Another process's start is its own.
+        // Another process is known by its own ID, its pid with its start. Its start alone may
+        // be this process's: Linux counts starts in clock ticks (proc(5)), and a child made
+        // in its parent's first tick starts in that tick. Once the child has gone, its ID
+        // names a process that doesn't live.
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--list")
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let child_start = started(child.id());
+        let pid = child.id();
+        let child_start = started(pid);
         let _ = child.wait();
         if let Ok(child_start) = child_start {
-            assert_ne!(child_start, start);
+            // Linux's ticks and macOS's Mach time count from boot and never go back;
+            // Windows' creation time is the wall clock's, which may.
+            #[cfg(unix)]
+            assert!(
+                child_start >= start,
+                "{pid} started at {child_start}, before this process at {start}"
+            );
+            std::fs::write(home.join(PID), format!("{pid} {child_start}\n")).unwrap();
+            assert!(!daemon_lives(&home), "{pid} {child_start} has gone");
         }
     }
 
@@ -2714,6 +2754,7 @@ mod tests {
             privileged: true,
             terms: vec!["xterm-kitty".into()],
             id: "1f".repeat(32),
+            member: "codex".into(),
             daemon: Identity {
                 dev: 1,
                 ino: 2,

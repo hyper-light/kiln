@@ -28,6 +28,10 @@ libc = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 shards-syscall-filter = { path = "../syscall-filter" }
 
+# A share's host's changes, for its guest's inotify (D235): FSEvents, bound when first used.
+[target.'cfg(target_os = "macos")'.dependencies]
+shards-apple = { path = "../apple" }
+
 [target.'cfg(windows)'.dependencies]
 shards-afunix = { path = "../afunix" }
 shards-ntfs = { path = "../ntfs" }
@@ -52,6 +56,10 @@ windows-sys = { workspace = true, features = [
   # A DAX window's answer must name a section or a file (NtQueryObject's type record).
   "Wdk_Foundation",
   "Win32_System_WindowsProgramming",
+  # The host's edition, which says whose limit a refused device assignment is (D154):
+  # RtlGetVersion's OSVERSIONINFOEXW.
+  "Wdk_System_SystemServices",
+  "Win32_System_SystemInformation",
 ] }
 
 [dev-dependencies]

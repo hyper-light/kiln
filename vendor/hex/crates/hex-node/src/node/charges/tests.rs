@@ -174,7 +174,7 @@ fn running(ids: &[(&str, u8)]) -> Vec<(BoxId, Scope, BoxCgroup)> {
         .map(|(id, n)| {
             (
                 BoxId::new(id).unwrap(),
-                [*n; 16],
+                Scope::Native([*n; 16]),
                 BoxCgroup::at(fleet().join(id)),
             )
         })
@@ -192,9 +192,10 @@ fn shards(_: &BoxId) -> Result<Option<Met>, Refusal> {
 /// Joint plan step 14 (AC-T7.4.1), C4 and C5 in the node: the placement's cgroup paths and weights. Do run a window
 /// of two cold Shards VMs, each booked at its whole 16-CPU, 8 GiB receipt, on a 32-CPU machine whose fleet budget is
 /// half of it, beside another node's fleet budgeted 8 CPUs; then a second window with nothing changed. Expect each
-/// VM's own cgroup given its weight by booking and `memory.high` its budget held at its 8 GiB ceiling (its `cpu.max`
-/// and `memory.max` left as its create wrote them); `.vm/node-a` capped at 16 CPUs and weighing half the machine;
-/// `.vm` weighing both fleets' 24 CPUs of 32; and the second window writing nothing.
+/// VM's own cgroup's `memory.max` its create wrote lifted to the kernel's none, its `memory.swap.max` with it (ROOT,
+/// 2026-11-13: no chosen memory bound), then its weight by booking and its `memory.high` its budget, 32 GiB, half the
+/// fleet's (its `cpu.max` left as its create wrote it, its ceiling); `.vm/node-a` capped at 16 CPUs and weighing half
+/// the machine; `.vm` weighing both fleets' 24 CPUs of 32; and the second window writing nothing.
 #[test]
 fn w14_the_learner_places_each_vm_its_fleet_and_vm_by_path_and_weight() {
     let io = Record::default();
@@ -216,10 +217,14 @@ fn w14_the_learner_places_each_vm_its_fleet_and_vm_by_path_and_weight() {
     assert_eq!(
         io.take(),
         vec![
+            vm("vm-1", "memory.max", "max"),
+            vm("vm-1", "memory.swap.max", "max"),
             vm("vm-1", "cpu.weight", "10000"),
-            vm("vm-1", "memory.high", &(8 * GIB).to_string()),
+            vm("vm-1", "memory.high", &(32 * GIB).to_string()),
+            vm("vm-2", "memory.max", "max"),
+            vm("vm-2", "memory.swap.max", "max"),
             vm("vm-2", "cpu.weight", "10000"),
-            vm("vm-2", "memory.high", &(8 * GIB).to_string()),
+            vm("vm-2", "memory.high", &(32 * GIB).to_string()),
             (fleet(), "cpu.weight", "5000".to_owned()),
             (fleet(), "cpu.max", "1600000 100000".to_owned()),
             (root().join(".vm"), "cpu.weight", "7500".to_owned()),
@@ -833,7 +838,7 @@ fn recorded_three(store: &crate::store::Store) -> Vec<(BoxId, Scope, BoxCgroup)>
         store.begin(&made).unwrap();
         store.made(&made).unwrap();
         let record = store.get(&id).unwrap().unwrap().unwrap();
-        let scope = *record.native_scope.unwrap().bytes();
+        let scope = Scope::Native(*record.native_scope.unwrap().bytes());
         vms.push((id, scope, BoxCgroup::at(fleet().join(name))));
     }
     vms
@@ -1018,7 +1023,7 @@ fn w14_a_last_resort_end_shows_in_inspect_and_survives_a_restart() {
         store.begin(&made).unwrap();
         store.made(&made).unwrap();
         let record = store.get(&id).unwrap().unwrap().unwrap();
-        let scope = *record.native_scope.unwrap().bytes();
+        let scope = Scope::Native(*record.native_scope.unwrap().bytes());
         vms.push((id, scope, BoxCgroup::at(fleet().join(name))));
     }
     let io = Record::default();
@@ -1099,6 +1104,90 @@ fn w14_a_last_resort_end_shows_in_inspect_and_survives_a_restart() {
         .1;
     assert_eq!(read, answer);
 
-    let made_again = [7; 16];
+    let made_again = Scope::Native([7; 16]);
     assert!(!record_last_resort(&store, &vms[1].0, made_again, Some(&end)).unwrap());
+}
+
+/// Joint plan step 14 (AC-T7.4.1), the learner's bounds (CLAUDE.md §2), as every OS's learner holds them
+/// (`recorded::charges::bounds`): VMs, its machine's population, the most boxes placement places on it; classes, as many,
+/// the least bound at which no VM's class is refused. Do run, on a machine of 20 milli-CPU (a population of two at Hex's
+/// least CPU bound), two VMs each of a class of its own; then the first gone and a third of a third class; then a fourth
+/// beside those two. Expect the first two held; the third held, the gone VM's class forgotten for it; and the fourth
+/// refused, typed, naming the machine's population.
+#[test]
+fn w14_the_learner_holds_its_machines_population_of_vms_of_as_many_classes() {
+    let io = Record::default();
+    let all = running(&[("vm-1", 1), ("vm-2", 2), ("vm-3", 3), ("vm-4", 4)]);
+    for (_, _, cgroup) in &all {
+        io.set(cgroup.dir(), 0, GIB);
+    }
+    // Each VM a class of its own: its receipt's profile is its number.
+    let record = |id: &BoxId| -> Result<Option<Met>, Refusal> {
+        let n: u8 = id.as_str().strip_prefix("vm-").unwrap().parse().unwrap();
+        let mut allocation = whole();
+        allocation.cost.id = [n; 32];
+        Ok(met(Class::Shards, allocation, 0))
+    };
+    let machine = res(20, 64 * GIB);
+    let mut learner = Learner::new(&fleet(), machine).unwrap();
+    let start = Instant::now();
+    learner
+        .window(
+            &io,
+            running(&[("vm-1", 1), ("vm-2", 2)]),
+            record,
+            &[],
+            machine,
+            start,
+        )
+        .unwrap();
+    learner
+        .window(
+            &io,
+            running(&[("vm-2", 2), ("vm-3", 3)]),
+            record,
+            &[],
+            machine,
+            start + WINDOW,
+        )
+        .unwrap();
+    let past = learner.window(
+        &io,
+        running(&[("vm-2", 2), ("vm-3", 3), ("vm-4", 4)]),
+        record,
+        &[],
+        machine,
+        start + WINDOW * 2,
+    );
+    assert_eq!(
+        past,
+        Err(Refusal::Exhausted {
+            what: "a node's VMs",
+            bound: 2
+        })
+    );
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C1 in the node: the learner's window is the period the node enforces a VM's CPU over,
+/// the period of the `cpu.max` a VM's create writes. Do take the writes of a VM's 16-CPU ceiling; expect its `cpu.max`
+/// period the learner's window, the window the node says.
+#[test]
+fn w14_the_window_is_the_period_of_the_cpu_max_the_node_writes() {
+    let writes = hex_core::cgroup::writes(
+        &Bounds {
+            cpu_max_milli: Some(16_000),
+            ..Bounds::default()
+        },
+        &[],
+    )
+    .unwrap();
+    let max = writes.iter().find(|w| w.file == "cpu.max").unwrap();
+    let period: u64 = max
+        .value
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(Duration::from_micros(period), WINDOW);
 }

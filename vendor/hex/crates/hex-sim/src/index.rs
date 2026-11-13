@@ -2248,6 +2248,7 @@ mod tests {
         node.priors[Class::Shards.index()] = Some(crate::model::Prior {
             profile: [7; 32],
             booking: prior,
+            ceiling: whole.unwrap().resources,
         });
         let mut learned = FitIndex::new(&[node.clone()]).unwrap();
         let receipt = learned.allocation(NodeId(0), &demand).unwrap().unwrap();

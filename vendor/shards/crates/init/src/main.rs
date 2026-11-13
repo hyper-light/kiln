@@ -26,6 +26,8 @@ mod domains;
 mod emulate;
 #[cfg(target_os = "linux")]
 mod engine;
+#[cfg(target_os = "linux")]
+mod enter;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod frames;
 #[cfg(target_os = "linux")]
@@ -58,6 +60,8 @@ mod metrics;
 mod net;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod netplan;
+#[cfg(target_os = "linux")]
+mod notice;
 #[cfg(target_os = "linux")]
 mod opath;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

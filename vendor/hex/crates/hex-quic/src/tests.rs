@@ -29,6 +29,8 @@ static HELD_ROOM: Patience = Patience::measuring("test.hex_quic.held_room");
 static RESET_AFTER_END: Patience = Patience::measuring("test.hex_quic.reset_after_end");
 /// A peer's reset, come to a connection whose owner hasn't read.
 static RESET: Patience = Patience::measuring("test.hex_quic.reset");
+/// A peer's connection ended, heard by the other end's driver.
+static GONE: Patience = Patience::measuring("test.hex_quic.gone");
 
 fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
@@ -98,18 +100,46 @@ fn hex_quic_10_both_ends_report_tls13_aes_256_gcm_sha384() {
     for (end, peer) in [(&client, peer), (&node, from)] {
         let (suite, group) = end.negotiated(peer).unwrap().unwrap();
         assert_eq!(suite, rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
-        assert!(
-            matches!(
-                group,
-                Some(
-                    rustls::NamedGroup::secp384r1MLKEM1024
-                        | rustls::NamedGroup::X25519MLKEM768
-                        | rustls::NamedGroup::secp256r1MLKEM768
-                )
-            ),
-            "{group:?}"
-        );
+        assert!(hybrid(group), "{group:?}");
     }
+}
+
+/// One of the node provider's hybrid post-quantum groups (Q5).
+fn hybrid(group: Option<NamedGroup>) -> bool {
+    matches!(
+        group,
+        Some(
+            NamedGroup::secp384r1MLKEM1024
+                | NamedGroup::X25519MLKEM768
+                | NamedGroup::secp256r1MLKEM768
+        )
+    )
+}
+
+/// HEX-QUIC-28 (Q12): each end's links name the other as its certificate does, with the suite and group its own TLS
+/// negotiated, `TLS13_AES_256_GCM_SHA384` under a hybrid post-quantum group; once a peer's connection ends, it is no
+/// link of the other's.
+#[test]
+fn hex_quic_28_each_end_names_its_links_with_their_suite_and_group() {
+    let ca = SimCa::new().unwrap();
+    let node = node(&ca, "node-28.test");
+    let client = client(enrolled(&ca, "client-28.test"));
+    within(&DIAL, |by| {
+        client.dial("node-28.test", node.local_addr(), by)
+    })
+    .unwrap();
+    for (end, other) in [(&client, "node-28.test"), (&node, "client-28.test")] {
+        let links = end.links().unwrap();
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].peer, other);
+        assert_eq!(links[0].suite, CipherSuite::TLS13_AES_256_GCM_SHA384);
+        assert!(hybrid(links[0].group), "{:?}", links[0].group);
+    }
+    drop(client);
+    until(&GONE, "the client's link to end", || {
+        node.links().unwrap().is_empty()
+    })
+    .unwrap();
 }
 
 /// HEX-QUIC-11 (Q3): connections to ports carry bytes both ways in order and end on each half's End; one whose owner

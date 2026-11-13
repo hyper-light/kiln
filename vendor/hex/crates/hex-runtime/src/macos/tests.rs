@@ -901,3 +901,93 @@ fn every_descriptor_the_runtime_makes_is_close_on_exec() {
         "descriptors (number, kind) a spawn that inherits would hand on: {made:?}"
     );
 }
+
+/// AC-T7.4.1 (CLAUDE.md §3; ROOT, 2026-11-13): a bound macOS can't hold of a process box is refused, typed, never made
+/// with the bound dropped, as Windows refuses its own (`hex_core::job::limits`): a CPU cap, a memory level to throttle
+/// at, and every disk bound. Do create a process box bounded at each, beside a memory bound it holds, through a
+/// rootless runtime and through a box-user one; expect each refused as the platform's, naming its bound and macOS,
+/// and no box made.
+#[test]
+fn a_process_box_bounded_where_macos_holds_no_bound_is_refused_typed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let sock = dir.path().join("helper.sock");
+    let listener = helper_daemon::bind(&sock).expect("bind the helper socket");
+    let server = thread::spawn(move || {
+        let daemon = Daemon::new(Sim::default(), vec![7000, 7001], 64);
+        let _ = daemon.serve_listener(listener.as_fd());
+    });
+    let rate = NonZeroU64::new(256 << 30).expect("nonzero");
+    let lateness =
+        hex_core::watch::lateness_seed(&super::machine_model().expect("this Mac's model"));
+    let rootless = MacRuntime::new(rate, rate, lateness).expect("a rootless runtime");
+    let helped = MacRuntime::detect(rate, rate, lateness, &sock).expect("detect box-user mode");
+    let held = Bounds {
+        memory_max: Some(256 << 20),
+        ..Bounds::default()
+    };
+    let unheld: [(&str, Bounds); 5] = [
+        (
+            "cpu_max_milli",
+            Bounds {
+                cpu_max_milli: Some(363),
+                ..held.clone()
+            },
+        ),
+        (
+            "memory_high",
+            Bounds {
+                memory_high: Some(128 << 20),
+                ..held.clone()
+            },
+        ),
+        (
+            "io_weight",
+            Bounds {
+                io_weight: Some(100),
+                ..held.clone()
+            },
+        ),
+        (
+            "io_latency_us",
+            Bounds {
+                io_latency_us: Some(1_000),
+                ..held.clone()
+            },
+        ),
+        (
+            "io_max",
+            Bounds {
+                io_max: Some(hex_api::IoRates {
+                    read_bps: Some(1 << 20),
+                    ..hex_api::IoRates::default()
+                }),
+                ..held.clone()
+            },
+        ),
+    ];
+    for rt in [&rootless, &helped] {
+        for (bound, bounds) in &unheld {
+            let id = BoxId::new("unheld").expect("box id");
+            let refused = rt.create(BoxSpec {
+                route: None,
+                allocation: None,
+                devices: Vec::new(),
+                id: id.clone(),
+                bounds: bounds.clone(),
+                class: ClassSpec::Process,
+                owner: None,
+                band: 0,
+            });
+            assert!(
+                matches!(
+                    &refused,
+                    Err(Refusal::Platform { what, platform: "macos", .. }) if what == bound
+                ),
+                "{bound}: {refused:?}"
+            );
+            assert!(matches!(rt.inspect(&id), Err(Refusal::NoSuchBox(_))));
+        }
+    }
+    drop((rootless, helped));
+    drop(server);
+}
