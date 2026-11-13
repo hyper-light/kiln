@@ -2365,6 +2365,11 @@ impl Host {
     async fn reconcile_legacy_mail(&self, s: &Session, input: &super::admission::Input, mode: LegacyReconciliation) -> Result<(), inbox::PromotionError> {
         use super::admission::{Lease, Stage};
         let invalid = |error| inbox::PromotionError::Invalid { why: format!("{error:?}") };
+        // Its opening prompt is its opener's, a person's, held to no depth (`mail::person`); what
+        // else it holds with no row is held to the depth: whose it is isn't known here (step 35).
+        let opening = session::opening_prompt_id(&s.id);
+        let opener = s.spec.lock().opener.as_deref().and_then(super::mail::opener_sender).unwrap_or_default();
+        let peer_of = |message: &str| if message == opening { opener.clone() } else { String::new() };
         let mut after: Option<String> = None;
         loop {
             let next = {
@@ -2388,7 +2393,7 @@ impl Host {
                 let item = core.state.queue.iter().map(|item| (None, item)).chain(core.state.tasks.iter().flat_map(|task| task.queue.iter().map(move |item| (Some(task.id.as_str()), item)))).find(|(_, item)| item.id == message);
                 let Some((task, item)) = item else { continue };
                 let bytes = super::admission::queued_command_bytes(item, task).map_err(invalid)?;
-                let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::Queued, token: None, handoff: None };
+                let lease = Lease { message: message.clone(), peer: peer_of(&message), epoch: core.state.epoch, bytes, stage: Stage::Queued, token: None, handoff: None };
                 {
                     let mut controller = input.controller.lock();
                     if let LegacyReconciliation::Debt { from, to } = mode {
@@ -2426,7 +2431,7 @@ impl Host {
                 let Some(flight) = core.input_legacy_flights.iter().find(|flight| flight.id == message) else { continue };
                 let bytes = core.writes.iter().filter(|wire| flight.matches(wire)).fold(std::mem::size_of::<super::admission::LegacyFlight>().checked_add(flight.id.capacity()), |bytes, wire| bytes.and_then(|bytes| bytes.checked_add(std::mem::size_of::<String>())).and_then(|bytes| bytes.checked_add(wire.capacity())));
                 let bytes = bytes.ok_or_else(|| inbox::PromotionError::Invalid { why: "legacy retained byte count overflowed".into() })?;
-                let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
+                let lease = Lease { message: message.clone(), peer: peer_of(&message), epoch: core.state.epoch, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
                 {
                     let mut controller = input.controller.lock();
                     if let LegacyReconciliation::Debt { from, to } = mode {
@@ -3932,6 +3937,52 @@ mod tests {
         assert_eq!(pipes("c"), Some((300, 301, 302, false)), "no carried descriptors: its record's, unchanged");
     }
 
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a session's opening prompt, adopted
+    /// from its queue or its provider flight with no journal row, is its opener's, a person's
+    /// (`Spec::opener`, the owner writing as `admin`), held to no depth; what else its queue holds
+    /// with no row, an agent's word among it, is still held to the depth, as before.
+    #[test]
+    fn s35_a_legacy_adopted_opening_prompt_is_its_openers_and_held_to_no_depth() -> anyhow::Result<()> {
+        use super::super::admission::{FlightProtocol, Input, LegacyFlight};
+        crate::rt::block_on(async {
+            for (flying, opener, writes_as) in [(false, "user:ada", "user:ada"), (true, "owner", "admin")] {
+                let directory = tempfile::tempdir()?;
+                let records = crate::records::open(&directory.path().join("records.db"))?;
+                let (sink, _updates) = async_channel::unbounded();
+                let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(records));
+                let spec = Spec { opener: Some(opener.into()), prompt: Some("map the repository".into()), ..no_harness(directory.path()) };
+                let session = host.open(Some(format!("s35-opening-{flying}")), spec)?;
+                host.settled(&session.id).await;
+                crate::rt::timeout(super::super::registry::ANSWER_WAIT, session.close_wait()).await.map_err(|_| anyhow::anyhow!("fixture owner did not stop"))?;
+                let inbox = host.inbox().cloned().ok_or_else(|| anyhow::anyhow!("fixture journal missing"))?;
+                let input = Input::new(0, host.input_budgets.budget(), Arc::clone(&inbox));
+                let opening = crate::util::derive_id(&["first-prompt", &session.id]);
+                let agents = "0123456789abcdef0123456789abcdef".to_owned();
+                let queued = |id: &str, text: &str| QueueItem { id: id.into(), text: text.into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None };
+                {
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.state.epoch = 0;
+                    core.state.status = Status::Running;
+                    core.state.manual_resume = false;
+                    core.writes.clear();
+                    core.state.queue = vec![queued(&agents, "a word from agent a1")];
+                    if flying { core.input_legacy_flights = vec![LegacyFlight { id: opening.clone(), protocol: FlightProtocol::Claude, request: None }]; }
+                    else { core.state.queue.push(queued(&opening, "map the repository")); }
+                }
+                host.set_input_budget(super::super::state_view::FRAME);
+                host.reconcile_legacy_mail(&session, &input, LegacyReconciliation::Journal).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                let peer = |id: &str| input.controller.lock().lease(id).map(|lease| lease.peer.clone());
+                anyhow::ensure!(peer(&opening).as_deref() == Some(writes_as), "the opening prompt is its opener's ({writes_as}), flying {flying}: {:?}", peer(&opening));
+                anyhow::ensure!(super::super::mail::person(writes_as), "{writes_as} is a person, held to no depth");
+                let kept = inbox.pending(&session.id, &opening).await?.ok_or_else(|| anyhow::anyhow!("the opening prompt has no durable row"))?;
+                anyhow::ensure!(kept.lease.peer == writes_as, "its durable row says whose it is: {:?}", kept.lease.peer);
+                anyhow::ensure!(peer(&agents).is_some_and(|p| !super::super::mail::person(&p)), "what else it held is still held to the depth: {:?}", peer(&agents));
+            }
+            Ok(())
+        })
+    }
+
     /// The journal failure is the real Host adoption path, not a synthetic consumption event.
     /// Certificate verification is covered by the isolated native upgrade proof; this fixture
     /// drives the owner/journal ordering beneath that boundary on real file-backed Records.
@@ -5039,7 +5090,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let heard = dir.join("heard.jsonl");
         let fake = dir.join("fake-claude.py");
-        std::fs::write(&fake, r##"import json, os, sys, time, uuid
+        std::fs::write(&fake, r##"import json, math, os, sys, time, uuid
 HEARD = sys.argv[1]
 args = sys.argv[2:]
 def out(o):
@@ -5056,6 +5107,7 @@ while True:
     line = sys.stdin.readline()
     if not line:
         break
+    started = time.monotonic_ns()
     with open(HEARD, "a") as f:
         f.write(json.dumps({"pid": os.getpid(), "line": line.strip()}) + "\n")
     try:
@@ -5075,7 +5127,10 @@ while True:
         if "long" in json.dumps(m.get("message")):
             time.sleep(60)
         out({"type": "assistant", "message": {"id": "msg_%s" % uuid.uuid4(), "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "done"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
-        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        # Claude Code's result for a turn that took its message (W20): which message it took, and how long the turn
+        # took, as kiln's consumption reads them (claude.rs `inputs_consumed`).
+        elapsed_ms = math.ceil((time.monotonic_ns() - started) / 1000000)
+        out({"type": "result", "subtype": "success", "terminal_reason": "completed", "is_error": False, "duration_ms": elapsed_ms, "duration_api_ms": elapsed_ms, "num_turns": 1, "user_message_uuid": uid, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
 "##)?;
         let program = dir.join("claude-stand-in");

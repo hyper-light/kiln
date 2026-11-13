@@ -6395,6 +6395,9 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     if let Some(i) = spec.isolation.as_mut() {
         i.person = caller.and_then(crate::harness::lineage::person_of);
     }
+    // Whose its opening prompt is, which its input admits as a person's, held to no depth: whoever
+    // asks (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 35), never what's asked.
+    spec.opener = caller.and_then(crate::harness::lineage::person_of);
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
@@ -6517,7 +6520,8 @@ async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
         } else {
             b.command.as_ref().and_then(|v| serde_json::from_value::<crate::harness::model::Command>(v.clone()).ok()).map_or(Some("command"), |c| crate::harness::attention_hooks::command_kind(&c))
         };
-        for row in report.results.iter().filter(|r| r.result == "sent") {
+        // Sent, or retained: kiln took the person's message into its custody (W20), waiting for the receiver's admission.
+        for row in report.results.iter().filter(|r| matches!(r.result, "sent" | "retained")) {
             let Some(kind) = kind else { break };
             crate::harness::attention_hooks::record(hub, caller, &row.id, kind, &report.id, attention_at).await;
             if b.approvals.is_some() && let Some(info)=among.iter().find(|i|i.id==row.id) {
@@ -6643,9 +6647,9 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
             };
             rx.await.unwrap_or_else(|_| crate::harness::registry::Sent::Unanswered("the server let go of it before its answer came".into()))
         }
-        None => hub.harness.command(hub, id, c).await,
+        None => hub.harness.command_from(hub, id, &crate::harness::ops::key_scope(&caller), c).await,
     };
-    if sent.went() && let Some(attention)=attention {
+    if sent.kept_for_person() && let Some(attention)=attention {
         crate::harness::attention_hooks::record_prepared(hub,&caller,id,attention).await;
     }
     answer_command(sent, message)
@@ -7388,7 +7392,7 @@ fn answer_of(cmd: String, rx: futures::channel::oneshot::Receiver<crate::harness
     // when that drops the viewer's answer future.
     drop(crate::rt::spawn(async move {
         let sent = rx.await.unwrap_or_else(|_| crate::harness::registry::Sent::Unanswered("the server let go of it before its answer came".into()));
-        if sent.went() && let Some(attention) = attention { attention.record(); }
+        if sent.kept_for_person() && let Some(attention) = attention { attention.record(); }
         let _ = tx.send(crate::harness::asked::frame(&cmd, &sent, kind));
     }));
     async move { output.await.ok() }.boxed()
@@ -7845,7 +7849,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         let (result, output) = futures::channel::oneshot::channel();
                         drop(crate::rt::spawn(async move {
                             let sent = h.harness.resolve(&h, &session, c, pending).await;
-                            if sent.went() && let Some(attention) = attention { attention.record(); }
+                            if sent.kept_for_person() && let Some(attention) = attention { attention.record(); }
                             let _ = result.send(refusal_frame(sent));
                         }));
                         answers.push(async move { output.await.ok().flatten() }.boxed());
@@ -8174,6 +8178,21 @@ mod tests {
         let mut spec = Spec { kind: "claude".into(), ..Spec::default() };
         as_asked(&mut spec, Some(&crate::authz::Caller::owner()));
         assert!(spec.isolation.is_none());
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: whose an agent's opening prompt is, which
+    /// its input admits as a person's, held to no depth, is whoever asks: a forged one is
+    /// replaced, none without a caller, so no caller's words pass the depth by naming a person.
+    #[test]
+    fn s35_an_opening_prompts_opener_is_whoever_asks() {
+        use crate::harness::session::Spec;
+        let forged = || Spec { kind: "claude".into(), prompt: Some("go".into()), opener: Some("user:someone-else".into()), ..Spec::default() };
+        let mut spec = forged();
+        as_asked(&mut spec, Some(&crate::authz::Caller::owner()));
+        assert_eq!(spec.opener.as_deref(), Some("owner"));
+        let mut spec = forged();
+        as_asked(&mut spec, None);
+        assert_eq!(spec.opener, None);
     }
 
     use super::*;

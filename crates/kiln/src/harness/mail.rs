@@ -29,6 +29,13 @@ pub struct StatusKey {
 /// handed over as the recipient's depth allows. None is refused for it.
 pub fn person(sender: &str) -> bool { sender == "admin" || sender.starts_with("user:") }
 
+/// The sender a session's opener (`Spec::opener`, `lineage::person_of`'s form: `owner`,
+/// `user:<id>`) writes as, in the form [`person`] reads: the owner as `admin`. None for any other.
+pub fn opener_sender(opener: &str) -> Option<String> {
+    if opener == "owner" { return Some("admin".to_owned()); }
+    opener.starts_with("user:").then(|| opener.to_owned())
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(test, derive(ts_rs::TS))]

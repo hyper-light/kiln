@@ -1514,7 +1514,7 @@ fn launchd(i: &Install<'_>) -> anyhow::Result<bool> {
     crate::util::write_secret(&path, launchd_body(i, &log, launcher.as_deref()).as_bytes(), 0o644)?;
     if i.server() {
         // macOS's own ways stay (docs/priority.md, "macOS"; goal 9, plan 01a1a87b2cec step 4).
-        say("priority    ProcessType Interactive: the server runs as an app does, its legs and agents under background policy; cores of its own and the real-time class are Linux's (docs/priority.md)");
+        say("priority    ProcessType Interactive: the server runs as an app does, its legs and agents below normal at nice 20 (PRIO_MAX), the lowest priority there is; cores of its own and the real-time class are Linux's (docs/priority.md)");
     }
     let kind = if i.system { "LaunchDaemon" } else { "LaunchAgent" };
     let domains = launchd_domains(i.system);
