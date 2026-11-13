@@ -117,6 +117,8 @@ pub struct Saved {
     manual_resume: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     move_on_limit: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    wait_at_limit: bool,
     #[serde(default, skip_serializing_if = "super::model::MovePlan::is_empty")]
     move_plan: super::model::MovePlan,
     /// A turn of its was under way, and hadn't ended, when this runner last saved it: a restart
@@ -396,6 +398,7 @@ fn record(s: &Session) -> Saved {
         pause_at: st.pause_at,
         manual_resume: st.manual_resume,
         move_on_limit: st.move_on_limit,
+        wait_at_limit: st.wait_at_limit,
         move_plan: st.move_plan.clone(),
         cut: s.turn_open.load(Ordering::Relaxed),
         harness: ran.0,
@@ -3256,7 +3259,7 @@ impl Host {
         let trees = super::survivors::trees(&alive);
         let session = self.open_seeded_with_input(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back, false, input)?;
         restore_owned_reach(&session, s.owned_reach);
-        let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
+        let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit || s.wait_at_limit;
         if !trees.is_empty() {
             session.ran.lock().1.clone_from(&alive);
             *session.left.lock() = trees.iter().map(|(root, _)| root.clone()).collect();
@@ -3276,6 +3279,7 @@ impl Host {
             core.state.pause_at = s.pause_at;
             core.state.manual_resume = s.manual_resume;
             core.state.move_on_limit = s.move_on_limit;
+            core.state.wait_at_limit = s.wait_at_limit;
             core.state.move_plan = s.move_plan;
             // The turn the restart cut short goes on first, in kiln's words, with what it started
             // that still runs.
@@ -3864,6 +3868,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         held: None,
         refused: None,
         move_on_limit: false,
+        wait_at_limit: false,
         move_plan: Default::default(),
         pause_at: None,
         max_subagents: None,
@@ -5470,6 +5475,37 @@ while True:
             let p = back.core.lock().state.pause.clone().ok_or_else(|| anyhow::anyhow!("pause not restored"))?;
             assert_eq!((p.since, p.checking), (7, None));
             assert_eq!(back.core.lock().state.pause_at, Some(90));
+            Ok(())
+        })
+    }
+
+    /// docs/ci.md §0.3 (2026-11-13): a conversation a person said waits for its limit's reset, with
+    /// nothing else to keep, keeps that choice across another start of its machine: going on
+    /// elsewhere is every other conversation's, so a lost choice to wait would send it away.
+    #[test]
+    fn a_choice_to_wait_at_a_limit_is_kept_across_a_restart() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (tx, _rx) = async_channel::unbounded();
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let host = sim(tx, Some(file.clone()), Limits::default());
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                ..Spec::default()
+            };
+            let s = host.open(Some("waits".into()), spec)?;
+            s.core.lock().state.wait_at_limit = true;
+            host.save_now();
+            let saved: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&file)?)?;
+            let a = saved.first().ok_or_else(|| anyhow::anyhow!("nothing saved"))?;
+            assert_eq!(a.get("wait_at_limit").and_then(serde_json::Value::as_bool), Some(true));
+            let (tx2, _rx2) = async_channel::unbounded();
+            let again = sim(tx2, Some(file.clone()), Limits::default());
+            again.restore();
+            let back = again.sessions.lock().get("waits").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            assert!(back.core.lock().state.wait_at_limit, "its choice to wait came back");
             Ok(())
         })
     }

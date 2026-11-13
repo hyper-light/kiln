@@ -1,5 +1,6 @@
-//! Going on on another machine at a usage limit, for a conversation that opted in
-//! (`State::move_on_limit`; docs/agents.md, "Usage limits: pause and resume").
+//! Going on on another machine at a usage limit, for every conversation but one a person said
+//! waits for the reset (`State::wait_at_limit`; docs/agents.md, "Usage limits: pause and resume"):
+//! the user's third exception to opt-in automation (docs/ci.md §0.3, 2026-11-13).
 //!
 //! When such a session pauses for a limit (reached, or its stop point), the server looks for
 //! another of your machines to take it over (only the one, and the harness and model, a person
@@ -46,17 +47,23 @@ struct Tried {
 
 static TRIED: LazyLock<Mutex<HashMap<String, Tried>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Every few seconds (`goals::run`): the paused sessions that opted in look for a machine to go on
-/// on, once a pause, then again now and then.
+/// Whether a session paused at a usage limit goes on elsewhere: every one does, unless a person
+/// said it waits for the reset.
+fn goes_on(info: &Info) -> bool {
+    !info.wait_at_limit
+}
+
+/// Every few seconds (`goals::run`): the paused sessions that go on elsewhere ([`goes_on`]) look
+/// for a machine to go on on, once a pause, then again now and then.
 pub fn tick(hub: &Arc<Hub>, all: &[Info], now: i64) {
-    // The paused sessions that opted in, looked up in a set, not scanned for each one tried (goal 9, plan 01a1a87b2cec
+    // The paused sessions that go on, looked up in a set, not scanned for each one tried (goal 9, plan 01a1a87b2cec
     // step 3).
-    let waiting: HashSet<&str> = all.iter().filter(|i| i.pause.is_some() && i.move_on_limit).map(|i| i.id.as_str()).collect();
+    let waiting: HashSet<&str> = all.iter().filter(|i| i.pause.is_some() && goes_on(i)).map(|i| i.id.as_str()).collect();
     let mut tried = TRIED.lock();
     tried.retain(|id, _| waiting.contains(id.as_str()));
     for info in all {
         let Some(p) = info.pause.as_ref() else { continue };
-        if !info.move_on_limit || matches!(info.status, Status::Exited) {
+        if !goes_on(info) || matches!(info.status, Status::Exited) {
             continue;
         }
         if let Some(t) = tried.get_mut(&info.id).filter(|t| t.since == p.since && t.arrived.is_none())
@@ -257,6 +264,25 @@ mod tests {
         // A state always says its plan (so a viewer knows its runner takes one), empty or not.
         let v = serde_json::to_value(super::super::model::State::default())?;
         assert_eq!(v.get("move_plan"), Some(&serde_json::json!({})));
+        Ok(())
+    }
+
+    /// docs/ci.md §0.3 (2026-11-13): at a usage limit every conversation goes on elsewhere by
+    /// itself, one nobody said anything of included; only one a person said waits for the reset
+    /// stays. Choosing to wait is `move_on_limit` off; a state from before the choice existed reads
+    /// as going on.
+    #[test]
+    fn every_conversation_goes_on_at_a_limit_but_one_told_to_wait() -> anyhow::Result<()> {
+        let mut info = Info::default();
+        assert!(goes_on(&info), "nothing said: it goes on");
+        info.wait_at_limit = true;
+        assert!(!goes_on(&info), "told to wait: it waits");
+        let c: Command = serde_json::from_str(r#"{"type":"move_on_limit","on":false}"#)?;
+        assert!(matches!(c, Command::MoveOnLimit { on: false, .. }), "waiting is said as move_on_limit off");
+        let old: super::super::model::State = serde_json::from_value(serde_json::json!({"move_on_limit": false}))?;
+        assert!(!old.wait_at_limit, "a state from before reads as going on");
+        let said: super::super::model::State = serde_json::from_value(serde_json::to_value(super::super::model::State { wait_at_limit: true, ..Default::default() })?)?;
+        assert!(said.wait_at_limit, "a choice to wait is kept");
         Ok(())
     }
 

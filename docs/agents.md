@@ -1718,7 +1718,7 @@ sockets").
 | `auto_resume` | `on` | whether a pause ends by itself at its limit's reset (`state.pause.auto`, and `state.manual_resume` for later pauses) |
 | `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
 | `max_subagents` | `count` (null: no limit of its own) | the most subagents it has at work at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, one pool whatever each does. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it, counting the agents it started that are at work (working, waiting on a person, or held to a goal still to go on a stack that runs) and its harness's own still going, so one idle or ended holds no place; a plan's steps side by side go to subagents within it, on its goal stack (docs/goals.md, "A plan's steps side by side") or in a run with an agent per step, the rest waiting for room; and a plan run on it as one message or a step a turn tells it so |
-| `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room (`state.move_on_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
+| `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room, as every conversation does unless told to wait; `on: false` waits for the reset (`state.wait_at_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
 | `limit_hold` | `window?, label?, until?, said?, account?` | the server's: another session on `account` reached a usage limit, so this one pauses until it resets too, if it's signed in to that account and its own usage, asked then, says the limit is its own as well |
 
 ### Questions
@@ -1849,9 +1849,10 @@ Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`,
   the limit; "account": another session on its account did; "threshold"), `cut?` (`{message?,
   text, at}`: the turn the limit cut off), `checkpoint?` (`{git_ref, commit, at}`), `tries`,
   `checking?`, `next_check?`. `pause_at?` — its stop point (percent). `manual_resume` — pauses end
-  only when a person resumes them. `move_on_limit` — at a limit it goes on on another machine with
-  room; `move_plan` (`{to?, kind?, model?}`, always sent by runners that take one) — where and in
-  what, as a person chose.
+  only when a person resumes them. `move_on_limit` — a person chose that at a limit it goes on on
+  another machine with room (what every conversation does unless one waits); `wait_at_limit` — a
+  person chose that it waits for the reset; `move_plan` (`{to?, kind?, model?}`, always sent by
+  runners that take one) — where and in what, as a person chose.
 
 - `trouble?` — what keeps its harness from its provider, said from the harness's own stream at its
   first retry rather than once it gives up (Claude Code retries a refused key for about four
@@ -1863,7 +1864,7 @@ Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`,
   `codexErrorInfo`.
 
 `Info` (the lists) carries `limits`, `account`, `plan`, `left_behind`, `pause`, `pause_at`,
-`move_on_limit` and `move_plan` too.
+`move_on_limit`, `wait_at_limit` and `move_plan` too.
 
 ## Usage limits: pause and resume
 
@@ -1911,10 +1912,13 @@ turn (`harness/pause.rs`):
   in one turn): at its next step, the command or edit under way finishing first. The turn it
   stopped goes on from there, first, once the limit resets. A turn waiting on you (an approval)
   is left to you. Off by default.
-- **Go on elsewhere.** With `move_on_limit` on ("At a limit" under the usage badge and in the
-  agent's Settings: wait for the reset, go on wherever has room, or go on on a machine you pick,
-  then the harness and model there; off by default, a conversation at a time), a pause sends the
-  agent to another of your machines instead of waiting (`harness/elsewhere.rs`). A machine and a
+- **Go on elsewhere.** A pause at a limit sends the agent to another of your machines instead of
+  waiting (`harness/elsewhere.rs`): every conversation's, the user's third exception to opt-in
+  automation (docs/ci.md §0.3, 2026-11-13). "At a limit", under the usage badge and in the agent's
+  Settings, says where: go on wherever has room (the default), go on on a machine you pick (then
+  the harness and model there), or wait for the reset (`wait_at_limit`), which keeps that
+  conversation where it is. A runner from before 2026-11-13 can't keep a choice to wait: its
+  conversations go on until it's upgraded. A machine and a
   harness chosen are the only ones it goes to; otherwise kiln picks one that is
   connected, takes sessions over (reach), and has the same harness signed in to another account,
   one kiln doesn't know to be as full. Failing that, another harness its conversation can be
