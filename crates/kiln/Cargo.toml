@@ -78,6 +78,8 @@ hex-node = "=0.1.0"
 # The holder's enrollment with kiln's CA, and its link to its machine's capacity keeper (`crate::capacity`;
 # kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 13): Hex's QUIC wire, the copy hex-node takes.
 hex-quic = "=0.1.0"
+hex-core = "=0.1.0"
+hex-api = "=0.1.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"

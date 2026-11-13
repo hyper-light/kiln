@@ -2453,6 +2453,8 @@ dependencies = [
  "futures",
  "glob",
  "hex",
+ "hex-api",
+ "hex-core",
  "hex-node",
  "hex-quic",
  "hmac 0.13.0",
