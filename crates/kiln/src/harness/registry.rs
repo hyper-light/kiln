@@ -3150,10 +3150,11 @@ impl Registry {
             if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
                 store.send(id, &u);
             }
-            // A session this server does not know yet (it restarted): ask for all of it.
-            if let Location::Machine(machine) = &from
-                && !matches!(u, Update::Closed)
-            {
+            // A session this server does not know yet (it restarted): ask for all of it. One that ended (on its
+            // machine while this server was down) has its goals let go of.
+            if matches!(u, Update::Closed) {
+                goals_ended(hub, id);
+            } else if let Location::Machine(machine) = &from {
                 self.request_snapshot(hub, machine, id);
             }
             return None;
@@ -3243,6 +3244,7 @@ impl Registry {
             Update::Reply { .. } | Update::Inbox { .. } | Update::MailFlow { .. } => {}
             Update::Closed => {
                 gone = true;
+                goals_ended(hub, id);
                 // Its identities with it (docs/ci.md W27-R01).
                 let (store, id) = (hub.store.clone(), id.to_owned());
                 drop(crate::rt::spawn(async move {
@@ -3944,6 +3946,11 @@ impl Registry {
     /// its runners' grace.
     pub async fn returned(&self, id: &str) {
         self.returning.wait(id, || self.sessions.slot(id).is_some()).await;
+    }
+
+    /// Whether this server can say now whether it has session `id`: [`Registry::returned`] without the wait.
+    pub fn can_say(&self, id: &str) -> bool {
+        self.returning.says(id, || self.sessions.slot(id).is_some())
     }
 
     /// Join a session's stream as a viewer that had it through revision `after` (`(born, rev)`),
@@ -5083,6 +5090,11 @@ impl Registry {
             }
             super::archive::closed(hub, id);
             super::attention::forget(id);
+            // Its goal stack with it, and what it held as another stack's subagent back there (`crate::goals::forget`),
+            // whoever closed it (its port, not kiln's own end of it, which forgets it too).
+            if let Err(e) = crate::goals::forget(hub, id).await {
+                tracing::warn!(session = %id, error = %format!("{e:#}"), "a closed agent's goal stack wasn't let go of");
+            }
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         ok || loc.is_some()
@@ -5278,6 +5290,20 @@ fn unsigned(hub: &Hub, id: &str, epoch: u64, took: &str, why: String) {
         }
     });
 }
+
+/// Agent `id` ended on its machine, or where this server had no copy of it: its goal stack with it, and
+/// what it held as another stack's subagent back there, in one transaction (`crate::goals::forget`),
+/// as kiln's own end of an agent does. Before, only that end forgot an agent's stack: one ended on its
+/// machine left the goal it held held, for its follower to find gone on a later look.
+fn goals_ended(hub: &Arc<Hub>, id: &str) {
+    let (hub, id) = (Arc::clone(hub), id.to_owned());
+    drop(crate::rt::spawn(async move {
+        if let Err(e) = crate::goals::forget(&hub, &id).await {
+            tracing::warn!(session = %id, error = %format!("{e:#}"), "an ended agent's goal stack wasn't let go of");
+        }
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
