@@ -213,7 +213,7 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "e55eea102ff87fa91a5967ce4b24bde5103e82e1"
+commit = "e82b9403b863718930fe9f224186d3ae862bfd61"
 path = "vendor/shards"
 take = [
   ".cargo",
@@ -257,11 +257,12 @@ own = ["UPSTREAM.md"]
 
 # Hex, the runtime and scheduler kiln's harness microVMs run under (its docs/design; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
 # steps 12 and 16), built on kiln's one Shards and hyper-raft: its upstream pins older revisions of both, and the
-# recorded changes move its pins to kiln's and adopt Shards' API there (vendor/hex/UPSTREAM.md). Its crates, the two
-# records they include as they build, and the record of what it vendors (its vendor/MANIFEST.toml and vendor/patches,
-# which kiln's pins are checked against) with seccompiler, the third-party code only Hex vendors; less its copies of
-# what kiln vendors itself (hyper-raft, Shards, cuda-rust, all-smi), the GPU renderer and Firecracker sources only its
-# own scripts build, and its docs, benchmarks and CI, which are Hex's.
+# recorded changes move its pins to kiln's and adopt Shards' API there (vendor/hex/UPSTREAM.md). The pair kiln builds:
+# Hex d84730ee on Shards e82b9403 (and hyper-raft fb74b595), the one Shards revision Hex and kiln both build on. Its
+# crates, the two records they include as they build, and the record of what it vendors (its vendor/MANIFEST.toml and
+# vendor/patches, which kiln's pins are checked against) with seccompiler, the third-party code only Hex vendors; less
+# its copies of what kiln vendors itself (hyper-raft, Shards, cuda-rust, all-smi), the GPU renderer and Firecracker
+# sources only its own scripts build, and its docs, benchmarks and CI, which are Hex's.
 [projects.hex]
 kind = "git"
 repository = "https://github.com/hyper-light/hex"

@@ -110,7 +110,7 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "e55eea102ff87fa91a5967ce4b24bde5103e82e1"
+commit = "e82b9403b863718930fe9f224186d3ae862bfd61"
 path = "vendor/shards"
 take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs"]
 own = ["Cargo.toml", "UPSTREAM.md"]

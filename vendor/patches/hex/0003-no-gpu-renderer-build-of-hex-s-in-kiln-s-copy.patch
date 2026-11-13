@@ -3,7 +3,7 @@ Why: Hex's shards-gpu entry names the files its scripts/shards-gpu/build.sh rebu
 Kiln-only: kiln's copy leaves out what only Hex's own scripts build
 
 diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
-index c7f616e9f6ffe07ed5b6eea203bd9d1e1500b137..5bdec683eafe46bf1a522e4abf6a6fb48cc3826d 100644
+index ac7a7b8d306ed09398a326608f384fe0c0b81fea..c292b92ee5fa80c55bdd7475fc7b46f27f3b592a 100644
 --- a/vendor/MANIFEST.toml
 +++ b/vendor/MANIFEST.toml
 @@ -115,25 +115,6 @@ path = "vendor/shards"
@@ -20,7 +20,7 @@ index c7f616e9f6ffe07ed5b6eea203bd9d1e1500b137..5bdec683eafe46bf1a522e4abf6a6fb4
 -[projects.shards-gpu]
 -kind = "git"
 -repository = "https://github.com/hyper-light/shards"
--commit = "e55eea102ff87fa91a5967ce4b24bde5103e82e1"
+-commit = "e82b9403b863718930fe9f224186d3ae862bfd61"
 -path = "vendor/shards-gpu"
 -take = [
 -    "LICENSE",

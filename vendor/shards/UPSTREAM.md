@@ -3,10 +3,11 @@
 The microVMs kiln's harnesses run in (`docs/shards.md`; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16), at
 the one Shards revision kiln and Hex build on.
 
-- **Upstream:** https://github.com/hyper-light/shards, commit `e55eea102ff87fa91a5967ce4b24bde5103e82e1`
-  (2026-11-12), MIT (`LICENSE`): its `main` as Shards' D237 landed, a `shards` built to be carried
-  (`SHARDS_HELPERS=beside`) that starts the VM and network processes beside it, which the program carrying it
-  wrote out and signed.
+- **Upstream:** https://github.com/hyper-light/shards, commit `e82b9403b863718930fe9f224186d3ae862bfd61`
+  (2026-11-12), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too. It has Shards' D237
+  (landed at `e55eea10`), a `shards` built to be carried (`SHARDS_HELPERS=beside`) that starts the VM and network
+  processes beside it, which the program carrying it wrote out and signed; and `shards-afunix`'s fix of a blocking
+  read on Windows that slept through its peer's end (`7ea3ce27`, PM M536), which Hex's client and node link.
 - **How kiln uses it:**
   - its Agentfile parser and build checks, `shards-agentfile`, linked: every Agentfile kiln keeps is checked in
     kiln's own process (`crates/kiln/src/agentfiles/check.rs`);

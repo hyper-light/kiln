@@ -1,5 +1,5 @@
 Subject: Hex builds on kiln's Shards and hyper-raft
-Why: kiln holds one copy of each project (docs/vendoring.md), and Hex at d84730ee pins older ones: Shards at 482c5d78 and hyper-raft at 0856e05 with changes of its own. Its pins move to kiln's (Shards e55eea10, hyper-raft fb74b595), its records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree), and its image class takes Shards' API there: a narrowing names its destinations (D236; none kept, as egress and MCP, default deny), a published port names whom it reaches (Bound::to), a spec asks no nesting grant (D234), a boot takes a patience (Duration::MAX, as the boot was before: the box's own wait bounds it), and a plug's refusal (D235) is the call's. Its own tests' model of Shards takes the same (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16).
+Why: kiln holds one copy of each project (docs/vendoring.md), and Hex at d84730ee pins older ones: Shards at 482c5d78 and hyper-raft at 0856e05 with changes of its own. Its pins move to kiln's (Shards e82b9403, hyper-raft fb74b595), its records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree), and its image class takes Shards' API there: a narrowing names its destinations (D236; none kept, as egress and MCP, default deny), a published port names whom it reaches (Bound::to), a spec asks no nesting grant (D234), a boot takes a patience (Duration::MAX, as the boot was before: the box's own wait bounds it), and a plug's refusal (D235) is the call's. Its own tests' model of Shards takes the same (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16).
 
 diff --git a/crates/hex-runtime/src/grants.rs b/crates/hex-runtime/src/grants.rs
 index 23524723a7d22b669ecd85d6a77e15cda7618333..6b60d09839da1594c5ed2d3b63f7e76bac18d255 100644
@@ -132,7 +132,7 @@ index f1b232c6f5f95b86a0517a6509d3684a2670fded..73633a687f24bb83c5bf9bec09104cb7
              .collect();
          Ok(Box::new(ModelGuest {
 diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
-index 24e8c560102dc64b0e0d1d92ad5b53f51780f68f..c7f616e9f6ffe07ed5b6eea203bd9d1e1500b137 100644
+index 24e8c560102dc64b0e0d1d92ad5b53f51780f68f..ac7a7b8d306ed09398a326608f384fe0c0b81fea 100644
 --- a/vendor/MANIFEST.toml
 +++ b/vendor/MANIFEST.toml
 @@ -33,7 +33,7 @@ own = ["UPSTREAM.md"]
@@ -149,7 +149,7 @@ index 24e8c560102dc64b0e0d1d92ad5b53f51780f68f..c7f616e9f6ffe07ed5b6eea203bd9d1e
  kind = "git"
  repository = "https://github.com/hyper-light/shards"
 -commit = "482c5d7856dfea06d167202876ecd430a680eada"
-+commit = "e55eea102ff87fa91a5967ce4b24bde5103e82e1"
++commit = "e82b9403b863718930fe9f224186d3ae862bfd61"
  path = "vendor/shards"
  take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs"]
  own = ["Cargo.toml", "UPSTREAM.md"]
@@ -158,7 +158,7 @@ index 24e8c560102dc64b0e0d1d92ad5b53f51780f68f..c7f616e9f6ffe07ed5b6eea203bd9d1e
  kind = "git"
  repository = "https://github.com/hyper-light/shards"
 -commit = "482c5d7856dfea06d167202876ecd430a680eada"
-+commit = "e55eea102ff87fa91a5967ce4b24bde5103e82e1"
++commit = "e82b9403b863718930fe9f224186d3ae862bfd61"
  path = "vendor/shards-gpu"
  take = [
      "LICENSE",
