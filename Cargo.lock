@@ -2510,6 +2510,7 @@ dependencies = [
  "sha2 0.11.1",
  "shards-agentfile",
  "shards-api",
+ "shards-image",
  "socket2",
  "str0m",
  "sysinfo",

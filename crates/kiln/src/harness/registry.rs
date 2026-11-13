@@ -2379,60 +2379,105 @@ impl Registry {
     /// is rebuilt with as many events as a live copy keeps, so the copy its machine goes on from
     /// is the session's; an older one with its last few, to show.
     pub async fn list_away(hub: &Arc<Hub>) {
-        let Some(st) = hub.harness.convo.clone() else { return };
+        if let Err(e) = Self::list_away_once(hub).await {
+            // Never given up on (2026-11-13 07:14Z: the store, busy with the runners' feeds as the server
+            // started, didn't answer in time, and four sessions stayed unlisted): tried again, waiting
+            // longer each time, until the store answers.
+            tracing::warn!(error = %format!("{e:#}"), "sessions of machines that are away couldn't be read from the conversation store: tried again until it answers");
+            let Some(commits) = hub.harness.convo.as_ref().map(crate::convo::store::Store::watch) else { return };
+            let hub = Arc::clone(hub);
+            crate::rt::spawn(async move {
+                // Again as the store next commits: it answers then, its writer between batches.
+                let mut tries = 1u64;
+                loop {
+                    commits.notified().await;
+                    tries = tries.saturating_add(1);
+                    match Self::list_away_once(&hub).await {
+                        Ok(()) => {
+                            tracing::info!(tries, "sessions of machines that are away, read from the conversation store at last");
+                            break;
+                        }
+                        Err(e) => tracing::warn!(error = %format!("{e:#}"), tries, "sessions of machines that are away still couldn't be read: tried again at the store's next commit"),
+                    }
+                }
+            });
+        }
+    }
+
+    /// [`Registry::list_away`], once: the store's unended sessions, then those runner processes were
+    /// last known to hold ([`Registry::restore_held`]). Read beside the writer (`Store::*_committed`),
+    /// never behind the runners' feeds queued on it.
+    async fn list_away_once(hub: &Arc<Hub>) -> anyhow::Result<()> {
+        let Some(st) = hub.harness.convo.clone() else { return Ok(()) };
         const AWAY_DAYS: i64 = 30;
         const AWAY_EVENTS: usize = 200;
         const RECENT: i64 = 24 * 3600 * 1000;
         let now = crate::util::now_ms();
         let since = now - AWAY_DAYS * 24 * 3600 * 1000;
-        // Sessions a runner process was last known to hold (`holders.json`): a session is let go of
-        // there only as it truly ends (`Registry::close`), so one there is one that never ended,
-        // whatever the store says of it (a build before 3ee57cb8a8f8 dropped ones no runner reported,
-        // and they read closed there: 2026-11-13).
-        let held: Vec<String> = hub.harness.holders.load().keys().cloned().collect();
-        let (st2, held2) = (st.clone(), held.clone());
-        let read = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
-            let st = st2;
-            let recent: std::collections::HashSet<String> = st.unended(now - RECENT)?.into_iter().map(|u| u.id).collect();
+        let away = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
+            let recent: std::collections::HashSet<String> = st.unended_committed(now - RECENT)?.into_iter().map(|u| u.id).collect();
             let mut out = Vec::new();
-            let mut listed = st.unended(since)?;
-            let have: std::collections::HashSet<String> = listed.iter().map(|u| u.id.clone()).collect();
-            for id in held2.into_iter().filter(|id| !have.contains(id)) {
-                if let Some(k) = st.kept(&id, MAX_EVENTS)?
-                    && let Some(info) = k.info
-                {
-                    listed.push(crate::convo::store::Unended { id, info, meta: k.meta, state: k.state, machine: None });
-                }
-            }
-            for u in listed {
+            for u in st.unended_committed(since)? {
                 let keep = if recent.contains(&u.id) { MAX_EVENTS } else { AWAY_EVENTS };
-                let mut events = st.events(&u.id, None, keep)?;
-                // Cut at `keep`: from where a run of the digests begins, as a live copy lets go of
-                // its oldest (`crate::wire::sums::run_after`).
-                if events.len() >= keep
-                    && let Some(first) = events.first().map(|e| e.seq)
-                {
-                    let from = crate::wire::sums::run_after(first);
-                    events.retain(|e| e.seq >= from);
-                }
+                let events = cut(st.events(&u.id, None, keep)?, keep);
                 out.push((u, events));
             }
             Ok(out)
         })
-        .await;
-        match read {
-            Ok(Ok(away)) => {
-                // Read closed though never ended: open again in the store, so it's listed from here on.
-                let reopened: Vec<(String, String)> = away.iter().filter(|(u, _)| held.contains(&u.id)).map(|(u, _)| (u.id.clone(), u.info.clone())).collect();
-                hub.harness.restore_away(hub, away).await;
-                for (id, info) in reopened {
-                    if let (Some(store), Ok(info)) = (hub.harness.convo.as_ref(), serde_json::from_str::<Info>(&info)) {
-                        store.send(&id, &Update::Open { info: Box::new(info), since: None });
+        .await??;
+        hub.harness.restore_away(hub, away).await;
+        Self::restore_held(hub).await
+    }
+
+    /// Sessions a runner process was last known to hold (`holders.json`) that this server doesn't
+    /// list: a session is let go of there only as it truly ends (`Registry::close`), so each never
+    /// ended, whatever the store says of it (a build before 3ee57cb8a8f8 dropped ones no runner
+    /// reported, and the store reads them closed). Each read from the store (closed or not, beside
+    /// the writer), listed (crashed with its machine up, offline with it away), opened again in the
+    /// store, and said in the log; one the store has nothing of, said too, with why. As the server
+    /// starts, and again as a runner's report finds one missing (`Hub`'s inventory).
+    pub async fn restore_held(hub: &Arc<Hub>) -> anyhow::Result<()> {
+        let Some(st) = hub.harness.convo.clone() else { return Ok(()) };
+        let missing: Vec<String> = hub.harness.holders.load().keys().filter(|id| !hub.harness.sessions.contains(id)).cloned().collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let found = crate::rt::blocking(move || -> anyhow::Result<Vec<(String, Result<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>), String>)>> {
+            let mut out = Vec::new();
+            for id in missing {
+                let got = match st.kept_committed(&id, MAX_EVENTS)? {
+                    Some(k) => match k.info {
+                        Some(info) => Ok((crate::convo::store::Unended { id: id.clone(), info, meta: k.meta, state: k.state, machine: None }, cut(k.events, MAX_EVENTS))),
+                        None => Err("the conversation store keeps its events but not what it is".to_owned()),
+                    },
+                    None => Err("the conversation store has nothing of it".to_owned()),
+                };
+                out.push((id, got));
+            }
+            Ok(out)
+        })
+        .await??;
+        let mut away = Vec::new();
+        for (id, got) in found {
+            match got {
+                Ok(row) => away.push(row),
+                Err(why) => {
+                    if NOT_RESTORED.lock().insert(id.clone()) {
+                        tracing::warn!(session = %id, why = %why, "a session a runner process was last known to hold couldn't be listed again");
                     }
                 }
             }
-            Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "sessions of machines that are away couldn't be read from the conversation store"),
         }
+        let reopened: Vec<(String, String)> = away.iter().map(|(u, _)| (u.id.clone(), u.info.clone())).collect();
+        hub.harness.restore_away(hub, away).await;
+        for (id, info) in reopened {
+            let status = hub.harness.info(&id).map(|i| i.status);
+            tracing::info!(session = %id, status = ?status, "a session a runner process was last known to hold, listed again");
+            if let (Some(store), Ok(info)) = (hub.harness.convo.as_ref(), serde_json::from_str::<Info>(&info)) {
+                store.send(&id, &Update::Open { info: Box::new(info), since: None });
+            }
+        }
+        Ok(())
     }
 
     pub async fn run_local(hub: Arc<Hub>) -> anyhow::Result<()> {
@@ -4178,6 +4223,8 @@ impl Registry {
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                         isolation: spec.isolation.clone(),
+                        runs: None,
+                        starts: Vec::new(),
                     };
                     let mut seed = Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus));
                     seed.opened_at = Some(std::time::Instant::now());
@@ -5040,6 +5087,22 @@ impl Registry {
             .unwrap_or(false)
     }
 }
+
+/// Events cut at `keep`: from where a run of the digests begins, as a live copy lets go of its
+/// oldest (`crate::wire::sums::run_after`).
+fn cut(mut events: Vec<crate::convo::rows::EventRow>, keep: usize) -> Vec<crate::convo::rows::EventRow> {
+    if events.len() >= keep
+        && let Some(first) = events.first().map(|e| e.seq)
+    {
+        let from = crate::wire::sums::run_after(first);
+        events.retain(|e| e.seq >= from);
+    }
+    events
+}
+
+/// Held sessions said in the log already as not listed again (`Registry::restore_held`): once each,
+/// not at every runner's report.
+static NOT_RESTORED: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 /// Whether runner process `holder` is one `me` came after: `me` a kiln id (UUIDv7, ordered by when
 /// it was made, `crate::util::new_id`), and the holder an older id, or a name from before runner
@@ -6397,6 +6460,36 @@ mod tests {
             store.sync()?;
             let open: Vec<String> = store.unended(0)?.into_iter().map(|u| u.id).collect();
             anyhow::ensure!(open.contains(&"release".to_owned()) && open.contains(&"amphora".to_owned()), "open again in the store: {open:?}");
+            Ok(())
+        })
+    }
+
+    /// Production, 2026-11-13 07:14Z: the restore at the start can miss (the store didn't answer
+    /// in time); a runner's report lists again each session a runner was last held by that the
+    /// server doesn't list (`Registry::restore_held`, as `Hub`'s inventory calls it): crashed with
+    /// its machine up, with why, open again in the store, and Resume isn't refused.
+    #[test]
+    fn crashed_state_a_held_session_missed_at_the_start_is_listed_again_on_a_report() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let info = Info { id: "missed".into(), kind: "claude".into(), target: "agent:mac".into(), status: Status::Idle, ..Info::default() };
+            store.send("missed", &Update::Open { info: Box::new(info), since: None });
+            store.send("missed", &Update::Closed);
+            hub.harness.held_by("missed", "main");
+            store.sync()?;
+            hub.put_agent(crate::hub::tests::live_runner("mac", "macos", "aarch64"));
+            anyhow::ensure!(hub.harness.info("missed").is_none(), "not listed yet");
+            Registry::restore_held(&hub).await?;
+            let i = hub.harness.info("missed").ok_or_else(|| anyhow::anyhow!("still missing"))?;
+            anyhow::ensure!(i.status == Status::Crashed && i.exit.as_ref().and_then(|e| e.error.as_deref()).is_some(), "{:?} {:?}", i.status, i.exit);
+            store.sync()?;
+            anyhow::ensure!(store.unended_committed(0)?.iter().any(|u| u.id == "missed"), "open again in the store");
+            let resumed = super::super::relocate::resume(&hub, "missed").await;
+            anyhow::ensure!(!resumed.as_ref().is_err_and(|e| e.contains("only a crashed agent") || e.contains("no such agent")), "{resumed:?}");
+            // Nothing more to list: a second report lists nothing twice.
+            Registry::restore_held(&hub).await?;
+            anyhow::ensure!(hub.harness.ids().iter().filter(|id| *id == "missed").count() == 1);
             Ok(())
         })
     }

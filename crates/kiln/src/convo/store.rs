@@ -294,6 +294,13 @@ pub trait Engine: Send + 'static {
 pub trait Read {
     /// As [`Engine::events`].
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
+    /// As [`Engine::unended`]: read beside the writer, so a server starting while its runners' feeds
+    /// fill the writer still lists its sessions (2026-11-13 07:14Z: it timed out twice and gave up).
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
+    /// As [`Engine::kept`].
+    fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
+    /// As [`Engine::ended`].
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>>;
 }
 
 /// The writer's engine as a [`Read`]: a store whose engine has no reader (or whose reader stopped) reads on its writer,
@@ -303,6 +310,18 @@ struct OnWriter<'a>(&'a mut dyn Engine);
 impl Read for OnWriter<'_> {
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.0.events(session, before, limit)
+    }
+
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.0.unended(since)
+    }
+
+    fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.0.kept(session, last)
+    }
+
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        self.0.ended(after, limit)
     }
 }
 
@@ -668,6 +687,26 @@ impl Store {
     pub fn events_committed(&self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         let s = session.to_owned();
         self.read(move |r| r.events(&s, before, limit))
+    }
+
+    /// [`Store::unended`], read beside the writer at the last commit ([`Store::read`]): never behind the
+    /// writes queued before it (a starting server's runners' feeds). Blocking, for `READ_WAIT` at most.
+    pub fn unended_committed(&self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.read(move |r| r.unended(since))
+    }
+
+    /// [`Store::ended`], read beside the writer at the last commit (a starting server's archive adopts what
+    /// closed before it, 2026-11-13 07:14:33Z: behind the runners' feeds, it timed out). Blocking.
+    pub fn ended_committed(&self, after: Option<(i64, String)>, limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        let (at, id) = after.unwrap_or((i64::MIN, String::new()));
+        let limit = limit.min(ENDED_MAX);
+        self.read(move |r| r.ended((at, &id), limit))
+    }
+
+    /// [`Store::kept`], read beside the writer at the last commit. Blocking, for `READ_WAIT` at most.
+    pub fn kept_committed(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        let s = session.to_owned();
+        self.read(move |r| r.kept(&s, last))
     }
 
     /// What is kept of `session`, with at most its last `last` events. Blocking.
@@ -1633,6 +1672,24 @@ mod tests {
     /// CP-T10.1: a hold keeps the records of sessions that ended at or after it, however long ago,
     /// while those that ended before it go; moved past them, they go at once (the server's
     /// transcripts are archived before their records go).
+    /// 2026-11-13 07:14Z: what a starting server lists its sessions with is read beside the writer,
+    /// never behind what's queued on it: the same answers as the writer's (unended, kept, ended).
+    #[test]
+    fn a_starting_servers_reads_beside_the_writer_say_what_the_writers_do() -> anyhow::Result<()> {
+        let (_d, store) = scratch()?;
+        let info = |id: &str| crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..Default::default() };
+        store.send("open", &Update::Open { info: Box::new(info("open")), since: None });
+        store.send("shut", &Update::Open { info: Box::new(info("shut")), since: None });
+        store.send("shut", &Update::Closed);
+        store.sync()?;
+        let ids = |v: Vec<Unended>| v.into_iter().map(|u| u.id).collect::<Vec<_>>();
+        assert_eq!(ids(store.unended_committed(0)?), ids(store.unended(0)?));
+        assert_eq!(store.kept_committed("shut", 10)?.map(|k| k.closed_at.is_some()), store.kept("shut", 10)?.map(|k| k.closed_at.is_some()));
+        assert!(store.kept_committed("shut", 10)?.is_some_and(|k| k.closed_at.is_some()), "a closed one is kept, and says so");
+        assert_eq!(store.ended_committed(None, 10)?, store.ended(None, 10)?);
+        Ok(())
+    }
+
     #[test]
     fn a_hold_keeps_the_records_of_sessions_that_ended_at_or_after_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
