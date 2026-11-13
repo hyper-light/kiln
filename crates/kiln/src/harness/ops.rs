@@ -2242,13 +2242,35 @@ for line in sys.stdin:
                 Ok(crate::harness::mail_delivery::capacity(&hub, &recipient).is_some_and(|capacity| capacity.eligible_peer.as_deref() == Some("server")))
             }).await?;
             let grant = crate::harness::mail_delivery::capacity(&hub, &recipient).ok_or_else(|| anyhow::anyhow!("source grant disappeared"))?;
+            // Another session's use of the machine's budget moves this one's capacity on, as a parallel
+            // run's sessions do (`Controller::budget_changed`, flowed as the native budget's change is): a
+            // new generation, the grant held.
+            let session = hub.harness.local.get(&recipient).ok_or_else(|| anyhow::anyhow!("source disappeared"))?;
+            let input = session.core.lock().input.clone().ok_or_else(|| anyhow::anyhow!("no admission input"))?;
+            let moved = {
+                let mut controller = input.controller.lock();
+                controller.budget_changed(false).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                controller.capacity()
+            };
+            session.mail_flow(crate::harness::admission::FlowEvent::Capacity { capacity: moved });
             let name = "ordinary-state-after-mail-peers";
             anyhow::ensure!(hub.harness.local.command(&recipient, Command::Control { id: "rename".into(), value: Some(json!(name)) }), "ordinary owner control was not queued");
             source_until(&hub, &recipient, "ordinary owner State after the grant", || async { Ok(hub.harness.info(&recipient).is_some_and(|info| info.name == name)) }).await?;
-            let local = hub.harness.local.get(&recipient).ok_or_else(|| anyhow::anyhow!("source disappeared"))?;
-            anyhow::ensure!(local.core.lock().state.admission.as_ref() == Some(&grant), "MailPeers did not update the authoritative State: {grant:?}");
-            anyhow::ensure!(crate::harness::mail_delivery::capacity(&hub, &recipient).as_ref() == Some(&grant), "an ordinary State revoked the live grant: {grant:?}");
-            anyhow::ensure!(hub.harness.state(&recipient).and_then(|state| state.admission).as_ref() == Some(&grant), "the raw State and admission projection disagree");
+            // The grant held through the ordinary State: the session's State, the server's projection of
+            // its capacity and the raw State agree, the server still eligible at the grant's epoch and no
+            // generation behind it. Its generation moves on with every budget, readiness or demand change
+            // (`Controller::changed`), sessions beside it in a parallel run sharing the machine's budget:
+            // the grant itself said again failed under that load (kiln runs r222 and r153, 2026-11-13).
+            let views = || {
+                let local = hub.harness.local.get(&recipient).and_then(|session| session.core.lock().state.admission.clone());
+                (local, crate::harness::mail_delivery::capacity(&hub, &recipient), hub.harness.state(&recipient).and_then(|state| state.admission))
+            };
+            source_until(&hub, &recipient, "the State and its projections agree", || async {
+                let (local, projected, raw) = views();
+                Ok(local.is_some() && local == projected && projected == raw)
+            }).await?;
+            let held = views().0.ok_or_else(|| anyhow::anyhow!("source disappeared"))?;
+            anyhow::ensure!(held.epoch == grant.epoch && held.eligible_peer == grant.eligible_peer && held.generation >= grant.generation, "an ordinary State revoked the live grant: {grant:?}, now {held:?}");
             let worker = Arc::clone(&hub);
             crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(worker).await; });
             source_disposition(&hub, &recipient, message, true).await?;
