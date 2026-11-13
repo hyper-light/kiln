@@ -59,8 +59,9 @@ pub struct HexVms {
     /// Hex's runtime. Shared, as Hex hands it out: `hex_node::images::ImageRuntime::new` answers an `Arc` (its books
     /// hold a weak reference to it), and each run holds a clone for its box's delete, which outlives any borrow.
     runtime: Arc<dyn Runtime>,
-    /// Names the box of a launch the seam names none for: placement's numbering (module docs).
-    names: Box<dyn Fn() -> BoxName + Send + Sync>,
+    /// Names the box of a launch the seam names none for: placement's numbering (module docs); none where no
+    /// placement runs to number it.
+    names: Box<dyn Fn() -> Option<BoxName> + Send + Sync>,
     /// Kiln's records, where each run's charge is kept as it ends ([`USE`]). With none, nothing is kept and the use
     /// is said at debug.
     ledger: Option<Arc<dyn Records>>,
@@ -184,9 +185,13 @@ async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
     }
 }
 
+/// Why a launch with no box named is refused where no placement numbers one.
+pub const UNNAMED: &str = "a microVM whose box no placement here names: kiln's placement isn't running on this machine";
+
 impl HexVms {
-    /// Over Hex's runtime `runtime`, naming each launch's box with `names`.
-    pub fn new(runtime: Arc<dyn Runtime>, names: impl Fn() -> BoxName + Send + Sync + 'static) -> Self {
+    /// Over Hex's runtime `runtime`, naming each launch's box with `names`, which answers none where nothing numbers
+    /// one (a launch then refused).
+    pub fn new(runtime: Arc<dyn Runtime>, names: impl Fn() -> Option<BoxName> + Send + Sync + 'static) -> Self {
         Self { runtime, names: Box::new(names), ledger: None, vms: parking_lot::Mutex::new(HashMap::new()) }
     }
 
@@ -247,7 +252,10 @@ impl HexVms {
 
 impl Sandbox for HexVms {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
-        Box::pin(self.launch_as((self.names)(), launch))
+        match (self.names)() {
+            Some(name) => Box::pin(self.launch_as(name, launch)),
+            None => Box::pin(async { Err(Refusal::Unsupported(UNNAMED.into())) }),
+        }
     }
 
     fn boundaries(&self) -> Vec<&'static str> {
@@ -551,7 +559,7 @@ impl Drop for HexRun {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
@@ -570,7 +578,7 @@ mod tests {
     fn vms() -> (Arc<SimRuntime>, HexVms) {
         let sim = Arc::new(SimRuntime::new());
         let n = AtomicU64::new(0);
-        let vms = HexVms::new(Arc::<SimRuntime>::clone(&sim), move || BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) });
+        let vms = HexVms::new(Arc::<SimRuntime>::clone(&sim), move || Some(BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) }));
         (sim, vms)
     }
 
@@ -661,7 +669,7 @@ mod tests {
     /// simulator doesn't model. Read `n` is `use_at(n)`. Its first delete may lose its answer (the box deleted,
     /// an error said), and its start may be refused.
     #[derive(Default)]
-    struct Metered {
+    pub(crate) struct Metered {
         sim: SimRuntime,
         started: parking_lot::Mutex<std::collections::HashSet<String>>,
         reads: AtomicU64,
@@ -739,7 +747,7 @@ mod tests {
     fn metered() -> (Arc<Metered>, Arc<SimRecords>, HexVms) {
         let (rt, records) = (Arc::new(Metered::default()), Arc::new(SimRecords::new()));
         let n = AtomicU64::new(0);
-        let vms = HexVms::new(Arc::<Metered>::clone(&rt), move || BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) }).with_ledger(Arc::<SimRecords>::clone(&records));
+        let vms = HexVms::new(Arc::<Metered>::clone(&rt), move || Some(BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) })).with_ledger(Arc::<SimRecords>::clone(&records));
         (rt, records, vms)
     }
 
