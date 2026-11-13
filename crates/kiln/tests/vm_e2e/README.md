@@ -81,7 +81,7 @@ for a run (`PUT /api/runners/<machine>/headroom` with `{"enabled": false}`) and 
 
 | Name | Client end | Server end | Owed by |
 |---|---|---|---|
-| `server-runner` | the runner's own view of its link to the server | the server's view of that runner's connection | kiln plan 01a1d2c1ef09707daafe3fe9b77754e6 step 2 (AES-256-GCM alone there, each end on kiln's API; it needs step 16's `Endpoint::negotiated`) |
+| `server-runner` | the runner's own view of its link to the server | the server's view of that runner's connection | kiln plan 01a1d2c1ef09707daafe3fe9b77754e6 step 2 (AES-256-GCM alone there, each end on kiln's API, read from step 16's `Endpoint::negotiated`) |
 | `kiln-hex` | kiln's Hex client | the Hex node's own report of each peer link | kiln's step 17 (its Hex wiring) and plan 01a1d2c1 step 3 (Hex's node report) |
 | `agent-control` | Shards' `control::controller` in kiln | the agent-control endpoint's own report | Shards step 11 (on its control lane) and kiln's step 17 (on the session) |
 | `mcp` | the harness's client | kiln's `/api/mcp` as the microVM reaches it | step 18 designs it as plain HTTP to `host.docker.internal:<port>`, which crosses no TLS: Ada's and ROOT's decision (Shards D238, "control that crosses no TLS"). Until it is TLS 1.3 at AES-256-GCM (or rides the agent-control link) this link has no suite and the run fails, saying so |
@@ -149,25 +149,57 @@ script and `harness.json` beside it and the harness's own name (`claude`, `codex
 Shards slice; then `VM_E2E_IMAGE_CLAUDE=agentfile:<id>` and `VM_E2E_IMAGE_CODEX=agentfile:<id>` with
 no `VM_E2E_PROMPT`.
 
-## What isn't checked yet, and why
+## What's owed, by whom, and what isn't checked yet
 
-- Claude Code past a steer: kiln hands a Claude Code session no command after a message steered into
-  its turn (the next queued message and a steered one each answered 202 and never reached the
-  harness; Linux and macOS, 2026-11-13, with or without an agent started from inside, the stand-in
-  saying Claude Code 2.1's `queued` lifecycle and replay). `host::s34_claude_code_through_kiln_on_the_host`
-  is ignored until kiln delivers past a steer (`cargo test -p kiln --test vm_harnesses -- --ignored host::`
-  shows it), and step 34's Claude Code run stops at its interrupt step until then.
+Step 34's plan (kiln plan 01a1d2c1ef09707daafe3fe9b77754e6) step 4. Each item names the step that owes
+it, the surface step 34's check reads, and the evidence, at kiln main 562268830 and Shards main
+8479be870 (2026-11-13).
 
-- Each link's ends: no surface says them yet (the table above names whose each is).
-- kiln's MCP from inside: kiln's own Agentfiles (`.kiln/images/harness-claude`, `harness-codex`) grant
-  their provider's 443/tcp alone, no reach to kiln's MCP server, and no runner serves `/api/mcp` to a
-  microVM yet: step 18 (its `host.docker.internal:<port>` form and refusals, on `p/s18-host-in-vm-v1`)
-  and the runner's loopback `/api/mcp` (step 35's) own it. Until both land, `mcp_round_trip` fails
-  step 34's runs, saying so.
-- That an isolated session holds no process of the host: step 17's `Duplex::host_pid` is none, but no
-  API says so; the process trees and the kernel line stand for it.
-- A harness that ran a process on the host and ended it between two looks: the looks see the harness
-  itself, a process of the whole session, and the kernel line is the harness's own shell's word on
-  where it ran. kiln's own record of what it started for a session would close this.
-- On a Windows host, Codex and the ACP harnesses get kiln's MCP server only through step 18's HTTP
-  form (on the host, kiln gives it them over the runner's Unix socket alone).
+1. **The agent-control link's ends, the microVM's identity and no host pid, on the session**: step 17's
+   Shards slice. Read from `GET /api/harness/sessions/<id>`, through `VM_E2E_LINKS`' `agent-control`
+   entry (the controller's end from Shards' `control::Controller` in kiln, the endpoint's own report),
+   and by `check_in_guest`. Evidence: the session's info (`harness/session.rs`, `Info`) says its
+   `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch
+   (`p/s17-launch-seam-v1`, 64dfab21f) reads its process's `host_pid()` inside (`session.rs` 4328 and
+   4724) and says none of it; Shards' `control::Controller` (`crates/remote/src/control/drive.rs`)
+   says no negotiated suite: the only reader is a test's (`#[cfg(test)] mod handshake`'s `Side::suite`
+   in `crates/remote/src/lib.rs`, asserted at both ends in `control.rs`'s tests).
+2. **The agent-control endpoint's own suite**: step 11 (Shards D238). Read from the endpoint's report on
+   its control lane, as kiln relays it on the session (`VM_E2E_LINKS`' `agent-control` server end).
+   Evidence: D238 asks for a test asserting each link's suite (D239), and Shards main has it, with no
+   report at run time; step 11's branches (`p/s11-control-v1`, `p/s11-controller-v1`) are on Shards
+   main.
+3. **kiln's MCP from inside, and its suite**: step 18, and Ada's and ROOT's decision (D238). Read by
+   `mcp_round_trip`, and through `VM_E2E_LINKS`' `mcp` entry. Evidence: step 18's branch
+   (`p/s18-host-in-vm-v1`, a5ce21085) reaches `/api/mcp` as plain HTTP at
+   `host.docker.internal:<port>` (`harness/isolated/mcp.rs`), which crosses no TLS; D238's "Control
+   that crosses no TLS" (ROOT's ruling, 2026-11-13) takes the request slots, `engine.sock` and the
+   endpoint's AF_UNIX and vsock leg as host-local and names no MCP; kiln's own Agentfiles grant their
+   provider's 443/tcp alone (`.kiln/images/harness-claude/Agentfile`, `harness-codex/Agentfile`), and
+   the runner's loopback `/api/mcp` is step 35's. The ways: the MCP hop taken as host-local too (the
+   drive then drops `mcp` from `REQUIRED_LINKS`), TLS 1.3 at AES-256-GCM to the runner's `/api/mcp`,
+   or carried on the agent-control link. Until one is decided and built, `mcp` has no suite and step
+   34's runs fail, saying so.
+4. **kiln's MCP on a Windows host**: step 18. Read by `mcp_round_trip` on a Windows runner. Evidence: on
+   the host, kiln gives a session its MCP server over the runner's Unix socket alone
+   (`harness/kinds.rs`, `local_tools`, `#[cfg(unix)]`; its other twin gives none), so Codex and the ACP
+   harnesses on Windows reach it only through step 18's HTTP form.
+5. **The server-runner link's ends**: step 34's plan step 2 (AES-256-GCM alone on the link,
+   `net::LINK_PROVIDER`, and each end's negotiated suite on kiln's API). Read through `VM_E2E_LINKS`'
+   `server-runner` entry.
+6. **The kiln-Hex link's Hex end**: step 34's plan step 3, through Hex's lead (the node's own report of
+   each peer link's suite and group); the kiln end is step 17's Hex client. Read through
+   `VM_E2E_LINKS`' `kiln-hex` entry.
+7. **A microVM image without a vendor's turn**: step 17's Shards slice ("Without a vendor's turn",
+   above).
+8. **Claude Code past a steer**: kiln's own, found here (ROOT has the finding). kiln hands a Claude Code
+   session no command after a message steered into its turn (the next queued message and a steered
+   one each answered 202 and never reached the harness; Linux and macOS, 2026-11-13, with or without
+   an agent started from inside, the stand-in saying Claude Code 2.1's `queued` lifecycle and replay).
+   `host::s34_claude_code_through_kiln_on_the_host` is ignored until kiln delivers past a steer
+   (`cargo test -p kiln --test vm_harnesses -- --ignored host::` shows it), and step 34's Claude Code
+   run stops at its interrupt step until then.
+9. **A harness that ran a process on the host and ended it between two looks**: no step owns it yet. The
+   looks see the harness itself, a process of the whole session, and the kernel line is the harness's
+   own shell's word on where it ran. kiln's own record of what it started for a session would close
+   this.
