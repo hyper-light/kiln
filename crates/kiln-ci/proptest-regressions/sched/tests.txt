@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d5ef0bd6ab23b2acf036fdc7dca52d4d9f4aa20b9f0249f74bec4ef8e02d0db0 # shrinks to fleet = [1, 2, 2], legs = [(0, 0, 0, 45984, None), (36621, 0, 0, 1, None), (6543, 0, 0, 30078, None), (6543, 0, 0, 1, None), (0, 0, 0, 36621, None)], lost = None, share = 0.0

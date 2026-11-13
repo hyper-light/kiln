@@ -101,7 +101,7 @@ fn pax(key: &str, value: &str) -> Vec<u8> {
 }
 
 fn tree(strip: usize, t: Totals) -> Spec {
-    Spec::Tree(Tree { strip, unpacked_bytes: t.bytes, entries: t.entries })
+    Spec::Tree(Tree { strip, unpacked_bytes: t.bytes, entries: t.entries, skip: Vec::new() })
 }
 
 fn member(path: &str, data: &[u8]) -> Spec {
@@ -305,7 +305,7 @@ fn nothing_of_a_tree_shows_until_all_of_it_is_in() -> anyhow::Result<()> {
         assert_eq!((t.entries, t.bytes), (4, 12));
         let entries = t.entries.checked_add_signed(more_entries).ok_or_else(|| anyhow::anyhow!("entries"))?;
         let bytes = t.bytes.checked_add_signed(more_bytes).ok_or_else(|| anyhow::anyhow!("bytes"))?;
-        let pin = Spec::Tree(Tree { strip: 1, unpacked_bytes: bytes, entries });
+        let pin = Spec::Tree(Tree { strip: 1, unpacked_bytes: bytes, entries, skip: Vec::new() });
 
         let Err(Unpack { entry, why, .. }) = tar_gz(&c.gz, URL, &pin, &c.arch, Path::new("."), None) else {
             anyhow::bail!("{entries} entries and {bytes} bytes pinned: unpacked, not refused");
@@ -563,7 +563,7 @@ fn a_member_is_one_regular_file_held_to_its_pin() -> anyhow::Result<()> {
 #[test]
 fn the_unpack_object_is_one_form_or_refused() -> anyhow::Result<()> {
     let cursor: Spec = serde_json::from_str(r#"{"format": "tar.gz", "strip": 1, "unpacked_bytes": 2048, "entries": 3}"#)?;
-    assert_eq!(cursor, Spec::Tree(Tree { strip: 1, unpacked_bytes: 2048, entries: 3 }));
+    assert_eq!(cursor, Spec::Tree(Tree { strip: 1, unpacked_bytes: 2048, entries: 3, skip: Vec::new() }));
     let agy: Spec = serde_json::from_str(r#"{"format": "tar.gz", "member": "antigravity", "sha256": "00ff", "size": 7}"#)?;
     assert_eq!(agy, Spec::Member(Member { member: "antigravity".into(), sha256: "00ff".into(), size: 7, alone: false }));
 
@@ -613,7 +613,7 @@ fn the_unpack_object_is_one_form_or_refused() -> anyhow::Result<()> {
 fn what_is_not_a_gzip_tar_is_refused_whole() -> anyhow::Result<()> {
     let c = context()?;
     fs::write(&c.gz, b"not gzip at all")?;
-    let pin = Spec::Tree(Tree { strip: 1, unpacked_bytes: 0, entries: 0 });
+    let pin = Spec::Tree(Tree { strip: 1, unpacked_bytes: 0, entries: 0, skip: Vec::new() });
     let Err(Unpack { entry, why: Why::Io(_), .. }) = tar_gz(&c.gz, URL, &pin, &c.arch, Path::new("."), None) else {
         anyhow::bail!("unpacked, or refused for another reason");
     };
@@ -847,5 +847,195 @@ fn alone_is_a_members_field() -> anyhow::Result<()> {
         assert!(is(&why), "{json}: {why:?}");
     }
     assert!(serde_json::from_str::<Spec>(r#"{"format": "tar.gz", "member": "antigravity", "alone": "yes", "sha256": "00", "size": 1}"#).is_err());
+    Ok(())
+}
+
+/// Codex's arm64 shape (kiln plan 01a1ce705d7076648c1d9f9ee26214d3 step 1's pin): OpenAI's package at
+/// strip 0, its own glibc codex-path/rg among its programs.
+fn codex_package(w: &mut Writer) -> io::Result<()> {
+    w.dir("./", 0o755)?;
+    w.dir("bin/", 0o755)?;
+    w.file("bin/codex", 0o755, b"\x7fELF codex\n")?;
+    w.dir("codex-resources/", 0o755)?;
+    w.file("codex-resources/bwrap", 0o755, b"\x7fELF bwrap\n")?;
+    w.dir("codex-path/", 0o755)?;
+    w.file("codex-path/rg", 0o755, b"\x7fELF glibc rg\n")?;
+    w.file("codex-package.json", 0o644, b"{\"layoutVersion\": 1}\n")
+}
+
+const RG_URL: &str = "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz";
+const RIPGREP: &str = "ripgrep-15.2.0-aarch64-unknown-linux-musl";
+const STATIC_RG: &[u8] = b"\x7fELF static rg\n";
+
+/// ripgrep's own static archive: one top directory, its rg among its files.
+fn ripgrep(w: &mut Writer) -> io::Result<()> {
+    w.dir(&format!("{RIPGREP}/"), 0o755)?;
+    w.file(&format!("{RIPGREP}/README.md"), 0o644, b"# ripgrep\n")?;
+    w.file(&format!("{RIPGREP}/rg"), 0o755, STATIC_RG)
+}
+
+fn skipping(t: Totals, skip: &[&str]) -> Spec {
+    Spec::Tree(Tree { strip: 0, unpacked_bytes: t.bytes, entries: t.entries, skip: skip.iter().map(|s| (*s).to_owned()).collect() })
+}
+
+/// Codex's arm64 build in pin order: the package's tree skips its glibc codex-path/rg, then ripgrep's
+/// static rg is the member written there. The tree's pinned totals are the archive's own, the skipped
+/// rg counted, as `tar -t` and `tar -tv` list it; nothing is ever overwritten.
+#[test]
+fn codex_arm64s_tree_skips_its_rg_and_ripgreps_static_rg_takes_its_place() -> anyhow::Result<()> {
+    let c = context()?;
+    let rg_gz = c.root.join(".rg.part");
+    let t = archive(&c.gz, codex_package)?;
+    archive(&rg_gz, ripgrep)?;
+    assert_eq!((t.entries, t.bytes), (8, 57), "codex-path/rg among them");
+
+    tar_gz(&c.gz, URL, &skipping(t, &["codex-path/rg"]), &c.arch, Path::new("."), None)?;
+    assert!(!c.arch.join("codex-path/rg").exists(), "the package's rg is never written");
+    tar_gz(&rg_gz, RG_URL, &member(&format!("{RIPGREP}/rg"), STATIC_RG), &c.arch, Path::new("codex-path/rg"), Some(0o755))?;
+
+    let want = tree_of(&[
+        ("bin", true, 0o755),
+        ("bin/codex", false, 0o755),
+        ("codex-package.json", false, 0o644),
+        ("codex-path", true, 0o755),
+        ("codex-path/rg", false, 0o755),
+        ("codex-resources", true, 0o755),
+        ("codex-resources/bwrap", false, 0o755),
+    ]);
+    assert_eq!(walk(&c.arch)?, want);
+    assert_eq!(fs::read(c.arch.join("codex-path/rg"))?, STATIC_RG);
+    assert_eq!(names(&c.root)?, set(&["cursor-amd64"]), "both archives removed, and no staging directory");
+    Ok(())
+}
+
+/// Without its skip, the package's rg is there when ripgrep's comes: Exists, naming ripgrep's URL, its
+/// member and the path, and the package's rg stays as it was.
+#[test]
+fn without_its_skip_ripgreps_rg_collides_with_the_packages_and_the_first_stays() -> anyhow::Result<()> {
+    let c = context()?;
+    let rg_gz = c.root.join(".rg.part");
+    let t = archive(&c.gz, codex_package)?;
+    archive(&rg_gz, ripgrep)?;
+    tar_gz(&c.gz, URL, &skipping(t, &[]), &c.arch, Path::new("."), None)?;
+
+    let rg = member(&format!("{RIPGREP}/rg"), STATIC_RG);
+    let Err(Unpack { url, entry, why: Why::Exists(at) }) = tar_gz(&rg_gz, RG_URL, &rg, &c.arch, Path::new("codex-path/rg"), Some(0o755)) else {
+        anyhow::bail!("ripgrep's rg written over the package's, or refused for another reason");
+    };
+
+    assert_eq!((url.as_str(), entry, at), (RG_URL, Some(format!("{RIPGREP}/rg")), PathBuf::from("codex-path/rg")));
+    assert_eq!(fs::read(c.arch.join("codex-path/rg"))?, b"\x7fELF glibc rg\n");
+    assert_eq!(names(&c.root)?, set(&["cursor-amd64"]), "ripgrep's archive is removed too");
+    Ok(())
+}
+
+/// A tree's `skip` names regular files the archive holds, each once. One it doesn't hold is Missing; a
+/// directory is Kind('5'); a link or a set-ID file is refused as every entry is; a path outside the
+/// tree or naming nothing is Escapes, before the archive is read; a path named twice is Duplicate. Each
+/// names the path, and leaves no per-arch directory, no staging directory and no archive.
+#[test]
+fn a_skipped_path_is_one_regular_file_the_archive_holds() -> anyhow::Result<()> {
+    type Is = fn(&Why) -> bool;
+    type Extra = fn(&mut Writer) -> io::Result<()>;
+    let none: Extra = |_| Ok(());
+    let link: Extra = |w| w.add(b"codex-path/link", EntryType::Symlink, 0o777, b"", Some("rg"));
+    let suid: Extra = |w| w.file("codex-path/suid", 0o4755, b"suid\n");
+    let cases: [(&[&str], Extra, &str, Is); 9] = [
+        (&["codex-path/fd"], none, "codex-path/fd", |w| matches!(w, Why::Missing)),
+        (&["codex-path"], none, "codex-path/", |w| matches!(w, Why::Kind(b'5'))),
+        (&["codex-path/link"], link, "codex-path/link", |w| matches!(w, Why::Link)),
+        (&["codex-path/suid"], suid, "codex-path/suid", |w| matches!(w, Why::SetId)),
+        (&["/codex-path/rg"], none, "/codex-path/rg", |w| matches!(w, Why::Escapes)),
+        (&["../codex-path/rg"], none, "../codex-path/rg", |w| matches!(w, Why::Escapes)),
+        (&[""], none, "", |w| matches!(w, Why::Escapes)),
+        (&["."], none, ".", |w| matches!(w, Why::Escapes)),
+        (&["codex-path/rg", "./codex-path/rg"], none, "./codex-path/rg", |w| matches!(w, Why::Duplicate)),
+    ];
+    for (skip, extra, shown, is) in cases {
+        let c = context()?;
+        let t = archive(&c.gz, |w| {
+            codex_package(w)?;
+            extra(w)
+        })?;
+
+        let Err(Unpack { url, entry, why }) = tar_gz(&c.gz, URL, &skipping(t, skip), &c.arch, Path::new("."), None) else {
+            anyhow::bail!("skip {skip:?}: unpacked, not refused");
+        };
+
+        assert_eq!((url.as_str(), entry.as_deref()), (URL, Some(shown)), "skip {skip:?}");
+        assert!(is(&why), "skip {skip:?}: {why:?}");
+        assert_eq!(names(&c.root)?, set(&[]), "skip {skip:?}: nothing is left");
+    }
+    Ok(())
+}
+
+/// A skipped file counts in the tree's totals as tar lists it, so pin.sh pins the archive's own: totals
+/// that leave it out are refused at the entry that takes the count past them, and leave nothing.
+#[test]
+fn a_skipped_file_counts_in_the_trees_totals() -> anyhow::Result<()> {
+    type Is = fn(&Why) -> bool;
+    let rg = b"\x7fELF glibc rg\n".len() as u64;
+    let cases: [(u64, u64, Is); 2] =
+        [(1, 0, |w| matches!(w, Why::Entries { expected: 7, got: 8 })), (0, rg, |w| matches!(w, Why::Bytes { expected: 43, got: 57 }))];
+    for (fewer_entries, fewer_bytes, is) in cases {
+        let c = context()?;
+        let t = archive(&c.gz, codex_package)?;
+        let pin = Spec::Tree(Tree { strip: 0, unpacked_bytes: t.bytes - fewer_bytes, entries: t.entries - fewer_entries, skip: vec!["codex-path/rg".into()] });
+
+        let Err(Unpack { entry, why, .. }) = tar_gz(&c.gz, URL, &pin, &c.arch, Path::new("."), None) else {
+            anyhow::bail!("totals without the skipped rg: unpacked, not refused");
+        };
+
+        assert_eq!(entry.as_deref(), Some("codex-package.json"));
+        assert!(is(&why), "{why:?}");
+        assert_eq!(names(&c.root)?, set(&[]));
+    }
+    Ok(())
+}
+
+/// `skip` is a tree's field: it parses with the tree's three, it beside a member's fields is Both, and
+/// alone it still needs the tree's others.
+#[test]
+fn a_trees_skip_is_a_trees_field() -> anyhow::Result<()> {
+    let codex: Spec = serde_json::from_str(r#"{"format": "tar.gz", "strip": 0, "skip": ["codex-path/rg"], "unpacked_bytes": 57, "entries": 8}"#)?;
+    assert_eq!(codex, Spec::Tree(Tree { strip: 0, unpacked_bytes: 57, entries: 8, skip: vec!["codex-path/rg".into()] }));
+
+    type Is = fn(&Why) -> bool;
+    let refused: [(&str, Is); 2] = [
+        (r#"{"format": "tar.gz", "member": "rg", "sha256": "00", "size": 1, "skip": ["rg"]}"#, |w| matches!(w, Why::Both)),
+        (r#"{"format": "tar.gz", "skip": ["codex-path/rg"]}"#, |w| matches!(w, Why::Lacks("strip"))),
+    ];
+    for (json, is) in refused {
+        let Err(why) = Spec::try_from(serde_json::from_str::<Fields>(json)?) else {
+            anyhow::bail!("{json}: taken, not refused");
+        };
+        assert!(is(&why), "{json}: {why:?}");
+    }
+    Ok(())
+}
+
+/// Every built-in's pinned archives are in the shared shape: each `unpack` in each built-in's pin.json
+/// parses as a [`Spec`]. Codex's three are among them: both packages as trees, with their totals and
+/// arm64's skip, and ripgrep's rg as a member.
+#[test]
+fn every_builtins_pinned_unpack_is_a_spec() -> anyhow::Result<()> {
+    let mut codex = Vec::new();
+    for b in crate::agentfiles::builtin::ALL {
+        let pin: serde_json::Value = serde_json::from_str(b.pin)?;
+        for build in pin.get("builds").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            for file in build.get("files").and_then(serde_json::Value::as_array).into_iter().flatten() {
+                let Some(unpack) = file.get("unpack") else { continue };
+                let spec: Spec = serde_json::from_value(unpack.clone()).map_err(|e| anyhow::anyhow!("{}: {unpack}: {e}", b.name))?;
+                if b.name == "harness-codex" {
+                    codex.push(spec);
+                }
+            }
+        }
+    }
+    let trees: Vec<&Tree> = codex.iter().filter_map(|s| if let Spec::Tree(t) = s { Some(t) } else { None }).collect();
+    let members = codex.iter().filter(|s| matches!(s, Spec::Member(_))).count();
+    anyhow::ensure!(trees.len() == 2 && members == 1, "Codex's pin: {codex:?}");
+    anyhow::ensure!(trees.iter().all(|t| t.strip == 0 && t.entries > 0 && t.unpacked_bytes > 0), "Codex's trees: {trees:?}");
+    anyhow::ensure!(trees.iter().filter(|t| t.skip == ["codex-path/rg"]).count() == 1, "arm64's tree skips codex-path/rg: {trees:?}");
     Ok(())
 }

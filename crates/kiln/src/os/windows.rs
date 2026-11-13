@@ -172,11 +172,14 @@ pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<
 
 // ------------------------------------------------------------------- in-place re-execution
 
-/// Windows has no exec: upgrades restart the process (and its terminals).
+/// Windows has no exec: a new binary is taken up as a fresh process the supervisor starts, not by
+/// re-executing in place.
 pub const IN_PLACE_UPGRADE: bool = false;
 
-/// Terminals are never handed to a successor on Windows (see the Unix layer).
-pub const UPGRADE_BY_SUCCESSOR: bool = false;
+/// A supervised Windows runner hands its agent sessions' harness processes to its supervisor and
+/// exits, and the supervisor starts the new binary as a fresh process that goes on with them
+/// (`os::supervise::Handover`). Terminals (ConPTY) are not handed over; they restart.
+pub const UPGRADE_BY_SUCCESSOR: bool = true;
 
 pub fn keep_across_exec(_fd: &()) -> io::Result<()> {
     Err(io::Error::other("in-place upgrade is not supported on Windows"))

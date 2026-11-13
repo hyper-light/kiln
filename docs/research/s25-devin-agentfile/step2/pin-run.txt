@@ -1,0 +1,22 @@
+# pin.sh 3000.12.43, which wrote the committed pin.json, then pin-tests.sh verify of it
+#
+# Kiln plan 01a1ce705e4d7008993f5c7291ef4476 (step 25 of 01a1cd8e862e7169a074db3d5fa33f3d), step 2. Ran on
+# adacachy (Linux 7.2.9-2-cachyos x86_64, 32 cores) over ssh, as systemd --user units, in a scratch clone of
+# kiln main 3a4b09005 with this step's change applied (~/.cache/s25-devin-tree-pin, removed after). pin.sh sha256
+# 4cc09f930a07b5198f900f82a94298c438bdb90e050929d67ca4c1eb17b70d6c and pin-tests.sh sha256
+# 21faaad2239a84fd3e0d138d6dbafff217a4ac5450bd84bbd2632877ccf059c3, as committed. job.sh and live.sh beside this
+# file ran them; `===` lines are job.sh's.
+
+=== pin: bash .kiln/images/harness-devin/pin.sh 3000.12.43 (2026-11-12T22:05:20Z)
+pin.sh: pinning 3000.12.43 while current/ names 3000.12.57; https://static.devin.ai/cli/3000.12.43/manifest.json (sha256 093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1), read 2026-11-12T22:05:20Z
+pin.sh: no signature: each of 13 URLs answers 403 or 404 (13 answered 403, 0 answered 404): https://static.devin.ai/cli/3000.12.43/SHA256SUMS, and .sig, .asc, .sha256 and .sigstore.json beside the manifest and both bundles
+pin.sh: linux/amd64 (x86_64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz, sha256 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562 as the manifest gives it, 71424183 bytes; 234 regular files and 16 directories (250 entries) of 210206170 bytes, bin/devin -rwxr-xr-x, 209662952 bytes
+pin.sh: linux/arm64 (aarch64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz, sha256 1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274 as the manifest gives it, 67806876 bytes; 234 regular files and 16 directories (250 entries) of 192507154 bytes, bin/devin -rwxr-xr-x, 191963936 bytes
+pin.sh: wrote /home/adalundhe/.cache/s25-devin-tree-pin/kiln/.kiln/images/harness-devin/pin.json (sha256 772cb68ff44852601b7e1f0ed403d6bede220da5786400cfdadefffb488eb7ff): devin 3000.12.43 for linux/amd64 linux/arm64
+=== pin exit 0 (2026-11-12T22:05:28Z)
+=== pin-verify: bash .kiln/images/harness-devin/pin-tests.sh verify .kiln/images/harness-devin/pin.json (2026-11-12T22:05:28Z)
+PASS https://static.devin.ai/cli/3000.12.43/manifest.json downloaded again: sha256 093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1, as pin.json records
+PASS linux/amd64 (x86_64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz downloaded again: sha256sum 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562 and stat 71424183 bytes equal pin.json's, the manifest gives this URL and SHA-256, and unpack is {"entries":250,"format":"tar.gz","strip":0,"unpacked_bytes":210206170}, the tree tarfile counts in the download
+PASS linux/arm64 (aarch64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz downloaded again: sha256sum 1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274 and stat 67806876 bytes equal pin.json's, the manifest gives this URL and SHA-256, and unpack is {"entries":250,"format":"tar.gz","strip":0,"unpacked_bytes":192507154}, the tree tarfile counts in the download
+builds whose SHA-256 and size match both the manifest and a fresh download: 2 of 2
+=== pin-verify exit 0 (2026-11-12T22:05:30Z)

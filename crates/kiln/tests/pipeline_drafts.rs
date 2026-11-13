@@ -493,6 +493,47 @@ fn w29_r10_no_other_repository_uses_a_draft() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W29-R16, stage 2: a repository moves its own `.kiln/` workflows to the engine with
+/// `.kiln/config.yaml`'s `kiln_workflows: on`, the server's `[ci] kiln_workflows` off. Its push
+/// runs its workflow on the engine, and v1 makes no run of it; a repository that says nothing stays
+/// on v1, and the engine makes no run of its.
+#[test]
+fn w29_r16_a_repository_moves_its_kiln_workflows_to_the_engine() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let hello = "name: hello\non: push\njobs:\n  h:\n    runs-on: local\n    steps:\n      - run: echo hello\n";
+    // The setting on the default branch first, then the workflow's push.
+    let on = hosted_with(&s, &home, dir.path(), "acme/moved", &[(".kiln/config.yaml", "kiln_workflows: on\n")])?;
+    let off = hosted(&s, &home, dir.path(), "acme/stays")?;
+    push_files(&home, &on, "main", &[(".kiln/hello.yaml", hello)])?;
+    push_files(&home, &off, "main", &[(".kiln/hello.yaml", hello)])?;
+    let finished = |r: &Value| r.get("finished_at").is_some_and(|f| !f.is_null());
+    until_run(&s, "acme/moved", "of .kiln/hello.yaml, finished on the engine", |r| r.get("workflow").and_then(Value::as_str) == Some(".kiln/hello.yaml") && finished(r))?;
+    // `/api/runs` lists the engine's runs too: v1's are those the engine doesn't.
+    let v1 = |repo: &str| -> anyhow::Result<Vec<Value>> {
+        let engine: Vec<Value> = runs(&s, repo)?;
+        let all = get(&s, &format!("/api/runs?repo={repo}&limit=100"))?.as_array().cloned().unwrap_or_default();
+        Ok(all.into_iter().filter(|r| !engine.iter().any(|e| e.get("id").is_some() && e.get("id") == r.get("id"))).collect())
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let stays = v1("acme/stays")?;
+        if stays.iter().any(|r| r.get("pipeline").and_then(Value::as_str) == Some("hello") && finished(r)) {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no v1 run of hello in acme/stays: {stays:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // Each push was decided whole by then, the engine's side and v1's: nothing ran twice.
+    let moved = v1("acme/moved")?;
+    assert!(moved.is_empty(), "v1 stood aside for acme/moved: {moved:?}\n{}", s.log());
+    let stays = runs(&s, "acme/stays")?;
+    assert!(stays.is_empty(), "the engine left acme/stays to v1: {stays:?}\n{}", s.log());
+    Ok(())
+}
+
 /// A Pipelines verb through Ship, as the admin: its status and answer.
 fn act(s: &Server, body: &Value) -> anyhow::Result<(u16, Value)> {
     let (st, text) = http(s.port, "POST", "/api/ship/pipelines", &s.admin, Some(body))?;

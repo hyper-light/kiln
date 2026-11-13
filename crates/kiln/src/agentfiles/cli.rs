@@ -216,4 +216,90 @@ mod tests {
             Ok(())
         })
     }
+
+    /// Live, where a test names a folder for it (`KILN_TEST_LIVE_CONTEXT`, under `~/.cache` on kiln's Linux
+    /// machines): `kiln agentfiles context codex` makes Codex's context for linux/amd64 and linux/arm64 from
+    /// OpenAI's and ripgrep's releases. It holds the Agentfile and the two harness directories alone, each
+    /// with the embedded harness.json beside OpenAI's whole package: as many directories and regular files
+    /// as the package's tree pins (`entries`, its skipped rg among them), nothing else, and on amd64 the
+    /// pinned bytes (`unpacked_bytes`). arm64's codex-path/rg is ripgrep's static build, hashing to the
+    /// pin's member SHA-256 at 0755. Codex itself is never run (kiln plan 01a1ce705d7076648c1d9f9ee26214d3,
+    /// step 3's live test: 2 of 2).
+    #[test]
+    fn step20_a_live_codex_context_holds_the_pinned_builds() -> anyhow::Result<()> {
+        use serde_json::Value;
+        let Some(root) = std::env::var_os("KILN_TEST_LIVE_CONTEXT") else {
+            eprintln!("skipped: KILN_TEST_LIVE_CONTEXT names no folder");
+            return Ok(());
+        };
+        let codex = builtin::ALL.iter().find(|b| b.harness == "codex").ok_or_else(|| anyhow::anyhow!("no codex built-in"))?;
+        let pin: Value = serde_json::from_str(codex.pin)?;
+        let harness_json = codex.files.iter().find(|(name, _)| *name == "harness.json").map(|(_, text)| *text).ok_or_else(|| anyhow::anyhow!("no harness.json"))?;
+        let names = |dir: &std::path::Path| -> anyhow::Result<Vec<String>> {
+            let mut names = std::fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned())).collect::<Result<Vec<_>, _>>()?;
+            names.sort();
+            Ok(names)
+        };
+        // The directories and regular files under a harness directory, its harness.json aside, and the
+        // files' bytes, as `tar -t` and `tar -tv` count them; anything else (a link) refused.
+        let tree = |dir: &std::path::Path| -> anyhow::Result<(u64, u64)> {
+            let (mut entries, mut bytes) = (0u64, 0u64);
+            let mut todo = vec![dir.to_path_buf()];
+            while let Some(at) = todo.pop() {
+                for e in std::fs::read_dir(&at)? {
+                    let e = e?;
+                    if at.as_path() == dir && e.file_name() == "harness.json" {
+                        continue;
+                    }
+                    let meta = std::fs::symlink_metadata(e.path())?;
+                    anyhow::ensure!(meta.is_dir() || meta.is_file(), "{}: neither a directory nor a regular file", e.path().display());
+                    entries += 1;
+                    if meta.is_dir() {
+                        todo.push(e.path());
+                    } else {
+                        bytes += meta.len();
+                    }
+                }
+            }
+            Ok((entries, bytes))
+        };
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir_in(&root)?;
+            let cmd = AgentfilesCmd::Context { harness: "codex".into(), dir: dir.path().to_owned(), platform: vec!["linux/amd64".into(), "linux/arm64".into()], variant: None, base: None };
+            run(AgentfilesArgs { cmd }).await?;
+            anyhow::ensure!(names(dir.path())? == ["Agentfile", "codex-amd64", "codex-arm64"], "the context holds {:?}", names(dir.path())?);
+            anyhow::ensure!(std::fs::read_to_string(dir.path().join("Agentfile"))? == codex.text, "the Agentfile isn't the embedded one");
+            let build = |platform: &str| {
+                pin.get("builds").and_then(Value::as_array).and_then(|b| b.iter().find(|b| b.get("platform").and_then(Value::as_str) == Some(platform))).ok_or_else(|| anyhow::anyhow!("no {platform} build pinned"))
+            };
+            for (platform, arch) in [("linux/amd64", "amd64"), ("linux/arm64", "arm64")] {
+                let pinned = build(platform)?.pointer("/files/0/unpack").ok_or_else(|| anyhow::anyhow!("{platform}: no package tree pinned"))?;
+                let (entries, bytes) = (pinned.get("entries").and_then(Value::as_u64), pinned.get("unpacked_bytes").and_then(Value::as_u64));
+                let harness = dir.path().join(format!("codex-{arch}"));
+                anyhow::ensure!(std::fs::read_to_string(harness.join("harness.json"))? == harness_json, "{platform}: harness.json isn't the embedded one");
+                let (found, found_bytes) = tree(&harness)?;
+                anyhow::ensure!(Some(found) == entries, "{platform}: {found} directories and files, where the pin's tree has {entries:?}");
+                // arm64's skipped rg isn't written: ripgrep's is, of its own size.
+                anyhow::ensure!(arch != "amd64" || Some(found_bytes) == bytes, "{platform}: {found_bytes} bytes, where the pin's tree has {bytes:?}");
+                println!("TREE {platform} {found} entries {found_bytes} bytes");
+            }
+            let rg = build("linux/arm64")?
+                .get("files")
+                .and_then(Value::as_array)
+                .and_then(|f| f.iter().find(|f| f.get("path").and_then(Value::as_str) == Some("codex-path/rg")))
+                .ok_or_else(|| anyhow::anyhow!("no rg pinned for linux/arm64"))?;
+            let want = rg.pointer("/unpack/sha256").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no rg member SHA-256 pinned"))?;
+            let binary = dir.path().join("codex-arm64/codex-path/rg");
+            let got = hex::encode(Sha256::digest(std::fs::read(&binary)?));
+            anyhow::ensure!(got == want, "{}: SHA-256 {got}, the pin's member {want}", binary.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&binary)?.permissions().mode() & 0o7777;
+                anyhow::ensure!(mode == 0o755, "{}: mode {mode:o}, not 755", binary.display());
+            }
+            println!("MATCH linux/arm64 codex-path/rg {got}");
+            Ok(())
+        })
+    }
 }

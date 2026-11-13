@@ -128,6 +128,17 @@ def flip(path):
     b[len(b) // 2] ^= 1
     open(path, "wb").write(bytes(b))
 
+def tree(bundle):
+    """The unpack kiln's one unpacker takes for BUNDLE at the harness directory's root: strip 0, its
+    directories and regular files, and its regular files' bytes, counted with tarfile (which, as
+    tar --list does, shows no pax or GNU metadata header as an entry)."""
+    with tarfile.open(bundle, "r:gz") as tf:
+        taken = [m for m in tf.getmembers() if m.isdir() or m.isreg()]
+    return {"format": "tar.gz", "strip": 0, "unpacked_bytes": sum(m.size for m in taken if m.isreg()), "entries": len(taken)}
+
+def unpack_of(bundle):
+    print(json.dumps(tree(bundle), separators=(",", ":"), sort_keys=True))
+
 def check_pin(path, version, verified, murl, msha, *builds):
     """Holds pin.json to step 19's schema and to the values the fixture was made with."""
     pin = json.load(open(path))
@@ -147,8 +158,8 @@ def check_pin(path, version, verified, murl, msha, *builds):
         for f in b.get("files") or []:
             if isinstance(f.get("unpack"), str):
                 bad.append(f"{b.get('platform')}'s unpack is the string {f['unpack']!r}: every pin writes the object form")
-    want = [{"platform": builds[i], "files": [{"url": builds[i + 1], "sha256": builds[i + 2], "size": int(builds[i + 3]), "path": ".", "unpack": {"format": "tar.gz"}}]}
-            for i in range(0, len(builds), 4)]
+    want = [{"platform": builds[i], "files": [{"url": builds[i + 1], "sha256": builds[i + 2], "size": int(builds[i + 3]), "path": ".", "unpack": tree(builds[i + 4])}]}
+            for i in range(0, len(builds), 5)]
     eq("builds", pin.get("builds"), want)
     if bad:
         sys.exit("; ".join(bad))
@@ -218,7 +229,7 @@ def mutate(src, dst, old, new):
 
 cmd, args = sys.argv[1], sys.argv[2:]
 {"bundle": bundle, "manifest": manifest, "edit": edit, "flip": flip, "check-pin": check_pin,
- "pin-facts": pin_facts, "entries": entries, "serve": serve, "mutate": mutate}[cmd](*args)
+ "pin-facts": pin_facts, "entries": entries, "serve": serve, "mutate": mutate, "unpack-of": unpack_of}[cmd](*args)
 PY
 py() { python3 -I "$root/tools.py" "$@"; }
 sha() {
@@ -228,7 +239,7 @@ sha() {
 }
 
 verify() { # PIN
-    local p=$1 kind murl msha version platform url psha psize path unpack target t u h mu ms got size n=0 builds=0
+    local p=$1 kind murl msha version platform url psha psize path unpack target t u h mu ms got size tree n=0 builds=0
     py pin-facts "$p" >"$root/facts"
     read -r kind murl msha version <"$root/facts"
     curl -fsSL --proto =https -o "$root/manifest.json" "$murl" </dev/null
@@ -255,12 +266,13 @@ verify() { # PIN
         curl -fsSL --proto =https -o "$root/bundle" "$url" </dev/null
         got=$(sha256sum "$root/bundle" | cut -d' ' -f1)
         size=$(stat -c %s "$root/bundle")
+        tree=$(py unpack-of "$root/bundle")
         rm -f "$root/bundle"
-        if [[ $url == "$mu" && $psha == "$ms" && $got == "$psha" && $size == "$psize" && $path == . && $unpack == '{"format":"tar.gz"}' ]]; then
+        if [[ $url == "$mu" && $psha == "$ms" && $got == "$psha" && $size == "$psize" && $path == . && $unpack == "$tree" ]]; then
             n=$((n + 1))
-            echo "PASS $platform ($target): $url downloaded again: sha256sum $got and stat $size bytes equal pin.json's, the manifest gives this URL and SHA-256, and unpack is $unpack"
+            echo "PASS $platform ($target): $url downloaded again: sha256sum $got and stat $size bytes equal pin.json's, the manifest gives this URL and SHA-256, and unpack is $unpack, the tree tarfile counts in the download"
         else
-            echo "FAIL $platform ($target): pin.json $url $psha $psize $path $unpack; manifest ${mu:-none} ${ms:-none}; download sha256 $got, $size bytes"
+            echo "FAIL $platform ($target): pin.json $url $psha $psize $path $unpack; manifest ${mu:-none} ${ms:-none}; download sha256 $got, $size bytes, $tree"
         fi
     done <"$root/facts"
     echo "builds whose SHA-256 and size match both the manifest and a fresh download: $n of $builds"
@@ -403,8 +415,8 @@ pins() {
         return 1
     fi
     why=$(py check-pin "$last/pin.json" "$V" "$verified" "$b/$V/manifest.json" "$(sha "$d/cli/$V/manifest.json")" \
-        linux/amd64 "$b/$V/devin-$V-x86_64-unknown-linux.tar.gz" "$(sha "$x86")" "$(stat -c %s "$x86")" \
-        linux/arm64 "$b/$V/devin-$V-aarch64-unknown-linux.tar.gz" "$(sha "$arm")" "$(stat -c %s "$arm")" 2>&1) || return 1
+        linux/amd64 "$b/$V/devin-$V-x86_64-unknown-linux.tar.gz" "$(sha "$x86")" "$(stat -c %s "$x86")" "$x86" \
+        linux/arm64 "$b/$V/devin-$V-aarch64-unknown-linux.tar.gz" "$(sha "$arm")" "$(stat -c %s "$arm")" "$arm" 2>&1) || return 1
 }
 
 echo "== host $(hostname) $(uname -srm); $(bash --version | sed -n 1p); $(tar --version | sed -n 1p); $(curl --version | sed -n 1p | cut -d' ' -f1-2); $(openssl version); $(python3 --version)"
@@ -412,14 +424,14 @@ echo "== pin.sh sha256 $(sha "$pin"); pin-tests.sh sha256 $(sha "$0"); HTTPS fix
 
 # Each pin that must succeed: SCENARIO:ARG.
 successes=(default: current:current version-same:$V version-old:$V pretty: dotslash: sig-404:)
-echo "== pins that must succeed, each with unpack {\"format\": \"tar.gz\"} and never a string"
+echo "== pins that must succeed, each bundle's unpack the tree kiln's one unpacker takes (strip 0, its entries and bytes) and never a string"
 for sc in "${successes[@]}"; do
     s=${sc%%:*} arg=${sc#*:}
     setup "$s"
     args=()
     [[ -z $arg ]] || args=("$arg")
     if pins "$pin" "$s" "${args[@]}"; then
-        good "pin.sh${arg:+ $arg} ($s): exit 0; pin.json holds devin $V, both builds' URL, SHA-256 and size, path . and unpack {\"format\": \"tar.gz\"}, the manifest's URL and SHA-256, read_at, the base digest and: $(sed -n 's/.*"verified": "\(.*\)",$/\1/p' "$last/pin.json"); it said: $(grep -o 'no signature: [^:]*' "$last.out")"
+        good "pin.sh${arg:+ $arg} ($s): exit 0; pin.json holds devin $V, both builds' URL, SHA-256 and size, path . and unpack {\"format\": \"tar.gz\", \"strip\": 0} with each bundle's entries and bytes, the manifest's URL and SHA-256, read_at, the base digest and: $(sed -n 's/.*"verified": "\(.*\)",$/\1/p' "$last/pin.json"); it said: $(grep -o 'no signature: [^:]*' "$last.out")"
     else
         bad "pin.sh${arg:+ $arg} ($s): $why"
     fi
@@ -499,7 +511,7 @@ else
     bad "pin.sh takes no 404 as absent to take out"
 fi
 mutant=$root/unpack-string.sh
-if py mutate "$pin" "$mutant" '"unpack": {\n            "format": "tar.gz"\n          }' '"unpack": "tar.gz"' >/dev/null; then
+if py mutate "$pin" "$mutant" '"unpack": {\n            "format": "tar.gz",' '"unpack": "tar.gz",\n          "x": {\n            "format": "tar.gz",' >/dev/null; then
     if pins "$mutant" default; then
         bad "pin.sh writing unpack as the string \"tar.gz\" still passes"
     elif [[ $why == *"is the string"* ]]; then

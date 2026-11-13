@@ -819,7 +819,8 @@ pub(crate) async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, 
     let counts = gitops::pr_counts(hub, repo, &f.parent, &f.sha).await;
     let (pr, diff) = events_of(repo, &ctx, trunk, base_sha, author, f, changed, counts);
     let commit = super::load::load(hub, repo, &f.sha).await?;
-    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
+    let kiln = super::repo_config::kiln_workflows(hub, repo).await;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || kiln)) {
         let both = [&pr, &diff];
         for e in both.iter().take(if f.branch.is_some() { 1 } else { 2 }) {
             super::events::start(hub, repo, e, l, &f.message, &author.0, Value::Null).await?;
@@ -850,7 +851,8 @@ async fn tip(hub: &Hub, repo: &Repo, branch: &str) -> Option<String> {
 async fn start_at(hub: &Hub, repo: &Repo, e: &Event, sha: &str, message: &str, author: &str) -> anyhow::Result<()> {
     let _ = gitops::ensure_commit(hub, repo, sha).await;
     let commit = super::load::load(hub, repo, sha).await?;
-    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
+    let kiln = super::repo_config::kiln_workflows(hub, repo).await;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || kiln)) {
         super::events::start(hub, repo, e, l, message, author, Value::Null).await?;
     }
     Ok(())
@@ -1038,7 +1040,8 @@ pub(crate) async fn activity(hub: &Hub, repo: &Repo, d: &Diff, action: &str, by:
     }
     let Some((e, sha, _)) = activity_event(hub, repo, d, action, by, tweak).await? else { return Ok(()) };
     let commit = super::load::load(hub, repo, &sha).await?;
-    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
+    let kiln = super::repo_config::kiln_workflows(hub, repo).await;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || kiln)) {
         super::events::start(hub, repo, &e, l, &d.title, &d.author, Value::Null).await?;
     }
     target(hub, repo, &d.trunk, &e, &d.title, &d.author).await
@@ -1085,7 +1088,8 @@ async fn held_back_runs(hub: &Hub, repo: &Repo, d: &Diff, by: &str) -> anyhow::R
     // kiln's own event for the version, beside GitHub's, as a version's push sends them.
     let diff = Event { name: "diff".into(), action: String::new(), ..sync.clone() };
     let commit = super::load::load(hub, repo, &sha).await?;
-    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows) && changed.contains(&l.path)) {
+    let kiln = super::repo_config::kiln_workflows(hub, repo).await;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || kiln) && changed.contains(&l.path)) {
         if l.workflow.as_ref().is_some_and(|w| kiln_ci::trigger::matches(w, &ready).is_ok()) {
             continue;
         }

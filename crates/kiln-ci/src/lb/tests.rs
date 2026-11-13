@@ -438,6 +438,49 @@ fn w05_r04_a_good_place_holds_only_among_cores_as_fast() -> Result<(), String> {
     Ok(())
 }
 
+/// W05-R26 (docs/lb.md "Wide and narrow"; the CI engine's asks, `crate::sched::balance`): on a
+/// measured fleet a wide ask is ranked by core-equivalents under contention, a narrow one by its
+/// cores' speed. Runners 0 and 2 have eight cores at the reference's speed, runner 1 two cores
+/// twice as fast: a narrow ask of one core goes to 1, wide asks to 0 and 2 (eight
+/// core-equivalents to its four), in turn; and between those two, a kind's wide asks go back to
+/// where its work last went well.
+#[test]
+fn w05_r26_a_wide_ask_takes_the_most_core_equivalents_and_its_kinds_good_place() -> Result<(), String> {
+    let mut o = Owner::new(OwnerId(0));
+    let mut out = Out::default();
+    let s = o.sig();
+    for (i, cpus, speed) in [(0u32, 8, SPEED_ONE), (1, 2, 2 * SPEED_ONE), (2, 8, SPEED_ONE)] {
+        let budget = [cpus * CPU, 0, 0, 0];
+        let mut r = Runner::new(RunnerId(i), budget, 1);
+        r.watch(OwnerId(0));
+        r.measure(speed, SPEED_ONE);
+        o.join(RunnerId(i), budget, r.word(), &mut out);
+        o.add(s, RunnerId(i), &mut out);
+    }
+    let pick = |o: &mut Owner, wide: bool, kind: KindId| -> Result<u32, String> {
+        let mut out = Out::default();
+        let asked = if wide { o.ask_kind_wide(s, kind, [0; 4], &mut out) } else { o.ask_kind(s, kind, [CPU, 0, 0, 0], &mut out) };
+        let a = asked.map_err(|e| format!("{e:?}"))?;
+        let (r, _) = a.send.ok_or("no start")?;
+        let _ = o.unsent(a.run);
+        Ok(r.0)
+    };
+    if pick(&mut o, false, KindId::NONE)? != 1 {
+        return Err("a narrow ask didn't take the fastest cores".into());
+    }
+    let (a, b) = (pick(&mut o, true, KindId::NONE)?, pick(&mut o, true, KindId::NONE)?);
+    if a == 1 || b == 1 || a == b {
+        return Err(format!("wide asks went to {a} then {b}: 0 and 2, in turn"));
+    }
+    o.won(RunnerId(2), KIND);
+    for _ in 0..3 {
+        if pick(&mut o, true, KIND)? != 2 {
+            return Err("a kind's wide ask didn't go back to its good place".into());
+        }
+    }
+    Ok(())
+}
+
 /// `inflight` runs of one kind on `n` idle runners of eight cores, then `steps` times one ends (on
 /// a runner drawn by how full it is, so twin fleets end alike) and another is asked, each run said
 /// to have gone well or nothing said (`says`). A digest of how many runners held each number of

@@ -1,0 +1,36 @@
+[package]
+name = "s20-unpack-scratch"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The unpack module alone, with kiln's own versions (crates/kiln/Cargo.toml) and kiln's workspace lints
+# (Cargo.toml [workspace.lints]), to iterate on it without building all of kiln.
+[dependencies]
+flate2 = "1.1.10"
+tar = "0.4.46"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+hex = "0.4.3"
+thiserror = "2.0.21"
+uuid = { version = "1.28.0", features = ["v7"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+anyhow = "1.0.104"
+serde_json = "1.0.154"
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+exit = "deny"
+type_complexity = "allow"
