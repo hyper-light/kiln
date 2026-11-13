@@ -7739,7 +7739,7 @@ pub(crate) mod tests {
             anyhow::ensure!(hub.harness.info("held").is_some_and(|i| i.status == Status::Disconnected));
             anyhow::ensure!(hub.fold_duplicates(ID).await? == ["fedora"]);
             anyhow::ensure!(hub.harness.location("held") == Some(Location::Machine(ID.into())), "{:?}", hub.harness.location("held"));
-            anyhow::ensure!(hub.harness.info("gone").is_none(), "one the machine doesn't hold is gone");
+            anyhow::ensure!(hub.harness.info("gone").is_some_and(|i| i.status == Status::Crashed), "one the machine doesn't hold reads crashed, never dropped (Ada, 2026-11-13)");
             // What the fold asked: the snapshot of the one it holds that reads disconnected.
             hub.harness.machine_lost(&hub, ID).await;
             let asked = hub.harness.moved_onto_connected(&hub, ID, &["held".to_owned()], &["held".to_owned()]).await;
