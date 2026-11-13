@@ -206,10 +206,22 @@ fn ac_m1_4_kiln_links_one_revision_of_each_vendored_project_and_product() -> any
         ("vorpal-kg", "vorpal"),
         ("tree-sitter", "vorpal"),
         ("tree-sitter-rust", "vorpal"),
+        // Shards and Hex at one Shards revision (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16), with what
+        // each alone vendors: QuickJS's C in Shards', seccompiler in Hex's.
+        ("shards-api", "shards"),
+        ("shards-agentfile", "shards"),
+        ("rquickjs-sys", "shards"),
+        ("hex-node", "hex"),
+        ("hex-runtime", "hex"),
+        ("seccompiler", "hex"),
     ] {
         ensure!(v.crates.get(name).map(String::as_str) == Some(project), "{name} isn't among {project}'s vendored crates: {:?}", v.crates);
     }
-    ensure!(["hyper-light/quiver", "hyper-light/focal", "hyper-light/hyper-raft", "hyper-light/vorpal"].iter().all(|r| v.repositories.contains(*r)), "{:?}", v.repositories);
+    ensure!(
+        ["hyper-light/quiver", "hyper-light/focal", "hyper-light/hyper-raft", "hyper-light/vorpal", "hyper-light/shards", "hyper-light/hex"].iter().all(|r| v.repositories.contains(*r)),
+        "{:?}",
+        v.repositories
+    );
     let lock = kiln_lock()?;
     // kiln links them from their folders: none from git.
     ensure!(!lock.lines().any(|l| l.starts_with("source = \"git+https://github.com/hyper-light/")), "a hyper-light product linked from git");
@@ -283,8 +295,8 @@ fn ac_m1_4_a_vendored_crate_taken_from_git_fails_the_check() -> anyhow::Result<(
     Ok(())
 }
 
-/// A crate of a hyper-light product kiln takes by git (none, since hyper-raft is vendored: a stand-in,
-/// `hyper-light/shards`'s), as Cargo.lock would say it.
+/// A crate of a hyper-light product kiln takes by git (none, since hyper-raft and Shards are vendored: a
+/// stand-in, `hyper-light/veil`'s), as Cargo.lock would say it.
 fn by_git(name: &str, url: &str, commit: &str) -> String {
     format!("\n[[package]]\nname = \"{name}\"\nversion = \"0.1.0\"\nsource = \"git+{url}#{commit}\"\n")
 }
@@ -302,10 +314,10 @@ fn ac_m1_4_a_product_both_vendored_and_taken_by_git_fails_the_check() -> anyhow:
 fn ac_m1_4_a_product_by_ssh_in_another_letter_case_is_the_same_product() -> anyhow::Result<()> {
     let v = vendored(&root())?;
     let lock = kiln_lock()?
-        + &by_git("shards-api", "https://github.com/hyper-light/shards?rev=0123456", "0123456789abcdef0123456789abcdef01234567")
-        + &by_git("shards-sim", "ssh://git@github.com/Hyper-Light/shards.git", "fedcba9876543210fedcba9876543210fedcba98");
+        + &by_git("veil-api", "https://github.com/hyper-light/veil?rev=0123456", "0123456789abcdef0123456789abcdef01234567")
+        + &by_git("veil-sim", "ssh://git@github.com/Hyper-Light/veil.git", "fedcba9876543210fedcba9876543210fedcba98");
     let found = problems(&lock, &v)?;
-    ensure!(found.iter().any(|p| p.starts_with("hyper-light/shards is linked at 2 commits") && p.contains("fedcba9876543210fedcba9876543210fedcba98 (shards-sim)")), "{found:?}");
+    ensure!(found.iter().any(|p| p.starts_with("hyper-light/veil is linked at 2 commits") && p.contains("fedcba9876543210fedcba9876543210fedcba98 (veil-sim)")), "{found:?}");
     Ok(())
 }
 
@@ -313,10 +325,10 @@ fn ac_m1_4_a_product_by_ssh_in_another_letter_case_is_the_same_product() -> anyh
 fn ac_m1_4_a_product_crate_from_a_fork_is_a_second_copy() -> anyhow::Result<()> {
     let v = vendored(&root())?;
     let lock = kiln_lock()?
-        + &by_git("shards-api", "https://github.com/hyper-light/shards?rev=0123456", "0123456789abcdef0123456789abcdef01234567")
-        + "\n[[package]]\nname = \"shards-api\"\nversion = \"0.1.0\"\nsource = \"git+https://github.com/someone/shards?rev=0123456#0123456\"\n";
+        + &by_git("veil-api", "https://github.com/hyper-light/veil?rev=0123456", "0123456789abcdef0123456789abcdef01234567")
+        + "\n[[package]]\nname = \"veil-api\"\nversion = \"0.1.0\"\nsource = \"git+https://github.com/someone/veil?rev=0123456#0123456\"\n";
     let found = problems(&lock, &v)?;
-    ensure!(found.iter().any(|p| p.starts_with("shards-api (from hyper-light/shards) is linked 2 times") && p.contains("github.com/someone/shards")), "{found:?}");
+    ensure!(found.iter().any(|p| p.starts_with("veil-api (from hyper-light/veil) is linked 2 times") && p.contains("github.com/someone/veil")), "{found:?}");
     // And a vendored product's crate from a fork beside its folder's is a second copy too.
     let lock = kiln_lock()? + "\n[[package]]\nname = \"hyper-rt\"\nversion = \"0.1.0\"\nsource = \"git+https://github.com/someone/hyper-raft?rev=0123456#0123456\"\n";
     let found = problems(&lock, &v)?;
@@ -328,11 +340,11 @@ fn ac_m1_4_a_product_crate_from_a_fork_is_a_second_copy() -> anyhow::Result<()> 
 fn ac_m1_4_a_product_linked_at_two_commits_fails_the_check() -> anyhow::Result<()> {
     let v = vendored(&root())?;
     let lock = kiln_lock()?
-        + &by_git("shards-api", "https://github.com/hyper-light/shards?rev=fedcba9", "fedcba9876543210fedcba9876543210fedcba98")
-        + &by_git("shards-sim", "https://github.com/hyper-light/shards?rev=0123456", "0123456789abcdef0123456789abcdef01234567");
+        + &by_git("veil-api", "https://github.com/hyper-light/veil?rev=fedcba9", "fedcba9876543210fedcba9876543210fedcba98")
+        + &by_git("veil-sim", "https://github.com/hyper-light/veil?rev=0123456", "0123456789abcdef0123456789abcdef01234567");
     let found = problems(&lock, &v)?;
     ensure!(
-        found.iter().any(|p| p.starts_with("hyper-light/shards is linked at 2 commits") && p.contains("0123456789abcdef0123456789abcdef01234567 (shards-sim)")),
+        found.iter().any(|p| p.starts_with("hyper-light/veil is linked at 2 commits") && p.contains("0123456789abcdef0123456789abcdef01234567 (veil-sim)")),
         "{found:?}"
     );
     Ok(())

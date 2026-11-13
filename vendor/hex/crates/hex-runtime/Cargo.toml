@@ -1,0 +1,55 @@
+[package]
+name = "hex-runtime"
+description = "Hex's runtime classes: process boxes (cgroup v2 on Linux) and OCI containers (Hex's own runtime)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex-api.workspace = true
+hex-client.workspace = true
+hex-core.workspace = true
+hex-gpu.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shards-api.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+triomphe.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+rustix.workspace = true
+seccompiler.workspace = true
+
+# The macOS `process` class: posix_spawn, proc_pid_rusage, kqueue, the Mach time-constraint watcher
+# (crates/hex-runtime/src/macos). rustix wraps kqueue, kill and waitid; libc binds the rest.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+rustix.workspace = true
+
+# The Windows `process` class: job objects and suspended, job-listed process creation
+# (crates/hex-runtime/src/windows). windows-sys binds the OS calls; windows binds the in-process WMI
+# COM query for the installer features (windows/wmi.rs).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys.workspace = true
+windows.workspace = true
+
+[features]
+# Read-only held-child phase witness for Node native tests; no execution authority.
+native-gate-test = []
+# Measurement-only shared typed startup builder; native entry remains separately reviewed.
+native-trusted-entry-measurement = []
+
+[dev-dependencies]
+# The image class's tests wait on their own facts' patiences (src/guest/image_tests.rs).
+hex-testkit.workspace = true
+proptest = "1.12.0"
+tempfile.workspace = true
+
+[lints]
+workspace = true

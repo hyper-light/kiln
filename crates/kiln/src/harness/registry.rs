@@ -2319,10 +2319,15 @@ impl Registry {
             // The machine whose feed brought it, else the one its updates came from.
             let Some(machine) = u.machine.clone().or_else(|| info.target.strip_prefix("agent:").map(str::to_owned)) else { continue };
             info.target = format!("agent:{machine}");
-            if hub.agents.load().get(&machine).is_some_and(|a| a.connected) {
-                continue;
+            // Its machine up, and none of its runners said it holds it (it would be here): crashed,
+            // with why, resumed in place; else offline, until its machine says what it has.
+            let up = hub.agents.load().get(&machine).is_some_and(|a| a.connected);
+            if up {
+                info.status = Status::Crashed;
+                info.exit = Some(super::model::ExitInfo { error: Some(format!("the runner on {} doesn't hold it: its harness is gone", hub.shown(&machine))), at: crate::util::now_ms(), ..super::model::ExitInfo::default() });
+            } else {
+                info.status = Status::Disconnected;
             }
-            info.status = Status::Disconnected;
             let state: Value = u.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
             // Old stored list entries predate native subagent briefs. Their last task
             // snapshot still supplies those read-only children while the machine is away.
@@ -2337,7 +2342,7 @@ impl Registry {
                 }
             }
             let mut state = StateDoc::of_value(&state);
-            state.set("status", &json!("disconnected"));
+            state.set("status", &json!(if up { "crashed" } else { "disconnected" }));
             m.state = Arc::new(state);
             // A conversation cleared since: what came before it is history, not its timeline.
             let cleared = m.state.get::<u64>("cleared").unwrap_or(0);
@@ -3483,12 +3488,21 @@ impl Registry {
         let keep: std::collections::HashSet<String> = inv.sessions.into_iter().collect();
         // What it holds, for an attach waiting as the server starts (`super::returning`).
         self.returning.reported(machine, keep.iter().cloned());
-        let (others, away): (std::collections::HashSet<String>, Vec<String>) = match instance {
+        let (others, away, gone_holder): (std::collections::HashSet<String>, Vec<String>, Vec<(String, String)>) = match instance {
             Some(me) => {
                 let g = self.holders.load();
                 let others: std::collections::HashSet<String> = g.iter().filter(|(_, h)| h.as_str() != me).map(|(id, _)| id.clone()).collect();
-                let away = g.iter().filter(|(id, h)| h.as_str() != me && !present.contains(h) && !keep.contains(*id)).map(|(id, _)| id.clone()).collect();
-                (others, away)
+                let (mut away, mut crashed) = (Vec::new(), Vec::new());
+                for (id, h) in g.iter().filter(|(id, h)| h.as_str() != me && !present.contains(h) && !keep.contains(*id)) {
+                    // Held by a process this one superseded (older, and gone): its harness went
+                    // with it, while the machine is up. Crashed, not offline (Amphora, 2026-11-12).
+                    if superseded(h, me) {
+                        crashed.push((id.clone(), h.clone()));
+                    } else {
+                        away.push(id.clone());
+                    }
+                }
+                (others, away, crashed)
             }
             None => Default::default(),
         };
@@ -3498,24 +3512,36 @@ impl Registry {
             tracing::info!(%machine, sessions = away.len(), "agent sessions another runner process of this machine holds, which isn't connected: kept, away");
             self.sessions_lost(hub, &away).await;
         }
+        let superseded_held: Vec<(String, String)> = gone_holder.into_iter().filter(|(id, _)| self.sessions.with(id, |v| *v.location == at && v.info.status != Status::Crashed).unwrap_or(false)).collect();
+        if !superseded_held.is_empty() {
+            tracing::warn!(%machine, sessions = superseded_held.len(), "agent sessions an older runner process of this machine held, gone, and the one there now doesn't: crashed, resumable in place");
+            self.sessions_crashed(hub, &superseded_held).await;
+        }
         let (keep, others) = (Arc::new(keep), Arc::new(others));
-        // Not one this server opened there that the machine hasn't announced yet: the report was made before the open got
-        // there. Its viewers are told, and its feed's topic goes with the last of them. A session at a time, as its owner's
-        // turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
-        let gone: Vec<String> = self
+        // One its machine's runner doesn't hold, and no other process of it does: its harness is
+        // gone while its machine is up, so it's crashed, listed with why and resumed in place, never
+        // dropped, and its goals, plans and subagents stay its own (Ada, 2026-11-13: a session is
+        // offline only when its machine is, ended only when it's ended). Not one this server opened
+        // there that the machine hasn't announced yet: the report was made before the open got there.
+        // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3).
+        let why = format!("the runner on {} doesn't hold it: its harness is gone", hub.shown(machine));
+        let lost: Vec<Info> = self
             .sessions
             .on_each_session(
-                move |id, m| *m.location == at && !keep.contains(id) && !others.contains(id) && m.opened_at.is_none_or(|t| t.elapsed() > OPEN_GRACE),
-                |s, id| s.remove(id).map(|_| id.to_owned()),
+                move |id, m| *m.location == at && !keep.contains(id) && !others.contains(id) && m.opened_at.is_none_or(|t| t.elapsed() > OPEN_GRACE) && m.info.status != Status::Crashed,
+                move |s, id| s.get_mut(id).map(|m| crashed(m, why.clone())),
             )
             .await;
         let kinds = inv.kinds;
         self.kinds.update(|k| k.insert(format!("agent:{machine}"), kinds.clone()));
-        self.forget_holders(&gone);
-        for id in gone {
-            super::archive::closed(hub, &id);
-            super::attention::forget(&id);
-            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
+        // No process of it holds it now: the one it was held by is let go of.
+        self.forget_holders(&lost.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
+        if !lost.is_empty() {
+            self.mail_delivery.changed();
+            tracing::warn!(%machine, sessions = lost.len(), "agent sessions its machine's runner doesn't hold, its machine up: crashed, resumable in place");
+        }
+        for info in lost {
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -3753,6 +3779,21 @@ impl Registry {
 
     /// One runner process of a machine went away while another of the machine stays connected
     /// (see `crate::instances`): the sessions it held keep running there and come back with it.
+    /// Sessions whose harness is gone while their machine is up, each with the runner process that
+    /// held it: said crashed, why in their `exit`, and resumed in place (`Registry::resume_on`).
+    pub async fn sessions_crashed(&self, hub: &Hub, held: &[(String, String)]) {
+        self.mail_delivery.changed();
+        let why: Arc<HashMap<String, String>> = Arc::new(held.iter().map(|(id, h)| (id.clone(), format!("its runner process ({h}) ended and the one on its machine now doesn't hold it: its harness went with it"))).collect());
+        let w = Arc::clone(&why);
+        let infos: Vec<Info> = self.sessions.on_each_session(move |id, _| w.contains_key(id), move |s, id| {
+            let why = why.get(id).cloned().unwrap_or_default();
+            s.get_mut(id).map(|m| crashed(m, why))
+        }).await;
+        for info in infos {
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        }
+    }
+
     pub async fn sessions_lost(&self, hub: &Hub, ids: &[String]) {
         self.mail_delivery.changed();
         let ids: Arc<std::collections::HashSet<String>> = Arc::new(ids.iter().cloned().collect());
@@ -4707,7 +4748,11 @@ impl Registry {
             Location::Local => return Err("it runs on the server itself, which is up: move it instead".into()),
             Location::Machine(m) => m.clone(),
         };
-        if hub.agents.load().get(&from_name).is_some_and(|a| a.connected) {
+        // Online and holding it: it moves from there instead. Crashed (online, its harness gone with
+        // the runner process that held it): it goes on from the server's copy, there too, under its
+        // id, and never beside a process of it, since no runner of it holds it.
+        let crashed = self.sessions.with(id, |v| v.info.status == Status::Crashed).unwrap_or(false);
+        if !crashed && hub.agents.load().get(&from_name).is_some_and(|a| a.connected) {
             return Err(format!("{} is online: move the session from there instead", hub.shown(&from_name)));
         }
         if !hub.agents.load().get(to).is_some_and(|a| a.connected) {
@@ -4720,7 +4765,8 @@ impl Registry {
         let (from_shown, to_shown) = (hub.shown(&from_name), hub.shown(to));
         // The package, and its timeline for kiln's take of it (every event's digest), made on the blocking pool (goal 9,
         // plan 01a1a87b2cec step 3).
-        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)).map(|p| {
+        let in_place = from_name == to;
+        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package_for(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown), in_place).map(|p| {
             let t = crate::custody::timeline(&i, p.state.epoch, &p.events);
             (p, t)
         }))
@@ -4966,6 +5012,26 @@ impl Registry {
             .await
             .unwrap_or(false)
     }
+}
+
+/// Whether runner process `holder` is one `me` came after: both kiln ids (UUIDv7, ordered by when
+/// they were made, `crate::util::new_id`), the holder's older. A name that isn't one (`main`, an
+/// old runner's) says nothing of order: never superseded by it.
+fn superseded(holder: &str, me: &str) -> bool {
+    let id = |s: &str| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    id(holder) && id(me) && holder < me
+}
+
+/// A copy whose harness is gone while its machine is up: said crashed, with why, to its viewers too.
+fn crashed(m: &mut Mirror, why: String) -> Info {
+    let info = Arc::make_mut(&mut m.info);
+    info.status = Status::Crashed;
+    info.exit = Some(super::model::ExitInfo { error: Some(why), at: crate::util::now_ms(), ..super::model::ExitInfo::default() });
+    if m.state.is_object() {
+        Arc::make_mut(&mut m.state).set("status", &json!("crashed"));
+    }
+    m.commit(|m| m.state_frame());
+    Info::clone(&m.info)
 }
 
 /// A copy whose machine (or runner process) went away: said disconnected, to its viewers too.
@@ -6245,8 +6311,9 @@ mod tests {
         })
     }
 
-    /// A session this server opened on a machine isn't ended by a report the machine made before
-    /// the open got there; one it had announced is, once a report leaves it out.
+    /// A session this server opened on a machine isn't touched by a report the machine made before
+    /// the open got there; one it had announced, once a report leaves it out, reads crashed (Ada,
+    /// 2026-11-13: listed, resumable, never dropped while its machine is up).
     #[test]
     fn a_report_made_before_an_open_got_there_doesnt_end_it() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -6261,16 +6328,120 @@ mod tests {
             let att = hub.harness.attach("announced").ok_or_else(|| anyhow::anyhow!("no copy"))?;
             let at = att.at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
             hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default()).await;
-            let left = hub.harness.ids();
-            anyhow::ensure!(left == vec!["opened".to_owned()], "{left:?}");
-            // Its viewer hears it's gone: its feed's last frame.
+            let status = |id: &str| hub.harness.info(id).map(|i| i.status);
+            anyhow::ensure!(hub.harness.ids() == ["announced", "opened"], "{:?}", hub.harness.ids());
+            anyhow::ensure!(status("announced") == Some(Status::Crashed), "{:?}", status("announced"));
+            anyhow::ensure!(status("opened") != Some(Status::Crashed), "opened, not announced yet: left as it is");
+            // Its viewer hears it crashed, not that it closed.
             let read = futures::executor::block_on(kiln_seams::Bus::read(&hub.bus, &att.topic, at, 100))?;
             let said: Vec<String> = read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect();
-            anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::closed()), "its viewer heard {said:?}");
+            anyhow::ensure!(!said.last().is_some_and(|t| t == super::super::live::closed()), "its viewer heard {said:?}");
             // Its machine announces it: from then on its reports count.
             hub.harness.ingest(&there, "opened", Update::Open { info: Box::new(info("opened")), since: None }).await;
             hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default()).await;
-            anyhow::ensure!(hub.harness.ids().is_empty());
+            anyhow::ensure!(status("opened") == Some(Status::Crashed), "{:?}", status("opened"));
+            Ok(())
+        })
+    }
+
+    /// Ada, 2026-11-13: after a server restart, a session the conversation store has that no runner
+    /// reports is listed, never dropped: offline while its machine is away, crashed (with why, and
+    /// resumable in place) once its machine's runner reports without it, and crashed at once when
+    /// its machine is up as the server lists it.
+    #[test]
+    fn crashed_state_a_session_no_runner_reports_after_a_restart_is_listed_crashed_and_resumable() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let row = |id: &str, machine: &str| -> anyhow::Result<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)> {
+                let info = Info { id: id.into(), kind: "claude".into(), target: format!("agent:{machine}"), status: Status::Idle, ..Info::default() };
+                Ok((crate::convo::store::Unended { id: id.into(), info: serde_json::to_string(&info)?, meta: None, state: None, machine: Some(machine.into()) }, Vec::new()))
+            };
+            // The server starts: its machine away.
+            hub.harness.restore_away(&hub, vec![row("release", "mac")?]).await;
+            let status = |id: &str| hub.harness.info(id).map(|i| i.status);
+            anyhow::ensure!(status("release") == Some(Status::Disconnected), "away: offline, {:?}", status("release"));
+            // Its machine comes back, its runner holding none of it.
+            hub.put_agent(crate::hub::tests::live_runner("mac", "macos", "aarch64"));
+            let me = crate::util::new_id();
+            hub.harness.inventory(&hub, "mac", Some(&me), std::slice::from_ref(&me), crate::harness::host::Inventory::default()).await;
+            let i = hub.harness.info("release").ok_or_else(|| anyhow::anyhow!("dropped"))?;
+            anyhow::ensure!(i.status == Status::Crashed, "{:?}", i.status);
+            anyhow::ensure!(super::super::wait::stand(&i) == "crashed");
+            anyhow::ensure!(i.exit.as_ref().and_then(|e| e.error.as_deref()).is_some_and(|w| w.contains("doesn't hold it")), "{:?}", i.exit);
+            let resumed = super::super::relocate::resume(&hub, "release").await;
+            anyhow::ensure!(!resumed.as_ref().is_err_and(|e| e.contains("only a crashed agent") || e.contains("no such agent") || e.contains("is online")), "{resumed:?}");
+            // Listed while its machine is up already: crashed at once.
+            hub.harness.restore_away(&hub, vec![row("later", "mac")?]).await;
+            anyhow::ensure!(status("later") == Some(Status::Crashed), "{:?}", status("later"));
+            Ok(())
+        })
+    }
+
+    /// Ada, 2026-11-12 (Amphora): a session whose runner process ended while its machine is up reads
+    /// crashed, never offline, with why, for every harness kiln supports: held by a process the one
+    /// reporting superseded (an older kiln id, gone) that the reporting one doesn't hold. One whose
+    /// holder may still be up (a name, not an id of an older process) stays away, as before.
+    #[test]
+    fn crashed_state_a_session_whose_runner_process_ended_reads_crashed_never_offline_for_every_harness() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+            let there = Location::Machine("box".into());
+            let (old, me) = (crate::util::new_id(), crate::util::new_id());
+            anyhow::ensure!(old < me, "kiln ids are made in order");
+            let kinds = super::super::kinds::Kind::all();
+            for k in kinds {
+                let info = Info { id: format!("c-{}", k.id), kind: k.id.into(), ..Info::default() };
+                hub.harness.ingest(&there, &info.id.clone(), Update::Open { info: Box::new(info.clone()), since: None }).await;
+                hub.harness.held_by(&info.id, &old);
+            }
+            hub.harness.ingest(&there, "away", Update::Open { info: Box::new(Info { id: "away".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            hub.harness.held_by("away", "main");
+            hub.harness.inventory(&hub, "box", Some(&me), std::slice::from_ref(&me), crate::harness::host::Inventory::default()).await;
+            for k in kinds {
+                let id = format!("c-{}", k.id);
+                let i = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("{id} gone"))?;
+                anyhow::ensure!(i.status == Status::Crashed, "{}: {:?}", k.id, i.status);
+                anyhow::ensure!(super::super::wait::stand(&i) == "crashed", "{}: {}", k.id, super::super::wait::stand(&i));
+                anyhow::ensure!(i.exit.as_ref().and_then(|e| e.error.as_deref()).is_some_and(|w| w.contains(&old)), "{}: why {:?}", k.id, i.exit);
+            }
+            anyhow::ensure!(hub.harness.info("away").map(|i| i.status) == Some(Status::Disconnected), "a holder that may be up: away");
+            Ok(())
+        })
+    }
+
+    /// Ada, 2026-11-12: a crashed session is resumed in place, under its id, for every harness kiln
+    /// supports: none of resume's refusals hold it back (it goes on to its conversation's package),
+    /// while one a runner holds is refused: never two processes on one conversation.
+    #[test]
+    fn resume_in_place_a_crashed_session_goes_on_under_its_id_for_every_harness() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+            let there = Location::Machine("box".into());
+            let (old, me) = (crate::util::new_id(), crate::util::new_id());
+            let kinds = super::super::kinds::Kind::all();
+            for k in kinds {
+                let info = Info { id: format!("r-{}", k.id), kind: k.id.into(), ..Info::default() };
+                hub.harness.ingest(&there, &info.id.clone(), Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.held_by(&format!("r-{}", k.id), &old);
+            }
+            hub.harness.ingest(&there, "held", Update::Open { info: Box::new(Info { id: "held".into(), kind: "claude".into(), status: Status::Idle, ..Info::default() }), since: None }).await;
+            hub.harness.held_by("held", &me);
+            let report = crate::harness::host::Inventory { sessions: vec!["held".into()], ..Default::default() };
+            hub.harness.inventory(&hub, "box", Some(&me), std::slice::from_ref(&me), report).await;
+            let refusals = ["only a crashed agent", "is online", "already", "isn't connected", "is not connected", "no such agent"];
+            for k in kinds {
+                let id = format!("r-{}", k.id);
+                anyhow::ensure!(hub.harness.info(&id).map(|i| i.status) == Some(Status::Crashed), "{id} crashed first");
+                if let Err(e) = super::super::relocate::resume(&hub, &id).await {
+                    anyhow::ensure!(!refusals.iter().any(|r| e.contains(r)), "{}: resume was refused: {e}", k.id);
+                }
+            }
+            let held = super::super::relocate::resume(&hub, "held").await;
+            anyhow::ensure!(held.as_ref().is_err_and(|e| e.contains("only a crashed agent")), "{held:?}");
+            let online = hub.harness.resume_on(&hub, "held", "box", None).await;
+            anyhow::ensure!(online.as_ref().is_err_and(|e| e.contains("is online") || e.contains("keeps no conversations")), "{online:?}");
             Ok(())
         })
     }
@@ -6298,9 +6469,11 @@ mod tests {
             let status = |id: &str| hub.harness.info(id).map(|i| i.status);
             anyhow::ensure!(status("old-1") == Some(Status::Disconnected) && status("old-2") == Some(Status::Disconnected), "away: {:?} {:?}", status("old-1"), status("old-2"));
             anyhow::ensure!(status("mine") != Some(Status::Disconnected), "{:?}", status("mine"));
-            // The process that holds them says it holds one of them: the other ends.
+            // The process that holds them says it holds one of them: the other is crashed (its machine
+            // up, no process of it holding it: Ada, 2026-11-13), still listed, its holder let go of.
             hub.harness.inventory(&hub, "box", Some("01a14794"), &["main".to_owned(), "01a14794".to_owned()], report(&["old-1"])).await;
-            anyhow::ensure!(left(&hub) == ["mine", "old-1"], "{:?}", left(&hub));
+            anyhow::ensure!(left(&hub) == ["mine", "old-1", "old-2"], "{:?}", left(&hub));
+            anyhow::ensure!(status("old-2") == Some(Status::Crashed), "{:?}", status("old-2"));
             anyhow::ensure!(hub.harness.holder("old-2").is_none(), "its holder goes with it");
             // Who holds what is kept for the next start: written on the blocking pool, soon after.
             let read = || -> Option<HashMap<String, String>> { serde_json::from_slice(&std::fs::read(hub.harness.dir.join("holders.json")).ok()?).ok() };

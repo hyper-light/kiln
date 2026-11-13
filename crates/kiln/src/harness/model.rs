@@ -673,6 +673,11 @@ pub enum Status {
     Exited,
     /// Its machine is not connected right now (the agent keeps running there).
     Disconnected,
+    /// Its harness's process is gone while its machine is connected: no runner of it holds the
+    /// session (the runner process that held it ended, and the one there now didn't take it).
+    /// Offline is only ever a machine that is: this one is resumed in place, under its id
+    /// (`POST /api/harness/sessions/{id}/resume`, `agents.resume`). Why: its `exit`.
+    Crashed,
 }
 
 /// A decision the agent is waiting for: a tool call to approve, questions to answer, a plan.
@@ -2193,6 +2198,11 @@ pub enum Command {
         /// its folder or its harness's record travels, and it goes by way of the server.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         local: bool,
+        /// With `local`: the newer process reads a package that goes on natively from the harness's
+        /// own record here (`proto::feature::NATIVE_RESUME`), so an ACP agent or Antigravity goes on
+        /// in its own conversation; else (an older build, a rollback) its conversation goes in words.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        native: bool,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {

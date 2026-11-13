@@ -19,7 +19,7 @@ Object.assign(globalThis, {
 });
 const { setMailScope } = await import("../src/api/client.ts");
 setMailScope("upload-test-scope");
-const { readHeld } = await import("../src/api/held.ts");
+const { flushHeld, readHeld } = await import("../src/api/held.ts");
 const { holdWith, uploadingHere, useHeld } = await import("../src/views/harness/state.ts");
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -101,13 +101,13 @@ await test("W21-R15: files whose uploads went with an earlier page are let go on
   assert.equal(useHeld.getState().held["agent-4"], undefined);
 });
 
-await test("W20: a failed original transaction restores Taken and never commits or launches its upload continuation", async () => {
+await test("composer_send: a write this browser can't make still keeps the message here and goes on with its upload", async () => {
   const put = IDBObjectStore.prototype.put;
   let restored = 0;
   let cleared = 0;
   IDBObjectStore.prototype.put = function (...args) {
     const request = put.apply(this, args);
-    if (args[1] === "originals") this.transaction.abort();
+    this.transaction.abort();
     return request;
   };
   try {
@@ -128,13 +128,15 @@ await test("W20: a failed original transaction restores Taken and never commits 
           },
         },
       ),
-      false,
+      true,
+      "kept in this page's memory: storage that refuses never stops it",
     );
-    assert.equal(restored, 1);
-    assert.equal(cleared, 0, "file chips/draft ownership cannot clear before commit");
-    assert.ok(!uploadingHere.has("keep-file"));
+    assert.equal(restored, 0);
+    assert.equal(cleared, 1, "the box lets go of what it handed on");
+    assert.equal(useHeld.getState().held["failed-original"]?.[0]?.text, "keep words");
+    await flushHeld();
   } finally {
     IDBObjectStore.prototype.put = put;
   }
-  assert.equal((await readHeld())["failed-original"], undefined);
+  assert.equal((await readHeld())["failed-original"], undefined, "IndexedDB couldn't take it");
 });

@@ -151,37 +151,107 @@ pub async fn heard(hub: &Arc<Hub>, sender: PeerId, json: String) {
     }
 }
 
+/// The connection of the process that superseded `owner`'s: its machine's newest runner process,
+/// when that's another process and `owner`'s has no connection of its own any more (it ended, and
+/// its machine's runner started again). None while `owner`'s process is connected, or nothing
+/// newer is.
+fn successor(hub: &Hub, owner: &Principal) -> Option<PeerId> {
+    let instances = hub.instances.load();
+    let of = |peer: PeerId| instances.get(peer).and_then(|i| i.id.clone());
+    let lives = owner.instance.is_some() && instances.of(&owner.machine).into_iter().any(|peer| instances.current_connection(peer) && of(peer) == owner.instance);
+    let newest = instances.newest(&owner.machine)?;
+    (!lives && instances.current_connection(newest) && (owner.instance.is_none() || of(newest) != owner.instance)).then_some(newest)
+}
+
+/// Whether runner connection `sender` speaks for the process `owner` names, at the session's epoch
+/// `epoch` against the binding's `minimum`: that process itself (its stored instance), or
+/// (2026-11-12: adacachy's runner started again, and the sessions a hand-over had left with its
+/// old process could never be claimed, their mail refused as a stale owner's without end) the
+/// process of its machine that superseded it ([`successor`]), with the session past the binding's
+/// epoch: the old process can't act again, and only a holder that went on with the session has
+/// moved its epoch past it. Without an epoch (an inventory, a dispatch), the stored process only.
+fn speaks_for(hub: &Hub, sender: PeerId, owner: &Principal, epoch: Option<u64>, minimum: u64) -> bool {
+    let Ok(me) = principal(hub, sender) else { return false };
+    if me.machine != owner.machine {
+        return false;
+    }
+    (me.instance.is_some() && me.instance == owner.instance) || (epoch.is_some_and(|epoch| epoch > minimum) && successor(hub, owner) == Some(sender))
+}
+
+/// [`speaks_for`], and at the binding's own epoch its successor too when the bound process signed a hand-on of
+/// `session` (`custody::handed_on_by`): that process's word that it let the session go, which the epoch alone can't
+/// say. 2026-11-12, adacachy: its old process handed each session on to its next epoch and the new one held them on
+/// at the one they had (each's epoch the binding's: 1, 7 and 5), and none could be claimed, their mail refused.
+async fn speaks_for_session(hub: &Hub, sender: PeerId, owner: &Principal, epoch: Option<u64>, minimum: u64, session: &str) -> bool {
+    if speaks_for(hub, sender, owner, epoch, minimum) {
+        return true;
+    }
+    let Some(instance) = owner.instance.as_deref() else { return false };
+    if epoch != Some(minimum) || successor(hub, owner) != Some(sender) {
+        return false;
+    }
+    crate::custody::handed_on_by(&hub.store, session, minimum, &owner.machine, instance).await.unwrap_or(false)
+}
+
+/// Whether the process `owner` names is connected now.
+fn lives(hub: &Hub, owner: &Principal) -> bool {
+    let instances = hub.instances.load();
+    owner.instance.is_some() && instances.of(&owner.machine).into_iter().any(|peer| instances.current_connection(peer) && instances.get(peer).is_some_and(|i| i.id == owner.instance))
+}
+
+/// The latest hand-over of `session`, one its source's process left unfinished (offered or
+/// prepared) and was superseded before finishing settled first, since that process will never
+/// say its word: committed for the destination that prepared it and is connected (what an adopt
+/// does: the mail goes on at the destination's epoch), else aborted (the mail stays with the
+/// source's epoch). Its runners are told as that phase tells them; one that's gone can't hear it.
+async fn settled(hub: &Hub, session: &str) -> Result<Option<Record>, Refusal> {
+    let Some(record) = handoffs::latest(&hub.store, session.to_owned()).await? else { return Ok(None) };
+    if !matches!(record.phase, Phase::Offered | Phase::Prepared) || successor(hub, &record.source).is_none() {
+        return Ok(Some(record));
+    }
+    let done = if record.phase == Phase::Prepared && lives(hub, &record.destination) {
+        handoffs::adopt(&hub.store, record.manifest.clone(), record.destination.clone()).await?
+    } else {
+        handoffs::abort(&hub.store, record.manifest.clone(), record.source.clone()).await?
+    };
+    tracing::info!(%session, attempt = %done.manifest.attempt, phase = ?done.phase, "a hand-over its source's process left unfinished is settled: that process was superseded");
+    let _ = terminal(hub, &done).await;
+    Ok(Some(done))
+}
+
 /// A new owner cannot bypass the durable handover by publishing Open or an inventory first.
 pub async fn allows_claim(hub: &Hub, sender: PeerId, session: &str, epoch: Option<u64>) -> bool {
-    let record = match handoffs::latest(&hub.store, session.to_owned()).await { Ok(record) => record, Err(_) => return false };
+    let record = match settled(hub, session).await { Ok(record) => record, Err(_) => return false };
     let Some(record) = record else { return true };
     let (owner, minimum) = match record.phase {
         Phase::Offered | Phase::Prepared | Phase::Aborted => (&record.source, record.manifest.source_epoch),
         Phase::Committed => (&record.destination, record.manifest.destination_epoch),
     };
-    principal(hub, sender).as_ref().ok() == Some(owner) && epoch.is_none_or(|epoch| epoch >= minimum)
+    epoch.is_none_or(|epoch| epoch >= minimum) && speaks_for_session(hub, sender, owner, epoch, minimum, session).await
 }
 
 pub async fn allows_generic_adoption(hub: &Hub, sender: PeerId, session: &str, success: bool) -> bool {
-    match handoffs::latest(&hub.store, session.to_owned()).await {
+    match settled(hub, session).await {
         Ok(None) => true,
         Ok(Some(record)) => match record.phase {
             Phase::Offered | Phase::Prepared => false,
-            Phase::Committed => principal(hub, sender).ok().as_ref() == Some(&record.destination),
-            Phase::Aborted => !success && principal(hub, sender).ok().as_ref() == Some(&record.destination),
+            Phase::Committed => speaks_for(hub, sender, &record.destination, None, record.manifest.destination_epoch),
+            Phase::Aborted => !success && speaks_for(hub, sender, &record.destination, None, record.manifest.destination_epoch),
         },
         Err(_) => false,
     }
 }
 
 pub async fn dispatch_ready(hub: &Hub, session: &str, capacity: &super::admission::Capacity) -> Result<bool, Refusal> {
-    let Some(record) = handoffs::latest(&hub.store, session.to_owned()).await? else { return Ok(true) };
+    let Some(record) = settled(hub, session).await? else { return Ok(true) };
     match record.phase {
         Phase::Offered | Phase::Prepared => Ok(false),
         Phase::Aborted => Ok(true),
         Phase::Committed => {
             let owner = hub.instances.load().owner(&Owned::Agent(session.to_owned()));
-            Ok(capacity.epoch >= record.manifest.destination_epoch && owner.and_then(|owner| principal(hub, owner).ok()).as_ref() == Some(&record.destination))
+            let minimum = record.manifest.destination_epoch;
+            let Some(owner) = owner.filter(|_| capacity.epoch >= minimum) else { return Ok(false) };
+            Ok(speaks_for_session(hub, owner, &record.destination, Some(capacity.epoch), minimum, session).await)
         }
     }
 }

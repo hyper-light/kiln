@@ -886,7 +886,7 @@ pub async fn tick(hub: &Arc<crate::hub::Hub>, all: &[Info], now: i64, driven: &[
     if let Err(error) = load(hub).await { tracing::warn!(error=?error, "internal news canonical state unavailable"); return; }
     for parent in all { if let Err(error) = load_parent(hub, &parent.id).await { tracing::warn!(agent=%parent.id,error=?error,"internal news producer state unavailable"); return; } }
     // News a server before this one queued, waiting still: this one adds to it.
-    for p in all.iter().filter(|p| !matches!(p.status, Status::Exited | Status::Disconnected) && (p.queue_partial || p.queue.iter().any(|q| super::queued::from_before(&q.id, NEWS)))) {
+    for p in all.iter().filter(|p| !matches!(p.status, Status::Exited | Status::Disconnected | Status::Crashed) && (p.queue_partial || p.queue.iter().any(|q| super::queued::from_before(&q.id, NEWS)))) {
         if TOLD.lock().news.contains_key(&p.id) {
             continue;
         }
@@ -1352,7 +1352,7 @@ impl Told {
                 self.remove_news(&parent);
                 continue;
             }
-            if matches!(info.status, Status::Disconnected | Status::Exited) || unheard {
+            if matches!(info.status, Status::Disconnected | Status::Crashed | Status::Exited) || unheard {
                 continue;
             }
             let text = n.text();

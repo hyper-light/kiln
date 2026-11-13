@@ -8,6 +8,7 @@ run's id. Nothing is aggregated here; the report reads these.
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import sys
@@ -51,8 +52,9 @@ class Records:
 
 
 def read(path: str) -> Iterator[Dict[str, Any]]:
-    """Every record in a file, in order; a line that isn't one is reported as `unparsed`."""
-    with open(path, encoding="utf-8") as f:
+    """Every record in a file (gzipped where it ends `.gz`, as committed records are), in order; a
+    line that isn't one is reported as `unparsed`."""
+    with (gzip.open(path, "rt", encoding="utf-8") if path.endswith(".gz") else open(path, encoding="utf-8")) as f:
         for number, line in enumerate(f, 1):
             line = line.strip()
             if not line:

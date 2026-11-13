@@ -20,8 +20,8 @@ from typing import Dict, List
 
 from . import records, report, witness
 
-HOST_KEYS = {"on", "needs", "shards", "label", "python", "image", "ballast", "chaos", "rounds", "deadline_s", "seed"}
-PLAN_KEYS = {"hosts", "image", "ballast", "chaos", "rounds", "deadline_s", "seed", "kiln"}
+HOST_KEYS = {"on", "needs", "shards", "label", "python", "image", "ballast", "chaos", "rounds", "deadline_s", "seed", "driver", "hex", "vm", "kind", "asks"}
+PLAN_KEYS = {"hosts", "image", "ballast", "chaos", "rounds", "deadline_s", "seed", "kiln", "driver", "vm", "kind", "asks"}
 
 
 def load_plan(path: str) -> dict:
@@ -56,6 +56,10 @@ def host_command(plan: dict, host: dict, run_id: str, now_ns: int) -> List[str]:
         "--ballast", str(get("ballast", 0)), "--chaos", get("chaos", "none"), "--rounds", str(get("rounds", 0)),
         "--deadline-s", str(get("deadline_s")), "--seed", str(get("seed")), "--controller-t", str(now_ns), "--echo",
     ]
+    if get("driver", "shards") == "hex":
+        agent += ["--driver", "hex", "--hex", host.get("hex", ""), "--vm", get("vm", "")]
+    elif get("driver", "shards") == "kiln":
+        agent += ["--driver", "kiln", "--kind", get("kind", "claude"), "--asks", str(get("asks", 0))]
     # `$HOME` is the remote shell's: everything else is quoted as given.
     text = " ".join(a if a.startswith("$HOME/") else shlex.quote(a) for a in agent)
     text = text.replace("$HOME/", '"$HOME"/')
