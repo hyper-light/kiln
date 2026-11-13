@@ -72,17 +72,28 @@ pub enum SessionWord {
     Fallback { runners: Vec<String> },
 }
 
-/// A runner's word `json` (`Say::Place`) as an owner from before `place.health` reads it
-/// (AUDIT L1, L2): a reason it doesn't know (`Strained`, `Barred`, appended after it) is said as
-/// `Draining`, which it does (it waits there, taking nothing new), rather than as a word it can't
-/// read and drops; every other word as it is.
-pub fn for_older_owner(json: String) -> String {
+/// A runner's word `json` (`Say::Place`) as an owner reads it, by what its link named: a reason it
+/// doesn't know is said as one it does, on which it waits there alike, taking nothing new, rather
+/// than as a word it can't read and drops. To an owner from before `place.keeper` (`keeper`),
+/// `Unsynced` (Hex's capacity-view.md CV11) is said as `Strained`, its why kept; to one from before
+/// `place.health` (`health`; AUDIT L1, L2), `Strained`, `Barred` and `Unsynced` as `Draining`. Every
+/// other word as it is.
+pub fn for_owner(json: String, health: bool, keeper: bool) -> String {
     use kiln_ci::place::msg::Reason;
-    let Ok(mut e) = serde_json::from_str::<Envelope<ToOwner>>(&json) else { return json };
-    match &mut e.msg {
-        ToOwner::Waiting { reason, .. } if matches!(reason, Reason::Strained { .. } | Reason::Barred { .. }) => *reason = Reason::Draining,
-        _ => return json,
+    // `Unsynced`'s tag, which serde writes first in its reason and no string inside the word can
+    // spell unescaped: an owner that reads health's words reads every word but one carrying it.
+    if health && (keeper || !json.contains(r#""kind":"unsynced""#)) {
+        return json;
     }
+    let Ok(mut e) = serde_json::from_str::<Envelope<ToOwner>>(&json) else { return json };
+    let ToOwner::Waiting { reason, .. } = &mut e.msg else { return json };
+    let said = match reason {
+        Reason::Unsynced { .. } if keeper => return json,
+        Reason::Unsynced { why } if health => Reason::Strained { why: std::mem::take(why) },
+        Reason::Strained { .. } | Reason::Barred { .. } | Reason::Unsynced { .. } if !health => Reason::Draining,
+        _ => return json,
+    };
+    *reason = said;
     serde_json::to_string(&e).unwrap_or(json)
 }
 
@@ -106,6 +117,7 @@ fn reason_kind(r: &kiln_ci::place::msg::Reason) -> &'static str {
         Reason::Away => "away",
         Reason::Strained { .. } => "strained",
         Reason::Barred { .. } => "barred",
+        Reason::Unsynced { .. } => "unsynced",
     }
 }
 
@@ -124,6 +136,7 @@ fn reason_words(r: &kiln_ci::place::msg::Reason) -> String {
         Reason::Away => "its owner's link is down".to_owned(),
         Reason::Strained { why } => format!("this machine is under strain: {why}"),
         Reason::Barred { why, .. } => why.clone(),
+        Reason::Unsynced { why } => format!("this runner takes nothing new here: {why}"),
     }
 }
 
@@ -1732,6 +1745,10 @@ impl Placer {
         let state = match (self.admission.taking(), strained) {
             (Err(kiln_ci::place::msg::Reason::Draining), _) => Taking::Draining,
             (_, Some(why)) => Taking::Strained { why },
+            // Not synced with its machine's capacity keeper (CV11): it takes nothing new, said with
+            // its why in the state every server reads, as the machine's strain is (an offers hint
+            // a server can't read is dropped whole).
+            (Err(kiln_ci::place::msg::Reason::Unsynced { why }), None) => Taking::Strained { why },
             _ => Taking::Taking,
         };
         let room = kiln_ci::place::ask::amounts(&self.admission.hint());
@@ -1987,12 +2004,38 @@ mod key_tests {
         use kiln_ci::place::msg::{Estimate, Place, Reason};
         let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default(), pace: Default::default() } });
         for r in [Reason::Strained { why: "stalled".into() }, Reason::Barred { cause: "disk".into(), why: "full".into() }] {
-            let older: Envelope<ToOwner> = serde_json::from_str(&for_older_owner(say(r)?))?;
+            let older: Envelope<ToOwner> = serde_json::from_str(&for_owner(say(r)?, false, false))?;
             anyhow::ensure!(older.epoch == 3 && matches!(older.msg, ToOwner::Waiting { reason: Reason::Draining, place, .. } if place == Place::of(2)), "{older:?}");
         }
         let line = say(Reason::Line)?;
-        anyhow::ensure!(for_older_owner(line.clone()) == line, "a reason it reads goes as it is");
+        anyhow::ensure!(for_owner(line.clone(), false, false) == line, "a reason it reads goes as it is");
         anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_HEALTH), "this build reads them");
+        Ok(())
+    }
+
+    /// Hex's capacity-view.md CV11 for owners from before: a runner's word that it isn't synced
+    /// with its machine's capacity keeper goes to an owner that didn't name `place.keeper` as
+    /// `Strained`, its why kept, where that owner reads health's words, else as `Draining`; to one
+    /// that named it as it is, and health's own words go as they did.
+    #[test]
+    fn an_owner_from_before_the_keeper_hears_unsynced_as_a_reason_it_reads() -> anyhow::Result<()> {
+        use kiln_ci::place::msg::{Estimate, Place, Reason};
+        let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default(), pace: Default::default() } });
+        let reason = |json: &str| -> anyhow::Result<Reason> {
+            match serde_json::from_str::<Envelope<ToOwner>>(json)?.msg {
+                ToOwner::Waiting { reason, place, .. } if place == Place::of(2) => Ok(reason),
+                other => anyhow::bail!("{other:?}"),
+            }
+        };
+        let unsynced = say(Reason::Unsynced { why: "joining".into() })?;
+        anyhow::ensure!(reason(&for_owner(unsynced.clone(), true, false))? == Reason::Strained { why: "joining".into() });
+        anyhow::ensure!(reason(&for_owner(unsynced.clone(), false, false))? == Reason::Draining);
+        anyhow::ensure!(for_owner(unsynced.clone(), true, true) == unsynced, "an owner that reads it hears it as it is");
+        let strained = say(Reason::Strained { why: "stalled".into() })?;
+        anyhow::ensure!(for_owner(strained.clone(), true, false) == strained, "health's words go as they did");
+        anyhow::ensure!(reason_kind(&Reason::Unsynced { why: String::new() }) == "unsynced");
+        anyhow::ensure!(reason_words(&Reason::Unsynced { why: "joining".into() }).ends_with("joining"));
+        anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_KEEPER), "this build reads it");
         Ok(())
     }
 

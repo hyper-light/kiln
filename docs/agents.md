@@ -1103,8 +1103,9 @@ None is a process on its machine, as agents start without one. Its start names i
 microVM's image (`spec.isolation: {kind: "microvm", image}`, docs/api.md "Agentfiles"). It goes
 only to a runner that says it starts microVMs (its facts' `virt.microvm`), and anywhere else it's
 refused, never run as a process; where the machine picked would refuse it, the composer says so
-under the row. A runner's kiln starts no microVM itself until it carries Shards (the plan's steps
-16 and 17), so until then such a start is refused there, saying so.
+under the row. A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now
+(docs/shards.md), but it doesn't yet start a harness through Hex (the plan's step 17), so until then
+such a start is refused there, saying so.
 
 **Placed and charged by kiln's balancer** (step 32). An isolated agent is placed as runs are
 (docs/lb.md), or not at all: its placement asks its microVM's own vCPUs and memory, never what its
@@ -1143,9 +1144,10 @@ given to it, no network but the ports and hosts its grants name, nothing coming 
   isolated agent's agents are isolated too: it can't start one as a process on its machine".
 - **Where it runs.** Only on a runner that says it starts microVMs (its facts' `virt.microvm`, the
   need `microvm`). Anywhere else it's refused, never run as a process.
-- **Not yet.** No runner starts microVMs yet: a runner's kiln starts them once it carries Shards,
-  and Hex to run them. Until then every isolated start is refused, saying so. The rest of this
-  section is what one gets once its start goes through.
+- **Not yet.** No runner starts microVMs yet. kiln holds Shards and Hex at one Shards revision and
+  can carry Shards' programs (docs/shards.md), but its releases don't carry them yet, and kiln
+  doesn't yet start a harness through Hex. Until then every isolated start is refused, saying so.
+  The rest of this section is what one gets once its start goes through.
 
 ### What kiln's Agentfiles give it
 
@@ -1160,8 +1162,8 @@ kiln ships an Agentfile for each harness it drives, `harness-<id>`. Read one on 
   (the harness table at the top of this page).
 - **Its network, every part named.** Names resolve through the microVM's resolver, TCP 443 goes
   out, and nothing comes in; no other port or protocol goes out. TCP 443 goes to any address for
-  now: naming each provider's hosts instead (Shards' destinations by name) comes with a kiln that
-  carries such a Shards.
+  now. The Shards kiln holds can name each provider's hosts instead (its destinations by name), but
+  kiln's Agentfiles don't name them yet.
 - **Your project at `/workspace`**, until kiln plugs it in at the path it has on your machine, so
   that the same absolute paths work inside and out.
 - **A volume of yours**, given to it at run time, where the harness keeps its settings, sign-in,
