@@ -6407,6 +6407,7 @@ async fn installed_identity(given: crate::proto::IdentityGiven, state_dir: PathB
 /// This process was promoted (blue/green): the sessions it took over held at the epoch they go on
 /// at, each let go of so its ask for the next epoch (the one the hand-on names) may go
 /// ([`ask_agent_identity`], `custody::to_ask`), as `(session, epoch it goes on at now)`.
+#[cfg(any(unix, test))]
 fn promoted_asks() -> Vec<(String, u64)> {
     crate::runner::custody::promoted()
 }
