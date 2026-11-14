@@ -486,6 +486,13 @@ export const harnessApi = {
    * without their bodies, as the socket sends them.
    */
   timeline: (id: string, before: number, lean = true) => call<TimelinePage>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/timeline?before=${before}${lean ? "&lean=1" : ""}`),
+  /**
+   * A subagent's thread: its events under the call `parent` that started it, from the server's conversation store, the
+   * newest 200 before event number `before` (none: its newest), oldest first, lean. A viewer's window holds the newest
+   * of the whole session, which a quiet subagent's work in a busy one is older than.
+   */
+  thread: (id: string, parent: string, before: number | null) =>
+    call<ThreadPage>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/thread?parent=${encodeURIComponent(parent)}&lean=1${before === null ? "" : `&before=${before}`}`),
   /** One event of a session, whole: what a lean one held back (its number finds it in the conversation store, past what the server's copy holds). */
   event: (id: string, event: string, seq: number) => call<HEvent>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/events/${encodeURIComponent(event)}?seq=${seq}`),
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
@@ -711,6 +718,19 @@ interface HistoryRead {
   seqs: Set<number>;
   promise: Promise<void>;
 }
+/** A page of a subagent's thread (api.rs `harness_thread`): `before`, the number of its first event; `more`, whether there are more before it. */
+export interface ThreadPage {
+  events: HEvent[];
+  before: number | null;
+  more: boolean;
+}
+/** What of a subagent's thread has come from the server's store ({@link SessionStore.thread}): from where, whether more is before it, whether it's on its way. */
+export interface ThreadHistory {
+  before: number | null;
+  more: boolean;
+  loading: boolean;
+  error: string | null;
+}
 /** An older page's size (W21-R02; the server clamps it, api.rs `conversation_events_for`): `limit` events at most, about `bytes` of them. */
 export type OlderPage = { limit: number; bytes: number };
 /** What "Earlier messages" asks for at a time. */
@@ -742,6 +762,8 @@ export interface Snapshot {
   outgoing: Outgoing[];
   /** There are events before those it holds: they come a page at a time as the person reads back to them ({@link SessionStore.older}). */
   more: boolean;
+  /** Subagents' threads read from the server's store, by the call that started each ({@link SessionStore.thread}). */
+  threads: Readonly<Record<string, ThreadHistory>>;
 }
 
 /** What a lean tool call held back (docs/wire.md, "Windows"): its bodies' sizes; none when it's whole. Its whole self comes with {@link SessionStore.body}. */
@@ -823,6 +845,7 @@ const EMPTY: Snapshot = {
   asked: [],
   outgoing: [],
   more: false,
+  threads: {},
 };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
@@ -1114,6 +1137,8 @@ export class SessionStore {
   private paging: Promise<void> | null = null;
   /** Some older pages came: what's held goes back further than the window, and isn't let go of. */
   private paged = false;
+  /** Subagents' threads on their way from the server's store, by the call that started each. */
+  private threadReads = new Map<string, Promise<void>>();
   /** The whole events asked for, by id, with the lean one each was asked for. */
   private bodies = new Map<string, { e: HEvent; p: Promise<HEvent | string> }>();
   /** Every lean event's body, being asked for (find in the conversation reads them all). */
@@ -1699,6 +1724,47 @@ export class SessionStore {
     return this.paging;
   };
 
+  /**
+   * A subagent's thread, its events under the call `parent` that started it, from the server's conversation store: its
+   * newest, or (`older`) the page before what came of it. Merged in by number as an older page is, never over an event
+   * held; kept, as older pages are, until a snapshot replaces what's held. A viewer's window holds the newest of the
+   * whole session (docs/wire.md, "Windows"): in a busy session a quiet subagent's work is older than all of it. Once
+   * per thread, and one at a time.
+   */
+  thread = (parent: string, older = false): Promise<void> => {
+    const going = this.threadReads.get(parent);
+    if (going) return going;
+    const was = this.snap.threads[parent];
+    if (this.disposed || (older ? !was?.more : was !== undefined)) return READY;
+    const generation = this.snapshotGeneration;
+    const before = older ? (was?.before ?? null) : null;
+    const set = (t: ThreadHistory) => this.patch({ threads: { ...this.snap.threads, [parent]: t } });
+    set({ before: was?.before ?? null, more: was?.more ?? false, loading: true, error: null });
+    const read = harnessApi
+      .thread(this.id, parent, before)
+      .then((page) => {
+        if (this.disposed || this.snapshotGeneration !== generation) return;
+        for (const e of page.events) {
+          if (this.byId.has(e.id) || this.bySeq.has(e.seq)) continue;
+          this.byId.set(e.id, e);
+          this.bySeq.set(e.seq, e.id);
+        }
+        // What's held goes back further than the window now: it isn't let go of.
+        this.paged = true;
+        this.reorder = true;
+        set({ before: page.before ?? before, more: page.more, loading: false, error: null });
+      })
+      .catch((error: unknown) => {
+        if (this.disposed || this.snapshotGeneration !== generation) return;
+        set({ before: was?.before ?? null, more: was?.more ?? false, loading: false, error: error instanceof Error ? error.message : "The thread could not be loaded." });
+      })
+      .finally(() => {
+        if (this.threadReads.get(parent) === read) this.threadReads.delete(parent);
+      });
+    this.threadReads.set(parent, read);
+    return read;
+  };
+
   /** An older page, taken in: its events before what's held, by number; one held already is as new as it gets (live frames bring changes). */
   private takePage(page: TimelinePage) {
     for (const e of page.events) {
@@ -2232,10 +2298,12 @@ export class SessionStore {
     this.byId = byId;
     this.bySeq = new Map([...byId.values()].map((e) => [e.seq, e.id]));
     this.reorder = true;
-    // A snapshot (not a resume) is what's held now: the older pages taken before go with it.
+    // A snapshot (not a resume) is what's held now: the older pages taken before go with it, and the threads read.
     if (!inc.resumed) {
       this.paged = false;
       this.bodies.clear();
+      this.threadReads.clear();
+      this.snap = { ...this.snap, threads: {} };
     }
     this.floor = inc.floor;
     // What's shown goes as far as the open or resume said.

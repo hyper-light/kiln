@@ -686,6 +686,14 @@ impl Link<'_> {
         Ok(rows)
     }
 
+    /// [`Engine::thread`], on this connection.
+    fn thread(&self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        let limit = int(i64::try_from(limit).unwrap_or(i64::MAX));
+        let mut rows = self.event_rows(sql::EVENTS_OF_PARENT, &[Value::from_text(session.to_owned()), Value::from_text(parent.to_owned()), seq(before.unwrap_or(u64::MAX)), limit])?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// [`Engine::search_some`], on this connection.
     fn search_some(&self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
         // Newest first by an index, so nothing is sorted and it stops once it has `want`; the words
@@ -756,6 +764,10 @@ impl TursoRead {
 impl Read for TursoRead {
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.link().events(session, before, limit)
+    }
+
+    fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.link().thread(session, parent, before, limit)
     }
 
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
@@ -1642,6 +1654,10 @@ impl Engine for Turso {
         self.link().events(session, before, limit)
     }
 
+    fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.link().thread(session, parent, before, limit)
+    }
+
     fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
         self.link().search_some(q, from, rows, want)
     }
@@ -1712,6 +1728,41 @@ mod tests {
         let whole = began.elapsed();
         eprintln!("restore read of a 100k-event session: {cheap:?} (kept with EVENTS_LAST: {whole:?}); plan: {plan_text}");
         assert!(cheap < super::super::store::READ_WAIT / 20, "{cheap:?}");
+        Ok(())
+    }
+
+    /// A subagent's thread, read by its own index: its events under the call that started it, oldest first, a page at a
+    /// time back from where the viewer's begin, whatever else the session holds around them; on a store kept by an
+    /// older kiln too (schema 3), once it opens.
+    #[test]
+    fn a_subagent_s_thread_is_read_by_its_call_alone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("conversations.db");
+        let under = |id: &str, seq: u64, parent: Option<&str>| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: parent.map(str::to_owned), by: None, body: Body::Assistant { text: "words".into(), streaming: false } }] };
+        let rows: Vec<_> = (1..=3_000u64).flat_map(|i| super::super::rows::of("a1", &under(&format!("m{i}"), i, (i % 10 == 0).then_some("toolu_5")), 0)).collect();
+        {
+            let mut old = Turso::open_at(&path, 3)?;
+            old.apply(&rows)?;
+        }
+        let mut t = Turso::open(&path)?;
+        let link = t.link();
+        let mut plan = link.prepare(&format!("EXPLAIN QUERY PLAN {}", sql::EVENTS_OF_PARENT))?;
+        let mut said_plan = Vec::new();
+        link.run(&mut plan, &[Value::from_text("a1".to_owned()), Value::from_text("toolu_5".to_owned()), int(i64::MAX), int(100)], |r| {
+            said_plan.push((0..4).filter_map(|i| r.get::<String>(i).ok()).collect::<Vec<_>>().join(" "));
+            Ok(())
+        })?;
+        let plan_text = said_plan.join(" | ");
+        assert!(plan_text.contains("events_by_parent") && !plan_text.to_uppercase().contains("SORTER") && !plan_text.to_uppercase().contains("TEMP B-TREE"), "{plan_text}");
+        let mut reader = t.reader().ok_or_else(|| anyhow::anyhow!("no reader"))?;
+        let seqs = |rows: Vec<EventRow>| rows.iter().map(|e| e.seq).collect::<Vec<_>>();
+        let newest = seqs(reader.thread("a1", "toolu_5", None, 3)?);
+        assert_eq!(newest, [2_980, 2_990, 3_000], "its newest, oldest first");
+        assert_eq!(seqs(reader.thread("a1", "toolu_5", Some(2_980), 2)?), [2_960, 2_970], "the page before");
+        assert_eq!(reader.thread("a1", "toolu_5", None, 1_000)?.len(), 300, "all of it, and nothing else");
+        assert!(reader.thread("a1", "toolu_6", None, 100)?.is_empty());
+        assert!(reader.thread("a2", "toolu_5", None, 100)?.is_empty(), "another session's call of that id isn't this one's");
+        assert_eq!(seqs(t.thread("a1", "toolu_5", Some(31), 10)?), [10, 20, 30], "the writer reads it as the reader does");
         Ok(())
     }
 

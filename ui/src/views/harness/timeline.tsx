@@ -1826,6 +1826,15 @@ export const Timeline = React.memo(function Timeline({
   const keptFiles = useSession(store, (s) => s.files);
   const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
   const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
+  // A subagent's own work, from the server's store: the session's window holds its newest events, which a quiet
+  // subagent's in a busy session are older than all of (docs/wire.md, "Windows").
+  const threadRead = useSession(store, (s) => (parent ? s.threads[parent] : undefined));
+  const readThread = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (el && parent) void store.thread(parent);
+    },
+    [store, parent],
+  );
   // A Codex child's own work is keyed by its thread: opened from any of its calls, or with its row
   // gone, it still shows (its row's id, else the thread the opened call names).
   const thread = React.useMemo(() => {
@@ -2113,6 +2122,26 @@ export const Timeline = React.memo(function Timeline({
                     {history.loading ? "Loading earlier messages…" : "Earlier messages"}
                   </button>
                 )}
+                {/* Mounted again once a snapshot replaces what's held (and the threads read with it): read again. */}
+                {parent && <div key={`thread-${parent}-${threadRead ? "read" : "unread"}`} ref={readThread} hidden />}
+                {from === 0 && threadRead?.more && (
+                  <button
+                    type="button"
+                    className="hx-earlier-steps"
+                    disabled={threadRead.loading}
+                    onClick={() => {
+                      read();
+                      void store.thread(parent ?? "", true);
+                    }}
+                  >
+                    {threadRead.loading ? "Loading earlier work…" : "Earlier work"}
+                  </button>
+                )}
+                {from === 0 && threadRead?.error && (
+                  <div role="alert" className="hx-bad text-[11px]">
+                    Couldn't load this subagent's work. {threadRead.error}
+                  </div>
+                )}
                 {from === 0 && history?.error && (
                   <div role="alert" className="hx-bad text-[11px]">
                     Couldn't load earlier messages. {history.error}
@@ -2132,7 +2161,11 @@ export const Timeline = React.memo(function Timeline({
                           {going && task.last_tool && <span className="hx-trunc">{task.last_tool}</span>}
                         </div>
                       )}
-                      {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
+                      {task?.summary ? (
+                        <Prose text={task.summary} className="hx-sub-result" />
+                      ) : (
+                        <p className="hx-dim text-[12px]">{threadRead === undefined || threadRead.loading ? "Loading its work…" : "No work has been reported in this thread yet."}</p>
+                      )}
                     </div>
                   ) : (
                     mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>

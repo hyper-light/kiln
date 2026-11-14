@@ -221,6 +221,9 @@ pub trait Engine: Send + 'static {
     fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
     /// A session's events before `before` (its event numbers), the newest `limit`, oldest first.
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
+    /// A session's events under call `parent` (a subagent's thread) before `before` (None: all of
+    /// them), the newest `limit`, oldest first.
+    fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
     /// Events matching `q`, newest first: up to `want` of them among the next `rows` events it
     /// looks at after `from` (None: from the newest), and where to go on from (None: it has looked
     /// at every one).
@@ -296,6 +299,8 @@ pub trait Engine: Send + 'static {
 pub trait Read {
     /// As [`Engine::events`].
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
+    /// As [`Engine::thread`].
+    fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
     /// As [`Engine::unended`]: read beside the writer, so a server starting while its runners' feeds
     /// fill the writer still lists its sessions (2026-11-13 07:14Z: it timed out twice and gave up).
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
@@ -316,6 +321,10 @@ struct OnWriter<'a>(&'a mut dyn Engine);
 impl Read for OnWriter<'_> {
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.0.events(session, before, limit)
+    }
+
+    fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.0.thread(session, parent, before, limit)
     }
 
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
@@ -697,6 +706,14 @@ impl Store {
     pub fn events_committed(&self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         let s = session.to_owned();
         self.read(move |r| r.events(&s, before, limit))
+    }
+
+    /// A subagent's thread as committed: a session's newest `limit` events under call `parent`
+    /// before event number `before` (all of them: none), oldest first, by an index of their own
+    /// (`events_by_parent`), whatever else the session holds. Read beside the writer. Blocking.
+    pub fn thread_committed(&self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        let (s, p) = (session.to_owned(), parent.to_owned());
+        self.read(move |r| r.thread(&s, &p, before, limit))
     }
 
     /// [`Store::unended`], read beside the writer at the last commit ([`Store::read`]): never behind the
@@ -1208,6 +1225,9 @@ impl Engine for SlowToLetGo {
     }
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.inner.events(session, before, limit)
+    }
+    fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.inner.thread(session, parent, before, limit)
     }
     fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
         self.inner.search_some(q, from, rows, want)

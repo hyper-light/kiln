@@ -247,3 +247,55 @@ await test("w21_r02 a deferred whole-body page cannot overwrite a newer lean eve
     globalThis.fetch = originalFetch;
   }
 });
+
+await test("a quiet subagent's work, older than the session's window, comes by its call: its newest, then the page before, kept until a new snapshot", async () => {
+  // The window: the newest of the whole session, every event another subagent's.
+  const busy = (s: number) => ({ ...note(s), parent: "toolu_other" });
+  const { store, off, ws } = await opened("quiet", 901, 1000, true, busy);
+  const its = (s: number) => ({ ...cmd(s, true), parent: "toolu_5" });
+  const under = (parent: string) =>
+    store
+      .get()
+      .events.filter((e) => e.parent === parent)
+      .map((e) => e.seq);
+  try {
+    assert.deepEqual(under("toolu_5"), [], "none of its work is in the window");
+    answers.set("/api/harness/sessions/quiet/thread?parent=toolu_5&lean=1", () => ({ events: [its(30), its(40), { ...busy(950) }], before: 30, more: true }));
+    answers.set("/api/harness/sessions/quiet/thread?parent=toolu_5&lean=1&before=30", () => ({ events: [its(10), its(20)], before: 10, more: false }));
+    const reading = store.thread("toolu_5");
+    assert.equal(store.thread("toolu_5"), reading, "one read at a time");
+    assert.equal(store.get().threads.toolu_5?.loading, true);
+    await reading;
+    await tick();
+    assert.deepEqual(under("toolu_5"), [30, 40], "its newest, among the session's in order");
+    assert.deepEqual(store.get().threads.toolu_5, { before: 30, more: true, loading: false, error: null });
+    assert.equal(store.get().events.filter((e) => e.seq === 950).length, 1, "one held already stays as held");
+    const was = asked.length;
+    await store.thread("toolu_5");
+    assert.equal(asked.length, was, "read once");
+    await store.thread("toolu_5", true);
+    await tick();
+    assert.deepEqual(under("toolu_5"), [10, 20, 30, 40]);
+    assert.equal(store.get().threads.toolu_5?.more, false);
+    await store.thread("toolu_5", true);
+    assert.equal(asked.length, was + 1, "nothing more to ask for");
+    // Live events go on: the thread's stay held beside the window as it grows.
+    ws.frame({ t: "events", events: range(1001, 1010).map(busy), rev: 6 });
+    await tick();
+    assert.deepEqual(under("toolu_5"), [10, 20, 30, 40]);
+    // A snapshot replaces what's held: the threads read go with it, to be read again.
+    ws.frame({ t: "open", info: { id: "quiet", status: "idle" }, rev: 9, born: 11, window: { before: 911, more: true } });
+    ws.frame({ t: "events", events: range(911, 1010).map(busy) });
+    ws.frame({ t: "synced" });
+    await tick();
+    assert.deepEqual(under("toolu_5"), []);
+    assert.equal(store.get().threads.toolu_5, undefined);
+    // A thread the store can't give says why.
+    await store.thread("toolu_gone");
+    await tick();
+    assert.equal(store.get().threads.toolu_gone?.loading, false);
+    assert.match(store.get().threads.toolu_gone?.error ?? "", /not found/);
+  } finally {
+    off();
+  }
+});

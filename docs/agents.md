@@ -574,6 +574,7 @@ server says, and counts every session it has, ended ones included, until it's up
 | GET | `/api/harness/history?target=&kind=&limit=` | a machine's past sessions to continue → `PastSession[]`, newest first; see below |
 | GET | `/api/harness/sessions/:id/events?before=&limit=` | the session's history from the conversation store, beyond what its timeline holds → `{events}`, oldest first ([conversations.md](conversations.md)) |
 | GET | `/api/harness/sessions/:id/timeline?before=&lean=` | the page of its events just before number `before`, where a window (or the last page) begins → `{events, before?, more}`, oldest first, whole turns where they fit; from the server's copy, then the conversation store ([wire.md](wire.md), "Windows") |
+| GET | `/api/harness/sessions/:id/thread?parent=&before=&limit=&lean=` | a subagent's thread, its events under the call `parent` that started it, from the conversation store by an index of their own → `{events, before, more}`, oldest first, the newest `limit` (200, at most 1000) before number `before` ([wire.md](wire.md), "Windows") |
 | GET | `/api/harness/sessions/:id/events/:event?seq=` | one event whole: what a lean one held back, asked for as it's opened ([wire.md](wire.md), "Windows") |
 | GET | `/api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=` | events across every agent's conversation, newest first → `{hits: [{agent, name, machine, event}]}` |
 

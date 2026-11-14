@@ -461,6 +461,18 @@ neither (an older tab) is sent every event, whole, as before.
   where the last began, and new events are numbered after them all, so pages asked for one after
   another meet with no gap and nothing twice while the session goes on. A viewer holding a window
   takes no live event from before it that it doesn't hold: that one comes with its page.
+- **A subagent's thread.** The window is the newest of the whole session. In a session whose other
+  subagents are busy, a quiet one's work (a long wait on one call, a while back) is older than all
+  of it, and its thread would show none of it however long it ran. So a subagent's thread, as it
+  opens, asks for its own events:
+  `GET /api/harness/sessions/:id/thread?parent=<call>[&before=<seq>][&limit=][&lean=1]`, the
+  events under the call that started it, from the conversation store by an index of their own
+  (`events_by_parent`): `{events, before, more}`, oldest first, the newest 200 (at most 1000)
+  before `before`, and "Earlier work" asks for the page before. They join what the viewer holds by
+  number, as an older page's do, never over one held, and stay until a snapshot replaces what's
+  held, when the thread asks again. A Claude Code subagent resumed (a SendMessage to one that
+  finished) runs under the call that resumed it; kiln keeps it, and its output from then on, under
+  the call that started it (`claude.rs`, `resumed`), so its thread is that one call's.
 - **Lean events.** A settled tool call of kind shell, read, search, web or edit goes without its
   output and input (`null`) and with its diffs' hunks empty, each diff saying its lines added and
   taken out (`add`, `del`), and `held: {output, input, lines}` saying what was held back. What the

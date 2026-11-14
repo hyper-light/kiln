@@ -99,7 +99,8 @@ C, no SIMD, no FTS.
     session (the server's store).
   - `events(session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev)`, keyed by
     `(session, id)`. `text` holds what a search matches: a message's words, a tool's title and
-    output, a notice's text.
+    output, a notice's text. Indexed by `(session, seq)`, by `at`, by `rev`, and (migration 4) by
+    `(session, parent, seq)`, which reads a subagent's thread alone (`Store::thread_committed`).
   - `records(session, source, n, line_end, line, rev)`: the harness's record. `source` is Claude
     Code's session id, or a Codex rollout's file name.
   - `drops(rev, session, what, source, n, at)`: what was dropped.

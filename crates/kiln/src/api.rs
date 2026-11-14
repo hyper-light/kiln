@@ -1566,6 +1566,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::GET, ["api", "harness", "sessions", id, "events"]) => boxed(|| conversation_events_for(&hub, &caller, id, &q)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "events", event]) => boxed(|| harness_event(&hub, id, event, &q)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "timeline"]) => boxed(|| harness_timeline(&hub, id, &q)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "thread"]) => boxed(|| harness_thread(&hub, &caller, id, &q)).await,
         (&Method::GET, ["api", "conversations", "search"]) => boxed(|| conversation_search(&hub, &q)).await,
         // The runners that keep a copy of the server's conversation store (docs/conversations.md, "Mirrors").
         (&Method::GET, ["api", "conversations", "mirrors"]) => Ok(srv::json(StatusCode::OK, &json!({ "mirrors": hub.harness.copies.as_ref().map(|m| m.view()).unwrap_or_default() }))),
@@ -6141,6 +6142,36 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
     made.map(pre_encoded).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e:#}")))
 }
 
+/// `GET /api/harness/sessions/:id/thread?parent=<call>[&before=<seq>][&limit=][&lean=1]`: a subagent's thread, its
+/// events under the call that started it, from the conversation store by an index of their own (`events_by_parent`):
+/// `{events, before, more}`, oldest first, the newest `limit` (200, at most 1000) before event number `before` (none:
+/// its newest), `before` the number of the first of them, to ask for the page before it. A viewer's window holds the
+/// newest of the whole session (docs/wire.md, "Windows"): in a session whose other subagents are busy, a quiet one's
+/// work is older than all of it, and its thread would show none of it.
+async fn harness_thread(hub: &Hub, caller: &crate::authz::Caller, id: &str, q: &HashMap<String, String>) -> R {
+    let Some(parent) = q.get("parent").map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()) else { return Err(err(StatusCode::BAD_REQUEST, "parent is the call that started the thread")) };
+    let before = q.get("before").map(|b| b.parse::<u64>()).transpose().map_err(|_| err(StatusCode::BAD_REQUEST, "before must be an event number"))?;
+    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200).clamp(1, 1000);
+    let lean = q.get("lean").is_some_and(|v| v == "1");
+    crate::harness::lineage::may_see(hub, caller, id).await.map_err(|(c, m)| err(c, m))?;
+    let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
+    let session = id.to_owned();
+    let made = crate::rt::blocking(move || {
+        // One more than asked for says whether there are more: the oldest, left out.
+        let rows = store.thread_committed(&session, &parent, before, limit.saturating_add(1))?;
+        let more = rows.len() > limit;
+        let rows: Vec<_> = rows.into_iter().skip(usize::from(more)).collect();
+        let first = rows.first().map(|r| r.seq);
+        let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok()).map(|e| if lean { crate::harness::window::lean(&e).unwrap_or(e) } else { e }).collect();
+        crate::reads::encode(&json!({ "events": events, "before": first, "more": more }))
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let made = made.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let response = pre_encoded(made);
+    Ok(srv::with_header(srv::with_header(response, header::CACHE_CONTROL, "private, no-store"), header::VARY, "Cookie, Authorization"))
+}
+
 /// `GET /api/harness/sessions/{id}/events` as the conversation store's `rows` say it: `{events}`, each row's body read
 /// as JSON (one that isn't is left out) and written out as `srv::json` writes an answer, compact.
 fn stored_events(rows: &[crate::convo::rows::EventRow]) -> anyhow::Result<Bytes> {
@@ -8937,6 +8968,73 @@ mod tests {
                 anyhow::ensure!(inflated == 0 && read == 0, "{path}: {inflated} inflated, {read} read from a spill file on its shard");
             }
             anyhow::ensure!(n > 300, "the newest 300 reach the spilled chunks");
+            Ok(())
+        })
+    }
+
+    /// A subagent's thread from the conversation store, by the call that started it: in a session whose other work is
+    /// newer than all of it, its events alone, oldest first, a page at a time back from `before`; lean when asked; a
+    /// call with none, none; no `parent`, a bad request.
+    #[test]
+    fn a_subagent_s_thread_is_read_by_its_call_however_busy_its_session() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, ToolCall, ToolKind, ToolStatus};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            let shell = |n: u64| {
+                Body::Tool(Box::new(ToolCall {
+                    tool_id: format!("e{n}"),
+                    name: "Bash".into(),
+                    tool: ToolKind::Shell,
+                    title: format!("step {n}"),
+                    detail: None,
+                    input: json!({"command": "cargo test"}),
+                    status: ToolStatus::Done,
+                    output: Some("x".repeat(64)),
+                    truncated: false,
+                    diffs: Vec::new(),
+                    todos: Vec::new(),
+                    task: None,
+                    exit_code: Some(0),
+                    started: 1,
+                    ended: Some(2),
+                    server: None,
+                    tool_short: None,
+                    skill: None,
+                    runner: None,
+                }))
+            };
+            // Its five steps first; then 2,000 of others'.
+            let event = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: Some(if n <= 5 { "toolu_5" } else { "toolu_other" }.into()), by: None, body: shell(n) };
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=2_005).map(event).collect() }).await;
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            crate::rt::blocking(move || store.sync()).await??;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let get = |path: String| {
+                let api = Arc::clone(&api);
+                async move {
+                    let r = api.handle(lab_get(&path)?).await;
+                    let status = r.status();
+                    anyhow::Ok((status, serde_json::from_slice::<serde_json::Value>(&body_of(r).await?).unwrap_or_default()))
+                }
+            };
+            let seqs = |v: &serde_json::Value| v.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("seq").and_then(serde_json::Value::as_u64)).collect::<Vec<_>>();
+            let (status, all) = get("/api/harness/sessions/a/thread?parent=toolu_5".into()).await?;
+            assert_eq!((status, seqs(&all), all.get("more")), (StatusCode::OK, vec![1, 2, 3, 4, 5], Some(&json!(false))));
+            assert!(all.pointer("/events/0/output").is_some_and(|o| o.as_str().is_some()), "whole unless asked lean: {all}");
+            let (_, newest) = get("/api/harness/sessions/a/thread?parent=toolu_5&limit=2&lean=1".into()).await?;
+            assert_eq!((seqs(&newest), newest.get("before"), newest.get("more")), (vec![4, 5], Some(&json!(4)), Some(&json!(true))));
+            assert!(newest.pointer("/events/0/output").is_none() && newest.pointer("/events/0/held").is_some(), "lean: {newest}");
+            let (_, page) = get("/api/harness/sessions/a/thread?parent=toolu_5&limit=2&before=4".into()).await?;
+            assert_eq!((seqs(&page), page.get("more")), (vec![2, 3], Some(&json!(true))));
+            let (_, none) = get("/api/harness/sessions/a/thread?parent=toolu_9".into()).await?;
+            assert_eq!((seqs(&none), none.get("more")), (Vec::<u64>::new(), Some(&json!(false))));
+            let (status, _) = get("/api/harness/sessions/a/thread".into()).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
             Ok(())
         })
     }

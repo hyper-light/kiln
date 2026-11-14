@@ -75,6 +75,9 @@ pub const MIGRATIONS: &[&str] = &[
     // 3: the sessions a mirror's copy brought back into this store while it restores from it:
     // the copy fills those in, and leaves alone what the store has from anywhere else.
     "CREATE TABLE IF NOT EXISTS copied (session TEXT PRIMARY KEY);",
+    // 4: a subagent's thread, its events by the call that started it ([`EVENTS_OF_PARENT`]): read
+    // by an index of their own, however many other events the session has around them.
+    "CREATE INDEX IF NOT EXISTS events_by_parent ON events (session, parent, seq);",
 ];
 
 /// Where the migrations done so far are counted.
@@ -134,6 +137,12 @@ pub const EVENTS_NEWEST: &str = "SELECT session, id, seq, at, parent, by, kind, 
 pub const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 ORDER BY seq DESC, rev DESC LIMIT ?2";
 /// A session's `?3` events before event number `?2`, newest first.
 pub const EVENTS_BEFORE: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 AND seq < ?2 ORDER BY seq DESC, rev DESC LIMIT ?3";
+
+/// A session's `?4` events under call `?2` (a subagent's thread) before event number `?3`, newest
+/// first: `events_by_parent` read backwards and stopped at the limit, no sort. Named (`INDEXED BY`):
+/// with no statistics, Turso's planner takes the key's `session` prefix and sorts every event of
+/// the session; ordered by number alone, as [`EVENTS_NEWEST`], since `rev` isn't in the index.
+pub const EVENTS_OF_PARENT: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events INDEXED BY events_by_parent WHERE session = ?1 AND parent = ?2 AND seq < ?3 ORDER BY seq DESC LIMIT ?4";
 
 /// The columns an event row is read from, in this order.
 pub const EVENT_COLUMNS: usize = 12;
