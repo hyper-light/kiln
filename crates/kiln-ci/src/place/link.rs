@@ -44,6 +44,16 @@ impl Rtt {
     pub fn rto_of(rtt: Option<&Rtt>) -> Ms {
         rtt.map_or(Rtt::INITIAL, Rtt::rto)
     }
+
+    /// RFC 6298 §2.5: "A maximum value MAY be placed on RTO provided it is at least 60 seconds".
+    /// The least the RFC allows: a word lost on a link that stays up is said again within a minute.
+    pub const MOST: Ms = 60_000;
+
+    /// The timeout `rto` after it ran out `n` times: RFC 6298 §5.5 doubles it each time ("back off
+    /// the timer"), to at most [`Rtt::MOST`].
+    pub fn backed_off(rto: Ms, n: u32) -> Ms {
+        rto.saturating_mul(1u64.checked_shl(n).unwrap_or(u64::MAX)).min(Rtt::MOST)
+    }
 }
 
 /// The offset between an owner's clock and a runner's, as NTP's on-wire protocol takes it from
@@ -83,6 +93,9 @@ mod tests {
         r.sample(100);
         assert_eq!((r.srtt, r.rttvar), (100, 37));
         assert_eq!(Rtt::rto_of(None), 1000);
+        // §5.5's back-off doubles the timer each time it runs out, to §2.5's least maximum.
+        assert_eq!([0, 1, 2, 6, 7, 64].map(|n| Rtt::backed_off(1000, n)), [1000, 2000, 4000, 60_000, 60_000, 60_000]);
+        assert_eq!(Rtt::backed_off(300, 3), 2400);
         // The runner's clock 5 s ahead, 20 ms each way, 2 ms at the runner.
         let o = Offset::of(1_000, 6_020, 6_022, 1_042);
         assert_eq!((o.theta, o.delta), (5_000, 40));

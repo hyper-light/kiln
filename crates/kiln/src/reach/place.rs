@@ -1244,6 +1244,31 @@ impl Placer {
         out
     }
 
+    /// Its shell gave it up before saying its start anywhere (its tree couldn't be copied there,
+    /// its link or custody wouldn't take it): its claim is declined, so its room is free there at
+    /// once ([`kiln_ci::place::owner::Owner::unsaid`], W05-R03), and its budget's reservation goes,
+    /// as it never ran.
+    pub fn unsaid(&mut self, run: &str, now: i64) -> Vec<Out> {
+        let (held, b) = self.budget.cancel(run, now);
+        let mut out = self.budget_outs(b, now);
+        if !held {
+            let acts = self.owner.unsaid(run);
+            out.extend(self.acts(acts, now));
+        }
+        out
+    }
+
+    /// Its go reached nothing that would start it (what asked for it went away while it waited):
+    /// told to go once, it never started, and is given up as [`Self::unsaid`]; a start said again
+    /// is of a run whose start went out, which its runner's word ends.
+    pub fn undriven(&mut self, run: &str, now: i64) -> Vec<Out> {
+        let Some(acts) = self.owner.undriven(run) else { return Vec::new() };
+        let (_, b) = self.budget.cancel(run, now);
+        let mut out = self.budget_outs(b, now);
+        out.extend(self.acts(acts, now));
+        out
+    }
+
     /// The local run `run` is about to start on `runner` under `fence`: whether it still may
     /// ([`Owner::starting`]); for this runner, its admission says whether it starts (`New`), on its
     /// reserve's grant where a capacity keeper is named: none while that waits, answered then as

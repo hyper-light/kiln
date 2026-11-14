@@ -552,6 +552,22 @@ the fleet (64).
   on another member, or, when none has room (`Told::Waiting`) or could (`Told::Never`), cancelled,
   its waits dropped unsent, and probed with the same ask. A start given up before it was sent is
   `Owner::unsent`: its room back in the view at once.
+- **A claim given up** (W05-R03). A run the shell gives up after its go and before its start is
+  said (its tree couldn't be copied there, its link or its custody wouldn't take it, what drove it
+  went away) is `Owner::unsaid`: its claim is declined at its runner, its room free there at once,
+  as a kernel start never sent is `unsent`. A go nothing took (what asked for the run went away
+  while it waited, or the node started again since) is `Owner::undriven`: a run told to go once is
+  given up so; a start said again is its runner's to end. A runner holds a taken claim until its
+  run starts, so a claim given up and not declined is held there for good, and every run asking
+  room there waits behind it ("others ahead of it" on an idle machine, 2026-11-13). A run placed on
+  its own machine says its end as it leaves, however it leaves.
+- **Asked again** (W05-R13). A probe unanswered on a link that stays up (a runner that took its
+  owner for away, a word lost on the way) is said again each time its link's timeout runs out, the
+  timeout doubled each time (RFC 6298 §5.5) to at most sixty seconds (§2.5), until the runner
+  answers or the run is placed; a runner answers a probe said again as the run stands there, so it
+  starts nothing twice. Before, the run said "haven't answered" until the link dropped. A runner
+  that started again can get a probe said again before its new epoch reaches the owner: what its
+  new process claims is its own, and the restart ends only its old process's claims.
 - **The runner** (`place::runner::Admission`) keeps one ledger. A run the kernel admits is a claim
   in the admission from its start: its room, its tenant's charge, its predicted and hard ends (kept
   room and expected starts count it), its record. The kernel's ledger is the admission's index:

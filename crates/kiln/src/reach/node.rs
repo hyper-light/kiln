@@ -304,6 +304,8 @@ pub enum Local {
     PlaceLocal { run: String, ended: Option<bool>, pid: Option<u32>, key: Option<String> },
     /// Its asker doesn't want a run any more.
     PlaceCancel { run: String },
+    /// A placed run given up before its start was said anywhere (W05-R03): its claim goes.
+    PlaceUnsaid { run: String },
     /// CI leg `ask.run`, assigned this runner: admitted against placement's ledger, or refused and
     /// why (AUDIT M4, G1).
     Leg { ask: Box<kiln_ci::place::ask::Ask>, reply: oneshot::Sender<Result<(), String>> },
@@ -487,6 +489,13 @@ impl Handle {
     /// Its asker doesn't want run `run` any more.
     pub async fn place_cancel(&self, run: &str) {
         let _ = self.tx.send(In::Local(Local::PlaceCancel { run: run.to_owned() })).await;
+    }
+
+    /// Run `run`, told to go, was given up before its start was said anywhere (its tree couldn't
+    /// be copied, its link or custody wouldn't take it): the claim it holds goes, its room free
+    /// there at once (W05-R03), rather than held there for good.
+    pub async fn place_unsaid(&self, run: &str) {
+        let _ = self.tx.send(In::Local(Local::PlaceUnsaid { run: run.to_owned() })).await;
     }
 
     /// What this runner's admission holds (JSON), for `/api/reach/offers`.
@@ -1680,10 +1689,21 @@ impl Node {
                 Out::Told { asker, answer } => asker.owed(&answer, crate::util::now_ms()),
                 Out::Local { run, placed } => {
                     let done = matches!(&placed, Placed::Answer(a) if matches!(a, kiln_ci::place::Answer::Never { .. } | kiln_ci::place::Answer::Ended { .. } | kiln_ci::place::Answer::Lost { .. }));
-                    if let Some(tx) = self.placing.get(&run)
-                        && (tx.send(placed).await.is_err() || done)
-                    {
+                    let go = matches!(placed, Placed::Go { .. });
+                    let taken = match self.placing.get(&run) {
+                        Some(tx) => tx.send(placed).await.is_ok(),
+                        None => false,
+                    };
+                    if !taken || done {
                         self.placing.remove(&run);
+                    }
+                    // A go nothing took (what asked for the run went away while it waited, or
+                    // this process started again since): nothing will start it, so the claim it
+                    // was told to go on goes now, rather than held at its runner for good (W05-R03).
+                    // What that says goes as every input's does, at this one's end (`place_later`).
+                    if go && !taken {
+                        let more = self.place.undriven(&run, crate::util::now_ms());
+                        self.place_later.extend(more);
                     }
                 }
                 // Said on the keeper's link it was made for alone: one since ended took its words
@@ -3183,6 +3203,11 @@ impl Node {
             Local::PlaceCancel { run } => {
                 self.placing.remove(&run);
                 let outs = self.place.cancel(&run, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            Local::PlaceUnsaid { run } => {
+                self.placing.remove(&run);
+                let outs = self.place.unsaid(&run, crate::util::now_ms());
                 self.place_do(outs).await;
             }
             Local::PlaceView { reply } => {
