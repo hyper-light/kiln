@@ -1614,8 +1614,8 @@ impl Placer {
         let mut said = Vec::new();
         self.admission.tick(now, &mut said);
         out.extend(self.said(said, now));
-        // Its machine's capacity keeper, answering nothing past the slowest answer it has given,
-        // is stalled: each reserve waiting on it isn't granted (docs/lb.md "Waits").
+        // A wait on its machine's capacity keeper, answered nothing past the slowest answer it has
+        // given, has run out: told once, its reserves still waiting on the link (docs/lb.md "Waits").
         out.extend(self.keeper_woke(now));
         out
     }

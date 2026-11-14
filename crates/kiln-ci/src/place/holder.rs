@@ -13,9 +13,12 @@
 //!   `Admission::fast` for a kernel start), and a start not granted lapses its claim or declines
 //!   its kernel start (`Admission::not_granted`, `Admission::fast_not_granted`);
 //! - its room given back once its work can no longer run ([`Holding::release`]);
-//! - when to wake it ([`Holding::due`]): a keeper that, its link alive, has said nothing (no
-//!   answer, no hint) for a whole window of the slowest answer it has given is stalled, and each
-//!   reserve waiting on it is not granted.
+//! - when to wake it ([`Holding::due`]): a wait on a keeper that, its link alive, has said nothing
+//!   (no answer, no hint) for a whole window of the slowest answer it has given has run out. The
+//!   run-out is told once, to its patience (Hex's `patience::Patience::ran_out`), and judges nothing:
+//!   every reserve waiting goes on waiting, following the keeper by its link, and only the link's
+//!   end or reset ([`Holding::ended`]) or the keeper's close of its session gives one up (Hex's
+//!   capacity-view.md CV6 and the holder's item 4; decision 9).
 //!
 //! Pure, as the rest of the place core: its shell carries each word to the keeper and each answer
 //! back on one link, in order, says when a link opens and ends, and passes its monotonic clock in,
@@ -24,11 +27,16 @@
 //! (`hex_core::capacity::most_held`, CV8, CV9).
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use hex_api::capacity::{self as hex, Close, Held, ReservationId, ToHolder, ToKeeper, Why};
+use hex_api::patience::Patience;
 
 use super::ask::{self, Amounts};
 use super::keeper::{self, Keeper, NotGranted, Unsynced, View, WaitEnded, Waits};
+
+/// The name its waits on the keeper's answers go by in Hex's waits census ([`Patience`]).
+pub const KEEPER_WAIT: &str = "kiln.place.keeper";
 
 /// The holder core's link, as its words and answers say it (the holder's states: Hex's
 /// capacity-view.md, "The protocol").
@@ -84,6 +92,8 @@ pub enum NotStarted {
 pub struct Holding {
     core: hex::Holder,
     waits: Waits,
+    /// Its waits' answers and run-outs, as Hex's patience learns them and its census records them.
+    patience: Patience,
     link: Link,
     /// Reservations said for starts here and not given back: asked, or granted (its run's).
     starts: BTreeSet<ReservationId>,
@@ -93,8 +103,11 @@ pub struct Holding {
     /// A close that outlives its session: `Superseded` for good, `NotServed` and `Malformed` until
     /// a new link.
     closed: Option<Unsynced>,
-    /// The keeper stalled ([`Waits`]), until it answers again.
-    stalled: bool,
+    /// The oldest word's wait ran out ([`Waits::ran_out`]) and was told, until its answer comes or
+    /// its link ends: each wait's run-out is told once.
+    ran_out: bool,
+    /// How many of its waits ran out in this process, each told once.
+    runs_out: u64,
     /// The most reservations it may hold: the most one sync lists.
     most: u64,
     /// Where it stood when it last said so.
@@ -213,11 +226,13 @@ impl Holding {
         Ok(Self {
             core,
             waits: Waits::default(),
+            patience: Patience::measuring(KEEPER_WAIT),
             link: Link::Down,
             starts: BTreeSet::new(),
             releasing: BTreeSet::new(),
             closed: None,
-            stalled: false,
+            ran_out: false,
+            runs_out: 0,
             most: u64::try_from(most).unwrap_or(u64::MAX),
             stood: None,
             unreserved: Numbering::new(epoch),
@@ -256,21 +271,18 @@ impl Holding {
         self.core.held()
     }
 
-    /// Whether nothing it said waits on the keeper: synced and not stalled, with no reserve asked
-    /// and unanswered and no release said and unanswered, so what it holds ([`Self::held`]) stands
-    /// as the keeper's books should (HEX-CV-2K's drain; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+    /// Whether nothing it said waits on the keeper: synced, with no reserve asked and unanswered
+    /// and no release said and unanswered, so what it holds ([`Self::held`]) stands as the
+    /// keeper's books should (HEX-CV-2K's drain; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
     /// step 13).
     pub fn settled(&self) -> bool {
-        self.link == Link::Up && !self.stalled && self.closed.is_none() && self.waits.waiting() == 0 && self.releasing.is_empty()
+        self.link == Link::Up && self.closed.is_none() && self.waits.waiting() == 0 && self.releasing.is_empty()
     }
 
     /// Where the runner stands with its keeper (module docs).
     pub fn keeper(&self) -> Keeper {
         if let Some(why) = self.closed {
             return Keeper::Unsynced(why);
-        }
-        if self.stalled {
-            return Keeper::Unsynced(Unsynced::Stalled);
         }
         match (self.link, self.core.view()) {
             (Link::Up, Some(view)) => Keeper::Synced(self.view(view)),
@@ -296,11 +308,23 @@ impl Holding {
         View { room: view.room.to_array(), held: view.held.to_array(), own, most_claims: self.most.saturating_sub(survivors).saturating_sub(releasing) }
     }
 
-    /// When its shell wakes it next ([`Self::woke`]): when its oldest word's wait ends. None while
-    /// none waits, while stalled (until an answer or the link's end), or before the keeper's first
-    /// answer: a cold start waits on liveness alone, its transport ending a link to a keeper gone.
+    /// When its shell wakes it next ([`Self::woke`]): when its oldest word's wait runs out. None
+    /// while none waits, once that wait's run-out is told (until its answer or the link's end), or
+    /// before the keeper's first answer: a cold start waits on liveness alone, its transport ending
+    /// a link to a keeper gone.
     pub fn due(&self) -> Option<i64> {
-        if self.stalled { None } else { self.waits.due() }
+        if self.ran_out { None } else { self.waits.due() }
+    }
+
+    /// How many of its waits on the keeper ran out in this process, each told once to its patience.
+    pub fn runs_out(&self) -> u64 {
+        self.runs_out
+    }
+
+    /// Its waits' patience: what it learned of the keeper's answers, and whether its next wait
+    /// follows the keeper (after a run-out, until an answer).
+    pub fn patience(&self) -> &Patience {
+        &self.patience
     }
 
     /// A link to the keeper opened at `now` (a connection to its port: CV9): its hello, unless a
@@ -337,9 +361,12 @@ impl Holding {
             // it (Waits).
             self.waits.heard(now);
         } else {
-            // The keeper answers in the order said (CV9): this is its oldest word's answer.
-            let _ = self.waits.answered(now);
-            self.stalled = false;
+            // The keeper answers in the order said (CV9): this is its oldest word's answer, the
+            // uncensored sample its patience rises to where its wait ran out.
+            if let Some(took) = self.waits.answered(now) {
+                self.patience.answered(Duration::from_millis(took));
+            }
+            self.ran_out = false;
         }
         let mut core = hex::Out::default();
         self.core.hear(msg, &mut core);
@@ -365,23 +392,20 @@ impl Holding {
     }
 
     /// Its shell's wake-up at `now`, at [`Self::due`] or after: where the keeper, its link alive,
-    /// has said nothing for a whole window of the slowest answer it has given, it is stalled
-    /// ([`Waits`]): each reserve waiting on it is not granted and given back at once (the keeper
-    /// may have granted it: CV5), and nothing new is admitted there until it answers again.
+    /// has said nothing for a whole window of the slowest answer it has given, its oldest word's
+    /// wait has run out ([`Waits::ran_out`]). That is told once, to its patience, and judges
+    /// nothing (Hex's capacity-view.md CV6, decision 9): every reserve waiting goes on waiting,
+    /// following the keeper by its link, given up only at the link's end or reset ([`Self::ended`])
+    /// or the keeper's close; nothing is said to the keeper, and it stands as it stood.
     pub fn woke(&mut self, now: i64) -> Out {
-        let mut out = Out::default();
-        let mut events = Vec::new();
-        if !self.stalled && self.waits.stalled(now) {
-            self.stalled = true;
-            let asked: Vec<ReservationId> = self.starts.iter().copied().filter(|id| !self.core.may_run(*id)).collect();
-            let mut core = hex::Out::default();
-            for id in asked {
-                self.core.ran_out(id, &mut core);
-            }
-            self.events(core.events, NotGranted::Unanswered(WaitEnded::Stalled), &mut events);
-            self.send(core.send, now, &mut out);
+        if !self.ran_out
+            && let Some(waited) = self.waits.ran_out(now)
+        {
+            self.ran_out = true;
+            self.runs_out = self.runs_out.saturating_add(1);
+            self.patience.ran_out(Duration::from_millis(waited));
         }
-        self.told(out, events)
+        self.told(Out::default(), Vec::new())
     }
 
     /// A start's reserve of `amounts` at `now` (the room its live claim holds,
@@ -454,7 +478,7 @@ impl Holding {
         let mut core = hex::Out::default();
         self.core.link_down(&mut core);
         self.link = Link::Down;
-        self.stalled = false;
+        self.ran_out = false;
         self.releasing.clear();
         let _ = self.waits.ended();
         self.events(core.events, NotGranted::Unanswered(how), events);

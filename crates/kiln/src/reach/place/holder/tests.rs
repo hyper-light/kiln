@@ -307,15 +307,15 @@ fn holder_a_reserve_refused_starts_nothing_and_says_why() -> anyhow::Result<()> 
     })
 }
 
-/// The holder's item 5 under its waits (no constants: Shards' R03): its hello answered in 10 ms and
-/// its sync in 20, the slowest answer is 20 ms; a leg's reserve said at 100 is due at 121, placement's
-/// timer then. At 121 the keeper, its link alive, has said nothing for longer than the slowest
-/// answer it has given: the reserve isn't granted (the leg refused, saying so) and is given back at
-/// once (the keeper may have granted it), and the runner stands stalled. The grant that comes late
-/// starts nothing and is given back too; the keeper's answer ends the stall, and once both releases
-/// are answered it holds nothing of the runner's.
+/// Hex's holder wait contract under placement (CV6, the holder's item 4; decision 9; no constants:
+/// Shards' R03): its hello answered in 10 ms and its sync in 20, the slowest answer is 20 ms; a
+/// leg's reserve said at 100 is due at 121, placement's timer then. At 121 the keeper, its link
+/// alive, has said nothing for longer than the slowest answer it has given: the wait has run out,
+/// told once, and judges nothing. The leg isn't refused and nothing is given back; the runner
+/// stays synced and takes a new leg; no timer is set for that wait again. The grant that comes late
+/// starts the leg. Its link's end is what gives a reserve up (`keeper_ended`).
 #[test]
-fn holder_a_reserve_with_no_answer_is_given_up_and_given_back() -> anyhow::Result<()> {
+fn holder_a_reserve_past_the_slowest_answer_runs_out_and_keeps_waiting() -> anyhow::Result<()> {
     crate::rt::block_on(async {
         let cap = machine()?;
         let mut p = runner(1);
@@ -330,17 +330,19 @@ fn holder_a_reserve_with_no_answer_is_given_up_and_given_back() -> anyhow::Resul
         anyhow::ensure!(none.is_empty() && synced(&p), "{none:?}");
         let (verdict, outs) = p.leg(ask("leg-1", 2, 4, None), 100);
         anyhow::ensure!(verdict.is_none() && reserves(&outs) == 1, "{outs:?}");
-        say(&*link, outs).await?;
         anyhow::ensure!(p.keeper_due() == Some(121) && p.timer().is_some_and(|t| t <= 121), "due once it waited longer than the slowest answer: {:?}", p.keeper_due());
         let early = p.tick(120);
         anyhow::ensure!(early.is_empty(), "still waiting at its due: {early:?}");
-        let stalled = p.tick(121);
-        anyhow::ensure!(stalled.contains(&Out::Leg { run: "leg-1".into(), verdict: Err(NotGranted::Unanswered(WaitEnded::Stalled).why().to_owned()) }), "{stalled:?}");
-        anyhow::ensure!(releases(&stalled) == 1 && p.admission().keeper() == Keeper::Unsynced(Unsynced::Stalled), "given back at once, and stalled: {stalled:?}");
-        let (verdict, _) = p.leg(ask("leg-2", 1, 1, None), 122);
-        anyhow::ensure!(verdict == Some(Err(Unsynced::Stalled.why().to_owned())), "nothing new while stalled: {verdict:?}");
-        let _ = talk(&mut p, &*link, stalled, 200).await?;
-        anyhow::ensure!(synced(&p) && !running(&p, CI, "leg-1") && books(&cap)?.is_empty(), "the late grant given back, the stall over: {:?}", books(&cap)?);
+        let ran_out = p.tick(121);
+        anyhow::ensure!(ran_out.is_empty(), "a run-out refuses no leg and gives nothing back: {ran_out:?}");
+        anyhow::ensure!(synced(&p) && p.keeper_due().is_none(), "still synced, and told once: {:?}", p.keeper_due());
+        anyhow::ensure!(p.tick(500).is_empty(), "nothing again later");
+        let (verdict, more) = p.leg(ask("leg-2", 1, 1, None), 122);
+        anyhow::ensure!(verdict.is_none() && reserves(&more) == 1, "a new leg's reserve said: {verdict:?} {more:?}");
+        let seen = talk(&mut p, &*link, outs.into_iter().chain(more).collect(), 200).await?;
+        anyhow::ensure!(seen.contains(&Out::Leg { run: "leg-1".into(), verdict: Ok(()) }) && running(&p, CI, "leg-1"), "the late grant starts it: {seen:?}");
+        anyhow::ensure!(seen.contains(&Out::Leg { run: "leg-2".into(), verdict: Ok(()) }) && running(&p, CI, "leg-2"), "{seen:?}");
+        anyhow::ensure!(releases(&seen) == 0 && books(&cap)?.len() == 2, "both held: {:?}", books(&cap)?);
         Ok(())
     })
 }

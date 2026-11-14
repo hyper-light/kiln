@@ -332,17 +332,21 @@ and so the sync again after a lost link) follows the keeper's liveness and progr
 the user restated it on 2026-11-13). Its words go on one link and are answered in the order said
 (CV9), so the answer due is the oldest word's. A wait ends, typed (`WaitEnded`), when the link dies,
 by the transport's own liveness rule (QUIC's idle timeout, three probe timeouts of the measured
-round trip: RFC 9000 §10.1, RFC 9002 §6.2); when the keeper starts again or resets the link
-(`Reset`: a stateless reset, RFC 9000 §10.3, or `Closed { Session }`); or when the keeper, its link
-alive, has said nothing for a whole window of the slowest answer it has given in this process
-(`Stalled`): the window runs from the word, or from the keeper's last word on the link where that
-came later, an answer or a hint (which answers nothing, but shows the keeper going on). Each answer
-is timed from its word, or from the answer before it where that came later; a hint times nothing.
-Until its first answer there is no such bound: a cold start waits on liveness alone, the runner
-admitting nothing new there meanwhile (CV11). A reserve whose wait ended is not granted
-(`NotGranted::Unanswered`); a stall leaves the runner `Unsynced` (`Stalled`), taking nothing new
-there until the keeper answers again; and a late answer comes to its own word and makes the slowest
-answer what it took.
+round trip: RFC 9000 §10.1, RFC 9002 §6.2); or when the keeper starts again or resets the link
+(`Reset`: a stateless reset, RFC 9000 §10.3, or `Closed { Session }`). No time ends one. Where the
+keeper, its link alive, has said nothing for a whole window of the slowest answer it has given in
+this process, the wait has run out (`Waits::ran_out`): the window runs from the word, or from the
+keeper's last word on the link where that came later, an answer or a hint (which answers nothing,
+but shows the keeper going on). A run-out is no verdict on the keeper (Hex's capacity-view.md CV6
+and the holder's item 4, decision 9: the slowest answer is a bound only while answers come within
+it): the holding tells it once, to its patience (Hex's `Patience::ran_out`, named
+`kiln.place.keeper` in Hex's waits census), and every reserve waiting goes on waiting, following the
+keeper by its link; the runner stays synced. Each answer is timed from its word, or from the answer
+before it where that came later; a hint times nothing. Until its first answer there is no such
+bound: a cold start waits on liveness alone, the runner admitting nothing new there meanwhile
+(CV11). A reserve whose wait ended (its link's end or reset) is not granted
+(`NotGranted::Unanswered`); and a late answer comes to its own word, starts its run where it is a
+grant, and makes the slowest answer what it took.
 
 The view is the decider's copy (CV7): the keeper validates every reserve, so a stale view costs a
 refusal and a placement again, never a double booking. Its `own` is the reservations granted the
@@ -371,8 +375,8 @@ records list from earlier processes, whose work still runs) and its releases not
 ledger's `most_claims`. kiln-ci's simulator (`place::holder_tests`) drives one to three holdings
 through Hex's own keeper over records in memory (`capacity::sim::SimView`), beside Hex's boxes,
 under a nemesis that restarts the keeper, crashes runners (their work dying or outliving them),
-cuts links with what was on them, drops sessions behind live links, delays words until the keeper
-stalls and gives up starts: on each of 24 seeds the work running fits the machine and is in the
+cuts links with what was on them, drops sessions behind live links, delays words until their waits
+run out (each told once, nothing given up for it), and gives up starts: on each of 24 seeds the work running fits the machine and is in the
 keeper's books after every step, and once healed and settled the keeper's books of each runner, its
 own, its records and what runs are the same, no sync disagreeing.
 
