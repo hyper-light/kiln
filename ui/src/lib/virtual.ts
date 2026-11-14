@@ -103,7 +103,10 @@ export function useWindowedBox(count: number, guess: number, { overscan = 10 }: 
  *
  * Exact for what was measured: a gap is the sum of its rows' last measured heights. A row that
  * changes while it's unmounted is measured again when it's next mounted, and what's in view stays
- * where it is as that happens (the browser's scroll anchoring; by hand where it has none).
+ * where it is, and on the page, as that happens (the browser's scroll anchoring; by hand where it
+ * has none). The window is always taken from where the viewport is over the list as it's asked
+ * for, and, while gaps are still to be drawn again from heights that changed, from where that will
+ * leave it.
  * ------------------------------------------------------------------------------------------- */
 
 /**
@@ -331,7 +334,11 @@ export class ListWindow {
   private drawn: readonly Part[] = NO_PARTS;
   /** Every mounted row is to be measured again (the rows changed places: a margin may have). */
   private all = false;
-  /** What the page is still to be scrolled by, once the gaps it's for are on the page (no scroll anchoring). */
+  /**
+   * What the page is still to be scrolled by, once the gaps it's for are on the page, for what's in
+   * view to be where it is: by the browser's scroll anchoring as it lays those out, by hand without it.
+   * Until then the window is taken from where that leaves the viewport.
+   */
   private owed = 0;
   private frame = 0;
   private view: { parts: readonly Part[] } = { parts: NO_PARTS };
@@ -470,8 +477,11 @@ export class ListWindow {
   }
 
   private compute(): { parts: readonly Part[] } {
+    // From where the viewport is now, not where it last said it was: the page scrolls without a word
+    // until its next frame (a row scrolled to, the browser keeping what's in view where it is).
+    this.measure();
     const tops = this.fresh();
-    const near = nearRows(tops, this.viewTop, this.viewHeight);
+    const near = nearRows(tops, this.viewTop + this.owed, this.viewHeight);
     const [from, to] = near;
     const keep = new Set<number>(this.ends);
     const add = (key: string | null | undefined) => {
@@ -525,7 +535,7 @@ export class ListWindow {
   /** Where the viewport is over the list, from the page. */
   private measure() {
     const el = this.el;
-    if (!el) return;
+    if (!el?.isConnected) return;
     const top = el.getBoundingClientRect().top + el.clientTop;
     // Nothing measured, a row's height is the window's: it changes with the viewport.
     if (window.innerHeight !== this.viewHeight && this.typical === undefined) this.stale = true;
@@ -557,28 +567,25 @@ export class ListWindow {
   }
 
   /**
-   * Heights changed (`was`: the tops before they did, where the browser has no scroll anchoring):
-   * the typical height follows, and what's in view is kept where it is by hand: scrolled now by what
-   * the measured rows above it gained (the page has them already), and, once the gaps are on the
-   * page as the new typical height makes them, by what those gained (`owed`).
+   * Heights changed (`was`: the tops before they did; `forgotten`: the heights the gaps on the page
+   * were drawn from, where the list's width changed and they were let go). The typical height
+   * follows, and what's in view is kept where it is. The rows on the page above it have their new
+   * heights already: the browser's scroll anchoring has scrolled by what they gained, and without it
+   * the page is scrolled by as much here. The gaps above it are drawn again only at the next render:
+   * what those gain is `owed` until then.
    */
-  private weighed(was: Float64Array | null) {
+  private weighed(was: Float64Array, forgotten?: ReadonlyMap<string, number>) {
     const typical = middle(this.tally);
-    if (!was || this.viewTop <= 0) {
-      if (typical !== this.typical) this.stale = true;
-      this.typical = typical;
-      return;
-    }
-    const measured = rowTops(this.keys, this.heights, this.typical ?? this.unmeasured());
-    const now = typical === this.typical ? measured : rowTops(this.keys, this.heights, typical ?? this.unmeasured());
-    const moved = shiftAbove(was, measured, this.viewTop);
-    // The same row at the viewport's top edge, by what the gaps above it are still to gain.
+    // The page as it is: its rows as just measured, its gaps as they were drawn.
+    const page = rowTops(this.keys, forgotten ? new Map([...forgotten, ...this.heights]) : this.heights, this.typical ?? this.unmeasured());
+    const now = !forgotten && typical === this.typical ? page : rowTops(this.keys, this.heights, typical ?? this.unmeasured());
+    // The row at the viewport's top edge, as the viewport stood over the list before any of it.
     const at = rowAt(was, this.viewTop);
-    this.owed += (now[at] ?? 0) - (measured[at] ?? 0);
+    this.owed += (now[at] ?? 0) - (page[at] ?? 0);
     this.typical = typical;
     this.tops = now;
     this.stale = false;
-    this.scrollBy(moved);
+    if (!anchors()) this.scrollBy(shiftAbove(was, page, this.viewTop));
   }
 
   private scrollBy(by: number) {
@@ -596,7 +603,7 @@ export class ListWindow {
     const el = this.el;
     const sizes = this.sizes;
     if (!el || !sizes) return;
-    const was = anchors() ? null : this.fresh();
+    const was = this.fresh();
     const here = new Set<Element>();
     const fresh: Element[] = [];
     for (const child of el.children) {
@@ -628,10 +635,10 @@ export class ListWindow {
   committed(el: HTMLElement, parts: readonly Part[]) {
     if (this.el !== el) this.attach(el);
     this.drawn = parts;
-    // The gaps the last change of heights made are on the page now.
+    // The gaps the last change of heights made are on the page now: the browser's scroll anchoring scrolls by what they gained as it lays them out; without it, here.
     const owed = this.owed;
     this.owed = 0;
-    this.scrollBy(owed);
+    if (!anchors()) this.scrollBy(owed);
     const all = this.all;
     this.all = false;
     this.children(all);
@@ -704,13 +711,17 @@ export class ListWindow {
   private resized(entries: ResizeObserverEntry[]) {
     const el = this.el;
     if (!el) return;
-    const was = anchors() ? null : this.fresh();
+    const was = this.fresh();
+    let forgotten: Map<string, number> | undefined;
     let changed = false;
     for (const entry of entries) {
       if (entry.target !== el) continue;
       const width = entry.borderBoxSize[0]?.inlineSize ?? entry.contentRect.width;
       // Measured at another width, the heights aren't these rows': those on the page say theirs again in this same pass.
-      if (this.width !== undefined && this.width !== width) this.forget();
+      if (this.width !== undefined && this.width !== width) {
+        forgotten ??= new Map(this.heights);
+        this.forget();
+      }
       this.width = width;
     }
     for (const entry of entries) {
@@ -718,8 +729,8 @@ export class ListWindow {
       if (key === undefined || !this.index.has(key)) continue;
       if (this.put(key, outerHeight(entry.target, entry.borderBoxSize[0]?.blockSize))) changed = true;
     }
+    if (changed) this.weighed(was, forgotten);
     this.measure();
-    if (changed) this.weighed(was);
     this.later();
   }
 
