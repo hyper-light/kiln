@@ -38,6 +38,8 @@ async function controlled(page: Page, events: HEvent[], history?: { cursor: stri
         for (const line of text.split("\n").filter(Boolean)) {
           const frame = JSON.parse(line) as Frame;
           if (frame.t === "history" && history) continue;
+          // The events given here are the snapshot whole, and nothing after its end is let through: no rest follows it.
+          if (frame.t === "history") delete frame.part;
           if (history && frame.t === "open") frame.window = { before: history.before, more: history.has_more };
           if (history && frame.t === "state") frame.state = { ...(frame.state as Record<string, unknown>), dropped: 100 };
           if (frame.t === "events") {

@@ -698,6 +698,8 @@ export interface SessionHistory {
   oversized: boolean;
   loading: boolean;
   error: string | null;
+  /** What's held is its window's first part (`FIRST_BYTES`): the rest of the window follows on the socket, and nothing before the window is asked for until it's in. */
+  filling: boolean;
 }
 interface HistoryWire {
   cursor: string;
@@ -710,6 +712,12 @@ interface HistoryRead {
   ids: Set<string>;
   seqs: Set<number>;
   promise: Promise<void>;
+}
+/** An older page as the server answers it (api.rs `conversation_events_for`). */
+interface HistoryPage {
+  events: HEvent[];
+  history: HistoryWire;
+  revision?: number;
 }
 /** An older page's size (W21-R02; the server clamps it, api.rs `conversation_events_for`): `limit` events at most, about `bytes` of them. */
 export type OlderPage = { limit: number; bytes: number };
@@ -966,8 +974,19 @@ export const changesPatched = (was: FileChange[] | null, u: { set?: FileChange[]
   return now;
 };
 
-/** The socket's query: a snapshot packed when it can be unpacked here, and a state and a changeset as what changed in them. */
-const TAKES = `${GUNZIP ? "?z=gzip&" : "?"}patch=state&patch=changes&window=1&lean=1&recent_turns=8&event_bytes=262144`;
+/** A conversation's window (W21-R02; docs/wire.md, "Windows"): its newest turns and about this many bytes of them at the most. */
+const WINDOW = { recent_turns: "8", event_bytes: "262144" };
+/**
+ * The window's first part: the fewest bytes a window is bounded to (history.rs `FLOOR`), its newest events, which are
+ * the ones a conversation opens on. The socket's snapshot is that part alone, so a slow link carries a screen's worth
+ * before the conversation shows, not the window (kiln-lab bar, 41,000 events: 88 KB packed for the window). The rest
+ * of the window follows it on the socket as a message of its own (`earlier`), and joins above what's shown.
+ */
+const FIRST_BYTES = 16 * 1024;
+/** The socket's query: a snapshot packed when it can be unpacked here, a state and a changeset as what changed in them, and its events a window. */
+const TAKES = `${GUNZIP ? "?z=gzip&" : "?"}patch=state&patch=changes&window=1&lean=1&${new URLSearchParams(WINDOW)}`;
+/** And the window's first part ahead, asked where nothing of the conversation is shown yet: what's shown already is added to or replaced whole. */
+const TAKES_FIRST = `&first_bytes=${FIRST_BYTES}`;
 
 /** The session socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
 const SESSION_FRAMES = {
@@ -991,6 +1010,7 @@ const SESSION_FRAMES = {
   ack: true,
   nack: true,
   history: true,
+  earlier: true,
 } satisfies Record<SessionDown["t"], true>;
 
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
@@ -1011,6 +1031,8 @@ interface Incoming {
   more: boolean;
   /** It adds to what's held (`resumed`), rather than replacing it. */
   resumed: boolean;
+  /** Its window's first part is in and its rest awaited: it takes the place of what's shown with the rest, in one change. */
+  parted?: boolean;
   /** Source revision captured by its header; later live lifecycle must not wait behind it. */
   revision?: number;
 }
@@ -1307,9 +1329,57 @@ export class SessionStore {
 
   get = () => this.snap;
 
-  private historyState(h: HistoryWire): SessionHistory {
-    return { cursor: h.cursor, before: h.before, hasMore: h.has_more, oversized: h.oversized, loading: false, error: null };
+  private historyState(h: HistoryWire, filling = false): SessionHistory {
+    return { cursor: h.cursor, before: h.before, hasMore: h.has_more, oversized: h.oversized, loading: false, error: null, filling };
   }
+
+  /** A history page's events taken into what's held: never over an event held already, nor one corrected or deleted while `read` was on its way. */
+  private takeHistory(read: HistoryRead, page: HistoryPage) {
+    for (const e of page.events) {
+      if (this.byId.has(e.id) || read.ids.has(e.id) || read.seqs.has(e.seq)) continue;
+      // A different canonical id at the same sequence supersedes this durable row.
+      if (this.bySeq.has(e.seq)) continue;
+      this.byId.set(e.id, e);
+      this.bySeq.set(e.seq, e.id);
+      if (page.revision !== undefined) this.pageThrough.set(e.id, page.revision);
+    }
+    this.reorder = true;
+  }
+
+  /**
+   * W21-R02: the rest of the window whose first part the snapshot was (`FIRST_BYTES`), which follows that snapshot on
+   * its socket before anything live. Of the same copy as the part, so it's taken in as it is, beside what's held: the
+   * two are the window a snapshot brought whole before, so it isn't history its reader asked for (`loadedHistory`).
+   */
+  private takeEarlier(u: Extract<SessionDown, { t: "earlier" }>) {
+    const history = this.snap.history;
+    // Of a snapshot that isn't what's held any more: not this window's.
+    if (!history?.filling || history.cursor !== u.cursor) return;
+    for (const e of u.events) {
+      if (this.byId.has(e.id) || this.bySeq.has(e.seq)) continue;
+      this.byId.set(e.id, e);
+      this.bySeq.set(e.seq, e.id);
+    }
+    this.reorder = true;
+    if (this.floor !== null) this.floor = u.before ?? this.floor;
+    this.patch({ history: this.historyState({ ...u, before: u.before ?? history.before }), more: u.has_more });
+    this.filledNow();
+  }
+
+  /** Those waiting for the window's rest ({@link filled}). */
+  private fillWaits: (() => void)[] = [];
+
+  private filledNow() {
+    const waits = this.fillWaits;
+    this.fillWaits = [];
+    for (const done of waits) done();
+  }
+
+  /**
+   * Settles once what's held is a whole window, or another snapshot took its place (its reader looks again): at once
+   * when it is one already.
+   */
+  filled = (): Promise<void> => (this.snap.history?.filling && !this.disposed ? new Promise<void>((done) => this.fillWaits.push(done)) : READY);
 
   private cancelHistory() {
     const read = this.historyRead;
@@ -1356,13 +1426,15 @@ export class SessionStore {
   loadOlder = (size: OlderPage = OLDER_PAGE): Promise<void> => {
     if (this.historyRead) return this.historyRead.promise;
     const history = this.snap.history;
+    // What's before a window is asked for once the window is whole.
+    if (history?.filling) return this.filled();
     if (this.disposed || this.incoming || !history?.hasMore || history.before === null) return READY;
     const controller = new AbortController();
     const read: HistoryRead = { controller, ids: new Set(), seqs: new Set(), promise: READY };
     this.historyRead = read;
     this.patch({ history: { ...history, loading: true, error: null } });
     const qs = new URLSearchParams({ before: String(history.before), cursor: history.cursor, limit: String(size.limit), bytes: String(size.bytes) });
-    read.promise = request<{ events: HEvent[]; history: HistoryWire; revision?: number }>("GET", apiPath(`/api/harness/sessions/${encodeURIComponent(this.id)}/events?${qs}`), undefined, {
+    read.promise = request<HistoryPage>("GET", apiPath(`/api/harness/sessions/${encodeURIComponent(this.id)}/events?${qs}`), undefined, {
       signal: controller.signal,
       // W21-R02: this visible action owns its network request. The page's shared plain-GET
       // reader strips individual signals; no-store bypasses it and preserves native cancellation.
@@ -1384,16 +1456,8 @@ export class SessionStore {
         ) {
           throw new Error("Earlier history returned an invalid cursor. Retry after reconnecting.");
         }
-        for (const e of page.events) {
-          if (this.byId.has(e.id) || read.ids.has(e.id) || read.seqs.has(e.seq)) continue;
-          // A different canonical id at the same sequence supersedes this durable row.
-          if (this.bySeq.has(e.seq)) continue;
-          this.byId.set(e.id, e);
-          this.bySeq.set(e.seq, e.id);
-          if (page.revision !== undefined) this.pageThrough.set(e.id, page.revision);
-        }
+        this.takeHistory(read, page);
         this.loadedHistory = true;
-        this.reorder = true;
         this.historyRead = null;
         this.patch({ history: this.historyState(next), more: next.has_more });
       })
@@ -1476,6 +1540,7 @@ export class SessionStore {
     this.cancelHistory();
     if (this.disposed) return;
     this.disposed = true;
+    this.filledNow();
     this.snapshotGeneration += 1;
     this.speculation?.resolve(false);
     this.speculation = null;
@@ -1852,9 +1917,10 @@ export class SessionStore {
     this.incoming = null;
     let ws: WebSocket;
     try {
-      // What's shown already: only what came after it, when the server's copy can say.
-      const after = this.born && this.rev ? `&after=${this.born}.${this.rev}` : "";
-      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}${after}`));
+      // What's shown already: only what came after it, when the server's copy can say. A window whose rest never came
+      // (its socket closed first) is asked for again from its start: what came after it wouldn't bring the rest.
+      const after = this.born && this.rev && !this.snap.history?.filling ? `&after=${this.born}.${this.rev}` : "";
+      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}${this.snap.ready ? "" : TAKES_FIRST}${after}`));
     } catch {
       this.retry();
       return;
@@ -2093,9 +2159,35 @@ export class SessionStore {
       case "mail_flow":
         this.mailFlow(u);
         return;
-      case "synced":
+      case "synced": {
+        // A window's first part shows at once where nothing is shown yet. Where a conversation is on the page (a viewer
+        // that fell behind is sent a snapshot again), the part alone would take its place and the page shrink to it
+        // until the rest came: there the part waits, and takes the place of what's shown together with its rest.
+        const inc = this.incoming;
+        if (inc?.history?.filling && !inc.resumed && this.snap.ready && this.snap.events.length > 0) {
+          window.clearTimeout(this.hold);
+          inc.parted = true;
+          return;
+        }
         this.commit();
         return;
+      }
+      case "earlier": {
+        const inc = this.incoming;
+        if (inc?.parted && inc.history?.cursor === u.cursor) {
+          // The rest of the part that waited: the two are the window, and take the place of what's shown now.
+          for (const e of u.events) if (!inc.byId.has(e.id)) inc.byId.set(e.id, e);
+          inc.history = this.historyState({ ...u, before: u.before ?? inc.history.before });
+          if (inc.floor !== null) inc.floor = u.before ?? inc.floor;
+          inc.more = u.has_more;
+          this.commit();
+          return;
+        }
+        // It follows its snapshot's "synced"; one cut short is complete as far as it came.
+        this.commit();
+        this.takeEarlier(u);
+        return;
+      }
       case "closed":
         if (!this.opened) {
           this.unknown();
@@ -2109,6 +2201,12 @@ export class SessionStore {
         return;
     }
     const inc = this.incoming;
+    // The rest of a window comes before anything live (docs/wire.md, "A window in two parts"): something live first
+    // means none is coming on this socket. What's before the part is then a page away, as before any window.
+    if (!inc && this.snap.history?.filling) {
+      this.snap = { ...this.snap, history: { ...this.snap.history, filling: false } };
+      this.filledNow();
+    }
     if (inc) {
       const revision = (u as { rev?: unknown }).rev;
       const laterState = (u.t === "state" || u.t === "state_patch") && inc.revision !== undefined && typeof revision === "number" && revision > inc.revision;
@@ -2169,7 +2267,8 @@ export class SessionStore {
   private gather(inc: Incoming, u: SessionDown) {
     switch (u.t) {
       case "history":
-        inc.history = this.historyState(u);
+        // Its window's first part (`part`, wire/ui.rs): the rest follows this snapshot.
+        inc.history = this.historyState(u, u.part === true);
         break;
       case "reset":
         inc.byId.clear();
@@ -2270,6 +2369,8 @@ export class SessionStore {
       this.speculation.resolve(true);
       this.close();
     }
+    // What's held is another snapshot's now: whoever waited for the last one's rest looks again.
+    this.filledNow();
   }
 
   /** The server doesn't know the session right now: it restarted and the session's machine isn't back yet, or the session ended. */
@@ -2522,7 +2623,7 @@ export class SessionStore {
     this.dirty = false;
     let events = this.ordered();
     // User-requested pages stay in this canonical store until it is retired; no background
-    // history is acquired. Eviction on idle/auth still retires the whole store as before.
+    // history is acquired (a window's rest is its window, `takeEarlier`). Eviction on idle/auth still retires the whole store as before.
     if (!this.paged && !this.loadedHistory && events.length > MAX_EVENTS + MAX_EVENTS / 4) {
       for (const e of events.slice(0, -MAX_EVENTS)) {
         this.byId.delete(e.id);

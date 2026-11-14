@@ -113,9 +113,11 @@ pub struct Meta {
     /// Its number, when it has one ([`Meta::seq`]: `len`'s top bit says so).
     seq: u64,
     pub at: u64,
-    /// Its text's length in bytes, in the low 63 bits (no allocation is 2^63 bytes long: Rust's are at most
-    /// `isize::MAX`), and in the top bit whether it has a number ([`NUMBERED`]), where an `Option<u64>` took 16
-    /// bytes of its own. Where its text begins is reckoned from the lengths before it ([`Chunk::off`]: a chunk
+    /// Its text's length in bytes, in the low 56 bits ([`TEXT_LEN`]: an event's JSON is far under the 64 PiB they
+    /// count), in the top bit whether it has a number ([`NUMBERED`]), where an `Option<u64>` took 16 bytes of its own,
+    /// and between them what a viewer's window is found by without reading the event ([`Meta::live`], [`Meta::begins_turn`],
+    /// [`Meta::is_reply`], [`Meta::is_tool`], [`Meta::tool_other`]): its kind, whether it's on its session's main thread,
+    /// whether it's still under way. Where its text begins is reckoned from the lengths before it ([`Chunk::off`]: a chunk
     /// holds at most [`CHUNK`]), never kept.
     len: u64,
     /// Its text's digest: made off the owner's shard, a chunk's all as it's packed ([`Chunk::pack`]:
@@ -132,6 +134,18 @@ const NO_SUM: u64 = 0;
 
 /// A meta's `len`'s top bit: its event has a number ([`Meta::seq`]).
 const NUMBERED: u64 = 1 << 63;
+/// A meta's `len`'s bits under that, above its text's length: its event is still coming or under way
+/// (`super::registry::Entry::live`); it's on its session's main thread; it's a tool call its harness names otherwise than
+/// its event (`Entry::tool_other`); and its kind ([`KINDS`]' place, from 1; 0 for another).
+const LIVE: u64 = 1 << 62;
+const MAIN: u64 = 1 << 61;
+const TOOL_OTHER: u64 = 1 << 60;
+const KIND_SHIFT: u32 = 56;
+const KIND: u64 = 0b111 << KIND_SHIFT;
+/// A meta's `len`'s bits that are its text's length.
+const TEXT_LEN: u64 = (1 << KIND_SHIFT) - 1;
+/// The kinds a meta says ([`KIND`]), each by its place here from 1: `super::model::Body`'s tags.
+const KINDS: [&str; 5] = ["user", "assistant", "thinking", "tool", "notice"];
 
 impl Clone for Meta {
     fn clone(&self) -> Self {
@@ -150,9 +164,17 @@ impl Eq for Meta {}
 
 impl Meta {
     fn of(ev: &Ev) -> Self {
-        let seq = ev.entry.seq();
-        let len = u64::try_from(ev.entry.text().len()).unwrap_or(u64::MAX) & !NUMBERED;
-        Self { id: Id::of(ev.entry.id().unwrap_or_default()), seq: seq.unwrap_or_default(), at: ev.at, len: if seq.is_some() { len | NUMBERED } else { len }, sum: AtomicU64::new(NO_SUM) }
+        let e = &ev.entry;
+        let seq = e.seq();
+        let mut len = u64::try_from(e.text().len()).unwrap_or(u64::MAX) & TEXT_LEN;
+        let kind = e.kind().and_then(|k| KINDS.iter().position(|known| *known == k)).and_then(|at| u64::try_from(at + 1).ok()).unwrap_or(0);
+        len |= kind << KIND_SHIFT;
+        for (bit, set) in [(NUMBERED, seq.is_some()), (LIVE, e.live()), (MAIN, e.on_main_thread()), (TOOL_OTHER, e.tool_other())] {
+            if set {
+                len |= bit;
+            }
+        }
+        Self { id: Id::of(e.id().unwrap_or_default()), seq: seq.unwrap_or_default(), at: ev.at, len, sum: AtomicU64::new(NO_SUM) }
     }
 
     /// Its event's number in its session's timeline, if it has one.
@@ -162,7 +184,37 @@ impl Meta {
 
     /// Its text's length in bytes.
     pub fn text_len(&self) -> usize {
-        usize::try_from(self.len & !NUMBERED).unwrap_or(usize::MAX)
+        usize::try_from(self.len & TEXT_LEN).unwrap_or(usize::MAX)
+    }
+
+    /// Whether its event is of kind `kind` (one of [`KINDS`]).
+    fn kind_is(&self, kind: &str) -> bool {
+        usize::try_from((self.len & KIND) >> KIND_SHIFT).ok().and_then(|at| at.checked_sub(1)).and_then(|at| KINDS.get(at)).is_some_and(|k| *k == kind)
+    }
+
+    /// Whether its event is still coming or under way: text that streams, or a tool call running or pending.
+    pub fn live(&self) -> bool {
+        self.len & LIVE != 0
+    }
+
+    /// Whether its event begins a person's turn: a message to its session's main thread (`super::window::begins_turn`).
+    pub fn begins_turn(&self) -> bool {
+        self.len & MAIN != 0 && self.kind_is("user")
+    }
+
+    /// Whether its event is a reply on its session's main thread ([`is_reply`]).
+    pub fn is_reply(&self) -> bool {
+        self.len & MAIN != 0 && self.kind_is("assistant")
+    }
+
+    /// Whether its event is a tool call: the one kind a viewer that takes events lean is sent otherwise than as kept.
+    pub fn is_tool(&self) -> bool {
+        self.kind_is("tool")
+    }
+
+    /// Whether its event is a tool call its harness names otherwise than its event (`super::registry::Entry::tool_other`).
+    pub fn tool_other(&self) -> bool {
+        self.len & TOOL_OTHER != 0
     }
 
     /// Its event's id (empty: none).
@@ -1730,6 +1782,18 @@ impl Sending<'_> {
     /// Whether event `i` was read and is kept.
     pub fn has(&self, i: usize) -> bool {
         self.read.contains_key(&i)
+    }
+
+    /// Event `i` read and kept now where it's a compact chunk's. A window's events are read newest first as the window is
+    /// found and oldest first as its frames are written, and one inflated chunk is kept at a time (`inflated`): a chunk
+    /// whose events were left for the writing was inflated again there, another having taken its place since. One kept in
+    /// memory costs nothing to read later, and is left.
+    pub fn keep(&mut self, i: usize) {
+        let compact = self.events.place(i).and_then(|(c, _)| self.events.chunk(c)).is_some_and(|c| c.is_compact());
+        if compact {
+            // Nothing kept where its chunk's segment can't be read: what writes it finds that, as before.
+            self.get(i);
+        }
     }
 
     /// Event `i` as sent, its own: as it was read before, or read now (and kept by none).

@@ -476,6 +476,24 @@ neither (an older tab) is sent every event, whole, as before.
 - **Resumes stay bounded.** A viewer of a window that resumes (`after=`) gets what changed since,
   lean as it takes them; one that missed more than a window holds (500 events or about 1 MiB) is
   sent a window again instead, never every event.
+- **A window in two parts.** A viewer under a history policy (`recent_turns=`, `event_bytes=`)
+  that takes a first part ahead (`first_bytes=<bytes>`, 16 KiB at the least) is sent its window as
+  two messages: the snapshot holds the window's newest events alone, as many as fit the part's
+  bytes (and what current interactions need, as every window does), and its `history` says `part`;
+  the rest of the window follows the snapshot's `synced` as one `earlier` frame (packed as a
+  message of its own to a viewer that takes snapshots packed), before anything live: the window's
+  other events, oldest first, and the window's own `cursor`, `before` and `has_more`. Both are of
+  the same copy at the snapshot's revision, so the two are the events the window sends at once. A
+  conversation opens on its newest events, so it shows after a part's bytes of a slow link, not a
+  window's (a 41,000-event session's window is 89 KB packed, its first part 11 KB of that:
+  `kiln-lab bar`, 2026-11-13), and the rest joins above what's shown. A window that fits its first
+  part comes at once and says no `part`; so does what follows a resume. The UI asks for a part
+  only where it shows nothing of the conversation yet; one sent to it while it shows the
+  conversation (a viewer that fell behind is sent a snapshot again) waits for its rest, and the
+  two take the place of what's shown in one change, so the page never shrinks to the part. A
+  viewer whose socket closes before the rest came asks again without `after=`. Nothing live is
+  sent before the rest: a viewer sent something live first takes it that no rest is coming on that
+  socket, and reads what's before its part by pages.
 
 ## Restarts
 
@@ -1133,6 +1151,8 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `files` | state | Files its messages mention. | Sent on attach. |
 | `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events; settled tool calls lean to a viewer that asks (`?lean=1`, "Windows"). | Every attach gets them all again, or a window of them (`?window=1`); a viewer that falls behind, what it missed. |
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
+| `/api/harness/sessions/:id/ws` | down | `history` | stream | A snapshot's bounded window under a history policy (`?recent_turns=`): its cursor, where it begins, whether there's more before it, and whether it's the window's first part (`part`, "Windows"). | Sent with each snapshot to a viewer that asked. |
+| `/api/harness/sessions/:id/ws` | down | `earlier` | stream | The rest of a window whose first part the snapshot was (`?first_bytes=`, "Windows"). | Follows that snapshot's `synced`; a viewer that didn't get it asks for the snapshot again. |
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
 | `/api/harness/sessions/:id/ws` | down | `mail_flow` | answer | A committed owner capacity or publication progress event. | Optional exact publication receipt and opaque sender scope bind progress before its initial ACK. |

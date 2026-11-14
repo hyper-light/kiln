@@ -6,7 +6,7 @@ import type { HEvent, SessionHistory } from "../src/api/harness.ts";
 const event = (seq: number): HEvent => ({ id: `e${seq}`, seq, at: seq, kind: "assistant", text: `row${seq}` });
 function fixture() {
   const events = new Map<number, HEvent>([[100, event(100)]]);
-  let history: SessionHistory | null = { cursor: "generation-a", before: 100, hasMore: true, oversized: false, loading: false, error: null };
+  let history: SessionHistory | null = { cursor: "generation-a", before: 100, hasMore: true, oversized: false, loading: false, error: null, filling: false };
   let ready = true;
   let current: Promise<void> | null = null;
   let release = () => {};
@@ -124,4 +124,51 @@ test("W21-R02 a published legacy full-snapshot position restores without requiri
   assert.equal(f.calls, 0);
   const beforeReady = { ...store, get: () => ({ ready: false, history: null }) } as unknown as Parameters<typeof restoreCanonicalPlace>[0];
   assert.equal((await restoreCanonicalPlace(beforeReady, position, new AbortController().signal, () => {}, f.publish)).type, "error", "a pre-ready snapshot is never adopted");
+});
+
+test("W21-R02 a place in the rest of a window waits for the rest, asking for no page", async () => {
+  const events = new Map<string, HEvent>([["e100", event(100)]]);
+  let history: SessionHistory = { cursor: "generation-a", before: 100, hasMore: true, oversized: false, loading: false, error: null, filling: true };
+  let filled = () => {};
+  let pages = 0;
+  const store = {
+    get: () => ({ ready: true, history }),
+    event: (id: string) => events.get(id),
+    loadOlder: () => {
+      pages++;
+      return Promise.resolve();
+    },
+    cancelOlder: () => {},
+    filled: () => (history.filling ? new Promise<void>((done) => (filled = done)) : Promise.resolve()),
+  } as unknown as Parameters<typeof restoreCanonicalPlace>[0];
+  const result = restoreCanonicalPlace(
+    store,
+    { id: "e60", offset: 0, seq: 60, row: true },
+    new AbortController().signal,
+    () => {},
+    async () => {},
+  );
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(pages, 0, "the window's rest comes by itself");
+  // The rest came: the place is in it.
+  events.set("e60", event(60));
+  history = { ...history, before: 40, filling: false };
+  filled();
+  assert.deepEqual(await result, { type: "found", position: { id: "e60", offset: 0, seq: 60, row: true } });
+  assert.equal(pages, 0);
+
+  // Left before the rest came: nothing waits on.
+  history = { ...history, before: 100, filling: true };
+  events.delete("e60");
+  const leaving = new AbortController();
+  const left = restoreCanonicalPlace(
+    store,
+    { id: "e60", offset: 0, seq: 60, row: true },
+    leaving.signal,
+    () => {},
+    async () => {},
+  );
+  await new Promise((r) => setTimeout(r, 5));
+  leaving.abort();
+  assert.deepEqual(await left, { type: "cancelled" });
 });

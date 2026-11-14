@@ -9,13 +9,9 @@ const bytes = (e: HEvent) => Buffer.byteLength(JSON.stringify(e));
 const mainUser = (e: HEvent) => e.kind === "user" && !e.parent;
 const amount = (value: string | null, fallback: number, low: number, high: number) => Math.min(high, Math.max(low, Number(value) || fallback));
 
-export function mockHistory(id: string, source: () => readonly HEvent[], state: State, params?: URLSearchParams) {
-  const all = source();
-  if (!params?.has("recent_turns") || process.env.MOCK_NO_SYNCED === "1") return { events: all, frame: null };
-  const cursor = `${incarnation}.0.${id}`;
-  sources.set(id, { cursor, events: source });
-  const turns = amount(params.get("recent_turns"), 8, 1, 30);
-  const budget = amount(params.get("event_bytes"), 262144, 16384, 1048576);
+/** The window of `all` that `turns` and `budget` bound, as the server selects it (history.rs `select`): its newest
+ * events back to a bound, and what current interactions need besides. `byBytes`: its bytes' bound ended it. */
+function windowOf(all: readonly HEvent[], state: State, turns: number, budget: number) {
   const required = new Set<string>();
   const user = all.findLast(mainUser);
   const answer = all.findLast((e) => e.kind === "assistant" && !e.parent);
@@ -35,21 +31,47 @@ export function mockHistory(id: string, source: () => readonly HEvent[], state: 
   }
   let start = all.length,
     size = 0,
-    seen = 0;
+    seen = 0,
+    byBytes = false;
   for (let i = all.length - 1; i >= 0; i--) {
     const e = all[i];
-    if (!e || size + bytes(e) > budget) break;
+    if (!e) break;
+    if (size + bytes(e) > budget) {
+      byBytes = true;
+      break;
+    }
     size += bytes(e);
     start = i;
     if (mainUser(e) && ++seen >= turns) break;
   }
   if (start === all.length && all.length) start = all.length - 1;
   const selected = all.filter((e, i) => i >= start || required.has(e.id));
+  return { selected, before: all[start]?.seq ?? (all.at(-1)?.seq ?? -1) + 1, more: start > 0, oversized: selected.reduce((sum, e) => sum + bytes(e), 0) > budget, byBytes };
+}
+
+export function mockHistory(id: string, source: () => readonly HEvent[], state: State, params?: URLSearchParams) {
+  const all = source();
+  if (!params?.has("recent_turns") || process.env.MOCK_NO_SYNCED === "1") return { events: all, frame: null, rest: null };
+  const cursor = `${incarnation}.0.${id}`;
+  sources.set(id, { cursor, events: source });
+  const turns = amount(params.get("recent_turns"), 8, 1, 30);
+  const budget = amount(params.get("event_bytes"), 262144, 16384, 1048576);
+  const whole = windowOf(all, state, turns, budget);
+  const head = (w: typeof whole) => ({ cursor, before: w.before, has_more: w.more, oversized: w.oversized });
+  // `first_bytes`: the window's first part alone, and the rest of the window to send after the snapshot (`earlier`).
+  if (!params.has("first_bytes")) return { events: whole.selected, frame: { t: "history" as const, ...head(whole) }, rest: null };
+  const part = windowOf(all, state, turns, amount(params.get("first_bytes"), budget, 16384, budget));
+  if (!part.byBytes) return { events: part.selected, frame: { t: "history" as const, ...head(part) }, rest: null };
+  const brought = new Set(part.selected);
   return {
-    events: selected,
-    frame: { t: "history" as const, cursor, before: all[start]?.seq ?? (all.at(-1)?.seq ?? -1) + 1, has_more: start > 0, oversized: selected.reduce((sum, e) => sum + bytes(e), 0) > budget },
+    events: part.selected,
+    frame: { t: "history" as const, ...head(part), part: true },
+    rest: { t: "earlier" as const, events: whole.selected.filter((e) => !brought.has(e)), ...head(whole) },
   };
 }
+
+/** MOCK_REST_MS: a window's rest held back that long after its first part (a slow link's), so a test or a probe sees the part alone. */
+export const REST_MS = Number(process.env.MOCK_REST_MS) || 0;
 
 export function handleMockHistory(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
   const match = /^\/api\/harness\/sessions\/([^/]+)\/events$/.exec(url.pathname);

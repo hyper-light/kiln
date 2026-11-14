@@ -71,7 +71,7 @@ import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { researchCall } from "@/api/research";
 import { ResearchCard } from "@/views/research/research";
 import { copyText } from "@/views/terminal/clipboard";
-import { Beam, Condense, formatThought, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
+import { Beam, Condense, formatThought, LoadingMark, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
 import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
@@ -1658,9 +1658,22 @@ function useKeeper(key: string, store: SessionStore, pending: RowPosition | null
         s.end = true;
         s.at = null;
       }
+      // Whether what's in the page fills the pane: a window's first part that doesn't isn't shown ahead of the rest of
+      // its window (`[data-filling]`, harness.css). The flow is a pixel taller than the pane's box when its content is
+      // shorter (harness.css), so it's the flow's own height against that box, its pixel and what rounding the pane's
+      // height to whole points leaves (under half a point each way) aside.
+      const style = getComputedStyle(root);
+      const pad = Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+      const fills = () => {
+        if (!root.hasAttribute("data-filling")) return;
+        const flow = root.firstElementChild;
+        root.toggleAttribute("data-tall", Boolean(flow) && (flow?.getBoundingClientRect().height ?? 0) - (root.clientHeight - pad) > 2);
+      };
+      fills();
       // Something changed size (it came in, loaded, opened, the view resized): before it's painted,
       // the end stays at the end, or what you were reading stays where it was.
       const hold = () => {
+        fills();
         // A keyboard or a growing answer can resize the pane while a question is being answered.
         // Keep that field visible instead of pinning an unrelated row (or the transcript's end).
         const focused = document.activeElement;
@@ -2087,6 +2100,7 @@ export const Timeline = React.memo(function Timeline({
         <div
           ref={keeper.ref}
           className="hx-timeline"
+          data-filling={history?.filling ? "" : undefined}
           data-scroll-restoration-id={`timeline:${placeKey(agent, parent)}`}
           onScroll={onScroll}
           onPointerDownCapture={keeper.onTouch}
@@ -2097,10 +2111,17 @@ export const Timeline = React.memo(function Timeline({
               <RestoringPlace store={store} position={restoring} resolved={restored} latest={latest} />
             ) : (
               <>
+                {/* A window's first part that doesn't fill the pane waits for the rest behind the loader the conversation opened with (harness.css). */}
+                {history?.filling && (
+                  <div className="hx-part-loading ag-loading" role="status">
+                    <LoadingMark />
+                    <PrismLabel live>Loading conversation</PrismLabel>
+                  </div>
+                )}
                 {/* Keyed by where the page starts: each time more joins, a new watch says at once whether more should. */}
                 {from > 0 && <div key={`from-${from}`} ref={earlier} className="hx-earlier" aria-hidden="true" />}
                 {from === 0 && !history && more && <div key={`older-${events[0]?.seq ?? 0}`} ref={older} className="hx-earlier" aria-hidden="true" />}
-                {from === 0 && history?.hasMore && (
+                {from === 0 && history?.hasMore && !history.filling && (
                   <button
                     type="button"
                     className="hx-earlier-steps"

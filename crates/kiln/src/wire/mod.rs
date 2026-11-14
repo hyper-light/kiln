@@ -493,6 +493,7 @@ pub const SOCKETS: &[SocketMsg] = &[
     msg(SESSION, Way::Down, "files", Class::State),
     msg(SESSION, Way::Down, "events", Class::Stream),
     msg(SESSION, Way::Down, "synced", Class::Stream),
+    msg(SESSION, Way::Down, "earlier", Class::Stream),
     msg(SESSION, Way::Down, "closed", Class::Stream),
     msg(SESSION, Way::Down, "error", Class::Answer),
     msg(SESSION, Way::Down, "mail_flow", Class::Answer),

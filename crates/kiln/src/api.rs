@@ -7071,7 +7071,11 @@ impl Takes {
             view: crate::harness::registry::View { window: has("window=1"), lean: has("lean=1") },
             history: query.and_then(|q| {
                 let value = |key: &str| q.split('&').find_map(|x| x.strip_prefix(key)).and_then(|v| v.parse::<usize>().ok());
-                value("recent_turns=").map(|turns| crate::harness::history::Limits::new(turns, value("event_bytes=").unwrap_or(256 * 1024)))
+                // `first_bytes`: a fresh snapshot is the window's first part of that many bytes, the rest sent after it (docs/wire.md, "Windows").
+                value("recent_turns=").map(|turns| {
+                    let whole = crate::harness::history::Limits::new(turns, value("event_bytes=").unwrap_or(256 * 1024));
+                    value("first_bytes=").map_or(whole, |first| whole.first_of(first))
+                })
             }),
             timing: has("timing=1"),
         }
@@ -7300,6 +7304,8 @@ where
     // 2.4 ms on the CPU in g9p16 with hogs), and then on the blocking pool: a round trip before every attach's first piece.
     let weight = snapshot.weight(packed);
     let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), weight).await;
+    // Where it brings its window's first part, the rest of the window is sent after it (W21-R02; docs/wire.md, "Windows").
+    let rest = snapshot.rest();
     if packed {
         // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5), a piece made while the one before it is written
         // ([`send_pieces`]; the memory audit's row A6): what's in flight is those two, not the whole message, and a place of
@@ -7307,6 +7313,7 @@ where
         sent.jobs += 1;
         let first = next_piece(snapshot.packing(&synced())).await?;
         send_pieces(tx, &mut held, first, next_piece, &mut sent).await?;
+        send_rest(tx, rest, true, &mut sent).await?;
         return Ok(sent);
     }
     sent.jobs += 1;
@@ -7325,7 +7332,28 @@ where
         turns.end().await;
     }
     tx.send(ws::text(synced())).await?;
+    send_rest(tx, rest, false, &mut sent).await?;
     Ok(sent)
+}
+
+/// Sends the rest of a window whose first part the snapshot just written brought (`crate::harness::registry::Rest`): a
+/// message of its own, so its viewer shows the part while this is on its way; made on the blocking pool, as the snapshot
+/// was, and let go of there. Nothing where the snapshot brought its window at once, or the part was the window.
+async fn send_rest<S>(tx: &mut S, rest: Option<crate::harness::registry::Rest>, packed: bool, sent: &mut Sent) -> anyhow::Result<()>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    use futures::SinkExt as _;
+    // None where the snapshot's plan found its first part to be the window: nothing is asked of the pool for it.
+    let Some(rest) = rest.filter(|rest| !rest.none()) else { return Ok(()) };
+    sent.jobs += 1;
+    let Some(message) = crate::rt::blocking(move || rest.message(packed)).await?? else { return Ok(()) };
+    // Its write in a turn of its own: a window's bytes at the most, as a snapshot's piece is.
+    hyper_rt::futures::yield_now().await;
+    let message = if packed { ws::binary(message) } else { ws::text(String::from_utf8(message)?) };
+    tx.send(message).await?;
+    Ok(())
 }
 
 /// A socket's audit rows waiting for the store, at most: past that, its next command waits for room
