@@ -39,6 +39,12 @@ export type AgentState = {
  */
 admission?: Capacity, 
 /**
+ * The depth its input learned (W20 learned depth), kept apart from `admission` across a
+ * native handover, which clears that for the new owner to say its own: where its depth
+ * starts there, so an upgrade is no cold start.
+ */
+learned_depth?: number, 
+/**
  * Bounded transport projection: missing detail fields are read from their owner at this revision.
  */
 view?: StateMetadata, 
@@ -123,7 +129,7 @@ compacting?: Compacting, exit?: ExitInfo,
 runs?: AgentRuns, 
 /**
  * kiln's record of each start of its harness (`session::Start`): one a start, as kiln's restart
- * rule paces them (`AGAIN_*`, `SOON_TRIES`), kept with the session, and handed to kiln's next
+ * rule paces them (`session::again`), kept with the session, and handed to kiln's next
  * image with it.
  */
 starts?: Array<AgentStart>, 

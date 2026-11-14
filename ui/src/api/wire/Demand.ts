@@ -5,4 +5,10 @@
  * The durable sender's exact waiting head. Fairness population also includes admitted peers;
  * a waiting revision is the only authority for starting that peer's natural refill witness.
  */
-export type Demand = { peer: string, revision: number, };
+export type Demand = { peer: string, revision: number, 
+/**
+ * How many of its originals wait, as the ledger counts them: what a receiver whose depth held
+ * them back would have taken at its handoff (W20 learned depth). Absent from a server that
+ * predates the count, which says its head alone: one.
+ */
+waiting?: number, };

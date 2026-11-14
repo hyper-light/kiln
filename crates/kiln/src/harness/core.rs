@@ -735,6 +735,11 @@ pub struct Frozen {
 }
 
 impl Frozen {
+    /// The depth its input learned: where its depth starts in the next image (W20 learned depth).
+    pub fn learned_depth(&self) -> Option<usize> {
+        super::admission::learned_depth(&self.state)
+    }
+
     /// The exact source timeline signed before a native journal changes ownership.
     #[cfg(any(unix, test))]
     pub(crate) fn handover_source(&self) -> (u64, &[Event]) {
@@ -744,6 +749,7 @@ impl Frozen {
     pub(super) fn transfer_epoch(&mut self, from: u64, to: u64) -> Result<(), String> {
         if self.state.epoch != from || from.checked_add(1) != Some(to) { return Err("native handover snapshot does not match its exact source/destination epoch".into()); }
         self.state.epoch = to;
+        self.state.learned_depth = super::admission::learned_depth(&self.state);
         self.state.admission = None;
         Ok(())
     }
@@ -753,6 +759,7 @@ impl Frozen {
         self.state.epoch = to;
         self.state.status = Status::Exited;
         self.state.manual_resume = true;
+        self.state.learned_depth = super::admission::learned_depth(&self.state);
         self.state.admission = None;
         Ok(super::session::Seed { events: self.events, state: self.state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: true })
     }

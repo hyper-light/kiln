@@ -1496,6 +1496,12 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub admission: Option<super::admission::Capacity>,
+    /// The depth its input learned (W20 learned depth), kept apart from `admission` across a
+    /// native handover, which clears that for the new owner to say its own: where its depth
+    /// starts there, so an upgrade is no cold start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub learned_depth: Option<usize>,
     /// Bounded transport projection: missing detail fields are read from their owner at this revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]

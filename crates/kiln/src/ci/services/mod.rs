@@ -109,6 +109,7 @@ pub async fn maintain(hub: &Hub) -> anyhow::Result<()> {
                 kiln_ci::work::reap::Reason::MaxAge => "max_age",
                 kiln_ci::work::reap::Reason::Target => "target",
                 kiln_ci::work::reap::Reason::Floor => "floor",
+                kiln_ci::work::reap::Reason::Pressure => "pressure",
             };
             crate::metrics::global().work_reaped_bytes.add(&["ledger", reason], e.bytes);
             tracing::info!(entry = %e.id, bytes = e.bytes, reason, rule = e.rule, scope = ?e.scope, "the reaper evicted a work ledger entry (W24-R31)");

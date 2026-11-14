@@ -18,7 +18,16 @@ pub enum Learning { Bootstrap, Observed }
 /// a waiting revision is the only authority for starting that peer's natural refill witness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-pub struct Demand { pub peer: String, pub revision: u64 }
+pub struct Demand {
+    pub peer: String,
+    pub revision: u64,
+    /// How many of its originals wait, as the ledger counts them: what a receiver whose depth held
+    /// them back would have taken at its handoff (W20 learned depth). Absent from a server that
+    /// predates the count, which says its head alone: one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub waiting: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -41,9 +50,11 @@ pub struct Capacity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub feedback_generation: Option<u64>,
-    /// The depth agents' and kiln's messages are held to, learned, even while it takes none
-    /// (`target` is none then: paused): the server queues theirs to it meanwhile. A person's
-    /// messages are held to no depth. Absent from a source that predates it.
+    /// The depth agents' and kiln's messages are held to, learned (what this receiver's own
+    /// consumption taught, kept with its state for its next start; before it has learned, the
+    /// target), even while it takes none (`target` is none then: paused): the server queues
+    /// theirs to it meanwhile. A person's messages are held to no depth. Absent from a source
+    /// that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub depth: Option<usize>,
@@ -470,20 +481,33 @@ impl Drop for PhysicalBudget {
 }
 
 #[derive(Clone, Copy)]
-struct Service { count: usize, elapsed_ns: u64, quantum: usize }
+struct Service { count: usize, elapsed_ns: u64 }
 
 #[derive(Clone, Copy)]
 struct Feedback { generation: u64, revision: u64, issued_ns: u64 }
 
 /// Observations cover one natural busy consumption/refill cycle. A lifecycle change invalidates
-/// the cycle; time passing and arrivals cannot enlarge the target.
+/// the cycle (what was learned from it stays: [`Controller::learned`]); time passing and arrivals
+/// alone cannot enlarge the target.
 #[derive(Default)]
 struct Observations {
     previous_consumption: Option<u64>,
     service: Option<Service>,
     feedback_ns: Option<u64>,
     outstanding: BTreeMap<String, Feedback>,
+    /// The agents' and kiln's messages the latest handoff took, and, where the depth was holding
+    /// theirs back as it came, every one of theirs still waiting in the ledger: what it would have
+    /// taken. A full window's handoff is censored by the window; its consumption alone could never
+    /// teach a larger depth than the one that held it (W20 learned depth).
+    batch: Option<usize>,
 }
+
+/// The depth a session's input learned, as its state keeps it: its last capacity's while that had
+/// learned one, else what a native handover kept of it (W20 learned depth).
+pub fn learned_depth(state: &super::model::State) -> Option<usize> {
+    state.admission.as_ref().filter(|capacity| capacity.learning == Learning::Observed).and_then(|capacity| capacity.depth).or(state.learned_depth)
+}
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Readiness { Ready, Restoring, Unavailable }
@@ -498,11 +522,19 @@ pub struct Controller {
     leases: BTreeMap<String, Lease>,
     peers: VecDeque<String>,
     demand: BTreeMap<String, u64>,
+    /// Each waiting sender's originals, as the ledger counts them (`Demand::waiting`; its head
+    /// alone, one, from a server that predates the count).
+    waiting: BTreeMap<String, u64>,
     physical: Arc<PhysicalBudget>,
     account: Arc<AtomicUsize>,
     observations: Observations,
     target: usize,
     learning: Learning,
+    /// The depth this receiver's own consumption taught ([`Self::learn`]), or its own depth from
+    /// before, kept with its state ([`Self::seed`]). It outlives the busy cycle it came from:
+    /// senders joining or leaving, a pause or a reconnect change none of what it measured. Only
+    /// this session's: how a person works with one session says nothing of another's.
+    learned: Option<usize>,
     readiness: Readiness,
     ownership: Ownership,
     available: bool,
@@ -510,16 +542,58 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(epoch: u64, physical: Arc<PhysicalBudget>) -> Self {
-        // These are two necessary pipeline roles, not a selected backlog allowance: a real item
-        // in service and one real refill item permit natural busy service to be observed.
-        let roles = [Stage::ProviderFlight, Stage::Queued];
-        Self { epoch, generation: 0, retry_generation: 0, leases: BTreeMap::new(), peers: VecDeque::new(), demand: BTreeMap::new(), physical, account: Arc::new(AtomicUsize::new(0)), observations: Observations::default(), target: roles.len(), learning: Learning::Bootstrap, readiness: Readiness::Ready, ownership: Ownership::Here, available: true }
+        let mut controller = Self { epoch, generation: 0, retry_generation: 0, leases: BTreeMap::new(), peers: VecDeque::new(), demand: BTreeMap::new(), waiting: BTreeMap::new(), physical, account: Arc::new(AtomicUsize::new(0)), observations: Observations::default(), target: 0, learning: Learning::Bootstrap, learned: None, readiness: Readiness::Ready, ownership: Ownership::Here, available: true };
+        controller.retarget(None);
+        controller
+    }
+
+    /// The depth agents' and kiln's messages are held to, from what it rests on now (W20 learned
+    /// depth, 2026-11-14: it was two "bootstrap roles" until a busy cycle completed, and back to
+    /// two whenever a sender joined or left, which human-driven traffic made always):
+    /// - what this receiver learned of its own consumption (its own alone: one session's traffic
+    ///   says nothing of another's);
+    /// - never less than one fair round: a place for each agent or kiln sender with messages
+    ///   waiting, and for the one offering now (its claimed head leaves the waiting list before
+    ///   its offer arrives), so no waiting sender stands behind more than one handoff of
+    ///   another's backlog, and a fan-in is taken in the round it arrives;
+    /// - taking messages at all, at least the one place that says so: a target of none is how
+    ///   the protocol says "takes no messages" (paused), and the server holds even a person's
+    ///   messages for it then. Nothing waiting, it's the only place there is.
+    fn depth_now(&self, offering: Option<&str>) -> usize {
+        let bounded = |peer: &str| !super::mail::person(peer);
+        let waiting = self.demand.keys().filter(|peer| bounded(peer)).count();
+        let extra = offering.is_some_and(|peer| bounded(peer) && !self.demand.contains_key(peer));
+        let round = waiting.saturating_add(usize::from(extra));
+        self.learned.map_or(round, |learned| learned.max(round)).max(1)
+    }
+
+    /// The depth recomputed: whether it changed.
+    fn retarget(&mut self, offering: Option<&str>) -> bool {
+        let depth = self.depth_now(offering);
+        let changed = depth != self.target;
+        self.target = depth;
+        changed
+    }
+
+    /// Its own depth from before, kept with its state (a restart, an upgrade's handover, a move):
+    /// it goes on from there instead of from nothing.
+    pub fn seed(&mut self, depth: usize) -> Result<(), Error> {
+        self.learned = Some(depth);
+        self.learning = Learning::Observed;
+        if self.retarget(None) { self.changed()?; }
+        Ok(())
+    }
+
+    /// The agents' and kiln's originals waiting in the ledger for this receiver.
+    fn waiting_bounded(&self) -> usize {
+        let total = self.waiting.iter().filter(|(peer, _)| !super::mail::person(peer)).map(|(_, n)| *n).fold(0u64, u64::saturating_add);
+        usize::try_from(total).unwrap_or(usize::MAX)
     }
 
     pub fn capacity(&self) -> Capacity {
         let eligible_peer = (self.accepting() && self.bounded_leases() < self.target).then(|| self.next_peer().cloned()).flatten();
         let feedback_generation = eligible_peer.as_ref().and_then(|peer| self.observations.outstanding.get(peer)).map(|feedback| feedback.generation);
-        Capacity { epoch: self.epoch, generation: self.generation, retry_generation: Some(self.retry_generation), learning: self.learning, target: if self.accepting() { self.target } else { 0 }, admitted: self.leases.len(), bytes: self.leases.values().map(|l| l.bytes).fold(0, usize::saturating_add), peers: self.peers.len(), eligible_peer, feedback_generation, depth: Some(self.target) }
+        Capacity { epoch: self.epoch, generation: self.generation, retry_generation: Some(self.retry_generation), learning: self.learning, target: if self.accepting() { self.target } else { 0 }, admitted: self.leases.len(), bytes: self.leases.values().map(|l| l.bytes).fold(0, usize::saturating_add), peers: self.peers.len(), eligible_peer, feedback_generation, depth: Some(self.learned.unwrap_or(self.target)) }
     }
 
     pub fn lease(&self, message: &str) -> Option<&Lease> { self.leases.get(message) }
@@ -634,24 +708,32 @@ impl Controller {
     fn credit(&mut self) -> Result<(), Error> { self.retry_generation = self.retry_generation.checked_add(1).ok_or(Error::Overflow)?; Ok(()) }
 
     /// Authenticated peers with unresolved custody, supplied by lifecycle events. Their arrival
-    /// order is retained; newly active peers divide the same target and reset obsolete samples.
+    /// order is retained. A sender joining or leaving changes neither what this receiver learned
+    /// of its own consumption nor its link's feedback: only a departed sender's own witness goes,
+    /// and the depth is recomputed (W20 learned depth; this reset to two bootstrap roles before,
+    /// and the server names the population with every offer, so under human-driven traffic no
+    /// receiver ever left bootstrap).
     pub fn peers(&mut self, active: &[String]) -> Result<bool, Error> {
         let same = self.peers.len() == active.len() && active.iter().all(|p| self.peers.contains(p));
         if same { return Ok(false); }
         self.peers.retain(|p| active.contains(p));
         for peer in active { if !self.peers.contains(peer) { self.peers.push_back(peer.clone()); } }
-        self.demand.retain(|peer, _| self.peers.contains(peer));
-        self.observations = Observations::default();
-        self.learning = Learning::Bootstrap;
-        self.target = [Stage::ProviderFlight, Stage::Queued].len();
+        self.demand.retain(|peer, _| active.contains(peer));
+        self.waiting.retain(|peer, _| active.contains(peer));
+        self.observations.outstanding.retain(|peer, _| active.contains(peer));
+        self.retarget(None);
         self.changed()?;
         Ok(true)
     }
 
     /// Waiting demand is supplied by the durable sender ledger, separately from the fairness
     /// population (which also includes already admitted communications). No arrival/ACK sample.
+    /// Each sender's count of waiting originals is kept for the next handoff's batch; a count
+    /// alone changing moves no depth and sends no capacity.
     pub fn demand(&mut self, waiting: &[Demand]) -> Result<bool, Error> {
         let next: BTreeMap<_, _> = waiting.iter().filter(|head| self.peers.contains(&head.peer)).map(|head| (head.peer.clone(), head.revision)).collect();
+        // A head is at least one waiting original, whatever a count says.
+        self.waiting = waiting.iter().filter(|head| self.peers.contains(&head.peer)).map(|head| (head.peer.clone(), head.waiting.unwrap_or(1).max(1))).collect();
         if self.demand == next { return Ok(false); }
         // Waiting→Dispatched withdraws a head before its Admit can arrive. Keep that one exact
         // witness until its matching publication answers, peer lifecycle ends, or another head
@@ -662,6 +744,7 @@ impl Controller {
             self.observations.previous_consumption = None;
             self.observations.feedback_ns = None;
         }
+        self.retarget(None);
         self.changed()?;
         Ok(true)
     }
@@ -735,12 +818,14 @@ impl Controller {
         // A person's message goes in a part of the inbox of its own: no turn and no depth holds it,
         // only its bytes. Agents' and kiln's take their turns under the learned depth.
         let person = super::mail::person(peer);
-        if !person {
-            if self.bounded_leases() >= self.target { return Ok(self.waiting(if self.learning == Learning::Bootstrap { WaitCause::Bootstrap } else { WaitCause::LogicalWindow })); }
-            let answered = self.observations.outstanding.get(peer).is_some_and(|feedback| Some(feedback.revision) == revision && Some(feedback.generation) == feedback_generation);
-            if !self.peers.is_empty() && self.next_peer().is_none_or(|first| first != peer) && !answered { return Ok(self.waiting(WaitCause::PeerTurn)); }
+        // The offering sender has a place in this round even once the server's claim took its
+        // head off the waiting list. A depth that moved goes out under a new generation, whatever
+        // this offer's answer.
+        let moved = !person && self.retarget(Some(peer));
+        if let Some(cause) = self.refusal(peer, person, bytes, feedback_generation, revision)? {
+            if moved { self.changed()?; }
+            return Ok(self.waiting(cause));
         }
-        if !self.physical.reserve_for(bytes, Some(&self.account))? { return Ok(self.waiting(WaitCause::PhysicalBytes)); }
         let lease = Lease { message: message.to_owned(), peer: peer.to_owned(), epoch, bytes, stage: Stage::Reserved, token: None, handoff: None };
         self.leases.insert(message.to_owned(), lease.clone());
         if person { self.changed()?; return Ok(Admission::Reserved(lease)); }
@@ -753,6 +838,19 @@ impl Controller {
         }
         self.changed()?;
         Ok(Admission::Reserved(lease))
+    }
+
+    /// Why an offer past the lifecycle checks must wait, else none and its bytes reserved: a
+    /// person's message only for its bytes; an agent's or kiln's for the depth, its sender's turn,
+    /// then its bytes.
+    fn refusal(&mut self, peer: &str, person: bool, bytes: usize, feedback_generation: Option<u64>, revision: Option<u64>) -> Result<Option<WaitCause>, Error> {
+        if !person {
+            if self.bounded_leases() >= self.target { return Ok(Some(if self.learning == Learning::Bootstrap { WaitCause::Bootstrap } else { WaitCause::LogicalWindow })); }
+            let answered = self.observations.outstanding.get(peer).is_some_and(|feedback| Some(feedback.revision) == revision && Some(feedback.generation) == feedback_generation);
+            if !self.peers.is_empty() && self.next_peer().is_none_or(|first| first != peer) && !answered { return Ok(Some(WaitCause::PeerTurn)); }
+        }
+        if !self.physical.reserve_for(bytes, Some(&self.account))? { return Ok(Some(WaitCause::PhysicalBytes)); }
+        Ok(None)
     }
 
     pub fn stage(&mut self, message: &str, stage: Stage) -> Result<(), Error> {
@@ -783,7 +881,8 @@ impl Controller {
     }
 
     /// One actual provider/tool response can hand over several communications. Its observed
-    /// service quantum is the number of distinct live leases it consumed, never a preset one.
+    /// batch is the number of distinct live leases it consumed, never a preset one, and, where
+    /// the depth held the rest back, the ones still waiting too.
     pub fn finish_batch(&mut self, messages: &[&str], disposition: Disposition, now_ns: u64, continuously_available: bool) -> Result<usize, Error> {
         let mut live = std::collections::BTreeSet::new();
         let mut bytes = 0usize;
@@ -794,6 +893,10 @@ impl Controller {
         }
         let count = live.len();
         if count == 0 { return Ok(0); }
+        // The agents' and kiln's part of this handoff, and whether the depth was holding the rest
+        // of theirs back as it came: every place of theirs taken.
+        let bounded = live.iter().filter(|message| self.leases.get(**message).is_some_and(|lease| !super::mail::person(&lease.peer))).count();
+        let censored = self.bounded_leases() >= self.target;
         for message in live { self.leases.remove(message); }
         self.physical.release_for(bytes, Some(&self.account));
         if !matches!(disposition, Disposition::Cancelled { reason: CancelReason::BeforeAcceptance }) { self.credit()?; }
@@ -801,9 +904,21 @@ impl Controller {
             if let Some(previous) = self.observations.previous_consumption
                 && let Some(elapsed_ns) = now_ns.checked_sub(previous).filter(|n| *n > 0)
             {
-                self.observations.service = Some(Service { count, elapsed_ns, quantum: count });
+                self.observations.service = Some(Service { count, elapsed_ns });
             }
             self.observations.previous_consumption = (!self.leases.is_empty()).then_some(now_ns);
+            // What this receiver takes in one handoff, from the handoffs that show it:
+            // - the depth full as it came: what it consumed and every one of theirs still waiting
+            //   in the ledger, which the depth held back;
+            // - room to spare and nothing of theirs waiting: what it consumed, all there was (a
+            //   quiet handoff, which shrinks it);
+            // - room to spare while theirs still wait: the server's refill hadn't caught up with
+            //   the room it had (one delivery a pass), which says nothing of its batch: no sample.
+            // A handoff that took none of theirs (a person's messages alone) says nothing either.
+            let waiting = self.waiting_bounded();
+            if bounded > 0 && (censored || waiting == 0) {
+                self.observations.batch = Some(bounded.saturating_add(if censored { waiting } else { 0 }));
+            }
             self.learn()?;
         } else { self.observations = Observations::default(); }
         self.changed()?;
@@ -827,15 +942,26 @@ impl Controller {
     /// cycle. They never create a sample or increase authority.
     pub fn interrupted(&mut self) { self.observations = Observations::default(); }
 
+    /// The depth this receiver's own consumption says (W20 learned depth): the latest batch it
+    /// took at a handoff, or would have had the depth not held it back, plus what it consumes
+    /// while a grant's feedback is in flight (`ceil(busy rate × feedback)`), once both that rate
+    /// and that feedback are measured. Each part counts as soon as it's observed; neither waits
+    /// for the other, and a quiet handoff shrinks it as a busy one grows it.
     fn learn(&mut self) -> Result<(), Error> {
-        let (Some(service), Some(feedback)) = (self.observations.service, self.observations.feedback_ns) else { return Ok(()) };
-        let work = u128::try_from(service.count).map_err(|_| Error::Overflow)?.checked_mul(u128::from(feedback)).ok_or(Error::Overflow)?;
-        let during_feedback = work.checked_div(u128::from(service.elapsed_ns)).ok_or(Error::Overflow)?;
-        let remainder = work.checked_rem(u128::from(service.elapsed_ns)).ok_or(Error::Overflow)?;
-        let whole = during_feedback.checked_add(u128::from(remainder != 0)).ok_or(Error::Overflow)?;
-        let target = usize::try_from(whole).map_err(|_| Error::Overflow)?.checked_add(service.quantum).ok_or(Error::Overflow)?;
-        self.target = target;
+        let Some(batch) = self.observations.batch else { return Ok(()) };
+        let in_flight = match (self.observations.service, self.observations.feedback_ns) {
+            (Some(service), Some(feedback)) => {
+                let work = u128::try_from(service.count).map_err(|_| Error::Overflow)?.checked_mul(u128::from(feedback)).ok_or(Error::Overflow)?;
+                let during_feedback = work.checked_div(u128::from(service.elapsed_ns)).ok_or(Error::Overflow)?;
+                let remainder = work.checked_rem(u128::from(service.elapsed_ns)).ok_or(Error::Overflow)?;
+                usize::try_from(during_feedback.checked_add(u128::from(remainder != 0)).ok_or(Error::Overflow)?).map_err(|_| Error::Overflow)?
+            }
+            _ => 0,
+        };
+        let depth = batch.checked_add(in_flight).ok_or(Error::Overflow)?;
+        self.learned = Some(depth);
         self.learning = Learning::Observed;
+        self.retarget(None);
         Ok(())
     }
 }
@@ -848,7 +974,8 @@ impl Drop for Controller {
 mod tests {
     use super::*;
 
-    fn waiting(peers: &[&str], revision: u64) -> Vec<Demand> { peers.iter().map(|peer| Demand { peer: (*peer).into(), revision }).collect() }
+    fn waiting(peers: &[&str], revision: u64) -> Vec<Demand> { peers.iter().map(|peer| Demand { peer: (*peer).into(), revision, waiting: None }).collect() }
+    fn counted(peers: &[(&str, u64)], revision: u64) -> Vec<Demand> { peers.iter().map(|(peer, n)| Demand { peer: (*peer).into(), revision, waiting: Some(*n) }).collect() }
 
     /// A person's message goes in a part of the inbox of its own: no turn and no depth holds it,
     /// and it takes no agent's room. Paused, the source takes nothing, yet says the depth agents'
@@ -1042,9 +1169,10 @@ mod tests {
         assert!(!owner.writes_ready());
         let mut token_owner = Controller::new(0, PhysicalBudget::new(1024));
         token_owner.restore(Lease { message: "accepted".into(), peer: "peer".into(), epoch: 0, bytes: 80, stage: Stage::ProviderFlight, token: Some(super::super::mail::Token { revision: 1, generation: 1 }), handoff: None })?;
+        let before = token_owner.capacity().target;
         assert_eq!(token_owner.begin_legacy_epoch(0, 1), Err(Error::InvalidTransition));
         assert_eq!(token_owner.lease("accepted").map(|lease| lease.epoch), Some(0));
-        assert_eq!(token_owner.capacity().target, 2);
+        assert_eq!(token_owner.capacity().target, before, "a refused promotion changes no depth");
         assert_eq!(token_owner.begin_legacy_epoch(0, 2), Err(Error::StaleEpoch));
         Ok(())
     }
@@ -1121,7 +1249,7 @@ mod tests {
         assert_eq!(c.restore_complete(), Err(Error::InvalidTransition));
         assert!(c.restoring().is_ok());
         assert!(c.restore_complete().is_ok());
-        assert_eq!(c.capacity().target, 2);
+        assert_eq!(c.capacity().target, 1, "one waiting sender, one place in the round");
         assert_eq!(c.capacity().eligible_peer.as_deref(), Some("peer"));
     }
 
@@ -1135,7 +1263,7 @@ mod tests {
         assert!(c.restore_complete().is_ok());
         assert_eq!(c.capacity().target, 0, "storage readiness cannot clear ownership fencing");
         assert!(c.fence(false).is_ok());
-        assert_eq!(c.capacity().target, 2);
+        assert_eq!(c.capacity().target, 1);
     }
 
     #[test]
@@ -1196,36 +1324,92 @@ mod tests {
     }
 
     #[test]
-    fn real_waiting_claim_withdrawal_admit_and_native_handoffs_can_leave_bootstrap() {
-        let mut c = Controller::new(1, PhysicalBudget::new(100));
-        assert!(c.peers(&["peer".into()]).is_ok());
-        for (revision, issued, arrived, id) in [(11, 10, 20, "first"), (12, 21, 31, "second")] {
-            assert!(c.demand(&waiting(&["peer"], revision)).is_ok());
-            c.advertised_ready(issued);
-            let witness = c.capacity().feedback_generation;
-            assert!(witness.is_some());
-            assert!(c.demand(&[]).is_ok(), "the server claimed the exact waiting publication before Admit arrives");
-            assert!(matches!(c.offer_publication(id, "peer", 1, 1, witness, revision, arrived), Ok(Admission::Reserved(_))));
-        }
+    fn w20_a_full_windows_handoff_learns_what_it_held_back_and_a_quiet_one_shrinks_it() -> Result<(), Error> {
         let consumed = Disposition::Consumed { boundary: Consumption::ProviderAccepted };
-        assert!(c.finish("first", consumed.clone(), 40, true).is_ok());
-        assert!(c.finish("second", consumed, 50, true).is_ok());
-        assert_eq!(c.capacity().learning, Learning::Observed);
-        assert_eq!(c.capacity().target, 2);
-        assert!(c.observations.previous_consumption.is_none(), "true idle terminates the active busy interval");
-        let idle_capacity = c.capacity();
-        c.advertised_ready(999);
-        assert_eq!(c.capacity(), idle_capacity, "idle time is not growth or synthetic demand");
-        assert!(c.demand(&waiting(&["peer"], 13)).is_ok());
-        c.advertised_ready(1000);
-        let witness = c.capacity().feedback_generation;
-        assert!(c.demand(&[]).is_ok());
-        assert!(matches!(c.offer_publication("after-idle", "peer", 1, 1, witness, 13, 1030), Ok(Admission::Reserved(_))));
-        assert_eq!(c.capacity().target, 4, "latest actual busy rate times this exact grant's 30ns refill plus service quantum; producer idle is excluded");
+        let mut c = Controller::new(1, PhysicalBudget::new(100));
+        c.peers(&["peer".into()])?;
+        c.demand(&counted(&[("peer", 5)], 1))?;
+        assert_eq!((c.capacity().target, c.capacity().learning), (1, Learning::Bootstrap), "one waiting sender, one place, nothing learned");
+        assert!(matches!(c.offer_publication("m1", "peer", 1, 1, None, 1, 10)?, Admission::Reserved(_)));
+        c.demand(&counted(&[("peer", 4)], 2))?;
+        assert!(matches!(c.offer_publication("m2", "peer", 1, 1, None, 2, 11)?, Admission::Waiting { cause: WaitCause::Bootstrap, .. }), "the window is full");
+        c.finish("m1", consumed.clone(), 20, true)?;
+        assert_eq!((c.capacity().target, c.capacity().learning), (5, Learning::Observed), "it took one with four held back: its batch is five, not the one it was let take");
+        for (message, revision) in [("m2", 2), ("m3", 3), ("m4", 4), ("m5", 5)] {
+            assert!(matches!(c.offer_publication(message, "peer", 1, 1, None, revision, 30)?, Admission::Reserved(_)), "{message}");
+        }
+        c.demand(&[])?;
+        assert_eq!(c.finish_batch(&["m2", "m3", "m4", "m5"], consumed.clone(), 40, true), Ok(4));
+        assert_eq!(c.capacity().target, 4, "four taken with a place to spare: its batch is four");
+        c.demand(&counted(&[("peer", 1)], 6))?;
+        assert!(matches!(c.offer_publication("m6", "peer", 1, 1, None, 6, 50)?, Admission::Reserved(_)));
+        c.demand(&[])?;
+        c.finish("m6", consumed, 60, true)?;
+        assert_eq!(c.capacity().target, 1, "a quiet handoff shrinks it as a busy one grew it");
+        Ok(())
     }
 
     #[test]
-    fn an_actual_batch_supplies_its_service_quantum_and_seventeen_peers_divide_the_window() {
+    fn w20_a_server_without_waiting_counts_still_learns_from_its_heads() -> Result<(), Error> {
+        let mut c = Controller::new(1, PhysicalBudget::new(100));
+        c.peers(&["a".into(), "b".into()])?;
+        c.demand(&waiting(&["a", "b"], 1))?;
+        assert_eq!(c.capacity().target, 2, "two waiting senders, a place each");
+        assert!(matches!(c.offer("a1", "a", 1, 1, None, 1)?, Admission::Reserved(_)));
+        assert!(matches!(c.offer("b1", "b", 1, 1, None, 2)?, Admission::Reserved(_)));
+        c.finish("a1", Disposition::Consumed { boundary: Consumption::ProviderAccepted }, 10, true)?;
+        assert_eq!(c.capacity().target, 3, "one taken, and each waiting head is at least one held back");
+        Ok(())
+    }
+
+    #[test]
+    fn w20_cold_start_takes_a_fan_in_in_the_round_it_arrives() -> Result<(), Error> {
+        let mut c = Controller::new(1, PhysicalBudget::new(1000));
+        let peers: Vec<String> = (0..17).map(|n| format!("agent:{n}")).collect();
+        c.peers(&peers)?;
+        assert_eq!(c.capacity().target, 1, "nothing waiting: only the place that says it takes messages");
+        c.demand(&peers.iter().map(|peer| Demand { peer: peer.clone(), revision: 1, waiting: Some(1) }).collect::<Vec<_>>())?;
+        assert_eq!(c.capacity().target, 17, "seventeen senders waiting: a place each in this round");
+        for (n, peer) in peers.iter().enumerate() {
+            assert!(matches!(c.offer(&format!("m{n}"), peer, 1, 1, None, 2)?, Admission::Reserved(_)), "{peer}");
+        }
+        assert!(matches!(c.offer("again", "agent:0", 1, 1, None, 3)?, Admission::Waiting { .. }), "one round, not one sender's backlog");
+        let mut person = Controller::new(1, PhysicalBudget::new(1000));
+        person.peers(&["user:ada".into()])?;
+        person.demand(&waiting(&["user:ada"], 1))?;
+        assert_eq!(person.capacity().target, 1, "a person's take no place of the agents', and it still takes messages");
+        assert!(matches!(person.offer("hi", "user:ada", 1, 1, None, 1)?, Admission::Reserved(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn w20_each_session_starts_from_and_learns_only_its_own_depth() -> Result<(), Error> {
+        let consumed = Disposition::Consumed { boundary: Consumption::ProviderAccepted };
+        // A session restored with the depth it learned before goes on from it.
+        let mut restored = Controller::new(1, PhysicalBudget::new(100));
+        restored.seed(5)?;
+        assert_eq!((restored.capacity().target, restored.capacity().learning, restored.capacity().depth), (5, Learning::Observed, Some(5)), "its own depth from before, not a cold start");
+        // A new session beside it borrows none of that: it starts from its own waiting senders.
+        let mut fresh = Controller::new(1, PhysicalBudget::new(100));
+        fresh.peers(&["a".into()])?;
+        fresh.demand(&counted(&[("a", 1)], 1))?;
+        assert_eq!((fresh.capacity().target, fresh.capacity().learning), (1, Learning::Bootstrap), "one waiting sender, one place; another session's depth is not its own");
+        assert!(matches!(fresh.offer("m", "a", 1, 1, None, 1)?, Admission::Reserved(_)));
+        fresh.demand(&[])?;
+        fresh.finish("m", consumed.clone(), 10, true)?;
+        assert_eq!((fresh.capacity().target, fresh.capacity().learning), (1, Learning::Observed), "it learns from its own handoff alone");
+        // And what each learns moves no other.
+        restored.peers(&["b".into()])?;
+        restored.demand(&counted(&[("b", 8)], 1))?;
+        assert!(matches!(restored.offer("n", "b", 1, 1, None, 1)?, Admission::Reserved(_)));
+        restored.finish("n", consumed, 10, true)?;
+        assert_eq!(restored.capacity().target, 5, "one taken with room to spare while eight still wait: the refill hadn't caught up, no sample; it keeps its own five");
+        assert_eq!(fresh.capacity().target, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_actual_batch_is_its_service_sample_and_waiting_senders_each_take_a_place() {
         let mut c = Controller::new(1, PhysicalBudget::new(100));
         for message in ["one", "two", "three", "four"] {
             assert!(c.restore(Lease { message: message.into(), peer: "peer".into(), epoch: 1, bytes: 1, stage: Stage::ProviderFlight, token: None, handoff: None }).is_ok());
@@ -1234,14 +1418,16 @@ mod tests {
         assert_eq!(c.finish_batch(&["one", "two"], disposition.clone(), 10, true), Ok(2));
         assert_eq!(c.finish_batch(&["three", "four"], disposition, 20, true), Ok(2));
         let observed = c.observations.service;
-        assert!(matches!(observed, Some(Service { count: 2, quantum: 2, elapsed_ns: 10 })));
+        assert!(matches!(observed, Some(Service { count: 2, elapsed_ns: 10 })));
+        assert_eq!(c.capacity().target, 2, "its batch is two");
         let peers: Vec<_> = (0..17).map(|n| format!("peer-{n}")).collect();
         assert!(c.peers(&peers).is_ok());
-        assert!(c.demand(&peers.iter().map(|peer| Demand { peer: peer.clone(), revision: 1 }).collect::<Vec<_>>()).is_ok());
-        assert_eq!(c.capacity().target, 2, "seventeen peers divide the two bootstrap roles rather than minting seventeen windows");
+        assert!(c.demand(&peers.iter().map(|peer| Demand { peer: peer.clone(), revision: 1, waiting: None }).collect::<Vec<_>>()).is_ok());
+        assert_eq!(c.capacity().target, 17, "seventeen waiting senders take a place each in the round, over what it learned");
+        assert_eq!(c.capacity().learning, Learning::Observed, "and what it learned stays");
         assert!(matches!(c.offer("new-one", "peer-0", 1, 1, None, 30), Ok(Admission::Reserved(_))));
         assert!(matches!(c.offer("new-two", "peer-1", 1, 1, None, 31), Ok(Admission::Reserved(_))));
-        assert!(matches!(c.offer("new-three", "peer-2", 1, 1, None, 32), Ok(Admission::Waiting { .. })));
+        assert!(matches!(c.offer("new-three", "peer-2", 1, 1, None, 32), Ok(Admission::Reserved(_))));
     }
 
     #[test]
@@ -1262,36 +1448,46 @@ mod tests {
     }
 
     #[test]
-    fn peers_divide_bootstrap_roles_and_lifecycle_invalidates_samples() {
+    fn w20_senders_joining_or_leaving_keep_what_was_learned_and_take_their_turns() -> Result<(), Error> {
         let mut c = Controller::new(1, PhysicalBudget::new(100));
         assert_eq!(c.peers(&["a".into(), "b".into(), "c".into()]), Ok(true));
-        assert!(c.demand(&waiting(&["a", "b", "c"], 1)).is_ok());
-        assert_eq!(c.capacity().target, 2);
+        c.demand(&waiting(&["a", "b", "c"], 1))?;
+        assert_eq!(c.capacity().target, 3);
         assert!(matches!(c.offer("b", "b", 1, 1, None, 1), Ok(Admission::Waiting { cause: WaitCause::PeerTurn, .. })));
         assert!(matches!(c.offer("a", "a", 1, 1, None, 1), Ok(Admission::Reserved(_))));
         assert!(matches!(c.offer("b", "b", 1, 1, None, 2), Ok(Admission::Reserved(_))));
-        assert!(matches!(c.offer("c", "c", 1, 1, None, 3), Ok(Admission::Waiting { cause: WaitCause::Bootstrap, .. })));
-        assert!(c.finish("a", Disposition::Cancelled { reason: CancelReason::User }, 4, false).is_ok());
-        assert!(matches!(c.offer("c", "c", 1, 1, None, 5), Ok(Admission::Reserved(_))));
-        assert_eq!(c.capacity().learning, Learning::Bootstrap);
+        assert!(matches!(c.offer("c", "c", 1, 1, None, 3), Ok(Admission::Reserved(_))));
+        assert!(matches!(c.offer("a2", "a", 1, 1, None, 4), Ok(Admission::Waiting { cause: WaitCause::Bootstrap, .. })), "one round taken");
+        c.demand(&counted(&[("a", 3), ("b", 1), ("c", 1)], 5))?;
+        c.finish("a", Disposition::Consumed { boundary: Consumption::ProviderAccepted }, 10, true)?;
+        let learned = c.capacity();
+        assert_eq!((learned.target, learned.learning), (6, Learning::Observed), "one taken, five held back");
+        c.advertised("b", learned.generation, 11);
+        assert!(c.observations.outstanding.contains_key("b"));
+        assert_eq!(c.peers(&["a".into(), "c".into(), "d".into()]), Ok(true));
+        assert_eq!((c.capacity().target, c.capacity().learning), (6, Learning::Observed), "a sender joining or leaving resets nothing it measured");
+        assert!(!c.observations.outstanding.contains_key("b"), "only the departed sender's own witness goes");
+        Ok(())
     }
 
     #[test]
-    fn only_a_real_busy_cycle_and_correlated_refill_learn_depth() {
+    fn w20_busy_rate_times_correlated_feedback_adds_what_it_consumes_meanwhile() -> Result<(), Error> {
+        let consumed = Disposition::Consumed { boundary: Consumption::ProviderAccepted };
         let mut c = Controller::new(1, PhysicalBudget::new(100));
-        assert!(c.peers(&["a".into()]).is_ok());
-        assert!(c.demand(&waiting(&["a"], 1)).is_ok());
-        assert!(c.offer("a1", "a", 1, 1, None, 1).is_ok());
-        assert!(c.offer("a2", "a", 1, 1, None, 1).is_ok());
-        assert!(c.finish("a1", Disposition::Consumed { boundary: Consumption::ProviderAccepted }, 10, true).is_ok());
+        c.peers(&["a".into()])?;
+        c.demand(&counted(&[("a", 2)], 1))?;
+        assert!(matches!(c.offer("a1", "a", 1, 1, None, 1)?, Admission::Reserved(_)));
+        c.finish("a1", consumed.clone(), 10, true)?;
+        assert_eq!(c.capacity().target, 3, "one taken, two held back");
+        assert!(matches!(c.offer("a2", "a", 1, 1, None, 1)?, Admission::Reserved(_)));
+        assert!(matches!(c.offer("a3", "a", 1, 1, None, 1)?, Admission::Reserved(_)));
+        c.finish("a2", consumed.clone(), 100, true)?;
         let generation = c.capacity().generation;
-        c.advertised("a", generation, 10);
-        assert!(c.finish("a2", Disposition::Consumed { boundary: Consumption::ProviderAccepted }, 20, true).is_ok());
-        assert!(c.offer_publication("a3", "a", 1, 1, Some(generation), 1, 30).is_ok());
-        assert_eq!(c.capacity().learning, Learning::Observed);
-        assert_eq!(c.capacity().target, 3, "one quantum plus two consumed during feedback");
-        assert!(c.peers(&["a".into(), "b".into()]).is_ok());
-        assert_eq!(c.capacity().learning, Learning::Bootstrap);
-        assert_eq!(c.capacity().target, 2, "new peers do not multiply capacity");
+        c.advertised("a", generation, 100);
+        c.finish("a3", consumed, 110, true)?;
+        assert_eq!(c.capacity().target, 3, "room to spare while two still wait: the refill hadn't caught up, no sample; its batch stays three");
+        assert!(matches!(c.offer_publication("a4", "a", 1, 1, Some(generation), 1, 130)?, Admission::Reserved(_)));
+        assert_eq!(c.capacity().target, 6, "its batch of three, and three more consumed during the 30 ns feedback at its one per 10 ns");
+        Ok(())
     }
 }

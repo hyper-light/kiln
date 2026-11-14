@@ -8478,6 +8478,12 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
   - Every eviction is recorded with what it freed, and the rule and scope that decided it
     (`kiln_work_reaped_bytes_total{store,reason}`). `kiln work reap --dry-run` shows what a reap
     would evict, and the effective policy names the scope each value came from.
+  - The projects' reaper (the folders a runner's agent sessions work in, and `~/.cache`) recognizes
+    only folders marked `CACHEDIR.TAG`, and none of the values above are set for it: it keeps the
+    fastest rate it has measured the disk filling between two of its looks and how long its last
+    pass took, and deletes, least recently used first, only when at that rate the disk would fill
+    before its next pass could finish, and only enough that it no longer would
+    (`kiln_ci::work::reap::projects`; reason `pressure`).
 
   R03 already gives equivalence by output digest; the hits e-classes add come from rewrite rules
   and from finding a congruent result before its inputs are materialized.

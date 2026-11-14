@@ -902,6 +902,7 @@ pub fn reap(work: &Path, layers: &[(reap::Scope, reap::Policy)], last: Option<i6
             reap::Reason::MaxAge => "max_age",
             reap::Reason::Target => "target",
             reap::Reason::Floor => "floor",
+            reap::Reason::Pressure => "pressure",
         };
         tracing::info!(slot = %e.id, bytes = e.bytes, reason, rule = e.rule, scope = ?e.scope, trigger = ?trigger, "the reaper evicted a warm workspace");
         crate::metrics::global().work_reaped_bytes.add(&["warm", reason], e.bytes);

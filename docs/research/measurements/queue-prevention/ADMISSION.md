@@ -647,3 +647,46 @@ journal success. These fixtures are written and unrun. Parser and scoped diff
 checks pass; root owns fresh compilation/execution/mutation evidence. This small
 release-timing correction does not close the previously recorded whole-edit or
 other provider/bridge/Records-read allocation audit limits.
+
+## Learned depth, cold start and imbalance (2026-11-14)
+
+Production showed the depth never left bootstrap. The server names the fairness population with
+every offer, and `Controller::peers` reset the depth to the two bootstrap roles (and discarded every
+observation) whenever that population changed. Under human-driven traffic it always changes, so
+every receiver sat at two. Learning was also censored: the service quantum was the number of
+leases a handoff consumed, which can never exceed the depth that admitted them, so a receiver held
+to two could only ever learn two. A parent with twenty children reporting at once took them two a
+turn. Ada's rule for the replacement: no arbitrary constants, a cold start that holds at scale (a
+deploy restarts every session at once), and a fast response to imbalance.
+
+The depth is now recomputed whenever what it rests on changes (`Controller::depth_now`):
+
+- **What the session learned of its own consumption** (`Controller::learn`), from the handoffs
+  that show its batch. With the depth full as it came, the batch is what it consumed plus every
+  agent's or kiln's original still waiting in the ledger (`Demand::waiting`, the ledger's count per
+  sender; a server that predates the count gives one per waiting head, a lower bound). With room
+  to spare and nothing waiting, it is what it consumed (a quiet handoff, which shrinks the depth).
+  With room to spare while originals still wait, the server's refill (one delivery a pass) hadn't
+  caught up, which says nothing of the batch: no sample. `ceil(busy rate × correlated feedback)`
+  is added once both are measured; neither waits for the other. What was learned outlives the busy
+  cycle: a pause, a reconnect, or a sender joining or leaving clears in-flight observations (and
+  only a departed sender's own witness), never the learned depth.
+- **Each session's own, never another's.** How a person works with one session says nothing of
+  another (Ada, 2026-11-14), so nothing learned is shared between sessions. A session's learned
+  depth is kept with its state (`Capacity::depth`, and `State::learned_depth` across a native
+  handover, which clears `admission` for the new owner) and seeds its controller on restart,
+  upgrade handover or move (`Controller::seed`, `host::seed_learned`): a deploy is not a cold
+  start. A session that has never learned starts from its own waiting senders (the round below).
+- **Never less than one fair round**: one place for each agent or kiln sender with waiting
+  originals, plus the sender offering now (the server's claim withdraws its head before its offer
+  arrives). A fan-in is taken in the round it arrives, and round-robin turns stop a flooding sender
+  from crowding out quiet ones. This supersedes the earlier "peers never add authority" rule:
+  breadth of waiting demand is a measurement of the receiver's next batch, and bytes still bound it
+  (`PhysicalBudget`).
+- **Taking messages at all, at least one place.** `target == 0` is how the protocol says "takes no
+  messages" (paused or fenced), and the server holds even a person's messages for it. With nothing
+  waiting and nothing learned, that place is the only one there is. It's a representation of
+  "accepting", not a window.
+
+A person's messages are still held to no depth. Restored debt still counts against the depth and is
+drained, never evicted.
