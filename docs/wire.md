@@ -1209,6 +1209,14 @@ scrollback comes in above it, and the page takes the session's size for itself o
 drawn, as it always has. What the part asks of the terminal (where the cursor is, a colour) the page
 doesn't answer: the replay asks it again.
 
+The page's terminals attach in turn (`ui/src/views/terminal/attach-order.ts`): the one in view at
+once, and each of the others once the one before it has its replay drawn, so a page of terminals
+doesn't put the one in view behind the others' replays. One picked while it waits attaches then.
+With ten such terminals at 1.6 Mbit/s and 300 ms, the one in view has its replay after 1.4 s, as if
+it were alone, where attached all at once it had it after 1.4 to 13 s, by how the ten interleaved;
+the last of the ten has its own after 14 s where it was 11 s, each attach now waiting for the one
+before it.
+
 A part is drawn by the page's terminal from the bytes the replay holds, so it's drawn as the replay
 is. What has to hold is that the terminal is in one state either way once both are drawn, and that
 is a matter of where the cut is (`termpart.rs` says why a cut stands). A cut is:
