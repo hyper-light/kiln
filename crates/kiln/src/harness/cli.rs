@@ -30,8 +30,9 @@ pub struct SpawnArgs {
     pub mode: Option<String>,
     #[arg(long)]
     pub name: Option<String>,
-    /// Start them on another machine: its name (`local` for the server), or what it needs
-    /// (`linux/amd64`, `macos`, `+gpu`, `cpus>=16`), the idlest that suits and has the harness.
+    /// Start them on another machine: what it needs (`linux/amd64`, `macos`, `+gpu`, `cpus>=16`),
+    /// placed by kiln's load balancer on one that suits and has the harness; or its name (`local`
+    /// for the server), when it must be that one.
     #[arg(long)]
     pub on: Option<String>,
     /// Their folder there (with --on; by default its home).

@@ -5,16 +5,19 @@ from a Mac, a test on the machine with the GPU, `uptime` on a box by name — ov
 encrypted link the kiln server only relays.
 
 ```text
-kiln run --needs linux/amd64 -- cargo test           # this machine if it is one, else the idlest; this repo synced over first
-kiln run --needs cpus=8,mem=32g,linux/amd64 -- make  # one with 8 cores idle and 32 GiB free
-kiln run --on adacachy --no-sync -- uptime           # a runner by name, in its home folder
-kiln runners linux                                   # the Linux runners, best first, and why others don't suit
+kiln run --needs linux/amd64 -- cargo test           # where the load balancer places it (§2.3); this repo synced over first
+kiln run --needs cpus=8,mem=32g,linux/amd64 -- make  # one with 8 cores idle and 32 GiB free, likewise
+kiln run --on adacachy --no-sync -- uptime           # a runner by name (a step that must run there), in its home folder
+kiln runners linux                                   # the Linux runners and what each is, and why others don't suit
 ```
 
 Agents get the same through kiln's MCP server (§7): one command at a time (`runners`, `run`,
 `output`, `stop`), or a program that runs commands on several machines at once and returns only what
-matters (`code_run`), so Claude Code, Codex or any harness that takes MCP servers can decide for
-itself to build or test elsewhere.
+matters (`code_run`), so Claude Code, Codex or any harness that takes MCP servers can run a step its
+own machine can't do (another platform, a GPU, more than it has) elsewhere, saying what it needs:
+which machine is the load balancer's to choose (§2.3). Everything else runs on the session's own
+machine. The tools tell agents so, and not to weigh machines' load, spread work across machines by
+name, or name one but for a step that has to happen there.
 
 ## 1. Pieces
 
@@ -668,7 +671,7 @@ on its own machine, with its own tools. Its tools:
 | --- | --- |
 | `code_run` | a JavaScript program against kiln (below); only what it returns comes back |
 | `code_search` | a program over the operations a program may call, and kiln's skills |
-| `runners` | the machines, best first for `want` |
+| `runners` | the machines and what each is, for `want` (not for choosing: `run` places by `needs`) |
 | `run` | a command on `on` (default: the session's preference, else this machine), synced first; returns exit code and output (the middle cut past 30k characters), or an id with `background`. What it leaves running (`nohup … &`, a daemon) ends with it: everything in its own group of processes where the machine holds them (a cgroup on Linux, however parented), else its process group. A server runs as a background run; a job meant to outlive it, as a systemd user unit (`systemd-run --user`), which leaves the run's cgroup and is left alone |
 | `output` | a background run's new output, and whether it ended |
 | `stop` | stop a background run |

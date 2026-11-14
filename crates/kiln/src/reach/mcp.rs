@@ -10,7 +10,7 @@
 //!   through the runner, for this session, which acts for whoever started it
 //!   ([`crate::mcp::runner_ask`]). Calls run side by side, and only what the program returns comes
 //!   back. `code_search` runs a program over the operations.
-//! - `runners`: which machines there are, best first for what the work needs;
+//! - `runners`: which machines there are and what each is (not for choosing: `run` places by `needs`);
 //! - `run`: a command on one of them (by name, or by what it must be: `linux/amd64`), this
 //!   repository synced over first; returns its output and exit code, or runs on in the background;
 //! - `output` / `stop`: a background run's new output, and stopping it;
@@ -55,17 +55,24 @@ fn instructions(prefer: Option<&str>, machines: &str, session: &str) -> String {
 When a step has to happen on another machine (the person's Mac, a server, the box with the GPU), run it there yourself: \
 don't hand the person a command to type. When a step needs a person at that machine (a password, a system dialog to \
 allow, something physical), start it yourself and tell them exactly what will appear and what to do. Everything else \
-runs on this machine, with your own tools: use another only when this one can't do the step, because it needs another \
-platform (build and test for Linux x86-64 from a Mac: needs: \"linux/amd64\"), a GPU (needs: \"+gpu\"), or more memory, \
-disk or cores than this machine has (needs: \"cpus=16,mem=32g\": that many cores idle and that much memory free); `on` \
-names a machine for a step that has to happen on that one. `run` runs one command on one machine. `code_run` runs a \
+runs on this machine, this session's, with your own tools: builds and tests too, never moved because it looks busy. Use \
+another only for a step this one can't do: another platform (needs: \"linux/amd64\" to build and test for Linux x86-64 from \
+a Mac), a GPU (\"+gpu\"), or more memory or cores than this machine has at all (\"cpus=16,mem=32g\"). Then say what the step \
+needs with `run`, and kiln's load balancer picks the machine: of those that have it, the most room for it at its measured \
+speed, back where that kind of work last went well, never one under strain. Picking it is the balancer's work, not yours: \
+don't look over machines' load (`runners`, uptime) to choose, don't spread work across machines by name, and name one (`on`) \
+only for a step that has to happen on that machine (its files, its hardware, a service or a person there). A run that waits \
+for room starts by itself when there is some, and kiln tells you: leave it queued rather than cancel it for another machine. One that failed for the machine's sake (it went away, ran out of disk or \
+memory, lacked a tool) counts against that machine for that kind of work, so the same `run` again goes elsewhere: don't name \
+a machine for it. `run` runs one command. `code_run` runs a \
 JavaScript program against kiln, and only what it returns comes back to you: the same build or test on several machines at \
-once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.machines.run({needs: \"macos\", command: \
+once (each placed by the balancer), returning just what failed (`const [mac, linux] = await Promise.all([kiln.machines.run({needs: \"macos\", command: \
 \"cargo test\"}), kiln.machines.run({needs: \"linux/amd64\", command: \"cargo test\"})])`), or CI runs and deployments \
 (`kiln.ci.*`, `kiln.cd.*`; `code_search` lists every operation and its input). The repository you are in is synced to \
-the other machine first (only what changed; git sees the same state there), and the command runs in the matching \
+the machine it runs on first (only what changed; git sees the same state there), and the command runs in the matching \
 folder, so you edit here and it builds or tests there; for a command that isn't about this repository, pass sync: false (it runs \
-in that machine's home folder). `runners` lists the machines, this one first when it suits. Long commands can run in the background \
+in that machine's home folder). `runners` says what machines there are and what each is, and why one doesn't meet a need: \
+it isn't for choosing where to run. Long commands can run in the background \
 (background: true): when its answer says `told`, kiln tells you when it ends (where, how long, its exit code, the end of its \
 output), so end your turn rather than wait on `output`; `stop` ends one. Nothing a command leaves running outlives it: what a run leaves behind \
 (`nohup … &`, a daemon) ends when it does, and what your own shell commands leave running on their own ends when your \
@@ -239,7 +246,7 @@ fn base_tools() -> Value {
     json!([
         {
             "name": "code_run",
-            "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({needs, command})` runs a shell command on one of this kiln's machines that has what it needs (or `on`, one by name) (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}; kiln tells you when it ends, as with `run`), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
+            "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({needs, command})` runs a shell command where kiln's load balancer places it for what it needs (or `on` a machine by name, for a step that has to happen there) (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side, each placed by the balancer. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}; kiln tells you when it ends, as with `run`), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
             "inputSchema": schema("code_run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
@@ -251,13 +258,13 @@ fn base_tools() -> Value {
         },
         {
             "name": "runners",
-            "description": "The machines (kiln runners) commands can run on, best first for `want` (this one first when it suits and has memory to spare): platform, idle cores, free memory, installed agents, and why others don't suit. `want` is what it must be and have, as `run`'s `needs` takes it (`linux/amd64`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`), or a runner's name.",
+            "description": "What machines this kiln has (its runners) and what each is: platform, idle cores and free memory now, installed agents, and why one doesn't meet `want`, which is what it must be and have, as `run`'s `needs` spells it (`linux/amd64`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`), or a runner's name. For knowing what exists or why a need can't be met, not for choosing where to run: `run` with `needs` has kiln's load balancer choose, by more than this shows (each machine's measured speed, where that kind of work last went well, its health).",
             "inputSchema": schema("runners"),
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
             "name": "run",
-            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `needs` picks it: what it must be and have (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): this machine when it suits and has room to spare, else the idlest that suits; `on` names a machine when the step has to happen on that one. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id: when its answer says `told`, kiln tells you when it ends (where, how long, its exit code and the end of its output), and when it starts if it hadn't, so end your turn rather than call `output` to wait; `output` reads its output, `stop` ends it.",
+            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory or cores than it has at all, or one that has to happen on that machine. Everything else runs here, this session's machine, with your own tools, never moved because it looks busy. `needs` says what the step must have and takes (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): kiln's load balancer picks the machine that has them, with the most room for it at its measured speed, back where that kind of work last went well, and queues it, telling you, until one has room. Don't pick the machine yourself: `on` names one only when the step has to happen on that machine (its files, its hardware, a person there); with neither, it runs here (or where the session's person prefers). By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id: when its answer says `told`, kiln tells you when it ends (where, how long, its exit code and the end of its output), and when it starts if it hadn't, so end your turn rather than call `output` to wait; `output` reads its output, `stop` ends it.",
             "inputSchema": schema("run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
@@ -307,7 +314,7 @@ fn machine_ops() -> Vec<Value> {
         json!({"name": name, "call": format!("kiln.{name}"), "summary": summary, "read_only": read_only, "destructive": destructive, "input": input})
     };
     vec![
-        op("machines.list", "The machines (kiln runners) commands can run on, best first for `want`: {me, runners: [{runner: {name, os, arch, ...}, why}], passed: [...]}.", true, false),
+        op("machines.list", "What machines this kiln has and what each is, for `want`: {me, runners: [{runner: {name, os, arch, ...}, why}], passed: [...]}. Not for choosing where to run: `kiln.machines.run` with `needs` has the load balancer choose.", true, false),
         op(
             "machines.run",
             "Run a shell command on a machine and wait for it to end: {runner, exit_code, output (stdout and stderr interleaved; the middle cut past 1,000,000 characters), why, synced}. A command that fails still resolves, with its exit code; a machine that can't be reached rejects.",
@@ -1460,15 +1467,17 @@ pub mod input {
     pub struct Run {
         /// Shell text, run by bash in the synced copy of this repository.
         pub command: String,
-        /// What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label),
+        /// What the work must have and takes: `linux/amd64`, `macos`, `+gpu` (a label),
         /// `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and
         /// free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on
-        /// it. Picks this machine when it has them and room to spare, else the idlest that has
-        /// them.
+        /// it. kiln's load balancer places it on the machine that has them with the most room for
+        /// it at its measured speed, back where that kind of work last went well, never one under
+        /// strain; queued, telling you, until one has room.
         pub needs: Option<String>,
-        /// A runner by name, for a step that has to happen on that machine (it must still meet
-        /// `needs`). Default: what `needs` picks; with neither, the session's preferred runner,
-        /// else this machine.
+        /// A runner by name, only for a step that has to happen on that machine (its files, its
+        /// hardware, a person or a service there; it must still meet `needs`), never to choose a
+        /// less busy one: that's the load balancer's. Default: where `needs` places it; with
+        /// neither, the session's preferred runner, else this machine.
         pub on: Option<String>,
         /// Copy this repository over first and run in it (default: true inside a git repository).
         pub sync: Option<bool>,
@@ -1501,15 +1510,17 @@ pub mod input {
     pub struct Command {
         /// Shell text, run by bash in the synced copy of this repository.
         pub command: String,
-        /// What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label),
+        /// What the work must have and takes: `linux/amd64`, `macos`, `+gpu` (a label),
         /// `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and
         /// free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on
-        /// it. Picks this machine when it has them and room to spare, else the idlest that has
-        /// them.
+        /// it. kiln's load balancer places it on the machine that has them with the most room for
+        /// it at its measured speed, back where that kind of work last went well, never one under
+        /// strain; queued, telling you, until one has room.
         pub needs: Option<String>,
-        /// A runner by name, for a step that has to happen on that machine (it must still meet
-        /// `needs`). Default: what `needs` picks; with neither, the session's preferred runner,
-        /// else this machine.
+        /// A runner by name, only for a step that has to happen on that machine (its files, its
+        /// hardware, a person or a service there; it must still meet `needs`), never to choose a
+        /// less busy one: that's the load balancer's. Default: where `needs` places it; with
+        /// neither, the session's preferred runner, else this machine.
         pub on: Option<String>,
         /// Copy this repository over first and run in it (default: true inside a git repository).
         pub sync: Option<bool>,
@@ -1810,7 +1821,11 @@ mod tests {
         assert!(instructions(Some("adacachy"), "", "").contains("prefers commands to run on adacachy"));
         let i = instructions(None, "", "");
         assert!(i.contains("run it there yourself") && i.contains("don't hand the person a command to type") && i.contains("code_run"));
-        assert!(i.contains("Everything else runs on this machine") && !i.contains("build or test there"), "{i}");
+        // This session's machine by default, never left because it looks busy; for a step it can't do,
+        // what the step needs, and the load balancer picks the machine (2026-11-13).
+        assert!(i.contains("Everything else runs on this machine, this session's") && i.contains("never moved because it looks busy"), "{i}");
+        assert!(i.contains("kiln's load balancer picks the machine") && i.contains("Picking it is the balancer's work, not yours"), "{i}");
+        assert!(!i.contains("this one first when it suits") && !i.contains("idlest"), "{i}");
         assert!(i.contains("goals_add") && i.contains("plans_run") && !i.contains("You are kiln agent"), "{i}");
         assert!(instructions(None, "", "01a14ab9").contains("You are kiln agent 01a14ab9"), "an agent is told who it is");
         let v = json!({"me": "adacachy", "runners": [{"runner": {"name": "adacachy", "os": "linux", "arch": "x86_64"}}, {"runner": {"name": "mac", "os": "macos", "arch": "aarch64"}}], "passed": [{"runner": {"name": "box", "os": "windows", "arch": "x86_64"}}]});
@@ -1880,8 +1895,8 @@ mod tests {
         let command = |waits: bool| {
             let mut props = json!({
                 "command": {"type": "string", "description": "Shell text, run by bash in the synced copy of this repository."},
-                "needs": {"type": "string", "description": "What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label), `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it. Picks this machine when it has them and room to spare, else the idlest that has them."},
-                "on": {"type": "string", "description": "A runner by name, for a step that has to happen on that machine (it must still meet `needs`). Default: what `needs` picks; with neither, the session's preferred runner, else this machine."},
+                "needs": {"type": "string", "description": "What the work must have and takes: `linux/amd64`, `macos`, `+gpu` (a label), `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it. kiln's load balancer places it on the machine that has them with the most room for it at its measured speed, back where that kind of work last went well, never one under strain; queued, telling you, until one has room."},
+                "on": {"type": "string", "description": "A runner by name, only for a step that has to happen on that machine (its files, its hardware, a person or a service there; it must still meet `needs`), never to choose a less busy one: that's the load balancer's. Default: where `needs` places it; with neither, the session's preferred runner, else this machine."},
                 "sync": {"type": "boolean", "description": "Copy this repository over first and run in it (default: true inside a git repository)."},
                 "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
                 "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},

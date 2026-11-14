@@ -62,8 +62,10 @@ it in `.github/workflows` and put kiln's keys in an overlay; an overlay may also
 - **Outputs**: `outputs.<name>: { value, secret: true }`, `exports: { env }`, `env-from`.
 - **Tests and benchmarks**: a step's `test-results: { path }`; a job's `quarantine: enforce`
   and `bench-gate: { metric, max-regression: 5% }`; metrics to `$KILN_METRICS`.
-- **Where it runs**: `runs-on` (labels), `requires: ["os == linux", "memory >= 16Gi"]`,
-  `prefer`, `exclusive: true`, `resources`.
+- **Where it runs**: what a job must have (`runs-on` labels, `requires: ["os == linux", "memory
+  >= 16Gi"]`) and what it takes (`resources`; `exclusive: true` for a benchmark's whole machine).
+  kiln's load balancer picks among the runners that qualify, so leave speed and room to it: no
+  machine pinned for them, no `prefer` facts (the kiln-ci-runners skill says when `prefer` helps).
 - **Retries**: `retry: { max: 2, on: [runner-lost, infra] }`.
 - **Debugging**: `debug: { keep-on-failure: 30m }`.
 

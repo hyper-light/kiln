@@ -954,10 +954,12 @@ it (docs/reach.md §8) gives it then.
 
 ### Where a child runs
 
-`on` is a machine's name (`local` or `server` for the server, `agent:<name>` too), or what it
-needs, as reach writes it: `linux/amd64`, `macos`, `arm64`, `+gpu`, `cpus>=16`, `mem>=32g`. Of
-the machines that suit and have the harness installed, the idlest (most idle cores, then free
-memory) gets it; outposts and job pods never do. Without `on`, an agent's child runs on the
+`on` is what it needs, as reach writes it: `linux/amd64`, `macos`, `arm64`, `+gpu`, `cpus>=16`,
+`mem>=32g`; or a machine's name (`local` or `server` for the server, `agent:<name>` too), when it
+must run there. kiln's load balancer places it among the machines that suit and have the harness
+installed (docs/reach.md §2.3), as it places commands; outposts and job pods never get it, and a
+fleet whose runners don't place sessions yet gives it the one with the most idle cores, then free
+memory. Without `on`, an agent's child runs on the
 agent's own machine, in its folder unless `cwd` says otherwise; a person's runs on the server
 when it runs agents, else on the best runner with the harness. A child on another machine starts
 in that machine's home unless `cwd` names a folder there. A machine named, or the agent's own,
