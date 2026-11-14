@@ -4099,6 +4099,74 @@ mod tests {
         })
     }
 
+    /// W21-R02 (a send's time is its turn at this writer): a call makes no temporary file. Each call runs in a
+    /// savepoint of its own, and SQLite keeps the pages a savepoint changes, as they were, in a journal: built as it
+    /// comes, 64 KiB of it in memory (15 pages), and past that in a temporary file it makes, writes page by page and
+    /// removes at the commit (https://www.sqlite.org/tempfiles.html, 2.5), so a call that changed more pages made one
+    /// (a feed batch's two custody records change 34 to 66). kiln's SQLite keeps the journal in memory
+    /// (`.cargo/config.toml`). In a process of its own, SQLite's temporary files given a folder of their own
+    /// (`SQLITE_TMPDIR`, read as SQLite starts), a call that rewrites 64 pages leaves that folder as it was. A
+    /// temporary table grown past its cache, which SQLite does keep in a file, changes it: the folder shows a file
+    /// made in it.
+    #[cfg(unix)]
+    #[test]
+    fn w21_r02_a_call_makes_no_temporary_file() -> anyhow::Result<()> {
+        const FOLDER: &str = "SQLITE_TMPDIR";
+        const ALONE: &str = "KILN_TEST_STORE_JOURNAL";
+        /// The pages the call rewrites: well past the 15 that SQLite, as it comes, keeps of a journal in memory.
+        const ROWS: usize = 64;
+        if std::env::var_os(ALONE).is_none() {
+            let temp = tempfile::tempdir()?;
+            let me = "store::tests::w21_r02_a_call_makes_no_temporary_file";
+            let out = std::process::Command::new(std::env::current_exe()?).args(["--exact", me, "--nocapture", "--test-threads=1"]).env(ALONE, "1").env(FOLDER, temp.path()).output()?;
+            let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            anyhow::ensure!(out.status.success() && said.contains("1 passed"), "in a process of its own:\n{said}");
+            return Ok(());
+        }
+        let temp = std::path::PathBuf::from(std::env::var_os(FOLDER).ok_or_else(|| anyhow::anyhow!("no folder for SQLite's temporary files"))?);
+        let dir = tempfile::tempdir()?;
+        let (db, cluster) = (dir.path().join("kiln.db"), dir.path().join("cluster"));
+        let s = Store::open_with(&db, Some(cluster.as_path()), Bounds::DEFAULT)?;
+        // Its rows, each on a page of its own (a value of most of a page), kept by a call before.
+        crate::rt::block_on({
+            let s = s.clone();
+            async move {
+                s.call(|c| {
+                    let tx = tx(c)?;
+                    for i in 0..ROWS {
+                        tx.execute("INSERT INTO kv (k, v) VALUES (?1, ?2)", params![format!("journal-{i:02}"), "a".repeat(3000)])?;
+                    }
+                    Ok(tx.commit()?)
+                })
+                .await
+            }
+        })?;
+        // The folder stamped with a time of its own: whatever is made in it, or removed from it, moves its stamp to now.
+        let stamped = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let stamp = |folder: &Path| -> anyhow::Result<std::time::SystemTime> { Ok(std::fs::metadata(folder)?.modified()?) };
+        std::fs::File::open(&temp)?.set_modified(stamped)?;
+        anyhow::ensure!(stamp(&temp)? == stamped, "the folder keeps the stamp it's given");
+        let rewritten = crate::rt::block_on({
+            let s = s.clone();
+            async move {
+                s.call(|c| {
+                    let tx = tx(c)?;
+                    let n = tx.execute("UPDATE kv SET v = replace(v, 'a', 'b') WHERE k LIKE 'journal-%'", [])?;
+                    tx.commit()?;
+                    Ok(n)
+                })
+                .await
+            }
+        })?;
+        anyhow::ensure!(rewritten == ROWS, "the call rewrote its {ROWS} rows: {rewritten}");
+        anyhow::ensure!(stamp(&temp)? == stamped, "a call that rewrote {ROWS} pages made a temporary file: SQLite's folder for them changed");
+        // What the folder shows when SQLite does make one.
+        let other = Connection::open_in_memory()?;
+        other.execute_batch("CREATE TEMP TABLE grown (v BLOB); INSERT INTO grown SELECT randomblob(4000) FROM (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i FROM n);")?;
+        anyhow::ensure!(stamp(&temp)? != stamped, "a temporary table of 8 MB left SQLite's folder as it was: the folder doesn't show its temporary files");
+        Ok(())
+    }
+
     /// Goal 5, plan 01a1a59c2aae step 2 (checkpoints off the writer): the writer's connection
     /// checkpoints nothing itself (`wal_autocheckpoint` 0); with the WAL said to be past its bound, the
     /// writer checkpoints once itself, between two groups, and the write after starts the WAL over (it
