@@ -2481,7 +2481,7 @@ impl Registry {
 
     /// Whether a session holders.json names is neither listed nor said to be beyond the store.
     fn held_missing(hub: &Hub) -> bool {
-        let said = NOT_RESTORED.lock();
+        let said = NOT_RESTORED.load();
         hub.harness.holders.load().keys().any(|id| !hub.harness.sessions.contains(id) && !said.contains(id))
     }
 
@@ -2515,7 +2515,7 @@ impl Registry {
             match got {
                 Ok(row) => away.push(row),
                 Err(why) => {
-                    if NOT_RESTORED.lock().insert(id.clone()) {
+                    if not_restored_first(&id) {
                         tracing::warn!(session = %id, why = %why, "a session a runner process was last known to hold couldn't be listed again");
                     }
                 }
@@ -2526,7 +2526,7 @@ impl Registry {
         for (id, info) in reopened {
             let Some(status) = hub.harness.info(&id).map(|i| i.status) else {
                 // Its record doesn't say what it is or which machine it's on: it can't be listed, said once.
-                if NOT_RESTORED.lock().insert(id.clone()) {
+                if not_restored_first(&id) {
                     tracing::warn!(session = %id, "a session a runner process was last known to hold couldn't be listed again: its record doesn't say what it is or which machine it's on");
                 }
                 continue;
@@ -5249,8 +5249,13 @@ const RESTORE_EVENTS: usize = 200;
 static RESTORE_RETRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Held sessions said in the log already as not listed again (`Registry::restore_held`): once each,
-/// not at every runner's report.
-static NOT_RESTORED: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+/// not at every runner's report. A copy swapped in whole (goal 5, plan 01a1a59c2aae): every runner's inventory reads it.
+static NOT_RESTORED: std::sync::LazyLock<crate::rcu::Rcu<std::collections::HashSet<String>>> = std::sync::LazyLock::new(crate::rcu::Rcu::default);
+
+/// `id` said not restored: whether it's the first time ([`NOT_RESTORED`]).
+fn not_restored_first(id: &str) -> bool {
+    !NOT_RESTORED.load().contains(id) && NOT_RESTORED.update(|s| s.insert(id.to_owned()))
+}
 
 /// Whether runner process `holder` is one `me` came after: `me` a kiln id (UUIDv7, ordered by when
 /// it was made, `crate::util::new_id`), and the holder an older id, or a name from before runner

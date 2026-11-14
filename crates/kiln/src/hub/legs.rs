@@ -57,17 +57,33 @@ impl Default for Legs {
 
 /// What runners' connections say to the server's kernel between the scheduling loop's looks
 /// (docs/lb.md "At scale"): each runner's newest word, the jobs heard of at their runners, and each
-/// runner's pace as last passed to the CI engine. A connection puts its runner's word here under a
-/// lock held for a map insert, never the kernel's own: the scheduling loop takes it whole as it looks
-/// ([`Mail::take`]) and applies it ([`Legs::apply`]), so the kernel's records are written by that
-/// loop alone and stay in its core's cache. A lock the connections' cores wrote the records through
-/// cost a decision 2.2x to 58x as one to eight of them hammered it (`kiln_ci`'s bench,
-/// `--hinters`). Bounded by the fleet: one word a runner, the newest.
-#[derive(Debug, Default)]
+/// runner's pace as last passed to the CI engine. A connection puts its runner's word here with no
+/// lock (goal 5, plan 01a1a59c2aae), never in the kernel's own records: the scheduling loop takes it
+/// whole as it looks ([`Mail::take`]) and applies it ([`Legs::apply`]), so the kernel's records are
+/// written by that loop alone and stay in its core's cache. A lock the connections' cores wrote the
+/// records through cost a decision 2.2x to 58x as one to eight of them hammered it (`kiln_ci`'s
+/// bench, `--hinters`). Bounded by the fleet: one word a runner, the newest; the jobs heard of are
+/// those started, refused or ended between two looks.
 pub(crate) struct Mail {
-    words: HashMap<String, FastWord>,
-    heard: Vec<String>,
-    paces: HashMap<String, kiln_ci::sched::balance::Pace>,
+    /// Each runner's newest word since the last look, in a take-once cell of its own: the cells' map
+    /// changes only as a runner first speaks.
+    words: crate::rcu::Rcu<HashMap<String, Arc<arc_swap::ArcSwapOption<FastWord>>>>,
+    /// The jobs heard of, in the order they were.
+    heard: (crate::memory::queue::Sender<String>, crate::memory::queue::Receiver<String>),
+    /// Each runner's pace as last passed on, changed only when it does.
+    paces: crate::rcu::Rcu<HashMap<String, kiln_ci::sched::balance::Pace>>,
+}
+
+impl Default for Mail {
+    fn default() -> Self {
+        Mail { words: crate::rcu::Rcu::default(), heard: crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS), paces: crate::rcu::Rcu::default() }
+    }
+}
+
+impl std::fmt::Debug for Mail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mail").field("runners", &self.words.load().len()).field("heard", &self.heard.1.len()).finish()
+    }
 }
 
 /// What [`Mail::take`] took: the jobs heard of, in order, and each runner's newest word.
@@ -87,31 +103,42 @@ impl Mail {
     /// Runner `runner`'s newest word, in place of what it said before since the last look. Its
     /// measured pace when that changed, for the CI engine's load balancer (docs/lb.md "The CI
     /// engine"): the same runner's speed, whichever kernel ranks it.
-    pub(crate) fn word(&mut self, runner: &str, w: &FastWord) -> Option<kiln_ci::sched::balance::Pace> {
+    pub(crate) fn word(&self, runner: &str, w: &FastWord) -> Option<kiln_ci::sched::balance::Pace> {
         let pace = kiln_ci::sched::balance::Pace { speed: w.speed, slowness: w.slowness, measured: w.measured, disk: w.disk, net: w.net };
-        let changed = match self.paces.get_mut(runner) {
-            Some(p) if *p == pace => None,
-            Some(p) => {
-                *p = pace;
-                Some(pace)
-            }
-            None => {
-                self.paces.insert(runner.to_owned(), pace);
-                (pace != kiln_ci::sched::balance::Pace::default()).then_some(pace)
-            }
+        let changed = if self.paces.load().get(runner) == Some(&pace) {
+            None
+        } else {
+            self.paces.update(|m| match m.insert(runner.to_owned(), pace) {
+                Some(p) if p == pace => None,
+                Some(_) => Some(pace),
+                None => (pace != kiln_ci::sched::balance::Pace::default()).then_some(pace),
+            })
         };
-        self.words.insert(runner.to_owned(), *w);
+        let cell = self.words.load().get(runner).cloned();
+        let cell = match cell {
+            Some(c) => c,
+            None => self.words.update(|m| Arc::clone(m.entry(runner.to_owned()).or_insert_with(|| Arc::new(arc_swap::ArcSwapOption::empty())))),
+        };
+        cell.store(Some(Arc::new(*w)));
         changed
     }
 
     /// Job `job` was heard of at its runner (started, refused, or left it).
-    pub(crate) fn heard(&mut self, job: &str) {
-        self.heard.push(job.to_owned());
+    pub(crate) fn heard(&self, job: &str) {
+        // Unbounded, and its receiver is this mail's own: the send always goes.
+        let _ = self.heard.0.try_send(job.to_owned());
     }
 
-    /// What was said since the last look, all of it, leaving the paces.
-    pub(crate) fn take(&mut self) -> Taken {
-        Taken { heard: std::mem::take(&mut self.heard), words: std::mem::take(&mut self.words) }
+    /// What was said since the last look, all of it, leaving the paces. The words first, then the jobs
+    /// heard: a connection says a job's hearing before a word of its runner's that counts it, so every
+    /// hearing before a word taken here is taken with it.
+    pub(crate) fn take(&self) -> Taken {
+        let words = self.words.load().iter().filter_map(|(r, c)| Some((r.clone(), *c.swap(None)?))).collect();
+        let mut heard = Vec::new();
+        while let Ok(job) = self.heard.1.try_recv() {
+            heard.push(job);
+        }
+        Taken { heard, words }
     }
 }
 
@@ -430,7 +457,7 @@ mod tests {
         let key = Legs::kind(&[], &[], "");
         let mut direct = Legs::default();
         let mut mailed = Legs::default();
-        let mut mail = Mail::default();
+        let mail = Mail::default();
         for legs in [&mut direct, &mut mailed] {
             legs.hint("a", &word(8));
             legs.hint("b", &word(4));

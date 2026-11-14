@@ -218,7 +218,8 @@ pub static BROADCASTS: Owner = Owner::new("broadcasts");
 /// and of Mantle's client (`crate::memory::queue::answer`), files', archived records', git's and REAPI's bytes on
 /// their way to a response or a file (`crate::rt::file_source`, `crate::rt::file_sink`, `crate::harness::archive`,
 /// `crate::ci::facade`, `crate::ci::work::reapi`), Mantle's requests, an HTTP tunnel's answers and bindings
-/// (`crate::tunnel`), and the process's signals. Each item is counted at its place alone
+/// (`crate::tunnel`), the jobs runners were heard of for the server's placement kernel (`crate::hub::legs::Mail`),
+/// and the process's signals. Each item is counted at its place alone
 /// (`crate::memory::queue::places`, `crate::memory::queue::unbounded`), as many as each channel held, so its
 /// bytes aren't what they carry: not among [`ALL`], as the channels they were weren't counted.
 pub static CHANNELS: Owner = Owner::new("channels");

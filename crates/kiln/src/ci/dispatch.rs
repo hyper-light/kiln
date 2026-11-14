@@ -30,9 +30,11 @@ use crate::proto::{CAP_ACTIONS, CAP_CI2, CAP_DOCKER, CAP_LEASES, JobResult, LANE
 use crate::rcu::Rcu;
 use crate::store::{Repo, Status};
 
-fn preflight_slot() -> Option<async_lock::SemaphoreGuardArc> {
-    static SLOTS: std::sync::LazyLock<Arc<async_lock::Semaphore>> = std::sync::LazyLock::new(|| Arc::new(async_lock::Semaphore::new(32)));
-    SLOTS.try_acquire_arc()
+/// A dependency preflight's slot, if one is free: 32 at once, taken as a turn of a gate with no lock (`crate::turn::Gate`,
+/// goal 5, plan 01a1a59c2aae), never waited for.
+fn preflight_slot() -> Option<crate::turn::Turn<'static>> {
+    static SLOTS: crate::turn::Gate = crate::turn::Gate::new(32);
+    SLOTS.try_turn()
 }
 
 /// A run to start: a workflow that matched an event.
@@ -130,11 +132,11 @@ pub enum Msg {
     Start(Box<Start>),
     /// W29-R23: network preflight runs outside the dispatcher. Its bounded slot stays held
     /// until this message is consumed, bounding ready snapshots as well as active fetches.
-    PreparedStart { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, permit: async_lock::SemaphoreGuardArc },
+    PreparedStart { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, permit: crate::turn::Turn<'static> },
     PreparedRerun {
         run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, snapshot: Result<Box<super::locks::Frozen>, String>, fresh_actions: bool,
         no_reuse: bool, cold: bool, placed: HashMap<String, kiln_ci::sched::Placement>, by: String, agent: Option<String>,
-        reply: crate::memory::queue::Sender<Result<u32, String>>, permit: async_lock::SemaphoreGuardArc,
+        reply: crate::memory::queue::Sender<Result<u32, String>>, permit: crate::turn::Turn<'static>,
     },
     /// A runner connected (or said what it can do); `running` are the legs it still runs.
     RunnerUp { agent: String, running: Vec<String> },
@@ -189,7 +191,7 @@ pub enum Msg {
     Explain { leg: String, reply: crate::memory::queue::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
     Preview { start: Box<Start>, reply: crate::memory::queue::Sender<serde_json::Value> },
-    PreparedPreview { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, reply: crate::memory::queue::Sender<serde_json::Value>, permit: async_lock::SemaphoreGuardArc },
+    PreparedPreview { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, reply: crate::memory::queue::Sender<serde_json::Value>, permit: crate::turn::Turn<'static> },
     /// The stored routing rules changed (W05-R21): read them again.
     RoutingChanged,
     /// A run's deployments were reviewed (W15-R03): its legs held for approval are let go, or
