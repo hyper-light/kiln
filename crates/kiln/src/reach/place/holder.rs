@@ -7,7 +7,7 @@
 //! start, this node's own runs, a CI leg, an agent session, a word the owner says itself) reserves
 //! its room through the keeper before this runner's ledger starts it, and starts only on the
 //! keeper's grant; what waits on the start (a spec, a local run, a leg's or a session's answer)
-//! waits with it. A reserve not granted (refused, or unanswered once its wait ends: `Waits`) starts
+//! waits with it. A reserve not granted (refused, or unanswered as its link ends: `Waits`) starts
 //! nothing: a claim lapses, a kernel start is declined for room, a leg is refused, each saying why. A
 //! start that asks nothing reserves nothing and starts at once, its box numbered (its cold start). A
 //! run's reservation is kept with its record before its process starts, so this runner's next
@@ -201,9 +201,9 @@ impl Placer {
         self.keeper.as_ref().and_then(|h| h.holding.due())
     }
 
-    /// The time, for its holding's waits: a keeper that, its link alive, has said nothing for
-    /// longer than the slowest answer it has given is stalled, and each reserve waiting on it isn't
-    /// granted (docs/lb.md "Waits").
+    /// The time, for its holding's waits: a wait on a keeper that, its link alive, has said nothing
+    /// for longer than the slowest answer it has given has run out, told once to its patience; its
+    /// reserves go on waiting, following the keeper by its link (docs/lb.md "Waits").
     pub(super) fn keeper_woke(&mut self, now: i64) -> Vec<Out> {
         let Some(h) = self.keeper.as_mut() else { return Vec::new() };
         let out = h.holding.woke(now);

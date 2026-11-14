@@ -355,7 +355,7 @@ fn holder_a_reserve_not_granted_lapses_its_claim_and_the_run_waits() -> Result<(
     assert_eq!(a.live_claim(O1, "r1", g, 5), Some([4_000, 4 * GIB, 0, 0]), "a refusal of the lapsed claim leaves the new one: {out:?}");
     run_it(&mut a, "r1", g, 6)?;
     let mut out = Vec::new();
-    a.not_granted(O1, "r1", g, NotGranted::Unanswered(WaitEnded::Stalled), 7, &mut out);
+    a.not_granted(O1, "r1", g, NotGranted::Unanswered(WaitEnded::Reset), 7, &mut out);
     assert!(running(&a, "r1") && !a.records().is_empty(), "a run started stays started: {out:?}");
     a.check()
 }
@@ -413,30 +413,30 @@ fn holder_a_run_asking_nothing_starts_without_a_reservation() -> Result<(), Stri
 
 /// The holder's waits (no constants: Shards' R03, as the user restated it on 2026-11-13): nothing
 /// seeded, nothing multiplied. Before the keeper's first answer a word waits on liveness alone,
-/// however long; the first answer is the bound, and a word stalls only once it has waited longer
-/// than the slowest answer, timed from the answer before it where it waited behind one, so an
-/// answer as slow as the slowest is no stall. A late answer comes to its own word and makes the
-/// slowest what it took, which ends the stall. A link that dies ends every word on it, the slowest
-/// kept for the next link's. A hint, something from the keeper that answers no word, starts the
-/// oldest word's window again and times nothing (Hex's wait contract, decision 9: given up only
-/// after a whole window with nothing from the keeper). A runner told its keeper stalled takes
-/// nothing new, saying so.
+/// however long; the first answer is the bound, and a word's wait runs out only once it has waited
+/// longer than the slowest answer, timed from the answer before it where it waited behind one, so
+/// an answer as slow as the slowest is no run-out. A run-out says how long the word has waited. A
+/// late answer comes to its own word and makes the slowest what it took. A link that dies ends
+/// every word on it, the slowest kept for the next link's. A hint, something from the keeper that
+/// answers no word, starts the oldest word's window again and times nothing (Hex's wait contract,
+/// decision 9: run out only after a whole window with nothing from the keeper). A runner told its
+/// keeper unsynced takes nothing new, saying so.
 #[test]
 fn holder_waits_follow_the_keepers_liveness_and_progress_alone() -> Result<(), String> {
     let mut w = Waits::default();
     w.said(0);
-    assert_eq!((w.due(), w.stalled(i64::MAX)), (None, false), "a cold start waits on liveness alone");
+    assert_eq!((w.due(), w.ran_out(i64::MAX)), (None, None), "a cold start waits on liveness alone");
     assert_eq!(w.answered(40), Some(40));
     assert_eq!(w.slowest(), Some(40));
     w.said(100);
     w.said(110);
     assert_eq!(w.due(), Some(141), "the oldest word, past the slowest answer");
-    assert!(!w.stalled(140) && w.stalled(141));
-    assert_eq!(w.answered(140), Some(40), "as slow as the slowest: no stall");
+    assert_eq!((w.ran_out(140), w.ran_out(141)), (None, Some(41)), "run out once past the slowest answer, waited since its word");
+    assert_eq!(w.answered(140), Some(40), "as slow as the slowest: no run-out");
     assert_eq!(w.due(), Some(181), "the next word waited behind it, so it's timed from that answer");
-    assert!(w.stalled(181), "nothing answered for longer than the slowest answer");
+    assert_eq!(w.ran_out(181), Some(41), "nothing answered for longer than the slowest answer, waited since the answer before it");
     assert_eq!(w.answered(300), Some(160), "a late answer comes to its own word");
-    assert_eq!((w.slowest(), w.due(), w.stalled(1_000)), (Some(160), None, false), "the slowest is what it took");
+    assert_eq!((w.slowest(), w.due(), w.ran_out(1_000)), (Some(160), None, None), "the slowest is what it took");
     w.said(400);
     assert_eq!(w.ended(), 1, "the link died: its word ends");
     assert_eq!((w.waiting(), w.slowest()), (0, Some(160)), "the slowest stays the keeper's");
@@ -447,12 +447,11 @@ fn holder_waits_follow_the_keepers_liveness_and_progress_alone() -> Result<(), S
     // keeper. A hint answers nothing and shows it going on: the window runs from it.
     w.heard(700);
     assert_eq!(w.due(), Some(861), "a hint, something from the keeper, starts the window again");
-    assert!(!w.stalled(860) && w.stalled(861), "a whole window with nothing after it");
+    assert_eq!((w.ran_out(860), w.ran_out(861)), (None, Some(261)), "a whole window with nothing after it, waited since its word");
     assert_eq!(w.answered(900), Some(300), "the answer is timed from its word, not from the hint");
     assert_eq!(w.slowest(), Some(300));
     let mut a = runner(8, 16, 1000);
-    let _ = said(&mut a, Keeper::Unsynced(Unsynced::Stalled), 0);
-    assert_eq!(a.taking(), Err(Reason::Unsynced { why: Unsynced::Stalled.why().to_owned() }));
-    assert_eq!(NotGranted::Unanswered(WaitEnded::Stalled).why(), "its reserve went unanswered: its machine's capacity keeper said nothing for longer than the slowest answer it has given");
+    let _ = said(&mut a, Keeper::Unsynced(Unsynced::Joining), 0);
+    assert_eq!(a.taking(), Err(Reason::Unsynced { why: Unsynced::Joining.why().to_owned() }));
     a.check()
 }

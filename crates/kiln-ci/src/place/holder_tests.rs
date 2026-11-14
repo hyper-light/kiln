@@ -2,19 +2,21 @@
 //! keeper"; Hex's docs/design/capacity-view.md, "What kiln's runner implements as a holder", CV5,
 //! CV8, CV9, CV11; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 13), against Hex's own keeper
 //! over records in memory (`hex_api::capacity::sim::SimView`): each holder state, a run admitted
-//! only once synced and granted, a reserve with no answer given up and given back, a lost link and
+//! only once synced and granted, a reserve past the slowest answer running out once and waiting on
+//! its link, given up only as the link ends, a lost link and
 //! the sync after it, each close as the contract has it, survivors and releases counted against
 //! the claims it may hold, the keeper's refusals typed; and kiln-ci's simulator, runners holding
 //! through one keeper under crashes on either side, dropped links, partitions and heals, with no
 //! oversubscription on any seed and the two sides' books the same once healed.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Duration;
 
 use hex_api::capacity::sim::SimView;
 use hex_api::capacity::{self as hex, Budget, CapacityView, Held, Host, ReservationId, ToHolder, ToKeeper};
 
 use super::ask::{Ask, Peer, Sample};
-use super::holder::{BoxName, Event, Holding, Link, Numbering, Out, Paired};
+use super::holder::{BoxName, Event, Holding, KEEPER_WAIT, Link, Numbering, Out, Paired};
 use super::keeper::{Keeper, NotGranted, Unsynced, View, WaitEnded};
 use super::msg::{Reason, ToOwner};
 use super::runner::{Admission, Init, Records, Said, Settings, Start};
@@ -232,78 +234,118 @@ fn holder_a_run_starts_only_once_synced_and_granted() -> Result<(), String> {
     a.check()
 }
 
-/// The holder's item 5 under its waits (no constants: Shards' R03): its hello answered in 10 ms
-/// and its sync in 20, the slowest answer is 20 ms. Before then nothing is due (a cold start waits
-/// on liveness alone). A reserve said at 100 is due at 121: at 120 it still waits; at 121 the
-/// keeper, its link alive, has said nothing for longer than the slowest answer it has given,
-/// so it is stalled: the reserve isn't granted and is given back at once (the keeper may have
-/// granted it), and the runner stands `Stalled`, saying no reserve. The keeper's grant that comes
-/// late starts nothing and is given back too; its answer ends the stall and makes the slowest what
-/// it took; once both releases are answered the keeper holds nothing of the runner's.
-#[test]
-fn holder_a_reserve_with_no_answer_is_given_up_and_given_back() -> Result<(), String> {
-    let mut keeper = machine(8, 16, 1, most()?)?;
+/// A holding joined to `keeper` on link 1 at 0: its hello answered in 10 ms and its sync in 20, so
+/// the slowest answer is 20 ms. Before then nothing is due (a cold start waits on liveness alone).
+fn joined_slowest_20(keeper: &mut SimView) -> Result<Holding, String> {
     let mut h = holding("runner-1", 1, &[])?;
     let hello = h.linked(0);
     assert_eq!(h.due(), None, "before its first answer, no time bounds a wait");
-    let mut words = hello.send.into_iter();
-    let welcome = keeper.hear(1, words.next().ok_or("hello")?).map_err(debug)?;
-    let sync = h.heard(welcome, 10);
-    let mut words = sync.send.into_iter();
-    let synced = keeper.hear(1, words.next().ok_or("sync")?).map_err(debug)?;
-    let _ = h.heard(synced, 30);
-    assert_eq!(h.due(), None, "nothing waits");
-    let (id, word) = reserve(&mut h, amounts(2, 4), 100)?;
-    assert_eq!(h.due(), Some(121), "said at 100, stalled once it waited longer than the slowest answer, 20 ms");
-    let early = h.woke(120);
-    assert_eq!(early, Out::default(), "still a reserve at its due");
-    let stalled = h.woke(121);
-    assert_eq!(stalled.events, vec![Event::Keeper(Keeper::Unsynced(Unsynced::Stalled)), Event::NotGranted(id, NotGranted::Unanswered(WaitEnded::Stalled))]);
-    assert!(matches!(stalled.send.as_slice(), [ToKeeper::Release { id: r, .. }] if *r == id), "given back at once: {stalled:?}");
-    assert_eq!(h.reserve(amounts(1, 1), 122), Err(NotGranted::Unsynced(Unsynced::Stalled)), "nothing new while stalled");
-    assert_eq!(h.due(), None, "stalled: nothing more to wake for until an answer or the link's end");
-    let grant = keeper.hear(1, word).map_err(debug)?;
-    assert!(matches!(grant, ToHolder::Granted { .. }), "{grant:?}");
-    let late = h.heard(grant, 200);
-    assert!(!granted(&late.events, id), "nothing starts on a grant given up: {late:?}");
-    assert!(matches!(late.send.as_slice(), [ToKeeper::Release { id: r, .. }] if *r == id), "the late grant given back: {late:?}");
-    assert!(matches!(h.keeper(), Keeper::Synced(_)), "an answer ends the stall");
-    for word in stalled.send.into_iter().chain(late.send) {
-        let answer = keeper.hear(1, word).map_err(debug)?;
-        let _ = h.heard(answer, 210);
-    }
-    assert!(books(&keeper, "runner-1")?.is_empty(), "both releases answered, the keeper holds nothing of its");
-    let _ = reserve(&mut h, amounts(1, 1), 300)?;
-    assert_eq!(h.due(), Some(401), "the slowest answer now the late grant's, 100 ms");
-    Ok(())
-}
-
-/// Hex's holder wait contract (decision 9, as its lead restated it on 2026-11-13): a reserve is
-/// given up only after a whole window of the slowest answer with nothing from the keeper. Its hello
-/// answered in 10 ms and its sync in 20, a reserve said at 100 would be due at 121; Hex's boxes
-/// moving the view at 115 have the keeper hint the runner, something from it that answers nothing,
-/// so the reserve's window runs from 115: at 121 it is still waited for, at 136 a whole window has
-/// passed with nothing, and it is given up and given back. The hint times no answer.
-#[test]
-fn holder_a_hint_from_the_keeper_starts_its_reserves_window_again() -> Result<(), String> {
-    let mut keeper = machine(8, 16, 1, most()?)?;
-    let mut h = holding("runner-1", 1, &[])?;
-    let hello = h.linked(0);
     let welcome = keeper.hear(1, hello.send.into_iter().next().ok_or("hello")?).map_err(debug)?;
     let sync = h.heard(welcome, 10);
     let synced = keeper.hear(1, sync.send.into_iter().next().ok_or("sync")?).map_err(debug)?;
     let _ = h.heard(synced, 30);
-    let (id, _) = reserve(&mut h, amounts(2, 4), 100)?;
+    assert_eq!(h.due(), None, "nothing waits");
+    assert_eq!(h.patience().slowest(), Some(Duration::from_millis(20)), "its patience learned the slowest answer");
+    Ok(h)
+}
+
+/// Hex's holder wait contract (capacity-view.md CV6, the holder's item 4; decision 9): past the
+/// keeper's slowest answer a wait runs out, told once, and goes on following the keeper by its
+/// link; there is no stall verdict. The slowest answer is 20 ms; a reserve said at 100 is due at
+/// 121. At 120 it still waits; at 121 it has run out: told once to its patience (its next wait
+/// follows the keeper), nothing given up, nothing said to the keeper, the runner still synced and
+/// taking new reserves, and nothing more to wake for. Later wakes tell nothing again. The keeper's
+/// grant that comes late starts the run, and makes the slowest answer what it took (100 ms).
+#[test]
+fn holder_a_reserve_past_the_slowest_answer_runs_out_once_and_keeps_waiting() -> Result<(), String> {
+    let mut keeper = machine(8, 16, 1, most()?)?;
+    let mut h = joined_slowest_20(&mut keeper)?;
+    let (id, word) = reserve(&mut h, amounts(2, 4), 100)?;
+    assert_eq!(h.due(), Some(121), "said at 100, run out once it waited longer than the slowest answer, 20 ms");
+    assert_eq!(h.woke(120), Out::default(), "still within its window at 120");
+    assert_eq!(h.runs_out(), 0);
+    let ran_out = h.woke(121);
+    assert_eq!(ran_out, Out::default(), "a run-out gives nothing up and says nothing to the keeper: {ran_out:?}");
+    assert_eq!(h.runs_out(), 1, "told once");
+    assert_eq!(h.patience().deadline(), None, "its patience follows the keeper until an answer comes");
+    assert_eq!(h.patience().slowest(), Some(Duration::from_millis(20)), "a run-out is no sample");
+    assert!(matches!(h.keeper(), Keeper::Synced(_)), "no stall verdict: still synced, standing {:?}", h.keeper());
+    assert_eq!(h.due(), None, "told: nothing more to wake for until its answer or the link's end");
+    for later in [122, 500, 10_000] {
+        assert_eq!(h.woke(later), Out::default(), "nothing at {later}");
+    }
+    assert_eq!(h.runs_out(), 1, "never told again for the same wait");
+    let (next, next_word) = reserve(&mut h, amounts(1, 1), 150)?;
+    let grant = keeper.hear(1, word).map_err(debug)?;
+    assert!(matches!(grant, ToHolder::Granted { .. }), "{grant:?}");
+    let late = h.heard(grant, 200);
+    assert!(granted(&late.events, id), "the late grant starts the run that waited for it: {late:?}");
+    assert!(late.send.is_empty(), "nothing given back: {late:?}");
+    assert_eq!(h.patience().deadline(), Some(Duration::from_millis(100)), "the late answer is the slowest now, 100 ms");
+    assert_eq!(h.due(), Some(301), "the next word's window runs from that answer, the slowest 100 ms");
+    let answer = keeper.hear(1, next_word).map_err(debug)?;
+    assert!(granted(&h.heard(answer, 210).events, next));
+    assert_eq!(h.runs_out(), 1);
+    assert!(h.settled() && books(&keeper, "runner-1")?.len() == 2, "both held, the keeper's books the runner's");
+    Ok(())
+}
+
+/// A run-out gives nothing up; the link's end does (Hex's `Holder::link_down`, CV5): two reserves
+/// said at 100 and 105 wait past the slowest answer, the run-out told once, and as the link dies
+/// at 400 both are not granted, unanswered as it died, and the runner stands joining.
+#[test]
+fn holder_reserves_that_ran_out_are_given_up_only_as_the_link_ends() -> Result<(), String> {
+    let mut keeper = machine(8, 16, 1, most()?)?;
+    let mut h = joined_slowest_20(&mut keeper)?;
+    let (a, _) = reserve(&mut h, amounts(2, 4), 100)?;
+    let (b, _) = reserve(&mut h, amounts(1, 1), 105)?;
+    assert_eq!(h.woke(121), Out::default());
+    assert_eq!(h.woke(300), Out::default());
+    assert_eq!(h.runs_out(), 1, "one wait, one run-out told");
+    let ended = h.ended(WaitEnded::Died);
+    assert_eq!(
+        ended.events,
+        vec![Event::Keeper(Keeper::Unsynced(Unsynced::Joining)), Event::NotGranted(a, NotGranted::Unanswered(WaitEnded::Died)), Event::NotGranted(b, NotGranted::Unanswered(WaitEnded::Died))],
+        "given up as the link ended"
+    );
+    assert!(ended.send.is_empty(), "no link to say anything on: {ended:?}");
+    assert_eq!(h.due(), None, "nothing waits");
+    Ok(())
+}
+
+/// Hex's holder wait contract (decision 9, as its lead restated it on 2026-11-13): a wait runs out
+/// only after a whole window of the slowest answer with nothing from the keeper. Its hello
+/// answered in 10 ms and its sync in 20, a reserve said at 100 would be due at 121; Hex's boxes
+/// moving the view at 115 have the keeper hint the runner, something from it that answers nothing,
+/// so the reserve's window runs from 115: at 121 it is still within it, at 136 a whole window has
+/// passed with nothing, and it has run out, told once, the reserve still waiting. The hint times no
+/// answer.
+#[test]
+fn holder_a_hint_from_the_keeper_starts_its_reserves_window_again() -> Result<(), String> {
+    let mut keeper = machine(8, 16, 1, most()?)?;
+    let mut h = joined_slowest_20(&mut keeper)?;
+    let (id, word) = reserve(&mut h, amounts(2, 4), 100)?;
     assert_eq!(h.due(), Some(121));
     keeper.set_local(hex_amounts(1, 1)).map_err(debug)?;
     let hints: Vec<ToHolder> = keeper.hints().map_err(debug)?.into_iter().filter(|(to, _)| *to == 1).map(|(_, hint)| hint).collect();
     let [hint @ ToHolder::Hint { .. }] = hints.as_slice() else { return Err(format!("a hint for the synced link: {hints:?}")) };
     let _ = h.heard(hint.clone(), 115);
     assert_eq!(h.due(), Some(136), "the window runs from the keeper's last word");
-    assert_eq!(h.woke(121), Out::default(), "something came from the keeper within the window: still waited for");
-    let stalled = h.woke(136);
-    assert_eq!(stalled.events, vec![Event::Keeper(Keeper::Unsynced(Unsynced::Stalled)), Event::NotGranted(id, NotGranted::Unanswered(WaitEnded::Stalled))]);
-    assert!(matches!(stalled.send.as_slice(), [ToKeeper::Release { id: r, .. }] if *r == id), "given back at once: {stalled:?}");
+    assert_eq!(h.woke(121), Out::default(), "something came from the keeper within the window");
+    assert_eq!(h.runs_out(), 0, "not run out within the window");
+    assert_eq!(h.woke(136), Out::default(), "run out: nothing given up");
+    assert_eq!((h.runs_out(), h.due()), (1, None), "told once");
+    let answer = keeper.hear(1, word).map_err(debug)?;
+    assert!(granted(&h.heard(answer, 140).events, id), "its answer still comes to it");
+    Ok(())
+}
+
+/// Its waits go by their name in Hex's waits census.
+#[test]
+fn holder_waits_are_named_for_the_census() -> Result<(), String> {
+    let h = holding("runner-1", 1, &[])?;
+    assert_eq!((h.patience().name(), KEEPER_WAIT), ("kiln.place.keeper", "kiln.place.keeper"));
+    assert_eq!(h.patience().slowest(), None, "nothing seeded: a cold start learns from its first answer");
     Ok(())
 }
 
@@ -558,7 +600,7 @@ struct Runner {
 struct Tally {
     started: u64,
     unreserved: u64,
-    stalled: u64,
+    ran_out: u64,
     keeper_restarts: u64,
     crashes: u64,
     partitions: u64,
@@ -651,10 +693,8 @@ impl Sim {
                 }
                 Event::NotGranted(id, why) => {
                     r.asked.remove(&id);
-                    match why {
-                        NotGranted::Unanswered(WaitEnded::Stalled) => self.tally.stalled += 1,
-                        NotGranted::Room => self.tally.refused_room += 1,
-                        _ => {}
+                    if why == NotGranted::Room {
+                        self.tally.refused_room += 1;
                     }
                 }
                 Event::Synced { agree, released, adopted, disagreed } => {
@@ -754,7 +794,9 @@ impl Sim {
         let now = self.now;
         let Some(h) = self.runners.get_mut(i).and_then(|r| r.holding.as_mut()) else { return Ok(()) };
         if h.due().is_some_and(|due| due <= now) {
+            let told = h.runs_out();
             let out = h.woke(now);
+            self.tally.ran_out += h.runs_out().saturating_sub(told);
             return self.apply(i, out);
         }
         Ok(())
@@ -938,8 +980,8 @@ impl Sim {
 /// `capacity::sim::SimView`): one to three runners hold through one machine's keeper beside Hex's
 /// own boxes, under a nemesis that restarts the keeper from its records, crashes runners (their
 /// runs' work dying with them or outliving them), cuts links with what was on them (the keeper
-/// hearing it at once or later), drops sessions behind live links, delays words until the keeper
-/// stalls, and gives up starts. On every one of a fixed set of seeds, after every step, the work
+/// hearing it at once or later), drops sessions behind live links, delays words until their waits
+/// run out (each told once, nothing given up for it), and gives up starts. On every one of a fixed set of seeds, after every step, the work
 /// running fits the machine and is in the keeper's books; healed and settled, every 150 steps and
 /// at the end, each runner's books on both sides, its records and what runs are the same, and no
 /// sync disagreed. The nemesis is held to having tried each fault over the set.
@@ -959,7 +1001,7 @@ fn holder_sim_no_oversubscription_and_the_books_agree_once_healed() -> Result<()
         let t = &sim.tally;
         seen.started += t.started;
         seen.unreserved += t.unreserved;
-        seen.stalled += t.stalled;
+        seen.ran_out += t.ran_out;
         seen.keeper_restarts += t.keeper_restarts;
         seen.crashes += t.crashes;
         seen.partitions += t.partitions;
@@ -967,7 +1009,7 @@ fn holder_sim_no_oversubscription_and_the_books_agree_once_healed() -> Result<()
         seen.released_by_sync += t.released_by_sync;
         seen.refused_room += t.refused_room;
     }
-    let tried = [seen.started, seen.unreserved, seen.stalled, seen.keeper_restarts, seen.crashes, seen.partitions, seen.sessions_lost, seen.released_by_sync, seen.refused_room];
+    let tried = [seen.started, seen.unreserved, seen.ran_out, seen.keeper_restarts, seen.crashes, seen.partitions, seen.sessions_lost, seen.released_by_sync, seen.refused_room];
     assert!(tried.iter().all(|n| *n > 0), "the nemesis tried each fault: {seen:?}");
     Ok(())
 }
