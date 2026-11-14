@@ -3979,7 +3979,18 @@ impl Dispatch {
         let tree = Arc::clone(&r.tree);
         let acts = r.plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree });
         runs::log(&self.hub, run, seq, "cancel", None, Some(serde_json::json!({ "reason": reason }).to_string())).await?;
-        Box::pin(self.actions(run, acts)).await
+        Box::pin(self.actions(run, acts)).await?;
+        // Cancelled, with no leg of it left to stop, and its plan hasn't ended it: its plan waits
+        // for legs that were never made, so none will ever report to it. A run held behind its
+        // concurrency group as the server stopped is rebuilt so (W05-R25: its plan's first actions
+        // aren't given again, so its plan says its first legs are queued, and none has a row):
+        // production's runs #2758 to #2761 stayed queued through two restarts, whatever cancelled
+        // them (2026-11-13). It ends here, as a run that never started does.
+        let stranded = self.runs.get(run).is_some_and(|r| !r.keys.values().any(|id| self.legs.contains_key(id)));
+        if stranded {
+            return Box::pin(self.actions(run, vec![PlanAction::Finish(PlanC::Cancelled)])).await;
+        }
+        Ok(())
     }
 
     /// Some of a run's legs cancelled by their ids, the run going on (docs/ci.md W26-R21): each
