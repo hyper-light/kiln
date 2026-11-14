@@ -7279,11 +7279,12 @@ pub(crate) mod tests {
 
     /// Goal 10, plan 01a1a87b2dae step 4: a runner's Opens on their sessions' loops, then its inventory, a barrier on the
     /// control loop. The inventory is read once the Opens are taken by the sessions' owners: the sessions it no longer
-    /// lists are let go of, as when one loop took both, never left to an Open taken after it; the one it lists stays,
-    /// where it runs.
+    /// lists read crashed, as when one loop took both (an Open taken after it would leave one as its Open said), and stay
+    /// listed (3ee57cb8a, Ada 2026-11-13: never dropped while their machine is up); the one it lists stays, where it runs.
     #[test]
     fn g10_s4_a_runners_inventory_is_read_after_its_opens() -> anyhow::Result<()> {
         use crate::harness::core::Update;
+        use crate::harness::model::Status;
         use crate::wire::channel::Frame;
         crate::rt::block_on(async {
             let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
@@ -7311,8 +7312,12 @@ pub(crate) mod tests {
                 hub.harness.applied(id).await;
             }
             anyhow::ensure!(hub.harness.located_on(&kept, "fedora"), "{kept}, which the inventory lists, was let go of");
+            let status = |id: &str| hub.harness.info(id).map(|i| i.status);
+            anyhow::ensure!(status(&kept).is_some_and(|s| s != Status::Crashed), "{kept}, which the inventory lists, reads {:?}", status(&kept));
             for id in ids.iter().skip(1) {
-                assert!(hub.harness.info(id).is_none(), "{id}: its Open was taken after the inventory that no longer lists it");
+                let read = status(id);
+                anyhow::ensure!(read.is_some(), "{id}, on a machine that's up, was dropped");
+                assert_eq!(read, Some(Status::Crashed), "{id}: its Open was taken after the inventory that no longer lists it");
             }
             Ok(())
         })
