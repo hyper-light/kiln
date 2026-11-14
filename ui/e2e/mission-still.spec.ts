@@ -61,13 +61,22 @@ test("with nothing only the answer can tell, Mission control comes in still: its
   test.skip(REAL, "the mock's agents");
   // Every connected machine's runner current (none too old to run agents), and no notifications on offer.
   await page.route("**/api/push", (route) => route.fulfill({ json: { enabled: false, available: false, why: "Not here", public_key: null, kinds: [], muted: [], reached: null } }));
-  await page.route("**/api/harness/kinds", async (route) => {
-    const res = await route.fetch();
-    const kinds = (await res.json()) as Record<string, unknown[]>;
-    const machines = (await (await page.request.get("/api/agents")).json()) as { name: string; connected: boolean }[];
-    for (const m of machines) if (m.connected) kinds[`agent:${m.name}`] ??= kinds.local ?? [];
-    await route.fulfill({ response: res, json: kinds });
-  });
+  // The kinds as the page asks for them (`?shared=1`: each distinct list once, and which is each target's), or by target from a server before that.
+  await page.route(
+    (url) => url.pathname === "/api/harness/kinds",
+    async (route) => {
+      const res = await route.fetch();
+      const kinds = (await res.json()) as Record<string, unknown[]> | { lists: unknown[][]; targets: Record<string, number> };
+      const machines = (await (await page.request.get("/api/agents")).json()) as { name: string; connected: boolean }[];
+      const shared = "targets" in kinds && !Array.isArray(kinds.targets) ? (kinds as { lists: unknown[][]; targets: Record<string, number> }) : null;
+      for (const m of machines) {
+        if (!m.connected) continue;
+        if (shared) shared.targets[`agent:${m.name}`] ??= shared.targets.local ?? 0;
+        else (kinds as Record<string, unknown[]>)[`agent:${m.name}`] ??= (kinds as Record<string, unknown[]>).local ?? [];
+      }
+      await route.fulfill({ response: res, json: kinds });
+    },
+  );
   const frames = await framesOf(page);
   for (const part of PARTS) expect(moved(frames, part), `${part} moved`).toEqual([]);
   // The rows are the agents', not the skeleton's: their heights are their own.
