@@ -8,6 +8,7 @@
  * own controls and what the page asks is only watched, never answered in its place.
  */
 import { expect, test, type Page, type Request } from "@playwright/test";
+import { wholeList } from "./mission-list";
 
 test.skip(!!process.env.E2E_BASE_URL, "The scenarios organize only simulated agents");
 test.beforeEach(async ({ request }) => {
@@ -23,11 +24,11 @@ test.afterEach(async ({ page, request }) => {
 const row = (page: Page, id: string) => page.locator(`li.ms-row[data-agent="${id}"]`);
 /** The live list's rows, in order. */
 const ids = (page: Page) => page.locator('ul[data-list="live"] > li.ms-row').evaluateAll((rows) => rows.map((r) => r.getAttribute("data-agent") ?? ""));
-/** Mission control, once the app has started (a fresh mock server's first page takes a while): what follows is what's tested. */
-async function open(page: Page) {
-  await page.goto("/agents");
-  await page.locator('ul[data-list="live"] > li.ms-row').first().waitFor();
-}
+/**
+ * Mission control, once the app has started (a fresh mock server's first page takes a while): what
+ * follows is what's tested. The whole list in the page (mission-list.ts): these read rows wherever they are in it.
+ */
+const open = (page: Page) => wholeList(page);
 /** The row's ⋯ menu, and one of its items. */
 async function menu(page: Page, id: string, item: string) {
   await row(page, id)

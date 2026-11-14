@@ -5,6 +5,7 @@
  * mock, on a desktop and a phone.
  */
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { wholeList } from "./mission-list";
 
 /** Against a real kiln server (playwright.config.ts): these drive the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
@@ -46,7 +47,8 @@ async function onTheField(field: Locator) {
 
 test("Mission control's composers mark what's typed as an agent's composer does", async ({ page }, info) => {
   test.skip(REAL, "the mock's agents");
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): the agent picked is read wherever it is in it.
+  await wholeList(page);
 
   // Starting an agent: its first message's Markdown, marked as it's typed.
   const start = page.getByRole("textbox", { name: "Its first message" });

@@ -13,6 +13,7 @@
  * The head's controls sit on its hairline's ends, with room over and under its buttons. On a desktop and a phone.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { wholeList } from "./mission-list";
 
 /** Against a real kiln server (playwright.config.ts): these drive the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
@@ -115,7 +116,8 @@ async function settled(page: Page, row: string) {
 
 test("picking agents moves nothing: the list stays where it is, the head keeps its one line and its buttons their places", async ({ page }, info) => {
   test.skip(REAL, "the mock's agents");
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): agents are picked wherever they are in it.
+  await wholeList(page);
   await expect(page.locator("li.ms-row").first()).toBeVisible();
   const touch = await touchScreen(page);
   // By touch the line is there from Select on, before any agent is picked (and the head no taller for it).
@@ -186,7 +188,8 @@ function composerRows(page: Page) {
 
 test("messaging those picked, the composer has starting's rows: its line, the box, the To line where More options was, and no room left empty", async ({ page }) => {
   test.skip(REAL, "the mock's agents");
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): agents are picked wherever they are in it.
+  await wholeList(page);
   await expect(page.locator("li.ms-row").first()).toBeVisible();
   let last = "";
   await expect
@@ -243,7 +246,8 @@ test("the list's head sits on its hairline's ends, as the filter and the sort ov
   page,
 }) => {
   test.skip(REAL, "the mock's agents");
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): agents are picked wherever they are in it.
+  await wholeList(page);
   await expect(page.locator("li.ms-row").first()).toBeVisible();
   // As far over and under its buttons as they are apart.
   const placed = { left: 0, right: 0, above: 8, below: 8 };
@@ -256,7 +260,8 @@ test("the list's head sits on its hairline's ends, as the filter and the sort ov
 
 test("Clear, or putting back the last one picked, ends selecting", async ({ page }) => {
   test.skip(REAL, "the mock's agents");
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): agents are picked wherever they are in it.
+  await wholeList(page);
   const touch = await touchScreen(page);
   await pick(page, "fam-orch", "att-ci");
   await expect(bulk(page, 2)).toBeVisible();
@@ -277,7 +282,8 @@ test("Clear, or putting back the last one picked, ends selecting", async ({ page
 
 test("selected agents are stopped and moved at once, each as its own would be, and how it went opens to each", async ({ page }, info) => {
   test.skip(REAL, "the mock's agents");
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): agents are picked wherever they are in it.
+  await wholeList(page);
   // "Fix the flaky retry test" works (Codex, on metal-ryzen-01); "Update the docs" is ready (Claude Code, on metal-ryzen-02).
   await pick(page, "fam-tests", "fam-docs");
   await expect(bulk(page, 2)).toBeVisible();
@@ -336,7 +342,8 @@ test("selected agents are stopped and moved at once, each as its own would be, a
 
 test("a selected agent's goals are paused and resumed, and ending it offers the agents it started", async ({ page }) => {
   test.skip(REAL, "the mock's agents");
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): agents are picked wherever they are in it.
+  await wholeList(page);
   // "Release prep" runs its goals, and started three agents that still run.
   await pick(page, "fam-orch");
   await expect(bulk(page, 1)).toBeVisible();
@@ -363,7 +370,8 @@ test("a selected agent's goals are paused and resumed, and ending it offers the 
 test("ending selected agents ends each, and they leave the list and the selection", async ({ page }, info) => {
   test.skip(REAL, "the mock's agents");
   test.skip(info.project.name !== "desktop", "once: it ends the mock's agents for good");
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): agents are picked wherever they are in it.
+  await wholeList(page);
   // The plan run's two steps' agents: "Step 1: Freeze main" and "Step 2: Run the full bench".
   await pick(page, "run-freeze", "run-bench");
   await inMenu(page, () => action(page, "End…").click());
@@ -376,7 +384,8 @@ test("ending selected agents ends each, and they leave the list and the selectio
 test("mc_attention: parking 5 from the Actions menu leaves one Undo where they were, and Undo puts all 5 back in their places", async ({ page }) => {
   test.skip(REAL, "the mock's agents");
   expect((await page.request.post("/api/mock/attention/reset")).ok()).toBe(true);
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): agents are picked wherever they are in it.
+  await wholeList(page);
   const order = () => page.locator('ul[data-list="live"] > li.ms-row').evaluateAll((rows) => rows.map((r) => r.getAttribute("data-agent") ?? ""));
   await expect(page.locator("li.ms-row").first()).toBeVisible();
   const five = ["att-ci", "demo-claude", "demo-codex", "demo-long", "fam-orch"];
