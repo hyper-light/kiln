@@ -4967,6 +4967,45 @@ mod tests {
         })
     }
 
+    /// W05-R25: a run the rebuild brings back with none of its legs made ends when it's cancelled.
+    /// Held behind its concurrency group as the server stopped, a run never started: it has its row
+    /// and its plan, and no leg. The rebuild takes it for one that had started (its plan's first
+    /// actions aren't given again), so its plan says its first legs are queued, and waits for them.
+    /// A cancel then changed nothing: the plan cancelled legs the dispatcher never made, and went on
+    /// waiting for their reports (production's runs #2758 to #2761, 2026-11-13: queued through two
+    /// restarts, whatever cancelled them). With no leg left to stop it ends cancelled, as a run that
+    /// never started does.
+    #[test]
+    fn w05_r25_a_run_rebuilt_with_none_of_its_legs_made_ends_when_cancelled() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let src = "on: push\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: x\n";
+            let (wf, diags) = kiln_ci::wf::parse_workflow(".kiln/ci.yaml", src, kiln_ci::expr::Dialect::Kiln);
+            let model = serde_json::to_string(&wf.ok_or_else(|| anyhow::anyhow!("{diags:?}"))?)?;
+            // As `start` leaves a run it holds behind its group: its row and its plan, no leg.
+            hub.store.call(|c| Ok(c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/x', '', 0)")?)).await?;
+            let repo = hub.store.repos().await?.into_iter().find(|r| r.id == "r").ok_or_else(|| anyhow::anyhow!("no repository"))?;
+            let new = super::runs::NewRun { id: "R".into(), workflow: ".kiln/ci.yaml".into(), name: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), model, input: "{}".into(), ..Default::default() };
+            super::runs::create(&hub, &repo, new).await?;
+            // The server starts again.
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            // Its status and conclusion, whether its plan is done, and how many legs it has.
+            let stands = || {
+                hub.store.call(|c| {
+                    let read = "SELECT r.status, r.conclusion, p.done, (SELECT COUNT(*) FROM jobs WHERE run_id = r.id) FROM runs r JOIN ci_plans p ON p.run_id = r.id WHERE r.id = 'R'";
+                    Ok(c.query_row(read, [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, bool>(2)?, r.get::<_, i64>(3)?)))?)
+                })
+            };
+            anyhow::ensure!(d.runs.contains_key("R") && d.legs.is_empty(), "rebuilt, with none of its legs made");
+            assert_eq!(stands().await?, ("queued".to_owned(), None, false, 0));
+            d.handle(super::Msg::Cancel { run: "R".into(), reason: "cancelled by a test".into() }).await;
+            assert_eq!(stands().await?, ("cancelled".to_owned(), Some("cancelled".to_owned()), true, 0), "cancelled, it ended");
+            anyhow::ensure!(!d.runs.contains_key("R"), "the dispatcher let go of it");
+            Ok(())
+        })
+    }
+
     /// A runner of the hub's, `slots` of them, labelled as the legs [`queue`] makes ask.
     fn runner(name: &str, slots: u32) -> crate::hub::AgentLive {
         crate::hub::AgentLive { labels: vec!["kiln".into()], slots, ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
