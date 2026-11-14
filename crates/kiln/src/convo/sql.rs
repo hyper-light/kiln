@@ -129,23 +129,56 @@ pub const EVENTS_RESET: &str = "DELETE FROM events WHERE session = ?1 AND seq >=
 /// A session's newest events by number alone, for listing a session again (`Store::restorable_committed`):
 /// `events_by_seq` (session, seq) gives them in order, read backwards and stopped at the limit, with no sort of the
 /// session's events (EVENTS_LAST's `rev` key isn't in an index; on a session of hundreds of thousands of events its
-/// sort outlasted READ_WAIT, 2026-11-13 08:41Z).
+/// sort outlasted READ_WAIT, 2026-11-13 08:41Z). [`EVENTS_LAST`] and [`EVENTS_BEFORE`] say the order a page has; no
+/// read runs them any more (`EVENTS_BEFORE_BY_SEQ`), and the store's tests hold its pages to theirs.
 pub const EVENTS_NEWEST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 ORDER BY seq DESC LIMIT ?2";
 pub const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 ORDER BY seq DESC, rev DESC LIMIT ?2";
 /// A session's `?3` events before event number `?2`, newest first.
 pub const EVENTS_BEFORE: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 AND seq < ?2 ORDER BY seq DESC, rev DESC LIMIT ?3";
+
+/// [`EVENTS_BEFORE`] and [`EVENTS_LAST`] by number alone, each event with its durable revision last: `events_by_seq`
+/// (session, seq) read backwards from the page's end and stopped at the limit, so a page costs its own events and no
+/// more, wherever it is in however long a session. W21-R02's "Earlier messages".
+///
+/// Each names its index (`INDEXED BY`), because Turso's planner can't be left to choose it. Given a session and a
+/// bound on the number, it costs this index and the primary key's (`sqlite_autoindex_events_1 (session=?)`) the same,
+/// and takes whichever its schema lists first: this one in a process that opened the store's file, the primary key's
+/// in one that made the file, which then reads the session's every event and sorts them for each page. A number's own
+/// events ([`EVENTS_AT`]) it reads by the primary key's in both, and [`EVENTS_BEFORE`], whose `rev` key no index has,
+/// it sorts in both. Counted by the statements' own metrics on a session of 100,000 events (400 bytes each; vendored
+/// Turso 0.9.0-pre.1, 2026-11-13): a page of 101 from its middle read 100,100 rows in 751,469 VM steps and a sort
+/// (67 ms) by the primary key's index, and 100 rows in 924 steps and no sort (0.08 ms) by this one, the same 924
+/// steps at the session's start, at its end and in a session of 300 events. On kiln's lab (`kiln-lab bar`), an older
+/// page of a 45,154-event session took 0.7 to 10 s by how many events lay before it.
+///
+/// Events that share a number (another id took it) come here in no order of their own: the reader takes the last
+/// number's all ([`EVENTS_AT`]) and orders what it read as those two do (`Link::newest`).
+pub const EVENTS_BEFORE_BY_SEQ: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events INDEXED BY events_by_seq WHERE session = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3";
+pub const EVENTS_LAST_BY_SEQ: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events INDEXED BY events_by_seq WHERE session = ?1 ORDER BY seq DESC LIMIT ?2";
+/// Every event of a session numbered `?2`, each with its durable revision last.
+pub const EVENTS_AT: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events INDEXED BY events_by_seq WHERE session = ?1 AND seq = ?2";
 
 /// The columns an event row is read from, in this order.
 pub const EVENT_COLUMNS: usize = 12;
 /// A search looks at events newest first by an index, a slice at a time: across every agent by
 /// time (`events_by_time`), from `?1` back; in one agent's by number (`events_by_seq`), from `?2`
 /// back. Each row: its rowid, the key it goes in order of, its time, kind, tool, status, text.
+///
+/// One agent's names its index, as its pages' statements do and for their reason ([`EVENTS_BEFORE_BY_SEQ`]): left to
+/// choose, Turso's planner reads it by `events_by_seq` in a process that opened the store's file and by the primary
+/// key's index, every event of the session sorted before the first is looked at, in one that made the file.
 pub const SEARCH_ALL: &str = "SELECT rowid, at, at, kind, tool, status, text FROM events WHERE at <= ?1 ORDER BY at DESC, rowid DESC";
-pub const SEARCH_SESSION: &str = "SELECT rowid, seq, at, kind, tool, status, text FROM events WHERE session = ?1 AND seq <= ?2 ORDER BY seq DESC, rowid DESC";
+pub const SEARCH_SESSION: &str = "SELECT rowid, seq, at, kind, tool, status, text FROM events INDEXED BY events_by_seq WHERE session = ?1 AND seq <= ?2 ORDER BY seq DESC, rowid DESC";
 /// W21-R02: bounded timeline Find sees the newest durable revision at each sequence, as history
 /// paging does. Filter obsolete ids before matching their text; legacy search keeps its contract.
-pub const SEARCH_CANONICAL_SESSION: &str = "SELECT e.rowid, e.seq, e.at, e.kind, e.tool, e.status, e.text FROM events e WHERE e.session = ?1 AND e.seq <= ?2
-    AND NOT EXISTS (SELECT 1 FROM events newer WHERE newer.session = e.session AND newer.seq = e.seq
+///
+/// Both of its reads name `events_by_seq`. Whether a number has a newer event is asked for each event looked at, and
+/// left to choose, Turso's planner answered it by the primary key's index: the session's every event read for each one
+/// looked at. Counted by the statement's own metrics (vendored Turso 0.9.0-pre.1, 2026-11-13): 200 events looked at
+/// in a session of 300 read 59,999 rows in 366,214 VM steps (197 ms), and with the index named 398 rows in 7,413
+/// steps (0.8 ms), as in a session of 100,000 (402 rows, 7,459 steps).
+pub const SEARCH_CANONICAL_SESSION: &str = "SELECT e.rowid, e.seq, e.at, e.kind, e.tool, e.status, e.text FROM events e INDEXED BY events_by_seq WHERE e.session = ?1 AND e.seq <= ?2
+    AND NOT EXISTS (SELECT 1 FROM events newer INDEXED BY events_by_seq WHERE newer.session = e.session AND newer.seq = e.seq
         AND (newer.rev > e.rev OR (newer.rev = e.rev AND newer.rowid > e.rowid))) ORDER BY e.seq DESC, e.rowid DESC";
 /// An event a search found, whole.
 pub const EVENT_BY_ROWID: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE rowid = ?1";
