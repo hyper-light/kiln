@@ -28,6 +28,34 @@ export function entriesOf(rows: readonly MissionRow[], sectioned: boolean): Entr
   return out;
 }
 
+/**
+ * `entries` with each open tree of subagents after its agent's row (`open`: the agents whose trees
+ * are open; one without subagents has none): a line of the list of its own (`tree:<agent>`), as tall
+ * as its subagents are many, so the list is windowed line by line (W21-R02).
+ */
+export function withTrees(entries: Entry[], open: ReadonlySet<string>): Entry[] {
+  if (open.size === 0) return entries;
+  return entries.flatMap((e) => (e.row && e.key.startsWith("row:") && open.has(e.row.a.id) && (e.row.a.subagents?.length ?? 0) > 0 ? [e, { key: `tree:${e.row.a.id}`, row: e.row }] : [e]));
+}
+
+/**
+ * Where the rows acted on (`ids`) are in the lists on the page (`lists`, in the page's order, each
+ * with its lines' keys): the list the first of them is in, and the lines before and after it that
+ * stay (not one acted on, not the Undo, not a tree, which goes with its row). Read from the lists as
+ * they are, not from the page: a windowed list has only the rows near the viewport on it (W21-R02).
+ */
+export function placeOf(ids: readonly string[], lists: readonly { list: string; keys: readonly string[] }[]): { list: string; key: string; prev: string | null; next: string | null } | null {
+  const acted = new Set(ids.map((id) => `row:${id}`));
+  const stays = (key: string) => key !== "undo" && !key.startsWith("tree:") && !acted.has(key);
+  for (const { list, keys } of lists) {
+    const at = keys.findIndex((key) => acted.has(key));
+    const key = keys[at];
+    if (key === undefined) continue;
+    return { list, key, prev: keys.slice(0, at).findLast(stays) ?? null, next: keys.slice(at + 1).find(stays) ?? null };
+  }
+  return null;
+}
+
 /** Where a row was when you acted on it (the list it was in, what was before and after it, its height): its Undo stands there. */
 export interface Anchor {
   list: string;

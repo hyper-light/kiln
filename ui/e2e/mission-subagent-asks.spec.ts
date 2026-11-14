@@ -6,6 +6,7 @@
  * (a notification's link): each lands on its thread.
  */
 import { expect, test } from "@playwright/test";
+import { wholeList } from "./mission-list";
 
 /** Against a real kiln server (playwright.config.ts): these drive the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
@@ -17,7 +18,8 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("Answer on a subagent's question opens it under its row, and the answer goes to that subagent", async ({ page }) => {
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): its row is read wherever it is in it.
+  await wholeList(page);
   const row = page.locator('.ms-row[data-agent="ask-lead"]');
   await expect(row.locator(".ms-text")).toHaveText("Its subagent “Step 2: Exec through a seed”: Asks: Which goes first, observe's gate or mine?");
   const sent = page.waitForRequest((r) => r.method() === "POST" && new URL(r.url()).pathname === "/api/harness/sessions/ask-s2/command");
@@ -31,7 +33,8 @@ test("Answer on a subagent's question opens it under its row, and the answer goe
 });
 
 test("Allow on a subagent's request goes to that subagent, and Review opens its thread", async ({ page }) => {
-  await page.goto("/agents");
+  // The whole list in the page (mission-list.ts): its row is read wherever it is in it.
+  await wholeList(page);
   const row = page.locator('.ms-row[data-agent="ask-perm"]');
   await expect(row.locator(".ms-text")).toHaveText("Its subagent “Step 1: Check the figures”: Bash: npm run figures -- --check");
   await expect(row.locator("a.ms-link", { hasText: "Review" })).toHaveAttribute("href", "/agents/ask-perm?task=ask-perm-s1");
