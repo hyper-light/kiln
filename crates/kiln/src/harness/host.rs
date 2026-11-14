@@ -5117,7 +5117,10 @@ mod tests {
     }
 
     /// A stand-in for Claude Code: it answers kiln's initialize and each turn (a turn that says
-    /// "long" goes on for a minute), and notes in `heard` each line it reads, with its pid.
+    /// "long" goes on for a minute; a message that says "had already" it only says back, as Claude
+    /// Code does one it has in the conversation; of one that says "says nothing" it says nothing),
+    /// answers an interrupt with what it still holds, and notes in `heard` each line it reads, with
+    /// its pid.
     #[cfg(unix)]
     pub(crate) fn stand_in(dir: &std::path::Path) -> anyhow::Result<(PathBuf, PathBuf)> {
         use std::os::unix::fs::PermissionsExt;
@@ -5152,9 +5155,21 @@ while True:
         resp = {}
         if req.get("subtype") == "initialize":
             resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": "2.1.296"}
+        # What it still holds in its queue, as Claude Code answers an interrupt (2.1.296 on): nothing, as it runs
+        # each message to its end before it reads the next line.
+        if req.get("subtype") == "interrupt":
+            resp = {"still_queued": []}
         out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
     elif m.get("type") == "user":
         uid = m.get("uuid")
+        # One it has in the conversation already under that id: as Claude Code does (2.1.322), it only says it
+        # back, with no lifecycle and no turn.
+        if "had already" in json.dumps(m.get("message")):
+            out({"type": "user", "message": m.get("message"), "session_id": session, "parent_tool_use_id": None, "uuid": uid, "isReplay": True})
+            continue
+        # One it says nothing of at all.
+        if "says nothing" in json.dumps(m.get("message")):
+            continue
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
         out({"type": "system", "subtype": "init", "cwd": ".", "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": "2.1.296"})
         if "long" in json.dumps(m.get("message")):
@@ -5170,6 +5185,68 @@ while True:
         std::fs::write(&program, format!("#!/bin/sh\nexec python3 '{}' '{}' \"$@\"\n", fake.display(), heard.display()))?;
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
         Ok((program, heard))
+    }
+
+    /// CP-T3.2 (each message once). Quiver, 2026-11-13: paused at its usage limit and told to go on
+    /// on another machine now, it said it was moving and never went. kiln had given Claude Code
+    /// messages it had in the conversation already; Claude Code only said them back, kiln held them
+    /// in flight for good, and the move waited for a turn that wasn't under way. Now what Claude
+    /// Code says back alone isn't in flight: the session comes to rest, and its move goes as far as
+    /// handing it over (which this machine, reaching no other, can't do, and says).
+    #[cfg(unix)]
+    #[test]
+    fn cp_t3_2_an_agent_given_a_message_claude_code_had_already_comes_to_rest_and_moves() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (program, _heard) = stand_in(dir.path())?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("held".into()), spec)?;
+            let idle = || s.pid.lock().is_some() && s.core.lock().state.status == Status::Idle;
+            let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
+            until_it("the stand-in's start", 300, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            assert!(host.command("held", message("m1", "hello")));
+            until_it("m1's turn, over", 60, || idle() && s.core.lock().state.harness_session.is_some()).await?;
+            assert!(host.command("held", message("m2", "one it had already")));
+            until_it("m2 said back, and the session at rest", 60, || idle() && s.core.lock().state.delivery.get("m2") == Some(&super::super::model::Delivery::Completed)).await?;
+            assert!(host.command("held", Command::MoveTo { to: "elsewhere".into(), cwd, note: None, now: true, kind: None, model: None, local: false, native: false }));
+            until_it("its move, tried", 60, || said("Couldn't move to elsewhere")).await?;
+            assert!(!s.core.lock().hold, "it goes on here: nothing waits on the move");
+            assert!(host.close("held"));
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2. Quiver's own case, 2026-11-13: held as working by messages nothing would end (given
+    /// by a kiln from before the one above, Claude Code's answer to them long past), then told to go
+    /// on on another machine now. The move's interrupt is answered with what Claude Code still holds
+    /// in its queue: none of them, so they leave the messages in flight, the session comes to rest
+    /// and its move goes as far as handing it over. Before, it said "Moving to … now" and waited for
+    /// good.
+    #[cfg(unix)]
+    #[test]
+    fn cp_t3_2_an_agent_held_as_working_by_a_message_nothing_ends_moves_when_told_to_go_now() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (program, _heard) = stand_in(dir.path())?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("wedged".into()), spec)?;
+            let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
+            until_it("the stand-in's start", 300, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            assert!(host.command("wedged", message("m1", "hello")));
+            until_it("m1's turn, over", 60, || s.core.lock().state.status == Status::Idle && s.core.lock().state.harness_session.is_some()).await?;
+            assert!(host.command("wedged", message("m2", "one it says nothing of")));
+            until_it("m2 written, and the session held as working", 60, || s.core.lock().state.delivery.get("m2") == Some(&super::super::model::Delivery::Sent) && s.core.lock().state.status == Status::Running).await?;
+            assert!(host.command("wedged", Command::MoveTo { to: "elsewhere".into(), cwd, note: None, now: true, kind: None, model: None, local: false, native: false }));
+            until_it("its move, tried", 60, || said("Couldn't move to elsewhere")).await?;
+            assert!(host.close("wedged"));
+            Ok(())
+        })
     }
 
     /// Kiln's Agentfile for Claude Code, as an isolated session started with none named is made from.

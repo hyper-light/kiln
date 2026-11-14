@@ -124,6 +124,23 @@ stopped (what's open, below, says when it doesn't). What the harness was handed 
 ends dropped, never left on its way; and when the agent ends, so does what still waited to go.
 Before, a switch out of a Codex still starting lost the message, which said queued for good.
 
+**A turn cut short.** A message Claude Code has taken into its conversation (it says each back as
+it does) and then says is cancelled had its turn cut short: by a message sent to go now, a stop, or
+kiln's own interrupt at a usage limit or for a move. It's in the conversation, so it isn't given
+again, and whatever cut the turn says how it's picked up (a usage limit's pause goes on with it at
+the reset, or on the machine the agent moves to). Only a message Claude Code never took (refused,
+or dropped from its queue: never said back) is kept and given again. Given a message it has already
+under that id, Claude Code only says it back, with no lifecycle and no turn (resumed with it in its
+transcript, it says it completed): that's its answer, and the message isn't in flight. An
+interrupt's answer names what Claude Code still holds in its queue (`still_queued`): a message kiln
+wrote before asking, that it neither holds nor ever started, leaves the messages in flight too,
+kept for another try where kiln keeps it, kiln's own dropped. Before, kiln took every cancelled
+message for one Claude Code never got and gave it again; Claude Code said it back and no more, and
+kiln held it in flight for good: the agent read as working, its queue never went, its usage limit's
+pause could never go on, and a move waited for a turn that wasn't under way (Quiver, 2026-11-13:
+three messages held so for ten hours, and "Go on now" from its usage limit said it was moving and
+never went).
+
 **One runner a machine.** A session an older runner process hands to its machine's newest
 (docs/releases.md, "One runner a machine") goes as a move does: it takes no messages as it's handed
 over, its inbox's newest ids go with it (the newest process keeps an inbox of its own, in its own
