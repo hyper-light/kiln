@@ -748,7 +748,10 @@ declared `[telemetry] sample_seconds` cadence (W21-R15); placement measures inde
   directory's free space (APFS's important-use figure too), pressure (Linux PSI `some`/`full` for
   CPU, memory and I/O, the machine's and the runner's own cgroup's, from their cumulative stall
   times; macOS's memory pressure level) and the work device's throughput, latency, queue and
-  errors from the OS's own counters. A read costs microseconds and starts nothing.
+  errors from the OS's own counters. A read costs microseconds and starts nothing. What a runner
+  offers placement is its own budget, as its cgroups bound it (AUDIT M6): its CPUs as its affinity
+  and the least `cpu.max` above it allow, idle as that quota less what its tasks used, its memory as
+  the least `memory.max` allows (a runner in a container offers the container, not the machine).
 - **What the work volume is** (`RunnerFacts.storage`, probed with the other facts, unprivileged):
   file system, mount, source, network or not, and each device under it with its kind by
   interconnect before medium flag (NVMe, SSD, HDD, network, virtual, RAM), its model, size and,

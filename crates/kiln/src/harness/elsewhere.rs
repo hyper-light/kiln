@@ -133,7 +133,7 @@ fn rank(mut options: Vec<Choice>) -> Option<Choice> {
 }
 
 /// How full an account is, as its sessions' limits say: the most used window that hasn't reset.
-fn fullest(limits: &[&Limit], now: i64) -> f64 {
+pub(crate) fn fullest(limits: &[&Limit], now: i64) -> f64 {
     limits
         .iter()
         .filter(|l| l.unit.is_none() && l.resets_at.is_none_or(|r| r > now))

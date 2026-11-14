@@ -959,7 +959,11 @@ it (docs/reach.md §8) gives it then.
 must run there. kiln's load balancer places it among the machines that suit and have the harness
 installed (docs/reach.md §2.3), as it places commands; outposts and job pods never get it, and a
 fleet whose runners don't place sessions yet gives it the one with the most idle cores, then free
-memory. Without `on`, an agent's child runs on the
+memory. Placed by what it needs, it goes only where its harness is signed in and its account has
+room, as far as kiln knows: each machine's accounts are checked once, and again when its harnesses
+change (or its accounts page, or a move at a usage limit, checks them), and an account's use is
+what its sessions report. A machine kiln knows nothing of yet stays a choice; when none that suits
+can take it, it's refused, naming why for each, and `on` naming a machine starts it there anyway. Without `on`, an agent's child runs on the
 agent's own machine, in its folder unless `cwd` says otherwise; a person's runs on the server
 when it runs agents, else on the best runner with the harness. A child on another machine starts
 in that machine's home unless `cwd` names a folder there. A machine named, or the agent's own,

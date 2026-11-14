@@ -6,7 +6,8 @@
 //! back) is read from its output and shown in the console. What is typed in goes to the CLI only:
 //! it is never logged, kept once the sign-in ends, or shown again.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -347,12 +348,58 @@ fn emit(hub: &Hub, flow: &Flow) {
     hub.emit(&crate::wire::events::ServerEvent::AccountFlow { flow: Box::new(flow.clone()) });
 }
 
+/// Each machine's accounts as its latest status check said them ([`status`]), with the harnesses
+/// it had installed then: what placing an agent reads without asking the machine again
+/// (`harness::lineage`, docs/agents.md "Where a child runs").
+static KNOWN: LazyLock<Mutex<HashMap<String, (Vec<String>, Vec<Account>)>>> = LazyLock::new(Mutex::default);
+/// The machines a status check is under way on, from [`tick`]: one at a time each.
+static ASKING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// The harnesses kiln knows `target` has installed, sorted.
+fn installed(hub: &Hub, target: &str) -> Vec<String> {
+    let mut ids: Vec<String> = hub.harness.kinds().get(target).map(|k| k.iter().filter(|k| k.available).map(|k| k.id.clone()).collect()).unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// Harness `kind`'s account on `target` as the latest status check there said it; none before one.
+pub fn known(target: &str, kind: &str) -> Option<Account> {
+    KNOWN.lock().get(target).and_then(|(_, accounts)| accounts.iter().find(|a| a.kind == kind).cloned())
+}
+
+/// Every few seconds (`goals::run`): each connected machine never checked, or whose installed
+/// harnesses changed since its last check, has its accounts checked in the background, one check
+/// at a time on each. A machine signed out by hand is seen at its next check (its accounts page,
+/// a move at a usage limit, a harness installed or updated).
+pub fn tick(hub: &Arc<Hub>) {
+    let mut targets: Vec<String> = hub.agents.load().values().filter(|a| a.connected && !a.outpost && !a.ephemeral).map(|a| format!("agent:{}", a.name)).collect();
+    targets.push("local".to_owned());
+    for target in targets {
+        let now = installed(hub, &target);
+        if now.is_empty() || KNOWN.lock().get(&target).is_some_and(|(was, _)| *was == now) || !ASKING.lock().insert(target.clone()) {
+            continue;
+        }
+        let hub = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            if status(&hub, &target).await.is_err() {
+                // Out of reach: nothing known of its accounts, and not asked again until its
+                // harnesses change or something else checks them.
+                KNOWN.lock().insert(target.clone(), (installed(&hub, &target), Vec::new()));
+            }
+            ASKING.lock().remove(&target);
+        });
+    }
+}
+
 /// The harnesses' accounts on `target` ("local" or "agent:<machine>"): those installed there.
+/// Kept as what placement knows of them ([`known`]).
 pub async fn status(hub: &Arc<Hub>, target: &str) -> anyhow::Result<Vec<Account>> {
     reachable(hub, target)?;
     let installed: Option<Vec<String>> = hub.harness.kinds().get(target).map(|k| k.iter().filter(|k| k.available).map(|k| k.id.clone()).collect());
     let checks = CLIS.iter().filter(|c| installed.as_ref().is_none_or(|k| k.iter().any(|k| k == c.kind))).map(|c| account(hub, target, c));
-    Ok(futures::future::join_all(checks).await)
+    let accounts = futures::future::join_all(checks).await;
+    KNOWN.lock().insert(target.to_owned(), (self::installed(hub, target), accounts.clone()));
+    Ok(accounts)
 }
 
 /// One harness's account on `target`.

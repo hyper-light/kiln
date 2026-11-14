@@ -2372,6 +2372,9 @@ where
                 // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
                 hyper_rt::futures::label(&ELSEWHERE);
                 crate::harness::elsewhere::tick(hub, &all, now);
+                // Machines' accounts checked where never checked, or their harnesses changed: what
+                // placing an agent reads (`accounts::known`).
+                crate::accounts::tick(hub);
                 // The infos copied for this tick let go of where they were made (`listed`): each a score
                 // of blocks, every session's freed on the driver's shard each tick (goal 9, plan
                 // 01a1a87b2cec step 3).
