@@ -30,7 +30,7 @@ interface Fence {
 }
 
 /** A text as far as it was cut, and how its last line (which more text may still change) was reached. */
-interface Cut {
+interface CutSoFar {
   text: string;
   blocks: string[];
   /** The blocks that ended before the last line: more text can't change them. */
@@ -45,7 +45,7 @@ interface Cut {
 }
 
 /** `text` cut, on from `from` where `text` continues the text that was cut to. */
-function cut(text: string, from?: Cut): Cut {
+function cut(text: string, from?: CutSoFar): CutSoFar {
   if (from?.whole) return { ...from, text, blocks: [text] };
   const out = from ? from.blocks.slice(0, from.settled) : [];
   let start = from?.start ?? 0;
@@ -99,7 +99,7 @@ export function streamBlocks(text: string): string[] {
  * a continuation of the last is cut from its start.
  */
 export class BlockCutter {
-  private last: Cut | null = null;
+  private last: CutSoFar | null = null;
 
   cut(text: string): string[] {
     const last = this.last;
