@@ -9,7 +9,7 @@
 //! `task_*`, `control_request`/`control_response`/`control_cancel_request`, `stream_event`,
 //! `result`). Unknown messages and fields are ignored, so newer CLIs keep working.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -309,6 +309,15 @@ pub struct Claude {
     /// request, and the subagent the call is in.
     #[serde(default)]
     held_calls: Vec<(String, String)>,
+    /// The messages in flight as each interrupt was asked, by its request: its answer says which of
+    /// them Claude Code still holds ([`Self::still_queued`]). One written after it was asked isn't
+    /// among them: the answer says nothing of it.
+    #[serde(default)]
+    stops: HashMap<String, Vec<String>>,
+    /// The messages in flight that Claude Code has said back ([`Self::said_back`]): in its
+    /// conversation, whatever becomes of their turn.
+    #[serde(default)]
+    said: BTreeSet<String>,
 }
 
 impl Claude {
@@ -362,6 +371,8 @@ impl Claude {
             waking: BTreeSet::new(),
             compaction: None,
             held_calls: Vec::new(),
+            stops: HashMap::new(),
+            said: BTreeSet::new(),
         }
     }
 
@@ -676,6 +687,9 @@ impl Claude {
     fn request(&mut self, core: &mut Core, kind: Pending, body: Value) {
         self.next_req += 1;
         let id = format!("kiln_{}", self.next_req);
+        if matches!(kind, Pending::Interrupt | Pending::NowAfter(_)) && !self.inflight.is_empty() {
+            self.stops.insert(id.clone(), self.inflight.iter().cloned().collect());
+        }
         self.pending.insert(id.clone(), kind);
         core.write(&json!({"type": "control_request", "request_id": id, "request": body}));
     }
@@ -745,6 +759,8 @@ impl Claude {
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
         self.turn = false;
         self.inflight.clear();
+        self.stops.clear();
+        self.said.clear();
         // A "now" whose interrupt went unanswered goes first when it starts again: never dropped.
         let held: Vec<QueueItem> = self.pending.drain().filter_map(|(_, p)| if let Pending::NowAfter(item) = p { Some(*item) } else { None }).collect();
         for item in held.into_iter().rev() {
@@ -1903,13 +1919,19 @@ impl Claude {
         let Some(resp) = v.get("response") else { return };
         let Some(id) = str_of(resp, "request_id") else { return };
         let Some(kind) = self.pending.remove(id) else { return };
+        let ok = str_of(resp, "subtype") == Some("success");
+        let body = resp.get("response").cloned().unwrap_or(Value::Null);
+        // An interrupt's answer says what Claude Code still holds of what was in flight as it was asked.
+        if let Some(asked) = self.stops.remove(id)
+            && ok
+        {
+            self.still_queued(core, asked, &body);
+        }
         // Answered, stopped or not: the person's "now" goes, with priority.
         if let Pending::NowAfter(item) = kind {
             self.write_send(core, *item, SendMode::Now);
             return;
         }
-        let ok = str_of(resp, "subtype") == Some("success");
-        let body = resp.get("response").cloned().unwrap_or(Value::Null);
         if !ok {
             let err = str_of(resp, "error").unwrap_or("request failed").to_owned();
             match kind {
@@ -2820,6 +2842,10 @@ impl Claude {
             // A person's prompt (our own, replayed, or one from the transcript) names its turn.
             let human = v.get("isReplay").and_then(Value::as_bool) == Some(true);
             self.entry(&uuid, human.then_some(uuid.as_str()));
+            // Said back, whatever its words are (a command's come back wrapped, and are shown no further).
+            if human {
+                self.said_back(core, &uuid);
+            }
         }
         let content = msg.get("content").cloned().unwrap_or(Value::Null);
         let structured = v.get("tool_use_result").cloned().unwrap_or(Value::Null);
@@ -2902,8 +2928,17 @@ impl Claude {
         // Claude Code starts what waits in its queue together, as one prompt, their words joined:
         // its replay (under the last one's id, or an id of its own) says what kiln shows already,
         // each message as it was sent. It changes none of them, and adds none.
-        if v.get("isReplay").and_then(Value::as_bool) == Some(true) && joins_in_flight(core, &id, t, ours) {
-            return;
+        if v.get("isReplay").and_then(Value::as_bool) == Some(true) {
+            // What it started together with this one is in the conversation with it, though it
+            // says none of them back by itself ([`Self::said_back`]).
+            for with in started_with(core, &id, t) {
+                if self.inflight.contains(&with) {
+                    self.said.insert(with);
+                }
+            }
+            if joins_in_flight(core, &id, t, ours) {
+                return;
+            }
         }
         // The CLI's replay of what we sent: keep the reply it answered, already on the event.
         let reply_to = match core.get(&id).map(|e| &e.body) {
@@ -3232,6 +3267,63 @@ impl Claude {
         }
     }
 
+    /// Claude Code said message `id` back (its replay of what kiln wrote). One it had queued or
+    /// started is in its conversation from here on ([`Self::said`]). One kiln had only written, of
+    /// which it said nothing else, it has in this conversation already under that id: the replay is
+    /// its whole answer (Claude Code 2.1.322: no lifecycle, no turn), and it won't take it a second
+    /// time. So that one got there before and isn't on its way (CP-T3.2): left in flight, nothing
+    /// would ever end it, and the session read as working for good, its queue, its resume after a
+    /// usage limit and a move all waiting on it (Quiver, 2026-11-13).
+    fn said_back(&mut self, core: &mut Core, id: &str) {
+        if !self.inflight.contains(id) {
+            return;
+        }
+        if core.state.delivery.get(id) != Some(&Delivery::Sent) {
+            self.said.insert(id.to_owned());
+            return;
+        }
+        self.inflight.remove(id);
+        core.input_consumed(id, super::admission::Consumption::ProviderAccepted);
+        core.state.delivery.insert(id.to_owned(), Delivery::Completed);
+        core.touch_state();
+        self.settle(core);
+        self.drain_queue(core);
+        self.reload_when_idle(core);
+    }
+
+    /// An interrupt was answered: its answer names the messages Claude Code still holds in its queue
+    /// (`still_queued`; a Claude Code from before it says nothing, and nothing is concluded). One
+    /// kiln had written before it asked (`asked`), that Claude Code neither holds nor ever started,
+    /// isn't on its way to it any more, whatever became of it (dropped as one it had already, its
+    /// answer missed): it leaves the messages in flight, so the session isn't held as working by a
+    /// message nothing will end. Whether it got there kiln can't say, so it's kept for another try
+    /// where it's kept at all (given again, Claude Code runs one it lacks and says one it has back:
+    /// [`Self::said_back`]); kiln's own, which may have run, ends dropped and isn't sent again
+    /// (CP-T3.2).
+    fn still_queued(&mut self, core: &mut Core, asked: Vec<String>, body: &Value) {
+        let Some(held) = body.get("still_queued").and_then(Value::as_array) else { return };
+        let held: HashSet<&str> = held.iter().filter_map(Value::as_str).collect();
+        let mut gone = false;
+        for id in asked {
+            let waits = matches!(core.state.delivery.get(&id), Some(Delivery::Sent | Delivery::Queued));
+            if !waits || held.contains(id.as_str()) || !self.inflight.contains(&id) {
+                continue;
+            }
+            self.inflight.remove(&id);
+            self.said.remove(&id);
+            if !core.input_retained(&id) {
+                core.state.delivery.insert(id, Delivery::Cancelled);
+            }
+            gone = true;
+        }
+        if gone {
+            core.touch_state();
+            self.settle(core);
+            self.drain_queue(core);
+            self.reload_when_idle(core);
+        }
+    }
+
     fn lifecycle(&mut self, core: &mut Core, v: &Value) {
         let Some(id) = str_of(v, "command_uuid") else { return };
         let state = match str_of(v, "state").unwrap_or("") {
@@ -3241,13 +3333,28 @@ impl Claude {
             "cancelled" | "discarded" | "refused" => Delivery::Cancelled,
             _ => return,
         };
-        if matches!(state, Delivery::Completed | Delivery::Cancelled) {
+        let was = core.state.delivery.get(id).copied();
+        let ended = matches!(state, Delivery::Completed | Delivery::Cancelled);
+        if ended {
             self.inflight.remove(id);
         }
         if state == Delivery::Started {
             self.begin(core);
         }
-        let retained = state == Delivery::Cancelled && core.input_retained(id);
+        // Cancelled once it's in the conversation (Claude Code said it back), its turn was cut
+        // short: by a "now" message, a stop, kiln's own interrupt at a usage limit or for a move.
+        // That's the provider's acceptance of it, and it isn't given again (CP-T3.2: each message
+        // once): given again under its id, Claude Code only says it back ([`Self::said_back`]) and
+        // never runs it. One that never got that far (refused, dropped from its queue, its turn dead
+        // before it was read) is kept for another try, as before.
+        let cut = ended && self.said.remove(id) && state == Delivery::Cancelled;
+        // Completed without ever starting here: it had it already (a conversation resumed with the
+        // message in its transcript says so of one given again).
+        let had = state == Delivery::Completed && matches!(was, Some(Delivery::Sent | Delivery::Queued));
+        if cut || had {
+            core.input_consumed(id, super::admission::Consumption::ProviderAccepted);
+        }
+        let retained = state == Delivery::Cancelled && !cut && core.input_retained(id);
         if !retained && core.state.delivery.contains_key(id) {
             core.state.delivery.insert(id.to_owned(), state);
             core.touch_state();
@@ -3300,6 +3407,18 @@ fn joins_in_flight(core: &Core, id: &str, text: &str, ours: bool) -> bool {
     }
     // What's left once each of them is taken out: nothing but how they were joined.
     others.iter().fold(text.to_owned(), |rest, w| rest.replacen(w.as_str(), "", 1)).trim().is_empty()
+}
+
+/// The messages Claude Code said it started whose words a replay under another id (`id`) holds:
+/// started together with it, as one prompt.
+fn started_with(core: &Core, id: &str, text: &str) -> Vec<String> {
+    core.state
+        .delivery
+        .iter()
+        .filter(|(k, d)| k.as_str() != id && **d == Delivery::Started)
+        .filter(|(k, _)| matches!(core.get(k).map(|e| &e.body), Some(Body::User { text: words, .. }) if !words.trim().is_empty() && text.contains(words.trim())))
+        .map(|(k, _)| k.clone())
+        .collect()
 }
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -4915,6 +5034,196 @@ mod tests {
         c.line(&mut core, r#"{"type":"command_lifecycle","command_uuid":"m1","state":"completed"}"#);
         c.command(&mut core, Command::Send { id: "m2".into(), text: "later".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         assert!(core.take_writes().first().is_some_and(|l| l.contains("later") && !l.contains("priority")));
+    }
+
+    /// A message kiln keeps until its harness has it, as a person's or another agent's is (the
+    /// inbox's custody of it).
+    fn kept(core: &mut Core, id: &str) {
+        core.input_legacy_flights.push(crate::harness::admission::LegacyFlight { id: id.into(), protocol: crate::harness::admission::FlightProtocol::Claude, request: None });
+    }
+
+    /// The messages the provider is said to have accepted, of those kiln keeps.
+    fn accepted(core: &Core) -> Vec<String> {
+        use crate::harness::admission::{Consumption, Disposition};
+        core.input_receipts.iter().filter(|r| r.disposition == Disposition::Consumed { boundary: Consumption::ProviderAccepted }).flat_map(|r| r.messages.clone()).collect()
+    }
+
+    fn lifecycle_of(c: &mut Claude, core: &mut Core, id: &str, state: &str) {
+        c.line(core, &json!({"type": "command_lifecycle", "command_uuid": id, "state": state, "uuid": "x", "session_id": "s1"}).to_string());
+    }
+
+    /// Claude Code saying a message back, as `--replay-user-messages` has it.
+    fn said_back(c: &mut Claude, core: &mut Core, id: &str, text: &str) {
+        c.line(core, &json!({"type": "user", "message": {"role": "user", "content": text}, "session_id": "s1", "parent_tool_use_id": null, "uuid": id, "isReplay": true}).to_string());
+    }
+
+    fn queue(c: &mut Claude, core: &mut Core, id: &str, text: &str) {
+        c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+    }
+
+    fn wrote(core: &mut Core, id: &str) -> bool {
+        core.take_writes().iter().filter_map(|w| serde_json::from_str::<Value>(w).ok()).any(|v| str_of(&v, "type") == Some("user") && str_of(&v, "uuid") == Some(id))
+    }
+
+    /// CP-T3.2 (each message once). Quiver, 2026-11-13: a person's messages sent "now" cut the turns
+    /// before them short. Claude Code said each cut turn's message cancelled, kiln took that for a
+    /// message it never got and gave it again under its id, and Claude Code, which had it in the
+    /// conversation, only said it back: kiln held three such messages in flight for ten hours, the
+    /// agent read as working throughout, and a move at its usage limit waited on them for good. The
+    /// lines are Claude Code 2.1.322's own, of a turn interrupted during its first tool call.
+    #[test]
+    fn cp_t3_2_a_message_whose_turn_was_cut_short_is_in_the_conversation_and_isnt_given_again() {
+        let (mut c, mut core, _) = started();
+        kept(&mut core, "m1");
+        kept(&mut core, "m2");
+        queue(&mut c, &mut core, "m1", "run the long check");
+        assert!(wrote(&mut core, "m1"));
+        lifecycle_of(&mut c, &mut core, "m1", "queued");
+        lifecycle_of(&mut c, &mut core, "m1", "started");
+        said_back(&mut c, &mut core, "m1", "run the long check");
+        assert_eq!(core.state.status, Status::Running);
+        c.line(&mut core, &json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_tools", "stop_reason": "tool_use", "num_turns": 3, "user_message_uuid": "m1", "user_message_uuids": ["m1"], "session_id": "s1"}).to_string());
+        lifecycle_of(&mut c, &mut core, "m1", "cancelled");
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));
+        assert!(core.input_retained.is_empty(), "it's in the conversation: never kept for another try ({:?})", core.input_retained);
+        assert_eq!(accepted(&core), ["m1"], "the provider has it");
+        assert_eq!(core.state.status, Status::Idle);
+        assert!(!wrote(&mut core, "m1"), "and it isn't written a second time");
+        // Two it started together, as one prompt said back under the second's id (as Claude Code
+        // 2.1 does), are both in the conversation when their turn is cut.
+        for id in ["j1", "j2"] {
+            kept(&mut core, id);
+            c.command(&mut core, Command::Send { id: id.into(), text: format!("the words of {id}"), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None });
+            lifecycle_of(&mut c, &mut core, id, "queued");
+        }
+        lifecycle_of(&mut c, &mut core, "j1", "started");
+        lifecycle_of(&mut c, &mut core, "j2", "started");
+        said_back(&mut c, &mut core, "j2", "the words of j1\nthe words of j2");
+        c.line(&mut core, &json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_streaming", "session_id": "s1"}).to_string());
+        lifecycle_of(&mut c, &mut core, "j1", "cancelled");
+        lifecycle_of(&mut c, &mut core, "j2", "cancelled");
+        assert!(core.input_retained.is_empty(), "{:?}", core.input_retained);
+        assert_eq!(accepted(&core), ["m1", "j1", "j2"]);
+        core.take_writes();
+        // One Claude Code never took (dropped from its queue, never said back) is still kept for
+        // another try: it isn't in the conversation.
+        queue(&mut c, &mut core, "m2", "and then this");
+        assert!(wrote(&mut core, "m2"));
+        lifecycle_of(&mut c, &mut core, "m2", "queued");
+        lifecycle_of(&mut c, &mut core, "m2", "discarded");
+        assert_eq!(core.input_retained, ["m2"]);
+        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Queued));
+        assert_eq!(accepted(&core), ["m1", "j1", "j2"]);
+        assert_eq!(core.state.status, Status::Idle);
+    }
+
+    /// CP-T3.2. Given a message it has in this conversation already under that id, Claude Code only
+    /// says it back: no lifecycle, no turn (2.1.322, of one given again after its turn was cut and
+    /// of one given again after it was done). That is its answer: the message isn't on its way, the
+    /// session isn't at work for it, and what waits in kiln's queue goes on. Before, nothing ever
+    /// ended it.
+    #[test]
+    fn cp_t3_2_a_message_claude_code_only_says_back_it_had_already_and_it_isnt_in_flight() {
+        let (mut c, mut core, _) = started();
+        kept(&mut core, "m1");
+        queue(&mut c, &mut core, "m1", "run the long check");
+        queue(&mut c, &mut core, "m2", "then report");
+        assert!(wrote(&mut core, "m1"), "m1 goes; m2 waits its turn in kiln's queue");
+        assert_eq!((core.state.status, core.state.queue.len(), core.state.delivery.get("m1")), (Status::Running, 1, Some(&Delivery::Sent)));
+        said_back(&mut c, &mut core, "m1", "run the long check");
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed), "it got there before");
+        assert_eq!(accepted(&core), ["m1"]);
+        assert!(core.input_retained.is_empty());
+        assert!(wrote(&mut core, "m2"), "kiln's queue goes on");
+        // m2, which Claude Code takes, is said back in the usual way: in flight until its turn ends.
+        lifecycle_of(&mut c, &mut core, "m2", "queued");
+        lifecycle_of(&mut c, &mut core, "m2", "started");
+        said_back(&mut c, &mut core, "m2", "then report");
+        assert_eq!((core.state.status, core.state.delivery.get("m2")), (Status::Running, Some(&Delivery::Started)));
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "terminal_reason": "completed", "stop_reason": "end_turn", "num_turns": 1, "duration_api_ms": 12, "user_message_uuids": ["m2"], "session_id": "s1"}).to_string());
+        lifecycle_of(&mut c, &mut core, "m2", "completed");
+        assert_eq!((core.state.status, core.state.delivery.get("m2")), (Status::Idle, Some(&Delivery::Completed)));
+        assert_eq!(accepted(&core), ["m1"], "m2's turn was done: not merely accepted");
+        // A conversation resumed with the message in its transcript says it completed, never having
+        // started it (2.1.322): it had it already, too.
+        kept(&mut core, "m3");
+        queue(&mut c, &mut core, "m3", "from before the restart");
+        assert!(wrote(&mut core, "m3"));
+        said_back(&mut c, &mut core, "m3", "from before the restart");
+        lifecycle_of(&mut c, &mut core, "m3", "completed");
+        assert_eq!((core.state.status, core.state.delivery.get("m3")), (Status::Idle, Some(&Delivery::Completed)));
+        assert_eq!(accepted(&core), ["m1", "m3"]);
+        // And so when it says so first.
+        kept(&mut core, "m4");
+        queue(&mut c, &mut core, "m4", "from before the restart, too");
+        assert!(wrote(&mut core, "m4"));
+        lifecycle_of(&mut c, &mut core, "m4", "completed");
+        said_back(&mut c, &mut core, "m4", "from before the restart, too");
+        assert_eq!((core.state.status, core.state.delivery.get("m4")), (Status::Idle, Some(&Delivery::Completed)));
+        assert_eq!(accepted(&core), ["m1", "m3", "m4"]);
+    }
+
+    /// CP-T3.2. An interrupt's answer names what Claude Code still holds in its queue
+    /// (`still_queued`, 2.1.322). A message kiln wrote before it asked, that Claude Code neither
+    /// holds nor ever started, isn't on its way any more: it leaves the messages in flight, so a
+    /// stop (a person's, a usage limit's, a move's "now") frees a session that read as working for
+    /// a message nothing would end. Kept for another try where kiln keeps it; kiln's own dropped.
+    #[test]
+    fn cp_t3_2_an_interrupts_answer_says_which_messages_claude_code_still_holds() {
+        let steer = |c: &mut Claude, core: &mut Core, id: &str| c.command(core, Command::Send { id: id.into(), text: format!("words of {id}"), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None });
+        let stop = |c: &mut Claude, core: &mut Core, held: Option<Value>| {
+            core.take_writes();
+            c.command(core, Command::Interrupt);
+            let reqs = requests(core);
+            reply_to(c, core, &reqs, "interrupt", held.map_or_else(|| json!({}), |h| json!({"still_queued": h})));
+        };
+        let (mut c, mut core, _) = started();
+        kept(&mut core, "lost");
+        // Written, and nothing said of them since: one kiln keeps, one of kiln's own.
+        steer(&mut c, &mut core, "lost");
+        steer(&mut c, &mut core, "goal-1");
+        // One Claude Code holds in its queue, and one whose turn is under way.
+        steer(&mut c, &mut core, "waits");
+        lifecycle_of(&mut c, &mut core, "waits", "queued");
+        steer(&mut c, &mut core, "at-work");
+        lifecycle_of(&mut c, &mut core, "at-work", "queued");
+        lifecycle_of(&mut c, &mut core, "at-work", "started");
+        assert_eq!(core.state.status, Status::Running);
+        // A Claude Code from before the answer said it: nothing is concluded.
+        stop(&mut c, &mut core, None);
+        assert_eq!(core.state.delivery.get("lost"), Some(&Delivery::Sent));
+        // Asked again: one written after the asking isn't spoken of by the answer.
+        core.take_writes();
+        c.command(&mut core, Command::Interrupt);
+        let reqs = requests(&mut core);
+        steer(&mut c, &mut core, "after");
+        reply_to(&mut c, &mut core, &reqs, "interrupt", json!({"still_queued": ["waits"]}));
+        assert_eq!(core.input_retained, ["lost"], "kept for another try");
+        assert_eq!(core.state.delivery.get("lost"), Some(&Delivery::Queued));
+        assert_eq!(core.state.delivery.get("goal-1"), Some(&Delivery::Cancelled), "kiln's own may have run: dropped, not sent again");
+        assert_eq!(["waits", "at-work", "after"].map(|id| core.state.delivery.get(id)), [Some(&Delivery::Queued), Some(&Delivery::Started), Some(&Delivery::Sent)]);
+        // The turn under way is cut, what waited starts and ends, and the one written after is
+        // taken: nothing holds the session as working then.
+        said_back(&mut c, &mut core, "at-work", "words of at-work");
+        c.line(&mut core, &json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_streaming", "session_id": "s1"}).to_string());
+        lifecycle_of(&mut c, &mut core, "at-work", "cancelled");
+        for id in ["waits", "after"] {
+            lifecycle_of(&mut c, &mut core, id, "started");
+            said_back(&mut c, &mut core, id, &format!("words of {id}"));
+            c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "terminal_reason": "completed", "stop_reason": "end_turn", "session_id": "s1"}).to_string());
+            lifecycle_of(&mut c, &mut core, id, "completed");
+        }
+        assert_eq!(core.state.status, Status::Idle);
+        // Quiver's case: at rest but for messages nothing would end, it comes free at a stop.
+        let (mut c, mut core, _) = started();
+        for id in ["a", "b", "c"] {
+            kept(&mut core, id);
+            steer(&mut c, &mut core, id);
+        }
+        assert_eq!(core.state.status, Status::Running);
+        stop(&mut c, &mut core, Some(json!([])));
+        assert_eq!(core.state.status, Status::Idle);
+        assert_eq!(core.input_retained, ["a", "b", "c"]);
     }
 
     #[test]
