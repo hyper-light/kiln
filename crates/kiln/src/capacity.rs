@@ -121,6 +121,57 @@ pub fn issue(pki: &Pki, ask: &EnrollHolder) -> anyhow::Result<Enrolled> {
     Ok(Enrolled { name, chain: issued.chain.iter().map(|c| b64(c)).collect(), roots: issued.roots.iter().map(|c| b64(c)).collect() })
 }
 
+/// What an operator sends `POST /api/capacity/keeper`: a capacity keeper's signing request (its
+/// enrollment folder's `request.pem`, as Hex's `hex_quic::enroll::store::begin` wrote it), whose
+/// key is the keeper's own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeeperAsk {
+    pub request_pem: String,
+}
+
+/// What the server answers: the keeper's certificate, named as its request asks, and kiln's roots,
+/// as `chain.pem` and `roots.pem` (Hex's `store::finish` writes these bytes) and as each
+/// certificate's DER in hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperIssued {
+    pub name: String,
+    pub chain_pem: String,
+    pub roots_pem: String,
+    pub chain: Vec<String>,
+    pub roots: Vec<String>,
+}
+
+/// A capacity keeper's certificate from kiln's CA (Hex's capacity-view.md, the keeper's side of
+/// the holder's item 2: a holder checks the keeper's certificate for the name its `[capacity]`
+/// names, under kiln's roots; HEX-CV-2K; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 13), for
+/// the operator's word alone (`POST /api/capacity/keeper` is the server's settings'): for the
+/// request's key, named as it asks and nothing else, for either side of a link as a holder's is.
+/// A request kiln's CA would name otherwise (a name it doesn't issue as written, or the server's
+/// own) is refused, never renamed: the keeper's store keeps an answer for its request's name alone.
+pub fn issue_keeper(pki: &Pki, request_pem: &str) -> anyhow::Result<KeeperIssued> {
+    let block = pem::parse(request_pem).context("the keeper's request isn't PEM")?;
+    anyhow::ensure!(block.tag() == "CERTIFICATE REQUEST", "the keeper's request holds a {:?} block, not a signing request", block.tag());
+    let params = rcgen::CertificateSigningRequestParams::from_pem(request_pem).context("the keeper's request can't be read as a signing request")?;
+    let name = params
+        .params
+        .subject_alt_names
+        .iter()
+        .find_map(|san| match san {
+            rcgen::SanType::DnsName(name) => Some(name.as_str().to_owned()),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("the keeper's request names no peer"))?;
+    anyhow::ensure!(crate::pki::sanitize_name(&name) == name, "kiln's CA names a keeper as its request asks, and {name:?} isn't a name it issues as written (lowercase letters, digits, '-' and '.'): begin the keeper's enrollment under one");
+    let ca = PkiCa::new(pki);
+    let grant = crate::util::random_token().into_bytes();
+    ca.admit(&name, &grant);
+    let issued = ca.enroll(&Request { name: name.clone(), csr: block.into_contents(), grant })?;
+    // As Hex's `store::finish` writes them, byte for byte.
+    let pems = |certs: &[CertificateDer<'static>]| pem::encode_many(&certs.iter().map(|c| pem::Pem::new("CERTIFICATE", c.to_vec())).collect::<Vec<_>>());
+    let hexes = |certs: &[CertificateDer<'static>]| certs.iter().map(::hex::encode).collect();
+    Ok(KeeperIssued { name, chain_pem: pems(&issued.chain), roots_pem: pems(&issued.roots), chain: hexes(&issued.chain), roots: hexes(&issued.roots) })
+}
+
 impl Enrolled {
     fn issued(&self) -> anyhow::Result<Issued> {
         let ders = |what: &str, list: &[String]| -> anyhow::Result<Vec<CertificateDer<'static>>> { list.iter().map(|t| unb64(what, t).map(CertificateDer::from)).collect() };
@@ -553,6 +604,35 @@ mod tests {
         let ca = PkiCa::new(&pki);
         let failures = hex_quic::enroll::conformance::run(&ca, &Fixture(&ca));
         anyhow::ensure!(failures.is_empty(), "{failures:?}");
+        Ok(())
+    }
+
+    /// Step 13, HEX-CV-2K's keeper: kiln's CA answers a keeper's request as Hex's own store keeps
+    /// it. From the answer's DER hex, `store::finish` keeps it in the keeper's folder, its files the
+    /// answer's PEM byte for byte, and `store::load` takes them: named as asked, under kiln's root,
+    /// for both sides of a link. A request naming the server, or a name kiln's CA wouldn't issue as
+    /// written, is refused and nothing is issued.
+    #[test]
+    fn kiln_s_ca_answers_a_keeper_s_request_as_hex_s_store_keeps_it() -> anyhow::Result<()> {
+        let (dir, pki) = scratch()?;
+        let folder = dir.path().join("keeper");
+        let request = store::begin(&folder, "hex-cv-keeper").map_err(|e| anyhow::anyhow!("{e}"))?;
+        let issued = issue_keeper(&pki, &std::fs::read_to_string(request)?)?;
+        anyhow::ensure!(issued.name == "hex-cv-keeper", "{}", issued.name);
+        let ders = |list: &[String]| -> anyhow::Result<Vec<CertificateDer<'static>>> { list.iter().map(|h| Ok(CertificateDer::from(::hex::decode(h)?))).collect() };
+        store::finish(&folder, &Issued { chain: ders(&issued.chain)?, roots: ders(&issued.roots)? }).map_err(|e| anyhow::anyhow!("{e}"))?;
+        anyhow::ensure!(std::fs::read_to_string(folder.join(store::CHAIN))? == issued.chain_pem, "chain.pem as Hex's store writes it");
+        anyhow::ensure!(std::fs::read_to_string(folder.join(store::ROOTS))? == issued.roots_pem, "roots.pem as Hex's store writes it");
+        let creds = store::load(&folder).map_err(|e| anyhow::anyhow!("{e}"))?;
+        anyhow::ensure!(creds.roots == vec![CertificateDer::from(pki.ca_der.clone())], "under kiln's root alone");
+        let leaf = creds.chain.first().ok_or_else(|| anyhow::anyhow!("no certificate"))?;
+        anyhow::ensure!(crate::pki::cert_dns_name(leaf).as_deref() == Some("hex-cv-keeper"));
+        for name in [crate::pki::SERVER_NAME, "Hex-CV-Keeper"] {
+            let other = dir.path().join(format!("other-{}", name.len()));
+            let request = store::begin(&other, name).map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::ensure!(issue_keeper(&pki, &std::fs::read_to_string(request)?).is_err(), "{name} is refused");
+        }
+        anyhow::ensure!(issue_keeper(&pki, "not a request").is_err(), "a request that isn't one is refused");
         Ok(())
     }
 

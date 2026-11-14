@@ -256,6 +256,14 @@ impl Holding {
         self.core.held()
     }
 
+    /// Whether nothing it said waits on the keeper: synced and not stalled, with no reserve asked
+    /// and unanswered and no release said and unanswered, so what it holds ([`Self::held`]) stands
+    /// as the keeper's books should (HEX-CV-2K's drain; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+    /// step 13).
+    pub fn settled(&self) -> bool {
+        self.link == Link::Up && !self.stalled && self.closed.is_none() && self.waits.waiting() == 0 && self.releasing.is_empty()
+    }
+
     /// Where the runner stands with its keeper (module docs).
     pub fn keeper(&self) -> Keeper {
         if let Some(why) = self.closed {

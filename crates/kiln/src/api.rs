@@ -876,6 +876,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             boxed(|| approve_join(&hub, &id, req, &by)).await
         }
         (&Method::POST, ["api", "join-requests", id, "deny"]) => boxed(|| deny_join(&hub, id)).await,
+        (&Method::POST, ["api", "capacity", "keeper"]) => boxed(|| issue_keeper(&hub, req)).await,
         (&Method::DELETE, ["api", "agents", name]) => {
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| forget_agent(&hub, name, &by)).await
@@ -4323,6 +4324,24 @@ async fn enroll_capacity(hub: &Hub, req: Request) -> R {
     hub.store.audit(name.clone(), "agent.capacity".into(), String::new()).await;
     tracing::info!(agent = %name, "issued a capacity holder's certificate");
     Ok(srv::json(StatusCode::OK, &enrolled))
+}
+
+/// `POST /api/capacity/keeper`: a capacity keeper's certificate from kiln's CA, for its request
+/// (`crate::capacity::issue_keeper`; Hex's capacity-view.md; HEX-CV-2K; kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d, step 13): named as its request asks, its `chain.pem` and
+/// `roots.pem` as Hex's store writes them and as DER hex. The server's settings' to say
+/// (`settings.manage`, the route table's default), since a runner trusts whatever certificate of
+/// kiln's carries its keeper's name.
+async fn issue_keeper(hub: &Hub, req: Request) -> R {
+    let ask: crate::capacity::KeeperAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let issued = crate::capacity::issue_keeper(&hub.pki, &ask.request_pem).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Every certificate kiln issues is recorded first (W27-R01).
+    let leaf = issued.chain.first().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "no certificate was issued".to_owned()))?;
+    let der = ::hex::decode(leaf).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::identities::record(&hub.store, "keeper", &issued.name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit(issued.name.clone(), "capacity.keeper".into(), String::new()).await;
+    tracing::info!(keeper = %issued.name, "issued a capacity keeper's certificate");
+    Ok(srv::json(StatusCode::OK, &issued))
 }
 
 /// `POST /api/agents/instance`: a certificate for a second runner process of a machine that is

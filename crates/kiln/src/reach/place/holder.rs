@@ -42,6 +42,26 @@ pub(super) struct Holder {
     asking: BTreeMap<RunKey, ReservationId>,
     /// What each run started here holds through the keeper (its box), until it ends.
     runs: BTreeMap<RunKey, BoxName>,
+    /// The last `HEX_CV_HELD=` line it logged ([`Placer::show_held`]).
+    shown: Option<String>,
+    /// The lines it logged for HEX-CV-2K ([`hex_cv`]), for its tests to read.
+    #[cfg(test)]
+    logged: Vec<String>,
+}
+
+/// Logs `line`, one of HEX-CV-2K's reads of the runner's log (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d, step 13): each fact in its text (`agree=true`, `link=2`), so
+/// it reads the same whatever the log's format.
+fn hex_cv(h: &mut Holder, warn: bool, line: String) {
+    if warn {
+        tracing::warn!("{line}");
+    } else {
+        tracing::info!("{line}");
+    }
+    #[cfg(test)]
+    h.logged.push(line);
+    #[cfg(not(test))]
+    let _ = h;
 }
 
 /// A start waiting for its reserve's answer.
@@ -60,6 +80,13 @@ enum Begin {
     Kernel { ask: Arc<Ask>, kernel: kiln_ci::lb::Handle, at: u32 },
     /// A CI leg, admitted on its grant or not at all.
     Leg(Box<Ask>),
+}
+
+/// The line HEX-CV-2K reads for what a settled holder holds: `HEX_CV_HELD=` and the hex of the
+/// JSON of `held`, Hex's `Holder::held` in its order (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+/// step 13).
+pub(super) fn held_line(held: &[hex::Held]) -> Result<String, serde_json::Error> {
+    Ok(format!("HEX_CV_HELD={}", ::hex::encode(serde_json::to_vec(held)?)))
 }
 
 /// What waits on a start's outcome besides its owner, which hears it from the ledger.
@@ -120,7 +147,7 @@ impl Placer {
                 if !survivors.is_empty() {
                     tracing::info!(survivors = survivors.len(), "this runner holds through its machine's capacity keeper what its last process's runs that go on held");
                 }
-                self.keeper = Some(Holder { holding, link: 0, pending: BTreeMap::new(), asking: BTreeMap::new(), runs });
+                self.keeper = Some(Holder { holding, link: 0, pending: BTreeMap::new(), asking: BTreeMap::new(), runs, shown: None, #[cfg(test)] logged: Vec::new() });
                 self.admission.keeper_said(stands, now, &mut said);
             }
             Err(why) => {
@@ -145,6 +172,8 @@ impl Placer {
     pub fn keeper_linked(&mut self, now: i64) -> Vec<Out> {
         let Some(h) = self.keeper.as_mut() else { return Vec::new() };
         h.link = h.link.saturating_add(1);
+        let line = if h.link == 1 { format!("capacity keeper joined link={}: this runner's first link to it opened", h.link) } else { format!("capacity keeper rejoined link={}: a new link to it opened", h.link) };
+        hex_cv(h, false, line);
         let out = h.holding.linked(now);
         self.keeper_out(out, now)
     }
@@ -161,6 +190,9 @@ impl Placer {
     pub fn keeper_ended(&mut self, how: WaitEnded, now: i64) -> Vec<Out> {
         let Some(h) = self.keeper.as_mut() else { return Vec::new() };
         let out = h.holding.ended(how);
+        let unanswered = out.events.iter().filter(|e| matches!(e, Event::NotGranted(_, NotGranted::Unanswered(_)))).count();
+        let line = format!("capacity keeper link lost link={} how={how:?} unanswered={unanswered}: its unanswered reserves given up, nothing new taken until it rejoins", h.link);
+        hex_cv(h, false, line);
         self.keeper_out(out, now)
     }
 
@@ -374,13 +406,35 @@ impl Placer {
                 }
                 Event::Granted(id) => self.granted(id, now, &mut out),
                 Event::NotGranted(id, why) => self.not_granted(id, why, now, &mut out),
-                Event::Synced { agree: true, released, adopted, disagreed } => tracing::debug!(released, adopted, disagreed, "synced with this machine's capacity keeper"),
-                Event::Synced { agree: false, released, adopted, disagreed } => {
-                    tracing::warn!(released, adopted, disagreed, "this runner's sync with its machine's capacity keeper disagreed with what it holds: the keeper's books are the machine's");
+                Event::Synced { agree, released, adopted, disagreed } => {
+                    let then = if agree { "its books and this runner's agree" } else { "disagreeing with what this runner holds: the keeper's books are the machine's" };
+                    if let Some(h) = self.keeper.as_mut() {
+                        hex_cv(h, !agree, format!("capacity keeper synced agree={agree} link={link} released={released} adopted={adopted} disagreed={disagreed}: {then}"));
+                    }
                 }
             }
         }
+        self.show_held();
         out
+    }
+
+    /// Once nothing it said waits on the keeper (`Holding::settled`, no start waiting on a reserve
+    /// either), what it holds, as HEX-CV-2K reads it after its drain: `HEX_CV_HELD=` and the hex of
+    /// the JSON of Hex's `Holder::held` ([`held_line`]), logged again only when that changed.
+    fn show_held(&mut self) {
+        let Some(h) = self.keeper.as_mut() else { return };
+        if !h.pending.is_empty() || !h.holding.settled() {
+            return;
+        }
+        let held: Vec<hex::Held> = h.holding.held().collect();
+        match held_line(&held) {
+            Ok(line) if h.shown.as_deref() != Some(line.as_str()) => {
+                h.shown = Some(line.clone());
+                hex_cv(h, false, line);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "what this runner holds through its machine's capacity keeper couldn't be written as JSON"),
+        }
     }
 
     /// Reservation `id` granted: its start goes ahead now, never sooner (the holder's item 1). The
