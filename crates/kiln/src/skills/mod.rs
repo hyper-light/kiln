@@ -598,7 +598,8 @@ struct Reading {
     error: Option<String>,
     got: BTreeMap<String, Vec<u8>>,
     part: BTreeMap<String, Vec<u8>>,
-    done: Option<async_channel::Sender<()>>,
+    /// Told once its read is complete: one answer, queued with no lock (`crate::memory::queue::answer`; goal 5).
+    done: Option<crate::memory::queue::Sender<()>>,
 }
 
 static READS: parking_lot::Mutex<BTreeMap<u64, Reading>> = parking_lot::Mutex::new(BTreeMap::new());
@@ -617,7 +618,7 @@ pub async fn read_folder(hub: &Hub, machine: &str, path: &str) -> R<Vec<File>> {
     let (_, peers) = machines(hub);
     let Some(peer) = peers.get(machine).copied() else { return Err(Error::Bad(format!("{machine}'s kiln doesn't install skills yet: upgrade kiln on {machine}"))) };
     let req = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     READS.lock().insert(req, Reading { peer, done: Some(tx), ..Reading::default() });
     hub.send_peer(peer, &crate::proto::ServerMsg::Skills { json: json!({"read": {"req": req, "path": path}}).to_string() }).await;
     let waited = crate::rt::timeout(crate::gitops::GIT_TIMEOUT, rx.recv()).await;

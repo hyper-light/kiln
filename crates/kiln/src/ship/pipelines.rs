@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use http::StatusCode;
 use kiln_ci::pipelines::{self as core, Facts, Kind, Outcome, Row};
 use kiln_ci::wf;
-use parking_lot::Mutex;
 use serde_json::Value;
 
 use super::Fail;
@@ -67,11 +66,13 @@ impl Env {
     }
 }
 
+/// Copies swapped in whole (goal 5, plan 01a1a59c2aae): every Pipelines request reads them, and every run's and
+/// job's frame marks its repository.
 #[derive(Default)]
 struct Model {
-    held: Mutex<BTreeMap<String, Arc<Held>>>,
+    held: crate::rcu::Rcu<BTreeMap<String, Arc<Held>>>,
     /// Repositories something was heard of since they were gathered.
-    dirty: Mutex<HashSet<String>>,
+    dirty: crate::rcu::Rcu<HashSet<String>>,
     /// Every repository's rows are to be gathered again (frames went unheard).
     all: AtomicBool,
     listening: AtomicBool,
@@ -87,7 +88,7 @@ fn model() -> Arc<Model> {
 /// `repo`'s refs moved (a push to a repository kiln hosts): its rows are gathered again.
 pub(crate) fn heard(repo: &str) {
     if let Some(m) = MODEL.get() {
-        m.dirty.lock().insert(repo.to_owned());
+        m.mark(repo);
     }
 }
 
@@ -152,8 +153,15 @@ impl Model {
             },
             _ => return false,
         };
-        self.dirty.lock().insert(repo);
+        self.mark(&repo);
         true
+    }
+
+    /// `repo`'s rows to be gathered again: a new copy only where it isn't marked yet.
+    fn mark(&self, repo: &str) {
+        if !self.dirty.load().contains(repo) {
+            self.dirty.update(|d| d.insert(repo.to_owned()));
+        }
     }
 
     /// Gathers what was heard of after [`SETTLE`], so a page hears `pipelines` without asking.
@@ -176,9 +184,9 @@ impl Model {
     /// event; one that can't be gathered keeps the rows it had.
     async fn fresh(&self, hub: &Hub) -> Vec<Arc<Held>> {
         let repos = hub.store.repos().await.unwrap_or_default();
-        let dirty: HashSet<String> = std::mem::take(&mut *self.dirty.lock());
+        let dirty: HashSet<String> = if self.dirty.load().is_empty() { HashSet::new() } else { self.dirty.update(std::mem::take) };
         let all = self.all.swap(false, Ordering::AcqRel);
-        let had: BTreeMap<String, Arc<Held>> = self.held.lock().clone();
+        let had: BTreeMap<String, Arc<Held>> = BTreeMap::clone(&self.held.load());
         let stale = |name: &str| all || dirty.contains(name) || had.get(name).is_none_or(|h| h.at.elapsed() >= KEEP_FOR);
         let mut env: Option<Env> = None;
         let mut out: BTreeMap<String, Arc<Held>> = BTreeMap::new();
@@ -210,7 +218,7 @@ impl Model {
                 }
             }
         }
-        *self.held.lock() = out.clone();
+        self.held.set(out.clone());
         out.into_values().collect()
     }
 }

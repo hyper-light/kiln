@@ -273,7 +273,7 @@ fn w05_r03_place_agents_holds_a_child_agents_claim_from_start_to_end() -> anyhow
         let first = crate::rt::timeout(HANG, place_agents(&hub, Some(&parent), Some("cpus=4"), "claude", 1)).await?.map_err(refused)?;
         let [(on, Some(claim))] = first.as_slice() else { anyhow::bail!("one child, with its claim: {first:?}") };
         anyhow::ensure!(on == "agent:linux" && claim.owner == "mac" && claim.run.starts_with("session-"), "placed on linux by mac's owner, its parent's runner: {first:?}");
-        anyhow::ensure!(hub.session_places.lock().is_empty(), "the server waits on no more words of it once it's placed");
+        anyhow::ensure!(hub.session_places.load().is_empty(), "the server waits on no more words of it once it's placed");
         anyhow::ensure!(lab.linux.session_started(claim.clone(), Some(crate::reach::place::Group::Session("child-1".into()))).await?, "its claim was live on linux at its start");
         let hc = held_and_cap(&lab.linux).await?;
         anyhow::ensure!(hc.0.first() == Some(&4_000) && within(hc), "its 4 CPUs held on linux from its start: {hc:?}");

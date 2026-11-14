@@ -709,8 +709,8 @@ mod tests {
         }
     }
 
-    /// Step 17: an isolated launch is its image's harness member, in the session's folder at its own
-    /// path, given only what its image's command doesn't: Codex none, Claude Code its session's
+    /// Step 17: an isolated launch is its image's harness member, in the session's folder as its microVM
+    /// sees it (a Unix folder at its own path, a Windows one at `/work/<its name>`), given only what its image's command doesn't: Codex none, Claude Code its session's
     /// flags; of the session's environment only its locale and time zone, and no kiln variable.
     #[test]
     fn s17_an_isolated_launch_is_the_members_with_what_the_session_adds() -> anyhow::Result<()> {
@@ -721,8 +721,14 @@ mod tests {
         let codex = launch_of(kind("codex")?, &spec("codex"), "harness-codex@sha256:00".into())?;
         assert_eq!((codex.program.as_str(), codex.args.as_slice()), ("codex", &[][..]), "its image's command runs it as kiln's adapter drives it");
         assert_eq!(codex.boundary, Boundary::MicroVm { image: "harness-codex@sha256:00".into() });
-        assert_eq!(codex.folder.as_deref(), Some(cwd.as_str()));
-        assert_eq!(codex.shares, [Share::at_its_path(&cwd)], "its project, at its own path: its home comes with its person's volume");
+        // Its project, shared from this machine's folder to where its microVM sees it, which is its member's
+        // working folder too: a Unix folder at its own path, a Windows one at `/work/<its name>` (`guest_path`;
+        // jupiter, 2026-11-13: `/work/.tmpAoo893` for `C:\Users\…\Temp\.tmpAoo893`). Its home comes with its
+        // person's volume.
+        let name = dir.path().file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("{cwd} has no name"))?;
+        let at = if cfg!(windows) { format!("{PROJECTS}/{name}") } else { cwd.clone() };
+        assert_eq!(codex.shares, [Share { host: cwd.clone(), at: at.clone(), writable: true }], "its project, where its microVM sees it");
+        assert_eq!(codex.folder.as_deref(), Some(at.as_str()), "its working folder, its project's place in its microVM");
         // A Windows machine's project: shared from where it is, at a Linux path of its own name, which is
         // its working folder too; Unix's at its own path.
         let windows = project_share(r"C:\Users\ada\proj").map_err(anyhow::Error::msg)?;

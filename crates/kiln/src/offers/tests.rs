@@ -38,7 +38,7 @@ fn hint(seq: u64, at: i64, room: Amounts, start_in: u64) -> Hint {
 /// Every version told since the last look.
 fn told(o: &Offers) -> u32 {
     let mut n = 0;
-    while o.kick.1.try_recv().is_ok() {
+    while futures::FutureExt::now_or_never(o.kick.notified()).is_some() {
         if o.flush().is_some() {
             n += 1;
         }
@@ -119,8 +119,7 @@ fn changes_in_one_turn_go_as_one_version() {
         o.heard(name, hint(1, at, SMALL, MIN), at);
         leg_waiting(&o, &format!("l{i}"), BIG);
     }
-    assert_eq!(o.kick.1.len(), 1, "one wake for all of them");
-    assert_eq!(told(&o), 1);
+    assert_eq!(told(&o), 1, "one wake for all of them");
     assert_eq!(o.version(), 1);
     assert_eq!(o.flush(), None);
 }

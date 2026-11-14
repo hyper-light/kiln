@@ -439,11 +439,12 @@ pub(crate) async fn pin_ref_readonly(hub: &Hub, r: &Remote, refresh: bool) -> an
     pin_ref_with(hub, r, false, refresh).await
 }
 
-/// A fixed number of locks, shared by pinning and lock-file reads. Fetch cannot expose a
-/// commit before its trees have arrived; hash collisions only serialize unrelated sources.
-pub(crate) fn source_lock(r: &Remote) -> anyhow::Result<&'static async_lock::RwLock<()>> {
-    static LOCKS: std::sync::OnceLock<[async_lock::RwLock<()>; 64]> = std::sync::OnceLock::new();
-    let locks = LOCKS.get_or_init(|| std::array::from_fn(|_| async_lock::RwLock::new(())));
+/// A fixed number of read-write turns, shared by pinning and lock-file reads. Fetch cannot expose a
+/// commit before its trees have arrived; hash collisions only serialize unrelated sources. Turns
+/// with no lock (`crate::turn::ReadWrite`, goal 5, plan 01a1a59c2aae): readers together, a writer alone.
+pub(crate) fn source_lock(r: &Remote) -> anyhow::Result<&'static crate::turn::ReadWrite> {
+    static LOCKS: std::sync::OnceLock<[crate::turn::ReadWrite; 64]> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::array::from_fn(|_| crate::turn::ReadWrite::new()));
     let slot = r.full().bytes().fold(usize::from(r.native), |n, b| n.wrapping_mul(31).wrapping_add(usize::from(b))) % 64;
     locks.get(slot).ok_or_else(|| anyhow::anyhow!("action mirror lock is unavailable"))
 }
