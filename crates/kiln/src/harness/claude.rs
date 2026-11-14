@@ -301,6 +301,12 @@ pub struct Claude {
     /// until they've taken that one.
     #[serde(default)]
     waking: BTreeSet<String>,
+    /// The calls that resumed a subagent (a SendMessage to one that had finished or stopped) → the
+    /// call that started it. Claude Code runs a resumed subagent under the call that resumed it
+    /// (its `task_started` and its output name that call), so its work stays in its first call's
+    /// thread, with all it did before.
+    #[serde(default)]
+    resumed: HashMap<String, String>,
     /// The compaction under way or just over (its boundary says more of it after its status said
     /// it ended): its conversation's parent, and its marker's key, one marker for both.
     #[serde(default)]
@@ -369,6 +375,7 @@ impl Claude {
             relays: HashMap::new(),
             relay_calls: HashMap::new(),
             waking: BTreeSet::new(),
+            resumed: HashMap::new(),
             compaction: None,
             held_calls: Vec::new(),
             stops: HashMap::new(),
@@ -1877,7 +1884,8 @@ impl Claude {
         if let Some(seen) = super::trouble::of_claude(&v) {
             super::trouble::take(core, seen);
         }
-        let parent = str_of(&v, "parent_tool_use_id").map(str::to_owned);
+        // A resumed subagent's output is under the call that started it.
+        let parent = str_of(&v, "parent_tool_use_id").map(|p| self.resumed.get(p).cloned().unwrap_or_else(|| p.to_owned()));
         match str_of(&v, "type").unwrap_or("") {
             "control_response" => self.control_response(core, &v),
             "control_request" => self.control_request(core, &v),
@@ -2520,6 +2528,12 @@ impl Claude {
             "task_started" => {
                 let Some(id) = str_of(v, "task_id") else { return };
                 let tool_id = str_of(v, "tool_use_id").map(str::to_owned);
+                // A subagent resumed (the same task, under the call that resumed it) stays under
+                // the call that started it, and so does its output from here on.
+                let first = core.state.tasks.iter().find(|t| t.id == id).and_then(|t| t.tool_id.clone()).filter(|first| tool_id.as_ref().is_some_and(|now| now != first));
+                if let (Some(first), Some(now)) = (&first, &tool_id) {
+                    self.resumed.insert(now.clone(), first.clone());
+                }
                 // A subagent its hook let start has: it counts as running from here.
                 if let Some(t) = &tool_id {
                     self.agents_allowed.remove(t);
@@ -2529,7 +2543,7 @@ impl Claude {
                 let output = tool_id.as_deref().and_then(|t| self.bg_files.remove(t)).map(|(_, f)| f);
                 let mut task = Task {
                     id: id.to_owned(),
-                    tool_id: str_of(v, "tool_use_id").map(str::to_owned),
+                    tool_id: first.or_else(|| tool_id.clone()),
                     description: str_of(v, "description").unwrap_or("").to_owned(),
                     kind: str_of(v, "subagent_type").or_else(|| str_of(v, "task_type")).unwrap_or("task").to_owned(),
                     status: "running".into(),
@@ -2546,11 +2560,13 @@ impl Claude {
                 task.class = class;
                 task.output = output;
                 task.stoppable = true;
-                if let Some(tid) = task.tool_id.clone()
-                    && let Some(ev) = core.get_mut(&tid)
-                    && let Body::Tool(t) = &mut ev.body
-                {
-                    t.task = Some(task.id.clone());
+                // Its call, and the one that resumed it: each opens its thread.
+                for tid in task.tool_id.iter().chain(tool_id.iter()) {
+                    if let Some(ev) = core.get_mut(tid)
+                        && let Body::Tool(t) = &mut ev.body
+                    {
+                        t.task = Some(task.id.clone());
+                    }
                 }
                 // One resumed with a message kiln had it passed on: it has taken it.
                 self.waking.remove(&task.id);
@@ -5330,6 +5346,34 @@ mod tests {
         assert!(core.take_writes().is_empty());
         assert_eq!(core.state.delivery.get("m3"), Some(&Delivery::Cancelled));
         Ok(())
+    }
+
+    /// A subagent resumed (a SendMessage to one that finished) runs under the call that resumed it,
+    /// as Claude Code says it (its `task_started` and its output name that call): its thread stays
+    /// its first call's, with what it did before and what it does now, and either call opens it.
+    #[test]
+    fn a_resumed_subagent_s_work_stays_in_its_first_call_s_thread() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        feed(&mut c, &mut core, &[
+            r#"{"type":"assistant","message":{"id":"msg_1","model":"m","content":[{"type":"tool_use","id":"toolu_5","name":"Agent","input":{"description":"Land","prompt":"land it","run_in_background":true}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a5","tool_use_id":"toolu_5","description":"Land","subagent_type":"general-purpose","task_type":"local_agent","is_backgrounded":true,"prompt":"land it"}"#,
+            r#"{"type":"assistant","message":{"id":"msg_2","model":"m","content":[{"type":"text","text":"Merged."}]},"parent_tool_use_id":"toolu_5"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a5","tool_use_id":"toolu_5","status":"completed","summary":"Merged."}"#,
+            r#"{"type":"assistant","message":{"id":"msg_3","model":"m","content":[{"type":"tool_use","id":"toolu_8","name":"SendMessage","input":{"to":"a5","message":"now the tests"}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a5","tool_use_id":"toolu_8","description":"Land","subagent_type":"general-purpose","task_type":"local_agent","is_backgrounded":true,"prompt":"now the tests"}"#,
+            r#"{"type":"assistant","message":{"id":"msg_4","model":"m","content":[{"type":"tool_use","id":"toolu_9","name":"Bash","input":{"command":"cargo test"}}]},"parent_tool_use_id":"toolu_8"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_5","type":"message","role":"assistant","content":[]}},"parent_tool_use_id":"toolu_8"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Green."}},"parent_tool_use_id":"toolu_8","api_message_id":"msg_5"}"#,
+        ]);
+        let tasks: Vec<_> = core.state.tasks.iter().map(|t| (t.id.as_str(), t.tool_id.as_deref(), t.status.as_str())).collect();
+        assert_eq!(tasks, [("a5", Some("toolu_5"), "running")], "one task, under the call that started it, running again");
+        let thread: Vec<&str> = core.events().filter(|e| e.parent.as_deref() == Some("toolu_5")).map(|e| e.id.as_str()).collect();
+        assert_eq!(thread, ["msg_2:0", "toolu_9", "msg_5:0"], "before the resume and after, in one thread");
+        assert!(core.events().all(|e| e.parent.as_deref() != Some("toolu_8")), "nothing under the call that resumed it");
+        for call in ["toolu_5", "toolu_8"] {
+            assert!(matches!(core.get(call).map(|e| &e.body), Some(Body::Tool(t)) if t.task.as_deref() == Some("a5")), "{call} opens its thread");
+        }
     }
 
     /// An agent that started a subagent in the background and ended its turn is done with it:
