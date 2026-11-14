@@ -1100,6 +1100,8 @@ export class SessionStore {
   private listeners = new Set<() => void>();
   private ws: WebSocket | null = null;
   private wsAt = 0;
+  /** The socket there is brought its snapshot (or what it missed) whole. */
+  private held = false;
   /** Frames on this connection so far. */
   private frames = 0;
   /** How far what's shown goes in the server's copy (docs/wire.md, "Revisions"): its process's
@@ -1944,6 +1946,7 @@ export class SessionStore {
     this.ws = ws;
     this.mailConnection = clientId();
     this.wsAt = Date.now();
+    this.held = false;
     this.unpacking = 0;
     this.packedBytes = 0;
     ws.onopen = () => {
@@ -2065,7 +2068,11 @@ export class SessionStore {
       return;
     }
     if (this.snap.conn === "open") this.patch({ conn: "reconnecting" });
-    this.retry();
+    // One that brought its snapshot whole and held as long as the first wait is was a connection, and what was lost is
+    // the link: it's asked for again at once (W21-R02: that wait was half of a reconnect on a slow link). One cut
+    // before its snapshot, or dropped sooner, waits as it did, so a server that drops them is asked no oftener.
+    const held = this.held && Date.now() - this.wsAt >= (BACKOFF[0] ?? 250);
+    this.retry(held ? 0 : undefined);
   }
 
   private retry(ms?: number) {
@@ -2336,6 +2343,7 @@ export class SessionStore {
     // A socket that brought its snapshot whole held: its backoff starts over. One that dies before
     // (or a server that keeps dropping it) waits longer each time, a snapshot each for the server.
     this.attempt = 0;
+    this.held = true;
     window.clearTimeout(this.quiet);
     window.clearTimeout(this.hold);
     const byId = new Map<string, HEvent>();
