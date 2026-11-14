@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AttentionPresentation, displayedPair, type AttentionPair, type AttentionShown } from "../src/lib/attention-exposure.ts";
-import { AttentionControls, AttentionOrder } from "../src/lib/attention-order.ts";
+import { AttentionControls, AttentionOrder, keepSame } from "../src/lib/attention-order.ts";
+import { sameJson } from "../src/lib/utils.ts";
 import { onOwnAgentAction, ownAgentAction } from "../src/lib/own-agent-action.ts";
 const pair: AttentionPair = { key: "first", order_a: ["a", "fixed", "b", "hidden"], order_b: ["b", "hidden", "a", "fixed"], arm: 0, model_order: true };
 const shown = ["fixed", "a", "b"];
@@ -131,4 +132,62 @@ test("mc_attention: preload before controls binds the first presentation without
     controls.sampled(requested);
     assert.equal(controls.allowed, false, "a control change while a fresh request is pending stays conservative");
   }
+});
+
+test("W26-R15 what the list shows is projected in steps that grow with the list, not with its square: twice the agents, no more than twice the reads", () => {
+  /** How many times the lists' ids are read to project a list of `n` agents (each list counts its own reads). */
+  const reads = (n: number) => {
+    let count = 0;
+    const counted = (ids: string[]) =>
+      new Proxy(ids, {
+        get(target, key, receiver) {
+          if (typeof key === "string" && /^\d+$/.test(key)) count++;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+    const ids = Array.from({ length: n }, (_, i) => `agent-${i}`);
+    const drawn: AttentionPair = { key: "many", order_a: counted([...ids]), order_b: counted([...ids].reverse()), arm: 0, model_order: true };
+    const projected = displayedPair(drawn, counted([...ids]), new Set(ids), true);
+    assert.equal(projected.consistent, true);
+    assert.deepEqual(projected.order_b, [...ids].reverse());
+    return count;
+  };
+  // Each id read a few times whatever the list's length: twice the agents, no more than twice the reads.
+  const few = reads(200);
+  const twice = reads(400);
+  assert.ok(twice <= 2 * few, `twice the agents took ${twice} reads, ${(twice / few).toFixed(1)} times the ${few} of half as many`);
+});
+
+test("W26-R15 a snapshot read again keeps each mark and the settings that say the same as the objects they were", () => {
+  const snapshot = () => ({
+    order: ["a", "b", "c"],
+    settings: { sort: "learned", park_later_minutes: 60 },
+    agents: {
+      a: { revision: 1, pinned: 2, urgency: { score: 0.5, stale: false, reason: "soon" } },
+      b: { revision: 0, deferred_requests: [{ agent: "b", kind: "approval", id: "q1", at: 5 }] },
+      c: { revision: 3 },
+    } as Record<string, object>,
+  });
+  const was = snapshot();
+  const next = { ...snapshot(), order: ["c", "a", "b"] };
+  next.agents.c = { revision: 4, parked_until: 9 };
+  next.agents.d = { revision: 0 };
+  delete next.agents.b;
+  const kept = keepSame(was, next);
+  // Parsed anew, and yet the marks that didn't change are the ones the rows already have.
+  assert.notEqual(next.agents.a, was.agents.a);
+  assert.equal(kept.agents.a, was.agents.a);
+  assert.equal(kept.settings, was.settings);
+  assert.deepEqual(kept.agents.c, { revision: 4, parked_until: 9 });
+  assert.deepEqual(Object.keys(kept.agents), ["a", "c", "d"]);
+  assert.deepEqual(kept.order, ["c", "a", "b"]);
+  assert.equal(keepSame(undefined, next), next);
+  // Nothing changed at all: the marks are the very object they were (what's made from all of them isn't made again).
+  assert.equal(keepSame(was, snapshot()).agents, was.agents);
+  assert.notEqual(kept.agents, was.agents);
+  assert.notEqual(keepSame(was, { ...next, settings: { sort: "yours", park_later_minutes: 60 } }).settings, was.settings);
+  assert.equal(sameJson({ a: [1, { b: null }], c: "x" }, { c: "x", a: [1, { b: null }] }), true);
+  assert.equal(sameJson({ a: [1, 2] }, { a: [2, 1] }), false);
+  assert.equal(sameJson({ a: 1 }, { a: 1, b: undefined }), false);
+  assert.equal(sameJson([], {}), false);
 });

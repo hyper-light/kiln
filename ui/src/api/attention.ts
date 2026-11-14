@@ -3,7 +3,7 @@ import * as React from "react";
 import { useServerEvents } from "./events";
 import { request } from "./client";
 import { clientId, type AgentInfo } from "./harness";
-import { AttentionControls, AttentionOrder, AttentionVisits } from "@/lib/attention-order";
+import { AttentionControls, AttentionOrder, AttentionVisits, keepSame } from "@/lib/attention-order";
 import { AttentionPresentation, type AttentionClose, type AttentionFrame, type AttentionPair } from "@/lib/attention-exposure";
 import { onOwnAgentAction } from "@/lib/own-agent-action";
 import { useAuth } from "@/lib/auth";
@@ -279,7 +279,7 @@ const read = (signal: AbortSignal): Promise<AttentionView> => {
         scope.acted.clear();
         scope.pairKey = next.pair?.key;
       }
-      scope.snapshot = scope.order.snapshot(next);
+      scope.snapshot = keepSame(scope.snapshot, scope.order.snapshot(next));
       scope.view = viewOf(scope, scope.snapshot);
       return scope.view;
     })
@@ -363,10 +363,10 @@ async function settleOrganized(
     scope.order.returned();
     scope.acted.clear();
     scope.pairKey = last.pair?.key;
-    scope.snapshot = scope.order.snapshot(last);
+    scope.snapshot = keepSame(scope.snapshot, scope.order.snapshot(last));
   } else if (last && scope.visit === visit) {
     scope.order.place(ids, reference ?? last.order);
-    scope.snapshot = scope.order.snapshot(last);
+    scope.snapshot = keepSame(scope.snapshot, scope.order.snapshot(last));
   } else {
     // Nothing came back for this visit: the server's word, read again, stands over what showed.
     invalidate(scope.key);
@@ -382,7 +382,7 @@ async function refreshActed(scope: Scope, ids: readonly string[]) {
   const next = await request<AttentionSnapshot>("GET", `/api/harness/attention?${params}`);
   if (scope.visit !== visit || scopes.get(scope.key) !== scope) return;
   scope.order.place(ids, next.order);
-  scope.snapshot = scope.order.snapshot(next);
+  scope.snapshot = keepSame(scope.snapshot, scope.order.snapshot(next));
   publish(scope);
 }
 

@@ -56,6 +56,26 @@ export function placeOf(ids: readonly string[], lists: readonly { list: string; 
   return null;
 }
 
+/** A pin's place among your pins. */
+export interface PinPlace {
+  index: number;
+  count: number;
+}
+
+/**
+ * Each of your pins' places (`pins`, in your order). One whose place and whose count are what they
+ * were (`was`) keeps the object it had, so its row has nothing to render again (W26-R15); and a row
+ * finds its own by its id, not by going through your pins.
+ */
+export function pinPlaces(pins: readonly string[], was: ReadonlyMap<string, PinPlace>): Map<string, PinPlace> {
+  const places = new Map<string, PinPlace>();
+  pins.forEach((id, index) => {
+    const before = was.get(id);
+    places.set(id, before && before.index === index && before.count === pins.length ? before : { index, count: pins.length });
+  });
+  return places;
+}
+
 /** Where a row was when you acted on it (the list it was in, what was before and after it, its height): its Undo stands there. */
 export interface Anchor {
   list: string;

@@ -1,7 +1,23 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentInfo } from "../src/api/harness.ts";
-import { briefsOf, keepOf, stepLive, subagentRows, subagentTree, threadCrumbs, threadHref, topOf, treePaths, within, wider, type Brief } from "../src/views/harness/subagent-tree.ts";
+import {
+  agentIn,
+  briefsOf,
+  keepOf,
+  keepRows,
+  nodeAsk,
+  stepLive,
+  subagentRows,
+  subagentTree,
+  threadCrumbs,
+  threadHref,
+  topOf,
+  treePaths,
+  within,
+  wider,
+  type Brief,
+} from "../src/views/harness/subagent-tree.ts";
 import type { Perms } from "../src/api/wire/Perms.ts";
 
 const agent = (id: string, rest: Partial<AgentInfo> = {}): AgentInfo => ({
@@ -281,4 +297,112 @@ test("Keep on a variant tells its parent to use its result, naming what it varie
   assert.equal(keepOf(ofTask, list)?.text.includes("the variant of “Measure election time”"), true);
   assert.equal(keepOf(varied, list), undefined, "not a variant");
   assert.equal(keepOf({ ...v, parent: undefined }, list), undefined, "no parent to tell");
+});
+
+test("W26-R15 a tree is made reading through the agents once, however many subagents it has", () => {
+  /** How many times the list's agents are read to make the tree of a lead with `briefs` harness subagents and three of kiln's, among 300 agents. */
+  const reads = (briefs: number) => {
+    let count = 0;
+    const lead = agent("lead", { subagents: Array.from({ length: briefs }, (_, i) => brief(`h${i}`, 100 + i, i > 0 && i % 4 === 0 ? { parent_task: `h${i - 1}` } : {})) });
+    const all = [lead, kiln("k1", "lead", 10), kiln("k2", "lead", 20, { subagents: [brief("k2a", 21)] }), kiln("k3", "k2", 30), ...Array.from({ length: 300 }, (_, i) => agent(`other-${i}`))];
+    const list = new Proxy(all, {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/.test(key)) count++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const nodes = subagentTree(lead, list);
+    assert.equal(nodes.length, briefs + 4);
+    assert.deepEqual(
+      nodes.slice(0, 4).map((n) => [n.key, n.depth]),
+      [
+        ["k1", 0],
+        ["k2", 0],
+        ["k2/k2a", 1],
+        ["k3", 1],
+      ],
+    );
+    // Asked again of the same list (another open tree, the next row): not read through again.
+    const before = count;
+    subagentTree(lead, list);
+    assert.equal(count, before);
+    return count;
+  };
+  const few = reads(10);
+  const many = reads(200);
+  assert.equal(few, 304, `${few} reads of 304 agents: each once`);
+  assert.equal(many, few, "twenty times the subagents read the list no more");
+});
+
+test("W26-R15 a tree made again keeps the row of each subagent that says what it said, and each row finds its agent without going through them all", () => {
+  const lead = (doing: string) => agent("lead", { subagents: [brief("h0", 40, { last_tool: doing }), brief("h1", 41, { last_tool: "Read", parent_task: "h0" }), brief("h2", 42)] });
+  const others = [kiln("k1", "lead", 10, { doing: "Running cargo test" }), agent("else")];
+  const was = subagentRows(lead("Bash"), [lead("Bash"), ...others]);
+  // The next word from anyone: every row is made anew, saying the same.
+  const same = subagentRows(lead("Bash"), [lead("Bash"), ...others]);
+  assert.deepEqual(same, was);
+  assert.ok(same.every((row, i) => row !== was[i]));
+  assert.ok(keepRows(was, same).every((row, i) => row === was[i]));
+  // One subagent moves on: its row alone is new.
+  const next = keepRows(was, subagentRows(lead("Edit"), [lead("Edit"), ...others]));
+  assert.deepEqual(
+    next.map((row, i) => [row.key, row === was[i]]),
+    [
+      ["k1", true],
+      ["lead/h0", false],
+      ["lead/h1", true],
+      ["lead/h2", true],
+    ],
+  );
+  assert.equal(next[1]?.line, "Edit");
+  // One gone, one new: those there keep theirs where what they say (their piece of the path too) is the same.
+  const fewer = keepRows(was, subagentRows(lead("Bash"), [lead("Bash"), others[1]!]));
+  assert.deepEqual(
+    fewer.map((row) => row.key),
+    ["lead/h0", "lead/h1", "lead/h2"],
+  );
+  assert.equal(fewer[1], was[2]);
+  assert.deepEqual(keepRows(was, []), []);
+  // Each row's agent, by its id.
+  let reads = 0;
+  const list = new Proxy([lead("Bash"), ...others], {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) reads++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  assert.equal(agentIn(list, "k1")?.id, "k1");
+  const once = reads;
+  assert.equal(agentIn(list, "else")?.id, "else");
+  assert.equal(agentIn(list, "nobody"), undefined);
+  assert.equal(reads, once, "the list is gone through once, whoever is asked for");
+});
+
+test("W26-R15 a subagent's row is told of its agent only while it asks you something its agent's row doesn't answer already", () => {
+  const ask = { id: "q1", tool: "question", tool_name: "", title: "Which first?", at: 5 };
+  assert.equal(nodeAsk({ stand: "needs", ask }), ask);
+  assert.equal(nodeAsk({ stand: "needs", ask }, "another"), ask);
+  // Its agent's row answers that one: not again under it.
+  assert.equal(nodeAsk({ stand: "needs", ask }, "q1"), undefined);
+  // At work, done, or needing you with nothing to answer here: nothing of its agent's is its news.
+  assert.equal(nodeAsk({ stand: "working", ask }), undefined);
+  assert.equal(nodeAsk({ stand: "done" }), undefined);
+  assert.equal(nodeAsk({ stand: "needs" }), undefined);
+  // As a tree has them: of a lead's two subagents, the one that asks, and neither once the lead's row answers it.
+  const lead = agent("lead", {
+    subagents: [brief("h0", 40), brief("h1", 41)],
+    approvals: [{ id: "q1", tool: "shell", tool_name: "Bash", title: "cargo test", at: 6, agent: "h1" }],
+  });
+  const rows = subagentRows(lead, [lead]);
+  assert.deepEqual(
+    rows.map((row) => [row.key, nodeAsk(row)?.id]),
+    [
+      ["lead/h0", undefined],
+      ["lead/h1", "q1"],
+    ],
+  );
+  assert.deepEqual(
+    rows.map((row) => nodeAsk(row, "q1")?.id),
+    [undefined, undefined],
+  );
 });

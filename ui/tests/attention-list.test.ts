@@ -12,7 +12,7 @@ const loader = registerHooks({
     return url.endsWith(".css") ? { format: "module", source: "export {};", shortCircuit: true } : nextLoad(url, context);
   },
 });
-const { described, entriesOf, inverseOf, placeOf, withTrees, withUndo } = await import("../src/views/harness/attention-list.ts");
+const { described, entriesOf, inverseOf, pinPlaces, placeOf, withTrees, withUndo } = await import("../src/views/harness/attention-list.ts");
 loader.deregister();
 
 const row = (id: string, more: Partial<MissionRow> = {}): MissionRow => ({ a: { ...defaultInfo(), id, approvals: [] }, stand: "working", ...more });
@@ -112,4 +112,33 @@ test("W21-R02 where a row acted on is, is read from the lists as they are (a win
   assert.deepEqual(placeOf(["y"], [live, ended]), { list: "ended", key: "row:y", prev: "row:x", next: null });
   assert.equal(placeOf(["nowhere"], [live, ended]), null);
   assert.equal(placeOf(["x"], [live]), null, "a list that isn't on the page (folded) has no place for it");
+});
+
+test("W26-R15 a pin's place is the same object while it's where it was among as many, so its row isn't drawn again", () => {
+  const first = pinPlaces(["a", "b", "c"], new Map());
+  assert.deepEqual(
+    [...first],
+    [
+      ["a", { index: 0, count: 3 }],
+      ["b", { index: 1, count: 3 }],
+      ["c", { index: 2, count: 3 }],
+    ],
+  );
+  // The same pins, as the next render has them: every place the object it was.
+  const again = pinPlaces(["a", "b", "c"], first);
+  for (const id of ["a", "b", "c"]) assert.equal(again.get(id), first.get(id));
+  // b and c change places: a keeps its object, they get theirs anew.
+  const moved = pinPlaces(["a", "c", "b"], again);
+  assert.equal(moved.get("a"), first.get("a"));
+  assert.deepEqual(
+    [moved.get("c"), moved.get("b")],
+    [
+      { index: 1, count: 3 },
+      { index: 2, count: 3 },
+    ],
+  );
+  assert.notEqual(moved.get("b"), first.get("b"));
+  // One unpinned: each of the rest is one of fewer (Move pin down turns off for the last), and it has none.
+  const fewer = pinPlaces(["a", "c"], moved);
+  assert.deepEqual([fewer.get("a"), fewer.get("c"), fewer.get("b")], [{ index: 0, count: 2 }, { index: 1, count: 2 }, undefined]);
 });

@@ -6,7 +6,7 @@
  * let go, so a request the agent still waits on shows again.
  */
 import { useSyncExternalStore } from "react";
-import { clientId, commandId, harnessApi, type ApprovalBrief, type Command, type SessionStore } from "@/api/harness";
+import { clientId, commandId, harnessApi, type AgentInfo, type ApprovalBrief, type Command, type SessionStore } from "@/api/harness";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { Tries } from "@/lib/tries";
@@ -169,4 +169,22 @@ export function asAnswered<T extends { id: string; approvals: ApprovalBrief[]; s
   const next = { ...a, approvals: left, status: working ? "running" : a.status };
   if (resumed) delete next.held;
   return next;
+}
+
+let answeredLast: { list: readonly AgentInfo[]; done: ReadonlyMap<string, number>; out: readonly AgentInfo[] } | undefined;
+
+/**
+ * Every agent of `list` as answered here (`asAnswered`): the list itself when nothing answered
+ * touches it, and the same list again for the same agents and answers. Mission control's head, its
+ * rows and its open trees each ask, and what's made from the list once is made once (W26-R15).
+ */
+export function agentsAnswered(list: readonly AgentInfo[], done: ReadonlyMap<string, number>): readonly AgentInfo[] {
+  if (answeredLast && answeredLast.list === list && answeredLast.done === done) return answeredLast.out;
+  let out = list;
+  if (done.size > 0) {
+    const answered = list.map((agent) => asAnswered(agent, done));
+    if (answered.some((agent, i) => agent !== list[i])) out = answered;
+  }
+  answeredLast = { list, done, out };
+  return out;
 }
