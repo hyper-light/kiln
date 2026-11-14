@@ -13,11 +13,10 @@ kiln runners linux                                   # the Linux runners and wha
 
 Agents get the same through kiln's MCP server (§7): one command at a time (`runners`, `run`,
 `output`, `stop`), or a program that runs commands on several machines at once and returns only what
-matters (`code_run`), so Claude Code, Codex or any harness that takes MCP servers can run a step its
-own machine can't do (another platform, a GPU, more than it has) elsewhere, saying what it needs:
-which machine is the load balancer's to choose (§2.3). Everything else runs on the session's own
-machine. The tools tell agents so, and not to weigh machines' load, spread work across machines by
-name, or name one but for a step that has to happen there.
+matters (`code_run`), so Claude Code, Codex or any harness that takes MCP servers can hand a build
+or a test to kiln, saying what it needs: where it runs is the load balancer's to choose (§2.3), and
+the tools tell agents so: they don't weigh machines' load, pick one to spread work out, or name one
+but for a step that has to happen there.
 
 ## 1. Pieces
 
