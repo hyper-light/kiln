@@ -717,6 +717,51 @@ fn may_start_on(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>, 
     Ok(ok.into_iter().map(|m| if m == "local" { m } else { format!("agent:{m}") }).collect())
 }
 
+/// Whether placement chooses an agent's machine by what it needs (`on` a need, or nothing said and
+/// no parent's machine to take), rather than taking the machine named or its parent's.
+fn by_needs(hub: &Hub, on: Option<&str>, default: Option<&str>) -> bool {
+    match on.map(str::trim).filter(|o| !o.is_empty()) {
+        Some(o) => named(hub, o).is_none(),
+        None => default.is_none(),
+    }
+}
+
+/// Of `targets`, those where harness `kind` can take a new agent as far as kiln knows
+/// ([`not_ready`]); refused, saying why for each, when none can.
+fn ready(hub: &Hub, targets: Vec<String>, kind: &str) -> Result<Vec<String>, Refused> {
+    let sessions = hub.harness.list();
+    let now = crate::util::now_ms();
+    let (mut kept, mut why) = (Vec::new(), Vec::new());
+    for t in targets {
+        match not_ready(kind, &t, crate::accounts::known(&t, kind).as_ref(), &sessions, now) {
+            Some(w) => why.push(format!("{}: {w}", hub.shown(t.strip_prefix("agent:").unwrap_or(&t)))),
+            None => kept.push(t),
+        }
+    }
+    if kept.is_empty() && !why.is_empty() {
+        return Err((StatusCode::CONFLICT, format!("no machine that suits it can take {kind} now ({}): name one with `on` to start it there anyway", why.join("; "))));
+    }
+    Ok(kept)
+}
+
+/// Why harness `kind` on `target` can't take a new agent now, when kiln knows it can't: the last
+/// check of its accounts there found it signed out, or the account it uses there is at its limit
+/// by the usage its sessions report (the account that check named, else the one its newest session
+/// there used). What isn't known is no reason.
+fn not_ready(kind: &str, target: &str, known: Option<&crate::accounts::Account>, sessions: &[Info], now: i64) -> Option<String> {
+    if known.is_some_and(|a| a.signed_in == Some(false)) {
+        return Some(format!("{kind} isn't signed in there"));
+    }
+    let limits: Vec<&super::model::Limit> = match known.and_then(|a| a.email.as_deref()) {
+        Some(who) => sessions.iter().filter(|o| o.account.as_deref().and_then(|a| super::model::account_is(a, kind, who)) == Some(true)).flat_map(|o| o.limits.iter()).collect(),
+        None => {
+            let account = sessions.iter().filter(|o| o.target == target && o.kind == kind).filter_map(|o| Some((o.created_at, o.account.as_deref()?))).max()?.1;
+            sessions.iter().filter(|o| o.account.as_deref() == Some(account)).flat_map(|o| o.limits.iter()).collect()
+        }
+    };
+    (super::elsewhere::fullest(&limits, now) >= 100.0).then(|| format!("the account {kind} uses there is at its limit"))
+}
+
 /// Where each of `count` agents of harness `kind` starts for `on`, with its claim there (AUDIT M4,
 /// docs/needs.md E5): placed as a runner's owner places its runs, by the runners' own admission,
 /// in the same ledger as CI legs and commands (G1). Among the machines that can run it
@@ -735,6 +780,10 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
     use crate::reach::place::{SessionAsk, SessionWord};
     let default = parent.map(target_of);
     let targets = may_start_on(hub, on, kind, default.as_deref(), isolation.is_some())?;
+    // Chosen by what it needs, not a machine named nor its parent's: only where its harness is signed
+    // in and its account has room, as far as kiln knows (2026-11-13). An isolated agent's harness
+    // and sign-in are its image's.
+    let targets = if isolation.is_none() && by_needs(hub, on, default.as_deref()) { ready(hub, targets, kind)? } else { targets };
     let unplaced = |why: &str| -> Refused { (StatusCode::CONFLICT, format!("an isolated agent is placed only by kiln's balancer, and {why} (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32)")) };
     let runners: Vec<String> = targets.iter().filter_map(|t| t.strip_prefix("agent:")).map(str::to_owned).collect();
     if runners.is_empty() {
@@ -1526,6 +1575,28 @@ pub fn children_brief(hub: &Hub, id: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-11-13 (after t3code): an agent placed by what it needs skips a machine where kiln knows
+    /// its harness is signed out, or the account it uses there is at its limit (the usage counted
+    /// wherever that account's sessions run); a machine kiln knows nothing of stays.
+    #[test]
+    fn an_agent_isnt_placed_where_its_harness_is_signed_out_or_its_account_is_at_its_limit() {
+        use super::super::model::Limit;
+        use crate::accounts::Account;
+        let now = 1_000;
+        let at_limit = Limit { id: "five_hour".into(), status: Some("rejected".into()), ..Limit::default() };
+        let half = Limit { id: "five_hour".into(), used_percent: Some(50.0), ..Limit::default() };
+        let session = |target: &str, account: &str, limit: &Limit, created_at: i64| Info { kind: "claude".into(), target: target.into(), account: Some(account.into()), limits: vec![limit.clone()], created_at, ..Info::default() };
+        assert_eq!(not_ready("claude", "agent:a", None, &[], now), None, "nothing known: no reason");
+        let out = Account { kind: "claude".into(), signed_in: Some(false), ..Account::default() };
+        assert!(not_ready("claude", "agent:a", Some(&out), &[], now).is_some_and(|w| w.contains("isn't signed in")));
+        // Its newest session there uses an account now at its limit, as a session elsewhere says.
+        let full = [session("agent:a", "claude:max:h1", &half, 1), session("agent:b", "claude:max:h1", &at_limit, 2)];
+        assert!(not_ready("claude", "agent:a", None, &full, now).is_some_and(|w| w.contains("at its limit")));
+        assert_eq!(not_ready("codex", "agent:a", None, &full, now), None, "another harness's sessions say nothing of its account");
+        let roomy = [session("agent:a", "claude:max:h2", &half, 1)];
+        assert_eq!(not_ready("claude", "agent:a", None, &roomy, now), None, "an account with room");
+    }
 
     /// Step 18: an isolated agent's person is whoever asked for it, else its parent's; an agent that
     /// isn't isolated gets no isolation.

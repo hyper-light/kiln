@@ -713,13 +713,22 @@ fn next_epoch_on(d: &impl EpochDisk) -> anyhow::Result<u64> {
 /// what's in use of it, by everything. A share its interval was too short to show (no CPU tick
 /// passed) is the last measure's.
 pub fn sample_of_measure(m: &crate::sense::Measure, last: Option<&crate::sense::Measure>) -> Sample {
-    let idle = m.cpu_idle.or_else(|| last.and_then(|l| l.cpu_idle)).unwrap_or(1.0);
-    let busy = ((1.0 - idle.clamp(0.0, 1.0)) * f64::from(m.cpus) * 1000.0).round();
-    let busy = if busy.is_finite() && busy >= 0.0 { busy as u64 } else { 0 };
+    // The runner's own budget, as its cgroups bound it (AUDIT M6, as the host sample says it): a
+    // runner in a container takes no more than the container lets it, whatever the machine around
+    // it has idle. Its CPUs: the fewest of those it may run on and its quota allows; idle, its
+    // quota less what its tasks used, no more than the machine's idle ([`Measure::idle_cpus`]).
+    let budget = m.budget();
+    let quota = m.cgroup.as_ref().and_then(|c| c.cpu_limit).filter(|q| *q > 0.0);
+    let all = quota.map_or(f64::from(m.cpus), |q| q.min(f64::from(m.cpus)));
+    let idle = m.idle_cpus().or_else(|| last.and_then(crate::sense::Measure::idle_cpus)).unwrap_or(all).clamp(0.0, all);
+    let milli = |cpus: f64| {
+        let v = (cpus * 1000.0).round();
+        if v.is_finite() && v >= 0.0 { v as u64 } else { 0 }
+    };
     let (disk_total, disk_free) = m.space.map_or((0, 0), |s| (s.total, s.free));
     Sample {
-        size: Resources { cpu: Cpus::whole(u64::from(m.cpus)), mem: m.mem_total, disk: disk_total, gpu: 0 },
-        used: Resources { cpu: Cpus::milli(busy), mem: m.mem_total.saturating_sub(m.mem_available), disk: disk_total.saturating_sub(disk_free), gpu: 0 },
+        size: Resources { cpu: Cpus::milli(milli(all)), mem: budget.mem_total, disk: disk_total, gpu: 0 },
+        used: Resources { cpu: Cpus::milli(milli(all - idle)), mem: budget.mem_used, disk: disk_total.saturating_sub(disk_free), gpu: 0 },
         ..Sample::default()
     }
 }
@@ -2799,6 +2808,24 @@ mod topo_tests {
 #[cfg(test)]
 mod hex_gpu_port_tests {
     use super::*;
+    /// AUDIT M6 for the runner's own admission (2026-11-13): a runner whose cgroups allow 8 of a
+    /// machine's 32 CPUs and 40 GiB of its 124 offers what those leave (8 CPUs, 2 of them idle when
+    /// its tasks use 6; 40 GiB, 10 of them free), not the machine's 30 idle CPUs; one without a
+    /// cgroup of its own offers the machine, as before.
+    #[test]
+    fn the_runners_sample_is_what_its_cgroup_lets_it_take() {
+        let g = 1u64 << 30;
+        let cgroup = crate::sense::Cgroup { cpu_limit: Some(8.0), cpu_used: Some(6.0), mem_limit: Some(40 * g), mem_available: Some(10 * g), ..crate::sense::Cgroup::default() };
+        let m = crate::sense::Measure { cpus: 32, cpu_idle: Some(30.0 / 32.0), mem_total: 124 * g, mem_available: 10 * g, cgroup: Some(cgroup), ..crate::sense::Measure::default() };
+        let s = sample_of_measure(&m, None);
+        assert_eq!((s.size.cpu, s.used.cpu), (Cpus::milli(8000), Cpus::milli(6000)), "{s:?}");
+        assert_eq!((s.size.mem, s.used.mem), (40 * g, 30 * g), "{s:?}");
+        let machine = crate::sense::Measure { cgroup: None, mem_available: 60 * g, ..m };
+        let s = sample_of_measure(&machine, None);
+        assert_eq!((s.size.cpu, s.used.cpu), (Cpus::milli(32_000), Cpus::milli(2000)), "{s:?}");
+        assert_eq!((s.size.mem, s.used.mem), (124 * g, 64 * g), "{s:?}");
+    }
+
     #[test]
     fn w13_r01_gpu_inventory_survives_host_samples_and_changes_on_local_facts() {
         let facts = RunnerFacts { gpus: vec![kiln_ci::facts::Gpu { model: "A100".into(), memory: 80 << 30, ..Default::default() }; 2], ..RunnerFacts::default() };
