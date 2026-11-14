@@ -20,7 +20,10 @@ would go (below) with its `runs-on`.
 A leg waits for one of: no runner connected that carries its labels, a runner lacking a
 requirement (a capability, an architecture, memory), every eligible runner busy, a concurrency
 group, a quota, or a reviewer (an environment). The answer names which; fix that, not the
-symptom. Don't widen `runs-on` to "any runner" to make a leg start.
+symptom. Don't widen `runs-on` to "any runner" to make a leg start, nor narrow it to one machine
+to make it start sooner or run faster: of the runners a leg's `runs-on` and `requires` allow,
+kiln's load balancer already gives it the one with the most room at its measured speed, back
+where that kind of leg last went well, and moves a kind off a runner that let it down.
 
 ## Where would a job go?
 
@@ -50,9 +53,13 @@ written against those facts, by these names:
 - a fact alone holds when it's true or there: `virt.kvm`, `tools.cargo`;
 - `label bench`; `!`, `&&`, `||` and parentheses combine them (`arch == aarch64 || label arm`).
 
-A job asks with `requires: [...]` (kiln dialect, or an overlay for a GitHub workflow), and leans
-with `prefer: [{ fact: disk.free, higher: true }]`. `exclusive: true` takes a whole runner (for
-benchmarks); `resources: { cpu, memory }` reserves part of one.
+A job asks with `requires: [...]` for what it must have (kiln dialect, or an overlay for a GitHub
+workflow); `exclusive: true` takes a whole runner (for benchmarks); `resources: { cpu, memory }`
+reserves part of one. Which of the runners that qualify gets each leg is the load balancer's.
+`prefer: [...]` ranks runners ahead of it for every leg of the job, so keep it to what the
+balancer can't measure: `warm` and `affinity` (a runner that holds the job's workspace, or what it
+needs from another job). A fact or a label it already weighs (`{ fact: disk.free, higher: true }`,
+a `fast` label) only overrides its choice.
 
 ## Routing rules
 

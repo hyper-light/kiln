@@ -12,8 +12,10 @@
 //!   one agent has at most as many subagents at work at once as its own Subagents setting says, one
 //!   pool whatever each does ([`room`]); with no setting, no limit (unless kiln's config sets
 //!   `[agents] max_children`).
-//! - **Where.** `on` is a machine's name, or what it needs (`linux/amd64`, `+gpu`, `cpus>=16`),
-//!   picked as reach picks: of the machines that suit and have the harness, the idlest.
+//! - **Where.** `on` is what it needs (`linux/amd64`, `+gpu`, `cpus>=16`), or a machine's name:
+//!   placed by the load balancer among the machines that suit and have the harness
+//!   ([`place_agents`]); the directory's own pick ([`pick`]: the most room) only where no runner
+//!   places sessions.
 
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -509,8 +511,9 @@ pub fn live_descendants(all: &[Info], id: &str) -> Vec<Info> {
 pub struct Ask {
     /// The harness (`claude`, `codex`, …).
     pub kind: String,
-    /// Where: a machine's name (`local` for the server), or what it needs (`linux/amd64`,
-    /// `+gpu`). The caller's own machine when it's an agent, else the server or the best runner.
+    /// Where: what it needs (`linux/amd64`, `+gpu`), placed by the load balancer, or a machine's
+    /// name (`local` for the server). The caller's own machine when it's an agent, else the server
+    /// or where the balancer places it.
     pub on: Option<String>,
     pub cwd: Option<String>,
     pub prompt: Option<String>,
@@ -591,8 +594,10 @@ fn server_as_runner(hub: &Hub) -> Option<crate::reach::directory::RunnerInfo> {
     })
 }
 
-/// The machines that could run harness `kind` for `want`, best first (the idlest, as reach picks),
-/// and why each other one was passed over. The server counts as `local`.
+/// The machines that could run harness `kind` for `want`, the one with the most room first as the
+/// directory measures it (for [`pick`], the fallback where no runner places sessions; [`may_start_on`]
+/// takes them as a filter, in no order), and why each other one was passed over. The server counts
+/// as `local`.
 fn candidates(hub: &Hub, want: &crate::reach::directory::Want) -> (Vec<String>, Vec<String>) {
     let outposts: Vec<String> = hub.agents.load().values().filter(|a| a.outpost).map(|a| a.name.clone()).collect();
     let mut machines = hub.reach_directory();
