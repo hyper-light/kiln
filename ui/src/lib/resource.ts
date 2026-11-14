@@ -66,6 +66,13 @@ export interface ResourceOptions<T = unknown> {
    * fill a slow link.
    */
   apply?(data: T, ev: ServerEvent): T | undefined;
+  /**
+   * `apply` for all the events gathered since the data was last brought up to date, in the order
+   * they came, at once: a list of N things that takes a burst of E events one by one copies itself
+   * E times and looks each thing up among N (many agents at work send hundreds between two applies).
+   * Undefined: they can't be applied, so it's loaded again. Where it's given, `apply` isn't asked.
+   */
+  applyMany?(data: T, events: readonly ServerEvent[]): T | undefined;
   /** Refresh this often while it's shown. */
   pollMs?: number;
 }
@@ -396,14 +403,22 @@ function take(e: Entry, ev: ServerEvent) {
       return;
     }
     let data = e.snap.data;
-    for (const n of news) {
-      const next = e.snap.has ? e.opts.apply?.(data, n) : undefined;
+    if (e.opts.applyMany) {
+      const next = e.snap.has ? e.opts.applyMany(data, news) : undefined;
       if (next === undefined) {
         soon(e);
         return;
       }
       data = next;
-    }
+    } else
+      for (const n of news) {
+        const next = e.snap.has ? e.opts.apply?.(data, n) : undefined;
+        if (next === undefined) {
+          soon(e);
+          return;
+        }
+        data = next;
+      }
     if (data !== e.snap.data) set(e, { data });
     // A load on its way read the data before these: once it lands, load again.
     if (e.promise) e.later = true;
@@ -616,7 +631,7 @@ events.on(wantedTypes, (ev) => {
   for (const e of entries.values()) {
     if (!e.opts.on?.includes(ev.type) || (e.opts.relevant && !e.opts.relevant(ev))) continue;
     if (e.listeners.size === 0) markStale(e);
-    else if (e.opts.apply) take(e, ev);
+    else if (e.opts.apply || e.opts.applyMany) take(e, ev);
     else soon(e);
   }
 });

@@ -1,14 +1,19 @@
 /**
  * The agents with something to show wherever you are in kiln (cards.ts: a request, goals paused for
- * you, a stop of their own, a usage limit), kept for the whole app: read once when first asked for,
- * then kept from the server's events, and read again whenever the event stream comes back (what
- * changed while it was away isn't told). Only a change in what the cards show tells the page; an
- * agent's other news doesn't. Only for a person who may see agents (`agents.run` on the server, as
- * the agents' routes need): one who may not gets no cards, and kiln isn't asked (it would refuse).
+ * you, a stop of their own, a usage limit), kept for the whole app from the one list of agents every
+ * page reads (lib/data.ts's `harnessSessionsRes`): it's read once for them all and kept from the
+ * server's events, and read again when the event stream comes back without what it missed
+ * (lib/resource.ts). This kept a list of its own once, read as the shell mounted and again each time
+ * the stream opened, resumed or not: every page asked the server for all its agents two or three
+ * times as it opened, and again at each reconnect. Only a change in what the cards show tells the
+ * page; an agent's other news doesn't. Only for a person who may see agents (`agents.run` on the
+ * server, as the agents' routes need): one who may not gets no cards, and kiln isn't asked (it
+ * would refuse).
  */
-import { events } from "@/api/events";
-import { harnessApi, listed, type AgentInfo } from "@/api/harness";
+import type { AgentInfo } from "@/api/harness";
 import { useAuth } from "@/lib/auth";
+import { harnessSessionsRes } from "@/lib/data";
+import { resourceData, watch } from "@/lib/resource";
 import { atLimit, notable, stoppedItself } from "./cards";
 
 const agents = new Map<string, AgentInfo>();
@@ -52,18 +57,14 @@ function mayRead(): boolean {
   return !can || can["agents.run"] === "server";
 }
 
-async function read() {
-  if (!mayRead()) return;
-  let list: AgentInfo[];
-  try {
-    list = await harnessApi.list();
-  } catch {
-    return;
-  }
+/** The cards as the list of agents now says them: only an agent whose entry is another than it was is looked at again. */
+function sync() {
+  const list = mayRead() ? (resourceData(harnessSessionsRes) ?? []) : [];
   const gone = new Set(agents.keys());
   let any = false;
   for (const a of list) {
     gone.delete(a.id);
+    if (agents.get(a.id) === a) continue;
     agents.set(a.id, a);
     any = changed(a, a.id) || any;
   }
@@ -75,29 +76,20 @@ async function read() {
 }
 
 function start() {
-  const offEvents = events.on(["harness", "harness_closed"], (ev) => {
-    if (ev.type === "harness" && listed(ev.info)) {
-      agents.set(ev.info.id, ev.info);
-      if (changed(ev.info, ev.info.id)) publish();
-    } else if (ev.type === "harness_closed") {
-      agents.delete(ev.id);
-      if (changed(undefined, ev.id)) publish();
-    }
-  });
-  let was = events.getSnapshot().state;
-  const offState = events.subscribeState(() => {
-    const now = events.getSnapshot().state;
-    if (now === "open" && was !== "open") void read();
-    was = now;
-  });
-  // Read once the person is known, if that's after the cards were first asked for.
+  let off = () => {};
+  const follow = () => {
+    off();
+    off = mayRead() ? watch(harnessSessionsRes.key, harnessSessionsRes.fetch, harnessSessionsRes.opts ?? {}, sync) : () => {};
+    sync();
+  };
+  follow();
+  // The list is its login's own (lib/resource.ts lets go of it as that ends): followed afresh once the person is known.
   const offAuth = useAuth.subscribe((now, before) => {
-    if (now.kind === "authed" && before.kind !== "authed") void read();
+    if (now.kind === "authed" && before.kind !== "authed") follow();
+    else if (now.kind !== "authed" && before.kind === "authed") sync();
   });
-  void read();
   return () => {
-    offEvents();
-    offState();
+    off();
     offAuth();
   };
 }

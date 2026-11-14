@@ -10,7 +10,7 @@ import { create } from "zustand";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
 import { harnessApi, listed, type AgentInfo } from "@/api/harness";
-import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
+import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, ServerEvent, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
 import { loaded, preload, recent, useSuspenseResource, type ResourceOptions, type ResourceFetcher } from "./resource";
 
 /** What a key loads, and how. */
@@ -217,15 +217,45 @@ export const harnessSessionsRes: Res<AgentInfo[]> = {
   // Each event carries the agent's whole entry (or says it closed): applied, the list isn't loaded again.
   opts: {
     on: ["harness", "harness_closed"],
-    apply: (list, ev) => {
-      if (ev.type === "harness_closed") return list.filter((a) => a.id !== ev.id);
-      if (ev.type !== "harness") return undefined;
-      if (!listed(ev.info)) return list.filter((a) => a.id !== ev.info.id);
-      const i = list.findIndex((a) => a.id === ev.info.id);
-      return i === -1 ? [...list, ev.info] : list.map((a, j) => (j === i ? ev.info : a));
-    },
+    applyMany: agentsWith,
   },
 };
+
+/**
+ * The agents `list` with what `events` say of them, in the order they came: each agent's newest
+ * entry in its place (one that isn't listed, or closed, gone), new ones after the rest in the order
+ * they first came. One pass over the list whatever the events (W26-R15): applied one by one, a burst
+ * of E events to N agents looked each up among the N and copied the list E times. An agent no event
+ * names keeps its very entry, and a list no event changes is the list itself.
+ */
+export function agentsWith(list: AgentInfo[], events: readonly ServerEvent[]): AgentInfo[] | undefined {
+  // Each agent's last word: its entry, or null once it's gone.
+  const news = new Map<string, AgentInfo | null>();
+  for (const ev of events) {
+    if (ev.type === "harness") news.set(ev.info.id, listed(ev.info) ? ev.info : null);
+    else if (ev.type === "harness_closed") news.set(ev.id, null);
+    else return undefined;
+  }
+  if (news.size === 0) return list;
+  let changed = false;
+  const next: AgentInfo[] = [];
+  for (const a of list) {
+    if (!news.has(a.id)) {
+      next.push(a);
+      continue;
+    }
+    const now = news.get(a.id);
+    news.delete(a.id);
+    if (now) next.push(now);
+    if (now !== a) changed = true;
+  }
+  for (const now of news.values())
+    if (now) {
+      next.push(now);
+      changed = true;
+    }
+  return changed ? next : list;
+}
 
 /** The terminal sessions the server keeps (any device can attach to them). */
 export const terminalSessionsRes: Res<TerminalSessionInfo[]> = { key: "terminal/sessions", fetch: (s) => api.terminalSessions(s).catch(() => []), opts: { on: ["terminals"] } };
