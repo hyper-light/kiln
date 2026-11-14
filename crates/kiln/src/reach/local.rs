@@ -509,6 +509,9 @@ pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &crate::
         let local = claim.map(|(run, _)| (handle.clone(), run));
         return run_here(handle, spec, &req, ev, ctl, t, local, told, me, owned).await;
     }
+    // Told to go on `peer`, its claim held there until its start is said there: given up before
+    // (a refusal, a link or a copy that failed), the claim goes (W05-R03).
+    let mut owed = Owed::start(claim.as_ref().map(|(run, _)| (handle.clone(), run.clone())));
     if !elsewhere {
         taken(peer.clone()).await?;
     }
@@ -554,7 +557,11 @@ pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &crate::
     }
     let proof = owned.is_some().then_some(proof);
     let id = match (&claim, &picked) {
-        (Some((run, fence)), _) => handle.place_run(&peer, run, *fence, spec, says_tx, frames, proof).await?,
+        (Some((run, fence)), _) => {
+            let id = handle.place_run(&peer, run, *fence, spec, says_tx, frames, proof).await?;
+            owed.paid();
+            id
+        }
         (None, Some(runner)) => t.start(handle, runner, spec, says_tx, frames, proof).await?,
         (None, None) => match proof {
             Some(proof) => handle.run_observed(&peer, spec, says_tx, frames, proof).await?,
@@ -650,6 +657,44 @@ pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &crate::
     super::told::detached(handle, &peer, id, told, says).await
 }
 
+/// What a placed run's claim is owed should its driver leave before saying it (W05-R03): that its
+/// start was never said at its runner ([`Handle::place_unsaid`]), or its end here
+/// ([`Handle::place_local`]). Said as the driver leaves (an error, its client gone, its future
+/// dropped) unless it was [`Owed::paid`]: unsaid, the claim stays held for good, and every run
+/// asking room there waits behind it.
+struct Owed(Option<(Handle, String, bool)>);
+
+impl Owed {
+    /// Its start's owed until it's said at `run`'s runner.
+    fn start(placed: Option<(Handle, String)>) -> Owed {
+        Owed(placed.map(|(h, run)| (h, run, false)))
+    }
+
+    /// Its end here's owed until it's said.
+    fn end(placed: Option<(Handle, String)>) -> Owed {
+        Owed(placed.map(|(h, run)| (h, run, true)))
+    }
+
+    /// Said: what follows the run says the rest.
+    fn paid(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        if let Some((h, run, end)) = self.0.take() {
+            let _ = crate::rt::spawn(async move {
+                if end {
+                    h.place_local(&run, Some(false)).await;
+                } else {
+                    h.place_unsaid(&run).await;
+                }
+            });
+        }
+    }
+}
+
 /// A run placement gave a runner: which, and its claim there; and its answers' teller, when its
 /// agent is told them (AUDIT O5).
 struct Placing {
@@ -735,6 +780,10 @@ async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &crate::memory::queu
 // placement's `placed`, told's `told`): kept apart, as their owners keep them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>, t: &super::history::Try, placed: Option<(Handle, String)>, mut told: super::told::Watch, me: &str, owned: Option<&std::sync::Arc<super::owned::Run>>) -> anyhow::Result<()> {
+    // Started here by placement, its room held until its end is said: left before (its folder or
+    // its launch refused, its process lost, its client gone and its process stopped), it's said
+    // then (W05-R03).
+    let mut unended = Owed::end(placed.clone());
     let cwd = super::serve::resolve_cwd(&spec, None)?;
     // Its kind of work as this runner keys it (sense's), for its asker's key (AUDIT L2).
     let here_key = crate::sense::run::command_key(&spec.command, &cwd);
@@ -761,6 +810,7 @@ pub(crate) async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &
                     if let Some((h, run)) = &placed {
                         h.place_local(run, Some(error.is_none())).await;
                     }
+                    unended.paid();
                     told.seen();
                     return t.exit_here(handle, ev, req, code, error, used.as_deref()).await;
                 }
@@ -789,12 +839,15 @@ pub(crate) async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &
     let (fwd, follow) = crate::memory::queue::places::<super::serve::Event>(&crate::memory::owners::CHANNELS, 16);
     crate::rt::spawn(super::told::follow_here(follow, told, me.to_owned()));
     let (t, handle) = (t.clone(), handle.clone());
+    // Its end's owed by what follows it from here: said as it ends, or as this loses it.
+    let mut unended = unended;
     crate::rt::spawn(async move {
         while let Ok(e) = rx.recv().await {
             let ended = if let super::serve::Event::Exit { error, used, .. } = &e {
                 if let Some((h, run)) = &placed {
                     h.place_local(run, Some(error.is_none())).await;
                 }
+                unended.paid();
                 t.record(&handle, used.as_deref());
                 true
             } else {

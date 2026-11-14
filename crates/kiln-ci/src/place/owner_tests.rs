@@ -707,3 +707,93 @@ mod props {
         assert_eq!(m.get("lin-c"), Some(&false));
     }
 }
+
+/// W05-R13, docs/needs.md E5: a run waits for what's so, never for an answer that can't come. A
+/// probe unanswered on a link that stays up (a runner that took this owner for away, a word lost
+/// on the way: "haven't answered" all day) is said again each time its link's timeout runs out, the
+/// timeout doubled each time (RFC 6298 §5.5) to at most a minute (§2.5); once the runner answers,
+/// or the run is placed, it isn't said again.
+#[test]
+fn w05_r13_an_unanswered_probe_is_said_again_backing_off_until_answered() -> Result<(), String> {
+    let mut o = owner();
+    assert_eq!(probes(&o.ask(ask("r1", "linux/amd64,cpus=4")?, 0)), vec!["lin-a", "lin-b"]);
+    let _ = o.heard("lin-a", waiting("r1", Reason::Line, 2, soon(10), res(0, 8)), 1);
+    // lin-b never answers: said again at 1 s (an unmeasured link's timeout, §2.1), then 2, 4, ...
+    let mut at = 0i64;
+    for n in 0..8u32 {
+        let due = at.saturating_add(i64::try_from(Rtt::backed_off(Rtt::INITIAL, n)).map_err(|e| e.to_string())?);
+        assert!(probes(&o.tick(due - 1)).is_empty(), "not before its timeout ({n})");
+        assert_eq!(probes(&o.tick(due)), vec!["lin-b"], "said again at its timeout, lin-a's answer kept ({n})");
+        at = due;
+    }
+    assert_eq!(at, 1_000 + 2_000 + 4_000 + 8_000 + 16_000 + 32_000 + 60_000 + 60_000, "a minute at most");
+    // Answered: not said again.
+    let _ = o.heard("lin-b", waiting("r1", Reason::Line, 3, soon(10), res(0, 8)), at + 1);
+    assert!(probes(&o.tick(at + 3_600_000)).is_empty(), "answered");
+    // Placed while another probe is unanswered: that one isn't said again.
+    let mut o = owner();
+    let _ = o.ask(ask("r2", "linux/amd64")?, 0);
+    let _ = offered(&mut o, "lin-a", "r2", Fence { epoch: 1, n: 1 }, 1);
+    assert_eq!(o.stage("r2"), Some(("taking", Some("lin-a"))));
+    assert!(probes(&o.tick(3_600_000)).is_empty(), "placed");
+    Ok(())
+}
+
+/// W05-R03: a claim holds a runner's room for a run that starts there. A run the shell gives up
+/// before its start is said (its tree couldn't be copied there, its link or custody wouldn't take
+/// it, what asked for it went away) declines its claim, so its room is free there at once; held
+/// for good instead, every run asking room there waits behind it. A cancel once its start went out
+/// leaves the claim to its runner's word, as before. A go nothing took gives up a run told to go
+/// once, never one whose start is said again.
+#[test]
+fn w05_r03_a_run_given_up_before_its_start_lets_its_claim_go() -> Result<(), String> {
+    let f = Fence { epoch: 1, n: 1 };
+    let declined = |acts: &[Act], to: &str| acts.iter().any(|a| matches!(a, Act::Tell { runner, msg: ToRunner::Decline { fence, .. } } if runner == to && *fence == f));
+    let at = |o: &mut Owner, run: &str, start: bool| -> Result<(), String> {
+        let _ = o.ask(ask(run, "linux/amd64,cpus=12,mem=40g")?, 0);
+        let _ = offered(o, "lin-a", run, f, 1);
+        let _ = o.heard("lin-a", ToOwner::Held { run: run.into(), fence: f }, 2);
+        if start && !o.starting(run, "lin-a", f) {
+            return Err(format!("{run} didn't start"));
+        }
+        Ok(())
+    };
+    // Given up as its tree was copied: declined where it's held, its ticket gone.
+    let mut o = owner();
+    at(&mut o, "r1", true)?;
+    let acts = o.unsaid("r1");
+    assert!(declined(&acts, "lin-a"), "{acts:?}");
+    assert_eq!(o.stage("r1"), None);
+    // Cancelled once its start went out: the runner's word ends it.
+    at(&mut o, "r2", true)?;
+    assert!(!declined(&o.cancel("r2"), "lin-a"));
+    // A go nothing took, told once: given up.
+    at(&mut o, "r3", false)?;
+    let acts = o.undriven("r3").unwrap_or_default();
+    assert!(declined(&acts, "lin-a"), "{acts:?}");
+    assert_eq!(o.stage("r3"), None);
+    // A start said again that nothing took: its start went out, left to its runner.
+    at(&mut o, "r4", true)?;
+    assert!(o.undriven("r4").is_none());
+    assert_eq!(o.stage("r4"), Some(("starting", Some("lin-a"))));
+    Ok(())
+}
+
+/// W05-R25: a runner started again ends its old process's claims, not those its new one made. A
+/// probe said again can reach the new process before its new epoch reaches this owner, and what it
+/// starts there under its new epoch runs on (kiln-sim place, seed 157).
+#[test]
+fn w05_r25_a_restarted_runner_s_new_claims_are_its_own() -> Result<(), String> {
+    let mut o = owner();
+    let _ = o.ask(ask("r1", "linux/amd64")?, 0);
+    let f = Fence { epoch: 2, n: 1 };
+    let _ = offered(&mut o, "lin-a", "r1", f, 1);
+    let _ = o.heard("lin-a", ToOwner::Held { run: "r1".into(), fence: f }, 2);
+    assert!(o.starting("r1", "lin-a", f));
+    let _ = o.heard("lin-a", ToOwner::Started { run: "r1".into(), fence: f }, 3);
+    let again: Vec<Machine> = fleet().into_iter().map(|m| if m.name == "lin-a" { Machine { epoch: 2, ..m } } else { m }).collect();
+    let acts = o.machines(again);
+    assert!(answer(&acts).is_none(), "{acts:?}");
+    assert_eq!(o.stage("r1"), Some(("running", Some("lin-a"))));
+    Ok(())
+}

@@ -232,6 +232,17 @@ enum Stage {
     Fallback,
 }
 
+impl Stage {
+    /// The claim a stage past waiting holds there, when it names one.
+    fn fence(self) -> Option<Fence> {
+        match self {
+            Stage::Taking { fence } | Stage::Held { fence } | Stage::Starting { fence } => Some(fence),
+            Stage::Running { fence } => fence,
+            Stage::Waiting | Stage::Fallback => None,
+        }
+    }
+}
+
 /// An offer held while the owner chooses: its runner, its claim, what it gets and what was free.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Offer {
@@ -404,6 +415,17 @@ pub struct Owner {
     /// First answers due, and choices due, by when.
     due: BTreeSet<(i64, Tid)>,
     choose: BTreeSet<(i64, Tid)>,
+    /// Probes not answered yet, each said again when its link's timeout runs out (RFC 6298 §5.4),
+    /// the timeout backed off each time ([`Rtt::backed_off`]): a probe or its answer lost on a link
+    /// that stayed up (a runner that took this owner for away, a word dropped on the way) leaves
+    /// no run waiting on it for ever, "haven't answered". A runner answers a probe said again as
+    /// the run stands there, so saying it twice starts nothing twice. By when, and each one's
+    /// time with how many times its timeout ran out.
+    again: BTreeSet<(i64, Tid, Rid)>,
+    asked: FxMap<(Tid, Rid), (i64, u32)>,
+    /// The time as the last input that knew it said it: a probe said by one that doesn't (a link
+    /// back, the directory) times its answer from then.
+    clock: i64,
     draw: Vec<u32>,
     /// The runners whose latest hint shows any room, in no order (each knows its place).
     roomy: Vec<Rid>,
@@ -755,12 +777,19 @@ impl Owner {
     }
 
     fn set_word(&mut self, t: Tid, r: Rid, w: Word) {
+        let asked = matches!(w, Word::Asked);
         let Some(tk) = self.t_mut(t) else { return };
         match tk.words.iter_mut().find(|(x, _)| *x == r) {
             Some((_, old)) => *old = w,
             None => tk.words.push((r, w)),
         }
         self.note(r, t);
+        // Asked, its answer is awaited for its link's timeout; any other word is an answer.
+        if asked {
+            self.ask_again(t, r, 0, self.clock);
+        } else {
+            self.unask(t, r);
+        }
     }
 
     fn drop_word(&mut self, t: Tid, r: Rid) {
@@ -768,8 +797,25 @@ impl Owner {
             tk.words.retain(|(x, _)| *x != r);
             tk.offers.retain(|o| o.runner != r);
         }
+        self.unask(t, r);
         self.unnote(r, t);
         self.unhold_if_none(t);
+    }
+
+    /// Ticket `t`'s probe at `r` is said again if it's still unanswered when the link's timeout,
+    /// run out `n` times before, runs out from `now` ([`Owner::again`]).
+    fn ask_again(&mut self, t: Tid, r: Rid, n: u32, now: i64) {
+        self.unask(t, r);
+        let at = later(now, Rtt::backed_off(self.rto(r), n));
+        self.asked.insert((t, r), (at, n));
+        self.again.insert((at, t, r));
+    }
+
+    /// Ticket `t`'s probe at `r` is answered, withdrawn or gone: it isn't said again.
+    fn unask(&mut self, t: Tid, r: Rid) {
+        if let Some((at, _)) = self.asked.remove(&(t, r)) {
+            self.again.remove(&(at, t, r));
+        }
     }
 
     /// An offer held from `r` gone (it lapsed, its runner went or said otherwise).
@@ -803,6 +849,7 @@ impl Owner {
         }
         for (r, _) in &tk.words {
             self.unnote(*r, t);
+            self.unask(t, *r);
         }
         if let Some(r) = tk.runner {
             self.unnote(r, t);
@@ -1228,7 +1275,8 @@ impl Owner {
                 }
                 Change::Restarted => {
                     self.unhint(*r);
-                    self.restarted(*r, out);
+                    let epoch = self.machine(*r).map_or(0, |m| m.epoch);
+                    self.restarted(*r, epoch, out);
                 }
                 Change::Away => self.went_away(*r, out),
                 Change::Back => self.came_back(*r, out),
@@ -1329,14 +1377,19 @@ impl Owner {
         }
     }
 
-    /// `r` started again under a new epoch: its claims of the old one end; a start sent to it is
-    /// said again, for the record on its disk to answer (it ran, how it ended, or the claim
-    /// lapsed); a run there under the old epoch is lost; its probes are made again.
-    fn restarted(&mut self, r: Rid, out: &mut Vec<Cmd>) {
+    /// `r` started again under a new epoch, `epoch`: its claims of the old one end; a start sent to
+    /// it is said again, for the record on its disk to answer (it ran, how it ended, or the claim
+    /// lapsed); a run there under the old epoch is lost; its probes are made again. A claim its new
+    /// process made (a probe said again reached it before its new epoch reached this owner) is that
+    /// process's own: nothing of it went with the old one.
+    fn restarted(&mut self, r: Rid, epoch: u64, out: &mut Vec<Cmd>) {
         let connected = self.connected(r);
         let syncs = self.machine(r).is_some_and(|m| m.syncs);
         for t in self.runs_at(r) {
             let Some((stage, here, word)) = self.where_is(t, r) else { continue };
+            if here && stage.fence().is_some_and(|f| f.epoch >= epoch) {
+                continue;
+            }
             match stage {
                 // Its record on its disk says what it started (LB03): asked, never said again.
                 Stage::Running { .. } | Stage::Starting { .. } if here && syncs => {
@@ -1543,6 +1596,7 @@ impl Owner {
     /// drawn among those that could, are linked and place; its first answer comes once each has
     /// answered, or by the last of their links' timeouts.
     pub fn ask_c(&mut self, ask: Ask, now: i64, out: &mut Vec<Cmd>) {
+        self.clock = self.clock.max(now);
         self.ask_in(ask, now, true, out);
     }
 
@@ -1655,6 +1709,7 @@ impl Owner {
     /// Runner `r`'s word about a run, by handle: the run by the token this owner gave it (0: none,
     /// found by its id), as the in-process path carries it ([`super::runner::Reply`]).
     pub fn heard_c(&mut self, r: u32, token: u64, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
+        self.clock = self.clock.max(now);
         if matches!(msg, Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } | Up::FastHint { .. }) {
             self.fast_heard(r, run_id, msg, now, out);
             return;
@@ -1983,6 +2038,7 @@ impl Owner {
     /// the rest are asked again, in the epoch they were asked in. Then every runner that answers
     /// `Sync` is asked it once, so the claims this owner's earlier process left there go.
     pub fn reask_c(&mut self, now: i64, out: &mut Vec<Cmd>) {
+        self.clock = self.clock.max(now);
         for k in std::mem::take(&mut self.pending) {
             let epoch = k.epoch;
             let run: Arc<str> = Arc::from(k.ask.run.as_str());
@@ -2148,7 +2204,7 @@ impl Owner {
         slot.epoch = epoch;
         if was != 0 {
             self.unhint(r);
-            self.restarted(r, out);
+            self.restarted(r, epoch, out);
         }
     }
 
@@ -2200,12 +2256,29 @@ impl Owner {
     /// The asker doesn't want it any more: its probes are withdrawn, and a claim it took or an
     /// offer it held declined. A run starting or running is stopped by the shell, as any run is.
     pub fn cancel_c(&mut self, run: &str, out: &mut Vec<Cmd>) {
+        self.let_go(run, false, out);
+    }
+
+    /// The shell gave run `run` up before it said its start anywhere: its tree couldn't be copied
+    /// there, its link or its custody wouldn't take it, or what asked for it went away before its
+    /// go. It goes as a cancelled run does ([`Self::cancel_c`]), and its claim with it: a claim is
+    /// held at its runner until its run starts there, and this one never will, so it's declined,
+    /// its room free there at once (else it's held for good, and every run asking room there
+    /// waits behind it); a start the kernel decided goes back as never sent.
+    pub fn unsaid_c(&mut self, run: &str, out: &mut Vec<Cmd>) {
+        self.let_go(run, true, out);
+    }
+
+    /// Ticket of `run` let go ([`Self::cancel_c`], [`Self::unsaid_c`]): its probes withdrawn, the
+    /// offers it held declined, and the claim it took declined unless its start may have gone out
+    /// (`unsaid`: it didn't), when the shell stops the run and its runner's word ends it.
+    fn let_go(&mut self, run: &str, unsaid: bool, out: &mut Vec<Cmd>) {
         let Some(t) = self.by_run.get(run).copied() else { return };
         let Some(tk) = self.remove(t) else { return };
         if let Some(h) = tk.fast {
             // Its start not sent yet, the kernel's room goes back at once; sent, it's ended where
             // it starts, as any run is, and the kernel hears so.
-            if matches!(tk.stage, Stage::Held { .. }) {
+            if unsaid || matches!(tk.stage, Stage::Held { .. }) {
                 let _ = self.fast.lb.unsent(h);
             } else {
                 self.fast.out.clear();
@@ -2214,7 +2287,12 @@ impl Owner {
             }
             return;
         }
-        if let (Stage::Taking { fence } | Stage::Held { fence }, Some(r)) = (tk.stage, tk.runner) {
+        let claim = match tk.stage {
+            Stage::Taking { fence } | Stage::Held { fence } => Some(fence),
+            Stage::Starting { fence } if unsaid => Some(fence),
+            _ => None,
+        };
+        if let (Some(fence), Some(r)) = (claim, tk.runner) {
             out.push(Cmd::Tell { to: r, run: Arc::clone(&tk.run), msg: Down::Decline { fence } });
         }
         for (r, w) in &tk.words {
@@ -2318,10 +2396,11 @@ impl Owner {
         }
     }
 
-    /// The time: choices due (an offer held its time) are made with the offers held, and first
-    /// answers due (a runner probed hasn't answered within its link's timeout) are given with
-    /// what's known.
+    /// The time: choices due (an offer held its time) are made with the offers held, first answers
+    /// due (a runner probed hasn't answered within its link's timeout) are given with what's known,
+    /// and probes still unanswered past their link's timeout are said again ([`Owner::again`]).
     pub fn tick_c(&mut self, now: i64, out: &mut Vec<Cmd>) {
+        self.clock = self.clock.max(now);
         while let Some(&(at, t)) = self.choose.first() {
             if at > now {
                 break;
@@ -2344,12 +2423,25 @@ impl Owner {
             }
             self.answer(t, out);
         }
+        // Probes still unanswered at their link's timeout, said again, the timeout backed off: after
+        // the choices, so that a run placed by one isn't probed again where it's then withdrawn.
+        while let Some(&(at, t, r)) = self.again.first() {
+            if at > now {
+                break;
+            }
+            self.again.remove(&(at, t, r));
+            let n = self.asked.remove(&(t, r)).map_or(0, |(_, n)| n);
+            if self.t(t).is_some_and(|tk| tk.stage == Stage::Waiting && matches!(tk.word(r), Some(Word::Asked))) && self.connected(r) {
+                self.probe_at(t, r, out);
+                self.ask_again(t, r, n.saturating_add(1), now);
+            }
+        }
     }
 
-    /// When it's to be told the time again ([`Self::tick`]): the soonest choice or first answer
-    /// due.
+    /// When it's to be told the time again ([`Self::tick`]): the soonest choice, first answer or
+    /// probe to say again due.
     pub fn timer(&self) -> Option<i64> {
-        [self.choose.first().map(|(at, _)| *at), self.due.first().map(|(at, _)| *at)].into_iter().flatten().min()
+        [self.choose.first().map(|(at, _)| *at), self.due.first().map(|(at, _)| *at), self.again.first().map(|(at, ..)| *at)].into_iter().flatten().min()
     }
 
     /// Where a run's ticket stands, in a word, and its runner, if it has one.
@@ -2458,6 +2550,19 @@ impl Owner {
 
     pub fn cancel(&mut self, run: &str) -> Vec<Act> {
         self.wire(|o, c| o.cancel_c(run, c))
+    }
+
+    pub fn unsaid(&mut self, run: &str) -> Vec<Act> {
+        self.wire(|o, c| o.unsaid_c(run, c))
+    }
+
+    /// The shell had no one to give run `run`'s go to: what asked for it went away while it waited.
+    /// Told to go once ([`Stage::Held`]), it never started, and nothing will start it: given up as
+    /// unsaid ([`Self::unsaid_c`]), what that says returned. A start said again ([`Cmd::Restart`])
+    /// is of a run whose start went out, which its runner's word ends: left as it is (`None`).
+    pub fn undriven(&mut self, run: &str) -> Option<Vec<Act>> {
+        let held = self.by_run.get(run).and_then(|t| self.t(*t)).is_some_and(|tk| matches!(tk.stage, Stage::Held { .. }));
+        held.then(|| self.wire(|o, c| o.let_go(run, true, c)))
     }
 
     pub fn handed(&mut self, run: &str, by: &str) -> Vec<Act> {
@@ -3120,6 +3225,7 @@ impl Owner {
     /// probing). A gang is answered never, as one at a time answers it: the place core starts no
     /// gang (docs/needs.md E5), and the auction's step is a batch, never a gang.
     pub fn ask_many_c(&mut self, asks: Vec<Ask>, now: i64, out: &mut Vec<Cmd>) {
+        self.clock = self.clock.max(now);
         #[cfg(test)]
         let together = self.auction && super::mutant() != Some(super::Mutant::AuctionOneByOne);
         #[cfg(not(test))]
