@@ -26,16 +26,7 @@ export const SIGNED = ["/api/harness/sessions"];
  * would only take the connections its code needs.
  */
 export const EARLY: Record<string, readonly string[]> = {
-  "/agents": [
-    "/api/harness/kinds",
-    "/api/agents",
-    "/api/terminal/sessions",
-    "/api/reach/runners",
-    "/api/harness/workspaces",
-    "/api/push",
-    "/api/push/subscriptions",
-    "/api/voice",
-  ],
+  "/agents": ["/api/harness/kinds", "/api/agents", "/api/terminal/sessions", "/api/reach/runners", "/api/harness/workspaces", "/api/push", "/api/push/subscriptions", "/api/voice"],
   // Ship's rows, each repository's newest commit: what its list waits on (a facet chosen in the
   // address reads another URL, and the app reads that itself).
   "/ship": [SHIP_FIRST_READ],
