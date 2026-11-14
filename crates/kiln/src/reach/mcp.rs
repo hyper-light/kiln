@@ -54,15 +54,16 @@ fn instructions(prefer: Option<&str>, machines: &str, session: &str) -> String {
     let mut s = "This is kiln's own MCP server: the machines of this kiln (its runners), and kiln itself (CI, deployments). \
 When a step has to happen on another machine (the person's Mac, a server, the box with the GPU), run it there yourself: \
 don't hand the person a command to type. When a step needs a person at that machine (a password, a system dialog to \
-allow, something physical), start it yourself and tell them exactly what will appear and what to do. Everything else \
-runs on this machine, this session's, with your own tools: builds and tests too, never moved because it looks busy. Use \
-another only for a step this one can't do: another platform (needs: \"linux/amd64\" to build and test for Linux x86-64 from \
-a Mac), a GPU (\"+gpu\"), or more memory or cores than this machine has at all (\"cpus=16,mem=32g\"). Then say what the step \
-needs with `run`, and kiln's load balancer picks the machine: of those that have it, the most room for it at its measured \
-speed, back where that kind of work last went well, never one under strain. Picking it is the balancer's work, not yours: \
-don't look over machines' load (`runners`, uptime) to choose, don't spread work across machines by name, and name one (`on`) \
-only for a step that has to happen on that machine (its files, its hardware, a service or a person there). A run that waits \
-for room starts by itself when there is some, and kiln tells you: leave it queued rather than cancel it for another machine. One that failed for the machine's sake (it went away, ran out of disk or \
+allow, something physical), start it yourself and tell them exactly what will appear and what to do. Quick steps \
+(reading, editing, git, a check that takes seconds) run here, with your own tools. Work that loads a machine (a build, a test \
+suite, a benchmark), or needs what this one may not have, goes through `run` with what it needs: its platform (needs: \
+\"linux/amd64\" to build and test for Linux x86-64 from a Mac), a GPU (\"+gpu\"), the cores and memory it takes \
+(\"cpus=16,mem=32g\"). kiln's load balancer places it on the machine that has them with the most room for it at its measured \
+speed, back where that kind of work last went well, never one under strain: this one, when it's that machine. Choosing is the \
+balancer's work, not yours: don't check machines' load (uptime, free, `runners`) to decide, don't pick one to spread work out \
+or because it looks idle, and name one (`on`) only for a step that has to happen on that machine (its files, its hardware, a \
+service or a person there). A run that waits for room starts by itself when there is some, and kiln tells you: leave it \
+queued rather than cancel it for another machine. One that failed for the machine's sake (it went away, ran out of disk or \
 memory, lacked a tool) counts against that machine for that kind of work, so the same `run` again goes elsewhere: don't name \
 a machine for it. `run` runs one command. `code_run` runs a \
 JavaScript program against kiln, and only what it returns comes back to you: the same build or test on several machines at \
@@ -264,7 +265,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "run",
-            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory or cores than it has at all, or one that has to happen on that machine. Everything else runs here, this session's machine, with your own tools, never moved because it looks busy. `needs` says what the step must have and takes (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): kiln's load balancer picks the machine that has them, with the most room for it at its measured speed, back where that kind of work last went well, and queues it, telling you, until one has room. Don't pick the machine yourself: `on` names one only when the step has to happen on that machine (its files, its hardware, a person there); with neither, it runs here (or where the session's person prefers). By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id: when its answer says `told`, kiln tells you when it ends (where, how long, its exit code and the end of its output), and when it starts if it hadn't, so end your turn rather than call `output` to wait; `output` reads its output, `stop` ends it.",
+            "description": "Run a shell command (bash) where kiln's load balancer places it: work that loads a machine (a build, a test suite, a benchmark) or needs what this one may not have (quick steps run here with your own tools). `needs` says what the work must have and takes (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): the balancer puts it on the machine that has them with the most room for it at its measured speed, back where that kind of work last went well, and queues it, telling you, until one has room. Don't choose the machine yourself: `on` names one only for a step that has to happen on that machine (its files, its hardware, a person there); with neither, it runs here (or where the session's person prefers). By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id: when its answer says `told`, kiln tells you when it ends (where, how long, its exit code and the end of its output), and when it starts if it hadn't, so end your turn rather than call `output` to wait; `output` reads its output, `stop` ends it.",
             "inputSchema": schema("run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
@@ -1821,11 +1822,9 @@ mod tests {
         assert!(instructions(Some("adacachy"), "", "").contains("prefers commands to run on adacachy"));
         let i = instructions(None, "", "");
         assert!(i.contains("run it there yourself") && i.contains("don't hand the person a command to type") && i.contains("code_run"));
-        // This session's machine by default, never left because it looks busy; for a step it can't do,
-        // what the step needs, and the load balancer picks the machine (2026-11-13).
-        assert!(i.contains("Everything else runs on this machine, this session's") && i.contains("never moved because it looks busy"), "{i}");
-        assert!(i.contains("kiln's load balancer picks the machine") && i.contains("Picking it is the balancer's work, not yours"), "{i}");
-        assert!(!i.contains("this one first when it suits") && !i.contains("idlest"), "{i}");
+        // Placement is the load balancer's: the agent says what work needs, and doesn't choose (2026-11-13).
+        assert!(i.contains("Choosing is the balancer's work, not yours") && i.contains("goes through `run` with what it needs"), "{i}");
+        assert!(!i.contains("Everything else runs on this machine") && !i.contains("this one first when it suits") && !i.contains("idlest"), "{i}");
         assert!(i.contains("goals_add") && i.contains("plans_run") && !i.contains("You are kiln agent"), "{i}");
         assert!(instructions(None, "", "01a14ab9").contains("You are kiln agent 01a14ab9"), "an agent is told who it is");
         let v = json!({"me": "adacachy", "runners": [{"runner": {"name": "adacachy", "os": "linux", "arch": "x86_64"}}, {"runner": {"name": "mac", "os": "macos", "arch": "aarch64"}}], "passed": [{"runner": {"name": "box", "os": "windows", "arch": "x86_64"}}]});
