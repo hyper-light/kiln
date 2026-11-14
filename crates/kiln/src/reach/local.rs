@@ -684,7 +684,7 @@ impl Owed {
 impl Drop for Owed {
     fn drop(&mut self) {
         if let Some((h, run, end)) = self.0.take() {
-            let _ = crate::rt::spawn(async move {
+            crate::rt::spawn(async move {
                 if end {
                     h.place_local(&run, Some(false)).await;
                 } else {
