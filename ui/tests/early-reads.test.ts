@@ -78,7 +78,7 @@ test("the sign-in check is handed the document's own answer, and a plain read of
 });
 
 test("the document asks every page's first reads and its own page's, under a peer's base; signed out, only who this is", async () => {
-  const { EARLY, EARLY_SCRIPT } = await import("../src/lib/early-script.ts");
+  const { EARLY, EARLY_SCRIPT, SIGNED } = await import("../src/lib/early-script.ts");
   const run = (pathname: string, signedOut: string | null) => {
     const asked: string[] = [];
     const scope = { location: { pathname }, localStorage: { getItem: () => signedOut }, fetch: (u: string) => (asked.push(u), Promise.resolve()) };
@@ -90,9 +90,13 @@ test("the document asks every page's first reads and its own page's, under a pee
     );
     return asked;
   };
-  assert.deepEqual(run("/agents/", null), ["/api/me", "/api/peers/open", ...EARLY["/agents"]!]);
-  assert.deepEqual(run("/ship", null), ["/api/me", "/api/peers/open", "/api/ship/commits?by=repo&limit=100"]);
-  assert.deepEqual(run("/ship/deploys", null), ["/api/me", "/api/peers/open"]);
+  // Signed in, every page asks the agents its shell shows (once: Mission control's list reads the same).
+  assert.deepEqual(SIGNED, ["/api/harness/sessions"]);
+  assert.ok(!EARLY["/agents"]!.includes("/api/harness/sessions"));
+  assert.deepEqual(run("/agents/", null), ["/api/me", "/api/peers/open", ...SIGNED, ...EARLY["/agents"]!]);
+  assert.deepEqual(run("/ship", null), ["/api/me", "/api/peers/open", ...SIGNED, "/api/ship/commits?by=repo&limit=100"]);
+  assert.deepEqual(run("/ship/deploys", null), ["/api/me", "/api/peers/open", ...SIGNED]);
+  assert.deepEqual(run("/agents/0123abcd", null), ["/api/me", "/api/peers/open", ...SIGNED], "an agent's page: its agents asked with the document");
   assert.deepEqual(run("/.kiln-peer/lab/agents", "1"), ["/.kiln-peer/lab/api/me", "/.kiln-peer/lab/api/peers/open"]);
 });
 
