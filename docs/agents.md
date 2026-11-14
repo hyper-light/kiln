@@ -264,11 +264,28 @@ to pick up where it left off. Its timeline says how the process ended ("exit 143
 outside it") and that it starts again. Until it's back, it stands as working, and its `exit` says
 when it starts again (`again_at`, Unix ms).
 
-The first start again waits 2 s. Each after it waits twice as long as the one before, at most
-5 minutes, and once a process runs 10 minutes the wait is 2 s again. A harness that never starts
-(its program is missing), or that ends within 20 s of each of its last three starts, won't start:
-it stands stopped, saying why, until a person restarts it or sends it a message. Where its
-machine holds as many agents at work as it may, it starts again once there's room.
+kiln decides by the harness's own record, never by a chosen time or count (R03):
+
+- **Ready is progress.** A start is ready once its status first leaves `starting`: its session is
+  open, its first answer given. A run that got ready made progress, however soon it ended, and kiln
+  starts it again.
+- **The wait is the harness's own start.** Each start again waits the slowest start that got ready
+  of its harness kind on this machine, timed from before its launch (a microVM's boot is part of
+  it) to its getting ready. Its starts again never come faster than it can get ready.
+- **Cold start.** Before any start of its kind has got ready on this machine (kiln's runner keeps
+  the record in memory, so a runner that starts again begins cold), there's no record to wait: it
+  starts again at once, and its next start's own readiness, or its end before it, decides.
+- **No progress stops it.** A first start, or one a person asked for, that ends before it was ready
+  is started again once: one end proves nothing about the next. kiln's own start again that ends
+  before it was ready, or that ends part-way through the turn it picked up with no turn ended in
+  between, shows no progress. kiln stops there, and the agent stands stopped, its `exit.error`
+  saying which of these it was and its kind's record here, followed by what the harness said as
+  it ended. A harness that never starts (its program is missing) stops at once, saying why.
+- **No cap, no reset.** No wait grows, so there's none to cap or reset. A harness that gets no
+  further stops instead of backing off.
+
+A stopped agent waits until a person restarts it or sends it a message, which counts as a person's
+start. Where its machine holds as many agents at work as it may, it starts again once there's room.
 
 A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
 again the same way, from its record (above).

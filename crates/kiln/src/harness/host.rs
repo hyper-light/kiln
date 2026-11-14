@@ -5406,8 +5406,8 @@ while True:
         })
     }
 
-    /// A harness that ends as soon as it starts, three starts in a row, won't start: it isn't
-    /// started again, and stands stopped, waiting for a person, with why.
+    /// A harness that ends as soon as it starts, before it is ready, and again on kiln's start again,
+    /// won't start: it isn't started again, and stands stopped, waiting for a person, with why.
     #[cfg(unix)]
     #[test]
     fn a_harness_that_wont_start_waits_for_a_person() -> anyhow::Result<()> {
