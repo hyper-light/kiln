@@ -5,6 +5,7 @@
  * (mock/agents.ts: the tree-* agents, `POST /api/mock/tree-variant`).
  */
 import { expect, test, type Page } from "@playwright/test";
+import { wholeList } from "./mission-list";
 
 /** Against a real kiln server (playwright.config.ts): these branch the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
@@ -49,7 +50,8 @@ test("Branch makes a Variant beside the subagent, marked in the tree; New agent 
   await expect(panel).toHaveCount(0);
 
   // Beside it, under the same agent, the fork before its name.
-  await page.goto("/agents");
+  // Mission control's lists are windowed: the row asked for by its agent is in the page once the whole list is (mission-list.ts).
+  await wholeList(page);
   await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents" }).click();
   const tree = page.getByRole("list", { name: "Storage lead's subagents" });
   const variant = tree.locator(".ms-node", { hasText: "Batch entries 64 at a time" });
