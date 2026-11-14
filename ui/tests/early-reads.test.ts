@@ -21,9 +21,9 @@ async function page(early: Record<string, string> = {}) {
     __kilnEarly: Object.fromEntries(Object.entries(early).map(([u, body]) => [u, Promise.resolve(new Response(body))])),
   };
   Object.assign(globalThis, { window: win });
-  await import(`../src/lib/early.ts?${Math.random()}`);
+  const mod = (await import(`../src/lib/early.ts?${Math.random()}`)) as typeof import("../src/lib/early.ts");
   const read = async (url: string, init?: RequestInit) => (await (win.fetch as typeof fetch)(url, init)).text();
-  return { win, calls, read, expire: () => timers.splice(0).forEach((t) => t()) };
+  return { win, calls, read, expire: () => timers.splice(0).forEach((t) => t()), earlyAnswer: mod.earlyAnswer };
 }
 
 test("the first render's reads take what the document asked, each its own copy; later reads go to the server", async () => {
@@ -61,6 +61,20 @@ test("anything but a plain read goes straight through", async () => {
   await p.win.fetch("/healthz");
   assert.equal(p.calls.length, 3);
   assert.equal(await p.read("/api/me"), "early");
+});
+
+test("the sign-in check is handed the document's own answer, and a plain read of it still has one; a change takes it back", async () => {
+  const p = await page({ "/api/me": "who" });
+  const asked = p.earlyAnswer("/api/me");
+  assert.ok(asked, "the document asked it");
+  assert.equal(await (await asked).text(), "who");
+  // Its own copy: the first render's plain read of the same URL is answered too, with no request.
+  assert.equal(await p.read("/api/me"), "who");
+  assert.equal(p.earlyAnswer("/api/agents"), null, "what the document didn't ask has none");
+  assert.equal(p.calls.length, 0);
+  // A change the page makes empties what the document asked: who this is may have changed with it.
+  await p.win.fetch("/api/auth/logout", { method: "POST" });
+  assert.equal(p.earlyAnswer("/api/me"), null);
 });
 
 test("the document asks every page's first reads and its own page's, under a peer's base; signed out, only who this is", async () => {
