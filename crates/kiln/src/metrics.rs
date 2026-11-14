@@ -1757,7 +1757,7 @@ pub fn render() -> String {
     help(&mut o, "kiln_work_classes_total", "counter", "The work ledger's equivalence classes (W24-R30), by layer and event (merge, split, hit).");
     m.work_classes.render(&mut o, "kiln_work_classes_total");
     scalar!("kiln_work_saved_seconds_total", "counter", "Seconds of work saved: what the results reuse took over had run.", m.work_saved_seconds.get());
-    help(&mut o, "kiln_work_reaped_bytes_total", "counter", "Bytes the reaper freed (W24-R31), by store (warm, ...) and reason (max_age, target, floor).");
+    help(&mut o, "kiln_work_reaped_bytes_total", "counter", "Bytes the reaper freed (W24-R31), by store (warm, projects, ...) and reason (max_age, target, floor, pressure).");
     m.work_reaped_bytes.render(&mut o, "kiln_work_reaped_bytes_total");
     help(&mut o, "kiln_job_duration_seconds", "histogram", "Job wall time.");
     m.job_duration.render(&mut o, "kiln_job_duration_seconds", "");

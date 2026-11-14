@@ -294,6 +294,9 @@ pub enum Reason {
     Target,
     /// Protected by a keep rule, but the floor couldn't be held otherwise.
     Floor,
+    /// The projects' reaper ([`projects::need`]): at the fastest rate it measured the disk filling,
+    /// the disk would fill before its next pass could finish.
+    Pressure,
 }
 
 /// One eviction, and what decided it.
