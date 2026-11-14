@@ -127,6 +127,10 @@ refused?: RefusedMessages,
  */
 move_on_limit?: boolean, 
 /**
+ * It waits for its limit's reset instead (as `State::wait_at_limit`).
+ */
+wait_at_limit?: boolean, 
+/**
  * Where it goes on then (as `State::move_plan`).
  */
 move_plan?: MovePlan, 
