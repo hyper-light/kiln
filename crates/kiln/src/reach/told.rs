@@ -115,10 +115,10 @@ struct State {
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
-/// News came to the outbox.
-static NEWS: LazyLock<event_listener::Event> = LazyLock::new(event_listener::Event::new);
+/// News came to the outbox. Waited on with no lock (`crate::rt::Changed`; goal 5, plan 01a1a59c2aae).
+static NEWS: LazyLock<crate::rt::Changed> = LazyLock::new(crate::rt::Changed::new);
 /// The server came, went, or said whether it takes news.
-static LINK: LazyLock<event_listener::Event> = LazyLock::new(event_listener::Event::new);
+static LINK: LazyLock<crate::rt::Changed> = LazyLock::new(crate::rt::Changed::new);
 
 /// Where the outbox is kept (`dir`, the reach node's), read in now unless `taking_over` (a new
 /// build taking over from the runner being upgraded, which follows its runs until it ends:
@@ -141,7 +141,7 @@ pub fn predecessor_ended() {
             follow_on(e).await;
         }
         persist();
-        NEWS.notify(usize::MAX);
+        NEWS.notify();
     }));
 }
 
@@ -244,8 +244,8 @@ fn set_link(up: Option<bool>, takes: Option<bool>) {
     if let Some(h) = start {
         drop(crate::rt::spawn(forward(h.clone())));
     }
-    LINK.notify(usize::MAX);
-    NEWS.notify(usize::MAX);
+    LINK.notify();
+    NEWS.notify();
 }
 
 /// News goes from this runner now (its server takes it).
@@ -301,7 +301,7 @@ fn put(session: &str, news: RunNews, by: Option<u32>, answer: bool) {
         }
     }
     persist();
-    NEWS.notify(usize::MAX);
+    NEWS.notify();
 }
 
 /// Sends the outbox to the server, one at a time and in order, each once the one before it was

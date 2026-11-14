@@ -684,8 +684,9 @@ pub struct Hub {
     /// of them come sooner than the commands loop waits for ([`Hub::commands_sooner`]): it looks now.
     commands_due: Notify,
     /// What the commands loop waits for, when it waits (none: for ever, or it's looking now): a
-    /// change that brings something due before it tells the loop (goal 9).
-    commands_armed: Mutex<Option<Instant>>,
+    /// change that brings something due before it tells the loop (goal 9). An atomic ([`Armed`]):
+    /// every command sent reads it (goal 5, plan 01a1a59c2aae).
+    commands_armed: Armed,
     /// Told when an integration is made, changed or removed (`crate::ci::integrations`): the replies' reader reads
     /// their list again (`crate::ci::replies::run`).
     pub integrations_changed: Notify,
@@ -808,17 +809,20 @@ pub struct Hub {
     /// What each runner can take and what waits, and why (`crate::offers`, docs/reach.md §2.2).
     pub offers: crate::offers::Offers,
     /// The fleet's topology as the server sees it (LB08, `crate::reach::topo`): its own
-    /// coordinate, each runner's word, each runner's link's drops and outages.
-    pub topo: parking_lot::Mutex<crate::reach::topo::Fleet>,
+    /// coordinate, each runner's word, each runner's link's drops and outages. A copy swapped in whole
+    /// (goal 5, plan 01a1a59c2aae): every runner's hint writes it, the directory's readers read it.
+    pub topo: crate::rcu::Rcu<crate::reach::topo::Fleet>,
     /// Agent sessions' starts the server asked a runner to own (AUDIT M4): by question, the
-    /// owner's process and where its words go (`harness::lineage`); closed when it goes.
-    pub session_places: parking_lot::Mutex<HashMap<u64, (PeerId, crate::memory::queue::Sender<String>)>>,
+    /// owner's process and where its words go (`harness::lineage`); closed when it goes. A copy swapped in
+    /// whole (goal 5, plan 01a1a59c2aae): a session's start puts its question, its owner's every word reads it.
+    pub session_places: crate::rcu::Rcu<HashMap<u64, (PeerId, crate::memory::queue::Sender<String>)>>,
     /// The placement kernel for CI legs, the server their owner (docs/lb.md, "Adopted"; W05-R23):
     /// an ordinary leg's pick from the runners' kernel words, before the engine's own.
     legs: parking_lot::Mutex<legs::Legs>,
     /// What runners' connections say to `legs` between the scheduling loop's looks (docs/lb.md "At
-    /// scale"): taken in by that loop alone, so the kernel's records stay in its core's cache.
-    legs_mail: parking_lot::Mutex<legs::Mail>,
+    /// scale"): taken in by that loop alone, so the kernel's records stay in its core's cache. Written
+    /// with no lock by every runner's word (goal 5, plan 01a1a59c2aae).
+    legs_mail: legs::Mail,
     session_place_req: AtomicU64,
     /// The git repositories each machine holds, as it last said (`crate::sync::places`).
     pub places: crate::sync::places::Places,
@@ -950,7 +954,7 @@ impl Hub {
             cmds: crate::wire::commands::Owner::start(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
             away_peers: Default::default(),
             commands_due: Notify::new(),
-            commands_armed: Mutex::new(None),
+            commands_armed: Armed::new(),
             integrations_changed: Notify::new(),
             ai_sessions: Default::default(),
             ai_requests: Default::default(),
@@ -1005,10 +1009,10 @@ impl Hub {
             custody_in: crate::custody::runners::Intake::default(),
             copies,
             offers: crate::offers::Offers::default(),
-            topo: parking_lot::Mutex::default(),
-            session_places: parking_lot::Mutex::default(),
+            topo: crate::rcu::Rcu::default(),
+            session_places: crate::rcu::Rcu::default(),
             legs: parking_lot::Mutex::new(fast_legs),
-            legs_mail: parking_lot::Mutex::new(legs::Mail::default()),
+            legs_mail: legs::Mail::default(),
             session_place_req: AtomicU64::new(1),
             places,
             tasks,
@@ -2043,7 +2047,7 @@ impl Hub {
     /// for later, or for ever (goal 9).
     fn commands_sooner(&self, due: Option<Instant>) {
         let Some(due) = due else { return };
-        if self.commands_armed.lock().is_none_or(|armed| due < armed) {
+        if self.commands_armed.sooner(due) {
             self.commands_due.notify();
         }
     }
@@ -2089,14 +2093,14 @@ impl Hub {
                 at = [due, self.refusals.load().due_at()].into_iter().flatten().min();
                 look = false;
             }
-            *self.commands_armed.lock() = at;
+            self.commands_armed.set(at);
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 () = self.commands_due.notified().fuse() => look = true,
                 () = drops.fuse() => {}
                 () = crate::rt::due(at).fuse() => look = true,
             }
-            *self.commands_armed.lock() = None;
+            self.commands_armed.set(None);
         }
     }
 
@@ -2138,7 +2142,9 @@ impl Hub {
         }?;
         let req = self.session_place_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-        self.session_places.lock().insert(req, (peer, tx));
+        self.session_places.update(|m| {
+            m.insert(req, (peer, tx.clone()));
+        });
         self.send_peer(peer, &ServerMsg::Place { req, json }).await;
         Some((req, rx))
     }
@@ -2146,7 +2152,9 @@ impl Hub {
     /// The question `req` of an agent session's start is over: what its owner says after isn't
     /// waited on.
     pub fn unplace_session(&self, req: u64) {
-        self.session_places.lock().remove(&req);
+        if self.session_places.load().contains_key(&req) {
+            self.session_places.update(|m| m.remove(&req).is_some());
+        }
     }
 
     /// Runner `owner` lets go of agent session run `run` it placed (its session didn't start):
@@ -2748,7 +2756,7 @@ impl Hub {
             m
         };
         let announced = self.reach.announced();
-        let mut topo = self.topo.lock().entries(crate::util::now_ms());
+        let mut topo = self.topo.load().entries(crate::util::now_ms());
         let agents = self.agents.load();
         let speeds = self.pace.fit();
         let mut out: Vec<crate::reach::directory::RunnerInfo> = agents
@@ -3010,7 +3018,9 @@ impl Hub {
                 crate::api::boxed(|| self.handovers_lost(peer)).await;
                 let lost = self.instances.update(|i| i.lost(peer));
                 // The sessions it was placing: whoever waits on them hears it went (AUDIT M4).
-                self.session_places.lock().retain(|_, (p, _)| *p != peer);
+                if self.session_places.load().values().any(|(p, _)| *p == peer) {
+                    self.session_places.update(|m| m.retain(|_, (p, _)| *p != peer));
+                }
                 if let (Some(name), Some(m)) = (&name, &self.harness.copies) {
                     m.disconnected(name, peer);
                 }
@@ -3240,7 +3250,7 @@ impl Hub {
     /// Keeps `runner`'s link history and the fleet's co-drops (LB08), in the store's key-value
     /// table, so a restarted server knows them.
     fn keep_topo(&self, runner: &str) {
-        let (link, co) = self.topo.lock().kept(runner);
+        let (link, co) = self.topo.load().kept(runner);
         let store = self.store.clone();
         let key = format!("topo/link/{runner}");
         crate::rt::spawn(async move {
@@ -3261,9 +3271,9 @@ impl Hub {
     /// spans since it stopped are nobody's.
     pub async fn load_topo(&self) {
         let links = self.store.kv_prefix("topo/link/".to_owned()).await.unwrap_or_default();
-        let links = links.into_iter().filter_map(|(k, v)| Some((k.strip_prefix("topo/link/")?.to_owned(), serde_json::from_str(&v).ok()?))).collect();
-        let co = self.store.kv_get("topo/codrops".to_owned()).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-        self.topo.lock().restore(links, co);
+        let links: std::collections::BTreeMap<String, kiln_ci::topo::stability::History> = links.into_iter().filter_map(|(k, v)| Some((k.strip_prefix("topo/link/")?.to_owned(), serde_json::from_str(&v).ok()?))).collect();
+        let co: kiln_ci::topo::domains::CoDrops = self.store.kv_get("topo/codrops".to_owned()).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+        self.topo.update(|t| t.restore(links.clone(), co.clone()));
     }
 
     async fn agent_lost(&self, name: &str, reason: &str) {
@@ -3285,7 +3295,8 @@ impl Hub {
         crate::offers::gone(self, name);
         // Its link dropped (LB08): its last process gone, and not because the server stops.
         if !self.shutdown.is_cancelled() {
-            self.topo.lock().down(name, crate::util::now_ms());
+            let now = crate::util::now_ms();
+            self.topo.update(|t| t.down(name, now));
             self.keep_topo(name);
         }
         // The fleet's gauges and standing follow it at once (`crate::fleet::follow_loop`, goal 9: they were looked at
@@ -3509,7 +3520,7 @@ impl Hub {
                 }
             }
             // Its runner's admission took it: its room is in that runner's words from now.
-            AgentMsg::JobStarted { job } => self.legs_mail.lock().heard(&job),
+            AgentMsg::JobStarted { job } => self.legs_mail.heard(&job),
             AgentMsg::Sample(s) => {
                 self.change_agent(&agent, |a| {
                     a.sample = Some(s.clone());
@@ -3689,18 +3700,18 @@ impl Hub {
             // An owner's word on an agent session's start it was asked to place (AUDIT M4): to
             // whoever waits on it (`harness::lineage`), which reads it.
             AgentMsg::Placed { req, json } => {
-                let tx = self.session_places.lock().get(&req).filter(|(p, _)| *p == peer).map(|(_, tx)| tx.clone());
+                let tx = self.session_places.load().get(&req).filter(|(p, _)| *p == peer).map(|(_, tx)| tx.clone());
                 if let Some(tx) = tx
                     && tx.send(json).await.is_err()
                 {
-                    self.session_places.lock().remove(&req);
+                    self.session_places.update(|m| m.remove(&req).is_some());
                 }
             }
             AgentMsg::Offers { json } => {
                 if let Some(room) = crate::offers::heard(self, &agent, &json) {
                     if let Some(w) = &room.fast {
                         // Into the kernel's mail: the scheduling loop takes it in as it looks.
-                        let pace = self.legs_mail.lock().word(&agent, w);
+                        let pace = self.legs_mail.word(&agent, w);
                         // Its pace, when it changed, to the CI engine's load balancer too.
                         if let Some(pace) = pace {
                             self.ci.send(crate::ci::dispatch::Msg::RunnerPace { agent: String::from(&*agent), pace });
@@ -4221,7 +4232,7 @@ impl Hub {
             FromRunner::ReachAsk { req, ask, raw } => match *ask {
                 crate::reach::Question::Directory => {
                     let runners = self.directory().await;
-                    let server = self.topo.lock().server();
+                    let server = self.topo.load().server();
                     if self.cfg.ci.budgets.is_empty() {
                         let answer = serde_json::json!({ "runners": runners, "server": server });
                         self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
@@ -4619,13 +4630,13 @@ impl Hub {
         // Its link's history (LB08): up from now, if no process of it was connected.
         if !live.ephemeral && !was_connected {
             let machine = self.said_machine.load().get(&peer).cloned();
-            {
-                let mut t = self.topo.lock();
-                if let Some(m) = machine {
-                    t.machine(&name, &m);
+            let now = crate::util::now_ms();
+            self.topo.update(|t| {
+                if let Some(m) = &machine {
+                    t.machine(&name, m);
                 }
-                t.up(&name, crate::util::now_ms());
-            }
+                t.up(&name, now);
+            });
             self.keep_topo(&name);
         }
         // A machine known by its id connecting: its other records fold into it (docs/machines.md).
@@ -4864,7 +4875,7 @@ impl Hub {
     }
 
     pub(crate) fn release_slot(&self, agent: &str, job: &str) {
-        self.legs_mail.lock().heard(job);
+        self.legs_mail.heard(job);
         let what = crate::instances::Owned::Job(job.to_owned());
         self.instances.update(|i| i.disown(&what));
         self.change_agent(agent, |a| {
@@ -5223,7 +5234,7 @@ impl Hub {
     async fn schedule_once(&self) -> anyhow::Result<bool> {
         // What runners' connections said since the last look, taken in by this loop alone (docs/lb.md
         // "At scale"): its picks see each runner's newest word.
-        let mail = self.legs_mail.lock().take();
+        let mail = self.legs_mail.take();
         if !mail.is_empty() {
             self.legs.lock().apply(mail);
         }
@@ -5811,6 +5822,35 @@ fn fast_kind(job: &Job) -> Option<(u64, kiln_ci::lb::Amounts)> {
     Some((legs::Legs::kind(&job.labels, &spec.requires, &placement), [asked.cpu.get(), asked.mem, asked.disk, u64::from(asked.gpu)]))
 }
 
+/// What the commands loop waits for ([`Hub::commands_loop`]), with no lock (goal 5, plan 01a1a59c2aae): an instant
+/// as nanoseconds past the hub's making, none (it waits for ever, or it's looking now) as [`Armed::NONE`].
+struct Armed {
+    origin: Instant,
+    at: AtomicU64,
+}
+
+impl Armed {
+    const NONE: u64 = u64::MAX;
+
+    fn new() -> Self {
+        Armed { origin: Instant::now(), at: AtomicU64::new(Self::NONE) }
+    }
+
+    fn nanos(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(Self::NONE).min(Self::NONE - 1)
+    }
+
+    fn set(&self, at: Option<Instant>) {
+        self.at.store(at.map_or(Self::NONE, |a| self.nanos(a)), Ordering::SeqCst);
+    }
+
+    /// Whether `due` comes before what the loop waits for, or it waits for nothing.
+    fn sooner(&self, due: Instant) -> bool {
+        let armed = self.at.load(Ordering::SeqCst);
+        armed == Self::NONE || self.nanos(due) < armed
+    }
+}
+
 /// The kernel's picks made for a look at the queue ([`Hub::joint_picks`]): those not used by the
 /// time the look ends (a job skipped, a claim not made, an error) have their room put back in the
 /// kernel's view.
@@ -5905,6 +5945,21 @@ fn drains_on_its_own(reason: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Goal 5 (plan 01a1a59c2aae): what the commands loop waits for is an atomic, read by every command sent; it says
+    /// "sooner" as the lock it replaced did: when the loop waits for nothing, or for later than what's due.
+    #[test]
+    fn g5_commands_armed_says_sooner_with_no_lock() {
+        let armed = Armed::new();
+        let now = Instant::now();
+        assert!(armed.sooner(now), "a loop waiting for ever is told");
+        armed.set(Some(now + Duration::from_secs(5)));
+        assert!(armed.sooner(now + Duration::from_secs(1)), "something due before what it waits for");
+        assert!(!armed.sooner(now + Duration::from_secs(5)), "nothing sooner at the same time");
+        assert!(!armed.sooner(now + Duration::from_secs(9)), "nor later");
+        armed.set(None);
+        assert!(armed.sooner(now + Duration::from_secs(9)), "looking now, or waiting for ever: told");
+    }
 
     /// W21-R15: event-driven placement readings reach history and metrics at once, while
     /// a page gets each runner's newest reading on the server's configured sample cadence.
@@ -6350,7 +6405,7 @@ pub(crate) mod tests {
             hear(&hub, 1, LANE_CONTROL, &AgentMsg::Placed { req, json: "go".into() }).await?;
             anyhow::ensure!(rx.recv().await? == "go", "its own word only");
             hub.unplace_session(req);
-            anyhow::ensure!(hub.session_places.lock().is_empty());
+            anyhow::ensure!(hub.session_places.load().is_empty());
             Ok(())
         })
     }

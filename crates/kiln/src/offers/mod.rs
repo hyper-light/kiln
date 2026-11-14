@@ -108,8 +108,9 @@ struct Inner {
 pub struct Offers {
     inner: Mutex<Inner>,
     /// A change since the last version wakes the one task that tells it ([`spawn`]): one at a time,
-    /// so what changes before it runs goes with it.
-    kick: (async_channel::Sender<()>, async_channel::Receiver<()>),
+    /// so what changes before it runs goes with it. A permit with no lock (`crate::rt::Notify`; goal 5, plan
+    /// 01a1a59c2aae): changes before the task takes it leave the one.
+    kick: crate::rt::Notify,
     /// When this server's offers began (unix ms): with the version, the ETag, so a version of an
     /// earlier process is never taken for one of this.
     boot: i64,
@@ -117,7 +118,7 @@ pub struct Offers {
 
 impl Default for Offers {
     fn default() -> Self {
-        Offers { inner: Mutex::new(Inner::default()), kick: async_channel::bounded(1), boot: crate::util::now_ms() }
+        Offers { inner: Mutex::new(Inner::default()), kick: crate::rt::Notify::new(), boot: crate::util::now_ms() }
     }
 }
 
@@ -137,7 +138,7 @@ impl Offers {
     fn mark(&self, g: &mut Inner) {
         if !g.dirty {
             g.dirty = true;
-            let _ = self.kick.0.try_send(());
+            self.kick.notify();
         }
     }
 
@@ -292,7 +293,8 @@ pub fn heard(hub: &Hub, runner: &str, json: &str) -> Option<hint::Room> {
         Ok(h) => {
             let room = hint::Room::of(runner, &h);
             if let Some(t) = &h.topo {
-                hub.topo.lock().heard(runner, t, crate::util::now_ms());
+                let now = crate::util::now_ms();
+                hub.topo.update(|f| f.heard(runner, t, now));
             }
             hub.offers.heard(runner, h, crate::util::now_ms());
             Some(room)
@@ -344,9 +346,9 @@ pub fn ci(hub: &Hub, c: &kiln_ci::sched::Command) {
 /// The task that tells the pages each new version: woken by a change ([`Offers::mark`]), never on
 /// a timer. Whatever changed before it runs goes in the one event.
 pub fn spawn(hub: Arc<Hub>) {
-    let rx = hub.offers.kick.1.clone();
     crate::rt::spawn(async move {
-        while rx.recv().await.is_ok() {
+        loop {
+            hub.offers.kick.notified().await;
             if let Some(version) = hub.offers.flush() {
                 hub.emit(&crate::wire::events::ServerEvent::Offers { version });
             }
