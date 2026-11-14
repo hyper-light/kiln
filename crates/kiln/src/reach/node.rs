@@ -1611,7 +1611,7 @@ impl Node {
         }
         let (wake, woken) = crate::memory::queue::unbounded::<()>(&crate::memory::owners::CHANNELS);
         self.keeper.wake = Some(wake);
-        tracing::info!(keeper = %at.address, name = %at.name, "this runner holds its runs' room through its machine's capacity keeper");
+        tracing::info!(keeper = %at.address, name = %at.name, holder = %at.machine_name, "this runner holds its runs' room through its machine's capacity keeper, its holder named as its machine");
         crate::rt::spawn(crate::capacity::hold(at, self.tx.clone(), woken));
     }
 

@@ -83,6 +83,9 @@ hex-quic = "=0.1.0"
 hex-core = "=0.1.0"
 hex-api = "=0.1.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+# A capacity keeper's chain.pem and roots.pem, encoded as Hex's `hex_quic::enroll::store::finish` writes them
+# (`capacity::issue_keeper`); the copy hex-quic takes.
+pem = "4"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 bytes = "1.12.1"

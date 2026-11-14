@@ -2489,6 +2489,7 @@ dependencies = [
  "mime_guess",
  "nix 0.31.3",
  "parking_lot",
+ "pem",
  "portable-pty",
  "postcard",
  "quiver",

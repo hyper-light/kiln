@@ -341,6 +341,39 @@ fn holder_a_lost_link_gives_up_its_asks_and_the_next_sync_keeps_what_runs() -> R
     Ok(())
 }
 
+/// Settled only with nothing in flight (HEX-CV-2K's drain; kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d, step 13): not before its sync is answered, not while a
+/// reserve or a release waits for its answer, not once its link is lost; settled again once each
+/// is answered, what it holds then the keeper's books.
+#[test]
+fn holder_settled_only_with_no_reserve_or_release_in_flight() -> Result<(), String> {
+    let mut keeper = machine(8, 16, 1, most()?)?;
+    let mut h = holding("runner-1", 1, &[])?;
+    assert!(!h.settled(), "down");
+    let hello = h.linked(0);
+    assert!(!h.settled(), "joining");
+    let _ = talk(&mut keeper, 1, &mut h, hello, 0)?;
+    assert!(h.settled(), "synced, nothing asked");
+    let (id, word) = reserve(&mut h, amounts(2, 4), 1)?;
+    assert!(!h.settled(), "a reserve waits for its answer");
+    assert!(granted(&talk(&mut keeper, 1, &mut h, said(vec![word]), 2)?, id));
+    assert!(h.settled(), "granted");
+    let release = h.release(id, 3);
+    assert!(!h.settled(), "a release waits for its answer");
+    let _ = talk(&mut keeper, 1, &mut h, release, 4)?;
+    assert!(h.settled(), "released");
+    assert_eq!((h.held().count(), books(&keeper, "runner-1")?), (0, BTreeMap::new()));
+    let (_, word) = reserve(&mut h, amounts(1, 1), 5)?;
+    let _ = keeper.hear(1, word).map_err(debug)?;
+    keeper.link_down(1).map_err(debug)?;
+    let _ = h.ended(WaitEnded::Died);
+    assert!(!h.settled(), "down, its reserve given up");
+    let _ = join(&mut keeper, 2, &mut h, 6)?;
+    assert!(h.settled(), "joined again and synced");
+    assert_eq!((h.held().count(), books(&keeper, "runner-1")?), (0, BTreeMap::new()));
+    Ok(())
+}
+
 /// The holder's item 5, each close as the contract has it. Its session gone (the keeper started
 /// again: `Session`), its reserve isn't granted and it says hello again at once on the same link,
 /// and syncs. A newer process of the runner there (`OlderEpoch`), it stands superseded for good and

@@ -422,3 +422,46 @@ fn holder_a_runner_started_again_lists_its_survivors_and_gives_each_back_as_it_e
         Ok(())
     })
 }
+
+/// What each `HEX_CV_HELD=` line among `lines` says, in order.
+fn held_lines(lines: &[String]) -> anyhow::Result<Vec<Vec<hex::Held>>> {
+    lines.iter().filter_map(|l| l.split("HEX_CV_HELD=").nth(1)).map(|h| Ok(serde_json::from_slice(&::hex::decode(h.trim())?)?)).collect()
+}
+
+/// HEX-CV-2K's reads of the runner's log (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 13): a
+/// line per sync answered, with its `agree`; per link lost, with the reserves it gave up unanswered;
+/// per join again; and once nothing it said waits on the keeper, `HEX_CV_HELD=` and the hex of the
+/// JSON of what it holds (Hex's `Holder::held`), logged again only when that changed, the last one
+/// the keeper's books.
+#[test]
+fn holder_logs_each_sync_each_link_lost_each_rejoin_and_what_it_holds_once_settled() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let cap = machine()?;
+        let mut p = runner(1);
+        let _ = p.keeper_start(0);
+        let link = join(&mut p, &cap, 1).await?;
+        let (_, outs) = p.leg(ask("leg-1", 1, 1, None), 10);
+        let _ = talk(&mut p, &*link, outs, 11).await?;
+        let granted = books(&cap)?;
+        anyhow::ensure!(granted.len() == 1, "{granted:?}");
+        let outs = p.leg_ended("leg-1", true, 20);
+        let _ = talk(&mut p, &*link, outs, 21).await?;
+        // A reserve said and its answer never heard: the link goes, and it is given up.
+        let (_, outs) = p.leg(ask("leg-2", 1, 1, None), 30);
+        say(&*link, outs).await?;
+        drop(link);
+        let _ = p.keeper_ended(WaitEnded::Died, 31);
+        let _link = join(&mut p, &cap, 40).await?;
+        anyhow::ensure!(synced(&p), "synced again: {:?} {:?}", p.view().get("keeper"), books(&cap)?);
+        let lines = p.keeper.as_ref().map(|h| h.logged.clone()).unwrap_or_default();
+        let count = |what: &str| lines.iter().filter(|l| l.contains(what)).count();
+        anyhow::ensure!(count("capacity keeper synced") == 2 && count("agree=true") == 2, "a line per sync, each agreeing: {lines:#?}");
+        anyhow::ensure!(count("capacity keeper link lost") == 1 && lines.iter().any(|l| l.contains("capacity keeper link lost") && l.contains("unanswered=1")), "{lines:#?}");
+        anyhow::ensure!(count("capacity keeper joined") == 1 && count("capacity keeper rejoined") == 1, "{lines:#?}");
+        let held = held_lines(&lines)?;
+        let leg_1: Vec<hex::Held> = granted.iter().map(|(id, amount)| hex::Held { id: *id, amount: *amount }).collect();
+        anyhow::ensure!(held == vec![Vec::new(), leg_1, Vec::new()], "once settled, each change: {held:?} {lines:#?}");
+        anyhow::ensure!(books(&cap)?.is_empty(), "the last one the keeper's books");
+        Ok(())
+    })
+}
