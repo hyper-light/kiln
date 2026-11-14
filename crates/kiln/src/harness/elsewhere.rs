@@ -279,7 +279,14 @@ mod tests {
         assert!(!goes_on(&info), "told to wait: it waits");
         let c: Command = serde_json::from_str(r#"{"type":"move_on_limit","on":false}"#)?;
         assert!(matches!(c, Command::MoveOnLimit { on: false, .. }), "waiting is said as move_on_limit off");
-        let old: super::super::model::State = serde_json::from_value(serde_json::json!({"move_on_limit": false}))?;
+        // A state from before the choice existed: every field it had (`status` among them), and the
+        // old switch off, with no word of waiting.
+        let mut old = serde_json::to_value(super::super::model::State::default())?;
+        if let Some(o) = old.as_object_mut() {
+            o.remove("wait_at_limit");
+            o.insert("move_on_limit".into(), serde_json::json!(false));
+        }
+        let old: super::super::model::State = serde_json::from_value(old)?;
         assert!(!old.wait_at_limit, "a state from before reads as going on");
         let said: super::super::model::State = serde_json::from_value(serde_json::to_value(super::super::model::State { wait_at_limit: true, ..Default::default() })?)?;
         assert!(said.wait_at_limit, "a choice to wait is kept");
