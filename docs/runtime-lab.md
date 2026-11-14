@@ -414,6 +414,39 @@ answered T3's list 1,000 of 1,000 in one window and 312 of 1,000 in another, its
 4.8 s for a CPU for each second they ran, 10 of its 17 in `SCHED_IDLE`. Compare products where no such
 rule runs, or where its owner has turned it off for the run.
 
+### Long conversations (`kiln-lab bar`)
+
+`kiln-lab bar` reads a fresh kiln's conversations as its UI reads them, at the sizes T3 Code published
+its own speedups at (2026-11-13: a 41,000-event conversation opened, an older page of a 45,154-event
+one, a message sent to a 75,324-event one), with a fleet beside them (11 runners and 134 small
+sessions by default). Each long session is written by the lab's stand-in through its runner, as a
+session's are (`lab:history:<events>:<a turn's>`).
+
+```sh
+# one build: its report in bar/work/bar.md and bar.json
+kiln-lab bar --kiln a/kiln --out bar/work
+# then again from a fresh process (and, on Linux, with its files' pages let go of)
+kiln-lab bar --kiln a/kiln --out bar/work --cold
+# keep the kiln up afterwards for a browser's own probes (its address and token in hold.json)
+kiln-lab bar --kiln a/kiln --out bar/work --hold
+```
+
+It reports, over loopback and by the lab's clock around each whole exchange:
+
+- **open**: the session socket as `ui/src/api/harness.ts` attaches, to its snapshot's end (the first
+  open after the fill, then the median, least and most of `--samples` more), the snapshot's bytes as
+  sent and unpacked, and where the snapshot is its window's first part (docs/wire.md, "Windows"), the
+  same to the end of the rest;
+- **older pages**: the page before the window, then pages a quarter, half and three quarters of the
+  way back and at the session's start, each with the server's own time (`Server-Timing`);
+- **send**: a message to the longest session, to its answer;
+- **launch**: what Mission control's first reads bring for the fleet, as sent and unpacked.
+
+Two builds are compared by running each (`--out` a folder each): the sessions are the same events in
+both. On a busy machine its times hold whatever else ran; a statement's or a read's own count of its
+work (rows read, chunks inflated: the tests beside the code) says what a change did.
+
+
 ## Main's baseline
 
 Measured on 2026-11-04 (10:00 to 11:56 UTC) on a Linux machine with an Intel Core i9-14900HX (32

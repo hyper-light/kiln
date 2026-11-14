@@ -13,10 +13,12 @@
 //! kiln-lab report DIR/run.json [--quantum-us 266.666]
 //! kiln-lab rate --target targets/kiln.toml --kiln new=a/kiln --kiln prod=b/kiln --target t3.toml   # fixed rates
 //! kiln-lab browser probe|profiles|check-profiles   (the browser lab: docs/browser-lab.md)
+//! kiln-lab bar --kiln target/release/kiln [--cold] [--hold]   # conversations at T3 Code's published sizes (`bar`)
 //! ```
 //!
 //! `rate` measures servers at fixed request rates, open loop (goal 10, Ada's fixed-rate benchmark; `rate`).
 
+mod bar;
 mod browser;
 mod client;
 mod fleet;
@@ -143,6 +145,8 @@ enum Cmd {
     /// Servers at fixed request rates, open loop and without coordinated omission: each read of each target at
     /// each rate, its latency from when each request fell due, the server's CPU and memory, and the generator's own.
     Rate(rate::Args),
+    /// kiln's conversations at the sizes T3 Code published its speedups at, read as the UI reads them (`bar`).
+    Bar(bar::Args),
     /// A CPU hog (the lab starts these itself): `threads` threads, each spinning.
     #[command(hide = true)]
     Hog {
@@ -313,6 +317,7 @@ fn main() -> anyhow::Result<()> {
             print!("{}", report::table(&loaded));
         }
         Cmd::Rate(a) => rate::main(&a)?,
+        Cmd::Bar(a) => bar::main(&a, SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))?,
         Cmd::Hog { threads } => lab::hog(threads),
         Cmd::Browser(b) => browser::run(b)?,
     }

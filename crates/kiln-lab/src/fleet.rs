@@ -212,6 +212,41 @@ impl Fleet {
         }
     }
 
+    /// Stops the server (and what it started), keeping its data: its runners try it again until it's back
+    /// ([`Fleet::start_again`]; the bar's cold reads, `crate::bar`).
+    pub fn stop_server(&mut self) {
+        self.server.kill();
+    }
+
+    /// The server started again as it was first: the same kiln.toml (its data, its ports), `env` as well, answering.
+    pub fn start_again(&mut self, kiln: &Path, env: &[(String, String)], place: &crate::lab::Place, unit: &str) -> anyhow::Result<()> {
+        let dir = self.dir.clone();
+        let log = std::fs::OpenOptions::new().append(true).create(true).open(dir.join("server.log"))?;
+        let mut cmd = clean(place.server(kiln, unit));
+        cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"])
+            .env("HOME", dir.join("home"))
+            .env("KILN_MACHINE_ID", format!("lab server {}", dir.display()))
+            .env("KILN_WARM_FLOOR", "0")
+            .env("NO_COLOR", "1")
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        self.server = Proc { child: cmd.spawn()? };
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut http = Http::new(self.port, &self.admin);
+        loop {
+            if let Some(status) = self.server.child.try_wait()? {
+                anyhow::bail!("the server exited ({status}) as it started again: {}", tail(&dir.join("server.log")));
+            }
+            if http.send("GET", "/api/me", None).is_ok_and(|a| a.status == 200) {
+                return Ok(());
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the server didn't answer within 120 s of starting again");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Runner `name` of `kiln`, its `claude` the stand-in in `bin` (first on its PATH).
     pub fn runner(&mut self, kiln: &Path, name: &str, bin: &Path) -> anyhow::Result<()> {
         let join = std::fs::read_to_string(self.dir.join("data/join.token"))?.trim().to_owned();

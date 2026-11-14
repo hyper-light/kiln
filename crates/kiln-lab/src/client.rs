@@ -311,6 +311,8 @@ pub struct Socket {
     arrived: Option<u64>,
     /// How long a read waits before its reader can look up ([`Socket::open`]).
     tick: Duration,
+    /// The bytes of the message [`Socket::next`] gave last, as it came (a packed snapshot's as it's packed).
+    last: usize,
 }
 
 /// What a socket brought.
@@ -344,7 +346,13 @@ impl Socket {
         anyhow::ensure!(head.starts_with("HTTP/1.1 101"), "not upgraded: {}", head.lines().next().unwrap_or(""));
         buf.drain(..end + 4);
         s.set_read_timeout(Some(tick))?;
-        Ok(Self { s, buf, arrived, tick })
+        Ok(Self { s, buf, arrived, tick, last: 0 })
+    }
+
+    /// The bytes of the message [`Socket::next`] gave last, as it came on the wire above its frames' heads: a binary
+    /// one's too (a packed snapshot, which `next` says only came), what the bar's opens count (`crate::bar`).
+    pub fn last_len(&self) -> usize {
+        self.last
     }
 
     /// When the last bytes it read arrived at its socket, microseconds since the epoch, where the socket stamps
@@ -374,6 +382,7 @@ impl Socket {
                     op => message = Some((op, payload)),
                 }
                 if fin && let Some((op, m)) = message.take() {
+                    self.last = m.len();
                     return Ok(if op == 0x2 { Frame::Binary } else { Frame::Text(m) });
                 }
             }
