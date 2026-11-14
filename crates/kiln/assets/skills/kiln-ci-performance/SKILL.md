@@ -32,7 +32,8 @@ Read it in this order:
 2. **Waiting** before running is capacity or policy, not the code: `waits` by reason
    (`capacity` and `no-runner` want runners or a pool; `concurrency` a group's limit;
    `exclusive` a dedicated runner; `approval` a reviewer). The kiln-ci-runners skill explains a
-   leg's wait.
+   leg's wait. Long `capacity` waits want runners, not jobs pinned to machines that look idle:
+   kiln's load balancer already starts each leg where it would finish soonest.
 3. **Slow steps**: what one step costs across every run (`total`).
 
 ## Caches

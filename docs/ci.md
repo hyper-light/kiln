@@ -144,6 +144,11 @@ These hold for every line written under this spec.
   they choose only between runners the rank can't tell apart (a run goes back to where its kind of
   work last went well, its caches warm, and that pick is the cheapest to make); each such pick
   says why, and `[reach] good_places = false` turns them off.
+  A third, decided by the user (2026-11-13): at a usage limit an agent's conversation goes on on
+  another of the person's machines whose harness is signed in to an account with room (docs/agents.md,
+  "Go on elsewhere"), since it carries on only what the person already asked of it, on their own
+  machines and accounts; its timeline says where it went and why, and its "At a limit" setting,
+  "Wait for the reset", keeps that conversation where it is.
 - **Tests and checks before handing over:** the tests relevant to the change must pass before it's
   pushed. Decided by the user (2026-11-04): full runs (`cargo clippy --workspace --all-targets --
   -D warnings`, `cargo test --workspace`, a workstream's scenario suites (W22), the gate and the

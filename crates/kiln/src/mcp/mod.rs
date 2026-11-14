@@ -507,7 +507,7 @@ const INSTRUCTIONS: &str = "kiln builds, tests and deploys code, and runs coding
 workflows (validate and plan before proposing), reruns, approvals, and failed legs kept to look into (`ci.legs.exec` runs \
 a command in one, `ci.legs.rerun_step` reruns a step there). Deployments (GitOps CD) are under `kiln.cd`: apps, their \
 sync and health, resources and why they differ, diffs, history, syncs, clusters. Agents are under `kiln.agents`: start \
-agents for parts of the work on any machine (`agents_start`), carry on while they work (kiln tells you when each is done; \
+agents for parts of the work on any machine (`agents_start`: say what each needs, and kiln's load balancer places it), carry on while they work (kiln tells you when each is done; \
 `agents_wait` when you can't go on without one) and read what they concluded \
 (`agents_result`), and put an agent's work up for review (`agents_change`); what they ask a person stays a person's to answer. \
 Goal stacks, plans and research are under `kiln.goals`, `kiln.plans` and `kiln.research`. Prefer code_run: one program can list, filter and act on a \

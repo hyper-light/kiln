@@ -106,7 +106,8 @@ export function AtLimit({ agent, state, send }: { agent: Agent; state: State | n
   const { places } = usePlaces(agent);
   const [asked, setAsked] = React.useState<{ at: number; want: string; next: { on: boolean } & MovePlan } | null>(null);
   const now = useClock(asked ? 1000 : 60_000);
-  const has = state?.move_on_limit === true;
+  // Every conversation goes on elsewhere at a limit unless a person said it waits (docs/ci.md §0.3).
+  const has = state?.wait_at_limit !== true;
   // A runner from before a machine and harness could be chosen sends no plan: anywhere, its own.
   const plans = state?.move_plan !== undefined;
   const kept: MovePlan = state?.move_plan ?? {};

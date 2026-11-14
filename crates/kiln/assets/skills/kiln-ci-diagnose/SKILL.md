@@ -103,7 +103,11 @@ A culprit is a regression's evidence; open the revert or the fix as a diff.
 A fix is a change to the code or the workflow, proposed for review: validate and plan-preview a
 workflow change first, and say in the proposal what failed, why, and how the fix was checked
 (the command that passed in the kept leg, the step rerun's conclusion). Reruns are for flaky and
-infrastructure failures only, once.
+infrastructure failures only, once, and as they were: kiln's load balancer counts a runner that
+let a leg down (lost, out of disk or memory, an image that wouldn't pull) against it for that kind
+of leg, and sends the next attempt after an unexplained failure elsewhere once, to tell the work's
+fault from the machine's. Don't pin the rerun to another runner or retry it `elsewhere` yourself:
+that's for a person checking a machine.
 
 ## Limits
 

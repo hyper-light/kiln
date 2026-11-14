@@ -4300,6 +4300,7 @@ impl Registry {
                         held: None,
                         refused: None,
                         move_on_limit: false,
+                        wait_at_limit: false,
                         move_plan: Default::default(),
                         pause_at: None,
                         max_subagents: None,

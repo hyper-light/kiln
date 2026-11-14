@@ -236,11 +236,17 @@ max_subagents?: number,
  */
 manual_resume?: boolean, 
 /**
- * At a usage limit (or its stop point) it goes on on another machine whose harness is signed
- * in to an account with room, its conversation and repository going along: opted in to, a
- * conversation at a time (the server sees to it, `harness::elsewhere`).
+ * A person chose that at a usage limit (or its stop point) it goes on on another machine whose
+ * harness is signed in to an account with room, its conversation and repository going along:
+ * what every conversation does now unless one waits (`wait_at_limit`).
  */
 move_on_limit?: boolean, 
+/**
+ * A person chose that it waits for its limit's reset. Every other conversation goes on on
+ * another machine at a limit by itself (the server sees to it, `harness::elsewhere`): the
+ * user's third exception to opt-in automation (docs/ci.md §0.3, 2026-11-13).
+ */
+wait_at_limit?: boolean, 
 /**
  * Where it goes on then, if a person said (`MovePlan`). Always sent, so a viewer knows its
  * runner takes one.

@@ -327,12 +327,14 @@ async fn run(cx: Cx, v: Value) -> Out {
         }
         (None, Some(n)) => {
             let s = |k: &str| n.get(k).and_then(Value::as_str).map(str::to_owned);
-            Target::New { target: s("target").unwrap_or_else(|| "local".into()), kind: s("kind").ok_or_else(|| (StatusCode::BAD_REQUEST, "`new.kind` is required".to_owned()))?, cwd: s("cwd") }
+            // `on` as one agent per step reads it (what it needs, placed by the load balancer, or a
+            // machine), `target` its older name.
+            Target::New { target: s("on").filter(|o| !o.trim().is_empty()).or_else(|| s("target")).unwrap_or_else(|| "local".into()), kind: s("kind").ok_or_else(|| (StatusCode::BAD_REQUEST, "`new.kind` is required".to_owned()))?, cwd: s("cwd") }
         }
         // An agent that says neither runs it itself.
         (None, None) => match cx.caller.agent.as_deref() {
             Some(me) => Target::Session(me.to_owned()),
-            None => return Err((StatusCode::BAD_REQUEST, "say where to run it: `session`, or `new` {target, kind, cwd}".into())),
+            None => return Err((StatusCode::BAD_REQUEST, "say where to run it: `session`, or `new` {on, kind, cwd}".into())),
         },
     };
     let pick = super::Pick { only: only_of(&v)?, split: v.get("split").and_then(Value::as_bool).unwrap_or(false) };
@@ -409,7 +411,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "plans.run",
-            summary: "Run a plan, or some of its steps (`only`), on an agent: `session` (one that runs) or `new` {target: local|agent:<machine>, kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (its steps become goals on that agent's goal stack; `split`: each step a goal stack of its acceptance criteria and tests), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead. A plan its agent's goals wait on a person's review of (said ready with `then: review`) isn't run a second way: a person's run approves it (as plans.review does: its steps go to that agent as the goal's parts; answers `approved`), and an agent's is refused.",
+            summary: "Run a plan, or some of its steps (`only`), on an agent: `session` (one that runs) or `new` {on: what it needs (linux/amd64, +gpu, cpus>=16: kiln's load balancer places it) or a machine (local, agent:<machine>) only when it must run there (`target`, its older name, says the same), kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (its steps become goals on that agent's goal stack; `split`: each step a goal stack of its acceptance criteria and tests), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead. A plan its agent's goals wait on a person's review of (said ready with `then: review`) isn't run a second way: a person's run approves it (as plans.review does: its steps go to that agent as the goal's parts; answers `approved`), and an agent's is refused.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::PlansRun>(),
