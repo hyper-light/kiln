@@ -176,18 +176,31 @@ pub struct Reply {
 }
 
 /// A run started here, as the record the shell keeps on disk has it: under which claim, how it
-/// ended (`None` while it runs; `Some(true)` its process exited, `Some(false)` it was lost), and the
+/// ended (`None` while it runs; `Some(true)` its process exited, `Some(false)` it was lost), the
 /// reservation its machine's capacity keeper granted its start (docs/lb.md "A machine's keeper"):
-/// its id, `(epoch, seq)`, none where no keeper is known or the run asks nothing. Kept with its
-/// start, before its process starts ([`Admission::reserved`]), so the runner's next process lists
-/// it while the run's work goes on (Hex's capacity-view.md CV5, the holder's item 3). Appended:
-/// absent from a record kept before it.
+/// its id, `(epoch, seq)`, none where no keeper is known or the run asks nothing; and its process
+/// once it's up. The reservation is kept with its start, before its process starts
+/// ([`Admission::reserved`]), and its process as it's up ([`Admission::up`]), so the runner's next
+/// process lists the reservation while the run's work goes on and gives it back as that work ends
+/// (Hex's capacity-view.md CV5, the holder's items 3 and 4). Each appended: absent from a record
+/// kept before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Record {
     pub fence: Fence,
     pub ended: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation: Option<(u64, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<Process>,
+}
+
+/// A run's process as its shell saw it start (its process group's leader): its pid, and when it
+/// started as the system says (seconds since the epoch), so a pid given out again is never taken
+/// for it. What the runner's next process follows a run by, should its work outlive this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Process {
+    pub pid: u32,
+    pub born: u64,
 }
 
 /// The record of runs started here, by owner, the owner's epoch and run: nested, so that looking
@@ -2629,7 +2642,7 @@ impl Admission {
         self.charge(s, now);
         // W05-R25: kernel starts must reach the shell's commit-before-spawn journal too.
         self.changed.insert((from.name.to_owned(), from.epoch, run.to_string()));
-        let record = Record { fence, ended: None, reservation: None };
+        let record = Record { fence, ended: None, reservation: None, process: None };
         self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.to_string(), record);
         if let Some(p) = self.get(s) {
             self.record_asks.insert((from.name.to_owned(), from.epoch, run.to_string()), Arc::clone(&p.ask));
@@ -2801,7 +2814,7 @@ impl Admission {
         if let Some(p) = self.get_mut(s) {
             p.state = State::Running { fence, from: now };
         }
-        let record = Record { fence, ended: None, reservation: None };
+        let record = Record { fence, ended: None, reservation: None, process: None };
         self.changed.insert((from.name.to_owned(), from.epoch, run.to_owned()));
         if let Some(p) = self.get(s) {
             self.record_asks.insert((from.name.to_owned(), from.epoch, run.to_owned()), Arc::clone(&p.ask));
@@ -3072,6 +3085,17 @@ impl Admission {
     pub fn reserved(&mut self, from: Peer<'_>, run: &str, reservation: (u64, u64)) {
         if let Some(r) = self.record_mut(from.name, from.epoch, run) {
             r.reservation = Some(reservation);
+            self.changed.insert((from.name.to_owned(), from.epoch, run.to_owned()));
+        }
+    }
+
+    /// Run `run` of owner `from` is up here as `process` (its shell saw it start): kept with its
+    /// record, so this runner's next process follows the run's work by it should that work outlive
+    /// this one (the holder's items 3 and 4). A run with no record here, or one that ended, is left
+    /// as it is.
+    pub fn up(&mut self, from: Peer<'_>, run: &str, process: Process) {
+        if let Some(r) = self.record_mut(from.name, from.epoch, run).filter(|r| r.ended.is_none()) {
+            r.process = Some(process);
             self.changed.insert((from.name.to_owned(), from.epoch, run.to_owned()));
         }
     }

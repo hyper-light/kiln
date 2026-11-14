@@ -301,7 +301,7 @@ pub enum Local {
     /// Run on `peer` under claim `fence` of run `run`: its start said first, then the spec.
     PlaceRun { peer: String, run: String, fence: kiln_ci::sched::Fence, spec: Box<RunSpec>, says: Says, evidence: Option<crate::memory::queue::Sender<bool>>, reply: oneshot::Sender<u64>, custody: Vec<String> },
     /// A run of this node's that placement started here is up (`ended` None), or ended.
-    PlaceLocal { run: String, ended: Option<bool>, pid: Option<u32>, key: Option<String> },
+    PlaceLocal { run: String, ended: Option<bool>, pid: Option<u32>, born: Option<u64>, key: Option<String> },
     /// Its asker doesn't want a run any more.
     PlaceCancel { run: String },
     /// A placed run given up before its start was said anywhere (W05-R03): its claim goes.
@@ -315,6 +315,9 @@ pub enum Local {
     SessionStarted { claim: super::place::Claim, at: Option<super::place::Group>, reply: oneshot::Sender<bool> },
     /// An agent session placed here under `claim` ended.
     SessionEnded { claim: super::place::Claim },
+    /// A command whose work outlived this node's process before this one ended
+    /// (`Placer::take_outlived`): its process exited, what it left running ended with it.
+    PlaceOutlived { owner: String, epoch: u64, run: String },
     /// What this runner's admission holds, for a view (JSON).
     PlaceView { reply: oneshot::Sender<Value> },
     /// The box an agent session placed here under `claim` runs as (`Handle::box_of`).
@@ -477,13 +480,13 @@ impl Handle {
 
     /// A placed run here is up (`ended` None) or ended.
     pub async fn place_local(&self, run: &str, ended: Option<bool>) {
-        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended, pid: None, key: None })).await;
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended, pid: None, born: None, key: None })).await;
     }
 
-    /// A run of this node's that placement started here is up, as process `pid`: what it uses is
-    /// read from its group (room counted once).
-    pub async fn place_local_up(&self, run: &str, pid: u32, key: String) {
-        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended: None, pid: Some(pid), key: Some(key) })).await;
+    /// A run of this node's that placement started here is up, as process `pid`, which started at
+    /// `born`: what it uses is read from its group (room counted once), and its record keeps it.
+    pub async fn place_local_up(&self, run: &str, pid: u32, born: Option<u64>, key: String) {
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended: None, pid: Some(pid), born, key: Some(key) })).await;
     }
 
     /// Its asker doesn't want run `run` any more.
@@ -1601,8 +1604,26 @@ impl Node {
                 if n > 0 {
                     tracing::info!(runs = n, "placement took up the runs this node owned before it started again");
                 }
+                self.follow_outlived();
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "placement's records couldn't be read: what it owned before isn't taken up"),
+        }
+    }
+
+    /// The commands this node's process before this one started whose work goes on, each followed to
+    /// its end apart from this loop: its process's exit (`crate::os::proc::wait_exit_of`), then what
+    /// it left running in its process group ended as that process would have ended it at the run's
+    /// end (`serve::end_outlived`), then its end said here ([`Local::PlaceOutlived`]), which frees
+    /// its room and gives its reservation back to the machine's keeper.
+    fn follow_outlived(&mut self) {
+        for ((owner, epoch, run), process) in self.place.take_outlived() {
+            tracing::info!(%owner, epoch, %run, pid = process.pid, "a command this node's process before this one started goes on: its room held, and it followed to its end");
+            let tx = self.tx.clone();
+            crate::rt::spawn(async move {
+                crate::os::proc::wait_exit_of(process.pid, process.born).await;
+                let _ = crate::rt::blocking(move || serve::end_outlived(process.pid)).await;
+                let _ = tx.send(In::Local(Local::PlaceOutlived { owner, epoch, run })).await;
+            });
         }
     }
 
@@ -2840,12 +2861,12 @@ impl Node {
         let Some(r) = s.runs.get_mut(&id) else { return };
         let link = s.link.clone();
         match ev {
-            serve::Event::Started { pid, cwd } => {
+            serve::Event::Started { pid, born, cwd } => {
                 r.pid = Some(pid);
                 if let Some(link) = link {
                     self.say_on(&link, &Say::Started { id, pid, cwd }).await;
                 }
-                let outs = self.place.spawned_pid(&key.0, id, Some(pid), crate::util::now_ms());
+                let outs = self.place.spawned_pid(&key.0, id, Some(pid), born, crate::util::now_ms());
                 self.place_do(outs).await;
             }
             serve::Event::Output { stream, data } => {
@@ -3152,6 +3173,10 @@ impl Node {
                 let outs = self.place.session_ended(&claim, crate::util::now_ms());
                 self.place_do(outs).await;
             }
+            Local::PlaceOutlived { owner, epoch, run } => {
+                let outs = self.place.outlived_ended(&owner, epoch, &run, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
             Local::PlaceStarting { run, runner, fence, reply } => {
                 let (ok, outs) = self.place.starting(&run, &runner, fence, crate::util::now_ms());
                 self.place_do(outs).await;
@@ -3188,14 +3213,14 @@ impl Node {
                 self.send_or_queue(&peer, Ask::Place { json }).await;
                 self.send_or_queue(&peer, Ask::Run(spec)).await;
             }
-            Local::PlaceLocal { run, ended, pid, key } => {
+            Local::PlaceLocal { run, ended, pid, born, key } => {
                 let now = crate::util::now_ms();
                 if let Some(k) = key {
                     let (me, epoch) = self.place.owner_of_claims();
                     self.place.ran_as(&me, epoch, &run, k);
                 }
                 let outs = match ended {
-                    None => self.place.local_spawned_pid(&run, pid, now),
+                    None => self.place.local_spawned_pid(&run, pid, born, now),
                     Some(ok) => self.place.local_ended(&run, ok, now),
                 };
                 self.place_do(outs).await;

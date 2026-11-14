@@ -598,9 +598,24 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
 /// Wait for `pid` to end when it isn't this process's child (another runner of this machine
 /// started it and handed it over): its pidfd says so on Linux; elsewhere it is polled, with its
 /// start time checked so a recycled pid isn't taken for it.
-#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 pub async fn wait_foreign_exit(pid: u32) {
+    wait_gone(pid, None).await;
+}
+
+/// [`wait_foreign_exit`] for the process `pid` that started at `born` ([`started_at`]), as a record
+/// kept it (a run whose work outlived the runner process that started it): one with its pid that
+/// started at another time is another process, and `pid`'s ended.
+pub async fn wait_exit_of(pid: u32, born: u64) {
+    wait_gone(pid, Some(born)).await;
+}
+
+#[allow(clippy::disallowed_methods)] // (e) polls a process's state where no pidfd says its exit
+async fn wait_gone(pid: u32, born: Option<u64>) {
     if let Some(fd) = pidfd(pid) {
+        // Its pid given out again before the pidfd was opened: the process asked for is gone.
+        if born.is_some_and(|b| started_at(pid) != Some(b)) {
+            return;
+        }
         // Readable once it has ended (as a zombie, if its parent hasn't reaped it yet).
         loop {
             if crate::rt::timeout(Duration::from_secs(5), ready(&fd, false)).await.is_ok() {
@@ -611,7 +626,7 @@ pub async fn wait_foreign_exit(pid: u32) {
             }
         }
     }
-    let born = started_at(pid);
+    let born = born.or_else(|| started_at(pid));
     loop {
         if !crate::os::pid_alive(pid) || started_at(pid) != born {
             return;
@@ -621,7 +636,7 @@ pub async fn wait_foreign_exit(pid: u32) {
 }
 
 /// When `pid` started (seconds since the epoch), to tell it from a later process with its pid.
-fn started_at(pid: u32) -> Option<u64> {
+pub fn started_at(pid: u32) -> Option<u64> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let mut sys = System::new();
     let p = Pid::from_u32(pid);

@@ -796,10 +796,10 @@ pub(crate) async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &
         use futures::FutureExt as _;
         futures::select_biased! {
             e = rx.recv().fuse() => match e {
-                Ok(super::serve::Event::Started { pid: p, cwd }) => {
+                Ok(super::serve::Event::Started { pid: p, born, cwd }) => {
                     pid = Some(p);
                     if let Some((h, run)) = &placed {
-                        h.place_local_up(run, p, here_key.clone()).await;
+                        h.place_local_up(run, p, born, here_key.clone()).await;
                     }
                     told.started();
                     let _ = ev.send(Ev::Started { runner: String::new(), pid: p, cwd }).await;

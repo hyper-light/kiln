@@ -215,6 +215,20 @@ pub async fn wait_pid_exit<S>(_pid: u32, mut try_wait: impl FnMut() -> io::Resul
     }
 }
 
+/// When `pid` started (seconds since the epoch), to tell it from a later process with its pid.
+pub fn started_at(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    let p = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), false, ProcessRefreshKind::nothing());
+    sys.process(p).map(sysinfo::Process::start_time)
+}
+
+/// Unix's wait for a process that outlived the runner process that started it: none does here.
+/// Every process a runner starts is in a job that ends with it (`KILL_ON_JOB_CLOSE`), so no run's
+/// work outlives the runner (`crate::os::pid_alive` says none runs), and there's nothing to wait for.
+pub async fn wait_exit_of(_pid: u32, _born: u64) {}
+
 /// Run to completion and capture stdout/stderr, killing the job if it outlives `timeout`.
 pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Output> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());

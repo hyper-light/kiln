@@ -184,4 +184,4 @@ pub use ask::{Ask, Peer, Sample};
 pub use link::{Offset, Rtt};
 pub use msg::{Down, Estimate, Place, Reason, Short, ToOwner, ToRunner, Up};
 pub use owner::{Act, Attempt, Cmd, Kept, Link, Machine, Owner, Size};
-pub use runner::{Admission, Init, Record, Records, Reply, Settings, Start};
+pub use runner::{Admission, Init, Process, Record, Records, Reply, Settings, Start};

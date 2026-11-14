@@ -122,7 +122,8 @@ impl Placer {
     /// through it from now on. Its holding starts under this node's epoch, durable and one more at
     /// each start of its process (the holder's item 2), with its survivors (item 3): the
     /// reservations its records keep of runs whose work outlived its last process ([`Self::restore`]
-    /// took them up), each its run's ask's room. Before any word: until its first sync is answered
+    /// took them up: agent sessions, and commands whose processes still run), each its run's ask's
+    /// room. One whose room isn't known here is said in the log, never left out unsaid. Before any word: until its first sync is answered
     /// it stands joining and takes nothing new (CV11). A holding that can't start (more survivors
     /// than one sync lists, or one its core refuses) leaves it unsynced for good, malformed, saying
     /// why.
@@ -133,8 +134,13 @@ impl Placer {
             for (epoch, by_run) in by_epoch {
                 for (run, record) in by_run {
                     let (Some((e, seq)), None) = (record.reservation, record.ended) else { continue };
-                    let Some(Held::Running { ask: Some(asked), .. }) = self.admission.holding(Peer { name: owner, epoch: *epoch }, run) else { continue };
                     let id = ReservationId { epoch: e, seq };
+                    let Some(Held::Running { ask: Some(asked), .. }) = self.admission.holding(Peer { name: owner, epoch: *epoch }, run) else {
+                        // Its record holds it running with no room it can be listed with: said, never
+                        // dropped unsaid (the keeper releases it at the sync).
+                        tracing::error!(%owner, epoch, %run, reservation = %format!("{e}-{seq}"), "a run this runner holds as running can't be shown to hold its reservation: its room isn't known here, so its reservation isn't listed and goes back at the keeper's sync");
+                        continue;
+                    };
                     survivors.push(hex::Held { id, amount: hex::Amounts::from_array(ask::amounts(&asked.needs.request)) });
                     runs.insert((owner.clone(), *epoch, run.clone()), BoxName::Reserved(id));
                 }

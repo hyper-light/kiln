@@ -19,7 +19,9 @@ use super::wire::{RunSpec, Signal, Stream};
 /// What a run says, in order.
 #[derive(Debug)]
 pub enum Event {
-    Started { pid: u32, cwd: String },
+    /// It's up as process `pid` (its process group's leader), which started at `born` as the
+    /// system says (`crate::os::proc::started_at`; none where it couldn't say).
+    Started { pid: u32, born: Option<u64>, cwd: String },
     Output { stream: Stream, data: Vec<u8> },
     /// It ended; `used`: what it used, measured here (`super::measure`; docs/reach.md, "Sizes from
     /// history"), none when it never started.
@@ -354,6 +356,12 @@ fn end_leftovers(pgid: u32, group: Option<crate::os::contain::Group>) {
     }
 }
 
+/// What a run whose process `pgid` outlived the runner process that started it left running ends,
+/// as that process would have ended it at the run's end ([`end_leftovers`]): its process group.
+pub fn end_outlived(pgid: u32) {
+    end_leftovers(pgid, None);
+}
+
 /// Whether anything is still in process group `pgid`.
 fn group_alive(pgid: u32) -> bool {
     #[cfg(unix)]
@@ -449,7 +457,8 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         let (mut out_scan, mut err_scan) = (crate::sense::health::Scan::default(), crate::sense::health::Scan::default());
         // Measured from its own group, from now to its end (audit H5).
         let measure = super::measure::Measure::start(group.as_ref());
-        if events.send(Event::Started { pid, cwd: cwd.to_string_lossy().into_owned() }).await.is_err() {
+        let born = crate::os::proc::started_at(pid);
+        if events.send(Event::Started { pid, born, cwd: cwd.to_string_lossy().into_owned() }).await.is_err() {
             end_now(pid, group);
             return;
         }

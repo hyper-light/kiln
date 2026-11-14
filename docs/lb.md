@@ -385,7 +385,10 @@ machine's keeper: `keeper`, where its capacity port is reached (`host:port`), an
 name its certificate carries; it is off unless both are declared. Its runner's node then holds
 through it. Its placement starts a holding as its records are read, under the node's durable epoch,
 its survivors the reservations its records keep of runs that went on past its last process (agent
-sessions, whose harness continues them), each with its ask's room. Its link runs apart from the
+sessions, whose harness continues them, and commands whose process, kept with their record as they
+came up, still runs), each with its ask's room; each command is followed to its process's exit and
+gives its reservation back then. A run its records hold that can't be shown to go on, or whose room
+isn't known, is said in its log as its reservation goes back at the sync, never left out unsaid. Its link runs apart from the
 node's loop: the holder's credentials enrolled first (`credentials`; what it can't do yet, the
 server not reached or the keeper's address not resolving, it tries again as the server comes back,
 on no clock of its own), then one link after another (`capacity::links`), each said to the node as

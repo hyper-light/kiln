@@ -467,3 +467,133 @@ fn holder_logs_each_sync_each_link_lost_each_rejoin_and_what_it_holds_once_settl
         Ok(())
     })
 }
+
+/// A command placed here, up as a real process of this machine's, ended as it's let go of.
+#[cfg(unix)]
+struct Command(std::process::Child);
+
+#[cfg(unix)]
+impl Command {
+    /// Its process, and that process's identity as its record keeps it: its pid and start time.
+    fn up() -> anyhow::Result<(Command, u32, Option<u64>)> {
+        let child = std::process::Command::new("sleep").arg("300").spawn()?;
+        let pid = child.id();
+        Ok((Command(child), pid, crate::os::proc::started_at(pid)))
+    }
+
+    /// Its process ends, reaped.
+    fn end(&mut self) -> anyhow::Result<()> {
+        self.0.kill()?;
+        self.0.wait()?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Command {
+    fn drop(&mut self) {
+        let _ = self.end();
+    }
+}
+
+/// The holder's items 3 and 4 for commands (Hex lead, goal 3's two-machine holder crash: a runner
+/// SIGKILLed, its five commands running on reparented, and its next process's sync listing none of
+/// them, `released=5`, so the machine's room was booked twice). Three commands start here on their
+/// reserves' grants, each kept with its record and its process as it's up: this node's own run, and
+/// two of owner "asker"'s. The runner's process ends; two of the commands go on, one ends meanwhile.
+/// The next process, in a later epoch, takes the two that go on up, their room held again, and
+/// lists their reservations in its sync, the keeper agreeing and releasing the third's alone, the
+/// lost one's said. Each that goes on is followed to its end, and gives its own reservation back
+/// then, its room free.
+#[cfg(unix)]
+#[test]
+fn holder_a_runner_started_again_lists_the_commands_that_outlived_it_and_gives_each_back_as_it_ends() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let dir = tempfile::tempdir()?;
+        let records = crate::records::open(&dir.path().join("place.db"))?;
+        let cap = machine()?;
+        let mut p = runner(1);
+        p.keep_in(Arc::clone(&records));
+        let _ = p.restore(load(&*records).await?, 0);
+        let _ = p.keeper_start(0);
+        let link = join(&mut p, &cap, 1).await?;
+
+        // This node's own run, placed here as `kiln run` places it.
+        let _ = p.directory(&[], 10);
+        let mut outs = p.ask(ask("l-1", 1, 1, None), 11);
+        let go = |outs: &[Out]| {
+            outs.iter().find_map(|o| match o {
+                Out::Local { run, placed: Placed::Go { runner, fence } } if run == "l-1" && runner == ME => Some(*fence),
+                _ => None,
+            })
+        };
+        if go(&outs).is_none() {
+            outs.extend(p.tick(5_000));
+        }
+        let fence = go(&outs).ok_or_else(|| anyhow::anyhow!("placed here: {outs:?}"))?;
+        let (_, outs) = p.starting("l-1", ME, fence, 5_001);
+        let seen = talk(&mut p, &*link, outs, 5_002).await?;
+        anyhow::ensure!(seen.contains(&Out::Started { run: "l-1".into(), ok: true }), "{seen:?}");
+        let (mut local, pid, born) = Command::up()?;
+        let _ = p.local_spawned_pid("l-1", Some(pid), born, 5_003);
+
+        // Two of owner "asker"'s, each with its spec.
+        let mut asker = Vec::new();
+        for (n, run) in [(1, "r-1"), (2, "r-2")] {
+            let fence = claimed(&mut p, &ask(run, 2, 4, None), 5_010)?;
+            let outs = p.told("asker", &word(ToRunner::Start { run: run.into(), fence, elsewhere: 0 }, Some(n))?, 5_011);
+            let _ = talk(&mut p, &*link, outs, 5_012).await?;
+            anyhow::ensure!(p.spec("asker", n) == Spec::Start { run: run.into() }, "{run} started on its grant");
+            let (child, pid, born) = Command::up()?;
+            let _ = p.spawned_pid("asker", n, Some(pid), born, 5_013);
+            asker.push(child);
+        }
+        for tx in p.take_unkept() {
+            records.commit(tx).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        }
+        let held = books(&cap)?;
+        anyhow::ensure!(held.len() == 3, "{held:?}");
+        let kept = load(&*records).await?;
+        anyhow::ensure!(kept.ran.iter().filter(|(_, row)| row.record.reservation.is_some() && row.record.process.is_some()).count() == 3, "each kept with its reservation and its process: {kept:?}");
+        let id_of = |owner: &str, run: &str| match p.box_of(owner, 1, run) {
+            Some(BoxName::Reserved(id)) => Ok(id),
+            other => Err(anyhow::anyhow!("{run}: {other:?}")),
+        };
+        let (l1, r1, r2) = (id_of(ME, "l-1")?, id_of("asker", "r-1")?, id_of("asker", "r-2")?);
+
+        // The runner's process ends, its commands going on; r-2's ends meanwhile.
+        drop(link);
+        drop(p);
+        asker.pop().ok_or_else(|| anyhow::anyhow!("r-2"))?.end()?;
+
+        let mut p = runner(2);
+        p.keep_in(Arc::clone(&records));
+        let _ = p.restore(load(&*records).await?, 20);
+        let _ = p.keeper_start(20);
+        anyhow::ensure!(p.box_of(ME, 1, "l-1") == Some(BoxName::Reserved(l1)) && p.box_of("asker", 1, "r-1") == Some(BoxName::Reserved(r1)), "the survivors' boxes");
+        anyhow::ensure!(p.box_of("asker", 1, "r-2").is_none(), "the one that ended isn't held");
+        anyhow::ensure!(running(&p, ME, "l-1") && running(&p, "asker", "r-1") && !running(&p, "asker", "r-2"), "{:?}", p.admission().probes());
+        let followed: Vec<String> = p.take_outlived().into_iter().map(|((_, _, run), _)| run).collect();
+        anyhow::ensure!(followed == vec!["l-1".to_owned(), "r-1".to_owned()] || followed == vec!["r-1".to_owned(), "l-1".to_owned()], "each followed to its end: {followed:?}");
+        let link = join(&mut p, &cap, 21).await?;
+        anyhow::ensure!(synced(&p), "{:?}", p.view());
+        let lines = p.keeper.as_ref().map(|h| h.logged.clone()).unwrap_or_default();
+        anyhow::ensure!(lines.iter().any(|l| l.contains("agree=true") && l.contains("released=1")), "the lost one's alone released: {lines:#?}");
+        let books_now = books(&cap)?;
+        anyhow::ensure!(books_now.keys().copied().collect::<Vec<_>>() == { let mut v = vec![l1, r1]; v.sort(); v } && !books_now.contains_key(&r2), "its sync listed the two that go on: {books_now:?}");
+
+        // Each gives its own back as it ends.
+        local.end()?;
+        let outs = p.outlived_ended(ME, 1, "l-1", 30);
+        anyhow::ensure!(releases(&outs) == 1, "{outs:?}");
+        let _ = talk(&mut p, &*link, outs, 31).await?;
+        anyhow::ensure!(books(&cap)?.keys().copied().collect::<Vec<_>>() == vec![r1] && !running(&p, ME, "l-1"), "l-1's alone given back: {:?}", books(&cap)?);
+        for mut c in asker {
+            c.end()?;
+        }
+        let outs = p.outlived_ended("asker", 1, "r-1", 40);
+        let _ = talk(&mut p, &*link, outs, 41).await?;
+        anyhow::ensure!(books(&cap)?.is_empty() && !running(&p, "asker", "r-1"), "{:?}", books(&cap)?);
+        Ok(())
+    })
+}

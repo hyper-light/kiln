@@ -221,10 +221,13 @@ own), so either can start again without a run starting twice or its result being
   runner that started again (its words' epoch rose) is asked the same, rather than told its starts
   again.
 - **The runner's ledger** is rebuilt from its records, truthfully: a run whose process goes on past
-  its restart (an agent session, which its harness continues) has its room held again as it
-  starts, under the claim it started under, so it never admits past its budget beside it; a session
-  its harness can't continue is let go. A command can't be followed on past the process that ran it:
-  its record ends it, lost, as its owner hears. A CI leg's room isn't kept: its owner, the server's
+  its restart has its room held again as it starts, under the claim it started under, so it never
+  admits past its budget beside it: an agent session, which its harness continues, and a command
+  whose process still runs (a runner killed leaves its commands running), known by the pid and start
+  time its record kept as it came up, and followed to its exit, when what it left running in its
+  process group ends as it would have, and its end is said; a session its harness can't continue is
+  let go. A command whose process ended meanwhile, or whose record kept none, is ended, lost, as its
+  owner hears (on Windows every command ends with its runner, its job's). A CI leg's room isn't kept: its owner, the server's
   CI engine, keeps its grants in its store and reconciles them with what runners say they run
   (docs/needs.md §8).
 - **Its asker.** A `kiln run` attached to the runner that owns its run loses its connection with

@@ -26,7 +26,7 @@ use kiln_ci::place::answer::Answer;
 use kiln_ci::place::ask::{Ask, Peer, Sample};
 use kiln_ci::place::msg::{How, ToOwner, ToRunner};
 use kiln_ci::place::owner::{Act, Kept, Machine, Owner, Size};
-use kiln_ci::place::runner::{Admission, Init, Record, Records, Settings, Start};
+use kiln_ci::place::runner::{Admission, Init, Process, Record, Records, Settings, Start};
 use kiln_seams::records::{Scan, TX_MAX, Tx, Write};
 use kiln_ci::sched::state::{Cpus, Fence, Resources};
 
@@ -244,6 +244,46 @@ struct RanRow {
     record: Record,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ask: Option<Ask>,
+}
+
+/// Whether the work of a run a runner's record has running outlived the runner process that started
+/// it ([`Placer::restore`]): an agent session's does (its harness continues it); a command's does
+/// while the process its record kept runs; any other's can't be shown to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outlived {
+    Session,
+    Runs(Process),
+    /// A command whose process its record kept has ended.
+    Ended,
+    /// A command whose record kept no process: it ended before its process was kept, or its
+    /// start time couldn't be read.
+    Unknown,
+    /// A record kept without its ask: what it is can't be read.
+    NoAsk,
+}
+
+impl Outlived {
+    fn why(self) -> &'static str {
+        match self {
+            Outlived::Session | Outlived::Runs(_) => "its work goes on",
+            Outlived::Ended => "its process ended while no runner process followed it",
+            Outlived::Unknown => "its record kept no process to follow it by, so it can't be shown to run",
+            Outlived::NoAsk => "its ask wasn't kept with its record, so what it is can't be read",
+        }
+    }
+}
+
+/// Whether the work of the run `row` records outlived its runner's process ([`Outlived`]).
+fn outlived(row: &RanRow) -> Outlived {
+    let Some(ask) = &row.ask else { return Outlived::NoAsk };
+    if ask.key.as_deref().is_some_and(|k| k.starts_with("session:")) {
+        return Outlived::Session;
+    }
+    match row.record.process {
+        Some(p) if crate::os::pid_alive(p.pid) && crate::os::proc::started_at(p.pid) == Some(p.born) => Outlived::Runs(p),
+        Some(_) => Outlived::Ended,
+        None => Outlived::Unknown,
+    }
 }
 
 /// A runner record's key: its owner, NUL, its epoch (8 bytes, big-endian), its run.
@@ -465,6 +505,10 @@ pub struct Placer {
     budget: super::budget::Budget,
     /// Its part in hand-offs of runs whose owner can't be reached (LB03, [`handoff`]).
     hand: handoff::Hand,
+    /// The commands its process before this one started whose work outlived that process
+    /// ([`Self::restore`]), by owner, the owner's epoch and run, with the process each is: held
+    /// again, to be followed to their ends by the node ([`Self::take_outlived`]).
+    outlived: Vec<((String, u64, String), Process)>,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when. Read
@@ -803,10 +847,15 @@ impl Placer {
     /// runs: each answer still owed told again (to the agent session that asked, through told), the
     /// rest asked again or held where their start went once the directory comes, and every runner
     /// that answers `Sync` asked what it started. The runner's records: the first epoch they're kept
-    /// from is the one before this one's first; a run they have running goes on only if it's an agent
-    /// session (its harness continues it), its room held again; any other (a command, which can't
-    /// be followed on past the process that ran it) ended, lost with that process. A CI leg's room
-    /// is never kept: its owner, the server's CI engine, keeps its grants itself (docs/needs.md §8).
+    /// from is the one before this one's first; a run they have running goes on, its room held again
+    /// (and its reservation listed to its machine's keeper, `holder`), where its work outlived that
+    /// process: an agent session (its harness continues it), or a command whose process its record
+    /// kept still runs (killing the runner leaves its commands running, reparented), followed to
+    /// its end from here ([`Self::take_outlived`]). Any other ended, lost with that process, said
+    /// in the log where it held a reservation, which goes back to the keeper at its sync: a command
+    /// whose process ended meanwhile, or one whose process its record never kept (that process ended
+    /// between its start and keeping it), which can't be shown to run. A CI leg's room is never
+    /// kept: its owner, the server's CI engine, keeps its grants itself (docs/needs.md §8).
     pub fn restore(&mut self, loaded: Loaded, now: i64) -> Vec<Out> {
         let Loaded { own, ran, since, forgot, budget, hand, members } = loaded;
         let fresh = since.is_none();
@@ -825,13 +874,21 @@ impl Placer {
             if row.record.ended.is_some() {
                 continue;
             }
-            let session = row.ask.as_ref().is_some_and(|a| a.key.as_deref().is_some_and(|k| k.starts_with("session:")));
-            let adopted = match row.ask {
-                Some(ask) if session => self.admission.adopt(Peer { name: &owner, epoch }, std::sync::Arc::new(ask), now),
+            let lived = outlived(&row);
+            let adopted = match (row.ask, lived) {
+                (Some(ask), Outlived::Session | Outlived::Runs(_)) => self.admission.adopt(Peer { name: &owner, epoch }, std::sync::Arc::new(ask), now),
                 _ => false,
             };
-            if !adopted {
-                self.admission.lose(&owner, epoch, &run);
+            match lived {
+                Outlived::Runs(process) if adopted => self.outlived.push(((owner, epoch, run), process)),
+                Outlived::Session if adopted => {}
+                why => {
+                    if let Some((e, seq)) = row.record.reservation {
+                        let why = if matches!(why, Outlived::Session | Outlived::Runs(_)) { "its work goes on, but its room couldn't be held again here" } else { why.why() };
+                        tracing::warn!(%owner, epoch, %run, reservation = %format!("{e}-{seq}"), why, "a run this runner's process before this one started, holding a reservation through its machine's capacity keeper, is taken as lost: its reservation goes back at the keeper's sync");
+                    }
+                    self.admission.lose(&owner, epoch, &run);
+                }
             }
         }
         let mut kept = Vec::with_capacity(own.len());
@@ -986,7 +1043,7 @@ impl Placer {
         let mut owner = Owner::seeded(me, epoch, rand::random());
         owner.configure(&settings);
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), keeper: None, numbering: kiln_ci::place::holder::Numbering::new(epoch), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
+        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), keeper: None, numbering: kiln_ci::place::holder::Numbering::new(epoch), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default(), outlived: Vec::new() }
     }
 
     /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
@@ -1332,10 +1389,12 @@ impl Placer {
         serde_json::to_string(&Envelope { epoch: self.epoch, spec: Some(spec), ballot: self.hand.ballot_of(run), members, msg }).unwrap_or_default()
     }
 
-    /// A run of this node's started here: its process is up (the runner's word), process `pid`.
-    pub fn local_spawned_pid(&mut self, run: &str, pid: Option<u32>, now: i64) -> Vec<Out> {
+    /// A run of this node's started here: its process is up (the runner's word), process `pid`,
+    /// which started at `born`, kept with its record.
+    pub fn local_spawned_pid(&mut self, run: &str, pid: Option<u32>, born: Option<u64>, now: i64) -> Vec<Out> {
         let (me, epoch) = (self.me.clone(), self.epoch);
         self.grouped_pid(&me, epoch, run, pid);
+        self.up(&me, epoch, run, pid, born);
         self.local_spawned(run, now)
     }
 
@@ -1462,9 +1521,10 @@ impl Placer {
     }
 
     /// A run started here for `peer` (spec `id`) is up, process `pid`.
-    pub fn spawned_pid(&mut self, peer: &str, id: u64, pid: Option<u32>, now: i64) -> Vec<Out> {
+    pub fn spawned_pid(&mut self, peer: &str, id: u64, pid: Option<u32>, born: Option<u64>, now: i64) -> Vec<Out> {
         if let Some((epoch, run)) = self.started.get(&(peer.to_owned(), id)).cloned() {
             self.grouped_pid(peer, epoch, &run, pid);
+            self.up(peer, epoch, &run, pid, born);
         }
         self.spawned(peer, id, now)
     }
@@ -1806,6 +1866,37 @@ impl Placer {
         self.admission.ended(Peer { name: &c.owner, epoch: c.epoch }, &c.run, true, now, &mut said);
         let mut out = self.said(said, now);
         out.extend(self.keeper_release(&c.owner, c.epoch, &c.run, now));
+        out
+    }
+
+    /// Run `run` of owner `owner` (`epoch`) is up as process `pid`, started at `born`: kept with its
+    /// record (`Admission::up`), what its work is followed by should it outlive this process. One
+    /// whose start time couldn't be read keeps none, and is lost with this process.
+    fn up(&mut self, owner: &str, epoch: u64, run: &str, pid: Option<u32>, born: Option<u64>) {
+        if let (Some(pid), Some(born)) = (pid, born) {
+            self.admission.up(Peer { name: owner, epoch }, run, Process { pid, born });
+        }
+    }
+
+    /// The commands taken up from this node's process before this one whose work goes on
+    /// ([`Self::restore`]), each with its process: the node follows each to its end, then says it
+    /// ([`Self::outlived_ended`]).
+    pub fn take_outlived(&mut self) -> Vec<((String, u64, String), Process)> {
+        std::mem::take(&mut self.outlived)
+    }
+
+    /// A command of owner `owner` (`epoch`) whose work outlived this node's process before this one
+    /// ended ([`Self::take_outlived`]): its process exited, so its room is free, and its
+    /// reservation through its machine's keeper goes back after its record (the holder's item 4);
+    /// its end goes to its owner, or is handed off where its owner can't be reached (LB03).
+    pub fn outlived_ended(&mut self, owner: &str, epoch: u64, run: &str, now: i64) -> Vec<Out> {
+        self.ungrouped(owner, epoch, run);
+        let mut said = Vec::new();
+        self.admission.ended(Peer { name: owner, epoch }, run, true, now, &mut said);
+        let mut out = self.said(said, now);
+        out.extend(self.keeper_release(owner, epoch, run, now));
+        out.extend(self.hand_ended(owner, epoch, run, now));
+        out.extend(self.hand_room(now));
         out
     }
 
