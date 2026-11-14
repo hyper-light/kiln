@@ -649,6 +649,13 @@ impl Handovers {
 /// inbox's ids can't go with it.
 const HOST_GONE: &str = "this runner's host of its sessions is gone, so it stays here";
 
+/// A session's depth starts where its own was, kept with its state (a restart, an upgrade's
+/// handover, a move): never another session's, as how a person works with one says nothing of
+/// another (W20 learned depth). One that never learned starts from its own waiting senders.
+fn seed_learned(input: &super::admission::Input, depth: Option<usize>) {
+    if let Some(depth) = depth { let _ = input.controller.lock().seed(depth); }
+}
+
 /// What kiln says first to a session whose turn its restart cut short.
 const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through your last turn, which stopped it. Pick up where you left off.";
 
@@ -1846,6 +1853,10 @@ impl Host {
             let _ = input.controller.lock().restoring();
             input
         }));
+        if let Some(input) = &input {
+            let depth = seed.as_ref().and_then(|sd| super::admission::learned_depth(&sd.state)).or_else(|| handed.as_ref().and_then(|h| h.core.learned_depth()));
+            seed_learned(input, depth);
+        }
         let started = match handed {
             Some(h) => session::start_handed_input(id.clone(), spec, self.sink.clone(), on_change, files, h, input),
             None => session::start_seeded_input(id.clone(), spec, self.sink.clone(), on_change, files, seed, input),
@@ -1933,6 +1944,13 @@ impl Host {
         }
     }
 
+    /// A session's new input at `epoch`, its depth starting where its own was ([`seed_learned`]).
+    fn learned_input(&self, epoch: u64, inbox: Arc<inbox::Inbox>, depth: Option<usize>) -> super::admission::Input {
+        let input = super::admission::Input::new(epoch, self.input_budgets.budget(), inbox);
+        seed_learned(&input, depth);
+        input
+    }
+
     /// Each session's input is held to a resource-derived strict budget of its own, through all
     /// its stages: `bytes`, the share Root's resource events measure, is each one's bound. One
     /// session's backlog never takes another's room. No timer is introduced.
@@ -1957,7 +1975,8 @@ impl Host {
             s.input_changed();
             return false;
         };
-        let input = core.input.get_or_insert_with(|| super::admission::Input::new(current_epoch, self.input_budgets.budget(), inbox)).clone();
+        let depth = super::admission::learned_depth(&core.state);
+        let input = core.input.get_or_insert_with(|| self.learned_input(current_epoch, inbox, depth)).clone();
         let bytes = match super::admission::command_bytes(command) {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -2006,7 +2025,8 @@ impl Host {
     fn open_lane(&self, lanes: &mut HashMap<String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>)>, id: &str, epoch: u64, back: bool) {
         if let (Some(s), Some(inbox)) = (self.get(id), self.inbox.clone()) {
             let mut core = s.core.lock();
-            let input = core.input.get_or_insert_with(|| super::admission::Input::new(epoch, self.input_budgets.budget(), inbox));
+            let depth = super::admission::learned_depth(&core.state);
+            let input = core.input.get_or_insert_with(|| self.learned_input(epoch, inbox, depth));
             let _ = input.controller.lock().restoring();
         }
         // At most `LANE` waiting, whatever each carries, as the channel it was held.
@@ -2315,7 +2335,8 @@ impl Host {
         let input = {
             let mut core = s.core.lock();
             let epoch = core.state.epoch;
-            core.input.get_or_insert_with(|| super::admission::Input::new(epoch, self.input_budgets.budget(), inbox)).clone()
+            let depth = super::admission::learned_depth(&core.state);
+            core.input.get_or_insert_with(|| self.learned_input(epoch, inbox, depth)).clone()
         };
         match input.inbox.promotion(&s.id).await {
             Ok(Some(promotion)) if promotion.phase != inbox::PromotionPhase::Active => {
@@ -4053,7 +4074,9 @@ mod tests {
                     let capacity = controller.capacity();
                     assert_eq!((capacity.epoch, capacity.admitted, capacity.bytes), (1, 1, bytes));
                     if prior_unavailable { assert_eq!(capacity.target, 0, "a genuine prior unavailable state must remain held"); }
-                    else { assert!(capacity.target > capacity.admitted, "successful owner reconciliation left promotion unavailable after a temporary copy refusal"); }
+                    // Taking messages again: a target of none is "takes none" (W20 learned depth:
+                    // with nothing waiting, its one place is taken by the restored debt).
+                    else { assert!(capacity.target > 0, "successful owner reconciliation left promotion unavailable after a temporary copy refusal"); }
                 }
             }
             Ok(())

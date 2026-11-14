@@ -2147,10 +2147,12 @@ for line in sys.stdin:
             crate::goals::add(&hub, &coordinator, vec!["the lab program passes".into(), "the view loads in 300 ms".into()], true).await?;
             source_until(&hub, &coordinator, "one real refill goal", || async {
                 Ok(hub.harness.local.get(&coordinator).is_some_and(|session| session.core.lock().state.queue.len() == 1)
-                    && crate::harness::mail_delivery::capacity(&hub, &coordinator).is_some_and(|capacity| capacity.admitted == capacity.target))
+                    && crate::harness::mail_delivery::capacity(&hub, &coordinator).is_some_and(|capacity| capacity.admitted == 2))
             }).await?;
             let capacity = crate::harness::mail_delivery::capacity(&hub, &coordinator).ok_or_else(|| anyhow::anyhow!("no capacity"))?;
-            anyhow::ensure!(capacity.learning == Learning::Bootstrap && capacity.target == 2 && capacity.admitted == 2, "only the two actual cold-start roles: {capacity:?}");
+            // W20 learned depth: the person's initial message takes no place; kiln's goal takes the
+            // one place a receiver that has learned nothing has while nothing else waits.
+            anyhow::ensure!(capacity.learning == Learning::Bootstrap && capacity.target == 1 && capacity.admitted == 2, "the person's message and kiln's goal, the goal in the agents' one place: {capacity:?}");
             let goal_id = hub.harness.local.get(&coordinator).and_then(|session| session.core.lock().state.queue.first().map(|item| item.id.clone())).ok_or_else(|| anyhow::anyhow!("no queued goal"))?;
             let original_recipient = coordinator.clone();
             let originals: Vec<(String, String)> = hub.store.read(move |connection| {
@@ -2167,7 +2169,9 @@ for line in sys.stdin:
             let accepted = call(peer.clone(), "agents.send", blocked.clone()).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
             anyhow::ensure!(accepted.get("id") == Some(&json!(blocked_id)) && accepted.get("repeat") == Some(&json!(false)) && accepted.get("disposition") == Some(&json!("waiting")), "a busy coordinator's peer is taken into custody, not refused: {accepted}");
             let current = crate::harness::mail_delivery::capacity(&hub, &coordinator).ok_or_else(|| anyhow::anyhow!("no capacity"))?;
-            anyhow::ensure!(current.admitted <= current.target && current.admitted == capacity.admitted && prompts(&heard) == [initial_id.clone()], "custody cannot grow source admission or fabricate consumption");
+            // A person's messages are held to no depth, so `admitted` (theirs too) is no bound
+            // against `target`: what's held is that nothing more was admitted.
+            anyhow::ensure!(current.admitted == capacity.admitted && prompts(&heard) == [initial_id.clone()], "custody cannot grow source admission or fabricate consumption");
             // The gate reader was opened before native Started, so this nonblocking writer
             // cannot wait on a missing provider or strand a blocking pool job on cancellation.
             let mut release = std::fs::OpenOptions::new().write(true).custom_flags(nix::libc::O_NONBLOCK).open(&gate)?;
@@ -2238,7 +2242,7 @@ for line in sys.stdin:
             let Sent::Published(original) = hub.harness.command(&hub, &recipient, command).await else { anyhow::bail!("the original was not committed") };
             anyhow::ensure!(original.generation == 0 && original.disposition == mail::Disposition::Waiting && prompts(&heard).is_empty(), "custody alone is not native consumption: {original:?}");
             let epoch = hub.harness.epoch_of(&recipient);
-            anyhow::ensure!(hub.harness.local.command(&recipient, Command::MailPeers { epoch, peers: vec!["server".into()], demand: vec![Demand { peer: "server".into(), revision: original.revision }] }), "MailPeers was not queued");
+            anyhow::ensure!(hub.harness.local.command(&recipient, Command::MailPeers { epoch, peers: vec!["server".into()], demand: vec![Demand { peer: "server".into(), revision: original.revision, waiting: None }] }), "MailPeers was not queued");
             source_until(&hub, &recipient, "source grant for the retained publication", || async {
                 Ok(crate::harness::mail_delivery::capacity(&hub, &recipient).is_some_and(|capacity| capacity.eligible_peer.as_deref() == Some("server")))
             }).await?;

@@ -9,8 +9,10 @@ export type Capacity = { epoch: number, generation: number,
  */
 retry_generation?: number, learning: Learning, target: number, admitted: number, bytes: number, peers: number, eligible_peer?: string, feedback_generation?: number, 
 /**
- * The depth agents' and kiln's messages are held to, learned, even while it takes none
- * (`target` is none then: paused): the server queues theirs to it meanwhile. A person's
- * messages are held to no depth. Absent from a source that predates it.
+ * The depth agents' and kiln's messages are held to, learned (what this receiver's own
+ * consumption taught, kept with its state for its next start; before it has learned, the
+ * target), even while it takes none (`target` is none then: paused): the server queues
+ * theirs to it meanwhile. A person's messages are held to no depth. Absent from a source
+ * that predates it.
  */
 depth?: number, };

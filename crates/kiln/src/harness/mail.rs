@@ -210,11 +210,13 @@ pub async fn waiting_peers(store: &Store, recipient: String, after: u64, budget:
 
 fn waiting_peers_on(c: &Connection, recipient: &str, after: u64, budget: usize) -> Result<Page<super::admission::Demand>, Error> {
     let mut page = Page { items: Vec::new(), next: None }; let mut bytes = 0;
-    let mut q = c.prepare("SELECT sender,MIN(revision) AS first FROM agent_mail WHERE recipient=?1 AND disposition='waiting' GROUP BY sender HAVING first>?2 ORDER BY first").map_err(sql_error)?;
+    // Each sender's count of waiting originals too: what a receiver whose depth held them back
+    // would have taken at its handoff (W20 learned depth).
+    let mut q = c.prepare("SELECT sender,MIN(revision) AS first,COUNT(*) FROM agent_mail WHERE recipient=?1 AND disposition='waiting' GROUP BY sender HAVING first>?2 ORDER BY first").map_err(sql_error)?;
     let mut rows = q.query(params![recipient, number(after)?]).map_err(sql_error)?;
     while let Some(row) = rows.next().map_err(sql_error)? {
         let cursor = unsigned(row.get(1).map_err(sql_error)?)?;
-        let demand = super::admission::Demand { peer: row.get(0).map_err(sql_error)?, revision: cursor };
+        let demand = super::admission::Demand { peer: row.get(0).map_err(sql_error)?, revision: cursor, waiting: Some(unsigned(row.get(2).map_err(sql_error)?)?) };
         if !push_page(&mut page, &mut bytes, demand, cursor, budget)? { encoded(&page, budget, cursor)?; return Ok(page); }
     }
     page.next = None; encoded(&page, budget, after)?; Ok(page)
@@ -813,7 +815,7 @@ mod tests {
             assert!(capacity(ready).admitted == 0);
             let mut ledger = db()?;
             let publication = put(&mut ledger, &original)?;
-            assert!(host.command(&id, Command::MailPeers { epoch, peers: vec!["sender".into()], demand: vec![admission::Demand { peer: "sender".into(), revision: publication.revision }] }));
+            assert!(host.command(&id, Command::MailPeers { epoch, peers: vec!["sender".into()], demand: vec![admission::Demand { peer: "sender".into(), revision: publication.revision, waiting: None }] }));
             let (offered, _) = flow(&rx, &id, |event| matches!(event, FlowEvent::Capacity { capacity } if capacity.eligible_peer.as_deref() == Some("sender"))).await?;
             let offered = capacity(offered);
             let first = claim_at_on(&mut ledger, publication.revision, epoch, offered.retry_permission(), Some("one-actual-connection"), crate::harness::state_view::FRAME)?.ok_or_else(|| anyhow::anyhow!("the first publication was not claimable"))?;
@@ -860,7 +862,7 @@ mod tests {
             let (withdrawn, _) = flow(&rx, &id, |event| matches!(event, FlowEvent::Capacity { capacity } if capacity.generation > waiting.generation && capacity.eligible_peer.is_none())).await?;
             let withdrawn = capacity(withdrawn);
             assert_eq!(withdrawn.retry_permission(), waiting.retry_permission());
-            assert!(host.command(&id, Command::MailPeers { epoch, peers: vec!["sender".into()], demand: vec![admission::Demand { peer: "sender".into(), revision: publication.revision }] }));
+            assert!(host.command(&id, Command::MailPeers { epoch, peers: vec!["sender".into()], demand: vec![admission::Demand { peer: "sender".into(), revision: publication.revision, waiting: None }] }));
             let (bookkeeping, _) = flow(&rx, &id, |event| matches!(event, FlowEvent::Capacity { capacity } if capacity.generation > withdrawn.generation && capacity.eligible_peer.as_deref() == Some("sender"))).await?;
             let bookkeeping = capacity(bookkeeping);
             assert_eq!(bookkeeping.retry_permission(), waiting.retry_permission(), "demand withdrawal/reappearance and own buffers cannot mint retry permission");
@@ -1216,7 +1218,7 @@ mod tests {
         let frozen=claim_on(&mut c,d.revision,7,4096)?.ok_or_else(||anyhow::anyhow!("missing frozen claim"))?;
         transition_on(&mut c,frozen.token,None,Disposition::Waiting,None)?;
         let page=waiting_peers_on(&c,"recipient",0,512)?;
-        assert_eq!(page.items,vec![super::super::admission::Demand { peer:"sender-a".into(), revision:a.revision },super::super::admission::Demand { peer:"sender-c".into(), revision:d.revision }]);
+        assert_eq!(page.items,vec![super::super::admission::Demand { peer:"sender-a".into(), revision:a.revision, waiting:Some(1) },super::super::admission::Demand { peer:"sender-c".into(), revision:d.revision, waiting:Some(1) }]);
         assert!(serde_json::to_vec(&page)?.len()<=512);
         assert!(matches!(waiting_peers_on(&c,"recipient",0,1),Err(Error::TooLarge { .. })));
         assert!(waiting_peers_on(&c,"other-recipient",0,512)?.items.is_empty());
