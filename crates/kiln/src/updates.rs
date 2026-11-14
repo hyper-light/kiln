@@ -2446,7 +2446,16 @@ pub async fn server(hub: &Arc<Hub>, force: bool) -> ServerInfo {
         s.namespace = Some(ns);
         return s;
     }
-    let upload = stored(hub, crate::api::TARGET).filter(|b| !own.as_ref().is_ok_and(|o| o.sha256 == b.sha256));
+    // A kept binary replaces this server only when it may be newer, never for differing alone: an
+    // upload of a09fa59a3 kept from 2026-11-12, offered as newer than each later deploy's file,
+    // put production back on it twice on 2026-11-13, and with it a refusal of agents' messages
+    // fixed since (`harness::mail::publish_on`).
+    let differing = stored(hub, crate::api::TARGET).filter(|b| !own.as_ref().is_ok_and(|o| o.sha256 == b.sha256));
+    let superseded = match &differing {
+        Some(b) => superseded(hub, b, crate::api::COMMIT).await.map(|commit| (b.build.clone(), commit)),
+        None => None,
+    };
+    let upload = differing.filter(|_| superseded.is_none());
     let replacement = match (&upload, &release) {
         (Some(b), _) => Some(Replacement { origin: "upload", build: Some(b.build.clone()), version: None }),
         (None, r) if r.newer && own_release_target().is_some() => Some(Replacement { origin: "release", build: None, version: r.latest.clone() }),
@@ -2471,8 +2480,37 @@ pub async fn server(hub: &Arc<Hub>, force: bool) -> ServerInfo {
         (None, _) if release.latest.is_none() => "No newer build: no kiln release is published on GitHub yet. Upload a kiln binary for this platform to install it.".to_owned(),
         (None, _) => format!("Up to date: kiln {} is the latest release. Upload a kiln binary for this platform to install another build.", env!("CARGO_PKG_VERSION")),
     };
+    if replacement.is_none()
+        && let Some((build, commit)) = &superseded
+    {
+        s.note = format!(
+            "Up to date: the build kept here ({build}, of {}) is this server's commit or an older one ({} runs now), so it isn't offered: installing it would put this server back. Upload a kiln binary for this platform to install another build.",
+            crate::fleet::short(commit),
+            crate::fleet::short(crate::api::COMMIT),
+        );
+    }
     s.replacement = replacement;
     s
+}
+
+/// The commit of `kept`, a binary kept for this server's platform, when it's no newer than the
+/// server's commit `own`: the same commit, or one `own` leads to, as the release repository's
+/// mirror has them. Such a binary is never offered in the server's place: installing it would
+/// put the server back. None when kiln can't tell (it knows no commit for the binary, the server
+/// knows none of its own, or the mirror can't place them): an upload is offered as it is.
+async fn superseded(hub: &Hub, kept: &Binary, own: &str) -> Option<String> {
+    if own.is_empty() {
+        return None;
+    }
+    let commit = kept.sha.clone().or_else(|| crate::fleet::commit_of(hub, &kept.build))?;
+    if commit.eq_ignore_ascii_case(own) {
+        return Some(commit);
+    }
+    let repo = crate::fleet::release_repo(hub).await?;
+    // The server's own commit fetched when the mirror hasn't it yet (just deployed); every older
+    // one comes with it.
+    let mirror = crate::gitops::ensure_commit(hub, &repo, own).await.ok()?.to_string_lossy().into_owned();
+    crate::fleet::is_ancestor(hub, &mirror, &commit, own).await.then_some(commit)
 }
 
 /// Upgrade the server: a rollout restart (Kubernetes) or its binary replaced (supervised).
@@ -3330,6 +3368,65 @@ mod tests {
             assert_eq!(again.id, run.id, "the run under way is the build");
             let releases = hub.store.runs(Some(repo.id.clone()), 50, None).await?.into_iter().filter(|r| r.pipeline == "release").count();
             assert_eq!(releases, 1, "nothing more started");
+            Ok(())
+        })
+    }
+
+    /// 2026-11-13: an upload of a09fa59a3 kept from the day before was offered as newer than each
+    /// later deploy, for differing from it, and Install put production back on it twice. A kept
+    /// binary of the server's commit or an older one is superseded, never offered in its place;
+    /// a newer one, or one whose commit kiln can't place, is offered as an upload is.
+    #[test]
+    fn a_kept_build_no_newer_than_the_server_is_never_offered_in_its_place() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo = release_repo(&hub).await?;
+            // The release repository as kiln mirrors it: an older commit, then a newer one.
+            let work = tempfile::tempdir()?;
+            let w = work.path().to_owned();
+            let mirror = crate::gitops::mirror_path(&hub, &repo.name);
+            let (older, newer) = crate::rt::blocking(move || -> anyhow::Result<(String, String)> {
+                let git = |args: &[&str]| -> anyhow::Result<String> {
+                    let o = std::process::Command::new("git")
+                        .current_dir(&w)
+                        .args(["-c", "user.name=kiln", "-c", "user.email=kiln@localhost", "-c", "commit.gpgsign=false"])
+                        .args(args)
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .output()?;
+                    anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+                    Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                };
+                git(&["init", "--quiet", "--initial-branch=main"])?;
+                git(&["commit", "--quiet", "--allow-empty", "-m", "older"])?;
+                let older = git(&["rev-parse", "HEAD"])?;
+                git(&["commit", "--quiet", "--allow-empty", "-m", "newer"])?;
+                let newer = git(&["rev-parse", "HEAD"])?;
+                git(&["clone", "--quiet", "--bare", &w.to_string_lossy(), &mirror.to_string_lossy()])?;
+                Ok((older, newer))
+            })
+            .await??;
+            let kept = |build: &str, sha: Option<&str>| Binary {
+                target: crate::api::TARGET.into(),
+                sha256: "ab".repeat(32),
+                size: 2 << 20,
+                origin: "upload".into(),
+                at: 0,
+                build: build.into(),
+                run: None,
+                sha: sha.map(str::to_owned),
+                by: None,
+            };
+            // The upload of 2026-11-12: kept with no commit, which kiln knows by its build alone,
+            // as the server and the runners that ran it reported it.
+            crate::fleet::remember(&hub, "6708040045e9", crate::api::TARGET, &older);
+            let stale = kept("6708040045e9", None);
+            assert_eq!(superseded(&hub, &stale, &newer).await, Some(older.clone()), "older than the server's commit: never offered");
+            assert_eq!(superseded(&hub, &stale, &older).await, Some(older.clone()), "the server's own commit is no newer");
+            assert_eq!(superseded(&hub, &kept("built", Some(&newer)), &older).await, None, "newer than the server's commit: offered");
+            assert_eq!(superseded(&hub, &kept("nameless", None), &newer).await, None, "a build kiln knows no commit of: offered, as an upload is");
+            assert_eq!(superseded(&hub, &kept("off", Some("0123456789abcdef0123456789abcdef01234567")), &newer).await, None, "a commit the mirror can't place: offered");
+            assert_eq!(superseded(&hub, &stale, "").await, None, "a server that knows no commit of its own can't tell");
             Ok(())
         })
     }

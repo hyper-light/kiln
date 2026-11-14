@@ -396,7 +396,7 @@ fn receipt_on(c: &Connection, owner: &str, sender: &str, recipient: &str, id: &s
 /// `bytes_authority` is the room this one encoded original may take on disk: the caller's
 /// physical authority, its SQLite/WAL overhead reserved separately. Nothing is summed over every
 /// conversation's mail, so one conversation's backlog takes no other's room; each recipient's
-/// each recipient's depth paces handing over, never acceptance. A failed
+/// depth, and its owner's handover, pace handing over, never acceptance. A failed
 /// transaction does not transfer custody.
 pub async fn publish(store: &Store, publication: Publish, bytes_authority: u64) -> Result<Receipt, Error> {
     store.call(move |c| Ok(publish_on(c, &publication, bytes_authority))).await.map_err(store_error)?
@@ -426,11 +426,13 @@ fn publish_on(c: &mut Connection, publication: &Publish, authority: u64) -> Resu
     let bytes = u64::try_from(body.len()).map_err(|_| Error::Capacity { required: u64::MAX, authority })?;
     let body = String::from_utf8(body).map_err(|e| Error::Unavailable { reason: e.to_string() })?;
     if bytes > authority { return Err(Error::Capacity { required: bytes, authority }); }
-    if handoff_active(&tx, &publication.recipient)? { return Err(Error::Unavailable { reason: "current owner handover retains all accepted communication; new custody is waiting".into() }); }
     // Every message is taken into custody and waits here until its recipient admits it: none is
     // refused for the recipient's depth, which paces their handing over (`super::admission`), never
     // their acceptance (Ada, 2026-11-12: "Messages cannot and should never be dropped"; a refusal
-    // left the sender to send again, and most never did).
+    // left the sender to send again, and most never did). Nor while its owner hands the recipient
+    // over: one taken then waits never handed out (generation 0, no epoch), so it's in neither the
+    // handover's manifest nor its transfer, which hold only what was handed out before, and
+    // `claim_at_on` hands out nothing until the handover settles; then it goes to the settled owner.
     if let Some(status) = &publication.status {
         tx.execute("UPDATE agent_mail SET disposition='superseded' WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0",
             params![publication.owner, publication.sender, publication.recipient, status.task, status.key]).map_err(sql_error)?;

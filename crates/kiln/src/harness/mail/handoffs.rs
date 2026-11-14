@@ -307,6 +307,32 @@ mod tests {
         Ok(())
     }
 
+    /// Ada, 2026-11-12: "Messages cannot and should never be dropped." A message that comes while
+    /// its recipient's owner hands it over is taken and waits, never refused (a 503 left its
+    /// sender, a child reporting to its parent, to send again): the handover moves only what was
+    /// handed out before it, and once it settles the message goes to the owner it settled on.
+    #[test]
+    fn a_message_during_a_handover_is_taken_and_goes_to_the_settled_owner() -> anyhow::Result<()> {
+        let mut c=db()?;let a=peer("A","aa");let b=peer("B","bb");
+        let flight=seeded(&mut c,"flight",1,mail::Disposition::Admitted)?;
+        let offer=offered(manifest("A-B",1,2),a,b.clone());offer_on(&mut c,&offer).map_err(why)?;
+        let during_offer=mail::publish_on(&mut c,&publication("while-offered"),u64::MAX)?;
+        assert_eq!(during_offer.disposition,mail::Disposition::Waiting,"taken while the handover is offered");
+        assert!(mail::claim_at_on(&mut c,during_offer.revision,1,2,Some("source-connection"),crate::harness::state_view::FRAME)?.is_none(),"nothing is handed out while the handover is open");
+        finish_on(&mut c,&offer.manifest,&b,Phase::Prepared).map_err(why)?;
+        let during_prepare=mail::publish_on(&mut c,&publication("while-prepared"),u64::MAX)?;
+        assert_eq!(during_prepare.disposition,mail::Disposition::Waiting,"taken while the handover is prepared");
+        assert_eq!(affected_on(&c,"session",1).map_err(why)?,1,"the handover's rows are what was handed out before it");
+        finish_on(&mut c,&offer.manifest,&b,Phase::Committed).map_err(why)?;
+        assert_eq!(snapshot(&c,flight.token.revision)?.get("epoch"),Some(&json!(2)));
+        for taken in [during_offer,during_prepare] {
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM agent_mail_transfers WHERE revision=?1",[i64::try_from(taken.revision)?],|row|row.get::<_,i64>(0))?,0,"a message taken during the handover isn't moved by it");
+            let delivery=mail::claim_at_on(&mut c,taken.revision,2,1,Some("destination-connection"),crate::harness::state_view::FRAME)?.ok_or_else(||anyhow::anyhow!("the settled owner can't take a message that came during its handover"))?;
+            assert_eq!((delivery.epoch,delivery.token.generation),(2,1));
+        }
+        Ok(())
+    }
+
     #[test]
     fn offered_metadata_reserves_its_exact_longest_phase_with_no_clipping() -> anyhow::Result<()> {
         let mut c=db()?;let mut offer=offered(manifest("bounded",1,2),peer("A","aa"),peer("B","bb"));
