@@ -846,8 +846,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => boxed(|| get_artifacts(&hub, id)).await,
         (&Method::GET, ["api", "agents"]) => Ok(boxed(|| agents_read(&hub, &caller)).await),
         (&Method::GET, ["api", "reach", "runners"]) => {
-            let want = srv::query(&req).get("want").cloned();
-            reach_runners(&hub, want.as_deref())
+            let q = srv::query(&req);
+            reach_runners(&hub, q.get("want").map(String::as_str), q.get("lean").is_some_and(|lean| lean == "1"))
         }
         // The copies of runners' trees other runners keep (docs/reach.md §5.1): the rules for them,
         // what each runner holds and let go, and asking runners to let go now.
@@ -4264,14 +4264,36 @@ async fn enroll(hub: &Hub, req: Request) -> R {
 
 /// `GET /api/reach/runners?want=linux/amd64`: reach's directory, ranked for `want` (every runner
 /// without one), with why the others were passed over.
-fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
+fn reach_runners(hub: &Hub, want: Option<&str>, lean: bool) -> R {
     let runners = hub.reach_directory();
     let want = match want.map(crate::reach::directory::Want::parse).transpose() {
         Ok(w) => w.unwrap_or_default(),
         Err(e) => return Err(err(StatusCode::BAD_REQUEST, format!("{e:#}"))),
     };
+    if lean {
+        return Ok(srv::json(StatusCode::OK, &json!({ "runners": lean_runners(&runners) })));
+    }
     let (ranked, passed) = crate::reach::directory::rank(&runners, &want, "");
     Ok(srv::json(StatusCode::OK, &json!({ "want": want.describe(), "runners": runners, "ranked": ranked, "passed": passed })))
+}
+
+/// What a runner is to reach without what only a ranking reads (W21-R02): its facts, its CPUs' layout and
+/// its features, which are four fifths of it (53 KB of eleven runners to 9: `kiln-lab bar`, 2026-11-14). For
+/// a page that lists the runners by name and what they're doing (`?lean=1`): Mission control's composer as
+/// it opens, an agent's move.
+fn lean_runners<T: serde::Serialize>(runners: &[T]) -> Vec<serde_json::Value> {
+    runners
+        .iter()
+        .filter_map(|runner| serde_json::to_value(runner).ok())
+        .map(|mut runner| {
+            if let Some(fields) = runner.as_object_mut() {
+                for heavy in ["facts", "topo", "features"] {
+                    fields.remove(heavy);
+                }
+            }
+            runner
+        })
+        .collect()
 }
 
 /// `GET /api/reach/offers?after=<cursor>&limit=<n>` (docs/reach.md §2.2): every runner with what it
@@ -5955,8 +5977,26 @@ fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
     let all = hub.harness.kinds();
     match q.get("target") {
         Some(t) => srv::json(StatusCode::OK, &all.get(t).cloned().unwrap_or_default()),
+        None if q.get("shared").is_some_and(|shared| shared == "1") => srv::json(StatusCode::OK, &shared_kinds(&all)),
         None => srv::json(StatusCode::OK, &all),
     }
+}
+
+/// What each target offers, each list written once (W21-R02): `lists`, and for each target which of them is
+/// its own (`targets`). Machines of one kind offer the same harnesses with the same models, so written a
+/// target at a time the answer is as many copies of one list as there are machines: 68 KB for twelve targets
+/// where one list is 6 KB (`kiln-lab bar`, 2026-11-14).
+fn shared_kinds(all: &HashMap<String, Vec<crate::harness::kinds::KindInfo>>) -> serde_json::Value {
+    let mut lists: Vec<&Vec<crate::harness::kinds::KindInfo>> = Vec::new();
+    let mut targets = std::collections::BTreeMap::new();
+    for (target, kinds) in all {
+        let at = lists.iter().position(|list| *list == kinds).unwrap_or_else(|| {
+            lists.push(kinds);
+            lists.len().saturating_sub(1)
+        });
+        targets.insert(target.as_str(), at);
+    }
+    json!({ "lists": lists, "targets": targets })
 }
 
 /// A machine's past conversations to continue (`?target=local|agent:<name>`, `kind=claude|codex|devin`,
@@ -8251,6 +8291,38 @@ mod tests {
     }
 
     use super::*;
+
+    /// W21-R02: the kinds each target offers, each list once: every target's list is the one it has, and
+    /// targets that offer the same share one.
+    #[test]
+    fn w21_r02_the_kinds_targets_offer_alike_are_written_once() -> anyhow::Result<()> {
+        let kind = |id: &str, available: bool| -> anyhow::Result<crate::harness::kinds::KindInfo> {
+            Ok(serde_json::from_value(json!({"id": id, "name": id, "verified": true, "available": available, "modes": [], "structured": true}))?)
+        };
+        let both = vec![kind("claude", true)?, kind("codex", true)?];
+        let one = vec![kind("claude", true)?, kind("codex", false)?];
+        let all: HashMap<String, Vec<crate::harness::kinds::KindInfo>> =
+            [("local", both.clone()), ("agent:a", both.clone()), ("agent:b", one.clone()), ("agent:c", both.clone()), ("agent:d", Vec::new())].into_iter().map(|(t, k)| (t.to_owned(), k)).collect();
+        let shared = shared_kinds(&all);
+        let lists = shared.get("lists").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        assert_eq!(lists.len(), 3, "{shared}");
+        for (target, kinds) in &all {
+            let at = shared.pointer(&format!("/targets/{}", target.replace('~', "~0").replace('/', "~1"))).and_then(serde_json::Value::as_u64);
+            let list = at.and_then(|at| lists.get(usize::try_from(at).ok()?));
+            assert_eq!(list, Some(&serde_json::to_value(kinds)?), "{target}");
+        }
+        assert_eq!(shared.get("targets").and_then(serde_json::Value::as_object).map(serde_json::Map::len), Some(all.len()));
+        Ok(())
+    }
+
+    /// W21-R02: a runner listed lean is itself without its facts, its CPUs' layout and its features.
+    #[test]
+    fn w21_r02_a_lean_runner_is_itself_without_what_a_ranking_reads() {
+        let runner = json!({"name": "a", "label": "box", "connected": true, "reach": true, "cpus": 8, "harnesses": ["claude"], "facts": {"os": "linux"}, "topo": {"cores": []}, "features": ["x"]});
+        let lean = lean_runners(std::slice::from_ref(&runner));
+        assert_eq!(lean, vec![json!({"name": "a", "label": "box", "connected": true, "reach": true, "cpus": 8, "harnesses": ["claude"]})]);
+        assert_eq!(lean_runners::<serde_json::Value>(&[]), Vec::<serde_json::Value>::new());
+    }
 
     /// W21-R02: a terminal's viewer that asked for its screen first is sent it ahead of the replay, each a
     /// message of its own, and its `session` frame says so; one that didn't is sent what it always was.

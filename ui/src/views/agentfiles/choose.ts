@@ -16,13 +16,14 @@ import { tildify } from "@/views/harness/derive";
 type Listed = Pick<AgentfileListing, "agentfiles" | "builtin">;
 
 /**
- * The list as a start chooses from it (`GET /api/agentfiles`): yours and kiln's, or none where it
- * can't be had (a server from before Agentfiles), so a start never waits on it failing.
+ * The list as a start chooses from it (`GET /api/agentfiles?lean=1`): yours and kiln's by their names,
+ * kiln's without their texts (most of what the list carries, and a start shows none of them), or none
+ * where it can't be had (a server from before Agentfiles), so a start never waits on it failing.
  */
 export const agentfileChoicesRes: Res<Listed> = {
   key: "agentfiles/choices",
   fetch: (signal) =>
-    request<AgentfileListing>("GET", "/api/agentfiles", undefined, { signal }).catch((e: unknown) => {
+    request<AgentfileListing>("GET", "/api/agentfiles?lean=1", undefined, { signal }).catch((e: unknown) => {
       if (signal.aborted) throw e;
       return { agentfiles: [], builtin: [] };
     }),

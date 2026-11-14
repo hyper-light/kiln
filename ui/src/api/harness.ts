@@ -3,6 +3,7 @@
  * the API to list, start and stop agents, and a live session store fed by its websocket.
  * Nothing here is specific to one harness: Claude Code, Codex and the rest all speak this.
  */
+import { KINDS_READ } from "./launch-reads";
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
 import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
@@ -479,6 +480,20 @@ export interface Recording {
 /** Where a recording's file is read (`video`, `inputs`, `test`). */
 export const recordingUrl = (session: string, id: string, what: "video" | "inputs" | "test") => apiPath(`/api/harness/sessions/${encodeURIComponent(session)}/recordings/${id}/${what}`);
 
+/** The kinds each target offers as a server that knows `shared` writes them: each distinct list once, and which is each target's. */
+export interface SharedKinds {
+  lists: KindInfo[][];
+  targets: Record<string, number>;
+}
+
+/** What each target offers, by target: targets that offer alike hold the one list. A server from before `shared` answers by target already. */
+export function kindsByTarget(read: Record<string, KindInfo[]> | SharedKinds): Record<string, KindInfo[]> {
+  const { lists, targets } = read as Partial<SharedKinds>;
+  // A target is `local` or `agent:<machine>`: never one of these two names.
+  if (!Array.isArray(lists) || typeof targets !== "object" || targets === null || Array.isArray(targets)) return read as Record<string, KindInfo[]>;
+  return Object.fromEntries(Object.entries(targets).map(([target, at]) => [target, lists[at] ?? []]));
+}
+
 export const harnessApi = {
   /**
    * The page of a session's events just before number `before`, where what's shown begins
@@ -509,7 +524,7 @@ export const harnessApi = {
   /** Recordings of its streams. */
   recordings: (id: string) => call<Recording[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/recordings`),
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
-  kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
+  kindsAll: () => call<Record<string, KindInfo[]> | SharedKinds>("GET", KINDS_READ).then(kindsByTarget),
   /** Where agents can have workspaces of their own (Slates volumes), by target. */
   workspaces: () => call<WorkspacesAvailable>("GET", "/api/harness/workspaces"),
   /** An agent's workspace of its own, and the files under it changed on disk since it changed them. */

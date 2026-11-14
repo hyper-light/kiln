@@ -536,7 +536,7 @@ server says, and counts every session it has, ended ones included, until it's up
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
+| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes). Without `target`, every machine's by its target; with `shared=1`, each distinct list once: `{ lists: KindInfo[][], targets: { <target>: <which of lists> } }` (machines of one kind offer the same, so by target the answer is one list as many times as there are machines) |
 | GET | `/api/harness/sessions` | `Info[]` |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?, ids?}` → `Info[]`; `ids`: the ids to start them under, one each (32 lowercase hex digits), made by the client so its page can open the agent's own page before it has started (docs/ci.md W21-R15); an id that's a session's already, or another start's under way, is refused (409) before anything starts, so a start asked again under its ids never starts twice |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good (409 while its archive or restore is under way: it goes on; end it once that's done) |

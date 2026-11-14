@@ -138,6 +138,12 @@ pub fn views() -> Vec<View> {
     ALL.iter().map(|b| View { name: b.name.to_owned(), harness: b.harness.to_owned(), text: b.text.to_owned() }).collect()
 }
 
+/// Every one by its name and harness alone, its text left empty: for a list that shows no more of them
+/// (W21-R02: Mission control's composer, which offers them by name as its page opens).
+pub fn names() -> Vec<View> {
+    ALL.iter().map(|b| View { name: b.name.to_owned(), harness: b.harness.to_owned(), text: String::new() }).collect()
+}
+
 pub mod destinations;
 
 #[cfg(test)]

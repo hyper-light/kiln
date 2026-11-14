@@ -185,7 +185,7 @@ interface AgentfileListing { agentfiles: AgentfileBrief[]; reaches_all: boolean 
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/api/agentfiles?repo=&all=` | `AgentfileListing`: yours, newest change first, without their texts; beside them, read only, those kiln ships per harness (`builtin`), and with `repo` (`owner/name`, a repository whose runs you read, else 404) its `.kiln/images/<name>/Agentfile` files at its default branch (`text` null past 2 MiB). `all=true`: everyone's (403 without `agentfiles.manage`) |
+| GET | `/api/agentfiles?repo=&all=&lean=` | `AgentfileListing`: yours, newest change first, without their texts; beside them, read only, those kiln ships per harness (`builtin`), and with `repo` (`owner/name`, a repository whose runs you read, else 404) its `.kiln/images/<name>/Agentfile` files at its default branch (`text` null past 2 MiB). `all=true`: everyone's (403 without `agentfiles.manage`) With `lean=1` those kiln ships come by their names and harnesses alone, their texts left empty (a start's list, which shows no more of them: the texts are most of what the list carries). |
 | POST | `/api/agentfiles` | `{ name, text }` → `AgentfileSaved`, version 1. `name`: an image's (lowercase letters and digits joined by `.`, `_` or `-`, 255 at most), once among yours (409). `text`: 2 MiB at the most (400); Shards' refusal is 422 |
 | POST | `/api/agentfiles/check` | `{ text }` → `AgentfileCheck`: what keeping it would say, nothing kept (the editor's lint) |
 | GET | `/api/agentfiles/:id` | `Agentfile` |

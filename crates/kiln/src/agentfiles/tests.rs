@@ -121,6 +121,18 @@ fn step30_a_person_reaches_only_their_own() -> anyhow::Result<()> {
             let ids: Vec<String> = l.get("agentfiles").and_then(Value::as_array).into_iter().flatten().map(|a| text_of(a, "/id")).collect();
             anyhow::ensure!(ids == [want.clone()], "{} lists {ids:?}", who.name);
             anyhow::ensure!(l.get("builtin").is_some_and(Value::is_array) && l.get("project").is_none() && l.get("reaches_all") == Some(&json!(false)), "{l}");
+            // W21-R02: listed lean, those kiln ships are the same by name and harness, their texts left
+            // empty; one's own are as they were (they come without their texts either way). As an operation
+            // takes it, and as the route's query says it.
+            let asked = op(&hub, who, "agentfiles.list", json!({"lean": true})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let cx = crate::ops::Cx { hub: std::sync::Arc::clone(&hub), caller: (*who).clone() };
+            let queried = crate::ops::run_own(cx, "agentfiles.list", json!({"lean": "1"})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            for lean in [asked, queried] {
+                let of = |l: &Value, key: &str| -> Vec<String> { l.get("builtin").and_then(Value::as_array).into_iter().flatten().map(|b| text_of(b, key)).collect() };
+                anyhow::ensure!(!of(&l, "/name").is_empty() && of(&lean, "/name") == of(&l, "/name") && of(&lean, "/harness") == of(&l, "/harness"), "{lean}");
+                anyhow::ensure!(of(&l, "/text").iter().all(|t| !t.is_empty()) && of(&lean, "/text").iter().all(String::is_empty), "{lean}");
+                anyhow::ensure!(lean.get("agentfiles") == l.get("agentfiles") && lean.get("reaches_all") == l.get("reaches_all"), "{lean}");
+            }
         }
         // Bo reaches none of Ada's: each is as no Agentfile.
         for (name, input) in [

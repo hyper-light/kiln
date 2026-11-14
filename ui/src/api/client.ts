@@ -1,3 +1,4 @@
+import { REACH_READ } from "./launch-reads";
 import { apiPath } from "@/lib/peer-base";
 import type {
   Agent,
@@ -371,7 +372,7 @@ export const api = {
   convoLog: (filters: { q?: string; limit?: number; since?: number }, signal?: AbortSignal) => get<ConvoLog>(`/api/conversations/log${qs(filters)}`, signal),
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
   /** Reach's directory: every runner, whether it takes commands from other runners, how busy it is. */
-  reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>("/api/reach/runners", signal),
+  reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>(REACH_READ, signal),
   /** End a session: its shell stops on every device. */
   closeTerminalSession: (id: string) => del<void>(`/api/terminal/sessions/${enc(id)}`),
   /** Names a terminal session ("" takes its name away). */

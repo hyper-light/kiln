@@ -51,7 +51,7 @@ fn blobs(cx: &Cx) -> &dyn kiln_seams::blobs::Blobs {
 
 async fn list(cx: Cx, v: Value) -> Out {
     let repo = some_text(&v, "repo");
-    json_of(&super::listing(&cx.hub, &cx.caller, flag(&v, "all"), repo.as_deref()).await.map_err(fail)?)
+    json_of(&super::listing(&cx.hub, &cx.caller, flag(&v, "all"), repo.as_deref(), flag(&v, "lean")).await.map_err(fail)?)
 }
 
 async fn get(cx: Cx, v: Value) -> Out {
@@ -195,6 +195,9 @@ pub mod input {
         pub repo: Option<String>,
         /// Everyone's: the server's owner's, and those with agentfiles.manage.
         pub all: Option<bool>,
+        /// Those kiln ships by their names and harnesses alone, their texts left empty: for a list that
+        /// shows no more of them (W21-R02: the texts are most of what the list carries).
+        pub lean: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
