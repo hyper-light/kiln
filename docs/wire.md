@@ -1164,7 +1164,7 @@ CIs typecheck the UI against them.
 | `/api/terminal/ws` | up | `input` | command, refused while away | Keystrokes, never replayed later. | Not answered. |
 | `/api/terminal/ws` | up | `resize` | state | The newest wins. | Not answered. |
 | `/api/terminal/ws` | up | `unread` | ack | As the session socket's. | Noted on the runner's page (`terminal_down`). |
-| `/api/terminal/ws` | down | `output` | stream | By byte offset. | A reconnect attaches again from a replay. |
+| `/api/terminal/ws` | down | `output` | stream | By byte offset. | A reconnect attaches again from a replay, behind the part of it that draws the session's screen where one goes ahead ("A terminal's screen first"). |
 | `/api/terminal/ws` | down | `refused` | ack | What the page sent as text that couldn't be read. | Noted on the runner's page too (`terminal_up`). |
 | `/api/ci/legs/:id/terminal` | up | `input` | command, refused while away | As the terminal's. | Not answered. |
 | `/api/ci/legs/:id/terminal` | up | `resize` | state | As the terminal's. | Not answered. |
@@ -1190,6 +1190,78 @@ CIs typecheck the UI against them.
 The browser protocol's socket (`GET /api/live`, goal 3, docs/browser-protocol.md) carries goal 2's
 frames, not JSON: what comes up is read into `kiln_bp::frames`, and what can't be is answered `Unread`
 and noted on the wires `bp_up` and `bp_down` ("What can't be read").
+
+### A terminal's screen first
+
+A terminal's viewer attaches from a replay: a shell's is its backlog, up to 256 KiB of what it has
+said (`termsess::BACKLOG_BYTES`), which a fresh terminal draws to reach the session's screen with its
+scrollback above. Over a slow link the screen waited for all of it. A viewer that asks
+(`first=screen`, on `/api/terminal/ws` and a leg's) is sent the part of the replay that draws the
+screen ahead of it, where the replay has one: its `session` frame says `screen`, the binary message
+after it is the part, and the one after that is the replay, the same any viewer is sent.
+
+The part is the replay's own bytes from a cut on (`crate::termpart`): the last screen of lines the
+shell printed and whatever follows them, behind the attributes' reset, the cursor's look as it was at
+the cut and the cursor put at the start of the last row; then the modes the replay ends with. The
+page draws it on its terminal at the session's size, reset in the same write, and then the replay
+the same way. The replay ends on the screen the part drew, so nothing on it changes as the
+scrollback comes in above it, and the page takes the session's size for itself once the replay is
+drawn, as it always has. What the part asks of the terminal (where the cursor is, a colour) the page
+doesn't answer: the replay asks it again.
+
+A part is drawn by the page's terminal from the bytes the replay holds, so it's drawn as the replay
+is. What has to hold is that the terminal is in one state either way once both are drawn, and that
+is a matter of where the cut is (`termpart.rs` says why a cut stands). A cut is:
+
+- after a line feed that came with the cursor in the first column, on the last row: a screen of
+  line feeds have come since the cursor last moved other than along its line or down by one;
+- where all a terminal keeps that shows only in what's drawn later is as a fresh terminal has it:
+  no colour or attribute on, no scroll region, its character sets its own, autowrap on, no hyperlink
+  open, not on the alternate screen, no sequence begun;
+- followed by a screen of line feeds with the cursor moved no other way. Those lines have then
+  taken the screen, and whatever comes after them is drawn the same on both.
+
+The latest such cut is taken. It's let go of where a cursor is restored that was saved before it, or
+that the screen has scrolled under since it was saved: the page keeps a saved cursor's row counted
+from the top of everything it has drawn, which a part has less of.
+
+No part goes ahead:
+
+- of a full-screen program's replay, which is its screen already;
+- where the replay has no such cut: a display that keeps redrawing the lines above its last (a
+  pull's progress), a colour left on across every line's end, fewer than two screens of lines since
+  a full-screen program ended;
+- where the replay is no more than twice the part: it comes sooner by the replay's bytes less its
+  own, and the replay later by the part's, so it would cost more than it gains;
+- where the replay says whether a line feed returns the carriage (`CSI 20 h`, `l`): the page's
+  terminal keeps that through a reset, so a part that said it would change how the replay after it
+  is drawn. (It keeps whether the cursor shows and whether it blinks through one too; a part says
+  those as they are at its cut, and the replay ends on them either way.)
+
+`session` then says no `screen` and the replay comes alone, as to a viewer that didn't ask and as
+from a server that doesn't know `first=`.
+
+The cut follows the page's terminal, xterm.js 6.0.0: what it keeps of each sequence is read from
+its handlers, where its parser and the server's part ways nothing after is taken as known, and a
+test holds `ui/package-lock.json` to that version. `ci/ui/terminal_part.mjs` draws both as the page
+does, in that terminal (left as an earlier attach might have left it, the part behind a reset, then
+the replay behind another), and compares what it shows after each, cell for cell, over generated
+output: sessions' plain lines with what moves the cursor and changes what's hidden around them, and
+sequences cut short, split by line feeds and out of shape. An emulator's own account of the screen is what was sent ahead
+at first, and the same comparison is why it isn't: of 264 such screens the page drew 145 otherwise
+than their replays (bold with dim, a background colour as lines scroll, the cursor after a line is
+put in, a character's width). Of 5,158 parts compared as they are now, over 23,400 generated
+streams at six terminal sizes, it drew none otherwise.
+
+Measured 2026-11-14 (a release kiln-server on loopback behind a paced relay, a compressed socket, a
+shell that has printed 4.7 MB of base64'd noise in 76-column lines; T3 Code attaches to such a
+terminal in 751 ms on the first of these links). At 5 Mbit/s and 120 ms the screen is in after 128
+ms, where it was after 498 ms: the socket itself opens at 123 ms, one round trip, and the part is
+3.2 KB. The replay is in at 498 ms, as before (199 KB sent, 2.4 KB more with the part). At 1.6
+Mbit/s and 300 ms the screen is in after 320 ms, where it was after 1,383 ms. With ten such
+terminals attaching at once, the first one's screen is in after 132 ms and 321 ms on the two links,
+where it was after 1,243 ms and 1,389 ms. Finding the part takes the server 0.7 to 1.7 ms of a full
+backlog. The same noise in one unbroken line has no line feed to be cut after: 494 ms, as before.
 
 ### The events socket
 

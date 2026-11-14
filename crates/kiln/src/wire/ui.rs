@@ -556,8 +556,16 @@ impl Socket {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalDown {
-    /// First on every attach: which session this socket is on.
-    Session { session: crate::termsess::Info },
+    /// First on every attach: which session this socket is on. `screen`, to a viewer that asked
+    /// (`first=screen`): the binary message after this one is the part of the session's replay that
+    /// draws its screen, and the one after that the replay, each to be drawn on a terminal reset first
+    /// (W21-R02, `crate::termpart`).
+    Session {
+        session: crate::termsess::Info,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+        screen: bool,
+    },
     /// The session isn't known (yet), e.g. its machine is reconnecting: try again by its id.
     Missing { session: String },
     /// The session's machine dropped; it keeps running there: attach again by its id.

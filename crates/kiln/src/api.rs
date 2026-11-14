@@ -5734,9 +5734,10 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let cmd = q.get("cmd").cloned();
+    let screen_first = screen_first(&q);
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), cmd, "admin".into(), socket, sock).await {
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), cmd, "admin".into(), screen_first, socket, sock).await {
             tracing::debug!(error = %format!("{e:#}"), "terminal websocket ended");
         }
     });
@@ -5778,9 +5779,10 @@ async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, ca
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let sock = ui::Socket::of(Wire::TerminalUp, Wire::TerminalDown, &caller.name, Some(Page::Runner(agent.clone())));
     let (target, actor) = (format!("leg:{id}@{agent}"), caller.name.clone());
+    let screen_first = screen_first(&q);
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), None, actor, socket, sock).await {
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), None, actor, screen_first, socket, sock).await {
             tracing::debug!(error = %format!("{e:#}"), "leg terminal websocket ended");
         }
     });
@@ -5794,11 +5796,26 @@ fn terminal_page(target: &str) -> Option<Page> {
     runner.map(|m| Page::Runner(m.to_owned()))
 }
 
+/// A terminal's viewer asks (`first=screen`) to be sent what draws the session's screen ahead of its
+/// replay (W21-R02, docs/wire.md "A terminal's screen first").
+fn screen_first(q: &HashMap<String, String>) -> bool {
+    q.get("first").is_some_and(|first| first == "screen")
+}
+
+/// What a terminal's viewer is sent as it attaches, in order, before anything live: which session it's
+/// on; the part of its replay that draws its screen, where one goes ahead (to a viewer that asked:
+/// W21-R02), which the `session` frame then says; and its replay.
+fn terminal_opening(session: crate::termsess::Info, screen: Option<Vec<u8>>, replay: bytes::Bytes) -> impl Iterator<Item = ws::Message> {
+    let first = ws::text(TerminalDown::Session { session, screen: screen.is_some() }.text());
+    std::iter::once(first).chain(screen.map(ws::binary)).chain((!replay.is_empty()).then(|| ws::binary(replay)))
+}
+
 /// One browser on one session: identity, replay, then live output; input both ways. Closing the
 /// socket only detaches — the shell keeps running for the next attach. What it sends that can't be
-/// read is answered `refused` and noted (`sock`).
+/// read is answered `refused` and noted (`sock`). To a viewer that asked (`screen_first`), what draws
+/// the session's screen goes ahead of the replay where there is such a part, and its `session` frame says so.
 #[allow(clippy::too_many_arguments)]
-async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String, (cols, rows): (u16, u16), cmd: Option<String>, actor: String, socket: ws::WebSocket, sock: ui::Socket) -> anyhow::Result<()> {
+async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String, (cols, rows): (u16, u16), cmd: Option<String>, actor: String, screen_first: bool, socket: ws::WebSocket, sock: ui::Socket) -> anyhow::Result<()> {
     use crate::termsess::{Frame, Input};
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
@@ -5833,13 +5850,23 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
             }
         }
     };
-    let attachment = session.attach();
+    let attachment = if screen_first { session.attach_screen_first() } else { session.attach() };
+    let replay = bytes::Bytes::from(attachment.replay);
+    // The part that draws the screen goes ahead where the replay has one, which it's read through for: off the shard.
+    // Lost there, none goes.
+    let screen = match attachment.ahead {
+        Some(ahead) => {
+            let replay = replay.clone();
+            crate::rt::compute(move || ahead.part(&replay)).await.ok().flatten()
+        }
+        None => None,
+    };
     let mut live = attachment.live;
     let result: anyhow::Result<()> = async {
         // Read after subscribing: a resize from here on also arrives as a live size frame.
-        tx.send(ws::text(TerminalDown::Session { session: session.info() }.text())).await?;
-        if !attachment.replay.is_empty() {
-            tx.send(ws::binary(attachment.replay)).await?;
+        // Each a message of its own, on its way before the next is written: the screen isn't behind the replay.
+        for message in terminal_opening(session.info(), screen, replay) {
+            tx.send(message).await?;
         }
         if let Some((code, error)) = attachment.ended {
             let msg = match error {
@@ -8224,6 +8251,37 @@ mod tests {
     }
 
     use super::*;
+
+    /// W21-R02: a terminal's viewer that asked for its screen first is sent it ahead of the replay, each a
+    /// message of its own, and its `session` frame says so; one that didn't is sent what it always was.
+    #[test]
+    fn w21_r02_a_terminals_viewer_is_sent_its_screen_ahead_of_its_replay() -> anyhow::Result<()> {
+        let session = crate::termsess::Session::detached("t1".into(), "local".into(), None, 80, 24);
+        for i in 0..400 {
+            session.output(format!("line {i} of a build's output, as long as a line of one is\r\n").as_bytes());
+        }
+        let said = |m: &ws::Message| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_str(m.to_text()?)?) };
+        // Asked for: the frame says a screen comes, then the screen, then the replay.
+        let a = session.attach_screen_first();
+        let replay = a.replay.clone();
+        let screen = a.ahead.and_then(|ahead| ahead.part(&replay)).unwrap_or_default();
+        let sent: Vec<ws::Message> = terminal_opening(session.info(), Some(screen.clone()), replay.clone().into()).collect();
+        let [first, second, third] = sent.as_slice() else { anyhow::bail!("{} messages to a viewer that asked", sent.len()) };
+        let frame = said(first)?;
+        assert_eq!((frame.get("type"), frame.get("screen")), (Some(&json!("session")), Some(&json!(true))), "{frame}");
+        assert!(second.is_binary() && third.is_binary());
+        assert_eq!((second.clone().into_data().as_ref(), third.clone().into_data().as_ref()), (screen.as_slice(), replay.as_slice()));
+        assert!(!screen.is_empty() && screen.len() < replay.len(), "a screen of {} bytes, a replay of {}", screen.len(), replay.len());
+        // Not asked for: the frame as it was (no `screen`), then the replay.
+        let b = session.attach();
+        assert!(b.ahead.is_none());
+        let sent: Vec<ws::Message> = terminal_opening(session.info(), None, b.replay.into()).collect();
+        let [first, second] = sent.as_slice() else { anyhow::bail!("{} messages to a viewer that didn't ask", sent.len()) };
+        let frame = said(first)?;
+        assert!(frame.get("screen").is_none() && frame.pointer("/session/id") == Some(&json!("t1")), "{frame}");
+        assert_eq!(second.clone().into_data().as_ref(), replay.as_slice());
+        Ok(())
+    }
 
     /// A socket's sending half as a test sees it: what was sent it, and how often it was flushed. One `slow` takes
     /// each frame in its shard's whole quantum, as read while it takes it (the shard's own cell, which nothing changes

@@ -110,6 +110,7 @@ pub mod sup;
 pub mod supervise;
 pub mod tailscale;
 pub mod terminal;
+pub mod termpart;
 pub mod termsess;
 pub mod toolfix;
 pub mod trail;

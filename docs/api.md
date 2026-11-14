@@ -237,6 +237,9 @@ Agentfile, in a microVM of its own").
 * `GET /api/terminal/ws?target=local|agent:<name>&cols=120&rows=40` — full PTY.
   Client → server: **binary** = keystrokes, text `{type:"resize", cols, rows}`.
   Server → client: **binary** = PTY output, text `{type:"exit", code}` / `{type:"error", message}`.
+  `?session=<id>` attaches to a running session: `{type:"session", session}`, its replay, then its
+  output. With `&first=screen` the part of the replay that draws the session's screen comes ahead of
+  it, where it has one (`session` then says `screen`: docs/wire.md, "A terminal's screen first").
 * `GET /api/agents/tunnel` — **open**; an agent's QUIC datagrams when UDP to the QUIC port gets no
   answer (see architecture.md, *Agent transport*). Each **binary** message is one UDP datagram of at
   most 1500 bytes, both ways: the server relays it to its own QUIC listener from a loopback socket
