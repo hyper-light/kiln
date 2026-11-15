@@ -1556,6 +1556,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, name, body)).await
         }
+        // What its launch gave it, beside its live overrides (kiln plan 01a1dd2e…, P5.2's page: `sessions.grants`).
+        (&Method::GET, ["api", "harness", "sessions", id, "grants"]) => boxed(|| own_op(&hub, &caller, "sessions.grants", json!({"agent": id}))).await,
         // Its copies on other runners, and its own rules for them (docs/reach.md §5.1).
         (&Method::GET, ["api", "harness", "sessions", id, "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.agent(&hub, id)).await)),
         (m @ (&Method::PUT | &Method::DELETE), ["api", "harness", "sessions", id, "keep"]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::Agent(id), *m == Method::PUT, req)).await,

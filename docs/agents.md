@@ -1436,6 +1436,15 @@ None is read-only; the removals are destructive. `agents_get` says the session's
 takes (`live`): a session on its machine's host is offered its volumes' alone, and refuses the network ones,
 naming its engine (409).
 
+`sessions.grants` (`GET /api/harness/sessions/:id/grants`, MCP `sessions_grants`, code mode
+`kiln.sessions.grants`, read-only) says what the session's launch gave it as it started, its `base`, beside
+these overrides (`live`): its working `folder`, the machine's folders it sees (`volumes`: `host`, `at`,
+`writable`), the folders its harness is allowed (`allowed_dirs`), its `plug_roots` and `egress_ceiling` as its
+launch declared them, what it reaches past its microVM (`egress`, as `/runs/reach` says; `{"as": "host"}` on its
+host, which narrows nothing), its credentials by reference (`secrets`: `name`, `toward`), and `ports` and
+`networks`, none at a launch (default deny). A microVM session's runner records its base as it launches it
+(`runs.granted`); one from a runner before that says `reported: false`.
+
 A volume joins its harness's own allowed folders, each harness's way, and kiln's scope for the session: its
 file calls there are inside its folder (Permissions' `folder`), and a read-only one's changes are refused at each
 call kiln holds. In a microVM it's also plugged in, read-only or writable as asked: by default at

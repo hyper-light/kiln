@@ -41,11 +41,30 @@ pub struct Started {
 
 /// What a run's launch declared of the changes it takes while it runs (kiln plan 01a1dd2e…, P6b.4; Shards'
 /// `ImageSpec::plug_roots` and `egress_ceiling`): where a folder is plugged in with no member restarted, and the most
-/// egress it may be granted (`Launch::plug_roots`, `Launch::egress_ceiling`).
+/// egress it may be granted (`Launch::plug_roots`, `Launch::egress_ceiling`); and what it gave its run as it started,
+/// the base its live overrides change (`sessions.grants`): its working folder, the machine's folders it sees
+/// (`Launch::folder`, `Launch::shares`) and its credentials, by reference and the hosts each is filled in toward
+/// (`Launch::credentials`, never a placeholder or a value).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Declared {
     pub plug_roots: Vec<String>,
     pub egress_ceiling: Vec<String>,
+    pub folder: Option<String>,
+    pub shares: Vec<kiln_seams::sandbox::Share>,
+    pub credentials: Vec<(String, Vec<String>)>,
+}
+
+impl Declared {
+    /// What `launch` declares and gives its run.
+    pub fn of(launch: &kiln_seams::sandbox::Launch) -> Self {
+        Self {
+            plug_roots: launch.plug_roots.clone(),
+            egress_ceiling: launch.egress_ceiling.clone(),
+            folder: launch.folder.clone(),
+            shares: launch.shares.clone(),
+            credentials: launch.credentials.iter().map(|c| (c.reference.clone(), c.toward.clone())).collect(),
+        }
+    }
 }
 
 /// The pipes and end of a held run, for a `Duplex`.

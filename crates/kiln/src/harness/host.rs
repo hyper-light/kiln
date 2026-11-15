@@ -5424,7 +5424,10 @@ while True:
             until_it("its link, said", 60, || matches!(s.info().runs, Some(session::Runs::Microvm { control: Some(_), .. }))).await?;
             // Claude Code's image serves one provider: its destinations are all its run's, kept whole, no fallback said.
             let one_use = crate::sandbox::narrow::Reach::Whole { why: crate::sandbox::narrow::Whole::OneUse };
-            assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()), reach: Some(Box::new(one_use)) }));
+            // What its launch gave it, the base its live overrides change (`sessions.grants`): its folder and shares as launched.
+            let granted = session::Granted::of(&crate::sandbox::held::Declared::of(launch));
+            assert!(granted.folder.is_some() && !granted.volumes.is_empty(), "its project folder, at least: {granted:?}");
+            assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()), reach: Some(Box::new(one_use)), granted: Some(Box::new(granted)) }));
             let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
             let granted = crate::sandbox::isolated::granted(claude.text).map_err(anyhow::Error::msg)?.ok_or_else(|| anyhow::anyhow!("claude's image grants more than names"))?;
             assert_eq!(launch.egress, kiln_seams::sandbox::Egress::Only(granted), "its image's own grants, each by name, narrowed no further");

@@ -663,7 +663,46 @@ pub fn view(info: &super::session::Info, state: &Value) -> Value {
     })
 }
 
+/// What `sessions.grants` says of session `info`, holding `state` (kiln plan 01a1dd2e…, P5.2's page: the base beside
+/// the live overrides): its engine; its base, what its launch gave it as it started (a microVM session's as its runner
+/// launched it, `Runs::Microvm::granted`; a host session's harness its working folder): its folder, the machine's
+/// folders it sees and where, the folders its harness is allowed (its folder and theirs), where its microVM takes a
+/// folder live and the most egress it may be granted live (as its launch declared them), what it reaches past its
+/// microVM (`reach`; `{"as": "host"}` on its host, which narrows nothing), its credentials by reference, and no port
+/// published or network joined (none is, at a launch: default deny); and its live overrides beside it.
+pub fn grants_of(info: &super::session::Info, state: &Value) -> Value {
+    let overrides = state.get("overrides").cloned().unwrap_or_else(|| json!({}));
+    let declared = |k: &str| overrides.get(k).cloned().unwrap_or_else(|| json!([]));
+    let mut live = overrides.clone();
+    if let Some(o) = live.as_object_mut() {
+        o.remove("roots");
+        o.remove("ceiling");
+    }
+    let base = match &info.runs {
+        Some(super::session::Runs::Microvm { image, reach, granted, .. }) => {
+            let g = granted.as_deref().cloned().unwrap_or_default();
+            let mut allowed: Vec<String> = g.folder.iter().cloned().collect();
+            for v in &g.volumes {
+                if !allowed.contains(&v.at) {
+                    allowed.push(v.at.clone());
+                }
+            }
+            json!({"image": image, "folder": g.folder, "volumes": g.volumes, "allowed_dirs": allowed, "plug_roots": declared("roots"), "egress": reach, "egress_ceiling": declared("ceiling"), "ports": [], "networks": [], "secrets": g.secrets, "reported": granted.is_some()})
+        }
+        _ => json!({"folder": info.cwd, "volumes": [], "allowed_dirs": [info.cwd], "plug_roots": [], "egress": {"as": "host"}, "egress_ceiling": [], "ports": [], "networks": [], "secrets": [], "reported": true}),
+    };
+    json!({"agent": info.id, "engine": if info.isolation.is_some() { "microvm" } else { "host" }, "base": base, "live": live})
+}
+
 // ---------------------------------------------------------------------------------------- the operations
+
+/// `sessions.grants`: a session the caller sees, its base beside its live overrides ([`grants_of`]).
+async fn grants(cx: Cx, v: Value) -> Out {
+    let info = super::ops::known(&cx, &text(&v, "agent")?)?;
+    super::lineage::may_see(&cx.hub, &cx.caller, &info.id).await?;
+    let state = cx.hub.harness.state_value(&info.id).unwrap_or_default();
+    Ok(grants_of(&info, &state))
+}
 
 /// The session `v` names, seen and steered by the caller (an agent steers only those it started, and theirs).
 async fn session_of(cx: &Cx, v: &Value) -> Result<super::session::Info, Fail> {
@@ -828,6 +867,15 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(network(cx, v, false)),
         },
         Op {
+            name: "sessions.grants",
+            summary: "What a session's launch gave its harness as it started, its base, beside its live overrides (state.overrides, as each sessions.* operation changes them): its `engine`; in `base`, its working `folder`, the machine's folders it sees (`volumes`: each `host` path, where it sees it `at`, `writable`), the folders its harness is allowed (`allowed_dirs`), where its microVM takes a folder live (`plug_roots`), what it reaches past its microVM (`egress`, as `/runs/reach` says it; `{\"as\": \"host\"}` on its host, which narrows nothing) and the most egress it may be granted live (`egress_ceiling`), its credentials by reference (`secrets`: each `name` and the hosts it's filled in `toward`), and `ports` and `networks`, none at a launch (default deny); `reported` is false where its runner is from before it said them. Every engine.",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::Grants>(),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "sessions", &text(v, "agent")?, "grants"]))),
+            run: |cx, v| Box::pin(grants(cx, v)),
+        },
+        Op {
             name: "sessions.volumes.add",
             summary: "Give a running session a folder of its machine (`path`), `access` ro or rw, in place: it joins its harness's own allowed folders (each harness's way) and the session's scope (kiln holds its file calls there to `access`), and in a microVM session it's plugged into the microVM too, for `members` (else its harness), at `at`: by default beneath its session's volume root (/volumes/<name>); strictly beneath one of the plug roots it declared as it started (state.overrides.roots), else refused. Every engine. Kept on the session and given again whenever its harness starts again; agents_get shows how each took it (state.overrides).",
             read_only: false,
@@ -899,6 +947,13 @@ pub mod input {
         pub member: Option<String>,
         /// The network's name.
         pub network: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Grants {
+        /// The session: an agent's id, as agents.list gives it.
+        pub agent: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
