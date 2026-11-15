@@ -29,6 +29,8 @@ const A = {
   "pr-triage": { name: "pr-triage", yours: true, v: 2, changed: "yesterday", harness: "codex", model: "gpt-6.1-sol-mini", agentfile: "rust-dev", instructions: "Label and route new pull requests.", playbook: "", tools: ["CI runs and legs"], mcp: [], skills: [], limits: { time: "10m", tokens: "", cost: "" } },
   "release-notes": { name: "release-notes", yours: true, v: 1, changed: "4 days ago", harness: "gemini", model: "", agentfile: "docs-site", instructions: "Write the release's notes from its landed diffs.", playbook: "", tools: [], mcp: [], skills: [], limits: { time: "", tokens: "", cost: "" } },
 };
+/* kiln's own, read only, in three groups (the person, 2026-11-14): one per harness, one per CI skill, and the agents kiln's UI starts. */
+const KILN_UI = [["about", "claude", "Sonnet 5.5", "About this code: a card's helper, reading only"], ["ask", "claude", "Sonnet 5.5", "Ask an agent: a runner's diagnosis, its findings handed over"], ["review", "claude", "Opus 5.5", "Ship's review agents: a diff's review, its words signed"], ["attach", "claude", "Sonnet 5.5", "Attach agent: a run, a deploy or an incident watched"]];
 const KILNS = [["ci-diagnose", "claude", "Sonnet 5.5", "kiln-ci-diagnose"], ["ci-review", "claude", "Sonnet 5.5", "kiln-ci-review"], ["ci-performance", "codex", "GPT-6.1 Sol", "kiln-ci-performance"], ["ci-migrate", "claude", "Opus 5.5", "kiln-ci-migrate"], ["ci-author", "claude", "Sonnet 5.5", "kiln-ci-author"], ["ci-secrets", "claude", "Sonnet 5.5", "kiln-ci-secrets"], ["ci-runners", "codex", "GPT-6.1 Sol", "kiln-ci-runners"]];
 const VERSIONS = [[4, "3 hours ago", "you", "model Sonnet 5.5 → Opus 5.5"], [3, "yesterday", "you · from rust-dev's text", "skill no-panics added"], [2, "2 days ago", "you", "limits: 45m"], [1, "5 days ago", "you", "copied from kiln's ci-review"]];
 const HISTORY = [["12 min ago", "hyper-light/kiln", "adas-mac-studio-3.local", "microvm", "v4", "warm · 212 ms", "succeeded", "reviewed 3 files · 2 findings"], ["1 hour ago", "hyper-light/kiln", "adacachy2", "microvm", "v4", "template · 0.41 s", "succeeded", "reviewed 11 files · 0 findings"], ["yesterday", "hyper-light/shards", "adas-mac-studio.local", "microvm", "v3", "cold · 1.9 s", "failed", "limit: 45m reached on a turn"], ["2 days ago", "hyper-light/kiln", "adacachy", "host", "v2", "process · 0.3 s", "succeeded", "reviewed 5 files · 1 finding"]];
@@ -63,10 +65,18 @@ function listView() {
   <p class="mk-note">Press <b>reviewer</b> to open its editor (settings, versions, history, the sync conflict), or <b>Run</b> to start it in place.</p>
   <section class="af-section" aria-label="kiln's">
     <h2 class="af-h">kiln&rsquo;s</h2>
-    <p class="af-dim">One for each of kiln's CI skills, read only. Each runs in its harness's own Agentfile.</p>
+    <p class="af-dim">Read only: copy one to make it yours. Each runs in its harness's own Agentfile.</p>
+    <div class="label mt-2">One for each harness</div>
+    <ul class="af-rows">${HARNESSES.map((h) => `<li><div class="af-row"><span class="af-name">${h.id}</span><span class="af-dim">${h.name} ${h.version} · ${h.models[0]?.[1] ?? "its default model"} · no instructions of its own</span>
+      <span class="af-acts"><button class="btn btn-secondary btn-xs" data-act="copyh" data-id="${h.id}">Copy as yours</button></span></div></li>`).join("")}</ul>
+    <div class="label mt-2">One for each CI skill</div>
     <ul class="af-rows">${KILNS.map(([n, h, m, sk]) => `<li><div class="af-row"><span class="af-name">${n}</span><span class="af-dim">${harnessName(h)} · ${m} · skill ${sk}</span>
       <span class="af-acts"><button class="btn btn-ghost btn-xs" data-act="kread" data-id="${n}">${S.kilnRead === n ? "Hide" : "Read"}</button><button class="btn btn-secondary btn-xs" data-act="copy" data-id="${n}">Copy as yours</button></span></div>
       ${S.kilnRead === n ? `<pre class="af-read">harness   ${harnessName(h)} · ${m}\nagentfile harness-${h} (kiln's)\nskills    ${sk}\ntools     kiln: CI runs and legs, Code search\nlimits    none\n\n${sk === "kiln-ci-diagnose" ? "Find out why a kiln CI run failed, classify it and fix it, using a failed leg kept to look into." : "As the skill says."}</pre>` : ""}</li>`).join("")}</ul>
+    <div class="label mt-2">kiln's own, as its UI starts them</div>
+    <ul class="af-rows">${KILN_UI.map(([n, h, m, what]) => `<li><div class="af-row"><span class="af-name">${n}</span><span class="af-dim">${harnessName(h)} · ${m} · ${what}</span>
+      <span class="af-acts"><button class="btn btn-secondary btn-xs" data-act="copyui" data-id="${n}">Copy as yours</button></span></div></li>`).join("")}</ul>
+    <p class="af-dim">These are what kiln's own cards and pages start. Yours, copied, can stand in for one under Settings → Agents.</p>
   </section>`;
 }
 function newAgent() {
@@ -88,7 +98,7 @@ function runPanel(a) {
       <div class="select-field"><label class="field-label" for="rp">Project</label>${select("rp", [["kiln", "hyper-light/kiln"], ["shards", "hyper-light/shards"], ["none", "No project: an empty folder"]], "kiln")}</div>
       <div class="select-field"><label class="field-label" for="rw">Where</label>${select("rw", [["auto", "kiln places it"], ["s3", "adas-mac-studio-3.local"], ["c2", "adacachy2"], ["m1", "adas-mac-studio.local"]], "auto")}</div>
     </div>
-    <p class="ag-place">kiln places it on adas-mac-studio-3.local: a microvm runner with ${a.agentfile} v8 built for linux/arm64 and a warm ${a.name} waiting (41 of 47 starts warm today).</p>
+    <p class="ag-place" id="place">kiln places it on adas-mac-studio-3.local: a microvm runner with ${a.agentfile} v8 built for linux/arm64 and a warm ${a.name} waiting (41 of 47 starts warm today).</p>
     <div><label class="field-label" for="rm">First message</label><div class="field"><textarea id="rm" placeholder="What should ${a.name} do?">Review the top diff of my stack.</textarea></div></div>
     <div class="af-actions"><button class="btn btn-primary btn-sm" data-act="start" data-id="${a.name}">Start</button><button class="btn btn-ghost btn-sm" data-act="runclose">Cancel</button>
       <span class="af-dim">It starts with this definition's settings, v${a.v}, in ${a.agentfile}'s microVM.</span></div>
@@ -185,7 +195,7 @@ function versions(a) {
     <div class="af-row"><span class="af-name">v${v}</span><span class="af-dim">${at} · ${by} · ${what}${v === a.v ? " · current" : ""}</span>
       <span class="af-acts"><button class="btn btn-ghost btn-xs" data-act="vread" data-v="${v}">${S.reading === v ? "Hide" : "Read"}</button>${v === a.v ? "" : `<button class="btn btn-ghost btn-xs" data-act="restore" data-v="${v}">Make current</button>`}</span></div>
     ${S.reading === v ? `<pre class="af-read">harness   Claude Code · ${v >= 4 ? "Opus 5.5" : "Sonnet 5.5"}\nagentfile rust-dev\nskills    kiln-ci-review, rust-style${v >= 3 ? ", no-panics" : ""}\nlimits    ${v >= 2 ? "time 45m" : "none"}</pre>` : ""}</li>`).join("")}</ul>
-    <p class="af-dim">Making one current keeps it as a new version, and rewrites its Agentfile's lines to match: nothing is lost.</p></section>`;
+    <p class="af-dim">Making one current keeps it as a new version and rewrites the agent's own lines in its Agentfile to match; the rest of the Agentfile stays as it is. Nothing is lost.</p></section>`;
 }
 function history() {
   return `<section class="af-section" aria-label="History"><div class="table-wrap"><table class="data-table"><thead><tr><th class="w-6"></th><th>Started</th><th class="hidden sm:table-cell">Project</th><th class="hidden md:table-cell">Runner</th><th class="hidden md:table-cell">Engine</th><th>Version</th><th class="hidden sm:table-cell">Start</th><th class="hidden lg:table-cell">Outcome</th></tr></thead><tbody>
@@ -218,6 +228,7 @@ $("#page").addEventListener("click", (e) => {
   if (act === "start") { press(b, 900, () => { S.ran = b.dataset.id; render(); }); return; }
   if (act === "kread") { S.kilnRead = S.kilnRead === b.dataset.id ? null : b.dataset.id; render(); return; }
   if (act === "copy") { press(b, 700, () => { const k = KILNS.find((x) => x[0] === b.dataset.id); const n = `${k[0]}-1`; A[n] = { name: n, yours: true, v: 1, changed: "just now", harness: k[1], model: harnessOf(k[1]).models.find(([, l]) => l === k[2])?.[0] ?? "", agentfile: `harness-${k[1]}`, instructions: "", playbook: "", tools: ["CI runs and legs", "Code search"], mcp: [], skills: [k[3]], limits: { time: "", tokens: "", cost: "" } }; openEditor(n); }); return; }
+  if (act === "copyh" || act === "copyui") { press(b, 700, () => { const id = b.dataset.id; const h = act === "copyh" ? id : "claude"; const n = `${id}-1`; A[n] = { name: n, yours: true, v: 1, changed: "just now", harness: h, model: harnessOf(h).models[0]?.[0] ?? "", agentfile: `harness-${h}`, instructions: "", playbook: "", tools: [], mcp: [], skills: [], limits: { time: "", tokens: "", cost: "" } }; openEditor(n); }); return; }
   if (act === "addmcp") { const n = $("#mcpn").value.trim(), s = $("#mcps").value.trim(); try { parseAddress(s); } catch { return; } if (n) { S.draft.mcp.push([n, s]); render(); } return; }
   if (act === "rmmcp") { S.draft.mcp.splice(Number(b.dataset.i), 1); render(); return; }
   if (act === "discard") { S.draft = strip(a); S.said = null; render(); return; }
@@ -239,6 +250,7 @@ $("#page").addEventListener("click", (e) => {
 });
 $("#page").addEventListener("input", (e) => {
   const t = e.target;
+  if (t.id === "rw") { const pin = { s3: "adas-mac-studio-3.local", c2: "adacachy2", m1: "adas-mac-studio.local" }[t.value]; $("#place").textContent = pin ? `Pinned to ${pin}: it starts there, or is refused saying why (that runner offline, full, or without ${A[S.running].agentfile}'s image built yet). It doesn't go elsewhere.` : `kiln places it on adas-mac-studio-3.local: a microvm runner with ${A[S.running].agentfile} v8 built for linux/arm64 and a warm ${S.running} waiting (41 of 47 starts warm today).`; return; }
   if (!S.draft) return;
   if (t.dataset.k) { S.draft[t.dataset.k] = t.value; if (t.dataset.k === "harness") { S.draft.model = harnessOf(t.value).models[0]?.[0] ?? ""; render(); } else refreshSave(); }
   else if (t.dataset.l) { S.draft.limits[t.dataset.l] = t.value; refreshSave(); }

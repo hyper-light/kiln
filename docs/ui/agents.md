@@ -12,9 +12,9 @@ Status: design for the person's approval. Nothing here is built. The mockup is
 - The API is `agentdefs.{list,get,create,update,versions,restore,delete,check,run}` on `/api/agentdefs`, with MCP
   `agentdefs_*` and code mode `kiln.agentdefs.*`, and the capability `agentdefs.manage`. `agents.*` and
   `/api/agents` are sessions' and runners'.
-- The page reads **Agent definitions** at `/agents/definitions`, under Agents beside Agentfiles, Plans and
-  Research (crumbs `05 / Agents / Definitions`). Its command-palette entry is "Agent definitions: in Agents,
-  agents as you define them". See open question 1.
+- The page reads **Agent definitions** (decision 8: the name stays) at `/agents/definitions`, under Agents
+  beside Agentfiles, Plans and Research (crumbs `05 / Agents / Definitions`). Its command-palette entry is
+  "Agent definitions: in Agents, agents as you define them".
 
 ## The list (`/agents/definitions`)
 
@@ -25,11 +25,23 @@ It's laid out exactly as the Agentfiles page (`views/agentfiles/agentfiles.tsx`,
     hours ago`, then **Run**;
   - **New agent** opens a form in place at the head of the list: name, harness (one of the ten), Agentfile.
     "Keep it" makes v1 and opens its editor.
-- **kiln's**: one for each of kiln's seven CI skills (ci-diagnose, ci-review, ci-performance, ci-migrate,
-  ci-author, ci-secrets, ci-runners), read only, with **Read** (its settings in place, as `.af-read`) and
-  **Copy as yours**.
+- **kiln's**, read only, each with **Copy as yours**, in three groups (the person, 2026-11-14):
+  - **one for each harness**: the ten (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor,
+    pi), each on its harness's own Agentfile with its first model and no instructions of its own;
+  - **one for each CI skill**: ci-diagnose, ci-review, ci-performance, ci-migrate, ci-author, ci-secrets and
+    ci-runners, each with **Read** (its settings in place, as `.af-read`);
+  - **kiln's own, as its UI starts them**:
+    - `about`: About this code, a card's helper (`harness/about.rs`);
+    - `ask`: Ask an agent, on a runner's diagnosis;
+    - `review`: Ship's review agents;
+    - `attach`: Attach agent, on a run, deploy or incident.
+
+    Under them: "Yours, copied, can stand in for one under Settings → Agents."
 - **Run**, on a row or in the editor, opens a run form in place under it: no dialog.
-  - The form: project, where (`kiln places it`, or one of your runners), and a first message.
+  - The form: project, where, and a first message. Where is `kiln places it`, or one of your runners pinned
+    (decision 8).
+  - Pinned, the line reads "Pinned to adacachy2: it starts there, or is refused saying why (that runner offline,
+    full, or without rust-dev's image built yet). It doesn't go elsewhere."
   - Above Start, one mono line says where kiln would place it and why: "kiln places it on
     adas-mac-studio-3.local: a microvm runner with rust-dev v8 built for linux/arm64 and a warm reviewer
     waiting". kiln's load balancer gives that reason; the page makes up nothing.
@@ -96,7 +108,8 @@ The mockup has a checkbox that makes the next save meet this.
 - Kept like the Agentfile's versions: `v4 · 3 hours ago · you · model Sonnet 5.5 → Opus 5.5 · current`, with
   Read and Make current.
 - Each version says what changed and where from ("from rust-dev's text" when the Agentfile changed it).
-- Making one current keeps it as a new version and rewrites the Agentfile's lines.
+- Making one current keeps it as a new version, and rewrites only the agent's own lines in its Agentfile
+  (decision 8). The rest of the Agentfile stays as it is.
 
 ### History
 
@@ -136,7 +149,7 @@ rust-dev as a new version of it; its sessions keep their history."
 
 - P5.2 AC1: create an agent, edit it, see v2 in Versions, make v1 current, see v3.
 - P5.2 AC2:
-  - Run starts a session;
+  - Run starts a session; Run pinned to a runner starts there, or is refused saying why;
   - the session's harness, model and Agentfile match the definition's (its page and `agents.get`);
   - History lists it.
 - P5.1 AC2: another person's definition URL shows "No agent definition here", as the Agentfile page does.
@@ -145,13 +158,15 @@ rust-dev as a new version of it; its sessions keep their history."
   - editing the Agentfile's text changes the definition;
   - a stale save shows the conflict block, and nothing is kept until a choice.
 
-## Open questions for the person
+## Decided (the person and decision 8, 2026-11-14)
 
-1. **The page's name.** The nav's Agents is Mission control (running agents). ROOT says the page can read
-   "Agents". The mockup calls it **Agent definitions**, at `/agents/definitions`, to keep the two apart. Keep
-   that, or another name?
-2. **kiln's own agents.** The mockup offers one per CI skill (seven). Should kiln ship those, others, or none
-   (yours alone)?
-3. **Run's "Where".** Should a person be able to pin a run to one runner, or only let kiln place it?
-4. **What a version covers.** A version of the definition keeps its settings. Should Make current also put back
-   the Agentfile version it ran in, or only the agent's own lines (the mockup)?
+- The page's name stays **Agent definitions**.
+- kiln's list: one per harness (the ten), one per CI skill (seven), and kiln's own UI agents (about, ask,
+  review, attach).
+- Run may pin a runner.
+- Make current restores the agent's own lines alone.
+
+## Open question for the person
+
+1. Settings → Agents: may a copy of yours stand in for one of kiln's UI agents (your own `about` on About this
+   code cards)? The mockup says so; drop that line if not.

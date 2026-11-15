@@ -45,13 +45,13 @@ const harnessOf = (id) => HARNESSES.find((h) => h.id === id);
 
 /** The person's secrets, by name and scope: names only, never a value (W09). */
 const SECRETS = [
-  ["yours", "GH_READ_TOKEN"],
-  ["yours", "GH_DEPLOY_KEY"],
-  ["yours", "MANTLE_ACCESS_KEY_ID"],
-  ["yours", "MANTLE_SECRET_ACCESS_KEY"],
-  ["yours", "R2_ACCESS_KEY_ID"],
-  ["yours", "R2_SECRET_ACCESS_KEY"],
-  ["yours", "RELEASES_BEARER"],
+  ["user", "GH_READ_TOKEN"],
+  ["user", "GH_DEPLOY_KEY"],
+  ["user", "MANTLE_ACCESS_KEY_ID"],
+  ["user", "MANTLE_SECRET_ACCESS_KEY"],
+  ["user", "R2_ACCESS_KEY_ID"],
+  ["user", "R2_SECRET_ACCESS_KEY"],
+  ["user", "RELEASES_BEARER"],
   ["server", "ANTHROPIC_API_KEY"],
 ];
 function secretOptions(selected, none = "None") {

@@ -52,6 +52,7 @@
       <tbody id="rows"></tbody>
     </table>
   </div>
+  <p class="mk-note"><label class="inline-flex items-center gap-2"><input type="checkbox" class="check" id="viewer"> Mockup: see it as someone without <span class="mono">runners.manage</span></label></p>
   <p class="mk-note">Press a runner to open it in place. Try <b>adas-mac-studio.local</b> (switch it to host: its microVM session drains first), <b>adas-mac-studio-2.local</b> (can't run microVMs: Shards says why) and <b>adas-mac-studio-3.local</b> (warm pools).</p>
 </div>
 
@@ -88,7 +89,11 @@ const IMAGES = {
   "harness-devin": { by: "kiln's", for: "devin", digest: "sha256:c40a8e19b2d6", size: "702 MiB", got: "prebuilt 2 days ago", used: "3 days ago" },
 };
 let open = null;
+let manage = true; // the viewer holds runners.manage (decision 8: only they switch)
+const WORKSPACE = "microvm"; // Settings → Runners: the workspace's default engine
+const OVERRIDES = { cec3: [["hyper-light/kiln", "host"]] }; // projects that ask another engine here
 let asking = null; // runner id whose switch is being confirmed
+let ending = null; // runner id whose "End them now" is being confirmed
 const ui = {}; // per-runner transient: {moving:{to, left:[...]}}
 
 function stateDot(r) { return r.busy > 0 ? "running" : "succeeded"; }
@@ -163,20 +168,23 @@ function engineBlock(r, moving) {
   const why = !r.can ? `<p class="eng-why">${esc(r.why)}</p><p class="mk-note" style="margin:0">Shards' host check, 4 min ago, without booting a VM. <button class="text-link" data-act="recheck">Check again</button></p>` : "";
   const confirm = asking === r.id ? `
     <div class="confirm" role="group" aria-label="Confirm switching the engine">
-      <p>Switch <b>${esc(r.name)}</b> to <b>${other}</b>? New sessions start on the ${other === "host" ? "host, with no microVM," : "microVM engine"} at once. ${r.sessions.length ? `Its ${r.sessions.length} ${r.engine} session${r.sessions.length === 1 ? " drains" : "s drain"} first: ${r.sessions.length === 1 ? "it goes" : "they go"} on until ${r.sessions.length === 1 ? "it ends" : "they end"}, and none is stopped.` : `Nothing runs on ${r.engine} here, so it switches at once.`}</p>
+      <p>Switch <b>${esc(r.name)}</b> to <b>${other}</b>? New sessions start on the ${other === "host" ? "host, with no microVM," : "microVM engine"} at once. ${r.sessions.length ? `Its ${r.sessions.length} ${r.engine} session${r.sessions.length === 1 ? " drains" : "s drain"} first: ${r.sessions.length === 1 ? "it goes" : "they go"} on until ${r.sessions.length === 1 ? "it ends" : "they end"}, and none is stopped unless you end ${r.sessions.length === 1 ? "it" : "them"} yourself.` : `Nothing runs on ${r.engine} here, so it switches at once.`}</p>
       ${r.sessions.length ? `<ul class="eng-drain">${r.sessions.map((s) => `<li><i class="dot" data-status="${s.state === "idle" ? "succeeded" : "running"}"></i><span class="mono">${s.who}</span><span class="dim">${s.kind} · ${s.state} · ${s.since}</span></li>`).join("")}</ul>` : ""}
       <div class="confirm-actions"><button class="btn btn-primary btn-xs" data-act="switch" data-to="${other}">${r.sessions.length ? "Switch and drain" : "Switch"}</button><button class="btn btn-ghost btn-xs" data-act="keep">Keep ${r.engine}</button></div>
     </div>` : "";
   const drain = moving && moving.left.length ? `
     <ul class="eng-drain">${moving.left.map((s) => `<li><i class="dot" data-status="running"></i><span class="mono">${s.who}</span><span class="dim">${s.kind} · ${s.state} · ${s.since}</span><span class="right dim mono" style="font-size:10.5px">${r.engine} until it ends</span></li>`).join("")}</ul>
-    <div class="row"><button class="btn btn-ghost btn-xs" data-act="cancel">Cancel the switch</button></div>` : "";
+    ${ending === r.id ? `<div class="confirm" data-tone="danger" role="group" aria-label="Confirm ending them"><p>End ${moving.left.length === 1 ? "it" : `all ${moving.left.length}`} now? ${moving.left.length === 1 ? "Its turn stops and the session ends" : "Their turns stop and the sessions end"}; ${moving.left.length === 1 ? "its conversation is kept" : "their conversations are kept"}, to go on later on the ${moving.to === "host" ? "host" : "microVM engine"}.</p><div class="confirm-actions"><button class="btn btn-danger btn-xs" data-act="endnow">${moving.left.length === 1 ? "End it now" : "End them now"}</button><button class="btn btn-ghost btn-xs" data-act="noend">${moving.left.length === 1 ? "Let it finish" : "Let them finish"}</button></div></div>` : ""}
+    <div class="row"><button class="btn btn-ghost btn-xs" data-act="cancel">Cancel the switch</button>${ending === r.id ? "" : `<button class="btn btn-ghost-danger btn-xs" data-act="askend">End them now</button>`}</div>` : "";
   return `<div class="eng-block" aria-label="Engine">
     <div class="label-row"><div class="label">Engine <span class="mk-new">new</span></div><span class="dim mono" style="font-size:10.5px">workspace → runner → project → session</span></div>
     <div class="seg" role="group" aria-label="Engine of ${esc(r.name)}" data-runner="${r.id}">
-      <button type="button" data-v="host" aria-pressed="${want === "host"}" ${moving ? "disabled" : ""}>host</button>
-      <button type="button" data-v="microvm" aria-pressed="${want === "microvm"}" ${!r.can || moving ? "disabled" : ""} ${!r.can ? `title="${esc(r.why)}"` : ""}>microvm</button>
+      <button type="button" data-v="host" aria-pressed="${want === "host"}" ${moving || !manage ? "disabled" : ""} ${!manage ? 'title="Only those who manage runners switch its engine"' : ""}>host</button>
+      <button type="button" data-v="microvm" aria-pressed="${want === "microvm"}" ${!r.can || moving || !manage ? "disabled" : ""} ${!r.can ? `title="${esc(r.why)}"` : !manage ? 'title="Only those who manage runners switch its engine"' : ""}>microvm</button>
     </div>
+    ${!manage ? `<p class="eng-why" style="color:var(--color-meta)">Only those who manage runners (<span class="mono">runners.manage</span>) switch its engine: ask the runner's owner.</p>` : ""}
     <p class="eng-line">${line}</p>${why}${confirm}${drain}
+    <p class="mk-note" style="margin:0">Workspace default: <span class="mono">${WORKSPACE}</span>, in <a class="text-link" href="#">Settings → Runners</a>. ${(OVERRIDES[r.id] || []).length ? OVERRIDES[r.id].map(([p, e]) => `<span class="warn">${p} asks for <span class="mono">${e}</span>: its sessions here run on the ${e === "host" ? "host" : "microVM engine"}.</span>`).join(" ") : "No project overrides it here."}</p>
   </div>`;
 }
 
@@ -226,7 +234,10 @@ $("#rows").addEventListener("click", (e) => {
     if (a === "keep") { asking = null; render(); return; }
     if (a === "recheck") { press(act, 900, () => render()); return; }
     if (a === "release") { press(act, 600, () => { r.pools.splice(Number(act.dataset.i), 1); render(); }); return; }
-    if (a === "cancel") { delete ui[r.id]; render(); return; }
+    if (a === "cancel") { delete ui[r.id]; ending = null; render(); return; }
+    if (a === "askend") { ending = r.id; render(); return; }
+    if (a === "noend") { ending = null; render(); return; }
+    if (a === "endnow") { press(act, 700, () => { const m = ui[r.id]?.moving; if (!m) return; r.busy = Math.max(0, r.busy - m.left.length); m.left = []; r.sessions = []; delete ui[r.id]; ending = null; r.engine = m.to; r.origin = m.to === "host" ? "owner" : "default"; r.originWhen = "just now"; if (m.to === "host") r.pools = []; render(); }); return; }
     if (a === "switch") {
       const to = act.dataset.to;
       press(act, 500, () => {
@@ -239,9 +250,9 @@ $("#rows").addEventListener("click", (e) => {
           const m = ui[r.id]?.moving; if (!m) return;
           m.left.shift(); r.sessions = [...m.left]; r.busy = Math.max(0, r.busy - 1);
           if (m.left.length === 0) { delete ui[r.id]; r.engine = to; r.origin = to === "host" ? "owner" : "default"; r.originWhen = "just now"; if (to === "host") r.pools = []; render(); }
-          else { render(); setTimeout(tick, 2600); }
+          else { render(); setTimeout(tick, 8000); }
         };
-        setTimeout(tick, 2600);
+        setTimeout(tick, 8000);
       });
       return;
     }
@@ -252,6 +263,7 @@ $("#rows").addEventListener("click", (e) => {
 });
 $("#rows").addEventListener("keydown", (e) => { const tr = e.target.closest("tr[data-id]"); if (e.key === "Enter" && tr && e.target === tr) { open = open === tr.dataset.id ? null : tr.dataset.id; render(); } });
 $("#q").addEventListener("input", render);
+$("#viewer").addEventListener("change", (e) => { manage = !e.target.checked; asking = null; render(); });
 open = "cec3";
 render();
 </script>

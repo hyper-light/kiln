@@ -18,174 +18,247 @@
 </div>
 <script src="assets/mockup.js"></script>
 <script>
-const COLORS = ["#a6c4ed", "#d6a2aa", "#d8cbb0", "#b8d9d2"]; // kiln's chart SERIES: blue, rose, sand, teal; every mark also carries its arm's letter
+const COLORS = ["#a6c4ed", "#d6a2aa", "#d8cbb0", "#b8d9d2"]; // kiln's chart SERIES; every mark also carries its variant's letter
 const KEYS = "ABCD";
+const AGENTS = [["reviewer", "reviewer (Claude Code · Opus 5.5)"], ["pr-triage", "pr-triage (Codex · GPT-6.1 Sol mini)"], ["release-notes", "release-notes (Gemini CLI)"]];
 const AGENTFILES = [["rust-dev", "rust-dev (yours, v9)"], ["docs-site", "docs-site (yours, v3)"], ["harness-claude", "harness-claude (kiln's)"], ["harness-codex", "harness-codex (kiln's)"]];
-const RUNS = [["agent:reviewer", "agent reviewer (Claude Code · Opus 5.5)"], ["agent:pr-triage", "agent pr-triage (Codex · GPT-6.1 Sol mini)"], ["harness:claude", "harness claude, no agent"], ["harness:codex", "harness codex, no agent"]];
-const S = {
-  phase: "setup", // setup | running | results
-  name: "reviewer-size",
-  arms: [
-    { agentfile: "rust-dev", runs: "agent:reviewer", engine: "microvm", cpus: "2", mem: "4" },
-    { agentfile: "rust-dev", runs: "agent:reviewer", engine: "microvm", cpus: "4", mem: "8" },
-  ],
-  workload: "command", project: "kiln", command: "cargo test -p kiln-ci --release", n: 10, where: "one",
-  done: 0, log: [], order: [], failed: new Set(), kept: null, applied: false, table: false,
-};
-const LIST = [["reviewer-size", "2 arms · reviewer on 2 vCPU · 4 GiB against 4 vCPU · 8 GiB", "this one"], ["codex-vs-claude-start", "2 arms · harness codex against harness claude, starts only", "done 2 days ago · kept B"], ["rust-dev-host-vs-microvm", "2 arms · rust-dev on host against microvm", "done last week · kept A"]];
 
-function armLabel(a) { return `${a.runs.replace(":", " ")} in ${a.agentfile} · ${a.engine}${a.engine === "microvm" ? ` · ${a.cpus} vCPU · ${a.mem} GiB` : ""}`; }
-function key(i) { return `<span class="ex-key" style="background:${COLORS[i]}" aria-hidden="true">${KEYS[i]}</span>`; }
-function crumbs() { return `<nav class="eyebrow crumbs" aria-label="Breadcrumb"><span class="spectrum-rule"></span><a href="#">05 / Agents</a><span aria-hidden="true">/</span><span>Experiments</span></nav>`; }
-/** A balanced interleave: ABBA BAAB … so neither arm always goes first. */
-function orderOf(k, n) { const out = []; for (let r = 0; r < n; r++) { const base = [...Array(k).keys()]; const seq = r % 2 ? base.reverse() : base; out.push(...seq); } return out; }
+/* What each variant really is, for the simulation alone: the page computes every interval from the sessions it makes. */
+const TRUTH = {
+  "microvm-2-4": { cold: [1910, 80], template: [412, 25], warm: [214, 12], peak: [2.31, 0.1], steady: [1.62, 0.07], cpu: [0.41, 0.05], fail: 0.08, done: 0.82 },
+  "microvm-4-8": { cold: [1970, 85], template: [455, 26], warm: [219, 12], peak: [3.02, 0.11], steady: [2.05, 0.08], cpu: [0.43, 0.05], fail: 0.01, done: 0.9 },
+  "host": { process: [310, 30], peak: [1.48, 0.12], steady: [1.12, 0.08], cpu: [0.37, 0.05], fail: 0.03, done: 0.86 },
+};
+const truthOf = (v) => (v.engine === "host" ? TRUTH.host : v.mem === "8" ? TRUTH["microvm-4-8"] : TRUTH["microvm-2-4"]);
+let seed = 7;
+const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+const gauss = ([m, sd]) => { const u = rnd() || 1e-9, v = rnd(); return m + sd * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+const S = {
+  tab: "split",
+  state: "live", // draft | live | paused | promoted
+  name: "reviewer-size",
+  target: { kind: "agent", agent: "reviewer", harness: "claude", agentfile: "rust-dev" },
+  variants: [
+    { agentfile: "rust-dev", engine: "microvm", cpus: "2", mem: "4", weight: 50, current: true },
+    { agentfile: "rust-dev", engine: "microvm", cpus: "4", mem: "8", weight: 50 },
+  ],
+  sessions: [], // {v, kind, start, peak, steady, cpu, failed, done, at, project, runner}
+  promoted: null, asking: null, table: false, started: "2 hours ago",
+  replay: { session: "s1", reps: 5, picks: [0, 1], state: "done", done: 0 },
+};
+const LIST = [["reviewer-size", "reviewer split 50/50: 2 vCPU · 4 GiB against 4 vCPU · 8 GiB"], ["codex-vs-claude-start", "pr-triage on harness codex against harness claude", "promoted B · 2 days ago"], ["rust-dev-host-vs-microvm", "reviewer on host against microvm", "promoted B · last week"]];
+
+/* ------------------------------------------------------------ sessions arriving */
+function assign() {
+  // Each new session gets a variant by weight, and keeps it for its life.
+  let r = rnd() * 100, i = 0;
+  for (; i < S.variants.length - 1; i++) { r -= S.variants[i].weight; if (r < 0) break; }
+  return i;
+}
+const PROJECTS = ["hyper-light/kiln", "hyper-light/shards", "hyper-light/hex"];
+const RUNNERS_ = ["adas-mac-studio-3.local", "adacachy2", "adas-mac-studio.local", "adas-macbook-pro-2.local"];
+function arrive(v = S.state === "paused" ? S.variants.findIndex((x) => x.current) : assign()) {
+  const t = truthOf(S.variants[v]);
+  const kind = S.variants[v].engine === "host" ? "process" : (() => { const r = rnd(); return r < 0.7 ? "warm" : r < 0.9 ? "template" : "cold"; })();
+  const failed = rnd() < t.fail;
+  S.sessions.push({ v, kind, start: gauss(t[kind]), peak: gauss(t.peak), steady: gauss(t.steady), cpu: gauss(t.cpu), failed, done: !failed && rnd() < t.done, project: PROJECTS[Math.floor(rnd() * 3)], runner: S.variants[v].engine === "host" ? "adacachy" : RUNNERS_[Math.floor(rnd() * 4)], paused: S.state === "paused" });
+}
+for (let i = 0; i < 96; i++) arrive();
+
+/* ------------------------------------------------------------ intervals from the sessions themselves */
+const median = (xs) => { const s = [...xs].sort((a, b) => a - b), n = s.length; return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2; };
+function medianCI(xs) {
+  // A 95% interval of the median from the order statistics (distribution-free), as kiln's bootstrap would give near it.
+  const s = [...xs].sort((a, b) => a - b), n = s.length;
+  if (n < 3) return null;
+  const h = 1.96 * Math.sqrt(n) / 2;
+  const lo = s[Math.max(0, Math.floor(n / 2 - h))], hi = s[Math.min(n - 1, Math.ceil(n / 2 + h) - 1)];
+  return [lo, median(s), hi];
+}
+function wilson(k, n) { if (!n) return null; const z = 1.96, p = k / n, d = 1 + (z * z) / n, c = (p + (z * z) / (2 * n)) / d, w = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / d; return [Math.max(0, c - w) * 100, p * 100, Math.min(1, c + w) * 100]; }
+const MEASURES = [
+  { id: "cold", m: "Start: cold", unit: "ms", better: "lower", pick: (s) => (s.kind === "cold" && !s.failed ? s.start : null) },
+  { id: "template", m: "Start: from its template", unit: "ms", better: "lower", pick: (s) => (s.kind === "template" && !s.failed ? s.start : null) },
+  { id: "warm", m: "Start: warm", unit: "ms", better: "lower", pick: (s) => (s.kind === "warm" && !s.failed ? s.start : null) },
+  { id: "process", m: "Start: as a process (host)", unit: "ms", better: "lower", pick: (s) => (s.kind === "process" && !s.failed ? s.start : null) },
+  { id: "peak", m: "Footprint: peak", unit: "GiB", better: "lower", pick: (s) => (s.failed ? null : s.peak) },
+  { id: "steady", m: "Footprint: steady", unit: "GiB", better: "lower", pick: (s) => (s.failed ? null : s.steady) },
+  { id: "cpu", m: "Host CPU", unit: "CPU·s a session minute", better: "lower", pick: (s) => (s.failed ? null : s.cpu) },
+  { id: "fail", m: "Failures", unit: "% of sessions", better: "lower", rate: (s) => s.failed },
+  { id: "done", m: "Session outcome", unit: "% ended done", better: "higher", rate: (s) => s.done },
+];
+function stats(meas) {
+  return S.variants.map((_, i) => {
+    const mine = S.sessions.filter((s) => s.v === i && !s.paused);
+    if (meas.rate) { const ci = wilson(mine.filter(meas.rate).length, mine.length); return ci && { ci, n: mine.length, k: mine.filter(meas.rate).length }; }
+    const xs = mine.map(meas.pick).filter((x) => x !== null);
+    const ci = medianCI(xs); return ci && { ci, n: xs.length };
+  });
+}
+function verdict(meas, st) {
+  const have = st.map((x, i) => [x, i]).filter(([x]) => x);
+  if (have.length < 2) return { w: null, t: have.length ? "one variant has sessions of this kind" : "no sessions of this kind yet" };
+  const lower = meas.better === "lower";
+  // A winner beats every other variant's whole interval.
+  for (const [x, i] of have) if (have.every(([y, j]) => j === i || (lower ? x.ci[2] < y.ci[0] : x.ci[0] > y.ci[2]))) {
+    const best = have.filter(([, j]) => j !== i).map(([y]) => y.ci[1]);
+    const other = lower ? Math.min(...best) : Math.max(...best);
+    const rel = meas.unit.startsWith("%") ? `${Math.abs(x.ci[1] - other).toFixed(0)} points ${lower ? "fewer" : "more"}` : meas.unit === "GiB" ? `${Math.abs(other - x.ci[1]).toFixed(2)} GiB less` : `${Math.abs(Math.round((1 - x.ci[1] / other) * 100))}% ${meas.id.length < 9 && meas.unit === "ms" ? "faster" : "less"}`;
+    return { w: i, t: `${KEYS[i]} ${rel}` };
+  }
+  return { w: null, t: `no clear difference yet (n = ${have.map(([x]) => x.n).join(", ")})` };
+}
+const fmt = (x, u) => (u === "ms" || u.startsWith("of ") ? String(Math.round(x)) : u.startsWith("%") ? x.toFixed(0) : x.toFixed(2));
+
+/* ------------------------------------------------------------ the page */
+const key = (i) => `<span class="ex-key" style="background:${COLORS[i]}" aria-hidden="true">${KEYS[i]}</span>`;
+const vLabel = (v) => `${v.agentfile} · ${v.engine}${v.engine === "microvm" ? ` · ${v.cpus} vCPU · ${v.mem} GiB` : ""}`;
+const targetLabel = () => (S.target.kind === "agent" ? `agent ${S.target.agent}` : `harness ${S.target.harness} in ${S.target.agentfile}`);
+function stateWord() { return { draft: "not started", live: `live · ${S.sessions.length} sessions`, paused: `paused · ${S.sessions.length} sessions`, promoted: `promoted ${KEYS[S.promoted]}` }[S.state]; }
 
 function render() {
-  $("#page").innerHTML = `${crumbs()}<h1 class="af-title">Experiments <span class="mk-new">new</span></h1>
-  <p class="af-dim af-lead">Agents deployed different ways, measured against each other. Each arm is a microVM deployment: an Agentfile, the agent or harness it runs, its engine and its size. They run one fixed workload, interleaved, n times each, and each measure comes back as an interval. No model is asked anything, so no tokens are spent or counted.</p>
-  <section class="af-section" aria-label="Yours"><div class="af-head"><h2 class="af-h">Yours</h2><button class="btn btn-secondary btn-xs">New experiment</button></div>
-    <ul class="af-rows">${LIST.map(([n, d, s], i) => `<li><div class="af-row"><span class="af-name">${n}</span><span class="af-dim">${d}</span><span class="af-acts"><span class="dim mono" style="font-size:10.5px">${i === 0 ? phaseWord() : s}</span></span></div></li>`).join("")}</ul></section>
+  $("#page").innerHTML = `<nav class="eyebrow crumbs" aria-label="Breadcrumb"><span class="spectrum-rule"></span><a>05 / Agents</a><span aria-hidden="true">/</span><span>Experiments</span></nav>
+  <h1 class="af-title">Experiments <span class="mk-new">new</span></h1>
+  <p class="af-dim af-lead">Split an agent's real sessions between ways of deploying it. Each variant is a microVM deployment (or the host); each session that starts is given one, by its weight, and keeps it for its life. Every measure comes from those sessions. Replay, beside it, runs a recorded session's tool calls against variants, offline. No model is asked anything for an experiment, and no tokens are counted.</p>
+  <section class="af-section" aria-label="Yours"><div class="af-head"><h2 class="af-h">Yours</h2><button class="btn btn-secondary btn-xs" data-act="new">New experiment</button></div>
+    <ul class="af-rows">${LIST.map(([n, d, s], i) => `<li><div class="af-row"><span class="af-name">${n}</span><span class="af-dim">${i === 0 ? `${esc(targetLabel())} split ${S.variants.map((v) => v.weight).join("/")}` : d}</span><span class="af-acts"><span class="dim mono" style="font-size:10.5px">${i === 0 ? stateWord() : s}</span></span></div></li>`).join("")}</ul></section>
   <section class="af-section" aria-label="${esc(S.name)}">
-    <div class="af-head"><h2 class="af-h">${esc(S.name)}</h2><span class="dim mono" style="font-size:10.5px">${phaseWord()}</span></div>
-    ${S.phase === "setup" ? setup() : S.phase === "running" ? running() : results()}
+    <div class="af-head"><h2 class="af-h">${esc(S.name)}</h2><span class="dim mono" style="font-size:10.5px">${stateWord()}</span></div>
+    <div class="pt" role="tablist" aria-label="Experiment">${[["split", "Live split", S.sessions.length], ["replay", "Replay"]].map(([id, l, n]) => `<button role="tab" aria-selected="${S.tab === id}" data-tab="${id}">${l}${n ? ` <span class="pt-n">${n}</span>` : ""}</button>`).join("")}</div>
+    ${S.tab === "split" ? split() : replay()}
   </section>`;
 }
-function phaseWord() { return S.phase === "setup" ? "setting up" : S.phase === "running" ? `running · ${S.done} of ${S.order.length}` : S.kept !== null ? `done · kept ${KEYS[S.kept]}` : "done · decide"; }
 
-/* ------------------------------------------------------------ set up */
-function setup() {
-  const total = S.arms.length * S.n;
-  const ord = orderOf(S.arms.length, Math.min(S.n, 4));
-  return `<div class="stack">
-    <div style="max-width:420px"><label class="field-label" for="xname">Its name</label><div class="field mono-in"><input id="xname" data-x="name" value="${esc(S.name)}"></div></div>
-    <div class="label-row"><div class="label">Arms</div>${S.arms.length < 4 ? `<button class="btn btn-ghost btn-xs" data-act="addarm">Add an arm</button>` : ""}</div>
-    <div class="ex-arms">${S.arms.map((a, i) => `<div class="ex-arm" data-arm="${i}">
-      <div class="ex-arm-head">${key(i)}<span class="mono" style="font-size:12.5px;color:#e4e5e7">Arm ${KEYS[i]}</span>${S.arms.length > 2 ? `<button class="btn btn-ghost-danger btn-xs right" data-act="rmarm" data-i="${i}">Remove</button>` : ""}</div>
-      <div class="select-field"><label class="field-label">Agentfile</label>${select(`af${i}`, AGENTFILES, a.agentfile, 'data-a="agentfile"')}</div>
-      <div class="select-field"><label class="field-label">Runs</label>${select(`rn${i}`, RUNS, a.runs, 'data-a="runs"')}</div>
-      <div><div class="field-label">Engine</div><div class="seg seg-xs" role="group" aria-label="Arm ${KEYS[i]}'s engine" data-seg="${i}"><button data-v="microvm" aria-pressed="${a.engine === "microvm"}">microvm</button><button data-v="host" aria-pressed="${a.engine === "host"}">host</button></div></div>
-      ${a.engine === "microvm" ? `<div class="grid2"><div class="select-field"><label class="field-label">vCPUs</label>${select(`cp${i}`, ["1", "2", "4", "8"].map((v) => [v, v]), a.cpus, 'data-a="cpus"')}</div><div class="select-field"><label class="field-label">Memory</label>${select(`mm${i}`, ["2", "4", "8", "16"].map((v) => [v, v + " GiB"]), a.mem, 'data-a="mem"')}</div></div>` : `<p class="af-dim">On the host it runs as a process of the machine: its footprint is the process tree's.</p>`}
-    </div>`).join("")}</div>
-    <p class="af-dim">${differ()}</p>
-    <div class="label hair">Workload</div>
-    <div class="seg" role="group" aria-label="Workload" data-wl><button data-v="starts" aria-pressed="${S.workload === "starts"}">Starts only</button><button data-v="command" aria-pressed="${S.workload === "command"}">A command</button></div>
-    ${S.workload === "command" ? `<div class="grid2"><div class="select-field"><label class="field-label" for="xp">Project</label>${select("xp", [["kiln", "hyper-light/kiln at b2fc6ceb"], ["shards", "hyper-light/shards at b9dfa258"]], S.project, 'data-x="project"')}</div>
-      <div><label class="field-label" for="xc">Command, in each arm's microVM</label><div class="field mono-in"><input id="xc" data-x="command" value="${esc(S.command)}"></div></div></div>
-      <p class="af-dim">A unit of work is one run of the command; it fails when the command exits non-zero. The project is plugged in at the same commit for every rep.</p>` : `<p class="af-dim">Each rep starts the arm's agent to ready and stops it: cold, from its template, and warm, in turn.</p>`}
-    <div class="grid3">
-      <div><label class="field-label" for="xn">Reps per arm (n)</label><div class="field mono-in"><input id="xn" data-x="n" inputmode="numeric" value="${S.n}"></div></div>
-      <div class="select-field" style="grid-column:span 2"><label class="field-label" for="xw">Where</label>${select("xw", [["one", "One runner for every rep, picked by kiln: linux/arm64 microvm"], ["each", "Each rep where kiln places it (comparable only across like runners)"]], S.where, 'data-x="where"')}</div>
-    </div>
-    <div><div class="field-label">Order, interleaved</div><div class="ex-order">${ord.map((k) => `<i style="border-color:${COLORS[k]}55;color:${COLORS[k]}">${KEYS[k]}</i>`).join("")}${S.n > 4 ? `<span class="dim mono" style="font-size:10.5px;align-self:center;margin-left:4px">… ${total} reps</span>` : ""}</div></div>
-    <div class="label">Measures, each arm</div>
-    <div class="afs-egress">${["start: cold", "start: template", "start: warm", "footprint", "host CPU per unit of work", "throughput", "failures"].map((m) => `<span class="chip">${m}</span>`).join("")}</div>
-    <div class="af-actions"><button class="btn btn-primary btn-sm" data-act="start">Start experiment</button><span class="af-dim">${total} reps, ${S.n} on each arm${S.workload === "command" ? "; each runs the command once" : ""}.</span></div>
-  </div>`;
-}
-function differ() {
-  const [a, b] = S.arms; const d = [];
-  for (const k of ["agentfile", "runs", "engine", "cpus", "mem"]) if (S.arms.some((x) => x[k] !== a[k])) d.push({ agentfile: "Agentfile", runs: "what runs", engine: "engine", cpus: "vCPUs", mem: "memory" }[k]);
-  return d.length ? `The arms differ in ${d.join(" and ")} alone: that is what the results measure.` : `<span class="warn">The arms are alike: change something in one.</span>`;
-}
+function split() {
+  const live = S.state === "live" || S.state === "paused";
+  const fixed = S.state !== "draft"; // the target and the variants' deployments are fixed once it starts; weights aren't
+  return `<div class="stack mt-3">
+    <div class="label">Target</div>
+    ${fixed ? `<p class="eng-line"><span class="mono">${esc(targetLabel())}</span>: the sessions of it you start (Mission control, Run, a plan's step) are split. Others' aren't.</p>` : `
+    <div class="seg" role="group" aria-label="Target" data-tk><button data-v="agent" aria-pressed="${S.target.kind === "agent"}">An agent</button><button data-v="harness" aria-pressed="${S.target.kind === "harness"}">A harness in an Agentfile</button></div>
+    <div class="grid2">${S.target.kind === "agent" ? `<div class="select-field"><label class="field-label" for="ta">Agent</label>${select("ta", AGENTS, S.target.agent, 'data-t="agent"')}</div>` : `<div class="select-field"><label class="field-label" for="th">Harness</label>${select("th", HARNESSES.map((h) => [h.id, h.name]), S.target.harness, 'data-t="harness"')}</div><div class="select-field"><label class="field-label" for="tf">Agentfile</label>${select("tf", AGENTFILES, S.target.agentfile, 'data-t="agentfile"')}</div>`}</div>
+    <p class="af-dim">The sessions of it you start (Mission control, Run, a plan's step) are split. Others' aren't.</p>`}
 
-/* ------------------------------------------------------------ running */
-function running() {
-  const total = S.order.length;
-  const per = S.arms.map((_, i) => S.log.filter((l) => l.arm === i));
-  return `<div class="stack">
-    <div class="ex-progress" role="progressbar" aria-valuenow="${S.done}" aria-valuemax="${total}"><span style="width:${(S.done / total) * 100}%"></span></div>
-    <div class="row"><span style="font-size:12.5px;color:#c8cad0">Rep ${Math.min(S.done + 1, total)} of ${total} on adas-mac-studio-3.local · arm ${KEYS[S.order[S.done] ?? 0]} ${S.workload === "command" ? "running the command" : "starting"}</span><button class="btn btn-ghost-danger btn-xs right" data-act="stop">Stop</button></div>
-    <div class="ex-order">${S.order.map((k, j) => `<i data-state="${S.failed.has(j) ? "failed" : j < S.done ? "done" : j === S.done ? "now" : ""}" style="${j < S.done && !S.failed.has(j) ? `background:${COLORS[k]}` : ""}">${KEYS[k]}</i>`).join("")}</div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>Arm</th><th class="num">Done</th><th class="num">Failed</th><th class="num hidden sm:table-cell">Warm start, median</th><th class="num">Units / min, median</th></tr></thead><tbody>
-      ${S.arms.map((a, i) => { const ok = per[i].filter((l) => l.ok); const med = (xs) => xs.length ? xs.sort((x, y) => x - y)[Math.floor(xs.length / 2)] : null; const w = med(ok.map((l) => l.warm)), t = med(ok.map((l) => l.tp)); return `<tr><td>${key(i)} <span class="cell-mono" style="margin-left:6px">${esc(a.engine === "microvm" ? `${a.cpus} vCPU · ${a.mem} GiB` : "host")}</span></td><td class="num cell-mono">${per[i].length} of ${S.n}</td><td class="num cell-mono">${per[i].filter((l) => !l.ok).length}</td><td class="num cell-mono hidden sm:table-cell">${w ? w + " ms" : "—"}</td><td class="num cell-mono">${t ? t.toFixed(2) : "—"}</td></tr>`; }).join("")}
+    <div class="label-row hair"><div class="label">Variants and weights</div>${!fixed && S.variants.length < 4 ? `<button class="btn btn-ghost btn-xs" data-act="addv">Add a variant</button>` : ""}</div>
+    <div class="ex-arms">${S.variants.map((v, i) => variantCard(v, i, fixed)).join("")}</div>
+    <p class="af-dim">${weightsLine()}</p>
+
+    <div class="af-actions">${S.state === "draft" ? `<button class="btn btn-primary btn-sm" data-act="start">Start the split</button><span class="af-dim">From then on, each ${esc(targetLabel())} session that starts gets a variant by these weights.</span>`
+      : S.state === "live" ? `<button class="btn btn-secondary btn-sm" data-act="pause">Pause</button><span class="af-dim">Live since ${S.started}. A weight changed now applies to sessions that start from now on.</span>`
+      : S.state === "paused" ? `<button class="btn btn-primary btn-sm" data-act="resume">Resume</button><span class="af-dim">Paused: new sessions start on ${KEYS[S.variants.findIndex((x) => x.current)]}, what it runs on now, and aren't counted. Sessions already given a variant keep it.</span>`
+      : `<span class="said" data-tone="ok">Promoted ${KEYS[S.promoted]}: ${esc(targetLabel())} starts on ${esc(vLabel(S.variants[S.promoted]))} from now on. The split has ended; its sessions and results are kept.</span>`}</div>
+
+    ${S.state === "draft" ? "" : `
+    <div class="label hair">Assigned</div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Variant</th><th class="num">Weight</th><th class="num">Sessions</th><th class="num hidden sm:table-cell">Share</th><th class="num">Running now</th></tr></thead><tbody>
+      ${S.variants.map((v, i) => { const n = S.sessions.filter((s) => s.v === i && !s.paused).length, all = S.sessions.filter((s) => !s.paused).length; return `<tr><td>${key(i)} <span class="cell-mono" style="margin-left:6px">${esc(vLabel(v))}</span>${v.current ? `<span class="cell-sub" style="display:inline;margin-left:6px">current</span>` : ""}</td><td class="num cell-mono">${v.weight}%</td><td class="num cell-mono">${n}</td><td class="num cell-mono hidden sm:table-cell">${all ? Math.round((n / all) * 100) : 0}%</td><td class="num cell-mono">${live ? Math.max(0, Math.round(n / 9)) : 0}</td></tr>`; }).join("")}
     </tbody></table></div>
-    <ul class="ex-log" aria-label="Reps, newest first">${[...S.log].reverse().map((l) => `<li>${key(l.arm)}<span class="mono">rep ${l.rep}</span><span class="dim">${l.ok ? `warm ${l.warm} ms · ${l.tp.toFixed(2)} units/min · peak ${l.rss} GiB` : `<span class="fail">failed</span>: cargo exited 137, OOM-killed at ${S.arms[l.arm].mem} GiB`}</span></li>`).join("")}</ul>
-    <p class="af-dim">A failed rep is counted, never dropped or run again.</p>
+    <ul class="ex-log" aria-label="Sessions, newest first">${S.sessions.slice(-8).reverse().map((s, j) => `<li>${key(s.v)}<span class="mono">${esc(S.target.agent || S.target.harness)} · ${s.project}</span><span class="dim">${s.failed ? `<span class="fail">failed to start</span>: OOM-killed at ${S.variants[s.v].mem} GiB` : `${s.kind} start ${Math.round(s.start)} ms · ${s.runner}`}${s.paused ? " · paused, not counted" : ""}</span><span class="right dim mono" style="font-size:10.5px">${j === 0 ? "just now" : `${j * 3} min ago`}</span></li>`).join("")}</ul>
+    ${results()}`}
   </div>`;
 }
+function variantCard(v, i, fixed) {
+  return `<div class="ex-arm" data-var="${i}">
+    <div class="ex-arm-head">${key(i)}<span class="mono" style="font-size:12.5px;color:#e4e5e7">Variant ${KEYS[i]}</span>${v.current ? `<span class="chip">current</span>` : ""}${!fixed && S.variants.length > 2 ? `<button class="btn btn-ghost-danger btn-xs right" data-act="rmv" data-i="${i}">Remove</button>` : ""}</div>
+    ${fixed ? `<p class="eng-line mono" style="font-size:12px">${esc(vLabel(v))}</p>` : `
+    <div class="select-field"><label class="field-label">Agentfile</label>${select(`vf${i}`, AGENTFILES, v.agentfile, 'data-vk="agentfile"')}</div>
+    <div><div class="field-label">Engine</div><div class="seg seg-xs" role="group" aria-label="Variant ${KEYS[i]}'s engine" data-veng="${i}"><button data-v="microvm" aria-pressed="${v.engine === "microvm"}">microvm</button><button data-v="host" aria-pressed="${v.engine === "host"}">host</button></div></div>
+    ${v.engine === "microvm" ? `<div class="grid2"><div class="select-field"><label class="field-label">vCPUs</label>${select(`vc${i}`, ["1", "2", "4", "8"].map((x) => [x, x]), v.cpus, 'data-vk="cpus"')}</div><div class="select-field"><label class="field-label">Memory</label>${select(`vm${i}`, ["2", "4", "8", "16"].map((x) => [x, x + " GiB"]), v.mem, 'data-vk="mem"')}</div></div>` : `<p class="af-dim">On the host it runs as a process of the machine, on a runner whose engine is host: its footprint is its process tree's.</p>`}`}
+    <div><div class="label-row"><label class="field-label" for="w${i}">Weight</label><span class="mono" style="font-size:12px;color:#e4e5e7" id="wv${i}">${v.weight}%</span></div>
+      <input type="range" id="w${i}" min="0" max="100" step="1" value="${v.weight}" data-w="${i}" ${S.state === "promoted" ? "disabled" : ""} style="width:100%;accent-color:${COLORS[i]}" aria-label="Variant ${KEYS[i]}'s weight"></div>
+  </div>`;
+}
+function weightsLine() {
+  const sum = S.variants.reduce((a, v) => a + v.weight, 0);
+  return `Weights ${S.variants.map((v, i) => `${KEYS[i]} ${v.weight}%`).join(" · ")}, ${sum}% in all: moving one moves the others, in proportion, so they always add up to 100. A variant at 0% takes no new sessions.`;
+}
+function setWeight(i, w) {
+  const others = S.variants.map((_, j) => j).filter((j) => j !== i);
+  const rest = 100 - w, was = others.reduce((a, j) => a + S.variants[j].weight, 0);
+  S.variants[i].weight = w;
+  let given = 0;
+  others.forEach((j, k) => {
+    const share = k === others.length - 1 ? rest - given : Math.round(was ? (S.variants[j].weight / was) * rest : rest / others.length);
+    S.variants[j].weight = Math.max(0, share); given += S.variants[j].weight;
+  });
+}
 
-/* ------------------------------------------------------------ results */
-const RESULTS = [
-  { m: "Start: cold", unit: "s", better: "lower", v: [[1.84, 1.91, 1.99], [1.88, 1.97, 2.05]] },
-  { m: "Start: template", unit: "ms", better: "lower", v: [[398, 412, 431], [433, 455, 474]] },
-  { m: "Start: warm", unit: "ms", better: "lower", v: [[205, 214, 226], [208, 219, 231]] },
-  { m: "Footprint, peak", unit: "GiB", better: "lower", v: [[2.24, 2.31, 2.39], [2.91, 3.02, 3.1]] },
-  { m: "Host CPU per unit of work", unit: "CPU·s", better: "lower", v: [[39.8, 41.2, 42.9], [41.1, 43.0, 44.6]] },
-  { m: "Throughput", unit: "units/min", better: "higher", v: [[1.17, 1.21, 1.25], [1.96, 2.04, 2.11]] },
-  { m: "Failures", unit: "of 10", better: "lower", v: [[0.57, 2, 5.1], [0, 0, 2.8]], counts: ["2 of 10", "0 of 10"] },
-];
-function verdict(r) {
-  const [a, b] = r.v; const lowerWins = r.better === "lower";
-  const aBetter = lowerWins ? a[2] < b[0] : a[0] > b[2];
-  const bBetter = lowerWins ? b[2] < a[0] : b[0] > a[2];
-  if (!aBetter && !bBetter) return { w: null, t: r.counts ? "no clear difference at n = 10: B's none and A's two OOM kills overlap" : "no clear difference" };
-  const w = aBetter ? 0 : 1, o = 1 - w;
-  const ratio = r.v[w][1] / r.v[o][1];
-  return { w, t: `${KEYS[w]} ${r.better === "higher" ? `${(ratio).toFixed(2)}× the units a minute` : r.unit === "GiB" ? `${(r.v[o][1] - r.v[w][1]).toFixed(2)} GiB smaller` : `${Math.round((1 - ratio) * 100)}% ${r.m.startsWith("Start") ? "faster" : "less"}`}` };
-}
-const fmt = (x, u) => (u === "of 10" ? String(Math.round(x * 10) / 10) : u === "ms" ? String(Math.round(x)) : x.toFixed(2));
-function measure(r) {
-  const lo = Math.min(...r.v.map((x) => x[0])), hi = Math.max(...r.v.map((x) => x[2]));
-  const pad = (hi - lo) * 0.15 || 1; const a0 = Math.max(0, lo - pad), a1 = hi + pad;
-  const pos = (x) => ((x - a0) / (a1 - a0)) * 100;
-  const v = verdict(r);
-  return `<div class="ex-measure"><div class="ex-measure-head"><h3>${r.m}</h3><span class="dim mono" style="font-size:10.5px">${r.unit}, ${r.better} is better</span><span class="ex-verdict right" ${v.w !== null ? 'data-tone="win"' : ""}>${v.w !== null ? "✓ " : ""}${v.t}</span></div>
-    ${r.v.map(([l, m, h], i) => `<div class="ex-ci" title="Arm ${KEYS[i]}: median ${fmt(m, r.unit)} ${r.unit}, 95% interval ${fmt(l, r.unit)} to ${fmt(h, r.unit)}">${key(i)}<div class="ex-ci-track"><span class="ex-ci-bar" style="left:${pos(l)}%;width:${Math.max(1, pos(h) - pos(l))}%;background:${COLORS[i]}"></span><span class="ex-ci-mid" style="left:calc(${pos(m)}% - 1px);background:${COLORS[i]}"></span></div><span class="ex-ci-val">${r.counts ? r.counts[i] : `${fmt(m, r.unit)} (${fmt(l, r.unit)}–${fmt(h, r.unit)})`}</span></div>`).join("")}
-    <div class="ex-axis"><span>${fmt(a0, r.unit)}</span><span>${fmt(a1, r.unit)}</span></div></div>`;
-}
 function results() {
-  const wins = RESULTS.map(verdict);
-  const aw = wins.filter((w) => w.w === 0).length, bw = wins.filter((w) => w.w === 1).length;
-  return `<div class="stack">
-    <p class="eng-line"><b>B does ${(2.04 / 1.21).toFixed(2)}× the work a minute</b> and had no failures; <b>A</b> starts from its template faster and is 0.71 GiB smaller. Clear on ${aw + bw} of 7 measures: ${bw} for B, ${aw} for A.</p>
-    <div class="row"><span class="dim" style="font-size:12px">${S.arms.map((a, i) => `${KEYS[i]}: ${esc(armLabel(a))}`).join(" · ")}</span><button class="btn btn-ghost btn-xs right" data-act="table">${S.table ? "Show as intervals" : "Show as a table"}</button></div>
-    ${S.table ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Measure</th>${S.arms.map((_, i) => `<th class="num">${KEYS[i]}: median (95%)</th>`).join("")}<th class="hidden sm:table-cell">Clear?</th></tr></thead><tbody>${RESULTS.map((r, j) => `<tr><td style="font-size:12.5px">${r.m} <span class="cell-sub">${r.unit}</span></td>${r.v.map(([l, m, h], i) => `<td class="num cell-mono">${r.counts ? r.counts[i] : `${fmt(m, r.unit)} (${fmt(l, r.unit)}–${fmt(h, r.unit)})`}</td>`).join("")}<td class="hidden sm:table-cell" style="font-size:12px">${wins[j].w !== null ? `<span class="ok">${KEYS[wins[j].w]}</span>` : "no"}</td></tr>`).join("")}</tbody></table></div>` : RESULTS.map(measure).join("")}
-    <p class="af-dim">Intervals are 95% bootstrap intervals of each arm's median over its ${S.n} reps (failures: Wilson intervals of the rate). A measure names a winner only where the intervals don't overlap.</p>
+  const rows = MEASURES.map((m) => ({ m, st: stats(m) })).filter(({ st }) => st.some(Boolean));
+  const vs = rows.map(({ m, st }) => verdict(m, st));
+  const clear = vs.filter((v) => v.w !== null);
+  const by = S.variants.map((_, i) => clear.filter((v) => v.w === i).length);
+  return `<div class="label-row hair"><div class="label">Results, from these sessions</div><button class="btn btn-ghost btn-xs" data-act="table">${S.table ? "Show as intervals" : "Show as a table"}</button></div>
+    <p class="eng-line">Clear on ${clear.length} of ${rows.length} measures${clear.length ? `: ${by.map((n, i) => (n ? `${n} for ${KEYS[i]}` : "")).filter(Boolean).join(", ")}` : ""}. ${S.state === "live" ? "The intervals narrow as sessions come." : ""}</p>
+    ${S.table ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Measure</th>${S.variants.map((_, i) => `<th class="num">${KEYS[i]}: median (95%)</th>`).join("")}<th class="hidden sm:table-cell">Clear?</th></tr></thead><tbody>${rows.map(({ m, st }, j) => `<tr><td style="font-size:12.5px">${m.m}<span class="cell-sub">${m.unit}</span></td>${st.map((x) => `<td class="num cell-mono">${x ? `${fmt(x.ci[1], m.unit)} (${fmt(x.ci[0], m.unit)}–${fmt(x.ci[2], m.unit)})<span class="cell-sub">n = ${x.n}</span>` : "—"}</td>`).join("")}<td class="hidden sm:table-cell" style="font-size:12px">${vs[j].w !== null ? `<span class="ok">${KEYS[vs[j].w]}</span>` : "no"}</td></tr>`).join("")}</tbody></table></div>`
+    : rows.map(({ m, st }, j) => measure(m, st, vs[j])).join("")}
+    <p class="af-dim">Each interval is 95%: of the median for times, footprints and CPU (from the sessions' own order statistics), and Wilson's for rates. A measure names a winner only where its interval clears every other variant's. Failed starts count as failures and nowhere else.</p>
     <div class="label hair">Decide</div>
-    ${S.kept === null ? `<div class="row">${S.arms.map((a, i) => `<button class="btn btn-secondary btn-xs" data-act="keep" data-i="${i}">${key(i)} Keep ${KEYS[i]}</button>`).join("")}<span class="dim" style="font-size:12px">Keeping an arm records your choice; it changes nothing else until you say.</span></div>`
-    : `<div class="confirm" role="group" aria-label="Kept"><p>Kept <b>${KEYS[S.kept]}</b>: ${esc(armLabel(S.arms[S.kept]))}. By you, just now.</p>
-        ${S.applied ? `<p class="ok">reviewer's definition now starts it on ${S.arms[S.kept].cpus} vCPU · ${S.arms[S.kept].mem} GiB, as its v5.</p>` : `<div class="confirm-actions"><button class="btn btn-primary btn-xs" data-act="apply">Start reviewer this way from now on</button><button class="btn btn-ghost btn-xs" data-act="unkeep">Undo</button></div>`}</div>`}
+    ${S.state === "promoted" ? `<p class="said" data-tone="ok">Promoted ${KEYS[S.promoted]}, by you, just now.</p>`
+      : S.asking !== null ? `<div class="confirm" role="group" aria-label="Confirm promoting"><p>Promote <b>${KEYS[S.asking]}</b>? ${esc(targetLabel())} starts on ${esc(vLabel(S.variants[S.asking]))} from now on${S.target.kind === "agent" ? ", as its definition's next version" : ""}, and the split ends. Sessions running on the other variants go on as they are.</p><div class="confirm-actions"><button class="btn btn-primary btn-xs" data-act="promote">Promote ${KEYS[S.asking]}</button><button class="btn btn-ghost btn-xs" data-act="noask">Keep the split</button></div></div>`
+      : `<div class="row">${S.variants.map((v, i) => `<button class="btn btn-secondary btn-xs" data-act="ask" data-i="${i}" ${v.current ? "disabled" : ""}>${key(i)} Promote ${KEYS[i]}</button>`).join("")}<span class="dim" style="font-size:12px">Nothing changes until you press one.</span></div>`}`;
+}
+function measure(m, st, v) {
+  const have = st.filter(Boolean);
+  const lo = Math.min(...have.map((x) => x.ci[0])), hi = Math.max(...have.map((x) => x.ci[2]));
+  const pad = (hi - lo) * 0.15 || 1, a0 = Math.max(0, lo - pad), a1 = hi + pad, pos = (x) => ((x - a0) / (a1 - a0)) * 100;
+  return `<div class="ex-measure"><div class="ex-measure-head"><h3>${m.m}</h3><span class="dim mono" style="font-size:10.5px">${m.unit}, ${m.better} is better</span><span class="ex-verdict right" ${v.w !== null ? 'data-tone="win"' : ""}>${v.w !== null ? "✓ " : ""}${v.t}</span></div>
+    ${st.map((x, i) => x ? `<div class="ex-ci" title="Variant ${KEYS[i]}: ${fmt(x.ci[1], m.unit)}, 95% interval ${fmt(x.ci[0], m.unit)} to ${fmt(x.ci[2], m.unit)}, n = ${x.n}">${key(i)}<div class="ex-ci-track"><span class="ex-ci-bar" style="left:${pos(x.ci[0])}%;width:${Math.max(1, pos(x.ci[2]) - pos(x.ci[0]))}%;background:${COLORS[i]}"></span><span class="ex-ci-mid" style="left:calc(${pos(x.ci[1])}% - 1px);background:${COLORS[i]}"></span></div><span class="ex-ci-val">${m.rate ? `${x.k} of ${x.n}` : `${fmt(x.ci[1], m.unit)} (${fmt(x.ci[0], m.unit)}–${fmt(x.ci[2], m.unit)})`}<span class="cell-sub" style="display:inline;margin-left:6px">n ${x.n}</span></span></div>` : `<div class="ex-ci">${key(i)}<span class="dim" style="font-size:11.5px">no sessions of this kind</span><span></span></div>`).join("")}
+    <div class="ex-axis"><span>${fmt(a0, m.unit)}</span><span>${fmt(a1, m.unit)}</span></div></div>`;
+}
+
+/* ------------------------------------------------------------ replay (offline) */
+const RECORDED = [["s1", "reviewer · hyper-light/kiln · 12 min ago · 214 tool calls (Read 120, Bash 61, Edit 33)"], ["s2", "reviewer · hyper-light/shards · yesterday · 88 tool calls (Read 51, Bash 30, Edit 7)"], ["s3", "pr-triage · hyper-light/kiln · 2 days ago · 19 tool calls"]];
+const REPLAYED = [[[41.2, 43.0, 45.1], [27.6, 28.9, 30.4]], [[52.1, 54.3, 57.0], [55.0, 56.8, 59.2]], [[2.27, 2.33, 2.41], [2.96, 3.04, 3.12]], [[0, 0, 0], [0, 0, 0]]];
+function replay() {
+  const R = S.replay;
+  return `<div class="stack mt-3">
+    <p class="eng-line">Run a recorded session's tool calls again, in order, in each variant's microVM, against the project at the session's commit. The model isn't asked: what each call returned that the next one used is played back as recorded. It runs offline, beside the live split, and moves no one's sessions.</p>
+    <div class="select-field"><label class="field-label" for="rs">Recorded session</label>${select("rs", RECORDED, R.session, 'data-r="session"')}</div>
+    <div><div class="field-label">Against</div><div class="ag-checks">${S.variants.map((v, i) => `<label><input type="checkbox" class="check" data-rpick="${i}" ${R.picks.includes(i) ? "checked" : ""}> ${key(i)} <span class="mono" style="font-size:12px">${esc(vLabel(v))}</span></label>`).join("")}</div></div>
+    <div class="grid3"><div><label class="field-label" for="rn">Times each</label><div class="field mono-in"><input id="rn" data-r="reps" value="${R.reps}" inputmode="numeric"></div></div></div>
+    <div class="af-actions">${R.state === "running" ? `<div class="grow"><div class="ex-progress"><span style="width:${(R.done / (R.reps * R.picks.length)) * 100}%"></span></div><p class="af-dim mt-2">Replay ${R.done} of ${R.reps * R.picks.length} · interleaved</p></div>` : `<button class="btn btn-primary btn-sm" data-act="replay" ${R.picks.length < 1 ? "disabled" : ""}>Replay</button><span class="af-dim">${R.reps * R.picks.length} replays, interleaved; each boots its variant from cold.</span>`}</div>
+    ${R.state === "done" ? `<div class="label hair">Last replay · 214 tool calls · 5 times each · 40 min ago</div>
+      ${[["Replay time", "s", "lower"], ["Host CPU", "CPU·s", "lower"], ["Footprint: peak", "GiB", "lower"], ["Calls that went otherwise", "of 214", "lower"]].map(([n, u, b], j) => { const st = R.picks.slice(0, 2).map((i, k) => ({ ci: REPLAYED[j][k], n: 5 })); const v = j === 3 ? { w: null, t: "none: every call returned as recorded" } : verdict({ better: b, unit: u, id: "replay" }, st); return measure({ m: n, unit: u, better: b }, st, v); }).join("")}
+      <p class="af-dim">B replays the session in two thirds of A's time: its four vCPUs run the session's cargo builds side by side.</p>` : ""}
   </div>`;
 }
 
-/* ------------------------------------------------------------ the simulated run */
+/* ------------------------------------------------------------ events */
 let timer = null;
-function startRun() {
-  S.order = orderOf(S.arms.length, S.n); S.done = 0; S.log = []; S.failed = new Set(); S.phase = "running"; render();
-  const reps = S.arms.map(() => 0);
-  timer = setInterval(() => {
-    if (S.done >= S.order.length) { clearInterval(timer); S.phase = "results"; render(); return; }
-    const arm = S.order[S.done]; reps[arm] += 1;
-    const small = S.arms[arm].mem === "4";
-    const ok = !(small && (reps[arm] === 4 || reps[arm] === 8));
-    if (!ok) S.failed.add(S.done);
-    S.log.push({ arm, rep: reps[arm], ok, warm: Math.round((small ? 214 : 219) + (Math.random() - 0.5) * 18), tp: (small ? 1.21 : 2.04) + (Math.random() - 0.5) * 0.08, rss: (small ? 2.31 : 3.02).toFixed(2) });
-    S.done += 1; render();
-  }, 380);
-}
-
+function tickOn() { clearInterval(timer); timer = setInterval(() => { if (S.state === "live" || S.state === "paused") { arrive(); if (S.tab === "split" && !document.activeElement?.matches?.("input[type=range]")) render(); } }, 1600); }
 $("#page").addEventListener("click", (e) => {
-  const seg = e.target.closest("[data-seg] button");
-  if (seg) { S.arms[Number(seg.parentElement.dataset.seg)].engine = seg.dataset.v; render(); return; }
-  const wl = e.target.closest("[data-wl] button");
-  if (wl) { S.workload = wl.dataset.v; render(); return; }
+  const tab = e.target.closest("[data-tab]"); if (tab) { S.tab = tab.dataset.tab; render(); return; }
+  const tk = e.target.closest("[data-tk] button"); if (tk) { S.target.kind = tk.dataset.v; render(); return; }
+  const ve = e.target.closest("[data-veng] button"); if (ve) { S.variants[Number(ve.parentElement.dataset.veng)].engine = ve.dataset.v; render(); return; }
   const b = e.target.closest("[data-act]"); if (!b) return;
   const act = b.dataset.act;
-  if (act === "addarm") { S.arms.push({ ...S.arms[S.arms.length - 1] }); render(); return; }
-  if (act === "rmarm") { S.arms.splice(Number(b.dataset.i), 1); render(); return; }
-  if (act === "start") { press(b, 600, startRun); return; }
-  if (act === "stop") { clearInterval(timer); S.phase = "setup"; render(); return; }
+  if (act === "new") { clearInterval(timer); Object.assign(S, { state: "draft", name: "reviewer-host", tab: "split", sessions: [], promoted: null, asking: null, variants: [{ agentfile: "rust-dev", engine: "microvm", cpus: "4", mem: "8", weight: 80, current: true }, { agentfile: "rust-dev", engine: "host", cpus: "4", mem: "8", weight: 20 }] }); render(); return; }
+  if (act === "addv") { S.variants.push({ ...S.variants[S.variants.length - 1], current: false, weight: 0 }); render(); return; }
+  if (act === "rmv") { const w = S.variants[Number(b.dataset.i)].weight; S.variants.splice(Number(b.dataset.i), 1); S.variants[0].weight += w; render(); return; }
+  if (act === "start") { press(b, 600, () => { S.state = "live"; S.started = "just now"; tickOn(); render(); }); return; }
+  if (act === "pause") { press(b, 500, () => { S.state = "paused"; render(); }); return; }
+  if (act === "resume") { press(b, 500, () => { S.state = "live"; render(); }); return; }
   if (act === "table") { S.table = !S.table; render(); return; }
-  if (act === "keep") { press(b, 500, () => { S.kept = Number(b.dataset.i); render(); }); return; }
-  if (act === "unkeep") { S.kept = null; render(); return; }
-  if (act === "apply") { press(b, 700, () => { S.applied = true; render(); }); return; }
+  if (act === "ask") { S.asking = Number(b.dataset.i); render(); return; }
+  if (act === "noask") { S.asking = null; render(); return; }
+  if (act === "promote") { press(b, 700, () => { S.promoted = S.asking; S.asking = null; S.state = "promoted"; clearInterval(timer); render(); }); return; }
+  if (act === "replay") { press(b, 400, () => { const R = S.replay; R.state = "running"; R.done = 0; render(); const t = setInterval(() => { R.done++; if (R.done >= R.reps * R.picks.length) { clearInterval(t); R.state = "done"; } if (S.tab === "replay") render(); }, 350); }); return; }
+});
+$("#page").addEventListener("input", (e) => {
+  const t = e.target;
+  if (t.dataset.w !== undefined) { setWeight(Number(t.dataset.w), Number(t.value)); S.variants.forEach((v, i) => { const el = $(`#w${i}`), lab = $(`#wv${i}`); if (el && i !== Number(t.dataset.w)) el.value = v.weight; if (lab) lab.textContent = v.weight + "%"; }); const line = t.closest(".stack").querySelector(".ex-arms + p"); if (line) line.innerHTML = weightsLine(); return; }
 });
 $("#page").addEventListener("change", (e) => {
-  const t = e.target; const arm = t.closest("[data-arm]");
-  if (arm && t.dataset.a) { S.arms[Number(arm.dataset.arm)][t.dataset.a] = t.value; render(); return; }
-  if (t.dataset.x) { S[t.dataset.x] = t.dataset.x === "n" ? Math.max(2, Math.min(50, parseInt(t.value, 10) || 10)) : t.value; render(); }
+  const t = e.target;
+  if (t.dataset.w !== undefined) { render(); return; }
+  if (t.dataset.t) { S.target[t.dataset.t] = t.value; render(); return; }
+  const card = t.closest("[data-var]"); if (card && t.dataset.vk) { S.variants[Number(card.dataset.var)][t.dataset.vk] = t.value; render(); return; }
+  if (t.dataset.rpick !== undefined) { const i = Number(t.dataset.rpick), p = S.replay.picks; t.checked ? p.push(i) : p.splice(p.indexOf(i), 1); p.sort(); render(); return; }
+  if (t.dataset.r) { S.replay[t.dataset.r] = t.dataset.r === "reps" ? Math.max(1, Math.min(20, parseInt(t.value, 10) || 5)) : t.value; render(); }
 });
-render();
+render(); tickOn();
 </script>
 </body>
 </html>

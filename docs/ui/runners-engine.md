@@ -2,7 +2,11 @@
 
 Serves kiln plan 01a1cd8e862e7169a074db3d5fa33f3d's build plan P2.3 (a runner's engine) and P3.2 (warm-pool
 view), from the kiln × Hex × Shards design, sections A and E. Decision 3 (the person's, 2026-11-14) holds: a
-runner that can run microVMs defaults to `microvm`, and its owner opts out per runner.
+runner that can run microVMs defaults to `microvm`, and its owner opts out per runner. Decision 8's rulings
+hold too:
+- a switch drains, waiting, with an explicit "End them now";
+- only `runners.manage` switches; others see the control disabled, with why;
+- the workspace default lives in Settings → Runners, and a project's override is shown.
 
 Status: design for the person's approval. Nothing here is built. The mockup is
 [mockups/runners.html](mockups/runners.html): open it in a browser, or as kiln showed it. It uses kiln's own
@@ -33,9 +37,11 @@ Two blocks join `AgentDetails`, each under a mono `.label`, between the actions 
 
 ### Engine
 
-- A `Segmented` control, `host | microvm`, for the runner's owner (those with `runners.manage`; others see the
-  line alone). The precedence, `workspace → runner → project → session`, sits at the block's right in faint
-  mono.
+- A `Segmented` control, `host | microvm`, at the block's head.
+  - Only those with `runners.manage` switch it.
+  - Anyone else sees it disabled, with the words "Only those who manage runners (`runners.manage`) switch its
+    engine: ask the runner's owner." (the mockup's "see it as someone without runners.manage" box).
+  - The precedence, `workspace → runner → project → session`, sits at the block's right in faint mono.
 - One line under it says what holds and why:
   - "Sessions here run in microVMs of their own (Shards, through Hex) on Hypervisor.framework. The default for
     a runner that can: you can opt out."
@@ -50,9 +56,18 @@ Two blocks join `AgentDetails`, each under a mono `.label`, between the actions 
   - It lists the sessions that drain (dot, name, harness, state, age).
   - Its actions are "Switch and drain" (or "Switch" when nothing runs) and "Keep microvm".
   - Pressed, the button says its request is on its way (W21-R15).
-- **While it drains**, the control is disabled, the line says "Switching to host. New sessions here start on the
-  host already; the 2 microvm sessions below finish first, then the switch is done.", the sessions are listed
-  with "microvm until it ends", and "Cancel the switch" ends it.
+- **While it drains**, the control is disabled.
+  - The line says "Switching to host. New sessions here start on the host already; the 2 microvm sessions below
+    finish first, then the switch is done."
+  - The sessions are listed with "microvm until it ends".
+  - "Cancel the switch" ends it.
+  - **End them now** (ghost-danger) asks in place, with a danger `Confirm`: "End them now? Their turns stop and
+    the sessions end; their conversations are kept, to go on later on the host." Its actions are "End them now"
+    and "Let them finish" (the singular "it" for one).
+  - Ended, the switch completes at once.
+- Under the line, the **workspace default** and any **project override**: "Workspace default: microvm, in
+  Settings → Runners." followed, in the warn tone, by each project that asks for another engine here
+  ("hyper-light/kiln asks for host: its sessions here run on the host."), or "No project overrides it here."
 - A switch to `host` releases that runner's warm pools once it's done.
 
 ### MicroVMs here
@@ -95,9 +110,12 @@ Two blocks join `AgentDetails`, each under a mono `.label`, between the actions 
   - `host_check: { usable, backend, why, at }`;
   - `hex_class: string[]`;
   - `room: { memory, vcpus }`.
+- `overrides: [{project, engine}]` on `Agent`, and the workspace default (`GET/PUT /api/settings/runners`, its
+  `engine` field), for Settings → Runners.
 - New routes:
   - `PUT /api/agents/:name/engine {engine}`: refused, typed, when the runner can't run microVMs, with Shards'
-    why;
+    why, and for a caller without `runners.manage`;
+  - `POST /api/agents/:name/engine/switch/end`: End them now;
   - `DELETE /api/agents/:name/engine/switch`: cancels a switch;
   - `POST /api/agents/:name/host-check`: Check again.
 - `GET /api/agents/:name/images` and `GET /api/agents/:name/pools`, and
@@ -116,17 +134,14 @@ Two blocks join `AgentDetails`, each under a mono `.label`, between the actions 
   - the switch completes when the drained session ends.
 - P2.3 AC4: the details show the five isolation facts with their sources.
 - A runner that can't is refused: the `microvm` pill is disabled, and the API's refusal is shown in its words.
+- Someone without `runners.manage` sees the control disabled, with why, and the API refuses their switch.
+- During a drain, End them now ends the sessions and completes the switch, and their conversations are kept.
+- A project's override shows under the line.
 - P3.2 AC2: after repeated starts of agent A on a runner, its pools table shows A, its size and a hit.
 - P3.2 AC3: with no starts for a keep window, the pool leaves the table.
 
-## Open questions for the person
+## Decided (decision 8, 2026-11-14)
 
-1. **Draining long-lived agents.** A switch "drains" sessions of the other engine, but an agent's conversation
-   can live for days. The mockup waits until each session ends, and offers "Cancel the switch". Should it
-   instead move each conversation to another runner of its engine ("Go on elsewhere", as at a usage limit),
-   or offer "End them now"?
-2. **Who may switch.** The mockup lets the runner's owner (`runners.manage`) switch. Should a person who only
-   runs agents there see the control disabled with why, or not see it?
-3. **Workspace default.** The design orders workspace → runner → project → session. Is the workspace default
-   set on Settings → Runners, and should the details show when a project overrides this runner? The mockup
-   shows only the order.
+- A switch waits for the other engine's sessions to end, and offers an explicit **End them now**.
+- Only `runners.manage` switches; others see the control disabled, with why.
+- The workspace default lives in Settings → Runners; a project's override shows in the runner's details.

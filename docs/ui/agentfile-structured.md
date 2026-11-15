@@ -16,6 +16,7 @@ One of your Agentfiles, `/agents/agentfiles/:id` (`views/agentfiles/agentfile.ts
 - The text editor gets a **structured view** beside it:
   - on a wide window (the page at 1040 px and more) the two stand side by side, the text sticky at the right;
   - narrower, a `Segmented` control `Structured | Text` picks one, Structured first.
+- Side by side on wide windows stays (decision 8).
 - One Save keeps whichever was changed: the view writes the text, and the text is what's kept, a version as
   today.
 - **On your runners** (the builds) joins the page under Save, above Versions.
@@ -35,7 +36,7 @@ Its sections are separated by hairlines, each headed as the page's `af-h`.
 
 | Row | Control | Writes |
 |---|---|---|
-| Version | for kiln's pin: the versions kiln has pinned (`2.1.311 (kiln's newest pin)`); for other sources, what the source names | the path or URL |
+| Version | for kiln's pin: the newest, and each older pin an Agentfile version still uses (`2.1.298 (kept: rust-dev v7 uses it)`); for other sources, what the source names | the path or URL |
 | Install source | `Segmented` Path · Git · S3 · HTTPS tarball, and that kind's fields (below) | `HARNESS <id> [flags] FROM <source>` |
 | Model | the harness's models | `LABEL kiln.harness.<id>.model=<model>` |
 | Sign-in | "Your own sign-in, kept in your HOME volume" or "API key: <secret name> · <scope>" | `LABEL kiln.harness.<id>.sign-in=home \| secret:<NAME>` |
@@ -59,6 +60,8 @@ Each kind writes Shards' own flags for `AGENT` and `HARNESS`, as they are at Sha
 | HTTPS tarball | URL; SHA-256 (required: the field is refused until it's 64 hex digits); sign-in to the server; redirects allowed to | the digest | a bearer or basic header |
 
 - Every credential is a native select of the person's **secret names**, each with its scope, and "None" first.
+  The scope is the new **`user`** scope (the person, 2026-11-14): a person's own secrets, for install-source
+  credentials.
 - No value is ever shown, typed or written. The line under it says so: "kept by kiln with this version and
   handed to the fetch step alone; never in the text, a layer, the build record or a log".
 - Every kind with an origin says the grant: "Fetches from releases.example.dev:443 alone: a grant for that step
@@ -118,8 +121,11 @@ Each kind writes Shards' own flags for `AGENT` and `HARNESS`, as they are at Sha
   - grants;
   - the other lines, each with its line range, so the view never parses on its own. The mockup's small parser
     stands in for Shards'.
+- A `user` secret scope (`/api/ci/secrets?scope=user:<id>`, names only, its owner alone), beside `server`,
+  `org`, `repo`, `workflow` and `env`.
 - An Agentfile's credential references, kept with each version: a map from source to secret name and scope.
   They aren't in the text, and are refused if they name a secret the person can't use.
+- kiln keeps a harness pin while any Agentfile version references it.
 - Builds:
   - `GET /api/agentfiles/:id/builds`: per runner, platform, state, step, digest, took, and Shards' words on
     failure;
@@ -141,15 +147,10 @@ Each kind writes Shards' own flags for `AGENT` and `HARNESS`, as they are at Sha
   - a broken source shows Shards' words in its row.
 - P5.4: change pr-triage's definition, then this text; the Agents row shows the conflict until a choice.
 
-## Open questions for the person
+## Decided (the person and decision 8, 2026-11-14)
 
-1. **Where model and sign-in live in the text.** No Shards directive carries a harness's model or sign-in. The
-   mockup writes them as image labels, `LABEL kiln.harness.<id>.model=…` and `…sign-in=home|secret:<NAME>`, so
-   they're text both ways and a secret's name, never its value, is all that's written. Is a label the form you
-   want, or should they stay kiln settings beside the text (then P5.3's "the text changes to match" covers the
-   other four alone)?
-2. **The person's secrets.** kiln's secrets today are `server`, `org`, `repo`, `workflow` and `env` scoped. The
-   pickers assume a scope of your own ("yours"). Add one, or pick from the server's and your projects'?
-3. **Side by side.** Wide windows show the view and the text together. Keep that, or always one at a time?
-4. **kiln's pinned versions.** The version picker offers the versions kiln has pinned. Should an older pin stay
-   choosable once kiln pins a newer one, and for how long?
+- A harness's model and sign-in are written as labels: `LABEL kiln.harness.<id>.model=…` and
+  `LABEL kiln.harness.<id>.sign-in=home|secret:<NAME>`. A secret's name, never its value.
+- Install-source credentials come from the new `user` secret scope.
+- The view and the text stand side by side on wide windows.
+- An older pin stays while any Agentfile version references it.
