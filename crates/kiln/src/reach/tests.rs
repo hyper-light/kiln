@@ -1708,6 +1708,54 @@ fn e5_a_queued_command_waits_through_a_disconnect_and_starts_after() -> anyhow::
     })
 }
 
+/// A run stopped while it waits for a runner with room never starts (docs/needs.md E5; ROOT's machine
+/// runs, 2026-11-15: three stopped runs answered "collected" and ran 13 minutes later): its asker's
+/// signal gives its place up and it is told "stopped before it started"; room freeing after starts
+/// nothing of it, and nothing of it waits or is held on either runner. Without the stop heard while it
+/// waits, it waits on and starts once room frees.
+#[cfg(unix)]
+#[test]
+fn e5_a_queued_run_stopped_never_starts_and_says_so() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(100.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let req = RunReq { target: "cpus=2".into(), command: "echo it-ran".into(), ..RunReq::default() };
+        let (ev_tx, ev_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        let (ctl_tx, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        let handle = lab.mac.clone();
+        crate::rt::spawn(async move { local::run(&handle, "mac", req, ev_tx, ctl_rx).await });
+        let mut evs: Vec<Ev> = Vec::new();
+        loop {
+            let e = crate::rt::timeout(HANG, ev_rx.recv()).await.map_err(|_| anyhow::anyhow!("timed out: {evs:?}"))?.map_err(|_| anyhow::anyhow!("its events ended: {evs:?}"))?;
+            let queued = matches!(&e, Ev::Placed { json } if json.contains("\"queued\""));
+            if queued && !evs.iter().any(|x| matches!(x, Ev::Placed { .. })) {
+                ctl_tx.send(super::wire::Req::Signal(super::wire::Signal::Interrupt)).await.map_err(|_| anyhow::anyhow!("its run took no signal"))?;
+            }
+            let end = matches!(e, Ev::Exit { .. } | Ev::Error(_));
+            evs.push(e);
+            if end {
+                break;
+            }
+        }
+        let said = evs.iter().find_map(|e| if let Ev::Error(m) = e { Some(m.clone()) } else { None }).unwrap_or_default();
+        anyhow::ensure!(said.starts_with(local::STOPPED_BEFORE), "told it stopped before it started: {evs:?}");
+        anyhow::ensure!(!evs.iter().any(|e| matches!(e, Ev::Started { .. })), "it never started: {evs:?}");
+        // Room frees on linux: nothing of it starts there, and nothing of it waits or is held anywhere.
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        crate::rt::sleep(Duration::from_millis(500)).await;
+        for v in [lab.linux.place_view().await?, lab.mac.place_view().await?] {
+            anyhow::ensure!(v.get("held").cloned() == Some(serde_json::json!([0, 0, 0, 0])), "nothing held: {v}");
+            let waiting: u64 = v.get("queued").and_then(serde_json::Value::as_object).map_or(0, |q| q.values().filter_map(serde_json::Value::as_u64).sum());
+            anyhow::ensure!(waiting == 0, "nothing waits: {v}");
+        }
+        anyhow::ensure!(ev_rx.try_recv().is_err(), "nothing more was said of it");
+        anyhow::Ok(())
+    })
+}
+
 /// The asking agent hears placement's answers for a run it isn't waiting on (AUDIT O5, docs/needs.md
 /// E5), as `req` says it was asked of mac while both runners are full: queued (its place), then
 /// started on linux by linux's word, once linux measures room. Every word pushed (the asker's

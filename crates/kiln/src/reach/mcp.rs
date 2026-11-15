@@ -693,7 +693,7 @@ impl Server {
             let _ = w.send(&Req::Signal(Signal::Interrupt));
         }
         if let Ok(mut r) = cell.0.lock() { r.telling.stopped(); }
-        let (v, failed) = report(id, &cell, 5, true, max);
+        let (mut v, failed) = report(id, &cell, 5, true, max);
         if running(&v)
             && let Ok(mut r) = cell.0.lock()
             && let Some(w) = r.signal.as_mut()
@@ -703,7 +703,20 @@ impl Server {
         if let Ok(mut runs) = self.runs.lock() {
             runs.remove(id);
         }
-        (v, failed)
+        // What the stop did, in words its asker can trust: one still waiting for a runner was stopped
+        // before it started (its place given up there, so none runs it), one that had started was
+        // stopped on its runner, and one still ending was told to.
+        let before = v.get("error").and_then(Value::as_str).is_some_and(|e| e.starts_with(super::local::STOPPED_BEFORE));
+        let said = match (before, running(&v), v.get("runner").and_then(Value::as_str).filter(|r| !r.is_empty())) {
+            (true, _, _) => "before it started".to_owned(),
+            (false, true, _) => "asked: it's ending".to_owned(),
+            (false, false, Some(runner)) => format!("on {runner}"),
+            (false, false, None) => "before it started".to_owned(),
+        };
+        if let Some(o) = v.as_object_mut() {
+            o.insert("stopped".into(), json!(said));
+        }
+        (v, failed && !before)
     }
 
     /// Ask the kiln server, through the runner, for this session.

@@ -484,7 +484,25 @@ pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &crate::
     // Placed where the room is (docs/needs.md E5): this node owns the run, and the runner with room
     // admits it. A runner named, or placement not ready, picks as before: by the sizes history
     // predicts (`t`, docs/reach.md "Sizes from history").
-    let placed = place(handle, me, &req, ev).await?;
+    let mut held = Vec::new();
+    let placed = place(handle, me, &req, ev, &ctl, &mut held).await?;
+    // What its client sent while it waited goes to its run first, then the rest as it comes.
+    let ctl = if held.is_empty() {
+        ctl
+    } else {
+        let (tx, rx) = crate::memory::queue::unbounded::<Req>(&crate::memory::owners::CHANNELS);
+        for r in held {
+            let _ = tx.send(r).await;
+        }
+        crate::rt::spawn(async move {
+            while let Ok(r) = ctl.recv().await {
+                if tx.send(r).await.is_err() {
+                    return;
+                }
+            }
+        });
+        rx
+    };
     let (peer, claim, picked, answers) = match placed {
         Some(p) => {
             let _ = ev.send(Ev::Picked { runner: p.runner.clone(), why: "its room was first".to_owned() }).await;
@@ -695,6 +713,10 @@ impl Drop for Owed {
     }
 }
 
+/// What a run stopped while it waited for a runner says it is, its words' start ([`place`]): none
+/// ran it, and none will.
+pub(crate) const STOPPED_BEFORE: &str = "stopped before it started";
+
 /// A run placement gave a runner: which, and its claim there; and its answers' teller, when its
 /// agent is told them (AUDIT O5).
 struct Placing {
@@ -710,8 +732,10 @@ struct Placing {
 /// ends; and the agent session that asked, once it's queued, through told (AUDIT O5,
 /// [`super::told::Answers`]): pushed both ways, never polled, and no answer says to ask again.
 /// `None`: placed as before (a runner named, placement not ready, or only older runners could take
-/// it).
-async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &crate::memory::queue::Sender<Ev>) -> anyhow::Result<Option<Placing>> {
+/// it). While it waits its client's word is heard (`ctl`): a signal stops it before it starts, its
+/// place given up and its client told so; its client gone gives it up too, but a detached run's,
+/// which goes on without it; its input meanwhile is kept for its start (`held`).
+async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: &crate::memory::queue::Receiver<Req>, held: &mut Vec<Req>) -> anyhow::Result<Option<Placing>> {
     use super::place::Placed;
     let Ok(needs) = kiln_ci::sched::needs::parse(&req.target) else { return Ok(None) };
     let run = format!("{me}-{}", crate::util::new_id());
@@ -726,8 +750,36 @@ async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &crate::memory::queu
         return Ok(None);
     }
     let tell = |a: &kiln_ci::place::Answer| Ev::Placed { json: serde_json::to_string(a).unwrap_or_default() };
+    let mut client = true;
     loop {
-        match rx.recv().await {
+        use futures::FutureExt as _;
+        let placed = if client {
+            futures::select_biased! {
+                c = ctl.recv().fuse() => match c {
+                    Ok(Req::Signal(_)) => {
+                        handle.place_cancel(&run).await;
+                        anyhow::bail!("{STOPPED_BEFORE}: it was waiting for a runner with room, and none will run it now");
+                    }
+                    Ok(other) => {
+                        held.push(other);
+                        continue;
+                    }
+                    Err(_) if req.detach => {
+                        client = false;
+                        continue;
+                    }
+                    Err(_) => {
+                        super::told::gone(req.client);
+                        handle.place_cancel(&run).await;
+                        anyhow::bail!("its client left before it started: none will run it now");
+                    }
+                },
+                p = rx.recv().fuse() => p,
+            }
+        } else {
+            rx.recv().await
+        };
+        match placed {
             Ok(Placed::Answer(a)) => {
                 if let Some(t) = &answers {
                     t.heard(&a, crate::util::now_ms());
