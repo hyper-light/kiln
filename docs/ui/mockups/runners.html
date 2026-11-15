@@ -50,7 +50,8 @@ const FLEET = () => GRID(["Runner", "Engine", "VMs", "CPU", "Memory", "Disk", "W
 function engineCell(r) {
   const m = S.moving[r.id];
   if (m) return `<span class="cr">${st("drain", "Switching: draining")}${icon(m.to, ENGINE_TIP[m.to])}<span class="ell h640">${m.to}</span></span>`;
-  return `<span class="cr">${icon(r.engine, ENGINE_TIP[r.engine])}<span class="ell h640">${r.engine}</span>${!r.can ? st("off", r.why) : ""}</span>`;
+  if (narrow()) return `<span class="cr"><span class="badge3">${icon(r.engine, ENGINE_TIP[r.engine])}${!r.can ? st("off", r.why) : ""}</span></span>`;
+  return `<span class="cr">${icon(r.engine, ENGINE_TIP[r.engine])}<span class="ell">${r.engine}</span>${!r.can ? st("off", r.why) : ""}</span>`;
 }
 /** One glyph per VM, in its state: the count at a glance. */
 function vmMix(r) { return `<span class="gl">${r.vms.map((v) => st(vmState(v, r), `${v.agent} · ${STATES[vmState(v, r)][1]}`)).join("")}</span>`; }

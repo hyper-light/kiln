@@ -205,7 +205,7 @@
 @media (max-width: 639px) { .srch3 { min-width: 0; } }
 
 /* The status glyph's own column: its header empty, so every header starts where its text starts. */
-.t3 th.lead, .t3 td.lead { width: 34px; padding-right: 0; }
+.t3 th.lead, .t3 td.lead { width: 40px; padding-right: 0; }
 .t3 th.lead + th, .t3 td.lead + td { padding-left: 0; }
 .mid { text-overflow: clip !important; }
 .blk { display: inline-flex; gap: 2px; }
@@ -216,3 +216,6 @@
 .title3 { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; min-height: 32px; }
 .title3 .right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
 @media (max-width: 639px) { .checks3 { display: grid; grid-template-columns: repeat(2, auto); gap: 6px 16px; } .ch.wrap3 { flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px; } }
+@media (max-width: 639px) { .t3 .ctl .ib { width: 22px; } }
+.badge3 { position: relative; display: inline-flex; }
+.badge3 .st { position: absolute; right: -5px; bottom: -4px; width: 9px; height: 9px; border-radius: 50%; background: var(--card); box-shadow: 0 0 0 1.5px var(--card); }
