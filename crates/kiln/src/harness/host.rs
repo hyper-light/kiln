@@ -5425,7 +5425,7 @@ while True:
             // Claude Code's image serves one provider: its destinations are all its run's, kept whole, no fallback said.
             let one_use = crate::sandbox::narrow::Reach::Whole { why: crate::sandbox::narrow::Whole::OneUse };
             // What its launch gave it, the base its live overrides change (`sessions.grants`): its folder and shares as launched.
-            let granted = session::Granted::of(&crate::sandbox::held::Declared::of(&launch));
+            let granted = session::Granted::of(&crate::sandbox::held::Declared::of(launch));
             assert!(granted.folder.is_some() && !granted.volumes.is_empty(), "its project folder, at least: {granted:?}");
             assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()), reach: Some(Box::new(one_use)), granted: Some(Box::new(granted)) }));
             let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
