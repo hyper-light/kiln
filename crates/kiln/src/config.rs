@@ -568,11 +568,16 @@ pub struct Agents {
     /// says. None (the default): as many as that setting says, and with none, no limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_children: Option<u32>,
+    /// The most egress an agent's microVM may be granted while it runs (kiln plan 01a1dd2e…, P6b.4; Shards'
+    /// `ImageSpec::egress_ceiling`), each `host:port`: the org's policy, declared at each session's start. None (the
+    /// default): none is granted live (default deny).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub egress_ceiling: Vec<String>,
 }
 
 impl Default for Agents {
     fn default() -> Self {
-        Self { max_depth: 3, max_children: None }
+        Self { max_depth: 3, max_children: None, egress_ceiling: Vec::new() }
     }
 }
 

@@ -71,6 +71,7 @@ pub mod model;
 pub mod moving;
 pub mod opened;
 pub mod ops;
+pub mod overrides;
 pub mod packed;
 pub mod pause;
 pub mod pi;

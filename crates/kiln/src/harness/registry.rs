@@ -4160,6 +4160,9 @@ impl Registry {
     /// lost, a start never starts its sessions twice.
     pub async fn open_as(&self, hub: &Hub, target: &str, mut spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
         let count = count.clamp(1, 16);
+        // The most egress its microVM may be granted live: the org's policy, never what was asked (kiln plan 01a1dd2e…,
+        // P6b.4).
+        spec.egress_ceiling.clone_from(&hub.cfg.agents.egress_ceiling);
         // An isolated agent's agents are isolated too, however they're started; and one is held so
         // only where its machine starts microVMs: one that can't would run it as a process, unasked
         // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).

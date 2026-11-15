@@ -94,6 +94,11 @@ pub fn args(spec: &Spec) -> Vec<String> {
         BYPASS if spec.allow_bypass => a.push("--dangerously-skip-permissions".to_owned()),
         _ => {}
     }
+    // The folders a person gave the session (`harness::overrides`): agy's own, "Add a directory to the workspace
+    // (repeatable)" (antigravity.google/docs/cli/reference).
+    for d in &spec.dirs {
+        a.extend(["--add-dir".to_owned(), d.at.clone()]);
+    }
     a
 }
 
@@ -331,7 +336,7 @@ impl Agy {
             Command::Control { id, value } => {
                 super::goback::control(core, &id, value.as_ref());
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
             // One of its subagents, held at its calls through kiln's hook.
             Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
             Command::Perms { perms, task: Some(task) } => self.set_task_perms(core, &task, perms),

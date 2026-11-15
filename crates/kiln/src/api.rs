@@ -1380,6 +1380,16 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let body = boxed(|| body_value(req)).await?;
             boxed(|| own_op(&hub, &caller, "agentdefs.check", body)).await
         }
+        // A person's click on what their agent asked (`crate::confirms`).
+        (&Method::GET, ["api", "confirms"]) => boxed(|| own_op(&hub, &caller, "confirms.list", query_value(&q))).await,
+        (&Method::POST, ["api", "confirms", id]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "confirms.answer", body)).await
+        }
         (&Method::POST, ["api", "agentdefs", "use"]) => {
             let body = boxed(|| body_value(req)).await?;
             boxed(|| own_op(&hub, &caller, "agentdefs.use", body)).await
@@ -1517,6 +1527,26 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
             let id = (*id).to_owned();
             boxed(|| harness_command(&hub, &id, req)).await
+        }
+        // Its live overrides, in place (kiln plan 01a1dd2e…, P6b.4: `crate::harness::overrides`).
+        (&Method::POST, ["api", "harness", "sessions", id, what @ ("ports" | "egress" | "networks" | "volumes"), rest @ ..]) if rest.len() <= 1 => {
+            let name = match (*what, rest.first().copied()) {
+                ("ports", None) => "sessions.ports.publish",
+                ("ports", Some("unpublish")) => "sessions.ports.unpublish",
+                ("egress", None) => "sessions.egress.grant",
+                ("egress", Some("revoke")) => "sessions.egress.revoke",
+                ("networks", None) => "sessions.networks.connect",
+                ("networks", Some("disconnect")) => "sessions.networks.disconnect",
+                ("volumes", None) => "sessions.volumes.add",
+                ("volumes", Some("remove")) => "sessions.volumes.remove",
+                _ => return Err(err(StatusCode::NOT_FOUND, "not found")),
+            };
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
         }
         // Its copies on other runners, and its own rules for them (docs/reach.md §5.1).
         (&Method::GET, ["api", "harness", "sessions", id, "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.agent(&hub, id)).await)),
@@ -6382,6 +6412,8 @@ async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     may_steer_goals(hub, caller, id).await?;
     let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
+    // Goals a person gives an agent are their words to it: the turn they start is theirs (P5.6).
+    crate::harness::attention_hooks::spoke(hub, caller, id, attention_at).await;
     crate::harness::attention_hooks::record(hub, caller, id, "command", &crate::util::new_id(), attention_at).await;
     hub.store.audit(caller.name.clone(), "goals.set".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
@@ -6409,6 +6441,8 @@ async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     }
     let goals = crate::goals::keyed(&crate::harness::ops::key_scope(caller), id, key.as_deref(), goals);
     let s = crate::goals::add_at(hub, id, goals, start, &crate::goals::At::End).await.map_err(goals_err)?;
+    // Goals a person gives an agent are their words to it: the turn they start is theirs (P5.6).
+    crate::harness::attention_hooks::spoke(hub, caller, id, attention_at).await;
     crate::harness::attention_hooks::record(hub, caller, id, "command", &key.unwrap_or_else(crate::util::new_id), attention_at).await;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))

@@ -414,7 +414,7 @@ placeholder), so each implementation supplies its own.
 
 A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
 than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
-read-only, signals, credentials filled in at its egress. What it holds it enforces; a launch that
+read-only, signals, credentials filled in at its egress, changes to a run while it runs. What it holds it enforces; a launch that
 asks for what it doesn't hold is refused `Unsupported`, never taken and ignored, and the suite checks
 both halves.
 
@@ -459,7 +459,14 @@ the lanes its controller was granted on it as it dialed, by Shards' names). A
 link is awaited: it's said once it's made, none at once for a process of the machine's, whose stdio
 are its pipes, and none where its link ends before it's made.
 
-Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`.
+A run's network and folders change while it runs (`change`; kiln plan 01a1dd2e…, P6b.4, through Hex's
+wire calls for Shards' P6b.1 and P6b.2): a host port published to a member's port and unpublished,
+egress granted to a member toward a host and port and revoked, a member connected to a named network
+and disconnected, a machine's folder plugged in for members, read-only or writable, and unplugged.
+Every one names who, to whom, which ports and which way (default deny). A change after its end is
+refused `Ended`; a boundary that takes none live refuses one `Unsupported`, and its run goes on.
+
+Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, `change`.
 
 - **SANDBOX-1** what a run writes reaches its stdout in order, then its end, then nothing
 - **SANDBOX-2** stdin reaches the program in order, and closing it is the end of its input
@@ -474,6 +481,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`.
 - **SANDBOX-11** a run sent a signal to end ends, its end said once, and a signal after its end is refused Ended; a sandbox that delivers no signals refuses one Unsupported, and its run goes on
 - **SANDBOX-12** a run on the host has no id of a boundary's and no link, and a run says the same id and link after its end as before
 - **SANDBOX-13** a run's credential, granted by reference toward a host its egress reaches, is filled in toward that host alone: never toward another host it reaches, for a credential it isn't granted, or for a run granted none; a grant toward a host its egress doesn't reach, an address, a host with a port or no host, or by a reference no store names, is refused Invalid; a sandbox that fills in no credentials refuses them Unsupported
+- **SANDBOX-14** a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on
 
 ## Placement
 

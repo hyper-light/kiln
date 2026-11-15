@@ -91,7 +91,7 @@ impl Client {
             url: url.to_owned(),
             headers: Vec::new(),
             body: Payload::None,
-            timeout: DEFAULT_TIMEOUT,
+            timeout: Some(DEFAULT_TIMEOUT),
             reach: None,
         }
     }
@@ -160,7 +160,9 @@ pub struct RequestBuilder<'c> {
     url: String,
     headers: Vec<(String, String)>,
     body: Payload,
-    timeout: Duration,
+    /// How long it waits to connect and receive its response's head; none where it follows its connection
+    /// ([`RequestBuilder::followed`]).
+    timeout: Option<Duration>,
     reach: Option<super::io::Reach>,
 }
 
@@ -214,26 +216,44 @@ impl RequestBuilder<'_> {
 
     /// Time allowed to connect and receive the response head (bodies are read separately).
     pub fn timeout(mut self, d: Duration) -> Self {
-        self.timeout = d;
+        self.timeout = Some(d);
+        self
+    }
+
+    /// No time of its own: it follows its connection, its answer waited for while the connection is there and
+    /// refused when the connection's end says none comes (its name not found, the connection refused, reset or
+    /// closed), so no clock judges a peer that is still answering (R03).
+    pub fn followed(mut self) -> Self {
+        self.timeout = None;
         self
     }
 
     #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     pub async fn send(self) -> anyhow::Result<Response> {
         let timeout = self.timeout;
-        let deadline = Instant::now().checked_add(timeout);
+        let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         let mut request = self;
         loop {
             let again = request.again();
-            let left = deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
-            let resp = match crate::rt::timeout(left, request.send_inner()).await {
-                Ok(r) => r?,
-                Err(_) => anyhow::bail!("request timed out after {timeout:?}"),
+            let resp = match timeout {
+                Some(timeout) => {
+                    let left = deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
+                    match crate::rt::timeout(left, request.send_inner()).await {
+                        Ok(r) => r?,
+                        Err(_) => anyhow::bail!("request timed out after {timeout:?}"),
+                    }
+                }
+                None => request.send_inner().await?,
             };
             // A kiln server that shed the request did nothing with it (goal 6, plan 01a1a59c2abe step 4):
-            // it is sent again after the server's `Retry-After`, while that leaves time before the deadline.
+            // it is sent again after the server's `Retry-After`, while that leaves time before the deadline
+            // (a followed request has none).
+            let in_time = |wait: Duration| match timeout {
+                None => true,
+                Some(_) => Instant::now().checked_add(wait).zip(deadline).is_some_and(|(next, end)| next < end),
+            };
             match (again, shed_wait(&resp)) {
-                (Some(again), Some(wait)) if Instant::now().checked_add(wait).zip(deadline).is_some_and(|(next, end)| next < end) => {
+                (Some(again), Some(wait)) if in_time(wait) => {
                     tracing::debug!(url = %again.url, wait_s = wait.as_secs(), "the server shed the request; sending it again after its Retry-After");
                     crate::rt::sleep(wait).await;
                     request = again;
