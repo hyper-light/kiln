@@ -51,9 +51,7 @@ export function DefinitionPanel({ agentId }: { agentId: string }) {
             <span className="meter" role="meter" aria-valuenow={variant.weight} aria-valuemin={0} aria-valuemax={100} aria-label={`Weight ${variant.weight}%`}>
               <span style={{ width: `${variant.weight}%` }} />
             </span>
-            <span>
-              {variant.weight}% of {d.experiment.id}
-            </span>
+            <span title={`${variant.weight}% of ${d.experiment.id}'s new sessions`}>{variant.weight}%</span>
           </span>
         )}
         <DefFields d={d} />

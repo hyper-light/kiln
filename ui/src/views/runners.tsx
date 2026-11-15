@@ -50,6 +50,8 @@ import { limitLine, parseLimit, settable, standing, withEvent } from "./agent-li
 import { refusedLately, refusedLine } from "./refused";
 import { useClock } from "./harness/dom";
 import { ImagesPanel, PoolsPanel } from "./runners-pools";
+import { EngineBlock, EngineCell, MicrovmsSection } from "./runners-microvms";
+import { enginesRes } from "@/api/microvms";
 import { useAuth } from "@/lib/auth";
 
 /** The facets runners are filtered by, with each runner's values. */
@@ -127,7 +129,8 @@ export default function Runners() {
 function RunnersBody() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes);
+  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, enginesRes);
+  const engines = useRes(enginesRes).data;
   const agents = useAgentsLive();
   const history = useMetricsHistory().data;
   const joinRequests = useRes(joinRequestsRes).data;
@@ -320,6 +323,9 @@ function RunnersBody() {
                       <td className="hidden md:table-cell">
                         <Chips labels={a.labels} max={4} />
                       </td>
+                      <td>
+                        <EngineCell e={engines[a.name]} />
+                      </td>
                       {/* What it can run legs in, as it last probed (W21-R08). */}
                       <td className="cell-mono hidden lg:table-cell">{a.facts ? Object.keys(a.facts.executors).join(", ") || "—" : "—"}</td>
                       <td className="min-w-[90px]">
@@ -364,7 +370,7 @@ function RunnersBody() {
                     </tr>
                     {open && (
                       <tr className="runner-detail-row">
-                        <td colSpan={11}>{details(a)}</td>
+                        <td colSpan={12}>{details(a)}</td>
                       </tr>
                     )}
                   </React.Fragment>
@@ -422,6 +428,7 @@ function RunnersHead() {
         <th className="w-6" aria-label="State" />
         <th>Runner</th>
         <th className="hidden md:table-cell">Labels</th>
+        <th>Engine</th>
         <th className="hidden lg:table-cell">Executors</th>
         <th>Slots</th>
         <th className="num hidden sm:table-cell">CPU</th>
@@ -544,6 +551,9 @@ function AgentDetails({
   onTerminal: () => void;
 }) {
   const [forgetting, setForgetting] = React.useState(false);
+  // Those who manage runners switch an engine and release pools; others see them, disabled, with why.
+  const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
+  const manage = !can || can["runners.manage"] === "server";
   const samples = useAgentHistory(agent.name);
   const jobs = useRunningJobs(agent.running);
   const shown = shownName(agent);
@@ -591,6 +601,9 @@ function AgentDetails({
         )}
       </div>
       <RunnerName agent={agent} onRename={onRename} />
+      <Loadable label={`${shown}'s engine`} fallback={<Hold height={64} />}>
+        <EngineBlock name={agent.name} manage={manage} />
+      </Loadable>
       {staleWhy(agent) && <p className="mt-3 text-[12.5px] text-[#c8cad0]">{staleWhy(agent)}</p>}
       {forgetting && (
         <Confirm
@@ -641,6 +654,10 @@ function AgentDetails({
           <AgentLimit key={agent.name} runner={agent.name} />
         </Loadable>
       </div>
+
+      <Loadable label={`${shown}'s microVMs`} fallback={<Hold height={160} />}>
+        <MicrovmsSection name={agent.name} manage={manage} />
+      </Loadable>
 
       {agent.facts && (
         <div className="mt-8">

@@ -29,7 +29,8 @@ export function Segmented<T extends string>({
 }: {
   value: T;
   onChange: (v: T) => void;
-  options: { value: T; label: React.ReactNode; count?: number }[];
+  /** `disabled`: it can't be chosen; `title` says why. */
+  options: { value: T; label: React.ReactNode; count?: number; disabled?: boolean; title?: string }[];
   label: string;
   className?: string;
   size?: keyof typeof SIZES;
@@ -44,6 +45,8 @@ export function Segmented<T extends string>({
           key={o.value}
           type="button"
           aria-pressed={o.value === value}
+          disabled={o.disabled}
+          title={o.title}
           {...sendingProps(o.value === pending)}
           onClick={() => {
             if (pending === null) onChange(o.value);
