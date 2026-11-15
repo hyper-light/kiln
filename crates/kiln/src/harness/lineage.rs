@@ -777,7 +777,7 @@ fn not_ready(kind: &str, target: &str, known: Option<&crate::accounts::Account>,
 /// microVM's own vCPUs and memory of runners that start microVMs ([`session_needs`]), and is placed
 /// by the balancer or not at all: where none of the runners that place agents could place it, it's
 /// refused, never picked as before, so every one holds a claim for its microVM's life.
-async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, isolation: Option<&Isolation>, want: Option<Engine>, queued: &Queued) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
+async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, (isolation, want): (Option<&Isolation>, Option<Engine>), queued: &Queued) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
     use crate::reach::place::{SessionAsk, SessionWord};
     let default = parent.map(target_of);
     let targets = may_start_on(hub, on, kind, default.as_deref(), isolation.is_some())?;
@@ -896,7 +896,7 @@ pub fn session_needs(mut asked: kiln_ci::sched::needs::Needs, isolation: Option<
 pub async fn place_on(hub: &Hub, target: &str, spec: &Spec, count: usize, parent: Option<&Info>) -> Result<Vec<crate::reach::place::Claim>, Refused> {
     let want = named(hub, target).unwrap_or_else(|| Ok(target.to_owned()))?;
     let engine = spec.isolation.as_ref().map(|_| Engine::Microvm);
-    let placed = place_agents(hub, parent, Some(target), &spec.kind, count, spec.isolation.as_ref(), engine, &Queued::default()).await?;
+    let placed = place_agents(hub, parent, Some(target), &spec.kind, count, (spec.isolation.as_ref(), engine), &Queued::default()).await?;
     let mut claims = Vec::new();
     for (t, c) in &placed {
         match c {
@@ -913,7 +913,7 @@ pub async fn place_on(hub: &Hub, target: &str, spec: &Spec, count: usize, parent
 /// [`place_agents`], for reach's doors tests to drive with their lab's runners (docs/ci.md W05-R03).
 #[cfg(all(test, unix))]
 pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
-    place_agents(hub, parent, on, kind, count, None, None, &Queued::default()).await
+    place_agents(hub, parent, on, kind, count, (None, None), &Queued::default()).await
 }
 
 /// An agent start's placement as [`start_as`] makes it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -923,7 +923,7 @@ pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on:
 pub(crate) async fn place_start_for_tests(hub: &Hub, parent: Option<&Info>, ask: &Ask) -> Result<(Option<Isolation>, Vec<(String, Option<crate::reach::place::Claim>)>), Refused> {
     let isolation = start_isolation(hub, parent, ask, None, ask.on.as_deref())?;
     let want = wanted(ask.isolation.as_deref(), isolation.as_ref());
-    let placed = place_agents(hub, parent, ask.on.as_deref(), &ask.kind, ask.count.unwrap_or(1), isolation.as_ref(), want, &Queued::default()).await?;
+    let placed = place_agents(hub, parent, ask.on.as_deref(), &ask.kind, ask.count.unwrap_or(1), (isolation.as_ref(), want), &Queued::default()).await?;
     Ok((isolation, placed))
 }
 
@@ -1513,7 +1513,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // again since refuses it (kiln plan 01a1dd2e…, P2.3).
     let settings = hub.engines.now();
     let decided_under = |target: &str| target.strip_prefix("agent:").map(|m| settings.get(m).map_or(0, |a| a.version));
-    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.as_ref(), want, &ask.queued).await?;
+    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, (isolation.as_ref(), want), &ask.queued).await?;
     // Each one's boundary (kiln plan 01a1dd2e…, P2.3): as it asked, or else its runner's engine's.
     // A conversation taken up (`resume`) stays where its harness keeps it.
     let boundary = |target: &str| isolation.clone().or_else(|| (want.is_none() && resume.is_none() && engine_at(hub, target) == Ok(Engine::Microvm)).then(|| sized(Isolation::microvm(), &requested(hub, on.as_deref()).request)));

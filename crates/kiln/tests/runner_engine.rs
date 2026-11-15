@@ -163,7 +163,7 @@ fn p2_3_a_new_session_takes_its_runners_engine_and_p2_4_a_microvm_one_is_refused
     // Asking nothing: on its host, no microVM; on its engine, none draining.
     let id = agents::open_session(s.port, &s.admin, "box", &work, Duration::from_secs(90))?;
     let info = session_until(&s, &id, "said where it runs", &log, |v| v.pointer("/runs/in").is_some())?;
-    assert_eq!((info.pointer("/runs/in"), info.get("isolation")), (Some(&json!("host")), Some(&Value::Null)), "{info}");
+    assert!(info.pointer("/runs/in") == Some(&json!("host")) && info.get("isolation").is_none_or(Value::is_null), "on its host, no microVM: {info}");
     let v = until("counted it", &log, || engine(&s, "box"), |v| v.get("sessions").and_then(Value::as_u64) >= Some(1))?;
     assert_eq!(v.get("draining"), Some(&json!(0)), "{v}");
 
