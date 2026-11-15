@@ -1,9 +1,14 @@
 //! What the scheduler takes of its node's charge learner (joint plan step 14, AC-T7.4.1;
 //! `docs/design/learned-charge.md`).
 
+use std::sync::Arc;
+
 use super::*;
-use hex_api::{LearnedPrior, LearnedUse, RuntimeCost};
+use crate::placement::{Driver, Runtimes};
+use hex_api::{LearnedPrior, LearnedUse, NodeVmPhase, NodeVmReceipt, Runtime, RuntimeCost};
+use hex_sim::index::Pick;
 use hex_sim::model::{NodeId, Resources};
+use hex_sim::peer::Budget;
 
 const GIB: u64 = 1 << 30;
 
@@ -43,6 +48,7 @@ fn node() -> NodeSpec {
 
 fn capacity(learned: Option<Learned>) -> hex_api::Capacity {
     hex_api::Capacity {
+        own: Default::default(),
         id: "shards".into(),
         total: CapacityResources {
             cpu_milli: 16_000,
@@ -57,6 +63,8 @@ fn capacity(learned: Option<Learned>) -> hex_api::Capacity {
         backings: Vec::new(),
         unavailable: Vec::new(),
         learned,
+        node_vms: Vec::new(),
+        unlearned: None,
     }
 }
 
@@ -84,6 +92,14 @@ fn w14_the_scheduler_takes_the_priors_its_nodes_learner_carries() {
         holdings: Vec::new(),
         ended: Vec::new(),
         ceilings: Vec::new(),
+        rates: Vec::new(),
+        window: None,
+        unread: Vec::new(),
+        awaits: Vec::new(),
+        ranked: Vec::new(),
+        unrecorded: Vec::new(),
+        unacted: Vec::new(),
+        reservations: None,
     };
     let reports = vec![(Class::Shards, Some(capacity(Some(carried([14; 32])))))];
     let mut local = node();
@@ -132,7 +148,7 @@ fn w14_the_scheduler_books_each_vm_it_runs_at_its_holding() {
         seq,
     };
     let holding = |id: &str, gib: u64| hex_api::LearnedHolding {
-        id: BoxId::new(id).unwrap(),
+        id: hex_api::LearnedHolder::Box(BoxId::new(id).unwrap()),
         holding: CapacityResources {
             cpu_milli: 100,
             mem_bytes: gib * GIB,
@@ -145,6 +161,14 @@ fn w14_the_scheduler_books_each_vm_it_runs_at_its_holding() {
         holdings,
         ended: Vec::new(),
         ceilings: Vec::new(),
+        rates: Vec::new(),
+        window: None,
+        unread: Vec::new(),
+        awaits: Vec::new(),
+        ranked: Vec::new(),
+        unrecorded: Vec::new(),
+        unacted: Vec::new(),
+        reservations: None,
     };
     let learned = vec![
         (
@@ -161,8 +185,67 @@ fn w14_the_scheduler_books_each_vm_it_runs_at_its_holding() {
     assert_eq!(
         booked,
         vec![
-            (key(1), holding("vm-a", 2).holding),
-            (key(2), holding("vm-b", 1).holding),
+            (
+                hex_sim::peer::Holder::Box(key(1)),
+                holding("vm-a", 2).holding
+            ),
+            (
+                hex_sim::peer::Holder::Box(key(2)),
+                holding("vm-b", 1).holding
+            ),
+        ]
+    );
+}
+
+/// Joint plan step 39 (ROOT's ruling of 2026-11-13; goal 14's learner, goal 13's ledger): a node VM's learned holding
+/// reaches the ledger as its run's, a holder beside the boxes. Do: take an answer holding a box the node runs and a node
+/// VM. Expect: the box booked against its key, the node VM against its run.
+#[test]
+fn a_node_vms_learned_holding_reaches_the_ledger_as_its_runs() {
+    let key = hex_sim::peer::Key {
+        owner: 0,
+        epoch: 1,
+        seq: 1,
+    };
+    let run = hex_api::NodeRun::from_bytes([4; 16]);
+    let resources = CapacityResources {
+        cpu_milli: 300,
+        mem_bytes: 2 * GIB,
+        disk_bytes: 0,
+    };
+    let learned = vec![(
+        Class::Shards,
+        Learned {
+            priors: Vec::new(),
+            used: LearnedUse::default(),
+            holdings: vec![
+                hex_api::LearnedHolding {
+                    id: hex_api::LearnedHolder::Box(BoxId::new("vm-a").unwrap()),
+                    holding: resources,
+                },
+                hex_api::LearnedHolding {
+                    id: hex_api::LearnedHolder::Node(run),
+                    holding: resources,
+                },
+            ],
+            ended: Vec::new(),
+            ceilings: Vec::new(),
+            rates: Vec::new(),
+            window: None,
+            unread: Vec::new(),
+            awaits: Vec::new(),
+            ranked: Vec::new(),
+            unrecorded: Vec::new(),
+            unacted: Vec::new(),
+            reservations: None,
+        },
+    )];
+    let ids = BTreeMap::from([(BoxId::new("vm-a").unwrap(), key)]);
+    assert_eq!(
+        holds(&learned, &ids).unwrap(),
+        vec![
+            (hex_sim::peer::Holder::Box(key), resources),
+            (hex_sim::peer::Holder::Node(run), resources),
         ]
     );
 }
@@ -211,6 +294,14 @@ fn w14_a_prior_books_a_receipt_of_its_own_ceiling_alone() {
         holdings: Vec::new(),
         ended: Vec::new(),
         ceilings: Vec::new(),
+        rates: Vec::new(),
+        window: None,
+        unread: Vec::new(),
+        awaits: Vec::new(),
+        ranked: Vec::new(),
+        unrecorded: Vec::new(),
+        unacted: Vec::new(),
+        reservations: None,
     };
     let mut local = node();
     local.costs[Class::Shards.index()] = Some(sizes);
@@ -219,4 +310,79 @@ fn w14_a_prior_books_a_receipt_of_its_own_ceiling_alone() {
     let at = |receipt| hex_sim::model::booked_at(Some(receipt), prior).unwrap();
     assert_eq!(at(least).booking(), booking);
     assert_eq!(at(largest).booking(), largest.resources, "booked whole");
+}
+
+/// Joint plan step 39 (AC-T7.4.1; ROOT, 2026-11-13: a node VM's receipt reaches the scheduler on its node's capacity
+/// answer, its record the one source): do refresh a node's ledger from its answers, the node VM they name Booting, then
+/// Ready twice, then Ended; then Ready again, then named by no answer. Expect its booking held while it is Booting or
+/// Ready, once however many refreshes name it, and released once it is Ended and once no answer names it.
+#[test]
+fn w39_a_node_vms_receipt_is_booked_from_its_answer_while_it_runs_and_released_at_its_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = node().capacity;
+    let runtime: Arc<dyn Runtime> = Arc::new(hex_api::sim::SimRuntime::default());
+    let driver = Driver::boot(
+        NodeId(0),
+        &[NodeSpec::new(NodeId(0), room)],
+        &[],
+        Budget { owned: 4, ran: 4 },
+        Pick::default(),
+        dir.path(),
+        Runtimes::new([(Class::Oci, runtime)]).unwrap(),
+    )
+    .unwrap();
+    driver.refresh_node(NodeSpec::new(NodeId(0), room)).unwrap();
+    driver.open_view(&dir.path().join("capacity"), 1).unwrap();
+    let run = hex_api::NodeRun::from_bytes([39; 16]);
+    let booking = CapacityResources {
+        cpu_milli: 4_000,
+        mem_bytes: 8 * GIB,
+        disk_bytes: 0,
+    };
+    let refresh = |phase: Option<NodeVmPhase>| {
+        let mut answer = capacity(None);
+        answer.node_vms = phase
+            .map(|phase| NodeVmReceipt {
+                run,
+                booking,
+                phase,
+                guest: CapacityResources::default(),
+            })
+            .into_iter()
+            .collect();
+        driver
+            .book_nodes(&node_vms(&[(Class::Oci, Some(answer))]).unwrap())
+            .unwrap();
+        let held = driver.view().unwrap().held;
+        (held.cpu_milli, held.mem_bytes)
+    };
+    let booked = (4_000, 8 * GIB);
+    assert_eq!(refresh(Some(NodeVmPhase::Booting)), booked);
+    assert_eq!(refresh(Some(NodeVmPhase::Ready)), booked);
+    assert_eq!(
+        refresh(Some(NodeVmPhase::Ready)),
+        booked,
+        "booked once, however many refreshes name it"
+    );
+    assert_eq!(refresh(Some(NodeVmPhase::Ended)), (0, 0));
+    assert_eq!(refresh(Some(NodeVmPhase::Ready)), booked);
+    assert_eq!(refresh(None), (0, 0), "released once no answer names it");
+}
+
+/// Joint plan step 39: one node's records name each of its node VMs once. Do: take two classes' answers naming the same
+/// node VM. Expect them refused, never booked twice.
+#[test]
+fn w39_answers_naming_a_node_vm_twice_are_refused() {
+    let mut answer = capacity(None);
+    answer.node_vms = vec![NodeVmReceipt {
+        run: hex_api::NodeRun::from_bytes([39; 16]),
+        booking: CapacityResources::default(),
+        phase: NodeVmPhase::Ready,
+        guest: CapacityResources::default(),
+    }];
+    let twice = [
+        (Class::Oci, Some(answer.try_clone().unwrap())),
+        (Class::Shards, Some(answer)),
+    ];
+    assert!(matches!(node_vms(&twice), Err(Refusal::Invalid { .. })));
 }

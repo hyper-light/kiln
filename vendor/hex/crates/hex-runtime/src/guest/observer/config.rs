@@ -629,24 +629,16 @@ pub(in crate::guest) mod tests {
         assert!(observer.verify(&config).is_err());
     }
 
-    /// AC-T7.4.1: the readiness child spends only its original finite remainder.
+    /// AC-T7.4.1 (the review's C-9): the readiness child is its configured program alone, told no deadline.
     #[test]
-    fn work_ready_program_uses_only_explicit_artifacts_and_finite_remaining_budget() {
+    fn work_ready_program_uses_only_explicit_artifacts_and_no_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let (config, input, allocation) = fixture(dir.path());
         let observer = GpuObserver::new(input, &config, allocation).unwrap();
-        let remaining = std::time::Duration::from_nanos(123_456);
-        let program = driver::program(&observer, 1, remaining).unwrap();
-        let suffix = program.args.get(program.args.len() - 2..).unwrap();
-        assert_eq!(suffix, ["--wait-ns", "123456"]);
+        let program = driver::program(&observer, 1).unwrap();
+        assert_eq!(program.args, observer.program(1).unwrap().args);
         assert_eq!(program.env, observer.program(1).unwrap().env);
-        for invalid in [
-            std::time::Duration::ZERO,
-            std::time::Duration::MAX,
-            std::time::Duration::from_nanos(u64::MAX),
-        ] {
-            assert!(driver::program(&observer, 1, invalid).is_err());
-        }
+        assert!(!program.args.iter().any(|arg| arg == "--wait-ns"));
     }
 
     /// AC-T7.4.1: unknown/mutable/aliased artifacts and an observer exceeding

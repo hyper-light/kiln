@@ -29,7 +29,7 @@ use std::process::Command;
 use hex_api::{Bounds, BoxId, BoxSpec, ClassSpec, Exit, Program, Refusal, Runtime, Stdio};
 use hex_core::patience::Patience;
 use hex_node::{Node, OCI_BOXES};
-use hex_testkit::waits::until;
+use hex_testkit::waits::follow::{self, Party};
 
 const TEST: &str = "a_root_nodes_boxes_join_ipc_and_uts_namespaces_made_ahead";
 /// The ipc and uts pool's refill thread's makes, which no recorded operation makes and no census row times yet: measuring,
@@ -322,10 +322,10 @@ fn sweep(box_root: &Path) {
     let _ = std::fs::remove_dir(box_root);
 }
 
-/// Waits for `fact` on `wait`. The node publishes no event as its pool fills; its counts are read again once other
-/// threads have run, as oci_box.rs waits out the inits' refill, rather than after a picked sleep (hex_testkit::waits).
+/// Waits for `fact` on `wait`. A look: the node publishes no event as its pool fills, its counts read. Its party is the
+/// in-process node this test holds, its refill thread's work the fact (the review's C-5).
 fn wait_for(wait: &Patience, fact: impl FnMut() -> bool, what: &str) {
-    until(wait, what, fact).unwrap();
+    follow::until(wait, what, || Party::Live, fact).unwrap();
 }
 
 /// Makes and starts box `id` from `bundle`; its init waits.

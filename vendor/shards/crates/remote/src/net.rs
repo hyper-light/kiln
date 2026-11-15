@@ -3,19 +3,20 @@
 //! threads reach the driver with a [`Command`] on its channel and a datagram from its waker to
 //! a wake socket of the driver's own, beside the one it serves on, which it waits on with that
 //! one (poll(2); WSAPoll): what every target's sockets give, Windows' consoles and pipes among
-//! the descriptors no poll of a socket reaches.
+//! the descriptors no poll of a socket reaches. The waker and the wake are connected to each
+//! other, so that the wake takes datagrams from the waker alone.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use hyper_quic::{
     ClientConfig, ClientConfigHandle, Connection, ConnectionError, ConnectionHandle, DatagramEvent, Dir,
-    Endpoint, EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, VarInt,
+    Endpoint, EndpointConfig, EndpointEvent, Event, ServerConfig, StreamEvent, StreamId, VarInt,
 };
 
 use crate::Error;
@@ -37,12 +38,71 @@ pub enum Command<C> {
     Stop,
 }
 
+/// What a driver has heard and the window its connections have shown, for another thread to
+/// judge a wait on it by, as the driver judges its own ([`Liveness`]): the datagrams it has taken
+/// in from peers, and the longest window any of its connections has been judged by, each no
+/// sooner than its probe timeout (RFC 9002 §6.2.1) and, cold, before any answer was seen on its
+/// path, its handshake's window of [`COLD_PROBE_TIMEOUTS`] probe timeouts ([`Liveness::bound`]);
+/// and apart from it the longest window learned from its connections' answers
+/// ([`Liveness::window`]), without which none of its sends is ever judged stalled. Each is none
+/// before the driver has looked at a connection.
+#[derive(Debug, Clone, Default)]
+pub struct View(Arc<Viewed>);
+
+#[derive(Debug, Default)]
+struct Viewed {
+    heard: AtomicU64,
+    /// Nanoseconds, saturated; zero before any connection was looked at.
+    window: AtomicU64,
+    /// Nanoseconds, saturated; zero before any connection's window was learned.
+    learned: AtomicU64,
+}
+
+impl View {
+    /// The datagrams its driver has taken in from peers.
+    pub fn heard(&self) -> u64 {
+        self.0.heard.load(Ordering::Relaxed)
+    }
+
+    /// The longest window its driver's connections have been judged by: none before it has
+    /// looked at one.
+    pub fn window(&self) -> Option<Duration> {
+        nonzero(self.0.window.load(Ordering::Relaxed))
+    }
+
+    /// The longest window learned from its driver's connections' answers: none while each is
+    /// cold, its sends then followed for as long as they take, never told stalled
+    /// ([`Liveness::look`]).
+    pub fn learned(&self) -> Option<Duration> {
+        nonzero(self.0.learned.load(Ordering::Relaxed))
+    }
+
+    fn heard_one(&self) {
+        self.0.heard.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn judged_by(&self, liveness: &Liveness) {
+        let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.0
+            .window
+            .fetch_max(nanos(liveness.bound()), Ordering::Relaxed);
+        if let Some(learned) = liveness.window() {
+            self.0.learned.fetch_max(nanos(learned), Ordering::Relaxed);
+        }
+    }
+}
+
+fn nonzero(nanos: u64) -> Option<Duration> {
+    (nanos != 0).then(|| Duration::from_nanos(nanos))
+}
+
 /// Where another thread sends the driver [`Command`]s, waking it.
 pub struct Sender<C> {
     commands: Commands<C>,
     stopping: Arc<AtomicBool>,
+    view: View,
+    /// Connected to its driver's wake ([`Driver::wake`]), the one place it sends to.
     waker: UdpSocket,
-    to: SocketAddr,
 }
 
 enum Commands<C> {
@@ -54,6 +114,10 @@ enum Commands<C> {
 /// reserve host/kernel memory or grant it: the caller retains that reservation.
 #[derive(Debug, Clone, Copy)]
 pub struct DriverLimits {
+    /// The connections it holds at once. One open, its handshake's or established, holds its
+    /// place until it closes, or, established and stalled, until a newcomer needs the place
+    /// (the driver's `reclaim`); one closed (closing or draining, RFC 9000 §10.2) until a
+    /// newcomer needs the place (the driver's `free_closed`).
     pub connections: usize,
     pub command_slots: usize,
     pub queued_datagram_bytes: usize,
@@ -62,7 +126,7 @@ pub struct DriverLimits {
 impl<C> std::fmt::Debug for Sender<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sender")
-            .field("to", &self.to)
+            .field("waker", &self.waker.local_addr().ok())
             .finish_non_exhaustive()
     }
 }
@@ -88,7 +152,7 @@ impl<C> Sender<C> {
                 .map_err(|e| mpsc::TrySendError::Disconnected(e.0))?,
             Commands::Bounded(to) => to.try_send(command)?,
         }
-        let _ = self.waker.send_to(&[0], self.to);
+        let _ = self.waker.send(&[0]);
         Ok(())
     }
 
@@ -100,10 +164,15 @@ impl<C> Sender<C> {
             .map_err(|e| Error::new(format!("the driver's waker: {e}")))
     }
 
+    /// What its driver has heard, and the window its connections have shown ([`View`]).
+    pub fn view(&self) -> View {
+        self.view.clone()
+    }
+
     /// Idempotent owner revocation does not wait behind queued data.
     pub fn request_stop(&self) {
         self.stopping.store(true, Ordering::Release);
-        let _ = self.waker.send_to(&[0], self.to);
+        let _ = self.waker.send(&[0]);
     }
 }
 
@@ -181,11 +250,11 @@ impl<C> Sender<C> {
                 Commands::Bounded(to) => Commands::Bounded(to.clone()),
             },
             stopping: Arc::clone(&self.stopping),
+            view: self.view.clone(),
             waker: self
                 .waker
                 .try_clone()
                 .map_err(|e| Error::new(format!("the driver's waker: {e}")))?,
-            to: self.to,
         })
     }
 }
@@ -219,18 +288,17 @@ pub trait Handler {
     fn lost(&mut self, io: &mut Io<'_>, conn: ConnKey, why: &str, code: Option<u64>);
     /// Why a connection ended, as QUIC told it (RFC 9000 §20, RFC 9001 §4.8), just before
     /// [`Handler::lost`] tells of it: for a handler that types its peer's refusals, which
-    /// `lost`'s words and application code do not carry. Nothing, by default; a connection
-    /// whose handshake ran out past the slowest seen from its peer has none, and one taken for
-    /// dead at use ([`Liveness::look`]) is QUIC's `TimedOut`.
+    /// `lost`'s words and application code do not carry. Nothing, by default; a stalled
+    /// connection let go for a newcomer ([`Driver::reclaim`]) is QUIC's `TimedOut`.
     fn cause(&mut self, _conn: ConnKey, _error: &ConnectionError) {}
     /// A connection whose handshake has not ended sent another probe (RFC 9002 §6.2): `probes`
-    /// datagrams in all, `waited` since it began. Its handshake waits on, with no deadline of its
-    /// own where it has none, for as long as its handler does: one that gives up closes it.
+    /// datagrams in all, `waited` since it began. Its handshake waits on, with no window of its
+    /// own where it has none or its window ran out ([`RanOut::Handshake`]), for as long as its
+    /// handler does: one that gives up closes it.
     fn unanswered(&mut self, _io: &mut Io<'_>, _conn: ConnKey, _probes: u64, _waited: Duration) {}
-    /// A send on an established connection has waited `waited`, past the slowest answer seen
-    /// on its path (`window`), while its peer still makes progress: told once a wait, and the
+    /// A wait of `conn`'s ran out ([`RanOut`]): told once a wait at each stage, and the
     /// connection goes on.
-    fn ran_out(&mut self, _io: &mut Io<'_>, _conn: ConnKey, _waited: Duration, _window: Duration) {}
+    fn ran_out(&mut self, _io: &mut Io<'_>, _conn: ConnKey, _what: RanOut) {}
     /// Another thread's command.
     fn command(&mut self, io: &mut Io<'_>, command: Self::Command);
     /// The peer allows more of the streams this side opens (MAX_STREAMS, RFC 9000 §4.6): one
@@ -255,8 +323,8 @@ pub struct Io<'a> {
     next: &'a mut ConnKey,
     client: Option<ClientConfigHandle>,
     now: Instant,
-    /// How long the handshake of a connection it opens is waited for: none, as long as its
-    /// probing goes on.
+    /// The window the handshake of a connection it opens is judged by ([`Liveness::due`]):
+    /// none, waited for as long as its probing goes on.
     handshake: Option<Duration>,
     /// The slowest answer its peer's path has shown, which a connection it opens starts from.
     answer: Duration,
@@ -275,14 +343,27 @@ struct Conn {
     quic: Connection,
     connected: bool,
     liveness: Liveness,
+    received: u64,
 }
 
-/// When a connection was last heard from, and whether it lives on (the person's ruling,
+impl Conn {
+    fn heard_authenticated(&mut self, now: Instant) {
+        let total = received(&self.quic);
+        if total > self.received {
+            self.liveness.heard(now);
+        }
+        self.received = total;
+    }
+}
+
+/// When a connection was last heard from, and how its waits stand (the person's ruling,
 /// 2026-11-13: a cold start, and every wait after a run-out, follows the peer's liveness and
-/// progress, and after that a wait's bound is the slowest answer seen). Its handshake: held to
-/// its driver's deadline from its start, the slowest seen from its peer or what a bounded
-/// driver's owner admitted, or to none, its probing told as it goes ([`Liveness::unanswered`]).
-/// Once connected, where its driver checks it at use ([`Liveness::look`]): each send of this
+/// progress, and after that a wait's bound is the slowest answer seen). Its handshake, with a
+/// peer reached before, is judged as a send is ([`Liveness::due`]): by a window of the slowest
+/// handshake seen from that peer, no sooner than its probe timeout, past which it runs out and
+/// goes on with none ([`Liveness::handshake_ran_out`]); with a peer never reached, or whose last
+/// wait ran out, it has no window, its probing told as it goes ([`Liveness::unanswered`]). Once
+/// connected, where its driver checks it at use ([`Liveness::look`]): each send of this
 /// side's waits for the peer to acknowledge any of it, within a window of the slowest answer
 /// seen on its path and the peer's own `max_ack_delay` (its transport parameter, as RFC 9002
 /// §6.2.1's probe timeout adds it). Cold, before any send's answer has been seen on its path,
@@ -291,16 +372,23 @@ struct Conn {
 /// of how long it takes to answer a request, its work and its host's scheduling with it (a join's
 /// record synced to disk took a daemon 123-152 ms, past a window its handshake seeded). Past the
 /// window a wait goes on while the peer makes progress (it is heard, or acknowledges), told once
-/// as a run-out; a whole window with no progress ends the connection. The longest silence it
-/// lived through is kept.
+/// as a run-out; a whole window with no progress is a stall, told once, and the wait follows the
+/// peer's liveness with no window from then on, QUIC probing it (ROOT's ruling A, 2026-11-13):
+/// its answer, whenever it comes, ends the stall and is the slowest seen, so that the path's
+/// window covers such a stall from then on. Nothing here ends a connection. The longest silence
+/// it lived through is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Liveness {
     began: Instant,
-    /// How long its handshake is waited for: none, for as long as its probing goes on.
+    /// The window its handshake is judged by, the slowest seen from its peer: none, or none once
+    /// it ran out ([`Liveness::handshake_ran_out`]), waited for as long as its probing goes on.
     handshake: Option<Duration>,
     heard: Option<Instant>,
     /// When its handshake ended.
     connected: Option<Instant>,
+    /// This side's own absence before its handshake ended ([`Liveness::absent`]), which the
+    /// handshake's time does not count.
+    absent: Duration,
     longest: Duration,
     /// The slowest answer seen on its path: what was known of it, then this connection's.
     answer: Duration,
@@ -314,9 +402,8 @@ pub struct Liveness {
     /// Its transport's ack-eliciting frames sent and bytes acknowledged, as last looked at.
     sent: u64,
     acked: u64,
-    /// The silence after which it was found dead, its next send unanswered.
-    lost: Option<Duration>,
-    /// A wait of its ran out: its handshake past its deadline, or a send past its window.
+    /// A wait of its ran out: its handshake past its deadline, or a send past its window, or one
+    /// stalled.
     ran_out: bool,
     /// Its peer refused it, definitely: an ICMP port-unreachable told its connected socket.
     refused: bool,
@@ -324,7 +411,31 @@ pub struct Liveness {
     flight: Option<u64>,
     /// The datagrams sent as its first look, or its last probe told, found them.
     probes: u64,
+    /// When a newcomer that found its driver's places taken asked it for an answer (a PING), the
+    /// first such ask it has not answered since ([`Liveness::ask`]), judged by its probe timeout
+    /// ([`Liveness::unanswering`]).
+    asked: Option<Instant>,
+    /// A stalled send's answer came this long after it was sent, not yet told
+    /// ([`Look::Answered`]).
+    answered: Option<Duration>,
+    /// How far its handshake had advanced as last looked at (its transport's
+    /// `handshake_progress`: new CRYPTO data read or acknowledged, keys installed), and when it
+    /// last did ([`Liveness::advance`]): an answer that advances nothing is no progress
+    /// ([`Liveness::unfinished`]).
+    progress: u64,
+    advanced: Instant,
 }
+
+/// RFC 9002's kPersistentCongestionThreshold (§7.6.1, Appendix B.2): the probe timeouts in a row,
+/// no packet acknowledged, after which a path is taken to have lost everything; "approximately
+/// equivalent to having two TLPs before an RTO in TCP". A cold handshake's window is that many of
+/// its probe timeouts, each backed off (§6.2.1): its first flight's and its two probes'
+/// ([`Liveness::unfinished`]).
+const PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
+
+/// The probe timeouts a cold handshake's window holds: [`PERSISTENT_CONGESTION_THRESHOLD`] of
+/// them in a row, each double the last (RFC 9002 §6.2.1's backoff): 1 + 2 + 4.
+const COLD_PROBE_TIMEOUTS: u32 = (1 << PERSISTENT_CONGESTION_THRESHOLD) - 1;
 
 /// A send waiting for its answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,32 +445,72 @@ struct Wait {
     acked: u64,
     /// The silence before it, since the peer was last heard.
     quiet: Duration,
-    /// Its run-out has been told.
-    told: bool,
+    /// How far it has gone unanswered, each stage told as it is reached.
+    stage: Stage,
+}
+
+/// How far a send's wait has gone unanswered (R04): each stage told once ([`Look`]), and the
+/// wait ends, whatever its stage, as its answer comes ([`Liveness::note`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Within its window, or past it with nothing told yet.
+    Waiting,
+    /// Past its window and probe timeout while its peer made progress: told.
+    RanOut,
+    /// A whole window with no progress past its probe timeout: told, and followed with no
+    /// window until its answer comes.
+    Stalled,
+}
+
+/// A wait of a connection's that ran out, told once ([`Handler::ran_out`]) as the connection goes
+/// on (R04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RanOut {
+    /// Its handshake, with a peer reached before: nothing heard from it in the slowest handshake
+    /// seen from it (`window`), past its probe timeout ([`Liveness::due`]), `waited` since it
+    /// began. It goes on as a peer never reached's does, with no deadline of its own, each probe
+    /// told ([`Handler::unanswered`]).
+    Handshake { waited: Duration, window: Duration },
+    /// A send, its connection established: unanswered past its window and probe timeout while its
+    /// peer still makes progress ([`Look::RanOut`]).
+    Send { waited: Duration, window: Duration },
+    /// A send, its connection established: a whole window (`window`) with no progress past its
+    /// probe timeout, its peer `unheard` that long ([`Look::Stalled`]). The peer may be busy,
+    /// frozen or gone: the wait follows its liveness with no window, QUIC probing it, until its
+    /// answer comes ([`RanOut::Answered`]), which is the slowest seen from then on, or its holder
+    /// gives up.
+    Stalled { unheard: Duration, window: Duration },
+    /// A stalled send's answer came at last, `after` it was sent: the stall is over, and its
+    /// time is the slowest answer seen from then on ([`Look::Answered`]).
+    Answered { after: Duration },
 }
 
 /// What looking at an established connection found (R04).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Look {
-    /// Nothing waits, or what waits is within its window.
+    /// Nothing waits, or what waits is within its window, or stalled and told.
     Fine,
     /// A send has waited past its window, its peer still making progress: told once, and the
     /// connection goes on.
     RanOut { waited: Duration, window: Duration },
-    /// A whole window passed with no progress: the connection is dead, found so after `quiet`
-    /// of silence before the send that went unanswered.
-    Dead { quiet: Duration, window: Duration },
+    /// A whole window passed with no progress, its peer `unheard` that long: told once, and the
+    /// wait goes on with no window ([`RanOut::Stalled`]).
+    Stalled { unheard: Duration, window: Duration },
+    /// A stalled send was answered, `after` it was sent: told once ([`RanOut::Answered`]).
+    Answered { after: Duration },
 }
 
 impl Liveness {
-    /// A connection begun at `now`, its handshake waited for `handshake` (none: as long as its
-    /// probing goes on), the slowest answer its path has shown `answer` (zero where none has).
+    /// A connection begun at `now`, its handshake judged by the window `handshake` (none: waited
+    /// for as long as its probing goes on), the slowest answer its path has shown `answer` (zero
+    /// where none has).
     pub fn new(now: Instant, handshake: Option<Duration>, answer: Duration) -> Liveness {
         Liveness {
             began: now,
             handshake,
             heard: None,
             connected: None,
+            absent: Duration::ZERO,
             longest: Duration::ZERO,
             answer,
             ack_delay: Duration::ZERO,
@@ -367,11 +518,14 @@ impl Liveness {
             wait: None,
             sent: 0,
             acked: 0,
-            lost: None,
             ran_out: false,
             refused: false,
             flight: None,
             probes: 0,
+            asked: None,
+            answered: None,
+            progress: 0,
+            advanced: now,
         }
     }
 
@@ -386,8 +540,12 @@ impl Liveness {
     /// Its handshake ended at `now`, its transport having sent `sent` ack-eliciting frames and
     /// had `acked` bytes acknowledged by then: what the handshake sent is no send waiting (its
     /// frames are answered as it ends, so a wait for them would end with no answer, its quiet
-    /// peer then taken for dead), and its time is no answer of a send's ([`Liveness`]).
+    /// peer then taken for dead), and its time is no answer of a send's ([`Liveness`]). One that
+    /// ends past its window and its probe timeout both ran out ([`Liveness::outran`]).
     pub fn connected(&mut self, now: Instant, sent: u64, acked: u64) {
+        if self.outran(now) {
+            self.ran_out = true;
+        }
         self.connected = Some(now);
         self.sent = sent;
         self.acked = acked;
@@ -403,23 +561,69 @@ impl Liveness {
     /// sooner, so no wait is judged sooner either. A peer acknowledges application data up to
     /// its `max_ack_delay` late, and later as its timer fires late, where its handshake's
     /// packets it acknowledges at once (RFC 9000 §13.2.1): a window its handshake seeded alone
-    /// would take that peer's first delayed acknowledgement for none.
+    /// would take that peer's first delayed acknowledgement for none. Nor is a handshake judged
+    /// sooner ([`Liveness::due`]).
     pub fn probe_timeout(&mut self, pto: Duration) {
         self.pto = pto;
     }
 
-    /// When the driver ends it unless its handshake ends first: none once it has, or where its
-    /// handshake has no deadline.
+    /// When its handshake runs out, unless it ends first ([`Liveness::handshake_ran_out`]),
+    /// judged as a send is ([`Liveness::look`]): a whole window of the slowest handshake seen
+    /// from its peer with nothing heard from that peer (its Initial and Handshake packets
+    /// count), past the later of when it was last heard and its probe timeout (QUIC declares no
+    /// loss sooner, RFC 9002 §6.2.1), however long it has gone on while it was heard. None once
+    /// it has ended, or where its handshake has no window. A bound of the slowest handshake
+    /// alone, from a path's quiet samples (one, after a join), refused a daemon reached before
+    /// as the suite's own load slowed its answer: ROOT's runs at 084891178, tests/context.rs 8
+    /// of 21 on HVF and 1 on KVM, "within the slowest handshake seen from it" of 0.93-4.2 ms.
     pub fn due(&self) -> Option<Instant> {
         if self.connected.is_some() {
             return None;
         }
-        self.handshake.and_then(|h| self.began.checked_add(h))
+        judged_from(self.heard, self.began, self.pto).checked_add(self.handshake?)
     }
 
-    /// Its handshake ran out past its deadline.
-    pub fn handshake_ran_out(&mut self) {
+    /// Whether its handshake, not ended by `now`, has gone past its window and its probe timeout
+    /// both: a run-out, which its record keeps (`tls::Known::RanOut`), as its wait goes on while
+    /// its peer is heard ([`Liveness::due`]).
+    pub fn outran(&self, now: Instant) -> bool {
+        self.connected.is_none()
+            && self
+                .handshake
+                .is_some_and(|window| now.saturating_duration_since(self.began) > window.max(self.pto))
+    }
+
+    /// This side was absent for `gone`: its driver's thread neither ran nor waited as it had
+    /// planned for that long (its process frozen or starved by its host, or descheduled), in a
+    /// turn's midst or past its timer ([`Turn::absent`]). A wait of it is judged on the time this
+    /// side was there to hear,
+    /// so each of its instants moves on by that much, as though the absence had not been: its
+    /// peer is not held to it, and what its record learns (an answer, a silence, a handshake's
+    /// time) does not count it. kiln's runners froze whole processes so: a 2 ms sleep on
+    /// adacachy2 took 124 ms at its p99, and one 121 ms freeze took six of `tests/loopback.rs`'s
+    /// daemons' live clients for dead at once.
+    pub fn absent(&mut self, gone: Duration) {
+        if self.connected.is_none() {
+            self.absent = self.absent.saturating_add(gone);
+        }
+        let on = |at: Instant| at.checked_add(gone).unwrap_or(at);
+        self.began = on(self.began);
+        self.heard = self.heard.map(on);
+        self.connected = self.connected.map(on);
+        self.asked = self.asked.map(on);
+        self.advanced = on(self.advanced);
+        if let Some(wait) = self.wait.as_mut() {
+            wait.since = on(wait.since);
+        }
+    }
+
+    /// Its handshake ran out ([`Liveness::due`]): marked, and its window let go, so that it goes
+    /// on as a peer never reached's does, with no deadline of its own (the person's ruling,
+    /// 2026-11-13: every wait after a run-out follows the party's liveness and progress); the
+    /// window it ran out of, none where it had none.
+    pub fn handshake_ran_out(&mut self) -> Option<Duration> {
         self.ran_out = true;
+        self.handshake.take()
     }
 
     /// Its peer refused it, definitely.
@@ -430,8 +634,8 @@ impl Liveness {
     /// While its handshake has not ended and nothing of its peer's has been heard, `datagrams`
     /// sent in all: where more went than before, the datagrams its probes sent (RFC 9002 §6.2),
     /// past its first flight, which its first look finds and which is no probe, and how long it
-    /// has waited. A peer heard is answering, however slowly: its handshake's deadline, where it
-    /// has one, holds it.
+    /// has waited. A peer heard is answering, however slowly: its handshake's window, where it
+    /// has one, judges it ([`Liveness::due`]).
     pub fn unanswered(&mut self, now: Instant, datagrams: u64) -> Option<(u64, Duration)> {
         if self.connected.is_some() || self.heard.is_some() {
             return None;
@@ -448,6 +652,16 @@ impl Liveness {
         Some((datagrams - flight, now.saturating_duration_since(self.began)))
     }
 
+    /// What a wait of its is judged by, as another thread sees it ([`View`]): its window, no
+    /// sooner than its probe timeout; cold, before any answer was seen on its path, its
+    /// handshake's, [`COLD_PROBE_TIMEOUTS`] probe timeouts ([`Liveness::unfinished`]).
+    pub fn bound(&self) -> Duration {
+        self.window().map_or_else(
+            || self.pto.saturating_mul(COLD_PROBE_TIMEOUTS),
+            |window| window.max(self.pto),
+        )
+    }
+
     /// Its window: the slowest answer seen and the peer's `max_ack_delay`; none, cold, before
     /// any send's answer has been seen on its path.
     pub fn window(&self) -> Option<Duration> {
@@ -457,18 +671,80 @@ impl Liveness {
     /// Looks at it at `now`, its transport's ack-eliciting frames sent and bytes acknowledged in
     /// all being `sent` and `acked`: an answer raises the slowest; a send with none waiting
     /// begins a wait; a wait past its window with progress is a run-out, told once; a whole
-    /// window with no progress, its death. Neither is judged before its probe timeout
-    /// ([`Liveness::probe_timeout`]): a run-out is past the window and that timeout both, and a
-    /// death a whole window with no progress past the later of its last progress and that
-    /// timeout.
+    /// window with no progress, a stall, told once, after which the wait has no window until its
+    /// answer comes. Neither is judged before its probe timeout ([`Liveness::probe_timeout`]): a
+    /// run-out is past the window and that timeout both, and a stall a whole window with no
+    /// progress past the later of its last progress and that timeout.
     pub fn look(&mut self, now: Instant, sent: u64, acked: u64) -> Look {
         let Some(connected) = self.connected else {
             return Look::Fine;
         };
+        self.note(now, sent, acked);
+        if let Some(after) = self.answered.take() {
+            return Look::Answered { after };
+        }
+        // Cold, a wait follows its peer's liveness and progress for as long as it takes.
+        let Some(window) = self.window() else {
+            return Look::Fine;
+        };
+        let stalled = self.stalled(now);
+        let last = self.heard.map_or(connected, |heard| heard.max(connected));
+        let Some(wait) = self.wait.as_mut() else {
+            return Look::Fine;
+        };
+        match wait.stage {
+            // Followed with no window, its answer to come.
+            Stage::Stalled => Look::Fine,
+            _ if stalled => {
+                wait.stage = Stage::Stalled;
+                self.ran_out = true;
+                Look::Stalled {
+                    unheard: now.saturating_duration_since(last),
+                    window,
+                }
+            }
+            Stage::Waiting if now.saturating_duration_since(wait.since) > window.max(self.pto) => {
+                wait.stage = Stage::RanOut;
+                self.ran_out = true;
+                Look::RanOut {
+                    waited: now.saturating_duration_since(wait.since),
+                    window,
+                }
+            }
+            Stage::Waiting | Stage::RanOut => Look::Fine,
+        }
+    }
+
+    /// Whether a send of its has gone a whole window with no progress, past the later of its
+    /// last progress and its probe timeout, by `now`: what a stall is ([`Liveness::look`]), told
+    /// or not, judged afresh, so that a peer heard since its stall was told is not one. None
+    /// cold, with no window.
+    pub fn stalled(&self, now: Instant) -> bool {
+        let (Some(wait), Some(window)) = (self.wait, self.window()) else {
+            return false;
+        };
+        now.saturating_duration_since(judged_from(self.heard, wait.since, self.pto)) > window
+    }
+
+    /// Takes in what its transport has sent and had acknowledged by `now`, `sent` ack-eliciting
+    /// frames and `acked` bytes in all: an answer raises the slowest and ends the wait it
+    /// answers, a stalled one's too, whose answer takes in its stall; a send with none waiting
+    /// begins one, as of `now`. Taken in as a send goes, before anything more is read (as its
+    /// driver sends between reads, [`Driver::take_in`]): taken in after its answer had come, a
+    /// send would begin a wait that answer had already ended, and its quiet peer, with nothing
+    /// more to answer, would be taken for stalled.
+    pub fn note(&mut self, now: Instant, sent: u64, acked: u64) {
+        let Some(connected) = self.connected else {
+            return;
+        };
         if let Some(wait) = self.wait
             && acked > wait.acked
         {
-            self.answer = self.answer.max(now.saturating_duration_since(wait.since));
+            let took = now.saturating_duration_since(wait.since);
+            self.answer = self.answer.max(took);
+            if wait.stage == Stage::Stalled {
+                self.answered = Some(took);
+            }
             self.wait = None;
         }
         if sent > self.sent && self.wait.is_none() {
@@ -477,50 +753,108 @@ impl Liveness {
                 since: now,
                 acked,
                 quiet: now.saturating_duration_since(last),
-                told: false,
+                stage: Stage::Waiting,
             });
         }
         self.sent = sent;
         self.acked = acked;
-        // Cold, a wait follows its peer's liveness and progress for as long as it takes.
-        let Some(window) = self.window() else {
-            return Look::Fine;
-        };
-        let Some(wait) = self.wait.as_mut() else {
-            return Look::Fine;
-        };
-        let progress = judged_from(self.heard, wait.since, self.pto);
-        if now.saturating_duration_since(progress) > window {
-            self.ran_out = true;
-            self.lost = Some(wait.quiet);
-            return Look::Dead {
-                quiet: wait.quiet,
-                window,
-            };
-        }
-        let waited = now.saturating_duration_since(wait.since);
-        if waited > window.max(self.pto) && !wait.told {
-            wait.told = true;
-            self.ran_out = true;
-            return Look::RanOut { waited, window };
-        }
-        Look::Fine
     }
 
     /// When [`Liveness::look`] must look again for what waits to change: its window's end (its
     /// probe timeout's, where that is later), and a whole window past its last progress (or past
-    /// its probe timeout).
+    /// its probe timeout); none once it stalled, its answer what changes it.
     pub fn next(&self) -> Option<Instant> {
         let wait = self.wait?;
         let window = self.window()?;
-        let dead = judged_from(self.heard, wait.since, self.pto).checked_add(window)?;
-        match wait.told {
-            true => Some(dead),
-            false => wait
+        let stall = judged_from(self.heard, wait.since, self.pto).checked_add(window)?;
+        match wait.stage {
+            Stage::Stalled => None,
+            Stage::RanOut => Some(stall),
+            Stage::Waiting => wait
                 .since
                 .checked_add(window.max(self.pto))
-                .map(|out| out.min(dead)),
+                .map(|out| out.min(stall)),
         }
+    }
+
+    /// A newcomer found its driver's places taken at `now` and asks it for an answer (its driver
+    /// sends a PING): the ask it has to answer, unless an earlier one is still unanswered, which
+    /// stands, so that newcomers dialing again put off no judgement of it.
+    pub fn ask(&mut self, now: Instant) {
+        if self.answered_ask() {
+            self.asked = Some(now);
+        }
+    }
+
+    /// Whether it has answered the last ask, or none was made: its peer heard since.
+    fn answered_ask(&self) -> bool {
+        self.asked
+            .is_none_or(|asked| self.heard.is_some_and(|heard| heard > asked))
+    }
+
+    /// Whether a newcomer may take its place at `now` ([`Driver::reclaim`]): unheard since an
+    /// earlier newcomer asked it for an answer, past its own probe timeout (RFC 9002 §6.2.1: its
+    /// smoothed RTT, four times its variation and its peer's `max_ack_delay`, within which a
+    /// live peer acknowledges the PING), warm or cold, stalled or not (ROOT's ruling on #72: a
+    /// cold holder, whose path showed no answer, has no window and never stalls, and was never
+    /// given up), its handshake in flight or ended. One heard since the ask, however late, keeps
+    /// it. A handshake's probe timeout counts no `max_ack_delay` (§6.2.1: its Initial and
+    /// Handshake packets are acknowledged at once, RFC 9000 §13.2.1); before its first RTT
+    /// sample it is the initial RTT's (§6.2.2).
+    pub fn unanswering(&self, now: Instant) -> bool {
+        let pto = match self.connected {
+            Some(_) => self.pto,
+            None => self.handshake_probe_timeout(),
+        };
+        self.asked
+            .is_some_and(|asked| !self.answered_ask() && now.saturating_duration_since(asked) > pto)
+    }
+
+    /// Its handshake's own spaces' probe timeout (RFC 9002 §6.2.1: no `max_ack_delay`, as its
+    /// Initial and Handshake packets are acknowledged at once, RFC 9000 §13.2.1): its transport's
+    /// application-data one less its peer's `max_ack_delay`.
+    fn handshake_probe_timeout(&self) -> Duration {
+        self.pto.saturating_sub(self.ack_delay)
+    }
+
+    /// Its handshake, not ended, had advanced as far as `progress` by `now` (its transport's
+    /// count of new CRYPTO data read or acknowledged and keys installed): more than before is
+    /// progress, as of `now`.
+    pub fn advance(&mut self, now: Instant, progress: u64) {
+        if self.connected.is_none() && progress > self.progress {
+            self.progress = progress;
+            self.advanced = now;
+        }
+    }
+
+    /// Where its handshake, not ended, has made no progress for a whole window by `now`, that
+    /// window; such a handshake gives its place to a newcomer that needs it ([`Driver::reclaim`]; ROOT's ruling on
+    /// #72's unfinished handshakes): an answer is no progress, as a handshake's goal is to end.
+    /// The window is `slowest`, the slowest handshake its endpoint has completed, no shorter
+    /// than its handshake's probe timeout (QUIC declares no loss sooner, RFC 9002 §6.2.1). Cold,
+    /// none completed yet, it is the time QUIC's own recovery takes to give up on a silent path:
+    /// [`PERSISTENT_CONGESTION_THRESHOLD`] probe timeouts in a row, each backed off (§6.2.1:
+    /// PTO, 2 PTO, 4 PTO, so 7 PTO in all), within which a live peer that is advancing
+    /// acknowledges its server's flight or one of its two probes.
+    pub fn unfinished(&self, now: Instant, slowest: Option<Duration>) -> Option<Duration> {
+        if self.connected.is_some() {
+            return None;
+        }
+        let pto = self.handshake_probe_timeout();
+        let window = match slowest {
+            Some(slowest) => slowest.max(pto),
+            None => pto.saturating_mul(COLD_PROBE_TIMEOUTS),
+        };
+        (now.saturating_duration_since(self.advanced) > window).then_some(window)
+    }
+
+    /// The silence after which a send of its stalled and is still unanswered, its path maybe
+    /// lost (a middlebox's state gone, or its peer): none where no send waits stalled, a stall
+    /// its answer ended being its peer's slowness, not the path's.
+    pub fn lost(&self) -> Option<Duration> {
+        self.wait
+            .filter(|wait| wait.stage == Stage::Stalled)
+            .map(|wait| wait.quiet)
     }
 
     /// When a keep-alive goes, where its path must be kept alive within `keep` of silence (the
@@ -549,15 +883,22 @@ impl Liveness {
     pub fn handshake_took(&self) -> Option<Duration> {
         self.connected.map(|at| at.saturating_duration_since(self.began))
     }
+
+    /// This side's own absence while its handshake went on, which [`Liveness::handshake_took`]
+    /// does not count.
+    pub fn handshake_absent(&self) -> Duration {
+        self.absent
+    }
 }
 
 /// What a connection saw of the path it crossed, for its caller's record: the longest its
 /// peer went unheard and when it was last heard ([`Liveness`]), its round trip as last
 /// estimated (RFC 9002 §5), the bytes it sent in UDP datagrams and the bytes of them its peer
-/// acknowledged, and the packets it took for lost; and what its peer's record learns from it
-/// (`tls::Known::after`): how long its handshake took, where it ended, the slowest answer it
-/// waited for, the silence after which it was found dead, whether a wait of it ran out, and
-/// whether its peer refused it.
+/// acknowledged, the packets it took for lost, and the idle timeout it ran on (RFC 9000 §10.1:
+/// none between two shards ends, which advertise none); and what its peer's record learns from
+/// it (`tls::Known::after`): how long its handshake took, where it ended, the slowest answer it
+/// waited for, the silence after which a send of its stalled and was never answered
+/// ([`Liveness::lost`]), whether a wait of it ran out, and whether its peer refused it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Seen {
     pub longest_silence: Duration,
@@ -568,7 +909,16 @@ pub struct Seen {
     pub sent_bytes: u64,
     pub acked_bytes: u64,
     pub lost_packets: u64,
+    /// The idle timeout its transport ran on, as both ends negotiated it (hyper-quic's patch
+    /// Q34): a peer's own, where it advertised one, bounds a stalled wait (D180).
+    pub idle: Option<Duration>,
+    /// Its transport's probe timeout as it ended (RFC 9002 §6.2.1, patch Q7's), which its waits
+    /// were judged no sooner than.
+    pub pto: Duration,
     pub handshake: Option<Duration>,
+    /// This side's own absence while its handshake went on (`Liveness::absent`), which
+    /// `handshake` does not count: on the clock its handshake took the two together.
+    pub absent: Duration,
     pub answer: Duration,
     pub lost: Option<Duration>,
     pub ran_out: bool,
@@ -614,20 +964,25 @@ impl Io<'_> {
             .endpoint
             .connect(self.now, handle, to, crate::tls::SERVER_NAME, None)
             .map_err(|e| Error::new(format!("connecting to {to}: {e}")))?;
+        let mut liveness = Liveness::new(self.now, self.handshake, self.answer);
+        liveness.probe_timeout(quic.probe_timeout());
+        liveness.peer_ack_delay(quic.peer_max_ack_delay());
         Ok(place(
             self.conns,
             self.next,
             Conn {
                 handle,
+                received: received(&quic),
                 quic,
                 connected: false,
-                liveness: Liveness::new(self.now, self.handshake, self.answer),
+                liveness,
             },
         ))
     }
 
     /// What `conn` saw of its path so far.
     pub fn seen(&mut self, conn: ConnKey) -> Option<Seen> {
+        let now = self.now;
         let conn = self.conn(conn).ok()?;
         let stats = conn.quic.stats();
         Some(Seen {
@@ -637,12 +992,20 @@ impl Io<'_> {
             sent_bytes: stats.udp_tx.bytes,
             acked_bytes: stats.path.acked_bytes,
             lost_packets: stats.path.lost_packets,
+            idle: conn.quic.idle_timeout(),
+            pto: conn.quic.probe_timeout(),
             handshake: conn.liveness.handshake_took(),
+            absent: conn.liveness.handshake_absent(),
             answer: conn.liveness.answer,
-            lost: conn.liveness.lost,
-            ran_out: conn.liveness.ran_out,
+            lost: conn.liveness.lost(),
+            ran_out: conn.liveness.ran_out || conn.liveness.outran(now),
             refused: conn.liveness.refused,
         })
+    }
+
+    /// Where `conn`'s peer is, as its packets last came from (RFC 9000 §9: a peer may move).
+    pub fn peer(&mut self, conn: ConnKey) -> Option<SocketAddr> {
+        self.conn(conn).ok().map(|c| c.quic.remote_address())
     }
 
     /// What `conn`'s own TLS handshake negotiated, once it has chosen its suite and its group
@@ -809,7 +1172,6 @@ fn place(conns: &mut HashMap<ConnKey, Conn>, next: &mut ConnKey, conn: Conn) -> 
 #[allow(missing_debug_implementations)]
 pub struct Driver<H: Handler> {
     socket: UdpSocket,
-    waker: SocketAddr,
     endpoint: Endpoint,
     conns: HashMap<ConnKey, Conn>,
     next: ConnKey,
@@ -820,8 +1182,10 @@ pub struct Driver<H: Handler> {
     handler: H,
     stopping: bool,
     stop_requested: Arc<AtomicBool>,
+    view: View,
     limits: Option<DriverLimits>,
-    /// How long each connection's handshake is waited for: none, as long as its probing goes on.
+    /// The window each connection's handshake is judged by ([`Liveness::due`]): none, waited
+    /// for as long as its probing goes on.
     handshake: Option<Duration>,
     /// The slowest answer its peer's path has shown, which each connection starts from.
     answer: Duration,
@@ -831,17 +1195,38 @@ pub struct Driver<H: Handler> {
     /// The one peer its socket is connected to, where it was aimed ([`Driver::aim`]): an ICMP
     /// port-unreachable then reads as that peer's refusal.
     aimed: Option<SocketAddr>,
+    /// Its aimed peer refused, as a send was told ([`Driver::flush_datagrams`]).
+    refusal: bool,
     /// Where its [`Sender`]s wake it, a socket of its own beside the one it serves on: a socket
     /// aimed at its peer takes datagrams from that peer alone (connect(2): Linux udp(7), XNU
-    /// `udp_input`, Winsock's connect), so a wake sent there would never come.
+    /// `udp_input`, Winsock's connect), so a wake sent there would never come. It is connected
+    /// to its senders' waker, and the waker to it, by the same rule: the wake takes datagrams
+    /// from the waker alone, none another local process sends it, and the waker sends nowhere
+    /// else (`send`: XNU's `udp_output` refuses `sendto` an address on a connected socket).
     wake: UdpSocket,
-    /// The handshakes it holds at once from peers not yet known, its owner's resources' bound
-    /// ([`Driver::hold_handshakes`]): past it, the oldest unanswered is given up for the newest.
-    slots: Option<usize>,
+    /// The connections it holds at once, its owner's resources' bound: a bounded driver's
+    /// admitted connections, or what [`Driver::hold_connections`] says. Past it a newcomer is
+    /// refused, and takes the place of a holder that does not answer ([`Driver::reclaim`]).
+    places: Option<usize>,
+    /// The slowest handshake it has completed, learned as each ends: the window a handshake
+    /// holding a place may go without progress before it gives way to a newcomer; none before
+    /// the first ([`Liveness::unfinished`]).
+    slowest: Option<Duration>,
     out: VecDeque<(SocketAddr, Vec<u8>)>,
 }
 
-/// How a driver holds its connections: its handshakes' deadline, the slowest answer they start
+/// Why a holder gives its place to a newcomer ([`Driver::reclaim`], R04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GiveWay {
+    /// Unheard since a newcomer asked it for an answer, past its probe timeout
+    /// ([`Liveness::unanswering`]).
+    Unanswered,
+    /// Its handshake made no progress for a whole `window` ([`Liveness::unfinished`]), learned
+    /// (the slowest completed here) or `cold`.
+    Unfinished { window: Duration, cold: bool },
+}
+
+/// How a driver holds its connections: its handshakes' window, the slowest answer they start
 /// from, and the silence they are kept alive within. Every established connection's liveness
 /// is checked at use, its transport having no idle timer of its own.
 #[derive(Debug, Clone, Copy)]
@@ -864,7 +1249,7 @@ impl<H: Handler> Driver<H> {
     ) -> Result<(Self, Sender<H::Command>), Error> {
         let path = known.path();
         let held = Held {
-            handshake: known.handshake_deadline(),
+            handshake: known.handshake_window(),
             answer: path.map_or(Duration::ZERO, |p| p.answer),
             lost: path.and_then(|p| p.lost),
         };
@@ -917,6 +1302,12 @@ impl<H: Handler> Driver<H> {
         let to = wake
             .local_addr()
             .map_err(|e| Error::new(format!("the driver's wake: {e}")))?;
+        waker
+            .connect(to)
+            .map_err(|e| Error::new(format!("the driver's waker: {e}")))?;
+        wake.connect(waker_at)
+            .map_err(|e| Error::new(format!("the driver's wake: {e}")))?;
+        drop_strays(&wake).map_err(|e| Error::new(format!("the driver's wake: {e}")))?;
         let endpoint = Endpoint::new(EndpointConfig::default(), server, true, None)
             .map_err(|_| Error::new("no random bytes for QUIC"))?;
         let (commands_tx, commands) = match limits {
@@ -930,10 +1321,10 @@ impl<H: Handler> Driver<H> {
             }
         };
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let view = View::default();
         Ok((
             Driver {
                 socket,
-                waker: waker_at,
                 endpoint,
                 conns: HashMap::new(),
                 next: 0,
@@ -943,20 +1334,23 @@ impl<H: Handler> Driver<H> {
                 handler,
                 stopping: false,
                 stop_requested: Arc::clone(&stop_requested),
+                view: view.clone(),
                 limits,
                 handshake: held.handshake,
                 answer: held.answer,
                 lost: held.lost,
                 aimed: None,
+                refusal: false,
                 wake,
-                slots: None,
+                places: limits.map(|limits| limits.connections),
+                slowest: None,
                 out: VecDeque::new(),
             },
             Sender {
                 commands: commands_tx,
                 stopping: stop_requested,
+                view,
                 waker,
-                to,
             },
         ))
     }
@@ -973,11 +1367,13 @@ impl<H: Handler> Driver<H> {
         Ok(())
     }
 
-    /// Holds `slots` handshakes at once from peers not yet known, the bound its owner's own
-    /// resources set (the person's ruling, 2026-11-13: no deadline of shards' own): a handshake
-    /// that comes past it takes the place of the oldest still unanswered, which is given up.
-    pub fn hold_handshakes(&mut self, slots: usize) {
-        self.slots = Some(slots);
+    /// Holds `places` connections at once, handshakes and established alike, the bound its
+    /// owner's own resources set (ROOT's ruling on #72): a newcomer past it is refused, each
+    /// holder, its handshake in flight or ended, asked for an answer (a PING), and a later
+    /// attempt takes the place of one that has not answered it within its probe timeout
+    /// ([`Driver::reclaim`]).
+    pub fn hold_connections(&mut self, places: usize) {
+        self.places = Some(places);
     }
 
     /// The address the socket serves on.
@@ -985,6 +1381,14 @@ impl<H: Handler> Driver<H> {
         self.socket
             .local_addr()
             .map_err(|e| Error::new(format!("the driver's socket: {e}")))
+    }
+
+    /// Where its wake is bound ([`Driver::wake`]): with [`Driver::local`] and its senders'
+    /// [`Sender::waker_addr`], every socket a driver and its senders hold.
+    pub fn wake_addr(&self) -> Result<SocketAddr, Error> {
+        self.wake
+            .local_addr()
+            .map_err(|e| Error::new(format!("the driver's wake: {e}")))
     }
 
     /// What the kernel holds for its sockets' queues: the one it serves on and its wake's.
@@ -1012,8 +1416,28 @@ impl<H: Handler> Driver<H> {
             .try_reserve_exact(DATAGRAM)
             .map_err(|_| Error::new("no memory for the endpoint datagram"))?;
         datagram.resize(DATAGRAM, 0);
+        let mut last: Option<Turn> = None;
         loop {
             let now = Instant::now();
+            let cpu = thread_cpu();
+            // The time since the last turn began that this side neither ran nor waited as it
+            // planned is its own absence, which no wait of it is judged on ([`Liveness::absent`]),
+            // before anything is judged this turn.
+            if let Some(gone) = last
+                .take()
+                .map(|turn| turn.absent(now, cpu))
+                .filter(|g| !g.is_zero())
+            {
+                for conn in self.conns.values_mut() {
+                    conn.liveness.absent(gone);
+                }
+            }
+            let mut turn = Turn {
+                at: now,
+                cpu,
+                blocked: Duration::ZERO,
+                late: Duration::ZERO,
+            };
             self.commands_now(now);
             if self.handler.due().is_some_and(|at| at <= now) {
                 let (mut io, handler) = self.io(now);
@@ -1038,6 +1462,9 @@ impl<H: Handler> Driver<H> {
             } else {
                 self.transmit(now)?;
             }
+            if std::mem::take(&mut self.refusal) {
+                self.refused(Instant::now());
+            }
             // After what this turn sent: a send's wait begins as it goes, and what the watch
             // queues (a keep-alive) goes on the next turn, which its due time brings at once.
             self.watch(now);
@@ -1048,10 +1475,23 @@ impl<H: Handler> Driver<H> {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            // Until its next timer; with none due, until a datagram or a wake comes, which every
-            // command and stop sends ([`Sender`]) to its wake socket ([`Driver::wake`]).
-            let wait = next.map(|at| at.saturating_duration_since(Instant::now()));
-            let (served, woken) = match readable(&self.socket, &self.wake, wait) {
+            // Until its next timer, in the whole milliseconds poll(2) waits; with none due, until
+            // a datagram or a wake comes, which every command and stop sends ([`Sender`]) to its
+            // wake socket ([`Driver::wake`]).
+            let looked = Instant::now();
+            let wait = next.map(|at| whole_ms(at.saturating_duration_since(looked)));
+            let planned = wait.filter(|w| !w.is_zero()).and_then(|w| looked.checked_add(w));
+            let ready = readable(&self.socket, &self.wake, wait);
+            let back = Instant::now();
+            // Waited as planned until its timer, or until what came; past its timer, absent.
+            turn.blocked = planned
+                .map_or(back, |at| back.min(at))
+                .saturating_duration_since(looked);
+            turn.late = planned
+                .and_then(|at| back.checked_duration_since(at))
+                .unwrap_or_default();
+            last = Some(turn);
+            let (served, woken) = match ready {
                 Ok(ready) => ready,
                 // A signal interrupts the wait (Linux signal(7)): another turn checks commands
                 // and timers without losing any of the connections.
@@ -1069,63 +1509,93 @@ impl<H: Handler> Driver<H> {
             if !served && self.aimed.is_none() {
                 continue;
             }
-            // What is there read without waiting, the least a socket's timeout takes being a
-            // nanosecond (`set_read_timeout` refuses none).
+            // What is there read without waiting: the socket non-blocking while it is read. A
+            // receive timeout of the least, a microsecond, Linux keeps in whole jiffies
+            // (SO_RCVTIMEO, net/core/sock.c `sock_set_timeout`), so that an aimed socket with
+            // nothing to read waited a whole one out each turn, a wait none of the driver's timers
+            // planned ([`Turn::absent`]).
             self.socket
-                .set_read_timeout(Some(Duration::from_nanos(1)))
+                .set_nonblocking(true)
                 .map_err(|e| Error::new(format!("the driver's socket: {e}")))?;
-            match self.socket.recv_from(&mut datagram) {
-                Ok((n, from)) => {
-                    if from == self.waker {
-                        continue;
-                    }
-                    let now = Instant::now();
-                    let bytes = BytesMut::from(datagram.get(..n).unwrap_or_default());
-                    self.receive(now, from, bytes)?;
-                    // Whatever else came meanwhile, before a turn sends anything.
-                    self.socket
-                        .set_nonblocking(true)
-                        .map_err(|e| Error::new(format!("the driver's socket: {e}")))?;
-                    let turns = self
-                        .limits
-                        .map_or(usize::MAX, |l| l.queued_datagram_bytes / DATAGRAM);
-                    for _ in 1..turns {
-                        let Ok((n, from)) = self.socket.recv_from(&mut datagram) else {
-                            break;
-                        };
-                        if from != self.waker {
-                            let bytes = BytesMut::from(datagram.get(..n).unwrap_or_default());
-                            self.receive(now, from, bytes)?;
+            let taken = self.take_in(&mut datagram);
+            self.socket
+                .set_nonblocking(false)
+                .map_err(|e| Error::new(format!("the driver's socket: {e}")))?;
+            taken?;
+        }
+    }
+
+    /// Takes in what its socket holds, its socket non-blocking: each datagram as it is read,
+    /// within its admitted queue, before a turn sends anything; or its aimed peer's refusal.
+    fn take_in(&mut self, datagram: &mut [u8]) -> Result<(), Error> {
+        match self.socket.recv_from(datagram) {
+            Ok((n, from)) => {
+                let now = Instant::now();
+                let bytes = BytesMut::from(datagram.get(..n).unwrap_or_default());
+                let mut fed = self.receive(now, from, bytes)?;
+                // Whatever else came meanwhile, each heard as it is read, and what a connection it
+                // fed has to send sent before more is read: its acknowledgement above all, which
+                // its peer awaits at once from its second ack-eliciting packet (RFC 9000
+                // §13.2.2), within its max_ack_delay at the latest (§13.2.1). Drained whole before
+                // any was sent, a backlog at a peer's full rate held every acknowledgement back
+                // and heard each datagram as of the drain's start, its silence as long as the
+                // drain (moved.rs's live move on HVF: an import's connection taken for dead
+                // mid-stream).
+                let turns = self
+                    .limits
+                    .map_or(usize::MAX, |l| l.queued_datagram_bytes / DATAGRAM);
+                let mut buffer = Vec::new();
+                for _ in 1..turns {
+                    if let Some(key) = fed.take() {
+                        self.transmit_conn(Instant::now(), key, &mut buffer)?;
+                        self.flush_datagrams();
+                        // What it sent, taken in before what answers it is read.
+                        if let Some(conn) = self.conns.get_mut(&key)
+                            && conn.connected
+                        {
+                            let stats = conn.quic.stats();
+                            conn.liveness.note(
+                                Instant::now(),
+                                eliciting(&stats.frame_tx),
+                                stats.path.acked_bytes,
+                            );
                         }
                     }
-                    self.socket
-                        .set_nonblocking(false)
-                        .map_err(|e| Error::new(format!("the driver's socket: {e}")))?;
+                    let Ok((n, from)) = self.socket.recv_from(datagram) else {
+                        break;
+                    };
+                    let bytes = BytesMut::from(datagram.get(..n).unwrap_or_default());
+                    fed = self.receive(Instant::now(), from, bytes)?;
                 }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                // A signal interrupts a timed receive (Linux signal(7)): another turn
-                // checks commands and timers without losing any of the connections.
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                // An ICMP port-unreachable: on a socket aimed at its one peer, that peer's
-                // definite refusal (ECONNREFUSED; Windows' WSAECONNRESET); on another, a
-                // datagram of one peer's of many refused, which its connection's own probing
-                // deals with.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    if self.aimed.is_some() {
-                        self.refused(Instant::now());
-                    }
-                }
-                Err(e) => return Err(Error::new(format!("the driver's socket: {e}"))),
+                Ok(())
             }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(())
+            }
+            // A signal interrupts a receive (Linux signal(7)): another turn checks commands
+            // and timers without losing any of the connections.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
+            // An ICMP port-unreachable: on a socket aimed at its one peer, that peer's
+            // definite refusal (ECONNREFUSED; Windows' WSAECONNRESET); on another, a
+            // datagram of one peer's of many refused, which its connection's own probing
+            // deals with.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                if self.aimed.is_some() {
+                    self.refused(Instant::now());
+                }
+                Ok(())
+            }
+            Err(e) => Err(Error::new(format!("the driver's socket: {e}"))),
         }
     }
 
@@ -1180,18 +1650,30 @@ impl<H: Handler> Driver<H> {
         }
     }
 
-    fn receive(&mut self, now: Instant, from: SocketAddr, bytes: BytesMut) -> Result<(), Error> {
+    /// Feeds `bytes` from `from` to its connection, or to a new one: the connection fed, if any.
+    fn receive(&mut self, now: Instant, from: SocketAddr, bytes: BytesMut) -> Result<Option<ConnKey>, Error> {
+        self.view.heard_one();
         let mut response = Vec::new();
         match self.endpoint.handle(now, from, None, None, bytes, &mut response) {
             Some(DatagramEvent::NewConnection(incoming)) => {
-                if self.stopping || self.limits.is_some_and(|l| self.conns.len() >= l.connections) {
-                    // Its places taken, each connection holding one is asked for an answer (a
-                    // PING), so that one whose peer is gone is found so at this use of its
-                    // place, a whole window unanswered past its probe timeout, and the place is
-                    // free for a newcomer's next attempt; this one is refused.
+                if let Some(places) = self.places
+                    && !self.stopping
+                {
+                    self.free_closed(now, places)?;
+                    if self.conns.len() >= places && self.reclaim(now) {
+                        self.free_closed(now, places)?;
+                    }
+                }
+                if self.stopping || self.places.is_some_and(|places| self.conns.len() >= places) {
+                    // Its places still taken, each open connection holding one, its handshake in
+                    // flight or ended, is asked for an answer (a PING): one whose peer does not
+                    // answer it within its probe timeout gives its place to a newcomer's later
+                    // attempt ([`Driver::reclaim`]); one that answers, however late, keeps it.
+                    // This one is refused.
                     if !self.stopping {
                         for conn in self.conns.values_mut() {
-                            if conn.connected && !conn.quic.is_closed() {
+                            if !conn.quic.is_closed() {
+                                conn.liveness.ask(now);
                                 conn.quic.ping();
                             }
                         }
@@ -1202,24 +1684,27 @@ impl<H: Handler> Driver<H> {
                             response.get(..transmit.size).unwrap_or_default(),
                         )?;
                     }
-                    return Ok(());
+                    return Ok(None);
                 }
-                self.make_room(now);
                 match self.endpoint.accept(incoming, now, &mut response, None, None) {
                     Ok((handle, quic)) => {
                         let mut liveness = Liveness::new(now, self.handshake, self.answer);
+                        liveness.probe_timeout(quic.probe_timeout());
+                        liveness.peer_ack_delay(quic.peer_max_ack_delay());
                         liveness.heard(now);
                         let key = place(
                             &mut self.conns,
                             &mut self.next,
                             Conn {
                                 handle,
+                                received: received(&quic),
                                 quic,
                                 connected: false,
                                 liveness,
                             },
                         );
                         self.pump(now, key);
+                        return Ok(Some(key));
                     }
                     Err(e) => {
                         if let Some(transmit) = e.response {
@@ -1234,10 +1719,11 @@ impl<H: Handler> Driver<H> {
             Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                 if let Some(key) = self.key_of(handle) {
                     if let Some(conn) = self.conns.get_mut(&key) {
-                        conn.liveness.heard(now);
                         conn.quic.handle_event(event, self.endpoint.configs_mut());
+                        conn.heard_authenticated(now);
                     }
                     self.pump(now, key);
+                    return Ok(Some(key));
                 }
             }
             Some(DatagramEvent::Response(transmit)) => {
@@ -1248,7 +1734,7 @@ impl<H: Handler> Driver<H> {
             }
             None => {}
         }
-        Ok(())
+        Ok(None)
     }
 
     fn key_of(&self, handle: ConnectionHandle) -> Option<ConnKey> {
@@ -1257,27 +1743,116 @@ impl<H: Handler> Driver<H> {
             .find_map(|(key, c)| (c.handle == handle).then_some(*key))
     }
 
-    /// A handshake comes: where the handshakes held fill their slots, the oldest still
-    /// unanswered is given up ([`given_up`]), its handler told.
-    fn make_room(&mut self, now: Instant) {
-        let Some(slots) = self.slots else {
-            return;
-        };
-        let held: Vec<(ConnKey, Instant)> = self
-            .conns
-            .iter()
-            .filter(|(_, c)| !c.connected && !c.quic.is_closed())
-            .map(|(key, c)| (*key, c.liveness.began))
-            .collect();
-        if let Some(key) = given_up(&held, slots) {
-            let (mut io, handler) = self.io(now);
-            io.close(key, 0, "a newer handshake took its place");
-            handler.lost(&mut io, key, "its handshake gave its place to a newer one", None);
-            self.client = io.client;
+    /// A newcomer finds its `places` full: a place held by a closed connection is freed for it.
+    /// Closed (closing or draining, RFC 9000 §10.2), a connection carries nothing again, its
+    /// state kept three probe timeouts only to absorb its peer's last packets: the one nearest
+    /// its drain is let go at once, as §10.2 lets an endpoint end those states early "to allow
+    /// for faster resource recovery", at the cost §10.2 names, a late packet of its peer's
+    /// answered by a stateless reset (§10.3), which ends the connection for that peer as its
+    /// close would. What it has yet to send, its CONNECTION_CLOSE (a datagram at most), goes
+    /// with this turn's datagrams, so none is freed while the socket holds back an earlier one.
+    /// A connection open, its handshake's or established, keeps its place.
+    fn free_closed(&mut self, now: Instant, places: usize) -> Result<(), Error> {
+        let mut buffer = Vec::new();
+        while self.conns.len() >= places && self.out.is_empty() {
+            let Some(key) = self
+                .conns
+                .iter_mut()
+                .filter_map(|(key, c)| c.quic.is_closed().then(|| (*key, c.quic.poll_timeout())))
+                .min_by_key(|(_, drains)| *drains)
+                .map(|(key, _)| key)
+            else {
+                return Ok(());
+            };
+            buffer.clear();
+            if let Some(conn) = self.conns.get_mut(&key)
+                && let Some(transmit) = conn
+                    .quic
+                    .poll_transmit(now, 1, &mut buffer, self.endpoint.configs())
+            {
+                self.queue_datagram(
+                    transmit.destination,
+                    buffer.get(..transmit.size).unwrap_or_default(),
+                )?;
+            }
+            // Its last events, then its endpoint told it has drained.
+            self.pump(now, key);
+            if let Some(conn) = self.conns.remove(&key) {
+                self.endpoint.handle_event(conn.handle, EndpointEvent::drained());
+            }
         }
+        Ok(())
     }
 
-    /// The aimed peer refused: each connection ends so, its handler told.
+    /// A newcomer finds every place taken: of the open connections holding them, its handshake's
+    /// or established (ROOT's ruling on #72's handshakes: a handshake whose client vanished held
+    /// its place for good, as only established holders were asked), the one
+    /// unheard longest of those that have not answered, within their probe timeout, the PING an
+    /// earlier newcomer sent them ([`Liveness::unanswering`]) is let go for it, its handler told
+    /// as QUIC tells a peer unheard past its bound (RFC 9000 §10.1), for a handler that types its
+    /// ends; whether one was. So is a handshake that answers but has made no progress for a whole
+    /// window, the slowest handshake completed here or, cold, seven backed-off probe timeouts
+    /// ([`Liveness::unfinished`]; ROOT's ruling on #72's unfinished handshakes: clients that
+    /// answered every ask and never finished held a listener's places for good). A stall alone
+    /// ends no connection (ROOT's ruling A): one is let go only as a newcomer needs its place, so
+    /// that a driver's resources stay its owner's bound ([`Driver::hold_connections`]); an
+    /// established holder that answers, however late, keeps its place, and so does a handshake
+    /// that keeps advancing, however slowly.
+    fn reclaim(&mut self, now: Instant) -> bool {
+        let slowest = self.slowest;
+        let Some((key, why)) = self
+            .conns
+            .iter()
+            .filter(|(_, c)| !c.quic.is_closed())
+            .filter_map(|(key, c)| {
+                let why = match c.liveness.unanswering(now) {
+                    true => GiveWay::Unanswered,
+                    false => GiveWay::Unfinished {
+                        window: c.liveness.unfinished(now, slowest)?,
+                        cold: slowest.is_none(),
+                    },
+                };
+                Some((*key, why, c.liveness.last_heard()))
+            })
+            .min_by_key(|(_, _, heard)| *heard)
+            .map(|(key, why, _)| (key, why))
+        else {
+            return false;
+        };
+        let (mut io, handler) = self.io(now);
+        match why {
+            GiveWay::Unanswered => {
+                io.close(key, 0, "unanswered past its probe timeout, its place needed");
+                handler.cause(key, &ConnectionError::TimedOut);
+                handler.lost(
+                    &mut io,
+                    key,
+                    "no answer to a newcomer's PING within its probe timeout, its place needed by the newcomer",
+                    None,
+                );
+            }
+            GiveWay::Unfinished { window, cold } => {
+                io.close(
+                    key,
+                    0,
+                    "its handshake made no progress for a whole window, its place needed",
+                );
+                handler.cause(key, &ConnectionError::TimedOut);
+                let of = match cold {
+                    true => "seven backed-off probe timeouts, none completed here yet",
+                    false => "the slowest handshake completed here",
+                };
+                let why = format!(
+                    "its handshake made no progress for {window:?} ({of}), its place needed by a newcomer"
+                );
+                handler.lost(&mut io, key, &why, None);
+            }
+        }
+        self.client = io.client;
+        true
+    }
+
+    /// The aimed peer refused: each connection not closed yet ends so, its handler told once.
     fn refused(&mut self, now: Instant) {
         self.keys.clear();
         self.keys.extend(self.conns.keys());
@@ -1285,8 +1860,9 @@ impl<H: Handler> Driver<H> {
             let Some(&key) = self.keys.get(at) else {
                 break;
             };
-            if let Some(conn) = self.conns.get_mut(&key) {
-                conn.liveness.refused();
+            match self.conns.get_mut(&key) {
+                Some(conn) if !conn.quic.is_closed() => conn.liveness.refused(),
+                _ => continue,
             }
             let (mut io, handler) = self.io(now);
             io.close(key, 0, "refused there");
@@ -1301,8 +1877,8 @@ impl<H: Handler> Driver<H> {
     }
 
     /// Each connection's liveness: a handshake's probes told; an established connection's,
-    /// where the driver checks it, looked at (a run-out told, a death ended) and kept alive where
-    /// its path or its peer's idle timer has shown it must be.
+    /// where the driver checks it, looked at (a run-out told, a stall told, neither ending it)
+    /// and kept alive where its path or its peer's idle timer has shown it must be.
     fn watch(&mut self, now: Instant) {
         self.keys.clear();
         self.keys.extend(self.conns.keys());
@@ -1316,6 +1892,14 @@ impl<H: Handler> Driver<H> {
             if conn.quic.is_closed() {
                 continue;
             }
+            // Its handshake's too, whose window is judged no sooner ([`Liveness::due`]), and whose
+            // own probe timeout, an ask's judge, is this less its peer's `max_ack_delay`, which
+            // its transport parameters may yet change ([`Liveness::unanswering`]).
+            conn.liveness.probe_timeout(conn.quic.probe_timeout());
+            if !conn.connected {
+                conn.liveness.peer_ack_delay(conn.quic.peer_max_ack_delay());
+            }
+            self.view.judged_by(&conn.liveness);
             let stats = conn.quic.stats();
             if let Some((probes, waited)) = conn.liveness.unanswered(now, stats.udp_tx.datagrams) {
                 let (mut io, handler) = self.io(now);
@@ -1326,32 +1910,19 @@ impl<H: Handler> Driver<H> {
             if !conn.connected {
                 continue;
             }
-            conn.liveness.probe_timeout(conn.quic.probe_timeout());
             let look = conn
                 .liveness
                 .look(now, eliciting(&stats.frame_tx), stats.path.acked_bytes);
-            match look {
-                Look::Fine => {}
-                Look::RanOut { waited, window } => {
-                    let (mut io, handler) = self.io(now);
-                    handler.ran_out(&mut io, key, waited, window);
-                    self.client = io.client;
-                }
-                // Typed as QUIC types a peer unheard past its bound (RFC 9000 §10.1), for a
-                // handler that types its ends.
-                Look::Dead { .. } => {
-                    let (mut io, handler) = self.io(now);
-                    io.close(key, 0, "unanswered past the slowest answer seen");
-                    handler.cause(key, &ConnectionError::TimedOut);
-                    handler.lost(
-                        &mut io,
-                        key,
-                        "no answer within the slowest answer seen on its path",
-                        None,
-                    );
-                    self.client = io.client;
-                    continue;
-                }
+            let told = match look {
+                Look::Fine => None,
+                Look::RanOut { waited, window } => Some(RanOut::Send { waited, window }),
+                Look::Stalled { unheard, window } => Some(RanOut::Stalled { unheard, window }),
+                Look::Answered { after } => Some(RanOut::Answered { after }),
+            };
+            if let Some(what) = told {
+                let (mut io, handler) = self.io(now);
+                handler.ran_out(&mut io, key, what);
+                self.client = io.client;
             }
             let Some(conn) = self.conns.get_mut(&key) else {
                 continue;
@@ -1374,6 +1945,7 @@ impl<H: Handler> Driver<H> {
             while let Some(event) = conn.quic.poll_endpoint_events() {
                 if let Some(event) = self.endpoint.handle_event(conn.handle, event) {
                     conn.quic.handle_event(event, self.endpoint.configs_mut());
+                    conn.heard_authenticated(now);
                 }
             }
             while let Some(event) = conn.quic.poll() {
@@ -1385,6 +1957,12 @@ impl<H: Handler> Driver<H> {
             for event in events {
                 self.event(now, key, event);
             }
+        }
+        // How far its handshake has advanced, as of what it was just fed.
+        if let Some(conn) = self.conns.get_mut(&key)
+            && !conn.connected
+        {
+            conn.liveness.advance(now, conn.quic.handshake_progress());
         }
         // A connection drained of its last packets is let go.
         if self.conns.get(&key).is_some_and(|c| c.quic.is_drained()) {
@@ -1411,6 +1989,9 @@ impl<H: Handler> Driver<H> {
                     conn.liveness
                         .connected(now, eliciting(&stats.frame_tx), stats.path.acked_bytes);
                     conn.liveness.peer_ack_delay(conn.quic.peer_max_ack_delay());
+                    if let Some(took) = conn.liveness.handshake_took() {
+                        self.slowest = Some(self.slowest.map_or(took, |slowest| slowest.max(took)));
+                    }
                 }
                 let (mut io, handler) = self.io(now);
                 if let Err(close) = handler.connected(&mut io, key, &peer) {
@@ -1482,24 +2063,34 @@ impl<H: Handler> Driver<H> {
         }
     }
 
-    /// Ends each connection whose handshake is not done within its bound of its start
-    /// ([`Liveness::due`]), its handler told as of a timeout: its transport's own idle bound
-    /// is for a peer known to be there.
+    /// Each connection whose handshake has not ended by its due time ([`Liveness::due`]) has run
+    /// out: marked, its handler told once ([`RanOut::Handshake`]), and its handshake goes on as a
+    /// peer never reached's does, with no deadline of its own, each probe told, until it ends or
+    /// its handler gives up (the person's ruling, 2026-11-13: every wait after a run-out follows
+    /// the party's liveness and progress). Given up there, a daemon its loaded host descheduled
+    /// past its probe timeout and slowest handshake was asked "is it listening there" (ROOT's run
+    /// of `tests/loopback.rs` on adas-macbook-pro-2 at ea6f4b53b, load1 about 44).
     fn expire(&mut self, now: Instant) {
         self.keys.clear();
-        for (key, conn) in &mut self.conns {
-            if !conn.quic.is_closed() && conn.liveness.due().is_some_and(|at| at <= now) {
-                conn.liveness.handshake_ran_out();
-                self.keys.push(*key);
-            }
-        }
+        self.keys.extend(
+            self.conns
+                .iter()
+                .filter(|(_, c)| !c.quic.is_closed() && c.liveness.due().is_some_and(|at| at <= now))
+                .map(|(key, _)| *key),
+        );
         for at in 0..self.keys.len() {
             let Some(&key) = self.keys.get(at) else {
                 break;
             };
+            let Some(conn) = self.conns.get_mut(&key) else {
+                continue;
+            };
+            let waited = now.saturating_duration_since(conn.liveness.began);
+            let Some(window) = conn.liveness.handshake_ran_out() else {
+                continue;
+            };
             let (mut io, handler) = self.io(now);
-            io.close(key, 0, "its handshake took too long");
-            handler.lost(&mut io, key, "timed out", None);
+            handler.ran_out(&mut io, key, RanOut::Handshake { waited, window });
             self.client = io.client;
         }
     }
@@ -1574,6 +2165,25 @@ impl<H: Handler> Driver<H> {
                 }
                 // The socket's buffer is full: the rest goes on the next turn.
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // A socket aimed at its peer is told of that peer's refusal (an ICMP port
+                // unreachable) by its next send as by its next read, whichever comes first: Linux
+                // gives a connected socket's pending error, and clears it, at either (udp(7):
+                // ECONNREFUSED, "caused by a previous packet sent over the socket"), as Winsock's
+                // send does (WSAECONNRESET, "a previous send operation resulted in an ICMP Port
+                // Unreachable message"). On Linux's loopback the refusal of a flight's first
+                // datagram comes back before its second is sent, and a client whose second send
+                // took it, its read finding none, waited on forever (ROOT's KVM run at 237f3ebe7,
+                // tests/loopback.rs's closed port 22 minutes).
+                Err(e)
+                    if self.aimed.is_some()
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                {
+                    self.out.pop_front();
+                    self.refusal = true;
+                }
                 // A datagram refused as it was sent goes as a lost one would.
                 Err(_) => {
                     self.out.pop_front();
@@ -1596,42 +2206,37 @@ impl<H: Handler> Driver<H> {
             let Some(&key) = self.keys.get(at) else {
                 break;
             };
-            loop {
-                buffer.clear();
-                let Some(conn) = self.conns.get_mut(&key) else {
-                    break;
-                };
-                let Some(transmit) = conn
-                    .quic
-                    .poll_transmit(now, 1, &mut buffer, self.endpoint.configs())
-                else {
-                    break;
-                };
-                self.queue_datagram(
-                    transmit.destination,
-                    buffer.get(..transmit.size).unwrap_or_default(),
-                )?;
-                if self.limits.is_some() {
-                    self.flush_datagrams();
-                    if !self.out.is_empty() {
-                        break;
-                    }
-                }
-                self.pump(now, key);
-            }
+            self.transmit_conn(now, key, &mut buffer)?;
         }
         self.flush_datagrams();
         Ok(())
     }
-}
 
-/// Of the handshakes `held` (each connection and when it began), the one a newer gives its
-/// place to where they fill `slots`: the oldest, unanswered longest; none while a slot is free.
-fn given_up(held: &[(ConnKey, Instant)], slots: usize) -> Option<ConnKey> {
-    if held.len() < slots {
-        return None;
+    /// Queues what connection `key` has to send, a bounded driver sending each as its socket
+    /// takes it.
+    fn transmit_conn(&mut self, now: Instant, key: ConnKey, buffer: &mut Vec<u8>) -> Result<(), Error> {
+        loop {
+            buffer.clear();
+            let Some(conn) = self.conns.get_mut(&key) else {
+                break;
+            };
+            let Some(transmit) = conn.quic.poll_transmit(now, 1, buffer, self.endpoint.configs()) else {
+                break;
+            };
+            self.queue_datagram(
+                transmit.destination,
+                buffer.get(..transmit.size).unwrap_or_default(),
+            )?;
+            if self.limits.is_some() {
+                self.flush_datagrams();
+                if !self.out.is_empty() {
+                    break;
+                }
+            }
+            self.pump(now, key);
+        }
+        Ok(())
     }
-    held.iter().min_by_key(|(_, began)| *began).map(|(key, _)| *key)
 }
 
 /// The ack-eliciting frames a connection sent (RFC 9002 §2: every frame but ACK, PADDING and
@@ -1665,11 +2270,110 @@ fn eliciting(f: &hyper_quic::FrameStats) -> u64 {
     .fold(0u64, u64::saturating_add)
 }
 
+/// What `quic` has taken from its peer: at e0613f52 hyper-quic records its frames only after
+/// AEAD and duplicate rejection (connection/mod.rs `drops_authenticated`, then
+/// `frame_rx.record`). ACK-only packets count; PADDING-only packets and saturated counters
+/// under-count, which can invent no liveness. CRYPTO frames count by the new handshake data
+/// they carry (`handshake_progress`), never by their number: a server's connection takes its
+/// first packet without putting its number in its dedup window (`handle_first_packet` skips
+/// `drops_authenticated`), so a replay of a client's first Initial, CRYPTO and PADDING alone,
+/// is taken again and its CRYPTO frames counted, though it repeats data already read, which
+/// RFC 9000 §12.3 has a receiver discard.
+fn received(quic: &Connection) -> u64 {
+    let f = &quic.stats().frame_rx;
+    [
+        eliciting(f).saturating_sub(f.crypto),
+        quic.handshake_progress(),
+        f.acks,
+        f.connection_close,
+        f.fec_source,
+        f.fec_repair,
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add)
+}
+
 /// Where a wait begun `since` counts its silence from: its peer last `heard` after it began, or
 /// its probe timeout `pto` past its start, whichever is later.
 fn judged_from(heard: Option<Instant>, since: Instant, pto: Duration) -> Instant {
     let progress = heard.map_or(since, |heard| heard.max(since));
     progress.max(since.checked_add(pto).unwrap_or(since))
+}
+
+/// A driver's turn, as it was had ([`Liveness::absent`]): when it began, the CPU time its thread
+/// had run by then, how long its wait blocked as planned (until its timer, or until what came),
+/// and how far past its timer it woke.
+#[derive(Debug, Clone, Copy)]
+struct Turn {
+    at: Instant,
+    cpu: Option<Duration>,
+    blocked: Duration,
+    late: Duration,
+}
+
+impl Turn {
+    /// How long, from this turn's start to the next's at `now` (its thread having run `cpu` by
+    /// then), its side was absent: the time its thread neither ran nor waited as planned, where
+    /// the host keeps a thread's CPU time ([`thread_cpu`]), which takes in a freeze in a turn's
+    /// midst as well as past its timer; else how far past its timer its wait woke.
+    fn absent(&self, now: Instant, cpu: Option<Duration>) -> Duration {
+        match (self.cpu, cpu) {
+            (Some(was), Some(is)) => now
+                .saturating_duration_since(self.at)
+                .saturating_sub(is.saturating_sub(was))
+                .saturating_sub(self.blocked),
+            _ => self.late,
+        }
+    }
+}
+
+/// The CPU time the calling thread has run, where the host keeps one finer than its scheduler's
+/// tick: POSIX's thread CPU-time clock (clock_gettime(2), `CLOCK_THREAD_CPUTIME_ID`).
+#[cfg(unix)]
+fn thread_cpu() -> Option<Duration> {
+    let mut at = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime(2) writes the timespec it is given, which lives through the call.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut at) };
+    if read != 0 {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(at.tv_sec).ok()?,
+        u32::try_from(at.tv_nsec).ok()?,
+    ))
+}
+
+/// None on Windows: a thread's times there move at the clock interrupt (GetThreadTimes), coarser
+/// than a turn, so a driver's absence is how far past its timer its wait woke alone.
+#[cfg(windows)]
+fn thread_cpu() -> Option<Duration> {
+    None
+}
+
+/// `wait`, rounded up to the whole milliseconds poll(2) and WSAPoll wait ([`readable`]).
+fn whole_ms(wait: Duration) -> Duration {
+    Duration::from_millis(u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX))
+}
+
+/// Drops what another socket sent `wake` before it was connected, still queued (connect(2)
+/// purges no queue): no sender has woken it yet. Each datagram goes whole, cut to the buffer
+/// (Unix), or cut with WSAEMSGSIZE (Windows' recv, which drops the rest); the queue ends at
+/// WouldBlock, `wake` being non-blocking.
+fn drop_strays(wake: &UdpSocket) -> std::io::Result<()> {
+    let mut stray = [0; 1];
+    loop {
+        match wake.recv(&mut stray) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            #[cfg(windows)]
+            Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE) => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Whether `socket` and `wake` have something to read (a datagram, or `socket`'s error: its
@@ -1848,17 +2552,126 @@ mod tests {
         worker.join().unwrap().unwrap();
     }
 
+    /// A handler that serves nothing, for tests of the driver's own sockets.
+    struct Idle;
+    impl Handler for Idle {
+        type Command = ();
+        fn connected(&mut self, _: &mut Io<'_>, _: ConnKey, _: &[u8]) -> Result<(), Close> {
+            Ok(())
+        }
+        fn opened(&mut self, _: &mut Io<'_>, _: ConnKey, _: StreamId) {}
+        fn readable(&mut self, _: &mut Io<'_>, _: ConnKey, _: StreamId) {}
+        fn writable(&mut self, _: &mut Io<'_>, _: ConnKey, _: StreamId) {}
+        fn stopped(&mut self, _: &mut Io<'_>, _: ConnKey, _: StreamId) {}
+        fn lost(&mut self, _: &mut Io<'_>, _: ConnKey, _: &str, _: Option<u64>) {}
+        fn command(&mut self, _: &mut Io<'_>, _: ()) {}
+        fn done(&self) -> bool {
+            false
+        }
+    }
+
+    /// A driver tells every socket it and its senders hold, each by name (Hex's default-deny
+    /// check, where Windows' UDP table shows no socket's peer): the one it serves on, its
+    /// wake and its senders' waker, as the sockets themselves report them, three distinct
+    /// addresses, each held while the driver lives and free once it and its senders are gone.
+    #[test]
+    fn a_driver_tells_every_socket_it_holds() {
+        for at in ["127.0.0.1:0", "[::1]:0"] {
+            if UdpSocket::bind(at).is_err() {
+                // A host without IPv6 loopback has no [::1] driver to test either.
+                continue;
+            }
+            let (driver, sender) =
+                Driver::bind(at.parse().unwrap(), None, Idle, crate::tls::Known::Never).unwrap();
+            let clone = sender.try_clone().unwrap();
+            let told = [
+                driver.local().unwrap(),
+                driver.wake_addr().unwrap(),
+                sender.waker_addr().unwrap(),
+            ];
+            let reported = [
+                driver.socket.local_addr().unwrap(),
+                driver.wake.local_addr().unwrap(),
+                sender.waker.local_addr().unwrap(),
+            ];
+            assert_eq!(told, reported, "{at}");
+            assert_eq!(
+                clone.waker_addr().unwrap(),
+                told[2],
+                "{at}: a clone holds the same waker"
+            );
+            // The wake and the waker, connected to each other.
+            assert_eq!(driver.wake.peer_addr().unwrap(), told[2], "{at}");
+            assert_eq!(sender.waker.peer_addr().unwrap(), told[1], "{at}");
+            assert!(
+                told[0] != told[1] && told[1] != told[2] && told[0] != told[2],
+                "{at}: {told:?}"
+            );
+            for addr in told {
+                let again = UdpSocket::bind(addr);
+                assert!(
+                    matches!(&again, Err(e) if e.kind() == std::io::ErrorKind::AddrInUse),
+                    "{at}: {addr} is not held: {again:?}"
+                );
+            }
+            drop((driver, sender, clone));
+            for addr in told {
+                UdpSocket::bind(addr).unwrap_or_else(|e| panic!("{at}: {addr} still held: {e}"));
+            }
+        }
+    }
+
+    /// The driver's wake takes datagrams from its own waker alone: one another local socket
+    /// sends it is dropped by the kernel (the two connected to each other), so no other process
+    /// can wake, or spam, a run's driver, and neither socket is open to every peer. The wake
+    /// through a clone of its sender, sent after the stranger's, is the first and only one read.
+    #[test]
+    fn the_wake_takes_datagrams_from_its_own_waker_alone() {
+        for at in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(stranger) = UdpSocket::bind(at) else {
+                // A host without IPv6 loopback has no [::1] driver to test either.
+                continue;
+            };
+            let (driver, sender) =
+                Driver::bind(at.parse().unwrap(), None, Idle, crate::tls::Known::Never).unwrap();
+            let wake = driver.wake.local_addr().unwrap();
+            // On loopback a datagram is queued at its receiver before sendto returns (or
+            // dropped): the stranger's would be read before the waker's.
+            assert_eq!(stranger.send_to(&[7], wake).unwrap(), 1);
+            sender.try_clone().unwrap().request_stop();
+            driver.wake.set_nonblocking(false).unwrap();
+            driver
+                .wake
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut got = [0; 2];
+            let (n, from) = driver.wake.recv_from(&mut got).unwrap();
+            assert_eq!(
+                (from, &got[..n]),
+                (sender.waker_addr().unwrap(), &[0][..]),
+                "{at}: the wake read another socket's datagram"
+            );
+            driver.wake.set_nonblocking(true).unwrap();
+            let rest = driver.wake.recv_from(&mut got);
+            assert!(
+                matches!(&rest, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "{at}: more than the waker's wake came: {rest:?}"
+            );
+        }
+    }
+
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 
-    /// A handshake is held to its deadline from its start, the slowest seen from its peer, or
-    /// to none, as long as its probing goes on, each new probe past its first flight told once
-    /// with how long it has waited, and none once its peer is heard; its end measures its first
-    /// answer, and nothing of the handshake's holds it after. The longest silence a connection
-    /// lived through is the one measured, its peer last heard at its last packet.
+    /// A handshake is judged by its window, the slowest seen from its peer
+    /// (`a_handshake_runs_out_a_whole_window_unheard_past_its_probe_timeout`), or by none, as
+    /// long as its probing goes on, each new probe past its first flight told once with how long
+    /// it has waited, and none once its peer is heard; its end measures its first answer, and
+    /// nothing of the handshake's holds it after. The longest silence a connection lived through
+    /// is the one measured, its peer last heard at its last packet.
     #[test]
-    fn a_handshake_is_held_to_its_deadline_or_probes_on_and_its_silences_are_measured() {
+    fn a_handshake_is_held_to_its_window_or_probes_on_and_its_silences_are_measured() {
         let t0 = Instant::now();
         let mut held = Liveness::new(t0, Some(ms(40)), Duration::ZERO);
         assert_eq!(held.due(), t0.checked_add(ms(40)));
@@ -1899,13 +2712,158 @@ mod tests {
         assert_eq!(l.due(), None);
     }
 
-    /// Liveness at use (the person's ruling, 2026-11-13): a send waits for the peer to
-    /// acknowledge any of it, within the slowest answer seen and the peer's max_ack_delay; an
-    /// answer raises the slowest; past the window, a wait whose peer is still heard is told once
-    /// as a run-out and goes on; a whole window with nothing heard is its death, after the
-    /// silence that came before the send.
+    /// A handshake with a peer reached before is judged as a send is: a whole window of the
+    /// slowest handshake seen from that peer with nothing heard from it, past the later of its
+    /// last packet heard and its probe timeout, before which QUIC declares no loss (RFC 9002
+    /// §6.2.1); one heard lives on past both, its run-out kept, and one that ends within them
+    /// ran out not, however much slower than the slowest. Red with the slowest handshake its
+    /// deadline from its start: ROOT's runs of tests/context.rs at 084891178 (8 of 21 on HVF, 1
+    /// on KVM), a daemon reached before given up "within the slowest handshake seen from it" of
+    /// 0.93-4.2 ms under the suite's own load. One unheard past them runs out, marked, and goes
+    /// on with no window, as a peer never reached's does, its probes told: red with its window
+    /// kept, its run-out its end ("is it listening there", ROOT's run of tests/loopback.rs on
+    /// adas-macbook-pro-2 at ea6f4b53b, load1 about 44).
     #[test]
-    fn a_send_waits_its_window_runs_out_with_progress_and_dies_without() {
+    fn a_handshake_runs_out_a_whole_window_unheard_past_its_probe_timeout() {
+        let t0 = Instant::now();
+        let mut l = Liveness::new(t0, Some(ms(2)), Duration::ZERO);
+        l.probe_timeout(ms(26));
+        assert_eq!(
+            l.due(),
+            t0.checked_add(ms(28)),
+            "no sooner than its probe timeout"
+        );
+        assert!(!l.outran(t0 + ms(26)));
+        assert!(
+            l.outran(t0 + ms(27)),
+            "past its window and its probe timeout both"
+        );
+        l.heard(t0 + ms(27));
+        assert_eq!(
+            l.due(),
+            t0.checked_add(ms(29)),
+            "a whole window past its last packet"
+        );
+        l.heard(t0 + ms(28));
+        l.connected(t0 + ms(29), 0, 0);
+        assert_eq!(
+            (l.due(), l.ran_out),
+            (None, true),
+            "it lived on, its run-out kept"
+        );
+        let mut slower = Liveness::new(t0, Some(ms(2)), Duration::ZERO);
+        slower.probe_timeout(ms(26));
+        slower.heard(t0 + ms(14));
+        slower.connected(t0 + ms(14), 0, 0);
+        assert_eq!(
+            (slower.handshake_took(), slower.ran_out),
+            (Some(ms(14)), false),
+            "seven times the slowest, within its probe timeout"
+        );
+        // Unheard past its window and probe timeout: run out, marked, and on with no window.
+        let mut unheard = Liveness::new(t0, Some(ms(2)), Duration::ZERO);
+        unheard.probe_timeout(ms(26));
+        assert_eq!(unheard.unanswered(t0, 2), None, "its first flight");
+        assert_eq!(unheard.due(), t0.checked_add(ms(28)));
+        assert_eq!(
+            unheard.handshake_ran_out(),
+            Some(ms(2)),
+            "the window it ran out of"
+        );
+        assert_eq!(
+            (unheard.due(), unheard.ran_out),
+            (None, true),
+            "no deadline, marked"
+        );
+        assert_eq!(
+            unheard.unanswered(t0 + ms(60), 4),
+            Some((2, ms(60))),
+            "its probes told on"
+        );
+        unheard.heard(t0 + ms(200));
+        unheard.connected(t0 + ms(200), 0, 0);
+        assert_eq!(
+            (unheard.handshake_took(), unheard.ran_out),
+            (Some(ms(200)), true),
+            "answered once heard, its run-out kept"
+        );
+    }
+
+    /// A send taken in as it goes (`Liveness::note`), before what answers it is read, is
+    /// answered by that answer, its quiet peer living on. Taken in only after its answer was
+    /// read, it began a wait that answer had already ended, and its peer, with nothing more to
+    /// answer, was taken for dead a window on: what failed `tests/loopback.rs` (2 to 3 of 26 on
+    /// adacachy2, 7 on macOS) as its driver first sent between its socket's reads.
+    #[test]
+    fn a_send_taken_in_before_its_answer_is_read_is_answered_by_it() {
+        let t0 = Instant::now();
+        let mut l = Liveness::new(t0, None, ms(2));
+        l.heard(t0);
+        l.connected(t0, 0, 0);
+        l.peer_ack_delay(ms(5));
+        l.probe_timeout(ms(10));
+        assert_eq!(l.look(t0 + ms(1), 1, 0), Look::Fine, "a first send waits");
+        l.note(t0 + ms(2), 2, 0);
+        l.heard(t0 + ms(3));
+        assert_eq!(l.look(t0 + ms(3), 2, 200), Look::Fine, "both answered at once");
+        assert_eq!(l.wait, None, "nothing waits");
+        assert_eq!(l.look(t0 + ms(100), 2, 200), Look::Fine, "its quiet peer lives");
+    }
+
+    /// A wait is judged on the time its side was there to hear (`Liveness::absent`): its driver
+    /// absent for 200 ms, woken that much past the time it planned to look again (kiln's runners
+    /// froze whole processes for up to 124 ms), a send waiting through it is not dead as its
+    /// driver resumes, and its answer and silence do not count the absence; a handshake's window
+    /// moves on by it too. Red with no absence taken: the send dead as its driver resumes.
+    #[test]
+    fn a_wait_is_judged_on_the_time_its_side_was_there_to_hear() {
+        let t0 = Instant::now();
+        let mut l = Liveness::new(t0, None, ms(2));
+        l.heard(t0);
+        l.connected(t0, 0, 0);
+        l.peer_ack_delay(ms(25));
+        l.probe_timeout(ms(26));
+        assert_eq!(
+            l.look(t0 + ms(1), 1, 0),
+            Look::Fine,
+            "a send waits, its window 27 ms"
+        );
+        l.absent(ms(200));
+        assert_eq!(
+            l.look(t0 + ms(203), 1, 0),
+            Look::Fine,
+            "not dead as its driver resumes"
+        );
+        l.heard(t0 + ms(205));
+        assert_eq!(l.look(t0 + ms(205), 1, 100), Look::Fine);
+        assert_eq!(
+            (l.answer, l.longest_silence()),
+            (ms(4), ms(5)),
+            "its answer and its silence less the 200 ms its side was absent"
+        );
+        let mut h = Liveness::new(t0, Some(ms(2)), Duration::ZERO);
+        h.probe_timeout(ms(26));
+        h.absent(ms(200));
+        assert_eq!(h.due(), t0.checked_add(ms(228)));
+        h.connected(t0 + ms(203), 0, 0);
+        h.absent(ms(5));
+        assert_eq!(
+            (h.handshake_took(), h.handshake_absent()),
+            (Some(ms(3)), ms(200)),
+            "its handshake less the 200 ms its side was absent before it ended, and that absence"
+        );
+    }
+
+    /// Liveness at use (the person's ruling, 2026-11-13, and ROOT's ruling A): a send waits for
+    /// the peer to acknowledge any of it, within the slowest answer seen and the peer's
+    /// max_ack_delay; an answer raises the slowest; past the window, a wait whose peer is still
+    /// heard is told once as a run-out and goes on; a whole window with nothing heard is a stall,
+    /// told once with how long its peer went unheard, and followed with no window: its answer,
+    /// however late, ends it and is the slowest seen, so that the window covers such a stall
+    /// from then on. Red with a stall the connection's death (`Look::Dead` before): a client
+    /// frozen 200 ms mid-import taken for dead by its daemon (tests/loopback.rs).
+    #[test]
+    fn a_send_waits_its_window_runs_out_with_progress_and_stalls_without() {
         let t0 = Instant::now();
         let mut l = Liveness::new(t0, None, Duration::ZERO);
         assert_eq!(
@@ -1939,13 +2897,92 @@ mod tests {
         assert_eq!(l.look(t0 + ms(146), 2, 100), Look::Fine);
         assert_eq!(
             l.look(t0 + ms(148), 2, 100),
-            Look::Dead {
-                quiet: ms(88),
+            Look::Stalled {
+                unheard: ms(18),
                 window: ms(17)
             }
         );
-        let seen = (l.answer, l.lost, l.ran_out);
-        assert_eq!(seen, (ms(12), Some(ms(88)), true));
+        assert_eq!(
+            l.look(t0 + ms(10_000), 2, 100),
+            Look::Fine,
+            "a stall is told once, and followed with no window"
+        );
+        assert_eq!(l.next(), None, "its answer is what changes it");
+        assert_eq!((l.lost(), l.ran_out), (Some(ms(88)), true));
+        // Its answer, 10 s after the send: the stall ends, told once, and the slowest answer
+        // covers it.
+        l.heard(t0 + ms(10_120));
+        assert_eq!(
+            l.look(t0 + ms(10_120), 2, 200),
+            Look::Answered { after: ms(10_000) }
+        );
+        assert_eq!(l.look(t0 + ms(10_121), 2, 200), Look::Fine);
+        let seen = (l.answer, l.window(), l.lost(), l.ran_out);
+        assert_eq!(seen, (ms(10_000), Some(ms(10_005)), None, true));
+        // As long a silence again is within its window.
+        assert_eq!(l.look(t0 + ms(10_200), 3, 200), Look::Fine);
+        assert_eq!(l.look(t0 + ms(20_000), 3, 200), Look::Fine);
+        assert_eq!(l.next(), Some(t0 + ms(20_205)));
+    }
+
+    /// A stall is judged afresh as a newcomer needs a place (`Liveness::stalled`): a send
+    /// unanswered a whole window past its probe timeout is stalled, told or not; one whose peer
+    /// was heard since is not, whatever was told, until a whole window passes unheard again;
+    /// cold, with no window, none is. A holder gives its place to a newcomer once it has not
+    /// answered, within its probe timeout, the PING an earlier newcomer sent it
+    /// (`Liveness::unanswering`), stalled or not, cold too; a later newcomer's ask puts off no
+    /// judgement of an earlier one still unanswered, and one answered is asked again.
+    #[test]
+    fn a_stalled_holder_unheard_since_a_newcomer_asked_gives_way() {
+        let t0 = Instant::now();
+        let mut l = Liveness::new(t0, None, ms(2));
+        l.heard(t0);
+        l.connected(t0, 0, 0);
+        l.peer_ack_delay(ms(5));
+        l.probe_timeout(ms(10));
+        assert!(!l.stalled(t0 + ms(100)), "nothing waits");
+        assert_eq!(l.look(t0 + ms(1), 1, 0), Look::Fine);
+        // Its window 7 ms, judged from its probe timeout, 11 ms in.
+        assert!(!l.stalled(t0 + ms(18)));
+        assert!(
+            l.stalled(t0 + ms(19)),
+            "a whole window unanswered past its probe timeout"
+        );
+        assert!(
+            !l.unanswering(t0 + ms(19)),
+            "stalled, but no newcomer asked it yet"
+        );
+        assert!(matches!(l.look(t0 + ms(19), 1, 0), Look::Stalled { .. }));
+        l.ask(t0 + ms(20));
+        assert!(!l.unanswering(t0 + ms(21)), "asked within its probe timeout");
+        assert!(
+            l.unanswering(t0 + ms(31)),
+            "unheard past its probe timeout since asked"
+        );
+        l.ask(t0 + ms(25));
+        assert_eq!(l.asked, Some(t0 + ms(20)), "the ask unanswered stands");
+        l.heard(t0 + ms(30));
+        assert!(
+            !l.stalled(t0 + ms(31)),
+            "its peer heard since: answering, however late"
+        );
+        assert!(!l.unanswering(t0 + ms(38)), "it answered the ask");
+        assert!(l.stalled(t0 + ms(38)), "and unheard a whole window again");
+        l.ask(t0 + ms(40));
+        assert_eq!(l.asked, Some(t0 + ms(40)), "asked again");
+        assert!(!l.unanswering(t0 + ms(41)));
+        assert!(l.unanswering(t0 + ms(51)));
+        let mut cold = Liveness::new(t0, None, Duration::ZERO);
+        cold.heard(t0);
+        cold.connected(t0, 0, 0);
+        cold.peer_ack_delay(ms(5));
+        assert_eq!(cold.look(t0, 1, 0), Look::Fine);
+        cold.ask(t0);
+        assert!(!cold.stalled(t0 + ms(100_000)), "cold: no window to judge by");
+        assert!(
+            cold.unanswering(t0 + ms(100_000)),
+            "cold, unheard since asked: judged by its liveness all the same"
+        );
     }
 
     /// What its handshake sent, answered as it ends, is no send waiting: a wait begun for it
@@ -1992,8 +3029,8 @@ mod tests {
     /// A wait is judged no sooner than QUIC's loss recovery judges its send (its probe timeout,
     /// RFC 9002 §6.2.1): a peer's acknowledgement delayed by its max_ack_delay and a late timer,
     /// past a window its path's record seeded (a 2 ms answer) but within the probe timeout, has
-    /// not run out, and is the slowest answer from then on; a send nothing answers runs out past its window and dies
-    /// a whole window past its probe timeout. Red before: 10 of tests/loopback.rs's 19 died on a
+    /// not run out, and is the slowest answer from then on; a send nothing answers runs out past
+    /// its window and stalls a whole window past its probe timeout. Red before: 10 of tests/loopback.rs's 19 died on a
     /// send 28.9 ms unanswered, their window 26.9 ms (a handshake of 1.9 ms and 25 ms of
     /// max_ack_delay), their probe timeout 30.7 ms.
     #[test]
@@ -2028,11 +3065,12 @@ mod tests {
         assert_eq!(l.look(t0 + ms(125), 2, 100), Look::Fine);
         assert_eq!(
             l.look(t0 + ms(126), 2, 100),
-            Look::Dead {
-                quiet: ms(9),
+            Look::Stalled {
+                unheard: ms(95),
                 window: ms(54)
             }
         );
+        assert_eq!(l.lost(), Some(ms(9)), "the silence before the send that stalled");
     }
 
     /// A keep-alive goes before the silence its path is kept within, early by the window so
@@ -2061,15 +3099,960 @@ mod tests {
         assert_eq!(keep_within(None, None), None);
     }
 
-    /// A handshake past the slots its driver's owner holds takes the place of the oldest still
-    /// unanswered; while a slot is free, none is given up.
+    /// What a test's party heard of its connections.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Heard {
+        Connected(ConnKey),
+        Bytes(ConnKey),
+        Stalled(ConnKey),
+        Lost(ConnKey, String),
+        Frozen,
+    }
+
+    /// What a test asks of a party's driver.
+    enum Ask {
+        Connect(SocketAddr, Box<ClientConfig>),
+        /// Holds its driver's thread, as a process stopped or descheduled is held, until let go.
+        Freeze(mpsc::Receiver<()>),
+        /// A byte on a stream of its own, which its peer hears.
+        Say(ConnKey),
+        /// Ends its driver without a word to its peers, as a killed process's ends.
+        Vanish,
+        /// Ends its driver as its next connection's handshake ends, once what ends it is sent:
+        /// nothing of its endpoint's is answered after, as of an owner gone at its handshake.
+        VanishAtConnect,
+    }
+
+    /// A bounded endpoint or a client of one, on the real transport: it tells what its driver
+    /// tells it.
+    struct Party {
+        heard: mpsc::Sender<Heard>,
+        vanished: bool,
+        vanish_at_connect: bool,
+    }
+
+    impl Handler for Party {
+        type Command = Ask;
+        fn connected(&mut self, _: &mut Io<'_>, conn: ConnKey, _: &[u8]) -> Result<(), Close> {
+            self.vanished |= self.vanish_at_connect;
+            let _ = self.heard.send(Heard::Connected(conn));
+            Ok(())
+        }
+        fn opened(&mut self, io: &mut Io<'_>, conn: ConnKey, stream: StreamId) {
+            self.readable(io, conn, stream);
+        }
+        fn readable(&mut self, io: &mut Io<'_>, conn: ConnKey, stream: StreamId) {
+            let mut any = false;
+            while let Read::Bytes(bytes) | Read::End(bytes) = io.read(conn, stream) {
+                if bytes.is_empty() {
+                    break;
+                }
+                any = true;
+            }
+            if any {
+                let _ = self.heard.send(Heard::Bytes(conn));
+            }
+        }
+        fn writable(&mut self, _: &mut Io<'_>, _: ConnKey, _: StreamId) {}
+        fn stopped(&mut self, _: &mut Io<'_>, _: ConnKey, _: StreamId) {}
+        fn lost(&mut self, _: &mut Io<'_>, conn: ConnKey, why: &str, _: Option<u64>) {
+            let _ = self.heard.send(Heard::Lost(conn, why.to_string()));
+        }
+        fn ran_out(&mut self, _: &mut Io<'_>, conn: ConnKey, what: RanOut) {
+            if let RanOut::Stalled { .. } = what {
+                let _ = self.heard.send(Heard::Stalled(conn));
+            }
+        }
+        fn command(&mut self, io: &mut Io<'_>, ask: Ask) {
+            match ask {
+                Ask::Connect(to, config) => {
+                    if let Err(e) = io.connect(to, *config) {
+                        let _ = self.heard.send(Heard::Lost(ConnKey::MAX, e.to_string()));
+                    }
+                }
+                Ask::Freeze(until) => {
+                    let _ = self.heard.send(Heard::Frozen);
+                    let _ = until.recv();
+                }
+                Ask::Say(conn) => {
+                    let stream = io.open(conn).unwrap();
+                    assert_eq!(io.write(conn, stream, b"x").unwrap(), 1);
+                    io.finish(conn, stream).unwrap();
+                }
+                Ask::Vanish => self.vanished = true,
+                Ask::VanishAtConnect => self.vanish_at_connect = true,
+            }
+        }
+        fn done(&self) -> bool {
+            self.vanished
+        }
+    }
+
+    /// A party's driver as bound, and what reaches it.
+    type Bound = Result<(Driver<Party>, Sender<Ask>), Error>;
+
+    /// A party running: what reaches it, what it hears, where it is, and its driver's thread.
+    type Running = (
+        Sender<Ask>,
+        mpsc::Receiver<Heard>,
+        SocketAddr,
+        std::thread::JoinHandle<Result<(), Error>>,
+    );
+
+    /// A party on a driver and a thread of its own.
+    fn party(bound: impl FnOnce(Party) -> Bound) -> Running {
+        let (heard, hears) = mpsc::channel();
+        let (mut driver, asks) = bound(Party {
+            heard,
+            vanished: false,
+            vanish_at_connect: false,
+        })
+        .unwrap();
+        let at = driver.local().unwrap();
+        let running = std::thread::spawn(move || driver.run());
+        (asks, hears, at, running)
+    }
+
+    /// The next of what `hears` hears that `want` takes, the rest of it told if it never comes.
+    fn next_heard(hears: &mpsc::Receiver<Heard>, want: impl Fn(&Heard) -> bool) -> Heard {
+        let patience = Duration::from_secs(60);
+        let mut other = Vec::new();
+        loop {
+            match hears.recv_timeout(patience) {
+                Ok(heard) if want(&heard) => return heard,
+                Ok(heard) => other.push(heard),
+                Err(_) => panic!("nothing wanted within {patience:?}; heard {other:?}"),
+            }
+        }
+    }
+
+    /// A bounded endpoint's one place, held by an established connection (step 5's output and
+    /// input endpoints and D238's agent-control endpoint share this driver): a newcomer that
+    /// finds it taken is refused and the holder asked for an answer (a PING). A holder frozen
+    /// past its window stalls, told once, and keeps its place: let go, it answers, and the next
+    /// newcomer is refused again. A holder gone without a word stalls the same, and the next
+    /// newcomer takes its place (ROOT's ruling A, its third condition: the reclaim on contention
+    /// bounds the endpoint's resources). Red with a stall the holder's death: the frozen holder
+    /// let go at its stall, before any newcomer needed its place.
     #[test]
-    fn a_handshake_past_its_slots_takes_the_oldest_unanswered_place() {
+    fn a_stalled_holder_gives_its_place_to_a_newcomer_and_one_that_answers_keeps_it() {
+        let server = crate::identity::Identity::generate().unwrap();
+        let config = |of: &crate::identity::Identity| {
+            Box::new(crate::tls::client(of, server.fingerprint(), crate::tls::Known::Never).unwrap())
+        };
+        let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let tls = crate::tls::server(&server).unwrap();
+        let limits = DriverLimits {
+            connections: 1,
+            command_slots: 8,
+            queued_datagram_bytes: DATAGRAM * 8,
+        };
+        let (endpoint, at_endpoint, address, serving) =
+            party(|p| Driver::bind_bounded(any, Some(tls), p, limits));
+        let bind = |p: Party| Driver::bind(any, None, p, crate::tls::Known::Never);
+        let (holder, at_holder, _, holding) = party(bind);
+        let (newcomer, at_newcomer, _, _coming) = party(bind);
+        let (holder_id, newcomer_id) = (
+            crate::identity::Identity::generate().unwrap(),
+            crate::identity::Identity::generate().unwrap(),
+        );
+        let connected = |h: &Heard| matches!(h, Heard::Connected(_));
+        holder
+            .send(Command::Handler(Ask::Connect(address, config(&holder_id))))
+            .unwrap();
+        let Heard::Connected(held) = next_heard(&at_endpoint, connected) else {
+            panic!("not connected")
+        };
+        let Heard::Connected(mine) = next_heard(&at_holder, connected) else {
+            panic!("not connected")
+        };
+        // Heard by its endpoint, which has an answer of the holder's by then, its window.
+        holder.send(Command::Handler(Ask::Say(mine))).unwrap();
+        assert_eq!(next_heard(&at_endpoint, |_| true), Heard::Bytes(held));
+
+        // Frozen: a newcomer is refused, and the holder, asked for an answer, stalls.
+        let (thaw, frozen) = mpsc::channel();
+        holder.send(Command::Handler(Ask::Freeze(frozen))).unwrap();
+        assert_eq!(next_heard(&at_holder, |_| true), Heard::Frozen);
+        let lost = |h: &Heard| matches!(h, Heard::Lost(..));
+        newcomer
+            .send(Command::Handler(Ask::Connect(address, config(&newcomer_id))))
+            .unwrap();
+        let refused = next_heard(&at_newcomer, |h| lost(h) || connected(h));
+        assert!(matches!(refused, Heard::Lost(..)), "{refused:?}");
+        assert_eq!(
+            next_heard(&at_endpoint, |_| true),
+            Heard::Stalled(held),
+            "its holder stalls, and keeps its place"
+        );
+        // Let go, it answers; the next newcomer is refused, its place kept.
+        thaw.send(()).unwrap();
+        holder.send(Command::Handler(Ask::Say(mine))).unwrap();
+        assert_eq!(next_heard(&at_endpoint, |_| true), Heard::Bytes(held));
+        newcomer
+            .send(Command::Handler(Ask::Connect(address, config(&newcomer_id))))
+            .unwrap();
+        let refused = next_heard(&at_newcomer, |h| lost(h) || connected(h));
+        assert!(matches!(refused, Heard::Lost(..)), "{refused:?}");
+        holder.send(Command::Handler(Ask::Say(mine))).unwrap();
+        assert_eq!(
+            next_heard(&at_endpoint, |_| true),
+            Heard::Bytes(held),
+            "a holder that answered keeps its place"
+        );
+
+        // Gone without a word: the next newcomer finds it stalled, and takes its place.
+        holder.send(Command::Handler(Ask::Vanish)).unwrap();
+        holding.join().unwrap().unwrap();
+        newcomer
+            .send(Command::Handler(Ask::Connect(address, config(&newcomer_id))))
+            .unwrap();
+        let refused = next_heard(&at_newcomer, |h| lost(h) || connected(h));
+        assert!(matches!(refused, Heard::Lost(..)), "{refused:?}");
+        assert_eq!(next_heard(&at_endpoint, |_| true), Heard::Stalled(held));
+        newcomer
+            .send(Command::Handler(Ask::Connect(address, config(&newcomer_id))))
+            .unwrap();
+        let taken = next_heard(&at_newcomer, |h| lost(h) || connected(h));
+        assert!(matches!(taken, Heard::Connected(_)), "{taken:?}");
+        let Heard::Lost(gone, _) = next_heard(&at_endpoint, |_| true) else {
+            panic!("its holder was not let go");
+        };
+        assert_eq!(gone, held);
+        assert!(matches!(next_heard(&at_endpoint, |_| true), Heard::Connected(_)));
+        endpoint.send(Command::Stop).unwrap();
+        serving.join().unwrap().unwrap();
+        newcomer.send(Command::Handler(Ask::Vanish)).unwrap();
+    }
+
+    /// A holder gone as its handshake ended, nothing of its endpoint's answered after (an owner
+    /// gone before the handshake's last frames were acknowledged), is cold: its path showed no
+    /// answer, so it has no window and never stalls. Under contention a holder is judged by its
+    /// liveness (ROOT's ruling on #72): asked for an answer (a PING), it gives its place to a
+    /// later attempt once unheard past its probe timeout. Red with a stall the only way to
+    /// give it up: the newcomer refused at every attempt.
+    #[test]
+    fn a_cold_holder_unheard_past_its_probe_timeout_gives_its_place_to_a_newcomer() {
+        let server = crate::identity::Identity::generate().unwrap();
+        let config = |of: &crate::identity::Identity| {
+            Box::new(crate::tls::client(of, server.fingerprint(), crate::tls::Known::Never).unwrap())
+        };
+        let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let tls = crate::tls::server(&server).unwrap();
+        let limits = DriverLimits {
+            connections: 1,
+            command_slots: 8,
+            queued_datagram_bytes: DATAGRAM * 8,
+        };
+        let (endpoint, at_endpoint, address, serving) =
+            party(|p| Driver::bind_bounded(any, Some(tls), p, limits));
+        let bind = |p: Party| Driver::bind(any, None, p, crate::tls::Known::Never);
+        let (holder, _at_holder, _, holding) = party(bind);
+        let (newcomer, at_newcomer, _, _coming) = party(bind);
+        let (holder_id, newcomer_id) = (
+            crate::identity::Identity::generate().unwrap(),
+            crate::identity::Identity::generate().unwrap(),
+        );
+        holder.send(Command::Handler(Ask::VanishAtConnect)).unwrap();
+        holder
+            .send(Command::Handler(Ask::Connect(address, config(&holder_id))))
+            .unwrap();
+        let Heard::Connected(held) = next_heard(&at_endpoint, |h| matches!(h, Heard::Connected(_))) else {
+            panic!("not connected")
+        };
+        holding.join().unwrap().unwrap();
+        let patience = Duration::from_secs(20);
+        let until = Instant::now() + patience;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            newcomer
+                .send(Command::Handler(Ask::Connect(address, config(&newcomer_id))))
+                .unwrap();
+            match next_heard(&at_newcomer, |h| {
+                matches!(h, Heard::Lost(..) | Heard::Connected(_))
+            }) {
+                Heard::Connected(_) => break,
+                refused => assert!(
+                    Instant::now() < until,
+                    "refused {attempts} times over {patience:?}: {refused:?}"
+                ),
+            }
+        }
+        assert!(attempts >= 2, "its first attempt asks the holder");
+        let Heard::Lost(gone, _) = next_heard(&at_endpoint, |h| matches!(h, Heard::Lost(..))) else {
+            panic!("its holder was not let go");
+        };
+        assert_eq!(gone, held);
+        endpoint.send(Command::Stop).unwrap();
+        serving.join().unwrap().unwrap();
+        newcomer.send(Command::Handler(Ask::Vanish)).unwrap();
+    }
+
+    /// A repeated Initial is not an answer to a newcomer's PING: its packet number was already
+    /// accepted, so it supplies neither authenticated progress nor a fresh liveness event.
+    #[test]
+    fn a_replayed_handshake_does_not_keep_a_vanished_holders_place() {
+        let server = crate::identity::Identity::generate().unwrap();
+        let config = |of: &crate::identity::Identity| {
+            crate::tls::client(of, server.fingerprint(), crate::tls::Known::Never).unwrap()
+        };
+        let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let tls = crate::tls::server(&server).unwrap();
+        let limits = DriverLimits {
+            connections: 1,
+            command_slots: 8,
+            queued_datagram_bytes: DATAGRAM * 8,
+        };
+        let (endpoint, at_endpoint, address, serving) =
+            party(|p| Driver::bind_bounded(any, Some(tls), p, limits));
+        let (newcomer, at_newcomer, _, _coming) =
+            party(|p| Driver::bind(any, None, p, crate::tls::Known::Never));
+        let (holder_id, newcomer_id) = (
+            crate::identity::Identity::generate().unwrap(),
+            crate::identity::Identity::generate().unwrap(),
+        );
+
+        // The holder: a client endpoint driven by hand, which reads nothing of its server's, so
+        // that its handshake never ends. It answers as this test says with its first datagram
+        // again, which its endpoint routes to its handshake (by the Initial's destination
+        // connection ID) and hears, as it would a resend or a network's duplicate; a PING of its
+        // own, never acknowledged, its congestion window soon holds back.
+        let socket = UdpSocket::bind(any).unwrap();
+        let mut client = Endpoint::new(EndpointConfig::default(), None, true, None).unwrap();
+        let handle = client.insert_client_config(config(&holder_id)).unwrap();
+        let (_, mut quic) = client
+            .connect(Instant::now(), handle, address, crate::tls::SERVER_NAME, None)
+            .unwrap();
+        let mut first = Vec::new();
+        let sent = quic
+            .poll_transmit(Instant::now(), 1, &mut first, client.configs())
+            .unwrap();
+        first.truncate(sent.size);
+        socket.send_to(&first, address).unwrap();
+        // Its endpoint took it, and answered with its flight.
+        socket.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut datagram = vec![0; DATAGRAM];
+        socket.recv_from(&mut datagram).unwrap();
+
+        let attempt = || {
+            newcomer
+                .send(Command::Handler(Ask::Connect(
+                    address,
+                    Box::new(config(&newcomer_id)),
+                )))
+                .unwrap();
+            next_heard(&at_newcomer, |h| {
+                matches!(h, Heard::Lost(..) | Heard::Connected(_))
+            })
+        };
+        // Its first datagram replayed after each ask, as an answer would come, keeps no place.
+        let patience = Duration::from_secs(20);
+        let until = Instant::now() + patience;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match attempt() {
+                Heard::Connected(_) => break,
+                refused => assert!(
+                    Instant::now() < until,
+                    "refused {attempts} times over {patience:?}: {refused:?}"
+                ),
+            }
+            socket.send_to(&first, address).unwrap();
+        }
+        assert!(attempts >= 2, "its first attempt asks the holder");
+        // Let go as unanswering, its replays no answer: not as a handshake that answered and
+        // made no progress for its window, which a replay heard would have it be.
+        match next_heard(&at_endpoint, |_| true) {
+            Heard::Lost(_, why) => assert!(why.contains("no answer to a newcomer's PING"), "{why}"),
+            other => panic!("its handshake was let go first: {other:?}"),
+        }
+        assert!(matches!(next_heard(&at_endpoint, |_| true), Heard::Connected(_)));
+        endpoint.send(Command::Stop).unwrap();
+        serving.join().unwrap().unwrap();
+        newcomer.send(Command::Handler(Ask::Vanish)).unwrap();
+    }
+
+    /// A client driven by hand on a socket of its own, its handshake advanced as a test says:
+    /// its first flight sent (its first datagram kept, to replay), its server's datagrams read,
+    /// and what it has to send held, split into its packets, so that its Initial packets
+    /// (acknowledging its server's Initial CRYPTO) and the rest (its Handshake CRYPTO, its
+    /// Finished) go each when the test says. Or its server's packets kept unread
+    /// ([`Hand::take`]), each space's handed to its connection when the test says, while it
+    /// answers ([`Hand::answer`]).
+    struct Hand {
+        socket: UdpSocket,
+        endpoint: Endpoint,
+        quic: Connection,
+        to: SocketAddr,
+        first: Vec<u8>,
+        unread: Vec<Vec<u8>>,
+        answered: Option<Instant>,
+    }
+
+    /// How often a hand answers ([`Hand::answer`]): each initial RTT (RFC 9002 §6.2.2, 333 ms),
+    /// so that each ask is answered with two thirds of its server's cold handshake probe
+    /// timeout, 999 ms (§6.2.1), to spare ([`Liveness::unanswering`]). Its server stays cold
+    /// as long as it acknowledges nothing (no RTT sample, §5.1).
+    const ANSWER_EVERY: Duration = Duration::from_millis(333);
+
+    /// A hand's congestion window: room for every answer it sends unacknowledged in the longest
+    /// a test waits on it ([`Contended::connects_within`]'s 30 s), one each [`ANSWER_EVERY`] (91),
+    /// each at most a datagram of 1200 bytes (an Initial's, RFC 9000 §14.1), its first flight and
+    /// its probes beside. The window a connection begins with, ten datagrams (RFC 9002 §7.2),
+    /// holds a peer that reads nothing of its server's, and so has nothing acknowledged, back
+    /// within seconds.
+    const HAND_WINDOW: u64 = 1200 * 128;
+
+    /// Long-header packet types (RFC 9000 §17.2).
+    const INITIAL: u8 = 0;
+    const HANDSHAKE: u8 = 2;
+
+    /// A long-header packet's type (RFC 9000 §17.2); none for a short one.
+    fn long_type(packet: &[u8]) -> Option<u8> {
+        packet.first().filter(|b| *b & 0x80 != 0).map(|b| (b >> 4) & 0x3)
+    }
+
+    #[test]
+    fn replayed_and_unauthenticated_datagrams_do_not_advance_liveness() {
+        let server = crate::identity::Identity::generate().unwrap();
+        let client = crate::identity::Identity::generate().unwrap();
+        let (heard, _) = mpsc::channel();
+        let (mut driver, _) = Driver::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Some(crate::tls::server(&server).unwrap()),
+            Party {
+                heard,
+                vanished: false,
+                vanish_at_connect: false,
+            },
+            crate::tls::Known::Never,
+        )
+        .unwrap();
+        let mut hand = Hand::connect(
+            driver.local().unwrap(),
+            crate::tls::client(&client, server.fingerprint(), crate::tls::Known::Never).unwrap(),
+        );
+        let now = Instant::now();
+        let from = hand.socket.local_addr().unwrap();
+        let key = driver
+            .receive(now, from, BytesMut::from(hand.first.as_slice()))
+            .unwrap()
+            .unwrap();
+        let before = driver.conns.get(&key).unwrap().liveness.last_heard();
+        assert_eq!(before, Some(now), "accept records the first flight");
+        driver
+            .receive(now + ms(1), from, BytesMut::from(hand.first.as_slice()))
+            .unwrap();
+        assert_eq!(
+            driver.conns.get(&key).unwrap().liveness.last_heard(),
+            before,
+            "a replay is no progress"
+        );
+        let mut forged = hand.first.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        driver
+            .receive(now + ms(2), from, BytesMut::from(forged.as_slice()))
+            .unwrap();
+        assert_eq!(
+            driver.conns.get(&key).unwrap().liveness.last_heard(),
+            before,
+            "a forged tag is no progress"
+        );
+        driver.transmit(now + ms(3)).unwrap();
+        let (initial, rest) = hand.read(ms(1));
+        assert!(!initial.is_empty() || !rest.is_empty(), "the real client answers");
+        for packet in initial.into_iter().chain(rest) {
+            driver
+                .receive(now + ms(4), from, BytesMut::from(packet.as_slice()))
+                .unwrap();
+        }
+        assert!(
+            driver.conns.get(&key).unwrap().liveness.last_heard() > before,
+            "an authenticated nonduplicate handshake answer advances liveness"
+        );
+    }
+
+    impl Hand {
+        fn connect(to: SocketAddr, config: ClientConfig) -> Hand {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut endpoint = Endpoint::new(EndpointConfig::default(), None, true, None).unwrap();
+            let handle = endpoint.insert_client_config(config).unwrap();
+            let (_, mut quic) = endpoint
+                .connect(Instant::now(), handle, to, crate::tls::SERVER_NAME, None)
+                .unwrap();
+            // Its whole first flight (a ClientHello may take more than a datagram), the first
+            // datagram kept to send again.
+            let mut first = Vec::new();
+            loop {
+                let mut out = Vec::new();
+                let Some(sent) = quic.poll_transmit(Instant::now(), 1, &mut out, endpoint.configs()) else {
+                    break;
+                };
+                socket.send_to(&out[..sent.size], to).unwrap();
+                if first.is_empty() {
+                    first = out[..sent.size].to_vec();
+                }
+            }
+            Hand {
+                socket,
+                endpoint,
+                quic,
+                to,
+                first,
+                unread: Vec::new(),
+                answered: None,
+            }
+        }
+
+        /// An answer to its server, at most every [`ANSWER_EVERY`]: a PING its connection seals
+        /// in a packet of its own, of its newest keys' space and a packet number never sent
+        /// before, as a probe is (RFC 9000 §13.3, RFC 9002 §6.2.4). Its server authenticates it
+        /// and hears it; it carries no CRYPTO, so it advances no handshake.
+        fn answer(&mut self) {
+            if self.answered.is_some_and(|at| at.elapsed() < ANSWER_EVERY) {
+                return;
+            }
+            self.answered = Some(Instant::now());
+            self.gather();
+            self.quic.ping();
+            self.flush();
+        }
+
+        /// Keeps, unread, the packets of what its server has sent so far.
+        fn gather(&mut self) {
+            self.socket.set_nonblocking(true).unwrap();
+            let mut datagram = vec![0; DATAGRAM];
+            while let Ok((n, _)) = self.socket.recv_from(&mut datagram) {
+                self.unread.extend(coalesced(&datagram[..n]));
+            }
+            self.socket.set_nonblocking(false).unwrap();
+        }
+
+        /// Hands its connection the packets of type `ty` its server has sent (waiting for the
+        /// first), keeping the rest unread, and sends what it has to in answer; its Initial
+        /// packets lost on the way unless `acknowledged`, so that its server, which takes an RTT
+        /// sample from an acknowledgement (RFC 9002 §5.1), stays cold.
+        fn take(&mut self, ty: u8, acknowledged: bool) {
+            let until = Instant::now() + Duration::from_secs(60);
+            while !self.unread.iter().any(|p| long_type(p) == Some(ty)) {
+                assert!(Instant::now() < until, "no packet of type {ty} from its server");
+                self.gather();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (these, rest) = std::mem::take(&mut self.unread)
+                .into_iter()
+                .partition::<Vec<_>, _>(|p| long_type(p) == Some(ty));
+            self.unread = rest;
+            for packet in these {
+                let mut response = Vec::new();
+                let bytes = BytesMut::from(packet.as_slice());
+                if let Some(DatagramEvent::ConnectionEvent(_, event)) =
+                    self.endpoint
+                        .handle(Instant::now(), self.to, None, None, bytes, &mut response)
+                {
+                    self.quic.handle_event(event, self.endpoint.configs_mut());
+                }
+            }
+            while self.quic.poll_endpoint_events().is_some() {}
+            match acknowledged {
+                true => self.flush(),
+                false => loop {
+                    let mut out = Vec::new();
+                    let Some(sent) =
+                        self.quic
+                            .poll_transmit(Instant::now(), 1, &mut out, self.endpoint.configs())
+                    else {
+                        break;
+                    };
+                    out.truncate(sent.size);
+                    let kept: Vec<Vec<u8>> = coalesced(&out)
+                        .into_iter()
+                        .filter(|p| long_type(p) != Some(INITIAL))
+                        .collect();
+                    self.send(&kept);
+                },
+            }
+        }
+
+        /// Sends all its connection has to send.
+        fn flush(&mut self) {
+            loop {
+                let mut out = Vec::new();
+                let Some(sent) =
+                    self.quic
+                        .poll_transmit(Instant::now(), 1, &mut out, self.endpoint.configs())
+                else {
+                    break;
+                };
+                self.socket.send_to(&out[..sent.size], self.to).unwrap();
+            }
+        }
+
+        /// Reads what its server sent within `within` of quiet, and returns the packets it has to
+        /// send in answer: its Initial packets, and the rest.
+        fn read(&mut self, within: Duration) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+            self.socket.set_read_timeout(Some(within)).unwrap();
+            let mut datagram = vec![0; DATAGRAM];
+            while let Ok((n, from)) = self.socket.recv_from(&mut datagram) {
+                let mut response = Vec::new();
+                let bytes = BytesMut::from(&datagram[..n]);
+                if let Some(DatagramEvent::ConnectionEvent(_, event)) =
+                    self.endpoint
+                        .handle(Instant::now(), from, None, None, bytes, &mut response)
+                {
+                    self.quic.handle_event(event, self.endpoint.configs_mut());
+                }
+            }
+            while self.quic.poll_endpoint_events().is_some() {}
+            let (mut initial, mut rest) = (Vec::new(), Vec::new());
+            loop {
+                let mut out = Vec::new();
+                let Some(sent) =
+                    self.quic
+                        .poll_transmit(Instant::now(), 1, &mut out, self.endpoint.configs())
+                else {
+                    break;
+                };
+                out.truncate(sent.size);
+                for packet in coalesced(&out) {
+                    match packet.first().is_some_and(|b| b & 0xb0 == 0x80) {
+                        true => initial.push(packet),
+                        false => rest.push(packet),
+                    }
+                }
+            }
+            (initial, rest)
+        }
+
+        fn send(&self, packets: &[Vec<u8>]) {
+            for packet in packets {
+                self.socket.send_to(packet, self.to).unwrap();
+            }
+        }
+
+        /// Ends its connection, once it is established, with a word to its server.
+        fn close(&mut self) {
+            self.quic
+                .close(Instant::now(), VarInt::from_u32(0), bytes::Bytes::new());
+            let mut out = Vec::new();
+            if let Some(sent) = self
+                .quic
+                .poll_transmit(Instant::now(), 1, &mut out, self.endpoint.configs())
+            {
+                self.socket.send_to(&out[..sent.size], self.to).unwrap();
+            }
+        }
+    }
+
+    /// A datagram's QUIC packets (RFC 9000 §12.2): each long-header packet up to its Length's end
+    /// (§17.2), and a short-header one, which is last, to the datagram's end.
+    fn coalesced(datagram: &[u8]) -> Vec<Vec<u8>> {
+        fn varint(b: &[u8], at: &mut usize) -> usize {
+            let len = 1 << (b[*at] >> 6);
+            let mut v = (b[*at] & 0x3f) as usize;
+            for i in 1..len {
+                v = (v << 8) | b[*at + i] as usize;
+            }
+            *at += len;
+            v
+        }
+        let mut packets = Vec::new();
+        let mut rest = datagram;
+        while let Some(&first) = rest.first() {
+            if first & 0x80 == 0 {
+                packets.push(rest.to_vec());
+                break;
+            }
+            let mut at = 5;
+            at += 1 + rest[at] as usize;
+            at += 1 + rest[at] as usize;
+            if first & 0x30 == 0 {
+                let token = varint(rest, &mut at);
+                at += token;
+            }
+            let length = varint(rest, &mut at);
+            let end = (at + length).min(rest.len());
+            packets.push(rest[..end].to_vec());
+            rest = &rest[end..];
+        }
+        packets
+    }
+
+    /// A bounded endpoint of one place, with a newcomer that dials it as the test says.
+    struct Contended {
+        endpoint: Sender<Ask>,
+        at_endpoint: mpsc::Receiver<Heard>,
+        address: SocketAddr,
+        serving: std::thread::JoinHandle<Result<(), Error>>,
+        newcomer: Sender<Ask>,
+        at_newcomer: mpsc::Receiver<Heard>,
+        server: crate::identity::Identity,
+        newcomer_id: crate::identity::Identity,
+    }
+
+    impl Contended {
+        fn new() -> Contended {
+            let server = crate::identity::Identity::generate().unwrap();
+            let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let tls = crate::tls::server(&server).unwrap();
+            let limits = DriverLimits {
+                connections: 1,
+                command_slots: 8,
+                queued_datagram_bytes: DATAGRAM * 8,
+            };
+            let (endpoint, at_endpoint, address, serving) =
+                party(|p| Driver::bind_bounded(any, Some(tls), p, limits));
+            let (newcomer, at_newcomer, _, _) =
+                party(|p| Driver::bind(any, None, p, crate::tls::Known::Never));
+            Contended {
+                endpoint,
+                at_endpoint,
+                address,
+                serving,
+                newcomer,
+                at_newcomer,
+                server,
+                newcomer_id: crate::identity::Identity::generate().unwrap(),
+            }
+        }
+
+        fn config(&self, of: &crate::identity::Identity) -> ClientConfig {
+            crate::tls::client(of, self.server.fingerprint(), crate::tls::Known::Never).unwrap()
+        }
+
+        /// A hand ([`Hand`]) with a window of [`HAND_WINDOW`], its transport otherwise a
+        /// client's.
+        fn hand(&self) -> Hand {
+            let mut transport = crate::tls::transport(false, crate::tls::Known::Never);
+            let mut cubic = hyper_quic::congestion::CubicConfig::default();
+            cubic.initial_window(HAND_WINDOW);
+            transport.congestion(hyper_quic::congestion::Congestion::Cubic(cubic));
+            let config = crate::tls::client_with(
+                &crate::identity::Identity::generate().unwrap(),
+                self.server.fingerprint(),
+                transport,
+                crate::tls::ALPN,
+            )
+            .unwrap();
+            Hand::connect(self.address, config)
+        }
+
+        /// The newcomer's attempt: refused (`Lost`) or connected.
+        fn attempt(&self) -> Heard {
+            self.newcomer
+                .send(Command::Handler(Ask::Connect(
+                    self.address,
+                    Box::new(self.config(&self.newcomer_id)),
+                )))
+                .unwrap();
+            next_heard(&self.at_newcomer, |h| {
+                matches!(h, Heard::Lost(..) | Heard::Connected(_))
+            })
+        }
+
+        /// Attempts until `until`, the holder answering each as `answer` says: each refused.
+        fn refused_until(&self, until: Instant, mut answer: impl FnMut()) {
+            let mut attempts = 0;
+            while Instant::now() < until {
+                attempts += 1;
+                let heard = self.attempt();
+                assert!(
+                    matches!(heard, Heard::Lost(..)),
+                    "attempt {attempts}: the holder gave its place: {heard:?}; its endpoint heard {:?}",
+                    self.at_endpoint.try_iter().collect::<Vec<_>>()
+                );
+                answer();
+            }
+        }
+
+        /// Attempts, the holder answering each as `answer` says, until one connects within
+        /// `patience`: when it did.
+        fn connects_within(&self, patience: Duration, mut answer: impl FnMut()) -> Instant {
+            let until = Instant::now() + patience;
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                match self.attempt() {
+                    Heard::Connected(_) => return Instant::now(),
+                    refused => assert!(
+                        Instant::now() < until,
+                        "refused {attempts} times over {patience:?}: {refused:?}"
+                    ),
+                }
+                answer();
+            }
+        }
+
+        fn end(self) {
+            self.endpoint.send(Command::Stop).unwrap();
+            self.serving.join().unwrap().unwrap();
+            self.newcomer.send(Command::Handler(Ask::Vanish)).unwrap();
+        }
+    }
+
+    /// A handshake whose client answers every newcomer's ask (a PING of its own, newly sealed,
+    /// [`Hand::answer`]) but never advances it gives its place to a newcomer once it has made no
+    /// progress for a whole window (ROOT's ruling on #72's unfinished handshakes). Its client
+    /// reads its server's Initial at once and nothing after, its acknowledgement lost, so that
+    /// its answers are Handshake PINGs and its server takes no RTT sample. No handshake has completed at this endpoint,
+    /// so the window is the cold one: the first kPersistentCongestionThreshold (3) of its
+    /// handshake's probe timeouts, each backed off (RFC 9002 §6.2.1, §7.6.1), 7 of them, the
+    /// initial RTT's 999 ms each before any RTT sample (§6.2.2). Red with a handshake held by its
+    /// answers alone: the newcomer refused at every attempt.
+    #[test]
+    fn a_handshake_that_answers_but_never_advances_gives_its_place_after_a_window_without_progress() {
+        let c = Contended::new();
+        let began = Instant::now();
+        let mut holder = c.hand();
+        holder.take(INITIAL, false);
+
+        let took = c.connects_within(Duration::from_secs(30), || holder.answer());
+        let waited = took - began;
+        let lost = next_heard(&c.at_endpoint, |_| true);
+        assert!(
+            waited >= Duration::from_millis(6_993),
+            "let go within the cold window of seven backed-off probe timeouts: {waited:?}, {lost:?}"
+        );
+        match lost {
+            Heard::Lost(_, why) => assert!(why.contains("no progress"), "{why}"),
+            other => panic!("its handshake was let go first: {other:?}"),
+        }
+        assert!(matches!(
+            next_heard(&c.at_endpoint, |_| true),
+            Heard::Connected(_)
+        ));
+        c.end();
+    }
+
+    /// A handshake that advances slowly keeps its place however long it takes in all: its client
+    /// answers each newcomer's ask ([`Hand::answer`]: Initial PINGs, then Handshake ones),
+    /// acknowledges its server's Initial 4 s in (within the cold window of 7 s), and sends its
+    /// Finished 4 s after that, past the cold window from its start, which a handshake that never
+    /// advanced would have given way at.
+    #[test]
+    fn a_handshake_that_advances_slowly_keeps_its_place() {
+        let c = Contended::new();
+        let mut holder = c.hand();
+        let step = Duration::from_secs(4);
+        let start = Instant::now();
+        c.refused_until(start + step, || holder.answer());
+        holder.take(INITIAL, true);
+        c.refused_until(start + step * 2, || holder.answer());
+        holder.take(HANDSHAKE, true);
+        assert!(
+            matches!(next_heard(&c.at_endpoint, |_| true), Heard::Connected(_)),
+            "the slow handshake ended"
+        );
+        c.end();
+    }
+
+    /// The window is the slowest handshake completed at this endpoint, learned as they end: after
+    /// one that took 3 s, a handshake that answers but never advances keeps its place for 3 s
+    /// without progress, past its 999 ms probe timeout, and gives it way within the cold window
+    /// of 7 s. Red with a handshake held by its answers alone: the newcomer refused at every
+    /// attempt.
+    #[test]
+    fn the_learned_window_grows_with_a_slow_completed_handshake() {
+        let c = Contended::new();
+        // A fast one first, then a slow one, each closed after.
+        let quick = Duration::from_millis(300);
+        for slow in [Duration::ZERO, Duration::from_secs(3)] {
+            let mut hand = c.hand();
+            let (mut initial, rest) = hand.read(quick);
+            std::thread::sleep(slow);
+            initial.extend(rest);
+            hand.send(&initial);
+            assert!(matches!(
+                next_heard(&c.at_endpoint, |_| true),
+                Heard::Connected(_)
+            ));
+            let _ = hand.read(quick);
+            assert!(!hand.quic.is_handshaking());
+            hand.close();
+            assert!(matches!(next_heard(&c.at_endpoint, |_| true), Heard::Lost(..)));
+        }
+
+        let began = Instant::now();
+        let mut holder = c.hand();
+        holder.take(INITIAL, false);
+        let took = c.connects_within(Duration::from_secs(30), || holder.answer()) - began;
+        assert!(
+            took >= Duration::from_millis(2_500),
+            "let go before the slowest handshake's window: {took:?}, {:?}",
+            next_heard(&c.at_endpoint, |_| true)
+        );
+        assert!(
+            took < Duration::from_millis(6_500),
+            "held to the cold window: {took:?}"
+        );
+        c.end();
+    }
+
+    /// A handshake asked for an answer is judged by its own spaces' probe timeout, which counts
+    /// no `max_ack_delay` (RFC 9002 §6.2.1; its transport's application-data one, less its peer's
+    /// `max_ack_delay`): unheard past that since the ask, it gives way; heard since, it keeps its
+    /// place. Established, the application-data one judges it.
+    #[test]
+    fn a_handshake_asked_is_judged_by_its_handshakes_probe_timeout() {
         let t0 = Instant::now();
-        let held = [(4, t0 + ms(30)), (2, t0 + ms(10)), (7, t0 + ms(20))];
-        assert_eq!(given_up(&held, 4), None);
-        assert_eq!(given_up(&held, 3), Some(2));
-        assert_eq!(given_up(&held[..1], 1), Some(4));
-        assert_eq!(given_up(&[], 0), None);
+        let mut shaking = Liveness::new(t0, None, Duration::ZERO);
+        shaking.heard(t0);
+        shaking.peer_ack_delay(ms(25));
+        // Before any RTT sample: the initial RTT's 999 ms, and its peer's 25 ms.
+        shaking.probe_timeout(ms(1024));
+        shaking.ask(t0 + ms(1));
+        assert!(!shaking.unanswering(t0 + ms(1000)), "within its handshake's");
+        assert!(
+            shaking.unanswering(t0 + ms(1001)),
+            "past its handshake's, though within the application data's"
+        );
+        shaking.heard(t0 + ms(1002));
+        assert!(!shaking.unanswering(t0 + ms(5000)), "heard since the ask");
+        let mut established = shaking;
+        established.connected(t0 + ms(1003), 0, 0);
+        established.ask(t0 + ms(1004));
+        assert!(!established.unanswering(t0 + ms(2028)));
+        assert!(established.unanswering(t0 + ms(2029)));
+    }
+
+    /// Under contention a holder is judged by its liveness (ROOT's ruling on #72): asked for an
+    /// answer, one unheard past its own probe timeout gives way, warm or cold, stalled or not;
+    /// one heard since the ask keeps its place, within its probe timeout or later.
+    #[test]
+    fn a_holder_asked_gives_way_unheard_past_its_probe_timeout_warm_or_cold() {
+        let t0 = Instant::now();
+        // Cold: no answer seen on its path, so no window and no stall.
+        let mut cold = Liveness::new(t0, None, Duration::ZERO);
+        cold.heard(t0);
+        cold.connected(t0, 0, 0);
+        cold.peer_ack_delay(ms(5));
+        cold.probe_timeout(ms(10));
+        assert_eq!(cold.look(t0, 1, 0), Look::Fine);
+        assert!(!cold.unanswering(t0 + ms(100_000)), "never asked");
+        cold.ask(t0 + ms(1));
+        assert!(!cold.stalled(t0 + ms(100_000)), "cold: no window");
+        assert!(!cold.unanswering(t0 + ms(11)), "within its probe timeout");
+        assert!(cold.unanswering(t0 + ms(12)), "unheard past it");
+        // Warm, within its window: not stalled, but unheard past its probe timeout.
+        let mut warm = Liveness::new(t0, None, ms(50));
+        warm.heard(t0);
+        warm.connected(t0, 0, 0);
+        warm.peer_ack_delay(ms(5));
+        warm.probe_timeout(ms(10));
+        warm.ask(t0 + ms(1));
+        assert!(!warm.stalled(t0 + ms(12)));
+        assert!(warm.unanswering(t0 + ms(12)));
+        // Heard within its probe timeout: kept, however long after.
+        warm.heard(t0 + ms(5));
+        assert!(!warm.unanswering(t0 + ms(1000)));
+        // Asked again, heard past its probe timeout but before it was judged: kept.
+        warm.ask(t0 + ms(20));
+        assert_eq!(warm.asked, Some(t0 + ms(20)));
+        warm.ask(t0 + ms(25));
+        assert_eq!(warm.asked, Some(t0 + ms(20)), "the ask unanswered stands");
+        warm.heard(t0 + ms(40));
+        assert!(!warm.unanswering(t0 + ms(1000)));
     }
 }

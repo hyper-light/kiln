@@ -1,7 +1,7 @@
 //! The guest's ports through Shards (docs/design/shards-guest.md §2, Appendix A "Hex's side"): a
 //! [`Link`] whose first dial is `shards_api::Guest::connect_before` and every later one
-//! `connect_once_before`, Firecracker's `CONNECT <port>` on the guest's vsock, and a [`Duplex`] over the
-//! stream it returns. Hex never names Shards' stream type: on
+//! `connect_once_before`, a dial past its W* `connect_while_runs`, Firecracker's `CONNECT <port>` on the
+//! guest's vsock, and a [`Duplex`] over the stream it returns. Hex never names Shards' stream type: on
 //! Windows it is Shards' overlapped AF_UNIX socket, whose timeouts poll first, behind the same trait.
 
 use std::io::{self, Read, Write};
@@ -10,17 +10,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use hex_api::{ConnectFailure, ConnectPhase, ConnectReply, IoKind, Refusal};
+use hex_api::{
+    ConnectFailure, ConnectPhase, ConnectReply, GuestEnd, GuestFailure, IoKind, Refusal,
+};
+use hex_core::patience::{Patience, Piece};
 
-use super::{Duplex, DuplexOwner, Link, own_duplex};
+use super::{Duplex, DuplexOwner, Handoff, Link, own_duplex};
 
-/// The slowest recorded value of each wait that seeds a bound, by host class
-/// (bench/native/guest/records.tsv). A class with no row for a measure seeds from the slowest row of any
-/// class ([`seed_in`]); adding its own row, once its record is taken, makes that its seed, with no code
-/// change.
-pub const RECORDS: &str = include_str!("../../../../bench/native/guest/records.tsv");
-
-/// This host's class, as the records name it: the hypervisor Shards boots its guests with here.
+/// This host's class, as the records name it (bench/native/guest/records.tsv, evidence alone: no wait reads it, the
+/// review's C-9): the hypervisor Shards boots its guests with here.
 pub const CLASS: &str = if cfg!(target_os = "macos") {
     "macOS-HVF"
 } else if cfg!(target_os = "windows") {
@@ -29,83 +27,56 @@ pub const CLASS: &str = if cfg!(target_os = "macos") {
     "Linux-KVM"
 };
 
-/// The slowest value `table` records for `measure` on host class `class`: each line `measure`, `class`,
-/// microseconds and its record, tab-separated; `#` lines are comments. `None` where no row names both.
-pub fn slowest_in(table: &str, measure: &str, class: &str) -> Option<Duration> {
-    table
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .map(|line| line.split('\t'))
-        .find_map(|mut row| {
-            (row.next()? == measure && row.next()? == class)
-                .then(|| row.next()?.parse().ok().map(Duration::from_micros))?
-        })
-}
+/// A connection to one of the guest's ports, as Shards gives it. Its handles share it: each reads and writes it through
+/// `&dyn Stream` (Shards' `read_shared`, `write_shared`), never a duplicate socket, which on Windows passes to a process
+/// another thread starts until its inheritance is cleared (the review's D-5); and its caller's end is its own socket,
+/// moved ([`ShardsStream::into_end`]).
+pub struct ShardsStream(triomphe::Arc<Box<dyn shards_api::Stream>>);
 
-/// The seed `table` gives `measure` on host class `class`: its own slowest row where it has one; else the slowest
-/// row of any class, every class's records taken as one (decision 9: a bound is the slowest answer on record, with no
-/// margin past it), a class with no record of its own starting from the slowest any host has been seen to take,
-/// then rising with its node's own and backing off past each bound it runs out at (the learned bounds take the max
-/// with what the node sees). `None` where no class records the measure.
-pub fn seed_in(table: &str, measure: &str, class: &str) -> Option<Duration> {
-    if let Some(own) = slowest_in(table, measure, class) {
-        return Some(own);
+impl ShardsStream {
+    /// `stream`, its one handle until another shares it.
+    pub(crate) fn new(stream: Box<dyn shards_api::Stream>) -> Result<Self, Refusal> {
+        let owner = triomphe::UniqueArc::try_new(stream).map_err(|_| Refusal::Exhausted {
+            what: "guest stream owner",
+            bound: std::mem::size_of::<Box<dyn shards_api::Stream>>(),
+        })?;
+        Ok(Self(owner.shareable()))
     }
-    table
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| {
-            let mut row = line.split('\t');
-            if row.next()? != measure {
-                return None;
-            }
-            row.next()?;
-            row.next()?.parse().ok().map(Duration::from_micros)
-        })
-        .max()
-}
 
-/// The seed for `measure` on this host's class ([`seed_in`] over records.tsv), or the refusal naming the
-/// record to take where no class records it.
-pub fn recorded(measure: &str) -> Result<Duration, Refusal> {
-    seed_in(RECORDS, measure, CLASS).ok_or_else(|| Refusal::Platform {
-        what: "the oci class's guest",
-        platform: std::env::consts::OS,
-        why: format!(
-            "no {measure} record for any host class yet (bench/native/guest/records.tsv): record one first"
-        ),
-    })
+    /// Its socket, its caller's from here (HEX-RT-17): moved, never duplicated, so no copy of it is open to pass to a
+    /// process (the review's D-5), and left waiting, as a caller's file does. Refused while another handle shares it.
+    pub(crate) fn into_end(self) -> Result<hex_api::End, Refusal> {
+        let stream = triomphe::Arc::try_unwrap(self.0).map_err(|_| {
+            Refusal::Broken(
+                "a guest stream another handle shares can't be handed to its caller whole"
+                    .to_owned(),
+            )
+        })?;
+        super::waiting_end(stream.into_socket())
+    }
 }
-
-/// The seed of the first dial's bound before this node has seen a boot: the slowest boot to ready on record
-/// for this host's class, or with none, the slowest of any class (bench/native/guest/boot-ready/RECORD.md, its
-/// rows in records.tsv).
-pub fn recorded_boot() -> Result<Duration, Refusal> {
-    recorded("boot_ready")
-}
-
-/// A connection to one of the guest's ports, as Shards gives it.
-pub struct ShardsStream(pub(crate) Box<dyn shards_api::Stream>);
 
 impl Read for ShardsStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        self.0.read_shared(buf)
     }
 }
 
 impl Write for ShardsStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        self.0.write_shared(buf)
     }
 
+    /// Nothing waits: Shards' stream writes straight to its socket, as its own `flush` says.
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        Ok(())
     }
 }
 
 impl Duplex for ShardsStream {
+    /// Another handle on the same stream, shared, never a duplicate (the review's D-5).
     fn try_clone(&self) -> io::Result<DuplexOwner> {
-        own_duplex(Self(self.0.try_clone()?))
+        own_duplex(Self(triomphe::Arc::clone(&self.0)))
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))
     }
 
@@ -129,18 +100,20 @@ impl Duplex for ShardsStream {
     }
 }
 
-/// A guest's ports. Each dial has a finite absolute deadline, the caller's or else `bound` from the
-/// dial's start. Until a dial has reached the guest's relay it is one `connect_before`, within which
-/// Shards' client asks again while the guest doesn't listen there yet. The relay binds every port it
-/// serves before it serves any (`hex guest`), so after that a refused port has no relay behind it:
-/// each later dial is one `connect_once_before`, refused at once if nothing listens and by its
-/// deadline if nothing answers. `bound` is the caller's learned bound on a boot to ready
-/// (`hex_runtime::guest::GuestRuntime::first_dial_bound`), whose ready includes a whole CONNECT/OK
-/// exchange. Never a relative patience: Shards' client awaits a zero or `Duration::MAX` patience's
-/// answer without a bound (HEX-GUEST-33).
+/// A guest's ports. A dial given its caller's deadline waits within it; one given none waits within W* and
+/// past it follows the guest ([`ShardsLink::dial_following`], decision 9). Until a dial has reached the
+/// guest's relay its bounded attempt is one `connect_before`, within which Shards' client asks again while
+/// the guest doesn't listen there yet. The relay binds every port it serves before it serves any (`hex
+/// guest`), so after that a refused port has no relay behind it: each later attempt is one
+/// `connect_once_before`, refused at once if nothing listens. `bound` is its node's W* for the guest, the
+/// slowest boot to ready it has seen (`hex_runtime::guest::GuestRuntime::boot_bound`), whose ready includes a
+/// whole CONNECT/OK exchange; none before its node has seen one. Never a relative patience: Shards' client
+/// awaits a zero or `Duration::MAX` patience's answer without a bound (HEX-GUEST-33).
 pub struct ShardsLink {
     guest: ShardsGuest,
-    bound: Duration,
+    bound: Option<Duration>,
+    /// Its guest's boot's start, for a link made as its guest boots: its first dial is that boot's own wait.
+    booted: Option<Instant>,
     listened: AtomicBool,
 }
 
@@ -158,11 +131,17 @@ impl ShardsGuest {
     }
 }
 
+/// A guest link's dials with no caller deadline, as the waits census keeps them (decision 9): each stream, timed from
+/// its dial's start, and each dial's run-out past its W* ([`ShardsLink::dial_following`]). Its own slowest answer is the
+/// W* of a link whose node has seen no boot.
+static FOLLOWED: Patience = Patience::measuring("client.guest.link.dial");
+
 impl ShardsLink {
-    pub fn new(guest: Arc<dyn shards_api::Guest>, bound: Duration) -> Self {
+    pub fn new(guest: Arc<dyn shards_api::Guest>, bound: Option<Duration>) -> Self {
         Self {
             guest: ShardsGuest::Owned(guest),
             bound,
+            booted: None,
             listened: AtomicBool::new(false),
         }
     }
@@ -170,13 +149,135 @@ impl ShardsLink {
     /// AC-T7.4.1: retain the API's existing native/protocol receipt directly. The
     /// caller uses ManagedGuest::try_clone when it also retains a boot handle;
     /// adapting that handle needs no second Arc allocation or lifecycle owner.
-    pub fn managed(guest: shards_api::ManagedGuest, bound: Duration) -> Self {
+    pub fn managed(guest: shards_api::ManagedGuest, bound: Option<Duration>) -> Self {
         Self {
             guest: ShardsGuest::Managed(guest),
             bound,
+            booted: None,
             listened: AtomicBool::new(false),
         }
     }
+
+    /// The same link to a guest whose boot began at `began`: its first dial with no caller deadline is that boot's own
+    /// wait, its W* counted from the boot's start, as the slowest boot was (HEX-GUEST-34).
+    pub fn booted_at(mut self, began: Instant) -> Self {
+        self.booted = Some(began);
+        self
+    }
+
+    /// A dial to `port` with no caller deadline, as decision 9 waits (the person's ruling of 2026-11-13; the review's
+    /// C-9). Its W* is the link's bound, the slowest boot to ready its node has seen, whose ready includes a whole
+    /// CONNECT/OK exchange. A booting link's first dial is its boot's own wait: its W* is that bound alone, counted from
+    /// the boot's start, none before its node's first boot. Any other dial with no bound takes the slowest such dial
+    /// this process has seen ([`FOLLOWED`]).
+    /// - **Within it** one attempt, `connect_before` (`connect_once_before` once the relay listens): its stream is the
+    ///   answer, and a refusal before W* or at the guest's end is the dial's.
+    /// - **Past it** the run-out is told, once, and one dial follows the guest's VM by its life, Shards'
+    ///   `connect_while_runs`: refused at the guest's end, or as `Stalled` where its VM ran no CPU for a whole W* of
+    ///   Shards' own (Part B, the VM's liveness), never at a bound of Hex's. No attempt is given up and made again past
+    ///   it: each one closed unanswered is a connection the guest takes for nothing.
+    /// - **With no W*** it follows from its start, told once as it starts.
+    fn dial_following(&self, port: u32) -> Result<Box<dyn shards_api::Stream>, Refusal> {
+        let began = Instant::now();
+        let guest = self.guest.guest();
+        let party = [
+            Piece::Kind("the guest's VM, its port "),
+            Piece::Number(u64::from(port)),
+            Piece::Kind("'s answer to a dial"),
+        ];
+        let listened = self.listened.load(Ordering::Acquire);
+        let booting = self.booted.filter(|_| !listened);
+        match self.w_star(booting.is_some())? {
+            Some(w_star) => {
+                let from = booting.unwrap_or(began);
+                let at = from.checked_add(w_star).ok_or_else(unbounded)?;
+                let dialed = if listened {
+                    guest.connect_once_before(port, at)
+                } else {
+                    guest.connect_before(port, at)
+                };
+                match dialed {
+                    Ok(stream) => return Ok(self.answered(stream, began)),
+                    Err(why) if Instant::now() < at || gone(&why) => {
+                        return Err(refusal("connecting to the guest", &why));
+                    }
+                    // No sample (Karn's point): the run-out is told, and the dial follows the guest.
+                    Err(_) => FOLLOWED.ran_out(w_star, from.elapsed(), &party),
+                }
+            }
+            // A boot's own W* is its node's, whatever this process has learned of other dials (`follows`).
+            None => FOLLOWED.follows(&party),
+        }
+        let stream = guest
+            .connect_while_runs(port)
+            .map_err(|why| refusal("connecting to the guest", &why))?;
+        Ok(self.answered(stream, began))
+    }
+
+    /// The W* of a dial with no caller deadline ([`ShardsLink::dial_following`]): its bound, refused by type where that is
+    /// zero; with none, a boot's own first dial has none, and any other the slowest such dial this process has seen.
+    fn w_star(&self, booting: bool) -> Result<Option<Duration>, Refusal> {
+        match self.bound {
+            Some(bound) if bound.is_zero() => Err(unbounded()),
+            Some(bound) => Ok(Some(bound)),
+            None if booting => Ok(None),
+            None => Ok(FOLLOWED.deadline()),
+        }
+    }
+
+    /// `stream`, a dial's answer begun at `began`: its port's relay listens, and the dial's time is its sample.
+    fn answered(
+        &self,
+        stream: Box<dyn shards_api::Stream>,
+        began: Instant,
+    ) -> Box<dyn shards_api::Stream> {
+        self.listened.store(true, Ordering::Release);
+        FOLLOWED.answered(began.elapsed());
+        stream
+    }
+
+    /// A stream to port `port`, within `deadline` where the caller gives one ([`Link::dial_before`]), else waiting
+    /// within W* and past it following the guest ([`ShardsLink::dial_following`]).
+    fn stream_before(&self, port: u32, deadline: Option<Instant>) -> Result<ShardsStream, Refusal> {
+        let Some(at) = deadline else {
+            return ShardsStream::new(self.dial_following(port)?);
+        };
+        let cap = crate::calls::ReplyDeadline::caller_before(at)?;
+        cap.remaining("connecting to the guest within the original operation deadline")?;
+        let guest = self.guest.guest();
+        let stream = if self.listened.load(Ordering::Acquire) {
+            guest.connect_once_before(port, at)
+        } else {
+            guest.connect_before(port, at)
+        }
+        .map_err(|why| refusal("connecting to the guest", &why))?;
+        self.listened.store(true, Ordering::Release);
+        let stream = ShardsStream::new(stream)?;
+        cap.remaining("retaining the guest connection within the original operation deadline")?;
+        Ok(stream)
+    }
+}
+
+/// A link's bound that names no finite deadline, zero or past a monotonic one, refused by type before Shards is asked
+/// (HEX-GUEST-33).
+fn unbounded() -> Refusal {
+    Refusal::Invalid {
+        what: "guest dial bound",
+        why: "it must be positive and fit a monotonic deadline".to_owned(),
+    }
+}
+
+/// Whether Shards' refusal says its guest is gone: ended, no longer at its pid, its process unobservable or another,
+/// or its VM stalled.
+fn gone(why: &shards_api::Refusal) -> bool {
+    matches!(
+        why,
+        shards_api::Refusal::Ended(_)
+            | shards_api::Refusal::Gone { .. }
+            | shards_api::Refusal::Process { .. }
+            | shards_api::Refusal::Scope(_)
+            | shards_api::Refusal::Stalled(_)
+    )
 }
 
 impl Link for ShardsLink {
@@ -187,10 +288,15 @@ impl Link for ShardsLink {
             .map_err(|why| refusal("naming the guest's stream endpoint", &why))
     }
 
-    /// The learned bound on a boot to ready, whose ready includes the CONNECT/OK exchange and the
-    /// relay's token after it: a connect with no caller deadline spends it once on both.
+    /// A Shards guest's vsock socket takes a borrowed CONNECT from any caller its identity names (HEX-RT-17).
+    fn lends_identity(&self) -> bool {
+        true
+    }
+
+    /// The W* of a dial with no caller deadline ([`ShardsLink::dial_following`]), whose answer includes the CONNECT/OK
+    /// exchange: what a stream offer carries for a caller's borrowed CONNECTs (HEX-RT-17); none before any is learned.
     fn setup_bound(&self) -> Option<Duration> {
-        Some(self.bound)
+        self.bound.or_else(|| FOLLOWED.deadline())
     }
 
     /// Shards carries a half-close (its D12, held by its conformance case).
@@ -203,29 +309,16 @@ impl Link for ShardsLink {
     }
 
     fn dial_before(&self, port: u32, deadline: Option<Instant>) -> Result<DuplexOwner, Refusal> {
-        let at = match deadline {
-            Some(at) => at,
-            None => (!self.bound.is_zero())
-                .then(|| Instant::now().checked_add(self.bound))
-                .flatten()
-                .ok_or_else(|| Refusal::Invalid {
-                    what: "guest dial bound",
-                    why: "it must be positive and fit a monotonic deadline".to_owned(),
-                })?,
-        };
-        let cap = crate::calls::ReplyDeadline::caller_before(at)?;
-        cap.remaining("connecting to the guest within the original operation deadline")?;
-        let guest = self.guest.guest();
-        let stream = if self.listened.load(Ordering::Acquire) {
-            guest.connect_once_before(port, at)
-        } else {
-            guest.connect_before(port, at)
-        }
-        .map_err(|why| refusal("connecting to the guest", &why))?;
-        self.listened.store(true, Ordering::Release);
-        let stream = own_duplex(ShardsStream(stream))?;
-        cap.remaining("retaining the guest connection within the original operation deadline")?;
-        Ok(stream)
+        own_duplex(self.stream_before(port, deadline)?)
+    }
+
+    /// A Shards stream is handed to its caller as its own socket (the review's D-5).
+    fn dial_handoff_before(
+        &self,
+        port: u32,
+        deadline: Option<Instant>,
+    ) -> Option<Result<Handoff, Refusal>> {
+        Some(self.stream_before(port, deadline).map(Handoff::Shards))
     }
 }
 
@@ -297,6 +390,39 @@ pub fn refusal(op: &'static str, why: &shards_api::Refusal) -> Refusal {
         } => Refusal::Connect {
             port: *port,
             failure: connect_failure(failure),
+        },
+        // The guest's own failures, each in its kind (the review's B-15).
+        shards_api::Refusal::Stalled(stall) => Refusal::Guest {
+            op,
+            failure: GuestFailure::Stalled {
+                waited: stall.waited(),
+                over: stall.over(),
+                slowest: stall.slowest(),
+            },
+        },
+        shards_api::Refusal::Ended(end) => Refusal::Guest {
+            op,
+            failure: GuestFailure::Ended(match end {
+                shards_api::End::PowerOff => GuestEnd::PowerOff,
+                shards_api::End::Reset => GuestEnd::Reset,
+                shards_api::End::Stopped => GuestEnd::Stopped,
+                shards_api::End::Failed(why) => GuestEnd::Failed(why.clone()),
+            }),
+        },
+        shards_api::Refusal::Gone { pid, why } => Refusal::Guest {
+            op,
+            failure: GuestFailure::Gone {
+                pid: *pid,
+                why: why.clone(),
+            },
+        },
+        shards_api::Refusal::Rate(why) => Refusal::Guest {
+            op,
+            failure: GuestFailure::Rate(why.clone()),
+        },
+        shards_api::Refusal::HostUse(why) => Refusal::Guest {
+            op,
+            failure: GuestFailure::HostUse(why.to_string()),
         },
         other => Refusal::os(op, other),
     }

@@ -60,6 +60,8 @@ pub struct Rusage {
     /// (`bsd/kern/kern_exit.c:2075-2080`), and reads a live one's exit time as 0
     /// (`bsd/kern/kern_resource.c:3455-3462`).
     pub ended: bool,
+    /// When it ended, its exit's own time (`ri_proc_exit_abstime`): 0 while it runs.
+    pub exited: u64,
     pub footprint: u64,
     /// The highest footprint it reached.
     pub peak: u64,
@@ -99,6 +101,7 @@ pub fn rusage(pid: i32) -> io::Result<Option<Rusage>> {
     Ok(Some(Rusage {
         started: ri.ri_proc_start_abstime,
         ended: ri.ri_proc_exit_abstime != 0,
+        exited: ri.ri_proc_exit_abstime,
         footprint: ri.ri_phys_footprint,
         peak: ri.ri_lifetime_max_phys_footprint,
         cpu: ri.ri_user_time.saturating_add(ri.ri_system_time),
@@ -166,6 +169,13 @@ pub fn run_state(pid: i32) -> io::Result<Option<Run>> {
         libc::SZOMB => Run::Ended,
         _ => Run::Live,
     }))
+}
+
+/// Process `pid`'s effective user id, `proc_bsdinfo`'s `pbi_uid`: XNU fills it with `kauth_cred_getuid`, the id a
+/// `PROC_UID_ONLY` listing matches ([`user_pids`]; `bsd/kern/proc_info.c`). `None` when no process has that pid
+/// (`ESRCH`).
+pub(crate) fn uid_of(pid: i32) -> io::Result<Option<u32>> {
+    Ok(bsdinfo(pid)?.map(|info| info.pbi_uid))
 }
 
 /// `proc_pidinfo(PROC_PIDTBSDINFO)` of `pid`, or `None` when no process has that pid (`ESRCH`).

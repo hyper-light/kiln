@@ -26,6 +26,10 @@ const NANOSERVER_CARRIES: &[&str] = &[
     "mswsock.dll",
     "ntdll.dll",
     "oleaut32.dll",
+    // DeleteAppContainerProfile alone, from vendored shards-ipc's AppContainer (Shards D141). userenv.dll
+    // exports it at RVA 0xBF10, no forwarder, and each of its load-time imports resolves, in this layer and in
+    // nanoserver:ltsc2025 10.0.26100.33674's (diff_id sha256:9a4c0752...); cldapi.dll is a delay-load import.
+    "userenv.dll",
     "ws2_32.dll",
     // Reverse forwarders, in System32\forwarders.
     "advapi32.dll",

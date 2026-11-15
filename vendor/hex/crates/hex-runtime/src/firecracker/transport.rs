@@ -262,6 +262,12 @@ fn handshake(stream: &mut impl Duplex, port: u32, until: Instant) -> Result<(), 
 }
 
 impl Link for Endpoint {
+    /// Firecracker's hybrid vsock takes no borrowed CONNECT a caller in another process could make (HEX-RT-17 is
+    /// Shards'), so none is lent.
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn reply_budget(&self) -> Option<Duration> {
         Some(self.remaining())
     }

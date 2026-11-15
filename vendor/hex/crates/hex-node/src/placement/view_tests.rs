@@ -10,7 +10,7 @@ use hex_api::capacity::{
 use hex_api::{Bounds, BoxId, BoxSpec, ClassSpec, Refusal, Runtime};
 use hex_sim::index::Pick;
 use hex_sim::model::{Ask, Class, Classes, Demand, Kind, NodeId, NodeSpec, Resources};
-use hex_sim::peer::{Budget, Stop};
+use hex_sim::peer::{self, Budget, Stop};
 
 use super::View;
 use crate::placement::{Driver, Notice, Payload, Runtimes, Step};
@@ -232,6 +232,118 @@ fn the_nodes_admission_and_a_holders_reserve_check_one_view() {
     assert_eq!(driver.view().unwrap().held.cpu_milli, 1000);
 }
 
+/// A node's runtime that keeps each word of the machine's capacity view's keeper it is told (the review's A-10), its boxes
+/// the simulator's.
+#[derive(Default)]
+struct Keeping {
+    sim: hex_api::sim::SimRuntime,
+    words: std::sync::Mutex<Vec<hex_api::Reserved>>,
+}
+
+impl Runtime for Keeping {
+    fn classes(&self) -> Vec<hex_api::Class> {
+        self.sim.classes()
+    }
+    fn create(&self, spec: BoxSpec) -> Result<hex_api::BoxInfo, Refusal> {
+        self.sim.create(spec)
+    }
+    fn start(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.sim.start(id)
+    }
+    fn exec(
+        &self,
+        id: &BoxId,
+        program: hex_api::Program,
+        stdio: hex_api::Stdio,
+    ) -> Result<Box<dyn hex_api::Proc>, Refusal> {
+        self.sim.exec(id, program, stdio)
+    }
+    fn run(
+        &self,
+        spec: BoxSpec,
+        program: hex_api::Program,
+        stdio: hex_api::Stdio,
+    ) -> Result<Box<dyn hex_api::Proc>, Refusal> {
+        self.sim.run(spec, program, stdio)
+    }
+    fn signal(&self, id: &BoxId, signal: hex_api::Signal) -> Result<(), Refusal> {
+        self.sim.signal(id, signal)
+    }
+    fn inspect(&self, id: &BoxId) -> Result<hex_api::BoxInfo, Refusal> {
+        self.sim.inspect(id)
+    }
+    fn usage(&self, id: &BoxId) -> Result<hex_api::Usage, Refusal> {
+        self.sim.usage(id)
+    }
+    fn list(&self) -> Result<Vec<hex_api::BoxInfo>, Refusal> {
+        self.sim.list()
+    }
+    fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.sim.delete(id)
+    }
+    fn reserved(&self, word: hex_api::Reserved) -> Result<(), Refusal> {
+        self.words.lock().unwrap().push(word);
+        Ok(())
+    }
+}
+
+/// The review's A-10 (AC-T7.4.1; ROOT, 2026-11-14): what the machine's capacity view's holders reserve reaches the node's
+/// charge learner, its keeper's word woken at each change of it, off the holders' path. Do boot a node whose runtime keeps
+/// each word it is told, its view open, kiln's holder joined and its word's wake set; have the holder reserve 1.5 CPUs,
+/// granted; then tell the word. Expect the grant to wake it, and the runtime told the keeper's epoch and the 1.5 CPUs
+/// reserved, once, and nothing refused.
+#[test]
+fn a10_a_holders_reserve_wakes_and_tells_the_node_its_keepers_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = Resources {
+        cpu_milli: 2000,
+        mem_bytes: 8 * hex_api::MIN_MEMORY,
+        ..Resources::default()
+    };
+    let keeping = Arc::new(Keeping::default());
+    let runtime: Arc<dyn Runtime> = keeping.clone();
+    let driver = Driver::boot(
+        NodeId(0),
+        &[NodeSpec::new(NodeId(0), room)],
+        &[],
+        Budget { owned: 4, ran: 4 },
+        Pick::default(),
+        dir.path(),
+        Runtimes::new([(Class::Oci, runtime)]).unwrap(),
+    )
+    .unwrap();
+    driver.refresh_node(NodeSpec::new(NodeId(0), room)).unwrap();
+    driver.open_view(&dir.path().join("capacity"), 1).unwrap();
+    let (wake, woken) = hex_wait::mpsc::sync_channel(1).unwrap();
+    driver.on_reserved(wake).unwrap();
+    let mut kiln = Holder::start("kiln-runner".into(), 1, 4, &[]).unwrap();
+    let hello = kiln.connect().unwrap();
+    talk(&driver, &mut kiln, vec![hello]);
+    let _ = woken.try_recv();
+    let (run, msg) = kiln.reserve(cpu(1500)).unwrap();
+    assert_eq!(
+        talk(&driver, &mut kiln, vec![msg]),
+        vec![Event::Granted(run)]
+    );
+    assert!(
+        matches!(woken.try_recv(), Ok(())),
+        "a grant wakes its word's thread"
+    );
+    assert_eq!(driver.tell_reserved().unwrap(), Vec::new());
+    let keeper = driver.reserved_word().unwrap().unwrap().keeper;
+    assert_eq!(
+        *keeping.words.lock().unwrap(),
+        [hex_api::Reserved {
+            keeper,
+            reserved: hex_api::CapacityResources {
+                cpu_milli: 1500,
+                mem_bytes: 0,
+                disk_bytes: 0,
+            },
+        }]
+    );
+}
+
 /// A node whose facts say `room`, its capacity view open for one holder, and that holder joined.
 fn booted(dir: &std::path::Path, room: Resources) -> (Driver, Holder) {
     let runtime: Arc<dyn Runtime> = Arc::new(hex_api::sim::SimRuntime::default());
@@ -291,7 +403,12 @@ fn a_falling_learned_holding_frees_room_while_the_physical_room_stays() {
         talk(&driver, &mut kiln, vec![msg]),
         vec![Event::Refused(early, Why::Room)]
     );
-    assert_eq!(driver.rebook(&[(vm, holding(1000))]).unwrap(), 1);
+    assert_eq!(
+        driver
+            .rebook(&[(peer::Holder::Box(vm), holding(1000))])
+            .unwrap(),
+        1
+    );
     let view = driver.view().unwrap();
     assert_eq!((view.room.cpu_milli, view.held.cpu_milli), (4000, 1000));
     let (late, msg) = kiln.reserve(cpu(2000)).unwrap();
@@ -327,7 +444,9 @@ fn a_box_ending_mid_window_lets_nothing_past_the_physical_room() {
     let (d, p) = demand_of(3000);
     let (vm, step) = driver.submit(d, p).unwrap();
     assert!(started(&quiesce(&driver, step)));
-    driver.rebook(&[(vm, holding(1000))]).unwrap();
+    driver
+        .rebook(&[(peer::Holder::Box(vm), holding(1000))])
+        .unwrap();
     let (first, msg) = kiln.reserve(cpu(2500)).unwrap();
     assert_eq!(
         talk(&driver, &mut kiln, vec![msg]),
@@ -369,7 +488,9 @@ fn a_holding_past_the_room_blocks_the_nodes_admission_typed() {
     let (d, p) = demand_of(1000);
     let (vm, step) = driver.submit(d, p).unwrap();
     assert!(started(&quiesce(&driver, step)));
-    driver.rebook(&[(vm, holding(5000))]).unwrap();
+    driver
+        .rebook(&[(peer::Holder::Box(vm), holding(5000))])
+        .unwrap();
     assert_eq!(driver.view().unwrap().over().cpu_milli, 1000);
     let (d, p) = demand_of(1000);
     let (_, step) = driver.submit(d, p).unwrap();
@@ -392,7 +513,9 @@ fn a_holding_past_the_room_blocks_the_nodes_admission_typed() {
         talk(&driver, &mut kiln, vec![msg]),
         vec![Event::Refused(early, Why::Room)]
     );
-    driver.rebook(&[(vm, holding(1000))]).unwrap();
+    driver
+        .rebook(&[(peer::Holder::Box(vm), holding(1000))])
+        .unwrap();
     assert!(started(&quiesce(&driver, driver.retry().unwrap())));
     let (late, msg) = kiln.reserve(cpu(1000)).unwrap();
     assert_eq!(
@@ -418,11 +541,18 @@ fn a_holder_reaches_the_nodes_keeper_over_quic() {
     // once QUIC's idle timeout passes (RFC 9000 §10.1), and a write cut at a slice's end would leave half a message.
     /// The keeper's next word to the holder: its answer to what it said, or a hint.
     static HEAR: Patience = Patience::measuring("test.hex_node.capacity.hear");
-    let heard = |link: &mut Link| {
+    // By the life of the keeper's serving thread (the review's C-5), and the link's end, which the read says itself.
+    let heard = |link: &mut Link, keeper: &std::thread::JoinHandle<Refused>| {
         follow::within(
             &HEAR,
             "the keeper's next word",
-            || Party::Live,
+            || {
+                if keeper.is_finished() {
+                    Party::Ended
+                } else {
+                    Party::Live
+                }
+            },
             |by| match link.hear(by) {
                 Err(Refused::Deadline { .. }) => None,
                 heard => Some(heard),
@@ -472,11 +602,11 @@ fn a_holder_reaches_the_nodes_keeper_over_quic() {
         &["kiln.capacity.test".to_owned()],
         Arc::new(|_: &str| {}),
     );
-    {
+    let keeper = {
         let server = Arc::clone(&server);
         let acceptor = node.acceptor(CAPACITY_PORT);
-        std::thread::spawn(move || server.serve(acceptor));
-    }
+        std::thread::spawn(move || server.serve(acceptor))
+    };
     let kiln_end = Endpoint::start(Config {
         credentials: enrolled("kiln.capacity.test"),
         bind: loopback,
@@ -499,7 +629,7 @@ fn a_holder_reaches_the_nodes_keeper_over_quic() {
         while let Some(msg) = said.pop_front() {
             link.say(&msg, None).unwrap();
             let mut out = Out::default();
-            kiln.hear(heard(link), &mut out);
+            kiln.hear(heard(link, &keeper), &mut out);
             said.extend(out.send);
             events.extend(out.events);
         }
@@ -519,7 +649,7 @@ fn a_holder_reaches_the_nodes_keeper_over_quic() {
     let (_, step) = driver.submit(d, p).unwrap();
     assert!(started(&quiesce(&driver, step)));
     server.hint().unwrap();
-    let ToHolder::Hint { view, .. } = heard(&mut link) else {
+    let ToHolder::Hint { view, .. } = heard(&mut link, &keeper) else {
         panic!("no hint");
     };
     assert_eq!((view.room.cpu_milli, view.held.cpu_milli), (4000, 4000));
@@ -631,4 +761,248 @@ fn cv8_a_node_with_no_runtime_class_of_its_own_keeps_a_holders_reservations() {
         talk(&driver, &mut kiln, vec![msg]),
         vec![Event::Granted(run)]
     );
+}
+
+/// AC-T7.4.1, CV8 (R03: the bound pinned at its edge): a holder's name is held to a record's bytes less its epoch field,
+/// a u64 in decimal and one space. Do: open the view and say a hello naming a holder by the most bytes its bound takes, at
+/// the widest epoch; then one naming another holder a byte longer. Expect: the first welcomed, its record exactly a
+/// record's bytes; the second closed, its name invalid.
+#[test]
+fn a_holders_name_at_its_bound_fills_its_record_at_the_widest_epoch() {
+    use hex_api::capacity::{Close, Invalid};
+    let dir = tempfile::tempdir().unwrap();
+    let mut view = View::open(dir.path(), HOLDERS).unwrap();
+    view.set_room(conformance::ROOM);
+    let most = crate::records::MAX_BYTES - super::EPOCH_FIELD;
+    let hello = |name: String| ToKeeper::Hello {
+        holder: name,
+        epoch: u64::MAX,
+        scope: None,
+    };
+    let (welcome, _) = view
+        .hear(0, hello("h".repeat(most)), Amounts::ZERO)
+        .unwrap();
+    assert!(matches!(welcome, ToHolder::Welcome { .. }), "{welcome:?}");
+    let record = std::fs::metadata(dir.path().join("holder-0.rec"))
+        .unwrap()
+        .len();
+    assert_eq!(record, u64::try_from(crate::records::MAX_BYTES).unwrap());
+    let (closed, _) = view
+        .hear(1, hello("i".repeat(most + 1)), Amounts::ZERO)
+        .unwrap();
+    assert_eq!(
+        closed,
+        ToHolder::Closed {
+            rejected: None,
+            why: Close::Invalid(Invalid::Name),
+        }
+    );
+}
+
+/// An oci box's demand and payload: `cpu_milli` and the least memory a box holds, as [`demand_of`]'s process box, its
+/// image Linux on x86_64, as a routed oci box names its image's platform.
+fn oci_of(cpu_milli: u64) -> (Demand, Payload) {
+    let (mut demand, mut payload) = demand_of(cpu_milli);
+    demand.ask.os = Some(hex_sim::model::Os::Linux);
+    demand.ask.arch = Some(hex_sim::model::Arch::X86_64);
+    payload.spec.class = ClassSpec::Oci(Box::new(hex_api::OciSpec {
+        rootfs: hex_api::Rootfs::Dir(std::path::PathBuf::from("/images/agent")),
+        init: hex_api::Program::of(&["/bin/true"]),
+        mounts: Vec::new(),
+        hostname: None,
+        network: hex_api::Network::Private,
+        hosts: Vec::new(),
+    }));
+    (demand, payload)
+}
+
+/// A node's routes when its oci class runs in its node VM (joint plan step 39, V2): a process box's native one and an oci
+/// box's NodeVm one.
+fn node_vm_routes() -> Vec<hex_api::RouteOffer> {
+    let route = |class, execution| hex_api::RouteOffer {
+        key: hex_api::RouteKey {
+            class,
+            image: hex_api::ImagePlatform {
+                os: hex_api::ImageOs::Linux,
+                arch: hex_api::ImageArch::Amd64,
+            },
+            execution,
+            gpu: hex_api::GpuEligibility::None,
+        },
+        cost: None,
+        backing: None,
+    };
+    vec![
+        route(hex_api::Class::Process, hex_api::Execution::Native),
+        route(hex_api::Class::Oci, hex_api::Execution::NodeVm),
+    ]
+}
+
+/// A runtime offering [`node_vm_routes`] as a node VM's node answers them, its boxes made as their routes ask.
+struct Routed(hex_api::sim::SimRuntime);
+
+impl Runtime for Routed {
+    fn classes(&self) -> Vec<hex_api::Class> {
+        vec![hex_api::Class::Process, hex_api::Class::Oci]
+    }
+    fn capacity(&self, _: hex_api::Class) -> Result<Option<hex_api::Capacity>, Refusal> {
+        Ok(Some(hex_api::Capacity {
+            own: Default::default(),
+            id: "node-vm-host".into(),
+            total: hex_api::CapacityResources::default(),
+            free: hex_api::CapacityResources::default(),
+            devices: Vec::new(),
+            cost: None,
+            routes: node_vm_routes(),
+            device_routes: Vec::new(),
+            backings: Vec::new(),
+            unavailable: Vec::new(),
+            learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
+        }))
+    }
+    fn create(&self, spec: BoxSpec) -> Result<hex_api::BoxInfo, Refusal> {
+        self.0.create(spec)
+    }
+    fn start(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.0.start(id)
+    }
+    fn exec(
+        &self,
+        id: &BoxId,
+        program: hex_api::Program,
+        stdio: hex_api::Stdio,
+    ) -> Result<Box<dyn hex_api::Proc>, Refusal> {
+        self.0.exec(id, program, stdio)
+    }
+    fn run(
+        &self,
+        spec: BoxSpec,
+        program: hex_api::Program,
+        stdio: hex_api::Stdio,
+    ) -> Result<Box<dyn hex_api::Proc>, Refusal> {
+        self.0.run(spec, program, stdio)
+    }
+    fn signal(&self, id: &BoxId, signal: hex_api::Signal) -> Result<(), Refusal> {
+        self.0.signal(id, signal)
+    }
+    fn inspect(&self, id: &BoxId) -> Result<hex_api::BoxInfo, Refusal> {
+        self.0.inspect(id)
+    }
+    fn usage(&self, id: &BoxId) -> Result<hex_api::Usage, Refusal> {
+        self.0.usage(id)
+    }
+    fn list(&self) -> Result<Vec<hex_api::BoxInfo>, Refusal> {
+        self.0.list()
+    }
+    fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.0.delete(id)
+    }
+}
+
+/// A node of `room` whose oci class runs in its node VM (joint plan step 39, V2): its routes [`node_vm_routes`], its
+/// Ready node VM's guest admitted at 1.5 CPUs and 3 of the least boxes' memory.
+fn node_vm_node(room: Resources) -> NodeSpec {
+    let mut spec = NodeSpec::new(NodeId(0), room);
+    spec.routes = Some(
+        hex_sim::model::RuntimeRoutes {
+            admit: None,
+            offers: node_vm_routes(),
+            device_routes: Vec::new(),
+            backings: Vec::new(),
+            node_vm_room: Some(hex_api::CapacityResources {
+                cpu_milli: 1_500,
+                mem_bytes: 3 * hex_api::MIN_MEMORY,
+                disk_bytes: 0,
+            }),
+        }
+        .share()
+        .unwrap(),
+    );
+    spec
+}
+
+/// A node of four CPUs whose oci class runs in its node VM ([`node_vm_node`]), its view open for one holder, and its node
+/// VM, run 39, booked at 2 CPUs and 4 of the least boxes' memory.
+fn node_vm_booted(dir: &std::path::Path) -> (Driver, Holder) {
+    let runtime: Arc<dyn Runtime> = Arc::new(Routed(hex_api::sim::SimRuntime::default()));
+    let driver = Driver::boot(
+        NodeId(0),
+        &[node_vm_node(four_cpus())],
+        &[],
+        Budget { owned: 4, ran: 4 },
+        Pick::default(),
+        dir,
+        Runtimes::new([(Class::Oci, runtime)]).unwrap(),
+    )
+    .unwrap();
+    driver.refresh_node(node_vm_node(four_cpus())).unwrap();
+    driver.open_view(&dir.join("capacity"), 1).unwrap();
+    let mut kiln = Holder::start("kiln-runner".into(), 1, 4, &[]).unwrap();
+    let hello = kiln.connect().unwrap();
+    let joined = talk(&driver, &mut kiln, vec![hello]);
+    assert!(
+        matches!(joined.as_slice(), [Event::Synced { agree: true, .. }]),
+        "{joined:?}"
+    );
+    driver
+        .book_nodes(&std::collections::BTreeMap::from([(
+            hex_api::NodeRun::from_bytes([39; 16]),
+            Resources {
+                cpu_milli: 2_000,
+                mem_bytes: 4 * hex_api::MIN_MEMORY,
+                ..Resources::default()
+            },
+        )]))
+        .unwrap();
+    (driver, kiln)
+}
+
+/// V2 (a) (ROOT, 2026-11-13: the scheduler's ledger booked a node VM beside the oci boxes it hosts, A-5's double count
+/// at the scheduler): an oci box in its node's node VM is charged nothing at its host, the node VM's receipt holding it.
+/// Do book node VM 39 at 2 of a node's 4 CPUs, then place an oci box of 1 CPU through its NodeVm route. Expect it
+/// started, and the node's view holding the node VM's 2 CPUs alone.
+#[test]
+fn v2_an_oci_box_in_its_node_vm_is_held_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (driver, _kiln) = node_vm_booted(dir.path());
+    let (d, p) = oci_of(1_000);
+    let (_, step) = driver.submit(d, p).unwrap();
+    let notices = quiesce(&driver, step);
+    assert!(started(&notices), "{notices:?}");
+    assert_eq!(driver.view().unwrap().held.cpu_milli, 2_000);
+}
+
+/// V2 (ROOT, 2026-11-13: the node VM's route's room is its guest, the host-side pool, so a placement is right the first
+/// time): oci boxes are placed within their node VM's guest. Do book node VM 39, its guest admitted at 1.5 CPUs, then
+/// place an oci box of 1 CPU, then another. Expect the first started, and the second refused: 2 CPUs past the guest's
+/// 1.5.
+#[test]
+fn v2_oci_boxes_are_placed_within_their_node_vms_guest() {
+    let dir = tempfile::tempdir().unwrap();
+    let (driver, _kiln) = node_vm_booted(dir.path());
+    let (d, p) = oci_of(1_000);
+    let (_, step) = driver.submit(d, p).unwrap();
+    let notices = quiesce(&driver, step);
+    assert!(started(&notices), "{notices:?}");
+    let (d, p) = oci_of(1_000);
+    let (_, step) = driver.submit(d, p).unwrap();
+    assert!(!started(&quiesce(&driver, step)));
+}
+
+/// V2 (b) (ROOT, 2026-11-13: a node VM's receipt never reached its node's own admissions): a host box gets only the room
+/// past its node's node VM. Do book node VM 39 at 2 of a node's 4 CPUs, then place a process box of 3 CPUs on the host,
+/// then one of 2. Expect the first refused, 3 CPUs past the 2 the node VM leaves, and the second started.
+#[test]
+fn v2_a_host_box_gets_only_the_room_past_its_nodes_node_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let (driver, _kiln) = node_vm_booted(dir.path());
+    let (d, p) = demand_of(3_000);
+    let (_, step) = driver.submit(d, p).unwrap();
+    assert!(!started(&quiesce(&driver, step)));
+    let (d, p) = demand_of(2_000);
+    let (_, step) = driver.submit(d, p).unwrap();
+    let notices = quiesce(&driver, step);
+    assert!(started(&notices), "{notices:?}");
 }

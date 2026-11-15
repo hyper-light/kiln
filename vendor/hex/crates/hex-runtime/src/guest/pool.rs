@@ -29,7 +29,20 @@ pub(super) struct Receipt {
 }
 
 pub(super) fn refused(key: BackingKey, cause: LifecycleCause) -> Refusal {
-    Refusal::Backing { key, cause }
+    Refusal::Backing {
+        key,
+        cause,
+        why: None,
+    }
+}
+
+/// Backing `key` refused Uncertain, and `why` in the refusing site's own words (joint plan step 14, (B)).
+pub(super) fn uncertain(key: BackingKey, why: &str) -> Refusal {
+    Refusal::Backing {
+        key,
+        cause: LifecycleCause::Uncertain,
+        why: Some(why.to_owned()),
+    }
 }
 
 fn exhausted() -> Refusal {
@@ -49,11 +62,19 @@ impl Receipt {
         let guest = receipt
             .original
             .allocation
-            .ok_or_else(|| refused(receipt.original.key, LifecycleCause::Uncertain))?
+            .ok_or_else(|| {
+                uncertain(
+                    receipt.original.key,
+                    "its record holds no allocation for its guest",
+                )
+            })?
             .guest()?;
         let configured = selected::resources(config)?;
         if guest.cpu_milli != configured.cpu_milli || guest.mem_bytes != configured.mem_bytes {
-            return Err(refused(receipt.original.key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                receipt.original.key,
+                "its granted guest isn't the size its node configures",
+            ));
         }
         Ok(receipt)
     }
@@ -75,27 +96,46 @@ impl Receipt {
     }
 
     pub fn check(&self) -> Result<(), Refusal> {
-        let bad = || refused(self.original.key, LifecycleCause::Uncertain);
+        let bad = |why: &str| uncertain(self.original.key, why);
         self.original.check()?;
-        if self.original.phase != BackingPhase::Granted
-            || self.original.init.is_some()
-            || self.original.exit.is_some()
-            || self.original.allocation.is_none()
-            || !matches!(
-                self.original.execution,
-                Execution::ShardsShared | Execution::ShardsDedicated
-            )
-            || self.physical.len() != self.original.devices.len()
-            || self
-                .original
-                .devices
-                .iter()
-                .any(|id| id.kind != hex_api::DeviceKind::Gpu)
-            || (self.original.execution == Execution::ShardsShared && !self.physical.is_empty())
-        {
-            return Err(bad());
+        if self.original.phase != BackingPhase::Granted {
+            return Err(bad("its receipt's original record isn't the granted one"));
         }
-        shards_api::physical::check_selection(&self.physical).map_err(|_| bad())?;
+        if self.original.init.is_some() {
+            return Err(bad("its receipt's original record names a controller"));
+        }
+        if self.original.exit.is_some() {
+            return Err(bad("its receipt's original record holds an end"));
+        }
+        if self.original.allocation.is_none() {
+            return Err(bad("its receipt's original record holds no allocation"));
+        }
+        if !matches!(
+            self.original.execution,
+            Execution::ShardsShared | Execution::ShardsDedicated
+        ) {
+            return Err(bad(
+                "its receipt's original record isn't a Shards backing's",
+            ));
+        }
+        if self.physical.len() != self.original.devices.len() {
+            return Err(bad(
+                "its receipt's physical selection isn't its record's devices",
+            ));
+        }
+        if self
+            .original
+            .devices
+            .iter()
+            .any(|id| id.kind != hex_api::DeviceKind::Gpu)
+        {
+            return Err(bad("its record names a device that isn't a GPU"));
+        }
+        if self.original.execution == Execution::ShardsShared && !self.physical.is_empty() {
+            return Err(bad("a shared backing's receipt selects physical devices"));
+        }
+        shards_api::physical::check_selection(&self.physical)
+            .map_err(|_| bad("its receipt's physical selection isn't valid"))?;
         if let Some(report) = &self.report {
             super::physical::check_report(
                 &self.original.devices,
@@ -106,7 +146,9 @@ impl Receipt {
         }
         if let Some(readiness) = &self.readiness {
             if self.physical.is_empty() || self.report.is_none() {
-                return Err(bad());
+                return Err(bad(
+                    "its receipt holds readiness with no physical selection or report",
+                ));
             }
             readiness.check(self.original.scope(), self.physical.len())?;
         }
@@ -115,7 +157,9 @@ impl Receipt {
                 || attempt.configuration == [0; 32]
                 || attempt.max_queues == 0)
         {
-            return Err(bad());
+            return Err(bad(
+                "its boot attempt has no physical selection, configuration or queues",
+            ));
         }
         Ok(())
     }
@@ -128,7 +172,7 @@ impl Receipt {
         self.report
             .as_ref()
             .map(Some)
-            .ok_or_else(|| refused(self.original.key, LifecycleCause::Uncertain))
+            .ok_or_else(|| uncertain(self.original.key, "its receipt holds no native report"))
     }
 
     pub fn identity(&self) -> Result<&shards_api::Identity, Refusal> {
@@ -139,16 +183,20 @@ impl Receipt {
                 identity: Some(identity),
                 ..
             } => Ok(identity),
-            Phase::Intent | Phase::Released { identity: None, .. } => {
-                Err(refused(self.original.key, LifecycleCause::Uncertain))
-            }
+            Phase::Intent | Phase::Released { identity: None, .. } => Err(uncertain(
+                self.original.key,
+                "its receipt names no controller yet",
+            )),
         }
     }
 
     pub fn released_identity(&self) -> Result<Option<&shards_api::Identity>, Refusal> {
         match &self.phase {
             Phase::Released { identity, .. } => Ok(identity.as_ref()),
-            _ => Err(refused(self.original.key, LifecycleCause::Uncertain)),
+            _ => Err(uncertain(
+                self.original.key,
+                "its receipt isn't released yet",
+            )),
         }
     }
 
@@ -157,10 +205,18 @@ impl Receipt {
         if !self
             .attempt
             .as_ref()
-            .ok_or_else(|| refused(self.original.key, LifecycleCause::Uncertain))?
+            .ok_or_else(|| {
+                uncertain(
+                    self.original.key,
+                    "its receipt holds no boot attempt to be ready",
+                )
+            })?
             .ready_facts()?
         {
-            return Err(refused(self.original.key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                self.original.key,
+                "its boot attempt's facts aren't ready",
+            ));
         }
         Ok(readiness)
     }
@@ -172,25 +228,27 @@ impl Receipt {
         readiness
             .report
             .require_work_ready(self.physical.len(), readiness.max_queues)
-            .map_err(|_| refused(self.original.key, LifecycleCause::Uncertain))?;
+            .map_err(|_| uncertain(self.original.key, "its native report isn't ready for work"))?;
         Ok(readiness)
     }
 
     fn readiness_payload(&self) -> Result<&super::observer::Evidence, Refusal> {
         self.check()?;
         if !matches!(self.phase, Phase::Running(_)) {
-            return Err(refused(self.original.key, LifecycleCause::Uncertain));
+            return Err(uncertain(self.original.key, "its receipt isn't running"));
         }
-        let readiness = self
-            .readiness
-            .as_ref()
-            .ok_or_else(|| refused(self.original.key, LifecycleCause::Uncertain))?;
+        let readiness = self.readiness.as_ref().ok_or_else(|| {
+            uncertain(self.original.key, "its receipt holds no readiness evidence")
+        })?;
         let attempt = self
             .attempt
             .as_ref()
-            .ok_or_else(|| refused(self.original.key, LifecycleCause::Uncertain))?;
+            .ok_or_else(|| uncertain(self.original.key, "its receipt holds no boot attempt"))?;
         if !attempt.matches_readiness(readiness)? {
-            return Err(refused(self.original.key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                self.original.key,
+                "its readiness evidence isn't its boot attempt's",
+            ));
         }
         Ok(readiness)
     }
@@ -201,7 +259,10 @@ impl Receipt {
         if self.original.key != record.key
             || self.original.native_commitment()? != record.native_commitment()?
         {
-            return Err(refused(record.key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                record.key,
+                "its receipt is another backing's, or another commitment's",
+            ));
         }
         if record.phase == BackingPhase::Live && !self.physical.is_empty() {
             // Preserve v4 provenance/payload checks. A v5 opaque diagnostic is
@@ -220,14 +281,14 @@ impl Receipt {
             .report
             .as_ref()
             .map(|report| {
-                report
-                    .encode()
-                    .map_err(|_| refused(self.original.key, LifecycleCause::Uncertain))
+                report.encode().map_err(|_| {
+                    uncertain(self.original.key, "its native report couldn't be encoded")
+                })
             })
             .transpose()?;
         let original = self.original.encode()?;
         let original = std::str::from_utf8(&original)
-            .map_err(|_| refused(self.original.key, LifecycleCause::Uncertain))?;
+            .map_err(|_| uncertain(self.original.key, "its original record isn't UTF-8"))?;
         struct Length(usize);
         impl std::fmt::Write for Length {
             fn write_str(&mut self, text: &str) -> std::fmt::Result {
@@ -247,7 +308,10 @@ impl Receipt {
         self.render(&mut text, original, report.as_deref())
             .map_err(|_| exhausted())?;
         if parse(&text)? != *self {
-            return Err(refused(self.original.key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                self.original.key,
+                "its receipt doesn't read back as it was written",
+            ));
         }
         Ok(text)
     }

@@ -23,7 +23,8 @@ pub const WORKDIR_KEY: &[u8] = b"member-workdir=";
 /// own config's `run.env` and what is staged for it (init domains.rs `harness_env`).
 pub const IMAGE_ENV_KEY: &[u8] = b"image-env=";
 /// `member-ends`, alone: the run's owner hears each member's end
-/// ([`kind::MEMBER_ENDED`](super::kind::MEMBER_ENDED)), which a daemon's run does not ask.
+/// ([`kind::MEMBER_ENDED`](super::kind::MEMBER_ENDED)), which a daemon's run asks where its
+/// agent control tells its members' lanes their ends (D238).
 pub const ENDS: &[u8] = b"member-ends";
 /// `member-terminal=<index>`: the member's stdio is a terminal of its own (plan step 6,
 /// D244), whose master init holds: what the terminal shows is its stdout channel, its
@@ -72,11 +73,18 @@ pub enum Error {
     SecondMember,
     /// A second terminal for one member ([`TERMINAL_KEY`]).
     SecondTerminal,
+    /// A second MCP bridge for one member (`run::mcp::MEMBER_KEY`, D254).
+    SecondMcp,
+    /// An MCP token that is not the token's bytes in lowercase hex, or a second one
+    /// (`run::mcp::TOKEN_KEY`, D254).
+    McpToken,
     /// A terminal's size that is not its rows and columns, each a decimal u16.
     Size,
     /// An argument holding a NUL, which no command line exec'd holds (execve(2)'s strings
     /// end at one).
     Argument,
+    /// A signal that is no Linux signal's number, `1..=NSIG` in decimal.
+    Signal,
 }
 
 impl core::fmt::Display for Error {
@@ -92,8 +100,11 @@ impl core::fmt::Display for Error {
             Error::Shape => "an entry missing a field",
             Error::SecondMember => "a second member for one exec",
             Error::SecondTerminal => "a second terminal for one member",
+            Error::SecondMcp => "a second MCP bridge for one member",
+            Error::McpToken => "an MCP token that is not its bytes in lowercase hex, or a second one",
             Error::Size => "a terminal size that is not its rows and columns in decimal u16s",
             Error::Argument => "an argument holding a NUL",
+            Error::Signal => "a signal that is no Linux signal's number, 1 to 64 in decimal",
         })
     }
 }
@@ -379,29 +390,74 @@ pub fn staged_members(setup: &[Vec<u8>]) -> Result<Vec<u32>, Error> {
     Ok(members)
 }
 
-/// `[member, status]`, each a big-endian u32: the payload of
-/// [`kind::MEMBER_ENDED`](super::kind::MEMBER_ENDED), its status as `docker run` reports one
-/// (its code, or 128 plus the number of the signal that ended it).
+/// How a member's command ended, as its namespace's reaper saw it (`wait4(2)`): exited with
+/// its code, or killed by a signal, its number (`WTERMSIG`, `1..=`[`NSIG`](super::NSIG)). Its
+/// [`End::status`] is the one `docker run` reports, which cannot tell `exit 143` from a death
+/// by `SIGTERM`; this can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    Exited(u32),
+    Signaled(u32),
+}
+
+impl End {
+    const EXITED: u8 = 0;
+    const SIGNALED: u8 = 1;
+    /// Its tag, then its code or signal, a big-endian u32.
+    pub const LEN: usize = 1 + size_of::<u32>();
+
+    /// Its status as `docker run` reports one: its code, or 128 plus its signal's number.
+    pub fn status(self) -> u32 {
+        match self {
+            End::Exited(code) => code,
+            End::Signaled(signal) => signal.saturating_add(128),
+        }
+    }
+
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let (tag, word) = match self {
+            End::Exited(code) => (Self::EXITED, code),
+            End::Signaled(signal) => (Self::SIGNALED, signal),
+        };
+        let [a, b, c, d] = word.to_be_bytes();
+        [tag, a, b, c, d]
+    }
+
+    /// The end `bytes` say: none for a tag of neither, or a signal out of `1..=NSIG`.
+    pub fn decode(bytes: &[u8]) -> Option<End> {
+        let [tag, a, b, c, d] = <[u8; Self::LEN]>::try_from(bytes).ok()?;
+        let word = u32::from_be_bytes([a, b, c, d]);
+        match tag {
+            Self::EXITED => Some(End::Exited(word)),
+            Self::SIGNALED if (1..=super::NSIG).contains(&word) => Some(End::Signaled(word)),
+            _ => None,
+        }
+    }
+}
+
+/// `[member, end]`: the member (a big-endian u32), then its [`End`]: the payload of
+/// [`kind::MEMBER_ENDED`](super::kind::MEMBER_ENDED).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ended {
     pub member: u32,
-    pub status: u32,
+    pub end: End,
 }
 
 impl Ended {
-    pub const LEN: usize = 2 * size_of::<u32>();
+    pub const LEN: usize = size_of::<u32>() + End::LEN;
 
     pub fn encode(self) -> [u8; Self::LEN] {
         let [a, b, c, d] = self.member.to_be_bytes();
-        let [e, f, g, h] = self.status.to_be_bytes();
-        [a, b, c, d, e, f, g, h]
+        let [e, f, g, h, i] = self.end.encode();
+        [a, b, c, d, e, f, g, h, i]
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Ended> {
-        let [a, b, c, d, e, f, g, h] = <[u8; Self::LEN]>::try_from(bytes).ok()?;
+        let bytes = <&[u8; Self::LEN]>::try_from(bytes).ok()?;
+        let (member, end) = bytes.split_at(size_of::<u32>());
         Some(Ended {
-            member: u32::from_be_bytes([a, b, c, d]),
-            status: u32::from_be_bytes([e, f, g, h]),
+            member: u32::from_be_bytes(member.try_into().ok()?),
+            end: End::decode(end)?,
         })
     }
 }
@@ -486,6 +542,32 @@ pub fn parse_resize(args: &[Vec<u8>]) -> Result<(u32, super::Size), Error> {
     Ok((decimal(member)?, size))
 }
 
+/// [`builtin::SIGNAL`](super::builtin::SIGNAL)'s arguments: the member's index, then the
+/// signal's Linux number, each in decimal.
+pub fn signal_args(member: u32, signal: u32) -> Vec<Vec<u8>> {
+    [member, signal]
+        .into_iter()
+        .map(|n| {
+            let mut arg = Vec::new();
+            push_decimal(&mut arg, n);
+            arg
+        })
+        .collect()
+}
+
+/// The member and the signal [`signal_args`] gives, checked: two arguments, the index a
+/// decimal u32, the signal one of Linux's, `1..=NSIG`.
+pub fn parse_signal(args: &[Vec<u8>]) -> Result<(u32, u32), Error> {
+    let [member, signal] = args else {
+        return Err(Error::Shape);
+    };
+    let signal = decimal(signal)
+        .ok()
+        .filter(|n| (1..=super::NSIG).contains(n))
+        .ok_or(Error::Signal)?;
+    Ok((decimal(member)?, signal))
+}
+
 /// Why init ran no command in a member (plan step 6, D243), as its exec's
 /// [`kind::SYSTEM_ERR`](super::kind::SYSTEM_ERR) says after the class
 /// [`exec_failed::MEMBER`](super::exec_failed::MEMBER): a code, what that code carries, then
@@ -505,6 +587,10 @@ pub enum Refusal {
     /// A step of its confinement failed: which (init's `domains::Confining`, by its
     /// number), and the errno.
     Confining(u8, i32),
+    /// Its starter, the process of its own that starts what is run in it (init's
+    /// `starter`, D243), has gone: a process of the member's ended it, or it could not be
+    /// forked as the member started.
+    NoStarter,
 }
 
 impl Refusal {
@@ -514,6 +600,7 @@ impl Refusal {
     const WIDENING: u8 = 4;
     const JOINING: u8 = 5;
     const CONFINING: u8 = 6;
+    const NO_STARTER: u8 = 7;
 
     /// Its code and what it carries, then `words`.
     pub fn encode(self, words: &[u8]) -> Vec<u8> {
@@ -531,6 +618,7 @@ impl Refusal {
                 out.extend_from_slice(&[Self::CONFINING, step]);
                 out.extend_from_slice(&errno.to_be_bytes());
             }
+            Refusal::NoStarter => out.push(Self::NO_STARTER),
         }
         out.extend_from_slice(words);
         out
@@ -551,6 +639,7 @@ impl Refusal {
                 let (&step, rest) = rest.split_first()?;
                 (Refusal::Confining(step, errno(rest)?), rest.get(4..)?)
             }
+            Self::NO_STARTER => (Refusal::NoStarter, rest),
             _ => return None,
         })
     }
@@ -560,7 +649,7 @@ impl Refusal {
     pub fn not_started(self) -> bool {
         matches!(
             self,
-            Refusal::Processes | Refusal::Joining(_) | Refusal::Confining(..)
+            Refusal::Processes | Refusal::Joining(_) | Refusal::Confining(..) | Refusal::NoStarter
         )
     }
 }
@@ -570,7 +659,7 @@ fn split_once(bytes: &[u8], at: u8) -> Option<(&[u8], &[u8])> {
     Some((bytes.get(..i)?, bytes.get(i + 1..)?))
 }
 
-fn decimal(text: &[u8]) -> Result<u32, Error> {
+pub(super) fn decimal(text: &[u8]) -> Result<u32, Error> {
     // No sign, no leading zero but "0" itself, digits alone: one spelling for each index.
     let canonical = match text {
         [] => false,
@@ -601,7 +690,7 @@ fn octal(text: &[u8]) -> Result<u32, Error> {
     Ok(mode)
 }
 
-fn push_decimal(out: &mut Vec<u8>, n: u32) {
+pub(super) fn push_decimal(out: &mut Vec<u8>, n: u32) {
     let mut digits = [0u8; 10];
     let mut at = digits.len();
     let mut n = n;
@@ -876,20 +965,23 @@ mod tests {
     #[test]
     fn ends_round_trip() {
         for ended in [
-            Ended { member: 0, status: 0 },
+            Ended {
+                member: 0,
+                end: End::Exited(0),
+            },
             Ended {
                 member: 3,
-                status: 137,
+                end: End::Signaled(9),
             },
             Ended {
                 member: u32::MAX,
-                status: u32::MAX,
+                end: End::Exited(u32::MAX),
             },
         ] {
             assert_eq!(Ended::decode(&ended.encode()), Some(ended));
         }
-        assert_eq!(Ended::decode(&[0; 7]), None);
-        assert_eq!(Ended::decode(&[0; 9]), None);
+        assert_eq!(Ended::decode(&[0; 8]), None);
+        assert_eq!(Ended::decode(&[0; 10]), None);
     }
 
     /// An exec names one member at most, in the index's one spelling; an exec naming none
@@ -951,6 +1043,26 @@ mod tests {
         );
     }
 
+    /// A signal's arguments round-trip, for every signal Linux has; one outside them, an index
+    /// that is not one, or not two arguments, is refused.
+    #[test]
+    fn a_signal_says_its_member_and_number() {
+        for (member, signal) in [(0, 1), (3, 15), (u32::MAX, super::super::NSIG)] {
+            assert_eq!(parse_signal(&signal_args(member, signal)), Ok((member, signal)));
+        }
+        let args = |a: &[&[u8]]| a.iter().map(|x| x.to_vec()).collect::<Vec<_>>();
+        for signal in [&b"0"[..], b"65", b"-1", b"09", b"x", b""] {
+            assert_eq!(
+                parse_signal(&args(&[b"1", signal])),
+                Err(Error::Signal),
+                "{signal:?}"
+            );
+        }
+        assert_eq!(parse_signal(&args(&[b"01", b"15"])), Err(Error::Index));
+        assert_eq!(parse_signal(&args(&[b"1"])), Err(Error::Shape));
+        assert_eq!(parse_signal(&args(&[b"1", b"15", b"9"])), Err(Error::Shape));
+    }
+
     /// Every refusal round-trips with its words; one cut short, or of a code no refusal
     /// has, is none.
     #[test]
@@ -964,6 +1076,7 @@ mod tests {
             Refusal::Joining(i32::MIN),
             Refusal::Confining(13, 22),
             Refusal::Confining(0, -1),
+            Refusal::NoStarter,
         ] {
             for words in [&b""[..], b"agent main: it has ended", b"\0\xff"] {
                 let said = r.encode(words);
@@ -976,8 +1089,33 @@ mod tests {
             }
         }
         assert_eq!(Refusal::decode(&[0]), None);
-        assert_eq!(Refusal::decode(&[7, b'x']), None);
+        assert_eq!(Refusal::decode(&[8, b'x']), None);
         assert!(!Refusal::Unknown.not_started() && !Refusal::Widening.not_started());
         assert!(Refusal::Processes.not_started() && Refusal::Confining(1, 1).not_started());
+        assert!(Refusal::NoStarter.not_started());
+    }
+
+    /// A member's end says how it ended, typed: `exit 143` stays an exit, a death by TERM is
+    /// signal 15, each with the status `docker run` reports; a tag of neither, or a signal out
+    /// of `1..=NSIG`, is no end.
+    #[test]
+    fn a_members_end_tells_a_signal_from_its_status() {
+        for end in [
+            End::Exited(0),
+            End::Exited(143),
+            End::Exited(u32::MAX),
+            End::Signaled(15),
+            End::Signaled(64),
+        ] {
+            let ended = Ended { member: 3, end };
+            assert_eq!(Ended::decode(&ended.encode()), Some(ended));
+        }
+        assert_eq!(End::Exited(143).status(), 143);
+        assert_eq!(End::Signaled(15).status(), 143);
+        assert_ne!(End::Exited(143), End::Signaled(15));
+        assert_eq!(End::decode(&[1, 0, 0, 0, 0]), None);
+        assert_eq!(End::decode(&[1, 0, 0, 0, 65]), None);
+        assert_eq!(End::decode(&[2, 0, 0, 0, 1]), None);
+        assert_eq!(Ended::decode(&[0; Ended::LEN - 1]), None);
     }
 }

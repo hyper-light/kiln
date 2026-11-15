@@ -32,7 +32,7 @@ fn no_launch(
     _: NativeRecord<'_>,
     _: &hex_runtime::devices::ManagedLaunch<'_>,
     _: shards_api::LaunchIo,
-    _: Duration,
+    _: Option<Duration>,
     _: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
 ) -> Result<ManagedReceipt, Refusal> {
     panic!("read-only submission preflight cannot launch")
@@ -158,7 +158,7 @@ fn native_presence_and_io_failure_propagate_without_publishing_or_removing() {
         });
         if presence {
             assert!(
-                matches!(result, Err(Refusal::Backing { key, cause: LifecycleCause::Busy }) if key == row.key)
+                matches!(result, Err(Refusal::Backing { key, cause: LifecycleCause::Busy, why: None }) if key == row.key)
             );
         } else {
             assert!(
@@ -201,7 +201,7 @@ fn every_granted_or_later_phase_refuses_before_the_native_callback() {
         let before = pool_bytes(directory.path(), row.key);
         let syncs = store.syncs();
         assert!(
-            matches!(pool_transaction(&store, &row.key, &[], &native(&check), &mut |tx| tx.check_unsubmitted_pool()), Err(Refusal::Backing { key, cause: LifecycleCause::Uncertain }) if key == row.key)
+            matches!(pool_transaction(&store, &row.key, &[], &native(&check), &mut |tx| tx.check_unsubmitted_pool()), Err(Refusal::Backing { key, cause: LifecycleCause::Uncertain, why: Some(_) }) if key == row.key)
         );
         assert_eq!(pool_bytes(directory.path(), row.key), before);
         assert_eq!(store.syncs(), syncs);
@@ -225,7 +225,7 @@ fn every_granted_or_later_phase_refuses_before_the_native_callback() {
         let before = pool_bytes(directory.path(), row.key);
         let syncs = store.syncs();
         assert!(
-            matches!(pool_transaction(&store, &row.key, &[], &native(&check), &mut |tx| tx.check_unsubmitted_pool()), Err(Refusal::Backing { key, cause: LifecycleCause::Uncertain }) if key == row.key)
+            matches!(pool_transaction(&store, &row.key, &[], &native(&check), &mut |tx| tx.check_unsubmitted_pool()), Err(Refusal::Backing { key, cause: LifecycleCause::Uncertain, why: Some(_) }) if key == row.key)
         );
         assert_eq!(pool_bytes(directory.path(), row.key), before);
         assert_eq!(store.syncs(), syncs);
@@ -261,11 +261,11 @@ fn stale_missing_box_and_ungranted_released_owners_refuse_without_callback() {
     let syncs = store.syncs();
     for key in [stale, missing] {
         assert!(
-            matches!(pool_transaction(&store, &key, &[], &native(&check), &mut |tx| tx.check_unsubmitted_pool()), Err(Refusal::Backing { key: got, cause: LifecycleCause::Uncertain }) if got == key)
+            matches!(pool_transaction(&store, &key, &[], &native(&check), &mut |tx| tx.check_unsubmitted_pool()), Err(Refusal::Backing { key: got, cause: LifecycleCause::Uncertain, why: Some(_) }) if got == key)
         );
     }
     assert!(
-        matches!(transaction(&store, &sibling.spec.id, &[], &native(&check), &mut |tx| tx.check_unsubmitted_pool()), Err(Refusal::Lifecycle { id, cause: LifecycleCause::Uncertain }) if id == sibling.spec.id)
+        matches!(transaction(&store, &sibling.spec.id, &[], &native(&check), &mut |tx| tx.check_unsubmitted_pool()), Err(Refusal::Lifecycle { id, cause: LifecycleCause::Uncertain, .. }) if id == sibling.spec.id)
     );
     assert_eq!(pool_bytes(directory.path(), row.key), before);
     assert_eq!(store.syncs(), syncs);
@@ -343,7 +343,7 @@ fn cancelled_unallocated_ack_rechecks_native_metadata_and_fences_reused_generati
         });
         match injected {
             1 => assert!(
-                matches!(result, Err(Refusal::Backing { key: actual, cause: LifecycleCause::Busy }) if actual == key)
+                matches!(result, Err(Refusal::Backing { key: actual, cause: LifecycleCause::Busy, why: None }) if actual == key)
             ),
             2 => assert!(
                 matches!(result, Err(Refusal::Os { op, why }) if op == "reading cancelled owner's native metadata for ACK" && why.contains("denied"))

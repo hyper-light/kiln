@@ -43,6 +43,18 @@ mod admission;
 pub const FIRST_ID: u32 = shards_abi::DOMAIN_FIRST_ID;
 /// Where the domains' cgroups are.
 const CGROUPS: &str = "/sys/fs/cgroup/run/domains";
+
+/// The tasks of a member's cgroup that its starter is (D243, confine-11): one, a process of
+/// one thread ([`crate::starter`] starts none), which the pids controller counts as every
+/// task (cgroup-v2.rst, "PID").
+const STARTER_TASKS: u64 = 1;
+
+/// The `pids.max` of a member that declares `declared` processes: those, and its starter,
+/// so that its own number what it declared, as a container's do under runc, whose exec
+/// helper is gone once its command runs. None where it overflows.
+fn with_starter(declared: u64) -> Option<u64> {
+    declared.checked_add(STARTER_TASKS)
+}
 /// The `PATH` a domain starts with: Docker's default (moby oci/defaults.go).
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// The nodes a domain's `/dev` holds, as Docker's containers' (moby oci/defaults.go,
@@ -627,36 +639,22 @@ fn harness_env(dir: &str, label: &str, image: &[String], given: &[String]) -> Re
     Ok(env)
 }
 
-/// The program `d` starts, its config's `run.command`'s first word: an absolute one as
-/// written, a relative one its directory's, and a bare name found on the `PATH` of `env`,
-/// the environment it runs with, as execvp(3) finds one (its own artifact's before the
-/// system's tools, the inherited `PATH` letting a launcher such as nohup find its child):
-/// here, as the child may not allocate.
-fn executable(d: &Domain, env: &[CString]) -> Result<CString, String> {
+/// Candidate names are prepared before clone, but only searched by the confined
+/// child in its actual mounts and cwd. A relative command containing `/` remains
+/// relative to the artifact, as its config specifies; PATH entries use exec's rules.
+fn executable(d: &Domain, env: &[CString]) -> Result<(bool, Vec<CString>), String> {
     let first = d.argv.first().map(|a| a.to_bytes()).unwrap_or_default();
-    let cstr = |b: Vec<u8>| CString::new(b).map_err(|_| format!("{}: a NUL in its program", d.label));
-    if first.starts_with(b"/") {
-        return cstr(first.to_vec());
-    }
-    if first.contains(&b'/') {
-        return cstr([d.dir.as_slice(), b"/", first].concat());
-    }
-    let path = env
-        .iter()
-        .rev()
-        .find_map(|e| e.to_bytes().strip_prefix(b"PATH="))
-        .unwrap_or_default();
-    path.split(|&b| b == b':')
-        .filter_map(|p| CString::new([p, b"/", first].concat()).ok())
-        // SAFETY: access(2) of a NUL-terminated path.
-        .find(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 })
-        .ok_or_else(|| {
-            format!(
-                "{}: {:?} is on no directory of PATH",
-                d.label,
-                String::from_utf8_lossy(first)
-            )
-        })
+    let env: Vec<_> = env.iter().map(|e| e.as_bytes().to_vec()).collect();
+    let (explicit, paths) = if first.contains(&b'/') && !first.starts_with(b"/") {
+        (true, vec![[d.dir.as_slice(), b"/", first].concat()])
+    } else {
+        crate::run::candidates(first, &env)
+    };
+    let paths = paths
+        .into_iter()
+        .map(|p| CString::new(p).map_err(|_| format!("{}: a NUL in its program PATH", d.label)))
+        .collect::<Result<_, _>>()?;
+    Ok((explicit, paths))
 }
 
 /// `d`'s command line (D256): its program as found ([`executable`]), the rest of its config's
@@ -667,30 +665,6 @@ fn command_line<'a>(program: &'a CStr, d: &'a Domain, args: &'a [CString]) -> Ve
         .chain(d.argv.iter().skip(1).map(CString::as_c_str))
         .chain(args.iter().map(CString::as_c_str))
         .collect()
-}
-
-/// Where `home`, a member's `HOME`, lies among the mounts it may write as it starts, each by
-/// its mount point in its view (`points`: its scratch's `/tmp`, a writable volume's as
-/// declared and as it lies in the image): the deepest that is `home` or holds it, by its
-/// place in `points`, and `home`'s components beneath it. None where none does, or where
-/// `home` is no absolute path that stays where it says (`..`).
-fn home_in<'h>(home: &'h str, points: &[&str]) -> Option<(usize, Vec<&'h str>)> {
-    let comps: Vec<&str> = home
-        .strip_prefix('/')?
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
-    if comps.contains(&"..") {
-        return None;
-    }
-    let plain = format!("/{}", comps.join("/"));
-    let (at, point) = points
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| within(&plain, p))
-        .max_by_key(|(_, p)| p.len())?;
-    let depth = point.split('/').filter(|c| !c.is_empty()).count();
-    Some((at, comps.get(depth..).unwrap_or_default().to_vec()))
 }
 
 /// Whether `p` is relative and stays inside the directory it is relative to: the twin of
@@ -797,15 +771,37 @@ pub struct Started {
     /// A descriptor of its own terminal's master, where its stdio is one (plan step 6,
     /// D244), kept to size it (`builtin::RESIZE`).
     pub terminal: Option<OwnedFd>,
+    /// Init's end of its starter, which starts each command run in it (confine-10,
+    /// [`crate::starter`]); none once it has gone.
+    pub starter: Option<crate::starter::Starter>,
+    /// The processes it declared (`pids.max` less its starter's, confine-11): its cgroup's
+    /// limit once its starter has gone.
+    pub pids: Option<u64>,
 }
 
 impl Started {
+    /// Its starter has gone (confine-11): its `pids.max` is what it declared, so that a
+    /// member that ended its starter, and reaped it, is given no process more.
+    pub fn starter_gone(&mut self) -> io::Result<()> {
+        self.starter = None;
+        held_to(&self.cgroup, self.pids)
+    }
+
     pub fn abort_output(&mut self, errno: i32) {
         self.stdout.abort();
         self.stderr.abort();
         if matches!(self.output_control, crate::capture::OutputControl::Active) {
             self.output_control = crate::capture::OutputControl::Pending(errno);
         }
+    }
+}
+
+/// `cgroup`'s `pids.max`, the directory of a member that declared `pids` processes, set to
+/// them; none where it declared none, as its limit is then the microVM's.
+fn held_to(cgroup: &str, pids: Option<u64>) -> io::Result<()> {
+    match pids {
+        Some(n) => std::fs::write(format!("{cgroup}/pids.max"), n.to_string()),
+        None => Ok(()),
     }
 }
 
@@ -877,6 +873,8 @@ struct Prepared {
     hide: Vec<CString>,
     hostname: CString,
     argv: Vec<*const libc::c_char>,
+    paths: Vec<CString>,
+    explicit: bool,
     envp: Vec<*const libc::c_char>,
     /// Its `/etc/hosts`, where it has a link.
     hosts: Option<Vec<u8>>,
@@ -897,6 +895,9 @@ struct Prepared {
     /// given is the terminal's other end, which is its stdin and stderr too and its
     /// session's controlling terminal.
     terminal: bool,
+    /// Its starter's end of the channel to init (confine-10, [`crate::starter`]), held at
+    /// [`crate::starter::STARTER_FD`] for the starter it forks.
+    starter: RawFd,
     /// Its root: the image as built, a mount not yet attached.
     root: RawFd,
     /// Its Unix sockets' directories, each a mount not yet attached and where it goes,
@@ -931,7 +932,7 @@ mod tree {
 /// A copy of the mount of directory `dir`, attached nowhere, with `attr` set: a mount of
 /// init's own, as `open_tree` has copied since Linux 5.2, and `mount_setattr` changes since
 /// 5.12.
-fn copy_of(dir: &str, attr: u64) -> io::Result<OwnedFd> {
+pub(crate) fn copy_of(dir: &str, attr: u64) -> io::Result<OwnedFd> {
     let path = CString::new(dir).map_err(io::Error::other)?;
     // SAFETY: open_tree(2) of a NUL-terminated path.
     let fd = unsafe {
@@ -1995,15 +1996,37 @@ pub fn start(
             "a terminal is asked for member {member}, which this image starts no program for"
         ));
     }
+    // The members with an MCP bridge and socket (D254): each one that starts here, else the
+    // run is refused, as a terminal is.
+    let mcp = crate::mcp::Asked::read(setup)?;
+    if let Some(member) = mcp
+        .iter()
+        .flat_map(|a| &a.members)
+        .find(|m| !domains.iter().any(|d| d.id.checked_sub(FIRST_ID) == Some(**m)))
+    {
+        return Err(format!(
+            "an MCP bridge is asked for member {member}, which this image starts no program for"
+        ));
+    }
+    // Their sockets, carried once every member has started, and their bridges' mounts, held
+    // until each member's view has its own.
+    let mut mcp_listeners = Vec::new();
+    let mut bridges = Vec::new();
     let mut started = Vec::new();
     for (i, d) in domains.iter().enumerate() {
         let member =
             d.id.checked_sub(FIRST_ID)
                 .ok_or("a domain's identity precedes its declared range")?;
         let group = format!("{CGROUPS}/{}", d.cgroup);
+        let pids = d
+            .pids
+            .map(|n| {
+                with_starter(n).ok_or_else(|| format!("{}: {n} processes and its starter overflow", d.label))
+            })
+            .transpose()?;
         let admitted = admission
             .prepare_child(&d.cgroup)
-            .and_then(|p| p.commit(d.pids, d.memory))
+            .and_then(|p| p.commit(pids, d.memory))
             .map_err(|e| e.message(&d.label))?;
         let cgroup = admitted.group();
         let filter = filters
@@ -2075,7 +2098,8 @@ pub fn start(
             }
             l.name_in(&mut env).map_err(|e| format!("{}: {e}", d.label))?;
         }
-        let argv0 = executable(d, &env)?;
+        let (explicit, paths) = executable(d, &env)?;
+        let argv0 = d.argv.first().ok_or_else(|| format!("{}: no program", d.label))?;
         // Its run-time arguments (D256): its command line points into them until it execs.
         let given_args = crate::staged::args(member, setup).map_err(|e| format!("{}: {e}", d.label))?;
         let workdir = crate::staged::workdir(member, setup)
@@ -2087,34 +2111,29 @@ pub fn start(
             .find_map(|e| e.to_bytes().strip_prefix(b"HOME="))
             .map(String::from_utf8_lossy)
             .unwrap_or_default();
-        // What it may write as it starts, each where it sees it: its scratch, at /tmp, and
-        // each writable volume given it, at its mount point as declared and as it lies in
-        // the image, with init's own mount of it.
-        let mut writable: Vec<(&str, crate::staged::Mount<'_>)> = Vec::new();
+        // Include read-only covers: staged files must land in the mount visible at
+        // their final path, not behind it in an ancestor's backing directory.
+        let mut mounts = Vec::new();
         if let Some(s) = &scratch {
-            writable.push(("/tmp", crate::staged::Mount::Held(s.as_fd())));
-        }
-        for (sh, at, real) in staged
-            .iter()
-            .filter(|(sh, _, _)| !sh.ro && given_volume(d, &sh.dest))
-        {
-            writable.extend([
-                (real.as_str(), crate::staged::Mount::At(at.as_str())),
-                (sh.dest.as_str(), crate::staged::Mount::At(at.as_str())),
-            ]);
-        }
-        let points: Vec<&str> = writable.iter().map(|(p, _)| *p).collect();
-        let place = home_in(&home, &points)
-            .and_then(|(i, beneath)| {
-                Some(crate::staged::Home {
-                    mount: writable.get(i)?.1,
-                    beneath,
-                })
-            })
-            .ok_or_else(|| {
-                format!("HOME, {home:?}, lies in neither its scratch nor a writable volume given it")
+            mounts.push(crate::staged::MountPoint {
+                path: "/tmp",
+                canonical: "/tmp",
+                mount: crate::staged::Mount::Held(s.as_fd()),
+                read_only: false,
             });
-        crate::staged::files(place, (d.id, d.id), member, setup).map_err(|e| format!("{}: {e}", d.label))?;
+        }
+        for (sh, at, real) in staged.iter().filter(|(sh, _, _)| given_volume(d, &sh.dest)) {
+            for path in [real.as_str(), sh.dest.as_str()] {
+                mounts.push(crate::staged::MountPoint {
+                    path,
+                    canonical: real.as_str(),
+                    mount: crate::staged::Mount::At(at.as_str()),
+                    read_only: sh.ro,
+                });
+            }
+        }
+        crate::staged::files(&home, &mounts, (d.id, d.id), member, setup)
+            .map_err(|e| format!("{}: {e}", d.label))?;
         let dir = server.start(
             i,
             d,
@@ -2124,11 +2143,27 @@ pub fn start(
             &peers,
             scratch.as_ref().map(AsRawFd::as_raw_fd),
         )?;
+        // Its MCP socket and its bridge's mount point beside the server's (D254), where its run
+        // asks for them: in its own directory, which no other member sees.
+        let bridged = mcp.as_ref().is_some_and(|a| a.members.contains(&member));
+        if bridged {
+            let listener = crate::mcp::listen(std::path::Path::new(&dir), d.id)
+                .map_err(|e| format!("{}: its MCP socket: {e}", d.label))?;
+            mcp_listeners.push((listener, member));
+        }
         let quiet = libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV | libc::MOUNT_ATTR_NOEXEC;
         let copy = copy_of(&dir, quiet | libc::MOUNT_ATTR_RDONLY)
             .map_err(|e| format!("{}: the in-VM server: {e}", d.label))?;
         sockets.push((copy.as_raw_fd(), cstr_of(SERVER_AT)?));
         copies.push((copy, cstr_of(SERVER_AT.trim_start_matches('/'))?));
+        // Its bridge, this binary, mounted on the empty file beside its socket, after the
+        // directory it lies in: runnable, where that directory is not.
+        if bridged {
+            let bridge =
+                crate::mcp::bridge_mount().map_err(|e| format!("{}: its MCP bridge: {e}", d.label))?;
+            sockets.push((bridge.as_raw_fd(), cstr_of(shards_abi::run::mcp::BRIDGE)?));
+            bridges.push(bridge);
+        }
         // Its volumes, each a copy of the run's mount of it, at its mount point.
         let mut volumes = Vec::new();
         let mut volume_rules = Vec::new();
@@ -2152,16 +2187,19 @@ pub fn start(
         };
         let root = image_root(skel_of, lower, !roots.is_empty())
             .map_err(|e| format!("{}: its root: {e}", d.label))?;
+        // The TCP rights Landlock refuses it: connecting unless it may open connections,
+        // binding unless it may be connected to.
+        let net_handled = match &d.link {
+            Some(l) => {
+                (if l.connects { 0 } else { landlock::NET_CONNECT_TCP })
+                    | (if l.accepts { 0 } else { landlock::NET_BIND_TCP })
+            }
+            None => landlock::NET_BIND_TCP | landlock::NET_CONNECT_TCP,
+        };
         let confinement = Confinement {
             id: d.id,
             last_cap,
-            net_handled: match &d.link {
-                Some(l) => {
-                    (if l.connects { 0 } else { landlock::NET_CONNECT_TCP })
-                        | (if l.accepts { 0 } else { landlock::NET_BIND_TCP })
-                }
-                None => landlock::NET_BIND_TCP | landlock::NET_CONNECT_TCP,
-            },
+            ruleset: ruleset(net_handled).map_err(|e| format!("{}: its Landlock ruleset: {e}", d.label))?,
             volumes: volume_rules,
             plug_roots: plug_roots.clone(),
             receives,
@@ -2184,11 +2222,13 @@ pub fn start(
                 .collect(),
             hostname: CString::new(d.cgroup.as_str())
                 .map_err(|_| format!("{}: a NUL in its name", d.label))?,
-            argv: command_line(&argv0, d, &given_args)
+            argv: command_line(argv0, d, &given_args)
                 .into_iter()
                 .map(CStr::as_ptr)
                 .chain([std::ptr::null()])
                 .collect(),
+            paths,
+            explicit,
             envp: env.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect(),
             hosts: d.link.as_ref().map(|l| l.hosts.clone()),
             resolv: d.resolv.clone(),
@@ -2197,8 +2237,12 @@ pub fn start(
             chooser: None,
             stdin: None,
             terminal: false,
+            starter: -1,
         };
         let mut prepared = prepared;
+        let (starter, starter_end) =
+            crate::starter::channel().map_err(|e| format!("{}: its starter's channel: {e}", d.label))?;
+        prepared.starter = starter_end.as_raw_fd();
         // A candidate for a port several are given: the channel its listener comes on.
         let address = d.link.as_ref().and_then(|l| l.addresses.first()).map(|a| a.addr);
         let chooser_channel = match address.filter(|a| candidates.contains(a)) {
@@ -2314,6 +2358,7 @@ pub fn start(
         drop(stdin);
         drop(stdout_write);
         drop(stderr_write);
+        drop(starter_end);
         drop(root);
         drop(copies);
         if let (Some(link), Some((r, w))) = (&d.link, go) {
@@ -2368,9 +2413,20 @@ pub fn start(
             end_told: false,
             confinement,
             terminal: master,
+            starter: Some(starter),
+            pids: d.pids,
         });
     }
     drop(joined);
+    drop(bridges);
+    // Each member's MCP connections carried to its host from here on, every member started
+    // (D254).
+    if let Some(asked) = &mcp {
+        for (listener, member) in mcp_listeners {
+            crate::mcp::serve(listener, member, asked.token)
+                .map_err(|e| format!("member {member}'s MCP socket: {e}"))?;
+        }
+    }
     Ok(started)
 }
 
@@ -2985,9 +3041,14 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
             (false, Some(fd)) => fd,
             (false, None) => libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC),
         };
-        let status = libc::fcntl(setup, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 2);
+        let above = crate::starter::STARTER_FD + 1;
+        let status = libc::fcntl(setup, libc::F_DUPFD_CLOEXEC, above);
+        let ruleset = libc::fcntl(c.ruleset.as_raw_fd(), libc::F_DUPFD_CLOEXEC, above);
+        let starter = libc::fcntl(p.starter, libc::F_DUPFD_CLOEXEC, above);
         if input < 0
             || status < 0
+            || ruleset < 0
+            || starter < 0
             || libc::dup2(input, 0) < 0
             || libc::dup2(stdout, 1) < 0
             || libc::dup2(out, 2) < 0
@@ -2997,13 +3058,13 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
         if libc::dup3(status, libc::STDERR_FILENO + 1, libc::O_CLOEXEC) < 0 {
             fail(2, c"retaining its launch status");
         }
-        if libc::syscall(
-            libc::SYS_close_range,
-            (libc::STDERR_FILENO + 2) as u32,
-            u32::MAX,
-            0u32,
-        ) != 0
-        {
+        if libc::dup3(ruleset, RULESET_FD, libc::O_CLOEXEC) < 0 {
+            fail(2, c"retaining its Landlock ruleset");
+        }
+        if libc::dup3(starter, crate::starter::STARTER_FD, libc::O_CLOEXEC) < 0 {
+            fail(2, c"retaining its starter's channel");
+        }
+        if libc::syscall(libc::SYS_close_range, above as u32, u32::MAX, 0u32) != 0 {
             crate::domains::fail(
                 2,
                 libc::STDERR_FILENO + 1,
@@ -3021,14 +3082,21 @@ fn exec_child(p: &Prepared, c: &Confinement) -> ! {
     let fail = |out, what| -> ! { fail(out, setup, crate::managed::Step::Setup, what) };
     // SAFETY: the actor's remaining confinement uses prepared buffers and system calls.
     unsafe {
+        if let Err(step) = rules(c, RULESET_FD).and_then(|()| confine(c, RULESET_FD)) {
+            fail(out, step.what());
+        }
+        // As the member (confine-02): it starts in no directory it could not enter itself,
+        // as a command run in it does (crate::enter).
         if libc::chdir(c.workdir.as_ptr()) != 0 {
             fail(out, c"entering its working directory");
         }
-        if let Err(step) = confine(c) {
-            fail(out, step.what());
-        }
-        libc::execve(
-            p.argv.first().copied().unwrap_or(std::ptr::null()),
+        // Its starter, everything it is now (confine-10): what is run in it is born in its
+        // own Landlock domain, as a process of its own would be.
+        crate::starter::fork();
+        // Its program found only now, in its own view (confine-04).
+        let _ = crate::run::exec_found(
+            p.paths.iter().map(CString::as_c_str),
+            p.explicit,
             p.argv.as_ptr(),
             p.envp.as_ptr(),
         );
@@ -3045,9 +3113,11 @@ pub struct Confinement {
     /// Its uid and gid, the n-th domain's `FIRST_ID + n`.
     pub id: u32,
     last_cap: u32,
-    /// The TCP rights Landlock refuses it: connecting unless it may open connections,
-    /// binding unless it may be connected to.
-    net_handled: u64,
+    /// Its Landlock ruleset (confine-01): made by init before its first process, which adds
+    /// its rules ([`rules`]) in its mounts before anything of its own runs; that process and
+    /// every command run in it enter this one ruleset, so a command is given only what its
+    /// member was, whatever the member has since done to the names the rules were found by.
+    pub(crate) ruleset: OwnedFd,
     /// Its volumes' mount points (D109), and whether each is read-only.
     volumes: Vec<(CString, bool)>,
     /// The run's plug roots (D235), `/Users`, beneath which Landlock grants it every right.
@@ -3076,8 +3146,7 @@ impl std::fmt::Debug for Confinement {
     }
 }
 
-/// The step of [`confine`] that failed, its errno the last; numbered as a command run in a
-/// member reports it ([`crate::enter`], `members::Refusal::Confining`).
+/// The step of [`confine`] that failed, its errno the last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Confining {
@@ -3085,7 +3154,6 @@ pub enum Confining {
     Ids,
     Capabilities,
     NoNewPrivs,
-    Ruleset,
     BaseRule,
     VolumeOpen,
     VolumeRule,
@@ -3097,34 +3165,12 @@ pub enum Confining {
 }
 
 impl Confining {
-    const ALL: [Confining; 13] = [
-        Confining::BoundingSet,
-        Confining::Ids,
-        Confining::Capabilities,
-        Confining::NoNewPrivs,
-        Confining::Ruleset,
-        Confining::BaseRule,
-        Confining::VolumeOpen,
-        Confining::VolumeRule,
-        Confining::PlugRootRule,
-        Confining::SocketRule,
-        Confining::Landlock,
-        Confining::Signals,
-        Confining::Seccomp,
-    ];
-
-    /// The step numbered `n`, as [`Confining`]'s discriminants number them.
-    pub fn numbered(n: u8) -> Option<Confining> {
-        Confining::ALL.into_iter().find(|c| *c as u8 == n)
-    }
-
     pub fn what(self) -> &'static CStr {
         match self {
             Confining::BoundingSet => c"dropping its capabilities",
             Confining::Ids => c"taking its own IDs",
             Confining::Capabilities => c"clearing its capabilities",
             Confining::NoNewPrivs => c"setting no_new_privs",
-            Confining::Ruleset => c"making its Landlock ruleset",
             Confining::BaseRule => c"adding a Landlock rule",
             Confining::VolumeOpen => c"opening its volume for Landlock",
             Confining::VolumeRule => c"adding its volume's Landlock rule",
@@ -3137,13 +3183,19 @@ impl Confining {
     }
 }
 
+/// Where a member's process holds its member's Landlock ruleset ([`Confinement`]'s) as it
+/// confines itself, past the descriptors of init's it closes: next above its launch status
+/// (or a command's error channel, crate::enter), CLOEXEC, so its program holds none.
+pub(crate) const RULESET_FD: RawFd = libc::STDERR_FILENO + 2;
+
 /// Confines this process as member `c` is, last before it execs: the member's own first
-/// process, in its mounts, and a command run in it ([`crate::enter`]), in its namespaces. Calls
-/// the kernel alone, on what `c` holds, for a child of `clone`; the first step that failed.
+/// process, in its mounts, and a command run in it ([`crate::enter`]), in its namespaces;
+/// both into `c`'s one Landlock ruleset, `ruleset` its descriptor here. Calls the kernel
+/// alone, on what `c` holds, for a child of `clone`; the first step that failed.
 ///
 /// # Safety
 /// In a process of one thread, which execs or exits next.
-pub(crate) unsafe fn confine(c: &Confinement) -> Result<(), Confining> {
+pub(crate) unsafe fn confine(c: &Confinement, ruleset: RawFd) -> Result<(), Confining> {
     // SAFETY: system calls on `c`'s buffers and this stack's, in a process of one thread.
     unsafe {
         // One that receives makes its sockets for others' uids to connect to (unix(7):
@@ -3170,7 +3222,9 @@ pub(crate) unsafe fn confine(c: &Confinement) -> Result<(), Confining> {
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(Confining::NoNewPrivs);
         }
-        landlocked(c)?;
+        if libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0u32) != 0 {
+            return Err(Confining::Landlock);
+        }
         // Its signals a new process's, as an exec's are: none ignored, which execve would
         // keep ignored (init's SIGPIPE), and none blocked.
         if !crate::defaults::signals() {
@@ -3194,33 +3248,45 @@ pub(crate) unsafe fn confine(c: &Confinement) -> Result<(), Confining> {
     }
 }
 
-/// Puts this process under member `c`'s Landlock ruleset, a layer under its mounts': every
-/// filesystem right handled, and given back as reads and execution everywhere, writes to
-/// /dev's nodes, and everything in its scratch, its writable volumes and beneath the run's
-/// plug roots; the TCP binds and connects its links do not grant handled, and none given;
-/// signals and abstract Unix sockets scoped to its domain. Each path as this process sees
-/// it, in the member's mounts.
-///
-/// # Safety
-/// As [`confine`].
-unsafe fn landlocked(c: &Confinement) -> Result<(), Confining> {
-    // SAFETY: Landlock's system calls on structs of this stack and the paths of `c`, open(2)
-    // and close(2) of descriptors this process alone holds.
-    unsafe {
-        let attr = landlock::RulesetAttr {
-            handled_access_fs: landlock::FS_ALL,
-            handled_access_net: c.net_handled,
-            scoped: landlock::SCOPE_ABSTRACT_UNIX_SOCKET | landlock::SCOPE_SIGNAL,
-        };
-        let ruleset = libc::syscall(
+/// Member `c`'s Landlock ruleset, made by init: every filesystem right handled, the TCP
+/// binds and connects its links do not grant handled, signals and abstract Unix sockets
+/// scoped to its domain. Its rules its first process adds ([`rules`]).
+fn ruleset(net_handled: u64) -> io::Result<OwnedFd> {
+    let attr = landlock::RulesetAttr {
+        handled_access_fs: landlock::FS_ALL,
+        handled_access_net: net_handled,
+        scoped: landlock::SCOPE_ABSTRACT_UNIX_SOCKET | landlock::SCOPE_SIGNAL,
+    };
+    // SAFETY: landlock_create_ruleset(2) of a struct on this stack, of the size given.
+    let fd = unsafe {
+        libc::syscall(
             libc::SYS_landlock_create_ruleset,
             &raw const attr,
             std::mem::size_of::<landlock::RulesetAttr>(),
             0u32,
-        );
-        if ruleset < 0 {
-            return Err(Confining::Ruleset);
-        }
+        )
+    };
+    let fd = RawFd::try_from(fd).map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?;
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the kernel just made this descriptor, owned here alone.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Adds member `c`'s rules to its ruleset, `ruleset` its descriptor here, in its first
+/// process, in its mounts, before anything of the member's own runs: reads and execution
+/// everywhere, writes to /dev's nodes, and everything in its scratch, its writable volumes
+/// and beneath the run's plug roots, each path as this process sees it. Only here: a rule
+/// found by a name later would find what the member has since made of the name
+/// (confine-01).
+///
+/// # Safety
+/// As [`confine`].
+unsafe fn rules(c: &Confinement, ruleset: RawFd) -> Result<(), Confining> {
+    // SAFETY: Landlock's system calls on structs of this stack and the paths of `c`, open(2)
+    // and close(2) of descriptors this process alone holds.
+    unsafe {
         // `fd` beneath which `allowed` is given, closed; whether the rule was added.
         let rule = |fd: libc::c_int, allowed: u64| {
             let rule = landlock::PathBeneathAttr {
@@ -3240,56 +3306,46 @@ unsafe fn landlocked(c: &Confinement) -> Result<(), Confining> {
         let open =
             |at: &CStr, flags: libc::c_int| libc::open(at.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | flags);
         let read = landlock::READ_FILE | landlock::READ_DIR | landlock::EXECUTE;
-        let added = (|| {
-            // A base path that is not there is skipped.
-            for (path, allowed) in [
-                (c"/", read),
-                (c"/dev", read | landlock::WRITE_FILE | landlock::IOCTL_DEV),
-                (c"/dev/shm", landlock::FS_ALL),
-                (c"/dev/mqueue", landlock::FS_ALL),
-                (c"/tmp", landlock::FS_ALL),
-            ] {
-                let fd = open(path, 0);
-                if fd >= 0 && !rule(fd, allowed) {
-                    return Err(Confining::BaseRule);
-                }
+        // A base path that is not there is skipped.
+        for (path, allowed) in [
+            (c"/", read),
+            (c"/dev", read | landlock::WRITE_FILE | landlock::IOCTL_DEV),
+            (c"/dev/shm", landlock::FS_ALL),
+            (c"/dev/mqueue", landlock::FS_ALL),
+            (c"/tmp", landlock::FS_ALL),
+        ] {
+            let fd = open(path, 0);
+            if fd >= 0 && !rule(fd, allowed) {
+                return Err(Confining::BaseRule);
             }
-            // Its volumes, written as it pleases where they are not read-only (D109).
-            for (at, ro) in &c.volumes {
-                let fd = open(at, 0);
-                if fd < 0 {
-                    return Err(Confining::VolumeOpen);
-                }
-                if !rule(fd, if *ro { read } else { landlock::FS_ALL }) {
-                    return Err(Confining::VolumeRule);
-                }
+        }
+        // Its volumes, written as it pleases where they are not read-only (D109).
+        for (at, ro) in &c.volumes {
+            let fd = open(at, 0);
+            if fd < 0 {
+                return Err(Confining::VolumeOpen);
             }
-            // The run's plug roots (D235): what is plugged into it as it runs, beneath one,
-            // written as it pleases where it is not read-only. A root grants nothing before:
-            // it lies on its root's mount, read-only. One that is no directory in its view
-            // is skipped, as the base paths above are.
-            for at in &c.plug_roots {
-                let fd = open(at, libc::O_DIRECTORY);
-                if fd >= 0 && !rule(fd, landlock::FS_ALL) {
-                    return Err(Confining::PlugRootRule);
-                }
+            if !rule(fd, if *ro { read } else { landlock::FS_ALL }) {
+                return Err(Confining::VolumeRule);
             }
-            for at in &c.receives {
-                let fd = open(at, 0);
-                if fd < 0 || !rule(fd, landlock::MAKE_SOCK | landlock::REMOVE_FILE) {
-                    return Err(Confining::SocketRule);
-                }
+        }
+        // The run's plug roots (D235): what is plugged into it as it runs, beneath one,
+        // written as it pleases where it is not read-only. A root grants nothing before:
+        // it lies on its root's mount, read-only. One that is no directory in its view
+        // is skipped, as the base paths above are.
+        for at in &c.plug_roots {
+            let fd = open(at, libc::O_DIRECTORY);
+            if fd >= 0 && !rule(fd, landlock::FS_ALL) {
+                return Err(Confining::PlugRootRule);
             }
-            Ok(())
-        })();
-        let entered = match added {
-            Ok(()) if libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0u32) != 0 => {
-                Err(Confining::Landlock)
+        }
+        for at in &c.receives {
+            let fd = open(at, 0);
+            if fd < 0 || !rule(fd, landlock::MAKE_SOCK | landlock::REMOVE_FILE) {
+                return Err(Confining::SocketRule);
             }
-            done => done,
-        };
-        libc::close(ruleset as libc::c_int);
-        entered
+        }
+        Ok(())
     }
 }
 
@@ -3461,32 +3517,6 @@ mod tests {
         assert!(d("/etc").is_err());
     }
 
-    /// A member's HOME lies in the deepest of its writable mounts that holds it, however it
-    /// is written but for `..`; what is staged for it goes there (staged.rs), never to a
-    /// mount beside it.
-    #[test]
-    fn a_members_home_lies_in_the_deepest_mount_that_holds_it() {
-        let points = ["/tmp", "/var/home/claude", "/home/claude", "/home/claude/.cache"];
-        assert_eq!(home_in("/tmp", &points), Some((0, vec![])));
-        assert_eq!(home_in("/tmp/h/i", &points), Some((0, vec!["h", "i"])));
-        assert_eq!(home_in("/home/claude", &points), Some((2, vec![])));
-        assert_eq!(home_in("//home/claude/./", &points), Some((2, vec![])));
-        assert_eq!(home_in("/home/claude/.cache/x", &points), Some((3, vec!["x"])));
-        assert_eq!(home_in("/var/home/claude/w", &points), Some((1, vec!["w"])));
-        for nowhere in [
-            "/root",
-            "/home",
-            "/home/claudette",
-            "tmp",
-            "",
-            "/tmp/../etc",
-            "/home/claude/../x",
-        ] {
-            assert_eq!(home_in(nowhere, &points), None, "{nowhere}");
-        }
-        assert_eq!(home_in("/tmp", &[]), None);
-    }
-
     /// A domain of `argv` whose directory is `dir`.
     fn domain_at(dir: &str, argv: &[&str]) -> Domain {
         Domain {
@@ -3513,36 +3543,62 @@ mod tests {
     /// bare name found on the PATH it runs with, whatever gave that PATH last.
     #[test]
     fn a_members_program_is_found_on_the_path_it_runs_with() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = shards_testdir::TempDir::new("program").unwrap();
-        let root = dir.path().to_str().unwrap();
-        for (d, mode) in [("bin", 0o755), ("other", 0o755)] {
-            std::fs::create_dir(dir.path().join(d)).unwrap();
-            let tool = dir.path().join(d).join("tool");
-            std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(mode)).unwrap();
+        let d = domain_at("/artifact", &["tool"]);
+        let env = vec![CString::new("PATH=/missing:/bin").unwrap()];
+        let (explicit, paths) = executable(&d, &env).unwrap();
+        assert!(!explicit);
+        assert_eq!(
+            paths,
+            [
+                CString::new("/missing/tool").unwrap(),
+                CString::new("/bin/tool").unwrap()
+            ]
+        );
+        for (argv, expected) in [("bin/tool", "/artifact/bin/tool"), ("/bin/tool", "/bin/tool")] {
+            let (explicit, paths) = executable(&domain_at("/artifact", &[argv]), &[]).unwrap();
+            assert!(explicit);
+            assert_eq!(paths, [CString::new(expected).unwrap()]);
         }
-        let env = |path: String| vec![CString::new("HOME=/tmp").unwrap(), CString::new(path).unwrap()];
-        let found = |argv: &[&str], path: String| executable(&domain_at(root, argv), &env(path));
-        let at = |p: &str| CString::new(format!("{root}/{p}")).unwrap();
-        assert_eq!(
-            found(&["tool"], format!("PATH={root}/none:{root}/bin")).unwrap(),
-            at("bin/tool")
-        );
-        assert_eq!(
-            found(&["tool"], format!("PATH={root}/other:{root}/bin")).unwrap(),
-            at("other/tool")
-        );
-        assert_eq!(
-            found(&["bin/tool", "-x"], "PATH=/nowhere".into()).unwrap(),
-            at("bin/tool")
-        );
-        assert_eq!(
-            found(&["/usr/bin/env"], "PATH=/nowhere".into()).unwrap(),
-            CString::new("/usr/bin/env").unwrap()
-        );
-        let e = found(&["tool"], "PATH=/nowhere".into()).unwrap_err();
-        assert!(e.contains("\"tool\" is on no directory of PATH"), "{e}");
+    }
+
+    #[test]
+    fn a_members_relative_path_is_resolved_in_its_working_directory() {
+        let dir = shards_testdir::TempDir::new("relative-program").unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        // Written by a process of its own (`shards_testdir::program`): no exec of it fails
+        // ETXTBSY.
+        for file in ["bin/tool", "tool"] {
+            shards_testdir::program(&dir.path().join(file), "#!/bin/sh\nexit 23\n").unwrap();
+        }
+        let mut d = domain_at(dir.path().to_str().unwrap(), &["tool"]);
+        d.workdir = CString::new(dir.path().to_str().unwrap()).unwrap();
+        for path in ["PATH=bin", "PATH=:/usr/bin", "PATH=missing:bin"] {
+            let (explicit, paths) = executable(&d, &[CString::new(path).unwrap()]).unwrap();
+            let argv = [c"tool".as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null()];
+            // SAFETY: the child uses only async-signal-safe syscalls and prepared buffers.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                // SAFETY: only this child's cwd changes; all buffers remain live until exec.
+                unsafe {
+                    if libc::chdir(d.workdir.as_ptr()) != 0 {
+                        libc::_exit(125);
+                    }
+                    crate::run::exec_found(
+                        paths.iter().map(CString::as_c_str),
+                        explicit,
+                        argv.as_ptr(),
+                        envp.as_ptr(),
+                    );
+                    libc::_exit(126);
+                }
+            }
+            let mut status = 0;
+            // SAFETY: waitpid of the child just made, with a valid status pointer.
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert_eq!(libc::WEXITSTATUS(status), 23, "{path}");
+        }
     }
 
     /// A member's command line (D256): its program as found, the rest of its config's
@@ -3651,6 +3707,11 @@ mod tests {
     /// already, its uid and gid there 0 (user_namespaces(7)), standing in for init's
     /// privileges. None, said as a SKIP, where this host gives an unprivileged process
     /// neither namespace.
+    /// The write end of [`as_root_of_own_mounts`]' result pipe, in its child: what a member
+    /// it starts closes ([`a_confined_member`]), so that the harness reads the pipe's end as
+    /// that child ends, whatever the member does.
+    static RESULT_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
     fn as_root_of_own_mounts(work: impl FnOnce() -> String) -> Option<String> {
         use std::io::{Read as _, Write as _};
         let mut fds = [0 as RawFd; 2];
@@ -3666,6 +3727,7 @@ mod tests {
         assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
         if pid == 0 {
             drop(r);
+            RESULT_PIPE.store(w.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
             // A panic here is the child's to say, never to unwind into the harness.
             let said = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let flags = libc::CLONE_NEWNS | if root { 0 } else { libc::CLONE_NEWUSER };
@@ -3851,6 +3913,977 @@ mod tests {
                 .contains("/tmp, a domain's own scratch"),
             "{}",
             DomainMount::Scratch
+        );
+    }
+
+    /// Runs `work` in a child of this process and returns what it says; for the steps a
+    /// member's processes take, which change the process that takes them for good.
+    fn in_child(work: impl FnOnce() -> String) -> String {
+        use std::io::{Read as _, Write as _};
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2(2) into a two-element array.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors were just made, and are owned here alone.
+        let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: fork(2) of a process of one thread (as_root_of_own_mounts's child); the
+        // child runs `work` and _exit(2)s.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            drop(r);
+            let said = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or_else(|_| "the child panicked".into());
+            let _ = std::fs::File::from(w).write_all(said.as_bytes());
+            // SAFETY: ends the child without running the harness's exit paths.
+            unsafe { libc::_exit(0) }
+        }
+        drop(w);
+        let mut said = String::new();
+        std::fs::File::from(r).read_to_string(&mut said).unwrap();
+        // SAFETY: waits for this process's own child.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        said
+    }
+
+    /// A member's confinement as a test gives it: uid and gid `id`, every TCP right
+    /// refused, and a seccomp filter that allows every call (the filter is not what these
+    /// tests look at).
+    fn member_confinement(id: u32, volumes: Vec<(CString, bool)>, workdir: &str) -> Confinement {
+        let last_cap = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let allow = libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        };
+        Confinement {
+            id,
+            last_cap,
+            ruleset: ruleset(landlock::NET_BIND_TCP | landlock::NET_CONNECT_TCP).unwrap(),
+            volumes,
+            plug_roots: Vec::new(),
+            receives: Vec::new(),
+            seccomp: (0, vec![allow]),
+            seccomp_len: 1,
+            env: Vec::new(),
+            workdir: CString::new(workdir).unwrap(),
+        }
+    }
+
+    fn cstring(p: &std::path::Path) -> CString {
+        CString::new(p.to_str().unwrap()).unwrap()
+    }
+
+    /// Whether this process may open its own `/proc/self/comm` to write it: the file's
+    /// mode lets its owner (proc(5)), so only Landlock refuses it. Dumpable first, as a
+    /// member's program is past its execve(2): taking its IDs made it not, and gave its
+    /// /proc files to root (proc(5), PR_SET_DUMPABLE in prctl(2)).
+    fn writes_its_comm() -> String {
+        // SAFETY: prctl(2) with constant arguments.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
+            return format!("dumpable: {}", io::Error::last_os_error());
+        }
+        match std::fs::OpenOptions::new().write(true).open("/proc/self/comm") {
+            Ok(_) => "written".into(),
+            Err(e) => format!("refused ({})", e.raw_os_error().unwrap_or(0)),
+        }
+    }
+
+    /// confine-01 (docs/bugs/2026-11-13/confine.md): a command run in a member is given no
+    /// filesystem right its member lacks, however the member moved what its volumes' mount
+    /// points' names lead to. The member owns a writable volume, `data`, and another
+    /// mounted in it, at `data/parent/inner`; it moves `data/parent` aside (the mount goes
+    /// with it) and leaves `data/parent/inner` a symlink to `/proc`. Landlock refused the
+    /// member a write to its `/proc/self/comm`; a command run in it later must be refused
+    /// too. Run as root of IDs past its own (`unshare --map-auto --map-root-user`), where
+    /// uid 1000 is another's; else a SKIP.
+    #[test]
+    fn a_command_run_in_a_member_gains_no_landlock_right_its_member_lacks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = shards_testdir::TempDir::new("ll").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = dir.path().join("data");
+        let volume = dir.path().join("volume");
+        std::fs::create_dir_all(data.join("parent/inner")).unwrap();
+        std::fs::create_dir(&volume).unwrap();
+        let said = as_root_of_own_mounts(|| {
+            let inner = data.join("parent/inner");
+            // SAFETY: mount(2) of NUL-terminated paths, in this child's own namespace.
+            if unsafe {
+                libc::mount(
+                    cstring(&volume).as_ptr(),
+                    cstring(&inner).as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                return format!("SKIP: mounting the inner volume: {}", io::Error::last_os_error());
+            }
+            for d in [&data, &data.join("parent"), &inner] {
+                if std::os::unix::fs::chown(d, Some(1000), Some(1000)).is_err() {
+                    return "SKIP: no uid 1000 in this namespace".into();
+                }
+            }
+            let c = member_confinement(1000, vec![(cstring(&data), false), (cstring(&inner), false)], "/");
+            let member = in_child(|| {
+                // SAFETY: a process of one thread, which exits next.
+                if let Err(step) = unsafe {
+                    rules(&c, c.ruleset.as_raw_fd()).and_then(|()| confine(&c, c.ruleset.as_raw_fd()))
+                } {
+                    return format!(
+                        "SKIP: confining the member: {step:?}: {}",
+                        io::Error::last_os_error()
+                    );
+                }
+                let before = writes_its_comm();
+                let moved = std::fs::rename(data.join("parent"), data.join("moved"))
+                    .and_then(|()| std::fs::create_dir(data.join("parent")))
+                    .and_then(|()| std::os::unix::fs::symlink("/proc", &inner));
+                match moved {
+                    Ok(()) => before,
+                    Err(e) => format!("moving its volume's name: {e}"),
+                }
+            });
+            if member.starts_with("SKIP") {
+                return member;
+            }
+            let command = in_child(|| {
+                // SAFETY: a process of one thread, which exits next.
+                if let Err(step) = unsafe { confine(&c, c.ruleset.as_raw_fd()) } {
+                    return format!("confining: {step:?}: {}", io::Error::last_os_error());
+                }
+                writes_its_comm()
+            });
+            format!("member {member}; command {command}")
+        });
+        let Some(said) = said else { return };
+        assert_eq!(said, "member refused (13); command refused (13)");
+    }
+
+    /// A member's first process ([`a_confined_member`]), killed and waited for as it drops:
+    /// as its test ends, or unwinds from a failure, which a paused member would otherwise
+    /// outlive.
+    struct Member(libc::pid_t);
+
+    impl Drop for Member {
+        fn drop(&mut self) {
+            // SAFETY: kill(2) and waitpid(2) of this process's own child.
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+                libc::waitpid(self.0, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+
+    /// The member's first process for a test of what a command run in it reaches: confined
+    /// as member `c`, it holds until it is killed, as its program would; `before`, run in it
+    /// once it is confined, before it says it is ready. None where it could not be confined.
+    /// It holds none of the harness's result pipe ([`RESULT_PIPE`]), nor does any process
+    /// it starts: a test that fails once it is made ends its child, and the harness reads
+    /// that pipe's end then, rather than wait on a member paused for good.
+    fn a_confined_member(c: &Confinement, before: impl FnOnce()) -> Option<Member> {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2(2) into a two-element array.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors were just made, and are owned here alone.
+        let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: fork(2) of a process of one thread (as_root_of_own_mounts's child); the
+        // child never returns.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: a process of one thread, which holds or exits; close(2) of the
+            // harness's result pipe's write end, which this process alone lets go of.
+            unsafe {
+                let result = RESULT_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+                if result >= 0 {
+                    libc::close(result);
+                }
+                if rules(c, c.ruleset.as_raw_fd())
+                    .and_then(|()| confine(c, c.ruleset.as_raw_fd()))
+                    .is_err()
+                {
+                    libc::_exit(1);
+                }
+                before();
+                libc::write(w.as_raw_fd(), b"r".as_ptr().cast(), 1);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        drop(w);
+        let mut ready = [0u8; 1];
+        // SAFETY: read(2) into a one-byte buffer of ours.
+        let n = unsafe { libc::read(r.as_raw_fd(), ready.as_mut_ptr().cast(), 1) };
+        if n != 1 {
+            // SAFETY: waitpid(2) of this process's own child, which has exited.
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            return None;
+        }
+        Some(Member(pid))
+    }
+
+    /// A test that fails once its member is made fails at once, its member ended: the member
+    /// holds none of the harness's result pipe, and is killed as the test unwinds. A member
+    /// that held it, paused for good, held the harness's read of it, and the test hung in
+    /// place of failing (the starter lane's finding, 2026-11-14). Run as root of IDs past its
+    /// own (`unshare --map-auto --map-root-user`), where uid 1000 is another's; else a SKIP.
+    #[test]
+    fn a_test_that_fails_once_its_member_is_made_fails_at_once() {
+        let said = as_root_of_own_mounts(|| {
+            let c = member_confinement(1000, Vec::new(), "/");
+            let Some(_member) = a_confined_member(&c, || {}) else {
+                return "SKIP: confining the member".into();
+            };
+            panic!("a test's failure once its member is made");
+        });
+        let Some(said) = said else { return };
+        assert_eq!(said, "the child panicked");
+    }
+
+    /// confine-10 (docs/bugs/2026-11-13/confine.md): a command run in a member signals the
+    /// member's own processes, as `docker exec C kill 1`, `pkill` and a supervisor's CLI do,
+    /// and as the member's processes signal one another: it is born of the member's starter,
+    /// in the member's own Landlock domain. A command that entered the member's ruleset
+    /// itself, as enter.rs had it, was a domain beside the member's, which the member's signal
+    /// scope holds apart (landlock(7), `LANDLOCK_SCOPE_SIGNAL`). The command is `/bin/sh -c
+    /// 'kill -0 PID'`. Run as root of IDs past its own (`unshare --map-auto
+    /// --map-root-user`), where uid 1000 is another's; else a SKIP.
+    #[test]
+    fn a_command_run_in_a_member_signals_its_members_processes() {
+        let said = as_root_of_own_mounts(|| {
+            let c = member_confinement(1000, Vec::new(), "/");
+            let (starter, theirs) = crate::starter::channel().unwrap();
+            let Some(member) = a_confined_member(&c, || {
+                // SAFETY: dup3(2) of the starter's end to where the starter holds it, then
+                // the starter forked, as a member's first process forks it.
+                unsafe {
+                    libc::dup3(theirs.as_raw_fd(), crate::starter::STARTER_FD, libc::O_CLOEXEC);
+                    crate::starter::fork();
+                    libc::close(crate::starter::STARTER_FD);
+                }
+            }) else {
+                return "SKIP: confining the member".into();
+            };
+            drop(theirs);
+            let said = command_in(
+                &starter,
+                &[
+                    c"/bin/sh",
+                    c"-c",
+                    c"kill -0 \"$0\"",
+                    &CString::new(member.0.to_string()).unwrap(),
+                ],
+            );
+            drop(member);
+            said
+        });
+        let Some(said) = said else { return };
+        assert_eq!(said, "exited 0");
+    }
+
+    /// confine-10's starter where a member is as init starts it: its first process is PID 1
+    /// of a PID namespace of its own (`start`'s `CLONE_NEWPID`), to which the kernel refuses
+    /// `CLONE_PARENT` (kernel/fork.c `copy_process`: no namespace's init makes siblings, its
+    /// `SIGNAL_UNKILLABLE`), which left every member with no starter and every command run in
+    /// one refused (`Refusal::NoStarter`). Its starter is born its child, of no exit signal,
+    /// so its program's `wait(2)` sees no child of it (kernel/exit.c `eligible_child`: a child
+    /// that reports by no SIGCHLD is waited for only with `__WCLONE` or `__WALL`), and a
+    /// command run in it signals its PID 1. Run as root of IDs past its own (`unshare
+    /// --map-auto --map-root-user`), where uid 1000 is another's; else a SKIP.
+    #[test]
+    fn a_member_first_of_its_pid_namespace_has_its_starter() {
+        let said = as_root_of_own_mounts(|| {
+            // SAFETY: unshare(2) of this single-threaded child: its next child is PID 1 of a
+            // PID namespace of its own.
+            if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+                return format!("SKIP: unshare: {}", io::Error::last_os_error());
+            }
+            let c = member_confinement(1000, Vec::new(), "/");
+            let (starter, theirs) = crate::starter::channel().unwrap();
+            let mut fds = [0 as RawFd; 2];
+            // SAFETY: pipe2(2) into a two-element array.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: both descriptors were just made, and are owned here alone.
+            let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            let Some(member) = a_confined_member(&c, || {
+                // SAFETY: dup3(2) of the starter's end to where the starter holds it, the
+                // starter forked as a member's first process forks it, both ends of it closed
+                // here as its program's exec closes them (close-on-exec), so that a starter
+                // not born closes the channel, then waitpid(2), getpid(2) and write(2) of a
+                // byte of this stack's.
+                unsafe {
+                    libc::dup3(theirs.as_raw_fd(), crate::starter::STARTER_FD, libc::O_CLOEXEC);
+                    crate::starter::fork();
+                    libc::close(crate::starter::STARTER_FD);
+                    libc::close(theirs.as_raw_fd());
+                    let waited = libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG);
+                    let none = waited == -1 && *libc::__errno_location() == libc::ECHILD;
+                    let byte = [match (libc::getpid() == 1, none) {
+                        (false, _) => b'n',
+                        (true, true) => b'e',
+                        (true, false) => b'w',
+                    }];
+                    libc::write(w.as_raw_fd(), byte.as_ptr().cast(), 1);
+                }
+            }) else {
+                return "SKIP: confining the member".into();
+            };
+            drop((theirs, w));
+            let mut waited = [0u8; 1];
+            // SAFETY: read(2) into a one-byte buffer of ours.
+            unsafe { libc::read(r.as_raw_fd(), waited.as_mut_ptr().cast(), 1) };
+            let said = command_in(&starter, &[c"/bin/sh", c"-c", c"kill -0 1"]);
+            drop(member);
+            let waited = match waited[0] {
+                b'e' => "its wait sees no child",
+                b'w' => "its wait sees its starter",
+                b'n' => "it is not PID 1",
+                _ => "it said nothing",
+            };
+            format!("{waited}; command {said}")
+        });
+        let Some(said) = said else { return };
+        assert_eq!(said, "its wait sees no child; command exited 0");
+    }
+
+    /// What `top` lists (procs.rs) in a PID namespace of the test's own, whose `/proc` lists
+    /// nothing of the host's, of a member whose first process runs `member` with the
+    /// starter's end of a starter channel and execs `sleep 1000` (whatever file it runs): the
+    /// names the dump gives its processes, read once that exec is done (its command line
+    /// says it), and whether a starter (by its name, which the test alone reads) was born.
+    /// The test's PID namespace ends with it, its starter with it. Run as root of IDs past
+    /// its own (`unshare --map-auto --map-root-user`); else a SKIP.
+    fn top_of_a_member(member: impl FnOnce(RawFd)) -> Option<String> {
+        as_root_of_own_mounts(|| {
+            // SAFETY: unshare(2) of this single-threaded child: its next child is PID 1 of a
+            // PID namespace of its own.
+            if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+                return format!("SKIP: unshare: {}", io::Error::last_os_error());
+            }
+            in_child(|| {
+                // SAFETY: mount(2) of NUL-terminated literals over /proc, in this test's own
+                // mounts: its PID namespace's /proc.
+                let proc = unsafe {
+                    libc::mount(
+                        c"proc".as_ptr(),
+                        c"/proc".as_ptr(),
+                        c"proc".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    )
+                };
+                if proc != 0 {
+                    return format!("SKIP: its /proc: {}", io::Error::last_os_error());
+                }
+                let (starter, theirs) = crate::starter::channel().unwrap();
+                // SAFETY: fork(2) of a process of one thread; the child runs `member`, which
+                // execs, or exits.
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+                if pid == 0 {
+                    member(theirs.as_raw_fd());
+                    // SAFETY: _exit(2) of a child whose `member` did not exec.
+                    unsafe { libc::_exit(1) }
+                }
+                drop(theirs);
+                let cmdline = format!("/proc/{pid}/cmdline");
+                while !std::fs::read(&cmdline)
+                    .unwrap_or_default()
+                    .starts_with(b"sleep\x001000\x00")
+                {
+                    // SAFETY: waitpid(2) of this process's own child, not waiting.
+                    if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
+                        return "the member ended before its exec".into();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let comm =
+                    |pid: &str| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+                let born = std::fs::read_dir("/proc")
+                    .unwrap()
+                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                    .any(|pid| comm(&pid).trim() == "starter");
+                let dump = crate::procs::dump(None, crate::procs::Members::Workload);
+                let listed: Vec<String> = dump
+                    .split(|&b| b == 0x1e)
+                    .skip(1)
+                    .filter_map(|record| {
+                        let stat = String::from_utf8_lossy(record.split(|&b| b == 0x1f).next()?).into_owned();
+                        Some(stat.get(stat.find('(')? + 1..stat.rfind(')')?)?.to_string())
+                    })
+                    .collect();
+                // SAFETY: kill(2) and waitpid(2) of this process's own child.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+                drop(starter);
+                format!("starter: {born}; listed: {listed:?}")
+            })
+        })
+    }
+
+    /// confine-11 (docs/bugs/2026-11-13/confine.md): the top of a member lists the member's
+    /// own processes alone, as `docker top` lists a container's, where runc's exec helper is
+    /// gone by the time its command runs: the member's starter (D243), a fork of this
+    /// program's that never execs, is left out with this program's other forks, by the file
+    /// it runs. The member is confined, forks its starter as a member's first process does,
+    /// and execs `sleep`; the dump is read with its starter alive.
+    #[test]
+    fn a_members_top_lists_its_own_processes_alone() {
+        let c = member_confinement(1000, Vec::new(), "/");
+        let said = top_of_a_member(|theirs| {
+            // SAFETY: the member's first process's last steps, in a child of one thread:
+            // confined, its starter's end at its place, its starter forked, its program run.
+            unsafe {
+                if rules(&c, c.ruleset.as_raw_fd())
+                    .and_then(|()| confine(&c, c.ruleset.as_raw_fd()))
+                    .is_err()
+                {
+                    return;
+                }
+                libc::dup3(theirs, crate::starter::STARTER_FD, libc::O_CLOEXEC);
+                crate::starter::fork();
+                let argv = [c"sleep".as_ptr(), c"1000".as_ptr(), std::ptr::null()];
+                libc::execv(c"/bin/sleep".as_ptr(), argv.as_ptr());
+            }
+        });
+        let Some(said) = said else { return };
+        assert_eq!(said, r#"starter: true; listed: ["sleep"]"#);
+    }
+
+    /// confine-11: a member's program at the path this program runs from, in the member's own
+    /// mounts, is listed. `/proc/PID/exe` reads a program's path as its own mounts have it
+    /// (d_path(9), from a root its mounts do not reach), so a member whose image has its
+    /// program where init's is (an image's `/init`) read as init's own fork, and `top` left
+    /// it out; init's forks are known by the file itself. The member, in mounts of its own,
+    /// binds `/bin/sleep` over this test's program and execs it there; its name is that
+    /// path's last part, as execve(2) names a process (`TASK_COMM_LEN`, 15 bytes).
+    #[test]
+    fn a_members_program_at_inits_path_is_listed() {
+        let path = std::fs::read_link("/proc/self/exe").unwrap();
+        let name: String = path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .chars()
+            .take(15)
+            .collect();
+        let mine = CString::new(path.into_os_string().into_encoded_bytes()).unwrap();
+        let said = top_of_a_member(|_| {
+            // SAFETY: unshare(2), mount(2) and execv(2) of NUL-terminated strings of this
+            // stack's, in a child of one thread, which execs or returns to exit.
+            unsafe {
+                if libc::unshare(libc::CLONE_NEWNS) != 0
+                    || libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    ) != 0
+                    || libc::mount(
+                        c"/bin/sleep".as_ptr(),
+                        mine.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    ) != 0
+                {
+                    return;
+                }
+                let argv = [c"sleep".as_ptr(), c"1000".as_ptr(), std::ptr::null()];
+                libc::execv(mine.as_ptr(), argv.as_ptr());
+            }
+        });
+        let Some(said) = said else { return };
+        assert_eq!(said, format!("starter: false; listed: [{name:?}]"));
+    }
+
+    /// What `argv`, asked of the starter of a member that declares `declared` processes,
+    /// came to, as `command_in` says it: the member's first process is moved into a cgroup
+    /// of the test's own, of the `pids.max` `start` commits ([`with_starter`]), before it is
+    /// confined and forks its starter. Run with SHARDS_TEST_CGROUP naming a cgroup this test
+    /// may write, holding no process and offering pids (a delegated scope's: `systemd-run
+    /// --user --scope -p Delegate=yes`, its processes moved into a leaf of its own), as root
+    /// of IDs past its own (`unshare --map-auto --map-root-user`); else a SKIP.
+    fn in_a_member_declaring(declared: u64, argv: &[&CStr]) -> Option<String> {
+        let Ok(base) = std::env::var("SHARDS_TEST_CGROUP") else {
+            eprintln!("SKIP: SHARDS_TEST_CGROUP names no cgroup of the test's own");
+            return None;
+        };
+        let c = member_confinement(1000, Vec::new(), "/");
+        let group = format!("{base}/c11-{}-{declared}", std::process::id());
+        as_root_of_own_mounts(|| {
+            // SAFETY: unshare(2) of this single-threaded child: its next child is PID 1 of a
+            // PID namespace of its own, whose end ends the member and its starter.
+            if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+                return format!("SKIP: unshare: {}", io::Error::last_os_error());
+            }
+            let made = std::fs::write(format!("{base}/cgroup.subtree_control"), "+pids")
+                .and_then(|()| std::fs::create_dir(&group))
+                .and_then(|()| {
+                    std::fs::write(
+                        format!("{group}/pids.max"),
+                        with_starter(declared).unwrap().to_string(),
+                    )
+                });
+            if let Err(e) = made {
+                return format!("SKIP: its cgroup: {e}");
+            }
+            let said = in_child(|| {
+                let (starter, theirs) = crate::starter::channel().unwrap();
+                let mut fds = [0 as RawFd; 4];
+                // SAFETY: pipe2(2) twice, into two-element halves of this array.
+                unsafe {
+                    assert_eq!(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                    assert_eq!(libc::pipe2(fds.as_mut_ptr().add(2), libc::O_CLOEXEC), 0);
+                }
+                // SAFETY: all four descriptors were just made, and are owned here alone.
+                let [go_r, go_w, ready_r, ready_w] = fds.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+                // SAFETY: fork(2) of a process of one thread; the child waits to be moved,
+                // confines itself, forks its starter and holds.
+                let member = unsafe { libc::fork() };
+                assert!(member >= 0, "fork: {}", io::Error::last_os_error());
+                if member == 0 {
+                    // SAFETY: read(2), the member's first process's last steps and write(2)
+                    // of a byte of this stack's, in a child of one thread, which holds or
+                    // exits.
+                    unsafe {
+                        let mut byte = [0u8; 1];
+                        if libc::read(go_r.as_raw_fd(), byte.as_mut_ptr().cast(), 1) != 1
+                            || rules(&c, c.ruleset.as_raw_fd())
+                                .and_then(|()| confine(&c, c.ruleset.as_raw_fd()))
+                                .is_err()
+                        {
+                            libc::_exit(1);
+                        }
+                        libc::dup3(theirs.as_raw_fd(), crate::starter::STARTER_FD, libc::O_CLOEXEC);
+                        crate::starter::fork();
+                        libc::close(crate::starter::STARTER_FD);
+                        libc::close(theirs.as_raw_fd());
+                        libc::write(ready_w.as_raw_fd(), b"r".as_ptr().cast(), 1);
+                        loop {
+                            libc::pause();
+                        }
+                    }
+                }
+                drop((theirs, go_r, ready_w));
+                let moved = std::fs::write(format!("{group}/cgroup.procs"), member.to_string());
+                let mut byte = [0u8; 1];
+                // SAFETY: write(2) and read(2) of a byte of this stack's.
+                let ready = unsafe {
+                    libc::write(go_w.as_raw_fd(), b"g".as_ptr().cast(), 1);
+                    libc::read(ready_r.as_raw_fd(), byte.as_mut_ptr().cast(), 1) == 1
+                };
+                let said = match (moved, ready) {
+                    (Err(e), _) => format!("not moved: {e}"),
+                    (Ok(()), false) => "not confined".into(),
+                    (Ok(()), true) => command_in(&starter, argv),
+                };
+                // SAFETY: kill(2) and waitpid(2) of this process's own child.
+                unsafe {
+                    libc::kill(member, libc::SIGKILL);
+                    libc::waitpid(member, std::ptr::null_mut(), 0);
+                }
+                said
+            });
+            // Its PID namespace has ended, and with it every task of the cgroup.
+            let _ = std::fs::remove_dir(&group);
+            said
+        })
+    }
+
+    /// confine-11: a member's cgroup gives the member as many processes as it declared, its
+    /// starter apart ([`with_starter`]), as runc's exec helper is gone from a container's
+    /// once its command runs. A member that declares two, its first process and a command
+    /// run in it, runs that command: with its starter counted against what it declared, the
+    /// command's fork met `pids.max` (and a member that declared one had no starter at all,
+    /// every command run in it refused `NoStarter`).
+    #[test]
+    fn a_member_runs_as_many_processes_as_it_declares_its_starter_apart() {
+        let Some(said) = in_a_member_declaring(2, &[c"/bin/true"]) else {
+            return;
+        };
+        assert_eq!(said, "exited 0");
+    }
+
+    /// confine-11: a command past what its member declared is refused, its starter's fork's
+    /// EAGAIN said to init (`Refusal::Processes`). The kernel writes a pidfd's number before
+    /// it charges the fork to `pids.max` (kernel/fork.c `copy_process`), and lets it go as it
+    /// refuses it; the starter that sent it as the command's failed EBADF and answered
+    /// nothing, so that the exec waited for ever (reproduced at with_starter's mutant, Linux
+    /// 7.3.3 x86_64).
+    #[test]
+    fn a_command_past_what_its_member_declared_is_refused() {
+        let Some(said) = in_a_member_declaring(1, &[c"/bin/true"]) else {
+            return;
+        };
+        assert_eq!(
+            said,
+            format!("not born: Ok(Some(NotBorn {{ id: 7, errno: {} }}))", libc::EAGAIN)
+        );
+    }
+
+    /// confine-11: `start`'s clone3 of a member's first process, refused at `pids.max`, lets
+    /// go of nothing at the number the kernel wrote into its `Launch`'s pidfd. The kernel
+    /// writes that number before it charges the fork and frees it as it refuses the fork
+    /// (kernel/fork.c `copy_process`), so by the time `start` returns the number may be
+    /// another descriptor's: here one opened after the refusal, which must outlive the
+    /// `Launch`. Run with SHARDS_TEST_CGROUP naming a cgroup this test may write, holding no
+    /// process and offering pids (a delegated scope's: `systemd-run --user --scope -p
+    /// Delegate=yes`, its processes moved into a leaf of its own); else a SKIP.
+    #[test]
+    fn a_first_process_refused_at_pids_max_closes_nothing_at_its_pidfd_number() {
+        let Ok(base) = std::env::var("SHARDS_TEST_CGROUP") else {
+            eprintln!("SKIP: SHARDS_TEST_CGROUP names no cgroup of the test's own");
+            return;
+        };
+        let group = format!("{base}/c11-pidfd-{}", std::process::id());
+        let made = std::fs::write(format!("{base}/cgroup.subtree_control"), "+pids")
+            .and_then(|()| std::fs::create_dir(&group))
+            .and_then(|()| std::fs::write(format!("{group}/pids.max"), "0"));
+        if let Err(e) = made {
+            eprintln!("SKIP: its cgroup: {e}");
+            return;
+        }
+        // In a child of one thread, so that no other thread takes the freed number first.
+        let said = in_child(|| {
+            let cgroup = std::fs::File::open(&group).unwrap();
+            let mut launch = crate::managed::Launch::new(0, &cgroup).unwrap();
+            let mut args = CloneArgs {
+                pidfd: (&raw mut launch.pidfd) as u64,
+                flags: libc::CLONE_PIDFD as u64 | CLONE_INTO_CGROUP,
+                exit_signal: libc::SIGCHLD as u64,
+                cgroup: cgroup.as_raw_fd() as u64,
+                ..CloneArgs::default()
+            };
+            // SAFETY: clone3(2) with a clone_args of the size given; a child born despite
+            // pids.max exits at once.
+            let pid =
+                unsafe { libc::syscall(libc::SYS_clone3, &raw mut args, std::mem::size_of::<CloneArgs>()) };
+            if pid == 0 {
+                // SAFETY: ends the child without running the harness's exit paths.
+                unsafe { libc::_exit(0) }
+            }
+            let errno = io::Error::last_os_error().raw_os_error();
+            let written = launch.pidfd;
+            // Held raw, so that a wrong close is said here, not an abort at its owner's drop.
+            let other = std::os::fd::IntoRawFd::into_raw_fd(std::fs::File::open("/dev/null").unwrap());
+            drop(launch);
+            // SAFETY: fcntl(2) F_GETFD of a number this child opened, then close(2) of it
+            // where it is still open.
+            let open = unsafe { libc::fcntl(other, libc::F_GETFD) } >= 0;
+            if open {
+                // SAFETY: as above.
+                unsafe { libc::close(other) };
+            }
+            format!(
+                "{pid} {errno:?}; written: {}, reused: {}, open: {open}",
+                written >= 0,
+                other == written
+            )
+        });
+        let _ = std::fs::remove_dir(&group);
+        assert_eq!(
+            said,
+            format!(
+                "-1 Some({}); written: true, reused: true, open: true",
+                libc::EAGAIN
+            )
+        );
+    }
+
+    /// confine-11: a member whose starter has gone is given what it declared, no more: its
+    /// cgroup's `pids.max` goes back to it, the one its starter took handed back to no one,
+    /// as a member that ended its starter and reaped it (`__WALL`) would have it.
+    #[test]
+    fn a_member_whose_starter_went_is_held_to_what_it_declared() {
+        let dir = shards_testdir::TempDir::new("c11-pids").unwrap();
+        let cgroup = dir.to_str().unwrap().to_string();
+        std::fs::write(dir.join("pids.max"), with_starter(5).unwrap().to_string()).unwrap();
+        assert_eq!(with_starter(5), Some(6));
+        assert_eq!(with_starter(u64::MAX), None);
+        held_to(&cgroup, Some(5)).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("pids.max")).unwrap(), "5");
+        held_to(&cgroup, None).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("pids.max")).unwrap(), "5");
+    }
+
+    /// The starter's terminal path in the member as init starts it, PID 1 of a PID namespace
+    /// of its own: a command asked for with `tty` is the leader of a session of its own whose
+    /// controlling terminal is its stdio, init's pty's peer (`enter::terminal`, 24 by 80), as
+    /// runc makes an exec's (setsid, then TIOCSCTTY). What it shows is read from the master
+    /// until the kernel says EIO, which it says only once no process holds the peer
+    /// (pty(7)): the starter and init let go of theirs as it is born, so the read ends as the
+    /// command does. Run as root of IDs past its own (`unshare --map-auto --map-root-user`),
+    /// where uid 1000 is another's; else a SKIP.
+    #[test]
+    fn a_command_run_in_a_member_on_a_terminal_has_it_as_its_sessions() {
+        let said = as_root_of_own_mounts(|| {
+            // SAFETY: unshare(2) of this single-threaded child: its next child is PID 1 of a
+            // PID namespace of its own.
+            if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+                return format!("SKIP: unshare: {}", io::Error::last_os_error());
+            }
+            let c = member_confinement(1000, Vec::new(), "/");
+            let (starter, theirs) = crate::starter::channel().unwrap();
+            let Some(member) = a_confined_member(&c, || {
+                // SAFETY: as in `a_member_first_of_its_pid_namespace_has_its_starter`.
+                unsafe {
+                    libc::dup3(theirs.as_raw_fd(), crate::starter::STARTER_FD, libc::O_CLOEXEC);
+                    crate::starter::fork();
+                    libc::close(crate::starter::STARTER_FD);
+                    libc::close(theirs.as_raw_fd());
+                }
+            }) else {
+                return "SKIP: confining the member".into();
+            };
+            drop(theirs);
+            // Made once the member is, so that none of its processes holds it, as none of a
+            // member's holds an exec's terminal. Its peer the test's own uid's: devpts is the
+            // host's, whose inodes this namespace's root may not give away (chown(2) EPERM).
+            // SAFETY: geteuid(2) reads this process's effective uid.
+            let euid = unsafe { libc::geteuid() };
+            let size = shards_abi::run::Size { rows: 24, cols: 80 };
+            let said = match crate::enter::terminal(size, euid) {
+                Ok((master, peer)) => {
+                    let script = c"stty size; : </dev/tty && echo controlling; echo ok";
+                    let born = started(
+                        &starter,
+                        &[c"/bin/sh", c"-c", script],
+                        [peer.as_raw_fd(); 3],
+                        true,
+                    );
+                    drop(peer);
+                    match born {
+                        Ok(born) => {
+                            let shown = shown(&master);
+                            format!("{shown:?} {}", end(&starter, &born))
+                        }
+                        Err(why) => why,
+                    }
+                }
+                Err(e) => format!("no terminal: {e}"),
+            };
+            drop(member);
+            said
+        });
+        let Some(said) = said else { return };
+        assert_eq!(said, "\"24 80\\r\\ncontrolling\\r\\nok\\r\\n\" exited 0");
+    }
+
+    /// What a terminal's master reads until the kernel says EIO, as it does once no process
+    /// holds its peer (pty(7)).
+    fn shown(master: &OwnedFd) -> String {
+        let mut shown = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            // SAFETY: read(2) into a buffer of ours, of its length.
+            let n = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            match usize::try_from(n) {
+                Ok(0) => break,
+                Ok(n) => shown.extend_from_slice(&buf[..n]),
+                Err(_) if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {}
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&shown).into_owned()
+    }
+
+    /// `argv`, run by `starter` as init runs a command in a member, its stdio /dev/null: how
+    /// it ended, as `exited N` or `signal N`, or why it did not start.
+    fn command_in(starter: &crate::starter::Starter, argv: &[&CStr]) -> String {
+        let null = || {
+            OwnedFd::from(
+                std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/null")
+                    .unwrap(),
+            )
+        };
+        let stdio = [null(), null(), null()];
+        match started(starter, argv, stdio.each_ref().map(AsRawFd::as_raw_fd), false) {
+            Ok(born) => end(starter, &born),
+            Err(why) => why,
+        }
+    }
+
+    /// `argv` asked of `starter` on `stdio`, with a terminal or not, as init asks it: born
+    /// and past its exec, or why not.
+    fn started(
+        starter: &crate::starter::Starter,
+        argv: &[&CStr],
+        stdio: [RawFd; 3],
+        tty: bool,
+    ) -> Result<crate::starter::Born, String> {
+        use std::io::Read as _;
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2(2) into a two-element array.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(format!("its error channel: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: both descriptors were just made, and are owned here alone.
+        let (err_r, err_w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let argv: Vec<CString> = argv.iter().map(|a| (*a).to_owned()).collect();
+        let program = [argv[0].clone()];
+        let asked = crate::starter::Command {
+            id: 7,
+            candidates: &program,
+            explicit: true,
+            argv: &argv,
+            envp: &[],
+            cwd: c"/",
+            stdio,
+            err: err_w.as_raw_fd(),
+            tty,
+        };
+        if let Err(e) = starter.start(&asked) {
+            return Err(format!("not asked: {e:?}"));
+        }
+        drop(err_w);
+        wait_readable(starter.fd());
+        let born = match starter.answer() {
+            Ok(Some(crate::starter::Answer::Born(born))) => born,
+            other => return Err(format!("not born: {other:?}")),
+        };
+        if born.id != 7 {
+            return Err(format!("born as exec {}", born.id));
+        }
+        let mut report = Vec::new();
+        if let Err(e) = std::fs::File::from(err_r).read_to_end(&mut report) {
+            return Err(format!("its error channel: {e}"));
+        }
+        if !report.is_empty() {
+            return Err(format!("not run: {report:?}"));
+        }
+        Ok(born)
+    }
+
+    /// How `born` ended, as `exited N` or `signal N`, once its pidfd says it has; reaped by
+    /// its starter after, as init has it reaped.
+    fn end(starter: &crate::starter::Starter, born: &crate::starter::Born) -> String {
+        wait_readable(born.pidfd.as_raw_fd());
+        let status = crate::starter::ended(born.pid);
+        starter.reap(born.ns_pid);
+        match status.map(crate::managed::ended) {
+            Some(shards_abi::run::members::End::Exited(code)) => format!("exited {code}"),
+            Some(shards_abi::run::members::End::Signaled(sig)) => format!("signal {sig}"),
+            None => "no end".into(),
+        }
+    }
+
+    fn wait_readable(fd: RawFd) {
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll(2) of one pollfd of ours.
+        assert_eq!(unsafe { libc::poll(&raw mut p, 1, -1) }, 1);
+    }
+
+    /// confine-02 (docs/bugs/2026-11-13/confine.md): a member starts in its working
+    /// directory only where it could enter it itself. Its artifact's `work` leads to
+    /// `private/work`, which is open, beneath `private`, root's alone (0700); a member that
+    /// read its `token` there would have read through a directory it may not search. A
+    /// working directory it may enter, `open/work`, it starts in. Run as root of IDs past
+    /// its own (`unshare --map-auto --map-root-user`), where uid 1000 is another's; else a
+    /// SKIP.
+    #[test]
+    fn a_member_starts_in_no_working_directory_it_could_not_enter() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = shards_testdir::TempDir::new("wd").unwrap();
+        let mode =
+            |p: &std::path::Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(dir.path(), 0o755);
+        for (at, token) in [("private/work", "sentinel"), ("open/work", "allowed")] {
+            std::fs::create_dir_all(dir.path().join(at)).unwrap();
+            std::fs::write(dir.path().join(at).join("token"), token).unwrap();
+        }
+        mode(&dir.path().join("private"), 0o700);
+        std::fs::create_dir(dir.path().join("artifact")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("private/work"), dir.path().join("artifact/work"))
+            .unwrap();
+        let said = as_root_of_own_mounts(|| {
+            if std::os::unix::fs::chown(dir.path().join("open"), Some(1000), Some(1000)).is_err() {
+                return "SKIP: no uid 1000 in this namespace".into();
+            }
+            let starts_in = |workdir: &std::path::Path| {
+                let c = member_confinement(1000, Vec::new(), workdir.to_str().unwrap());
+                let argv = [c"/bin/cat".as_ptr(), c"token".as_ptr(), std::ptr::null()];
+                let p = Prepared {
+                    hide: Vec::new(),
+                    hostname: CString::default(),
+                    argv: argv.to_vec(),
+                    paths: vec![c"/bin/cat".into()],
+                    explicit: true,
+                    envp: vec![std::ptr::null()],
+                    hosts: None,
+                    resolv: None,
+                    trust: None,
+                    go: None,
+                    chooser: None,
+                    stdin: None,
+                    terminal: false,
+                    starter: -1,
+                    root: -1,
+                    sockets: Vec::new(),
+                    volumes: Vec::new(),
+                    scratch: None,
+                    shm: CString::default(),
+                };
+                in_child(|| {
+                    use std::io::Read as _;
+                    let mut fds = [0 as RawFd; 2];
+                    // SAFETY: pipe2(2) into a two-element array.
+                    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), 0) }, 0);
+                    // SAFETY: fork(2) of a process of one thread; the child gives the pipe
+                    // its stdout and stderr, /dev/null its launch status, and runs the
+                    // member's first process's last steps, which exec or exit.
+                    let pid = unsafe { libc::fork() };
+                    if pid == 0 {
+                        // SAFETY: dup2(2) and open(2) of this child's own descriptors.
+                        unsafe {
+                            let ruleset = libc::fcntl(c.ruleset.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10);
+                            let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                            libc::dup2(fds[1], 1);
+                            libc::dup2(fds[1], 2);
+                            libc::dup2(null, 3);
+                            libc::dup3(ruleset, RULESET_FD, libc::O_CLOEXEC);
+                        }
+                        exec_child(&p, &c);
+                    }
+                    // SAFETY: the write end is this process's, closed once.
+                    unsafe { libc::close(fds[1]) };
+                    let mut out = String::new();
+                    // SAFETY: the read end is this process's alone.
+                    let _ = unsafe { std::fs::File::from_raw_fd(fds[0]) }.read_to_string(&mut out);
+                    // SAFETY: waits for this process's own child.
+                    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                    out
+                })
+            };
+            let open = starts_in(&dir.path().join("open/work"));
+            if open.contains("taking its own IDs") {
+                return format!("SKIP: {open}");
+            }
+            format!("{open} | {}", starts_in(&dir.path().join("artifact/work")))
+        });
+        let Some(said) = said else { return };
+        assert_eq!(
+            said,
+            "allowed | shards-init: entering its working directory: errno 13\n"
         );
     }
 }

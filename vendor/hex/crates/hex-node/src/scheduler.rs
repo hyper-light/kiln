@@ -95,6 +95,53 @@ pub struct CapacityHolder {
     pub name: String,
 }
 
+/// Starts the thread that tells the node what the capacity view's holders have reserved ([`Driver::tell_reserved`]; the
+/// review's A-10): woken at each change of what they hold and after each refresh ([`Driver::wake_reserved`]), and once
+/// now; it ends once its driver has gone. Each refusal is said through `report`.
+fn tell_reserved(driver: &Arc<Driver>, report: Report, id: NodeId) -> Result<(), Refusal> {
+    let (wake, waits) = hex_wait::mpsc::sync_channel(1)
+        .map_err(|why| Refusal::os("making the keeper's word's wake", why))?;
+    driver.on_reserved(wake).map_err(failed)?;
+    let driven = Arc::downgrade(driver);
+    std::thread::Builder::new()
+        .name("hex-reserved".to_owned())
+        .spawn(move || {
+            loop {
+                match waits.recv() {
+                    Ok(()) => {}
+                    Err(hex_wait::mpsc::RecvError::Disconnected) => return,
+                    Err(hex_wait::mpsc::RecvError::Failed(why)) => {
+                        report(
+                            id,
+                            &format!(
+                                "the keeper's word's thread can't wait ({why}): its node is told what the capacity \
+                                 view's holders reserve no more"
+                            ),
+                        );
+                        return;
+                    }
+                }
+                let Some(driver) = driven.upgrade() else {
+                    return;
+                };
+                let told = driver.tell_reserved().map_err(failed);
+                let said = |why: &Refusal| {
+                    report(
+                        id,
+                        &format!("telling the node what the capacity view's holders reserve: {why}"),
+                    );
+                };
+                match told {
+                    Ok(refused) => refused.iter().for_each(said),
+                    Err(why) => said(&why),
+                }
+            }
+        })
+        .map_err(|e| Refusal::os("starting the keeper's word's thread", e))?;
+    driver.wake_reserved();
+    Ok(())
+}
+
 /// The capacity view's lane, where the configuration asks for one: its server, the endpoint it is served on, and the
 /// log its events go to.
 struct Lane {
@@ -183,7 +230,7 @@ impl Lane {
             .name("hex-capacity".into())
             .spawn(move || match serving.serve(acceptor) {
                 hex_quic::Refused::Ended => {}
-                why => ended(&format!("hex.capacity event=lane_ended why={why:?}")),
+                why => ended(&lane_ended_line(&why)),
             })
             .map_err(|e| Refusal::os("starting the capacity lane", e))?;
         Ok(Self {
@@ -193,12 +240,51 @@ impl Lane {
         })
     }
 
-    /// Says every hint owed to the holders; a failure is logged, the holders' next hello telling them the view.
+    /// Hands every hint owed to its holder's link, whose own writer says it (CV7), never waiting for a holder; a failure
+    /// is logged, the holders' next hello telling them the view.
     fn hint(&self) {
         if let Err(why) = self.server.hint() {
-            (self.log)(&format!("hex.capacity event=hint_failed why={why:?}"));
+            (self.log)(&hint_failed_line(&why));
         }
     }
+}
+
+/// The capacity lane's end, but for the endpoint's own close: `hex.capacity event=lane_ended why=<a JSON string>`.
+fn lane_ended_line(why: &hex_quic::Refused) -> String {
+    hex_api::event::line(
+        "hex.capacity",
+        "lane_ended",
+        &[("why", hex_api::event::Value::Text(&why.to_string()))],
+    )
+}
+
+/// A hint owed to the holders that failed: `hex.capacity event=hint_failed why=<a JSON string>`.
+fn hint_failed_line(why: &hex_quic::Refused) -> String {
+    hex_api::event::line(
+        "hex.capacity",
+        "hint_failed",
+        &[("why", hex_api::event::Value::Text(&why.to_string()))],
+    )
+}
+
+/// The person's release of `holder`'s reservations: `hex.capacity event=forgotten holder=<a JSON string> epoch=<n>
+/// count=<n> cpu_milli=<n> mem_bytes=<n> disk_bytes=<n> gpus=<n>`.
+fn forgotten_line(holder: &str, released: &hex_api::capacity::Forgotten) -> String {
+    use hex_api::event::Value::{Number, Text};
+    let sum = released.sum;
+    hex_api::event::line(
+        "hex.capacity",
+        "forgotten",
+        &[
+            ("holder", Text(holder)),
+            ("epoch", Number(u128::from(released.epoch))),
+            ("count", Number(u128::from(released.count))),
+            ("cpu_milli", Number(u128::from(sum.cpu_milli))),
+            ("mem_bytes", Number(u128::from(sum.mem_bytes))),
+            ("disk_bytes", Number(u128::from(sum.disk_bytes))),
+            ("gpus", Number(u128::from(sum.gpus))),
+        ],
+    )
 }
 
 fn failed(error: Error) -> Refusal {
@@ -306,7 +392,8 @@ fn drain_failure(key: hex_api::BackingKey, why: Refusal) -> Result<Refusal, Refu
                 cause @ (hex_api::LifecycleCause::Pending
                 | hex_api::LifecycleCause::Busy
                 | hex_api::LifecycleCause::Uncertain),
-        } if actual == key => Ok(Refusal::Backing { key, cause }),
+            why,
+        } if actual == key => Ok(Refusal::Backing { key, cause, why }),
         other => Err(other),
     }
 }
@@ -333,7 +420,7 @@ fn encoded_cleanup_failures(failures: Vec<Refusal>) -> Result<Vec<Vec<u8>>, Refu
 /// Bootstrap has no control reply yet; the existing CLI reporter receives the same exact identity
 /// and qualified cause. Fixed hexadecimal widths make its allocation bound independent of input.
 fn cleanup_report(why: &Refusal) -> Result<String, Refusal> {
-    let Refusal::Backing { key, cause } = why else {
+    let Refusal::Backing { key, cause, .. } = why else {
         return Err(capacity::invalid(
             "cleanup diagnostic is not a backing refusal",
         ));
@@ -343,6 +430,7 @@ fn cleanup_report(why: &Refusal) -> Result<String, Refusal> {
         hex_api::LifecycleCause::Busy => "busy",
         hex_api::LifecycleCause::Uncertain => "uncertain",
         hex_api::LifecycleCause::Retired => "retired",
+        hex_api::LifecycleCause::NodeVmEnded => "node-vm-ended",
     };
     let prefix = "retained native backing cleanup pool=";
     let generation = " generation=";
@@ -873,6 +961,8 @@ impl Service {
         let mut local = local;
         // Joint plan step 14 (C2): what the node's learner carried, taken before the answers are applied.
         let learned = charges::learned(&snapshot.reports)?;
+        // Joint plan step 39: the node VMs its answers say hold room, booked before any admission is made.
+        let nodes = charges::node_vms(&snapshot.reports)?;
         capacity::apply(
             snapshot.reports,
             &facts,
@@ -913,6 +1003,7 @@ impl Service {
             )
             .map_err(failed)?,
         );
+        driver.book_nodes(&nodes).map_err(failed)?;
         if let Some(measured) = measured {
             driver.refresh_node(measured).map_err(failed)?;
         }
@@ -925,6 +1016,11 @@ impl Service {
             }
             None => None,
         };
+        // Its node is told what the view's holders have reserved, by a thread of its own, now and at each change of it
+        // and after each refresh (the review's A-10), off the holders' path.
+        if lane.is_some() {
+            tell_reserved(&driver, Arc::clone(&report), id)?;
+        }
         let control_limit =
             control_bound(driver.control_bound().map_err(failed)?, config.peers.len())?;
         let mut senders = BTreeMap::new();
@@ -1018,6 +1114,21 @@ impl Service {
     /// Where the capacity view's lane is bound, where the configuration asks for one.
     pub fn capacity_address(&self) -> Option<std::net::SocketAddr> {
         self.lane.as_ref().map(|lane| lane.endpoint.local_addr())
+    }
+
+    /// Ends this scheduler crash-only where its placement core stops (the review's E-10): `end` is told why, once, as
+    /// the core stops (a record it couldn't write, a record no core wrote), and its shell ends its process with it, so
+    /// the process exits naming the stop and its next start recovers from the records (capacity-view.md CV11), where
+    /// until now it refused every placement for its life.
+    pub fn end_with(&self, end: impl Fn(String) + Send + Sync + 'static) -> Result<(), Refusal> {
+        self.driver
+            .on_stop(Arc::new(move |stop: &peer::Stop| {
+                end(format!(
+                    "its placement core stopped, so the scheduler ends; its next start recovers from its records: \
+                     {stop:?}"
+                ))
+            }))
+            .map_err(failed)
     }
 
     /// Cancels and reaps only this service's authenticated peer children.
@@ -1328,6 +1439,8 @@ impl Service {
             .map_err(|e| Refusal::Broken(e.to_string()))?;
         // Joint plan step 14 (C2): what the node's learner carried, taken before the answers are applied.
         let learned = charges::learned(&snapshot.reports)?;
+        // Joint plan step 39: the node VMs its answers say hold room.
+        let nodes = charges::node_vms(&snapshot.reports)?;
         capacity::apply(
             snapshot.reports,
             &facts,
@@ -1345,6 +1458,9 @@ impl Service {
                 bound: 1,
             })?)
             .map_err(failed)?;
+        // Joint plan step 39: each node VM at its receipt while it is Booting or Ready, released once it is Ended or no
+        // answer names it, before the holdings, which hold a node VM only while it is booked.
+        self.driver.book_nodes(&nodes).map_err(failed)?;
         // Joint plan step 14 (C8): each VM at the holding its node's learner carried, booked against its key.
         let ids = self.driver.running_ids().map_err(failed)?;
         self.driver
@@ -1354,6 +1470,8 @@ impl Service {
             *node = local;
         }
         self.rebudget(&cluster)?;
+        // Its node told again what the view's holders have reserved, which the refresh measured beside (A-10).
+        self.driver.wake_reserved();
         Ok(actions)
     }
 
@@ -1369,16 +1487,7 @@ impl Service {
         let forget = match self.driver.view_forget(holder).map_err(failed)? {
             Ok(released) => {
                 let sum = released.sum;
-                (lane.log)(&format!(
-                    "hex.capacity event=forgotten holder={holder:?} epoch={} count={} cpu_milli={} mem_bytes={} \
-                     disk_bytes={} gpus={}",
-                    released.epoch,
-                    released.count,
-                    sum.cpu_milli,
-                    sum.mem_bytes,
-                    sum.disk_bytes,
-                    sum.gpus
-                ));
+                (lane.log)(&forgotten_line(holder, &released));
                 dto::Forget::Released {
                     holder: holder.to_owned(),
                     epoch: released.epoch,

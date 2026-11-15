@@ -47,7 +47,8 @@ impl PendingReply {
             detail: text.into_bytes(),
         })
     }
-    fn send(&self, connection: BorrowedFd<'_>, until: Instant) -> Result<(), Refusal> {
+    /// Sends the rejection on `connection`, following it: its peer's read, or the connection's end.
+    fn send(&self, connection: BorrowedFd<'_>) -> Result<(), Refusal> {
         rustix::net::sockopt::set_socket_nosigpipe(connection, true)
             .map_err(|error| Refusal::os("protecting retained helper rejection", error))?;
         let bytes = protocol::rejected::encode(VERSION, 0, &self.detail()?)
@@ -57,7 +58,7 @@ impl PendingReply {
             &bytes,
             &[],
             protocol::rejected::MAX_MESSAGE,
-            Some(until),
+            None,
         )
         .map_err(frame::Failure::refusal)
     }
@@ -129,7 +130,7 @@ fn run_owned(
             &ready,
             &[],
             protocol::MAX_MESSAGE,
-            Some(helper.until(None)?),
+            None,
         )
         .map_err(frame::Failure::refusal)?;
         Ok(listener)
@@ -147,7 +148,7 @@ fn run_owned(
             ) {
                 failure.failed(error);
             }
-            if let Err(error) = failure.send(rustix::stdio::stdout(), helper.until(None)?) {
+            if let Err(error) = failure.send(rustix::stdio::stdout()) {
                 failure.failed(error);
             }
             return Err(failure.refusal());
@@ -169,7 +170,7 @@ fn run_owned(
         {
             failure.failed(error);
         }
-        if let Err(error) = failure.send(startup.as_fd(), helper.until(None)?) {
+        if let Err(error) = failure.send(startup.as_fd()) {
             failure.failed(error);
         }
         if publisher.published() {
@@ -202,7 +203,7 @@ fn run_owned(
             if !matches!(same, Ok(true)) {
                 continue;
             }
-            match failure.send(connection.as_fd(), helper.until(None)?) {
+            match failure.send(connection.as_fd()) {
                 Ok(()) => pending = None,
                 Err(error) => failure.failed(error),
             }
@@ -217,7 +218,7 @@ fn run_owned(
             Entry::Command,
         ) {
             let mut failure = PendingReply::new(error);
-            match failure.send(connection.as_fd(), helper.until(None)?) {
+            match failure.send(connection.as_fd()) {
                 Ok(()) => {}
                 Err(error) => {
                     failure.failed(error);
@@ -286,16 +287,13 @@ fn serve(
     };
     rustix::net::sockopt::set_socket_nosigpipe(connection, true)
         .map_err(|error| Refusal::os("protecting helper connection disconnect", error))?;
-    let until = helper.until(None)?;
-    let (bytes, descriptors) = match frame::receive(
-        connection.as_fd(),
-        protocol::timed::MAX_MESSAGE,
-        Some(until),
-    ) {
-        Ok(received) => received,
-        Err(frame::Failure::Closed) if command => return Ok(()),
-        Err(failure) => return Err(failure.refusal()),
-    };
+    // Its client's ask, read as its connection gives it: the ask, or the connection's end (the review's C-9).
+    let (bytes, descriptors) =
+        match frame::receive(connection.as_fd(), protocol::timed::MAX_MESSAGE, None) {
+            Ok(received) => received,
+            Err(frame::Failure::Closed) if command => return Ok(()),
+            Err(failure) => return Err(failure.refusal()),
+        };
     peer(connection, peer_id)?;
     if let Ok((version, id, wanted)) = protocol::census::read_request(&bytes, descriptors.len()) {
         if matches!(entry, Entry::FirstPrepare(_)) {
@@ -315,7 +313,7 @@ fn serve(
             &[],
             protocol::census::message_bound(crate::MAX_BOXES)
                 .map_err(|_| native_allocation(crate::MAX_BOXES))?,
-            Some(until),
+            None,
         )
         .map_err(frame::Failure::refusal);
     }
@@ -344,12 +342,13 @@ fn serve(
             &answer,
             &[],
             protocol::MAX_MESSAGE.max(protocol::rejected::MAX_MESSAGE),
-            Some(until),
+            None,
         )
         .map_err(frame::Failure::refusal);
     }
-    // Joint plan step 14 (2c; ROOT, 2026-11-13): the node asks the slowest stop response this helper's managed CPU
-    // control has seen in its own holds, which it derives its charge window from: none before the first.
+    // Joint plan step 14 (2c; ROOT, 2026-11-13): the node asks the stop response this helper's managed CPU control
+    // estimates from its own holds, cold or not (the review's A-14), which it derives its charge window from: none before
+    // the first.
     if let Ok((version, id)) = protocol::response::read(&bytes, descriptors.len()) {
         if matches!(entry, Entry::FirstPrepare(_)) {
             return Err(super::super::configuration(
@@ -368,13 +367,14 @@ fn serve(
             &answer,
             &[],
             protocol::response::MAX_ANSWER,
-            Some(until),
+            None,
         )
         .map_err(frame::Failure::refusal);
     }
     let (version, id, expires, request) = protocol::timed::read(&bytes, descriptors.len())
         .map_err(|_| super::super::configuration("invalid bounded native request"))?;
-    let until = deadline(expires, helper.config.rpc_budget)?.min(until);
+    // Its work ends no later than its caller's deadline, where it carries one; with none it follows its connection.
+    let until = expires.map(deadline).transpose()?;
     if matches!(entry, Entry::FirstPrepare(_))
         && !matches!(&request, protocol::Request::Prepare { .. })
     {
@@ -406,7 +406,7 @@ fn serve(
                 &bytes,
                 &[],
                 protocol::rejected::MAX_MESSAGE,
-                Some(until),
+                until,
             ) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -446,7 +446,7 @@ fn serve(
         &bytes,
         borrowed,
         protocol::MAX_MESSAGE,
-        Some(until),
+        until,
     )
     .map_err(frame::Failure::refusal)
 }
@@ -507,7 +507,10 @@ fn get(
             })
         })
     {
-        return Err(scope.refusal(boxed.owner()));
+        return Err(scope.uncertain(
+            boxed.owner(),
+            "its attached controller isn't the one its record names",
+        ));
     }
     Ok(boxed)
 }
@@ -526,13 +529,20 @@ fn attached(
     let scope = boxed
         .scope()
         .ok_or_else(|| super::super::configuration("native helper slot has no scope"))?;
-    *scope
-        .notification
-        .lock()
-        .map_err(|_| scope.refusal(boxed.owner()))? = Some(writer);
+    *scope.notification.lock().map_err(|_| {
+        scope.uncertain(
+            boxed.owner(),
+            "its native scope's notification is poisoned as it is attached",
+        )
+    })? = Some(writer);
     // Covers a controller/member that became terminal before the new pipe was attached. This is
     // a notification only; every proxy query still proves the exact same native scope.
-    scope.notify().map_err(|_| scope.refusal(boxed.owner()))?;
+    scope.notify().map_err(|_| {
+        scope.uncertain(
+            boxed.owner(),
+            "its native scope's notification failed as it was attached",
+        )
+    })?;
     let controller = boxed.identity.get().map(|identity| ProcId {
         pid: identity.pid,
         start_ticks: identity.started,
@@ -542,7 +552,12 @@ fn attached(
         .get()
         .map(|vsock| copy_raw(vsock.as_os_str().as_bytes()))
         .transpose()?
-        .ok_or_else(|| scope.refusal(boxed.owner()))?;
+        .ok_or_else(|| {
+            scope.uncertain(
+                boxed.owner(),
+                "its native scope has no vsock to answer its attach with",
+            )
+        })?;
     Ok((
         protocol::Answer::Attached {
             key,
@@ -558,9 +573,9 @@ fn dispatch(
     runtime: &MacRuntime,
     request: &protocol::Request,
     descriptors: Vec<OwnedFd>,
-    until: Instant,
+    until: Option<Instant>,
 ) -> Result<(protocol::Answer, Option<OwnedFd>), Refusal> {
-    if until <= Instant::now() {
+    if until.is_some_and(|until| until <= Instant::now()) {
         return Err(super::super::configuration(
             "native helper request expired before effects",
         ));
@@ -587,10 +602,12 @@ fn dispatch(
                 || record.stage() != hex_core::record::NativeStage::Creating
                 || record.init().is_some()
             {
-                return Err(record.refusal(LifecycleCause::Uncertain));
+                return Err(record.uncertain("its launch isn't a fresh creation of its record"));
             }
             if record.devices().is_empty() != launch.report_scope.is_none() {
-                return Err(record.refusal(LifecycleCause::Uncertain));
+                return Err(
+                    record.uncertain("its launch's report scope doesn't follow its devices")
+                );
             }
             // Exact owner is created once. A retry cannot silently duplicate its VMM. A terminal
             // receipt is retained in this SAME slot for lost-reply/finalize retries, not another map.
@@ -603,7 +620,10 @@ fn dispatch(
                     Ok(boxed) => {
                         boxed
                             .scope()
-                            .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?
+                            .ok_or_else(|| {
+                                record
+                                    .uncertain("its failed preparation's slot has no native scope")
+                            })?
                             .preparation_failed(error)?;
                         attached(&boxed, key.try_clone()?)
                     }
@@ -650,7 +670,12 @@ fn dispatch(
                         .get()
                         .map(|vsock| copy_raw(vsock.as_os_str().as_bytes()))
                         .transpose()?
-                        .ok_or_else(|| scope.refusal(boxed.owner()))?;
+                        .ok_or_else(|| {
+                            scope.uncertain(
+                                boxed.owner(),
+                                "its native scope has no vsock to answer its inspection with",
+                            )
+                        })?;
                     Ok((
                         protocol::Answer::Metadata {
                             key: key.try_clone()?,
@@ -752,7 +777,12 @@ fn census(runtime: &MacRuntime, process: ProcId) -> Result<protocol::census::Cen
             super::super::configuration("a rootless native helper owns an ordinary process slot")
         })?;
         if matches!(
-            *scope.lock().map_err(|_| scope.refusal(owner.as_ref()))?,
+            *scope.lock().map_err(|_| {
+                scope.uncertain(
+                    owner.as_ref(),
+                    "its native scope's phase is poisoned as its helper's census is taken",
+                )
+            })?,
             super::super::Phase::Finalized(_)
         ) {
             continue;
@@ -783,14 +813,21 @@ fn completed(
         let scope = boxed.scope().ok_or_else(|| {
             super::super::configuration("helper completion has ordinary process slot")
         })?;
-        let end = match *scope.lock().map_err(|_| scope.refusal(owner.as_ref()))? {
+        let end = match *scope.lock().map_err(|_| {
+            scope.uncertain(
+                owner.as_ref(),
+                "its native scope's phase is poisoned as its helper's completion is taken",
+            )
+        })? {
             super::super::Phase::Finalized(end) if end.scope == TerminalScope::Released => end,
             _ => return Ok(None),
         };
-        let vsock = scope
-            .vsock
-            .get()
-            .ok_or_else(|| scope.refusal(owner.as_ref()))?;
+        let vsock = scope.vsock.get().ok_or_else(|| {
+            scope.uncertain(
+                owner.as_ref(),
+                "its finalized native scope has no vsock for its helper's completion",
+            )
+        })?;
         owners.push(protocol::completed::Completed {
             key: protocol::Key {
                 owner: owner.try_clone()?,

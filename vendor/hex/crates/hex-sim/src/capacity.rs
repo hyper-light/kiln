@@ -6,6 +6,16 @@
 //! runner for good, whose reservations the person then releases, and has the person release a runner
 //! wrongly: one that is away with work still running (CV6), which its next sync adopts (CV5).
 //!
+//! Every rate is a record's (ROOT's rulings of 2026-11-14; [`rates`]): kiln's runs arrive as they did at the machine
+//! whose room this is, Hex's boxes as the fleet day's `oci` boxes did at each of its `oci` hosts, each run and box ends
+//! at one over its recorded length, and links drop, runners crash and outages end as kiln's records of its runners'
+//! links say. A step is one event of that continuous-time chain, each kind as likely as its rate in the state the
+//! machine is in; a fault no record times strikes once a run ([`Fault`]). What the code does on its own trigger, it
+//! does there: a runner dials again as soon as its link can open, the keeper's hints go out after each message it
+//! hears and each command of its host, and Hex's node measures its room as it is asked to admit. In the bounded suite's
+//! time ([`Time::Filled`]) each run's and box's length is stretched by the one factor at which the recorded mean demand
+//! fills the room, every other ratio as recorded.
+//!
 //! After every step the work actually running fits the room but for what such a wrong release hid from the
 //! keeper and its sync then adopted, past the room, which the keeper's view then says; and every running run
 //! is in the keeper's books whenever the keeper is up, but one wrongly released, until its runner's next
@@ -16,13 +26,13 @@
 //! The room is measured, as the node measures it: every CPU, and the memory that is free or Hex's own boxes', which
 //! lacks what each runner's process and its runs use, a runner's runs held besides in its reservations (counted twice,
 //! CV12 being withdrawn: under-admission, never more than the machine holds). Each run uses memory within its
-//! reservation, moved by the nemesis between samples and, both ways, several times, on either side of the free memory's
-//! read in a sample's window. After every step the keeper decides in no more room than its host last measured: nothing
-//! is credited.
+//! reservation, moving at every step, a sample's window among them. After every step the keeper decides in no more
+//! room than its host last measured: nothing is credited.
 //!
 //! Pure, as the rest of hex-sim: one seed decides every step.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::OnceLock;
 
 use hex_api::capacity::{
     self, Amounts, Budget, Event, Held, Holder, Keeper, Out, ReservationId, Stop, ToHolder,
@@ -103,6 +113,8 @@ pub struct Report {
     pub runs_granted: u64,
     pub runs_refused: u64,
     pub runs_unanswered: u64,
+    /// Reserves a runner let go of before their answers came (CV5: the holder's own release of a waiting reserve).
+    pub runs_let_go: u64,
     pub link_drops: u64,
     pub keeper_crashes: u64,
     pub crashes_at_write: u64,
@@ -204,9 +216,9 @@ struct Runner {
     asked: BTreeMap<ReservationId, Amounts>,
     /// Runs running, started on a grant: the runner's own records, which its next process reads.
     running: BTreeMap<ReservationId, Amounts>,
+    /// Each run's recorded length in seconds, asked or running ([`Leg::runs_for`]).
+    lengths: BTreeMap<ReservationId, f64>,
     link: Link,
-    /// Whether its runs outlive its process.
-    survive: bool,
     /// Gone for good.
     retired: bool,
     /// Gone for good, and the person hasn't released its reservations yet.
@@ -236,6 +248,7 @@ impl Runner {
         self.hidden.remove(id);
         self.adopted.remove(id);
         self.uses.remove(id);
+        self.lengths.remove(id);
     }
 
     /// Every run of its ended with its process.
@@ -244,88 +257,389 @@ impl Runner {
         self.hidden.clear();
         self.adopted.clear();
         self.uses.clear();
+        self.lengths.clear();
+    }
+
+    /// A run asked for has no answer coming: it won't run, but where the planted runner started it anyway.
+    fn unasked(&mut self, id: &ReservationId) {
+        self.asked.remove(id);
+        if !self.running.contains_key(id) {
+            self.lengths.remove(id);
+        }
+    }
+
+    /// No asked run has an answer coming: its process ended.
+    fn all_unasked(&mut self) {
+        let asked: Vec<ReservationId> = self.asked.keys().copied().collect();
+        for id in asked {
+            self.unasked(&id);
+        }
     }
 }
 
-/// The nemesis's mix: each event and its weight among them all. A test generator's parameters, not a tuning
-/// of the system under test: delivery dominates so links drain between faults.
-const MIX: [(Kind, u64); 20] = [
-    (Kind::Deliver, 420),
-    (Kind::HexAdmit, 70),
-    (Kind::HexEnd, 50),
-    (Kind::Ask, 110),
-    (Kind::EndRun, 70),
-    (Kind::Hints, 40),
-    (Kind::Drop, 25),
-    (Kind::Connect, 60),
-    (Kind::Partition, 8),
-    (Kind::Heal, 15),
-    (Kind::CrashKeeper, 8),
-    (Kind::CrashAtWrite, 8),
-    (Kind::RestartKeeper, 40),
-    (Kind::CrashRunner, 10),
-    (Kind::RestartRunner, 40),
-    (Kind::RanOut, 15),
-    (Kind::Retire, 1),
-    (Kind::ForgetAway, 15),
-    (Kind::Use, 40),
-    (Kind::Sample, 30),
-];
-
-/// The most times a run's use moves on each side of the free memory's read in a sample's window, each move anywhere from
-/// none to its reservation: both ways, as often, so a use may fall and rise again while free memory is read (any
-/// movement, which no credit from the OS's reads survives: CV12). A test generator's parameter.
-const MOVES_IN_WINDOW: u64 = 3;
-
+/// The chain's events, each at the rate the records give it in the state the machine is in ([`World::rates_now`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    /// A word on a link is delivered.
     Deliver,
+    /// Hex's node is asked to admit a box of its own (`Submit`).
     HexAdmit,
+    /// One of Hex's own boxes ends.
     HexEnd,
+    /// kiln asks a runner for a run.
     Ask,
+    /// A run ends.
     EndRun,
-    Hints,
+    /// A link ends with what was on it; its runner dials again at once.
     Drop,
-    Connect,
+    /// A link ends with what was on it and is held down: an outage.
     Partition,
+    /// An outage ends.
     Heal,
-    CrashKeeper,
-    CrashAtWrite,
-    RestartKeeper,
+    /// A runner's process ends.
     CrashRunner,
+    /// A runner's process starts again.
     RestartRunner,
-    RanOut,
-    Retire,
-    ForgetAway,
-    /// A run's use moves.
-    Use,
-    /// The host measures its room.
-    Sample,
+    /// The keeper's process starts again.
+    RestartKeeper,
 }
 
-/// The machine's room: sixteen CPUs and 64 GiB, the shape of the recorded day's larger hosts (H10).
+/// The faults no record times (ROOT, 2026-11-14 (a): the least at which every fault happens in every seed's run): each
+/// strikes once a run, at a step drawn for it, or at the first step after where it can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// The keeper's process ends between messages.
+    CrashKeeper,
+    /// The keeper's process ends at its next write, which is lost.
+    CrashBeforeWrite,
+    /// The keeper's process ends at its next write, which lands.
+    CrashAfterWrite,
+    /// A runner lets go of a reserve before its answer: its run is no longer wanted (CV5), the one way a reserve is
+    /// abandoned with its link up, no wait of a holder's ending at a time (CV6; the review's E-8).
+    LetGo,
+    /// The person releases a runner away with work still running (CV6's mistake).
+    ForgetAway,
+    /// A runner leaves for good, and the person releases what it held: a live runner, never the last.
+    Retire,
+}
+
+const FAULTS: [Fault; 6] = [
+    Fault::CrashKeeper,
+    Fault::CrashBeforeWrite,
+    Fault::CrashAfterWrite,
+    Fault::LetGo,
+    Fault::ForgetAway,
+    Fault::Retire,
+];
+
+/// How the runs' lengths stand to the recorded rates (ROOT, 2026-11-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Time {
+    /// ROOT's (ii), the bounded suite's: each run's and box's length stretched by the factor at which the recorded mean
+    /// demand fills the room ([`Rates::fill`]), the regime of contention and refusals; every other ratio as recorded.
+    Filled,
+    /// ROOT's (i), the record sweep's mode, reported and not gated: every rate and length as recorded.
+    Recorded,
+}
+
+/// A case the nemesis runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Case {
+    /// kiln's runners on the machine.
+    pub runners: usize,
+    /// Whether their runs outlive their processes: kiln states it for neither its runs nor its CI legs (ROOT,
+    /// 2026-11-14), so each outcome is its own case.
+    pub survive: bool,
+    pub time: Time,
+}
+
+/// The machine's room: the recorded fleet's (H10's `bench/sched/huawei-r5-day30.fleet.trace`, from kiln's runner facts
+/// of 2026-11-05) smallest by memory of the hosts where Hex's own boxes and kiln's runs share one room, those that run
+/// Hex's `oci` class: fedora's 32 hardware threads and 62.5 GiB, no GPU, where the two contend for the least room
+/// (`the_machine_is_the_recorded_fleets_smallest_shared_host` reads it from the trace).
 pub const ROOM: Amounts = Amounts {
-    cpu_milli: 16_000,
-    mem_bytes: 64 << 30,
+    cpu_milli: 32_000,
+    mem_bytes: 67_128_643_584,
     disk_bytes: 0,
     gpus: 0,
 };
 
-/// The most reservations one runner holds: every run of the smallest charge the generator asks, a
-/// quarter CPU, fits the room's sixteen CPUs 64 times.
-pub const RESERVATIONS: usize = 64;
+/// kiln's own CI as recorded: fourteen days of its legs, each one's need what kiln measured it using, its mean cores in
+/// milli-cores and its peak RSS in bytes, and its length (`bench/sched/kiln_workload.md`): the runs kiln's runners
+/// ask (ROOT's ruling of 2026-11-14: drawn as recorded).
+const KILN_LEGS: &str = include_str!("../../../bench/sched/kiln-ci-20261022-20261105.trace");
 
-/// A runner's name, at most this many bytes.
-const NAME_BYTES: usize = 32;
+/// The recorded fleet's day (H10), whose `oci` legs are the boxes Hex places of its own (ROOT, 2026-11-14), on the room
+/// [`ROOM`] is read from.
+const FLEET: &str = include_str!("../../../bench/sched/huawei-r5-day30.fleet.trace");
+
+/// The resolution of a recorded leg's need: the trace's unit of CPU, a milli-core, to which `kiln_trace.py` rounds each
+/// mean, and the export's of memory, a 4 KiB page, of which every peak RSS kiln measured is a whole number
+/// (`a_recorded_legs_need_is_whole_units_of_its_resolution`). A leg recorded below it, 0, used between nothing and one
+/// unit: it is drawn as one unit, the bound above its true need (ROOT, 2026-11-14), so none is dropped and none made 0.
+const RESOLUTION: Amounts = Amounts {
+    cpu_milli: 1,
+    mem_bytes: 4096,
+    disk_bytes: 0,
+    gpus: 0,
+};
+
+/// The legs kiln ran on the machine whose room this is, fedora, in its export's fourteen days: 355 as
+/// fedora.attlocal.net up to 2026-10-26, then 341 as kiln-a094a12d.attlocal.net from 2026-10-27, the same machine
+/// renamed (`fedora_ran_696_of_the_exports_legs` counts them in the export).
+const FEDORA_LEGS: u32 = 696;
+
+/// The export's window, in seconds: runs created from 2026-10-22T00:00:00Z up to 2026-11-05T00:00:00Z (its header).
+const KILN_WINDOW: f64 = 1_209_600.0;
+
+/// The fleet trace's window, in seconds: Huawei Cloud region 5's day 30 (its header).
+const FLEET_DAY: f64 = 86_400.0;
+
+/// kiln's records of its runners' links to its server, read 2026-11-14T04:36Z through kiln's `runners`: each link's
+/// drops while up (`topo.drops`), its time up (`topo.up_ms`) and its outages' total (`topo.path.outage_ms`), for
+/// adas-mac-studio.local, adas-macbook-pro-2.local, adas-mac-studio-3.local, adas-mac-studio.local-2 and adacachy2, every
+/// link with a drop (adacachy's has none, so no outage of its is a drop's). kiln doesn't tell a crash, a restart and a
+/// network's drop apart: a drop is a drop (ROOT, 2026-11-14).
+const KILN_LINKS: [(u64, u64, u64); 5] = [
+    (178, 190_790_534, 114_855),
+    (78, 135_604_022, 75_192),
+    (67, 190_345_527, 113_336),
+    (46, 229_313_558, 41_087),
+    (8, 133_839_471, 1_078_559),
+];
+
+/// A recorded leg: what it needed, and how long it ran, in seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Leg {
+    need: Amounts,
+    runs_for: f64,
+}
+
+/// One leg from its trace row, `leg,<arrival ns>,<runs for ns>,<cpu milli>,<memory bytes>,...`: `None` for any other
+/// row.
+fn leg(row: &str) -> Option<Leg> {
+    let mut fields = row.trim().split(',');
+    if fields.next()? != "leg" {
+        return None;
+    }
+    let _arrives: u64 = fields.next()?.parse().ok()?;
+    let runs_for: u64 = fields.next()?.parse().ok()?;
+    let cpu_milli = fields.next()?.parse().ok()?;
+    let mem_bytes = fields.next()?.parse().ok()?;
+    Some(Leg {
+        need: Amounts {
+            cpu_milli,
+            mem_bytes,
+            ..Amounts::ZERO
+        },
+        // A trace's times are nanoseconds.
+        runs_for: runs_for as f64 / 1e9,
+    })
+}
+
+/// kiln's legs as its runners ask them ([`KILN_LEGS`]), none below its resolution.
+fn kiln_legs() -> &'static [Leg] {
+    static LEGS: OnceLock<Vec<Leg>> = OnceLock::new();
+    LEGS.get_or_init(|| {
+        KILN_LEGS
+            .lines()
+            .filter_map(leg)
+            .map(|leg| Leg {
+                need: Amounts {
+                    cpu_milli: leg.need.cpu_milli.max(RESOLUTION.cpu_milli),
+                    mem_bytes: leg.need.mem_bytes.max(RESOLUTION.mem_bytes),
+                    ..leg.need
+                },
+                ..leg
+            })
+            .collect()
+    })
+}
+
+/// Hex's own boxes, each a recorded `oci` leg ([`FLEET`]).
+fn oci_legs() -> &'static [Leg] {
+    static LEGS: OnceLock<Vec<Leg>> = OnceLock::new();
+    LEGS.get_or_init(|| {
+        FLEET
+            .lines()
+            .filter(|row| row.trim().ends_with(",oci"))
+            .filter_map(leg)
+            .collect()
+    })
+}
+
+/// What kiln's runs ask, one after another in recorded order ([`kiln_legs`], none below its resolution): a holder's runs
+/// in the capacity view's tests on real machines (hex-cli's `capacity_view`; ROOT's ruling 7, 2026-11-14).
+pub fn kiln_needs() -> impl Iterator<Item = Amounts> {
+    kiln_legs().iter().map(|leg| leg.need)
+}
+
+/// What Hex's own boxes ask, one after another in recorded order ([`oci_legs`]): Hex's boxes in those tests, as in this
+/// simulator's (ROOT's rulings 2 and 7, 2026-11-14).
+pub fn oci_needs() -> impl Iterator<Item = Amounts> {
+    oci_legs().iter().map(|leg| leg.need)
+}
+
+/// The most reservations one runner holds (CV8): runs of the smallest charge recorded ([`kiln_legs`]), as many as the
+/// room holds in its dimension that holds fewest, but never more than one sync carries (`hex_core::capacity::most_held`):
+/// the protocol's own bound, which wins (ROOT, 2026-11-14; `a_runners_reservation_bound_is_the_protocols_own`).
+pub fn reservations() -> Result<usize, Violation> {
+    let smallest = kiln_legs()
+        .iter()
+        .map(|leg| leg.need)
+        .reduce(Amounts::min)
+        .ok_or_else(|| stopped("no recorded leg"))?;
+    let fits = ROOM
+        .cpu_milli
+        .checked_div(smallest.cpu_milli)
+        .zip(ROOM.mem_bytes.checked_div(smallest.mem_bytes))
+        .map(|(cpu, mem)| cpu.min(mem))
+        .ok_or_else(|| stopped("a recorded charge of nothing"))?;
+    let most = hex_core::capacity::most_held().map_err(stopped)?;
+    Ok(usize::try_from(fits).map_or(most, |fits| fits.min(most)))
+}
+
+/// What the nemesis's chain runs at, per second of recorded time, each from a record (ROOT, 2026-11-14).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rates {
+    /// kiln's runs arriving at the machine: fedora's legs over the export's window ([`FEDORA_LEGS`]).
+    pub ask: f64,
+    /// Hex's own boxes arriving at it: the fleet day's `oci` legs over its `oci` hosts and the day.
+    pub admit: f64,
+    /// A link's drops while it is up, the fleet's ([`KILN_LINKS`]): the rate of each fault a record times, a link's end
+    /// (a drop, a partition) and a process's (a runner's crash), each cause at the whole rate since kiln can't tell
+    /// them apart (ROOT, 2026-11-14).
+    pub drop: f64,
+    /// An outage's end, one over the fleet's mean outage ([`KILN_LINKS`]): a partition's heal, a runner's or the keeper's
+    /// start again.
+    pub heal: f64,
+    /// The factor each run's and box's length is stretched by for the recorded mean demand to fill the room
+    /// ([`Time::Filled`]): one over the larger, of CPU's and memory's, of ρ = (`ask` × the mean of length × need over
+    /// kiln's legs + `admit` × the same over Hex's boxes) ÷ the room, the mean held being the arrival rate times the mean
+    /// of length times need (Little's law; `the_bounded_time_is_where_the_recorded_demand_fills_the_room`).
+    pub fill: f64,
+}
+
+/// The chain's rates ([`Rates`]), read from the records once.
+pub fn rates() -> Result<Rates, Violation> {
+    static RATES: OnceLock<Result<Rates, String>> = OnceLock::new();
+    RATES
+        .get_or_init(recorded)
+        .clone()
+        .map_err(Violation::Stopped)
+}
+
+/// A count as a rate's numerator.
+fn counted(n: usize) -> Result<f64, String> {
+    u32::try_from(n)
+        .map(f64::from)
+        .map_err(|_| format!("{n} is past a count a rate is made of"))
+}
+
+/// The mean of length × `of` over `legs`, in seconds × units.
+fn held_per_arrival(legs: &[Leg], of: fn(&Amounts) -> u64) -> Result<f64, String> {
+    let total: f64 = legs
+        .iter()
+        .map(|leg| leg.runs_for * of(&leg.need) as f64)
+        .sum();
+    Ok(total / counted(legs.len())?)
+}
+
+fn recorded() -> Result<Rates, String> {
+    let fleet = crate::replay::parse(FLEET, &crate::replay::Limits::default())
+        .map_err(|e| format!("the fleet trace: {e}"))?;
+    let hosts = fleet
+        .nodes
+        .iter()
+        .filter(|n| n.classes.has(crate::model::Class::Oci))
+        .count();
+    let ask = f64::from(FEDORA_LEGS) / KILN_WINDOW;
+    let admit = counted(oci_legs().len())? / (counted(hosts)? * FLEET_DAY);
+    let (drops, up_ms, outage_ms) =
+        KILN_LINKS
+            .iter()
+            .fold((0u64, 0u64, 0u64), |(drops, up, out), (d, u, o)| {
+                (
+                    drops.saturating_add(*d),
+                    up.saturating_add(*u),
+                    out.saturating_add(*o),
+                )
+            });
+    let drop = drops as f64 / (up_ms as f64 / 1e3);
+    let heal = drops as f64 / (outage_ms as f64 / 1e3);
+    let rho = |of: fn(&Amounts) -> u64, room: u64| -> Result<f64, String> {
+        Ok(
+            (ask * held_per_arrival(kiln_legs(), of)? + admit * held_per_arrival(oci_legs(), of)?)
+                / room as f64,
+        )
+    };
+    let fill =
+        1.0 / rho(|a| a.cpu_milli, ROOM.cpu_milli)?.max(rho(|a| a.mem_bytes, ROOM.mem_bytes)?);
+    let rates = Rates {
+        ask,
+        admit,
+        drop,
+        heal,
+        fill,
+    };
+    let all = [ask, admit, drop, heal, fill];
+    if all.iter().all(|r| r.is_finite() && *r > 0.0) {
+        Ok(rates)
+    } else {
+        Err(format!("a record gives no rate: {rates:?}"))
+    }
+}
+
+/// The deliveries one event of `kind` causes on a quiet machine whose `runners` are all synced, each the protocol's own:
+/// a reserve and its answer; a release and its answer; a hint to each other runner its change owes, or to every one
+/// for its host's (a box admitted or ended); and for a link's or a runner's end, the redial it causes, a hello, the
+/// welcome, the sync and its answer, at once for a drop and as the outage ends for the others, so an outage's end, the
+/// cause's, says none of its own. Delivery's rate is the sum over the kinds of each one's rate times these: the least at
+/// which the links drain (ROOT, 2026-11-14; `each_kinds_deliveries_are_the_protocols_own` counts them). The keeper's
+/// crash, which no record times, strikes once a run ([`Fault`]): its runners' redials as it starts again drain at that
+/// rate too.
+fn deliveries(kind: Kind, runners: usize) -> f64 {
+    let all = u32::try_from(runners).map_or(f64::MAX, f64::from);
+    let others = (all - 1.0).max(0.0);
+    match kind {
+        Kind::Ask | Kind::EndRun => 2.0 + others,
+        Kind::HexAdmit | Kind::HexEnd => all,
+        Kind::Drop | Kind::Partition | Kind::CrashRunner => 4.0,
+        Kind::Heal | Kind::RestartRunner | Kind::RestartKeeper | Kind::Deliver => 0.0,
+    }
+}
+
+/// Hex's admission under way: a `Submit` (`Service::command`), its refresh of the room first (`refresh`, the code's own
+/// trigger for measuring it: ROOT's (f)), its admission decided in that room, then the hints it owes. Its reads are a
+/// step apart, so the runs' uses move between them: of each runner's work (as the planted host makes it), of free
+/// memory, and the room given the keeper.
+#[derive(Debug)]
+struct Command {
+    leg: Leg,
+    before: Vec<u64>,
+    room: Option<Amounts>,
+    moved: bool,
+}
+
+/// A running run, by its runner's index and its id, with the hazard of its end ([`World::run_ends`]).
+type RunEnd = ((usize, ReservationId), f64);
 
 /// One machine under the nemesis (module docs).
 #[derive(Debug)]
 pub struct World {
     rng: Rng,
     budget: Budget,
+    case: Case,
+    rates: Rates,
+    /// The factor each run's and box's recorded length is stretched by: [`Rates::fill`] in [`Time::Filled`], else 1.
+    stretch: f64,
+    /// Hex's admission under way ([`World::command`]).
+    command: Option<Command>,
+    /// The faults no record times, each with the step it strikes at or after ([`Fault`]).
+    due: Vec<(u64, Fault)>,
     disk: Disk,
     keeper: Option<Keeper>,
-    boxes: BTreeMap<u64, Amounts>,
+    boxes: BTreeMap<u64, Leg>,
     next_box: u64,
     runners: Vec<Runner>,
     /// The room as the host last measured it: the most the keeper decides in (CV12, withdrawn).
@@ -334,20 +648,16 @@ pub struct World {
     report: Report,
 }
 
-/// A runner process's own memory: a CI runner agent's resident set, 64 MiB to 1 GiB. A test generator's
-/// parameter, as the charges are.
+/// A runner process's own memory: OWED. No record of a kiln runner agent's resident set exists; ROOT measures them on
+/// the fleet (2026-11-14), and until then this, 64 MiB to 1 GiB, is the generator's old picked range, chosen anew by
+/// nothing.
 fn own(rng: &mut Rng) -> u64 {
     rng.range(1, 16).saturating_mul(64 << 20)
 }
 
-/// Runs `steps` steps of seed `seed` with `runners` runners, then settles.
-pub fn run(
-    seed: u64,
-    runners: usize,
-    steps: u64,
-    mutant: Option<Mutant>,
-) -> Result<Report, Violation> {
-    let mut world = World::new(seed, runners, mutant)?;
+/// Runs `steps` steps of seed `seed` in `case`, then settles.
+pub fn run(seed: u64, case: Case, steps: u64, mutant: Option<Mutant>) -> Result<Report, Violation> {
+    let mut world = World::new(seed, case, steps, mutant)?;
     for _ in 0..steps {
         world.step()?;
     }
@@ -371,29 +681,58 @@ fn held(map: &BTreeMap<ReservationId, Amounts>) -> Vec<Held> {
         .collect()
 }
 
+/// The one of `weights` a roll in `[0, total)` lands in, by their order: the last with weight where rounding leaves it
+/// past them all.
+fn landed<T: Copy>(weights: &[(T, f64)], roll: f64) -> Option<T> {
+    let mut left = roll;
+    let mut last = None;
+    for (item, weight) in weights {
+        if *weight <= 0.0 {
+            continue;
+        }
+        last = Some(*item);
+        if left < *weight {
+            break;
+        }
+        left -= weight;
+    }
+    last
+}
+
 impl World {
-    pub fn new(seed: u64, runners: usize, mutant: Option<Mutant>) -> Result<Self, Violation> {
+    /// A machine in `case` for a run of `steps` steps, the steps its faults no record times strike at drawn from them.
+    pub fn new(
+        seed: u64,
+        case: Case,
+        steps: u64,
+        mutant: Option<Mutant>,
+    ) -> Result<Self, Violation> {
+        let rates = rates()?;
         let mut rng = Rng::new(seed);
+        let names: Vec<String> = (0..case.runners)
+            .map(|n| format!("kiln-runner-{n}"))
+            .collect();
+        // The keeper's bound on a holder's name (CV8): the longest its runners say in their hellos.
+        let name_bytes = names.iter().map(String::len).max().unwrap_or(0);
         let budget = Budget {
-            holders: runners,
-            reservations: RESERVATIONS,
-            name_bytes: NAME_BYTES,
+            holders: case.runners,
+            reservations: reservations()?,
+            name_bytes,
         };
         let mut disk = Disk::default();
         let keeper = Keeper::boot(budget, &mut disk).map_err(stopped)?;
         let mut all = Vec::new();
-        for n in 0..runners {
-            let name = format!("kiln-runner-{n}");
-            let survive = rng.chance(500);
-            let holder = Holder::start(name.clone(), 1, RESERVATIONS, &[]).map_err(stopped)?;
+        for name in names {
+            let holder =
+                Holder::start(name.clone(), 1, budget.reservations, &[]).map_err(stopped)?;
             all.push(Runner {
                 name,
                 epoch: 1,
                 holder: Some(holder),
                 asked: BTreeMap::new(),
                 running: BTreeMap::new(),
+                lengths: BTreeMap::new(),
                 link: Link::default(),
-                survive,
                 retired: false,
                 unforgotten: false,
                 hidden: BTreeMap::new(),
@@ -402,9 +741,22 @@ impl World {
                 uses: BTreeMap::new(),
             });
         }
+        let due = FAULTS
+            .iter()
+            .map(|fault| (rng.range(0, steps.saturating_sub(1)), *fault))
+            .collect();
+        let stretch = match case.time {
+            Time::Filled => rates.fill,
+            Time::Recorded => 1.0,
+        };
         let mut world = Self {
             rng,
             budget,
+            case,
+            rates,
+            stretch,
+            command: None,
+            due,
             disk,
             keeper: Some(keeper),
             boxes: BTreeMap::new(),
@@ -431,16 +783,15 @@ impl World {
 
     /// What Hex's own boxes hold.
     fn local(&self) -> Result<Amounts, Violation> {
-        sum(self.boxes.values()).ok_or_else(|| stopped("Hex's boxes overflow a sum"))
+        sum(self.boxes.values().map(|leg| &leg.need))
+            .ok_or_else(|| stopped("Hex's boxes overflow a sum"))
     }
 
-    /// A charge as the runners and Hex ask: a quarter CPU to four, 256 MiB to 8 GiB.
-    fn charge(&mut self) -> Amounts {
-        Amounts {
-            cpu_milli: self.rng.range(1, 16).saturating_mul(250),
-            mem_bytes: self.rng.range(1, 32).saturating_mul(256 << 20),
-            ..Amounts::ZERO
-        }
+    /// A leg drawn from `recorded`: one of them, each as likely.
+    fn draw(&mut self, recorded: &[Leg]) -> Result<Leg, Violation> {
+        self.pick(recorded.len())
+            .and_then(|at| recorded.get(at).copied())
+            .ok_or_else(|| stopped("no recorded leg"))
     }
 
     fn pick(&mut self, len: usize) -> Option<usize> {
@@ -448,62 +799,255 @@ impl World {
         usize::try_from(self.rng.range(0, last)).ok()
     }
 
-    fn kind(&mut self) -> Kind {
-        let total = MIX.iter().map(|(_, w)| *w).fold(0u64, u64::saturating_add);
-        let mut roll = self.rng.range(0, total.saturating_sub(1));
-        for (kind, weight) in MIX {
-            if roll < weight {
-                return kind;
-            }
-            roll = roll.saturating_sub(weight);
-        }
-        Kind::Deliver
+    /// One of the runners `which` holds for, each as likely.
+    fn pick_runner(&mut self, which: impl Fn(&Runner) -> bool) -> Option<usize> {
+        let eligible: Vec<usize> = (0..self.runners.len())
+            .filter(|n| self.runners.get(*n).is_some_and(&which))
+            .collect();
+        let at = self.pick(eligible.len())?;
+        eligible.get(at).copied()
     }
 
-    /// One step of the nemesis, then the checks.
+    /// A draw uniform in `[0, 1)`: the top 53 bits of the generator's next, a double's whole precision.
+    fn unit(&mut self) -> f64 {
+        self.rng.next_u64().checked_shr(11).unwrap_or(0) as f64 / 9_007_199_254_740_992.0
+    }
+
+    /// One step of the nemesis, then the checks: every run's use moves; Hex's admission under way takes its next
+    /// phase; a fault no record times strikes if its step has come and it can, else the chain's next event; the person
+    /// releases what a retired runner held; every runner that can dials again; then the checks.
     pub fn step(&mut self) -> Result<(), Violation> {
         self.report.steps = self.report.steps.saturating_add(1);
-        let runner = self.pick(self.runners.len());
-        match self.kind() {
-            Kind::Deliver => self.deliver_any()?,
-            Kind::HexAdmit => self.hex_admit()?,
-            Kind::HexEnd => self.hex_end(),
-            Kind::Ask => self.ask(runner),
-            Kind::EndRun => self.end_run(runner),
-            Kind::Hints => self.hints()?,
-            Kind::Drop => self.drop_link(runner)?,
-            Kind::Connect => self.connect(runner),
+        self.move_uses();
+        self.command()?;
+        match self.due_now() {
+            Some(fault) => self.strike(fault)?,
+            None => self.event()?,
+        }
+        self.forget_retired()?;
+        self.redial();
+        self.check()
+    }
+
+    /// Each running run's length, the hazard of its end: one over its recorded length stretched.
+    fn hazard(&self, length: f64) -> Result<f64, Violation> {
+        let hazard = 1.0 / (self.stretch * length);
+        if hazard.is_finite() && hazard > 0.0 {
+            Ok(hazard)
+        } else {
+            Err(stopped("a run of no recorded length"))
+        }
+    }
+
+    /// Every running run, with its runner and the hazard of its end.
+    fn run_ends(&self) -> Result<Vec<RunEnd>, Violation> {
+        let mut ends = Vec::new();
+        for (n, r) in self.runners.iter().enumerate() {
+            for id in r.running.keys() {
+                let length = r
+                    .lengths
+                    .get(id)
+                    .copied()
+                    .ok_or_else(|| stopped("a run of no recorded length"))?;
+                ends.push(((n, *id), self.hazard(length)?));
+            }
+        }
+        Ok(ends)
+    }
+
+    /// Every box of Hex's, with the hazard of its end.
+    fn box_ends(&self) -> Result<Vec<(u64, f64)>, Violation> {
+        self.boxes
+            .iter()
+            .map(|(key, leg)| Ok((*key, self.hazard(leg.runs_for)?)))
+            .collect()
+    }
+
+    /// Each kind's rate now, per second of recorded time ([`Rates`]): the arrivals' as recorded; each end's the sum of
+    /// its runs' or boxes' hazards; each fault's the drop rate for each link up or process running it can strike; each
+    /// outage's end one over the mean outage for each it can end; and delivery's the least at which the links drain
+    /// ([`deliveries`]). A runner retired is in none.
+    fn rates_now(&self) -> Result<[(Kind, f64); 11], Violation> {
+        let recorded = self.rates;
+        let count = |which: fn(&Runner) -> bool| {
+            let n = self
+                .runners
+                .iter()
+                .filter(|r| !r.retired && which(r))
+                .count();
+            u32::try_from(n).map_or(f64::MAX, f64::from)
+        };
+        let up = count(|r| r.link.up);
+        let running = count(|r| r.holder.is_some());
+        let down = count(|r| r.holder.is_none());
+        let partitioned = count(|r| r.link.partitioned);
+        let admit = if self.keeper.is_some() && self.command.is_none() {
+            recorded.admit
+        } else {
+            0.0
+        };
+        let keeper_down = if self.keeper.is_none() {
+            recorded.heal
+        } else {
+            0.0
+        };
+        let mut rates = [
+            (Kind::Ask, recorded.ask),
+            (Kind::HexAdmit, admit),
+            (Kind::EndRun, self.run_ends()?.iter().map(|(_, h)| h).sum()),
+            (Kind::HexEnd, self.box_ends()?.iter().map(|(_, h)| h).sum()),
+            (Kind::Drop, recorded.drop * up),
+            (Kind::Partition, recorded.drop * up),
+            (Kind::CrashRunner, recorded.drop * running),
+            (Kind::Heal, recorded.heal * partitioned),
+            (Kind::RestartRunner, recorded.heal * down),
+            (Kind::RestartKeeper, keeper_down),
+            (Kind::Deliver, 0.0),
+        ];
+        let deliver = rates
+            .iter()
+            .map(|(kind, rate)| rate * deliveries(*kind, self.runners.len()))
+            .sum();
+        if let Some(last) = rates.last_mut() {
+            *last = (Kind::Deliver, deliver);
+        }
+        Ok(rates)
+    }
+
+    /// The chain's next event, each kind as likely as its rate now: the direct method (D. T. Gillespie, "Exact
+    /// stochastic simulation of coupled chemical reactions", J. Phys. Chem. 81(25), 1977).
+    fn event(&mut self) -> Result<(), Violation> {
+        let rates = self.rates_now()?;
+        let total: f64 = rates.iter().map(|(_, rate)| rate).sum();
+        let roll = self.unit() * total;
+        let Some(kind) = landed(&rates, roll) else {
+            return Ok(());
+        };
+        match kind {
+            Kind::Deliver => self.deliver_any(),
+            Kind::HexAdmit => self.hex_admit(),
+            Kind::HexEnd => {
+                let ends = self.box_ends()?;
+                let total = ends.iter().map(|(_, h)| h).sum::<f64>();
+                let roll = self.unit() * total;
+                match landed(&ends, roll) {
+                    Some(key) => self.hex_end(key),
+                    None => Ok(()),
+                }
+            }
+            Kind::Ask => {
+                let runner = self.pick_runner(|r| !r.retired);
+                self.ask(runner)
+            }
+            Kind::EndRun => {
+                let ends = self.run_ends()?;
+                let total = ends.iter().map(|(_, h)| h).sum::<f64>();
+                let roll = self.unit() * total;
+                if let Some((n, id)) = landed(&ends, roll) {
+                    self.end_run(n, id);
+                }
+                Ok(())
+            }
+            Kind::Drop => {
+                let runner = self.pick_runner(|r| !r.retired && r.link.up);
+                self.drop_link(runner)
+            }
             Kind::Partition => {
+                let runner = self.pick_runner(|r| !r.retired && r.link.up);
                 self.drop_link(runner)?;
                 if let Some(r) = runner.and_then(|r| self.runners.get_mut(r)) {
                     r.link.partitioned = true;
                 }
+                Ok(())
             }
             Kind::Heal => {
+                let runner = self.pick_runner(|r| !r.retired && r.link.partitioned);
                 if let Some(r) = runner.and_then(|r| self.runners.get_mut(r)) {
                     r.link.partitioned = false;
                 }
+                Ok(())
             }
-            Kind::CrashKeeper => self.crash_keeper(false),
-            Kind::CrashAtWrite => {
-                if self.keeper.is_some() && self.disk.crash.is_none() {
-                    let at = self.disk.writes.saturating_add(self.rng.range(0, 2));
-                    self.disk.crash = Some((at, self.rng.chance(500)));
-                }
+            Kind::CrashRunner => {
+                let runner = self.pick_runner(|r| !r.retired && r.holder.is_some());
+                self.crash_runner(runner)
             }
-            Kind::RestartKeeper => self.restart_keeper()?,
-            Kind::CrashRunner => self.crash_runner(runner)?,
-            Kind::RestartRunner => self.restart_runner(runner)?,
-            Kind::RanOut => self.ran_out(runner)?,
-            Kind::Retire => self.retire(runner)?,
-            Kind::ForgetAway => self.forget_away(runner)?,
-            Kind::Use => {
-                self.move_use(runner);
+            Kind::RestartRunner => {
+                let runner = self.pick_runner(|r| !r.retired && r.holder.is_none());
+                self.restart_runner(runner)
             }
-            Kind::Sample => self.sample()?,
+            Kind::RestartKeeper => self.restart_keeper(),
         }
-        self.forget_retired()?;
-        self.check()
+    }
+
+    /// The fault no record times whose step has come and that can strike now, the first by [`FAULTS`]' order.
+    fn due_now(&mut self) -> Option<Fault> {
+        let step = self.report.steps;
+        let at = self
+            .due
+            .iter()
+            .position(|(at, fault)| *at < step && self.can(*fault))?;
+        (at < self.due.len()).then(|| self.due.remove(at).1)
+    }
+
+    /// Whether `fault` can strike now.
+    fn can(&self, fault: Fault) -> bool {
+        let keeper = self.keeper.is_some();
+        match fault {
+            Fault::CrashKeeper => keeper,
+            Fault::CrashBeforeWrite | Fault::CrashAfterWrite => keeper && self.disk.crash.is_none(),
+            Fault::LetGo => self
+                .runners
+                .iter()
+                .any(|r| r.holder.is_some() && !r.asked.is_empty()),
+            Fault::ForgetAway => keeper && self.runners.iter().any(Self::away_with_work),
+            Fault::Retire => {
+                self.runners.iter().filter(|r| !r.retired).count() >= 2
+                    && !self.runners.iter().any(|r| r.retired)
+            }
+        }
+    }
+
+    /// A runner the person may take for gone while its work runs (CV6): not retired, its link down.
+    fn away_with_work(r: &Runner) -> bool {
+        !r.retired && !r.link.up && !r.running.is_empty()
+    }
+
+    fn strike(&mut self, fault: Fault) -> Result<(), Violation> {
+        match fault {
+            Fault::CrashKeeper => {
+                self.crash_keeper(false);
+                Ok(())
+            }
+            Fault::CrashBeforeWrite => {
+                self.disk.crash = Some((self.disk.writes, false));
+                Ok(())
+            }
+            Fault::CrashAfterWrite => {
+                self.disk.crash = Some((self.disk.writes, true));
+                Ok(())
+            }
+            Fault::LetGo => {
+                let runner = self.pick_runner(|r| r.holder.is_some() && !r.asked.is_empty());
+                self.let_go(runner)
+            }
+            Fault::ForgetAway => {
+                let runner = self.pick_runner(Self::away_with_work);
+                self.forget_away(runner)
+            }
+            Fault::Retire => {
+                let runner = self.pick_runner(|r| !r.retired);
+                self.retire(runner)
+            }
+        }
+    }
+
+    /// kiln's holder dials again as soon as a link ends, and again as each dial nothing answered ends (kiln's
+    /// `capacity::links` and `dial_wait`): every runner whose process runs, its link down and its path open, opens a
+    /// link at once while the keeper is up.
+    fn redial(&mut self) {
+        for n in 0..self.runners.len() {
+            self.connect(Some(n));
+        }
     }
 
     /// What each runner's reserved work uses of memory now.
@@ -517,10 +1061,10 @@ impl World {
             .collect()
     }
 
-    /// The machine's room as its host measures it now (`Facts::node_with_owned`): every CPU, and the memory that is
-    /// free or Hex's own boxes', so it lacks what the runners' processes and their work use. None is left in a
-    /// dimension they use whole. It is the most the keeper may decide in until the next measure.
-    fn measure(&mut self) -> Result<Amounts, Violation> {
+    /// The machine's room as its host reads it now (`Facts::node_with_owned`): every CPU, and the memory that is free
+    /// or Hex's own boxes', so it lacks what the runners' processes and their work use. None is left in a dimension
+    /// they use whole.
+    fn room_now(&self) -> Result<Amounts, Violation> {
         let mut taken = 0u64;
         for (r, work) in self.runners.iter().zip(self.works()?) {
             taken = taken
@@ -528,173 +1072,180 @@ impl World {
                 .and_then(|t| t.checked_add(work))
                 .ok_or_else(|| stopped("the runners' memory overflows a sum"))?;
         }
-        self.measured = Amounts {
+        Ok(Amounts {
             mem_bytes: ROOM.mem_bytes.saturating_sub(taken),
             ..ROOM
-        };
+        })
+    }
+
+    /// The room measured now ([`World::room_now`]), the most the keeper may decide in until the next it is given.
+    fn measure(&mut self) -> Result<Amounts, Violation> {
+        self.measured = self.room_now()?;
         Ok(self.measured)
     }
 
-    /// One of runner `runner`'s running runs moves its use: anywhere from none to its reservation's memory, a holder's
-    /// work within what it reserved. Whether one moved.
-    fn move_use(&mut self, runner: Option<usize>) -> bool {
-        let Some(n) = runner else {
-            return false;
-        };
-        let len = self.runners.get(n).map_or(0, |r| r.running.len());
-        let Some(at) = self.pick(len) else {
-            return false;
-        };
-        let Some((id, most)) = self
-            .runners
-            .get(n)
-            .and_then(|r| r.running.iter().nth(at))
-            .map(|(id, amount)| (*id, amount.mem_bytes))
-        else {
-            return false;
-        };
-        let to = self.rng.range(0, most);
-        match self.runners.get_mut(n) {
-            Some(r) => {
-                r.uses.insert(id, to);
-                true
+    /// Every running run's use moves, anywhere from none to its reservation's memory, a holder's work within what it
+    /// reserved: memory moves at any time, so at every step, no rate picked (ROOT, 2026-11-14 (d), (f): no bound on the
+    /// moves, the most adversarial).
+    fn move_uses(&mut self) {
+        let rng = &mut self.rng;
+        let mut moved = false;
+        for r in &mut self.runners {
+            for (id, amount) in &r.running {
+                let to = rng.range(0, amount.mem_bytes);
+                moved |= r.uses.insert(*id, to) != Some(to);
             }
-            None => false,
+        }
+        if moved && let Some(command) = self.command.as_mut() {
+            command.moved = true;
         }
     }
 
-    /// The host's sample: the room measured and given the keeper as it is (CV12, withdrawn). A run's use moves, both
-    /// ways, several times, on either side of the free memory's read. The planted host also reads each joined runner's
-    /// work on either side, and credits the room the smaller, up to the runner's reservations: the withdrawn rule.
-    fn sample(&mut self) -> Result<(), Violation> {
-        if self.keeper.is_none() {
+    /// Hex's node is asked to admit a box of its own: its command begins with its refresh's first read ([`Command`]).
+    /// The node, the keeper's host, admits nothing while the keeper is down, and serves one command at a time.
+    fn hex_admit(&mut self) -> Result<(), Violation> {
+        if self.keeper.is_none() || self.command.is_some() {
             return Ok(());
         }
-        let joined: Vec<usize> = (0..self.runners.len())
-            .filter(|n| {
-                self.runners
-                    .get(*n)
-                    .is_some_and(|r| r.link.session.is_some())
-            })
-            .collect();
+        let leg = self.draw(oci_legs())?;
         let before = self.works()?;
-        let mover = self.pick(self.runners.len());
-        let mut moved = false;
-        for _ in 0..self.rng.range(0, MOVES_IN_WINDOW) {
-            moved |= self.move_use(mover);
-        }
-        let room = self.measure()?;
-        for _ in 0..self.rng.range(0, MOVES_IN_WINDOW) {
-            moved |= self.move_use(mover);
-        }
-        let mut credit = Amounts::ZERO;
-        if self.planted(Mutant::Credit) {
-            let after = self.works()?;
-            for n in joined {
-                let (Some(r), Some(keeper)) = (self.runners.get(n), self.keeper.as_ref()) else {
-                    continue;
-                };
-                let books = keeper
-                    .held_by(&r.name)
-                    .try_fold(Amounts::ZERO, |sum, h| sum.checked_add(h.amount))
-                    .ok_or_else(|| stopped("a runner's books overflow a sum"))?;
-                let used = before
-                    .get(n)
-                    .zip(after.get(n))
-                    .map_or(0, |(b, a)| (*b).min(*a));
-                let read = Amounts {
-                    mem_bytes: used,
-                    ..Amounts::ZERO
-                };
-                credit = credit
-                    .checked_add(read.min(books))
-                    .ok_or_else(|| stopped("the planted credit overflows a sum"))?;
-            }
-        }
-        let given = room
-            .checked_add(credit)
-            .ok_or_else(|| stopped("the room and its credit overflow a sum"))?;
-        if let Some(keeper) = self.keeper.as_mut() {
-            keeper.set_room(given);
-        }
-        let report = &mut self.report;
-        report.samples = report.samples.saturating_add(1);
-        if moved {
-            report.moved_in_window = report.moved_in_window.saturating_add(1);
-        }
+        self.command = Some(Command {
+            leg,
+            before,
+            room: None,
+            moved: false,
+        });
         Ok(())
     }
 
-    fn hex_admit(&mut self) -> Result<(), Violation> {
+    /// Hex's admission under way takes its next phase: its read of free memory, then its end.
+    fn command(&mut self) -> Result<(), Violation> {
+        let Some(mut command) = self.command.take() else {
+            return Ok(());
+        };
+        match command.room {
+            None => {
+                command.room = Some(self.room_now()?);
+                self.command = Some(command);
+                Ok(())
+            }
+            Some(room) => self.admit(command, room),
+        }
+    }
+
+    /// The planted host's credit, nothing in a correct one: each joined runner's work, the smaller of its reads as the
+    /// sample began and as it ends, up to the runner's reservations (CV12's withdrawn rule).
+    fn credit(&self, before: &[u64]) -> Result<Amounts, Violation> {
+        let mut credit = Amounts::ZERO;
+        let Some(keeper) = self.keeper.as_ref() else {
+            return Ok(credit);
+        };
+        if !self.planted(Mutant::Credit) {
+            return Ok(credit);
+        }
+        let after = self.works()?;
+        for (n, r) in self.runners.iter().enumerate() {
+            if r.link.session.is_none() {
+                continue;
+            }
+            let books = keeper
+                .held_by(&r.name)
+                .try_fold(Amounts::ZERO, |sum, h| sum.checked_add(h.amount))
+                .ok_or_else(|| stopped("a runner's books overflow a sum"))?;
+            let used = before
+                .get(n)
+                .zip(after.get(n))
+                .map_or(0, |(b, a)| (*b).min(*a));
+            let read = Amounts {
+                mem_bytes: used,
+                ..Amounts::ZERO
+            };
+            credit = credit
+                .checked_add(read.min(books))
+                .ok_or_else(|| stopped("the planted credit overflows a sum"))?;
+        }
+        Ok(credit)
+    }
+
+    /// The command's end: the room its refresh read given the keeper, the planted host's credit added; the box admitted
+    /// where it fits the view's room left (or, planted, the room less Hex's own alone); then the hints the command owes.
+    fn admit(&mut self, command: Command, room: Amounts) -> Result<(), Violation> {
+        let credit = self.credit(&command.before)?;
+        let given = room
+            .checked_add(credit)
+            .ok_or_else(|| stopped("the room and its credit overflow a sum"))?;
         let local = self.local()?;
-        let charge = self.charge();
         let ignores = self.planted(Mutant::LocalIgnoresForeign);
         let Some(keeper) = self.keeper.as_mut() else {
             return Ok(());
         };
+        self.measured = room;
+        keeper.set_room(given);
         let free = if ignores {
             keeper.room().less(local)
         } else {
             keeper.view(local).free()
         };
-        if charge.fits(free) {
-            self.boxes.insert(self.next_box, charge);
-            self.next_box = self.next_box.saturating_add(1);
+        let fits = command.leg.need.fits(free);
+        if fits {
             keeper.local_changed();
-            self.report.hex_started = self.report.hex_started.saturating_add(1);
+        }
+        let report = &mut self.report;
+        report.samples = report.samples.saturating_add(1);
+        if command.moved {
+            report.moved_in_window = report.moved_in_window.saturating_add(1);
+        }
+        if fits {
+            self.boxes.insert(self.next_box, command.leg);
+            self.next_box = self.next_box.saturating_add(1);
+            report.hex_started = report.hex_started.saturating_add(1);
         } else {
-            self.report.hex_refused = self.report.hex_refused.saturating_add(1);
+            report.hex_refused = report.hex_refused.saturating_add(1);
+        }
+        self.hints()
+    }
+
+    /// One of Hex's boxes ends: the host's command, then its hints.
+    fn hex_end(&mut self, key: u64) -> Result<(), Violation> {
+        if self.boxes.remove(&key).is_some()
+            && let Some(keeper) = self.keeper.as_mut()
+        {
+            keeper.local_changed();
+        }
+        self.hints()
+    }
+
+    fn ask(&mut self, runner: Option<usize>) -> Result<(), Violation> {
+        let leg = self.draw(kiln_legs())?;
+        let early = self.planted(Mutant::StartBeforeGrant);
+        let Some(r) = runner.and_then(|r| self.runners.get_mut(r)) else {
+            return Ok(());
+        };
+        if r.retired {
+            return Ok(());
+        }
+        let Some(holder) = r.holder.as_mut() else {
+            return Ok(());
+        };
+        // A runner that can't reserve now takes nothing new (CV11): kiln places the run elsewhere.
+        if let Ok((id, msg)) = holder.reserve(leg.need) {
+            r.asked.insert(id, leg.need);
+            r.lengths.insert(id, leg.runs_for);
+            r.link.to_keeper.push_back(msg);
+            if early {
+                r.running.insert(id, leg.need);
+            }
         }
         Ok(())
     }
 
-    fn hex_end(&mut self) {
-        let Some(at) = self.pick(self.boxes.len()) else {
+    fn end_run(&mut self, n: usize, id: ReservationId) {
+        let Some(runner) = self.runners.get_mut(n) else {
             return;
         };
-        if let Some(key) = self.boxes.keys().nth(at).copied() {
-            self.boxes.remove(&key);
-            if let Some(keeper) = self.keeper.as_mut() {
-                keeper.local_changed();
-            }
-        }
-    }
-
-    fn ask(&mut self, runner: Option<usize>) {
-        let charge = self.charge();
-        let early = self.planted(Mutant::StartBeforeGrant);
-        let Some(r) = runner.and_then(|r| self.runners.get_mut(r)) else {
-            return;
-        };
-        if r.retired {
+        if !runner.running.contains_key(&id) {
             return;
         }
-        let Some(holder) = r.holder.as_mut() else {
-            return;
-        };
-        if let Ok((id, msg)) = holder.reserve(charge) {
-            r.asked.insert(id, charge);
-            r.link.to_keeper.push_back(msg);
-            if early {
-                r.running.insert(id, charge);
-            }
-        }
-    }
-
-    fn end_run(&mut self, runner: Option<usize>) {
-        let Some(r) = runner else {
-            return;
-        };
-        let len = self.runners.get(r).map_or(0, |r| r.running.len());
-        let Some(at) = self.pick(len) else {
-            return;
-        };
-        let Some(runner) = self.runners.get_mut(r) else {
-            return;
-        };
-        let Some(id) = runner.running.keys().nth(at).copied() else {
-            return;
-        };
         runner.ended(&id);
         if let Some(holder) = runner.holder.as_mut() {
             let mut out = Out::default();
@@ -728,6 +1279,8 @@ impl World {
         }
     }
 
+    /// A word delivered to the keeper: its answer goes back on the link, then the hints it owes, as the keeper's lane
+    /// says them after each message a link said (`hex_quic::capacity::Server::hint`).
     fn deliver_to_keeper(&mut self, n: usize) -> Result<(), Violation> {
         let local = self.local()?;
         let drops = self.planted(Mutant::DropUnknownAtSync);
@@ -767,7 +1320,7 @@ impl World {
                     }
                     r.link.to_holder.push_back(answer);
                 }
-                Ok(())
+                self.hints()
             }
             Err(Stop::Crashed) => {
                 self.report.crashes_at_write = self.report.crashes_at_write.saturating_add(1);
@@ -807,11 +1360,11 @@ impl World {
                     report.runs_granted = report.runs_granted.saturating_add(1);
                 }
                 Event::Refused(id, _) => {
-                    r.asked.remove(&id);
+                    r.unasked(&id);
                     report.runs_refused = report.runs_refused.saturating_add(1);
                 }
                 Event::Unanswered(id) => {
-                    r.asked.remove(&id);
+                    r.unasked(&id);
                     report.runs_unanswered = report.runs_unanswered.saturating_add(1);
                 }
                 Event::Released(_) => {}
@@ -841,6 +1394,7 @@ impl World {
         Ok(())
     }
 
+    /// The hints the keeper owes, each put on the link its session runs on.
     fn hints(&mut self) -> Result<(), Violation> {
         let local = self.local()?;
         let Some(keeper) = self.keeper.as_mut() else {
@@ -900,11 +1454,13 @@ impl World {
         }
     }
 
-    /// The keeper's process ends: every link drops with it. Hex's boxes and the runners' runs go on.
+    /// The keeper's process ends: every link drops with it, and Hex's admission under way with its node. Hex's boxes
+    /// and the runners' runs go on.
     fn crash_keeper(&mut self, at_write: bool) {
         if self.keeper.take().is_none() {
             return;
         }
+        self.command = None;
         if self.planted(Mutant::AnswerBeforeWrite) {
             self.disk.undo_last();
         }
@@ -925,7 +1481,7 @@ impl World {
                 holder.link_down(&mut out);
                 for event in out.events {
                     if let Event::Unanswered(id) = event {
-                        r.asked.remove(&id);
+                        r.unasked(&id);
                     }
                 }
             }
@@ -964,8 +1520,8 @@ impl World {
         if let Some(r) = self.runners.get_mut(n) {
             r.holder = None;
             r.own = 0;
-            r.asked.clear();
-            if !r.survive {
+            r.all_unasked();
+            if !self.case.survive {
                 r.all_ended();
             }
             self.report.runner_crashes = self.report.runner_crashes.saturating_add(1);
@@ -991,14 +1547,21 @@ impl World {
         };
         r.epoch = r.epoch.saturating_add(1);
         let survivors = if forget { Vec::new() } else { held(&r.running) };
-        let holder =
-            Holder::start(r.name.clone(), r.epoch, RESERVATIONS, &survivors).map_err(stopped)?;
+        let holder = Holder::start(
+            r.name.clone(),
+            r.epoch,
+            self.budget.reservations,
+            &survivors,
+        )
+        .map_err(stopped)?;
         r.holder = Some(holder);
         r.own = own;
         Ok(())
     }
 
-    fn ran_out(&mut self, runner: Option<usize>) -> Result<(), Violation> {
+    /// A runner lets go of its oldest reserve waiting for an answer: abandoned, never started, and released at once
+    /// where its link is up, else left out of its next sync (CV5).
+    fn let_go(&mut self, runner: Option<usize>) -> Result<(), Violation> {
         let Some(n) = runner else {
             return Ok(());
         };
@@ -1009,8 +1572,10 @@ impl World {
             return Ok(());
         };
         let mut out = Out::default();
-        holder.ran_out(id, &mut out);
+        holder.release(id, &mut out);
         r.link.to_keeper.extend(out.send);
+        r.unasked(&id);
+        self.report.runs_let_go = self.report.runs_let_go.saturating_add(1);
         self.events(n, out.events)
     }
 
@@ -1028,7 +1593,7 @@ impl World {
         if let Some(r) = self.runners.get_mut(n) {
             r.holder = None;
             r.own = 0;
-            r.asked.clear();
+            r.all_unasked();
             r.all_ended();
             r.retired = true;
             r.unforgotten = true;
@@ -1037,9 +1602,10 @@ impl World {
     }
 
     /// The person releases a runner it takes for gone, wrongly (CV6): one away from the keeper, its link down
-    /// (partitioned, dropped, or its process crashed with its runs outliving it), not retired, with work still
+    /// (partitioned, or its process crashed with its runs outliving it), not retired, with work still
     /// running. That work is missing from the keeper's books until the runner's next sync adopts it (CV5). A
-    /// release the keeper refuses (the runner connected, or never seen) changes nothing.
+    /// release the keeper refuses (the runner connected, or never seen) changes nothing. The release is a command of
+    /// the keeper's host, its hints said after it.
     fn forget_away(&mut self, runner: Option<usize>) -> Result<(), Violation> {
         let Some(n) = runner else {
             return Ok(());
@@ -1047,7 +1613,7 @@ impl World {
         let Some(name) = self
             .runners
             .get(n)
-            .filter(|r| !r.retired && !r.link.up && !r.running.is_empty())
+            .filter(|r| Self::away_with_work(r))
             .map(|r| r.name.clone())
         else {
             return Ok(());
@@ -1068,7 +1634,7 @@ impl World {
         match released {
             Ok(_) => {
                 self.report.wrongly_forgotten = self.report.wrongly_forgotten.saturating_add(1);
-                Ok(())
+                self.hints()
             }
             Err(Stop::Crashed) => {
                 self.report.crashes_at_write = self.report.crashes_at_write.saturating_add(1);
@@ -1079,6 +1645,8 @@ impl World {
         }
     }
 
+    /// The person releases what a retired runner held, once the keeper is up: a command of its host, its hints said
+    /// after it.
     fn forget_retired(&mut self) -> Result<(), Violation> {
         for n in 0..self.runners.len() {
             let Some(name) = self
@@ -1099,6 +1667,7 @@ impl World {
                         r.unforgotten = false;
                     }
                     self.report.forgotten = self.report.forgotten.saturating_add(1);
+                    self.hints()?;
                 }
                 Ok(Err(why)) => return Err(stopped(why)),
                 Err(Stop::Crashed) => {
@@ -1128,7 +1697,7 @@ impl World {
             .runners
             .iter()
             .flat_map(|r| r.running.values())
-            .chain(self.boxes.values()))
+            .chain(self.boxes.values().map(|leg| &leg.need)))
         .ok_or_else(overflow)?;
         let hidden =
             sum(self.runners.iter().flat_map(|r| r.hidden.values())).ok_or_else(overflow)?;
@@ -1188,11 +1757,15 @@ impl World {
         Ok(())
     }
 
-    /// The nemesis stops; the keeper and every runner start again where down; every partition heals and
-    /// every link connects; everything said is delivered and every hint drained until nothing more is
-    /// said. Then the books each side keeps must agree.
+    /// The nemesis stops: no fault is due any more, and Hex's admission under way ends; the keeper and every runner
+    /// start again where down; every partition heals and every link connects; everything said is delivered and every
+    /// hint drained until nothing more is said. Then the books each side keeps must agree.
     pub fn settle(&mut self) -> Result<Report, Violation> {
+        self.due.clear();
         self.disk.crash = None;
+        // Its read of free memory where it hasn't made it, then its end.
+        self.command()?;
+        self.command()?;
         self.restart_keeper()?;
         if self.keeper.is_none() {
             return Err(Violation::Unsettled);
@@ -1232,11 +1805,15 @@ impl World {
     /// answer has its runner say at most one more (a welcome its sync; a grant of a reserve it abandoned, or of another
     /// amount, its release), itself answered once: four deliveries. A word on a link to a runner starts at most three.
     /// Once a runner, its sync's answer has it say the release of each reservation it released while it synced, at
-    /// most the [`RESERVATIONS`] it holds, each answered: two deliveries apiece. Once all is quiet the keeper owes each
-    /// runner at most one hint, and two looks find it quiet, the first draining those hints.
+    /// most the reservations it holds ([`reservations`]), each answered: two deliveries apiece. Once all is quiet the
+    /// keeper owes each runner at most one hint, and two looks find it quiet, the first draining those hints.
     fn settle_bound(&self) -> Result<usize, Violation> {
         let overflow = || stopped("the settle's bound overflows");
-        let releases = RESERVATIONS.checked_mul(2).ok_or_else(overflow)?;
+        let releases = self
+            .budget
+            .reservations
+            .checked_mul(2)
+            .ok_or_else(overflow)?;
         self.runners.iter().try_fold(2usize, |bound, r| {
             let to_keeper = r.link.to_keeper.len().checked_mul(4);
             let to_holder = r.link.to_holder.len().checked_mul(3);

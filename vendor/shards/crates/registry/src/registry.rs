@@ -17,7 +17,7 @@ use shards_image::store::{Download, Held, Limits, Store};
 
 use crate::auth::{Authorizer, Credentials, loopback};
 use crate::credentials::Found;
-use crate::http::{Client, Redirects, Request, Response};
+use crate::http::{Client, Redirects, Request, Response, RunOut};
 use crate::links::{Direction, Link, Record};
 use crate::url::{Scheme, Url};
 use crate::{Error, ErrorKind, Said, printable};
@@ -140,6 +140,26 @@ struct Plain {
     on_refusal: bool,
 }
 
+/// What a pull says of its waits as they come ([`Registry::saying_waits`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Notice<'a> {
+    /// It waits for its registry's credential helper: on what, and where it was named
+    /// (D184).
+    Helper(&'a str),
+    /// A trouble outlasted the longest its path had passed, and is ridden out while it
+    /// lasts (D222).
+    RanOut(&'a RunOut),
+}
+
+impl fmt::Display for Notice<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Notice::Helper(notice) => f.write_str(notice),
+            Notice::RanOut(run_out) => run_out.fmt(f),
+        }
+    }
+}
+
 impl fmt::Debug for Registry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Registry")
@@ -183,23 +203,38 @@ impl Registry {
 
     /// Runs `work`, saying through `say`, once, that it waits for the registry's credential
     /// helper where it does (D184): a helper may wait on its user, or never answer, and a
-    /// pull that waits on one says which, and where it was named.
-    pub fn saying_waits<T>(&self, say: &(dyn Fn(&str) + Sync), work: impl FnOnce() -> T) -> T {
-        if !self.auth.asks() {
-            return work();
+    /// pull that waits on one says which, and where it was named; and each trouble that
+    /// runs out past the longest its path had passed, once, as it runs out (D222).
+    pub fn saying_waits<T>(&self, say: &(dyn Fn(Notice<'_>) + Sync), work: impl FnOnce() -> T) -> T {
+        let asks = self.auth.asks();
+        if asks {
+            self.auth.watch();
         }
-        self.auth.watch();
+        let (watch, run_outs) = self.http.watch();
         std::thread::scope(|scope| {
-            let watcher = std::thread::Builder::new()
-                .name("credential wait".into())
-                .spawn_scoped(scope, || {
-                    if let Some(notice) = self.auth.waits() {
-                        say(&notice);
+            let helper = asks.then(|| {
+                std::thread::Builder::new()
+                    .name("credential wait".into())
+                    .spawn_scoped(scope, || {
+                        if let Some(notice) = self.auth.waits() {
+                            say(Notice::Helper(&notice));
+                        }
+                    })
+            });
+            // Its run-outs, each said as it comes; ended as the watch is let go of.
+            let told = std::thread::Builder::new()
+                .name("run-out tell".into())
+                .spawn_scoped(scope, move || {
+                    for run_out in run_outs {
+                        say(Notice::RanOut(&run_out));
                     }
                 });
             let out = work();
-            self.auth.done();
-            if let Ok(watcher) = watcher {
+            if asks {
+                self.auth.done();
+            }
+            self.http.unwatch(watch);
+            for watcher in [helper.and_then(Result::ok), told.ok()].into_iter().flatten() {
                 let _ = watcher.join();
             }
             out
@@ -291,7 +326,7 @@ impl Registry {
             Begun::Open(at, least) => (at, least),
         };
         // What the registry has taken, and what it had when a send last failed; and the
-        // trouble since it last took more, ridden out for its path's budget (D222).
+        // trouble since it last took more, ridden out while it lasts (D222).
         let (mut done, mut mark, mut trouble) = (0u64, 0u64, Trouble::default());
         loop {
             let asked = Instant::now();
@@ -325,16 +360,15 @@ impl Registry {
                         trouble.over(&self.http, &at);
                     }
                     mark = done;
-                    match trouble.wait(asked, self.http.budget(&at), None) {
-                        Some(wait) => self.http.pause(wait)?,
-                        None => {
-                            return Err(e.context(format!(
-                                "{}: the upload failed for {:.0?} without the registry taking more",
-                                desc.digest,
-                                trouble.lasted()
-                            )));
-                        }
+                    if trouble.gone(&self.http, &at, &e) {
+                        return Err(e.gone().context(format!(
+                            "{}: the upload failed for {:.0?} without the registry taking more",
+                            desc.digest,
+                            trouble.lasted()
+                        )));
                     }
+                    let wait = trouble.wait(&self.http, &at, asked, None);
+                    self.http.pause(wait)?;
                     match self.status(&at, size)? {
                         Some((url, had)) => (at, done) = (url, had),
                         None => match self.begin(desc, from, link)? {
@@ -371,9 +405,11 @@ impl Registry {
                 413 if len > least.max(1) => {
                     self.refused.fetch_min(len, Ordering::Relaxed);
                 }
-                // Not where the registry is: asked where that is, for a moment at most.
-                416 if trouble.wait(asked, self.http.budget(&at), None).is_some() => {
+                // Not where the registry is: asked where that is, as a trouble is ridden out.
+                416 => {
                     drop(response);
+                    let wait = trouble.wait(&self.http, &at, asked, None);
+                    self.http.pause(wait)?;
                     match self.status(&at, size)? {
                         Some((url, had)) => (at, done) = (url, had),
                         None => return Err(Error::new(format!("{}: the upload is gone", desc.digest))),
@@ -802,20 +838,18 @@ impl Registry {
                     plain.fallen.store(true, Ordering::Release);
                     continue;
                 }
-                // A timeout, a reset or a cut answer: ridden out while it lasts a moment. A
-                // file's body is resumed by its upload instead, from what the registry has.
-                // An overdue answer is asked again at once: its wait was drawn to end
-                // where the pause would have (crate::patience `Cutoff`).
+                // A timeout, a reset or a cut answer: ridden out while it lasts. A file's body
+                // is resumed by its upload instead, from what the registry has. An overdue
+                // answer, one past the slowest its path has shown, is asked again at once,
+                // that asking waited for as its connection lives (crate::patience). While the
+                // trouble follows liveness, a re-ask its far end ends unanswered is its end.
+                Err(e) if trouble.gone(&self.http, url, &e) => return Err(e.gone()),
                 Err(e) if e.kind() == ErrorKind::Transient && file.is_none() => {
-                    match trouble.wait(asked, self.http.budget(url), None) {
-                        Some(wait) => {
-                            if !e.is_overdue() {
-                                self.http.pause(wait)?;
-                            }
-                            continue;
-                        }
-                        None => return Err(e),
+                    let wait = trouble.wait(&self.http, url, asked, None);
+                    if !e.is_overdue() {
+                        self.http.pause(wait)?;
                     }
+                    continue;
                 }
                 Err(e) => return Err(e),
             };
@@ -848,13 +882,13 @@ impl Registry {
                     wait
                 }
                 // What the registry or its gateway says is passing (RFC 9110 §15.5.9,
-                // §15.6.3 to §15.6.5): ridden out while it lasts a moment, waited as long
-                // as it names.
-                408 | 502 | 503 | 504 => trouble.wait(asked, self.http.budget(url), retry_after(&response)),
+                // §15.6.3 to §15.6.5): ridden out while it lasts, waited as long as it
+                // names.
+                408 | 502 | 503 | 504 => Some(trouble.wait(&self.http, url, asked, retry_after(&response))),
                 // An unexpected condition, which RFC 9110 §15.6.1 does not say passes:
                 // asked again once, as it may have been the moment's, but not past a
                 // repeat, which is the request's own.
-                500 if !repeated => trouble.wait(asked, self.http.budget(url), retry_after(&response)),
+                500 if !repeated => Some(trouble.wait(&self.http, url, asked, retry_after(&response))),
                 _ => None,
             };
             let Some(wait) = wait else {
@@ -1331,11 +1365,10 @@ impl Registry {
                 trouble.over(&self.http, &url);
                 continue;
             }
-            // It brought nothing: resumed while that lasts its path's budget.
-            match trouble.wait(asked, self.http.budget(&url), None) {
-                Some(wait) => self.http.pause(wait)?,
-                None => return Err(stalled(&digest, trouble.lasted())),
-            }
+            // It brought nothing: resumed while that lasts, its re-asks ending it where the
+            // far end is gone (D222).
+            let wait = trouble.wait(&self.http, &url, asked, None);
+            self.http.pause(wait)?;
         }
         download.commit().map(drop).map_err(|e| Error::new(e.to_string()))
     }
@@ -1351,26 +1384,16 @@ impl Registry {
         self.http.keep_in(store.root());
     }
 
-    /// How long a trouble of `url`'s server is ridden out.
-    pub(crate) fn budget(&self, url: &Url) -> Duration {
-        self.http.budget(url)
+    /// After an attempt of `url`'s begun at `attempt` failed, a trouble of its server's:
+    /// how long to wait before asking again ([`Trouble::wait`]).
+    pub(crate) fn ride(&self, trouble: &mut Trouble, url: &Url, attempt: Instant) -> Duration {
+        trouble.wait(&self.http, url, attempt, None)
     }
 
     /// A trouble of `url`'s server ended, the asking of `url` answered.
     pub(crate) fn over(&self, trouble: &mut Trouble, url: &Url) {
         trouble.over(&self.http, url);
     }
-}
-
-/// A download that brought nothing for its path's budget (D222).
-pub(crate) fn stalled(digest: &Digest, lasted: Duration) -> Error {
-    Error::of(
-        ErrorKind::Transient,
-        format!(
-            "{digest}: the download brought nothing for {:.1} s",
-            lasted.as_secs_f64()
-        ),
-    )
 }
 
 /// A blob whose registry's answer, ended as its framing said, ends at `at` bytes, short of
@@ -1743,53 +1766,107 @@ fn allowance_window(response: &Response, said: &[u8]) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
-/// A registry's trouble, ridden out while it lasts a moment (D222, PM M486): each failure
-/// that may pass is asked again after a wait, a random share of how long the trouble has
-/// lasted so far (full jitter: a share of the failure's own length, so that the time lost
-/// past its end is at most what it had already lasted, and a crowd's asks do not come back
-/// together), at least what the registry names in `Retry-After` (RFC 9110 §10.2.3); until
-/// it has lasted its path's budget in all (crate::patience: twice the longest trouble the
-/// path passed, at least TCP's R2), or a wait it names would end past it. No count: a
-/// trouble of many quick failures (a gateway's cut connections) is ridden out as one of a
-/// few slow ones (a timeout's), for as long.
+/// A registry's trouble, ridden out while it lasts (D222, PM M486): each failure that may
+/// pass is asked again after a wait, a random share of how long the trouble has lasted so
+/// far (full jitter: a share of the failure's own length, so that the time lost past its
+/// end is at most what it had already lasted, and a crowd's asks do not come back
+/// together), at least what the registry names in `Retry-After` (RFC 9110 §10.2.3). Within
+/// its path's budget (crate::patience: the longest trouble the path passed) it rides;
+/// past it, or past a wait the registry names that would end past it, it runs out: told
+/// once, and no failure, but ridden out while it lasts, its far end asked again while it
+/// answers, and the path taught its length once it passes. What ends it is the far end's
+/// own word: an answer, a refusal, or a re-ask past a run-out that its far end refuses or
+/// ends before any answer ([`Trouble::gone`]). No count and no deadline: a trouble of many
+/// quick failures (a gateway's cut connections) is ridden out as one of a few slow ones (a
+/// timeout's), for as long.
 #[derive(Debug, Default)]
 pub(crate) struct Trouble {
-    /// When its first failed attempt began.
-    began: Option<Instant>,
+    phase: Phase,
+}
+
+/// Where a trouble is.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// None under way: what fails next begins one.
+    #[default]
+    Calm,
+    /// Under way since its first failed attempt began, within its path's budget, or on a
+    /// path that bounds none (the cold start: a path that has passed none, or whose last ran
+    /// out and none passed since).
+    Riding(Instant),
+    /// Under way since then, past its path's budget: told, and ridden out while it lasts.
+    RanOut(Instant),
 }
 
 impl Trouble {
     /// The trouble is over, the asking of `url` answered: what fails next begins another.
-    /// One that had begun passed, and its path learns how long it lasted (D222).
+    /// One under way passed, and teaches its path how long it lasted (D222), one that ran
+    /// out past the longest the path had passed most of all.
     pub(crate) fn over(&mut self, http: &Client, url: &Url) {
-        if let Some(began) = self.began.take() {
-            http.passed(url, began.elapsed());
+        match std::mem::take(&mut self.phase) {
+            Phase::Calm => {}
+            Phase::Riding(began) | Phase::RanOut(began) => http.passed(url, began.elapsed()),
         }
     }
 
     /// How long it has lasted.
     pub(crate) fn lasted(&self) -> Duration {
-        self.began.map_or(Duration::ZERO, |b| b.elapsed())
+        match self.phase {
+            Phase::Calm => Duration::ZERO,
+            Phase::Riding(began) | Phase::RanOut(began) => began.elapsed(),
+        }
     }
 
-    /// After an attempt begun at `attempt` failed: how long to wait before asking again,
-    /// or `None` where the trouble has lasted `budget`, or the registry names a wait
-    /// (`after`) past it.
+    /// Whether `failed`, an attempt of `url`'s, is its far end's end: refused, or ended
+    /// before any answer, on a re-ask while the trouble follows liveness, past its run-out or
+    /// on a path that bounds none (a path that has passed none, or whose last ran out). Its
+    /// first failure, and a re-ask within its path's budget, are a trouble's, ridden out (a
+    /// gateway's cut connections, a pooled connection its server had closed).
+    pub(crate) fn gone(&self, http: &Client, url: &Url, failed: &Error) -> bool {
+        let following = match self.phase {
+            Phase::Calm => false,
+            Phase::Riding(_) => http.budget(url).is_none(),
+            Phase::RanOut(_) => true,
+        };
+        following && (failed.is_refused() || failed.is_cut())
+    }
+
+    /// After an attempt of `url`'s begun at `attempt` failed: how long to wait before
+    /// asking again. Past its path's budget, the longest trouble it has passed, or where
+    /// the registry names a wait (`after`) that would end past it, the trouble runs out
+    /// ([`Client::trouble_ran_out`]), and is ridden out from then on while it lasts.
     pub(crate) fn wait(
         &mut self,
+        http: &Client,
+        url: &Url,
         attempt: Instant,
-        budget: Duration,
         after: Option<Duration>,
-    ) -> Option<Duration> {
-        let began = *self.began.get_or_insert(attempt);
+    ) -> Duration {
+        let began = match self.phase {
+            Phase::Calm => {
+                self.phase = Phase::Riding(attempt);
+                attempt
+            }
+            Phase::Riding(began) | Phase::RanOut(began) => began,
+        };
         let lasted = began.elapsed();
-        let left = budget.checked_sub(lasted).filter(|l| !l.is_zero())?;
+        let left = match (self.phase, http.budget(url)) {
+            (Phase::Riding(_), Some(budget)) => {
+                let left = budget.checked_sub(lasted).filter(|l| !l.is_zero());
+                match left {
+                    Some(left) if after.is_none_or(|a| a <= left) => Some(left),
+                    _ => {
+                        self.phase = Phase::RanOut(began);
+                        http.trouble_ran_out(url, lasted, budget);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         let share = lasted.mul_f64(jitter());
-        match after {
-            Some(after) if after > left => None,
-            Some(after) => Some(after.max(share).min(left)),
-            None => Some(share.min(left)),
-        }
+        let wait = after.map_or(share, |a| a.max(share));
+        left.map_or(wait, |left| wait.min(left))
     }
 }
 
@@ -1872,10 +1949,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let server = route(None, move |seen| Some((answer(seen), After::Keep)));
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        );
+        let http = crate::testing::client();
         let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
         let desc = Descriptor {
             media_type: "application/octet-stream".into(),
@@ -1946,10 +2020,7 @@ mod tests {
                 }
             });
             let reference = Reference::parse(&format!("127.0.0.1:{port}/test/image:v1")).unwrap();
-            let http = Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            );
+            let http = crate::testing::client();
             let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
             let url = registry.base.join("manifests/v1").unwrap();
             for _ in 0..2 {
@@ -2038,12 +2109,7 @@ mod tests {
                 });
             }
         });
-        let client = || {
-            Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            )
-        };
+        let client = || crate::testing::client();
         let reference = |path: &str| Reference::parse(&format!("{ip}:{port}/{path}:v1")).unwrap();
         // Not named: HTTPS alone, its plain answer a failure.
         let secure = Registry::new(client(), &reference("test/image"), Credentials::Anonymous).unwrap();
@@ -2105,11 +2171,7 @@ mod tests {
         )
         .unwrap();
         let plain = |host: &str| {
-            let client = Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            )
-            .with_registries(named.clone());
+            let client = crate::testing::client().with_registries(named.clone());
             let reference = Reference::parse(&format!("{host}/test/image:v1")).unwrap();
             let registry = Registry::new(client, &reference, Credentials::Anonymous).unwrap();
             registry.plain.map(|p| (p.port, p.on_refusal))
@@ -2140,12 +2202,7 @@ mod tests {
         let hub = answering("/nothing/");
         let first = answering("/manifests/");
         let second = answering("/referrers/");
-        let client = || {
-            Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            )
-        };
+        let client = || crate::testing::client();
         let reference = Reference::parse(&format!("127.0.0.1:{}/library/x:v1", hub.port)).unwrap();
         let mirror = |port: u16| {
             Registry::mirror(
@@ -2194,8 +2251,9 @@ mod tests {
     }
 
     /// The tag is asked for where the API is not found or refuses, a 404 of both an empty
-    /// list; but an API that could not answer, past its trouble's moment, is a failure, whatever
-    /// the tag's 404 says: a policy would read an empty list as no signature (D116).
+    /// list; but an API that could not answer is a failure, whatever the tag's 404 says: a
+    /// policy would read an empty list as no signature (D116). A gateway's 502, 503 or 504
+    /// is a trouble, ridden out until the API answers (D222).
     #[test]
     fn referrers_that_could_not_be_read_are_no_empty_list() {
         let digest = format!("sha256:{}", "c".repeat(64));
@@ -2228,12 +2286,7 @@ mod tests {
                 Some((reply, After::Keep))
             });
             let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-            // A gateway's failure is ridden out for a moment (D222): a short one here.
-            let http = Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            )
-            .with_moment(Duration::from_millis(300));
+            let http = crate::testing::client();
             let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
             registry
                 .referrers(&digest, &[], &[])
@@ -2252,15 +2305,9 @@ mod tests {
             assert_eq!(asked(api, None).unwrap(), empty, "{api}");
             assert_eq!(asked(api, Some(tagged)).unwrap().as_bytes(), tagged, "{api}");
         }
-        // An API that could not answer, past its trouble's moment: the tag where there is one,
-        // else its failure.
-        for api in [
-            "429 Too Many Requests",
-            "500 Internal Server Error",
-            "502 Bad Gateway",
-            "503 Service Unavailable",
-            "504 Gateway Timeout",
-        ] {
+        // An API that could not answer, a quota spent or a repeated 500: the tag where there
+        // is one, else its failure.
+        for api in ["429 Too Many Requests", "500 Internal Server Error"] {
             assert!(asked(api, None).is_err(), "{api}: read as none");
             assert_eq!(asked(api, Some(tagged)).unwrap().as_bytes(), tagged, "{api}");
         }
@@ -2294,10 +2341,7 @@ mod tests {
             });
             port.store(server.port, Ordering::SeqCst);
             let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-            let http = Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            );
+            let http = crate::testing::client();
             let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
             let checked = registry.exists(&desc, manifest, tag);
             (checked, server.requests())
@@ -2372,10 +2416,7 @@ mod tests {
             Some((page.into_bytes(), After::Keep))
         });
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image", server.port)).unwrap();
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        );
+        let http = crate::testing::client();
         let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
         assert_eq!(
             registry.tags().unwrap(),
@@ -2457,10 +2498,7 @@ mod tests {
             let dir = shards_testdir::TempDir::new(&format!("encodings-{}", server.port)).unwrap();
             let store = Store::open(&dir).unwrap();
             let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-            let http = Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            );
+            let http = crate::testing::client();
             let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
             let desc = Descriptor {
                 media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
@@ -2695,10 +2733,7 @@ mod tests {
         let serving = |answer: &'static [u8]| {
             let server = route(None, move |_| Some((answer.to_vec(), After::Keep)));
             let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-            let http = Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            );
+            let http = crate::testing::client();
             let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
             (server, registry)
         };
@@ -2806,10 +2841,7 @@ mod tests {
         });
         let dir = shards_testdir::TempDir::new("upload-through").unwrap();
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        );
+        let http = crate::testing::client();
         let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
         let results = blobs
             .iter()
@@ -2909,10 +2941,7 @@ mod tests {
             let blob = b"0123456789";
             std::fs::write(&path, blob).unwrap();
             let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-            let http = Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            );
+            let http = crate::testing::client();
             let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
             let desc = Descriptor {
                 media_type: "application/octet-stream".into(),
@@ -3033,12 +3062,7 @@ mod tests {
     #[test]
     fn logins_answer_the_registrys_challenge_and_keep_its_refresh_token() {
         use base64::Engine as _;
-        let client = || {
-            Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            )
-        };
+        let client = || crate::testing::client();
         let password = |p: &str| Credentials::Password {
             username: "u".into(),
             password: p.into(),
@@ -3133,16 +3157,21 @@ mod tests {
     }
 
     /// A trouble's waits are random shares of how long it has lasted, at least what the
-    /// registry names, until it has lasted its moment or names a wait past it (D222).
+    /// registry names. Past its moment, or named past it, it runs out: told once, to each
+    /// watch, and ridden out while it lasts, its waits shares and named waits as before; a
+    /// run-out over teaches its path its whole length (D222, waits-06).
     #[test]
-    fn a_troubles_waits_are_shares_of_its_length_within_a_moment() {
+    fn a_troubles_waits_are_shares_of_its_length_and_a_run_out_is_told_once() {
         let moment = Duration::from_secs(10);
         let ago = |d: Duration| Instant::now().checked_sub(d).unwrap();
+        let within = crate::testing::client().with_moment(moment);
+        let (watch, told) = within.watch();
+        let at = Url::parse("https://m.example/v2/").unwrap();
         let mut trouble = Trouble::default();
         let began = ago(Duration::from_secs(2));
         let mut waits = Vec::new();
         for _ in 0..200 {
-            let wait = trouble.wait(began, moment, None).unwrap();
+            let wait = trouble.wait(&within, &at, began, None);
             assert!(wait <= trouble.lasted(), "{wait:?} past {:?}", trouble.lasted());
             waits.push(wait);
         }
@@ -3150,42 +3179,61 @@ mod tests {
         waits.sort();
         assert!(waits[0] < waits[199], "{waits:?}");
         // Named: at least that.
-        let named = trouble.wait(Instant::now(), moment, Some(Duration::from_secs(3)));
-        assert!(named.unwrap() >= Duration::from_secs(3));
-        // Named past the moment: given up on.
-        assert_eq!(
-            trouble.wait(Instant::now(), moment, Some(Duration::from_secs(9))),
-            None
-        );
-        // Lasted the moment: given up on.
-        assert_eq!(Trouble::default().wait(ago(moment), moment, None), None);
-        // Over: what fails next begins another, and the path learns how long it lasted.
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        );
-        let url = Url::parse("https://r.example/v2/").unwrap();
-        trouble.over(&http, &url);
+        let named = trouble.wait(&within, &at, Instant::now(), Some(Duration::from_secs(3)));
+        assert!(named >= Duration::from_secs(3));
+        assert!(told.try_recv().is_err(), "within its moment: nothing told");
+        // Named past the moment: waited, and the trouble runs out, told once.
+        let past = trouble.wait(&within, &at, Instant::now(), Some(Duration::from_secs(9)));
+        assert!(past >= Duration::from_secs(9), "{past:?}");
+        let run_out = told.try_recv().unwrap();
+        assert_eq!(run_out.server, "m.example:443");
+        assert_eq!(run_out.longest, moment);
+        // Ridden out while it lasts, told no more.
+        for _ in 0..10 {
+            assert!(trouble.wait(&within, &at, began, None) <= trouble.lasted());
+        }
+        assert!(told.try_recv().is_err(), "told once");
+        // Lasted the moment, another of the path's, while the first is out: told no more.
+        let mut other = Trouble::default();
+        let _ = other.wait(&within, &at, ago(moment), None);
+        assert!(told.try_recv().is_err(), "a run-out under way: told once");
+        within.unwatch(watch);
+        assert!(told.recv().is_err(), "let go of, its receiver ends");
+        // Over: what fails next begins another, and the path learns how long it lasted, a
+        // run-out's whole length, which ends the run-out.
+        trouble.over(&within, &at);
         assert!(trouble.lasted().is_zero());
-        let shown = http.shown("r.example", 443);
+        let shown = within.shown("m.example", 443);
         assert_eq!(shown.troubles, 1);
         assert!(shown.trouble_us >= 2_000_000, "{shown:?}");
         // One not begun passed nothing.
-        Trouble::default().over(&http, &url);
-        assert_eq!(http.shown("r.example", 443).troubles, 1);
+        Trouble::default().over(&within, &at);
+        assert_eq!(within.shown("m.example", 443).troubles, 1);
+    }
+
+    /// What [`ridden`] saw: the answer's status (or error), the requests made, how long it
+    /// took and how long of that its client chose to wait (its round trips are the rest, as
+    /// long as the host running it makes them), the run-outs told, and the longest trouble
+    /// its path then had passed.
+    struct Ridden {
+        status: Result<u16, Error>,
+        asked: usize,
+        took: Duration,
+        paused: Duration,
+        told: usize,
+        longest: Duration,
     }
 
     /// A registry asked of a server that answers `failing` (a status line, or `None` to
     /// close the connection unanswered) until `lasting` has passed since its first request,
-    /// then 200; riding its trouble out for `moment`. Its answer's status (or error), the
-    /// requests it made, how long it took, and how long of that it chose to wait: its round
-    /// trips are the rest, as long as the host running it makes them.
+    /// then 200; riding its trouble out for `moment` before it runs out, its run-outs told
+    /// through [`Registry::saying_waits`].
     fn ridden(
         failing: Option<&'static str>,
         fields: &'static [(&'static str, &'static str)],
         lasting: Duration,
         moment: Duration,
-    ) -> (Result<u16, Error>, usize, Duration, Duration) {
+    ) -> Ridden {
         let first = Arc::new(std::sync::Mutex::new(None::<Instant>));
         let server = route(None, move |_| {
             let began = *first.lock().unwrap().get_or_insert_with(Instant::now);
@@ -3195,31 +3243,48 @@ mod tests {
             failing.map(|status| (http(status, fields), After::Keep))
         });
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        )
-        .with_moment(moment);
+        // Its answers within what its path has shown, so that none is cut: the trouble is
+        // the registry's alone.
+        let shown = crate::patience::Shown {
+            slowest_answer_us: Some(60_000_000),
+            ..crate::patience::Shown::default()
+        };
+        let http = crate::testing::client()
+            .with_moment(moment)
+            .showing("127.0.0.1", server.port, shown);
         let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
         let url = registry.base().join("manifests/v1").unwrap();
+        let told = AtomicU64::new(0);
+        let say = |notice: Notice<'_>| {
+            if let Notice::RanOut(run_out) = notice {
+                assert_eq!(run_out.longest, moment, "{run_out}");
+                told.fetch_add(1, Ordering::Relaxed);
+            }
+        };
         let t0 = Instant::now();
-        let status = registry.request("GET", &url, &[]).map(|(r, _)| r.status);
-        (
+        let status =
+            registry.saying_waits(&say, || registry.request("GET", &url, &[]).map(|(r, _)| r.status));
+        Ridden {
             status,
-            server.requests().len(),
-            t0.elapsed(),
-            registry.http.paused(),
-        )
+            asked: server.requests().len(),
+            took: t0.elapsed(),
+            paused: registry.http.paused(),
+            told: told.load(Ordering::Relaxed) as usize,
+            longest: Duration::from_micros(registry.http.shown("127.0.0.1", server.port).trouble_us),
+        }
     }
 
     /// A registry's passing trouble, a gateway's 502, 503 or 504 or connections cut
     /// unanswered, is ridden out for as long as it lasts within a moment, however many
-    /// times it fails meanwhile, and costs at most its own length again; one that outlasts
-    /// the moment is the answer; a wait the registry names is waited; a repeated 500 is the
-    /// request's own, answered at once (D222). Before, two 502s in a row failed a request,
-    /// as Docker Hub's token server's did a CI build (job 117733752147).
+    /// times it fails meanwhile, and costs at most its own length again. One that outlasts
+    /// the moment runs out: told once, no failure, ridden out to its end, which teaches the
+    /// path its length; a wait the registry names is waited, past the moment too
+    /// (waits-06); connections cut unanswered past the run-out are the far end's end, typed;
+    /// a repeated 500 is the request's own, answered at once (D222). Before, two 502s in a
+    /// row failed a request, as Docker Hub's token server's did a CI build (job
+    /// 117733752147); and past the moment the trouble was the answer.
     #[test]
-    fn a_registrys_passing_trouble_is_ridden_out_within_a_moment() {
+    fn a_registrys_passing_trouble_is_ridden_out_and_runs_out_past_its_moment() {
         let lasting = Duration::from_millis(400);
         let moment = Duration::from_secs(20);
         for failing in [
@@ -3229,52 +3294,204 @@ mod tests {
             Some("408 Request Timeout"),
             None,
         ] {
-            let (status, asked, took, paused) = ridden(failing, &[], lasting, moment);
-            assert_eq!(status.unwrap(), 200, "{failing:?}");
-            assert!(asked >= 3, "{failing:?}: asked {asked} times");
-            assert!(took >= lasting, "{failing:?}: {took:?}");
+            let r = ridden(failing, &[], lasting, moment);
+            assert_eq!(r.status.unwrap(), 200, "{failing:?}");
+            assert!(r.asked >= 3, "{failing:?}: asked {} times", r.asked);
+            assert!(r.took >= lasting, "{failing:?}: {:?}", r.took);
             // Its waits at most its length again; the rest of the time, the asking's own
             // round trips.
-            assert!(paused < lasting * 2, "{failing:?}: {paused:?} of {took:?}");
+            assert!(
+                r.paused < lasting * 2,
+                "{failing:?}: {:?} of {:?}",
+                r.paused,
+                r.took
+            );
+            assert_eq!(r.told, 0, "{failing:?}: within its moment");
         }
-        // Past the moment: the registry's answer, said.
+        // Past the moment: told once, and ridden out to its 200, its length then the
+        // path's longest.
         let short = Duration::from_millis(500);
-        let (status, _, took, paused) = ridden(
-            Some("503 Service Unavailable"),
-            &[],
-            Duration::from_secs(3600),
-            short,
+        let lasting = Duration::from_millis(1500);
+        for failing in [Some("503 Service Unavailable"), Some("502 Bad Gateway")] {
+            let r = ridden(failing, &[], lasting, short);
+            assert_eq!(r.status.unwrap(), 200, "{failing:?}");
+            assert_eq!(r.told, 1, "{failing:?}");
+            assert!(
+                r.took >= lasting && r.paused < lasting * 2,
+                "{:?} of {:?}",
+                r.paused,
+                r.took
+            );
+            assert!(r.longest >= lasting, "{failing:?}: {:?}", r.longest);
+        }
+        // Cut unanswered past the run-out: the far end's end, typed, told first.
+        let r = ridden(None, &[], Duration::from_secs(3600), short);
+        let e = r.status.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Gone, "{e}");
+        assert_eq!(r.told, 1);
+        assert!(
+            r.took >= short && r.paused < short * 2,
+            "{:?} of {:?}",
+            r.paused,
+            r.took
         );
-        assert_eq!(status.unwrap(), 503);
-        assert!(took >= short && paused < short * 2, "{paused:?} of {took:?}");
-        let (status, _, took, paused) = ridden(None, &[], Duration::from_secs(3600), short);
-        assert_eq!(status.unwrap_err().kind(), ErrorKind::Transient);
-        assert!(took >= short && paused < short * 2, "{paused:?} of {took:?}");
         // A wait it names is waited.
-        let (status, _, took, _) = ridden(
+        let r = ridden(
             Some("503 Service Unavailable"),
             &[("Retry-After", "1")],
             Duration::from_millis(100),
             moment,
         );
-        assert_eq!(status.unwrap(), 200);
-        assert!(took >= Duration::from_secs(1), "{took:?}");
-        // One past the moment is not: the answer at once.
-        let (status, asked, _, paused) = ridden(
+        assert_eq!(r.status.unwrap(), 200);
+        assert!(r.took >= Duration::from_secs(1), "{:?}", r.took);
+        assert_eq!(r.told, 0);
+        // One past the moment too: the trouble runs out, told, waited, and taught whole
+        // once over, never as a trouble of its first failure's length (waits-06).
+        let r = ridden(
             Some("503 Service Unavailable"),
-            &[("Retry-After", "3600")],
-            Duration::from_secs(3600),
-            moment,
+            &[("Retry-After", "2")],
+            Duration::from_millis(100),
+            short,
         );
-        assert_eq!((status.unwrap(), asked, paused), (503, 1, Duration::ZERO));
+        assert_eq!(r.status.unwrap(), 200);
+        assert_eq!(r.told, 1);
+        assert!(r.took >= Duration::from_secs(2), "{:?}", r.took);
+        assert!(r.longest >= Duration::from_secs(2), "{:?}", r.longest);
         // A 500 is asked again once; repeated, it is the answer.
-        let (status, asked, _, _) = ridden(
+        let r = ridden(
             Some("500 Internal Server Error"),
             &[],
             Duration::from_secs(3600),
             moment,
         );
-        assert_eq!((status.unwrap(), asked), (500, 2));
+        assert_eq!((r.status.unwrap(), r.asked), (500, 2));
+    }
+
+    /// A trouble is ridden out within the longest its path has passed, 0.3 s here, never
+    /// twice that nor TCP's 100 s; past it, it runs out: told once and no failure, a
+    /// gateway's 503s that last 1.5 s ridden out to their 200, whose length is then the
+    /// longest (D222, PM M558). A wait the registry names past the longest runs the trouble
+    /// out too, and teaches its length once over, never the 503's own (waits-06).
+    #[test]
+    fn a_trouble_past_the_longest_its_path_passed_runs_out_told_once() {
+        let first = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let since = first.clone();
+        let named = Arc::new(AtomicBool::new(false));
+        let naming = named.clone();
+        // 503 for 1.5 s from each trouble's first asking, then 200; or, named, a 503 that
+        // says to come back in a second, then 200.
+        let server = route(None, move |_| {
+            let began = *since.lock().unwrap().get_or_insert_with(Instant::now);
+            if naming.load(Ordering::Relaxed) {
+                if began.elapsed() >= Duration::from_millis(100) {
+                    return Some((http("200 OK", &[]), After::Keep));
+                }
+                return Some((
+                    http("503 Service Unavailable", &[("Retry-After", "1")]),
+                    After::Keep,
+                ));
+            }
+            if began.elapsed() >= Duration::from_millis(1500) {
+                return Some((http("200 OK", &[]), After::Keep));
+            }
+            Some((http("503 Service Unavailable", &[]), After::Keep))
+        });
+        let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
+        let passed = crate::patience::Shown {
+            trouble_us: 300_000,
+            troubles: 1,
+            ..crate::patience::Shown::default()
+        };
+        let http = crate::testing::client().showing("127.0.0.1", server.port, passed.clone());
+        let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
+        let url = registry.base().join("manifests/v1").unwrap();
+        let told = std::sync::Mutex::new(Vec::new());
+        let say = |notice: Notice<'_>| {
+            if let Notice::RanOut(run_out) = notice {
+                told.lock().unwrap().push(run_out.clone());
+            }
+        };
+        let t0 = Instant::now();
+        let status = registry.saying_waits(&say, || {
+            registry.request("GET", &url, &[]).map(|(r, _)| r.status).unwrap()
+        });
+        let took = t0.elapsed();
+        assert_eq!(status, 200, "ridden out past 0.3 s: {took:?}");
+        assert!(took >= Duration::from_millis(1500), "{took:?}");
+        {
+            let told = told.lock().unwrap();
+            assert_eq!(told.len(), 1, "{told:?}");
+            assert_eq!(told[0].longest, Duration::from_millis(300));
+            assert!(told[0].lasted >= Duration::from_millis(300), "{told:?}");
+        }
+        let shown = registry.http.shown("127.0.0.1", server.port);
+        assert!(shown.trouble_us >= 1_500_000 && shown.troubles == 2, "{shown:?}");
+        assert_eq!(
+            registry.http.budget(&url),
+            Some(Duration::from_micros(shown.trouble_us))
+        );
+        // The 503's named wait, past a longest of 0.3 s.
+        let http = crate::testing::client().showing("127.0.0.1", server.port, passed);
+        let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
+        *first.lock().unwrap() = None;
+        named.store(true, Ordering::Relaxed);
+        told.lock().unwrap().clear();
+        let status = registry.saying_waits(&say, || {
+            registry.request("GET", &url, &[]).map(|(r, _)| r.status).unwrap()
+        });
+        assert_eq!(status, 200);
+        assert_eq!(told.lock().unwrap().len(), 1);
+        let shown = registry.http.shown("127.0.0.1", server.port);
+        assert!(shown.trouble_us >= 1_000_000 && shown.troubles == 2, "{shown:?}");
+    }
+
+    /// A far end that is truly gone fails the request, typed, past any run-out: nothing
+    /// listening where it was (a connection refused, at once), or connections ended before
+    /// any answer on every re-ask, on a path that has passed no trouble (the cold start,
+    /// which follows liveness from the first) and on one past its run-out (D222).
+    #[test]
+    fn a_far_end_that_is_gone_fails_typed() {
+        // Nothing listens: refused.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let reference = Reference::parse(&format!("127.0.0.1:{port}/test/image:v1")).unwrap();
+        let registry = Registry::new(crate::testing::client(), &reference, Credentials::Anonymous).unwrap();
+        let url = registry.base().join("manifests/v1").unwrap();
+        let e = registry
+            .request("GET", &url, &[])
+            .map(|(r, _)| r.status)
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Gone, "{e}");
+        // Every connection closed unanswered.
+        let server = route(None, |_| None);
+        let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
+        // Cold: its first cut ridden, the re-ask's cut its end.
+        let registry = Registry::new(crate::testing::client(), &reference, Credentials::Anonymous).unwrap();
+        let url = registry.base().join("manifests/v1").unwrap();
+        let e = registry
+            .request("GET", &url, &[])
+            .map(|(r, _)| r.status)
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Gone, "{e}");
+        assert_eq!(server.requests().len(), 2);
+        // Within a path's longest, 0.3 s, ridden; past it, its end.
+        let passed = crate::patience::Shown {
+            trouble_us: 300_000,
+            troubles: 1,
+            ..crate::patience::Shown::default()
+        };
+        let http = crate::testing::client().showing("127.0.0.1", server.port, passed);
+        let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
+        let t0 = Instant::now();
+        let e = registry
+            .request("GET", &url, &[])
+            .map(|(r, _)| r.status)
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Gone, "{e}");
+        assert!(t0.elapsed() >= Duration::from_millis(300), "{:?}", t0.elapsed());
+        assert!(server.requests().len() > 4, "{}", server.requests().len());
     }
 
     /// A wait before asking a registry again ends at its client's cancel, which it says.
@@ -3285,11 +3502,7 @@ mod tests {
         });
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
         let cancel = crate::http::Cancel::new();
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        )
-        .cancelled_by(cancel.clone());
+        let http = crate::testing::client().cancelled_by(cancel.clone());
         let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
         let url = registry.base().join("manifests/v1").unwrap();
         let canceller = std::thread::spawn(move || {
@@ -3311,9 +3524,10 @@ mod tests {
     }
 
     /// A download that brings nothing, its connections cut before a byte, is resumed while
-    /// that lasts a moment, and fetched once the server sends again; one that brings nothing
-    /// for a moment fails, saying how long (D222). Before, three such answers in a row
-    /// failed it, however quickly they came.
+    /// that lasts, and fetched once the server sends again; one that brings nothing past its
+    /// moment runs out, told once, and is resumed on, each asking answered, until it brings
+    /// its bytes (D222). Before, three such answers in a row failed it, however quickly they
+    /// came; and then one that brought nothing for a moment did.
     #[test]
     fn a_download_that_brings_nothing_is_resumed_within_a_moment() {
         let blob: Arc<Vec<u8>> = Arc::new((0..100_000u32).map(|i| (i % 253) as u8).collect());
@@ -3335,11 +3549,7 @@ mod tests {
             let dir = shards_testdir::TempDir::new(&format!("nothing-{}", server.port)).unwrap();
             let store = Store::open(&dir).unwrap();
             let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-            let http = Client::new(
-                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-                "shards-test",
-            )
-            .with_moment(moment);
+            let http = crate::testing::client().with_moment(moment);
             let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
             let desc = Descriptor {
                 media_type: "application/vnd.oci.image.layer.v1.tar".into(),
@@ -3348,155 +3558,235 @@ mod tests {
                 platform: None,
                 annotations: Default::default(),
             };
+            let told = AtomicUsize::new(0);
+            let say = |notice: Notice<'_>| {
+                if let Notice::RanOut(_) = notice {
+                    told.fetch_add(1, Ordering::Relaxed);
+                }
+            };
             let t0 = Instant::now();
-            let fetched = registry
-                .fetch_blob(&store, &desc, &Limits::none(), &|_| {})
-                .map(|()| std::fs::read(store.blob_path(&digest)).unwrap());
+            let fetched = registry.saying_waits(&say, || {
+                registry
+                    .fetch_blob(&store, &desc, &Limits::none(), &|_| {})
+                    .map(|()| std::fs::read(store.blob_path(&digest)).unwrap())
+            });
             (
                 fetched,
                 server.requests().len(),
                 t0.elapsed(),
                 registry.http.paused(),
+                told.load(Ordering::Relaxed),
             )
         };
         // Its waits at most the trouble's length again; the rest, its round trips.
         let lasting = Duration::from_millis(400);
-        let (fetched, asked, _, paused) = fetch(lasting, Duration::from_secs(20));
+        let (fetched, asked, _, paused, told) = fetch(lasting, Duration::from_secs(20));
         assert_eq!(fetched.unwrap(), *blob);
         assert!(asked >= 4, "asked {asked} times");
         assert!(paused < lasting * 2, "{paused:?}");
-        let short = Duration::from_millis(500);
-        let (fetched, _, took, paused) = fetch(Duration::from_secs(3600), short);
-        let e = fetched.unwrap_err();
-        assert!(
-            e.to_string().contains("the download brought nothing for 0."),
-            "{e}"
-        );
-        assert!(took >= short && paused < short * 2, "{paused:?} of {took:?}");
+        assert_eq!(told, 0);
+        let lasting = Duration::from_millis(1500);
+        let (fetched, _, took, paused, told) = fetch(lasting, Duration::from_millis(500));
+        assert_eq!(fetched.unwrap(), *blob);
+        assert_eq!(told, 1);
+        assert!(took >= lasting && paused < lasting * 2, "{paused:?} of {took:?}");
     }
 
-    /// A path whose answers come 1.5 s late: its first, past the 1.25 s drawn from the
-    /// second a path starts with (RFC 6298 §2.1), is cut and asked again at once with the
-    /// wait doubled (§5.5), and answered; its answer, its cut and what the cut cost
-    /// learned, the next is waited for, asked once (D222).
+    /// A path whose answers come 1.5 s late. Where it has shown none, its first is waited
+    /// for as its connection lives, asked once, and its answer learned. Where it has shown
+    /// answers of 0.3 s at most, its first is cut past them and asked again at once, that
+    /// asking waited for as its connection lives, since what the path showed bounds it no
+    /// more, and answered; the cut learns nothing, the answer is its slowest. Either way an
+    /// answer within what it learned, 1 s, is waited for after, asked once (D222).
     #[test]
     fn a_paths_answers_are_waited_for_as_long_as_it_shows() {
-        // Every answer 1.5 s late.
+        // Every answer `late` ms late.
+        let late = Arc::new(AtomicU64::new(1500));
+        let lateness = late.clone();
         let server = route(None, move |_| {
-            std::thread::sleep(Duration::from_millis(1500));
+            std::thread::sleep(Duration::from_millis(lateness.load(Ordering::SeqCst)));
             Some((http("200 OK", &[]), After::Keep))
         });
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        )
-        .drawing(0.25);
-        let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
-        let url = registry.base().join("manifests/v1").unwrap();
-        let t0 = Instant::now();
-        let (response, _) = registry.request("GET", &url, &[]).unwrap();
-        let took = t0.elapsed();
-        assert_eq!(response.status, 200);
-        drop(response);
-        assert!(took >= Duration::from_millis(1250 + 1500), "{took:?}");
-        assert_eq!(server.requests().len(), 2, "cut at 1.25 s, asked again");
-        let shown = registry.http.shown("127.0.0.1", server.port);
-        let answers = &shown.answers;
-        assert_eq!(
-            (answers.answered.total(), answers.cut.total(), answers.agains),
-            (1, 1, 1),
-            "{shown:?}"
-        );
+        let ask = |shown: crate::patience::Shown| {
+            late.store(1500, Ordering::SeqCst);
+            let http = Client::new(
+                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
+                "shards-test",
+            )
+            .showing("127.0.0.1", server.port, shown);
+            let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
+            let url = registry.base().join("manifests/v1").unwrap();
+            let asked = server.requests().len();
+            let t0 = Instant::now();
+            let (response, _) = registry.request("GET", &url, &[]).unwrap();
+            let took = t0.elapsed();
+            assert_eq!(response.status, 200);
+            drop(response);
+            let shown = registry.http.shown("127.0.0.1", server.port);
+            // Its next, within what it learned: asked once.
+            late.store(1000, Ordering::SeqCst);
+            let again = server.requests().len();
+            let (response, _) = registry.request("GET", &url, &[]).unwrap();
+            drop(response);
+            assert_eq!(server.requests().len(), again + 1, "{shown:?}");
+            (again - asked, took, shown)
+        };
+        let (asked, took, shown) = ask(crate::patience::Shown::default());
+        assert_eq!(asked, 1, "nothing shown: waited for as its connection lives");
+        assert!(took >= Duration::from_millis(1500), "{took:?}");
+        assert!(shown.slowest_answer_us.unwrap() >= 1_500_000, "{shown:?}");
+        let (asked, took, shown) = ask(crate::patience::Shown {
+            slowest_answer_us: Some(300_000),
+            ..crate::patience::Shown::default()
+        });
+        assert_eq!(asked, 2, "cut past 0.3 s, asked again");
+        assert!(took >= Duration::from_millis(300 + 1500), "{took:?}");
+        assert!(took < Duration::from_millis(1500 * 2), "{took:?}");
+        assert!(shown.slowest_answer_us.unwrap() >= 1_500_000, "{shown:?}");
         // Its connections, the cut one's and the one after, each made in time.
         assert!(shown.connect.n >= 2, "{shown:?}");
-        // What it showed is waited for: the same answer again, asked once.
-        let (response, _) = registry.request("GET", &url, &[]).unwrap();
-        drop(response);
-        assert_eq!(server.requests().len(), 3);
     }
 
-    /// A download silent past its path's patience is cut and resumed where it was, and
-    /// its silences learned: one that pauses 1.5 s, past the second a path starts with, is
-    /// fetched whole over two connections, and its path waits longer after (D222).
+    /// A download silent past the slowest silence its path has shown is cut and resumed
+    /// where it was; the run-out learns nothing, and the resumed body's silences are waited
+    /// out as its connection lives until one ends longer than the slowest, 0.5 s past 0.3 s,
+    /// which is then the slowest and bounds the rest: not its first, which its head's own
+    /// bytes end at once. Where the path has shown none, the same download, silent 1.5 s, is
+    /// waited out on its one connection, and its silence learned (D222). Its answers within
+    /// what the path has shown, so that none is cut: the silences are the test's.
     #[test]
     fn a_silent_download_is_cut_and_resumed_and_its_silence_learned() {
         use std::io::{BufRead, BufReader, Write};
         let blob: Vec<u8> = (0..200_000u32).map(|i| (i % 249) as u8).collect();
         let digest = Digest::from_hash(Algorithm::Sha256, &Sha256::digest(&blob[..]));
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let body = blob.clone();
-        let served = std::thread::spawn(move || {
-            let mut ranges = Vec::new();
-            while ranges.len() < 2 {
-                let n = ranges.len();
-                let (mut tcp, _) = listener.accept().unwrap();
-                // Asked in TLS first, it answers as a plain registry does (testing.rs).
-                let mut first = [0u8; 1];
-                if tcp.peek(&mut first).is_ok_and(|n| n == 1) && first[0] == 0x16 {
-                    let _ = tcp.write_all(crate::testing::GO_BAD_REQUEST);
-                    continue;
-                }
-                let mut reader = BufReader::new(tcp.try_clone().unwrap());
-                let mut from = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if let Some(r) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
-                        from = r.trim().trim_end_matches('-').parse().unwrap();
-                    }
-                    if line == "\r\n" {
+        let fetched = |shown: crate::patience::Shown| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let body = Arc::new(blob.clone());
+            let (asked, stopping) = (ranges.clone(), stop.clone());
+            // Each connection on its own thread, so that a resumed asking is answered at
+            // once, whatever an earlier one is doing.
+            let acceptor = std::thread::spawn(move || {
+                let mut served = Vec::new();
+                for tcp in listener.incoming() {
+                    if stopping.load(Ordering::SeqCst) {
                         break;
                     }
+                    let mut tcp = tcp.unwrap();
+                    let (asked, body) = (asked.clone(), body.clone());
+                    served.push(std::thread::spawn(move || {
+                        // Asked in TLS first, it answers as a plain registry does (testing.rs).
+                        let mut first = [0u8; 1];
+                        if tcp.peek(&mut first).is_ok_and(|n| n == 1) && first[0] == 0x16 {
+                            let _ = tcp.write_all(crate::testing::GO_BAD_REQUEST);
+                            return;
+                        }
+                        let mut reader = BufReader::new(tcp.try_clone().unwrap());
+                        let mut from = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if let Some(r) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                                from = r.trim().trim_end_matches('-').parse().unwrap();
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                        }
+                        let n = {
+                            let mut asked = asked.lock().unwrap();
+                            asked.push(from);
+                            asked.len()
+                        };
+                        let rest = &body[from..];
+                        let status = if from == 0 {
+                            "200 OK"
+                        } else {
+                            "206 Partial Content"
+                        };
+                        let _ = write!(tcp, "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n", rest.len());
+                        if n == 1 {
+                            // Half, then silence for 1.5 s, then the rest.
+                            let _ = tcp.write_all(&rest[..100_000]);
+                            std::thread::sleep(Duration::from_millis(1500));
+                            let _ = tcp.write_all(&rest[100_000..]);
+                        } else {
+                            // Resumed: a little, then silence for 0.5 s, then the rest.
+                            let _ = tcp.write_all(&rest[..1000]);
+                            std::thread::sleep(Duration::from_millis(500));
+                            let _ = tcp.write_all(&rest[1000..]);
+                        }
+                    }));
                 }
-                ranges.push(from);
-                let rest = &body[from..];
-                let status = if from == 0 {
-                    "200 OK"
-                } else {
-                    "206 Partial Content"
-                };
-                let _ = write!(tcp, "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n", rest.len());
-                if n == 0 {
-                    // Half, then silence past a second, then the rest, which no one reads.
-                    let _ = tcp.write_all(&rest[..100_000]);
-                    std::thread::sleep(Duration::from_millis(1500));
-                    let _ = tcp.write_all(&rest[100_000..]);
-                } else {
-                    let _ = tcp.write_all(rest);
+                for thread in served {
+                    let _ = thread.join();
                 }
-            }
-            ranges
-        });
-        let dir = shards_testdir::TempDir::new(&format!("silent-{port}")).unwrap();
-        let store = Store::open(&dir).unwrap();
-        let reference = Reference::parse(&format!("127.0.0.1:{port}/test/image:v1")).unwrap();
-        // Its silence cut at the 1.25 s drawn from a second.
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        )
-        .drawing(0.25);
-        let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
-        let desc = Descriptor {
-            media_type: "application/vnd.oci.image.layer.v1.tar".into(),
-            digest: digest.to_string(),
-            size: 200_000,
-            platform: None,
-            annotations: Default::default(),
+            });
+            let dir = shards_testdir::TempDir::new(&format!("silent-{port}")).unwrap();
+            let store = Store::open(&dir).unwrap();
+            let reference = Reference::parse(&format!("127.0.0.1:{port}/test/image:v1")).unwrap();
+            let http = Client::new(
+                Box::new(|_| crate::tls::client_config(Vec::new(), None)),
+                "shards-test",
+            )
+            .showing("127.0.0.1", port, shown);
+            let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
+            let desc = Descriptor {
+                media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+                digest: digest.to_string(),
+                size: 200_000,
+                platform: None,
+                annotations: Default::default(),
+            };
+            registry
+                .fetch_blob(&store, &desc, &Limits::none(), &|_| {})
+                .unwrap();
+            assert_eq!(std::fs::read(store.blob_path(&digest)).unwrap(), blob);
+            let shown = registry.http.shown("127.0.0.1", port);
+            let silence = registry.http.silence("127.0.0.1", port);
+            drop(registry);
+            // Ends the server's accept loop, which then joins its connections' threads.
+            stop.store(true, Ordering::SeqCst);
+            drop(std::net::TcpStream::connect(("127.0.0.1", port)));
+            acceptor.join().unwrap();
+            let ranges = ranges.lock().unwrap().clone();
+            (ranges, shown, silence)
         };
-        registry
-            .fetch_blob(&store, &desc, &Limits::none(), &|_| {})
-            .unwrap();
-        assert_eq!(std::fs::read(store.blob_path(&digest)).unwrap(), blob);
-        let ranges = served.join().unwrap();
-        assert_eq!(ranges[0], 0);
+        let answers = Some(60_000_000);
+        let (ranges, shown, silence) = fetched(crate::patience::Shown {
+            slowest_answer_us: answers,
+            ..crate::patience::Shown::default()
+        });
+        assert_eq!(ranges, [0], "nothing shown: waited out on its one connection");
+        // The read that waited it out, begun just after the bytes before it were taken.
+        let slowest = shown.slowest_silence_us.unwrap();
+        assert!(slowest >= 1_000_000, "{shown:?}");
+        assert_eq!(
+            silence,
+            crate::patience::Bounded::Slowest(Duration::from_micros(slowest))
+        );
+        let (ranges, shown, silence) = fetched(crate::patience::Shown {
+            slowest_answer_us: answers,
+            slowest_silence_us: Some(300_000),
+            ..crate::patience::Shown::default()
+        });
+        assert_eq!(ranges.len(), 2, "cut past 0.3 s and resumed once: {ranges:?}");
         assert!(ranges[1] > 0, "resumed where it was cut: {ranges:?}");
-        let shown = registry.http.shown("127.0.0.1", port);
-        let silences = &shown.silences;
-        assert!(silences.answered.total() > 0, "{shown:?}");
-        assert_eq!((silences.cut.total(), silences.agains), (1, 1), "{shown:?}");
+        let slowest = shown.slowest_silence_us.unwrap();
+        assert!(
+            (400_000..1_500_000).contains(&slowest),
+            "the resumed body's 0.5 s the slowest, the 1.5 s cut learned nothing: {shown:?}"
+        );
+        assert_eq!(
+            silence,
+            crate::patience::Bounded::Slowest(Duration::from_micros(slowest)),
+            "the resumed body brought bytes: bounded again"
+        );
     }
 
     /// A whole blob whose answer ends as its framing says, short of its descriptor's size,
@@ -3513,10 +3803,7 @@ mod tests {
         let dir = shards_testdir::TempDir::new(&format!("short-{}", server.port)).unwrap();
         let store = Store::open(&dir).unwrap();
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", server.port)).unwrap();
-        let http = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        );
+        let http = crate::testing::client();
         let registry = Registry::new(http, &reference, Credentials::Anonymous).unwrap();
         let desc = Descriptor {
             media_type: "application/vnd.oci.image.layer.v1.tar".into(),

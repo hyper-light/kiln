@@ -870,19 +870,22 @@ fn boxes_namespaces(node: &Node) -> (u64, u64) {
     (counts.taken, counts.made_on_path)
 }
 
-/// The pool's refill thread's make of a network namespace: the `netns.make` record (hex_testkit::waits).
-static POOL_HOLDS: Patience = Patience::seeded(
-    "test.oci_spec_box.pool_holds",
-    hex_testkit::waits::NETNS_MAKE,
-);
+/// The pool's refill thread's make of a network namespace, measuring (decision 9: no record seeds it).
+static POOL_HOLDS: Patience = Patience::measuring("test.oci_spec_box.pool_holds");
 
-/// Waits for the fact a create from the pool needs: a root node's pool holds a namespace, which its
-/// thread makes as soon as the node opens.
+/// Waits for the fact a create from the pool needs: a root node's pool holds a namespace, which its thread makes as
+/// soon as the node opens. A look: the pool tells no event as it fills, its counts read. Its party is the in-process
+/// node this test holds, its refill thread's work the fact (the review's C-5).
 fn pool_holds_one(node: &Node) {
-    hex_testkit::waits::until(&POOL_HOLDS, "a namespace in the node's pool", || {
-        let c = node.netns().unwrap();
-        c.made_ahead > c.taken + c.discarded
-    })
+    hex_testkit::waits::follow::until(
+        &POOL_HOLDS,
+        "a namespace in the node's pool",
+        || hex_testkit::waits::follow::Party::Live,
+        || {
+            let c = node.netns().unwrap();
+            c.made_ahead > c.taken + c.discarded
+        },
+    )
     .unwrap();
 }
 

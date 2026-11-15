@@ -69,8 +69,7 @@ fn an_upgrades_first_create_is_timed() {
         .collect();
     let config = GuestConfig {
         binary,
-        kernel,
-        initrd,
+        boot: hex_runtime::guest::Boot::Kernel { kernel, initrd },
         vcpus: 1,
         gpu: false,
         // Shards' least and twice HEX-GUEST-19's measured peak, as guest_real sizes it.

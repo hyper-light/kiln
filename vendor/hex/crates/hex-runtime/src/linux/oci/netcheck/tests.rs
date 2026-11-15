@@ -468,7 +468,8 @@ fn a_dumps_reads_are_bounded_by_its_bytes() {
             &ours,
             &[0; NLMSG_HDR],
             &mut scratch,
-            &Patience::measuring("test")
+            &Patience::measuring("test"),
+            &mut None,
         ),
         Ok(())
     );
@@ -514,28 +515,159 @@ fn a_cold_dump_is_waited_for_and_its_slowest_answer_bounds_the_next() {
     );
 }
 
-/// Decision 9's bound: a read unanswered past the slowest answer seen is refused, the namespace thrown away, and it is
-/// no sample (Karn's point); the next read follows the kernel's answer alone, with no factor. Do: start the wait as it
-/// is once an answer of 1 ms has been seen (test-only `Patience::seeded`), then dump through a socket pair whose other
-/// end never answers. Expect: refused as unreadable once 1 ms has passed, not held for good; the slowest still 1 ms,
-/// and no bound after.
+/// The tests' own wait for a step of the kernel these tests stand for, a fact the waiting thread makes: measuring.
+static STEP: Patience = Patience::measuring("test.netcheck.step");
+
+/// A thread's end as a wait's party: ended once it has returned.
+fn running<T>(thread: &std::thread::ScopedJoinHandle<'_, T>) -> hex_testkit::waits::follow::Party {
+    if thread.is_finished() {
+        hex_testkit::waits::follow::Party::Ended
+    } else {
+        hex_testkit::waits::follow::Party::Live
+    }
+}
+
+/// The review's C-9 (decision 9; ROOT, 2026-11-14; AC-T7.4.1): a dump read unanswered past the slowest answer seen is
+/// told once and followed to its answer on its socket, never refused at W*: the namespace, which the check holds, can't
+/// end under it, and its answer is the sample W* rises to. Do: once an answer of 1 ms has been seen, dump through a
+/// socket pair whose other end answers each of the five dumps with its end only once the read's run-out is told.
+/// Expect: the dumps read, W* risen past 1 ms and bounding again.
 #[test]
-fn a_dump_unanswered_past_its_bound_is_refused_and_no_sample() {
-    let (ours, _theirs) = rustix::net::socketpair(
+fn c9_a_dump_unanswered_past_its_bound_is_told_once_then_answered_and_sampled() {
+    let (ours, theirs) = rustix::net::socketpair(
         AddressFamily::UNIX,
         SocketType::SEQPACKET,
         SocketFlags::CLOEXEC,
         None,
     )
     .unwrap();
-    let slowest = Patience::seeded("test", Duration::from_millis(1));
-    let mut scratch = Scratch::default();
-    assert_eq!(
-        dumps(&ours, &mut scratch, &slowest),
-        Err(Refused::Unreadable)
+    let slowest = Patience::measuring("test.netcheck.answers.past");
+    slowest.answered(Duration::from_millis(1));
+    std::thread::scope(|s| {
+        let dumping = s.spawn(|| {
+            let ours = ours;
+            dumps(&ours, &mut Scratch::default(), &slowest)
+        });
+        hex_testkit::waits::follow::until(
+            &STEP,
+            "the dump's run-out told",
+            || running(&dumping),
+            || slowest.deadline().is_none(),
+        )
+        .unwrap();
+        for seq in 1..=5 {
+            let done = msg(NLMSG_DONE, seq, &[0, 0, 0, 0]);
+            // A reader that ended has closed its end: nothing to answer.
+            let _ = rustix::net::send(&theirs, &done, SendFlags::NOSIGNAL);
+        }
+        assert_eq!(
+            dumping.join().unwrap(),
+            Ok(vec![Vec::new(); DUMPS.len()]),
+            "past W*, the dump was refused rather than followed to its answer"
+        );
+    });
+    assert!(
+        slowest
+            .slowest()
+            .is_some_and(|slowest| slowest > Duration::from_millis(1)),
+        "the late answer is the sample W* rises to: {:?}",
+        slowest.slowest()
     );
     assert_eq!(
-        (slowest.deadline(), slowest.slowest()),
-        (None, Some(Duration::from_millis(1)))
+        slowest.deadline(),
+        slowest.slowest(),
+        "bounded again at the slowest"
+    );
+}
+
+/// An `RTM_NEWADDR` (20) for ::1/128 on interface 1, tentative where `tentative` says.
+fn lo6_address(seq: u32, tentative: bool) -> Vec<u8> {
+    let flags = if tentative { IFA_F_TENTATIVE } else { 0 };
+    let mut p = vec![AF_INET6, 128, flags, 254, 1, 0, 0, 0];
+    let mut one = [0u8; 16];
+    one[15] = 1;
+    p.extend(attr(1, &one));
+    msg(20, seq, &p)
+}
+
+/// Answers one round of [`dumps`]' five requests on `kernel`, as the kernel would, `::1` tentative where `tentative`
+/// says; false where the asking end has closed first.
+fn answer_dumps(kernel: &OwnedFd, tentative: bool) -> bool {
+    // Room for any request, as the module reads its own answers.
+    let mut request = vec![0u8; READ_BYTES];
+    for seq in 1..=5u32 {
+        match rustix::net::recv(kernel, &mut request, RecvFlags::empty()) {
+            Ok((0, _)) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        assert_eq!(u32_at(&request, 8), Ok(seq), "the dumps' requests in order");
+        let done = msg(NLMSG_DONE, seq, &[0, 0, 0, 0]);
+        let answer = if seq == 2 {
+            [lo6_address(seq, tentative), done].concat()
+        } else {
+            done
+        };
+        if rustix::net::send(kernel, &answer, SendFlags::NOSIGNAL).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The review's C-9 (decision 9; ROOT, 2026-11-14; AC-T7.4.1): a fresh namespace whose loopback IPv6 address is still
+/// tentative past the slowest settle seen is told once and followed on the kernel's notices to its settle, never
+/// thrown away at W*: its answer is the sample W* rises to. Do: settle, once a settle of a nanosecond has been seen,
+/// through socket pairs standing for the kernel: its dumps show `::1` tentative until the settle's run-out is told,
+/// then a notice comes, and they show it settled. Expect: the settled dumps, and W* risen past the nanosecond.
+#[test]
+fn c9_a_settle_past_its_bound_is_told_and_followed_to_its_settle() {
+    let pair = || {
+        rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap()
+    };
+    let (notices, kernel_notices) = pair();
+    let (socket, kernel) = pair();
+    let settles = Patience::measuring("test.netcheck.settles.past");
+    settles.answered(Duration::from_nanos(1));
+    let answers = Patience::measuring("test.netcheck.settles.answers");
+    std::thread::scope(|s| {
+        let settling = s.spawn(|| {
+            let (notices, socket) = (notices, socket);
+            settle(
+                &notices,
+                &socket,
+                &mut Scratch::default(),
+                &settles,
+                &answers,
+            )
+        });
+        assert!(answer_dumps(&kernel, true), "the first round asked");
+        hex_testkit::waits::follow::until(
+            &STEP,
+            "the settle's run-out told",
+            || running(&settling),
+            || settles.deadline().is_none(),
+        )
+        .unwrap();
+        let notice = msg(20, 0, &[AF_INET6, 128, 0, 254, 1, 0, 0, 0]);
+        let _ = rustix::net::send(&kernel_notices, &notice, SendFlags::NOSIGNAL);
+        answer_dumps(&kernel, false);
+        let settled = settling.join().unwrap();
+        assert!(
+            settled.as_ref().is_ok_and(|dumps| !tentative(dumps)),
+            "past W*, the settle was refused rather than followed to its settle: {settled:?}"
+        );
+    });
+    assert!(
+        settles
+            .slowest()
+            .is_some_and(|slowest| slowest > Duration::from_nanos(1)),
+        "the late settle is the sample W* rises to: {:?}",
+        settles.slowest()
     );
 }

@@ -4,7 +4,7 @@ The crates Focal's bus, Quiver and Mantle are built on (`vendor/focal-bus`, `ven
 `vendor/mantle`), at one revision of hyper-raft for all of them.
 
 - **Upstream:** https://github.com/hyper-light/hyper-raft, commit
-  `045cf3ff82e1d96d1f8c339d6e644d17afc998a3` (2026-11-13), MIT (`LICENSE`): hyper-raft's `main`, the
+  `e0613f524b0df198cc61dc1e82b33c22d604cf7b` (2026-11-13), MIT (`LICENSE`): hyper-raft's `main`, the
   revision Hex and Shards' control link (`crates/remote`) take, whose hyper-quic gives a connection its
   negotiated idle timeout (patch Q34), taken with Hex's `c7603b0b` (kiln plan
   01a1cd8e862e7169a074db3d5fa33f3d step 17). Before it, `fb74b59` (2026-11-07), which holds what

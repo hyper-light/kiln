@@ -41,6 +41,9 @@ enum Owner {
 struct Flows {
     owner: Owner,
     streams: Vec<[Flow; 2]>,
+    /// How the relay ended, as the first of its two sides to end said it ([`Relayed`]): the
+    /// other's end is that end's consequence.
+    ended: Option<Relayed>,
 }
 struct Ledger {
     flows: Mutex<Flows>,
@@ -68,6 +71,37 @@ impl Ledger {
         self.lock().owner = Owner::Stopped;
         self.changed.notify_all();
     }
+    /// The relay ends as `ended` says, where neither side ended it before.
+    fn end(&self, ended: Relayed) {
+        let mut flows = self.lock();
+        flows.ended.get_or_insert(ended);
+        flows.owner = Owner::Stopped;
+        self.changed.notify_all();
+    }
+}
+
+/// How a relay of a run's members' output ended: each of its channels' end relayed; a side's
+/// end of its connection, its guest's as its run ends, or its owner's, which is its owner's
+/// to end the run for, or its `STOP_ORDER`'s where its owner is gone (D27); or broken, its
+/// owner's frames or its guest's refused, or the relay's own failure, as said.
+enum Relayed {
+    Done,
+    Ended,
+    Broke(io::Error),
+}
+
+impl Relayed {
+    /// How `e`, the error one of a relay's sides ended on, ends it: a frame refused
+    /// (`invalid`), or the relay's own failure (its allocation, its worker), breaks it; any
+    /// other is that side's connection ended.
+    fn of(e: io::Error) -> Relayed {
+        match e.kind() {
+            io::ErrorKind::InvalidData | io::ErrorKind::OutOfMemory | io::ErrorKind::Other => {
+                Relayed::Broke(e)
+            }
+            _ => Relayed::Ended,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -87,45 +121,123 @@ pub struct Control {
     members: Vec<AbortState>,
     inputs: Vec<InputState>,
 }
+/// How a run's managed control scope ended, as its guest said it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Served {
+    /// Its own end (`MANAGED_CONTROL_END`): the signal connection goes on to its relay's end.
+    ControlEnded,
+    /// Its relay's end (`SIGNALS_END`), the scope's with it: init says it so where a failure
+    /// broke its relay, then its words and its end on the run's connection (init run.rs).
+    RelayEnded,
+}
+/// What a run's managed control scope refused of its guest, which init never says there
+/// (init capture.rs `ControlQueue`): the frame named, so that the scope's loss says what came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// A frame of a kind, or of a length, that the scope never takes: its header's words.
+    Frame { kind: u8, len: u32 },
+    /// Eight bytes that are no frame's header (shards-abi `parse_header`).
+    Header([u8; run::HEADER]),
+    /// An abort's or an input end's payload, which does not decode as one.
+    Payload { kind: u8, why: managed::Error },
+    /// An abort of a member the run did not admit.
+    Tenant(u32),
+    /// An input's end of a member whose input is not open: none asked, or its end said.
+    Input(u32),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Frame { kind, len } => write!(f, "a frame of kind {kind}, {len} bytes long"),
+            Self::Header(header) => write!(f, "a header that is no frame's, {header:02x?}"),
+            Self::Payload { kind, why } => {
+                write!(f, "a frame of kind {kind} whose payload is refused: {why}")
+            }
+            Self::Tenant(member) => write!(f, "an abort of member {member}, which the run did not admit"),
+            Self::Input(member) => write!(f, "an input's end of member {member}, whose input is not open"),
+        }
+    }
+}
+
+/// How a run's managed control scope failed: its connection or its owner's link failed, or
+/// its guest said what it never says there.
+#[derive(Debug)]
+pub enum Unserved {
+    Failed(io::Error),
+    Refused(Refusal),
+}
+
+impl From<io::Error> for Unserved {
+    fn from(e: io::Error) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl std::fmt::Display for Unserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(e) => write!(f, "{e}"),
+            Self::Refused(refusal) => write!(f, "its guest sent {refusal}"),
+        }
+    }
+}
+
 impl Control {
-    pub fn supervise(self, signals: &UnixStream, boundary: &UnixStream) -> io::Result<()> {
+    /// [`Control::serve`]; the guest's run connection, `boundary`, ended where its control is
+    /// refused or ends unannounced.
+    pub fn supervise(self, signals: &UnixStream, boundary: &UnixStream) -> Result<Served, Unserved> {
         let result = self.serve(signals);
-        if result.is_err() {
+        if let Err(e) = &result {
+            *ENDED_RUN.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(format!("its managed control ended: {e}"));
             super::end_guest(boundary);
         }
         result
     }
-    pub fn serve(mut self, signals: &UnixStream) -> io::Result<()> {
+    pub fn serve(mut self, signals: &UnixStream) -> Result<Served, Unserved> {
         let mut read = shards_ipc::Polled(signals);
         loop {
             let mut header = [0; run::HEADER];
             read.read_exact(&mut header)?;
             match run::parse_header(header) {
-                Some((kind::MANAGED_CONTROL_END, 0)) => return Ok(()),
+                Some((kind::MANAGED_CONTROL_END, 0)) => return Ok(Served::ControlEnded),
+                Some((kind::SIGNALS_END, 0)) => return Ok(Served::RelayEnded),
                 Some((kind::MANAGED_ABORT, n)) if n == managed::ABORT_LEN as u32 => {}
                 Some((kind::MANAGED_INPUT_ENDED, n)) if n == managed::INPUT_ENDED_LEN as u32 => {
                     let mut payload = [0; managed::INPUT_ENDED_LEN];
                     read.read_exact(&mut payload)?;
-                    let ended = managed::InputEnded::decode(&payload).map_err(invalid)?;
-                    let state = self
-                        .inputs
-                        .get_mut(usize::try_from(ended.member).map_err(invalid)?)
+                    let ended = managed::InputEnded::decode(&payload).map_err(|why| {
+                        Unserved::Refused(Refusal::Payload {
+                            kind: kind::MANAGED_INPUT_ENDED,
+                            why,
+                        })
+                    })?;
+                    let state = usize::try_from(ended.member)
+                        .ok()
+                        .and_then(|member| self.inputs.get_mut(member))
                         .filter(|s| **s == InputState::Open)
-                        .ok_or_else(|| invalid("managed input end of a member with no open input"))?;
+                        .ok_or(Unserved::Refused(Refusal::Input(ended.member)))?;
                     crate::warm::managed_input_ended(&self.daemon, &payload)?;
                     *state = InputState::Ended;
                     continue;
                 }
-                _ => return Err(invalid("managed abort frame")),
+                Some((kind, len)) => return Err(Unserved::Refused(Refusal::Frame { kind, len })),
+                None => return Err(Unserved::Refused(Refusal::Header(header))),
             }
             let mut payload = [0; managed::ABORT_LEN];
             read.read_exact(&mut payload)?;
             let payload = payload.as_slice();
-            let abort = managed::Abort::decode(payload).map_err(invalid)?;
-            let state = self
-                .members
-                .get_mut(usize::try_from(abort.member).map_err(invalid)?)
-                .ok_or_else(|| invalid("managed abort tenant"))?;
+            let abort = managed::Abort::decode(payload).map_err(|why| {
+                Unserved::Refused(Refusal::Payload {
+                    kind: kind::MANAGED_ABORT,
+                    why,
+                })
+            })?;
+            let state = usize::try_from(abort.member)
+                .ok()
+                .and_then(|member| self.members.get_mut(member))
+                .ok_or(Unserved::Refused(Refusal::Tenant(abort.member)))?;
             if matches!(*state, AbortState::Aborted) {
                 continue;
             }
@@ -135,7 +247,11 @@ impl Control {
     }
 }
 
-pub fn start(spec: &mut run::Spec, given: Given) -> Result<Control, String> {
+/// Starts the run's managed capture: its members' output relayed from its guest to its owner,
+/// on a thread of its own, once its guest dials it; `run`, a copy of the run's connection,
+/// which a relay that breaks ends ([`relay_ending`]).
+pub fn start(spec: &mut run::Spec, given: Given, run: UnixStream) -> Result<Control, String> {
+    ENDED_RUN.lock().unwrap_or_else(PoisonError::into_inner).take();
     if managed::capacity(&spec.setup).map_err(|e| e.to_string())? != Some(given.capacity)
         || managed::members(&spec.setup).map_err(|e| e.to_string())? != Some(given.members)
         || managed::token(&spec.setup).map_err(|e| e.to_string())?.is_some()
@@ -216,7 +332,7 @@ pub fn start(spec: &mut run::Spec, given: Given) -> Result<Control, String> {
                 .recv()
                 .map_err(io::Error::other)
                 .and_then(|c| c.map_err(io::Error::other))
-                .and_then(|guest| relay(guest, given.stream, given.capacity, states));
+                .and_then(|guest| relay_ending(guest, given.stream, given.capacity, states, &run));
             if let Err(e) = result {
                 shards_vmm::debug!("managed capture aborted: {e}");
             }
@@ -297,16 +413,51 @@ fn start_inputs(spec: &mut run::Spec, inputs: &[[u8; 4]], owner: shards_ipc::Str
     Ok(())
 }
 
-fn relay(
+/// Why the run's managed capture ended the run, where its relay broke ([`relay_ending`]) or
+/// its control was refused or ended unannounced ([`Control::supervise`]), said whole.
+static ENDED_RUN: Mutex<Option<String>> = Mutex::new(None);
+
+/// Why the run's managed capture ended its run, where it did ([`ENDED_RUN`]), taken: for its
+/// serve to say, in place of the end of the run's connection it caused.
+pub fn ended_run() -> Option<String> {
+    ENDED_RUN.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
+/// [`relay`], and its run with it where it broke while its VM runs on: why kept for the
+/// run's serve to say ([`ended_run`]), then the run's connection, `run`, ended, as its guest
+/// takes for its end (it powers off) and its serve does for the guest's, which then fails the
+/// run in those words (warm.rs `finish`, `UNSERVED`, D258). Its members' output gone, a run
+/// that went on would wait for its owner's `STOP`. A relay that ended with every channel's
+/// end, or as one of its sides ended its connection, ends nothing of the run's: its run's
+/// end is its own, its owner's, or its `STOP_ORDER`'s.
+fn relay_ending(
     guest: UnixStream,
     owner: shards_ipc::Stream,
     capacity: usize,
     streams: Vec<[Flow; 2]>,
+    run: &UnixStream,
 ) -> io::Result<()> {
+    match relay(guest, owner, capacity, streams) {
+        Relayed::Done => Ok(()),
+        Relayed::Ended => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "one of its sides ended its connection",
+        )),
+        Relayed::Broke(e) => {
+            *ENDED_RUN.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(format!("its members' output could not be relayed: {e}"));
+            super::end_guest(run);
+            Err(e)
+        }
+    }
+}
+
+fn relay(guest: UnixStream, owner: shards_ipc::Stream, capacity: usize, streams: Vec<[Flow; 2]>) -> Relayed {
     let ledger = Ledger {
         flows: Mutex::new(Flows {
             owner: Owner::Running,
             streams,
+            ended: None,
         }),
         changed: Condvar::new(),
     };
@@ -314,26 +465,28 @@ fn relay(
         let credit = std::thread::Builder::new()
             .name("managed-credit".into())
             .spawn_scoped(scope, || {
-                let result = credits(&guest, &owner, capacity, &ledger);
+                if let Err(e) = credits(&guest, &owner, capacity, &ledger) {
+                    ledger.end(Relayed::of(e));
+                }
                 ledger.stop();
                 super::end_guest(&guest);
                 shards_ipc::end(&owner);
-                result
-            })?;
-        let result = records(&guest, &owner, capacity, &ledger);
-        ledger.stop();
+            });
+        let credit = match credit {
+            Ok(credit) => credit,
+            Err(e) => return Relayed::Broke(e),
+        };
+        let ended = match records(&guest, &owner, capacity, &ledger) {
+            Ok(()) => Relayed::Done,
+            Err(e) => Relayed::of(e),
+        };
+        ledger.end(ended);
         shards_ipc::end(&owner);
         super::end_guest(&guest);
-        let credit = credit
-            .join()
-            .map_err(|_| io::Error::other("managed credit worker panicked"))?;
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => match credit {
-                Err(credit) if e.kind() == io::ErrorKind::UnexpectedEof => Err(credit),
-                _ => Err(e),
-            },
+        if credit.join().is_err() {
+            ledger.end(Relayed::Broke(io::Error::other("managed credit worker panicked")));
         }
+        ledger.lock().ended.take().unwrap_or(Relayed::Ended)
     })
 }
 
@@ -550,12 +703,70 @@ mod tests {
         );
         assert_eq!(record(&mut owner), (kind::MANAGED, expected));
         drop(owner);
-        assert!(worker.join().unwrap().is_err());
+        assert!(matches!(worker.join().unwrap(), Relayed::Ended));
+    }
+
+    /// A relay that breaks while its VM runs on (here its owner's credit for a channel given
+    /// again before the first was used, which it refuses) ends the run in the VM: the run's
+    /// connection ended, so that its guest powers off and its serve returns, and why kept for
+    /// that serve to say (UNSERVED, D258); goal 75's WHP case left such a run to its owner's
+    /// STOP. One whose guest ends its capture, or whose owner ends its own, ends nothing of
+    /// its run: the guest's run ends with it, and an owner's end is its owner's to end the run
+    /// for, or its STOP_ORDER's where its owner is gone.
+    #[test]
+    fn a_relay_that_breaks_mid_run_ends_its_run_saying_why() {
+        let _serial = super::super::hellos::TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let capacity = managed::HEADER + 16;
+        let relaying = |end: &dyn Fn(&mut shards_ipc::Stream, &mut UnixStream)| {
+            let (vm, mut guest) = UnixStream::pair().unwrap();
+            let (pipe, mut owner) = shards_ipc::Stream::pair().unwrap();
+            let (run, guests_run) = UnixStream::pair().unwrap();
+            // The run's connection as its serve holds it beside the relay's copy, which the
+            // relay's end drops.
+            let held = run.try_clone().unwrap();
+            guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            guests_run
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut streams = vec![[Flow::NEW; 2]];
+            for slot in &mut streams[0] {
+                slot.credit = Credit::Waiting;
+            }
+            let worker = std::thread::spawn(move || relay_ending(vm, pipe, capacity, streams, &run));
+            send_credit(&mut owner, 0, Channel::Stdout, capacity);
+            assert_eq!(record(&mut guest).0, kind::MANAGED_CREDIT);
+            end(&mut owner, &mut guest);
+            let _ = worker.join().unwrap();
+            // Its run's end, as the guest's side of the run's connection reads it.
+            let ended = matches!((&guests_run).read(&mut [0]), Ok(0));
+            drop(held);
+            (ended, ended_run())
+        };
+        let (ended, why) = relaying(&|owner, _| send_credit(owner, 0, Channel::Stdout, capacity));
+        assert!(ended, "a relay that broke left its run's connection open");
+        assert_eq!(
+            why.as_deref(),
+            Some("its members' output could not be relayed: duplicate or closed managed credit")
+        );
+        let (ended, why) = relaying(&|_, guest| {
+            guest.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        assert!(!ended, "a guest's end of its capture ended its run");
+        assert_eq!(why, None);
+        let (ended, why) = relaying(&|owner, _| shards_ipc::end(owner));
+        assert!(!ended, "an owner's end of its capture ended its run");
+        assert_eq!(why, None);
     }
 
     #[test]
     fn explicit_control_end_preserves_layer_connection_but_unannounced_eof_ends_it() {
+        let _serial = super::super::hellos::TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         for graceful in [true, false] {
+            ended_run();
             let (signals, mut peer) = UnixStream::pair().unwrap();
             let (boundary, mut layer) = UnixStream::pair().unwrap();
             let (daemon, _owner) = shards_ipc::Stream::pair().unwrap();
@@ -580,10 +791,55 @@ mod tests {
                 (&retained_boundary).write_all(b"x").unwrap();
                 assert_eq!(record(&mut layer), (kind::LAYER, b"x".to_vec()));
             } else {
-                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+                assert!(
+                    matches!(&result, Err(Unserved::Failed(e)) if e.kind() == io::ErrorKind::UnexpectedEof),
+                    "{result:?}"
+                );
+                assert_eq!(
+                    ended_run().as_deref(),
+                    Some("its managed control ended: failed to fill whole buffer")
+                );
                 assert!(matches!(layer.read(&mut [0]), Ok(0)));
             }
         }
+    }
+
+    /// A guest whose relay ends inside the control scope, as init's does on a failure that
+    /// breaks its relay (run.rs: `say_signals_end` after the loop, then `SYSTEM_ERR` and `EXIT`
+    /// on the run's connection), has said its end: the scope ends with it, the run's
+    /// connection is left open for those words, and nothing is refused. Refused as "managed
+    /// abort frame", it ended the run's connection before they were read, and the run ended
+    /// "the guest stopped before the command ended: failed to fill whole buffer" (CI run
+    /// 43513425954, api_image's staged_credentials case, its signal connection lost to
+    /// "invalid data" just before).
+    #[test]
+    fn a_relays_end_within_the_control_scope_ends_it_and_leaves_the_run_open() {
+        let _serial = super::super::hellos::TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ended_run();
+        let (signals, mut peer) = UnixStream::pair().unwrap();
+        let (boundary, mut guests_run) = UnixStream::pair().unwrap();
+        let (daemon, _owner) = shards_ipc::Stream::pair().unwrap();
+        let control = Control {
+            daemon,
+            members: vec![AbortState::Active],
+            inputs: vec![InputState::None],
+        };
+        let retained = boundary.try_clone().unwrap();
+        let worker = std::thread::spawn(move || control.supervise(&signals, &boundary));
+        peer.write_all(&run::header(kind::SIGNALS_END, 0)).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), Served::RelayEnded);
+        assert_eq!(ended_run(), None);
+        // The guest's words after its relay's end reach the host on the run's connection.
+        guests_run.write_all(&run::header(kind::EXIT, 4)).unwrap();
+        guests_run.write_all(&3u32.to_be_bytes()).unwrap();
+        let mut said = [0; run::HEADER + 4];
+        (&retained).read_exact(&mut said).unwrap();
+        assert_eq!(said[run::HEADER..], 3u32.to_be_bytes());
+        // And the host's way to the guest is open too.
+        (&retained).write_all(b"x").unwrap();
+        assert_eq!(guests_run.read(&mut [0]).unwrap(), 1);
     }
 
     #[test]
@@ -643,8 +899,9 @@ mod tests {
             capacity: 4096,
             members: 2,
         };
+        let run = || UnixStream::pair().unwrap().0;
         let mut asked = spec(None);
-        let started = start(&mut asked, given());
+        let started = start(&mut asked, given(), run());
         assert!(started.is_ok(), "{:?}", started.err());
         let minted = managed::input_tokens(&asked.setup).unwrap();
         assert_eq!(minted.iter().map(|(m, _)| *m).collect::<Vec<_>>(), [1]);
@@ -654,7 +911,7 @@ mod tests {
             &[7; run::TOKEN],
         ]
         .concat();
-        let refused = start(&mut spec(Some(brought)), given());
+        let refused = start(&mut spec(Some(brought)), given(), run());
         assert_eq!(
             refused.err().as_deref(),
             Some("managed input tokens are the VM's to mint")
@@ -716,7 +973,80 @@ mod tests {
             // Closed after: a relay that took them all reads its end, never hangs.
             drop(peer);
             let refused = worker.join().unwrap().unwrap_err();
-            assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                matches!(refused, Unserved::Refused(Refusal::Input(1))),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// What the guest says within its run's managed control scope that the scope never takes
+    /// is named where the scope's loss is said, in the VM process's log and in the run's end.
+    /// At c120c8a95 every refusal said "invalid data" alone (ROOT's KVM runs of api_image on
+    /// adacachy2, 2026-11-13: `the guest's signal connection is lost: invalid data: its
+    /// workload takes no more signals, ...`), and what had come could not be told.
+    #[test]
+    fn what_the_control_scope_refuses_is_named_in_the_loss_it_says() {
+        use super::super::{Lost, Signals, ToGuest, Unsent, signal_guest, take_signals, will_run};
+        let _serial = super::super::hellos::TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let abort = managed::Abort { member: 4, errno: 5 }.encode().unwrap();
+        let cases = [
+            (
+                run::header(kind::STDOUT, 3).to_vec(),
+                Refusal::Frame {
+                    kind: kind::STDOUT,
+                    len: 3,
+                },
+            ),
+            // What init wrote where a failure broke its relay with three bytes of an abort
+            // gone: its end at once after them (init run.rs, the relay's end tests).
+            (
+                [
+                    &run::header(kind::MANAGED_ABORT, 0)[..3],
+                    &run::header(kind::SIGNALS_END, 0),
+                ]
+                .concat(),
+                Refusal::Header([kind::MANAGED_ABORT, 0, 0, kind::SIGNALS_END, 0, 0, 0, 0]),
+            ),
+            (
+                [
+                    &run::header(kind::MANAGED_ABORT, managed::ABORT_LEN as u32)[..],
+                    &abort,
+                ]
+                .concat(),
+                Refusal::Tenant(4),
+            ),
+        ];
+        for (said, refused) in cases {
+            ended_run();
+            let to: &'static ToGuest = Box::leak(Box::new(ToGuest::new(Signals::new())));
+            will_run(to);
+            let (host, mut guest) = UnixStream::pair().unwrap();
+            let (boundary, mut guests_run) = UnixStream::pair().unwrap();
+            let (daemon, _owner) = shards_ipc::Stream::pair().unwrap();
+            let control = Control {
+                daemon,
+                members: vec![AbortState::Active],
+                inputs: vec![InputState::None],
+            };
+            guest.write_all(&said).unwrap();
+            take_signals(to, host, Some((control, boundary)));
+            let lost = signal_guest(to, 15).unwrap_err();
+            assert_eq!(lost, Unsent::Lost(Lost::Refused(refused)));
+            assert_eq!(
+                lost.to_string(),
+                format!("the guest's signal connection is lost: its managed control refused {refused}")
+            );
+            assert_eq!(
+                ended_run(),
+                Some(format!("its managed control ended: its guest sent {refused}"))
+            );
+            assert!(
+                matches!(guests_run.read(&mut [0]), Ok(0)),
+                "the run's connection ended"
+            );
         }
     }
 }

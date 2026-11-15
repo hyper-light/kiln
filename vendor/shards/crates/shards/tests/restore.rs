@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use common::{Run, cannot_run_vms, cannot_snapshot, kernel, run_shards, test_guest};
 use shards_testguest::fill;
 
-const TIMEOUT: Duration = Duration::from_secs(120);
 const RO_SALT: u64 = 1;
 const RO_BYTES: usize = 4 << 20;
 const RESUMED: u32 = 2;
@@ -41,6 +40,7 @@ impl Scratch {
     }
 
     /// Boots the snapshot guest on two vCPUs, which asks for its snapshot and stops.
+    #[track_caller]
     fn boot_and_snapshot(&self) -> Run {
         let disk = format!("{}:ro", self.0.join("ro.img").display());
         let cmdline =
@@ -65,7 +65,6 @@ impl Scratch {
                 "--snapshot-then",
                 "stop",
             ],
-            TIMEOUT,
         )
     }
 }
@@ -100,7 +99,7 @@ fn cold_restores_side_by_side_go_on_apart() {
     let snapshot = s.snapshot();
     let runs: Vec<Run> = std::thread::scope(|scope| {
         let restores: Vec<_> = (0..3)
-            .map(|_| scope.spawn(|| run_shards(&["restore"], &[snapshot.to_str().unwrap()], TIMEOUT)))
+            .map(|_| scope.spawn(|| run_shards(&["restore"], &[snapshot.to_str().unwrap()])))
             .collect();
         restores.into_iter().map(|r| r.join().unwrap()).collect()
     });
@@ -160,16 +159,22 @@ fn a_held_restore_runs_its_guest_only_once_released() {
         }
         text
     });
-    // Within TIMEOUT, or past it while its VM process runs (D209): it prepares its restore,
-    // and says nothing as it does. One that runs nothing for DAEMON_QUIET fails.
-    let mut ran = common::Ran::of(child.id());
+    // While its VM process runs (D209, `common::Heard::running`): it prepares its restore,
+    // and says nothing as it does. One refused fails.
+    let mut heard = common::Heard::running(child.id());
     loop {
-        // Asked each pass, so that each slice of its VM process's is judged as it comes.
-        let running = ran.lately();
-        match ready.recv_timeout(Duration::from_secs(1)) {
-            Ok(()) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if started.elapsed() < TIMEOUT || running => {}
-            Err(_) => {
+        match ready.recv_timeout(heard.next_look()) {
+            Ok(()) => {
+                heard.answered();
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(refused) = heard.look(true) {
+                    let _ = child.kill();
+                    panic!("never ready: {refused}\n{}", err.join().unwrap());
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = child.kill();
                 panic!("never ready: {}", err.join().unwrap());
             }
@@ -183,14 +188,15 @@ fn a_held_restore_runs_its_guest_only_once_released() {
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"\n").unwrap();
     drop(stdin);
-    // Within TIMEOUT of its release, or past it while its VM process runs.
-    let deadline = Instant::now() + TIMEOUT;
+    // While its VM process runs; refused, ended, its status then what its asserts read.
+    let mut heard = common::Heard::running(child.id());
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
+            heard.answered();
             break status;
         }
-        let running = ran.lately();
-        if Instant::now() > deadline && !running {
+        if let Err(refused) = heard.look(true) {
+            let _ = writeln!(std::io::stderr(), "its end: {refused}");
             let _ = child.kill();
             break child.wait().unwrap();
         }

@@ -7,11 +7,11 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::patience::{Party, Patience};
+use crate::patience::{Party, Patience, Piece};
 use crate::{
     Bounds, BoxId, BoxOwner, BoxSpec, BoxState, Class, ClassSpec, CredentialGrant, Destination,
-    DeviceId, DeviceKind, Exit, Grant, GuestTime, Member, MemberKind, Mount, Network, OciSpec,
-    Ports, Program, Proto, Refusal, Rootfs, Runtime, Signal, Stdio, Upstream,
+    DeviceId, DeviceKind, Exit, Grant, GuestTime, LifecycleCause, Member, MemberKind, Mount,
+    Network, OciSpec, Ports, Program, Proto, Refusal, Rootfs, Runtime, Signal, Stdio, Upstream,
 };
 
 /// What a fixture's program does.
@@ -70,10 +70,12 @@ pub trait Fixture {
     fn party(&self) -> Party {
         Party::Live
     }
-    /// A wait past W* tells this once: what it waits on, what it wants and what the runtime last showed, for the test's
-    /// output. Where a runtime that differs stays alive, the wait goes on, and this is what the person sees of it.
+    /// A wait past W* tells this once: what it waits on, what it wants and what the runtime last showed, on the test's
+    /// stderr, where the person running it reads it (the review's E-4: a no-op told no one). Where a runtime that
+    /// differs stays alive, the wait goes on, and this is what the person sees of it.
     fn told(&self, note: &str) {
-        let _ = note;
+        // A test with no stderr has nowhere to tell it: the wait's run-out line and census row still say it ran out.
+        let _ = writeln!(std::io::stderr().lock(), "{note}");
     }
 }
 
@@ -98,6 +100,19 @@ pub struct Failure {
 /// record seeds it: the per-class end records it was seeded from until 2026-11-13 are evidence alone.
 pub static ENDS: Patience = Patience::measuring("conformance.ends");
 
+/// Program `p` as a following wait names its party ([`Piece`]): by its pid, a guest's own where it runs in a VM's guest.
+fn program<P: crate::Proc + ?Sized>(p: &P) -> [Piece<'static>; 3] {
+    [
+        Piece::Kind("program pid "),
+        Piece::Pid(i64::from(p.pid())),
+        Piece::Kind(if p.on_this_host() {
+            ", by its own events"
+        } else {
+            " in its guest, by its host's events"
+        }),
+    ]
+}
+
 /// Program `p`'s end, waited for as [`ENDS`] waits: within W*, and past it, its run-out told, by the program's life
 /// alone, on its own events (`Proc::wait_for` until its end), however long that takes. The end, however long it took,
 /// is the sample W* rises to. Refused only as the runtime refuses the wait.
@@ -108,8 +123,8 @@ pub fn end_of<P: crate::Proc + ?Sized>(p: &mut P) -> Result<Exit, Refusal> {
             ENDS.answered(asked.elapsed());
             return Ok(exit);
         }
-        // Past W*: no sample (Karn's point), but the census is told, once, and the wait goes on.
-        ENDS.ran_out(within);
+        // Past W*: no sample (Karn's point), but the run-out is told, once, and the wait goes on.
+        ENDS.ran_out(within, asked.elapsed(), &program(p));
     }
     loop {
         // `Duration::MAX`: until its end, each runtime's wait taking it as "no deadline".
@@ -254,7 +269,7 @@ pub const IMAGE_CASES: &[Case] = &[
     },
     Case {
         id: "HEX-IMG-5",
-        says: "a program exec'd in a running VM is refused Awaits(MemberExec), and a signal but KILL Awaits(MemberSignal); the VM runs on",
+        says: "a program exec'd in a running VM is refused Awaits(MemberExec); TERM is taken, its members' to take, and the VM runs on",
         run: image_members,
     },
     Case {
@@ -269,7 +284,7 @@ pub const IMAGE_CASES: &[Case] = &[
     },
     Case {
         id: "HEX-IMG-8",
-        says: "create of a VM granting its member a credential toward a host no egress grant of its own reaches by name over TCP, toward no host, by a reference no store names, twice, a second credential toward one host, or toward a host another member reaches ungranted, is refused Invalid naming credentials, making nothing; a VM granting a credential toward its member's own egress hosts is made, and inspect shows its every credential grant, or, where its node leases no credentials, it is refused Unconfigured, making nothing",
+        says: "create of a VM granting its member a credential toward a host no egress grant of its own reaches by name over TCP, toward no host, by a reference no store names, twice, with a placeholder no request could carry, with another credential's placeholder, or toward a host another member reaches ungranted, is refused Invalid naming credentials, making nothing; a VM granting its member credentials toward its own egress hosts, two toward one host each by its own placeholder, is made, and inspect shows its every credential grant, or, where its node leases no credentials, it is refused Unconfigured, making nothing",
         run: image_credentials,
     },
 ];
@@ -738,7 +753,14 @@ fn read_until<T, R: std::fmt::Debug>(
             && asked.elapsed() >= within
         {
             // Past W*: no sample (Karn's point), the run-out told once, and the wait goes on while the runtime lives.
-            ENDS.ran_out(within);
+            ENDS.ran_out(
+                within,
+                asked.elapsed(),
+                &[
+                    Piece::Kind("the runtime under test, for "),
+                    Piece::Name(what),
+                ],
+            );
             fx.told(&format!(
                 "{what}: past {within:?}, the runtime showing {stood:?}; following it"
             ));
@@ -1060,7 +1082,8 @@ fn image_made(rt: &dyn Runtime, fx: &dyn Fixture, name: &str) -> Result<BoxId, S
     Ok(id)
 }
 
-/// Runs `case` on box `id`, then deletes it whatever the case found: a failed case leaves no VM.
+/// Runs `case` on box `id`, then deletes it whatever the case found: a failed case leaves no VM, and names every
+/// refusal, its own and its delete's (ROOT, 2026-11-14: the HVF run's HEX-IMG-4 told its KILL's alone).
 fn deleting(
     rt: &dyn Runtime,
     id: &BoxId,
@@ -1068,7 +1091,10 @@ fn deleting(
 ) -> Result<(), String> {
     let outcome = case();
     let deleted = rt.delete(id).map_err(|e| format!("delete: {e}"));
-    outcome.and(deleted)
+    match (outcome, deleted) {
+        (Err(own), Err(delete)) => Err(format!("{own}; {delete}")),
+        (outcome, deleted) => outcome.and(deleted),
+    }
 }
 
 fn image_lifecycle(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
@@ -1087,7 +1113,7 @@ fn image_lifecycle(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
         ensure(again == Err(Refusal::Exists(id.clone())), || {
             format!("second create: {again:?}")
         })?;
-        rt.start(&id).map_err(|e| format!("start: {e}"))?;
+        booted(rt, &id)?;
         let info = rt.inspect(&id).map_err(|e| e.to_string())?;
         ensure((info.state, info.exit) == (BoxState::Running, None), || {
             format!("a started VM: {info:?}")
@@ -1113,12 +1139,43 @@ fn image_lifecycle(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
     Ok(())
 }
 
+/// Starts Shards image VM `id`: its start taken at once, or answered `Lifecycle { Pending }`, its boot under way past its
+/// runtime's W* (the 11-13 ruling), and then followed through [`Runtime::started`] to its boot's answer, a wait on the
+/// fact (decision 9), never on looks (ROOT, 2026-11-14).
+fn booted(rt: &dyn Runtime, id: &BoxId) -> Result<(), String> {
+    match rt.start(id) {
+        Ok(()) => Ok(()),
+        Err(Refusal::Lifecycle {
+            cause: LifecycleCause::Pending,
+            ..
+        }) => rt
+            .started(id)
+            .map(|_| ())
+            .map_err(|e| format!("started: {e}")),
+        Err(e) => Err(format!("start: {e}")),
+    }
+}
+
+/// KILL to Shards image VM `id`, its stop taken, its end for [`exit_of`] to follow. A stop past its runtime's W* is
+/// answered `Lifecycle { Pending }` (the 11-13 ruling: the stop goes on), a stop taken too. No call of the node's wire
+/// follows a stop's end yet, so a remote caller reads it as `exit_of` does (ROOT, 2026-11-14: the next appended call,
+/// if kiln asks for one).
+fn stopped(rt: &dyn Runtime, id: &BoxId) -> Result<(), String> {
+    match rt.signal(id, Signal::KILL) {
+        Ok(())
+        | Err(Refusal::Lifecycle {
+            cause: LifecycleCause::Pending,
+            ..
+        }) => Ok(()),
+        Err(e) => Err(format!("stop: {e}")),
+    }
+}
+
 fn image_stop(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
     let id = image_made(rt, fx, "image-stop")?;
     deleting(rt, &id, || {
-        rt.start(&id).map_err(|e| format!("start: {e}"))?;
-        rt.signal(&id, Signal::KILL)
-            .map_err(|e| format!("stop: {e}"))?;
+        booted(rt, &id)?;
+        stopped(rt, &id)?;
         let info = exit_of(rt, fx, &id)?;
         ensure(
             (info.state, info.exit) == (BoxState::Empty, Some(Exit::Signal(9))),
@@ -1141,7 +1198,7 @@ fn image_command_exit(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> 
     rt.create(fx.init(id.clone(), &Act::Fail(3)))
         .map_err(|e| format!("create: {e}"))?;
     deleting(rt, &id, || {
-        rt.start(&id).map_err(|e| format!("start: {e}"))?;
+        booted(rt, &id)?;
         let info = exit_of(rt, fx, &id)?;
         ensure(
             (info.state, info.exit) == (BoxState::Empty, Some(Exit::Code(3))),
@@ -1181,7 +1238,7 @@ fn image_guest_time(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
             format!("usage before its start: {early:?}")
         })?;
         let before = std::time::Instant::now();
-        rt.start(&id).map_err(|e| format!("start: {e}"))?;
+        booted(rt, &id)?;
         let first = per_vcpu(rt.usage(&id).map_err(|e| format!("usage: {e}"))?)?;
         let second = per_vcpu(rt.usage(&id).map_err(|e| format!("usage: {e}"))?)?;
         let wall = u64::try_from(before.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1199,8 +1256,7 @@ fn image_guest_time(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
         ensure(second.iter().all(|ns| *ns <= wall), || {
             format!("guest time {second:?} past the {wall} ns since its start")
         })?;
-        rt.signal(&id, Signal::KILL)
-            .map_err(|e| format!("stop: {e}"))?;
+        stopped(rt, &id)?;
         exit_of(rt, fx, &id)?;
         let late = rt.usage(&id);
         ensure(matches!(late, Err(Refusal::NotRunning(..))), || {
@@ -1212,7 +1268,7 @@ fn image_guest_time(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
 fn image_members(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
     let id = image_made(rt, fx, "image-members")?;
     deleting(rt, &id, || {
-        rt.start(&id).map_err(|e| format!("start: {e}"))?;
+        booted(rt, &id)?;
         let exec = rt.exec(&id, fx.program(&Act::Say("never")), Stdio::null());
         ensure(
             matches!(
@@ -1223,16 +1279,14 @@ fn image_members(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
             ),
             || format!("exec in a VM: {:?}", exec.as_ref().err()),
         )?;
+        // A signal but KILL is its run's members' (goal 2's item 2): taken, each member's lane given it. The fixture's
+        // image has a member that runs until a signal ends it, as image_real's harness does: one that had ended already
+        // takes none, and a VM whose members all had is refused NotRunning, as `Runtime::signal` says.
         let term = rt.signal(&id, Signal::TERM);
-        ensure(
-            term == Err(Refusal::Awaits {
-                needs: Upstream::MemberSignal,
-            }),
-            || format!("TERM to a VM: {term:?}"),
-        )?;
+        ensure(term == Ok(()), || format!("TERM to a VM: {term:?}"))?;
         let info = rt.inspect(&id).map_err(|e| e.to_string())?;
         ensure((info.state, info.exit) == (BoxState::Running, None), || {
-            format!("a VM after its members were refused: {info:?}")
+            format!("a VM after its members were signalled: {info:?}")
         })
     })
 }
@@ -1414,9 +1468,10 @@ fn image_grants(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
 }
 
 /// HEX-IMG-8 (joint plan step 33, AC-T7.7.2; Shards' D242; docs/design/credential-grants.md C2, C4): a credential grant
-/// grants no egress and names exactly whose flows its value is filled into, so one that could never be filled in as it
-/// says is refused, naming credentials, before anything is made. One that can is made where its node leases credentials,
-/// and inspect shows it as the record holds it, or refused as its node's configuration where it leases none.
+/// grants no egress and names exactly whose flows its value is filled into, where its own placeholder stands, so one
+/// that could never be filled in as it says is refused, naming credentials, before anything is made. Those that can,
+/// two toward one host among them, each by its own placeholder, are made where its node leases credentials, and inspect
+/// shows them as the record holds them, or refused as its node's configuration where it leases none.
 fn image_credentials(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
     let id = id("image-credentials")?;
     let _ = rt.delete(&id);
@@ -1437,10 +1492,19 @@ fn image_credentials(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
             last: 443,
         },
     };
+    // Placeholders as kiln's broker mints them (Shards' D242): a visible marker, then 256 random bits in hex; one for
+    // each credential here.
+    let placeholder = |reference: &str| match reference {
+        "anthropic/team" => {
+            "kiln-placeholder-fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        }
+        _ => "kiln-placeholder-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    };
     let credential = |member: &Member, reference: &str, toward: &[&str]| CredentialGrant {
         member: member.clone(),
         reference: reference.to_owned(),
         toward: toward.iter().map(|h| (*h).to_owned()).collect(),
+        placeholder: placeholder(reference).to_owned(),
     };
     let granted =
         |grants: Vec<Grant>, credentials: Vec<CredentialGrant>| -> Result<BoxSpec, String> {
@@ -1477,9 +1541,19 @@ fn image_credentials(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
         ),
         (
             providers(),
+            vec![CredentialGrant {
+                placeholder: "kiln placeholder".to_owned(),
+                ..credential(&claude, "anthropic/ada", &["api.anthropic.com"])
+            }],
+        ),
+        (
+            providers(),
             vec![
                 credential(&claude, "anthropic/ada", &["api.anthropic.com"]),
-                credential(&claude, "anthropic/team", &["api.anthropic.com"]),
+                CredentialGrant {
+                    placeholder: placeholder("anthropic/ada").to_owned(),
+                    ..credential(&claude, "anthropic/team", &["platform.claude.com"])
+                },
             ],
         ),
         (
@@ -1508,11 +1582,14 @@ fn image_credentials(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
             format!("a refused create ({credentials:?}) made {left:?}")
         })?;
     }
-    let credentials = vec![credential(
-        &claude,
-        "anthropic/ada",
-        &["api.anthropic.com", "platform.claude.com"],
-    )];
+    let credentials = vec![
+        credential(
+            &claude,
+            "anthropic/ada",
+            &["api.anthropic.com", "platform.claude.com"],
+        ),
+        credential(&claude, "anthropic/team", &["api.anthropic.com"]),
+    ];
     match rt.create(granted(providers(), credentials.clone())?) {
         Ok(_) => {
             let shown = rt.inspect(&id).map_err(|e| format!("inspect: {e}"));
@@ -1801,5 +1878,120 @@ mod tests {
             still_running().is_some_and(|watch| took < watch),
             "HEX-RT-4 took {took:?}"
         );
+    }
+
+    /// ROOT, 2026-11-14 (the HVF run's HEX-IMG-4, whose delete's refusal went untold; AC-T7.4.1): a case that fails, and
+    /// whose delete of its box is refused too, names both refusals. Do: run a failing case on a box the runtime holds no
+    /// record of, so its delete is refused NoSuchBox. Expect: the failure names the case's own words and the delete's
+    /// refusal.
+    #[test]
+    fn a_failing_case_whose_delete_is_refused_names_both_refusals() {
+        let rt = SimRuntime::new();
+        let id = BoxId::new("never-made").unwrap();
+        let why = deleting(&rt, &id, || Err("the case's own failure".to_owned())).unwrap_err();
+        assert!(why.contains("the case's own failure"), "{why}");
+        let delete = format!("delete: {}", Refusal::NoSuchBox(id));
+        assert!(why.contains(&delete), "{why}");
+    }
+
+    /// The simulator, every KILL it takes answered `Lifecycle { Pending }`, and where `starts` every start too, as a
+    /// Shards image VM's stop or boot past its W* is answered (the 11-13 ruling: it goes on, its end recorded when a
+    /// later call finds it); what the simulator refuses refused so.
+    struct PastWStar {
+        sim: SimRuntime,
+        starts: bool,
+    }
+
+    impl PastWStar {
+        fn pending(id: &BoxId) -> Refusal {
+            Refusal::Lifecycle {
+                id: id.clone(),
+                cause: crate::LifecycleCause::Pending,
+                why: None,
+            }
+        }
+    }
+
+    impl Runtime for PastWStar {
+        fn classes(&self) -> Vec<Class> {
+            self.sim.classes()
+        }
+        fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
+            self.sim.create(spec)
+        }
+        fn start(&self, id: &BoxId) -> Result<(), Refusal> {
+            self.sim.start(id)?;
+            if !self.starts {
+                return Ok(());
+            }
+            Err(Self::pending(id))
+        }
+        fn exec(
+            &self,
+            id: &BoxId,
+            program: Program,
+            stdio: Stdio,
+        ) -> Result<Box<dyn Proc>, Refusal> {
+            self.sim.exec(id, program, stdio)
+        }
+        fn run(
+            &self,
+            spec: BoxSpec,
+            program: Program,
+            stdio: Stdio,
+        ) -> Result<Box<dyn Proc>, Refusal> {
+            self.sim.run(spec, program, stdio)
+        }
+        fn signal(&self, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
+            self.sim.signal(id, signal)?;
+            if signal != Signal::KILL {
+                return Ok(());
+            }
+            Err(Self::pending(id))
+        }
+        fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+            self.sim.inspect(id)
+        }
+        fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
+            self.sim.usage(id)
+        }
+        fn list(&self) -> Result<Vec<BoxInfo>, Refusal> {
+            self.sim.list()
+        }
+        fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
+            self.sim.delete(id)
+        }
+    }
+
+    /// HEX-IMG-2 and HEX-IMG-4 (goal 2; ROOT, 2026-11-14): a Shards image VM's KILL its runtime answers
+    /// `Lifecycle { Pending }`, its stop under way past W*, is a stop taken, its end followed to the box's exit as
+    /// [`exit_of`] reads it. Do: run the image cases against a simulator whose every KILL it takes is answered so.
+    /// Expect: no case fails.
+    #[test]
+    fn w2_an_image_vms_stop_answered_pending_is_followed_to_its_end() {
+        let failures = run_image(
+            &PastWStar {
+                sim: SimRuntime::new(),
+                starts: false,
+            },
+            &SimFixture::ShardsImage,
+        );
+        assert_eq!(failures, Vec::new());
+    }
+
+    /// HEX-IMG-1 to HEX-IMG-5 (goal 2; ROOT, 2026-11-14): a Shards image VM's start its runtime answers
+    /// `Lifecycle { Pending }`, its boot under way past W*, is a start taken, followed through `Runtime::started` to its
+    /// boot's answer, so a caller waits on the fact and never on looks. Do: run the image cases against a simulator whose
+    /// every start and KILL it takes is answered so. Expect: no case fails.
+    #[test]
+    fn w2_an_image_vms_start_answered_pending_is_followed_through_started() {
+        let failures = run_image(
+            &PastWStar {
+                sim: SimRuntime::new(),
+                starts: true,
+            },
+            &SimFixture::ShardsImage,
+        );
+        assert_eq!(failures, Vec::new());
     }
 }

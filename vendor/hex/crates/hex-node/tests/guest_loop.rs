@@ -259,6 +259,8 @@ fn guest_box(id: &BoxId) -> hex_api::BoxInfo {
         route: None,
         last_resort: None,
         ended: None,
+        control: None,
+        control_wake: None,
         credentials: Vec::new(),
     }
 }
@@ -394,6 +396,21 @@ impl Write for Looped {
 impl shards_api::Stream for Looped {
     fn try_clone(&self) -> std::io::Result<Box<dyn shards_api::Stream>> {
         Ok(Box::new(Looped(self.0.try_clone()?)))
+    }
+
+    fn read_shared(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut &self.0, buf)
+    }
+
+    fn write_shared(&self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut &self.0, buf)
+    }
+
+    fn into_socket(self: Box<Self>) -> shards_api::OwnedSocket {
+        #[cfg(unix)]
+        return std::os::fd::OwnedFd::from(self.0);
+        #[cfg(windows)]
+        std::os::windows::io::OwnedSocket::from(self.0)
     }
 
     fn handle(&self) -> shards_api::Handle<'_> {
@@ -1060,8 +1077,10 @@ fn held_holds_no_other(socket: &std::path::Path, gate: &Gate, here: &BoxId) {
 fn config() -> GuestConfig {
     GuestConfig {
         binary: PathBuf::from("/shards"),
-        kernel: PathBuf::from("/k"),
-        initrd: PathBuf::from("/i"),
+        boot: hex_runtime::guest::Boot::Kernel {
+            kernel: PathBuf::from("/k"),
+            initrd: PathBuf::from("/i"),
+        },
         vcpus: 1,
         memory_mib: shards_api::min_memory_mib(std::env::consts::ARCH),
         gpu: false,
@@ -1466,19 +1485,26 @@ fn carried_streams() -> wire::Streams {
 /// whose `state` holds its records, and the node.
 fn recorded(guests: &Arc<LoopGuests>) -> (tempfile::TempDir, Recorded<WithGuest<Host>>) {
     let dir = tempfile::Builder::new().prefix("gl-").tempdir().unwrap();
+    let node = recorded_in(guests, &dir);
+    (dir, node)
+}
+
+/// A node opened over `dir`'s state as a node starts: its store, the state's one writer, reads every record there as
+/// it opens (the review's per-window reads), so what a crash left there is written before this.
+fn recorded_in(guests: &Arc<LoopGuests>, dir: &tempfile::TempDir) -> Recorded<WithGuest<Host>> {
     let node = WithGuest::new(
         Host(hex_api::sim::SimRuntime::new()),
         GuestRuntime::new(Arc::new(Shared(Arc::clone(guests))), config()),
     )
     .unwrap();
-    let node = Recorded::open(node, &dir.path().join("state")).unwrap();
-    (dir, node)
+    Recorded::open(node, &dir.path().join("state")).unwrap()
 }
 
 /// Box `id`'s record as a crash leaves it torn in `state`'s runtime record directory, where macOS's and Windows'
 /// nodes keep the records that needn't outlive their host: bytes that never decode. Its path.
 fn tear(state: &Path, id: &BoxId) -> PathBuf {
     let path = hex_node::store::runtime_record(&state.join("@records"), id);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, b"{\"version\":").unwrap();
     path
 }
@@ -1501,16 +1527,20 @@ fn t_t7_1_2_a_torn_records_box_in_the_guest_is_deleted_there_and_the_record_remo
         .unwrap()
         .extend([torn.clone(), named.clone()]);
     let guests = Arc::new(LoopGuests::new(Arc::clone(&gate)));
-    let (dir, node) = recorded(&guests);
+    let dir = tempfile::Builder::new().prefix("gl-").tempdir().unwrap();
     let state = dir.path().join("state");
+    // What the crash left, before the node opens over it as a node starts.
+    let path = tear(&state, &torn);
+    let kept = hex_node::store::runtime_record(&state.join("@records"), &named);
+    std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
     std::fs::write(
-        hex_node::store::runtime_record(&state.join("@records"), &named),
+        kept,
         BoxRecord::new(process(&named), Phase::Ready, Vec::new())
             .encode()
             .unwrap(),
     )
     .unwrap();
-    let path = tear(&state, &torn);
+    let node = recorded_in(&guests, &dir);
     let recovered = node
         .recover()
         .expect("the node starts beside a torn record");
@@ -1570,9 +1600,9 @@ fn process(id: &BoxId) -> BoxSpec {
 }
 
 /// T-T7.1.2: a torn record no box of the guest's carries may be the host's, whose `process` boxes no name of
-/// theirs outlives the node to prove ended, so nothing proves what it holds. Do: recover. Expect: the node
-/// starts and keeps the record, so its name is never reused: a create of it is refused as `Exists`, and the
-/// box as uncertain.
+/// theirs outlives the node to prove ended, so nothing proves what it holds. Do: open the node over a record a crash
+/// tore, as a node starts, and recover. Expect: the node starts and keeps the record, so its name is never reused: a
+/// create of it is refused as `Exists`, and the box as uncertain.
 #[test]
 fn t_t7_1_2_a_torn_record_no_guest_box_carries_is_kept_and_its_name_never_reused() {
     if shards_api::backend().is_err() {
@@ -1581,9 +1611,10 @@ fn t_t7_1_2_a_torn_record_no_guest_box_carries_is_kept_and_its_name_never_reused
     }
     let gate = Arc::new(Gate::default());
     let guests = Arc::new(LoopGuests::new(Arc::clone(&gate)));
-    let (dir, node) = recorded(&guests);
+    let dir = tempfile::Builder::new().prefix("gl-").tempdir().unwrap();
     let torn = BoxId::new("torn").unwrap();
     let path = tear(&dir.path().join("state"), &torn);
+    let node = recorded_in(&guests, &dir);
     let recovered = node
         .recover()
         .expect("the node starts beside a torn record");
@@ -1598,13 +1629,14 @@ fn t_t7_1_2_a_torn_record_no_guest_box_carries_is_kept_and_its_name_never_reused
         node.create(process(&torn)),
         Err(Refusal::Exists(torn.clone()))
     );
-    assert_eq!(
+    assert!(matches!(
         node.inspect(&torn),
         Err(Refusal::Lifecycle {
-            id: torn.clone(),
-            cause: LifecycleCause::Uncertain
-        })
-    );
+            id,
+            cause: LifecycleCause::Uncertain,
+            why: Some(_),
+        }) if id == torn
+    ));
     assert!(gate.unstaged.lock().unwrap().is_empty());
 }
 
@@ -1620,8 +1652,9 @@ fn t_t7_1_2_a_guest_that_cant_answer_keeps_the_torn_record_and_the_node_starts()
     let torn = BoxId::new("torn").unwrap();
     gate.boxes.lock().unwrap().insert(torn.clone());
     let guests = Arc::new(LoopGuests::new(Arc::clone(&gate)));
-    let (dir, node) = recorded(&guests);
+    let dir = tempfile::Builder::new().prefix("gl-").tempdir().unwrap();
     let path = tear(&dir.path().join("state"), &torn);
+    let node = recorded_in(&guests, &dir);
     guests.end_all();
     let recovered = node
         .recover()

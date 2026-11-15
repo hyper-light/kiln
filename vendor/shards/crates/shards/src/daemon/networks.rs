@@ -39,17 +39,15 @@ pub(super) struct Member {
 }
 
 /// Sends a network process `which` and waits for it to say it took it, as published
-/// ports are given (`give_ports`).
+/// ports are given (`give_ports`): while it goes on with it, as D215's judge follows a
+/// party ([`crate::netproc::ask`], the daemon's record of its network processes' answers).
 pub(super) fn ask_net(
-    net: &crate::netproc::Control,
+    net: &crate::netproc::NetLink,
     which: u8,
     payload: &[u8],
     fds: &[crate::netproc::Lent<'_>],
 ) -> Result<(), String> {
-    net.set_read_timeout(Some(super::PUBLISH_PATIENCE))
-        .map_err(|e| e.to_string())?;
-    crate::netproc::send(net, which, payload, fds).map_err(|e| format!("the network process: {e}"))?;
-    match crate::netproc::recv(net) {
+    match crate::netproc::ask(net, &crate::netproc::NET_ANSWERS, which, payload, fds) {
         Ok(Some(m)) if m.kind == which => Ok(()),
         Ok(_) => Err("the network process did not take it".into()),
         Err(e) => Err(format!("the network process: {e}")),
@@ -69,20 +67,22 @@ fn owned(end: shards_vmm::platform::UnixStream) -> crate::netproc::Sock {
 /// in the order asked. The descriptors an ask hands over are kept until its answer has
 /// come: XNU drops a socket in flight that no process holds (M24).
 pub(super) struct Asks<'n> {
-    net: &'n crate::netproc::Control,
+    net: &'n crate::netproc::NetLink,
     /// Each ask's kind, and what it is, to say where it is not taken.
     asked: Vec<(u8, &'static str)>,
     held: Vec<crate::netproc::Sock>,
+    /// The asks' waits, which follow the network process from the first ask's
+    /// ([`crate::netproc::until_ready`]), its answers teaching the daemon's record.
+    follow: Option<shards_api::Follow<'static>>,
 }
 
 impl<'n> Asks<'n> {
-    pub(super) fn new(net: &'n crate::netproc::Control) -> Result<Asks<'n>, String> {
-        net.set_read_timeout(Some(super::PUBLISH_PATIENCE))
-            .map_err(|e| format!("network process: {e}"))?;
+    pub(super) fn new(net: &'n crate::netproc::NetLink) -> Result<Asks<'n>, String> {
         Ok(Asks {
             net,
             asked: Vec::new(),
             held: Vec::new(),
+            follow: net.follow(&crate::netproc::NET_ANSWERS),
         })
     }
 
@@ -95,7 +95,9 @@ impl<'n> Asks<'n> {
         payload: &[u8],
         fds: &[crate::netproc::Lent<'_>],
     ) -> Result<(), String> {
-        crate::netproc::send(self.net, which, payload, fds)
+        crate::netproc::until_ready(self.net, crate::netproc::Way::Write, &mut self.follow)
+            .map_err(|e| format!("{what}: {e}"))?;
+        crate::netproc::send(&self.net.control, which, payload, fds)
             .map_err(|e| format!("{what}: the network process: {e}"))?;
         self.asked.push((which, what));
         Ok(())
@@ -115,11 +117,18 @@ impl<'n> Asks<'n> {
         Ok(())
     }
 
-    /// Each ask's answer, in the order asked: the first not taken says which.
-    pub(super) fn answered(self) -> Result<(), String> {
+    /// Each ask's answer, in the order asked: the first not taken says which. Each answer
+    /// teaches the daemon's record of its network processes' answers.
+    pub(super) fn answered(mut self) -> Result<(), String> {
         for (which, what) in &self.asked {
-            match crate::netproc::recv(self.net) {
-                Ok(Some(m)) if m.kind == *which => {}
+            crate::netproc::until_ready(self.net, crate::netproc::Way::Read, &mut self.follow)
+                .map_err(|e| format!("{what}: {e}"))?;
+            match crate::netproc::recv(&self.net.control) {
+                Ok(Some(m)) if m.kind == *which => {
+                    if let Some(follow) = self.follow.as_mut() {
+                        follow.answered();
+                    }
+                }
                 Ok(_) => return Err(format!("{what}: the network process did not take it")),
                 Err(e) => return Err(format!("{what}: the network process: {e}")),
             }
@@ -416,39 +425,16 @@ fn names_table(network: &Network, members: &[Member], asker: &str) -> Vec<u8> {
 }
 
 impl<D: Disk> Daemon<D> {
-    /// The ULA pool dockerd derives from its host's ID: fd00::/8 with the ID's hash's 40
-    /// bits, a /48.
+    /// The ULA pool dockerd derives from its host's ID (`crate::networks::ula_base`).
     fn ula_base(&self) -> u128 {
-        use sha2::Digest as _;
-        let hash = sha2::Sha256::digest(self.engine_id().as_bytes());
-        let gid = u64::from_be_bytes(hash.get(..8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]))
-            & ((1u64 << 40) - 1);
-        (0xfd00u128 << 112) | (u128::from(gid) << 80)
+        crate::networks::ula_base(&self.home)
     }
 
-    /// A run on the host's network's IPv6 address and its gateway's (D124): in the pool's
-    /// last /64, which no user network is given, `::2` and `::1`, each run's link to its
-    /// network process its own. What it sends past its loopback is the host's by them.
-    /// Also eth0's IPv6 for an image's agents' flows past the microVM on a network without
-    /// IPv6 (D99).
+    /// A run on the host's network's IPv6 address and its gateway's, and eth0's IPv6 for an
+    /// image's agents' flows past the microVM on a network without it
+    /// (`crate::networks::host_ipv6`, D99, D124).
     pub(super) fn host_ipv6(&self) -> (Ipv6Addr, Ipv6Addr) {
-        let subnet = self.ula_base() | (0xffff << 64);
-        (Ipv6Addr::from(subnet | 2), Ipv6Addr::from(subnet | 1))
-    }
-
-    /// The home's engine ID, made once: what dockerd derives its IPv6 ULA pool from. Callers
-    /// that make a home's first at once each take the one it keeps (`keep_first`).
-    pub(super) fn engine_id(&self) -> String {
-        let path = self.home.join("networks").join("engine-id");
-        if let Ok(id) = std::fs::read_to_string(&path) {
-            return id.trim().to_string();
-        }
-        let id = new_id().unwrap_or_default();
-        let _ = crate::networks::make_dir(&self.home.join("networks"));
-        match super::keep_first(&path, id.as_bytes()) {
-            Ok(false) => std::fs::read_to_string(&path).map_or(id, |kept| kept.trim().to_string()),
-            Ok(true) | Err(_) => id,
-        }
+        crate::networks::host_ipv6(&self.home)
     }
 
     /// The networks: dockerd's predefined ones, made here the first time they are
@@ -1039,7 +1025,7 @@ impl<D: Disk> Daemon<D> {
     }
 
     /// A copy of microVM `id`'s network process's control socket, while it runs.
-    fn net_control(&self, id: &str) -> Option<crate::netproc::Control> {
+    fn net_control(&self, id: &str) -> Option<crate::netproc::NetLink> {
         match lock(&self.runs).get(id) {
             Some(super::RunState::Tracked(t)) => t.net.as_ref()?.try_clone().ok(),
             _ => None,

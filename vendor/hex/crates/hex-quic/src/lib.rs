@@ -3,7 +3,8 @@
 //! QUIC connection a pair under TLS 1.3 with `TLS13_AES_256_GCM_SHA384` alone ([`tls`]). On it, each of a node's
 //! ports (its control, a program's stdio streams, staged file trees, its log) is a byte stream of its own on
 //! hyper-transport's lanes, as [`hex_core::lanes`] lays them out, which a peer opens ([`Endpoint::open`]) and the
-//! node accepts ([`Endpoint::accept`]). [`link`] runs the node agent's client over it.
+//! node accepts ([`Endpoint::accept`]). [`link`] runs the node agent's client over it. Each message of its wire that
+//! carries a secret goes sealed under its connection's [`seal`], so the transport beneath holds it as ciphertext.
 
 #![cfg_attr(
     test,
@@ -25,6 +26,7 @@ mod driver;
 pub mod enroll;
 pub mod limits;
 pub mod link;
+pub mod seal;
 pub mod tls;
 
 use std::collections::BTreeSet;
@@ -239,6 +241,14 @@ impl Endpoint {
         let (reply, answer) = sync_channel(1);
         self.commands.send(Command::Negotiated { peer, reply })?;
         answer.recv().map_err(|_| Refused::Ended)
+    }
+
+    /// The seal of the connection to `peer` now (docs/design/hex-quic.md Q13): what its node's wire's secrets go under,
+    /// a client's on its connections to that node ([`link::Link`]).
+    pub fn keys(&self, peer: PeerId) -> Result<Arc<seal::Keys>, Refused> {
+        let (reply, answer) = sync_channel(1);
+        self.commands.send(Command::Keys { peer, reply })?;
+        answer.recv().map_err(|_| Refused::Ended)?
     }
 
     /// Each peer connected now, with the suite and group its connection's TLS negotiated: what a node reports of its

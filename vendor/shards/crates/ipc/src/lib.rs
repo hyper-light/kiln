@@ -19,7 +19,14 @@ use std::path::{Path, PathBuf};
 /// `XDG_DATA_HOME` ignored. Whoever starts another shards process passes it this one
 /// ([`HOME`]).
 pub fn home() -> Result<PathBuf, String> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    home_in(|name| std::env::var_os(name))
+}
+
+/// The [`home`] a process whose environment `var` reads finds, from this process's working
+/// directory: a run host's, which its orchestrator starts with variables of its own over
+/// its environment.
+pub fn home_in(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    let var = |name: &str| var(name).filter(|v| !v.is_empty());
     let absolute = |p: PathBuf| std::path::absolute(&p).map_err(|e| format!("{}: {e}", p.display()));
     if let Some(home) = var(HOME) {
         return absolute(PathBuf::from(home));
@@ -43,6 +50,25 @@ pub fn home() -> Result<PathBuf, String> {
 /// The variable that names shards' home.
 pub const HOME: &str = "SHARDS_HOME";
 
+/// The directory of a home where its daemon and its run hosts make their microVMs' writable
+/// layers' files (D190), each named by [`layer_name`].
+pub const LAYERS: &str = "layers";
+
+/// The name of the `n`th writable layer's file process `pid` makes in [`LAYERS`]: its maker
+/// in its name ([`layer_maker`]), so that what a process left there as it ended is found by
+/// its pid alone (D253).
+pub fn layer_name(pid: u32, n: u64) -> String {
+    format!("{pid}-{n}")
+}
+
+/// The pid of the process that made the layer's file `name` ([`layer_name`]); none for a name
+/// it does not make.
+pub fn layer_maker(name: &str) -> Option<u32> {
+    let (pid, n) = name.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
 /// What a daemon that no longer serves keeps in its home while it ends its runs: its
 /// process, as [`this_process`] names it. A daemon or client that finds none serving waits
 /// for that one while it lives, as long as its runs' stop timeouts make it, and then takes
@@ -54,6 +80,38 @@ pub fn exiting(home: &Path) -> bool {
     named_lives(&home.join(STOPPING))
 }
 
+/// What a daemon keeps in a run's directory from the stop signal it sends that run's command
+/// until its grace is up (`stop -t`, the run's `--stop-timeout`, or the daemon's default):
+/// when the command's SIGKILL is due, as [`grace_text`] writes it. Removed at that SIGKILL,
+/// or at the run's end before it. A wait on the daemon reads it as the daemon's own
+/// deadline, before which it and its run may run nothing at all and are not stalled (D209):
+/// a `sleep` that ignores SIGTERM as its PID namespace's init keeps its daemon's stop quiet
+/// for its whole grace.
+pub const GRACE: &str = "stop.grace";
+
+/// [`GRACE`]'s contents for a SIGKILL due at `until`: its nanoseconds since the Unix epoch,
+/// in decimal. The system clock, the one clock std reads alike in two processes on every
+/// OS: a step of it moves the deadline as read by that step. None before the epoch or past
+/// u64's nanoseconds.
+pub fn grace_text(until: std::time::SystemTime) -> Option<String> {
+    let ns = until.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    u64::try_from(ns).ok().map(|ns| ns.to_string())
+}
+
+/// When the SIGKILL of the run whose directory is `dir` is due, as its [`GRACE`] says: none
+/// where it keeps none, or none that reads whole.
+pub fn grace_until(dir: &Path) -> Option<std::time::SystemTime> {
+    let text = std::fs::read_to_string(dir.join(GRACE)).ok()?;
+    let ns: u64 = text.trim().parse().ok()?;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_nanos(ns))
+}
+
+/// A file a daemon that has closed makes anew and holds locked (flock(2), LockFileEx) until
+/// it has let go of its home's lock: `stop daemon` waits for it by a shared lock, which none
+/// but a closed daemon holds against it, so that no next daemon's lock is waited for. Apart
+/// from [`STOPPING`], whose readers Windows' mandatory locks would refuse.
+pub const STOPPING_LOCK: &str = "daemon.stopping.lock";
+
 /// What the daemon that holds a home's lock writes in it as it takes it, before it offers
 /// any slot: its process, as [`this_process`] names it.
 pub const PID: &str = "daemon.pid";
@@ -64,6 +122,36 @@ pub fn daemon_lives(home: &Path) -> bool {
     named_lives(&home.join(PID))
 }
 
+/// A daemon of a build from before request slots (D185) serves the home: its socket there,
+/// `daemon.sock`, takes a connection. This build never asks it anything: a client and its
+/// daemon are one build (D36), and that daemon hears nothing but its socket. So a client or
+/// daemon that finds it refuses, naming what to end, as no slot reaches it. Only Unix's: no
+/// daemon ran on Windows before slots. `here` is best the home as the working directory
+/// (`.`), whose relative name fits a socket address whatever the home's path (PM M26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreSlotsDaemon;
+
+impl std::fmt::Display for PreSlotsDaemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "a daemon of a shards from before request slots serves this home at daemon.sock: \
+             this shards does not speak to it; end that daemon's process",
+        )
+    }
+}
+
+/// [`PreSlotsDaemon`] where one serves the home `here`, by its socket's taking a connection,
+/// which is closed unasked; none where none does (no socket, or one no process listens at).
+pub fn no_pre_slots_daemon(here: &Path) -> Result<(), PreSlotsDaemon> {
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(here.join("daemon.sock")).is_ok() {
+        return Err(PreSlotsDaemon);
+    }
+    #[cfg(not(unix))]
+    let _ = here;
+    Ok(())
+}
+
 /// A process as a home's [`PID`] and [`STOPPING`] name it: its ID, and its start, which tells
 /// it from a process given that ID once it has gone. An ID alone is reused (Linux hands
 /// them out again once `pid_max` wraps, proc(5); XNU and Windows likewise), so a client
@@ -71,26 +159,45 @@ pub fn daemon_lives(home: &Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Named {
     pub pid: u32,
-    /// Its start ([`started`]); `None` in a file a build from before starts were kept
-    /// wrote, whose daemon is known by its ID alone.
-    pub start: Option<u64>,
+    /// Its start ([`started`]).
+    pub start: u64,
+}
+
+/// Why a home's [`PID`] or [`STOPPING`], or a slot's taker, names no process: what this build
+/// writes is `PID START` ([`this_process`]), and nothing else is read as a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotNamed {
+    /// An ID with no start: written by a `shards` from before starts were kept (v0.7.0 and
+    /// before), so of another build, whose daemon this one never waits on by its ID (D36,
+    /// D185 *A daemon is known by its process ID and start*). Its record is stale, as a dead process's is.
+    IdAlone,
+    /// Not `PID START`: empty, words that are no numbers, or more than two.
+    Malformed,
 }
 
 impl Named {
-    /// What a file names: `PID START`, or `PID` alone.
-    pub fn parse(text: &str) -> Option<Named> {
+    /// What a file names: `PID START`, or why it names no process.
+    pub fn parse(text: &str) -> Result<Named, NotNamed> {
         let mut words = text.split_ascii_whitespace();
-        let pid = words.next()?.parse().ok()?;
+        let pid = words
+            .next()
+            .and_then(|pid| pid.parse().ok())
+            .ok_or(NotNamed::Malformed)?;
         let start = match words.next() {
-            Some(start) => Some(start.parse().ok()?),
-            None => None,
+            Some(start) => start.parse().map_err(|_| NotNamed::Malformed)?,
+            None => return Err(NotNamed::IdAlone),
         };
-        words.next().is_none().then_some(Named { pid, start })
+        match words.next() {
+            Some(_) => Err(NotNamed::Malformed),
+            None => Ok(Named { pid, start }),
+        }
     }
 
-    /// What the file at `path` names, where it names one process.
+    /// What the file at `path` names, where it names one process: none where there is no
+    /// file, or one that names none ([`NotNamed`]), a stale record whose writer is gone or
+    /// of another build.
     pub fn read(path: &Path) -> Option<Named> {
-        Named::parse(&std::fs::read_to_string(path).ok()?)
+        Named::parse(&std::fs::read_to_string(path).ok()?).ok()
     }
 
     /// Whether it lives: its ID's process lives, and is the one that started when it did.
@@ -99,10 +206,7 @@ impl Named {
         let alive = unix::alive;
         #[cfg(windows)]
         let alive = windows::alive;
-        alive(self.pid)
-            && self
-                .start
-                .is_none_or(|start| started(self.pid).is_ok_and(|now| now == start))
+        alive(self.pid) && started(self.pid).is_ok_and(|now| now == self.start)
     }
 }
 
@@ -157,6 +261,7 @@ pub const NAMES_STEP: &str = "\u{0}names";
 /// Message kinds between the daemon, warm VMs and clients.
 /// [`kind::DEVICE`]'s steps (D214), each a byte after the request's number.
 pub mod device {
+    pub use super::device_reply::{Refusal, Retry, decode, encode};
     /// A disk plugged in: a flags byte ([`READ_ONLY`]) and its serial; its file a
     /// descriptor. Answers its place on the PCI bus (`devfn`, decimal) and its guest's
     /// address of it, a space between.
@@ -182,6 +287,8 @@ pub mod device {
     /// iommufd, not its group's.
     pub const BY_NODE: u8 = 1;
 }
+
+mod device_reply;
 
 pub mod kind {
     /// Warm VM → daemon: the guest is connected and waiting for its command.
@@ -356,6 +463,16 @@ pub mod kind {
     /// not, typed (shards_net::lease::encode_answer). Asked only where the run has credential
     /// grants (`NET_CREDENTIALS`), of a run host that relays it to its orchestrator.
     pub const NET_LEASE: u8 = 100;
+    /// Run host → network process: the run's sign-in grants (D242, step 8), each a sign-in's
+    /// name, its CLI, the hosts its access token goes to and what an earlier capture of it
+    /// gave, never a value (shards_net::signin::encode_grants), after its `NET_POLICY` and
+    /// before its `NET_CREDENTIALS`, once; answered with the same kind once taken.
+    pub const NET_SIGN_INS: u8 = 104;
+    /// Network process ⇄ its run host: a sign-in's capture or refresh, asked by id, and its
+    /// answer by that id; or a revocation, told (D242, step 8; shards_net::signin's codec).
+    /// The network process asks it as the injector meets a sign-in's token response or its
+    /// CLI's refresh, of a run host that relays it to its orchestrator.
+    pub const NET_SIGN_IN: u8 = 105;
     /// Daemon → a running microVM's VM process: a run joins its network (D119). Its number
     /// (a big-endian u64, which `EXEC_TAKEN` answers), with the VM's end of the joiner's
     /// own connection to the daemon, on which the joiner's run goes as a warm VM's does
@@ -532,6 +649,13 @@ pub mod kind {
     /// that process goes, which on Windows came 95 ms after a run's end on jupiter and past
     /// 2 s on CI's runners (PM M380): the next program to bind one has it.
     pub const PORTS_FREE: u8 = 79;
+    /// Warm VM → daemon, empty, as its run ends: it has asked its network process to close
+    /// the run's published ports (`UNPUBLISH`), and waits for its answer while that process
+    /// lives, the VM process, confined, seeing nothing of its progress. The daemon follows
+    /// that process from here (D217's helper slice, its `Followed`), and ends it where it
+    /// goes on with nothing for a whole slice; `PORTS_FREE` ends the follow (ROOT's (A),
+    /// 2026-11-13).
+    pub const UNPUBLISHING: u8 = 103;
     /// Daemon → a running run's VM: a device plugged into its microVM, let go of, or a disk
     /// grown (D214): a number its answer ([`DEVICED`]) names (8, big-endian), then a step
     /// ([`device`]) and what it takes. With [`device::DISK`] the disk's file, with
@@ -623,6 +747,20 @@ pub mod kind {
     /// exits with for it (125, as `docker run` exits for dockerd's own failures), which no
     /// command gave: the run failed, in these words.
     pub const UNSERVED: u8 = 101;
+    /// A VM → its owner, unprompted: a connection a member made to its MCP socket (D254), its
+    /// guest's relay having carried it to the VM: the lane's number (8, big-endian, at or above
+    /// 2^63, `shards_abi::run::mcp::ACCEPTED_FIRST`, apart from every number its owner
+    /// chose), then the member's declared index (4, big-endian), as its guest's relay said it.
+    /// On Unix the connection beside it, held by the VM until its owner says it has it with
+    /// [`LANE_HELD`] (M24); on Windows none, its owner answering [`LANE_HELD`] with the socket
+    /// the VM relays it onto, or none for one it closes.
+    pub const LANE_ACCEPTED: u8 = 102;
+    /// A VM → its owner, once its machine is down and before its process lets go of it
+    /// (D260's final use), for a run it took alone: what its vCPUs ran of its guest in all,
+    /// each by its index, then what this process used of its host, as
+    /// `shards_abi::rate::used` writes a use's answer. Told from another thread than the
+    /// run's `DONE`, in no order with it: its owner reads both until the link closes.
+    pub const FINAL_USE: u8 = 106;
 
     /// Whether a network process's control message of `kind` hands it sockets: published
     /// ports' (`PUBLISH`, `NET_PUBLISHED`) and a peer's link (`NET_PEER`). Beside the
@@ -772,6 +910,35 @@ impl Attach {
             daemon: r.identity()?,
         };
         r.0.is_empty().then_some(attach)
+    }
+}
+
+/// A member's MCP connection as its VM hands it to its owner ([`kind::LANE_ACCEPTED`], D254):
+/// its lane's number, the VM's own, and the member its guest's relay said it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Accepted {
+    /// At or above `shards_abi::run::mcp::ACCEPTED_FIRST`, apart from every lane its owner
+    /// opens.
+    pub number: u64,
+    /// The member's declared index.
+    pub member: u32,
+}
+
+impl Accepted {
+    pub fn encode(&self) -> [u8; 12] {
+        let [a, b, c, d, e, f, g, h] = self.number.to_be_bytes();
+        let [i, j, k, l] = self.member.to_be_bytes();
+        [a, b, c, d, e, f, g, h, i, j, k, l]
+    }
+
+    /// `None` for anything but a whole one whose number is a VM's own.
+    pub fn decode(bytes: &[u8]) -> Option<Accepted> {
+        let (number, member) = bytes.split_first_chunk::<8>()?;
+        let accepted = Accepted {
+            number: u64::from_be_bytes(*number),
+            member: u32::from_be_bytes(<[u8; 4]>::try_from(member).ok()?),
+        };
+        (accepted.number >= shards_abi::run::mcp::ACCEPTED_FIRST).then_some(accepted)
     }
 }
 
@@ -1922,14 +2089,18 @@ impl Run {
 }
 
 /// What a registry is reached by (shards_registry's credentials, certs and proxy): the
-/// Docker CLI's config, credential helpers on `PATH`, the homes of `certs.d`, and the
-/// proxies Go's net/http takes from the environment; and the local engine a made microVM
+/// Docker CLI's config, the daemon.json and certs.d shards is given in place of Docker's
+/// daemons' (D194, D23),
+/// credential helpers on `PATH`, the homes of `certs.d` and of Docker's daemon.json files,
+/// and the proxies Go's net/http takes from the environment; and the local engine a made microVM
 /// is published to, as docker/cli v29.8.1 finds it (`DOCKER_HOST`, `DOCKER_CONTEXT`), or none
 /// (`SHARDS_LOCAL_STORE=none`).
-pub const REGISTRY_ENV: [&str; 18] = [
+pub const REGISTRY_ENV: [&str; 20] = [
     "SHARDS_AUTH_CONFIG",
     "DOCKER_AUTH_CONFIG",
     "DOCKER_CONFIG",
+    "SHARDS_DAEMON_JSON",
+    "SHARDS_CERTS_D",
     "HOME",
     "USERPROFILE",
     "PATH",
@@ -2271,6 +2442,10 @@ pub const MAX_FDS: usize = run_fds::CLIENT
     + run_fds::SHARES
     + run_fds::CAPTURE;
 
+mod host_memory;
+pub use host_memory::{holdable, holdable_known, host_available, host_memory};
+mod window;
+pub use window::{Window, WindowRefusal};
 pub mod slots;
 #[cfg(unix)]
 mod spawner;
@@ -2284,19 +2459,52 @@ pub use unix::*;
 mod pipe;
 #[cfg(windows)]
 pub use pipe::{
-    Arriving, Event, ExitWatch, Listener, Message, Pipe, Poller, Stream, await_any, await_streams, byte_pair,
-    end, readable_raw, recv, recv_by, send,
+    Arriving, Event, ExitWatch, Listener, Message, Pipe, Poller, RandomFailed, Stream, await_any,
+    await_streams, byte_pair, end, fill_random, hung_up, input_pair, output_pair, readable_raw, recv,
+    recv_by, send,
 };
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// Starts `command` by std's Command: every child shards starts so, whatever it then waits
+/// for (`spawn` then `wait` or `wait_with_output`, never `status` or `output`, which hold the
+/// spawn for the child's life). On Windows, where std's child inherits every handle this
+/// process holds inheritable (CreateProcessW, bInheritHandles TRUE, Rust's
+/// library/std/src/sys/process/windows.rs), it waits for each of shards' own spawns that holds
+/// one inheritable for its child alone ([`windows::spawn_std`]).
+#[cfg(windows)]
+pub fn spawn_std(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    windows::spawn_std(command)
+}
+
+/// Starts `command` by std's Command (Windows' twin above): a descriptor std's children
+/// inherit is one made without close-on-exec, which no shards spawn makes for its child
+/// (`unix::spawn` hands each one by dup2 in the child alone).
+#[cfg(not(windows))]
+pub fn spawn_std(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    command.spawn()
+}
+
+/// A caller's ordinary pipe writer paired with a cancellable reader. Ending a clone
+/// wakes an idle read; once all reader copies close, later writes fail. No relay thread.
+#[cfg(unix)]
+pub fn input_pair(room: u32) -> std::io::Result<(Stream, std::io::PipeWriter)> {
+    use std::os::fd::OwnedFd;
+    if room == 0 {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let (reader, writer) = Stream::pair()?;
+    Ok((reader, std::io::PipeWriter::from(OwnedFd::from(writer))))
+}
+
 /// A new file at `path`, its user's alone wherever it is, as a file a user's secret is
 /// written to must be (an invitation, a home's identity): mode 0600 on Unix; on Windows a
 /// DACL that grants this process's user, and no one else, all of it, protected from what
 /// its directory would give it, where an ACL inherited is whatever the directory's is.
-/// Refused where a file is there already.
+/// Refused where a file is there already. Another open of its user's reads it while this one
+/// holds it, on every host.
 pub fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -2350,6 +2558,39 @@ pub mod fd {
     impl<T: std::os::windows::io::AsRawHandle + ?Sized> AsRawFd for T {
         fn as_raw_fd(&self) -> RawFd {
             self.as_raw_handle()
+        }
+    }
+}
+
+/// A MAC address as shards' processes pass it to one another (review 2.32): its six
+/// bytes in hex, two digits each, between colons, as Linux and Docker write one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mac(pub [u8; 6]);
+
+impl std::fmt::Display for Mac {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [a, b, c, d, e, g] = self.0;
+        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
+    }
+}
+
+impl std::str::FromStr for Mac {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Mac, String> {
+        let not = || format!("{s:?} is not a MAC");
+        let mut octets = s.split(':');
+        let mut mac = [0u8; 6];
+        for byte in &mut mac {
+            let hex = octets
+                .next()
+                .filter(|h| h.len() == 2 && h.bytes().all(|c| c.is_ascii_hexdigit()))
+                .ok_or_else(not)?;
+            *byte = u8::from_str_radix(hex, 16).map_err(|_| not())?;
+        }
+        match octets.next() {
+            Some(_) => Err(not()),
+            None => Ok(Mac(mac)),
         }
     }
 }
@@ -2448,9 +2689,140 @@ impl Latch {
     }
 }
 
+/// `set`, what setting a socket's read or write timeout (SO_RCVTIMEO, SO_SNDTIMEO) did, as
+/// every caller is to take it: macOS refuses any option with EINVAL on a socket ended both ways
+/// (SS_CANTRCVMORE and SS_CANTSENDMORE, XNU bsd/kern/uipc_socket.c `sosetoptlock`), as a Unix
+/// stream is once its peer closes and a TCP connection once it is reset or closed both ways.
+/// Such a socket needs no bound: a read returns what is buffered, then its end, and a write fails,
+/// at once (PM M579: a peer that wrote six bytes and closed; the refusal, then all six read). So
+/// the refusal is no timeout needed, and the caller goes on to read the answer its peer sent.
+/// std's own refusal of a zero timeout, which carries no OS error, stays an error. Linux and
+/// Windows take the option on an ended socket, so this is theirs unchanged.
+pub fn timeout_set(set: std::io::Result<()>) -> std::io::Result<()> {
+    match set {
+        #[cfg(target_os = "macos")]
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        set => set,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    /// A daemon of a build from before slots (D185) that serves a home, its `daemon.sock`
+    /// listening, is refused typed, never asked; a home with none, or with a socket no
+    /// process listens at any more, has none. Red before: the client sent it its request.
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_slots_daemon_is_refused_never_asked() {
+        let home = shards_testdir::TempDir::new("pre-slots").unwrap();
+        assert_eq!(super::no_pre_slots_daemon(&home), Ok(()));
+        let listening = std::os::unix::net::UnixListener::bind(home.join("daemon.sock")).unwrap();
+        assert_eq!(super::no_pre_slots_daemon(&home), Err(super::PreSlotsDaemon));
+        drop(listening);
+        assert!(home.join("daemon.sock").exists());
+        assert_eq!(super::no_pre_slots_daemon(&home), Ok(()));
+    }
+
+    /// A timeout set after its peer wrote its answer and closed (PM M579): macOS refuses the
+    /// option itself (EINVAL), which `timeout_set` takes for none needed, and the answer is
+    /// read whole, then its end, at once. Red where the refusal is the caller's error: a fully
+    /// answered request failed.
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_set_after_its_peer_answered_and_closed_reads_the_answer() {
+        use std::io::{Read as _, Write as _};
+        let (mut peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.write_all(b"answer").unwrap();
+        drop(peer);
+        let raw = ours.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            raw.as_ref().map_err(std::io::Error::raw_os_error),
+            Err(Some(libc::EINVAL))
+        );
+        super::timeout_set(raw).unwrap();
+        super::timeout_set(ours.set_write_timeout(Some(std::time::Duration::from_secs(5)))).unwrap();
+        let began = std::time::Instant::now();
+        let mut answer = Vec::new();
+        (&ours).read_to_end(&mut answer).unwrap();
+        assert_eq!(answer, b"answer");
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        // std's own refusal, of a zero timeout, is no OS's: still an error.
+        assert!(super::timeout_set(ours.set_read_timeout(Some(std::time::Duration::ZERO))).is_err());
+    }
+
+    /// A layer's file's name says its maker's pid; a name no process makes there (a kept
+    /// layer's, one half a name) says none.
+    #[test]
+    fn a_layers_name_says_its_maker() {
+        assert_eq!(super::layer_maker(&super::layer_name(4242, 7)), Some(4242));
+        assert_eq!(
+            super::layer_maker(&super::layer_name(u32::MAX, u64::MAX)),
+            Some(u32::MAX)
+        );
+        for not in [
+            "",
+            "layer.ext4",
+            "4242",
+            "4242-",
+            "-7",
+            "4242-x",
+            "x-7",
+            "4242-7-1",
+            "-1-7",
+        ] {
+            assert_eq!(super::layer_maker(not), None, "{not:?}");
+        }
+    }
+
+    /// A MAC goes as text and comes back the same; what is not six two-digit hex bytes
+    /// between colons is no MAC.
+    #[test]
+    fn macs_read_back_as_written() {
+        let mac = super::Mac([0x02, 0x42, 0xac, 0x11, 0x00, 0xff]);
+        assert_eq!(mac.to_string(), "02:42:ac:11:00:ff");
+        assert_eq!("02:42:ac:11:00:ff".parse(), Ok(mac));
+        assert_eq!("02:42:AC:11:00:FF".parse(), Ok(mac));
+        for not in [
+            "",
+            "02:42:ac:11:00",
+            "02:42:ac:11:00:ff:01",
+            "2:42:ac:11:00:ff",
+            "+2:42:ac:11:00:ff",
+            "02:42:ac:11:00:fg",
+            "02-42-ac-11-00-ff",
+            "02:42:ac:11:00:ff:",
+        ] {
+            assert!(not.parse::<super::Mac>().is_err(), "{not:?}");
+        }
+    }
+
+    /// A private file its maker still holds is read by another open of its user's, on every
+    /// host, and none is made over it: a run's managed-output record, which the daemon holds
+    /// for the run's life, is how its owner finds the run, and Windows refused the owner's
+    /// read of it as long as the daemon held it (ERROR_SHARING_VIOLATION, CI run 43435318858's
+    /// code_mode_runs_a_program_with_the_callers_grants on windows-2022).
+    #[test]
+    fn a_private_file_its_maker_holds_is_read_by_its_user() {
+        use std::io::Write as _;
+        let dir = shards_testdir::TempDir::new("private").unwrap();
+        let path = dir.join("record");
+        let mut held = super::create_private(&path).unwrap();
+        held.write_all(b"shards managed output 1\n").unwrap();
+        held.flush().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"shards managed output 1\n");
+        assert_eq!(
+            super::create_private(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        drop(held);
+    }
+
     /// A run's request to its warm VM goes in one message however long its command's spec,
     /// up to what the run protocol carries in one frame: before, a spec at that bound
     /// could not go.
@@ -2594,6 +2966,43 @@ mod tests {
 
     use super::*;
 
+    /// D254: a member's MCP connection reads back as its VM wrote it; one cut short, longer,
+    /// or numbered as its owner numbers its own lanes, is refused.
+    #[test]
+    fn an_accepted_mcp_connection_reads_back_as_written() {
+        let first = shards_abi::run::mcp::ACCEPTED_FIRST;
+        for accepted in [
+            Accepted {
+                number: first,
+                member: 0,
+            },
+            Accepted {
+                number: u64::MAX,
+                member: u32::MAX,
+            },
+        ] {
+            assert_eq!(Accepted::decode(&accepted.encode()), Some(accepted));
+        }
+        let written = Accepted {
+            number: first + 1,
+            member: 3,
+        }
+        .encode();
+        assert_eq!(&written[8..], &[0, 0, 0, 3]);
+        assert_eq!(Accepted::decode(&written[..11]), None);
+        assert_eq!(Accepted::decode(&[&written[..], &[0]].concat()), None);
+        assert_eq!(
+            Accepted::decode(
+                &Accepted {
+                    number: first - 1,
+                    member: 3
+                }
+                .encode()
+            ),
+            None
+        );
+    }
+
     /// A run's head reads back as written, with what follows it; one cut short, or of a
     /// mode no build writes, is refused.
     #[test]
@@ -2655,8 +3064,9 @@ mod tests {
         let me = std::process::id();
         for (said, is) in [
             (this_process().unwrap().trim().to_string(), true),
-            // A build's from before starts were kept: by its ID alone.
-            (me.to_string(), true),
+            // A build's from before starts were kept (v0.7.0): by its ID alone, a stale
+            // record, though its ID's process lives.
+            (me.to_string(), false),
             (gone_pid.to_string(), false),
             ("0".to_string(), false),
             ("-1".to_string(), false),
@@ -2681,13 +3091,7 @@ mod tests {
         let start = started(me).unwrap();
         assert_eq!(started(me).unwrap(), start, "a start read twice differs");
         let written = this_process().unwrap();
-        assert_eq!(
-            Named::parse(&written),
-            Some(Named {
-                pid: me,
-                start: Some(start)
-            })
-        );
+        assert_eq!(Named::parse(&written), Ok(Named { pid: me, start }));
         std::fs::write(home.join(PID), &written).unwrap();
         assert!(daemon_lives(&home), "{written}");
         for other in [start.wrapping_add(1), start.wrapping_sub(1), 0] {
@@ -2720,6 +3124,59 @@ mod tests {
             std::fs::write(home.join(PID), format!("{pid} {child_start}\n")).unwrap();
             assert!(!daemon_lives(&home), "{pid} {child_start} has gone");
         }
+    }
+
+    /// A record by its ID alone, as v0.7.0 and every `shards` before starts were kept wrote
+    /// `daemon.pid` and `daemon.stopping`, names no process (`NotNamed::IdAlone`): its daemon
+    /// is of another build (D36), so the record is stale, as a dead process's is, though its
+    /// ID's process lives. Red before legacy3, where such a record named a live daemon by its
+    /// ID alone.
+    #[test]
+    fn a_record_by_its_id_alone_is_stale() {
+        let home = shards_testdir::TempDir::new("ipc-id-alone").unwrap();
+        let me = std::process::id();
+        assert_eq!(Named::parse(&format!("{me}\n")), Err(NotNamed::IdAlone));
+        for malformed in ["", "daemon", "-1 2", &format!("{me} start"), &format!("{me} 1 2")] {
+            assert_eq!(Named::parse(malformed), Err(NotNamed::Malformed), "{malformed:?}");
+        }
+        std::fs::write(home.join(PID), format!("{me}\n")).unwrap();
+        std::fs::write(home.join(STOPPING), format!("{me}\n")).unwrap();
+        assert_eq!(Named::read(&home.join(PID)), None);
+        assert!(!daemon_lives(&home), "{me} by its ID alone lives as a daemon");
+        assert!(!exiting(&home), "{me} by its ID alone is ending its runs");
+        std::fs::write(home.join(PID), this_process().unwrap()).unwrap();
+        assert!(daemon_lives(&home), "this process, by its ID and start");
+    }
+
+    /// A daemon that has exited lives no more while its parent has not reaped it (waits-08):
+    /// its ID's process still answers kill(2) and keeps its start (Linux's `/proc/PID/stat`,
+    /// macOS's `proc_pid_rusage`), so a client that waits on it while it lives would wait for
+    /// ever on a zombie. Red with liveness its ID and start alone. Here the child that names
+    /// itself is left unreaped (waitid's `WNOWAIT`) and so is a zombie.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreaped_daemon_does_not_live() {
+        let home = shards_testdir::TempDir::new("ipc-zombie").unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let id = libc::id_t::try_from(pid).unwrap();
+        // SAFETY: a siginfo_t, plain data, for waitid(2) to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid(2) of our own child into a siginfo_t of ours; WNOWAIT leaves it
+        // unreaped.
+        let waited = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+        let start = started(pid).expect("an unreaped child's start");
+        std::fs::write(home.join(PID), format!("{pid} {start}\n")).unwrap();
+        std::fs::write(home.join(STOPPING), format!("{pid} {start}\n")).unwrap();
+        let named = Named { pid, start };
+        assert!(!named.lives(), "{pid}, exited and unreaped, lives");
+        assert!(!daemon_lives(&home), "{pid}, exited and unreaped, lives");
+        assert!(!exiting(&home), "{pid}, exited and unreaped, is ending its runs");
+        let _ = child.wait();
     }
 
     /// A working set goes in parts each within a message's payload, and comes back whole,

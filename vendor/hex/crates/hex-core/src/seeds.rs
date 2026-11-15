@@ -43,7 +43,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use crate::patience::Patience;
+use crate::patience::{Patience, Piece};
 
 /// The line's wait's name, as the waits census records it.
 pub const WAIT: &str = "seeds.wait";
@@ -459,9 +459,17 @@ impl Seeds {
         match *waiting {
             Waiting::Within { until, .. } if now < until => Ok(Claim::Wait { until: Some(until) }),
             Waiting::Within { since, until } => {
-                // Past W*: no sample (Karn's point), but the census is told, once, and the create waits on.
+                // Past W*: no sample (Karn's point), but the run-out is told, once, and the create waits on.
                 *waiting = Waiting::Following { since };
-                self.wait.ran_out(until.saturating_sub(since));
+                self.wait.ran_out(
+                    until.saturating_sub(since),
+                    now.saturating_sub(since),
+                    &[
+                        Piece::Kind("the create seeds, freeing one for create "),
+                        Piece::Number(ticket.0),
+                        Piece::Kind(" in line"),
+                    ],
+                );
                 Ok(Claim::Wait { until: None })
             }
             Waiting::Following { .. } => Ok(Claim::Wait { until: None }),
@@ -526,11 +534,21 @@ impl Seeds {
     pub fn past_hang(&mut self, now: Duration) -> usize {
         let mut told = 0usize;
         for slot in &mut self.slots {
-            if let Holds::Busy { since, until, .. } = &mut slot.holds
+            if let Holds::Busy {
+                n, since, until, ..
+            } = &mut slot.holds
                 && let Some(at) = *until
                 && at <= now
             {
-                self.hang.ran_out(at.saturating_sub(*since));
+                self.hang.ran_out(
+                    at.saturating_sub(*since),
+                    now.saturating_sub(*since),
+                    &[
+                        Piece::Kind("create seed "),
+                        Piece::Number(*n),
+                        Piece::Kind(", serving a create, by its pidfd"),
+                    ],
+                );
                 *until = None;
                 told = told.saturating_add(1);
             }
@@ -599,9 +617,9 @@ impl Seeds {
         }
     }
 
-    /// The line's wait and the hang bound, as learned now (`None` before each's calibration): what the node's
-    /// metrics read.
-    pub fn deadlines(&self) -> (Option<Duration>, Option<Duration>) {
+    /// The line's wait and the hang bound, as learned now (`None` before each's calibration): what the tests read.
+    #[cfg(test)]
+    pub(crate) fn deadlines(&self) -> (Option<Duration>, Option<Duration>) {
         (self.wait.deadline(), self.hang.deadline())
     }
 
@@ -623,7 +641,15 @@ impl Seeds {
             if let Waiting::Within { since, until } = waiting
                 && until < now
             {
-                self.wait.ran_out(until.saturating_sub(since));
+                self.wait.ran_out(
+                    until.saturating_sub(since),
+                    now.saturating_sub(since),
+                    &[
+                        Piece::Kind("the create seeds, freeing one for create "),
+                        Piece::Number(ticket.0),
+                        Piece::Kind(" in line"),
+                    ],
+                );
             }
             self.wait.answered(now.saturating_sub(waiting.since()));
             self.hand(seed, now, Some(ticket));

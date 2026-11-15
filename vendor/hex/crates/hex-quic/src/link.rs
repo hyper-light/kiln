@@ -32,32 +32,74 @@ fn refusal(op: &'static str) -> impl Fn(Refused) -> Refusal {
     }
 }
 
-impl guest::Link for Link {
-    fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
+impl Link {
+    /// A connection to the node's port `port`, bridged to the owner's end of a local socket pair.
+    fn bridged(&self, port: u32) -> Result<guest::bridge::Bridged, Refusal> {
         let conn = self
             .endpoint
             .open(self.peer, port)
             .map_err(refusal("opening a connection to the node over QUIC"))?;
-        let socket = bridge::bridged(conn)
-            .map_err(|e| Refusal::os("bridging a QUIC connection to a local socket", e))?;
-        guest::own_duplex(socket)
+        bridge::bridged(conn)
+            .map_err(|e| Refusal::os("bridging a QUIC connection to a local socket", e))
     }
 
-    /// The open is queued without waiting for the node's answer, so the deadline bounds nothing more than it.
-    fn dial_before(&self, port: u32, deadline: Option<Instant>) -> Result<DuplexOwner, Refusal> {
+    /// [`Link::bridged`], refused where the caller's `deadline` has passed: the open is queued without waiting for the
+    /// node's answer, so the deadline bounds nothing more than it.
+    fn bridged_before(
+        &self,
+        port: u32,
+        deadline: Option<Instant>,
+    ) -> Result<guest::bridge::Bridged, Refusal> {
         if deadline.is_some_and(|at| at <= Instant::now()) {
             return Err(Refusal::Os {
                 op: "opening a connection to the node over QUIC",
                 why: "the caller's deadline passed".to_owned(),
             });
         }
-        self.dial(port)
+        self.bridged(port)
+    }
+}
+
+impl guest::Link for Link {
+    /// A node's ports over QUIC take this node's own connection alone: no caller in another process opens them.
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
+    fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
+        guest::own_duplex(self.bridged(port)?)
+    }
+
+    /// The open is queued without waiting for the node's answer, so the deadline bounds nothing more than it.
+    fn dial_before(&self, port: u32, deadline: Option<Instant>) -> Result<DuplexOwner, Refusal> {
+        guest::own_duplex(self.bridged_before(port, deadline)?)
+    }
+
+    /// A bridged connection is handed to its caller as the owner's end of its socket pair (the review's D-5).
+    fn dial_handoff_before(
+        &self,
+        port: u32,
+        deadline: Option<Instant>,
+    ) -> Option<Result<guest::Handoff, Refusal>> {
+        Some(
+            self.bridged_before(port, deadline)
+                .map(guest::Handoff::Bridged),
+        )
     }
 
     /// A connection's End ends its half alone (docs/design/hex-quic.md Q3), and the bridge carries the owner's
     /// half-close to it.
     fn carries_half_close(&self) -> bool {
         true
+    }
+
+    /// The seal of this link's connection to its node, its control connection's among its connections (Q13): the node's
+    /// wire's secrets go under it.
+    fn sealing(&self) -> Result<Option<Arc<dyn hex_core::wire::Seal>>, Refusal> {
+        let keys: Arc<dyn hex_core::wire::Seal> = self.endpoint.keys(self.peer).map_err(
+            refusal("reading the seal of the connection to the node over QUIC"),
+        )?;
+        Ok(Some(keys))
     }
 }
 

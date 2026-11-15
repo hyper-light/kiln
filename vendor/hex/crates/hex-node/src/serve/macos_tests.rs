@@ -431,3 +431,26 @@ fn a_socket_path_is_taken_only_from_an_ended_agent() {
     ));
     assert!(path.exists());
 }
+
+/// ROOT's one accounting of 2026-11-13: what a macOS node held at its start is a term of its fit, read from `/dev/fd`.
+/// The count is the process's, so the case runs alone in a process of its own, this binary run again for it. Do:
+/// count, open two descriptors, count, close them, count. Expect: two more, then as before.
+#[test]
+fn what_a_node_holds_is_read_from_its_descriptor_table() {
+    const ALONE: &str = "HEX_SERVE_MACOS_DESCRIPTORS_ALONE";
+    const NAME: &str = "serve::macos_tests::what_a_node_holds_is_read_from_its_descriptor_table";
+    if std::env::var_os(ALONE).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+            .env(ALONE, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the case alone in its process failed");
+        return;
+    }
+    let before = crate::serve::macos::open_descriptors().unwrap();
+    let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert_eq!(crate::serve::macos::open_descriptors().unwrap(), before + 2);
+    drop((a, b));
+    assert_eq!(crate::serve::macos::open_descriptors().unwrap(), before);
+}

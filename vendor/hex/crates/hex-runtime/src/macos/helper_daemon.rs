@@ -15,7 +15,7 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
 
@@ -23,6 +23,7 @@ use hex_api::{BoxId, Exit, Proc, Program, Refusal, Signal};
 use hex_core::boxuser::{self, Bound, Use};
 use hex_core::darwin;
 use hex_core::helper::{self, Answer, Refused, Request, START_FDS, State};
+use hex_core::patience::Piece;
 use hex_core::pool::{Account, ROLE_UIDS, next_account};
 
 use super::helper_client::{recv_framed, send_framed};
@@ -231,6 +232,14 @@ pub trait Privileged {
         kill_user(uid, signal)
     }
 
+    /// Whether box user `uid`, its processes killed, holds none running within `slice` (`Duration::MAX`: until it
+    /// holds none), each followed by its own end (`EVFILT_PROC` `NOTE_EXIT`, which root may place on any process) and
+    /// one a kill may have missed killed too; the end's wait on it is decision 9's ([`crate::emptying::followed`];
+    /// defaults to [`super::process::user_empties_within`]).
+    fn empties_within(&self, uid: u32, slice: Duration) -> Result<bool, Refusal> {
+        super::process::user_empties_within(uid, slice)
+    }
+
     /// Watch each of the live members `pids` of user `uid`'s box for its forks and its end (`EVFILT_PROC`,
     /// which root may place on any process), each watch tagged with `uid`; a pid already watched is
     /// watched once. Returns those already gone.
@@ -295,9 +304,6 @@ pub struct Daemon<P: Privileged> {
     /// when its spec names no `pids_max`. Each box has a uid of its own, and XNU's fork counts a uid's
     /// processes against its `RLIMIT_NPROC` (`bsd/kern/kern_fork.c:269-283`).
     per_uid: u32,
-    /// How long a killed user gets to empty, as this node learns it: the record's to start, raised by every
-    /// slower drain (hex_core::drain::Learned; the learned-waits rule, 2026-11-06).
-    drain: Mutex<hex_core::drain::Learned>,
 }
 
 /// How many users a daemon's pool holds now, busy or free.
@@ -323,7 +329,6 @@ impl<P: Privileged> Daemon<P> {
             names: None,
             peak: Mutex::new(0),
             per_uid,
-            drain: Mutex::new(hex_core::drain::Learned::default()),
         }
     }
 
@@ -347,7 +352,6 @@ impl<P: Privileged> Daemon<P> {
             names: Some(Mutex::new(listed.into_iter().map(|(n, _)| n).collect())),
             peak: Mutex::new(peak),
             per_uid,
-            drain: Mutex::new(hex_core::drain::Learned::default()),
         };
         // Counted to the kept peak; a full role range stops it short (the next box is refused by name).
         for _ in listed_len(&daemon)..usize::try_from(peak).unwrap_or(0) {
@@ -709,53 +713,34 @@ impl<P: Privileged> Daemon<P> {
                 None => return Answer::Refused(Refused::UnknownBox(box_id.clone())),
             }
         };
-        // Kill every process of the user, then wait for the user to empty before freeing it, so the next
-        // box never inherits a live process. KILL is 9; mapped through the table like the rest of Hex. The
-        // user's size sets how long it gets: the measured kill-to-empty envelope, doubled, as this node has
-        // learned it (hex_core::drain); past it the kill didn't take, a fault named (CLAUDE.md §4). The user
-        // can't be freed while it holds a process, so the node gets the refusal.
-        let members = match self.ops.list(uid) {
-            Ok(m) => m.len(),
-            Err(e) => return os("listing a box's user", &e),
-        };
-        let patience = match self.drain.lock() {
-            Ok(d) => d.bound(members),
-            Err(_) => {
-                return os(
-                    "reading the node's drain bound",
-                    &io::Error::other("poisoned"),
-                );
-            }
-        };
+        // Kill every process of the user, then wait for the user to empty before freeing it, so the next box never
+        // inherits a live process. KILL is 9; mapped through the table like the rest of Hex. The wait is decision 9's on
+        // the learned emptying (the review's E-12): within W*, the user's emptying; past it, its run-out told once and
+        // the user followed by its processes' own ends, never refused at a time. It was the killscale record's envelope
+        // doubled (hex_core::drain), refused past it while the user was listed and killed again and again.
         let killed = Instant::now();
         if let Err(e) = self.ops.kill(uid, Signal::KILL.number()) {
             return os("ending a box", &e);
         }
-        let deadline = killed.checked_add(patience);
-        loop {
-            match self.ops.list(uid).map(|m| m.is_empty()) {
-                Ok(true) => {
-                    if let Ok(mut d) = self.drain.lock() {
-                        d.observe(members, killed.elapsed());
-                    }
-                    break;
-                }
-                Ok(false) => {
-                    if deadline.is_none_or(|d| Instant::now() >= d) {
-                        return os(
-                            "emptying a box's user",
-                            &io::Error::other(format!("user {uid} still holds a live process")),
-                        );
-                    }
-                    let _ = self.ops.kill(uid, Signal::KILL.number());
-                    std::hint::spin_loop();
-                }
-                Err(e) => return os("checking a box's user is empty", &e),
-            }
+        let followed = crate::emptying::followed(
+            &crate::emptying::EMPTYING,
+            killed,
+            &[
+                Piece::Kind("the killed processes of box "),
+                Piece::Name(box_id.as_str()),
+                Piece::Kind(", its pool user "),
+                Piece::Number(u64::from(uid)),
+                Piece::Kind(", by their ends"),
+            ],
+            |slice| self.ops.empties_within(uid, slice),
+        );
+        if let Err(e) = followed {
+            return Answer::Refused(Refused::StartFailed(format!("emptying a box's user: {e}")));
         }
-        // Reap the box's programs (each a zombie now, or about to be) and keep their ends for the node.
+        // The box's programs have ended with its user: reap each whose end has come, and keep their ends, and the
+        // programs still to be reaped, for the node.
         if let Ok(mut k) = self.kids() {
-            k.close(box_id, Instant::now().checked_add(patience));
+            k.close(box_id);
         }
         if let Ok(mut pool) = self.pool.lock() {
             pool.push(uid);
@@ -855,13 +840,21 @@ impl<P: Privileged> Daemon<P> {
                 Ok(mut k) => k.put_back(box_id, pid, proc),
                 Err(_) => Err(proc),
             };
-            // Its box was dropped meanwhile: reap it here rather than leave a zombie.
+            // Its box was dropped meanwhile: end it and reap it here rather than leave it running or a zombie, its end
+            // followed as a killed box's is (decision 9).
             if let Err(mut p) = back {
-                let patience = self
-                    .drain
-                    .lock()
-                    .map_or_else(|_| hex_core::drain::bound(1), |d| d.bound(1));
-                let _ = p.wait_for(patience);
+                let killed = Instant::now();
+                let _ = p.kill();
+                let _ = crate::emptying::followed(
+                    &crate::emptying::EMPTYING,
+                    killed,
+                    &[
+                        Piece::Kind("the killed program "),
+                        Piece::Pid(i64::from(pid)),
+                        Piece::Kind(" of a dropped box, by its end"),
+                    ],
+                    |slice| Ok(p.wait_for(slice)?.is_some()),
+                );
             }
         }
         match got {

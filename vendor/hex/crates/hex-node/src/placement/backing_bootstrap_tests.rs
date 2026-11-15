@@ -65,6 +65,7 @@ fn fixture() -> (Capacity, NodeSpec, BackingKey) {
         },
     ];
     let report = Capacity {
+        own: Default::default(),
         id: "same native owner".into(),
         total,
         free: total,
@@ -84,6 +85,8 @@ fn fixture() -> (Capacity, NodeSpec, BackingKey) {
         }],
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     report.check().unwrap();
     let mut node = NodeSpec::new(
@@ -104,6 +107,7 @@ fn fixture() -> (Capacity, NodeSpec, BackingKey) {
             offers: routes,
             device_routes: Vec::new(),
             backings: vec![report.backings[0].try_clone().unwrap()],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -200,6 +204,7 @@ impl Runtime for Callback {
                     return Err(Refusal::Backing {
                         key,
                         cause: LifecycleCause::Uncertain,
+                        why: None,
                     });
                 }
                 CleanupReply::WrongGeneration => observed.key.generation = [99; 16],
@@ -281,6 +286,7 @@ fn driver_reserves_the_exact_backing_before_unlocked_native_callback() {
         if wrong_generation {
             assert!(matches!(result, Err(Error::Runtime(Refusal::Backing {
                 key: actual, cause: LifecycleCause::Uncertain,
+                why: Some(_),
             })) if actual == key));
             assert!(driver.state.lock().unwrap().admission.is_some());
         } else {
@@ -336,6 +342,7 @@ fn native_rearm_waits_for_the_original_released_snapshot() {
             offers: catalog.offers.clone(),
             device_routes: catalog.device_routes.clone(),
             backings: vec![report.backings[0].try_clone().unwrap()],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -382,6 +389,7 @@ fn native_rearm_waits_for_the_original_released_snapshot() {
             offers: catalog.offers.clone(),
             device_routes: catalog.device_routes.clone(),
             backings: vec![released.try_clone().unwrap()],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -403,6 +411,7 @@ fn native_rearm_waits_for_the_original_released_snapshot() {
             offers,
             device_routes: catalog.device_routes.clone(),
             backings: vec![prepared],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),

@@ -60,6 +60,10 @@ fn run(args: &[String]) -> Result<(), Refusal> {
                 hex_node::serve::limits(&platform),
                 platform.threads,
             )?;
+            // Crash-only (the review's E-10): a placement core that stops ends the server, so this process exits
+            // naming the stop, and its next start recovers from the records (capacity-view.md CV11).
+            let stopper = server.stopper();
+            service.end_with(move |why| stopper.stop(why))?;
             writeln!(std::io::stdout(), "ready {}", config.socket.display())
                 .map_err(|e| Refusal::os("reporting scheduler readiness", e))?;
             let fault = server.wait();

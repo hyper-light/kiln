@@ -110,7 +110,7 @@ fn no_launch(
     _: NativeRecord<'_>,
     _: &hex_runtime::devices::ManagedLaunch<'_>,
     _: shards_api::LaunchIo,
-    _: Duration,
+    _: Option<Duration>,
     _: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
 ) -> Result<ManagedReceipt, Refusal> {
     panic!("metadata/cancellation control cannot launch")
@@ -159,7 +159,7 @@ fn subset_handoff_reservation_and_cancel_keep_full_source_and_native_gate() {
         tx.put(&BoxRecord::new(spec.clone(),Phase::Creating,Vec::new()))?;
         let canonical=tx.read(&id)?.unwrap(); assert!(canonical.native_scope.is_some());
         assert_eq!(canonical.spec.devices,[devices()[0]]);
-        assert!(matches!(tx.managed_usage(),Err(Refusal::Backing {key,cause:hex_api::LifecycleCause::Pending}) if key==pool.key));
+        assert!(matches!(tx.managed_usage(),Err(Refusal::Backing { key,cause:hex_api::LifecycleCause::Pending, why: None }) if key==pool.key));
         assert_eq!(calls.get(),0);
         let source=tx.read_pool(&pool.key)?.unwrap();
         assert_eq!(source.devices,devices());
@@ -334,7 +334,10 @@ fn boot(scope: [u8; 16]) -> shards_api::PreparedBoot {
     };
     shards_api::prepare_boot(&guest, &root.join("shards"), &root.join("v"), 0)
         .unwrap()
-        .with_gpu_report(scope, Instant::now() + Duration::from_secs(60))
+        .with_gpu_report(
+            scope,
+            shards_api::Until::At(Instant::now() + Duration::from_secs(60)),
+        )
         .unwrap()
 }
 fn io() -> shards_api::LaunchIo {
@@ -365,7 +368,7 @@ fn subset_native_launch_waits_for_full_source_release_then_passes_only_selected_
     let launch = |record: NativeRecord<'_>,
                   plan: &hex_runtime::devices::ManagedLaunch<'_>,
                   _: shards_api::LaunchIo,
-                  _: Duration,
+                  _: Option<Duration>,
                   _: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>|
      -> Result<ManagedReceipt, Refusal> {
         assert_eq!(record.devices(), [devices()[0]]);
@@ -407,7 +410,7 @@ fn subset_native_launch_waits_for_full_source_release_then_passes_only_selected_
             tx.launch_managed(
                 &hex_runtime::devices::ManagedLaunch::Shards(&plan),
                 io(),
-                Duration::from_secs(60)
+                Some(Duration::from_secs(60))
             ),
             Err(Refusal::Backing {
                 cause: hex_api::LifecycleCause::Pending,
@@ -426,7 +429,7 @@ fn subset_native_launch_waits_for_full_source_release_then_passes_only_selected_
             tx.launch_managed(
                 &hex_runtime::devices::ManagedLaunch::Shards(&plan),
                 io(),
-                Duration::from_secs(60)
+                Some(Duration::from_secs(60))
             ),
             Err(Refusal::Exhausted {
                 what: "counted subset native launch",

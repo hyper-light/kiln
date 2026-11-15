@@ -69,7 +69,7 @@ mod layers;
 pub(crate) use layers::LayerFile;
 mod load;
 mod logs;
-mod managed;
+pub(crate) mod managed;
 mod metrics;
 mod moves;
 pub(crate) use moves::{Refused, home_baseline};
@@ -93,7 +93,7 @@ mod restart;
 mod rmi;
 mod ship;
 mod slots;
-mod snapshots;
+pub(crate) mod snapshots;
 mod top;
 mod update;
 mod visit;
@@ -121,15 +121,6 @@ const USAGE: &str = "usage: shards run daemon [--detached] [--listen ADDR:PORT]
     volume of a microVM (default: as long as the host's memory; 0, none): its large files
     read and written from the host's page cache, never copied into the guest's.";
 
-/// How long a starting VM may run nothing of its start before it is given up ([`ready`]),
-/// and a claim of a pool with none starting waits for one: a VM that runs its start is
-/// waited for as long as it takes its host, whose speed sets a boot's cost (PM M357).
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a VM's network process may take to say it has a run's published ports: a
-/// round trip on a socket pair to a process polling it. It was the second a network
-/// process was given to end, `netproc::GRACE`, which a network process's own progress
-/// replaced (PM M546); its own basis is owed (R03).
-const PUBLISH_PATIENCE: Duration = Duration::from_secs(1);
 /// A template whose warm VMs fail this many times in a row is removed and saved again.
 const MAX_FAILURES: u32 = 3;
 const DEFAULT_POOL: usize = 2;
@@ -150,8 +141,6 @@ const DEFAULT_IDLE: Duration = Duration::from_secs(900);
 /// How long a pool keeps warm VMs after its last claim unless `SHARDS_POOL_KEEP` says: D26's
 /// keep-alive, an orchestrator's pools' too (`shards_api::demand::KEEP`).
 const DEFAULT_KEEP: Duration = shards_api::demand::KEEP;
-/// Warm VMs a run may try: one can end while it waits, or before it has taken the run.
-const HANDOFF_TRIES: usize = 3;
 /// A stopped microVM's writable layer, in its directory (D37): kept whole, and being
 /// written as its microVM stops.
 pub(super) const LAYER: &str = "layer.tar";
@@ -239,10 +228,6 @@ const JOIN_ROOT: &str = "join-root";
 /// The home's private directory, 0700: a build's ID file, and what a share process keeps of
 /// a restored guest's files that no path reaches (D176).
 pub(crate) const PRIVATE: &str = "tmp";
-/// How long a daemon waits for the lock of one that neither listens nor ends its runs
-/// (shards_ipc::exiting): one started at the same moment, which listens as soon as it
-/// has the lock. One ending its runs is waited for as long as it takes.
-const TAKEOVER: Duration = Duration::from_secs(20);
 /// How long a command made with no stop timeout of its own is given to end after its stop
 /// signal, before SIGKILL: by `stop`, `restart` and the daemon's own stop alike. The
 /// input's meaning, not a figure of shards': a Compose file's `stop_grace_period` left out
@@ -252,13 +237,65 @@ const TAKEOVER: Duration = Duration::from_secs(20);
 /// `defaultStopTimeout` (moby v28.5.1 container/container_unix.go l. 26, read at
 /// container/container.go l. 601).
 const STOP_GRACE: Duration = Duration::from_secs(10);
-/// How often what could not watch a file it follows (its watch not made: Linux gives a user
-/// 128 inotify instances, shared with every program they run, PM M257) looks at it instead:
-/// the listener at its home, `logs -f`, a process's events, a log driver's copier. A figure
-/// picked, owed its replacement (docs/design/architecture.md, D185's admission). A listener
-/// out of descriptors no longer looks on a clock: it refuses the client it cannot take
-/// (`refuse_api`), and is woken as descriptors are let go of.
-const UNWATCHED: Duration = Duration::from_millis(250);
+/// What could not be watched: a follower's refusal, where the watch of what it follows
+/// could not be made (runs-11). The listener at its home, `logs -f`, a process's events and
+/// a log driver's shipper each refuse with it rather than look on a clock: none of them has
+/// a bound a look's interval could be derived from, and a follower that looked every so
+/// often would show late what a watched one shows at once. A watch needs nothing a follower
+/// may wait for: a descriptor (two on macOS, kqueue(2) and its directory's), and on Linux a
+/// watch of the process's one inotify instance (`max_user_watches`), or an instance of its
+/// own where the process could not make that (`max_user_instances`, inotify(7); PM M257).
+#[derive(Debug)]
+pub(crate) struct WatchRefused(io::Error);
+
+impl std::fmt::Display for WatchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "its watch could not be made, so it is not followed: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for WatchRefused {}
+
+impl From<WatchRefused> for io::Error {
+    fn from(refused: WatchRefused) -> io::Error {
+        io::Error::new(refused.0.kind(), refused)
+    }
+}
+
+/// A watch of the directory `dir` holds open, for what follows it, or why none could be made:
+/// [`WatchRefused`], for its follower to refuse with.
+pub(crate) fn watch(dir: &File) -> Result<FileWatch, WatchRefused> {
+    // A test makes a directory's watch fail by the name UNWATCHABLE in it: its user's
+    // instances or descriptors spent, without spending the test process's.
+    #[cfg(test)]
+    if shards_vmm::platform::open_in(dir, tests::UNWATCHABLE).is_ok() {
+        return Err(WatchRefused(io::Error::other("a test's directory, unwatchable")));
+    }
+    FileWatch::new(dir).map_err(WatchRefused)
+}
+
+/// The listener's watches ([`Daemon::listen`]): of the home, whose removal it must see, of its
+/// images, where a pull leaves a collection due (pull.rs, `collect_due`), and of the contexts
+/// this home joined (relay.rs), each made before the daemon says it serves. A daemon one of
+/// them cannot be made for does not start ([`WatchRefused`]), its starter told as of any other
+/// start it cannot make.
+fn home_watches(home: &Path) -> Result<[FileWatch; 3], String> {
+    let watched = |dir: &Path| {
+        shards_vmm::platform::create_private_dir(dir)
+            .and_then(|()| shards_vmm::platform::open_dir(dir))
+            .map_err(|e| format!("{}: {e}", dir.display()))
+            .and_then(|d| watch(&d).map_err(|e| format!("{}: {e}", dir.display())))
+    };
+    Ok([
+        watched(home)?,
+        watched(&home.join("images"))?,
+        watched(&home.join("contexts"))?,
+    ])
+}
 /// The threads the daemon keeps besides its clients': its listener, and the followers',
 /// the completer's, the files', the recorder's, the collector's, the refiller's, the
 /// health checks' and the memory pressure watcher's (D188); and the system's, the dispatch
@@ -373,17 +410,83 @@ fn fail(message: &str) -> ExitCode {
 /// A message in the daemon's log: its line written whole, in one write, so that a reader
 /// never finds part of it, nor another thread's line within it (stderr writes each piece
 /// of a formatted line as it comes).
-fn log(message: impl std::fmt::Display) {
+pub(crate) fn log(message: impl std::fmt::Display) {
     #[cfg(test)]
     LOGGED.fetch_add(1, Ordering::Relaxed);
     let line = format!("shards daemon {}: {message}\n", std::process::id());
     let _ = io::stderr().write_all(line.as_bytes());
 }
 
-/// The lines the daemons of a test process have logged: what a test's watchdog takes for
-/// its daemon's threads still ending, on a host that ends them slowly ([`log`]).
+/// A daemon thread's timed wait, held for its length (#77): under test, its deadline
+/// registered ([`DEADLINES`]), by which a test's judged wait knows that a thread asleep
+/// until then has not stalled, its next progress scheduled; elsewhere nothing. None, a wait
+/// with no deadline, registers none.
+#[must_use]
+struct Waiting(#[cfg(test)] Option<u64>);
+
+impl Waiting {
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn of(timeout: Option<Duration>) -> Waiting {
+        #[cfg(test)]
+        return Waiting(timeout.and_then(|t| Instant::now().checked_add(t)).map(|until| {
+            let key = NEXT_DEADLINE.fetch_add(1, Ordering::Relaxed);
+            lock(&DEADLINES).push((key, until));
+            key
+        }));
+        #[cfg(not(test))]
+        Waiting()
+    }
+}
+
+#[cfg(test)]
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if let Some(key) = self.0 {
+            lock(&DEADLINES).retain(|(k, _)| *k != key);
+        }
+    }
+}
+
+/// `wait`, a wait of at most `timeout` ([`Waiting`]).
+fn timed<T>(timeout: Option<Duration>, wait: impl FnOnce() -> T) -> T {
+    let _waiting = Waiting::of(timeout);
+    wait()
+}
+
+/// Sleeps `d` ([`timed`]).
+fn slept(d: Duration) {
+    timed(Some(d), || std::thread::sleep(d));
+}
+
+/// poll(2)'s timeout `ms` as [`timed`] takes it: none where it waits for ever (negative).
+#[cfg(unix)]
+fn poll_timeout(ms: libc::c_int) -> Option<Duration> {
+    u64::try_from(ms).ok().map(Duration::from_millis)
+}
+
+/// The deadlines daemon threads of this test process wait until ([`Waiting`]), each under
+/// its key.
+#[cfg(test)]
+static DEADLINES: Mutex<Vec<(u64, Instant)>> = Mutex::new(Vec::new());
+#[cfg(test)]
+static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(0);
+
+/// The latest deadline a daemon thread of this test process waits until now.
+#[cfg(test)]
+fn latest_deadline() -> Option<Instant> {
+    lock(&DEADLINES).iter().map(|(_, until)| *until).max()
+}
+
+/// The lines the daemons of a test process have logged ([`log`]), which tests count.
 #[cfg(test)]
 static LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// The setup entry carrying a microVM's own engine's token (D181), `engine=` and its bytes in
+/// lowercase hex, which init makes its command's socket by.
+fn engine_entry(token: &[u8; shards_abi::run::TOKEN]) -> Vec<u8> {
+    let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+    format!("engine={hex}").into_bytes()
+}
 
 /// The host's hosts file, as a microVM on its network has it (D124): `/etc/hosts`, or
 /// Windows' own; none where it cannot be read.
@@ -657,9 +760,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Ready {
     vm: Arc<shards_ipc::Child>,
     socket: UnixStream,
-    /// Its network process's control socket, if it has one: where its run's published
-    /// ports go.
-    net: Option<crate::netproc::Control>,
+    /// Its network process's control socket, and its process, if it has one: where its
+    /// run's published ports go.
+    net: Option<crate::netproc::NetLink>,
     /// The guest's MAC on its network, if it has one.
     mac: Option<[u8; 6]>,
     /// The pool it came from.
@@ -674,6 +777,10 @@ struct Ready {
     /// Its writable layer's file (D190), which it holds open and mapped: the run it takes
     /// keeps it, or lets it go.
     layer: Option<layers::LayerFile>,
+    /// When it joined its pool's waiting VMs; none for one started for a run, or a
+    /// joiner's. A run that one of them surely did not take tries the next only where it
+    /// was waiting before the run asked ([`Daemon::start_run`]).
+    pooled: Option<Instant>,
 }
 
 impl Ready {
@@ -872,8 +979,8 @@ struct Keep<'a> {
     /// The way its kept layer was taken, where it could go either, what it held, and when
     /// it was chosen: recorded as its command starts ([`layers::Restarts`]).
     layer_way: Option<LayerWay>,
-    /// How many segments its log keeps (D161): its own, else the daemon's.
-    log_files: u64,
+    /// How its log keeps its output (D161): its own, else the daemon's.
+    log_kept: LogRetention,
     /// Its log's rotated segments are compressed (D162).
     log_compress: bool,
     /// A visit to a stopped microVM's files (visit.rs): no start, no end, no state of
@@ -914,7 +1021,7 @@ struct RunSocket {
 
 impl RunSocket {
     fn new(stream: UnixStream) -> RunSocket {
-        if let Err(e) = stream.set_write_timeout(Some(TAKE_TIMEOUT)) {
+        if let Err(e) = shards_ipc::timeout_set(stream.set_write_timeout(Some(TAKE_TIMEOUT))) {
             log(format!("a run's socket: {e}"));
         }
         RunSocket {
@@ -940,8 +1047,9 @@ struct Tracked {
     visit: bool,
     /// Its guest's MAC on its network, for `inspect`.
     mac: Option<[u8; 6]>,
-    /// Its network process's control socket, where peers on its network come (D46).
-    net: Option<crate::netproc::Control>,
+    /// Its network process's control socket, and its process, where peers on its network
+    /// come (D46).
+    net: Option<crate::netproc::NetLink>,
     /// For a joiner of another's network (D119), the ID of the run it joins: `vm` is its
     /// VM, which this run never ends, pauses or reads as its own.
     joined: Option<String>,
@@ -982,8 +1090,8 @@ struct Inbox {
     /// the daemon made.
     container: PathBuf,
     segment: u64,
-    /// How many segments its log keeps (D161).
-    log_files: u64,
+    /// How its log keeps its output (D161): its segments, and their bound (runs-11).
+    log_kept: LogRetention,
     /// Its log's rotated segments are compressed (D162).
     log_compress: bool,
     /// Exec clients' connections handed to the VM and not yet taken, by number: held
@@ -1040,7 +1148,7 @@ struct Inbox {
     pausing: Vec<(u64, mpsc::Sender<Result<(), String>>)>,
     /// The device steps its VM was asked for (`DEVICE`, D214) and has yet to answer, each
     /// by its number.
-    devices: Vec<(u64, mpsc::Sender<Result<String, String>>)>,
+    devices: Vec<(u64, mpsc::Sender<Result<String, shards_ipc::device::Refusal>>)>,
     /// The guest times its VM was asked for (`GUEST_TIME`) and has yet to answer, each by
     /// its number.
     guest_times: Vec<(u64, mpsc::Sender<Result<shards_vmm::vm::GuestTimes, String>>)>,
@@ -1160,6 +1268,39 @@ struct Stop {
     next: Option<Instant>,
     /// Its command's teardown once it is sent SIGKILL.
     killed: Option<ends::Followed>,
+    /// Its grace, kept while it runs.
+    grace: Option<Grace>,
+}
+
+/// A run's stop grace, kept in its directory (`shards_ipc::GRACE`) from its stop signal
+/// until its SIGKILL or its end, which drop it: so that a wait on the daemon can tell the
+/// grace from a stall, as nothing need run in it (D209).
+struct Grace(PathBuf);
+
+impl Grace {
+    /// The grace of the run whose directory is `dir`, `grace` from now; none where it
+    /// cannot be kept, which the log says.
+    fn begin(dir: &Path, grace: Duration) -> Option<Grace> {
+        let file = dir.join(shards_ipc::GRACE);
+        let kept = std::time::SystemTime::now()
+            .checked_add(grace)
+            .and_then(shards_ipc::grace_text)
+            .ok_or_else(|| io::Error::other("its end past the system clock's reach"))
+            .and_then(|text| keep_whole(&file, text.as_bytes()));
+        match kept {
+            Ok(()) => Some(Grace(file)),
+            Err(e) => {
+                log(format!("{}: {e}", file.display()));
+                None
+            }
+        }
+    }
+}
+
+impl Drop for Grace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Why a template's pool gave no warm VM.
@@ -1251,11 +1392,14 @@ struct Daemon<D: Disk = Real> {
     /// The connections of `shards daemon stop`, held open until this daemon has let go
     /// of its home, which is how they learn it has exited.
     stoppers: Mutex<Vec<UnixStream>>,
+    /// [`shards_ipc::STOPPING_LOCK`], made anew and locked as it closes, let go of once it
+    /// has let go of its home ([`finish`](Self::finish)): what `stop daemon` waits on.
+    stopping_lock: Mutex<Option<File>>,
     /// Every run whose microVM exists and has not ended, by the microVM's ID.
     runs: Mutex<HashMap<String, RunState>>,
     /// The microVMs a client waits on, by their processes' IDs, each as the listener last
     /// looked at it ([`Daemon::log_progress`]).
-    followed: Mutex<HashMap<u32, Progress>>,
+    followed: Mutex<HashMap<u32, Looked>>,
     /// How long this host's microVMs have taken to end once killed, kept in the home
     /// (D217).
     ends: ends::Ends,
@@ -1320,6 +1464,10 @@ struct Daemon<D: Disk = Real> {
     /// What is plugged into each running microVM (D214), by microVM ID, then by the path
     /// its workload has it at.
     plugged: Mutex<devices::PluggedMap>,
+    /// Each running microVM's device steps, one at a time (D214).
+    device_steps: devices::Steps,
+    /// Which runs have each disk file plugged in, by its identity (devices-11, D214).
+    disk_claims: devices::DiskClaims,
     /// Each running microVM's join share process (D119), by the ID of the microVM whose
     /// run it is: the daemon's connection to it, on which each joiner's link to it goes.
     /// Made as the first joiner of that microVM's network brings volumes.
@@ -1537,8 +1685,10 @@ fn count(name: &str, default: u64) -> Result<u64, String> {
 }
 
 /// How much of a microVM's output its log keeps unless a setting says otherwise: its
-/// newest 1 GiB (the user's call, 2026-10-18; `shards configure disk`, D186).
-pub(crate) const DEFAULT_LOGS: LogRetention = crate::disk::log_retention(crate::disk::LOG_HISTORY);
+/// newest 1 GiB (the user's call, 2026-10-18; `shards configure disk`, D186), in segments
+/// as no file system's unit is known (`disk::log_retention`): where none is written (a
+/// log's flags read, `--log-driver none`'s run head), or the home's unit could not be read.
+pub(crate) const DEFAULT_LOGS: LogRetention = crate::disk::log_retention(crate::disk::LOG_HISTORY, None);
 
 /// A daemon's settings.
 #[derive(Debug, Clone, Copy)]
@@ -1716,9 +1866,14 @@ fn settings() -> Result<Settings, String> {
     let keep = Duration::from_secs(count("SHARDS_POOL_KEEP", DEFAULT_KEEP.as_secs())?);
     let given = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
     let logs = if given("SHARDS_LOG_MAX_SIZE") || given("SHARDS_LOG_MAX_FILE") {
+        // The other's default as the home's file system's unit makes it.
+        let unit = shards_ipc::home()
+            .ok()
+            .and_then(|home| shards_vmm::platform::allocation_unit(&home).ok());
+        let default = crate::disk::log_retention(crate::disk::LOG_HISTORY, unit);
         let logs = LogRetention {
-            size: count("SHARDS_LOG_MAX_SIZE", DEFAULT_LOGS.size)?,
-            files: count("SHARDS_LOG_MAX_FILE", DEFAULT_LOGS.files)?,
+            size: count("SHARDS_LOG_MAX_SIZE", default.size)?,
+            files: count("SHARDS_LOG_MAX_FILE", default.files)?,
         };
         if logs.size == 0 {
             return Err("SHARDS_LOG_MAX_SIZE: a log keeps at least a byte".into());
@@ -1756,6 +1911,17 @@ fn elect_bridge() -> Option<shards_net::bridge::Bridge> {
     bridge
 }
 
+/// Enters the daemon's home once; no daemon thread changes its working directory.
+fn entered_home(home: &Path) -> Result<PathBuf, String> {
+    std::env::set_current_dir(home).map_err(|e| format!("{}: {e}", home.display()))?;
+    // A pathname can be renamed and replaced while this process still owns its CWD.
+    // Keep every daemon-owned path relative to that directory, including slot cleanup.
+    #[cfg(unix)]
+    return Ok(PathBuf::from("."));
+    #[cfg(windows)]
+    Ok(home.to_path_buf())
+}
+
 fn serve(ready: Option<File>, listen: Option<std::net::SocketAddr>) -> Result<(), String> {
     let mut settings = settings()?;
     // A daemon its clients reach does not end for having had nothing to do (D180).
@@ -1765,13 +1931,15 @@ fn serve(ready: Option<File>, listen: Option<std::net::SocketAddr>) -> Result<()
     let descriptors = raise_descriptor_limit();
     let home = shards_ipc::home()?;
     shards_vmm::platform::create_private_dir(&home).map_err(|e| format!("{}: {e}", home.display()))?;
-    // The home's names are relative to it (its slots, an older build's socket): the home is
+    // The home's names are relative to it (its slots): the home is
     // the daemon's own, so this holds no client's directory busy.
-    std::env::set_current_dir(&home).map_err(|e| format!("{}: {e}", home.display()))?;
+    let home = entered_home(&home)?;
     let Some(home_lock) = take_lock(&home)? else {
         // Another daemon serves this home.
         return Ok(());
     };
+    // From here to its slots' lists is its start as a daemon waiting for the lock sees it.
+    let locked = Instant::now();
     // By its ID and its start, which a process given its ID once it has gone does not share
     // (shards_ipc::Named): a client waits for a slot while this daemon lives.
     let pid_file = home.join(shards_ipc::PID);
@@ -1785,19 +1953,23 @@ fn serve(ready: Option<File>, listen: Option<std::net::SocketAddr>) -> Result<()
     // works in the home, with the daemon's limits, as the children it makes do.
     shards_ipc::start_spawner(&exe, &[OsStr::new("spawner")])
         .map_err(|e| format!("the daemon's spawner: {e}"))?;
-    // Its daemon is gone, since this one holds the lock: an older build's socket with it
-    // (Unix's: no daemon ran on Windows before slots), and the writable layers made for its
+    // Its daemon is gone, since this one holds the lock: the writable layers made for its
     // microVMs that none took (D190).
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(shards_ipc::SOCKET);
     layers::clear(&home);
     let _ = std::fs::remove_file(crate::context::LISTENING);
     let _ = std::fs::remove_file(home.join(shards_ipc::STOPPING));
+    // One a daemon that died closed left: let go of with it, and none this one's until it
+    // closes, so that no stop waits on it.
+    let _ = std::fs::remove_file(home.join(shards_ipc::STOPPING_LOCK));
     // The request slots' lists (D185), how its clients reach it, made at once: a client
     // that finds them waits on them for its slot, which comes once the daemon is ready,
     // where one that found none would start another daemon to wait for this one's lock.
     let requests = shards_ipc::slots::Requests::open(&home)
         .map_err(|e| format!("{}: {e}", home.join(shards_ipc::slots::DIR).display()))?;
+    // The home's slowest start, which a daemon waiting for its lock is judged by (TAKEOVER).
+    if let Err(e) = ends::Ends::kept_in(&home).heard(ends::End::Start, locked.elapsed()) {
+        log(e);
+    }
     // The Engine API's (D170), beside it: one that cannot be made is said, and the daemon
     // serves its CLI without it.
     let _ = std::fs::remove_file(engine::SOCKET);
@@ -1831,6 +2003,9 @@ fn serve(ready: Option<File>, listen: Option<std::net::SocketAddr>) -> Result<()
         daemon.home.join(shards_ipc::slots::DIR).display(),
         descriptors.map_or_else(|| "an unknown number of".to_string(), |n| n.to_string())
     ));
+    // The listener's watches, before it says it serves: a daemon that could not see its
+    // home's removal, a pull's collection or its contexts is not started (runs-11).
+    let watches = home_watches(&daemon.home)?;
     // Other machines' clients (D180), before it says it serves: an address it cannot bind
     // is its starter's to hear.
     if let Some(at) = listen {
@@ -1859,7 +2034,7 @@ fn serve(ready: Option<File>, listen: Option<std::net::SocketAddr>) -> Result<()
         daemon.start_groups(threads);
         daemon.restart_at_start(threads);
         daemon.serve_slots(threads, requests);
-        daemon.listen(threads, api);
+        daemon.listen(threads, api, &watches);
     });
     Ok(())
 }
@@ -2009,9 +2184,16 @@ fn readable_fd(fd: RawFd) -> bool {
 }
 
 /// The home's lock, or `None` if another daemon serves the home. One that finds no
-/// daemon serving waits a while for the lock: the last daemon may be exiting. The lock is
-/// its file's (`File::try_lock`): flock(2) on Unix, LockFileEx on Windows, each exclusive
-/// and refused at once where another holds it.
+/// daemon serving waits for the lock while its holder lives (runs-11 TAKEOVER): a daemon
+/// started at the same moment, which serves as soon as it has made its slots' lists, or one
+/// ending its runs (shards_ipc::exiting), as long as that takes. The lock is its file's
+/// (`File::try_lock`): flock(2) on Unix, LockFileEx on Windows, each exclusive, refused at
+/// once where another holds it, and let go of by the OS as its holder ends, so that a lock
+/// held is a holder that lives. No home is taken, and no wait given up, on a clock: a
+/// starting holder that runs nothing at all for a whole slice past the slowest start this
+/// host has shown is refused typed ([`HolderStalled`]), and before the host has shown one,
+/// followed by its lock alone. Refused where a daemon of a build from before slots holds it
+/// ([`shards_ipc::PreSlotsDaemon`]).
 fn take_lock(home: &Path) -> Result<Option<File>, String> {
     let path = home.join("daemon.lock");
     let file = crate::os::owner_only(
@@ -2022,7 +2204,8 @@ fn take_lock(home: &Path) -> Result<Option<File>, String> {
     )
     .open(&path)
     .map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut deadline = Instant::now() + TAKEOVER;
+    let ends = ends::Ends::kept_in(home);
+    let mut judged = None;
     let mut said = false;
     loop {
         match file.try_lock() {
@@ -2030,15 +2213,12 @@ fn take_lock(home: &Path) -> Result<Option<File>, String> {
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(e)) => return Err(format!("{}: {e}", path.display())),
         }
-        // Its holder serves: its slots, or (Unix's) an older build's socket, whose client
-        // then has it step aside for its own.
-        #[cfg(unix)]
-        let older = UnixStream::connect(shards_ipc::SOCKET).is_ok();
-        #[cfg(windows)]
-        let older = false;
-        if shards_ipc::slots::served(home) || older {
+        // Its holder serves its slots; one of a build from before slots is refused, never
+        // asked to step aside (D185).
+        if shards_ipc::slots::served(home) {
             return Ok(None);
         }
+        shards_ipc::no_pre_slots_daemon(Path::new(".")).map_err(|e| e.to_string())?;
         // Held and offering nothing: its lists may have been removed by hand, which its
         // maker learns of only as a name of the home comes or goes. One made and removed
         // says so, once, never through a link at its name (D185).
@@ -2053,13 +2233,76 @@ fn take_lock(home: &Path) -> Result<Option<File>, String> {
                 let _ = std::fs::remove_file(&name);
             }
         }
-        if shards_ipc::exiting(home) {
-            deadline = Instant::now() + TAKEOVER;
-        } else if Instant::now() >= deadline {
-            return Ok(None);
+        // One ending its runs is no start to judge: its runs' stop timeouts bound it.
+        match ends.slice(ends::End::Start) {
+            Some(slice) if !shards_ipc::exiting(home) => {
+                judge_holder(home, slice, &mut judged).map_err(|stalled| stalled.to_string())?;
+            }
+            _ => judged = None,
         }
-        std::thread::sleep(Duration::from_millis(10));
+        slept(Duration::from_millis(10));
     }
+}
+
+/// A daemon that holds its home's lock and has not served yet, as one waiting for the lock
+/// follows it: the process the home's `daemon.pid` names, which it writes as it takes the
+/// lock, before it makes its slots' lists (`serve`).
+#[derive(Debug)]
+struct Judged {
+    holder: shards_ipc::Named,
+    /// When it is next looked at: none past what an `Instant` holds.
+    due: Option<Instant>,
+    followed: ends::Followed,
+}
+
+/// Why a daemon waiting for its home's lock waits no longer (runs-11 TAKEOVER): the daemon
+/// that holds it has made no slots' lists, and ran nothing, freed nothing and was held by
+/// its host from nothing (`ends::Followed::goes_on`, D215's readers) for a whole `slice`,
+/// the slowest start this host has shown (`ends::End::Start`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HolderStalled {
+    holder: shards_ipc::Named,
+    slice: Duration,
+}
+
+impl std::fmt::Display for HolderStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the daemon {} that holds this home has not served, and went on with nothing for \
+             {:?}, the slowest start this host has shown",
+            self.holder.pid, self.slice
+        )
+    }
+}
+
+/// Follows the lock's holder by D215's judge, a slice of `slice` at a time from when it is
+/// first seen named: on while it goes on, [`HolderStalled`] once it has not for a slice. A
+/// holder the home names no living process for is between its lock and its name: followed
+/// by its lock alone, and judged anew once named.
+fn judge_holder(home: &Path, slice: Duration, judged: &mut Option<Judged>) -> Result<(), HolderStalled> {
+    let Some(holder) = shards_ipc::Named::read(&home.join(shards_ipc::PID)).filter(shards_ipc::Named::lives)
+    else {
+        *judged = None;
+        return Ok(());
+    };
+    let now = Instant::now();
+    let judged = match judged {
+        Some(judged) if judged.holder == holder => judged,
+        _ => judged.insert(Judged {
+            holder,
+            due: now.checked_add(slice),
+            followed: ends::Followed::of(Some(holder.pid)),
+        }),
+    };
+    if judged.due.is_none_or(|due| now < due) {
+        return Ok(());
+    }
+    if judged.followed.goes_on().is_none() {
+        return Err(HolderStalled { holder, slice });
+    }
+    judged.due = now.checked_add(slice);
+    Ok(())
 }
 
 impl<D: Disk> Daemon<D> {
@@ -2113,6 +2356,7 @@ impl<D: Disk> Daemon<D> {
             live: Mutex::default(),
             socket_at: Mutex::new(()),
             stoppers: Mutex::default(),
+            stopping_lock: Mutex::default(),
             runs: Mutex::default(),
             followed: Mutex::default(),
             ends,
@@ -2133,6 +2377,8 @@ impl<D: Disk> Daemon<D> {
             changed_request: Condvar::new(),
             paused: Mutex::default(),
             plugged: Mutex::default(),
+            device_steps: devices::Steps::default(),
+            disk_claims: devices::DiskClaims::default(),
             join_shares: Mutex::default(),
             shared_by: Mutex::default(),
             noticing: Mutex::default(),
@@ -2182,13 +2428,15 @@ impl<D: Disk> Daemon<D> {
     }
 
     /// Ends its offers and removes the Engine API's socket, once: no client arrives from
-    /// here on.
+    /// here on. It names itself stopping first ([`name_stopping`](Self::name_stopping)),
+    /// at a stop's word or idle.
     fn close(&self) {
         {
             let _at = lock(&self.socket_at);
             if self.closed.load(Ordering::SeqCst) {
                 return;
             }
+            self.name_stopping();
             self.closed.store(true, Ordering::SeqCst);
             // A request still being read is taken no more: its reader ends, and its client,
             // told RESTART, asks the next daemon, as a closed daemon tells one whose request
@@ -2209,6 +2457,23 @@ impl<D: Disk> Daemon<D> {
         // other, which a holder of the runs' may take.
         let _runs = lock(&self.runs);
         self.resolved.notify_all();
+    }
+
+    /// Names this daemon stopping, before its slots go: its process in `STOPPING`, which a
+    /// daemon or client that finds none serving waits for while it ends its runs, however
+    /// long their stop timeouts (`shards_ipc::exiting`); and `STOPPING_LOCK`, made anew and
+    /// held until it has let go of its home ([`finish`](Self::finish)), which `stop daemon`
+    /// waits for, whatever its slot said (D185).
+    fn name_stopping(&self) {
+        let stopping = self.home.join(shards_ipc::STOPPING);
+        if let Err(e) = shards_ipc::this_process().and_then(|named| keep_whole(&stopping, named.as_bytes())) {
+            log(format!("{}: {e}", stopping.display()));
+        }
+        let held = self.home.join(shards_ipc::STOPPING_LOCK);
+        match held_anew(&held) {
+            Ok(file) => *lock(&self.stopping_lock) = Some(file),
+            Err(e) => log(format!("{}: {e}", held.display())),
+        }
     }
 
     /// Binds the Engine API's socket again where someone removed it while the daemon
@@ -2242,27 +2507,12 @@ impl<D: Disk> Daemon<D> {
     /// (no slot offered, the Engine API's socket gone), so that no client arrives after,
     /// serves any that already did, and exits. Its own clients come through its slots
     /// (slots.rs); here, the Engine API's, the contexts' relays, and its duties.
-    fn listen<'s, 'e>(&'s self, threads: &'s Threads<'s, 'e>, mut api: Option<ApiListener>) {
-        // The home, whose removal the listener must see, and its images,
-        // where a pull leaves a collection due (pull.rs, `collect_due`). Where a watch
-        // cannot be made, the listener looks again every UNWATCHED.
-        let watch = |dir: &Path| match shards_vmm::platform::open_dir(dir).and_then(|d| FileWatch::new(&d)) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                log(format!("watching {}: {e}", dir.display()));
-                None
-            }
-        };
-        let images = self.home.join("images");
-        // The contexts this home joined, whose engines it serves (relay.rs) as each comes
-        // and goes.
-        let contexts = self.home.join("contexts");
-        for dir in [&images, &contexts] {
-            if let Err(e) = shards_vmm::platform::create_private_dir(dir) {
-                log(format!("{}: {e}", dir.display()));
-            }
-        }
-        let watches = [watch(&self.home), watch(&images), watch(&contexts)];
+    fn listen<'s, 'e>(
+        &'s self,
+        threads: &'s Threads<'s, 'e>,
+        mut api: Option<ApiListener>,
+        watches: &[FileWatch; 3],
+    ) {
         // The slots' maker looked at its lists as it began, before the home was watched: a
         // removal between that look and the watch, which a client its first slots served
         // may make, is seen by one more look, now that the home is watched.
@@ -2293,7 +2543,7 @@ impl<D: Disk> Daemon<D> {
                 self.close_relays(threads, &mut relays, &mut spare);
                 true
             } else {
-                self.relay_contexts(&mut relays, contexts_changed || watches[2].is_none());
+                self.relay_contexts(&mut relays, contexts_changed);
                 accepting && self.relay_waiting(threads, &relays, &mut spare)
             };
             // The Engine API's clients, each served on a thread of its own as long as it
@@ -2355,13 +2605,8 @@ impl<D: Disk> Daemon<D> {
                 self.exit();
             }
             // A listener it could not take a client from, out of descriptors, waits for a wake
-            // as they are let go of; a home it could not watch is looked at again.
-            let looking = watches.iter().any(Option::is_none);
-            let timeout = if looking {
-                Some(UNWATCHED.min(self.next_duty(quiet).unwrap_or(UNWATCHED)))
-            } else {
-                self.next_duty(quiet)
-            };
+            // as they are let go of.
+            let timeout = self.next_duty(quiet);
             // A slot's client given until then to go on, and a microVM a client waits on
             // looked at again.
             let timeout = timeout
@@ -2373,14 +2618,13 @@ impl<D: Disk> Daemon<D> {
             (home_changed, contexts_changed) = self.wait_for_work(
                 api.as_ref().filter(|_| api_ready),
                 relays_ready.then_some(&relays),
-                &watches,
+                watches,
                 timeout,
             );
             // The slots' lists may have gone with a name of the home (a removal of the home
             // takes `requests/`), or a daemon waiting for the lock finds none and says so
-            // by a name it makes there (`take_lock`): the maker looks. Where the home's
-            // watch could not be made, it looks at each of the listener's looks.
-            if home_changed || watches[0].is_none() {
+            // by a name it makes there (`take_lock`): the maker looks.
+            if home_changed {
                 self.tell_slots(slots::Event::Look);
             }
         }
@@ -2442,13 +2686,18 @@ impl<D: Disk> Daemon<D> {
     }
 
     /// Logs what each microVM a client waits on has done, its run's own client or an
-    /// exec's, once each [`READY_STALL`], where it ran more than an idle microVM takes in as
-    /// long (`shards_vmm::platform::progressed`, PM M357): its CPU time and page faults, and
+    /// exec's, where it ran more than an idle microVM takes in as long
+    /// (`shards_vmm::platform::progressed`, PM M357): its CPU time and page faults, and
     /// what each grew by. The durable word by which the wait of a client whose workload its
     /// host runs slowly is told from one on a microVM that runs nothing (D209), which is
-    /// said nothing of, as an idle microVM has nothing to say: a liveness line, which the
-    /// tests' waits take for no progress of their subject (tests/common `HEARTBEAT` matches
-    /// it). How long until the next look is due; none where no client waits.
+    /// said nothing of, as an idle microVM has nothing to say. Its looks are paced by this
+    /// daemon's record of starts (`Answers::ready`, D215's judge): its first W*, the slowest
+    /// start seen, after the client began to wait, and each after twice as long as the
+    /// look before it, so that what a wait says grows with the logarithm of its length
+    /// however small W* is (RFC 6298 §5.5's doubling). Before this daemon's first READY, none:
+    /// a heartbeat is a diagnostic, not a wait's progress, which a client's own look at the
+    /// microVM's process reads. How long until the next look is due; none where no client
+    /// waits or no start has been seen.
     fn log_progress(&self) -> Option<Duration> {
         let inboxes: Vec<(String, Arc<Mutex<Inbox>>)> = lock(&self.runs)
             .iter()
@@ -2467,19 +2716,26 @@ impl<D: Disk> Daemon<D> {
             .collect();
         let mut followed = lock(&self.followed);
         followed.retain(|pid, _| waited.iter().any(|(_, p)| p == pid));
+        let shards_api::Seen::Learned { slowest, .. } = self.answers.ready.seen() else {
+            return None;
+        };
         let mut next: Option<Duration> = None;
         // A joiner's microVM is its provider's (D119): looked at once a turn, as one.
         for (id, pid) in &waited {
-            let progress = followed.entry(*pid).or_insert_with(|| Progress::of(*pid));
-            if progress.since() >= READY_STALL {
-                let look = progress.look();
+            let looked = followed.entry(*pid).or_insert_with(|| Looked {
+                progress: Progress::of(*pid),
+                every: slowest,
+            });
+            if looked.progress.since() >= looked.every {
+                let look = looked.progress.look();
                 if look.ran {
                     log(format!(
                         "container {id}: VM {pid} runs as its client waits: {look}"
                     ));
                 }
+                looked.every = looked.every.saturating_mul(2);
             }
-            let due = READY_STALL.saturating_sub(progress.since());
+            let due = looked.every.saturating_sub(looked.progress.since());
             next = Some(next.map_or(due, |n| n.min(due)));
         }
         next
@@ -2494,7 +2750,7 @@ impl<D: Disk> Daemon<D> {
         &self,
         api: Option<&ApiListener>,
         relays: Option<&relay::Relays>,
-        watches: &[Option<FileWatch>; 3],
+        watches: &[FileWatch; 3],
         timeout: Option<Duration>,
     ) -> (bool, bool) {
         let pollfd = |fd: RawFd| libc::pollfd {
@@ -2502,12 +2758,11 @@ impl<D: Disk> Daemon<D> {
             events: libc::POLLIN,
             revents: 0,
         };
-        let watched = |w: &Option<FileWatch>| w.as_ref().map_or(-1, |w| w.fd().as_raw_fd());
         let mut polled: Vec<libc::pollfd> = [
             self.listener_wake.fd(),
-            watched(&watches[0]),
-            watched(&watches[1]),
-            watched(&watches[2]),
+            watches[0].fd().as_raw_fd(),
+            watches[1].fd().as_raw_fd(),
+            watches[2].fd().as_raw_fd(),
             api.map_or(-1, AsRawFd::as_raw_fd),
         ]
         .into_iter()
@@ -2519,9 +2774,11 @@ impl<D: Disk> Daemon<D> {
             libc::c_int::try_from(t.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
         });
         let n = libc::nfds_t::try_from(polled.len()).unwrap_or(libc::nfds_t::MAX);
-        // SAFETY: poll(2) on pollfds of descriptors this daemon holds open (negative ones
-        // are ignored), `n` of them.
-        unsafe { libc::poll(polled.as_mut_ptr(), n, ms) };
+        timed(poll_timeout(ms), || {
+            // SAFETY: poll(2) on pollfds of descriptors this daemon holds open (negative
+            // ones are ignored), `n` of them.
+            unsafe { libc::poll(polled.as_mut_ptr(), n, ms) }
+        });
         let ready = |i: usize| polled.get(i).is_some_and(|p| p.revents != 0);
         if ready(0) {
             self.listener_wake.drain();
@@ -2540,7 +2797,7 @@ impl<D: Disk> Daemon<D> {
         &self,
         api: Option<&ApiListener>,
         relays: Option<&relay::Relays>,
-        watches: &[Option<FileWatch>; 3],
+        watches: &[FileWatch; 3],
         timeout: Option<Duration>,
     ) -> (bool, bool) {
         use std::os::windows::io::AsRawHandle as _;
@@ -2548,7 +2805,7 @@ impl<D: Disk> Daemon<D> {
         use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects, WaitForSingleObject};
         let _ = relays;
         let waited: Vec<_> = std::iter::once(self.listener_wake.event().raw())
-            .chain(watches.iter().flatten().map(|w| w.fd().as_raw_handle()))
+            .chain(watches.iter().map(|w| w.fd().as_raw_handle()))
             .chain(api.map(ApiListener::event))
             .collect();
         // Rounded up: a wait of 0 ms would return at once, and spin.
@@ -2556,26 +2813,26 @@ impl<D: Disk> Daemon<D> {
             u32::try_from(t.as_micros().div_ceil(1000)).map_or(INFINITE - 1, |ms| ms.min(INFINITE - 1))
         });
         let n = u32::try_from(waited.len()).unwrap_or(1);
-        // SAFETY: events this daemon holds, `n` of them.
-        unsafe { WaitForMultipleObjects(n, waited.as_ptr(), 0, ms) };
+        timed(timeout, || {
+            // SAFETY: events this daemon holds, `n` of them.
+            unsafe { WaitForMultipleObjects(n, waited.as_ptr(), 0, ms) }
+        });
         if self.listener_wake.pending() {
             self.listener_wake.drain();
         }
         // SAFETY: an event a watch of this daemon's holds, not waited for.
         let set = |w: &FileWatch| unsafe { WaitForSingleObject(w.fd().as_raw_handle(), 0) } == WAIT_OBJECT_0;
-        self.clear_watches(watches, |i| {
-            watches.get(i).and_then(Option::as_ref).is_some_and(set)
-        })
+        self.clear_watches(watches, |i| watches.get(i).is_some_and(set))
     }
 
     /// Clears each of `watches` that `ready` says saw a change, by its place among them:
     /// whether the home's (the first) did, and the contexts' (the third). Each is asked
     /// once, before any is cleared: on Windows `ready` reads a watch's event, which its
     /// clearing resets.
-    fn clear_watches(&self, watches: &[Option<FileWatch>; 3], ready: impl Fn(usize) -> bool) -> (bool, bool) {
+    fn clear_watches(&self, watches: &[FileWatch; 3], ready: impl Fn(usize) -> bool) -> (bool, bool) {
         let fired = [ready(0), ready(1), ready(2)];
         for (watch, fired) in watches.iter().zip(fired) {
-            if fired && let Some(watch) = watch {
+            if fired {
                 watch.clear();
             }
         }
@@ -2774,10 +3031,22 @@ impl<D: Disk> Daemon<D> {
             if let Some(parent) = self.home.parent() {
                 let _ = std::env::set_current_dir(parent);
             }
-            let _ = std::fs::remove_dir_all(&self.home);
+            #[cfg(unix)]
+            let removed = std::env::current_dir().and_then(std::fs::remove_dir_all);
+            #[cfg(windows)]
+            let removed = std::fs::remove_dir_all(&self.home);
+            if let Err(e) = removed {
+                log(format!("removing the daemon's unlinked home: {e}"));
+            }
         }
         // Let go of before its file closes (M244): flock(2)'s LOCK_UN, UnlockFile.
         let _ = self.home_lock.unlock();
+        // Then what `stop daemon` waits for: had by a shared lock from here, its name gone
+        // after, so that whoever finds it finds it held until the home is let go of.
+        if let Some(held) = lock(&self.stopping_lock).take() {
+            let _ = held.unlock();
+        }
+        let _ = std::fs::remove_file(self.home.join(shards_ipc::STOPPING_LOCK));
         lock(&self.stoppers).clear();
     }
 
@@ -3664,7 +3933,7 @@ impl<D: Disk> Daemon<D> {
             .and_then(|opened| {
                 let cdi = prepared.cdi.as_ref().ok().and_then(Option::as_ref);
                 prepared.spec.setup =
-                    crate::setup::setup(&run, &opened.mounts, cdi, Some(self.microvm_shm(&id, &run)))?;
+                    crate::setup::setup(&run, &opened.mounts, cdi, Some(self.microvm_shm(&id, &run).map_err(|e| e.to_string())?))?;
                 // An emulated command is never PID 1 of its namespace, but under shards'
                 // reaper, as `--init` runs one (D179, PM M251): the emulator ends a program
                 // that dies of a signal by sending itself that signal, which a namespace's
@@ -3737,11 +4006,10 @@ impl<D: Disk> Daemon<D> {
                     .is_some_and(crate::agentfile::Agentfile::egress6)
                     && !network_setup.iter().any(|e| e.starts_with(b"address6="))
                 {
-                    let (guest6, gateway6) = self.host_ipv6();
                     prepared
                         .spec
                         .setup
-                        .push(format!("uplink6={guest6}/64,{gateway6}").into_bytes());
+                        .push(crate::networks::uplink6_entry(self.host_ipv6()));
                 }
                 // On the host's network (D124): the host's hosts file, and eth0's IPv6, by
                 // which what it sends past its loopback is the host's.
@@ -3757,8 +4025,7 @@ impl<D: Disk> Daemon<D> {
                 }
                 // Its microVM's own engine (D181), whose socket init makes for its command.
                 if let Some(token) = &engine {
-                    let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
-                    prepared.spec.setup.push(format!("engine={hex}").into_bytes());
+                    prepared.spec.setup.push(engine_entry(token));
                 }
                 // Made through a microVM's own engine: it ends as that microVM's command does,
                 // and binds that command's files, which its init copies into its own (D181).
@@ -4089,10 +4356,26 @@ impl<D: Disk> Daemon<D> {
                     &agentfile.managed_labels,
                     &agentfile.active_members,
                 )?;
-                Ok((inputs, owned, managed::control_asked(&run.annotations)?))
+                let terminals = managed::terminal_members(
+                    &run.annotations,
+                    &agentfile.managed_labels,
+                    &agentfile.active_members,
+                )?;
+                let mcps = managed::mcp_members(
+                    &run.annotations,
+                    &agentfile.managed_labels,
+                    &agentfile.active_members,
+                )?;
+                Ok((
+                    inputs,
+                    owned,
+                    terminals,
+                    mcps,
+                    managed::control_asked(&run.annotations)?,
+                ))
             })
             .map_err(managed::Failure::Refused)
-            .and_then(|(inputs, owned, agent_control)| {
+            .and_then(|(inputs, owned, terminals, mcps, agent_control)| {
                 // What the daemon reads of the members it is shown an attached client on its
                 // stderr, as an agent's output always was (D59); a detached run's is kept
                 // alone.
@@ -4110,12 +4393,16 @@ impl<D: Disk> Daemon<D> {
                         active: &agentfile.active_members,
                         inputs: &inputs,
                         owned: &owned,
+                        terminals: &terminals,
+                        mcps: &mcps,
                     },
                     managed::Shown {
                         retention: kept.map(|k| LogRetention {
                             size: k.size,
                             files: k.files,
                         }),
+                        // Its members' rotated segments compressed as its own are (D162, D240).
+                        compress: kept.is_some_and(|k| k.compress),
                         to,
                     },
                     agent_control,
@@ -4196,10 +4483,14 @@ impl<D: Disk> Daemon<D> {
         match &resuming {
             Some(r) => {
                 payload.extend_from_slice(&r.tokens);
-                // Its engine's, which its guest's relay says (D181).
-                if let Some(token) = &r.engine {
-                    payload.extend_from_slice(token);
-                }
+                // Then what its save kept of its tokens, as a fresh run's spec carries them: its
+                // engine's (D181) and its members' MCP connections' (D254), which its guest's
+                // relay says (warm.rs `resumed_tokens`).
+                let mut kept = shards_abi::run::Spec::default();
+                kept.setup.extend(r.engine.as_ref().map(engine_entry));
+                kept.setup
+                    .extend(r.mcp.as_ref().map(shards_abi::run::mcp::token_entry));
+                kept.encode_into(&mut payload);
             }
             None => prepared.spec.encode_into(&mut payload),
         }
@@ -4220,7 +4511,10 @@ impl<D: Disk> Daemon<D> {
                 layer_pending: layer_out.is_some(),
                 layer_over: over.as_ref().map(|(_, at)| at.clone()),
                 layer_way,
-                log_files: kept.map_or(DEFAULT_LOGS.files, |k| k.files),
+                log_kept: kept.map_or(DEFAULT_LOGS, |k| LogRetention {
+                    size: k.size,
+                    files: k.files,
+                }),
                 log_compress: kept.is_some_and(|k| k.compress),
                 visit: false,
                 egress,
@@ -4300,9 +4594,13 @@ impl<D: Disk> Daemon<D> {
     /// Hands the run of microVM `id`, just created, to a warm VM from `acquire` (audit
     /// A06). Until a VM is committed to, the run is pending, and `rm` may cancel it; from
     /// then on commands wait to see whether the VM took it. A VM that surely did not gives
-    /// way to another; one that may have is followed as it is, so no run starts twice.
-    /// Returns the run, registered, for [`follow`](Self::follow), or what its client is
-    /// told.
+    /// way to another where it was waiting in its pool before the run asked: those are as
+    /// many as its pools held then, each tried once, however many ended unseen (runs-11:
+    /// no count of tries). One started after the run asked (for it, or a refill since)
+    /// that surely did not take it ends the start, said with why, rather than starting VMs
+    /// against a failure that may be every VM's. One that may have taken it is followed as
+    /// it is, so no run starts twice. Returns the run, registered, for
+    /// [`follow`](Self::follow), or what its client is told.
     #[allow(clippy::too_many_arguments)]
     fn start_run<'s, 'e>(
         &'s self,
@@ -4326,7 +4624,10 @@ impl<D: Disk> Daemon<D> {
                 self.not_started(id, why)
             }
         };
-        for _ in 0..HANDOFF_TRIES {
+        let asked = Instant::now();
+        // Whether another VM may stand in for `ready`, which surely did not take the run.
+        let gives_way = |ready: &Ready| ready.pooled.is_some_and(|since| since < asked);
+        loop {
             let mut ready = acquire().map_err(|e| failed(&e))?;
             // Every way on leaves `Handing` while `ready` holds the socket it names.
             if let Err(said) = self.commit(id, ready.socket.as_raw_fd()) {
@@ -4350,11 +4651,25 @@ impl<D: Disk> Daemon<D> {
                 log(format!("warm VM {}'s {e}", ready.vm.id()));
                 ready.end();
                 self.uncommit(id);
-                continue;
+                if gives_way(&ready) {
+                    continue;
+                }
+                return Err(failed(&format!(
+                    "the VM started for the run did not take it: its {e}"
+                )));
             }
             if ready.net.is_some() && keep.mac.is_some() {
                 ready.mac = keep.mac;
             }
+            #[cfg(unix)]
+            let handed = hand_over(
+                &ready.socket,
+                &mut health::Judged::of(ready.vm.id(), &self.answers.take),
+                payload,
+                fds,
+                ends,
+            );
+            #[cfg(windows)]
             let handed = hand_over(&ready.socket, payload, fds, ends);
             // Only now, so that starting its successor delays no run: on the refiller's
             // thread.
@@ -4371,6 +4686,11 @@ impl<D: Disk> Daemon<D> {
                     log(format!("warm VM {} did not take a run: {e}", ready.vm.id()));
                     ready.end();
                     self.uncommit(id);
+                    if !gives_way(&ready) {
+                        return Err(failed(&format!(
+                            "the VM started for the run did not take it: {e}"
+                        )));
+                    }
                 }
                 // What it sent before it ended tells what it did, as for any run.
                 Err(Untaken::Unknown(e)) => {
@@ -4383,7 +4703,6 @@ impl<D: Disk> Daemon<D> {
                 }
             }
         }
-        Err(failed("no warm VM took the run"))
     }
 
     /// A new microVM's ID, and its log: the spare's, made ahead, or made now.
@@ -4421,10 +4740,18 @@ impl<D: Disk> Daemon<D> {
     /// then free, as libnetwork's endpoint goes with a start that fails (moby
     /// daemon/start.go, Cleanup); and a joiner's volumes in its microVM's join share (D119).
     fn let_go(&self, id: &str) {
-        self.managed.end(id);
+        self.managed.abort(id);
         self.free_ports(Some(id), None);
         self.leave_network(id);
         lock(&self.joiner_links).remove(id);
+    }
+
+    /// The VM of run `id`, whose published ports the daemon holds ([`free_ports`](Self::free_ports)).
+    fn ports_vm(&self, id: &str) -> Option<u32> {
+        lock(&self.ports_held)
+            .iter()
+            .find(|h| h.container == id)
+            .and_then(|h| h.vm)
     }
 
     /// Lets go of what microVM `id`'s run, or VM `vm`'s network process, held: the
@@ -4441,8 +4768,8 @@ impl<D: Disk> Daemon<D> {
     /// Whose host address `at`, found in use, is: the host's; a running microVM's of
     /// this daemon, which knows its own bindings (`published`); or a run's that ended, waited
     /// for until its network process has gone, for as long as this host gives one before it
-    /// looks at it (`ends::End::Helper`, `netproc::reap`), where that process never said it
-    /// closed the run's ports. A run's VM says
+    /// looks at it (`ends::End::Helper`, `netproc::reap`; with none heard yet, until it has
+    /// gone), where that process never said it closed the run's ports. A run's VM says
     /// PORTS_FREE, as that process has, and DONE, before it tells its client (warm.rs
     /// `finish`), whose next program may bind the port at once: what the holder's run has
     /// sent is taken first, as a name's holder's is (`create`), so that a run its client
@@ -4450,9 +4777,10 @@ impl<D: Disk> Daemon<D> {
     /// free (PM M134, M158).
     fn in_use(&self, at: std::net::SocketAddr, proto: u8) -> publish::InUse {
         let began = Instant::now();
-        let deadline = began
-            .checked_add(self.ends.slice(ends::End::Helper))
-            .unwrap_or(began);
+        let deadline = self
+            .ends
+            .slice(ends::End::Helper)
+            .map(|slice| began.checked_add(slice).unwrap_or(began));
         let mut held = lock(&self.ports_held);
         // A run of this daemon's held it: gone from every run, it was freed, while this
         // waited or while it took the holder's messages without the lock.
@@ -4496,24 +4824,31 @@ impl<D: Disk> Daemon<D> {
             if running || lock(&self.runs).contains_key(&holder) {
                 return publish::InUse::Allocated;
             }
-            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            let left = deadline.map(|at| at.checked_duration_since(Instant::now()));
+            if let Some(None) = left {
                 log(format!(
                     "{at}: still {holder}'s after {:?}, its run ended: the host's",
                     began.elapsed()
                 ));
                 return publish::InUse::Host;
-            };
+            }
             if !waited {
                 log(format!(
                     "{at}: {holder}'s, its run ended: waiting for its network process"
                 ));
                 waited = true;
             }
-            held = self
-                .ports_freed
-                .wait_timeout(held, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            held = match left.flatten() {
+                Some(left) => {
+                    timed(Some(left), || self.ports_freed.wait_timeout(held, left))
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+                None => self
+                    .ports_freed
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner),
+            };
         }
     }
 
@@ -4796,7 +5131,7 @@ impl<D: Disk> Daemon<D> {
         };
         let streams = served
             .iter()
-            .map(|_| shards_ipc::byte_pair())
+            .map(|_| crate::os::share_pipe())
             .collect::<io::Result<Vec<_>>>()
             .map_err(|e| format!("a share's stream: {e}"))?;
         let mut args: Vec<&OsStr> = vec![OsStr::new("share")];
@@ -5050,7 +5385,7 @@ impl<D: Disk> Daemon<D> {
             id: id.to_string(),
             name: name.clone(),
             image: run.image.clone(),
-            image_id: Some(prepared.image_id.clone()),
+            image_id: prepared.image_id.clone(),
             image_manifest: Some(prepared.image_manifest.clone()),
             command: prepared
                 .spec
@@ -5500,13 +5835,7 @@ impl<D: Disk> Daemon<D> {
         if (keep.egress.as_deref() == Some(&shards_net::HOST_POLICY[..]) || on_bridge)
             && let Some(bridge) = self.bridge
         {
-            let (guest6, gateway6) = self.host_ipv6();
-            let mut address = bridge.guest().octets().to_vec();
-            address.push(bridge.subnet().1);
-            address.extend_from_slice(&bridge.gateway().octets());
-            address.extend_from_slice(&guest6.octets());
-            address.push(64);
-            address.extend_from_slice(&gateway6.octets());
+            let address = crate::networks::bridge_address(&bridge, self.host_ipv6());
             asks.ask("addresses", kind::NET_ADDRESS, &address, &[])?;
         }
         for batch in keep.published.chunks(shards_ipc::MAX_FDS) {
@@ -5653,7 +5982,7 @@ impl<D: Disk> Daemon<D> {
             layer_pending,
             layer_over,
             layer_way,
-            log_files,
+            log_kept,
             log_compress,
             visit,
             egress,
@@ -5692,7 +6021,7 @@ impl<D: Disk> Daemon<D> {
                         .map_err(|e| log(format!("container {id}: its network process: {e}")))
                         .ok()
                 })
-                .map(|net| hostnet::HostNet::new(net, PUBLISH_PATIENCE))
+                .map(hostnet::HostNet::new)
         } else {
             None
         };
@@ -5728,7 +6057,7 @@ impl<D: Disk> Daemon<D> {
             pool: ready.pool,
             container: lock(&self.containers).dir(id),
             segment: 0,
-            log_files,
+            log_kept,
             log_compress,
             execs_in_flight: Vec::new(),
             exec_ids: Vec::new(),
@@ -5876,12 +6205,30 @@ impl<D: Disk> Daemon<D> {
                 )),
                 // Its network process has closed its published ports: the daemon's copies
                 // close, and the ports are free (PM M380).
-                kind::PORTS_FREE => self.free_ports(Some(id), None),
+                kind::PORTS_FREE => {
+                    if let Some(vm) = self.ports_vm(id) {
+                        self.unpublished(vm);
+                    }
+                    self.free_ports(Some(id), None);
+                }
+                // Its VM waits on its network process to close the run's ports, which the
+                // daemon follows from here ([`follow_unpublish`](Self::follow_unpublish)).
+                kind::UNPUBLISHING => {
+                    if let Some(vm) = self.ports_vm(id) {
+                        self.follow_unpublish(vm);
+                    }
+                }
                 kind::LOST => self.log_lost(id, &m.payload),
                 kind::OOM => self.oom_killed(id, &m.payload),
                 kind::PIDS => self.pids_refused(id, &m.payload),
                 kind::WORKLOAD_READY => self.workload_ready(id, &m.payload),
                 kind::PROCESS => self.keep_processes(id, &m.payload),
+                // A member's end (D231), for its own lanes of the run's agent control (D238).
+                kind::MEMBER_ENDED => {
+                    if let Err(e) = self.managed.member_ended(id, &m.payload) {
+                        log(format!("container {id}: a member's end: {e}"));
+                    }
+                }
                 kind::MANAGED_ABORT => {
                     if let Err(e) = self.managed.abort_member(id, &m.payload) {
                         log(format!("container {id}: invalid managed abort: {e}"));
@@ -6070,6 +6417,71 @@ impl<D: Disk> Daemon<D> {
                         }
                     }
                 }
+                // A member's MCP connection its VM handed over unprompted (D254): its VM's
+                // copy goes once the daemon has it (M24), and its run holds it for its
+                // controller's asks; one its run gave no bridge, or holds no more, is let go,
+                // which ends its member's bridge. One its VM did not number as its own is let
+                // go alone.
+                #[cfg(unix)]
+                kind::LANE_ACCEPTED => {
+                    let accepted = shards_ipc::Accepted::decode(&m.payload);
+                    if let Some(accepted) = &accepted
+                        && let Err(e) =
+                            inbox
+                                .socket
+                                .send(kind::LANE_HELD, &accepted.number.to_be_bytes(), &[])
+                    {
+                        log(format!(
+                            "container {id}: answering a member's MCP connection: {e}"
+                        ));
+                    }
+                    if let (Some(accepted), Some(fd)) = (accepted, m.fds.into_iter().next())
+                        && let Err(why) = self.managed.mcp_accepted(id, accepted, UnixStream::from(fd))
+                    {
+                        log(format!(
+                            "container {id}: member {}'s MCP connection let go: {why}",
+                            accepted.member
+                        ));
+                    }
+                }
+                // On Windows a VM gives its daemon no handle: it holds the connection until
+                // its `LANE_HELD` brings a socket to relay it onto, as a member's input's
+                // (`MANAGED_INPUT`); one with none is closed.
+                #[cfg(windows)]
+                kind::LANE_ACCEPTED => {
+                    let Some(accepted) = shards_ipc::Accepted::decode(&m.payload) else {
+                        continue;
+                    };
+                    let held = accepted.number.to_be_bytes();
+                    let pair = match self.managed.bridged(id, accepted.member) {
+                        true => UnixStream::plain_pair().map_err(|e| e.to_string()),
+                        false => Err("a member its run gave no MCP bridge".to_string()),
+                    };
+                    let given = pair.and_then(|(ours, theirs)| {
+                        let shared = theirs.share().map_err(|e| e.to_string())?;
+                        inbox
+                            .socket
+                            .send(kind::LANE_HELD, &held, &[shared.as_fd()])
+                            .map_err(|e| format!("giving it its socket: {e}"))?;
+                        Ok(ours)
+                    });
+                    let held_here = given.map(|ours| self.managed.mcp_accepted(id, accepted, ours));
+                    match held_here {
+                        Ok(Ok(())) => {}
+                        Ok(Err(why)) => log(format!(
+                            "container {id}: member {}'s MCP connection let go: {why}",
+                            accepted.member
+                        )),
+                        Err(why) => {
+                            log(format!("container {id}: a member's MCP connection: {why}"));
+                            if let Err(e) = inbox.socket.send(kind::LANE_HELD, &held, &[]) {
+                                log(format!(
+                                    "container {id}: answering a member's MCP connection: {e}"
+                                ));
+                            }
+                        }
+                    }
+                }
                 // Its VM's answer to a save (D176), before anything after it: a microVM the
                 // save stops ends as saved.
                 kind::SAVED => snapshots::answered(inbox, &m.payload),
@@ -6082,11 +6494,7 @@ impl<D: Disk> Daemon<D> {
                             .position(|(n, _)| *n == u64::from_be_bytes(*number))
                     {
                         let (_, told) = inbox.devices.swap_remove(i);
-                        let text = String::from_utf8_lossy(said.get(1..).unwrap_or_default()).into_owned();
-                        let _ = told.send(match said.first() {
-                            Some(0) => Ok(text),
-                            _ => Err(text),
-                        });
+                        let _ = told.send(shards_ipc::device::decode(said));
                     }
                 }
                 // Its VM's answer to the guest times it was asked for.
@@ -6343,7 +6751,7 @@ impl<D: Disk> Daemon<D> {
                     id: id.to_string(),
                     dir: inbox.container.clone(),
                     seq,
-                    files: inbox.log_files,
+                    kept: inbox.log_kept,
                     pack: inbox.log_compress,
                     socket: inbox.socket.clone(),
                 });
@@ -6590,7 +6998,9 @@ impl<D: Disk> Daemon<D> {
 
     /// Run `id` ended: `done` is its DONE, or `None` for a VM that ended without one.
     fn run_ended(&self, id: &str, inbox: &mut Inbox, done: Option<&[u8]>) {
-        self.managed.end(id);
+        // Its owners' channels end now; what the daemon drains of its members goes on to its
+        // capture's end, which its end is told after (D240).
+        let capturing = self.managed.end(id);
         // Its pool has one run fewer going, and is idle from the last to end
         // (`shards_api::demand`).
         if let Some(key) = inbox.pool.take()
@@ -6663,9 +7073,16 @@ impl<D: Disk> Daemon<D> {
             detached: inbox.detached.take(),
             named: inbox.named.is_some(),
         };
-        // Told once what its command wrote has reached its Engine API attaches, where the
-        // daemon relays it to any (engine `Relaying`).
-        self.end_after_relays(id, ended);
+        // Told once its members' logs keep all its capture brought (D240), and what its
+        // command wrote has reached its Engine API attaches, where the daemon relays it to any
+        // (engine `Relaying`).
+        let ended = match &capturing {
+            Some(capture) => capture.tell_after(ended),
+            None => Some(ended),
+        };
+        if let Some(ended) = ended {
+            self.end_after_relays(id, ended);
+        }
     }
 
     /// Tells run `id`'s end: its microVM stopped, its waiters, `die`, and its restart or
@@ -6877,11 +7294,12 @@ impl<D: Disk> Daemon<D> {
                     revents: 0,
                 },
             ];
-            // SAFETY: poll(2) on two pollfds of descriptors this function holds open (a
-            // negative one is ignored).
-            if unsafe { libc::poll(polled.as_mut_ptr(), 2, ms) } < 0
-                && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
-            {
+            let polls = timed(poll_timeout(ms), || {
+                // SAFETY: poll(2) on two pollfds of descriptors this function holds open (a
+                // negative one is ignored).
+                unsafe { libc::poll(polled.as_mut_ptr(), 2, ms) }
+            });
+            if polls < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 break;
             }
             let [code, hung_up] = polled;
@@ -6961,12 +7379,6 @@ impl<D: Disk> Daemon<D> {
     /// 3c2e3cd3's CI).
     fn step_aside<'s, 'e>(&'s self, threads: &'s Threads<'s, 'e>, why: &str) {
         log(format!("stepping aside: {why}"));
-        // Before its slots go: whoever then finds no daemon serving waits for this one
-        // while it ends its runs, however long their stop timeouts.
-        let stopping = self.home.join(shards_ipc::STOPPING);
-        if let Err(e) = shards_ipc::this_process().and_then(|named| keep_whole(&stopping, named.as_bytes())) {
-            log(format!("{}: {e}", stopping.display()));
-        }
         self.close();
         self.stopping.store(true, Ordering::SeqCst);
         for (_, booting) in lock(&self.booting).drain() {
@@ -7041,8 +7453,8 @@ impl<D: Disk> Daemon<D> {
                     }
                     runs = match stops.values().filter_map(|stop| stop.next).min() {
                         Some(at) => {
-                            self.resolved
-                                .wait_timeout(runs, at.saturating_duration_since(now))
+                            let left = at.saturating_duration_since(now);
+                            timed(Some(left), || self.resolved.wait_timeout(runs, left))
                                 .unwrap_or_else(PoisonError::into_inner)
                                 .0
                         }
@@ -7053,13 +7465,17 @@ impl<D: Disk> Daemon<D> {
             for (id, socket, vm) in new {
                 let (signal, grace) = self.own_stop(&id);
                 let now = Instant::now();
-                let kill = match signal {
-                    Some(signal) => {
+                let (kill, grace) = match (signal, grace) {
+                    (Some(signal), grace) => {
                         let _ = socket.send(kind::SIGNAL, &signal.to_be_bytes(), &[]);
-                        grace.and_then(|grace| now.checked_add(grace))
+                        let dir = lock(&self.containers).dir(&id);
+                        (
+                            grace.and_then(|grace| now.checked_add(grace)),
+                            grace.and_then(|grace| Grace::begin(&dir, grace)),
+                        )
                     }
                     // A signal Linux has no number for cannot be sent: SIGKILL at once.
-                    None => Some(now),
+                    (None, _) => (Some(now), None),
                 };
                 stops.insert(
                     id,
@@ -7068,6 +7484,7 @@ impl<D: Disk> Daemon<D> {
                         vm,
                         next: kill,
                         killed: None,
+                        grace,
                     },
                 );
             }
@@ -7079,13 +7496,17 @@ impl<D: Disk> Daemon<D> {
                     Some(teardown) => {
                         if teardown.goes_on().is_some() {
                             // Its guest still at its end: another slice.
-                            stop.next = Instant::now().checked_add(self.ends.slice(ends::End::Teardown));
+                            stop.next = self
+                                .ends
+                                .slice(ends::End::Teardown)
+                                .and_then(|slice| Instant::now().checked_add(slice));
                             continue;
                         }
                         if let Some(vm) = &stop.vm {
                             log(format!(
                                 "container {id}: its command not ended as the daemon stops, its microVM gone on with nothing of its end for {:?}: its microVM killed",
-                                self.ends.slice(ends::End::Teardown)
+                                // Its deadline came: the home has a slice.
+                                self.ends.slice(ends::End::Teardown).unwrap_or_default()
                             ));
                             let _ = vm.kill(shards_ipc::signal::SIGKILL);
                         }
@@ -7093,15 +7514,17 @@ impl<D: Disk> Daemon<D> {
                     }
                     None => {
                         // A SIGKILL that cannot be sent leaves its guest nothing to end it
-                        // by, nor to say its end on: its VM goes at once.
+                        // by, nor to say its end on: its VM goes at once. One sent is given
+                        // this home's slice (none heard yet: its end alone, its liveness's).
                         let teardown = ends::Followed::of(stop.vm.as_ref().map(|vm| vm.id()));
+                        stop.grace = None;
                         let sent = stop.socket.send(kind::SIGNAL, &9u32.to_be_bytes(), &[]).is_ok();
                         let wait = if sent {
                             self.ends.slice(ends::End::Teardown)
                         } else {
-                            Duration::ZERO
+                            Some(Duration::ZERO)
                         };
-                        stop.next = Instant::now().checked_add(wait);
+                        stop.next = wait.and_then(|wait| Instant::now().checked_add(wait));
                         stop.killed = Some(teardown);
                     }
                 }
@@ -7441,6 +7864,7 @@ impl<D: Disk> Daemon<D> {
             records: None,
             joined: Some(provider),
             layer: None,
+            pooled: None,
         })
     }
 
@@ -7480,8 +7904,9 @@ impl<D: Disk> Daemon<D> {
                 return Err(failed(e));
             }
         }
-        link.set_read_timeout(Some(TAKE_TIMEOUT)).map_err(failed)?;
-        link.set_write_timeout(Some(TAKE_TIMEOUT)).map_err(failed)?;
+        shards_ipc::timeout_set(link.set_read_timeout(Some(TAKE_TIMEOUT))).map_err(failed)?;
+        shards_ipc::timeout_set(link.set_write_timeout(Some(TAKE_TIMEOUT))).map_err(failed)?;
+        let _waiting = Waiting::of(Some(TAKE_TIMEOUT));
         for ((dir, read_only, only), name) in volumes {
             let mut payload = name.as_bytes().to_vec();
             payload.push(0);
@@ -7547,8 +7972,9 @@ impl<D: Disk> Daemon<D> {
                 return Err(failed(e));
             }
         }
-        link.set_read_timeout(Some(TAKE_TIMEOUT)).map_err(failed)?;
-        link.set_write_timeout(Some(TAKE_TIMEOUT)).map_err(failed)?;
+        shards_ipc::timeout_set(link.set_read_timeout(Some(TAKE_TIMEOUT))).map_err(failed)?;
+        shards_ipc::timeout_set(link.set_write_timeout(Some(TAKE_TIMEOUT))).map_err(failed)?;
+        let _waiting = Waiting::of(Some(TAKE_TIMEOUT));
         for ((dir, read_only, only), name) in volumes {
             let mut payload = name.as_bytes().to_vec();
             payload.push(0);
@@ -7595,7 +8021,7 @@ impl<D: Disk> Daemon<D> {
     ) -> Result<JoinDoor, String> {
         let failed = |e: io::Error| format!("its microVM's join share: {e}");
         let exe = std::env::current_exe().map_err(|e| format!("this binary: {e}"))?;
-        let (served, vms) = shards_ipc::byte_pair().map_err(failed)?;
+        let (served, vms) = crate::os::share_pipe().map_err(failed)?;
         let (door, theirs) = UnixStream::pair().map_err(failed)?;
         let theirs = theirs.share().map_err(failed)?;
         let at = self.home.join(JOIN_ROOT);
@@ -7635,7 +8061,7 @@ impl<D: Disk> Daemon<D> {
         socket
             .send(kind::JOIN_SHARE, &number.to_be_bytes(), &[vms.as_fd()])
             .map_err(failed)?;
-        door.set_write_timeout(Some(TAKE_TIMEOUT)).map_err(failed)?;
+        shards_ipc::timeout_set(door.set_write_timeout(Some(TAKE_TIMEOUT))).map_err(failed)?;
         Ok((door, process))
     }
 
@@ -7688,7 +8114,7 @@ impl<D: Disk> Daemon<D> {
             // The process ends as the other end of its connection goes, with ours.
             return Err(failed(e));
         }
-        door.set_write_timeout(Some(TAKE_TIMEOUT)).map_err(failed)?;
+        shards_ipc::timeout_set(door.set_write_timeout(Some(TAKE_TIMEOUT))).map_err(failed)?;
         Ok(door)
     }
 
@@ -7901,7 +8327,10 @@ impl<D: Disk> Daemon<D> {
 
     /// A warm VM of pool `key`, once one is ready: one waiting, or one started for this run
     /// where none is starting for it, so a run is served whatever its pool keeps, and a
-    /// burst waits for no refill (audit A13, A14).
+    /// burst waits for no refill (audit A13, A14). Waited for while a VM of its pool starts,
+    /// whose watcher, D215's judge of its start (`ready`), wakes it as that VM is ready or
+    /// given up; refused at once where none is starting and none can be planned, as then
+    /// none comes for it.
     fn claim<'s, 'e>(
         &'s self,
         threads: &'s Threads<'s, 'e>,
@@ -7909,7 +8338,7 @@ impl<D: Disk> Daemon<D> {
         rootfs: &Path,
         stamp: Option<&str>,
     ) -> Result<Ready, Claim> {
-        let deadline = Instant::now() + READY_TIMEOUT;
+        let began = Instant::now();
         let mut state = lock(&self.state);
         let mut waiting = false;
         let leave = |state: &mut State, waiting: bool| {
@@ -7962,24 +8391,20 @@ impl<D: Disk> Daemon<D> {
             if state.pools.get(key).is_some_and(|p| p.failures >= MAX_FAILURES) {
                 continue;
             }
-            // Past its deadline, a claim waits on while a VM of its pool is starting: that
-            // VM's watcher says when it is ready or given up, as long as it runs its start
-            // however slowly its host runs it (`ready`), and wakes it then.
-            let left = deadline.saturating_duration_since(Instant::now());
+            // A claim waits while a VM of its pool is starting: that VM's watcher says when it
+            // is ready or given up, as long as it runs its start however slowly its host runs
+            // it (`ready`), and wakes it then. With none starting, and none planned above (its
+            // template collected, or its root filesystem unrecorded or replaced), none comes.
             let starting = state.pools.get(key).is_some_and(|p| p.starting > 0);
-            if left.is_zero() && !starting {
+            if !starting {
                 leave(&mut state, waiting);
                 return Err(Claim::Failed(format!(
-                    "no warm VM of {} was ready in {READY_TIMEOUT:?}",
-                    key.dir.display()
+                    "no warm VM of {} was ready in {:?}: none is starting for it",
+                    key.dir.display(),
+                    began.elapsed()
                 )));
             }
-            let wait = if left.is_zero() { READY_STALL } else { left };
-            state = self
-                .changed
-                .wait_timeout(state, wait)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            state = timed(None, || self.changed.wait(state)).unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -8139,7 +8564,13 @@ impl<D: Disk> Daemon<D> {
     fn log_retention(&self) -> Result<LogRetention, String> {
         match self.logs {
             Some(logs) => Ok(logs),
-            None => crate::disk::read(&self.home).map(|s| s.log_retention()),
+            None => {
+                // Its segments in its file system's unit (runs-11 `LOG_SEGMENT`).
+                let unit = shards_vmm::platform::allocation_unit(&self.home).map_err(|e| {
+                    format!("{}: its file system's allocation unit: {e}", self.home.display())
+                })?;
+                crate::disk::read(&self.home).map(|s| s.log_retention(Some(unit)))
+            }
         }
     }
 
@@ -8388,7 +8819,13 @@ impl<D: Disk> Daemon<D> {
         // The VM holds its side of its network now; its network process goes with it.
         // The control socket stays the daemon's.
         let (net_process, net_control) = match launched.net {
-            Some((process, control)) => (Some(process), Some((control, net))),
+            Some((process, control)) => {
+                let pid = process.id();
+                (
+                    Some(process),
+                    Some((crate::netproc::NetLink { control, pid }, net)),
+                )
+            }
             None => (None, None),
         };
         let vm = Arc::new(launched.vm);
@@ -8441,7 +8878,7 @@ impl<D: Disk> Daemon<D> {
         child: Arc<shards_ipc::Child>,
         socket: UnixStream,
         grants: Option<UnixStream>,
-        net: Option<(crate::netproc::Control, Option<[u8; 6]>)>,
+        net: Option<(crate::netproc::NetLink, Option<[u8; 6]>)>,
         dest: For,
         net_process: Option<crate::netproc::NetProcess>,
         layer: Option<layers::LayerFile>,
@@ -8463,6 +8900,7 @@ impl<D: Disk> Daemon<D> {
                     For::Pool(key) => Some(key.dir.as_path()),
                     For::Run(_) => None,
                 },
+                &self.answers.grants,
             ),
             _ => Ok::<(), GrantError>(()),
         };
@@ -8470,7 +8908,9 @@ impl<D: Disk> Daemon<D> {
         // A VM the host had not let run yet asked nothing and failed nothing of its own:
         // no fault of its template's (PM M166).
         let unstarted = matches!(&granted, Err(e) if !e.started);
-        let ready = granted.map_err(|e| e.why).and_then(|()| ready(&socket, pid));
+        let ready = granted
+            .map_err(|e| e.why)
+            .and_then(|()| ready(&socket, pid, &self.answers.ready));
         // Said with what its process says, which may take a second: before the daemon's
         // state is held.
         let ready = ready.map_err(|e| with_its_process(&child, e));
@@ -8500,6 +8940,7 @@ impl<D: Disk> Daemon<D> {
                             records,
                             joined: None,
                             layer,
+                            pooled: Some(Instant::now()),
                         });
                         let live: Vec<u32> = state
                             .pools
@@ -8536,6 +8977,7 @@ impl<D: Disk> Daemon<D> {
                         records: None,
                         joined: None,
                         layer,
+                        pooled: None,
                     }));
                 }
                 Err(e) => {
@@ -8568,7 +9010,7 @@ fn with_its_process(child: &shards_ipc::Child, why: String) -> String {
         if Instant::now() >= deadline {
             return format!("{why}; its process still ran a second after");
         }
-        std::thread::sleep(Duration::from_millis(10));
+        slept(Duration::from_millis(10));
     }
 }
 
@@ -8688,6 +9130,54 @@ enum Untaken {
 /// stdio or starts anything (warm.rs, receive), and if it cannot, it does neither: one
 /// that ends without a word never started the run. On Windows each of its shares' streams
 /// (`ends`, D197) follows the request, as a share process hands them to it on Unix.
+#[cfg(unix)]
+fn hand_over(
+    vm: &UnixStream,
+    judged: &mut health::Judged<'_>,
+    payload: &[u8],
+    fds: &[BorrowedFd<'_>],
+    ends: &[BorrowedFd<'_>],
+) -> Result<(), Untaken> {
+    // A live VM reads its run as it comes: the send waits for room while the VM's process goes
+    // on (D215's judge, `Answers::take`; runs-11 `TAKE_TIMEOUT`), and a request it cut short
+    // is no request: the VM never had all of it. A VM that has closed its end is found at once.
+    let surely = |e: io::Error| Untaken::Surely(e.to_string());
+    shards_ipc::send_judged(vm, kind::RUN, payload, fds, &mut || judged.judge()).map_err(surely)?;
+    // MAX_FDS a message at most; the VM takes the run only once it has them all.
+    for batch in ends.chunks(shards_ipc::MAX_FDS) {
+        shards_ipc::send_judged(vm, kind::SHARE_ENDS, &[], batch, &mut || judged.judge()).map_err(surely)?;
+    }
+    taken(vm, judged)
+}
+
+/// Waits for a warm VM sent a run to say it has taken it, while its process goes on
+/// ([`hand_over`]'s judge): its TAKEN teaches the judge's record.
+#[cfg(unix)]
+fn taken(vm: &UnixStream, judged: &mut health::Judged<'_>) -> Result<(), Untaken> {
+    match shards_ipc::recv_judged(vm, &mut || judged.judge()) {
+        Ok(Some(m)) if m.kind == kind::TAKEN => {
+            judged.answered();
+            Ok(())
+        }
+        Ok(Some(m)) => Err(Untaken::Unknown(format!(
+            "it said message kind {} instead of TAKEN",
+            m.kind
+        ))),
+        Ok(None) => Err(Untaken::Surely("it ended first".into())),
+        // Its end closed with the run still unread in it: Linux resets the peer of a
+        // stream socket released with data in its queue, and only then
+        // (net/unix/af_unix.c, unix_release_sock), and a TAKEN it had sent would be read
+        // before the reset. A pool's VM a stopped slice ended, before the pool saw it end.
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+            Err(Untaken::Surely(format!("it ended with the run unread: {e}")))
+        }
+        Err(e) => Err(Untaken::Unknown(e.to_string())),
+    }
+}
+
+/// [`hand_over`] on Windows: its judged twin is runs-11 `TAKE_TIMEOUT`'s slice (b), owed; until
+/// then its writes and its wait for TAKEN are bounded by `TAKE_TIMEOUT`.
+#[cfg(windows)]
 fn hand_over(
     vm: &UnixStream,
     payload: &[u8],
@@ -8696,13 +9186,10 @@ fn hand_over(
 ) -> Result<(), Untaken> {
     // A live VM reads its run at once: one that has stopped reading fails the send once a
     // write of it has waited TAKE_TIMEOUT for room, as a run's socket does (`RunSocket`).
-    // macOS refuses options on a socket its peer has closed (EINVAL): the send then finds
-    // the end at once.
-    match vm.set_write_timeout(Some(TAKE_TIMEOUT)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
-        Err(e) => return Err(Untaken::Surely(e.to_string())),
-    }
+    // A VM that has closed its end needs no bound: the send finds the end at once
+    // (`shards_ipc::timeout_set`).
+    shards_ipc::timeout_set(vm.set_write_timeout(Some(TAKE_TIMEOUT)))
+        .map_err(|e| Untaken::Surely(e.to_string()))?;
     // A request cut short is no request: the VM never had all of it.
     shards_ipc::send(vm, kind::RUN, payload, fds).map_err(|e| Untaken::Surely(e.to_string()))?;
     // MAX_FDS a message at most; the VM takes the run only once it has them all.
@@ -8712,15 +9199,14 @@ fn hand_over(
     taken(vm)
 }
 
-/// Waits for a warm VM sent a run to say it has taken it.
+/// [`taken`] on Windows, as [`hand_over`] there.
+#[cfg(windows)]
 fn taken(vm: &UnixStream) -> Result<(), Untaken> {
-    // macOS refuses options on a socket its peer has closed (EINVAL, xnu sosetoptlock):
-    // the read then finds the end at once.
-    match vm.set_read_timeout(Some(TAKE_TIMEOUT)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
-        Err(e) => return Err(Untaken::Unknown(e.to_string())),
-    }
+    // A VM that has closed its end needs no bound: the read finds the end at once
+    // (`shards_ipc::timeout_set`).
+    shards_ipc::timeout_set(vm.set_read_timeout(Some(TAKE_TIMEOUT)))
+        .map_err(|e| Untaken::Unknown(e.to_string()))?;
+    let _waiting = Waiting::of(Some(TAKE_TIMEOUT));
     match shards_ipc::recv(vm) {
         Ok(Some(m)) if m.kind == kind::TAKEN => Ok(()),
         Ok(Some(m)) => Err(Untaken::Unknown(format!(
@@ -8808,7 +9294,7 @@ fn keep_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// own there first (link(2)'s EEXIST, CreateHardLinkW's ERROR_ALREADY_EXISTS), so callers
 /// making a home's first record at once each take the one kept, never their own beside it.
 /// `Ok(true)` where these bytes are the record, `Ok(false)` where another's are.
-fn keep_first(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+pub(crate) fn keep_first(path: &Path, bytes: &[u8]) -> io::Result<bool> {
     let new = beside(path);
     let kept = std::fs::write(&new, bytes).and_then(|()| std::fs::hard_link(&new, path));
     let _ = std::fs::remove_file(&new);
@@ -8817,6 +9303,27 @@ fn keep_first(path: &Path, bytes: &[u8]) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// A file made beside `path`, locked exclusively, then renamed there, so that whoever opens
+/// `path` finds it held from the first ([`shards_ipc::STOPPING_LOCK`]); its own file removed
+/// on any error, as [`keep_whole`]'s is.
+fn held_anew(path: &Path) -> io::Result<File> {
+    let new = beside(path);
+    let made = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&new)
+        .and_then(|file| {
+            // No other has its name yet: taken at once.
+            file.lock()?;
+            std::fs::rename(&new, path)?;
+            Ok(file)
+        });
+    if made.is_err() {
+        let _ = std::fs::remove_file(&new);
+    }
+    made
 }
 
 /// A name beside `path` of this write's alone: a count of this process's writes, the one
@@ -9010,32 +9517,35 @@ impl Drop for Unwatched<'_> {
     }
 }
 
-/// How long a VM process may take to send its first request for access before its stacks
-/// are sampled: a diagnostic's trigger, not a limit. A sixth of [`READY_TIMEOUT`], so that
-/// the sample is taken while a stalled VM is still stalled, and four thousand times the
-/// VM process's measured launch (2.5 ms, PM M113). The stall it catches, a VM that asks
-/// nothing for the whole wait, is the open p99 flake that only its stacks while stalled
-/// can explain.
+/// Answers what VM `pid` asks to reach until it has all it needs and closes the link, each
+/// request waited for by D215's judge on `record`, this daemon's record of requests for
+/// access (`Answers::grants`): before its first, the VM's liveness alone, the link's end;
+/// then past W*, the slowest request seen from the answer before it or the VM's spawn, looked
+/// at each W* and given up on where a whole W* shows it ran no CPU, its host not the reason.
+/// A request there as its wait begins teaches nothing (D222's wait of nothing), nor does the
+/// link's end, which is no request. A VM first quiet past W*, before its first request or
+/// between two, is sampled once (Apple's sample(1), 3 s of its threads' stacks) into the
+/// home, beside daemon.log, as it goes on being waited for; a wait that then fails says
+/// where. It was `GRANT_STALL`'s 10 s and `READY_TIMEOUT`'s 60 s, picked (ROOT's (3)).
 #[cfg(target_os = "macos")]
-const GRANT_STALL: Duration = Duration::from_secs(10);
-
-/// Answers what VM `pid` asks to reach until it has all it needs and closes the link,
-/// each request within [`READY_TIMEOUT`] (macOS, grant). A VM that has said nothing for
-/// [`GRANT_STALL`], before its first request or between two, is sampled once (Apple's
-/// sample(1), 3 s of its threads' stacks) into the home, beside daemon.log, as it goes on
-/// being waited for; a wait that then fails says where.
-#[cfg(target_os = "macos")]
-fn grant(link: &UnixStream, pid: u32, template: Option<&Path>) -> Result<(), GrantError> {
-    use std::os::fd::AsRawFd as _;
+fn grant(
+    link: &UnixStream,
+    pid: u32,
+    template: Option<&Path>,
+    record: &shards_api::Record,
+) -> Result<(), GrantError> {
     let started = |why: String| GrantError { why, started: true };
-    link.set_read_timeout(Some(READY_TIMEOUT))
-        .map_err(|e| started(format!("VM {pid}: {e}")))?;
+    shards_ipc::timeout_set(link.set_read_timeout(None)).map_err(|e| started(format!("VM {pid}: {e}")))?;
     // A VM the host has not let run yet: its stacks would hold nothing (PM M166).
     let unstarted = || shards_vmm::platform::launched(pid) == Some(false);
     let mut sampled: Option<String> = None;
+    let mut said_unstarted = false;
     // Its spawn to its first request answered, its launch and the host's admission of it
     // among it, for a run that waits for it (cold, D25): said at debug.
     let spawned = Instant::now();
+    // The wait for the request before, which teaches once it is known to have been one: as
+    // the next wait begins.
+    let mut asked: Option<shards_api::Follow<'_>> = None;
     let served = crate::grant_answer::serve_waiting(link, template, &mut |sent| {
         if sent == 1 {
             shards_vmm::debug!(
@@ -9043,67 +9553,102 @@ fn grant(link: &UnixStream, pid: u32, template: Option<&Path>) -> Result<(), Gra
                 spawned.elapsed().as_micros()
             );
         }
-        if sampled.is_some() {
-            return;
+        if let Some(mut answered) = asked.take() {
+            answered.answered();
         }
-        let mut next = libc::pollfd {
-            fd: link.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let stall = i32::try_from(GRANT_STALL.as_millis()).unwrap_or(i32::MAX);
-        // SAFETY: poll(2) of one pollfd of ours.
-        if unsafe { libc::poll(&raw mut next, 1, stall) } != 0 {
-            return;
+        if readable_within(link, Some(Duration::ZERO)) {
+            return Ok(());
         }
-        if sent == 0 && unstarted() {
-            log(format!(
-                "VM {pid}: not started by the host in {GRANT_STALL:?}: it has run nothing yet, \
-                 as macOS admits each launch after it has assessed the executables launched \
-                 before it (PM M166)"
-            ));
-            return;
-        }
-        let file = format!("vm-{pid}.sample");
-        log(format!(
-            "VM {pid}: nothing said in {GRANT_STALL:?} after {sent} messages; sampling its \
-             stacks to {file}"
-        ));
-        // Made as every child of the daemon is, by its spawner (PM M158).
-        let spawned = File::open("/dev/null").and_then(|null| {
-            let pid = pid.to_string();
-            let args = [pid.as_str(), "3", "-mayDie", "-file", file.as_str()].map(OsStr::new);
-            let stdio = [0, 1, 2].map(|n| (null.as_fd(), n));
-            shards_ipc::spawn(Path::new("/usr/bin/sample"), &args, &stdio, false)
-        });
-        match spawned {
-            // Reaped where it ends, on a thread of its own, so that no zombie is left.
-            Ok(child) => {
-                let _ = std::thread::Builder::new()
-                    .name("sample".into())
-                    .spawn(move || child.wait());
+        let began = Instant::now();
+        let mut follow = shards_api::Followed::of_pid(pid)
+            .ok()
+            .flatten()
+            .and_then(|followed| shards_api::Follow::begin(record, followed).ok().flatten());
+        loop {
+            let wait = follow
+                .as_ref()
+                .and_then(shards_api::Follow::due)
+                .map(|due| due.saturating_duration_since(Instant::now()));
+            if readable_within(link, wait) {
+                break;
             }
-            Err(e) => log(format!("VM {pid}: sampling it: {e}")),
+            let Some(followed) = follow.as_mut() else {
+                continue;
+            };
+            followed.look().map_err(|why| match why {
+                shards_api::Unfollowed::Stalled(stall) => format!(
+                    "VM {pid} asked nothing after {sent} messages: it ran nothing for {:?}, past the slowest request seen ({:?}), {:?} into its wait",
+                    stall.over(),
+                    stall.slowest(),
+                    began.elapsed()
+                ),
+                shards_api::Unfollowed::Process { failure, .. } => {
+                    format!("VM {pid}: its process could not be read: {failure}")
+                }
+            })?;
+            if sampled.is_some() || said_unstarted {
+                continue;
+            }
+            if sent == 0 && unstarted() {
+                said_unstarted = true;
+                log(format!(
+                    "VM {pid}: not started by the host {:?} after its spawn, past the slowest \
+                     request seen: it has run nothing yet, as macOS admits each launch after it \
+                     has assessed the executables launched before it (PM M166)",
+                    spawned.elapsed()
+                ));
+                continue;
+            }
+            sampled = Some(sample(pid, sent, began.elapsed()));
         }
-        sampled = Some(file);
+        asked = follow;
+        Ok(())
     });
     served.map_err(|e| {
         if unstarted() {
             return GrantError {
                 why: format!(
                     "VM {pid}: not started by the host in {:?}: it has run nothing (PM M166): {e}",
-                    GRANT_STALL + READY_TIMEOUT
+                    spawned.elapsed()
                 ),
                 started: false,
             };
         }
         started(match &sampled {
-            Some(file) => {
-                format!("VM {pid}: {e} (its stacks once quiet {GRANT_STALL:?}: {file} in the home)")
-            }
+            Some(file) => format!(
+                "VM {pid}: {e} (its stacks once quiet past the slowest request seen: {file} in the home)"
+            ),
             None => format!("VM {pid}: {e}"),
         })
     })
+}
+
+/// Samples VM `pid`'s stacks, quiet `quiet` after `sent` messages, into the home (Apple's
+/// sample(1), 3 s of its threads), beside daemon.log: the file's name.
+#[cfg(target_os = "macos")]
+fn sample(pid: u32, sent: usize, quiet: Duration) -> String {
+    let file = format!("vm-{pid}.sample");
+    log(format!(
+        "VM {pid}: nothing said in {quiet:?} after {sent} messages, past the slowest request \
+         seen; sampling its stacks to {file}"
+    ));
+    // Made as every child of the daemon is, by its spawner (PM M158).
+    let spawned = File::open("/dev/null").and_then(|null| {
+        let pid = pid.to_string();
+        let args = [pid.as_str(), "3", "-mayDie", "-file", file.as_str()].map(OsStr::new);
+        let stdio = [0, 1, 2].map(|n| (null.as_fd(), n));
+        shards_ipc::spawn(Path::new("/usr/bin/sample"), &args, &stdio, false)
+    });
+    match spawned {
+        // Reaped where it ends, on a thread of its own, so that no zombie is left.
+        Ok(child) => {
+            let _ = std::thread::Builder::new()
+                .name("sample".into())
+                .spawn(move || child.wait());
+        }
+        Err(e) => log(format!("VM {pid}: sampling it: {e}")),
+    }
+    file
 }
 
 /// Why a VM was not granted what it asked: `started` false for one the host had not let
@@ -9115,22 +9660,20 @@ struct GrantError {
     started: bool,
 }
 
-/// How long a starting VM may go without saying it is ready before the daemon looks at what
-/// its process has done, and again each as long after, while it waits: the slice its
-/// progress is judged over ([`ready`]), and the log's word of a VM not ready yet. A sixth of
-/// [`READY_TIMEOUT`], as macOS's `GRANT_STALL`, so that a stalled VM is said while it is
-/// still stalled: the open p99 flake of a run that waits out the whole wait (CI's
-/// windows-2022 and windows-2025, `published_ports_are_free_at_once_while_the_daemon_makes_
-/// vms`), which only what its process did meanwhile can tell apart.
-pub(crate) const READY_STALL: Duration = Duration::from_secs(10);
+/// A microVM a client waits on, as the listener last looked at it
+/// ([`Daemon::log_progress`]): what it had done then, and how long until the next look.
+struct Looked {
+    progress: Progress,
+    every: Duration,
+}
 
-/// Whether `socket` has something to read, or has closed, within `wait`; an error is
-/// taken for something to read, for the read that follows to say.
-fn readable_within(socket: &UnixStream, wait: Duration) -> bool {
+/// Whether `socket` has something to read, or has closed, within `wait` (none: until it
+/// has); an error is taken for something to read, for the read that follows to say.
+fn readable_within(socket: &UnixStream, wait: Option<Duration>) -> bool {
     #[cfg(windows)]
     {
         socket
-            .wait_readable(None, Some(Instant::now() + wait))
+            .wait_readable(None, wait.map(|w| Instant::now() + w))
             .unwrap_or(true)
     }
     #[cfg(unix)]
@@ -9140,54 +9683,79 @@ fn readable_within(socket: &UnixStream, wait: Duration) -> bool {
             events: libc::POLLIN,
             revents: 0,
         };
-        let ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
-        // SAFETY: poll(2) of one pollfd of ours.
-        unsafe { libc::poll(&raw mut next, 1, ms) != 0 }
+        // Whole milliseconds, rounded up, so that a wait never ends before its time.
+        let ms = wait.map_or(-1, |w| {
+            i32::try_from(w.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
+        });
+        timed(poll_timeout(ms), || {
+            // SAFETY: poll(2) of one pollfd of ours.
+            unsafe { libc::poll(&raw mut next, 1, ms) != 0 }
+        })
     }
 }
 
-/// Waits for a starting VM to say it is ready, as long as its process runs its start: a
+/// Waits for a starting VM to say it is ready while its process goes on with its start: a
 /// boot's cost is its host's, 1.6 s alone on CI's windows-2022 and 52 s eight at once (PM
 /// M357), and over 60 s on an arm64 Windows host nested under QEMU's TCG, its process
-/// running a CPU flat out (the parity plan's step 10). A VM is given up on once it has run
-/// nothing a boot does ([`shards_vmm::platform::progressed`]) for [`READY_TIMEOUT`], judged
-/// each [`READY_STALL`]: at most that past its start where it never runs, as before; one
-/// whose CPU time cannot be read is held to [`READY_TIMEOUT`] from its start.
-fn ready(socket: &UnixStream, pid: u32) -> Result<(), String> {
+/// running a CPU flat out (the parity plan's step 10). Followed by D215's judge on `record`,
+/// this daemon's VMs' starts (`Answers::ready`): before its first, its liveness alone, its
+/// socket's end; then past W*, the slowest start seen, looked at each W* and given up on
+/// where a whole W* shows it ran no CPU, its host not the reason. Its READY teaches the
+/// record, but one there as the wait begins, which was waited for not at all (D222's wait of
+/// nothing): on macOS the wait begins once the VM has its grants, which a quick restore can
+/// end with its READY said, and as a sample, its W* of next to nothing would have each later
+/// start looked at each millisecond. The log says once, as a start first outlasts W*, how far
+/// into it it is. It was `READY_STALL`'s 10 s looks and `READY_TIMEOUT`'s 60 s, picked, judged
+/// by PM M357's idle microVM (ROOT's (3), 2026-11-13).
+fn ready(socket: &UnixStream, pid: u32, record: &shards_api::Record) -> Result<(), String> {
     let began = Instant::now();
-    let mut progress = Progress::of(pid);
-    let mut ran_last = began;
-    while !readable_within(socket, READY_STALL) {
-        let look = progress.look();
-        let (ran, now_at) = (look.ran, Instant::now());
-        if ran {
-            ran_last = now_at;
+    // Its time so far, to the microsecond, as the log says it.
+    let into = || Duration::from_micros(u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX));
+    // Followed only where its READY is still to come, as a slot's rest is learned only where
+    // it was waited for (D185's `Asked::waited`).
+    let mut follow = (!readable_within(socket, Some(Duration::ZERO)))
+        .then(|| shards_api::Followed::of_pid(pid).ok().flatten())
+        .flatten()
+        .and_then(|followed| shards_api::Follow::begin(record, followed).ok().flatten());
+    // Whether the log has said it outlasted the slowest start seen: once, as it does.
+    let mut said = false;
+    loop {
+        let wait = follow
+            .as_ref()
+            .and_then(shards_api::Follow::due)
+            .map(|due| due.saturating_duration_since(Instant::now()));
+        if readable_within(socket, wait) {
+            break;
         }
-        #[cfg(windows)]
-        let did = shards_ipc::process_activity(pid);
-        #[cfg(not(windows))]
-        let did = look.to_string();
-        let stalled = now_at.saturating_duration_since(ran_last);
-        log(format!(
-            "VM {pid}: not ready in {:?}{}: {did}",
-            Duration::from_secs(now_at.saturating_duration_since(began).as_secs()),
-            if ran { "" } else { ", running nothing of its start" }
-        ));
-        if stalled >= READY_TIMEOUT {
-            return Err(format!(
-                "VM {pid} was not ready: it ran nothing of its start for {READY_TIMEOUT:?}, \
-                 {:?} after it began",
-                Duration::from_secs(now_at.saturating_duration_since(began).as_secs())
+        let Some(followed) = follow.as_mut() else {
+            continue;
+        };
+        followed.look().map_err(|why| match why {
+            shards_api::Unfollowed::Stalled(stall) => format!(
+                "VM {pid} was not ready: it ran nothing for {:?}, past the slowest start seen ({:?}), {:?} after it began",
+                stall.over(),
+                stall.slowest(),
+                into()
+            ),
+            shards_api::Unfollowed::Process { failure, .. } => {
+                format!("VM {pid} was not ready: its process could not be read: {failure}")
+            }
+        })?;
+        if let (false, shards_api::Seen::Learned { slowest, .. }) = (said, record.seen()) {
+            said = true;
+            log(format!(
+                "VM {pid}: not ready {:?} into its start, past the slowest start seen ({slowest:?}): followed as it goes on",
+                into()
             ));
         }
     }
-    socket
-        .set_read_timeout(Some(READY_TIMEOUT))
-        .map_err(|e| format!("VM {pid}: {e}"))?;
-    let said = shards_ipc::recv(socket);
-    let _ = socket.set_read_timeout(None);
-    match said {
-        Ok(Some(m)) if m.kind == kind::READY => Ok(()),
+    match shards_ipc::recv(socket) {
+        Ok(Some(m)) if m.kind == kind::READY => {
+            if let Some(followed) = follow.as_mut() {
+                followed.answered();
+            }
+            Ok(())
+        }
         Ok(Some(m)) => Err(format!("VM {pid} said message kind {} instead of READY", m.kind)),
         Ok(None) => Err(format!("VM {pid} ended before it was ready")),
         Err(e) => Err(format!("VM {pid} was not ready: {e}")),
@@ -9199,7 +9767,36 @@ fn ready(socket: &UnixStream, pid: u32) -> Result<(), String> {
 mod tests {
     use std::io::{Read, Write};
 
+    use shards_api::{Found, Judge, Record, Seen, Stall};
     use shards_vmm::platform::{IDLE_VM_CPU, progressed};
+
+    /// A run handed over as `hand_over` hands it, its VM's party this process and its kind
+    /// cold: waited for on its socket's readiness alone.
+    fn handed_over(
+        vm: &UnixStream,
+        payload: &[u8],
+        fds: &[BorrowedFd<'_>],
+        ends: &[BorrowedFd<'_>],
+    ) -> Result<(), Untaken> {
+        #[cfg(unix)]
+        return hand_over(
+            vm,
+            &mut health::Judged::of(std::process::id(), &Record::new()),
+            payload,
+            fds,
+            ends,
+        );
+        #[cfg(windows)]
+        hand_over(vm, payload, fds, ends)
+    }
+
+    /// [`taken`] as [`handed_over`] waits.
+    fn taken_cold(vm: &UnixStream) -> Result<(), Untaken> {
+        #[cfg(unix)]
+        return taken(vm, &mut health::Judged::of(std::process::id(), &Record::new()));
+        #[cfg(windows)]
+        taken(vm)
+    }
 
     /// Cold boots wait their turn while the vCPUs under way and theirs would pass the most
     /// (PM M357): two of 4 within 8 go at once, and a third waits until one of them has
@@ -9413,7 +10010,7 @@ mod tests {
     /// an idle one's 10 s on either runner (31 and 63 ms) is no progress; a cold boot, a CPU's
     /// worth to its start (1.6 s of 1.6 s), and step 10's nested boot (FullReal04's VM 2340:
     /// 10,578 ms of CPU by 10 s, 32,249 ms by 20 s) are; a process whose time is unread never
-    /// is, and a VM held to READY_TIMEOUT from its start then, as before.
+    /// is.
     #[test]
     fn a_starting_vm_progresses_by_more_cpu_than_an_idle_one_takes() {
         let s = Duration::from_secs;
@@ -9448,8 +10045,66 @@ mod tests {
             !progressed(Some(ms(5)), Some(ms(1)), s(10)),
             "a time read backwards"
         );
-        // A stall is judged in slices, each a sixth of the time a VM may run nothing.
-        assert_eq!(READY_TIMEOUT, 6 * READY_STALL);
+    }
+
+    /// A starting VM is waited for while its process goes on with its start, its READY
+    /// teaching the daemon's record of starts (D215's judge): a stand-in that runs a CPU and
+    /// says READY 1.5 s on is taken, and the record has learned it; past a learned W*, one
+    /// that runs nothing is given up on a whole W* on, said so. Before, `READY_STALL`'s 10 s
+    /// looks and `READY_TIMEOUT`'s 60 s, picked, learned nothing (ROOT's (3), 2026-11-13).
+    #[cfg(unix)]
+    #[test]
+    fn a_starting_vm_is_waited_for_while_it_goes_on_with_its_start() {
+        let late = Duration::from_millis(1500);
+        let record = shards_api::Record::new();
+        let busy = shards_ipc::spawn(
+            Path::new("/bin/sh"),
+            &[OsStr::new("-c"), OsStr::new("while :; do :; done")],
+            &[],
+            false,
+        )
+        .unwrap();
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(late);
+                shards_ipc::send(&theirs, kind::READY, &[], &[]).unwrap();
+            });
+            ready(&ours, busy.id(), &record).unwrap();
+        });
+        let _ = busy.kill(shards_ipc::signal::SIGKILL);
+        let _ = busy.wait();
+        assert!(
+            matches!(record.seen(), shards_api::Seen::Learned { slowest, .. } if slowest >= late),
+            "{:?}",
+            record.seen()
+        );
+        // Its W* learned (taught here): one that runs nothing, given up on past it.
+        let slowest = Duration::from_millis(200);
+        let record = shards_api::Record::new();
+        record.teach(slowest, Duration::from_millis(1));
+        let asleep = sleeper(60);
+        std::thread::sleep(slowest);
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let began = Instant::now();
+        let refused = ready(&ours, asleep.id(), &record).unwrap_err();
+        assert!(began.elapsed() >= slowest, "{:?}", began.elapsed());
+        assert!(refused.contains("ran nothing for"), "{refused}");
+        let _ = asleep.kill(shards_ipc::signal::SIGKILL);
+        let _ = asleep.wait();
+    }
+
+    /// A READY there as its wait begins was waited for not at all: it is taken, and teaches
+    /// the daemon's record of starts nothing (D222's wait of nothing), whose W* of next to
+    /// nothing would have each later start looked at each millisecond. Its VM process is this
+    /// one, which lives throughout.
+    #[test]
+    fn a_ready_said_before_its_wait_teaches_nothing() {
+        let record = shards_api::Record::new();
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        shards_ipc::send(&theirs, kind::READY, &[], &[]).unwrap();
+        ready(&ours, std::process::id(), &record).unwrap();
+        assert_eq!(record.seen(), shards_api::Seen::Cold);
     }
 
     /// The basis as the daemon reads it of a VM's process, on this host: a process that
@@ -9460,12 +10115,12 @@ mod tests {
         let window = Duration::from_secs(1);
         let sleeping = sleeper(60);
         // Once its start's own CPU is spent: its time unchanged across a fifth of a second.
-        let settling = Instant::now() + PATIENCE;
+        // No bound: a wait ends as its party makes no progress, and this one's is that (D215).
         let mut last = cpu(sleeping.id());
         loop {
             std::thread::sleep(Duration::from_millis(200));
             let now = cpu(sleeping.id());
-            if now == last || Instant::now() > settling {
+            if now == last {
                 break;
             }
             last = now;
@@ -9645,7 +10300,7 @@ mod tests {
                     shards_ipc::send(&vm, kind::TAKEN, &[], &[]).unwrap();
                     run.fds
                 });
-                hand_over(
+                handed_over(
                     &daemon,
                     b"run",
                     &[shards_ipc::handed(&conn).unwrap().as_fd()],
@@ -9668,7 +10323,7 @@ mod tests {
         let (daemon, vm) = UnixStream::pair().unwrap();
         let (_client, conn) = UnixStream::pair().unwrap();
         let warm = std::thread::spawn(move || drop(shards_ipc::recv(&vm)));
-        let e = hand_over(
+        let e = handed_over(
             &daemon,
             b"run",
             &[shards_ipc::handed(&conn).unwrap().as_fd()],
@@ -9690,7 +10345,7 @@ mod tests {
             shards_ipc::send(&vm, kind::STARTED, &[], &[]).unwrap();
             vm
         });
-        let e = hand_over(
+        let e = handed_over(
             &daemon,
             b"run",
             &[shards_ipc::handed(&conn).unwrap().as_fd()],
@@ -9702,7 +10357,7 @@ mod tests {
         // So does a VM whose socket is gone before the request is whole.
         let (daemon, vm) = UnixStream::pair().unwrap();
         drop(vm);
-        let e = hand_over(
+        let e = handed_over(
             &daemon,
             b"run",
             &[shards_ipc::handed(&conn).unwrap().as_fd()],
@@ -9712,11 +10367,349 @@ mod tests {
         assert!(matches!(e, Untaken::Surely(_)), "{e:?}");
     }
 
-    /// How long a test waits for what must happen before it fails instead of hanging: a
-    /// test's bound alone, no wait of the daemon's (each it tests is its own, as the
-    /// daemon sets it), and no passing test's outcome rests on it; where daemons go on
-    /// saying something, they are waited on past it (`a daemon thread outlived its test`).
-    const PATIENCE: Duration = Duration::from_secs(20);
+    /// What this process has learned of its tests' waits on their daemons (D215's record):
+    /// one kind, as every one waits on the same party, this process's own threads.
+    static WAITS: Record = Record::new();
+
+    /// The CPU the threads waiting in a [`Wait`] have run while they waited, in [`cpu`]'s
+    /// units: a waiter that polls, reads a clock or wakes runs too, and is no party to its
+    /// wait.
+    static WAITERS: AtomicU64 = AtomicU64::new(0);
+
+    /// This process's CPU (`process`), or this thread's, in one clock's units: on Unix the
+    /// nanoseconds of their CPU clocks (clock_gettime(2): CLOCK_PROCESS_CPUTIME_ID,
+    /// CLOCK_THREAD_CPUTIME_ID); on Windows the cycles their threads used
+    /// (QueryProcessCycleTime, QueryThreadCycleTime), as GetProcessTimes documents no
+    /// resolution of its times (D215).
+    #[cfg(unix)]
+    fn cpu(process: bool) -> u64 {
+        let clock = if process {
+            libc::CLOCK_PROCESS_CPUTIME_ID
+        } else {
+            libc::CLOCK_THREAD_CPUTIME_ID
+        };
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime(2) writes one timespec into a local.
+        assert_eq!(unsafe { libc::clock_gettime(clock, &raw mut now) }, 0);
+        let now = Duration::new(now.tv_sec.try_into().unwrap(), now.tv_nsec.try_into().unwrap());
+        now.as_nanos().try_into().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn cpu(process: bool) -> u64 {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+        use windows_sys::Win32::System::WindowsProgramming::{QueryProcessCycleTime, QueryThreadCycleTime};
+        let mut cycles = 0u64;
+        // SAFETY: each writes one count into a local, of the pseudo-handle of this process or
+        // this thread, which needs no closing.
+        let read = unsafe {
+            if process {
+                QueryProcessCycleTime(GetCurrentProcess(), &raw mut cycles)
+            } else {
+                QueryThreadCycleTime(GetCurrentThread(), &raw mut cycles)
+            }
+        };
+        assert_ne!(read, 0, "{}", io::Error::last_os_error());
+        cycles
+    }
+
+    /// The CPU this process's threads have run apart from its waiters' waits ([`WAITERS`]):
+    /// its daemons' threads, and its other tests'.
+    fn others() -> i128 {
+        i128::from(cpu(true)) - i128::from(WAITERS.load(Ordering::Relaxed))
+    }
+
+    /// A test's wait on its daemon, whose threads run in this process: judged as D215 judges
+    /// a wait on a VM process (#77), its party this process. Past the slowest wait of its
+    /// tests seen ([`WAITS`], W*), it looks once each W*, and gives up only where no thread
+    /// of this process but its waiters has run for a whole W* its host did not hold it in,
+    /// counted from no earlier than the latest deadline a daemon thread waits until
+    /// ([`Waiting`]): a party asleep on a deadline of its own has not stalled before it.
+    /// Before the first answer it follows this process's liveness alone, and is judged from
+    /// the first that comes.
+    ///
+    /// Not [`shards_api::progress::Watch`]: of its own process every look finds it ran and
+    /// runnable, the looking thread among its threads. How long its host held it is what
+    /// its own sleeps and timed waits overran (`overran`): a host that holds the process
+    /// holds its waiter, and a stretch of it so held is no stretch its daemon could run in.
+    struct Wait<'r> {
+        record: &'r Record,
+        /// What its party has run ([`others`]; a test's stand-in).
+        party: fn() -> i128,
+        judge: Judge<'r>,
+        began: Instant,
+        /// What its party had run as it began (Unix: Windows keeps no rate in cycles), and at
+        /// the look before.
+        #[cfg(unix)]
+        from: i128,
+        others: i128,
+        /// This thread's CPU as it last added its own to [`WAITERS`].
+        mine: u64,
+        /// When its party last progressed, or the wait began or was first judged; and how
+        /// long its host has held it since.
+        since: Instant,
+        held: Duration,
+        /// The latest deadline its party waits until ([`latest_deadline`]; a test's
+        /// stand-in).
+        deadline: fn() -> Option<Instant>,
+    }
+
+    impl<'r> Wait<'r> {
+        fn on(record: &'r Record, party: fn() -> i128, deadline: fn() -> Option<Instant>) -> Wait<'r> {
+            let (began, mine, others) = (Instant::now(), cpu(false), party());
+            Wait {
+                record,
+                party,
+                judge: Judge::begin(record),
+                began,
+                #[cfg(unix)]
+                from: others,
+                others,
+                mine,
+                since: began,
+                held: Duration::ZERO,
+                deadline,
+            }
+        }
+
+        /// How long to wait before it looks: until its look is due; while it is not judged,
+        /// as long as it has waited, so that it finds its record's first answer within
+        /// twice the time it took to come.
+        fn slice(&self) -> Duration {
+            self.judge.due().map_or_else(
+                || self.began.elapsed(),
+                |due| due.saturating_duration_since(Instant::now()),
+            )
+        }
+
+        /// Its thread slept, or waited timed, `asked` and woke after `took`: its host held
+        /// it for the rest.
+        fn overran(&mut self, asked: Duration, took: Duration) {
+            self.held = self.held.saturating_add(took.saturating_sub(asked));
+        }
+
+        /// Looks at this process where a look is due ([`Wait`]): refused where none of its
+        /// threads but its waiters has run for a whole W* its host did not hold it in, past
+        /// the latest deadline it waits until.
+        fn look(&mut self) -> Result<(), Stall> {
+            let mine = cpu(false);
+            WAITERS.fetch_add(mine.saturating_sub(self.mine), Ordering::Relaxed);
+            self.mine = mine;
+            let now = Instant::now();
+            let Some(due) = self.judge.due() else {
+                // Begun before its kind's first answer: judged from the first.
+                if matches!(self.record.seen(), Seen::Learned { .. }) {
+                    self.judge = Judge::begin(self.record);
+                    (self.others, self.since, self.held) = ((self.party)(), now, Duration::ZERO);
+                }
+                return Ok(());
+            };
+            let Seen::Learned { slowest, .. } = self.record.seen() else {
+                return Ok(());
+            };
+            if now < due {
+                return Ok(());
+            }
+            let others = (self.party)();
+            let ran = others > std::mem::replace(&mut self.others, others);
+            if ran {
+                (self.since, self.held) = (now, Duration::ZERO);
+            }
+            let from = (self.deadline)().map_or(self.since, |until| until.max(self.since));
+            let free = now.saturating_duration_since(from).saturating_sub(self.held);
+            self.judge.found(if ran {
+                Found::Progressed
+            } else if free < slowest {
+                Found::Held
+            } else {
+                Found::Still
+            })
+        }
+
+        /// What it waited for came: its kind learns from it, the CPU this process's other
+        /// threads ran meanwhile its work.
+        fn answered(&self) {
+            #[cfg(unix)]
+            let work = Duration::from_nanos(u64::try_from((self.party)() - self.from).unwrap_or(0));
+            // Cycles, which no rate of D215's is kept in: R* is a refusal's diagnosis alone.
+            #[cfg(windows)]
+            let work = Duration::ZERO;
+            self.record.teach(self.began.elapsed(), work);
+        }
+    }
+
+    /// What a test says of a [`Wait`] it gave up on, after what it waited for.
+    fn stalled(stall: &Stall) -> String {
+        format!(
+            "no thread of this process ran for {:?} its host did not hold it in, {:?} into the \
+             wait, the slowest of its tests' waits seen {:?} (D215)",
+            stall.over(),
+            stall.waited(),
+            stall.slowest()
+        )
+    }
+
+    /// Waits until `f` holds, polled as the tests poll, `party` judged on `record`'s
+    /// judgment ([`Wait`]).
+    fn waited_on(
+        record: &Record,
+        party: fn() -> i128,
+        deadline: fn() -> Option<Instant>,
+        mut f: impl FnMut() -> bool,
+    ) -> Result<(), Stall> {
+        let mut wait = Wait::on(record, party, deadline);
+        loop {
+            if f() {
+                wait.answered();
+                return Ok(());
+            }
+            wait.look()?;
+            let (asked, slept) = (Duration::from_millis(1), Instant::now());
+            std::thread::sleep(asked);
+            wait.overran(asked, slept.elapsed());
+        }
+    }
+
+    /// Waits until `f` holds ([`Wait`]).
+    fn waited(f: impl FnMut() -> bool) -> Result<(), Stall> {
+        waited_on(&WAITS, others, latest_deadline, f)
+    }
+
+    /// Waits until `f` holds ([`Wait`]); a wait given up on fails the test, saying `what`.
+    fn until(what: &str, f: impl FnMut() -> bool) {
+        if let Err(stall) = waited(f) {
+            panic!("{what}: {}", stalled(&stall));
+        }
+    }
+
+    /// Why [`received`] has no value.
+    #[derive(Debug)]
+    enum Unreceived {
+        Stalled(Stall),
+        /// Its sender went, none sent.
+        Gone,
+    }
+
+    /// What `rx` gives, waited for ([`Wait`]).
+    fn received<T>(rx: &mpsc::Receiver<T>) -> Result<T, Unreceived> {
+        let mut wait = Wait::on(&WAITS, others, latest_deadline);
+        loop {
+            let (asked, began) = (wait.slice(), Instant::now());
+            match rx.recv_timeout(asked) {
+                Ok(value) => {
+                    wait.answered();
+                    return Ok(value);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Unreceived::Gone),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    wait.overran(asked, began.elapsed());
+                    wait.look().map_err(Unreceived::Stalled)?;
+                }
+            }
+        }
+    }
+
+    /// [`received`]; one not received fails the test, saying `what`.
+    fn receive<T>(what: &str, rx: &mpsc::Receiver<T>) -> T {
+        match received(rx) {
+            Ok(value) => value,
+            Err(Unreceived::Stalled(stall)) => panic!("{what}: {}", stalled(&stall)),
+            Err(Unreceived::Gone) => panic!("{what}: its sender ended"),
+        }
+    }
+
+    /// What `f` read of `socket`, read on a thread of its own and waited for ([`Wait`]): a
+    /// thread blocked in a read cannot look, and a read timeout would cut a message half
+    /// read. A read given up on fails the test, saying `what`, and is left blocked, holding
+    /// a clone of the socket.
+    fn read<T: Send + 'static>(
+        what: &str,
+        socket: &UnixStream,
+        f: impl FnOnce(&UnixStream) -> T + Send + 'static,
+    ) -> T {
+        read_past(what, Duration::ZERO, socket, f)
+    }
+
+    /// [`read`], waited for `past` before it is judged: a bound of the daemon's own, over
+    /// which it waits on nothing of this process's.
+    fn read_past<T: Send + 'static>(
+        what: &str,
+        past: Duration,
+        socket: &UnixStream,
+        f: impl FnOnce(&UnixStream) -> T + Send + 'static,
+    ) -> T {
+        let socket = socket.try_clone().unwrap();
+        let (sent, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("reader".into())
+            .spawn(move || {
+                let value = f(&socket);
+                // Closed before it says so, as its test may next wait for the socket's end.
+                drop(socket);
+                let _ = sent.send(value);
+            })
+            .unwrap();
+        match rx.recv_timeout(past) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: its sender ended"),
+            Err(mpsc::RecvTimeoutError::Timeout) => receive(what, &rx),
+        }
+    }
+
+    /// A test's wait gives up on a party that stopped, a whole W* gone by with nothing run;
+    /// waits on one that is slow but runs, many W* past the slowest seen; and waits on one
+    /// asleep until a deadline of its own, giving up a whole W* past the deadline where
+    /// nothing follows (#77). Each party is a stand-in whose run is a count, its deadline a
+    /// stand-in's, each case's record its own, taught a W* of 20 ms. Red where the wait is
+    /// bounded by wall time alone (the stopped one waited on for good, or the slow or
+    /// sleeping one cut), takes its own looks for progress, or judges a sleeping party
+    /// before its deadline.
+    #[test]
+    fn a_wait_gives_up_on_a_stopped_party_and_waits_on_a_slow_or_sleeping_one() {
+        static STOPPED: Record = Record::new();
+        static SLOW: Record = Record::new();
+        static ASLEEP: Record = Record::new();
+        static WOKE_TO_NOTHING: Record = Record::new();
+        static RUN: AtomicU64 = AtomicU64::new(0);
+        static UNTIL: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let slowest = Duration::from_millis(20);
+        for record in [&STOPPED, &SLOW, &ASLEEP, &WOKE_TO_NOTHING] {
+            record.teach(slowest, Duration::ZERO);
+        }
+        let still = || 0;
+        let none = || None;
+        let stall = waited_on(&STOPPED, still, none, || false).unwrap_err();
+        assert!(stall.waited() >= slowest, "{stall:?}");
+
+        // Asleep until 10 W* from now: waited on to its deadline, then a whole W* more.
+        let until = *UNTIL.get_or_init(|| Instant::now() + slowest * 10);
+        let asleep = || UNTIL.get().copied();
+        let began = Instant::now();
+        assert_eq!(
+            waited_on(&ASLEEP, still, asleep, || began.elapsed() >= slowest * 5),
+            Ok(())
+        );
+        let stall = waited_on(&WOKE_TO_NOTHING, still, asleep, || false).unwrap_err();
+        assert!(Instant::now() >= until + slowest, "{stall:?}");
+
+        let runs = || i128::from(RUN.load(Ordering::Relaxed));
+        let done = AtomicBool::new(false);
+        let began = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    RUN.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+            });
+            let waited = waited_on(&SLOW, runs, none, || began.elapsed() >= slowest * 25);
+            done.store(true, Ordering::Relaxed);
+            assert_eq!(waited, Ok(()));
+        });
+    }
 
     /// A thread's handle, scoped or not, for [`joined`].
     trait Joinable<T> {
@@ -9742,7 +10735,6 @@ mod tests {
         }
     }
 
-    /// What thread `h` returned, once it has, within [`PATIENCE`].
     /// The `kind::WORKING_SET` messages that carry `set`, each copied out.
     fn working_set_parts(name: &str, set: &[u8]) -> Vec<Vec<u8>> {
         let mut parts = Vec::new();
@@ -9753,27 +10745,20 @@ mod tests {
         parts
     }
 
-    /// Whether thread `h` finishes within [`PATIENCE`]; it is not joined.
+    /// Whether thread `h` finishes, waited for ([`Wait`]); it is not joined.
     fn finishes<T>(h: &impl Joinable<T>) -> bool {
-        let deadline = Instant::now() + PATIENCE;
-        while !h.finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        h.finished()
+        waited(|| h.finished()).is_ok()
     }
 
+    /// What thread `h` returned, once it has, waited for ([`Wait`]).
     fn joined<T>(h: impl Joinable<T>) -> T {
-        let deadline = Instant::now() + PATIENCE;
-        while !h.finished() {
-            assert!(Instant::now() < deadline, "a thread did not finish");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        until("a thread did not finish", || h.finished());
         h.join_now().unwrap()
     }
 
     /// What a test's disk lets through as its test ends, failing or not, so that no
     /// daemon thread waits on it past its test ([`Ending`]).
-    trait Opens {
+    pub(super) trait Opens {
         fn open(&self) {}
     }
 
@@ -9808,15 +10793,17 @@ mod tests {
     /// A daemon of a home of its own, which starts no VM itself: its tests play the warm
     /// VMs, over socket pairs, and hold each step of a run's start as long as they like
     /// (audit A06).
-    struct Test<D: Disk + Opens = Real> {
-        daemon: Daemon<D>,
+    pub(super) struct Test<D: Disk + Opens = Real> {
+        pub(super) daemon: Daemon<D>,
         home: shards_testdir::TempDir,
         /// The processes of the warm VMs played, ended with the test.
         vms: Mutex<Vec<Arc<shards_ipc::Child>>>,
+        /// When it began: the warm VMs it plays have waited in their pools since.
+        began: Instant,
     }
 
     impl Test {
-        fn new(tag: &str) -> Test {
+        pub(super) fn new(tag: &str) -> Test {
             Test::on(tag, Real)
         }
     }
@@ -9860,12 +10847,13 @@ mod tests {
                 daemon,
                 home,
                 vms: Mutex::default(),
+                began: Instant::now(),
             }
         }
 
         /// Runs `body` with the daemon's threads in a scope of its own. As the body ends,
         /// failing or not, the daemon's threads are made to end, and all are joined before
-        /// this returns; a thread that still has not ended after [`PATIENCE`] aborts the
+        /// this returns; a wait for them given up on ([`Wait`]) aborts the
         /// tests rather than hang them.
         fn run<'e, R>(&'e self, body: impl for<'s> FnOnce(&In<'s, 'e, D>) -> R) -> R {
             let (joined, joining) = mpsc::channel::<()>();
@@ -9884,7 +10872,6 @@ mod tests {
         /// its socket. Its process is a `sleep`, for the daemon to end.
         fn warm_vm(&self, pool: Option<&str>) -> (Ready, UnixStream) {
             let (ours, theirs) = UnixStream::pair().unwrap();
-            theirs.set_read_timeout(Some(PATIENCE)).unwrap();
             let sleep = sleeper(600);
             let vm = Arc::new(sleep);
             lock(&self.vms).push(vm.clone());
@@ -9897,6 +10884,7 @@ mod tests {
                 records: None,
                 joined: None,
                 layer: None,
+                pooled: Some(self.began),
             };
             (ready, theirs)
         }
@@ -9906,13 +10894,9 @@ mod tests {
             ask(&self.daemon, args)
         }
 
-        /// Waits until what `f` finds of the daemon holds.
+        /// Waits until what `f` finds of the daemon holds ([`Wait`]).
         fn until(&self, what: &str, f: impl Fn(&Daemon<D>) -> bool) {
-            let deadline = Instant::now() + PATIENCE;
-            while !f(&self.daemon) {
-                assert!(Instant::now() < deadline, "{what}");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            until(what, || f(&self.daemon));
         }
 
         fn record(&self, id: &str) -> Option<Container> {
@@ -10056,7 +11040,7 @@ mod tests {
                         layer_pending: false,
                         layer_over: None,
                         layer_way: None,
-                        log_files: DEFAULT_LOGS.files,
+                        log_kept: DEFAULT_LOGS,
                         log_compress: false,
                         visit: false,
                         egress: None,
@@ -10106,6 +11090,10 @@ mod tests {
             daemon.disk.open();
             daemon.recording.end();
             daemon.followers.end();
+            // What its VMs said as the test ended, which the followers' loop may have ended
+            // before it took (a loaded host's): taken, so that each run that ended lets go of
+            // the exec connections it held for its VM (M24), whose askers wait on them.
+            daemon.take_left();
             // A run's thread waiting for its end, which no follower takes now, returns.
             drop(lock(&daemon.runs));
             daemon.resolved.notify_all();
@@ -10116,6 +11104,8 @@ mod tests {
             daemon.checks.end();
             daemon.refills.end();
             daemon.collecting.end();
+            #[cfg(any(target_os = "macos", windows))]
+            daemon.groups.end();
             daemon.end_clients();
             for vm in lock(&self.test.vms).iter() {
                 let _ = vm.kill(shards_ipc::signal::SIGKILL);
@@ -10136,26 +11126,18 @@ mod tests {
                     "returned".into()
                 };
                 // Its own thread ends as the scope does: the sender goes once all are joined.
-                // Each PATIENCE in which the daemons said something is waited on: the runs a
-                // failing test leaves end saying so ("ended before its command did"), and a
-                // slow host's daemon ending sixty of them is not a thread stuck, which says
-                // nothing.
+                // Waited on while this process's threads run ([`Wait`]): the runs a failing
+                // test leaves end saying so ("ended before its command did"), and a slow
+                // host's daemon ending sixty of them is not a thread stuck.
                 let _ = std::thread::Builder::new()
                     .name("watchdog".into())
                     .spawn(move || {
-                        let began = Instant::now();
-                        let mut said = LOGGED.load(Ordering::Relaxed);
-                        while let Err(mpsc::RecvTimeoutError::Timeout) = joining.recv_timeout(PATIENCE) {
-                            let now = LOGGED.load(Ordering::Relaxed);
-                            if now != said {
-                                said = now;
-                                continue;
-                            }
+                        if let Err(Unreceived::Stalled(stall)) = received(&joining) {
                             let _ = writeln!(
                                 io::stderr(),
-                                "a daemon thread outlived its test by {:?}, {PATIENCE:?} of them \
-                                 with nothing said: {test}, which {how}",
-                                began.elapsed()
+                                "a daemon thread outlived its test: {}: {test}, which {how}; this process's threads:\n{}",
+                                stalled(&stall),
+                                threads_now()
                             );
                             std::process::abort();
                         }
@@ -10171,6 +11153,136 @@ mod tests {
         while matches!(runs.get(id), Some(RunState::Tracked(_))) && !daemon.followers.ending() {
             runs = daemon.resolved.wait(runs).unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// This process's threads, a line each, for a watchdog that gives up on one: each by the
+    /// name std gave it as it started it (Linux's `comm`, cut to 15 bytes; macOS's
+    /// `pth_name`; Windows' description), with what it waits in where its kernel says
+    /// (Linux's `wchan`), and on macOS each one's stack, as `sample` takes it where this
+    /// process may be sampled.
+    #[cfg(target_os = "linux")]
+    fn threads_now() -> String {
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            return "unread".into();
+        };
+        let mut each: Vec<String> = tasks
+            .flatten()
+            .map(|task| {
+                let path = task.path();
+                let read = |f: &str| std::fs::read_to_string(path.join(f)).unwrap_or_default();
+                format!(
+                    "{} {}: in {}",
+                    task.file_name().to_string_lossy(),
+                    read("comm").trim(),
+                    read("wchan").trim()
+                )
+            })
+            .collect();
+        each.sort();
+        each.join("\n")
+    }
+
+    /// [`threads_now`] (macOS): each thread's name and run state (proc_pidinfo), then
+    /// `sample`'s stacks.
+    #[cfg(target_os = "macos")]
+    fn threads_now() -> String {
+        // bsd/sys/proc_info.h: a process's threads' handles, a uint64_t each, which
+        // PROC_PIDTHREADINFO reads one by one.
+        const PROC_PIDLISTTHREADS: libc::c_int = 6;
+        let pid = i32::try_from(std::process::id()).unwrap();
+        // Listed into room for as many as it said it had, then for twice that where they
+        // filled it, as threads start meanwhile.
+        // SAFETY: a size query, no buffer.
+        let said = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, std::ptr::null_mut(), 0) };
+        let mut handles = vec![0u64; usize::try_from(said).unwrap_or(0) / 8 + 1];
+        let n = loop {
+            let room = i32::try_from(handles.len() * 8).unwrap();
+            // SAFETY: `handles` has room for `room` bytes.
+            let got =
+                unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, handles.as_mut_ptr().cast(), room) };
+            if got < room {
+                break usize::try_from(got).unwrap_or(0) / 8;
+            }
+            handles.resize(handles.len() * 2, 0);
+        };
+        let mut lines = Vec::new();
+        for &handle in handles.get(..n).unwrap_or_default() {
+            // SAFETY: a plain C struct, read into whole by the kernel or not at all.
+            let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+            let size = i32::try_from(size_of::<libc::proc_threadinfo>()).unwrap();
+            // SAFETY: `info` has room for `size` bytes.
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTHREADINFO,
+                    handle,
+                    (&raw mut info).cast(),
+                    size,
+                )
+            };
+            if read == size {
+                // SAFETY: the kernel's name, NUL-terminated within its array.
+                let name = unsafe { std::ffi::CStr::from_ptr(info.pth_name.as_ptr()) };
+                lines.push(format!(
+                    "{handle:#x} {}: run state {}",
+                    name.to_string_lossy(),
+                    info.pth_run_state
+                ));
+            }
+        }
+        let stacks = match std::process::Command::new("/usr/bin/sample")
+            .args([pid.to_string().as_str(), "1"])
+            .output()
+        {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Ok(out) => format!("sample: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            Err(e) => format!("sample: {e}"),
+        };
+        format!("{}\n{stacks}", lines.join("\n"))
+    }
+
+    /// [`threads_now`] (Windows): each thread's description (GetThreadDescription).
+    #[cfg(windows)]
+    fn threads_now() -> String {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, LocalFree};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+        };
+        let pid = std::process::id();
+        let mut lines = Vec::new();
+        // SAFETY: a snapshot of the system's threads, read and closed here; each of this
+        // process's opened, read and closed in turn, its description freed as documented.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return format!("unread: {}", io::Error::last_os_error());
+            }
+            let mut entry: THREADENTRY32 = std::mem::zeroed();
+            entry.dwSize = u32::try_from(size_of::<THREADENTRY32>()).unwrap();
+            let mut more = Thread32First(snapshot, &mut entry) != 0;
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    let thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, entry.th32ThreadID);
+                    let mut name = String::new();
+                    if !thread.is_null() {
+                        let mut described: *mut u16 = std::ptr::null_mut();
+                        if GetThreadDescription(thread, &mut described) >= 0 && !described.is_null() {
+                            let len = (0..).take_while(|&i| *described.add(i) != 0).count();
+                            name = String::from_utf16_lossy(std::slice::from_raw_parts(described, len));
+                            LocalFree(described.cast());
+                        }
+                        CloseHandle(thread);
+                    }
+                    lines.push(format!("{} {name}", entry.th32ThreadID));
+                }
+                more = Thread32Next(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+        }
+        lines.join("\n")
     }
 
     struct Starting<'s> {
@@ -10195,9 +11307,14 @@ mod tests {
     }
 
     fn ask<D: Disk>(daemon: &Daemon<D>, args: &[&str]) -> (u8, String, String) {
+        ask_as(daemon, args, &asker())
+    }
+
+    /// [`ask`], by `asker`: one that sends descriptors of its own.
+    fn ask_as<D: Disk>(daemon: &Daemon<D>, args: &[&str], asker: &commands::Asker) -> (u8, String, String) {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let argv: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-        let status = daemon.command(&argv, &asker(), &commands::Reply(&ours));
+        let status = daemon.command(&argv, asker, &commands::Reply(&ours));
         drop(ours);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         // A listing's rows, laid out as the client lays them out.
@@ -10251,12 +11368,14 @@ mod tests {
 
     /// [`heard`], the message whole, its descriptors with it.
     fn heard_whole(vm: &UnixStream) -> shards_ipc::Message {
-        loop {
-            let m = shards_ipc::recv(vm).unwrap().expect("the daemon hung up");
-            if m.kind != kind::STOP_ORDER {
-                return m;
+        read("the daemon said nothing to its VM", vm, |vm| {
+            loop {
+                let m = shards_ipc::recv(vm).unwrap().expect("the daemon hung up");
+                if m.kind != kind::STOP_ORDER {
+                    return m;
+                }
             }
-        }
+        })
     }
 
     fn say(vm: &UnixStream, what: u8, payload: &[u8]) {
@@ -10374,7 +11493,7 @@ mod tests {
                             layer_pending: false,
                             layer_over: None,
                             layer_way: None,
-                            log_files: DEFAULT_LOGS.files,
+                            log_kept: DEFAULT_LOGS,
                             log_compress: false,
                             visit: false,
                             egress: None,
@@ -10384,11 +11503,7 @@ mod tests {
                             link_local: Vec::new(),
                             engine: None,
                         },
-                        || {
-                            offered
-                                .recv_timeout(PATIENCE)
-                                .map_err(|_| "no warm VM".to_string())
-                        },
+                        || received(&offered).map_err(|e| format!("no warm VM: {e:?}")),
                     )
                     .map(|_| ())
             });
@@ -10691,23 +11806,74 @@ mod tests {
         (id, starting, vm)
     }
 
+    /// Do have the daemon's end of a running run's managed capture end as its VM's end of
+    /// it does, as its run ends; then fail on a record it refuses, its own failure. Expect:
+    /// nothing told the run for the first, whose end is its VM's; the run stopped for the
+    /// second as it stops (its stop signal heard): no run waits for its `STOP` on a failure
+    /// its daemon saw (D258; goal 75's survey). Why goes to the daemon's log, its stderr.
+    #[test]
+    fn a_capture_failure_of_the_daemons_own_stops_its_run_and_its_vms_end_does_not() {
+        let t = Test::new("capture-failed");
+        t.run(|t| {
+            let (id, starting, vm) = running(t, "captured");
+            t.daemon
+                .capture_failed(&id, "its members' output", &managed::Failure::Closed);
+            vm.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let told = loop {
+                match shards_ipc::recv(&vm) {
+                    Ok(Some(m)) if m.kind == kind::STOP_ORDER => continue,
+                    Ok(Some(m)) => break Some(m.kind),
+                    _ => break None,
+                }
+            };
+            assert_eq!(told, None, "a run told of its own capture's end");
+            vm.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let refused = managed::Failure::Protocol(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid capture record header",
+            ));
+            std::thread::scope(|s| {
+                let stopping = s.spawn(|| t.daemon.capture_failed(&id, "its members' output", &refused));
+                assert_eq!(
+                    heard(&vm),
+                    signal(15),
+                    "a run its daemon's capture failed was not stopped"
+                );
+                say(&vm, kind::DONE, &[143]);
+                stopping.join().unwrap();
+            });
+            let _ = joined(starting.run);
+        });
+    }
+
     /// A run's microVM is looked at for its progress while its own client waits on it, an
-    /// attached run's, until it ends; a detached run's, whose client has gone, is not. Each
-    /// look is due within READY_STALL, a sixth of the time a test's client gives a daemon
-    /// that says nothing (`common::DAEMON_QUIET`, READY_TIMEOUT): a microVM that runs its
-    /// workload is said to six times before its client would give up on it. A played VM, a
-    /// sleep, runs nothing, and is said nothing of.
+    /// attached run's, until it ends; a detached run's, whose client has gone, is not. Its
+    /// looks are paced by the daemon's record of starts: none before its first READY, and
+    /// once it has one, the first due within its W*, the slowest start seen, and each after
+    /// twice as long as the one before. A played VM, a sleep, runs nothing, and is said
+    /// nothing of. It was looked at each READY_STALL's 10 s, picked (ROOT's (3)).
     #[test]
     fn a_microvm_is_followed_while_a_client_waits_on_it() {
         let t = Test::new("followed");
         t.run(|t| {
             let (_, attached, vm) = running(t, "attached");
+            assert_eq!(
+                t.daemon.log_progress(),
+                None,
+                "looked at before any start was seen"
+            );
+            let slowest = Duration::from_millis(50);
+            t.daemon.answers.ready.teach(slowest, Duration::from_millis(1));
             let due = t
                 .daemon
                 .log_progress()
                 .expect("an attached run's microVM not followed");
-            assert!(due <= READY_STALL, "{due:?}");
+            assert!(due <= slowest, "{due:?}");
             assert_eq!(lock(&t.daemon.followed).len(), 1);
+            // Its first look made, the next is due twice as long after it.
+            std::thread::sleep(due);
+            let next = t.daemon.log_progress().unwrap();
+            assert!(next > slowest && next <= 2 * slowest, "{next:?}");
             say(&vm, kind::DONE, &[0]);
             joined(attached.run).unwrap();
             t.until("its end seen", |d| d.log_progress().is_none());
@@ -10720,14 +11886,185 @@ mod tests {
             assert_eq!(heard(&vm).0, kind::RUN);
             say(&vm, kind::TAKEN, &[]);
             say(&vm, kind::STARTED, &[]);
-            client.set_read_timeout(Some(PATIENCE)).unwrap();
-            let end = shards_ipc::recv(&client).unwrap().unwrap();
+            let end = read("the detached run's client heard no end", &client, |c| {
+                shards_ipc::recv(c)
+            })
+            .unwrap()
+            .unwrap();
             assert_eq!((end.kind, end.payload.as_slice()), (kind::END, &[0u8][..]));
             assert_eq!(t.daemon.log_progress(), None, "a detached run's microVM followed");
             say(&vm, kind::DONE, &[0]);
             joined(starting.run).unwrap();
         });
-        assert_eq!(READY_TIMEOUT, 6 * READY_STALL);
+    }
+
+    /// The home's lock held as a daemon holds it, by a file of its own: let go of as it drops.
+    fn held_lock(home: &Path) -> File {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(home.join("daemon.lock"))
+            .unwrap();
+        file.try_lock().unwrap();
+        file
+    }
+
+    /// `take_lock` on a thread of its own, its result sent once it returns.
+    fn taking_lock<'s>(
+        s: &'s std::thread::Scope<'s, '_>,
+        home: &'s Path,
+    ) -> std::sync::mpsc::Receiver<Result<Option<File>, String>> {
+        let (send, taken) = std::sync::mpsc::channel();
+        s.spawn(move || send.send(take_lock(home)).unwrap());
+        taken
+    }
+
+    /// A daemon waiting for its home's lock waits while its holder lives, however long, and
+    /// takes the home as soon as it is let go (runs-11 TAKEOVER). Red before: it stepped
+    /// aside after 20 s (`TAKEOVER`, picked), as if another served, while the holder had
+    /// still not served. A home with no start recorded follows its holder by its lock alone.
+    #[test]
+    fn a_daemon_waits_for_its_homes_lock_while_its_holder_lives() {
+        let home = shards_testdir::TempDir::new("takeover").unwrap();
+        let held = held_lock(&home);
+        std::fs::write(home.join(shards_ipc::PID), shards_ipc::this_process().unwrap()).unwrap();
+        std::thread::scope(|s| {
+            let taken = taking_lock(s, &home);
+            // Past the 20 s it gave up after.
+            let early = taken.recv_timeout(Duration::from_secs(21));
+            assert!(
+                early.is_err(),
+                "it stopped waiting for a holder that lives: {early:?}"
+            );
+            drop(held);
+            let file = taken.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            assert!(file.is_some(), "the home was not taken once its lock was let go");
+        });
+    }
+
+    /// Once the host has shown a start (`ends::End::Start`), a starting holder is followed
+    /// by D215's judge a slice of it at a time: waited for while it goes on (here this
+    /// process, which runs), and refused typed once it has run nothing for a whole slice (a
+    /// sleep named as the holder), never sooner than a slice from when it was first seen.
+    #[cfg(unix)]
+    #[test]
+    fn a_starting_holder_that_goes_on_with_nothing_for_the_hosts_slowest_start_is_refused() {
+        let home = shards_testdir::TempDir::new("takeover-judged").unwrap();
+        let slice = Duration::from_millis(200);
+        ends::Ends::kept_in(&home).heard(ends::End::Start, slice).unwrap();
+        let held = held_lock(&home);
+        std::fs::write(home.join(shards_ipc::PID), shards_ipc::this_process().unwrap()).unwrap();
+        let sleep = sleeper(600);
+        std::thread::scope(|s| {
+            let taken = taking_lock(s, &home);
+            let busy = Instant::now();
+            while busy.elapsed() < slice * 5 {
+                std::hint::black_box(busy.elapsed());
+            }
+            assert!(taken.try_recv().is_err(), "a holder that runs was not waited for");
+            let pid = sleep.id();
+            let named = format!("{pid} {}\n", shards_ipc::started(pid).unwrap());
+            std::fs::write(home.join(shards_ipc::PID), named).unwrap();
+            let seen = Instant::now();
+            let refused = taken.recv_timeout(Duration::from_secs(10));
+            let waited = seen.elapsed();
+            // Let go of, so that a waiter that did not stop takes it and ends.
+            drop(held);
+            let refused = refused.expect("a stalled holder was waited for on").unwrap_err();
+            assert!(waited >= slice, "refused within a slice: {waited:?}");
+            assert!(
+                refused.contains(&format!("the daemon {pid} that holds this home has not served")),
+                "{refused}"
+            );
+        });
+        let _ = sleep.kill(shards_ipc::signal::SIGKILL);
+        let _ = sleep.wait();
+    }
+
+    /// A renamed home's daemon must never remove a replacement home's request offers.
+    #[cfg(unix)]
+    #[test]
+    fn renamed_home_cleanup_keeps_replacement_files() {
+        const CHILD: &str = "SHARDS_RENAMED_HOME_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon::tests::renamed_home_cleanup_keeps_replacement_files",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let mut t = Test::new("home-anchor");
+        let original = t.home.to_path_buf();
+        let moved = original.with_extension("moved");
+        let owned = entered_home(&original).unwrap();
+        t.daemon.home = owned.clone();
+        let _old_requests = shards_ipc::slots::Requests::open(&owned).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let _new_requests = shards_ipc::slots::Requests::open(&original).unwrap();
+        std::fs::write(original.join(shards_ipc::PID), "replacement").unwrap();
+        std::fs::write(original.join(shards_ipc::STOPPING), "replacement").unwrap();
+        t.daemon.close();
+        assert_eq!(
+            std::fs::read(original.join(shards_ipc::STOPPING)).unwrap(),
+            b"replacement"
+        );
+        assert!(
+            shards_ipc::slots::served(&original),
+            "old close removed new offers"
+        );
+        t.daemon.finish();
+        assert_eq!(
+            std::fs::read(original.join(shards_ipc::PID)).unwrap(),
+            b"replacement"
+        );
+        // A partially removed home is still cleaned, using its actual location.
+        std::fs::remove_file(moved.join("daemon.lock")).unwrap();
+        t.daemon.home_gone.store(true, Ordering::SeqCst);
+        t.daemon.finish();
+        assert!(!moved.exists(), "the old home's remainder was not removed");
+        std::env::set_current_dir(original.parent().unwrap()).unwrap();
+    }
+
+    /// A daemon that closes, idle or at a stop's word, names itself stopping and holds
+    /// `STOPPING_LOCK` until `finish` has let go of its home's lock, then lets go of it and
+    /// its name: a stop's shared lock of it is had only once the home is free (D185, *A
+    /// stop's wait*).
+    #[test]
+    fn a_closed_daemon_holds_its_stopping_lock_until_its_home_is_let_go_of() {
+        let t = Test::new("stopping-lock");
+        let at = t.home.join(shards_ipc::STOPPING_LOCK);
+        let home_lock = t.home.join("daemon.lock");
+        // As `take_lock` takes it.
+        t.daemon.home_lock.lock().unwrap();
+        assert!(!at.exists(), "made before it closed");
+        t.daemon.close();
+        assert!(shards_ipc::exiting(&t.home), "not named stopping");
+        let waiter = File::open(&at).unwrap();
+        assert!(
+            matches!(waiter.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)),
+            "not held once closed"
+        );
+        std::thread::scope(|s| {
+            let had = s.spawn(|| {
+                waiter.lock_shared().unwrap();
+                let home = File::open(&home_lock).unwrap();
+                let free = home.try_lock().is_ok();
+                let _ = home.unlock();
+                let _ = waiter.unlock();
+                free
+            });
+            t.daemon.finish();
+            assert!(had.join().unwrap(), "had while its home was held");
+        });
+        assert!(!at.exists(), "its name left");
     }
 
     /// A daemon told to stop ends the clients it would otherwise wait for: one that never
@@ -10765,14 +12102,14 @@ mod tests {
                 ("logs -f", &following_client),
             ];
             for (who, client) in clients {
-                // macOS refuses options on a socket shut down both ways (EINVAL): this one's
-                // end has nothing more to wait for anyway.
-                let _ = client.set_read_timeout(Some(PATIENCE));
                 // One that asked nothing yet is told to ask the next daemon first.
-                let mut got = shards_ipc::recv(client);
-                if matches!(&got, Ok(Some(m)) if m.kind == kind::RESTART) {
-                    got = shards_ipc::recv(client);
-                }
+                let got = read("a client heard nothing of the stop", client, |client| {
+                    let got = shards_ipc::recv(client);
+                    if matches!(&got, Ok(Some(m)) if m.kind == kind::RESTART) {
+                        return shards_ipc::recv(client);
+                    }
+                    got
+                });
                 let what = match &got {
                     Ok(None) => String::new(),
                     Ok(Some(m)) => format!("message kind {}", m.kind),
@@ -10977,9 +12314,9 @@ mod tests {
     /// (cut off by its exit before its slot passed it on, x86_64 CI); and a client that
     /// takes nothing holds it no longer than the slowest take seen, from when its answer's
     /// writer began waiting on it, so that a stopped client keeps no daemon from exiting (PM
-    /// M261, M549). Unix's: a named pipe says nothing of its room before a write, so on
-    /// Windows a closed daemon follows its clients' ends alone.
-    #[cfg(unix)]
+    /// M261, M549). On every host: on Windows a part of an answer whose write pends is the
+    /// take (`slots::write_all_waiting`); before, no take was seen there, and a closed daemon
+    /// held such a client until it ended.
     #[test]
     fn a_closed_daemon_waits_for_its_clients_to_take_their_answers() {
         use shards_ipc::slots as s;
@@ -11069,8 +12406,8 @@ mod tests {
     /// said its microVM stopped before its command ended (125: budget E2E 40162744975's a,
     /// `a_daemon_ending_its_runs_is_waited_for`, PM M331). Its client leaving its answer
     /// untaken lets go of it once the slowest take seen has passed, no more: before, twice
-    /// the longest piece, at least TCP's R2, 100 s (PM M549). Unix's, as the test above.
-    #[cfg(unix)]
+    /// the longest piece, at least TCP's R2, 100 s (PM M549). On every host, as the test
+    /// above.
     #[test]
     fn a_closed_daemon_waits_for_what_a_slot_it_passed_on_has_yet_to_hear() {
         let t = Test::new("sp");
@@ -11102,8 +12439,7 @@ mod tests {
 
     /// Before any take has been seen, a closed daemon follows a client that takes nothing of
     /// its answer by its end alone (PM M549): held, with no time it lets go at, until the
-    /// client ends, and its writer's write fails then. Unix's, as the tests above.
-    #[cfg(unix)]
+    /// client ends, and its writer's write fails then. On every host, as the tests above.
     #[test]
     fn a_closed_daemon_with_no_take_seen_holds_a_client_until_it_ends() {
         let t = Test::new("cold");
@@ -11273,7 +12609,7 @@ mod tests {
                 }
                 let _ = heard.send(kinds);
             });
-            let ends = hearing.recv_timeout(PATIENCE);
+            let ends = received(&hearing);
             if ends.is_err() {
                 // Held open: a word from the client lets the slot's reader go, and this
                 // fails rather than hangs.
@@ -11554,11 +12890,7 @@ mod tests {
             assert_eq!(state.pools[&own("warm")].ready.len(), 1);
             assert_eq!(state.pools[&own("waited")].ready.len(), 1);
             drop(state);
-            let deadline = Instant::now() + PATIENCE;
-            while !ended_unreaped(&vms[0].1) {
-                assert!(Instant::now() < deadline, "the aged VM goes on");
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            until("the aged VM goes on", || ended_unreaped(&vms[0].1));
             assert!(
                 !ended_unreaped(&vms[1].1) && !ended_unreaped(&vms[2].1),
                 "a kept VM ended"
@@ -11574,17 +12906,20 @@ mod tests {
     fn a_vm_gone_before_the_wait_surely_never_took_the_run() {
         let (daemon_end, vm) = UnixStream::pair().unwrap();
         drop(vm);
-        assert_eq!(taken(&daemon_end), Err(Untaken::Surely("it ended first".into())));
+        assert_eq!(
+            taken_cold(&daemon_end),
+            Err(Untaken::Surely("it ended first".into()))
+        );
 
         let (daemon_end, vm) = UnixStream::pair().unwrap();
         say(&vm, kind::TAKEN, &[]);
         drop(vm);
-        assert_eq!(taken(&daemon_end), Ok(()));
+        assert_eq!(taken_cold(&daemon_end), Ok(()));
 
         let (daemon_end, vm) = UnixStream::pair().unwrap();
         say(&vm, kind::STARTED, &[]);
         drop(vm);
-        assert!(matches!(taken(&daemon_end), Err(Untaken::Unknown(_))));
+        assert!(matches!(taken_cold(&daemon_end), Err(Untaken::Unknown(_))));
     }
 
     /// A share's window by default follows its host (D189, PM M308): none on a virtual
@@ -11647,7 +12982,7 @@ mod tests {
         let (daemon_end, vm) = UnixStream::pair().unwrap();
         shards_ipc::send(&daemon_end, kind::RUN, b"run", &[]).unwrap();
         drop(vm);
-        let e = taken(&daemon_end).unwrap_err();
+        let e = taken_cold(&daemon_end).unwrap_err();
         assert!(matches!(e, Untaken::Surely(_)), "{e:?}");
     }
 
@@ -11838,13 +13173,13 @@ mod tests {
         let mut spare = Reserve::default();
         assert!(spare_held(&mut spare));
         let client = UnixStream::connect(&path).unwrap();
-        // Bounded before it is refused: macOS refuses setsockopt(2) on a socket whose
-        // connection has ended (EINVAL; CI run 43189239973, aarch64-apple-darwin).
-        client.set_read_timeout(Some(PATIENCE)).unwrap();
         assert!(refuse_api(&listener, &mut spare));
         assert!(spare.is_some(), "the spare not made again");
         assert!(
-            matches!(shards_ipc::recv(&client), Ok(None)),
+            matches!(
+                read("the client heard nothing", &client, shards_ipc::recv),
+                Ok(None)
+            ),
             "the client was not refused"
         );
         // None waiting: nothing to refuse, and the listener waits on no more.
@@ -12006,9 +13341,14 @@ mod tests {
     /// big-endian nanoseconds, its length in a big-endian u32, then its bytes, and each
     /// record's entry in the index.
     fn write_log(t: &Test, id: &str, lines: &[Logged]) {
-        use crate::spec::{INDEX_LINE, INDEX_STDERR};
         let dir = lock(&t.daemon.containers).dir(id);
-        std::fs::create_dir_all(&dir).unwrap();
+        write_log_in(&dir, lines);
+    }
+
+    /// [`write_log`]'s log, in `dir`.
+    fn write_log_in(dir: &Path, lines: &[Logged]) {
+        use crate::spec::{INDEX_LINE, INDEX_STDERR};
+        std::fs::create_dir_all(dir).unwrap();
         let (mut log, mut index) = (Vec::new(), Vec::new());
         for (stream, at, bytes) in lines {
             for (i, piece) in bytes.chunks(16 << 10).enumerate() {
@@ -12125,6 +13465,194 @@ mod tests {
         });
     }
 
+    /// A directory name a test's watches of fail at ([`watch`]): its user's descriptors or
+    /// inotify watches spent, without spending this process's.
+    pub(super) const UNWATCHABLE: &str = "unwatchable";
+
+    /// Makes microVM `id`'s directory, its log's and its record of processes', one no watch
+    /// can be made for.
+    fn unwatchable(t: &Test, id: &str) -> PathBuf {
+        let dir = lock(&t.daemon.containers).dir(id);
+        std::fs::write(dir.join(UNWATCHABLE), b"").unwrap();
+        dir
+    }
+
+    /// Does `ask` on a thread of its own while running microVM `id`'s run (`vm`) goes on,
+    /// until it has answered or follows the run (its end waited for); then ends the run, and
+    /// gives what `ask` gave and whether it had answered before the run's end.
+    fn asked_while_running<'s, T: Send>(
+        t: &In<'s, '_, Real>,
+        id: &str,
+        vm: &UnixStream,
+        starting: Starting<'s>,
+        ask: impl FnOnce() -> T + Send,
+    ) -> (T, bool) {
+        let answered = AtomicBool::new(false);
+        let (got, before_end) = std::thread::scope(|s| {
+            let asking = s.spawn(|| {
+                let got = ask();
+                answered.store(true, Ordering::SeqCst);
+                got
+            });
+            t.until("an answer, or a follow of the run", |d| {
+                answered.load(Ordering::SeqCst) || lock(&d.waiters).contains_key(id)
+            });
+            let before_end = answered.load(Ordering::SeqCst);
+            say(vm, kind::DONE, &[0]);
+            (asking.join().unwrap(), before_end)
+        });
+        joined(starting.run).unwrap();
+        (got, before_end)
+    }
+
+    /// `logs -f` of a log no watch can be made for is refused at once, typed, before any of
+    /// it is shown, and so is `watch processes`; neither reads on a clock while its run runs
+    /// (runs-11; before, each looked again every UNWATCHED, 250 ms, picked, until its run
+    /// ended, and said nothing of it).
+    #[test]
+    fn a_follow_no_watch_can_be_made_for_is_refused_before_anything_is_shown() {
+        let t = Test::new("unwatched");
+        t.run(|t| {
+            for args in [
+                &["logs", "-f", "logged"][..],
+                &["watch", "processes", "processed"],
+            ] {
+                let (id, starting, vm) = running(t, args[2]);
+                write_log(t, &id, &[(LOG_STDOUT, 1_000, b"out\n".to_vec())]);
+                unwatchable(t, &id);
+                let ((status, out, err), before_end) =
+                    asked_while_running(t, &id, &vm, starting, || ask_bytes(&t.daemon, args));
+                let err = String::from_utf8(err).unwrap();
+                assert!(before_end, "{args:?} followed its run unwatched: {err}");
+                assert_eq!(status, 1, "{args:?}: {err}");
+                assert!(
+                    out.is_empty(),
+                    "{args:?} showed {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+                assert!(err.contains("its watch could not be made"), "{args:?}: {err}");
+                assert!(
+                    !lock(&t.daemon.waiters).contains_key(&id),
+                    "{args:?}: its waiter kept"
+                );
+            }
+        });
+    }
+
+    /// A log driver's shipper whose log no watch can be made for ends with [`WatchRefused`] as
+    /// it begins to follow, its waiter forgotten, rather than read on a clock while its run
+    /// runs (runs-11).
+    #[test]
+    fn a_shipper_no_watch_can_be_made_for_ends_typed() {
+        struct Taking;
+        impl ship::Driver for Taking {
+            fn send(&mut self, _: &ship::Message<'_>, _: &ship::Wait<'_>) -> io::Result<()> {
+                Ok(())
+            }
+            fn part(&self) -> usize {
+                1 << 10
+            }
+        }
+        let t = Test::new("unwatched-ship");
+        t.run(|t| {
+            let (id, starting, vm) = running(t, "racer");
+            write_log(t, &id, &[(LOG_STDOUT, 1_000, b"out\n".to_vec())]);
+            let dir = unwatchable(t, &id);
+            let (_stop, stopped) = UnixStream::pair().unwrap();
+            // Its run ended once it has answered or follows: one that followed it ends Ok.
+            let (shipped, _) = asked_while_running(t, &id, &vm, starting, || {
+                t.daemon.ship(&id, &dir, &mut Taking, true, &stopped)
+            });
+            let Err(e) = shipped else {
+                panic!("a shipper followed its log unwatched");
+            };
+            assert!(
+                e.get_ref()
+                    .is_some_and(|e| e.downcast_ref::<WatchRefused>().is_some()),
+                "not refused as unwatched: {e}"
+            );
+            assert!(!lock(&t.daemon.waiters).contains_key(&id), "its waiter kept");
+        });
+    }
+
+    /// A daemon that cannot watch its home, its images or its contexts is not started: it
+    /// says which, rather than its listener look at them on a clock (runs-11).
+    #[test]
+    fn a_daemon_that_cannot_watch_its_home_is_not_started() {
+        let home = shards_testdir::TempDir::new("home-watches").unwrap();
+        assert!(home_watches(&home).is_ok());
+        for dir in [home.to_path_buf(), home.join("images"), home.join("contexts")] {
+            std::fs::write(dir.join(UNWATCHABLE), b"").unwrap();
+            let Err(refused) = home_watches(&home) else {
+                panic!("a home watched in part");
+            };
+            assert!(
+                refused.starts_with(&format!("{}: its watch could not be made", dir.display())),
+                "{refused}"
+            );
+            std::fs::remove_file(dir.join(UNWATCHABLE)).unwrap();
+        }
+    }
+
+    /// `shards read logs` shows a run's members' kept lines (D240), each after its member's
+    /// label on stderr, as a client attached to the run is shown them, after the run's own
+    /// output, which stays the command's on its own streams: its last line left unfinished
+    /// as it is, a member's ended; with `-t` each line's time first, and with `--tail` the
+    /// last lines of each log. Before, `logs` read the run's own log alone: a detached run's
+    /// agents were never seen (build.rs's engine-member test on CI, PM M543).
+    #[test]
+    fn logs_show_each_members_kept_lines_after_its_label() {
+        let t = Test::new("member-logs");
+        t.run(|t| {
+            let id = t.create("racer");
+            write_log(
+                t,
+                &id,
+                &[
+                    (LOG_STDOUT, 1_000, b"out\n".to_vec()),
+                    (LOG_STDERR, 2_000, b"err\n".to_vec()),
+                    (LOG_STDOUT, 5_000, b"last".to_vec()),
+                ],
+            );
+            // Member 1's log as the drain keeps it (managed/drain.rs): `members/<index>`,
+            // its label beside it.
+            let member = lock(&t.daemon.containers).dir(&id).join("members").join("1");
+            write_log_in(
+                &member,
+                &[
+                    (LOG_STDOUT, 3_000, b"confined uid=200001\n".to_vec()),
+                    (LOG_STDERR, 4_000, b"oops\n".to_vec()),
+                    (LOG_STDOUT, 6_000, b"hal".to_vec()),
+                ],
+            );
+            std::fs::write(member.join("label"), "agent main").unwrap();
+            for args in [&["logs", "racer"][..], &["logs", "-f", "racer"]] {
+                let (status, out, err) = ask_bytes(&t.daemon, args);
+                assert_eq!(status, 0, "{args:?}: {}", String::from_utf8_lossy(&err));
+                assert_eq!(String::from_utf8(out).unwrap(), "out\nlast", "{args:?}");
+                assert_eq!(
+                    String::from_utf8(err).unwrap(),
+                    "err\n[agent main] confined uid=200001\n[agent main] oops\n[agent main] hal\n",
+                    "{args:?}"
+                );
+            }
+            let (status, out, err) = ask_bytes(&t.daemon, &["logs", "--tail", "1", "racer"]);
+            assert_eq!(status, 0);
+            assert_eq!(String::from_utf8(out).unwrap(), "last");
+            assert_eq!(String::from_utf8(err).unwrap(), "[agent main] hal\n");
+            let (status, _, err) = ask_bytes(&t.daemon, &["logs", "-t", "racer"]);
+            assert_eq!(status, 0);
+            assert!(
+                String::from_utf8(err).unwrap().ends_with(&format!(
+                    "{} [agent main] oops\n{} [agent main] hal\n",
+                    commands::rfc3339_nano(4_000),
+                    commands::rfc3339_nano(6_000)
+                )),
+                "a member's lines after their times"
+            );
+        });
+    }
+
     /// Answers the exec `m` asks a VM for as its VM does: `output` on its stdout, then its
     /// exit `code` on its connection.
     fn answer_exec(m: &shards_ipc::Message, output: &[u8], code: u8) {
@@ -12137,29 +13665,51 @@ mod tests {
     }
 
     /// A microVM that does not answer its give-back keeps no other's from the host, and is
-    /// asked nothing more until its give-back has ended, which its time does (PM M308: a
-    /// pass that waited on each microVM in turn gave back 3 times in 600 s).
+    /// asked nothing more until its give-back has ended (PM M308: a pass that waited on each
+    /// microVM in turn gave back 3 times in 600 s). Its give-back ends as D215's judge ends
+    /// a wait whose kind has been answered (6fc62c231): at a look, past the slowest give-back
+    /// answered, that finds its VM process ran no CPU since the look before. A wait begun
+    /// before its kind's first answer follows liveness alone, whatever it learns meanwhile,
+    /// so the daemon learns a give-back's answer from a microVM that answers before it asks
+    /// the one that never does.
     #[test]
     fn a_microvm_that_does_not_give_back_keeps_no_other_waiting() {
         let t = Test::new("give-back");
         t.run(|t| {
-            let (stalled, _stalled, vm) = running(t, "stalled");
             let (answers, _answers, other) = running(t, "answers");
-            let t0 = Instant::now();
-            t.t.daemon.give_back_cold(t.threads);
-            let held = heard_whole(&vm);
-            assert_eq!(held.kind, kind::EXEC_RUN);
-            for pass in 0..2 {
-                if pass > 0 {
-                    t.t.daemon.give_back_cold(t.threads);
-                }
+            // One pass of the give-back, answered by the microVM that answers.
+            let answered = |t: &In<'_, '_, Real>| {
                 let asked = heard_whole(&other);
                 assert_eq!(asked.kind, kind::EXEC_RUN);
                 answer_exec(&asked, b"1048576 0", 0);
                 drop(asked);
                 t.until("its answer taken", |d| !d.watching.giving(&answers));
+            };
+            // What the daemon learns of a give-back's answer, from its own answers alone: pass
+            // after pass until one has taught it. This stand-in answers as it reads the ask, so
+            // its answer can be there before the daemon's wait begins (`exec_followed` spawns
+            // its output's reader first), and such a pass teaches nothing (D222, health.rs
+            // `await_exit`): two passes, both beaten so, left it cold (CI 43496145972, x86_64
+            // gnu and musl, Windows arm64).
+            let slowest = loop {
+                if let shards_api::Seen::Learned { slowest, .. } = t.t.daemon.answers.reclaim.seen() {
+                    break slowest;
+                }
+                t.t.daemon.give_back_cold(t.threads);
+                answered(t);
+            };
+            let (stalled, _stalled, vm) = running(t, "stalled");
+            let t0 = Instant::now();
+            t.t.daemon.give_back_cold(t.threads);
+            let held = heard_whole(&vm);
+            assert_eq!(held.kind, kind::EXEC_RUN);
+            // The one that answers is asked and served beside it, pass after pass.
+            for pass in 0..2 {
+                if pass > 0 {
+                    t.t.daemon.give_back_cold(t.threads);
+                }
+                answered(t);
             }
-            assert!(t0.elapsed() < TAKE_TIMEOUT, "{:?}", t0.elapsed());
             // The one still asked is asked nothing more meanwhile.
             assert!(t.t.daemon.watching.giving(&stalled));
             vm.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
@@ -12170,26 +13720,461 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            // Its time up, its give-back is ended on its exec's connection, as its VM says
-            // once it has ended it; then it may be asked again.
+            // Its VM process, a sleep, ran nothing: past the slowest answer, its give-back is
+            // ended on its exec's connection, as its VM says once it has ended it; then it may
+            // be asked again.
             let conn = stream_of(&held.fds[0]);
-            conn.set_read_timeout(Some(PATIENCE)).unwrap();
-            let ended = shards_ipc::recv(&conn).unwrap().unwrap();
+            // Past the daemon's own W*, over which it waits on a VM process that runs nothing.
+            let ended = read_past("the give-back was not ended", slowest, &conn, |c| {
+                shards_ipc::recv(c)
+            })
+            .unwrap()
+            .unwrap();
             assert_eq!((ended.kind, ended.payload), signal(9));
-            assert!(t0.elapsed() >= TAKE_TIMEOUT, "{:?}", t0.elapsed());
+            assert!(
+                t0.elapsed() >= slowest,
+                "{:?} into it, past {slowest:?}",
+                t0.elapsed()
+            );
             shards_ipc::send(&conn, kind::EXIT, &[137], &[]).unwrap();
             drop((conn, held));
             t.until("its give-back ended", |d| !d.watching.giving(&stalled));
         });
     }
 
+    /// Starts microVM `name`'s run under group `group` (D183, slice 3) on a warm VM the test
+    /// plays, its VM process held to `footprint` bytes as its group sums it, and has it
+    /// running: its ID, its run, the test's end of its socket, and its VM process.
+    #[cfg(any(target_os = "macos", windows))]
+    fn running_under<'s>(
+        t: &In<'s, '_, Real>,
+        name: &str,
+        group: &str,
+        footprint: u64,
+    ) -> (String, Starting<'s>, UnixStream, u32) {
+        let id = t.create(name);
+        // Its request, which names its group, as a client's run keeps it.
+        let dir = lock(&t.daemon.containers).dir(&id);
+        let kept = Run {
+            cgroup_parent: group.into(),
+            ..Run::default()
+        };
+        std::fs::write(dir.join(REQUEST), kept.encode()).unwrap();
+        let starting = t.start(&id);
+        let (ready, vm) = t.warm_vm(None);
+        let pid = ready.vm.id();
+        t.daemon.groups.play(pid, footprint);
+        starting.warm.send(ready).unwrap();
+        assert_eq!(heard(&vm).0, kind::RUN);
+        say(&vm, kind::TAKEN, &[]);
+        say(&vm, kind::STARTED, &[]);
+        t.until("the run started", |d| {
+            lock(&d.containers)
+                .get(&id)
+                .is_some_and(|c| c.state == Life::Running)
+        });
+        (id, starting, vm, pid)
+    }
+
+    /// Plays a group's member (D183, slice 3) whose init answers each word said to it: its
+    /// room told (`ROOM`) and nothing given back (`RECLAIM`); until its run is stopped,
+    /// which it ends 137 as its VM would, or `done` is set.
+    #[cfg(any(target_os = "macos", windows))]
+    fn answering(vm: &UnixStream, done: &AtomicBool) {
+        vm.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        while !done.load(Ordering::SeqCst) {
+            match shards_ipc::recv(vm) {
+                Ok(Some(m)) if m.kind == kind::EXEC_RUN => {
+                    let builtin = m
+                        .payload
+                        .get(9..)
+                        .and_then(shards_abi::run::Spec::decode)
+                        .map(|s| s.builtin);
+                    let said: &[u8] = if builtin == Some(shards_abi::run::builtin::RECLAIM) {
+                        b"0 0\n"
+                    } else {
+                        b"0"
+                    };
+                    answer_exec(&m, said, 0);
+                }
+                Ok(Some(m)) if m.kind == kind::SIGNAL => {
+                    say(vm, kind::DONE, &[137]);
+                    return;
+                }
+                Ok(Some(_)) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Ok(None) | Err(_) => return,
+            }
+        }
+    }
+
+    /// Sets its flag as it drops: a played VM's thread ends with its test, a failing one's too.
+    #[cfg(any(target_os = "macos", windows))]
+    struct Done<'a>(&'a AtomicBool);
+
+    #[cfg(any(target_os = "macos", windows))]
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Ends each run played on `vms` as its VM would, with its status, as it drops, a failing
+    /// test's too, the exec `held` unanswered let go of first: the daemon keeps its own end of
+    /// an exec's connection while its run lives (M24), so that one left waiting would outlive
+    /// its test.
+    #[cfg(any(target_os = "macos", windows))]
+    struct Ends<'a> {
+        held: Option<shards_ipc::Message>,
+        vms: Vec<(&'a UnixStream, u8)>,
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    impl Drop for Ends<'_> {
+        fn drop(&mut self) {
+            drop(self.held.take());
+            for (vm, status) in &self.vms {
+                let _ = shards_ipc::send(vm, kind::DONE, &[*status], &[]);
+            }
+        }
+    }
+
+    /// A group's member whose guest never answers holds up no other member's words and no
+    /// group's verdict (D183, slice 3): each member is told its room and asked to give back
+    /// on a thread of its own, its wait judged as D215's judge judges one, and the groups'
+    /// thread waits on none. One of group one never answers the room it is told before the
+    /// room's kind is learned; beside it are one that answers and group two's. Each group past its memory.max with nothing
+    /// given back, each group's largest is stopped, OOM-killed: the one that never answered
+    /// once its word has run past the slowest room answered. Red with a groups' thread that
+    /// told one member after another and so waited on it while it lived.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_member_that_never_answers_holds_up_no_other_member_or_group() {
+        let t = Test::new("group-words");
+        t.run(|t| {
+            // A cold word deliberately has no stall bound. This fixture tests a word
+            // whose own exec judge can refuse it, not an outside clock ending a cold wait.
+            t.daemon
+                .answers
+                .room
+                .teach(Duration::from_millis(20), Duration::ZERO);
+            let mib = |n: u64| n << 20;
+            for (group, max) in [("one", mib(1000)), ("two", mib(200))] {
+                let dir = groups::made(&t.daemon.home, group).unwrap();
+                for file in ["memory.high", "memory.max"] {
+                    std::fs::write(dir.join(file), format!("{max}\n")).unwrap();
+                }
+            }
+            t.t.daemon.start_groups(t.threads);
+            let (stuck, _stuck_run, stuck_vm, _) = running_under(t, "stuck", "one", mib(600));
+            // Its room: never answered, and refused by its own exec judge.
+            let held = heard_whole(&stuck_vm);
+            assert_eq!(held.kind, kind::EXEC_RUN);
+            let (_, _answers_run, answers_vm, _) = running_under(t, "answers", "one", mib(500));
+            let (other, _other_run, other_vm, _) = running_under(t, "other", "two", mib(300));
+            let _ends = Ends {
+                held: Some(held),
+                vms: vec![(&stuck_vm, 137), (&answers_vm, 0), (&other_vm, 0)],
+            };
+            let done = AtomicBool::new(false);
+            let stopped = |id: &str| {
+                let id = id.to_string();
+                move |d: &Daemon<Real>| lock(&d.containers).get(&id).is_some_and(|c| c.oom_killed)
+            };
+            std::thread::scope(|s| {
+                let _done = Done(&done);
+                s.spawn(|| answering(&answers_vm, &done));
+                s.spawn(|| answering(&other_vm, &done));
+                t.until(
+                    "group two's member, past its memory.max, was never stopped",
+                    stopped(&other),
+                );
+                t.until(
+                    "group one's largest, past its memory.max, was never stopped",
+                    stopped(&stuck),
+                );
+            });
+        });
+    }
+
+    /// A refusal is its own exec's alone (D183, waits-01): a member whose room was refused,
+    /// its kill acknowledged, and whose give-back then follows its VM's liveness (the
+    /// give-back's kind cold) is still asked by the round opened next, not counted as one
+    /// that gave nothing. Here `a` (600 MiB, under a high of 500 and a max of 1000) has its
+    /// room refused in round 1 and its give-back held; `b` (500 MiB) joins, opening round 2,
+    /// and gives nothing; `a` then gives 1 MiB back in round 2. Red with the room's refusal
+    /// left standing through the give-back: round 2 counted `a` as nothing given, its group
+    /// past its max, and OOM-killed `a` before its round-2 word came.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_refused_room_is_not_the_next_rounds_verdict() {
+        let t = Test::new("group-stale");
+        t.run(|t| {
+            t.daemon
+                .answers
+                .room
+                .teach(Duration::from_millis(20), Duration::ZERO);
+            let mib = |n: u64| n << 20;
+            let dir = groups::made(&t.daemon.home, "g").unwrap();
+            std::fs::write(dir.join("memory.high"), format!("{}\n", mib(500))).unwrap();
+            std::fs::write(dir.join("memory.max"), format!("{}\n", mib(1000))).unwrap();
+            t.t.daemon.start_groups(t.threads);
+            let builtin = |m: &shards_ipc::Message| {
+                assert_eq!(m.kind, kind::EXEC_RUN, "asked {} where an exec was due", m.kind);
+                m.payload
+                    .get(9..)
+                    .and_then(shards_abi::run::Spec::decode)
+                    .unwrap()
+                    .builtin
+            };
+            let (a, _a_run, a_vm, _) = running_under(t, "first", "g", mib(600));
+            // Round 1: its room never answered, refused by its own judge, the kill answered.
+            let room = heard_whole(&a_vm);
+            assert_eq!(builtin(&room), shards_abi::run::builtin::ROOM);
+            let conn = stream_of(&room.fds[0]);
+            let killed = shards_ipc::recv(&conn).unwrap().unwrap();
+            assert_eq!((killed.kind, killed.payload), signal(9));
+            shards_ipc::send(&conn, kind::EXIT, &[137], &[]).unwrap();
+            drop((conn, room));
+            // Its give-back of round 1, held: its kind cold, it follows liveness alone.
+            let give = heard_whole(&a_vm);
+            assert_eq!(builtin(&give), shards_abi::run::builtin::RECLAIM);
+            let (b, _b_run, b_vm, _) = running_under(t, "second", "g", mib(500));
+            let _ends = Ends {
+                held: None,
+                vms: vec![(&a_vm, 0), (&b_vm, 0)],
+            };
+            // Round 2: b gives nothing.
+            for (said, what) in [
+                (&b"0"[..], shards_abi::run::builtin::ROOM),
+                (b"0 0\n", shards_abi::run::builtin::RECLAIM),
+            ] {
+                let m = heard_whole(&b_vm);
+                assert_eq!(builtin(&m), what);
+                answer_exec(&m, said, 0);
+            }
+            t.until("b's give-back taken", |d| !d.watching.giving(&b));
+            // a's give-back of round 1 answered, then its words of round 2: 1 MiB given back.
+            answer_exec(&give, b"0 0\n", 0);
+            drop(give);
+            for (said, what) in [
+                (&b"0"[..], shards_abi::run::builtin::ROOM),
+                (b"1048576 0\n", shards_abi::run::builtin::RECLAIM),
+            ] {
+                let m = heard_whole(&a_vm);
+                assert_eq!(builtin(&m), what, "a was not asked its round-2 word");
+                answer_exec(&m, said, 0);
+            }
+            t.until("a's give-back taken", |d| !d.watching.giving(&a));
+            assert!(
+                !lock(&t.daemon.containers).get(&a).is_some_and(|c| c.oom_killed),
+                "a, asked in round 2 and giving back, was OOM-killed"
+            );
+        });
+    }
+
+    /// A group's member is held as of the footprint its room was read with (D183): told the
+    /// footprint its VM process held as the daemon read its room, its guest holds it at what
+    /// it used then and that room (`room_now`), whenever the word comes. So it grows into its
+    /// room once whether it grew before its footprint was read or after, before its word
+    /// came, and its group stays within its memory.max either way. Held at what it uses as
+    /// the word comes and that room, as a room told alone is, one that grew between the two
+    /// counts its growth twice: red so. Here a member of 400 MiB beside one of 300, under 1000,
+    /// grows to 600 after its room is read, and is then read again: each room holds it to 700.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_members_room_holds_as_of_the_footprint_it_was_read_with() {
+        let t = Test::new("group-room");
+        t.run(|t| {
+            let mib = |n: u64| n << 20;
+            let dir = groups::made(&t.daemon.home, "g").unwrap();
+            for file in ["memory.high", "memory.max"] {
+                std::fs::write(dir.join(file), format!("{}\n", mib(1000))).unwrap();
+            }
+            t.t.daemon.start_groups(t.threads);
+            let (_, _b_run, b_vm, _) = running_under(t, "beside", "g", mib(300));
+            let (_, _a_run, a_vm, a_pid) = running_under(t, "grows", "g", mib(400));
+            let _ends = Ends {
+                held: None,
+                vms: vec![(&a_vm, 0), (&b_vm, 0)],
+            };
+            // What its guest holds it to, once told its room `m`, as its init holds one: past
+            // what it uses as the word comes, its footprint `now` then, the room as of it
+            // where the word says the footprint it was read with, else the room as said.
+            let reach = |m: shards_ipc::Message, now: u64| -> u64 {
+                let spec = m
+                    .payload
+                    .get(9..)
+                    .and_then(shards_abi::run::Spec::decode)
+                    .unwrap();
+                assert_eq!(spec.builtin, shards_abi::run::builtin::ROOM);
+                let word = |i: usize| std::str::from_utf8(&spec.argv[i]).unwrap().to_string();
+                let room: i64 = word(0).parse().unwrap();
+                let held = match spec.argv.len() {
+                    1 => room,
+                    _ => shards_abi::run::room_now(room, word(1).parse().unwrap(), now).unwrap(),
+                };
+                // Answered, its descriptors let go of: its output ends, and so its exec.
+                answer_exec(&m, b"0", 0);
+                drop(m);
+                now.saturating_add_signed(held)
+            };
+            let done = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let _done = Done(&done);
+                s.spawn(|| answering(&b_vm, &done));
+                // Its room read as it held 400 MiB; it grows to 600 before the word comes.
+                let first = heard_whole(&a_vm);
+                t.daemon.groups.play(a_pid, mib(600));
+                let grew_after = reach(first, mib(600));
+                // Its room read again, as it holds 600 MiB.
+                let next = heard_whole(&a_vm);
+                let grew_before = reach(next, mib(600));
+                assert_eq!(
+                    (grew_after >> 20, grew_before >> 20),
+                    (700, 700),
+                    "held past 700 MiB, its group past its memory.max of 1000 with the other's 300"
+                );
+            });
+        });
+    }
+
+    /// A joiner and its provider in one group share one VM process (D119), which the group
+    /// holds once (D183): its `memory.current` sums each VM process of its microVMs once, by
+    /// its identity (its pid and start), and its `cgroup.procs` lists each once. Here a
+    /// provider of 600 MiB, its joiner in its VM process, and a microVM of 100 MiB of its own:
+    /// the group holds 700 MiB of two processes, where a sum by run counted the provider's
+    /// twice, 1300 MiB of three.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_joiner_and_its_provider_in_one_group_count_their_vm_process_once() {
+        let t = Test::new("group-joiner");
+        t.run(|t| {
+            let mib = |n: u64| n << 20;
+            let dir = groups::made(&t.daemon.home, "g").unwrap();
+            for file in ["memory.high", "memory.max"] {
+                std::fs::write(dir.join(file), format!("{}\n", mib(2000))).unwrap();
+            }
+            t.t.daemon.start_groups(t.threads);
+            let (provider, _p_run, p_vm, p_pid) = running_under(t, "provider", "g", mib(600));
+            // Its joiner, in its VM process, as join_vm makes one: its run under the group.
+            let id = t.create("joiner");
+            let dir_of = lock(&t.daemon.containers).dir(&id);
+            let kept = Run {
+                cgroup_parent: "g".into(),
+                ..Run::default()
+            };
+            std::fs::write(dir_of.join(REQUEST), kept.encode()).unwrap();
+            let joiner_run = t.start(&id);
+            let (mut ready, j_vm) = t.warm_vm(None);
+            ready.joined = Some(provider.clone());
+            ready.vm = match lock(&t.daemon.runs).get(&provider) {
+                Some(RunState::Tracked(run)) => run.vm.clone(),
+                _ => panic!("its provider does not run"),
+            };
+            assert_eq!(ready.vm.id(), p_pid);
+            joiner_run.warm.send(ready).unwrap();
+            assert_eq!(heard(&j_vm).0, kind::RUN);
+            say(&j_vm, kind::TAKEN, &[]);
+            say(&j_vm, kind::STARTED, &[]);
+            t.until("the joiner started", |d| {
+                lock(&d.containers)
+                    .get(&id)
+                    .is_some_and(|c| c.state == Life::Running)
+            });
+            let (_, _m_run, m_vm, m_pid) = running_under(t, "other", "g", mib(100));
+            let _ends = Ends {
+                held: None,
+                vms: vec![(&p_vm, 0), (&j_vm, 0), (&m_vm, 0)],
+            };
+            let done = AtomicBool::new(false);
+            let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap_or_default();
+            std::thread::scope(|s| {
+                let _done = Done(&done);
+                let done = &done;
+                for vm in [&p_vm, &j_vm, &m_vm] {
+                    s.spawn(move || answering(vm, done));
+                }
+                // Once its last microVM is summed: its own 100 MiB in it, after the joiner's.
+                t.until("its group never summed its last microVM", |_| {
+                    read("memory.current")
+                        .trim()
+                        .parse::<u64>()
+                        .is_ok_and(|held| held >= mib(700))
+                });
+                assert_eq!(
+                    read("memory.current").trim().parse::<u64>().unwrap() >> 20,
+                    700,
+                    "its provider's VM process, which its joiner shares, counted more than once"
+                );
+                // On macOS its VM processes, each once; on Windows its job's, which a played
+                // microVM has none of.
+                if cfg!(target_os = "macos") {
+                    let mut procs: Vec<u32> =
+                        read("cgroup.procs").lines().map(|p| p.parse().unwrap()).collect();
+                    procs.sort_unstable();
+                    let mut expected = vec![p_pid, m_pid];
+                    expected.sort_unstable();
+                    assert_eq!(procs, expected, "a VM process listed more than once");
+                }
+            });
+        });
+    }
+
+    /// A run whose end its followers' loop had not taken as it ended, with its test, ends
+    /// then as the loop would have ended it: the daemon lets go of the exec connection it
+    /// handed its VM and held until taken (M24), and the thread waiting on the exec returns.
+    /// Red with a test's end that left the run followed by none: the daemon's copy held the
+    /// exec's connection open, its asker waited on, and the tests' watchdog aborted them, as
+    /// a group's word to a member whose played VM answered no more did under load
+    /// (a_joiner_and_its_provider_in_one_group_count_their_vm_process_once, CI 43496145972).
+    #[test]
+    fn a_run_its_followers_left_lets_go_of_the_execs_handed_its_vm() {
+        let t = Test::new("left-run");
+        t.run(|t| {
+            let id = t.create("left");
+            let starting = t.start(&id);
+            let (ready, vm) = t.warm_vm(None);
+            starting.warm.send(ready).unwrap();
+            assert_eq!(heard(&vm).0, kind::RUN);
+            say(&vm, kind::TAKEN, &[]);
+            say(&vm, kind::STARTED, &[]);
+            t.until("it runs", |d| {
+                lock(&d.containers)
+                    .get(&id)
+                    .is_some_and(|c| c.state == Life::Running)
+            });
+            let (daemon, exec_id) = (&t.t.daemon, id.clone());
+            t.threads.spawn(move || {
+                let spec = shards_abi::run::Spec {
+                    argv: vec![b"true".to_vec()],
+                    ..Default::default()
+                };
+                daemon.exec_waiting(&exec_id, &spec, None, 1 << 12, health::Wait::Ending)
+            });
+            // Its VM hears the exec and lets it go untaken: the daemon's copy alone holds
+            // its connection.
+            assert_eq!(heard(&vm).0, kind::EXEC_RUN);
+            // Its followers' loop ends before its VM's end comes.
+            t.daemon.followers.end();
+            t.until("its followers' loop woke to end", |d| d.followers.ended_awake());
+            drop(vm);
+        });
+    }
+
     /// How many messages the daemon sends a warm VM before it lets go of its socket.
     fn heard_nothing(vm: &UnixStream) -> usize {
-        let mut n = 0;
-        while let Ok(Some(_)) = shards_ipc::recv(vm) {
-            n += 1;
-        }
-        n
+        read("the daemon kept its VM's socket", vm, |vm| {
+            let mut n = 0;
+            while let Ok(Some(_)) = shards_ipc::recv(vm) {
+                n += 1;
+            }
+            n
+        })
     }
 
     /// A VM that surely did not take the run gives way to another; one that may have is
@@ -12230,6 +14215,49 @@ mod tests {
             assert_eq!(count_asks(&starting.asks, &starting.asked), 1);
             let record = t.record(&id).unwrap();
             assert_eq!((record.state, record.exit_code), (Life::Created, Some(128)));
+        });
+    }
+
+    /// Every VM that waited in its pool before the run asked is tried in turn, however many
+    /// ended unseen, where three tries were once all a run had (runs-11); one started after
+    /// it asked that surely did not take it ends the run's start, and no other is asked for.
+    #[test]
+    fn untaken_pooled_vms_give_way_to_each_other_and_a_fresh_one_ends_the_start() {
+        let t = Test::new("handoff-all");
+        t.run(|t| {
+            let end_unseen = |starting: &Starting<'_>, ready: Ready, vm: UnixStream| {
+                let child = ready.vm.clone();
+                starting.warm.send(ready).unwrap();
+                assert_eq!(heard(&vm).0, kind::RUN);
+                drop(vm);
+                assert_eq!(child.wait().unwrap(), 128 + shards_ipc::signal::SIGKILL);
+            };
+            let id = t.create("many");
+            let starting = t.start(&id);
+            let ended = 4;
+            for _ in 0..ended {
+                let (ready, vm) = t.warm_vm(None);
+                end_unseen(&starting, ready, vm);
+            }
+            let (ready, vm) = t.warm_vm(None);
+            starting.warm.send(ready).unwrap();
+            serve(&vm, 0);
+            joined(starting.run).unwrap();
+            assert_eq!(count_asks(&starting.asks, &starting.asked), ended + 1);
+            let record = t.record(&id).unwrap();
+            assert_eq!((record.state, record.exit_code), (Life::Exited, Some(0)));
+
+            let id = t.create("fresh");
+            let starting = t.start(&id);
+            let (mut ready, vm) = t.warm_vm(None);
+            ready.pooled = None;
+            end_unseen(&starting, ready, vm);
+            let said = joined(starting.run).unwrap_err();
+            assert!(
+                said.contains("the VM started for the run did not take it"),
+                "{said}"
+            );
+            assert_eq!(count_asks(&starting.asks, &starting.asked), 1);
         });
     }
 
@@ -12299,7 +14327,7 @@ mod tests {
                 // Written either way, so that the scope ends.
                 held.let_through();
                 assert!(early.is_err(), "answered while a record was being written");
-                settled.recv_timeout(PATIENCE).unwrap();
+                receive("the daemon never settled", &settled);
             });
             assert!(lock(&t.daemon.containers).get(&id).is_some());
         });
@@ -12326,7 +14354,7 @@ mod tests {
                     early.is_err(),
                     "answered while its record was being written: {early:?}"
                 );
-                assert_eq!(found.recv_timeout(PATIENCE).unwrap(), Ok(id.clone()));
+                assert_eq!(receive("the microVM was not found", &found), Ok(id.clone()));
             });
             assert_eq!(t.daemon.resolve(id.get(..12).unwrap()), Ok(id.clone()));
         });
@@ -12397,10 +14425,7 @@ mod tests {
             let dir = t.home.join("containers").join(&id);
             let aside = t.home.join("containers").join(format!(".{id}.removing"));
             let set = || aside.exists() || !dir.exists();
-            let deadline = Instant::now() + PATIENCE;
-            while !set() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            let _ = waited(&set);
             let set_aside = set();
             let (arriving, seen, holder) = {
                 let registry = lock(&t.daemon.containers);
@@ -12715,23 +14740,71 @@ mod tests {
         });
     }
 
-    /// A warm VM that has stopped reading fails a run's handoff, surely untaken, once a
-    /// write waits TAKE_TIMEOUT for room, where the send waited for ever: the run then
-    /// tries another VM. (A write cut short by the timeout returns what it wrote; the next
-    /// waits again: two timeouts in all.)
+    /// A warm VM that has stopped reading, its process running nothing, fails a run's handoff,
+    /// surely untaken, once it has run nothing for a slice of its kind's slowest take (D215's
+    /// judge, runs-11 `TAKE_TIMEOUT`), never sooner: the run then tries another VM. Its write
+    /// cut short goes no further: the VM never had all of it.
+    #[cfg(unix)]
     #[test]
-    fn a_vm_that_reads_nothing_fails_its_handoff() {
+    fn a_vm_that_reads_nothing_and_runs_nothing_fails_its_handoff() {
         let (daemon, vm) = UnixStream::pair().unwrap();
+        let record = Record::new();
+        let slowest = Duration::from_millis(100);
+        record.teach(slowest, slowest / 1000);
+        let idle = sleeper(600);
         let (done, finished) = mpsc::channel();
         let t0 = Instant::now();
-        std::thread::spawn(move || {
-            let payload = vec![0u8; shards_ipc::MAX_PAYLOAD];
-            let _ = done.send(hand_over(&daemon, &payload, &[], &[]));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let payload = vec![0u8; shards_ipc::MAX_PAYLOAD];
+                let mut judged = health::Judged::of(idle.id(), &record);
+                let _ = done.send(hand_over(&daemon, &mut judged, &payload, &[], &[]));
+            });
+            let handed = finished.recv_timeout(Duration::from_secs(10));
+            // Closed, so that a wait that did not stop ends (a peer's shutdown alone gives macOS
+            // no room to write, msg-dontwait.c).
+            drop(vm);
+            let handed = handed.expect("a VM that ran nothing was waited for on");
+            assert!(matches!(handed, Err(Untaken::Surely(_))), "{handed:?}");
+            assert!(t0.elapsed() >= slowest, "{:?}", t0.elapsed());
         });
-        let handed = finished.recv_timeout(TAKE_TIMEOUT * 3).unwrap();
-        assert!(matches!(handed, Err(Untaken::Surely(_))));
-        assert!(t0.elapsed() >= TAKE_TIMEOUT, "{:?}", t0.elapsed());
-        drop(vm);
+        let _ = idle.kill(shards_ipc::signal::SIGKILL);
+        let _ = idle.wait();
+    }
+
+    /// A warm VM slow to read its run, its process going on, keeps its handoff however long it
+    /// takes (runs-11 `TAKE_TIMEOUT`): red before, its write waited 10 s for room (`TAKE_TIMEOUT`,
+    /// picked) and the run went elsewhere, surely untaken, from a VM that would have taken it.
+    /// Its kind's record learned at 100 ms, the VM (this process, a thread of it busy) reads at
+    /// 10.5 s.
+    #[cfg(unix)]
+    #[test]
+    fn a_vm_slow_to_read_its_run_while_it_runs_keeps_its_handoff() {
+        let (daemon, vm) = UnixStream::pair().unwrap();
+        let record = Record::new();
+        let slowest = Duration::from_millis(100);
+        record.teach(slowest, slowest / 1000);
+        let busy = AtomicBool::new(true);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while busy.load(Ordering::Relaxed) {
+                    std::hint::black_box(Instant::now());
+                }
+            });
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(10_500));
+                let run = shards_ipc::recv(&vm).unwrap().unwrap();
+                assert_eq!(run.kind, kind::RUN);
+                shards_ipc::send(&vm, kind::TAKEN, &[], &[]).unwrap();
+            });
+            let payload = vec![0u8; shards_ipc::MAX_PAYLOAD];
+            let mut judged = health::Judged::of(std::process::id(), &record);
+            let handed = hand_over(&daemon, &mut judged, &payload, &[], &[]);
+            busy.store(false, Ordering::Relaxed);
+            // Closed, so that a VM left reading a request cut short ends.
+            drop(daemon);
+            assert_eq!(handed, Ok(()));
+        });
     }
 
     /// A microVM being removed, not running, is listed so until it is gone, as dockerd
@@ -12756,8 +14829,8 @@ mod tests {
         });
     }
 
-    /// A run whose warm VM cannot be started is told why at once, where it waited
-    /// READY_TIMEOUT for one; and the template is not counted broken for it: the host
+    /// A run whose warm VM cannot be started is told why at once, where it waited a
+    /// minute for one; and the template is not counted broken for it: the host
     /// failed, not the template. (A test's daemon names a VM binary that is not there.)
     #[test]
     fn a_run_whose_vm_cannot_start_is_told_why_at_once() {
@@ -12793,6 +14866,133 @@ mod tests {
                 state.pools.get(&own(&dir)).map(|p| p.working_set_limit),
                 Some(Some(None))
             );
+        });
+    }
+
+    /// A claim of a pool none of whose VMs is starting, nor can be planned (its template
+    /// gone), is refused at once, said so: no VM comes for it. It waited READY_TIMEOUT's
+    /// minute, picked, for nothing (ROOT's (3), R03).
+    #[test]
+    fn a_claim_none_can_start_for_is_refused_at_once() {
+        let t = Test::new("claim-none");
+        t.run(|t| {
+            let dir = t.home.join("gone");
+            let rootfs = t.home.join("rootfs.erofs");
+            std::fs::write(&rootfs, b"erofs").unwrap();
+            let stamp = shards_image::store::rootfs_stamp(&rootfs);
+            let why = match t.t.daemon.claim(t.threads, &own(&dir), &rootfs, stamp.as_deref()) {
+                Err(Claim::Failed(why)) => why,
+                Err(Claim::Broken) => "found broken".to_string(),
+                Ok(_) => "a warm VM claimed".to_string(),
+            };
+            assert!(why.contains("none is starting for it"), "{why}");
+        });
+    }
+
+    /// Run `id` started on `vm`, on a daemon thread, as a visit's is: handed its VM, then
+    /// waited for until its VM holds (`await_holding`), then followed. The thread returns
+    /// what the wait for its hold found. Unix's, as its test's busy stand-in is.
+    #[cfg(unix)]
+    fn holding<'s>(
+        t: &In<'s, '_, Real>,
+        id: &str,
+        vm: Arc<shards_ipc::Child>,
+    ) -> (std::thread::ScopedJoinHandle<'s, Result<(), String>>, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        lock(&t.t.vms).push(vm.clone());
+        let ready = Ready {
+            vm,
+            socket: ours,
+            net: None,
+            mac: None,
+            pool: None,
+            records: None,
+            joined: None,
+            layer: None,
+            pooled: None,
+        };
+        let (daemon, threads, id) = (&t.t.daemon, t.threads, id.to_string());
+        let run = threads.spawn(move || {
+            let null = File::open(crate::os::NULL).unwrap();
+            let mut ready = Some(ready);
+            let inbox = daemon.start_run(
+                threads,
+                &id,
+                b"run",
+                &[null.as_fd()],
+                &[],
+                Keep {
+                    detached: None,
+                    options: crate::spec::Options::default(),
+                    health: None,
+                    published: Vec::new(),
+                    named: None,
+                    restarted: false,
+                    layer_pending: false,
+                    layer_over: None,
+                    layer_way: None,
+                    log_kept: DEFAULT_LOGS,
+                    log_compress: false,
+                    visit: false,
+                    egress: None,
+                    agentfile: None,
+                    nested: false,
+                    mac: None,
+                    link_local: Vec::new(),
+                    engine: None,
+                },
+                || ready.take().ok_or_else(|| "no warm VM".to_string()),
+            )?;
+            let held = daemon.await_holding(&id, &inbox);
+            daemon.follow(threads, id.clone(), inbox);
+            held
+        });
+        (run, theirs)
+    }
+
+    /// A visit's VM is waited for while it goes on with its start, judged by what the daemon
+    /// has seen of holds (D215's judge): one whose process runs a CPU and says STARTED 1.5 s
+    /// after its RUN is taken, teaching the daemon the slowest hold; past it, a stopped
+    /// stand-in (a sleep) is refused once it has run nothing for a whole such window, said
+    /// so, with how long. It was refused at READY_TIMEOUT's minute, judged each
+    /// READY_STALL's 10 s, picked (ROOT's (3), R03).
+    #[cfg(unix)]
+    #[test]
+    fn a_visits_vm_is_waited_for_while_it_starts_and_refused_once_still_past_the_slowest_hold() {
+        let late = Duration::from_millis(1500);
+        let t = Test::new("holding");
+        t.run(|t| {
+            let busy = shards_ipc::spawn(
+                Path::new("/bin/sh"),
+                &[OsStr::new("-c"), OsStr::new("while :; do :; done")],
+                &[],
+                false,
+            )
+            .unwrap();
+            let id = t.create("slow");
+            let (run, vm) = holding(t, &id, Arc::new(busy));
+            assert_eq!(heard(&vm).0, kind::RUN);
+            say(&vm, kind::TAKEN, &[]);
+            std::thread::sleep(late);
+            say(&vm, kind::STARTED, &[]);
+            assert_eq!(joined(run), Ok(()), "a slow hold with progress refused");
+            say(&vm, kind::DONE, &[0]);
+            until_ended(&t.t.daemon, &id);
+
+            let id = t.create("still");
+            let began = Instant::now();
+            let (run, vm) = holding(t, &id, Arc::new(sleeper(600)));
+            assert_eq!(heard(&vm).0, kind::RUN);
+            say(&vm, kind::TAKEN, &[]);
+            let refused = joined(run).unwrap_err();
+            assert!(began.elapsed() >= late, "{:?}", began.elapsed());
+            assert!(
+                refused.contains("ran nothing of its start for")
+                    && refused.contains("past the slowest hold seen"),
+                "{refused}"
+            );
+            say(&vm, kind::DONE, &[0]);
+            until_ended(&t.t.daemon, &id);
         });
     }
 
@@ -12853,7 +15053,7 @@ mod tests {
                 layer_pending: false,
                 layer_over: None,
                 layer_way: None,
-                log_files: DEFAULT_LOGS.files,
+                log_kept: DEFAULT_LOGS,
                 log_compress: false,
                 visit: false,
                 egress: None,
@@ -12905,7 +15105,7 @@ mod tests {
                 layer_pending: false,
                 layer_over: None,
                 layer_way: None,
-                log_files: DEFAULT_LOGS.files,
+                log_kept: DEFAULT_LOGS,
                 log_compress: false,
                 visit: false,
                 egress: None,
@@ -13030,9 +15230,11 @@ mod tests {
                 matches!(lock(&t.daemon.runs).get(&id), Some(RunState::Tracked(_))),
                 "freed as its run ended, not before"
             );
+            // A helper's end this home has heard, which a wait for one would take.
+            let slice = Duration::from_secs(10);
+            t.daemon.ends.heard(ends::End::Helper, slice).unwrap();
             let asked = Instant::now();
             assert_eq!(t.daemon.in_use(at, publish::TCP), publish::InUse::Host);
-            let slice = t.daemon.ends.slice(ends::End::Helper);
             assert!(asked.elapsed() < slice, "{:?}", asked.elapsed());
             say(&vm, kind::DONE, &[0]);
             t.until("the run did not end", |d| {
@@ -13096,6 +15298,9 @@ mod tests {
     fn a_network_process_is_ended_once_it_goes_on_no_more_and_the_ports_freed() {
         let t = Test::new("net-end");
         t.run(|t| {
+            // A helper's end this home has heard: its slice, W*.
+            let slice = Duration::from_millis(200);
+            t.daemon.ends.heard(ends::End::Helper, slice).unwrap();
             let (ready, _theirs) = t.warm_vm(None);
             let vm = ready.vm.clone();
             let net = sleeper(600);
@@ -13110,17 +15315,80 @@ mod tests {
             let ended = Instant::now();
             let _ = vm.kill(shards_ipc::signal::SIGKILL);
             t.until("the ports were not freed", |d| lock(&d.ports_held).is_empty());
-            let slice = t.daemon.ends.slice(ends::End::Helper);
             assert!(ended.elapsed() >= slice, "freed within its slice");
             assert!(reaped(net_pid), "the network process was not reaped");
-            let kept = std::fs::read_to_string(t.home.join(ends::RECORD)).unwrap_or_default();
+            let kept = ends::newest(&t.home.join(ends::RECORD)).unwrap_or_default();
             assert!(
-                !kept.lines().any(|l| l.starts_with("helper ") && l != "helper 0"),
+                kept.lines()
+                    .filter(|l| l.starts_with("helper "))
+                    .eq(["helper 200"]),
                 "an end the daemon made was kept as the host's: {kept}"
             );
             // The VM is reaped once its ports are freed (follow.rs), which the wait above
             // could see first.
             t.until("the VM was not reaped", |_| reaped(vm.id()));
+        });
+    }
+
+    /// Init's builtin asks (`STAT`, `TOP`, `STATS`, ...) are waited for while their
+    /// microVM's process runs, each builtin judged by its own record (D215's judge,
+    /// `Wait::WhileRuns`), and with no process to follow, until they end: never a fixed time.
+    /// Before, `TAKE_TIMEOUT`'s 10 s, picked (ROOT's (3), 2026-11-13).
+    #[test]
+    fn a_builtin_ask_is_waited_for_while_its_microvm_runs() {
+        let t = Test::new("answered");
+        t.run(|t| {
+            let stat = shards_abi::run::builtin::STAT;
+            let record = t.daemon.answers.builtins.get(usize::from(stat)).unwrap();
+            assert!(matches!(
+                t.daemon.answered_wait(Some(7), stat),
+                health::Wait::WhileRuns(7, judged) if std::ptr::eq(judged, record)
+            ));
+            assert!(matches!(t.daemon.answered_wait(None, stat), health::Wait::Ending));
+        });
+    }
+
+    /// A network process its VM waits on to close its run's ports (`UNPUBLISHING`) is
+    /// followed from then, as one whose VM has gone (D217's helper slice): ended once it has
+    /// gone on with nothing for a slice, its VM running still, which ends its VM's wait; and
+    /// one that answered (`PORTS_FREE`) is followed no more while its VM runs. Before, nothing
+    /// followed it while its VM ran, and the VM process gave up on it a second on, picked
+    /// (ROOT's (A), 2026-11-13).
+    #[test]
+    fn a_network_process_its_vm_waits_on_is_followed_until_it_answers() {
+        let t = Test::new("net-unpub");
+        t.run(|t| {
+            // A helper's end this home has heard: its slice, W*.
+            let slice = Duration::from_millis(200);
+            t.daemon.ends.heard(ends::End::Helper, slice).unwrap();
+            let (ready, _theirs) = t.warm_vm(None);
+            let vm = ready.vm.clone();
+            let net = sleeper(600);
+            let net_pid = net.id();
+            t.t.daemon.follow_vm(t.threads, vm.clone(), None, Some(net));
+            let asked = Instant::now();
+            t.daemon.follow_unpublish(vm.id());
+            t.until(
+                "a network process its VM waits on, doing nothing, was not ended",
+                |_| reaped(net_pid),
+            );
+            assert!(asked.elapsed() >= slice, "{:?}", asked.elapsed());
+            assert!(!reaped(vm.id()), "its VM ended with it");
+            let _ = vm.kill(shards_ipc::signal::SIGKILL);
+            // Its answer come: followed no more while its VM runs.
+            let (ready, _theirs) = t.warm_vm(None);
+            let vm = ready.vm.clone();
+            let net = sleeper(600);
+            let net_pid = net.id();
+            t.t.daemon.follow_vm(t.threads, vm.clone(), None, Some(net));
+            t.daemon.follow_unpublish(vm.id());
+            t.daemon.unpublished(vm.id());
+            std::thread::sleep(slice * 3);
+            assert!(!reaped(net_pid), "a network process that answered was ended");
+            let _ = vm.kill(shards_ipc::signal::SIGKILL);
+            t.until("the network process was not reaped after its VM", |_| {
+                reaped(net_pid)
+            });
         });
     }
 
@@ -13130,6 +15398,9 @@ mod tests {
     fn ports_are_freed_as_the_vm_ends_after_its_network_process() {
         let t = Test::new("net-first");
         t.run(|t| {
+            // A helper's end this home has heard, which a wait for one would take.
+            let slice = Duration::from_secs(10);
+            t.daemon.ends.heard(ends::End::Helper, slice).unwrap();
             let (ready, _theirs) = t.warm_vm(None);
             let vm = ready.vm.clone();
             let net = sleeper(600);
@@ -13147,7 +15418,6 @@ mod tests {
             let ended = Instant::now();
             let _ = vm.kill(shards_ipc::signal::SIGKILL);
             t.until("the ports were not freed", |d| lock(&d.ports_held).is_empty());
-            let slice = t.daemon.ends.slice(ends::End::Helper);
             assert!(ended.elapsed() < slice, "{:?}", ended.elapsed());
         });
     }
@@ -13159,6 +15429,12 @@ mod tests {
     fn a_vms_pid_is_kept_until_its_ports_are_freed() {
         let t = Test::new("vm-pid-kept");
         t.run(|t| {
+            // A helper's end this home has heard, past this test's own end of its network
+            // process, which a deadline then holds.
+            t.daemon
+                .ends
+                .heard(ends::End::Helper, Duration::from_secs(60))
+                .unwrap();
             let (ready, _theirs) = t.warm_vm(None);
             let vm = ready.vm.clone();
             let net = sleeper(600);
@@ -13194,6 +15470,11 @@ mod tests {
     fn a_vm_ended_before_it_is_followed_is_reaped() {
         let t = Test::new("vm-gone");
         t.run(|t| {
+            // A helper's end this home has heard, its network process's slice.
+            t.daemon
+                .ends
+                .heard(ends::End::Helper, Duration::from_millis(200))
+                .unwrap();
             // The loop, started and asleep, with nothing due.
             let (ready, _theirs) = t.warm_vm(None);
             t.t.daemon.follow_vm(t.threads, ready.vm.clone(), None, None);
@@ -13350,15 +15631,15 @@ mod tests {
             assert_eq!(heard(&vm).0, kind::RUN);
             say(&vm, kind::TAKEN, &[]);
             say(&vm, kind::STARTED, &[]);
-            client.set_read_timeout(Some(PATIENCE)).unwrap();
-            let warning = shards_ipc::recv(&client).unwrap().unwrap();
+            let heard = |what: &str| read(what, &client, shards_ipc::recv).unwrap().unwrap();
+            let warning = heard("the client was not warned");
             assert_eq!(warning.kind, kind::ERR);
             let said = String::from_utf8_lossy(&warning.payload).into_owned();
             assert_eq!(
                 said,
                 format!("WARNING: container {id}: its record is behind: a failing disk\n")
             );
-            let end = shards_ipc::recv(&client).unwrap().unwrap();
+            let end = heard("the client heard no end");
             assert_eq!((end.kind, end.payload.as_slice()), (kind::END, &[0u8][..]));
             t.daemon.disk.failing.store(false, Ordering::SeqCst);
             // The next command has it written again.
@@ -13503,17 +15784,10 @@ mod tests {
         let mut t = Test::new("refiller");
         t.daemon.target = 2;
         t.daemon.warm_max = 8;
-        // A VM that never says it is ready, written by a process of its own: a file this one
-        // held open to write, a child another test's thread forked meanwhile would hold
-        // until it execs, and the daemon's exec of it would fail with ETXTBSY until then.
+        // A VM that never says it is ready, written by a process of its own
+        // (`shards_testdir::program`): no exec of it fails ETXTBSY.
         let vm = t.home.join("vm");
-        let written = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(r#"printf '#!/bin/sh\nexec /bin/sleep 600\n' > "$0" && chmod 700 "$0""#)
-            .arg(&vm)
-            .status()
-            .unwrap();
-        assert!(written.success(), "{written}");
+        shards_testdir::program(&vm, "#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
         t.daemon.vm = vm;
         t.run(|t| {
             let dir = t.home.join("template");
@@ -13555,7 +15829,7 @@ mod tests {
                     layer_pending: false,
                     layer_over: None,
                     layer_way: None,
-                    log_files: DEFAULT_LOGS.files,
+                    log_kept: DEFAULT_LOGS,
                     log_compress: false,
                     visit: false,
                     egress: None,
@@ -13568,9 +15842,6 @@ mod tests {
                 let _inbox = t.daemon.register(ready, &id, keep);
                 say(&vm, kind::STARTED, &[]);
                 let (ours, theirs) = UnixStream::pair().unwrap();
-                // Before its far end may close: XNU sets no option on a socket closed both
-                // ways (sosetoptlock).
-                ours.set_read_timeout(Some(PATIENCE)).unwrap();
                 shards_ipc::send(&vm, kind::ENGINE_CONN, &5u64.to_be_bytes(), &[theirs.as_fd()]).unwrap();
                 t.daemon.settle();
                 // Held until the daemon has it: XNU's collector flushes a socket in flight
@@ -13587,8 +15858,11 @@ mod tests {
                         (&ours)
                             .write_all(b"GET /_ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
                             .unwrap();
-                        let mut answer = String::new();
-                        (&ours).read_to_string(&mut answer).unwrap();
+                        let answer = read("the engine did not answer", &ours, |mut ours| {
+                            let mut answer = String::new();
+                            ours.read_to_string(&mut answer).unwrap();
+                            answer
+                        });
                         assert!(
                             answer.starts_with("HTTP/1.1 200 OK\r\n") && answer.ends_with("\r\n\r\nOK"),
                             "{answer}"
@@ -13596,13 +15870,75 @@ mod tests {
                     }
                     None => {
                         assert!(arrived.is_empty());
-                        let mut answer = Vec::new();
-                        (&ours).read_to_end(&mut answer).unwrap();
+                        let answer = read("the connection was kept", &ours, |mut ours| {
+                            let mut answer = Vec::new();
+                            ours.read_to_end(&mut answer).unwrap();
+                            answer
+                        });
                         assert_eq!(answer, b"");
                     }
                 }
                 say(&vm, kind::DONE, &[0]);
             }
+        });
+    }
+
+    /// D254: a member's MCP connection its VM hands over unprompted is answered as taken
+    /// (M24); one its run gave no bridge is let go: its far end reads its end. One its VM did
+    /// not number as its own is let go unanswered.
+    #[cfg(unix)]
+    #[test]
+    fn a_members_mcp_connection_its_run_gave_no_bridge_is_answered_and_let_go() {
+        use std::io::Read as _;
+        let t = Test::new("mcp-accepted");
+        t.run(|t| {
+            let id = t.create("mcp");
+            let (ready, vm) = t.warm_vm(None);
+            let keep = Keep {
+                detached: None,
+                options: crate::spec::Options::default(),
+                health: None,
+                published: Vec::new(),
+                named: None,
+                restarted: false,
+                layer_pending: false,
+                layer_over: None,
+                layer_way: None,
+                log_kept: DEFAULT_LOGS,
+                log_compress: false,
+                visit: false,
+                egress: None,
+                agentfile: None,
+                nested: false,
+                mac: None,
+                link_local: Vec::new(),
+                engine: None,
+            };
+            let _inbox = t.daemon.register(ready, &id, keep);
+            say(&vm, kind::STARTED, &[]);
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let first = shards_abi::run::mcp::ACCEPTED_FIRST;
+            let owners = shards_ipc::Accepted {
+                number: first - 1,
+                member: 1,
+            };
+            say(&vm, kind::LANE_ACCEPTED, &owners.encode());
+            let accepted = shards_ipc::Accepted {
+                number: first,
+                member: 1,
+            };
+            shards_ipc::send(&vm, kind::LANE_ACCEPTED, &accepted.encode(), &[theirs.as_fd()]).unwrap();
+            t.daemon.settle();
+            // Held until the daemon has it (M24).
+            drop(theirs);
+            assert_eq!(heard(&vm), (kind::LANE_HELD, first.to_be_bytes().to_vec()));
+            let rest = read("the connection was kept", &ours, |mut ours| {
+                let mut rest = Vec::new();
+                ours.read_to_end(&mut rest).unwrap();
+                rest
+            });
+            assert_eq!(rest, b"");
+            say(&vm, kind::DONE, &[0]);
         });
     }
 
@@ -13628,7 +15964,9 @@ mod tests {
             // Its VM was told its stop as its run was tracked, its own signal in it, so that
             // it stops its run so should this daemon die (STOP_ORDER); then the stop's
             // signal. Linux numbers SIGUSR1 10.
-            let order = shards_ipc::recv(&vm).unwrap().unwrap();
+            let order = read("its VM was told nothing", &vm, shards_ipc::recv)
+                .unwrap()
+                .unwrap();
             let grace = u64::try_from(STOP_GRACE.as_millis()).unwrap();
             assert_eq!(
                 (order.kind, order.payload),
@@ -13934,10 +16272,7 @@ mod tests {
             t.daemon.set_aside(&removal).unwrap();
             std::thread::scope(|scope| {
                 let completing = scope.spawn(|| t.daemon.complete(&removal));
-                let deadline = Instant::now() + PATIENCE;
-                while !held.syncing.load(Ordering::SeqCst) && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                let _ = waited(|| held.syncing.load(Ordering::SeqCst));
                 let syncing = held.syncing.load(Ordering::SeqCst);
                 let seen = lock(&t.daemon.containers).get(&id).is_some();
                 let holder = lock(&t.daemon.containers)
@@ -14029,21 +16364,15 @@ mod tests {
             let held = &t.daemon.disk;
             held.holding_writes.store(true, Ordering::SeqCst);
             let id = t.reserve("racer");
-            let deadline = Instant::now() + PATIENCE;
-            while !held.writing.load(Ordering::SeqCst) {
-                assert!(Instant::now() < deadline, "the record was never written");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            until("the record was never written", || {
+                held.writing.load(Ordering::SeqCst)
+            });
             lock(&t.daemon.containers)
                 .update(&t.daemon.disk, &id, |c| c.exit_code = Some(5))
                 .unwrap();
             assert!(lock(&t.daemon.containers).get(&id).is_none(), "not seen yet");
             held.let_through();
-            let deadline = Instant::now() + PATIENCE;
-            while lock(&t.daemon.containers).get(&id).is_none() {
-                assert!(Instant::now() < deadline, "never seen");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            until("never seen", || lock(&t.daemon.containers).get(&id).is_some());
             assert_eq!(
                 lock(&t.daemon.containers).get(&id).and_then(|c| c.exit_code),
                 Some(5)
@@ -14116,7 +16445,6 @@ mod tests {
             let (free_first, first) = mpsc::channel();
             let (free_last, last) = mpsc::channel();
             let (ours, vm) = UnixStream::pair().unwrap();
-            vm.set_read_timeout(Some(PATIENCE)).unwrap();
             let dir = t.home.join("containers").join("made");
             std::fs::create_dir_all(&dir).unwrap();
             t.daemon.make_soon(files::Job::Hold(first));
@@ -14124,7 +16452,7 @@ mod tests {
                 id: "made".into(),
                 dir: dir.clone(),
                 seq: 1,
-                files: DEFAULT_LOGS.files,
+                kept: DEFAULT_LOGS,
                 pack: false,
                 socket: Arc::new(RunSocket::new(ours)),
             });
@@ -14142,11 +16470,55 @@ mod tests {
                 free_last.send(()).unwrap();
                 assert!(queued.is_err(), "done with jobs queued");
                 assert!(working.is_err(), "done with a job being made");
-                waited.recv_timeout(PATIENCE).unwrap();
+                receive("the jobs were not done", &waited);
             });
             assert!(dir.join(crate::segments::log_segment(1).0).is_file());
             let m = heard_whole(&vm);
             assert_eq!((m.kind, m.fds.len()), (kind::SEGMENT, 2));
+        });
+    }
+
+    /// Every run's log is held to its bound in bytes as it rotates, not by its count of segments
+    /// alone (runs-11 `LOG_SEGMENT`): a log continued under a retention whose segments are smaller
+    /// than those it holds (a history set smaller, or segments sized anew) lets go of its oldest
+    /// until its output is within `size × files`, each loss in `log.capped`. Red before: a run
+    /// with no members' logs was held by its count alone, which kept all three.
+    #[test]
+    fn a_runs_log_is_held_to_its_bound_whatever_its_segments() {
+        let t = Test::new("files-bound");
+        t.run(|t| {
+            t.t.daemon.start_files(t.threads);
+            let (ours, vm) = UnixStream::pair().unwrap();
+            let dir = t.home.join("containers").join("bound");
+            std::fs::create_dir_all(&dir).unwrap();
+            for seq in 1..=3 {
+                let (log, index) = crate::segments::log_segment(seq);
+                std::fs::write(dir.join(log), [b'x'; 64]).unwrap();
+                std::fs::write(dir.join(index), [0u8; 8]).unwrap();
+            }
+            t.daemon.make_soon(files::Job::Segment {
+                id: "bound".into(),
+                dir: dir.clone(),
+                seq: 4,
+                kept: LogRetention { size: 16, files: 8 },
+                pack: false,
+                socket: Arc::new(RunSocket::new(ours)),
+            });
+            let m = heard_whole(&vm);
+            assert_eq!((m.kind, m.fds.len()), (kind::SEGMENT, 2));
+            // Its loss is recorded once the segment has gone: both are waited for.
+            let capped = || managed::capped(&shards_vmm::platform::open_dir(&dir).unwrap()).unwrap();
+            t.until("the log was not held to its bound", |_| capped().segments > 0);
+            let capped = capped();
+            assert_eq!((capped.segments, capped.bytes), (1, 64));
+            let first = crate::segments::log_segment(1);
+            assert!(!dir.join(&first.0).exists() && !dir.join(&first.1).exists());
+            for seq in 2..=4 {
+                assert!(
+                    dir.join(crate::segments::log_segment(seq).1).exists(),
+                    "segment {seq}"
+                );
+            }
         });
     }
 
@@ -14199,7 +16571,9 @@ mod tests {
             assert!(ended, "its end waited for its files");
             assert_eq!(queued, 2, "its files made on the loop");
             joined(starting.run).unwrap();
-            let made = shards_ipc::recv(&vm).unwrap().unwrap();
+            let made = read("its VM was given no segment", &vm, shards_ipc::recv)
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 (made.kind, made.payload.as_slice(), made.fds.len()),
                 (kind::SEGMENT, &1u64.to_be_bytes()[..], 2)
@@ -14268,8 +16642,9 @@ mod tests {
     /// Runs `work` in a child of this process (fork(2)) whose file size limit is `limit`
     /// bytes (setrlimit(2), RLIMIT_FSIZE) and which ignores the SIGXFSZ a write past it
     /// raises, so that the write stops there with EFBIG. How the child ended: `work`'s value,
-    /// 255 where it could not be limited; None where a signal ended it. A child that has not
-    /// ended within [`PATIENCE`] is killed, and the test fails rather than hangs.
+    /// 255 where it could not be limited; None where a signal ended it. The wait for it
+    /// follows it as D215 follows a VM process, judged by its kind's record: one that stalls is
+    /// killed, and the test fails rather than hangs.
     #[cfg(unix)]
     fn under_limit(limit: usize, work: impl FnOnce() -> i32) -> Option<i32> {
         let limit = libc::rlim_t::try_from(limit).unwrap();
@@ -14297,22 +16672,43 @@ mod tests {
             unsafe { libc::_exit(code) };
         }
         assert!(pid > 0, "fork: {}", io::Error::last_os_error());
-        let deadline = Instant::now() + PATIENCE;
+        static CHILDREN: Record = Record::new();
+        let mut judge = Judge::begin(&CHILDREN);
+        let followed = shards_api::Followed::of_pid(u32::try_from(pid).unwrap()).unwrap();
+        let mut watch = followed.and_then(|f| shards_api::Watch::of(f).unwrap());
+        let from = watch.as_ref().map(shards_api::Watch::cpu);
         let mut status = 0;
         loop {
             // SAFETY: waitpid(2) of the child just made, its status written to a local.
             match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
-                0 if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
                 0 => {
-                    // SAFETY: kill(2), then waitpid(2), of the child just made, which has not
-                    // been waited for.
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                        libc::waitpid(pid, &mut status, 0);
+                    let now = Instant::now();
+                    let found = match &mut watch {
+                        Some(watch) if judge.due().is_some_and(|due| due <= now) => watch.look().unwrap(),
+                        _ => Found::Progressed,
+                    };
+                    if let Err(stall) = judge.found(found) {
+                        // SAFETY: kill(2), then waitpid(2), of the child just made, which has
+                        // not been waited for.
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                            libc::waitpid(pid, &mut status, 0);
+                        }
+                        panic!(
+                            "its child stalled: it ran nothing for {:?}, {:?} into the wait, past \
+                             the slowest child's {:?} (D215)",
+                            stall.over(),
+                            stall.waited(),
+                            stall.slowest()
+                        );
                     }
-                    panic!("its child did not end within {PATIENCE:?}");
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 ended => {
+                    // Its CPU as last looked at, before its end: what it ran by then.
+                    if let (Some(watch), Some(from)) = (&watch, from) {
+                        judge.answered(watch.cpu().saturating_sub(from));
+                    }
                     assert_eq!(ended, pid, "waitpid: {}", io::Error::last_os_error());
                     return libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
                 }
@@ -14394,7 +16790,9 @@ mod tests {
             Some(format!("{regs:x?}"))
         }
         fn process(b: &[u8]) -> Option<String> {
-            shards_ipc::Named::parse(std::str::from_utf8(b).ok()?).map(|n| format!("{n:?}"))
+            shards_ipc::Named::parse(std::str::from_utf8(b).ok()?)
+                .ok()
+                .map(|n| format!("{n:?}"))
         }
         // As context.rs reads it for an invitation.
         fn address(b: &[u8]) -> Option<String> {
@@ -14629,7 +17027,7 @@ mod tests {
                     .map(|_| {
                         s.spawn(|| {
                             start.wait();
-                            t.daemon.engine_id()
+                            crate::networks::engine_id(&t.daemon.home)
                         })
                     })
                     .collect();
@@ -14842,9 +17240,10 @@ mod tests {
             let exec = heard_whole(&vm);
             assert_eq!(exec.kind, kind::EXEC_RUN);
             let conn = stream_of(exec.fds.first().unwrap());
-            // Its VM process, a sleep, runs nothing.
-            conn.set_read_timeout(Some(TAKE_TIMEOUT + PATIENCE)).unwrap();
-            let told = shards_ipc::recv(&conn).map(|m| m.map(|m| (m.kind, m.payload)));
+            // Its VM process, a sleep, runs nothing: judged past the daemon's own TAKE_TIMEOUT.
+            let told = read_past("the stalled exec was told nothing", TAKE_TIMEOUT, &conn, |c| {
+                shards_ipc::recv(c).map(|m| m.map(|m| (m.kind, m.payload)))
+            });
             // Ended as an exec told SIGKILL ends; or, told nothing, let go. Its stdio let go of
             // with its end, as a VM lets an exec's go.
             say(&conn, kind::EXIT, &[137]);
@@ -15141,6 +17540,162 @@ mod tests {
             assert_eq!(err, format!("shards: {refused}\n"));
             let (status, _, err) = t.ask(&[shards_ipc::MOVE_STEP, "key", "web", &new]);
             assert_eq!(status, 0, "a lease under its own key: {err}");
+        });
+    }
+
+    /// Every path under `root`, relative to it, but those under `skip`.
+    fn tree_of(root: &Path, skip: &Path) -> std::collections::BTreeSet<PathBuf> {
+        let mut all = std::collections::BTreeSet::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.starts_with(skip) {
+                    continue;
+                }
+                if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                    dirs.push(path.clone());
+                }
+                all.insert(path.strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+        all
+    }
+
+    /// The names a move gives that the machine moved to makes paths of its home of (its
+    /// ID, its snapshot's, its volumes', the volumes its record mounts) are each refused
+    /// typed where they are not one name of their kind (migrate-11), as its `ready` step
+    /// reads its plan, as its `import` step reads its stream's, before anything of the
+    /// stream is put anywhere, and as `adopt` reads its record; and nothing is made or
+    /// renamed in the home. Until this, `import` joined each to the home's paths as given:
+    /// an ID of `../x` made `containers/../x` of it, and a mounted volume's name its guest's
+    /// share of a host directory outside the home's volumes.
+    #[test]
+    fn a_moves_names_that_are_no_one_name_are_refused_typed_and_reach_nothing() {
+        let t = Test::new("move-names");
+        t.run(|t| {
+            let src = t.create("src");
+            let plan = |id: &str, snapshot: &str, volumes: &[&str]| -> moves::Plan {
+                serde_json::from_value(serde_json::json!({
+                    "id": id,
+                    "name": "web",
+                    "image": "127.0.0.1:9/absent",
+                    "image_id": format!("sha256:{}", "b".repeat(64)),
+                    "arch": std::env::consts::ARCH,
+                    "format": shards_vmm::snapshot::FORMAT,
+                    "hypervisor": shards_vmm::hv::BACKEND,
+                    "snapshot": snapshot,
+                    "home": "/h",
+                    "files": [],
+                    "volumes": volumes,
+                    "binds": [],
+                }))
+                .unwrap()
+            };
+            let refused_as = |(status, out, err): (u8, String, String), field: moves::Named, value: &str| {
+                assert_eq!(status, 1, "{out}{err}");
+                let refused: moves::Refused = serde_json::from_str(out.trim())
+                    .unwrap_or_else(|e| panic!("not refused typed ({e}): {out}{err}"));
+                assert_eq!(
+                    refused,
+                    moves::Refused::NotAName {
+                        name: "web".into(),
+                        field,
+                        value: value.into(),
+                    }
+                );
+                assert_eq!(err, format!("shards: {refused}\n"));
+            };
+            let ours = crate::containers::new_id().unwrap();
+            let ready = |p: &moves::Plan| {
+                t.ask(&[shards_ipc::MOVE_STEP, "ready", &serde_json::to_string(p).unwrap()])
+            };
+            refused_as(ready(&plan("../x", "s1", &[])), moves::Named::Id, "../x");
+            refused_as(ready(&plan(&ours, "../s1", &[])), moves::Named::Snapshot, "../s1");
+            refused_as(
+                ready(&plan(&ours, "s1", &["../../x"])),
+                moves::Named::Volume,
+                "../../x",
+            );
+
+            // A move's stream: its plan, then the microVM directory `whole` names, if any,
+            // written from a directory of the test's own; imported as the mover's client
+            // sends it.
+            let streams = shards_testdir::TempDir::new("mv-names").unwrap();
+            let n = std::cell::Cell::new(0);
+            let import = |p: &moves::Plan, whole: Option<&Path>| {
+                let mut bytes = Vec::new();
+                let mut w = moves::Writer::new(&mut bytes, p).unwrap();
+                if let Some(dir) = whole {
+                    w.tree(dir, &format!("containers/{}", p.id), &|_| false).unwrap();
+                    w.finish().unwrap();
+                }
+                n.set(n.get() + 1);
+                let at = streams.join(format!("s{}", n.get()));
+                std::fs::write(&at, &bytes).unwrap();
+                let asker = commands::Asker {
+                    files: vec![OwnedFd::from(File::open(&at).unwrap())],
+                    ..asker()
+                };
+                ask_as(&t.daemon, &[shards_ipc::MOVE_STEP, "import"], &asker)
+            };
+            let private = t.home.join(PRIVATE);
+            let before = tree_of(&t.home, &private);
+            let unchanged = || {
+                assert_eq!(tree_of(&t.home, &private), before, "the home changed");
+                assert!(!t.home.join("x").exists() && !t.home.parent().unwrap().join("x").exists());
+                if private.exists() {
+                    assert_eq!(
+                        std::fs::read_dir(&private).unwrap().count(),
+                        0,
+                        "a move's staging stayed"
+                    );
+                }
+            };
+            // Its plan's names, before its entries are read: each stream ends past its plan,
+            // where an import that read on would fail instead.
+            refused_as(import(&plan("../x", "s1", &[]), None), moves::Named::Id, "../x");
+            unchanged();
+            refused_as(
+                import(&plan(&ours, "../../x", &[]), None),
+                moves::Named::Snapshot,
+                "../../x",
+            );
+            unchanged();
+            refused_as(
+                import(&plan(&ours, "s1", &["../../x"]), None),
+                moves::Named::Volume,
+                "../../x",
+            );
+            unchanged();
+
+            // A volume its record mounts, which its guest is shared a host directory of:
+            // its record's, which `adopt` reads from the stream whole.
+            let mut record = t.record(&src).unwrap();
+            record.id.clone_from(&ours);
+            record.name = "web".into();
+            record.mounts = vec![crate::volumes::MountPoint {
+                kind: "volume".into(),
+                name: "../../x".into(),
+                destination: "/data".into(),
+                rw: true,
+                ..Default::default()
+            }];
+            let sent = streams.join("c");
+            std::fs::create_dir(&sent).unwrap();
+            std::fs::write(sent.join("config.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+            refused_as(
+                import(&plan(&ours, "s1", &[]), Some(&sent)),
+                moves::Named::Volume,
+                "../../x",
+            );
+            unchanged();
+            assert!(t.record(&ours).is_none());
+
+            // The machine it ran on, told it moved or came back: its snapshot's name is
+            // joined to its directory there.
+            let (status, out, err) = t.ask(&[shards_ipc::MOVE_STEP, "done", "web", "../x", "back"]);
+            refused_as((status, out, err), moves::Named::Snapshot, "../x");
         });
     }
 }

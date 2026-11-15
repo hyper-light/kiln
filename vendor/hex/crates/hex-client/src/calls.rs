@@ -29,7 +29,7 @@ use hex_api::{
     BoxId, BoxInfo, BoxSpec, Class, Exit, Proc, Program, Refusal, Runtime, Signal, Stdio, Usage,
 };
 use hex_core::netns;
-use hex_core::patience::Patience;
+use hex_core::patience::{Patience, Piece};
 use hex_core::schedule::waits::WaitKind;
 use hex_core::wire::{self, Answer, Call, Header, Limits, Received, Request, Streams};
 use hex_wait::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -46,7 +46,8 @@ pub type Ended = Box<dyn FnOnce(Result<Exit, Refusal>) + Send>;
 /// The kinds whose answer no box's class times, in their table's order ([`Transport::answers`]): a hello, a list, the
 /// network namespaces' counts; then the scheduler's operations in [`WaitKind`] order up to the person's release; then
 /// a native physical report and the backing lifecycle's three; then the release (joint plan step 13); then the node's
-/// links (docs/design/hex-quic.md Q12). Waits only append.
+/// links (docs/design/hex-quic.md Q12); then a connection's lessors (docs/design/credential-grants.md C7). Waits only
+/// append.
 #[repr(usize)]
 enum PlainKind {
     Hello,
@@ -62,7 +63,7 @@ impl PlainKind {
 const SCHEDULED: usize = WaitKind::Forget as usize;
 
 /// The plain kinds' waits, scheduler's among them ([`PlainKind`]).
-pub const KINDS: usize = PlainKind::COUNT + SCHEDULED + 6;
+pub const KINDS: usize = PlainKind::COUNT + SCHEDULED + 8;
 
 /// AC-T7.4.1: the kinds whose answer a box's class times, in their tables' order ([`Transport::class_answers`]): its
 /// class's runtime does their work, a microVM's boot, its guest's relay, its teardown, orders of magnitude from a
@@ -84,10 +85,16 @@ pub enum BoxKind {
     Capacity,
     /// A member of a Shards image box handed over (`Call::Member`, joint plan step 17).
     Member,
+    /// A start followed to its end (`Call::Started`; ROOT, 2026-11-14): the rest of a boot its start answered Pending
+    /// for, timed apart from a start's own answer.
+    Started,
+    /// A member's next MCP connection (`Call::Mcp`; goal 2's item 3): answered as its harness connects, which may be
+    /// never, so past W* its wait follows the connection.
+    Mcp,
 }
 
 /// The box kinds' waits for one class ([`BoxKind`]).
-pub const BOX_KINDS: usize = BoxKind::Member as usize + 1;
+pub const BOX_KINDS: usize = BoxKind::Mcp as usize + 1;
 
 /// The classes a box is of ([`Class`]), a table of box kinds' waits for each, in [`by_class`]'s order.
 pub const CLASSES: usize = 4;
@@ -112,8 +119,8 @@ macro_rules! class_wait {
 }
 
 /// One class's box-kind waits, in [`BoxKind`]'s order, each named `<prefix>.<kind>.<class>` (AC-T7.4.1: one census
-/// name per (kind, class)); `measuring` makes every one of them so. A member's take (joint plan step 17) has no
-/// census row for any class, so it measures in every table.
+/// name per (kind, class)); `measuring` makes every one of them so. A member's take (joint plan step 17) and a start
+/// followed to its end have no census row for any class, so they measure in every table.
 macro_rules! class_waits {
     ($prefix:literal, $class:literal, measuring) => {
         $crate::calls::class_waits!(
@@ -144,6 +151,8 @@ macro_rules! class_waits {
             $crate::calls::class_wait!(concat!($prefix, ".run.", $class), $run),
             $crate::calls::class_wait!(concat!($prefix, ".capacity.", $class), $capacity),
             $crate::calls::class_wait!(concat!($prefix, ".member.", $class), measuring),
+            $crate::calls::class_wait!(concat!($prefix, ".started.", $class), measuring),
+            $crate::calls::class_wait!(concat!($prefix, ".mcp.", $class), measuring),
         ]
     };
 }
@@ -178,6 +187,8 @@ pub(crate) fn kind_of<'a>(waits: &'a [Patience; KINDS], request: &Request) -> Op
             Call::ReleaseBacking(_) => PlainKind::COUNT.checked_add(SCHEDULED)?.checked_add(2)?,
             Call::BackingUsage(_) => PlainKind::COUNT.checked_add(SCHEDULED)?.checked_add(3)?,
             Call::Links => PlainKind::COUNT.checked_add(SCHEDULED)?.checked_add(5)?,
+            Call::Lessors => PlainKind::COUNT.checked_add(SCHEDULED)?.checked_add(6)?,
+            Call::Reserved(_) => PlainKind::COUNT.checked_add(SCHEDULED)?.checked_add(7)?,
             Call::Create(_)
             | Call::Start(_)
             | Call::Exec { .. }
@@ -189,9 +200,18 @@ pub(crate) fn kind_of<'a>(waits: &'a [Patience; KINDS], request: &Request) -> Op
             | Call::ExecStreams { .. }
             | Call::Run { .. }
             | Call::Capacity(_)
-            | Call::Member { .. } => return None,
+            | Call::Member { .. }
+            | Call::MemberSignal { .. }
+            | Call::Started(_)
+            | Call::Mcp { .. } => return None,
         },
-        Request::Release | Request::Taken | Request::StreamsReady => return None,
+        Request::Release
+        | Request::Taken
+        | Request::StreamsReady
+        | Request::Lessor(_)
+        | Request::Leased { .. }
+        | Request::Captured { .. }
+        | Request::Refreshed { .. } => return None,
     };
     waits.get(n)
 }
@@ -222,6 +242,9 @@ fn box_kind_of(request: &Request) -> Option<(BoxKind, Timed<'_>)> {
         Call::Run { spec, .. } => (BoxKind::Run, Timed::Class(spec.class.class())),
         Call::Capacity(class) => (BoxKind::Capacity, Timed::Class(*class)),
         Call::Member { id, .. } => (BoxKind::Member, Timed::Box(id)),
+        Call::MemberSignal { id, .. } => (BoxKind::Signal, Timed::Box(id)),
+        Call::Started(id) => (BoxKind::Started, Timed::Box(id)),
+        Call::Mcp { id, .. } => (BoxKind::Mcp, Timed::Box(id)),
         Call::List
         | Call::Netns
         | Call::Schedule(_)
@@ -229,7 +252,9 @@ fn box_kind_of(request: &Request) -> Option<(BoxKind, Timed<'_>)> {
         | Call::InitializeBacking(_)
         | Call::ReleaseBacking(_)
         | Call::BackingUsage(_)
-        | Call::Links => return None,
+        | Call::Links
+        | Call::Lessors
+        | Call::Reserved(_) => return None,
     })
 }
 
@@ -309,7 +334,8 @@ impl Known {
             (
                 Call::Exec { id: of, .. }
                 | Call::ExecStreams { id: of, .. }
-                | Call::Member { id: of, .. },
+                | Call::Member { id: of, .. }
+                | Call::Mcp { id: of, .. },
                 Answer::Started { .. } | Answer::Given { .. },
             ) => {
                 if let Some(class) = self.boxes.get(of).copied() {
@@ -348,6 +374,57 @@ pub enum Sent {
     Refused(Refusal),
 }
 
+/// What the client armed, for its tests (ROOT's seam of 2026-11-14, AC-T7.4.1): each check of an operation's deadline
+/// by a step or a wait, and each wait it arms, with the absolute instant it took (none: a wait with no deadline), in the
+/// thread that armed it. A test reads back which instants an operation's waits took, so whether progress re-armed one
+/// is read from what was armed, never from a clock.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Armed {
+    /// The step or wait that armed it.
+    pub(crate) what: &'static str,
+    pub(crate) at: Option<Instant>,
+    /// A learned wait's bound under the caller's (decision 9): its end is a run-out to tell, never the operation's.
+    pub(crate) learned: bool,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// This thread's [`Armed`] log, a repeat of its last entry folded into it.
+    static ARMED: std::cell::RefCell<Vec<Armed>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn arm(what: &'static str, at: Option<Instant>, learned: bool) {
+    let armed = Armed { what, at, learned };
+    ARMED.with(|log| {
+        let mut log = log.borrow_mut();
+        if log.last() != Some(&armed) {
+            log.push(armed);
+        }
+    });
+}
+
+/// What this thread has armed since it last asked, taken.
+#[cfg(test)]
+pub(crate) fn armed() -> Vec<Armed> {
+    ARMED.with(|log| log.take())
+}
+
+/// Whether `armed`, an operation's armed log, holds each of `waits` armed at `at` and every entry that isn't a learned
+/// wait's at `at` too: the one deadline the operation took, by value, whatever it armed besides.
+#[cfg(test)]
+pub(crate) fn armed_at(armed: &[Armed], waits: &[&str], at: Option<Instant>) -> bool {
+    waits.iter().all(|what| {
+        armed
+            .iter()
+            .any(|armed| armed.what == *what && !armed.learned && armed.at == at)
+    }) && armed
+        .iter()
+        .filter(|armed| !armed.learned)
+        .all(|armed| armed.at == at)
+}
+
 /// One operation's absolute reply/setup deadline. The caller's authority and the learned answer
 /// wait stay distinct: exhausting caller authority is not a slower-answer calibration sample.
 #[derive(Clone, Copy, Debug)]
@@ -361,21 +438,12 @@ enum ReplyBound {
     Caller(Duration),
     CallerAbsolute,
     Learned(Duration),
-    /// A guest link's own bound on a connection's setup, where its caller gave no deadline.
-    Link(Duration),
 }
 
 impl ReplyDeadline {
     pub(crate) fn caller(budget: Option<Duration>) -> Result<Option<Self>, Refusal> {
         budget
             .map(|budget| Self::from_now(budget, ReplyBound::Caller(budget), "client reply budget"))
-            .transpose()
-    }
-
-    /// A link's own setup bound from now ([`crate::guest::Link::setup_bound`]): none where it has none.
-    pub(crate) fn link(bound: Option<Duration>) -> Result<Option<Self>, Refusal> {
-        bound
-            .map(|bound| Self::from_now(bound, ReplyBound::Link(bound), "guest link setup bound"))
             .transpose()
     }
 
@@ -413,6 +481,12 @@ impl ReplyDeadline {
 
     /// Remaining authority for protocol setup, or a refusal naming the bound that expired.
     pub fn remaining(self, op: &'static str) -> Result<Duration, Refusal> {
+        #[cfg(test)]
+        arm(
+            op,
+            Some(self.at),
+            matches!(self.source, ReplyBound::Learned(_)),
+        );
         let left = self.at.saturating_duration_since(Instant::now());
         if left.is_zero() {
             Err(self.refusal(op))
@@ -460,24 +534,30 @@ impl ReplyDeadline {
                     "none came in {wait:?}, the slowest answer to a call of its kind this process has seen"
                 )
             }
-            ReplyBound::Link(bound) => {
-                format!("the guest link's own setup bound of {bound:?} expired")
-            }
         };
         Refusal::Os { op, why }
     }
 
-    fn ran_out(self, waits: Option<&Patience>) {
+    /// Its learned wait passed with no answer to call `call`: a run-out to `waits`, naming the call's connection.
+    fn ran_out(self, waits: Option<&Patience>, call: u64) {
         if let (ReplyBound::Learned(wait), Some(waits)) = (self.source, waits) {
-            waits.ran_out(wait);
+            waits.ran_out(
+                wait,
+                wait,
+                &[
+                    Piece::Kind("the node agent's answer to call "),
+                    Piece::Number(call),
+                    Piece::Kind(", by its connection"),
+                ],
+            );
         }
     }
 
     /// A call's `budget` passed with no answer, and with it every learned wait before it: the call's own where its
     /// caller gave no deadline, else `learned`, the one under the caller's not yet told, each a run-out to `waits`.
-    fn ended(budget: Option<Self>, learned: Option<Self>, waits: Option<&Patience>) {
+    fn ended(budget: Option<Self>, learned: Option<Self>, waits: Option<&Patience>, call: u64) {
         for bound in [budget, learned].into_iter().flatten() {
-            bound.ran_out(waits);
+            bound.ran_out(waits, call);
         }
     }
 }
@@ -541,6 +621,12 @@ pub(crate) fn protocol_ready(
             return Ok(());
         }
     }
+}
+
+/// Waits until `conn` has something to read or has ended, at most `wait` (none: until it does), for a read that follows
+/// its connection rather than a deadline (decision 9). An interrupted wait finds nothing.
+pub(crate) fn readable(conn: Handle<'_>, wait: Option<Duration>) -> Result<(), Refusal> {
+    poll_for(conn, PollFlags::IN, None, wait).map(drop)
 }
 
 fn poll_for(
@@ -658,6 +744,11 @@ pub trait Transport: Send + Sync + 'static {
     /// `take`, a message cut across reads kept in `reading` for the next. Whether anything came; the connection's end,
     /// or a message `take` refuses, is the error, saying why.
     fn recv(&self, reading: &mut Self::Reading, take: &mut Take<'_>) -> Result<bool, Refusal>;
+    /// A message as its connection carries it, before it is framed: one that carries a secret sealed where the
+    /// connection seals them (a node over QUIC, docs/design/hex-quic.md Q13), any other as it is.
+    fn seal(&self, message: Vec<u8>) -> Result<Vec<u8>, Refusal> {
+        Ok(message)
+    }
     /// The bytes a message goes as: itself where the transport keeps messages whole, framed where it is a stream.
     fn frame(message: Vec<u8>) -> Result<Vec<u8>, Refusal> {
         Ok(message)
@@ -777,7 +868,7 @@ fn wait_refused(why: hex_wait::Failed) -> Refusal {
 /// The longest one wait on a connection can be: `i32::MAX` milliseconds, the most poll(2) takes where it has no
 /// `ppoll` (macOS; Windows' `WSAPoll`), its timeout a C `int` of milliseconds. A longer wait waits this long at a
 /// time, its caller waiting again until its own deadline.
-const MOST_ONE_WAIT: Duration = Duration::from_millis(2_147_483_647);
+pub(crate) const MOST_ONE_WAIT: Duration = Duration::from_millis(2_147_483_647);
 /// [`MOST_ONE_WAIT`] as poll(2) takes it.
 const MOST_ONE_WAIT_SPEC: rustix::event::Timespec = rustix::event::Timespec {
     tv_sec: 2_147_483,
@@ -822,6 +913,10 @@ struct Whole<'a>(&'a SendLock);
 
 impl SendLock {
     fn lock(&self, deadline: Option<Instant>) -> Result<Option<Whole<'_>>, Refusal> {
+        #[cfg(test)]
+        if deadline.is_some() {
+            arm("the send lock", deadline, false);
+        }
         let mut busy = self.busy.lock().map_err(poisoned)?;
         while *busy {
             busy = match deadline {
@@ -898,6 +993,9 @@ struct State {
     /// said, each peer holding one at least (docs/design/hex-quic.md Q12). None before the hello, which every call
     /// follows.
     links_bound: Option<usize>,
+    /// Its lessors, once it leases the credentials of the boxes it creates ([`Core::with_lessors`]): what the node asks
+    /// of them is handed there.
+    leasing: Option<Arc<leasing::Leasing>>,
 }
 
 impl State {
@@ -1022,6 +1120,26 @@ impl<T: Transport> Shared<T> {
         answer: Answer,
         fds: Vec<hex_api::End>,
     ) -> Result<(), Refusal> {
+        // What the node asks of this connection's lessors, or tells them, sent unasked (docs/design/credential-grants.md
+        // C7): handed to them, in order. A node asking a connection that leases nothing breaks the wire's promise.
+        if matches!(
+            answer,
+            Answer::LessorAsk(_)
+                | Answer::LeaseAsk { .. }
+                | Answer::LeaseGiven(_)
+                | Answer::LessorEnded
+                | Answer::CaptureAsk { .. }
+                | Answer::RefreshAsk { .. }
+                | Answer::SignInRevoked { .. }
+        ) {
+            let leasing = self.state()?.leasing.clone();
+            return match leasing {
+                Some(leasing) => leasing.hear(header.id, answer),
+                None => Err(Refusal::Broken(
+                    "the node agent asked a lease of a connection that leases nothing".to_owned(),
+                )),
+            };
+        }
         if let Answer::Given { .. } = &answer {
             // Owed before its taker wakes below, so the word goes ahead of anything its caller sends after.
             self.owe(header.id, &Request::Taken)?;
@@ -1200,6 +1318,7 @@ impl<T: Transport> Shared<T> {
     fn owe(&self, exec: u64, request: &Request) -> Result<(), Refusal> {
         let word = wire::request(exec, request, wire::MAX_MESSAGE)
             .map_err(Refusal::from)
+            .and_then(|message| self.transport.seal(message))
             .and_then(T::frame)?;
         let mut owed = self.owed.lock().map_err(poisoned)?;
         if owed.words.len() >= owed.bound {
@@ -1209,6 +1328,31 @@ impl<T: Transport> Shared<T> {
             });
         }
         owed.words.push_back(word);
+        Ok(())
+    }
+
+    /// Owes the node `request`, its header's id `id`, ahead of every later request ([`Owed`]), and sends what is owed now
+    /// where it can: a lessor's answer to the node's ask (docs/design/credential-grants.md C7), which may carry a
+    /// lease's value, its bytes wiped once they have gone ([`Shared::send_owed`]). Past the words the agent's budgets
+    /// let be owed, refused.
+    pub(crate) fn owe_word(&self, id: u64, request: &Request) -> Result<(), Refusal> {
+        let word = wire::request(id, request, wire::MAX_MESSAGE)
+            .map_err(Refusal::from)
+            .and_then(|message| self.transport.seal(message))
+            .and_then(T::frame)?;
+        {
+            let mut owed = self.owed.lock().map_err(poisoned)?;
+            if owed.words.len() >= owed.bound {
+                let mut word = word;
+                hex_api::lease::wipe(&mut word);
+                return Err(Refusal::Exhausted {
+                    what: "words owed to the node agent, its programs and its lease asks",
+                    bound: owed.bound,
+                });
+            }
+            owed.words.push_back(word);
+        }
+        self.send_owed_now();
         Ok(())
     }
 
@@ -1231,6 +1375,7 @@ impl<T: Transport> Shared<T> {
             let Some(word) = word else {
                 return Ok(true);
             };
+            let mut word = word;
             let mut at = 0;
             let sent = self.transport.try_send(&word, &mut at, NONE);
             if !matches!(sent, Ok(true)) {
@@ -1241,6 +1386,8 @@ impl<T: Transport> Shared<T> {
                     .words
                     .push_front(rest);
             }
+            // A word may carry a lease's value (docs/design/credential-grants.md C7): its bytes here are wiped as they go.
+            hex_api::lease::wipe(&mut word);
             match sent {
                 Ok(true) => {}
                 Ok(false) => return Ok(false),
@@ -1307,6 +1454,12 @@ impl<T: Transport> Shared<T> {
             }
             state.closed = Some(why);
             state.reading = false;
+        }
+        // What was owed goes nowhere now: its bytes, which may carry a lease's value, wiped.
+        if let Ok(mut owed) = self.owed.lock() {
+            for mut word in std::mem::take(&mut owed.words) {
+                hex_api::lease::wipe(&mut word);
+            }
         }
         for run in due {
             run();
@@ -1468,6 +1621,8 @@ impl<'a, T: Transport> Caller<'a, T> {
         deadline: Option<Instant>,
         patience: Option<Duration>,
     ) -> Result<(), Sent> {
+        #[cfg(test)]
+        arm("sending", deadline, false);
         let shared = self.shared;
         let no_room = || Refusal::Os {
             op: "sending to the node agent",
@@ -1666,12 +1821,17 @@ impl<'a, T: Transport> Caller<'a, T> {
         deadline: Option<Instant>,
         waits: Option<&Patience>,
     ) -> Option<Result<Answer, Refusal>> {
+        // The answer's wait, under its caller's deadline, a learned bound inside it where its kind has one.
+        #[cfg(test)]
+        arm("the answer", deadline, false);
         if let Some(bound) = *learned {
+            #[cfg(test)]
+            arm("the answer", Some(bound.at), true);
             if let Some(answer) = self.wait(Some(bound.at)) {
                 return Some(answer);
             }
             *learned = None;
-            bound.ran_out(waits);
+            bound.ran_out(waits, self.id);
         }
         self.wait(deadline)
     }
@@ -1752,6 +1912,7 @@ impl<T: Transport> Conn<T> {
         let mut caller = Caller::new(shared, program)?;
         let bytes = wire::request(caller.id, request, bound)
             .map_err(Refusal::from)
+            .and_then(|message| shared.transport.seal(message))
             .and_then(T::frame)?;
         // Legacy transports retain their existing setup path. An explicit cap requires an adapter
         // that consumes the caller's deadline, the call's, before any request is sent.
@@ -1764,7 +1925,7 @@ impl<T: Transport> Conn<T> {
             Err(Sent::Full(r)) => {
                 pending = caller.wait(Some(Instant::now()));
                 if pending.is_none() {
-                    ReplyDeadline::ended(budget, learned.take(), waits);
+                    ReplyDeadline::ended(budget, learned.take(), waits, caller.id);
                     return Err(budget.map_or(r, |d| d.refusal("sending to the node agent")));
                 }
             }
@@ -1815,6 +1976,7 @@ impl<T: Transport> Conn<T> {
                     shared.state()?.given.insert(caller.id, given);
                     let bytes = wire::request(caller.id, &Request::StreamsReady, bound)
                         .map_err(Refusal::from)
+                        .and_then(|message| shared.transport.seal(message))
                         .and_then(T::frame)?;
                     if let Err(why) = caller.send(&bytes, NONE, deadline, patience) {
                         pending = caller.wait(Some(Instant::now()));
@@ -1825,7 +1987,7 @@ impl<T: Transport> Conn<T> {
                         shared.send_owed_now();
                         return Err(match why {
                             Sent::Full(why) => {
-                                ReplyDeadline::ended(budget, learned.take(), waits);
+                                ReplyDeadline::ended(budget, learned.take(), waits, caller.id);
                                 budget.map_or(why, |d| d.refusal("accepting offered streams"))
                             }
                             Sent::Refused(why) => why,
@@ -1855,7 +2017,7 @@ impl<T: Transport> Conn<T> {
                         shared.owe(caller.id, &Request::Release)?;
                         shared.send_owed_now();
                     }
-                    ReplyDeadline::ended(budget, learned.take(), waits);
+                    ReplyDeadline::ended(budget, learned.take(), waits, caller.id);
                     return Err(budget.map_or_else(
                         || {
                             Refusal::Broken(
@@ -1892,7 +2054,7 @@ impl<T: Transport> Conn<T> {
         if cap.is_some_and(|cap| cap.remaining("releasing a program").is_err()) {
             return;
         }
-        let Ok(framed) = T::frame(bytes.to_vec()) else {
+        let Ok(framed) = shared.transport.seal(bytes.to_vec()).and_then(T::frame) else {
             return;
         };
         let Ok(Some(whole)) = shared.sending.lock(budget.map(ReplyDeadline::at)) else {
@@ -1945,6 +2107,8 @@ pub struct Deferred<T: Transport> {
     bytes: Vec<u8>,
     reserved: bool,
 }
+
+mod leasing;
 
 #[cfg(test)]
 mod tests;
@@ -2126,6 +2290,7 @@ impl<T: Transport> Core<T> {
             }
             Call::Run { spec, program, .. } => Launch::Run(spec, program),
             Call::Member { id, member, .. } => Launch::Member(id, member),
+            Call::Mcp { id, member, .. } => Launch::Mcp(id, member),
             call => {
                 return self.begun(&Request::Call(call), |_| Ok(NONE), then, None, deadline);
             }
@@ -2164,7 +2329,11 @@ impl<T: Transport> Core<T> {
     pub fn defer(&self, call: Call, then: Then, ended: Ended) -> Result<Deferred<T>, Refusal> {
         let program = matches!(
             call,
-            Call::Exec { .. } | Call::ExecStreams { .. } | Call::Run { .. } | Call::Member { .. }
+            Call::Exec { .. }
+                | Call::ExecStreams { .. }
+                | Call::Run { .. }
+                | Call::Member { .. }
+                | Call::Mcp { .. }
         )
         .then(|| Watching::Then(ended));
         self.deferred(&Request::Call(call), then, program)
@@ -2230,6 +2399,7 @@ impl<T: Transport> Core<T> {
         };
         deferred.bytes = wire::request(id, request, self.limits.message_bytes)
             .map_err(Refusal::from)
+            .and_then(|message| self.conn.shared.transport.seal(message))
             .and_then(T::frame)?;
         Ok(deferred)
     }
@@ -2308,6 +2478,46 @@ impl<T: Transport> Core<T> {
             Answer::Refused(r) => Err(r),
             other => Err(unexpected("links", &other)),
         }
+    }
+
+    /// This connection leases the credentials of the Shards image VMs it creates from now on, through `lessors`, its
+    /// orchestrator's (joint plan step 33; docs/design/credential-grants.md C7): the node asks them over this connection
+    /// for each run's lessor and each lease, and gives each lease and each run's end back, which a thread of the
+    /// client's own hears from now on, reading the connection for every call and program too (the event form's loop).
+    /// Every lease handed over and not given back is given back as the connection ends, by either side. Refused by type
+    /// where the node leases through no connection's lessors.
+    pub fn with_lessors(self, lessors: Arc<dyn hex_api::lease::Lessors>) -> Result<Self, Refusal> {
+        match self
+            .call(&Request::Call(Call::Lessors), |_| Ok(NONE), None)?
+            .1
+        {
+            Answer::Done => {}
+            Answer::Refused(why) => return Err(why),
+            other => return Err(unexpected("lessors", &other)),
+        }
+        let shared = SharedOwner::clone(&self.conn.shared);
+        let leasing = leasing::Leasing::new(lessors);
+        {
+            // Each ask the node may have waiting on this connection, its in-flight limit, is owed one answer.
+            let mut owed = shared.owed.lock().map_err(poisoned)?;
+            owed.bound = owed.bound.saturating_add(self.limits.in_flight);
+        }
+        shared.state()?.leasing = Some(Arc::clone(&leasing));
+        shared.read_by_loop()?;
+        std::thread::Builder::new()
+            .name("hex-client-lessors".to_owned())
+            .spawn(move || {
+                loop {
+                    let read = shared.turn(None);
+                    leasing.act(&shared);
+                    if read.is_err() {
+                        break;
+                    }
+                }
+                leasing.end();
+            })
+            .map_err(|e| Refusal::os("starting a connection's lessors' thread", e))?;
+        Ok(self)
     }
 
     /// The agent's network namespace counts within the caller's original absolute deadline, its kind's learned wait
@@ -2636,9 +2846,13 @@ impl<T: Transport> Core<T> {
                         };
                         Err(match killed {
                             Ok(()) => why,
-                            Err(_) => Refusal::Lifecycle {
+                            Err(kill) => Refusal::Lifecycle {
                                 id,
                                 cause: hex_api::LifecycleCause::Uncertain,
+                                why: Some(format!(
+                                    "its exec's streams couldn't be set up ({why}), and its kill couldn't confirm its \
+                                     end ({kill}), so the program may still run"
+                                )),
                             },
                         })
                     }
@@ -2664,6 +2878,8 @@ enum Launch {
     Exec(BoxId, Program),
     Run(Box<BoxSpec>, Program),
     Member(BoxId, hex_api::Member),
+    /// A member's next MCP connection (goal 2's item 3).
+    Mcp(BoxId, hex_api::Member),
 }
 
 impl Launch {
@@ -2693,6 +2909,12 @@ impl Launch {
                 streams,
                 ask,
             },
+            Self::Mcp(id, member) => Call::Mcp {
+                id,
+                member,
+                streams,
+                ask,
+            },
         }
     }
 
@@ -2700,7 +2922,7 @@ impl Launch {
     fn fits(&self) -> Result<(), Refusal> {
         match self {
             Self::Exec(_, program) | Self::Run(_, program) => program.fits(&WIRE_EXEC_LIMIT),
-            Self::Member(..) => Ok(()),
+            Self::Member(..) | Self::Mcp(..) => Ok(()),
         }
     }
 
@@ -2710,13 +2932,14 @@ impl Launch {
             Self::Exec(..) => "exec",
             Self::Run(..) => "run",
             Self::Member(..) => "member",
+            Self::Mcp(..) => "mcp",
         }
     }
 
     /// The box it starts its program in.
     fn id(&self) -> &BoxId {
         match self {
-            Self::Exec(id, _) | Self::Member(id, _) => id,
+            Self::Exec(id, _) | Self::Member(id, _) | Self::Mcp(id, _) => id,
             Self::Run(spec, _) => &spec.id,
         }
     }
@@ -2741,6 +2964,13 @@ pub(crate) fn unexpected(call: &str, answer: &Answer) -> Refusal {
         Answer::PhysicalReport(_) => "a native physical report",
         Answer::BackingOffer(_) => "a native backing receipt",
         Answer::Links { .. } => "the node's links",
+        Answer::LessorAsk(_) => "a lessor's ask",
+        Answer::LeaseAsk { .. } => "a lease's ask",
+        Answer::LeaseGiven(_) => "a lease given back",
+        Answer::LessorEnded => "a run's end of its leases",
+        Answer::CaptureAsk { .. } => "a sign-in's capture",
+        Answer::RefreshAsk { .. } => "a sign-in's refresh",
+        Answer::SignInRevoked { .. } => "a sign-in revoked",
     };
     Refusal::Broken(format!("the node agent answered a {call} with {kind}"))
 }
@@ -2908,6 +3138,7 @@ impl<T: Transport> Runtime for Core<T> {
             _ => Err(Refusal::Backing {
                 key,
                 cause: hex_api::LifecycleCause::Uncertain,
+                why: Some("its node answered its initialization with another reply".to_owned()),
             }),
         }
     }
@@ -2922,6 +3153,7 @@ impl<T: Transport> Runtime for Core<T> {
             _ => Err(Refusal::Backing {
                 key,
                 cause: hex_api::LifecycleCause::Uncertain,
+                why: Some("its node answered its release with another reply".to_owned()),
             }),
         }
     }
@@ -2988,8 +3220,43 @@ impl<T: Transport> Runtime for Core<T> {
         )
     }
 
+    /// Goal 2's item 2: a member's own signal, carried by the node's wire's appended call (`Call::MemberSignal`).
+    fn signal_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        signal: Signal,
+    ) -> Result<(), Refusal> {
+        self.done(
+            Call::MemberSignal {
+                id: id.clone(),
+                member: member.clone(),
+                signal,
+            },
+            "member signal",
+        )
+    }
+
     fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
         self.info(Call::Inspect(id.clone()), "inspect")
+    }
+
+    /// [`Call::Mcp`] (goal 2's item 3): a member's next MCP connection, its stdin and stdout asked for as a member's
+    /// streams are (an MCP connection has no stderr), answered once its harness connects; its end comes later as a
+    /// program's, and its kill rides [`Call::Kill`] as any program's does.
+    fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        let both = hex_api::Ask {
+            stdin: true,
+            stdout: true,
+            stderr: false,
+        };
+        self.spawn(
+            Launch::Mcp(id.clone(), member.clone()),
+            Stdio {
+                ask: both,
+                ..Stdio::null()
+            },
+        )
     }
 
     /// [`Call::Member`] (joint plan step 17): the member's stdin, stdout and stderr asked for as an exec's streams
@@ -3046,6 +3313,25 @@ impl<T: Transport> Runtime for Core<T> {
         })
     }
 
+    /// Refused, typed, before anything is sent (the review's B-6): the node's wire carries no host use, so a delete here
+    /// can't answer its VM's final use, and the trait's plain delete answering none would read as a run that never
+    /// started, which kiln charges nothing for.
+    fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<hex_api::HostUse>, Refusal> {
+        Err(Refusal::Invalid {
+            what: "delete_with_host_use",
+            why: format!(
+                "box {id}: the node's wire carries no host-use call yet, so a delete can't answer its VM's final use; \
+                 delete it with delete, or in the node's own process"
+            ),
+        })
+    }
+
+    /// The node follows the box's start to its end (`Call::Started`, appended; ROOT, 2026-11-14), so a start answered
+    /// Pending is waited for on the fact, never by looks.
+    fn started(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        self.info(Call::Started(id.clone()), "started")
+    }
+
     fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
         match self.plain(Call::Usage(id.clone()))? {
             Answer::Usage(usage) => Ok(usage),
@@ -3064,6 +3350,12 @@ impl<T: Transport> Runtime for Core<T> {
 
     fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
         self.done(Call::Delete(id.clone()), "delete")
+    }
+
+    /// The machine's capacity view's word to its node (`Call::Reserved`, appended; the review's A-10), which the node's
+    /// charge learner takes off its fleet's budget.
+    fn reserved(&self, word: hex_api::Reserved) -> Result<(), Refusal> {
+        self.done(Call::Reserved(word), "reserved")
     }
 }
 

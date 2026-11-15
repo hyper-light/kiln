@@ -3,9 +3,10 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{OnceLock, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hyper_quic::{ClientConfig, StreamId};
 use sha2::{Digest as _, Sha256};
@@ -14,6 +15,60 @@ use shards_remote::frame::{self, Tag};
 use shards_remote::identity::{Fingerprint, Identity};
 use shards_remote::managed::{self, Admitted, Reason, RunId, Scope};
 use shards_remote::net::{Close, Command, ConnKey, Driver, DriverLimits, Handler, Io, Read, Sender};
+
+/// What an observer's or an input writer's wait is held to.
+#[derive(Clone, Copy)]
+pub(super) enum Until<'a> {
+    /// Its caller's own deadline: the coordinator's campaigns' explicit phase deadlines, their
+    /// caller's input, and harness_bringup's none at all.
+    At(Instant),
+    /// Judged as the tests' waits are (D209): on the daemon of a home and its microVMs
+    /// (`common::Patience::of`), its kind its caller's call site; its driver given no deadline.
+    Judged(&'a Path),
+    /// No bound: what it waits for is owed by an event of this process's own, its driver's
+    /// end once the test cancels or stops it (the fixture's own unit tests, with no daemon).
+    Ordered,
+}
+
+impl From<Instant> for Until<'static> {
+    fn from(at: Instant) -> Self {
+        Until::At(at)
+    }
+}
+
+impl Until<'_> {
+    /// Its driver's deadline: its caller's, or none where its waits are judged.
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Until::At(at) => Some(at),
+            Until::Judged(_) | Until::Ordered => None,
+        }
+    }
+}
+
+/// `rx`'s next item as `until` holds its wait: within its caller's deadline, or while its
+/// home's daemon and microVMs go on, a timeout once its judge refuses it (its account on
+/// stderr, `Patience::holds`).
+#[track_caller]
+fn receive<T>(rx: &mpsc::Receiver<T>, until: Until<'_>) -> Result<T, mpsc::RecvTimeoutError> {
+    match until {
+        Until::At(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
+        Until::Ordered => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        Until::Judged(home) => {
+            let mut patience = crate::common::Patience::of(home);
+            loop {
+                match rx.recv_timeout(patience.next_look()) {
+                    Ok(item) => {
+                        patience.done();
+                        return Ok(item);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) if patience.holds() => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+}
 
 pub(super) enum Event {
     Record(u64, Vec<u8>),
@@ -51,6 +106,9 @@ pub(super) enum Ask {
     Ack(u64),
     AckAndFinish(u64),
     Cancel,
+    /// Panics its driver's thread, for a test of how a lost stream says its driver ended.
+    #[cfg(test)]
+    Panic,
     #[cfg(test)]
     RawControl {
         bytes: Vec<u8>,
@@ -71,7 +129,7 @@ struct Client {
     inbound: Vec<u8>,
     finish: bool,
     done: bool,
-    deadline: Instant,
+    deadline: Option<Instant>,
     window: usize,
 }
 
@@ -159,7 +217,7 @@ impl Handler for Client {
             }
             self.inbound.extend_from_slice(&bytes);
             loop {
-                let (tag, bytes) = match frame::take(&mut self.inbound) {
+                let (tag, bytes) = match frame::take(&mut self.inbound, |_| Some(frame::Most::Holdable)) {
                     Ok(Some(record)) => record,
                     Ok(None) => break,
                     Err(error) => {
@@ -199,10 +257,14 @@ impl Handler for Client {
 
     fn command(&mut self, io: &mut Io<'_>, command: Ask) {
         match command {
-            Ask::Connect(address) => match io.connect(address, self.config.take().unwrap()) {
-                Ok(conn) => self.conn = Some(conn),
-                Err(error) => self.fail(error.to_string()),
+            // An observer connects once: its client's config goes with its first Connect.
+            Ask::Connect(address) => match self.config.take().map(|config| io.connect(address, config)) {
+                Some(Ok(conn)) => self.conn = Some(conn),
+                Some(Err(error)) => self.fail(error.to_string()),
+                None => self.fail("an observer connects once".into()),
             },
+            #[cfg(test)]
+            Ask::Panic => panic!("an observer's driver asked to panic"),
             Ask::AckAndFinish(offset) => {
                 self.pending.extend_from_slice(&managed::consumed(offset));
                 self.finish = true;
@@ -243,22 +305,34 @@ impl Handler for Client {
         self.done
     }
     fn due(&self) -> Option<Instant> {
-        Some(self.deadline)
+        self.deadline
     }
     fn timeout(&mut self, _: &mut Io<'_>, _: Instant) {
         self.fail("observer deadline".into());
     }
 }
 
-/// A socket an owner observer opened, by the inode `/proc/self/fd` names it by, with the
-/// descriptor number it had. A process-wide descriptor count also moves with every test
-/// running beside it; an inode is this observer's socket alone.
-#[cfg(target_os = "linux")]
+/// A socket an owner observer opened, by the kernel's identity for it, with the descriptor
+/// number it had. A process-wide descriptor count also moves with every test running beside
+/// it; this identity is this observer's socket alone, which no other socket takes while
+/// the kernel holds either: Linux's inode, by which /proc/self/fd and /proc/net/udp name it;
+/// macOS's protocol control block generation, libproc's `insi_gencnt` (sys/proc_info.h,
+/// "generation count of this instance"), which xnu's in_pcballoc takes from its protocol's
+/// PCB table as it raises that table's count, so that no two of the table's PCBs share one.
+/// Windows names a socket by nothing a test can read again ([`UNIDENTIFIED`]).
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Held {
     pub(super) fd: i32,
-    pub(super) inode: u64,
+    pub(super) id: u64,
 }
+
+/// Why a Windows fixture leaves its observers' sockets' return unverified.
+#[cfg(windows)]
+pub(super) const UNIDENTIFIED: &str = "Windows names a socket by nothing a test can read again: no inode or \
+     protocol control block generation, a handle value is reused once closed, and a handle \
+     WSADuplicateSocket made holds the socket under another; its address alone, which another socket \
+     may take once it is free, would read a socket taken again as one not returned";
 
 /// This process's sockets: each inode with the descriptors that hold it.
 #[cfg(target_os = "linux")]
@@ -304,46 +378,348 @@ fn udp_sockets() -> Vec<(std::net::SocketAddrV4, u64)> {
         .collect()
 }
 
+/// This process's IPv4 UDP sockets: each one's generation with the descriptors that hold it.
+#[cfg(target_os = "macos")]
+fn sockets() -> BTreeMap<u64, Vec<i32>> {
+    let mut held = BTreeMap::<u64, Vec<i32>>::new();
+    let own = libc::pid_t::try_from(std::process::id()).unwrap();
+    let ours = libproc::udp(own)
+        .unwrap_or_else(|| panic!("libproc on this process: {}", std::io::Error::last_os_error()));
+    for (_, id, fd) in ours {
+        held.entry(id).or_default().push(fd);
+    }
+    held
+}
+
+/// The IPv4 UDP sockets of every process this user may look at, each local address with its
+/// generation: as /proc/net/udp lists a socket that a descriptor of any process holds, one
+/// another process took (a child that inherited it) among them. A process of another user,
+/// which libproc tells nothing of, holds none of this one's sockets unless passed it.
+#[cfg(target_os = "macos")]
+fn udp_sockets() -> Vec<(std::net::SocketAddrV4, u64)> {
+    // Once a socket, as /proc/net/udp lists it, however many descriptors hold it.
+    let listed: std::collections::BTreeSet<_> = libproc::processes()
+        .into_iter()
+        .filter_map(libproc::udp)
+        .flatten()
+        .map(|(address, id, _)| (address, id))
+        .collect();
+    listed.into_iter().collect()
+}
+
+/// What libproc (/usr/lib/libproc.dylib) says of a process's descriptors and sockets, laid out
+/// as the macOS SDK's sys/proc_info.h lays out its replies.
+#[cfg(target_os = "macos")]
+mod libproc {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    // sys/proc_info.h's numbers: the flavor asking for a socket's state, the kind an internet
+    // socket's union holds, and an IPv4 PCB's flag.
+    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+    const SOCKINFO_IN: libc::c_int = 1;
+    const INI_IPV4: u8 = 0x1;
+
+    #[repr(C)]
+    struct ProcFileinfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+
+    #[repr(C)]
+    struct SockbufInfo {
+        sbi_cc: u32,
+        sbi_hiwat: u32,
+        sbi_mbcnt: u32,
+        sbi_mbmax: u32,
+        sbi_lowat: u32,
+        sbi_flags: i16,
+        sbi_timeo: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct In4in6Addr {
+        i46a_pad32: [u32; 3],
+        i46a_addr4: libc::in_addr,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union InAddr {
+        ina_46: In4in6Addr,
+        ina_6: libc::in6_addr,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InV6 {
+        in6_hlim: u8,
+        in6_cksum: libc::c_int,
+        in6_ifindex: libc::c_ushort,
+        in6_hops: libc::c_short,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InSockinfo {
+        insi_fport: libc::c_int,
+        insi_lport: libc::c_int,
+        insi_gencnt: u64,
+        insi_flags: u32,
+        insi_flow: u32,
+        insi_vflag: u8,
+        insi_ip_ttl: u8,
+        rfu_1: u32,
+        insi_faddr: InAddr,
+        insi_laddr: InAddr,
+        insi_v4: u8,
+        insi_v6: InV6,
+    }
+
+    /// `un_sockinfo`, the union's largest member, which sizes it: two opaque handles and two
+    /// `SOCK_MAXADDRLEN` (255) addresses.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct UnSockinfo {
+        unsi_conn_so: u64,
+        unsi_conn_pcb: u64,
+        unsi_addr: [u8; 255],
+        unsi_caddr: [u8; 255],
+    }
+
+    #[repr(C)]
+    union SoiProto {
+        pri_in: InSockinfo,
+        pri_un: UnSockinfo,
+    }
+
+    #[repr(C)]
+    struct SocketInfo {
+        soi_stat: libc::vinfo_stat,
+        soi_so: u64,
+        soi_pcb: u64,
+        soi_type: libc::c_int,
+        soi_protocol: libc::c_int,
+        soi_family: libc::c_int,
+        soi_options: libc::c_short,
+        soi_linger: libc::c_short,
+        soi_state: libc::c_short,
+        soi_qlen: libc::c_short,
+        soi_incqlen: libc::c_short,
+        soi_qlimit: libc::c_short,
+        soi_timeo: libc::c_short,
+        soi_error: libc::c_ushort,
+        soi_oobmark: u32,
+        soi_rcv: SockbufInfo,
+        soi_snd: SockbufInfo,
+        soi_kind: libc::c_int,
+        rfu_1: u32,
+        soi_proto: SoiProto,
+    }
+
+    /// PROC_PIDFDSOCKETINFO's reply, `struct socket_fdinfo`.
+    #[repr(C)]
+    struct SocketFdinfo {
+        pfi: ProcFileinfo,
+        psi: SocketInfo,
+    }
+
+    /// Every process now (proc_listallpids(3)), asked again while its reply fills what it was
+    /// given, which processes started meanwhile may have cut short. Each ask has a slot more
+    /// than the count said, so that a reply which fills them all says the count grew.
+    pub(super) fn processes() -> Vec<libc::pid_t> {
+        loop {
+            // SAFETY: no buffer: the call says how many processes there are.
+            let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+            let count = usize::try_from(count)
+                .ok()
+                .filter(|count| *count > 0)
+                .unwrap_or_else(|| panic!("proc_listallpids: {}", std::io::Error::last_os_error()));
+            let mut pids: Vec<libc::pid_t> = vec![0; count.checked_add(1).unwrap()];
+            let room = libc::c_int::try_from(size_of_val(pids.as_slice())).unwrap();
+            // SAFETY: a buffer of `room` bytes for the call to fill.
+            let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), room) };
+            let filled = usize::try_from(filled).unwrap();
+            if filled < pids.len() {
+                pids.truncate(filled);
+                return pids;
+            }
+        }
+    }
+
+    /// `pid`'s descriptors (PROC_PIDLISTFDS), asked again while the reply fills what it was
+    /// given, as its table may have grown since the call said its size, with a slot more than
+    /// that, as [`processes`] asks; `None` where libproc tells nothing of it (another user's
+    /// process, or one ended meanwhile).
+    fn descriptors(pid: libc::pid_t) -> Option<Vec<libc::proc_fdinfo>> {
+        loop {
+            // SAFETY: no buffer: the call says how many bytes the process's table needs.
+            let room = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+            let room = usize::try_from(room).ok().filter(|room| *room > 0)?;
+            let entry = size_of::<libc::proc_fdinfo>();
+            let mut fds = Vec::new();
+            fds.resize_with(room.div_ceil(entry).checked_add(1).unwrap(), || {
+                libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                }
+            });
+            let given = libc::c_int::try_from(size_of_val(fds.as_slice())).ok()?;
+            // SAFETY: a buffer of `given` bytes for the call to fill.
+            let filled =
+                unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), given) };
+            let filled = usize::try_from(filled).ok().filter(|filled| *filled > 0)? / entry;
+            if filled < fds.len() {
+                fds.truncate(filled);
+                return Some(fds);
+            }
+        }
+    }
+
+    /// `pid`'s IPv4 UDP sockets: each one's local address and generation, with the descriptor
+    /// holding it; `None` where libproc tells nothing of its descriptors.
+    pub(super) fn udp(pid: libc::pid_t) -> Option<Vec<(SocketAddrV4, u64, i32)>> {
+        let size = libc::c_int::try_from(size_of::<SocketFdinfo>()).unwrap();
+        let mut found = Vec::new();
+        let socket_kind = u32::try_from(libc::PROX_FDTYPE_SOCKET).unwrap();
+        for fd in descriptors(pid)?
+            .iter()
+            .filter(|fd| fd.proc_fdtype == socket_kind)
+        {
+            // SAFETY: socket_fdinfo is plain C data, for which all zeroes is a value.
+            let mut info: SocketFdinfo = unsafe { std::mem::zeroed() };
+            // SAFETY: a buffer of `size` bytes for the call to fill.
+            let filled = unsafe {
+                libc::proc_pidfdinfo(
+                    pid,
+                    fd.proc_fd,
+                    PROC_PIDFDSOCKETINFO,
+                    (&raw mut info).cast(),
+                    size,
+                )
+            };
+            // A descriptor closed since the listing, or a process ended, tells nothing.
+            if filled <= 0 {
+                continue;
+            }
+            // The kernel fills its whole struct: one of another size than this one's is laid
+            // out otherwise, and none of its fields is read.
+            assert_eq!(
+                filled, size,
+                "socket_fdinfo's size as sys/proc_info.h lays it out"
+            );
+            let socket = &info.psi;
+            if socket.soi_family != libc::AF_INET
+                || socket.soi_protocol != libc::IPPROTO_UDP
+                || socket.soi_kind != SOCKINFO_IN
+            {
+                continue;
+            }
+            // SAFETY: SOCKINFO_IN says the union holds an in_sockinfo.
+            let inet = unsafe { socket.soi_proto.pri_in };
+            if inet.insi_vflag & INI_IPV4 == 0 {
+                continue;
+            }
+            // SAFETY: an IPv4 PCB's local address is the union's 4-in-6 form; in_pcb.h's port
+            // and address in network order.
+            let ip = Ipv4Addr::from(u32::from_be(unsafe { inet.insi_laddr.ina_46 }.i46a_addr4.s_addr));
+            let port = u16::from_be(u16::try_from(inet.insi_lport).unwrap());
+            found.push((SocketAddrV4::new(ip, port), inet.insi_gencnt, fd.proc_fd));
+        }
+        Some(found)
+    }
+}
+
 /// An observer's two sockets (crates/remote/src/net.rs, bind_with_limits), each by its own
 /// address, whatever other tests of the process open meanwhile: the endpoint's, and its
 /// waker's, which every clone of its sender holds again. Told apart by what changed as its
 /// sender was cloned, another test's sockets made in that window were taken for its waker
 /// (CI's arm64 musl run 43347049202: three such).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn observer_sockets(endpoint: SocketAddr, sender: &Sender<Ask>) -> Vec<Held> {
     let waker = sender.waker_addr().unwrap();
     let bound = |address: SocketAddr| {
         let SocketAddr::V4(at) = address else {
             panic!("an IPv4 observer socket: {address}");
         };
-        let found: Vec<_> = udp_sockets()
-            .into_iter()
-            .filter(|(local, _)| *local == at)
-            .map(|(_, inode)| inode)
-            .collect();
-        let [inode] = found[..] else {
+        let found = bound(at);
+        let [id] = found[..] else {
             panic!("one UDP socket at the observer's {at}: {found:?}");
         };
-        inode
+        id
     };
     let (endpoint, waker) = (bound(endpoint), bound(waker));
     let fds = sockets();
-    let held = |inode: u64| Held {
-        fd: fds[&inode][0],
-        inode,
-    };
+    let held = |id: u64| Held { fd: fds[&id][0], id };
     vec![held(endpoint), held(waker)]
+}
+
+/// This process's UDP sockets bound at `at`, each by its inode, once: getsockname(2) of a
+/// descriptor of each ([`sockets`]). Not from /proc/net/udp, which is no snapshot: its reader
+/// takes the table as little as each read(2) asks, resuming by position, so a socket inserted
+/// or removed meanwhile has another listed twice or not at all (CI's aarch64 musl run
+/// 43513425954: `[114149, 114149]`). /proc/self/fd is listed by descriptor number, which a
+/// descriptor held throughout keeps.
+#[cfg(target_os = "linux")]
+pub(super) fn bound(at: std::net::SocketAddrV4) -> Vec<u64> {
+    let local = |fd: i32| -> Option<std::net::SocketAddrV4> {
+        let mut kind: libc::c_int = 0;
+        let mut size = libc::socklen_t::try_from(size_of::<libc::c_int>()).ok()?;
+        // SAFETY: getsockopt(2) writes at most `size` bytes into `kind`, which holds them.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&raw mut kind).cast(),
+                &raw mut size,
+            )
+        };
+        if got != 0 || kind != libc::SOCK_DGRAM {
+            return None;
+        }
+        // SAFETY: sockaddr_in is plain data, all zeroes a valid value.
+        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut size = libc::socklen_t::try_from(size_of::<libc::sockaddr_in>()).ok()?;
+        // SAFETY: getsockname(2) writes at most `size` bytes into `address`, which holds them.
+        let got = unsafe { libc::getsockname(fd, (&raw mut address).cast(), &raw mut size) };
+        if got != 0 || libc::c_int::from(address.sin_family) != libc::AF_INET {
+            return None;
+        }
+        Some(std::net::SocketAddrV4::new(
+            u32::from_be(address.sin_addr.s_addr).into(),
+            u16::from_be(address.sin_port),
+        ))
+    };
+    sockets()
+        .into_iter()
+        .filter(|(_, fds)| fds.iter().any(|&fd| local(fd) == Some(at)))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// The UDP sockets bound at `at`, each by its generation, once ([`udp_sockets`]).
+#[cfg(target_os = "macos")]
+pub(super) fn bound(at: std::net::SocketAddrV4) -> Vec<u64> {
+    udp_sockets()
+        .into_iter()
+        .filter(|(local, _)| *local == at)
+        .map(|(_, id)| id)
+        .collect()
 }
 
 /// Which of `held` are not yet returned: still behind a descriptor of this process, or
 /// still a socket the kernel lists.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn not_returned(held: &[Held]) -> Vec<Held> {
     let ours = sockets();
-    let listed: Vec<_> = udp_sockets().into_iter().map(|(_, inode)| inode).collect();
+    let listed: Vec<_> = udp_sockets().into_iter().map(|(_, id)| id).collect();
     held.iter()
         .copied()
-        .filter(|socket| ours.contains_key(&socket.inode) || listed.contains(&socket.inode))
+        .filter(|socket| ours.contains_key(&socket.id) || listed.contains(&socket.id))
         .collect()
 }
 
@@ -352,7 +728,7 @@ pub(super) struct Observer {
     pub(super) sender: Sender<Ask>,
     pub(super) events: mpsc::Receiver<Event>,
     /// Its driver's QUIC socket and its waker's.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(super) held: Vec<Held>,
     ended: mpsc::Receiver<Result<(), shards_remote::Error>>,
     outcome: OnceLock<Result<(), String>>,
@@ -360,12 +736,12 @@ pub(super) struct Observer {
 }
 
 impl Observer {
-    pub(super) fn start(
+    pub(super) fn start<'a>(
         owner: &Identity,
         metadata: &Metadata,
         scope: Scope,
         address: SocketAddr,
-        until: Instant,
+        until: impl Into<Until<'a>>,
     ) -> Self {
         let window = metadata.capacity.checked_add(managed::DATA_HEAD).unwrap();
         let admitted = Admitted {
@@ -388,7 +764,7 @@ impl Observer {
             inbound: Vec::new(),
             finish: false,
             done: false,
-            deadline: until,
+            deadline: Into::<Until<'_>>::into(until).deadline(),
             window,
         };
         let (mut driver, sender) = Driver::bind_bounded(
@@ -402,7 +778,7 @@ impl Observer {
             },
         )
         .unwrap();
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let held = observer_sockets(driver.local().unwrap(), &sender);
         let (finished, ended) = mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -416,7 +792,7 @@ impl Observer {
             scope,
             sender,
             events,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             held,
             ended,
             outcome: OnceLock::new(),
@@ -424,14 +800,12 @@ impl Observer {
         }
     }
 
-    pub(super) fn next(&self, until: Instant) -> Event {
-        match self
-            .events
-            .recv_timeout(until.saturating_duration_since(Instant::now()))
-        {
+    #[track_caller]
+    pub(super) fn next<'a>(&self, until: impl Into<Until<'a>>) -> Event {
+        match receive(&self.events, until.into()) {
             Ok(event) => event,
             // The handler holds the event sender and drops with the driver once it ends.
-            Err(mpsc::RecvTimeoutError::Disconnected) => match self.outcome(Duration::ZERO) {
+            Err(mpsc::RecvTimeoutError::Disconnected) => match self.outcome(Until::At(Instant::now())) {
                 Some(Ok(())) => panic!("observer events ended before deadline: driver ended Ok"),
                 Some(Err(error)) => panic!("observer events ended before deadline: driver {error}"),
                 None => panic!("observer events ended before deadline: driver result not yet sent"),
@@ -440,10 +814,12 @@ impl Observer {
         }
     }
 
-    /// How the driver ended, once it has, taken from its thread within `within` and kept.
-    fn outcome(&self, within: Duration) -> Option<&Result<(), String>> {
+    /// How the driver ended, once it has, taken from its thread as `until` holds its wait and
+    /// kept.
+    #[track_caller]
+    fn outcome(&self, until: Until<'_>) -> Option<&Result<(), String>> {
         if self.outcome.get().is_none() {
-            let ended = match self.ended.recv_timeout(within) {
+            let ended = match receive(&self.ended, until) {
                 Ok(result) => result.map_err(|e| format!("failed: {e}")),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     Err("ended without a result: its thread panicked".into())
@@ -455,7 +831,9 @@ impl Observer {
         self.outcome.get()
     }
 
-    pub(super) fn exact(&self, label: &str, expected: &[u8], until: Instant) -> (u64, u64) {
+    #[track_caller]
+    pub(super) fn exact<'a>(&self, label: &str, expected: &[u8], until: impl Into<Until<'a>>) -> (u64, u64) {
+        let until: Until<'_> = until.into();
         let mut bytes = Vec::new();
         let mut wire = 0u64;
         let mut state = StreamState::New;
@@ -494,7 +872,8 @@ impl Observer {
         panic!("nonempty fixture output required");
     }
 
-    pub(super) fn refused(&self, expected: Option<Reason>, until: Instant) {
+    #[track_caller]
+    pub(super) fn refused<'a>(&self, expected: Option<Reason>, until: impl Into<Until<'a>>) {
         match self.next(until) {
             Event::Lost(code) => assert_eq!(code, expected.map(|reason| u64::from(reason as u32))),
             Event::Record(offset, bytes) => {
@@ -505,7 +884,8 @@ impl Observer {
         }
     }
 
-    pub(super) fn ack_and_finish(&self, wire: u64, until: Instant) {
+    #[track_caller]
+    pub(super) fn ack_and_finish<'a>(&self, wire: u64, until: impl Into<Until<'a>>) {
         self.sender
             .send(Command::Handler(Ask::AckAndFinish(wire)))
             .unwrap();
@@ -514,14 +894,12 @@ impl Observer {
         self.refused(Some(Reason::Closed), until);
     }
 
-    pub(super) fn join(&mut self, until: Instant) -> Result<(), String> {
+    #[track_caller]
+    pub(super) fn join<'a>(&mut self, until: impl Into<Until<'a>>) -> Result<(), String> {
         if self.thread.is_none() {
             return Ok(());
         }
-        let Some(result) = self
-            .outcome(until.saturating_duration_since(Instant::now()))
-            .cloned()
-        else {
+        let Some(result) = self.outcome(until.into()).cloned() else {
             return Err("observer completion deadline".into());
         };
         let joined = self
@@ -575,20 +953,33 @@ impl Metadata {
             return None;
         }
         let mut endpoints = BTreeMap::new();
+        // What the daemon appends to the record as its channels end, after the endpoints it
+        // published (daemon/managed.rs): an output's `canonical` and `state` lines, an
+        // input's `state` line, each of an endpoint published. A member that ends at once
+        // has its input's end there before its owner reads the record (HVF at 4a426c367).
+        let mut ended = false;
         for line in lines {
             let fields: Vec<_> = line.split_whitespace().collect();
-            let ["member", member, "channel", channel, "address", address] = fields.as_slice() else {
+            let ["member", member, "channel", channel, word, rest @ ..] = fields.as_slice() else {
                 return None;
             };
-            let member = member.parse().ok()?;
-            let channel = channel.parse().ok()?;
-            let address: SocketAddr = address.parse().ok()?;
+            let member: u32 = member.parse().ok()?;
+            let channel: u8 = channel.parse().ok()?;
             // 1 and 2 a member's output channels, 0 its input (plan step 5).
-            if !matches!(channel, 0..=2)
-                || !address.ip().is_loopback()
-                || endpoints.insert((member, channel), address).is_some()
-            {
+            if !matches!(channel, 0..=2) {
                 return None;
+            }
+            match (*word, rest) {
+                ("address", [address]) if !ended => {
+                    let address: SocketAddr = address.parse().ok()?;
+                    if !address.ip().is_loopback() || endpoints.insert((member, channel), address).is_some() {
+                        return None;
+                    }
+                }
+                ("canonical" | "state", [_, ..]) if endpoints.contains_key(&(member, channel)) => {
+                    ended = true
+                }
+                _ => return None,
             }
         }
         Some(Self {
@@ -637,7 +1028,7 @@ struct InputClient {
     pending: Vec<u8>,
     inbound: Vec<u8>,
     heard: mpsc::Sender<InputHeard>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     done: bool,
 }
 
@@ -743,7 +1134,7 @@ impl Handler for InputClient {
         self.done
     }
     fn due(&self) -> Option<Instant> {
-        Some(self.deadline)
+        self.deadline
     }
     fn timeout(&mut self, _: &mut Io<'_>, _: Instant) {
         let _ = self
@@ -767,14 +1158,16 @@ pub(super) struct InputWriter {
 impl InputWriter {
     /// Subscribes to `member`'s input at `address`, from offset `offset`, and waits to be
     /// told where its first record goes.
-    pub(super) fn start(
+    #[track_caller]
+    pub(super) fn start<'a>(
         owner: &Identity,
         metadata: &Metadata,
         member: u32,
         address: SocketAddr,
         offset: u64,
-        until: Instant,
+        until: impl Into<Until<'a>>,
     ) -> Result<Self, InputHeard> {
+        let until: Until<'_> = until.into();
         let admitted = Admitted {
             record_bytes: shards_abi::run::CHUNK,
             transport_bytes: u64::try_from(managed::input::TAKEN_BYTES).unwrap(),
@@ -795,7 +1188,7 @@ impl InputWriter {
             pending: Vec::new(),
             inbound: Vec::new(),
             heard,
-            deadline: until,
+            deadline: until.deadline(),
             done: false,
         };
         let (mut driver, sender) = Driver::bind_bounded(
@@ -825,27 +1218,53 @@ impl InputWriter {
         Ok(writer)
     }
 
+    /// What its endpoint says next, `awaited` within `until`. A driver that ends first, its
+    /// client and the channel with it, is joined and how it ended told, its thread's own
+    /// panic or failure, never a wait left to the deadline.
+    #[track_caller]
+    pub(super) fn next<'a>(
+        &mut self,
+        until: impl Into<Until<'a>>,
+        awaited: &str,
+    ) -> Result<InputHeard, InputHeard> {
+        match receive(&self.heard, until.into()) {
+            Ok(heard) => Ok(heard),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(InputHeard::Failed(format!(
+                "no {awaited} within the fixture's patience"
+            ))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(InputHeard::Failed(
+                match self.thread.take().map(JoinHandle::join) {
+                    Some(Ok(Ok(()))) => format!("no {awaited}: its driver ended Ok"),
+                    Some(Ok(Err(error))) => format!("no {awaited}: its driver failed: {error}"),
+                    Some(Err(_)) => format!("no {awaited}: its driver's thread panicked"),
+                    None => format!("no {awaited}: its driver had ended"),
+                },
+            )),
+        }
+    }
+
     /// Waits for the endpoint to say where the next record goes.
-    fn taken(&mut self, until: Instant) -> Result<u64, InputHeard> {
-        match self
-            .heard
-            .recv_timeout(until.saturating_duration_since(Instant::now()))
-        {
-            Ok(InputHeard::Said(managed::input::Said::Taken { accepted, room })) => {
+    #[track_caller]
+    fn taken(&mut self, until: Until<'_>) -> Result<u64, InputHeard> {
+        match self.next(until, "taken")? {
+            InputHeard::Said(managed::input::Said::Taken { accepted, room }) => {
                 self.at = accepted;
                 self.room = room as usize;
                 Ok(accepted)
             }
-            Ok(other) => Err(other),
-            Err(_) => Err(InputHeard::Failed(
-                "no taken within the fixture's patience".into(),
-            )),
+            other => Err(other),
         }
     }
 
     /// Writes `bytes` to the member's stdin, a record at a time, each within the room it was
     /// told, waiting for each to be taken; the offset after them.
-    pub(super) fn write_all(&mut self, bytes: &[u8], until: Instant) -> Result<u64, InputHeard> {
+    #[track_caller]
+    pub(super) fn write_all<'a>(
+        &mut self,
+        bytes: &[u8],
+        until: impl Into<Until<'a>>,
+    ) -> Result<u64, InputHeard> {
+        let until: Until<'_> = until.into();
         for part in bytes.chunks(self.room.max(1)) {
             let mut frame = Vec::new();
             managed::input::record(self.at, part, &mut frame).unwrap();
@@ -864,19 +1283,20 @@ impl InputWriter {
     }
 
     /// Ends the member's stdin (`errno` 0) or aborts it, and waits for its end.
-    pub(super) fn end(&mut self, errno: i32, until: Instant) -> Result<(u64, InputEnd), InputHeard> {
+    #[track_caller]
+    pub(super) fn end<'a>(
+        &mut self,
+        errno: i32,
+        until: impl Into<Until<'a>>,
+    ) -> Result<(u64, InputEnd), InputHeard> {
         self.sender
             .send(Command::Handler(InputAsk::Send(
                 managed::input::end(self.at, errno).to_vec(),
             )))
             .unwrap();
-        match self
-            .heard
-            .recv_timeout(until.saturating_duration_since(Instant::now()))
-        {
-            Ok(InputHeard::Said(managed::input::Said::Ended { written, end })) => Ok((written, end)),
-            Ok(other) => Err(other),
-            Err(_) => Err(InputHeard::Failed("no end within the fixture's patience".into())),
+        match self.next(until, "end")? {
+            InputHeard::Said(managed::input::Said::Ended { written, end }) => Ok((written, end)),
+            other => Err(other),
         }
     }
 }

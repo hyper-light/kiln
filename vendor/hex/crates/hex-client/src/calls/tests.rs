@@ -184,6 +184,7 @@ fn offered(request: u64) -> wire::StreamOffer {
             stdout: true,
             stderr: false,
         },
+        setup: None,
     }
 }
 
@@ -248,6 +249,7 @@ fn physical_report_uses_one_factual_rpc_and_preserves_typed_refusal() {
     let refusal = Refusal::Lifecycle {
         id: BoxId::new("uncertain-device").unwrap(),
         cause: hex_api::LifecycleCause::Uncertain,
+        why: Some("its device's report can't be read".to_owned()),
     };
     *transport.reply.lock().unwrap() = Some(Answer::Refused(refusal.clone()));
     assert_eq!(client.physical_report().unwrap_err(), refusal);
@@ -1153,12 +1155,13 @@ mod release_frame {
 /// AC-T7.4.1: the plain kinds' waits keep their order, the scheduler's and a physical report's after a hello, a list
 /// and the network namespaces' counts; a call naming a box or a class is no plain kind's, its box kind's wait its
 /// class's ([`BoxKind`]), a member's hand-over (joint plan step 17) appended last among them. Do: map each plain kind
-/// and each box kind's request. Expect: each plain kind at its place in a table of 19, the person's release of a
-/// capacity holder appended, then the node's links last; each box kind's none there, and its own kind and class.
+/// and each box kind's request. Expect: each plain kind at its place in a table of 21, the person's release of a
+/// capacity holder appended, then the node's links, then a connection's lessors (docs/design/credential-grants.md C7),
+/// then the capacity view keeper's word last (the review's A-10); each box kind's none there, and its own kind and class.
 #[test]
 fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
     let waits = <Memory as Transport>::answers();
-    assert_eq!((KINDS, BOX_KINDS, CLASSES), (19, 12, 4));
+    assert_eq!((KINDS, BOX_KINDS, CLASSES), (21, 14, 4));
     for (request, index) in [
         (
             Request::Hello {
@@ -1199,6 +1202,14 @@ fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
             17,
         ),
         (Request::Call(Call::Links), 18),
+        (Request::Call(Call::Lessors), 19),
+        (
+            Request::Call(Call::Reserved(hex_api::Reserved {
+                keeper: 1,
+                reserved: hex_api::CapacityResources::default(),
+            })),
+            20,
+        ),
     ] {
         assert!(
             std::ptr::eq(kind_of(waits, &request).unwrap(), &waits[index]),
@@ -1225,6 +1236,33 @@ fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
                 ask: hex_core::wire::Streams::default(),
             }),
             BoxKind::Member,
+        ),
+        // Goal 2's item 2: a member's own signal is timed as its box's signal is, by the box's class.
+        (
+            Request::Call(Call::MemberSignal {
+                id: b.clone(),
+                member: hex_api::Member {
+                    kind: hex_api::MemberKind::Harness,
+                    name: "claude".to_owned(),
+                },
+                signal: hex_api::Signal::TERM,
+            }),
+            BoxKind::Signal,
+        ),
+        // A start followed to its end (ROOT, 2026-11-14): its own kind, timed apart from a start's answer.
+        (Request::Call(Call::Started(b.clone())), BoxKind::Started),
+        // Goal 2's item 3: a member's next MCP connection, its own kind, answered as its harness connects.
+        (
+            Request::Call(Call::Mcp {
+                id: b.clone(),
+                member: hex_api::Member {
+                    kind: hex_api::MemberKind::Agent,
+                    name: "helper".to_owned(),
+                },
+                streams: hex_core::wire::Streams::default(),
+                ask: hex_core::wire::Streams::default(),
+            }),
+            BoxKind::Mcp,
         ),
     ] {
         assert!(kind_of(waits, &request).is_none(), "{request:?}");
@@ -1305,6 +1343,8 @@ fn every_kind_and_class_has_its_own_census_name() {
             "run",
             "capacity",
             "member",
+            "started",
+            "mcp",
         ];
         for wait in T::answers() {
             assert!(seen.insert(wait.name()), "{} twice", wait.name());
@@ -1600,4 +1640,42 @@ mod queued_deadline_probe {
     fn cp_t7_4_absent_native_reply_does_not_extend_expired_wait() {
         assert!(expired_native_submit(Queued::Absent).is_none());
     }
+}
+
+/// The review's B-6 (kiln's HexVms adapter; goal 54's change 3): a remote node's client follows a box's start through its
+/// node (`Call::Started`, appended; ROOT, 2026-11-14), never the trait's default, which answered `started` as an
+/// inspect, at once; and its wire has no call yet for a delete answering its VM's host use, so it refuses that, typed,
+/// naming the call and what its wire lacks, before anything is sent: never a plain delete answering none, read as a run
+/// that never started, so kiln charged nothing. Do: ask both of a client whose node refuses every request at once, the
+/// box unknown to it. Expect: `started` sent as `Call::Started` and answered with the node's own refusal; the delete
+/// `Invalid`, naming its call; nothing else sent.
+#[test]
+fn b6_a_client_follows_started_on_its_node_and_refuses_delete_with_host_use_unsent() {
+    let client = client();
+    let id = BoxId::new("b6-remote").unwrap();
+    *client.conn.shared.transport.reply.lock().unwrap() =
+        Some(Answer::Refused(Refusal::NoSuchBox(id.clone())));
+    let started = client.started(&id);
+    assert!(
+        matches!(&started, Err(Refusal::NoSuchBox(got)) if *got == id),
+        "{started:?}"
+    );
+    let deleted = client.delete_with_host_use(&id);
+    assert!(
+        matches!(
+            &deleted,
+            Err(Refusal::Invalid {
+                what: "delete_with_host_use",
+                ..
+            })
+        ),
+        "{deleted:?}"
+    );
+    let outbound = client.conn.shared.transport.outbound.lock().unwrap();
+    assert_eq!(outbound.len(), 1, "started alone is sent");
+    let (_, request) = sent_request(&outbound[0]);
+    assert!(
+        matches!(&request, Request::Call(Call::Started(got)) if *got == id),
+        "{request:?}"
+    );
 }

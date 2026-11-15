@@ -23,7 +23,7 @@
 //! as the run's host asks, and every lease it gave is released as the run ends.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 mod pool;
@@ -31,9 +31,10 @@ mod session;
 pub mod wire;
 
 pub use wire::{
-    Bound, Channel, ControlAsk, ControlAt, CredentialGrant, Fill, GuestTimes, HostUse, Keep, LeaseRefusal,
-    MemberInfo, MemberKind, MemberReach, Microvm, Narrowing, PlugRefusal, Proto, Publish, Ready, Receiving,
-    RunEnd, Secret, SocketGrant, StartedFrom, Stats, StatsScope, VcpuTime, decide,
+    Bound, Captured, Channel, Cli, ControlAsk, ControlAt, CredentialGrant, Fill, FinalUse, GuestTimes,
+    HostUse, Keep, LeaseRefusal, MemberInfo, MemberKind, MemberReach, Microvm, Narrowing, PlugRefusal, Proto,
+    Publish, Ready, Receiving, RunEnd, RunEnded, SaveRefusal, Secret, SignInGrant, SignInRefusal,
+    SignInTokens, SocketGrant, StartedFrom, Stats, StatsScope, Unused, UseBroken, VcpuTime, decide,
 };
 
 /// A credential's lease, as a run's [`Lessor`] gives it (D242): what its release names it
@@ -60,9 +61,40 @@ pub trait Lessor: Send + Sync {
     /// the run has no key, its lessor's run alone asking.
     fn lease(&self, reference: &str, key: Option<[u8; 32]>) -> Result<Leased, LeaseRefusal>;
     /// The lease [`lease`](Self::lease) named `lease`, released: the run has ended, or the
-    /// lease was given after it did or ended before it could be passed on. Called once for
-    /// each lease given.
+    /// lease was given after it did or ended before it could be passed on, or the value it
+    /// gave rotated (its sign-in refreshed, [`refresh`](Self::refresh)). Called once for each
+    /// lease given.
     fn release(&self, lease: &str);
+    /// Sign-in `sign_in`'s tokens, as the run's injector took them from its CLI's token
+    /// response (D242, step 8): kept outside by the run's broker, which gives back the
+    /// placeholders the CLI holds in their places ([`Captured`]: its access token's reference,
+    /// which the run's leases name from then on as a grant's, that token's placeholder, and its
+    /// refresh token's where `tokens` has one). Called on a thread of its own, once for each
+    /// capture, `sign_in` one of the run's sign-in grants, `key` as [`lease`](Self::lease) is
+    /// given it. An orchestrator that serves no sign-in refuses it `Unanswered`, as this does.
+    fn capture(
+        &self,
+        _sign_in: &str,
+        _tokens: SignInTokens,
+        _key: Option<[u8; 32]>,
+    ) -> Result<Captured, SignInRefusal> {
+        Err(SignInRefusal::Unanswered)
+    }
+    /// Sign-in `sign_in` refreshed by its broker, which alone calls its provider (Q1), once for
+    /// every run of it at a time (RFC 6749 §6), keeping the rotated tokens under the references
+    /// its capture gave: the token response its CLI is to have, as its provider gave it or with
+    /// the sign-in's placeholders in its tokens' places, as the run's injector gives them those
+    /// whatever it holds (Q2: they stay). Called on a thread of its own, once for each ask, every
+    /// flow of the run that asked one joined to it; once it answers, each lease of the access
+    /// token given the run is released ([`release`](Self::release)), its value rotated. Refused
+    /// `Unanswered` by an orchestrator that serves no sign-in, as by this.
+    fn refresh(&self, _sign_in: &str, _key: Option<[u8; 32]>) -> Result<Secret, SignInRefusal> {
+        Err(SignInRefusal::Unanswered)
+    }
+    /// The run's VM revoked sign-in `sign_in` (its CLI's logout, or a sign-in anew): answered
+    /// in the run's network process, its stored tokens kept. Told, on a thread of its own, so
+    /// that its broker may say so; never a revocation of the sign-in outside.
+    fn revoked(&self, _sign_in: &str, _key: Option<[u8; 32]>) {}
 }
 
 /// A run's [`Lessor`], as its spec holds it: equal to another where it is the same one, and
@@ -147,6 +179,13 @@ pub struct MemberSpec {
     /// `shards_abi::run::MAX_PAYLOAD`, Linux's own on a command line and environment, and
     /// refused past it, never cut.
     pub args: Vec<String>,
+    /// An MCP bridge of its own (D254): `/run/shards/mcp`, a stdio server its harness's MCP
+    /// config names as a command, each connection to which reaches the run's controller as a
+    /// lane of the run's agent-control endpoint, taken there by `Execs::mcp(member)`
+    /// ([`crate::control`]); so it needs [`ImageSpec::control`]. No network grant: nothing of
+    /// it is an address in the microVM. None: the member has neither the bridge nor its
+    /// socket, and an ask for its connection is refused.
+    pub mcp: bool,
 }
 
 /// A host directory the guest sees at `at`, as `-v HOST:AT[:ro]` gives one: a member gets
@@ -177,13 +216,28 @@ pub struct ImageSpec {
     /// D246), which the run host refuses the run unless every member reaches exactly.
     pub egress: Narrowing,
     /// The run's credential grants (D242): each a credential named by reference (a secret
-    /// in the orchestrator's store, never a value) and the hosts the injector may fill it
-    /// in toward. Empty for a run with none (default deny). An orchestrator keeps or drops
-    /// the image's, never adds one.
+    /// in the orchestrator's store, never a value), the hosts the injector may fill it in
+    /// toward, and the placeholder the orchestrator gives the member that uses it, which the
+    /// injector fills the value in where it stands. Empty for a run with none (default
+    /// deny). An orchestrator keeps or drops the image's, never adds one.
     pub credentials: Vec<CredentialGrant>,
     /// What answers the run's credential leases, for this run alone (D242): needed by a run
     /// with credential grants, which is refused without one; a run with none asks nothing.
     pub lessor: Option<RunLessor>,
+    /// The run's sign-in grants (D242, step 8): each a sign-in its CLI may sign in as (its name
+    /// in the orchestrator's store), the hosts its access token goes to, and the placeholders
+    /// an earlier capture of it gave, staged by the orchestrator into its CLI's file. Its
+    /// tokens are taken outside the microVM by the run's injector and kept by its
+    /// [`lessor`](Self::lessor), needed by a run with any. One sign-in of a CLI a run. Empty
+    /// for a run with none (default deny).
+    pub sign_ins: Vec<SignInGrant>,
+    /// The roots the run's injector trusts beside the host's own (D242), for its injected flows
+    /// alone (its credential grants' and sign-ins' hosts): a corporate TLS proxy's CA, a test's.
+    /// Never taken from any environment: the run's network process reads no `SSL_CERT_FILE` or
+    /// `SSL_CERT_DIR`. Each refused, by field, where it is no certificate, and past what the
+    /// network process's wire carries. Empty: the host's roots alone. A run with no grant and
+    /// no sign-in injects nothing, and its roots go nowhere.
+    pub upstream_roots: Vec<UpstreamRoot>,
     pub shares: Vec<ImageShare>,
     /// The nesting grant for the run's own command (D234): the run's consent, as
     /// `--security-opt nesting=true` gives it to `run vm`. Given only where the image's
@@ -213,14 +267,50 @@ pub struct ImageSpec {
     /// nesting grant its command reads them in `/run/shards/gpus` (D234's `gpus=`). None: no
     /// GPU.
     pub gpu_devices: Vec<crate::PhysicalGpu>,
+    /// The scope of the run's GPU report (D233), as a managed launch names its own
+    /// ([`crate::PreparedBoot::with_gpu_report`]): the run's VM process frames its renderer's
+    /// report with it, each device's physical identity and, on Windows, its current boot's LUID,
+    /// before its guest runs, and the run's host relays it; [`ImageGuest::take_gpu_report`]
+    /// takes it within the boot's patience. Nonzero, and only with
+    /// [`gpu_devices`](Self::gpu_devices): else refused as [`ImageRefusal::GpuProbe`] (`Scope`,
+    /// `Empty`). None: no report. A run that asks one boots on a run host of its own, never a
+    /// warm one ([`ImagePools`]), as a warm host's VM starts before its run names the scope.
+    pub gpu_report: Option<[u8; 16]>,
+}
+
+/// A root a run's injector trusts beside the host's own ([`ImageSpec::upstream_roots`], D242).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamRoot {
+    /// One X.509 certificate, DER (RFC 5280).
+    Der(Vec<u8>),
+    /// One or more X.509 certificates, PEM (RFC 7468 §5): a bundle's, any text between its
+    /// sections, and no section of anything else (a key).
+    Pem(String),
 }
 
 /// How a member ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberEnd {
-    /// Its population ended, its leader with this status (as `docker run` reports one).
+    /// Its population ended, its command having exited with this code.
     Exited(u32),
+    /// Its population ended, its command killed by this signal, its Linux number
+    /// (`1..=run::NSIG`): `docker run` would report 128 plus it, which an exit can be too.
+    Signaled(u32),
     /// The run ended first, and the member with it.
+    WithRun,
+}
+
+/// How a member's channel ended, as its run's host told it (`OUTPUT_END`, control-01): what
+/// its pipe's EOF alone does not say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelEnd {
+    /// Every writer of it in its guest closed it: all it wrote is in its pipe.
+    Closed,
+    /// Its capture ended before its writers did, with this errno (`ECONNRESET`, 104, where its
+    /// run host's capture reached its end with the channel open): what came after its last
+    /// bytes in its pipe is lost.
+    Aborted(i32),
+    /// Its run's host said all it will without telling it: it ended with its run.
     WithRun,
 }
 
@@ -239,8 +329,9 @@ pub enum ImageRefusal {
     Boot(String),
     /// What this does not do yet, by name.
     Unsupported { what: &'static str, why: String },
-    /// The run has ended.
-    Ended(RunEnd),
+    /// The run has ended, and what its microVM used in all (D260's final use): every ask of a
+    /// run that has ended, [`ImageGuest::stats`]'s among them, is refused with it.
+    Ended(RunEnded),
     /// The run host broke the channel's contract, or ended without its run's end.
     Host(String),
     /// What this process could not do: start the run host, a pipe, a thread.
@@ -256,6 +347,17 @@ pub enum ImageRefusal {
     Rate(String),
     /// A member's terminal its run's init did not size (D244), in its words.
     Terminal(String),
+    /// A save its run's host refused (D259), by what refused it.
+    Save(SaveRefusal, String),
+    /// The run's GPU report (D233), as a managed launch's is refused
+    /// ([`crate::Refusal::GpuProbe`]): not asked (`Unavailable`), taken already
+    /// (`ReportTaken`), past the boot's patience (`Pending`), its scope or selection refused
+    /// (`Scope`, `Empty`), its frame unwritten (`Unreported`) or unread (`Syntax`, `Count`),
+    /// or the selection its renderer refused (`Refused`), which a boot refused by it returns.
+    GpuProbe(crate::GpuProbeError),
+    /// A bound for the run host's diagnostics ([`ImageGuest::keep_diagnostics`]) short of
+    /// `tail`, the bytes of them kept to quote, which a cut leaves the file holding.
+    DiagnosticsBound { bound: u64, tail: u64 },
 }
 
 impl std::fmt::Display for ImageRefusal {
@@ -266,13 +368,19 @@ impl std::fmt::Display for ImageRefusal {
             Self::Image(why) => write!(f, "the image: {why}"),
             Self::Widening(why) => write!(f, "past the image's grants: {why}"),
             Self::Boot(why) => write!(f, "the run did not start: {why}"),
-            Self::Ended(end) => write!(f, "the run has ended: {end:?}"),
+            Self::Ended(ended) => write!(f, "the run has ended: {:?}", ended.end),
             Self::Host(why) => write!(f, "the run's host: {why}"),
             Self::Os { what, kind } => write!(f, "{what}: {kind:?}"),
             Self::Plug(cause, why) => write!(f, "the plug: {cause:?}: {why}"),
             Self::Room(why) => write!(f, "the run's room: {why}"),
             Self::Rate(why) => write!(f, "the run's rate: {why}"),
             Self::Terminal(why) => write!(f, "a member's terminal: {why}"),
+            Self::Save(cause, why) => write!(f, "the save: {cause:?}: {why}"),
+            Self::GpuProbe(why) => write!(f, "the run's GPU report: {why}"),
+            Self::DiagnosticsBound { bound, tail } => write!(
+                f,
+                "the run host's diagnostics: a bound of {bound} bytes, short of the {tail} kept to quote"
+            ),
         }
     }
 }
@@ -287,6 +395,110 @@ pub trait Images: Send + Sync {
     /// past it, the run's host is killed and its run refused with what it last said. It is
     /// the caller's until it drops, which ends it.
     fn boot(&self, spec: &ImageSpec, patience: Duration) -> Result<Box<dyn ImageGuest>, ImageRefusal>;
+    /// [`boot`](Self::boot), ended by `stop` (D231's stop of a boot under way): a
+    /// [`BootStop::stop`] from any thread while it boots kills the run's host and every
+    /// process it started, and the boot returns [`ImageRefusal::Ended`] ([`RunEnd::Stopped`],
+    /// its final use [`Unused::NotStarted`]) once they are gone; a stop that came before is the
+    /// same, booting nothing. A stop that
+    /// comes after the boot has returned is no longer the boot's: the guest's own
+    /// [`stop`](ImageGuest::stop) ends its run.
+    ///
+    /// By default, for an implementor with no run host to end mid-boot, the stop is honoured
+    /// as the boot returns: its guest stopped, and `Ended(Stopped)` returned.
+    fn boot_stoppable(
+        &self,
+        spec: &ImageSpec,
+        patience: Duration,
+        stop: &BootStop,
+    ) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
+        if stop.is_stopped() {
+            return Err(ImageRefusal::Ended(not_started()));
+        }
+        let guest = self.boot(spec, patience)?;
+        if stop.is_stopped() {
+            let _ = guest.stop();
+            let ended = guest.wait_for(Duration::ZERO).ok().flatten();
+            return Err(ImageRefusal::Ended(
+                ended.unwrap_or_else(|| RunEnded::unused(RunEnd::Stopped, Unused::Killed)),
+            ));
+        }
+        Ok(guest)
+    }
+}
+
+/// A stop for a boot under way ([`Images::boot_stoppable`], D231): its caller's, given to one
+/// boot at a time by reference and stopped from any other thread. Its stop is an event, never
+/// a flag a boot looks at: it kills the run host the boot holds here at once, every process
+/// that host started with it, and the boot, which waits on that host's end, returns as the
+/// host is followed to its end. Once stopped it stays stopped.
+#[derive(Debug, Default)]
+pub struct BootStop(Mutex<Stopping>);
+
+/// A [`BootStop`]'s state (R04): `Armed` to `Booting` as a boot holds its run host here and
+/// back as the boot lets go of it; either to `Stopped`, killing a host held, which a boot
+/// holding a host after finds and kills at once.
+#[derive(Debug, Default)]
+enum Stopping {
+    /// Not stopped, and no boot holds a run host here.
+    #[default]
+    Armed,
+    /// A boot holds its run host here while its run starts: the host the boot's own
+    /// session and its exit watcher already share.
+    Booting(Arc<shards_ipc::Child>),
+    /// Stopped: terminal.
+    Stopped,
+}
+
+impl BootStop {
+    pub fn new() -> BootStop {
+        BootStop::default()
+    }
+
+    /// Stops the boot under way, killing its run host and all the host started, or the next
+    /// boot given it. Never refused; once is enough. Returns at once: the boot returns
+    /// `Ended(Stopped)` once they are gone.
+    pub fn stop(&self) {
+        let mut state = self.state();
+        if let Stopping::Booting(host) = std::mem::replace(&mut *state, Stopping::Stopped) {
+            session::kill(&host);
+        }
+    }
+
+    /// Whether it has been stopped.
+    pub fn is_stopped(&self) -> bool {
+        matches!(*self.state(), Stopping::Stopped)
+    }
+
+    /// A boot's run `host`, held here until [`release`](Self::release): killed at once where
+    /// the stop has come. Refused where another boot holds one here.
+    fn hold(&self, host: &Arc<shards_ipc::Child>) -> Result<(), ImageRefusal> {
+        let mut state = self.state();
+        match *state {
+            Stopping::Armed => *state = Stopping::Booting(host.clone()),
+            Stopping::Booting(_) => {
+                return Err(ImageRefusal::Spec {
+                    what: "the boot's stop",
+                    why: "another boot under way holds it".into(),
+                });
+            }
+            Stopping::Stopped => session::kill(host),
+        }
+        Ok(())
+    }
+
+    /// Lets go of the host a boot held here: whether the stop came first.
+    fn release(&self) -> bool {
+        let mut state = self.state();
+        if matches!(*state, Stopping::Stopped) {
+            return true;
+        }
+        *state = Stopping::Armed;
+        false
+    }
+
+    fn state(&self) -> MutexGuard<'_, Stopping> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// A booted image. Dropping it ends it.
@@ -297,7 +509,8 @@ pub trait ImageGuest: Send + Sync {
     fn published(&self) -> &[Bound];
     /// Where the run's agent-control endpoint is bound, and its microVM's key, which its
     /// controller pins (D252), where [`ImageSpec::control`] asked for one: as the run started,
-    /// unchanged until it ends.
+    /// unchanged until it ends. With it, the endpoint's two other sockets, its waker and its
+    /// wake ([`ControlAt::sockets`], all three): every UDP socket the endpoint holds.
     fn control(&self) -> Option<&ControlAt>;
     /// A member's channel, as a pipe's read end, its bytes exactly as the member wrote
     /// them, ending at the channel's end; once each. What no one reads backs up into that
@@ -309,10 +522,23 @@ pub trait ImageGuest: Send + Sync {
     fn take_input(&self, member: &MemberName) -> Result<std::io::PipeWriter, ImageRefusal>;
     /// The member's end, waiting at most `timeout` (`Duration::MAX`: until it comes).
     fn wait_member(&self, member: &MemberName, timeout: Duration) -> Result<Option<MemberEnd>, ImageRefusal>;
+    /// How member `member`'s `channel` ended, typed, once its run's host told it, after every
+    /// byte of it that host sent: its writers' close, or its capture's abort, which its pipe's
+    /// EOF ([`take_output`](Self::take_output)) does not tell apart; waiting at most `timeout`
+    /// (`Duration::MAX`: until it comes). Kept past the run's end. Refused for a member that
+    /// does not run.
+    fn wait_channel(
+        &self,
+        member: &MemberName,
+        channel: Channel,
+        timeout: Duration,
+    ) -> Result<Option<ChannelEnd>, ImageRefusal>;
     /// The use of the run, of its own command or of a member, as its init reads its cgroup,
     /// waiting at most `patience` (`Duration::MAX`: until it answers or the run ends). The
     /// run's carries what its microVM costs its host beside it ([`Stats::microvm`], D241):
     /// its VM process's CPU time and memory, and each vCPU's guest time, read before them.
+    /// Once the run has ended, refused [`ImageRefusal::Ended`], which carries what its microVM
+    /// used in all ([`RunEnded::final_use`], D260).
     fn stats(&self, scope: StatsScope, patience: Duration) -> Result<Stats, ImageRefusal>;
     /// The room the orchestrator's budget leaves the run (D188, D241), told its init as a
     /// daemon's budget tells a run of its own: the bytes the run may use past what it uses
@@ -341,11 +567,11 @@ pub trait ImageGuest: Send + Sync {
     ) -> Result<Option<std::num::NonZeroU64>, ImageRefusal>;
     /// The period the run's VM's governor holds a [`rate`](Self::rate) over (D191, D247):
     /// each period the run's vCPUs together use at most the rate's share of it, held out of
-    /// their guest once it is spent until the period ends. As its run host said it as the run
-    /// started, the period its own build's hold uses, so that an orchestrator derives its
-    /// window from the run's own and copies no number: a period shards derives later (D191)
-    /// reaches it as it is.
-    fn rate_period(&self) -> Duration;
+    /// their guest once it is spent until the period ends. As its VM said it with its last
+    /// rate's answer, the period its governor derived for that rate from what it has learned
+    /// of its step (vcpus × g over the share), so that an orchestrator derives its window
+    /// from the run's own and copies no number: none until a rate has been answered.
+    fn rate_period(&self) -> Option<Duration>;
     /// How the run's microVM started (D253): restored from its image's template, booted saving
     /// one, or booted where its template did not restore, which was then removed; booted alone
     /// where its host had no template to restore or save. As its run host said it as the run
@@ -389,21 +615,58 @@ pub trait ImageGuest: Send + Sync {
     /// What is plugged in at `at` let go of: unmounted in its member, refused while anything
     /// there uses it ([`PlugRefusal::Busy`]), then taken off the microVM.
     fn unplug(&self, at: &str, patience: Duration) -> Result<(), ImageRefusal>;
+    /// The run's microVM saved whole and left running (D176, D259): its memory, its vCPUs'
+    /// and devices' state, its run's swap and its writable layer, as the daemon's `save vm`
+    /// saves one, in a snapshot directory (`shards_vmm::snapshot`'s: `current` naming the
+    /// generation, whose `memory`, `state`, `swap`, `layer-head`, `layer` and `window-heads`
+    /// they are) at `to`, which the save makes: absolute, beneath the run's home (its
+    /// `SHARDS_HOME`), beneath no directory its guest reaches (its shares, what is plugged
+    /// into it, the home's volumes), and with nothing there yet. It holds every value its
+    /// guest holds: it is its owner's alone, asked on the run's own channel and written
+    /// nowhere else, and its owner's to remove. Waits at most `patience`; refused as
+    /// [`ImageRefusal::Save`], by what refused it: a path not UTF-8 as [`ImageRefusal::Spec`].
+    fn save(&self, to: &std::path::Path, patience: Duration) -> Result<(), ImageRefusal>;
     /// Ends it at once: its VM's process is killed, and [`wait_for`](Self::wait_for) then
     /// returns [`RunEnd::Stopped`], or the end the run had come to before: its command's, or
-    /// its host's failure, in its words, as `wait_for` saw it. Never refused, as a VM left
-    /// running is a leak. Returns once the run's end is told, its VM gone; its host then
-    /// reaps what it started and exits on its own.
+    /// its host's failure, in its words, as `wait_for` saw it. Returns released, as a boot's
+    /// stop does (D231): its end told, its run host exited and reaped, and every process the
+    /// host started (its VM, network and share processes) gone, their diagnostics closed.
+    /// Refused only where those processes cannot be followed to their end
+    /// ([`ImageRefusal::Os`], on Windows), never `Ok` before they are gone.
     fn stop(&self) -> Result<(), ImageRefusal>;
     /// Its end, once it has come, waiting at most `timeout` (`Duration::MAX`: until it
-    /// comes).
-    fn wait_for(&self, timeout: Duration) -> Result<Option<RunEnd>, ImageRefusal>;
-    /// The run host's diagnostics, its VM's among them, written whole to `to` from now on, as
-    /// the host writes them, in place of any file named before, after the last of them kept
-    /// until now: what a refusal or a failed end quotes ([`ImageRefusal::Boot`],
-    /// [`RunEnd::Failed`]) is only their last. A file that stalls holds them up; a part it
-    /// refuses is lost to it alone.
-    fn keep_diagnostics(&self, to: std::fs::File) -> Result<(), ImageRefusal>;
+    /// comes), and what its microVM used in all ([`RunEnded::final_use`], D260): read by its
+    /// VM once its machine was down, which its end awaits; or why not ([`Unused`]): a run
+    /// [`stop`](Self::stop)ped before its machine was down carries [`Unused::Killed`], so a
+    /// caller that charges a run whose command has ended awaits its end before it stops it.
+    fn wait_for(&self, timeout: Duration) -> Result<Option<RunEnded>, ImageRefusal>;
+    /// The run host's diagnostics, its VM's among them, written to `to` from now on, as the
+    /// host writes them, in place of any file named before, after the last of them kept until
+    /// now: what a refusal or a failed end quotes ([`ImageRefusal::Boot`], [`RunEnd::Failed`])
+    /// is only their last. A file that stalls holds them up; a part it refuses is lost to it
+    /// alone.
+    ///
+    /// The file is held within `bound` bytes, what it held as it was named counted (Hex audit
+    /// B-9): a part that would take it past `bound` cuts it back to that last, the tail kept to
+    /// quote, exactly its latest bytes, the part's end among them, and the host's next parts
+    /// are written after it. `u64::MAX` never cuts. Refused [`ImageRefusal::DiagnosticsBound`]
+    /// for a bound short of that tail, and [`ImageRefusal::Os`] for a file that cannot be cut
+    /// (on Windows, one opened to append alone) or written.
+    fn keep_diagnostics(&self, to: std::fs::File, bound: u64) -> Result<(), ImageRefusal>;
+    /// The run's GPU report (D232, D233), its VM process's own, written before its guest ran
+    /// and relayed by its host: each selected device's physical identity, Vulkan UUID and, on
+    /// Windows, its current boot's LUID, read against [`ImageSpec::gpu_report`]'s scope and
+    /// [`ImageSpec::gpu_devices`] as `ManagedGuest::take_gpu_report` reads a managed
+    /// launch's. Taken once, within the boot's patience and at most `patience` from now: as a
+    /// managed launch's, the first take spends it, whatever it comes to. Refused as
+    /// [`ImageRefusal::GpuProbe`]: `Unavailable` for a run that asked none, `ReportTaken` once
+    /// taken, `Pending` past either budget, and its frame's own refusals.
+    fn take_gpu_report(&self, patience: Duration) -> Result<crate::physical::GpuReport, ImageRefusal>;
+}
+
+/// A run stopped before its microVM started: it used nothing of a machine.
+fn not_started() -> RunEnded {
+    RunEnded::unused(RunEnd::Stopped, Unused::NotStarted)
 }
 
 /// The images the `shards` binary boots.
@@ -422,9 +685,21 @@ impl Images for ImageShards {
     }
 
     fn boot(&self, spec: &ImageSpec, patience: Duration) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
+        self.boot_stoppable(spec, patience, &BootStop::new())
+    }
+
+    fn boot_stoppable(
+        &self,
+        spec: &ImageSpec,
+        patience: Duration,
+        stop: &BootStop,
+    ) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
+        if stop.is_stopped() {
+            return Err(ImageRefusal::Ended(not_started()));
+        }
         crate::backend().map_err(no_backend)?;
         let request = request(spec)?;
-        Ok(Box::new(session::Session::start(spec, &request, patience)?))
+        Ok(Box::new(session::Session::start(spec, &request, patience, stop)?))
     }
 }
 
@@ -458,9 +733,21 @@ impl Images for ImagePools {
     }
 
     fn boot(&self, spec: &ImageSpec, patience: Duration) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
+        self.boot_stoppable(spec, patience, &BootStop::new())
+    }
+
+    fn boot_stoppable(
+        &self,
+        spec: &ImageSpec,
+        patience: Duration,
+        stop: &BootStop,
+    ) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
+        if stop.is_stopped() {
+            return Err(ImageRefusal::Ended(not_started()));
+        }
         crate::backend().map_err(no_backend)?;
         let request = request(spec)?;
-        self.0.boot(spec, &request, patience)
+        self.0.boot(spec, &request, patience, stop)
     }
 }
 
@@ -469,6 +756,109 @@ fn no_backend(r: crate::Refusal) -> ImageRefusal {
         crate::Refusal::NoBackend { os, arch } => ImageRefusal::NoBackend { os, arch },
         other => ImageRefusal::Boot(other.to_string()),
     }
+}
+
+/// The run's sign-in grants (D242, step 8), as its request carries them: each names its sign-in
+/// and the hosts its access token goes to, each host a DNS name as a credential grant's are
+/// (lowered, never an address, a port or localhost); one sign-in of a CLI a run, as a capture
+/// names no sign-in; each placeholder an earlier capture gave a token, and one credential's alone,
+/// the run's credential grants' included; and a lessor to keep their tokens.
+fn sign_ins(
+    spec: &ImageSpec,
+    credentials: &[wire::CredentialGrant],
+) -> Result<Vec<SignInGrant>, ImageRefusal> {
+    let refuse = |why: String| ImageRefusal::Spec {
+        what: "a sign-in grant",
+        why,
+    };
+    let mut sign_ins: Vec<SignInGrant> = Vec::with_capacity(spec.sign_ins.len());
+    for s in &spec.sign_ins {
+        if s.sign_in.is_empty() {
+            return Err(refuse("a grant names its sign-in, which is empty".into()));
+        }
+        if s.toward.is_empty() {
+            return Err(refuse(format!(
+                "{}: a sign-in whose access token goes to no host could never be used",
+                s.sign_in
+            )));
+        }
+        if sign_ins.iter().any(|o| o.cli == s.cli) {
+            return Err(refuse(format!(
+                "{}: a second sign-in of its CLI, where a capture names no sign-in",
+                s.sign_in
+            )));
+        }
+        let mut toward = Vec::with_capacity(s.toward.len());
+        for host in &s.toward {
+            let lowered = host.to_ascii_lowercase();
+            if !shards_dns::host_name(&lowered) || lowered == "localhost" || lowered.ends_with(".localhost") {
+                return Err(refuse(format!(
+                    "{}: {host} is not a host a token is filled in toward: a DNS name, or {}, without a \
+                     port and never localhost (TLS names a server by its DNS name alone, RFC 6066 §3)",
+                    s.sign_in,
+                    shards_dns::HOST
+                )));
+            }
+            toward.push(lowered);
+        }
+        sign_ins.push(SignInGrant {
+            sign_in: s.sign_in.clone(),
+            cli: s.cli,
+            toward,
+            captured: s.captured.clone(),
+        });
+    }
+    shards_dns::credential::check_sign_ins(credentials, &sign_ins)
+        .map_err(|refused| refuse(refused.to_string()))?;
+    if !sign_ins.is_empty() && spec.lessor.is_none() {
+        return Err(ImageRefusal::Spec {
+            what: "the run's lessor",
+            why: "a run with sign-in grants needs a lessor to keep their tokens".into(),
+        });
+    }
+    Ok(sign_ins)
+}
+
+/// The run's upstream roots (D242) as the run host carries them: each certificate's DER, in
+/// order, a PEM bundle's each, refused by field where an entry holds bytes that are no
+/// certificate (as webpki parses a trust anchor, where the run's injector would refuse it), a
+/// PEM of none or of anything else, or one past the network process's wire.
+fn upstream_roots(roots: &[UpstreamRoot]) -> Result<Vec<Vec<u8>>, ImageRefusal> {
+    use rustls_pki_types::pem::SectionKind;
+    let refuse = |why: String| ImageRefusal::Spec {
+        what: "an upstream root",
+        why,
+    };
+    let mut ders = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        match root {
+            UpstreamRoot::Der(der) => ders.push(der.clone()),
+            UpstreamRoot::Pem(pem) => {
+                let mut read = pem.as_bytes();
+                let before = ders.len();
+                while let Some((kind, der)) = rustls_pki_types::pem::from_buf(&mut read)
+                    .map_err(|e| refuse(format!("the PEM at {i}: {e}")))?
+                {
+                    if kind != SectionKind::Certificate {
+                        return Err(refuse(format!(
+                            "the PEM at {i} holds a {kind:?} section, where a root is a certificate alone"
+                        )));
+                    }
+                    ders.push(der);
+                }
+                if ders.len() == before {
+                    return Err(refuse(format!("the PEM at {i} holds no certificate")));
+                }
+            }
+        }
+    }
+    shards_dns::credential::check_roots(&ders).map_err(|refused| refuse(refused.to_string()))?;
+    for (i, der) in ders.iter().enumerate() {
+        let cert = rustls_pki_types::CertificateDer::from(der.as_slice());
+        webpki::anchor_from_trusted_cert(&cert)
+            .map_err(|e| refuse(format!("the certificate at {i}: {e}")))?;
+    }
+    Ok(ders)
 }
 
 /// `spec` as the run host reads it, refused here where it could never be run: a member's
@@ -534,6 +924,21 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
             input: m.stdin,
             terminal: m.terminal,
             args: m.args.clone(),
+            mcp: m.mcp,
+        });
+    }
+    // A member's MCP bridge reaches its controller over the run's agent-control endpoint
+    // alone (D254), refused here without one, as the run host refuses it again.
+    if spec.control.is_none()
+        && let Some(m) = spec.members.iter().find(|m| m.mcp)
+    {
+        return Err(ImageRefusal::Spec {
+            what: "a member's MCP bridge",
+            why: format!(
+                "{}: its connections reach the run's controller over its agent-control endpoint, \
+                 which the spec's control asks for",
+                m.member.name
+            ),
         });
     }
     let mut shares = Vec::with_capacity(spec.shares.len());
@@ -576,7 +981,8 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
     // each host it is filled in toward is a DNS name as D236 names a destination's host by
     // name, or host.docker.internal, reusing shards_dns' RFC rules; never an address, never a
     // port, and never localhost. The hosts are stored lowered, so the
-    // injector's case-insensitive decision rests on a lowered store.
+    // injector's case-insensitive decision rests on a lowered store. Each placeholder is one
+    // credential's alone.
     let mut credentials = Vec::with_capacity(spec.credentials.len());
     for grant in &spec.credentials {
         if grant.reference.is_empty() {
@@ -617,8 +1023,15 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
         credentials.push(wire::CredentialGrant {
             reference: grant.reference.clone(),
             toward,
+            placeholder: grant.placeholder.clone(),
         });
     }
+    // Each placeholder stands where its member sends the credential: a bearer token, and no
+    // other credential's, so that the injector knows which value it is.
+    shards_dns::credential::check(&credentials).map_err(|refused| ImageRefusal::Spec {
+        what: "a credential grant",
+        why: refused.to_string(),
+    })?;
     // Its grants' values come by lease alone (D242): a run with grants and nothing to lease
     // them could never fill one.
     if !credentials.is_empty() && spec.lessor.is_none() {
@@ -627,6 +1040,8 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
             why: "a run with credential grants needs a lessor to lease their values".into(),
         });
     }
+    let sign_ins = sign_ins(spec, &credentials)?;
+    let upstream_roots = upstream_roots(&spec.upstream_roots)?;
     // The run's agent-control endpoint (D252): its socket grant's directory absolute and plain,
     // as a member's working directory is, refused here, by the run host and by init; its
     // admission one lane and one byte at least (R03: the caller's numbers), and the grant a run's
@@ -661,6 +1076,14 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
         what: "the GPU selection",
         why: e.to_string(),
     })?;
+    // Its report's scope (D233), refused as a managed launch's (`PreparedBoot::with_gpu_report`).
+    match spec.gpu_report {
+        Some(scope) if scope == [0; 16] => return Err(ImageRefusal::GpuProbe(crate::GpuProbeError::Scope)),
+        Some(_) if spec.gpu_devices.is_empty() => {
+            return Err(ImageRefusal::GpuProbe(crate::GpuProbeError::Empty));
+        }
+        _ => {}
+    }
     let request = wire::Request {
         image: spec.image.clone(),
         vcpus: spec.vcpus,
@@ -675,6 +1098,9 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
         credentials,
         control: spec.control.clone(),
         gpu_devices: spec.gpu_devices.clone(),
+        sign_ins,
+        upstream_roots,
+        gpu_report: spec.gpu_report,
     };
     // Past the channel's bound it would never be read; the guest's bound is the same one.
     request.encode().map_err(|e| ImageRefusal::Spec {
@@ -687,6 +1113,10 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A placeholder as kiln's broker mints one: a visible marker, then 256 random bits in hex.
+    const PLACEHOLDER: &str =
+        "kiln-placeholder-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn spec() -> ImageSpec {
         ImageSpec {
@@ -706,6 +1136,7 @@ mod tests {
                 stdin: false,
                 terminal: false,
                 args: Vec::new(),
+                mcp: false,
             }],
             publish: Vec::new(),
             egress: Narrowing::default(),
@@ -722,6 +1153,9 @@ mod tests {
             env: Vec::new(),
             control: None,
             gpu_devices: Vec::new(),
+            sign_ins: Vec::new(),
+            upstream_roots: Vec::new(),
+            gpu_report: None,
         }
     }
 
@@ -779,6 +1213,7 @@ mod tests {
         spec.credentials = vec![CredentialGrant {
             reference: "anthropic/claude-max".into(),
             toward: vec!["API.anthropic.com".into(), "platform.claude.com".into()],
+            placeholder: PLACEHOLDER.into(),
         }];
         spec.lessor = lessor();
         let r = request(&spec).unwrap();
@@ -818,6 +1253,180 @@ mod tests {
         let mut ok = spec.clone();
         ok.credentials[0].toward = vec!["host.docker.internal".into()];
         assert!(request(&ok).is_ok(), "host.docker.internal was refused");
+        // Its placeholder rides with it; one that is no bearer token is refused.
+        assert_eq!(r.credentials[0].placeholder, PLACEHOLDER);
+        for placeholder in ["", "two words", "a:b"] {
+            let mut bad = spec.clone();
+            bad.credentials[0].placeholder = placeholder.into();
+            assert!(
+                matches!(request(&bad), Err(ImageRefusal::Spec { .. })),
+                "{placeholder:?} was taken as a placeholder"
+            );
+        }
+        // One placeholder for two credentials is refused, as the injector could not tell
+        // which it stands for; one credential granted twice with it is two grants of one.
+        let mut twice = spec.clone();
+        twice.credentials.push(CredentialGrant {
+            reference: "anthropic/console".into(),
+            ..spec.credentials[0].clone()
+        });
+        assert!(matches!(request(&twice), Err(ImageRefusal::Spec { .. })));
+        twice.credentials[1].reference = "anthropic/claude-max".into();
+        assert!(request(&twice).is_ok());
+    }
+
+    /// Do: ask runs whose credential grant's reference, placeholder or hosts, or whose sign-in
+    /// grant's name, hosts, access token's reference or placeholders, are as long as the
+    /// network process's wire carries one (a two-byte length: shards-net's `NET_CREDENTIALS`
+    /// and `NET_SIGN_INS`), and one longer. Expect: each at the bound asked; each past it
+    /// refused here, by field, naming the field and never echoing its bytes, where before the
+    /// run host found it after the request had crossed.
+    #[test]
+    fn a_grants_fields_past_the_network_process_wire_are_refused_by_field() {
+        let most = usize::from(u16::MAX);
+        let host = || String::from("api.anthropic.com");
+        let base = || {
+            let mut s = spec();
+            s.credentials = vec![CredentialGrant {
+                reference: "anthropic/claude-max".into(),
+                toward: vec![host()],
+                placeholder: PLACEHOLDER.into(),
+            }];
+            s.sign_ins = vec![wire::SignInGrant {
+                sign_in: "ada/claude".into(),
+                cli: wire::Cli::ClaudeCode,
+                toward: vec![host()],
+                captured: Some(wire::Captured {
+                    access: "ada/claude/access".into(),
+                    access_placeholder: "kiln-placeholder-access-0123".into(),
+                    refresh_placeholder: Some("kiln-placeholder-refresh-4567".into()),
+                }),
+            }];
+            s.lessor = lessor();
+            s
+        };
+        assert!(request(&base()).is_ok());
+        type Set = fn(&mut ImageSpec, usize);
+        let fields: [(&str, &str, Set); 8] = [
+            ("a credential grant", "reference", |s, n| {
+                s.credentials[0].reference = "r".repeat(n)
+            }),
+            ("a credential grant", "placeholder", |s, n| {
+                s.credentials[0].placeholder = "p".repeat(n)
+            }),
+            ("a credential grant", "hosts", |s, n| {
+                s.credentials[0].toward = vec!["api.anthropic.com".into(); n]
+            }),
+            ("a sign-in grant", "name", |s, n| {
+                s.sign_ins[0].sign_in = "s".repeat(n)
+            }),
+            ("a sign-in grant", "hosts", |s, n| {
+                s.sign_ins[0].toward = vec!["api.anthropic.com".into(); n]
+            }),
+            ("a sign-in grant", "access token's reference", |s, n| {
+                if let Some(c) = s.sign_ins[0].captured.as_mut() {
+                    c.access = "a".repeat(n);
+                }
+            }),
+            ("a sign-in grant", "access token's placeholder", |s, n| {
+                if let Some(c) = s.sign_ins[0].captured.as_mut() {
+                    c.access_placeholder = "c".repeat(n);
+                }
+            }),
+            ("a sign-in grant", "refresh token's placeholder", |s, n| {
+                if let Some(c) = s.sign_ins[0].captured.as_mut() {
+                    c.refresh_placeholder = Some("f".repeat(n));
+                }
+            }),
+        ];
+        for (what, field, set) in fields {
+            let mut at = base();
+            set(&mut at, most);
+            assert!(request(&at).is_ok(), "{what}'s {field} at {most} was refused");
+            let mut past = base();
+            set(&mut past, most + 1);
+            match request(&past) {
+                Err(ImageRefusal::Spec { what: w, why }) => {
+                    assert_eq!(w, what, "{field}: {why}");
+                    assert!(why.contains(field), "{what}'s {field}: {why}");
+                    assert!(why.len() < 300, "{what}'s {field}: its refusal echoed its bytes");
+                }
+                Err(other) => panic!("{what}'s {field} past {most}: {other:?}"),
+                Ok(_) => panic!("{what}'s {field} past {most} was asked"),
+            }
+        }
+    }
+
+    /// The run's upstream roots (D242): certificates, DER or PEM (a bundle's, any text between
+    /// its sections), each a root the orchestrator names for its injected flows alone, checked
+    /// here as the network process's wire carries them (`NET_CREDENTIALS`: each DER behind two
+    /// bytes of length, their count behind two more). Expect: a DER and a bundle of two taken,
+    /// each certificate in order; bytes that are no certificate, a PEM of none, one whose
+    /// section is no base64, one of a key, a root past the wire's bound and one root past its
+    /// count each refused by field.
+    #[test]
+    fn a_runs_upstream_roots_are_certificates_the_network_process_wire_carries() {
+        let ca = |extension: usize| {
+            let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            if extension > 0 {
+                p.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+                    &[1, 3, 6, 1, 4, 1, 55555, 1],
+                    vec![0; extension],
+                )];
+            }
+            p.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap()
+        };
+        let (a, b) = (ca(0), ca(0));
+        let mut s = spec();
+        s.upstream_roots = vec![
+            UpstreamRoot::Der(a.der().to_vec()),
+            UpstreamRoot::Pem(format!("a proxy's bundle\n{}between\n{}", a.pem(), b.pem())),
+        ];
+        assert_eq!(
+            request(&s).unwrap().upstream_roots,
+            vec![a.der().to_vec(), a.der().to_vec(), b.der().to_vec()]
+        );
+        let refused = |roots: Vec<UpstreamRoot>| {
+            let mut s = spec();
+            s.upstream_roots = roots;
+            let Err(ImageRefusal::Spec { what, why }) = request(&s) else {
+                panic!("taken");
+            };
+            assert_eq!(what, "an upstream root");
+            why
+        };
+        let unparsed = "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n";
+        for bad in [
+            UpstreamRoot::Der(vec![0x30, 0x03, 0x01, 0x02, 0x03]),
+            UpstreamRoot::Der(Vec::new()),
+            UpstreamRoot::Pem("no certificate here".into()),
+            UpstreamRoot::Pem(format!("{}{unparsed}", a.pem())),
+            UpstreamRoot::Pem(format!(
+                "{}{}",
+                a.pem(),
+                rcgen::KeyPair::generate().unwrap().serialize_pem()
+            )),
+        ] {
+            refused(vec![bad]);
+        }
+        let most = usize::from(u16::MAX);
+        let big = ca(most);
+        assert!(big.der().len() > most);
+        let why = refused(vec![UpstreamRoot::Der(big.der().to_vec())]);
+        assert!(why.contains(&most.to_string()), "{why}");
+        let why = refused(vec![UpstreamRoot::Der(a.der().to_vec()); most + 1]);
+        assert!(why.contains(&(most + 1).to_string()), "{why}");
+        // As many as the wire's count holds pass this field's checks (the request may pass the
+        // channel's own bound, refused as that).
+        s.upstream_roots = vec![UpstreamRoot::Der(a.der().to_vec()); most];
+        assert!(!matches!(
+            request(&s),
+            Err(ImageRefusal::Spec {
+                what: "an upstream root",
+                ..
+            })
+        ));
     }
 
     /// Do: ask a run with credential grants and no lessor, with one, and a run with neither
@@ -830,6 +1439,7 @@ mod tests {
         granted.credentials = vec![CredentialGrant {
             reference: "anthropic/claude-max".into(),
             toward: vec!["api.anthropic.com".into()],
+            placeholder: PLACEHOLDER.into(),
         }];
         assert!(matches!(
             request(&granted),
@@ -1017,6 +1627,26 @@ mod tests {
         assert_eq!(request(&s).unwrap().control, s.control);
     }
 
+    /// D254: a member's MCP bridge is carried to its run host where the spec asks the run's
+    /// agent-control endpoint, and refused before any run host starts where it asks none.
+    #[test]
+    fn a_members_mcp_bridge_needs_the_runs_control_and_is_carried_with_it() {
+        let mut s = spec();
+        s.members[0].mcp = true;
+        assert!(matches!(
+            request(&s),
+            Err(ImageRefusal::Spec {
+                what: "a member's MCP bridge",
+                ..
+            })
+        ));
+        s.control = Some(ControlAsk {
+            controller: [1u8; 32],
+            sockets: None,
+        });
+        assert!(request(&s).unwrap().members[0].mcp);
+    }
+
     /// D232 through D231: a run's GPUs are D232's selection, checked before any run host starts
     /// (one GPU twice refused), and carried whole.
     #[test]
@@ -1027,5 +1657,22 @@ mod tests {
         assert_eq!(request(&s).unwrap().gpu_devices, vec![gpu]);
         s.gpu_devices = vec![gpu, gpu];
         assert!(matches!(request(&s), Err(ImageRefusal::Spec { .. })));
+    }
+
+    /// D233 through D231: a run's GPU report's scope is refused before any run host starts as a
+    /// managed launch's is (`PreparedBoot::with_gpu_report`): zero as `Scope`, of a run naming no
+    /// GPU as `Empty`; else carried whole.
+    #[test]
+    fn a_runs_gpu_report_scope_is_refused_as_a_managed_launchs() {
+        use crate::GpuProbeError;
+        let mut s = spec();
+        s.gpu_report = Some([3; 16]);
+        assert_eq!(request(&s), Err(ImageRefusal::GpuProbe(GpuProbeError::Empty)));
+        s.gpu_devices = vec![crate::PhysicalGpu::MetalRegistry(7)];
+        assert_eq!(request(&s).unwrap().gpu_report, Some([3; 16]));
+        s.gpu_report = Some([0; 16]);
+        assert_eq!(request(&s), Err(ImageRefusal::GpuProbe(GpuProbeError::Scope)));
+        s.gpu_report = None;
+        assert_eq!(request(&s).unwrap().gpu_report, None);
     }
 }

@@ -22,6 +22,7 @@ use crate::memory::GuestMemory;
 use crate::snapshot::{self, MachineConfig, Snapshot, codec::Writer};
 use crate::sync::{lock, wait};
 use crate::{debug, info, platform, warn};
+use shards_ipc::device::Refusal;
 
 /// Ok when this host can run VMs; otherwise, why not.
 pub fn check_host() -> Result<(), String> {
@@ -83,11 +84,8 @@ pub struct Handle {
 impl Handle {
     /// Plugs `device` into its PCI bus's first free slot (D214), on virtio's PCI
     /// transport: an error where it has no slots, or none free.
-    fn plug(&self, device: Box<dyn crate::devices::virtio::VirtioDevice>) -> Result<u8, String> {
-        let plugs = self
-            .control
-            .plugs()
-            .ok_or("this microVM has no PCI slots to plug a device into")?;
+    fn plug(&self, device: Box<dyn crate::devices::virtio::VirtioDevice>) -> Result<u8, Refusal> {
+        let plugs = self.control.plugs().ok_or(Refusal::NoBus)?;
         let memory = self.memory.clone();
         plugs.hotplug.plug(|slot| {
             let f = crate::devices::virtio::pci::VirtioPci::new(device, memory, slot.emulated_msi())?;
@@ -103,9 +101,11 @@ impl Handle {
         file: std::fs::File,
         read_only: bool,
         serial: &str,
-    ) -> Result<super::Plugged, String> {
+    ) -> Result<super::Plugged, Refusal> {
         let io = self.control.plugs().and_then(|p| p.io);
-        let disk = crate::devices::virtio::block::Block::of_file(file, read_only, serial)?.with_limit(io);
+        let disk = crate::devices::virtio::block::Block::of_file(file, read_only, serial)
+            .map_err(Refusal::Host)?
+            .with_limit(io);
         let size = disk.size();
         let devfn = self.plug(Box::new(disk))?;
         Ok(super::Plugged {
@@ -123,9 +123,11 @@ impl Handle {
         &self,
         tag: &str,
         slot: crate::devices::virtio::fs::Share,
-    ) -> Result<super::Plugged, String> {
+    ) -> Result<super::Plugged, Refusal> {
         let io = self.control.plugs().and_then(|p| p.io);
-        let share = crate::devices::virtio::fs::Fs::new(tag, slot)?.with_limit(io);
+        let share = crate::devices::virtio::fs::Fs::new(tag, slot)
+            .map_err(Refusal::Host)?
+            .with_limit(io);
         let devfn = self.plug(Box::new(share))?;
         Ok(super::Plugged {
             devfn,
@@ -142,7 +144,7 @@ impl Handle {
     /// or address space mapping what its endpoint's domain maps. Opened by its group's or
     /// its device's node: its guest finds it as its init rescans its PCI bus.
     #[cfg(target_os = "linux")]
-    pub fn plug_vfio(&self, f: &super::Vfio) -> Result<super::Plugged, String> {
+    pub fn plug_vfio(&self, f: &super::Vfio) -> Result<super::Plugged, Refusal> {
         self.plug_vfio_with(f, None)
     }
 
@@ -150,8 +152,12 @@ impl Handle {
     /// its host's limit ([`super::plug_refused`]), Windows' that it gives a microVM one as it
     /// starts alone, changing nothing.
     #[cfg(not(target_os = "linux"))]
-    pub fn plug_vfio(&self, f: &super::Vfio) -> Result<super::Plugged, String> {
-        Err(format!("{}: {}", f.name, super::plug_refused()))
+    pub fn plug_vfio(&self, f: &super::Vfio) -> Result<super::Plugged, Refusal> {
+        Err(Refusal::Unsupported(format!(
+            "{}: {}",
+            f.name,
+            super::plug_refused()
+        )))
     }
 
     /// [`plug_vfio`](Self::plug_vfio), of a function opened by another process, as a
@@ -162,7 +168,7 @@ impl Handle {
         &self,
         f: &super::Vfio,
         files: super::VfioFiles,
-    ) -> Result<super::Plugged, String> {
+    ) -> Result<super::Plugged, Refusal> {
         self.plug_vfio_with(f, Some(files))
     }
 
@@ -171,34 +177,33 @@ impl Handle {
         &self,
         f: &super::Vfio,
         files: Option<super::VfioFiles>,
-    ) -> Result<super::Plugged, String> {
+    ) -> Result<super::Plugged, Refusal> {
         use crate::devices::pci::{self, vfio as v};
-        let plugs = self
-            .control
-            .plugs()
-            .ok_or("this microVM has no PCI slots to plug a device into")?;
+        let plugs = self.control.plugs().ok_or(Refusal::NoBus)?;
         let named = |e: String| format!("{}: {e}", f.name);
         if f.iommu && f.noiommu {
-            return Err(named("a group without an IOMMU cannot follow the guest's".into()));
+            return Err(Refusal::InvalidRequest(named(
+                "a group without an IOMMU cannot follow the guest's".into(),
+            )));
         }
         let behind = plugs.hotplug.slots_behind_iommu();
         match (f.iommu, behind) {
             (true, false) => {
-                return Err(named(
+                return Err(Refusal::Unsupported(named(
                     "behind its microVM's IOMMU, where its slots are not: a microVM takes a host's function behind its IOMMU as it runs where it was booted for one (D214)".into(),
-                ));
+                )));
             }
             (false, true) => {
-                return Err(named(
+                return Err(Refusal::Unsupported(named(
                     "outside its microVM's IOMMU, where its slots sit behind it: a function plugged in there is behind it too".into(),
-                ));
+                )));
             }
             _ => {}
         }
         if !f.iommu
             && let Some(why) = &plugs.unpinnable
         {
-            return Err(named(why.clone()));
+            return Err(Refusal::Unsupported(named(why.clone())));
         }
         // Each step timed (PM M430): `Plugged::steps`, and the VM's log at debug.
         let mut clock = v::Clock::new();
@@ -308,12 +313,8 @@ impl Handle {
 
     /// Takes the device plugged at `devfn` off its PCI bus (D214), once its guest has let
     /// it go: an error, changing nothing, where its guest's driver still drives it.
-    pub fn unplug(&self, devfn: u8) -> Result<(), String> {
-        self.control
-            .plugs()
-            .ok_or("this microVM has no PCI slots")?
-            .hotplug
-            .unplug(devfn)
+    pub fn unplug(&self, devfn: u8) -> Result<(), Refusal> {
+        self.control.plugs().ok_or(Refusal::NoBus)?.hotplug.unplug(devfn)
     }
 
     /// What grows its file disk `index` of those it was made with (D214), as its host
@@ -357,12 +358,17 @@ impl Handle {
     /// ([`MILLI_PER_CPU`](super::MILLI_PER_CPU) a whole CPU's), its run's limit (D191) or
     /// its orchestrator's rate (D247), whatever its guest does with its own cgroups; 0, or
     /// every vCPU's whole CPU, lets them be. Returns what it holds them to, none where it
-    /// lets them be. Its governor's thread is made with the first limit.
-    pub fn hold_rate(&self, milli: u64) -> Result<Option<std::num::NonZeroU64>, String> {
+    /// lets them be, and the period it holds over, derived from g (D191, `granule::period`);
+    /// refused, the hold as it was, where that period outgrows a u64 of ns. Its governor's
+    /// thread is made with the first limit.
+    pub fn hold_rate(&self, milli: u64) -> Result<super::Rated, String> {
         let sh = &self.shared;
-        let held = sh.hold.set(milli);
-        if held.is_none() {
-            return Ok(None);
+        let held = sh
+            .hold
+            .set(milli)
+            .map_err(|e| format!("its hold's period: {e}"))?;
+        if held.milli.is_none() {
+            return Ok(held);
         }
         let mut governor = lock(&sh.governor);
         // Under the lock the teardown takes it by, once the machine stops: none is made
@@ -386,6 +392,9 @@ impl Handle {
         let mut governor = lock(&sh.group_governor);
         if governor.is_some() {
             return Err("this microVM is held by a group's budget already".into());
+        }
+        if group.budget().is_none() {
+            return Err("its group's CPU budget was never written".into());
         }
         if sh.exiting() {
             return Ok(());
@@ -469,20 +478,8 @@ impl Handle {
         if sh.template.load(Ordering::Acquire) {
             return Err("the microVM has its template still to save".into());
         }
-        {
-            let mut saving = lock(&sh.saving);
-            if sh.exiting() {
-                return Err("the microVM has stopped".into());
-            }
-            if *saving {
-                return Err("the microVM is being saved already".into());
-            }
-            *saving = true;
-        }
-        let saved = self.save_parked(parts, save);
-        *lock(&sh.saving) = false;
-        sh.saved.notify_all();
-        saved
+        let _reading = sh.begin_read(HostRead::Save).map_err(|e| e.to_string())?;
+        self.save_parked(parts, save)
     }
 
     /// Copies the running machine's memory, writable layer and run's swap into `out` for a
@@ -510,6 +507,7 @@ impl Handle {
         if sh.released_at_us.get().is_none() {
             return Err("the microVM has not started".into());
         }
+        let _reading = sh.begin_read(HostRead::Precopy).map_err(|e| e.to_string())?;
         let vm = parts.vm.upgrade().ok_or("the microVM has stopped")?;
         let fail = |e: std::io::Error| format!("sending its memory: {e}");
         let carried = Carried {
@@ -564,9 +562,15 @@ impl Handle {
                 swap.as_ref().map(|s| s.run_data()).transpose(),
             )
         };
-        self.resume();
+        let found = found.0.and_then(|layer| found.1.map(|swap| (layer, swap)));
+        let outcome = match found {
+            Ok(runs) => Scanned::Mapped(runs),
+            Err(e) if self.control.lost() => Scanned::Lost(e),
+            Err(e) => Scanned::Failed(e),
+        };
+        let found = self.shared.finish_scan(outcome);
         precopied.paused_us = crate::log::uptime_us().saturating_sub(paused);
-        let (layer_runs, swap_runs) = (found.0?, found.1?);
+        let (layer_runs, swap_runs) = found?;
         let mut buf = vec![0u8; live::MAX_RECORD];
         let mut send = |kind: u8, runs: &[(u64, u64)], read: &Reader<'_>| {
             for &(off, len) in runs {
@@ -628,8 +632,8 @@ impl Handle {
         let fail = |e: std::io::Error| format!("sending its memory: {e}");
         let (layer, swap) = (self.control.layer(), self.control.swap());
         for gpa in written.iter() {
-            if let Some((plugged, at, bytes)) = self.memory.page_at(gpa) {
-                w.record(if plugged { live::PLUGGED } else { live::RAM }, at, bytes)
+            if let Some((plugged, at, bytes)) = self.memory.page_at(gpa).map_err(|e| e.to_string())? {
+                w.record(if plugged { live::PLUGGED } else { live::RAM }, at, &bytes)
                     .map_err(fail)?;
                 continue;
             }
@@ -675,6 +679,7 @@ impl Handle {
             config: &parts.config,
             join: parts.join,
             swap: self.control.swap().map(|w| &**w),
+            init: self.control.guest_abi(),
         };
         if !sh.snapshot.wait_parked(&|| sh.exiting()) {
             return Err("the microVM has stopped".into());
@@ -871,6 +876,51 @@ impl Handle {
     pub fn guest_times(&self) -> GuestTimes {
         self.shared.guest.sample()
     }
+
+    /// What each of its vCPUs ran of its guest in all, by index, those gone among them at
+    /// what they read as they left (D260's final use): read once the machine is down
+    /// ([`Running::wait_then`]'s `free`), after its last guest instruction, it is the whole.
+    pub fn whole_guest_times(&self) -> GuestTimes {
+        self.shared.guest.whole()
+    }
+}
+
+/// Whether extent discovery left every withdrawn mapping available to the guest.
+enum Scanned<T> {
+    Mapped(T),
+    Failed(String),
+    Lost(String),
+}
+
+/// Host operations that keep mappings alive until their last read, including errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostRead {
+    Save,
+    Precopy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadRefused {
+    Stopped,
+    Busy(HostRead),
+}
+
+impl std::fmt::Display for ReadRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("the microVM has stopped"),
+            Self::Busy(kind) => write!(f, "the microVM has a {kind:?} reader already"),
+        }
+    }
+}
+
+struct Reading<'a>(&'a Shared);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.saving) = None;
+        self.0.saved.notify_all();
+    }
 }
 
 #[derive(Debug)]
@@ -908,9 +958,9 @@ struct Shared {
     parts: OnceLock<Parts>,
     /// Whether a template's snapshot is still to be taken, its coordinator waiting.
     template: AtomicBool,
-    /// Whether a snapshot the host asked for is being taken: one at a time, and the
-    /// machine is taken apart only once it is done (`Running::teardown`).
-    saving: Mutex<bool>,
+    /// The host reader, if any: save and precopy exclude each other and teardown
+    /// cannot release mappings until that reader has finished, including error paths.
+    saving: Mutex<Option<HostRead>>,
     saved: Condvar,
     /// The host's hold on the vCPUs' CPU time, a run's limit (D191), and its governor's
     /// thread, made as the first limit comes and joined as the machine is taken apart.
@@ -1002,7 +1052,7 @@ impl Shared {
             committed: Condvar::new(),
             parts: OnceLock::new(),
             template: AtomicBool::new(false),
-            saving: Mutex::new(false),
+            saving: Mutex::new(None),
             saved: Condvar::new(),
             hold: Hold::new(vcpus as usize),
             guest: GuestClocks::default(),
@@ -1011,10 +1061,39 @@ impl Shared {
         }
     }
 
-    /// Waits until no save the host asked for reads the machine.
+    fn finish_scan<T>(&self, outcome: Scanned<T>) -> Result<T, String> {
+        match outcome {
+            Scanned::Mapped(value) => {
+                self.hold.resume();
+                Ok(value)
+            }
+            Scanned::Failed(e) => {
+                self.hold.resume();
+                Err(e)
+            }
+            Scanned::Lost(e) => {
+                self.stop(ExitReason::Error(e.clone()));
+                Err(e)
+            }
+        }
+    }
+
+    fn begin_read(&self, kind: HostRead) -> Result<Reading<'_>, ReadRefused> {
+        let mut reading = lock(&self.saving);
+        if self.exiting() {
+            return Err(ReadRefused::Stopped);
+        }
+        if let Some(kind) = *reading {
+            return Err(ReadRefused::Busy(kind));
+        }
+        *reading = Some(kind);
+        Ok(Reading(self))
+    }
+
+    /// Waits until no host save or live copy reads the machine.
     fn await_save(&self) {
         let mut saving = lock(&self.saving);
-        while *saving {
+        while saving.is_some() {
             saving = wait(&self.saved, saving);
         }
     }
@@ -1281,6 +1360,23 @@ pub fn restore(cfg: &RestoreConfig) -> Result<(Handle, Running), String> {
 /// has checked ([`check_host`]): a restore that read it to learn its backing files reads
 /// and decodes it once, and resumes the very generation it checked (review 1.12).
 pub fn restore_from(cfg: &RestoreConfig, pinned: snapshot::Pinned) -> Result<(Handle, Running), String> {
+    restore_reported(cfg, pinned, None)
+}
+
+/// [`restore_from`], `report` given what the restored machine's renderer comes to as it rejoins
+/// the selection its snapshot keeps (D232's format 29, D233), as [`start_gpu_report`]'s boot
+/// gives it its own: before any guest vCPU runs. A snapshot of no selected GPU is refused, as
+/// such a boot is (`GpuProbeError::Empty`).
+pub fn restore_reported(
+    cfg: &RestoreConfig,
+    pinned: snapshot::Pinned,
+    report: Option<&mut super::GpuReportTo<'_>>,
+) -> Result<(Handle, Running), String> {
+    if report.is_some()
+        && (pinned.snapshot.config.gpu.is_none() || pinned.snapshot.config.gpu_devices.is_empty())
+    {
+        return Err(shards_abi::gpu::GpuProbeError::Empty.to_string());
+    }
     let snapshot::Pinned {
         snapshot: snap,
         memory: memory_file,
@@ -1358,6 +1454,7 @@ pub fn restore_from(cfg: &RestoreConfig, pinned: snapshot::Pinned) -> Result<(Ha
             window_heads: window_heads.as_ref(),
         },
         working_set.unwrap_or_default(),
+        report,
     )?;
     // The run's swap a snapshot of a run kept (D176), back where its guest had it before
     // any vCPU runs.
@@ -1709,6 +1806,7 @@ impl Coordinator {
             config: &self.config,
             join: self.join,
             swap: self.control.swap().map(|w| &**w),
+            init: self.control.guest_abi(),
         }
     }
 
@@ -1849,6 +1947,8 @@ struct Cut<'a> {
     join: Option<&'static Join>,
     /// Its swap window (D159), where it has one.
     swap: Option<&'a pmem::SwapWindow>,
+    /// The contract its guest's init announced, which its snapshot records (D176).
+    init: Option<u64>,
 }
 
 impl Cut<'_> {
@@ -1893,6 +1993,7 @@ impl Cut<'_> {
             data: None,
             arch,
             devices: w.into_bytes(),
+            init: self.init,
         }))
     }
 
@@ -1909,6 +2010,51 @@ impl Cut<'_> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_copy_whose_mapping_was_lost_stops_instead_of_resuming() {
+        let sh = Shared::new(0);
+        let result = sh.finish_scan::<()>(Scanned::Lost("layer map-back failed".into()));
+        assert_eq!(result, Err("layer map-back failed".into()));
+        assert!(sh.exiting(), "a live copy resumed after losing its layer mapping");
+    }
+
+    #[test]
+    fn a_live_copy_with_intact_mappings_can_continue_after_a_scan_error() {
+        let sh = Shared::new(0);
+        assert_eq!(sh.finish_scan(Scanned::Mapped(7)), Ok(7));
+        assert_eq!(
+            sh.finish_scan::<()>(Scanned::Failed("extent read failed".into())),
+            Err("extent read failed".into())
+        );
+        assert!(!sh.exiting());
+    }
+
+    #[test]
+    fn live_copy_excludes_save_and_teardown_until_its_guard_is_gone() {
+        let sh = Shared::new(0);
+        let reading = sh.begin_read(HostRead::Precopy).unwrap();
+        assert!(matches!(
+            sh.begin_read(HostRead::Save),
+            Err(ReadRefused::Busy(HostRead::Precopy))
+        ));
+        let (ended, end) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                sh.await_save();
+                ended.send(()).unwrap();
+            });
+            assert!(end.try_recv().is_err());
+            drop(reading);
+            end.recv().unwrap();
+        });
+        drop(sh.begin_read(HostRead::Save).unwrap());
+        sh.stop(ExitReason::Stopped);
+        assert!(matches!(
+            sh.begin_read(HostRead::Precopy),
+            Err(ReadRefused::Stopped)
+        ));
+    }
 
     /// A restore copies its generation's writable layer into an empty file or into a clone
     /// of another generation's, takes a clone of its own generation's as it is, and refuses
@@ -1959,6 +2105,7 @@ mod tests {
             data: None,
             arch: Vec::new(),
             devices: Vec::new(),
+            init: None,
         };
         assert_eq!(pmem::ALIGN, 2 << 20);
         assert_eq!(guest_pages(&snap), ((16 + 4 + 4) << 20) / machine::PAGE);

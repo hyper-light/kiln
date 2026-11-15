@@ -15,10 +15,12 @@
 //! remove_tree does; an rmdir before then is refused with EBUSY.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use hex_api::Proc;
 use hex_api::{Bounds, BoxId, IoRates, Refusal};
-use hex_runtime::linux::cgroup::{self, BoxRoot};
+use hex_core::patience::{Patience, Piece};
+use hex_runtime::linux::cgroup::{self, BoxCgroup, BoxRoot};
 use hex_runtime::linux::{disks, proc, process, sys};
 
 /// Runs `hex box run`'s arguments (everything after `box run`); returns the process exit code.
@@ -79,17 +81,21 @@ fn go(args: &[String]) -> Result<u8, Refusal> {
         }
     };
     let mut watched = proc::PidfdProc::of_child(child.id())?;
-    // Wait without a real deadline: the program runs as long as it needs; the caller ends it by
-    // signal (which reaches the boxed child). wait_for polls the pidfd; a long slice loops rarely.
+    // Followed to its end by its pidfd (`Duration::MAX`: until it), with no deadline: the program runs as long as it
+    // needs, and its caller ends it by signal (which reaches the boxed child). It was an hour's slice, picked
+    // (decision 9; ROOT, 2026-11-14).
     let exit = loop {
-        if let Some(e) = watched.wait_for(std::time::Duration::from_secs(3600))? {
+        if let Some(e) = watched.wait_for(Duration::MAX)? {
             break e;
         }
     };
 
-    // Clean the box up: end any strays, wait for it to empty, remove it.
-    let _ = cg.kill();
-    let _ = cg.wait_empty(CLEANUP_PATIENCE);
+    // Clean the box up: end any strays, follow it to its emptying, remove it. Strays a kill didn't reach are none of
+    // this wrapper's to wait on, so the remove refuses then, as it did.
+    let killed = Instant::now();
+    if cg.kill().is_ok() {
+        let _ = emptied(&cg, killed);
+    }
     let _ = cg.remove();
 
     Ok(exit_code(exit))
@@ -110,8 +116,35 @@ fn box_root(disks: Vec<hex_core::cgroup::Dev>) -> Result<BoxRoot, Refusal> {
     BoxRoot::open(&own.join(".hexbox"), disks)
 }
 
-/// How long to wait for the box to empty after killing strays before giving up the cleanup.
-const CLEANUP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+/// The box's emptying once its strays are killed (decision 9; the review's (c), 2026-11-14): within W*, the slowest
+/// emptying this wrapper has seen; past it, and before the first, its run-out told and the box followed by its life,
+/// its `cgroup.events`, to its emptying, so it is removed empty, never given up at a time. It was 10 s, the oci
+/// runtime's delete patience copied, past which the remove was refused and the box left.
+static CLEANUP: Patience = Patience::measuring("boxrun.emptying");
+
+/// Waits for `cg`, killed at `killed`, to empty, as [`CLEANUP`] waits: whether it emptied.
+fn emptied(cg: &BoxCgroup, killed: Instant) -> Result<bool, Refusal> {
+    if let Some(window) = CLEANUP.deadline() {
+        if cg.wait_empty(window.saturating_sub(killed.elapsed()))? {
+            CLEANUP.answered(killed.elapsed());
+            return Ok(true);
+        }
+        CLEANUP.ran_out(
+            window,
+            killed.elapsed(),
+            &[
+                Piece::Kind("box cgroup "),
+                Piece::Path(cg.dir()),
+                Piece::Kind(", by its cgroup.events"),
+            ],
+        );
+    }
+    let came = cg.wait_empty(Duration::MAX)?;
+    if came {
+        CLEANUP.answered(killed.elapsed());
+    }
+    Ok(came)
+}
 
 fn exit_code(exit: hex_api::Exit) -> u8 {
     match exit {

@@ -9,7 +9,20 @@ use hex_core::record::{NativeRecord, PoolRecord};
 use sha2::{Digest, Sha256};
 
 fn refused(key: BackingKey, cause: LifecycleCause) -> Refusal {
-    Refusal::Backing { key, cause }
+    Refusal::Backing {
+        key,
+        cause,
+        why: None,
+    }
+}
+
+/// Backing `key` refused Uncertain, and `why` in the refusing site's own words (joint plan step 14, (B)).
+fn backing_uncertain(key: BackingKey, why: &str) -> Refusal {
+    Refusal::Backing {
+        key,
+        cause: LifecycleCause::Uncertain,
+        why: Some(why.to_owned()),
+    }
 }
 
 fn observer_cost(config: &Config) -> Result<RuntimeCost, Refusal> {
@@ -181,7 +194,10 @@ impl FirecrackerRuntime {
                 }
             }
         {
-            return Err(refused(canonical.key, LifecycleCause::Uncertain));
+            return Err(backing_uncertain(
+                canonical.key,
+                "the prepared observer record names another cost, key, devices, allocation or controller than it expected",
+            ));
         }
         if canonical.phase == BackingPhase::Prepared && canonical.devices != devices {
             // No native I/O runs while the family metadata fence is held. Cancellation owes
@@ -217,20 +233,26 @@ impl FirecrackerRuntime {
             .try_reserve_exact(records.len())
             .map_err(|_| exhausted("observer consuming references", records.len()))?;
         for (id, boxed) in records {
-            let boxed = boxed.as_ref().map_err(|_| uncertain(id))?;
+            let boxed = boxed
+                .as_ref()
+                .map_err(|_| uncertain(id, "its record can't be read"))?;
             boxed.spec.check()?;
             let Some(route) = boxed.spec.route.filter(|route| {
                 route.key.execution == Execution::Firecracker && route.backing.is_some()
             }) else {
                 continue;
             };
-            let key = route.backing.ok_or_else(|| uncertain(id))?;
+            let key = route
+                .backing
+                .ok_or_else(|| uncertain(id, "its record routes it on no backing"))?;
             let source = family
                 .binary_search_by_key(&key, |pool| pool.key)
                 .ok()
                 .and_then(|at| family.get(at))
                 .copied()
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                .ok_or_else(|| {
+                    backing_uncertain(key, "its family names no record of its consuming reference")
+                })?;
             route.check_backing_parts(
                 boxed.spec.allocation.map(|allocation| allocation.cost),
                 key,
@@ -249,7 +271,10 @@ impl FirecrackerRuntime {
                 .first()
                 .copied()
                 .ok_or_else(|| invalid("missing consuming reference"))?;
-            return Err(refused(key, LifecycleCause::Uncertain));
+            return Err(backing_uncertain(
+                key,
+                "two boxes name it as their consuming reference",
+            ));
         }
         let mut current: Option<&PoolRecord> = None;
         let mut ack = None;
@@ -262,7 +287,10 @@ impl FirecrackerRuntime {
                     ack = Some(pool);
                 }
             } else if current.replace(pool).is_some() {
-                return Err(refused(pool.key, LifecycleCause::Uncertain));
+                return Err(backing_uncertain(
+                    pool.key,
+                    "its observer family holds a second current backing",
+                ));
             }
         }
         let devices =
@@ -330,18 +358,32 @@ impl FirecrackerRuntime {
         if self.census_observer(record)? {
             return Ok(());
         }
-        let bad = || refused(record.key, LifecycleCause::Uncertain);
-        if record.execution != Execution::Firecracker
-            || record.cost != observer_cost(&self.config)?
-            || record.key.pool != observer_configuration(&self.config, &record.devices)?
-        {
-            return Err(bad());
+        if record.execution != Execution::Firecracker {
+            return Err(backing_uncertain(
+                record.key,
+                "its record isn't a Firecracker observer's",
+            ));
+        }
+        if record.cost != observer_cost(&self.config)? {
+            return Err(backing_uncertain(
+                record.key,
+                "its record's cost isn't its node's observer's",
+            ));
+        }
+        if record.key.pool != observer_configuration(&self.config, &record.devices)? {
+            return Err(backing_uncertain(
+                record.key,
+                "its pool isn't its node's observer configuration's for its devices",
+            ));
         }
         hex_api::BackingOffer::check_selection_parts(&self.observer_claims()?, &record.devices)?;
         if let Some(allocation) = record.allocation
             && allocation != record.cost.allocate(CapacityResources::default())?
         {
-            return Err(bad());
+            return Err(backing_uncertain(
+                record.key,
+                "its allocation isn't its observer cost's",
+            ));
         }
         Ok(())
     }
@@ -373,7 +415,7 @@ impl FirecrackerRuntime {
         self.observer_records()?
             .into_iter()
             .find(|record| record.key == *key)
-            .ok_or_else(|| refused(*key, LifecycleCause::Uncertain))
+            .ok_or_else(|| backing_uncertain(*key, "its node holds no observer record of it"))
     }
 
     fn pool_paths(&self, record: &PoolRecord) -> Result<Paths, Refusal> {
@@ -412,10 +454,18 @@ impl FirecrackerRuntime {
         let native = transaction.attach_managed(identity.as_ref())?;
         if native
             .terminal()
-            .map_err(|_| refused(record.key, LifecycleCause::Uncertain))?
+            .map_err(|_| {
+                backing_uncertain(
+                    record.key,
+                    "its observer's end couldn't be read as its client was made",
+                )
+            })?
             .is_some()
         {
-            return Err(refused(record.key, LifecycleCause::Uncertain));
+            return Err(backing_uncertain(
+                record.key,
+                "its observer ended before its client was made",
+            ));
         }
         let link = own_link(transport::Endpoint {
             path: self.pool_paths(record)?.vsock,
@@ -524,11 +574,17 @@ impl FirecrackerRuntime {
                 &before.key,
                 &keys,
                 |transaction| {
-                    let record = transaction
-                        .read_pool(&before.key)?
-                        .ok_or_else(|| refused(before.key, LifecycleCause::Uncertain))?;
+                    let record = transaction.read_pool(&before.key)?.ok_or_else(|| {
+                        backing_uncertain(
+                            before.key,
+                            "its observer record is gone as its observations were read",
+                        )
+                    })?;
                     if record != before {
-                        return Err(refused(before.key, LifecycleCause::Uncertain));
+                        return Err(backing_uncertain(
+                            before.key,
+                            "its observer record changed as its observations were read",
+                        ));
                     }
                     let client = self.pool_client(&record, transaction, until)?;
                     self.pool_observations(&record, &client, until)
@@ -539,7 +595,7 @@ impl FirecrackerRuntime {
         // After observer handoff a retained GPU Box is the actual current driver provider. Read
         // each through its same method/device turns and managed receipt; never repick or cache.
         for (id, record) in self.authority()?.records()? {
-            let record = record.map_err(|_| uncertain(&id))?;
+            let record = record.map_err(|_| uncertain(&id, "its record can't be read"))?;
             if record.spec.backend_class()? != Class::Firecracker
                 || record.phase != Phase::Ready
                 || !record
@@ -587,14 +643,20 @@ impl FirecrackerRuntime {
                 // A repeated/interrupted Intent never starts another incarnation. Only a positively
                 // observed retained Live scope may answer idempotently.
                 if before.phase != BackingPhase::Live {
-                    return Err(refused(grant.key, LifecycleCause::Uncertain));
+                    return Err(backing_uncertain(
+                        grant.key,
+                        "a repeated grant found its observer not live",
+                    ));
                 }
                 let mut accepted = before.offer()?;
-                let retained = before
-                    .allocation
-                    .ok_or_else(|| refused(grant.key, LifecycleCause::Uncertain))?;
+                let retained = before.allocation.ok_or_else(|| {
+                    backing_uncertain(grant.key, "its live observer record holds no allocation")
+                })?;
                 if retained != grant.allocation || before.devices != grant.devices {
-                    return Err(refused(grant.key, LifecycleCause::Uncertain));
+                    return Err(backing_uncertain(
+                        grant.key,
+                        "the repeated grant's allocation or devices aren't its record's",
+                    ));
                 }
                 let client = self.pool_client(&before, transaction, Some(until))?;
                 self.pool_observations(&before, &client, Some(until))?;
@@ -629,7 +691,12 @@ impl FirecrackerRuntime {
             match fs::symlink_metadata(&paths.dir) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(Refusal::os("checking observer incarnation path", error)),
-                Ok(_) => return Err(refused(grant.key, LifecycleCause::Uncertain)),
+                Ok(_) => {
+                    return Err(backing_uncertain(
+                        grant.key,
+                        "its observer's incarnation path is on disk before its launch",
+                    ));
+                }
             }
             // The observer VM owns its own attached GPUs; no Box runs in it.
             let owner = crate::devices::managed_native_scope_id(NativeRecord::Pool(&record))?;
@@ -656,11 +723,11 @@ impl FirecrackerRuntime {
                     memlock,
                 },
                 io,
-                remaining(until)?,
+                Some(remaining(until)?),
             )?;
-            let mut current = transaction
-                .read_pool(&grant.key)?
-                .ok_or_else(|| refused(grant.key, LifecycleCause::Uncertain))?;
+            let mut current = transaction.read_pool(&grant.key)?.ok_or_else(|| {
+                backing_uncertain(grant.key, "its observer record is gone after its launch")
+            })?;
             if current.key != record.key
                 || current.cost != record.cost
                 || current.devices != record.devices
@@ -668,7 +735,10 @@ impl FirecrackerRuntime {
                 || current.phase != BackingPhase::Granted
                 || current.init.is_none()
             {
-                return Err(refused(grant.key, LifecycleCause::Uncertain));
+                return Err(backing_uncertain(
+                    grant.key,
+                    "its launched observer record isn't granted with its controller",
+                ));
             }
             transport::ready(&ready, native.as_ref(), &mut output, until)?;
             drop(output);
@@ -692,9 +762,9 @@ impl FirecrackerRuntime {
         let before = self.observer_record(key)?;
         let keys = self.catalog.conflict_ids(&before.devices)?;
         crate::devices::with_pool_transaction(&self.books, key, &keys, |transaction| {
-            let mut record = transaction
-                .read_pool(key)?
-                .ok_or_else(|| refused(*key, LifecycleCause::Uncertain))?;
+            let mut record = transaction.read_pool(key)?.ok_or_else(|| {
+                backing_uncertain(*key, "its observer record is gone before its release")
+            })?;
             self.preflight_backing(&record)?;
             if record.phase == BackingPhase::Released {
                 return record.offer();
@@ -720,7 +790,12 @@ impl FirecrackerRuntime {
                 Err(error) => {
                     return Err(Refusal::os("checking unsubmitted observer Intent", error));
                 }
-                Ok(_) => return Err(refused(key, LifecycleCause::Uncertain)),
+                Ok(_) => {
+                    return Err(backing_uncertain(
+                        key,
+                        "its unsubmitted observer left an intent on disk",
+                    ));
+                }
             }
             transaction.check_unsubmitted_pool()?;
             record.phase = BackingPhase::Released;
@@ -730,20 +805,29 @@ impl FirecrackerRuntime {
         transaction.put_pool(record)?;
         let identity = self.pool_identity(record)?;
         let native = transaction.attach_managed(identity.as_ref())?;
+        let began = Instant::now();
         native
             .stop()
-            .map_err(|_| refused(key, LifecycleCause::Uncertain))?;
-        let patience = until
-            .map(remaining)
-            .transpose()?
-            .map_or(self.config.stop_timeout, |left| {
-                left.min(self.config.stop_timeout)
-            });
-        let terminal = native
-            .wait_for(patience)
-            .map_err(|_| refused(key, LifecycleCause::Uncertain))?
-            .filter(|end| end.scope == shards_api::TerminalScope::Released)
-            .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+            .map_err(|_| backing_uncertain(key, "its observer's stop failed"))?;
+        // A caller's deadline bounds the stop it waits on; with none, the stop's own wait (managed.stop; decision 9):
+        // past the slowest stop seen, its scope followed by its life to its end, never refused at a configured time
+        // (A-13: census retirement at a node's start stops observers this way).
+        let released = match until {
+            Some(until) => native
+                .wait_for(remaining(until)?)
+                .map(|end| end.filter(|end| end.scope == shards_api::TerminalScope::Released)),
+            None => crate::guest::wait_stopped(&*native, began),
+        };
+        let terminal = released
+            .map_err(|_| {
+                backing_uncertain(
+                    key,
+                    "its observer's end couldn't be waited on after its stop",
+                )
+            })?
+            .ok_or_else(|| {
+                backing_uncertain(key, "its observer's scope wasn't released after its stop")
+            })?;
         record.exit = Some(exit(terminal.status));
         transaction.put_pool(record)?;
         transaction.finalize_managed(identity.as_ref())?;
@@ -776,7 +860,7 @@ impl FirecrackerRuntime {
     pub fn retire_census(&self) -> Result<(), Refusal> {
         self.retire_census_observers()?;
         for (id, record) in self.authority()?.records()? {
-            let record = record.map_err(|_| uncertain(&id))?;
+            let record = record.map_err(|_| uncertain(&id, "its record can't be read"))?;
             if record.retired || !matches!(record.spec.class, ClassSpec::Firecracker(_)) {
                 continue;
             }
@@ -814,11 +898,15 @@ impl FirecrackerRuntime {
             let key = record.key;
             let keys = self.catalog.conflict_ids(&record.devices)?;
             crate::devices::with_pool_transaction(&self.books, &key, &keys, |transaction| {
-                let mut record = transaction
-                    .read_pool(&key)?
-                    .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                let mut record = transaction.read_pool(&key)?.ok_or_else(|| {
+                    backing_uncertain(
+                        key,
+                        "its observer record is gone before its census retirement",
+                    )
+                })?;
                 for (id, boxed) in transaction.records()? {
-                    let mut boxed = boxed.map_err(|_| uncertain(&id))?;
+                    let mut boxed =
+                        boxed.map_err(|_| uncertain(&id, "its record can't be read"))?;
                     if boxed.retired
                         || boxed.spec.route.and_then(|route| route.backing) != Some(key)
                     {
@@ -848,16 +936,22 @@ impl FirecrackerRuntime {
         let before = self.observer_record(key)?;
         let keys = self.catalog.conflict_ids(&before.devices)?;
         crate::devices::with_pool_transaction(&self.books, key, &keys, |transaction| {
-            let record = transaction
-                .read_pool(key)?
-                .ok_or_else(|| refused(*key, LifecycleCause::Uncertain))?;
+            let record = transaction.read_pool(key)?.ok_or_else(|| {
+                backing_uncertain(
+                    *key,
+                    "its observer record is gone before its release was acknowledged",
+                )
+            })?;
             self.preflight_backing(&record)?;
             if record != before || record.phase != BackingPhase::Released {
-                return Err(refused(*key, LifecycleCause::Uncertain));
+                return Err(backing_uncertain(
+                    *key,
+                    "its observer record changed or isn't released as its release is acknowledged",
+                ));
             }
             let released = record.offer()?;
             for (id, boxed) in transaction.records()? {
-                let boxed = boxed.map_err(|_| uncertain(&id))?;
+                let boxed = boxed.map_err(|_| uncertain(&id, "its record can't be read"))?;
                 boxed.spec.check()?;
                 if boxed.spec.route.and_then(|route| route.backing) == Some(*key) {
                     // Parent metadata remains the immutable source for its sole Box S lifetime.
@@ -872,7 +966,12 @@ impl FirecrackerRuntime {
                 Err(error) => {
                     return Err(Refusal::os("checking acknowledged observer state", error));
                 }
-                Ok(_) => return Err(refused(*key, LifecycleCause::Uncertain)),
+                Ok(_) => {
+                    return Err(backing_uncertain(
+                        *key,
+                        "its observer's state is still on disk after its acknowledged release",
+                    ));
+                }
             }
             // SAME Tx removal revalidates native no-submission for an unallocated canceled
             // lifetime; allocated Released already owes positive full-scope finalization above.
@@ -885,9 +984,12 @@ impl FirecrackerRuntime {
         let before = self.observer_record(key)?;
         let keys = self.catalog.conflict_ids(&before.devices)?;
         crate::devices::with_pool_transaction(&self.books, key, &keys, |transaction| {
-            let record = transaction
-                .read_pool(key)?
-                .ok_or_else(|| refused(*key, LifecycleCause::Uncertain))?;
+            let record = transaction.read_pool(key)?.ok_or_else(|| {
+                backing_uncertain(
+                    *key,
+                    "its observer record is gone before its usage was read",
+                )
+            })?;
             self.preflight_backing(&record)?;
             let identity = self.pool_identity(&record)?;
             let _receipt = transaction.attach_managed(identity.as_ref())?;
@@ -912,17 +1014,28 @@ impl FirecrackerRuntime {
                         &record.key,
                         &keys,
                         |transaction| {
-                            let current = transaction
-                                .read_pool(&record.key)?
-                                .ok_or_else(|| refused(record.key, LifecycleCause::Uncertain))?;
+                            let current = transaction.read_pool(&record.key)?.ok_or_else(|| {
+                                backing_uncertain(
+                                    record.key,
+                                    "its observer record is gone at its recovery",
+                                )
+                            })?;
                             if current != record {
-                                return Err(refused(record.key, LifecycleCause::Uncertain));
+                                return Err(backing_uncertain(
+                                    record.key,
+                                    "its observer record changed at its recovery",
+                                ));
                             }
                             let identity = self.pool_identity(&current)?;
                             let native = transaction.attach_managed(identity.as_ref())?;
                             Ok(native
                                 .terminal()
-                                .map_err(|_| refused(record.key, LifecycleCause::Uncertain))?
+                                .map_err(|_| {
+                                    backing_uncertain(
+                                        record.key,
+                                        "its observer's end couldn't be read at its recovery",
+                                    )
+                                })?
                                 .is_some_and(|terminal| {
                                     terminal.scope == shards_api::TerminalScope::Released
                                 }))
@@ -976,7 +1089,6 @@ pub(super) mod tests {
             state_dir: "/fixture/state".into(),
             pool_id: "configured fixture pool".into(),
             boot_timeout: Duration::from_secs(3),
-            stop_timeout: Duration::from_secs(1),
             operation_timeout: Duration::from_secs(1),
             cost_evidence: "/fixture/evidence".into(),
             cost: RuntimeCost {
@@ -1338,5 +1450,147 @@ pub(super) mod tests {
         let mut malformed = config;
         malformed.cost.floor.cpu_milli = 500;
         assert!(observer_cost(&malformed).is_err());
+    }
+
+    /// A VMM slower to stop than any wait of a time (A-13): its scope ends, released, only for a wait that follows it
+    /// (`Duration::MAX`), as a stop that outlasted the `stop_ms` it once waited ends.
+    struct SlowStop {
+        identity: shards_api::Identity,
+        followed: std::sync::atomic::AtomicBool,
+    }
+
+    impl shards_api::ManagedProcess for SlowStop {
+        fn identity(&self) -> Result<&shards_api::Identity, shards_api::Refusal> {
+            Ok(&self.identity)
+        }
+        fn wait_for(
+            &self,
+            patience: Duration,
+        ) -> Result<Option<shards_api::ManagedEnd>, shards_api::Refusal> {
+            if patience == Duration::MAX {
+                self.followed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.terminal()
+        }
+        fn stop(&self) -> Result<(), shards_api::Refusal> {
+            Ok(())
+        }
+        fn terminal(&self) -> Result<Option<shards_api::ManagedEnd>, shards_api::Refusal> {
+            if !self.followed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(None);
+            }
+            Ok(Some(shards_api::ManagedEnd {
+                status: shards_api::ManagedStatus::Code(0),
+                scope: shards_api::TerminalScope::Released,
+            }))
+        }
+    }
+
+    /// One turn as a stop takes it: each VMM it attaches slow to stop ([`SlowStop`]), the scopes it finalizes counted.
+    #[derive(Default)]
+    struct Stopping {
+        finalized: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Transaction for Stopping {
+        fn records(&self) -> Result<crate::devices::Records, Refusal> {
+            panic!("a stop lists no records")
+        }
+        fn pool_records(&self) -> Result<crate::devices::PoolRecords, Refusal> {
+            panic!("a stop lists no pool records")
+        }
+        fn read_pool(&self, _: &BackingKey) -> Result<Option<PoolRecord>, Refusal> {
+            panic!("a stop reads no pool record")
+        }
+        fn put_pool(&self, _: &PoolRecord) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn grant_pool(&self, _: &BackingGrant) -> Result<PoolRecord, Refusal> {
+            panic!("a stop grants no pool")
+        }
+        fn remove_pool(&self, _: &BackingKey) -> Result<(), Refusal> {
+            panic!("a stop removes no pool")
+        }
+        fn check_unsubmitted_pool(&self) -> Result<(), Refusal> {
+            panic!("a stop checks no unsubmitted pool")
+        }
+        fn read(&self, _: &BoxId) -> Result<Option<BoxRecord>, Refusal> {
+            panic!("a stop reads no record")
+        }
+        fn put(&self, _: &BoxRecord) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn remove(&self, _: &BoxId) -> Result<(), Refusal> {
+            panic!("a stop removes no record")
+        }
+        fn launch_managed(
+            &self,
+            _: &crate::devices::ManagedLaunch<'_>,
+            _: shards_api::LaunchIo,
+            _: Option<Duration>,
+        ) -> Result<shards_api::ManagedReceipt, Refusal> {
+            panic!("a stop launches no VMM")
+        }
+        fn attach_managed(
+            &self,
+            identity: Option<&shards_api::Identity>,
+        ) -> Result<shards_api::ManagedReceipt, Refusal> {
+            let identity = identity.expect("a stop attaches a published VMM");
+            Ok(shards_api::managed_receipt(triomphe::Arc::new(SlowStop {
+                identity: shards_api::Identity {
+                    pid: identity.pid,
+                    started: identity.started,
+                    vsock: identity.vsock.clone(),
+                },
+                followed: std::sync::atomic::AtomicBool::new(false),
+            })))
+        }
+        fn finalize_managed(&self, _: Option<&shards_api::Identity>) -> Result<(), Refusal> {
+            self.finalized
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        fn managed_usage(&self) -> Result<hex_api::Usage, Refusal> {
+            panic!("a stop reads no usage")
+        }
+    }
+
+    /// A-13 (decision 9; ROOT, 2026-11-14), AC-T7.4.1: a VM's stop is its managed scope's, a wait of its own, measured
+    /// (`managed.stop`) and past the slowest stop seen following the scope to its end, never refused at the configured
+    /// `stop_ms`: census retirement at a node's start stops each census VM, and was refused Uncertain past it, so `hex
+    /// node` couldn't start until the timer was raised. Do: a VM whose VMM's scope ends only for a wait that follows it,
+    /// slower to stop than any timer; stop it as census retirement does (`stop_vm`). Expect: stopped, its scope seen
+    /// released and finalized, its exit recorded.
+    #[test]
+    fn a13_a_vm_slower_to_stop_than_any_timer_is_followed_to_its_end() {
+        let state = tempfile::tempdir().unwrap();
+        let (mut runtime, _no_calls) = family_fixture();
+        runtime.config.state_dir = state.path().to_path_buf();
+        let source = family_row(&runtime, &[256], BackingPhase::Live);
+        let mut vm = consuming_box(&runtime, &source, "first-consumer");
+        let turn = Stopping::default();
+        let stopped = runtime.stop_vm(&mut vm, &turn);
+        assert_eq!(stopped, Ok(()), "a stop slower than any timer");
+        assert_eq!(vm.exit, Some(hex_api::Exit::Code(0)));
+        assert_eq!(turn.finalized.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// A-13, as above for an observer's stop: census retirement at a node's start stops each census observer
+    /// (`retire_census_observers`, `stop_observer` with no deadline of a caller's), and was refused Uncertain past
+    /// `stop_ms`. Do: a live observer whose VMM's scope ends only for a wait that follows it; stop it as retirement
+    /// does. Expect: Released, its exit recorded, its scope finalized.
+    #[test]
+    fn a13_an_observer_slower_to_stop_than_any_timer_is_followed_to_its_end() {
+        let state = tempfile::tempdir().unwrap();
+        let (mut runtime, _no_calls) = family_fixture();
+        runtime.config.state_dir = state.path().to_path_buf();
+        let mut observer = family_row(&runtime, &[256], BackingPhase::Live);
+        let turn = Stopping::default();
+        let stopped = runtime.stop_observer(&turn, &mut observer, None);
+        assert_eq!(stopped, Ok(()), "a stop slower than any timer");
+        assert_eq!(observer.phase, BackingPhase::Released);
+        assert_eq!(observer.exit, Some(hex_api::Exit::Code(0)));
+        assert_eq!(turn.finalized.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

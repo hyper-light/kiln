@@ -43,6 +43,10 @@ use rustix::net::{
 struct Ports(PathBuf);
 
 impl Link for Ports {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<hex_client::guest::DuplexOwner, Refusal> {
         let name = if port == stream::CONTROL_PORT {
             "control.sock"

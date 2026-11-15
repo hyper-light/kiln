@@ -119,6 +119,11 @@ impl View {
         self.keeper.foreign()
     }
 
+    /// Its keeper's epoch, which grows at each of its boots (CV2): its word to the node names it (the review's A-10).
+    pub(super) fn epoch(&self) -> u64 {
+        self.keeper.epoch()
+    }
+
     /// A holder's word on `link`, decided beside the node's own `local`: the answer, and whether the
     /// holders' reservations changed, so the node's admission must be given its new room first.
     pub(super) fn hear(

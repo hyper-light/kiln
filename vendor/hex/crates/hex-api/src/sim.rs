@@ -104,11 +104,11 @@ struct SimBox {
 }
 
 /// A simulated Shards image VM: its vCPUs, from its allocation, when its start booted it, and the members whose
-/// streams its caller took ([`Runtime::member`]), at most the members its spec names.
+/// streams its caller took ([`Runtime::member`]), each with its program, at most the members its spec names.
 struct SimVm {
     vcpus: u32,
     booted: Option<Instant>,
-    taken: Vec<Member>,
+    taken: Vec<(Member, Arc<SimProc>)>,
 }
 
 #[derive(Default)]
@@ -245,6 +245,8 @@ impl SimRuntime {
             abandoned: 0,
             last_resort: None,
             ended: None,
+            control: None,
+            control_wake: None,
             credentials: match &b.spec.class {
                 ClassSpec::ShardsImage(image) => image.credentials.clone(),
                 _ => Vec::new(),
@@ -254,8 +256,9 @@ impl SimRuntime {
 }
 
 impl SimRuntime {
-    /// A signal to an image VM: KILL stops it, ending its run as Shards' stop does; any other is its
-    /// members' and awaits Shards' agent-control endpoint; once it has ended, none reaches it.
+    /// A signal to an image VM: KILL stops it, ending its run as Shards' stop does; any other is its run's
+    /// members', which its image runs and take it as their lanes give it (goal 2's item 2), the VM running on;
+    /// once it has ended, none reaches it.
     fn signal_vm(b: &SimBox, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
         let init = match &b.init {
             Some(init) if init.exit()?.is_none() => init,
@@ -264,9 +267,7 @@ impl SimRuntime {
         if signal == Signal::KILL {
             return init.end(Exit::Signal(Signal::KILL.number()));
         }
-        Err(Refusal::Awaits {
-            needs: Upstream::MemberSignal,
-        })
+        Ok(())
     }
 
     /// A running image VM's usage: every vCPU ran the guest the whole time since its boot. Before its
@@ -552,6 +553,52 @@ impl Runtime for SimRuntime {
         Ok(Box::new(SimHandle(proc, Some(given))))
     }
 
+    /// A member of a running image VM its spec names takes a signal alone (goal 2's item 2), its run's members the
+    /// spec's here: one its caller took ends by it, as its echo program keeps no handler, its end `Signal(n)`; one not
+    /// taken runs no program here, and takes it as nothing. Refused NotRunning where the VM doesn't run or the member
+    /// has ended, as the class's own lane refuses one.
+    fn signal_member(&self, id: &BoxId, member: &Member, signal: Signal) -> Result<(), Refusal> {
+        let boxes = self.boxes()?;
+        let b = boxes
+            .get(id)
+            .ok_or_else(|| Refusal::NoSuchBox(id.clone()))?;
+        let ClassSpec::ShardsImage(image) = &b.spec.class else {
+            return Err(Refusal::Invalid {
+                what: "member",
+                why: format!(
+                    "box {id} isn't a Shards image box: only one has members a signal reaches"
+                ),
+            });
+        };
+        if !image.members.iter().any(|m| &m.member == member) {
+            return Err(Refusal::Invalid {
+                what: "member",
+                why: format!("box {id}'s run declares no {member}"),
+            });
+        }
+        let running = match &b.init {
+            Some(init) => b.started && init.exit()?.is_none(),
+            None => false,
+        };
+        if !running {
+            return Err(Refusal::NotRunning(id.clone(), "signal a member"));
+        }
+        let taken = b.vm.as_ref().and_then(|vm| {
+            vm.taken
+                .iter()
+                .find(|(taken, _)| taken == member)
+                .map(|(_, proc)| proc)
+        });
+        match taken {
+            Some(proc) if proc.exit()?.is_some() => Err(Refusal::NotRunning(
+                id.clone(),
+                "signal a member: it has ended",
+            )),
+            Some(proc) => proc.set(Exit::Signal(signal.number())),
+            None => Ok(()),
+        }
+    }
+
     /// A member its image box's spec names (joint plan step 17): the echo program, its stdin, stdout and stderr the
     /// caller's, taken once, while the box's VM runs; its end the echo's, or KILL with its VM.
     fn member(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, Refusal> {
@@ -598,14 +645,14 @@ impl Runtime for SimRuntime {
         let vm =
             b.vm.as_mut()
                 .ok_or_else(|| Refusal::Broken("a Shards image box has no VM".to_owned()))?;
-        if vm.taken.contains(member) {
+        if vm.taken.iter().any(|(taken, _)| taken == member) {
             return Err(Refusal::Invalid {
                 what: "member",
                 why: format!("{member}'s streams in box {id} were taken already"),
             });
         }
-        vm.taken.push(member.clone());
         let proc = Arc::new(SimProc::default());
+        vm.taken.push((member.clone(), Arc::clone(&proc)));
         echo(Arc::clone(&proc), stdio.stdin.take(), stdio.stdout.take())?;
         b.procs.push(Arc::clone(&proc));
         Ok(Box::new(SimHandle(proc, Some(given))))

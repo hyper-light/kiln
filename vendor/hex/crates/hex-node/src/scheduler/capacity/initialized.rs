@@ -129,6 +129,21 @@ pub(super) fn apply(
     let mut masks = Vec::new();
     reserve(&mut masks, devices.len(), "normalized device route masks")?;
     masks.resize(devices.len(), 0u64);
+    // The room its NodeVm routes admit within (joint plan step 39, V2): its Ready node VM's guest, the one guest that
+    // serves its oci class.
+    let mut node_vm_room = None;
+    for receipt in reports
+        .iter()
+        .filter_map(|(_, report)| report.as_ref())
+        .flat_map(|report| &report.node_vms)
+        .filter(|receipt| receipt.phase == hex_api::NodeVmPhase::Ready)
+    {
+        if node_vm_room.replace(receipt.guest).is_some() {
+            return Err(invalid(
+                "two node VMs Ready in one node's answers: one guest serves its oci class",
+            ));
+        }
+    }
     let mut backings: Vec<hex_api::BackingOffer> = Vec::new();
     reserve(
         &mut backings,
@@ -183,6 +198,7 @@ pub(super) fn apply(
         offers,
         device_routes: masks,
         backings,
+        node_vm_room,
     };
     let provisioned = routes
         .unobserved_claims(&devices, node.id)
@@ -491,6 +507,7 @@ mod tests {
         backings: Vec<BackingOffer>,
     ) -> Capacity {
         Capacity {
+            own: Default::default(),
             id: "same-native-host".into(),
             total: room(),
             free: room(),
@@ -501,6 +518,8 @@ mod tests {
             backings,
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         }
     }
     fn facts() -> Facts {
@@ -716,7 +735,12 @@ mod tests {
                             devices: vec![id],
                         },
                         BackingOffer {
-                            guest: Default::default(),
+                            // Measured as it went Live (joint plan step 14, C7, pin 1): nothing of its own.
+                            guest: hex_api::LearnedOverhead {
+                                cpu_milli: Some(0),
+                                mem_bytes: Some(0),
+                                disk_bytes: Some(0),
+                            },
                             key: warm,
                             cost: profile(),
                             phase: BackingPhase::Live,
@@ -747,7 +771,11 @@ mod tests {
             None,
             &[hex_api::BackendUnavailable::from_refusal(
                 hex_api::Class::Shards,
-                Refusal::Backing { key: cold, cause },
+                Refusal::Backing {
+                    key: cold,
+                    cause,
+                    why: None,
+                },
             )
             .unwrap()],
         )
@@ -915,7 +943,12 @@ mod tests {
                                 devices: vec![id],
                             },
                             BackingOffer {
-                                guest: Default::default(),
+                                // Measured as it went Live (joint plan step 14, C7, pin 1): nothing of its own.
+                                guest: hex_api::LearnedOverhead {
+                                    cpu_milli: Some(0),
+                                    mem_bytes: Some(0),
+                                    disk_bytes: Some(0),
+                                },
                                 key: warm,
                                 cost: profile(),
                                 phase: BackingPhase::Live,

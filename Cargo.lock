@@ -1810,6 +1810,7 @@ dependencies = [
 name = "hex-quic"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "hex-api",
  "hex-client",
  "hex-core",
@@ -1839,6 +1840,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shards-abi",
  "shards-api",
  "socket2",
  "thiserror 2.0.21",
@@ -1852,6 +1854,7 @@ name = "hex-sim"
 version = "0.1.0"
 dependencies = [
  "hex-api",
+ "hex-core",
  "hex-health",
  "hyper-swim",
  "hyper-timing",
@@ -3960,9 +3963,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -4328,6 +4331,8 @@ name = "shards-api"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustls-pki-types",
+ "rustls-webpki",
  "sha2 0.11.1",
  "shards-abi",
  "shards-afunix",

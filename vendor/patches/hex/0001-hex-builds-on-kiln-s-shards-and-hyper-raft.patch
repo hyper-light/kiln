@@ -1,19 +1,6 @@
 Subject: Hex builds on kiln's Shards and hyper-raft
-Why: kiln holds one copy of each project (docs/vendoring.md), and Hex pins an older hyper-raft (0856e05) with changes of its own. Its pin moves to kiln's (fb74b595), and its records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree). Its Shards pin is kiln's own (e82b9403) since Hex's steps 4 and 12 (daa36e99), which took Shards' API there too, so this change's Shards part dropped out as upstream's own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16).
+Why: kiln holds one copy of each project (docs/vendoring.md), with one record of its changes: Hex's records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree). Its hyper-raft and Shards pins are kiln's own (e0613f52, fa953e3c) since Hex e19198bd, so this change's pin parts dropped out as upstream's own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 16 and 17).
 
-diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
-index 52697a37a5fa576c0df842ec7ed65744cd231ede..ff20ca5c4170645f741a4791e7dc5b28408cbb9b 100644
---- a/vendor/MANIFEST.toml
-+++ b/vendor/MANIFEST.toml
-@@ -33,7 +33,7 @@ own = ["UPSTREAM.md"]
- [projects.hyper-raft]
- kind = "git"
- repository = "https://github.com/hyper-light/hyper-raft"
--commit = "045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
-+commit = "fb74b59533908472ade7e526eb08117601cede0e"
- path = "vendor/hyper-raft"
- take = [
-     "Cargo.toml",
 diff --git a/vendor/patches/hyper-raft/0001-hyper-transport-takes-hyper-quic-without-its-qlog-traces.patch b/vendor/patches/hyper-raft/0001-hyper-transport-takes-hyper-quic-without-its-qlog-traces.patch
 deleted file mode 100644
 index 57fb3cd112c9cd9e26d817bb8d4ca963b06b8307..0000000000000000000000000000000000000000

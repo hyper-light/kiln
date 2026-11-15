@@ -3,8 +3,10 @@ use super::*;
 fn config() -> GuestConfig {
     GuestConfig {
         binary: "/model/shards".into(),
-        kernel: "/model/kernel".into(),
-        initrd: "/model/initrd".into(),
+        boot: crate::guest::Boot::Kernel {
+            kernel: "/model/kernel".into(),
+            initrd: "/model/initrd".into(),
+        },
         vcpus: 3,
         memory_mib: 256,
         gpu: false,
@@ -50,7 +52,10 @@ fn encoded() -> Vec<OsString> {
 #[test]
 fn fixed_carrier_preserves_original_typed_rights_and_deadline() {
     let mut config = config();
-    config.kernel = PathBuf::from(OsString::from_vec(b"/model/non-utf8-\xff".to_vec()));
+    let crate::guest::Boot::Kernel { kernel, .. } = &mut config.boot else {
+        panic!("the model's guest boots its kernel");
+    };
+    *kernel = PathBuf::from(OsString::from_vec(b"/model/non-utf8-\xff".to_vec()));
     let paths = RuntimePaths::new("/model/cache".into(), "/model/home".into()).unwrap();
     let args = arguments(
         native_fixture::Input {

@@ -199,13 +199,14 @@ pub struct HeldLaunch {
 
 /// Start an explicitly configured VM binary, without executing it until its native identity and
 /// canonical record have been published. `gate_budget` is the caller's remaining finite create
-/// budget, never a process-completion timer. Ordinary `exec` retains its existing vfork path.
+/// budget, none for a create that follows its guest (the review's C-9), never a process-completion
+/// timer. Ordinary `exec` retains its existing vfork path.
 pub fn exec_held(
     cg: &BoxCgroup,
     program: &Program,
     stdio: Stdio,
     launch: HeldLaunch,
-    gate_budget: Duration,
+    gate_budget: Option<Duration>,
 ) -> Result<HeldExec, Refusal> {
     let HeldLaunch { report, memlock } = launch;
     program.check()?;

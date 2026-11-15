@@ -69,7 +69,7 @@ use hex_core::netns_reuse::Refused as NetRefused;
 use hex_core::patience::Patience;
 use hex_core::reuse::Refused;
 use hex_node::Node;
-use hex_testkit::waits::{DELETE, EMPTYING, PROGRAM, until};
+use hex_testkit::waits::EMPTYING;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::inotify;
 use rustix::process::{Pid, PidfdFlags};
@@ -315,17 +315,23 @@ fn has_ended(fd: &OwnedFd) -> bool {
     rustix::event::poll(&mut fds, Some(&now)).unwrap() > 0
 }
 
-/// Runs `program` in box `id` to its end, waiting as `wait`, its end's own record, says: for at most its deadline, or,
-/// while it measures, for the end alone. Its answer is told to `wait` and to the census as [`until`]'s are.
+/// Runs `program` in box `id` to its end, as decision 9 waits on `wait` (`follow::within`): within W*, its end; past W*,
+/// its run-out told once, and the wait follows the program to its end, never a verdict at W* (it was one: the gate at
+/// 45fc1605 failed here under load, "the program ended in time"). Its answer is told to `wait` and to the census.
 fn run(node: &Node, id: &BoxId, program: Program, wait: &Patience) -> Exit {
     let mut p = node.exec(id, program, Stdio::null()).expect("exec");
-    let began = Instant::now();
-    let exit = p
-        .wait_for(wait.deadline().unwrap_or(Duration::MAX))
-        .expect("wait")
-        .expect("the program ended in time");
-    hex_testkit::waits::answered(wait, began.elapsed());
-    exit
+    hex_testkit::waits::follow::within(
+        wait,
+        "a box's program's end",
+        || hex_testkit::waits::follow::Party::Live,
+        |by| {
+            let left = by.map_or(Duration::MAX, |by| {
+                by.saturating_duration_since(Instant::now())
+            });
+            p.wait_for(left).expect("wait")
+        },
+    )
+    .expect("the program's end")
 }
 
 fn exercise(own: &Path, cache: &Path, exe: &str) {
@@ -1528,7 +1534,8 @@ impl Touched {
 
 /// Decision 8, "The p99.9 that stayed" (AC-T7.1.3): recovery removes the inits a node parked. Do: A of O created and
 /// deleted, so A's idle slot holds a parked init; the node abandoned as a crash leaves it (none of its teardown
-/// runs: `ManuallyDrop`); a node opened again over the same box root and state, and its recovery run. Expect: the
+/// runs, its store's hold of the state let go as its process's end would: `Node::crash`); a node opened again over the
+/// same box root and state, and its recovery run. Expect: the
 /// idle slot is gone and the parked init has ended. With parked procs (root only), the init's proc was made at A's
 /// delete; its tree is the crashed node's descriptor, gone with that process, and its pid namespace with the init.
 fn recovery_removes_an_init_parked_by_a_node_that_crashed(lab: &Lab, own: &Path) {
@@ -1562,7 +1569,8 @@ fn recovery_removes_an_init_parked_by_a_node_that_crashed(lab: &Lab, own: &Path)
         assert_eq!(held.procs_held, 1, "its proc made with it: {held:?}");
     }
     let init = pidfd(parked[0]);
-    let _abandoned = std::mem::ManuallyDrop::new(node);
+    // Its process's end lets its store's hold of the state go, and nothing of it runs: no teardown (`Node::crash`).
+    node.crash();
     let node = open();
     node.recover().unwrap();
     assert!(!slot.exists(), "recovery removed the idle slot");
@@ -2670,19 +2678,22 @@ fn new_route() -> Vec<u8> {
     nl_request(24, &body)
 }
 
-/// Waits for `cond` on `wait`, its own fact's record or measuring (hex_testkit::waits): says how many looks it took.
+/// Waits for `cond` on `wait`, measuring, by the life of the in-process node this test holds (the review's C-5), whose
+/// own threads make the fact: it lives while held. A look: the node tells no event of these facts, its state read.
+/// Says how many looks it took.
 fn wait_for(wait: &Patience, cond: impl FnMut() -> bool, what: &str) -> u64 {
-    until(wait, what, cond).unwrap()
+    hex_testkit::waits::follow::until(wait, what, || hex_testkit::waits::follow::Party::Live, cond)
+        .unwrap()
 }
 
 // Each wait here takes its own fact's record (hex_testkit::waits; the lead's rule of 2026-11-08), or measures where no
 // recorded operation makes its fact, its answers recorded for the census to come, from the suites run under it.
 /// A killed box's processes ending: `node.emptying`.
-static KILLED: Patience = Patience::seeded("test.oci_reuse.killed", EMPTYING);
+static KILLED: Patience = Patience::measuring("test.oci_reuse.killed");
 /// An init's run to its end: the program-run record.
-static INIT_ENDS: Patience = Patience::seeded("test.oci_reuse.init_ends", PROGRAM);
+static INIT_ENDS: Patience = Patience::measuring("test.oci_reuse.init_ends");
 /// An exec of `true` run to its end: the program-run record's own fact (`lifecycle.exec`, an exec of `true`).
-static TRUE_ENDS: Patience = Patience::seeded("test.oci_reuse.true_ends", PROGRAM);
+static TRUE_ENDS: Patience = Patience::measuring("test.oci_reuse.true_ends");
 /// A 3 GB sha256 burn's end, a 64 MiB hog's, a 1 MiB hog's, a hog's OOM kill past its bound, a spawn's refusal past
 /// its bound, and 64 MiB written to a box's root: none is an exec of `true`, whose end the program-run record is (each
 /// runs its own work first), and no recorded operation makes any.
@@ -2696,7 +2707,7 @@ static WRITE_ENDS: Patience = Patience::measuring("test.oci_reuse.write_ends");
 /// `true`'s, and made by no recorded operation.
 static SEND_ENDS: Patience = Patience::measuring("test.oci_reuse.send_ends");
 /// An owner's idle slot given its parked init: made within the delete (`Cgroups::give_back`), whose record bounds it.
-static PARKED: Patience = Patience::seeded("test.oci_reuse.parked", DELETE);
+static PARKED: Patience = Patience::measuring("test.oci_reuse.parked");
 /// A parked init asleep for its claim once its delete has answered: its own steps after it said it is parked, which
 /// no recorded operation makes.
 static PARKED_ASLEEP: Patience = Patience::measuring("test.oci_reuse.parked_asleep");

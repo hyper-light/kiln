@@ -697,27 +697,35 @@ fn w14_a_learning_helpers_scope_reads_its_own_response_never_the_launchs() {
 
 /// Joint plan step 14 (2c; ROOT, 2026-11-13, cold start (a)): a cold helper probes its control's first stop response
 /// before the first scope it controls starts from it: a spinner of its own held once at Hex's least CPU bound. Do ask a
-/// new helper's start for a scope. Expect its slowest seen no longer none, a response of some time.
+/// new helper's start for a scope. Expect its estimate no longer none, a response of some time, cold (the review's
+/// A-14: one hold is too few to have seen their p99.9).
 #[test]
 fn w14_a_cold_helpers_first_scope_is_probed_for_its_response() {
     let one = std::num::NonZeroU64::new(1).unwrap();
     let shared = Shared::new(one, one, Duration::from_nanos(1)).unwrap();
     assert_eq!(shared.cpu_response().unwrap(), None);
     let start = shared.cpu_start().unwrap();
-    assert_eq!(shared.cpu_response().unwrap(), Some(start));
+    assert_eq!(
+        shared.cpu_response().unwrap(),
+        Some(Estimate {
+            response: start,
+            cold: true,
+        })
+    );
     assert!(
         start > hex_core::helper::managed::COLD_RESPONSE,
         "{start:?}"
     );
 }
 
-/// Joint plan step 14 (2c; ROOT, 2026-11-13): a helper restarted with live scopes starts cold on purpose. Its slowest
-/// stop lived in the old helper's memory, so a re-attached scope's control starts from the new helper's own, probed
+/// Joint plan step 14 (2c; ROOT, 2026-11-13): a helper restarted with live scopes starts cold on purpose. Its holds'
+/// stops lived in the old helper's memory, so a re-attached scope's control starts from the new helper's own, probed
 /// before the scope is controlled, never the old helper's; and a first hold slower than that raises it, its overshoot
-/// charged whole (`cpu::tests::a_held_scopes_slower_stop_tops_up_its_hold`). Do learn a 2 s response on one helper;
-/// restart it (a new helper's shared state) and remake the live scope's control on it, as its re-attach does; then
-/// learn a hold 1 ms slower than the new start. Expect the new helper's start its own probe's, not 2 s; the scope's
-/// burst its maximum over that start, then over the hold's; and the new helper's slowest raised to the hold's.
+/// charged whole (`cpu::tests::a14_the_burst_follows_the_estimate_and_a_holds_overshoot_is_charged`). Do learn a 2 s
+/// response on one helper; restart it (a new helper's shared state) and remake the live scope's control on it, as its
+/// re-attach does; then learn a hold 1 ms slower than the new start. Expect the new helper's start its own probe's,
+/// not 2 s; the scope's burst its maximum over that start, then over the hold's; and the new helper's estimate the
+/// hold's, cold (the review's A-14: two holds are too few to have seen their p99.9).
 #[test]
 fn w14_a_restarted_helper_starts_its_live_scopes_cold_and_raises_on_their_first_hold() {
     let record = pool();
@@ -737,8 +745,58 @@ fn w14_a_restarted_helper_starts_its_live_scopes_cold_and_raises_on_their_first_
     let nanos = |d: Duration| i128::try_from(d.as_nanos()).unwrap();
     assert_eq!(scope.cpu_burst(), Some(i128::from(cpu) * nanos(start)));
     let hold = start + Duration::from_millis(1);
-    scope.cpu_learn(native.owner(), hold).unwrap();
-    after.observe_cpu_response(hold).unwrap();
+    let estimate = after.observe_cpu_response(hold).unwrap();
+    scope
+        .cpu_learn(native.owner(), hold, estimate.response)
+        .unwrap();
     assert_eq!(scope.cpu_burst(), Some(i128::from(cpu) * nanos(hold)));
-    assert_eq!(after.cpu_response().unwrap(), Some(hold));
+    assert_eq!(
+        after.cpu_response().unwrap(),
+        Some(Estimate {
+            response: hold,
+            cold: true,
+        })
+    );
+}
+
+/// The review's A-14 (ROOT, 2026-11-14; AC-T7.4.1): a helper's scopes hold to its estimate from its last SEEDABLE holds'
+/// stops, so a slow stop it once saw sets neither a new scope's start nor a held one's burst once newer holds have come,
+/// where its slowest seen held both for good. Do observe a 2 s stop on a helper and start a scope's control from it;
+/// then hold 2 SEEDABLE times, each stop 1 ms, the scope learning each against the helper's estimate after it. Expect
+/// the scope's burst its maximum over 2 s at first; then the helper's estimate 1 ms, not cold, a new scope's start 1 ms,
+/// and the held scope's burst its maximum over 1 ms.
+#[test]
+fn a14_a_helpers_scopes_hold_to_its_estimate_once_a_slow_stop_ages_out() {
+    let record = pool();
+    let native = NativeRecord::Pool(&record);
+    let control = super::super::CpuControl::cold(record.cost.id);
+    let cpu = record.allocation.unwrap().resources.cpu_milli;
+    let one = std::num::NonZeroU64::new(1).unwrap();
+    let shared = Shared::new(one, one, Duration::from_nanos(1)).unwrap();
+    let nanos = |d: Duration| i128::try_from(d.as_nanos()).unwrap();
+    let (slow, fast) = (Duration::from_secs(2), Duration::from_millis(1));
+    shared.observe_cpu_response(slow).unwrap();
+    let scope = Scope::new(
+        native,
+        Some((control, cpu)),
+        Duration::ZERO,
+        shared.cpu_start().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(scope.cpu_burst(), Some(i128::from(cpu) * nanos(slow)));
+    for _ in 0..2 * super::super::cpu::SEEDABLE {
+        let estimate = shared.observe_cpu_response(fast).unwrap();
+        scope
+            .cpu_learn(native.owner(), fast, estimate.response)
+            .unwrap();
+    }
+    assert_eq!(
+        shared.cpu_response().unwrap(),
+        Some(Estimate {
+            response: fast,
+            cold: false,
+        })
+    );
+    assert_eq!(shared.cpu_start().unwrap(), fast);
+    assert_eq!(scope.cpu_burst(), Some(i128::from(cpu) * nanos(fast)));
 }

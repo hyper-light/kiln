@@ -5,8 +5,9 @@
 //! `cgroup.kill` never reaches and that holds the cgroup populated. (Whether this also explains the
 //! separate 60 s empty-list stalls is unproven — another observation to evidence, not assume.) This
 //! test reproduces the leaderless group — a process in a box's cgroup whose leader thread calls
-//! `pthread_exit` while a worker thread lives — and requires `cgroup.kill` then `wait_empty` to empty
-//! the box. Without the fix the worker survives and `wait_empty` times out; the fix sweeps the box's
+//! `pthread_exit` while a worker thread lives — and requires the box's kill to empty it, waited for as decision 9 waits
+//! (the kill followed while it can still empty the box, never a timer). Without the fix the worker survives asleep with
+//! no kill pending, which nothing will end, and the wait fails at once; the fix sweeps the box's
 //! `cgroup.procs` and sends each process a process-directed SIGKILL through a process pidfd, which the
 //! kernel delivers to the whole thread group and so reaches the live worker the leader-directed
 //! `cgroup.kill` missed (`BoxCgroup::kill`, probe `delete_flake_point4.c`). A second test confirms a
@@ -27,20 +28,37 @@
     clippy::disallowed_macros
 )]
 
+use hex_api::{Bounds, BoxId};
+use hex_core::patience::Patience;
+use hex_runtime::linux::cgroup::BoxRoot;
+use hex_testkit::waits::follow::{self, Party};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
-
-use hex_api::{Bounds, BoxId};
-use hex_runtime::linux::cgroup::BoxRoot;
 
 const TEST: &str = "a_leaderless_thread_group_is_killed_on_delete";
 
-/// How long a box's cgroup has to empty after cgroup.kill: the oci class's own delete waits this long for it,
-/// `DELETE_PATIENCE` in crates/hex-runtime/src/linux/oci/run.rs (10 s; private there, so named here with its source),
-/// so the test holds the kill to the bound the delete it exercises holds it to (Ada's 2026-11-06 rule).
-const DELETE_PATIENCE: Duration = Duration::from_secs(10);
+/// A killed box's emptying, as decision 9 waits for it (the person's ruling of 2026-11-13): within the slowest emptying
+/// this test has seen, the answer; past it, its run-out told once and the kill followed while it can still empty the box
+/// ([`the_kill`]), never a timer's verdict.
+static EMPTIED: Patience = Patience::measuring("test.hex_cli.delete_flake.emptied");
+
+/// The box's kill as the party its emptying follows: live while it can still empty the box, some thread of its subtree
+/// on its way out, gone, or running, which may be its exit's start ([`hex_testkit::cgroup::thread`]), or none left;
+/// ended once every thread left sleeps with no kill pending and isn't exiting, which nothing will end: the kill missed
+/// it.
+fn the_kill(root: &Path) -> Party {
+    let threads = hex_testkit::cgroup::threads(root);
+    if threads.is_empty()
+        || threads
+            .iter()
+            .any(|tid| hex_testkit::cgroup::thread(*tid) != hex_testkit::cgroup::Thread::Sleeping)
+    {
+        Party::Live
+    } else {
+        Party::Ended
+    }
+}
 
 #[test]
 fn a_leaderless_thread_group_is_killed_on_delete() {
@@ -106,11 +124,14 @@ fn exercise(own: &Path) {
     );
 
     // The delete path: cgroup.kill, then empty. cgroup.kill alone leaves the leaderless worker alive
-    // (the bug); the fix SIGKILLs it by its thread id. Give it the oci delete's own patience.
+    // (the bug); the fix SIGKILLs it by its thread id. The emptying is followed by the kill's life.
     cg.kill().expect("kill the box");
-    let emptied = cg
-        .wait_empty(DELETE_PATIENCE)
-        .expect("wait for the box to empty");
+    let emptied = follow::until(
+        &EMPTIED,
+        "the box emptied by its kill",
+        || the_kill(cg.dir()),
+        || matches!(cg.populated(), Ok(false)),
+    );
     let left = survivors(cg.dir());
     // Tear down before asserting, so a run that fails (cgroup.kill left the leaderless worker alive)
     // leaks neither the helper nor its cgroup: a process-directed SIGKILL on the child reaches the
@@ -120,8 +141,8 @@ fn exercise(own: &Path) {
     let _ = child.wait();
     let _ = cg.remove();
     assert!(
-        emptied,
-        "the box must empty after cgroup.kill, but a leaderless thread held it: {left}"
+        emptied.is_ok(),
+        "the box must empty after cgroup.kill, but a leaderless thread held it: {left} ({emptied:?})"
     );
 }
 
@@ -160,9 +181,12 @@ fn spares_outsiders(own: &Path) {
     );
 
     cg.kill().expect("kill the box");
-    let emptied = cg
-        .wait_empty(DELETE_PATIENCE)
-        .expect("wait for the box to empty");
+    let emptied = follow::until(
+        &EMPTIED,
+        "the box emptied by its kill",
+        || the_kill(cg.dir()),
+        || matches!(cg.populated(), Ok(false)),
+    );
     // Still running? try_wait is None while the child lives, so the box's kill did not reach it.
     let outsider_alive = matches!(outsider.try_wait(), Ok(None));
     // Tear down before asserting, so a failing run leaks neither child nor the cgroup.
@@ -171,7 +195,10 @@ fn spares_outsiders(own: &Path) {
     let _ = outsider.kill();
     let _ = outsider.wait();
     let _ = cg.remove();
-    assert!(emptied, "the box with the leaderless group must empty");
+    assert!(
+        emptied.is_ok(),
+        "the box with the leaderless group must empty: {emptied:?}"
+    );
     assert!(
         outsider_alive,
         "a process outside the box must survive the box's kill"

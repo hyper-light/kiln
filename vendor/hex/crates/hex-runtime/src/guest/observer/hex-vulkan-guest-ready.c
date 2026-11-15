@@ -19,9 +19,14 @@
 struct limits {
     uint32_t devices, queues;
     size_t allocation, output;
+    /* NO_DEADLINE where --wait-ns is not given (the review's C-9). */
     uint64_t wait_ns;
     const char *icd;
 };
+
+/* No deadline: a wait with none told waits as Vulkan's vkWaitForFences does at UINT64_MAX, until its fence
+ * signals or its guest ends; any deadline told is less than it (--wait-ns refuses UINT64_MAX). */
+#define NO_DEADLINE UINT64_MAX
 
 struct output {
     size_t left;
@@ -55,6 +60,10 @@ static bool now_ns(uint64_t *value)
 
 static bool remaining(uint64_t deadline, uint64_t *left)
 {
+    if (deadline == NO_DEADLINE) {
+        *left = NO_DEADLINE;
+        return true;
+    }
     uint64_t now;
     if (!now_ns(&now) || now >= deadline)
         return false;
@@ -167,9 +176,10 @@ static bool positive(const char *text, uint64_t *number)
 
 static bool arguments(int argc, char **argv, struct limits *limit)
 {
-    /* Exactly six required flag/value pairs, each accepted once. */
-    if (argc != 1 + 6 * 2)
+    /* Five required flag/value pairs and --wait-ns where a deadline is told, each accepted once. */
+    if (argc != 1 + 6 * 2 && argc != 1 + 5 * 2)
         return false;
+    limit->wait_ns = NO_DEADLINE;
     unsigned seen = 0;
     for (int i = 1; i < argc; i += 2) {
         const char *flag = argv[i], *value = argv[i + 1];
@@ -195,7 +205,7 @@ static bool arguments(int argc, char **argv, struct limits *limit)
             } else if (strcmp(flag, "--max-output-bytes") == 0 && number <= SIZE_MAX) {
                 bit = 1u << 4;
                 limit->output = (size_t)number;
-            } else if (strcmp(flag, "--wait-ns") == 0 && number != UINT64_MAX) {
+            } else if (strcmp(flag, "--wait-ns") == 0 && number != NO_DEADLINE) {
                 bit = 1u << 5;
                 limit->wait_ns = number;
             } else {
@@ -208,7 +218,8 @@ static bool arguments(int argc, char **argv, struct limits *limit)
     }
     const char *icd = getenv("VK_DRIVER_FILES");
     const char *layers = getenv("VK_LOADER_LAYERS_DISABLE");
-    return seen == (1u << 6) - 1 && icd != NULL && layers != NULL &&
+    const unsigned required = (1u << 5) - 1, waits = 1u << 5;
+    return (seen == required || seen == (required | waits)) && icd != NULL && layers != NULL &&
         strcmp(icd, limit->icd) == 0 && strcmp(layers, "~all~") == 0;
 }
 
@@ -350,9 +361,13 @@ int main(int argc, char **argv)
     if (!arguments(argc, argv, &limit))
         return refused("arguments", 0);
     uint64_t start;
-    if (!now_ns(&start) || limit.wait_ns > UINT64_MAX - start)
+    if (!now_ns(&start) ||
+        (limit.wait_ns != NO_DEADLINE && limit.wait_ns >= NO_DEADLINE - start))
         return refused("deadline", 0);
-    struct output out = {.left = limit.output, .deadline = start + limit.wait_ns};
+    struct output out = {
+        .left = limit.output,
+        .deadline = limit.wait_ns == NO_DEADLINE ? NO_DEADLINE : start + limit.wait_ns,
+    };
     VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2,
     };

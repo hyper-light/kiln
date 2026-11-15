@@ -3,10 +3,16 @@
 //! least rate a party still answered at), and a wait's schedule and verdict ([`Judge`]). A
 //! wait that begins before its kind's first answer follows its party's liveness alone; one
 //! that begins once its kind has an answer looks at its party once each W* past its start,
-//! and is refused, [`Stall`], at a look that finds it made no progress at all since the
-//! look before, its host not the reason: a party its host held from running (runnable on no
-//! CPU, stalled on its host's memory) is live, and a stopped or frozen one stalled (ROOT,
-//! 2026-11-13). R* is the refusal's diagnosis, never its bound. What a look finds is its
+//! and is refused, [`Stall`], at a look that finds it has made no progress at all over a
+//! whole W* since a look last found it progressed or held, as far as the looks saw it (from
+//! that look's end to this one's beginning, [`Span`], a window never shorter than their
+//! counters' resolution; a look with nothing before it, [`Found::Based`], shows nothing),
+//! its host not the reason: a party
+//! its host held from running (runnable on no CPU, stalled on its host's memory) is live,
+//! and a stopped or frozen one stalled; and the time the judge's own looks ran late, past
+//! when each was meant, is its host's hold of everyone, which no party's window counts
+//! (ROOT, 2026-11-13), but for the time its caller spent on its own work meanwhile, its own
+//! polls (D209 Part 8), which is no hold ([`Span::own`]). R* is the refusal's diagnosis, never its bound. What a look finds is its
 //! caller's to say ([`Found`]): shards-api's waits read their guest's VM process
 //! (`progress::Follow`), and so do the daemon's waits on a microVM's own answers (D188).
 
@@ -27,7 +33,7 @@ impl Rate {
     /// `cpu × other.over < other.cpu × over` in nanoseconds, with no division and no float.
     /// Each side is the product of two u64s, which no u128 overflows; a duration past u64's
     /// nanoseconds (584 years) counts as its most.
-    pub(crate) fn below(&self, other: &Rate) -> bool {
+    pub fn below(&self, other: &Rate) -> bool {
         let ns = |d: Duration| u128::from(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         ns(self.cpu).saturating_mul(ns(other.over)) < ns(other.cpu).saturating_mul(ns(self.over))
     }
@@ -60,8 +66,9 @@ impl Stall {
         Duration::from_nanos(self.waited)
     }
 
-    /// The time since the look before, a whole [`slowest`](Stall::slowest) or more, over
-    /// which its party made no progress at all.
+    /// The time, a whole [`slowest`](Stall::slowest) or more, over which its party made no
+    /// progress at all since a look last found it progressed or held: the time its judge's
+    /// own looks ran late, its host holding the judge, not counted.
     pub fn over(&self) -> Duration {
         Duration::from_nanos(self.over)
     }
@@ -160,6 +167,10 @@ impl Default for Record {
 /// What a look at a wait's party found since the look before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Found {
+    /// Nothing to judge by: the look had no look before it to compare with (its party's
+    /// first, or one that first found a process of it), so it shows neither progress nor
+    /// stillness. The evidence of a stillness begins at its end ([`Span::ended`]).
+    Based,
     /// It made progress, or its end is under way, which judges nothing: its end is the
     /// wait's answer.
     Progressed,
@@ -172,6 +183,39 @@ pub enum Found {
     Gone,
 }
 
+/// When a look read its party, and how finely: it began reading at `began` and had read all
+/// it reads by `ended`, so that two looks that found no change show none over at least the
+/// time from the first's end to the second's beginning, and no less; and `resolution`, the
+/// least time its counters' least change stands for (a CPU clock's own, clock_getres(2)), so
+/// that a stillness shorter than it is no evidence of none. A look of no counter that coarse
+/// has a resolution of zero.
+///
+/// `own`: of the time this look ran late (from [`Judge::late_from`] to its beginning), how
+/// long its caller spent on its own work, not looking, as a test's waiter polls a state
+/// with commands of its own: lateness its caller made, no hold of its host's, so counted in
+/// its party's window (D209 Part 8: a poll loop whose every poll outlasted W* had nearly
+/// all its time taken for the judge's hold, and was refused only once its looks' own
+/// durations added up to a W*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub began: Instant,
+    pub ended: Instant,
+    pub resolution: Duration,
+    pub own: Duration,
+}
+
+impl Span {
+    /// A look made at `at` that took no time, of counters that show every change.
+    pub fn at(at: Instant) -> Span {
+        Span {
+            began: at,
+            ended: at,
+            resolution: Duration::ZERO,
+            own: Duration::ZERO,
+        }
+    }
+}
+
 /// A wait judged by the record of its kind of answer: its schedule of looks and its verdict.
 #[derive(Debug)]
 pub struct Judge<'a> {
@@ -181,58 +225,133 @@ pub struct Judge<'a> {
     /// one that finds the record learned meanwhile.
     judged: bool,
     began: Instant,
-    /// When the look before was, or its beginning.
+    /// When the look before was meant to be, or its beginning: its looks are due each W* past
+    /// its start, whenever each ran.
+    meant: Instant,
+    /// When the look before ended, or its beginning.
     last: Instant,
+    /// The end of the look from which every judged look since found its party still: the
+    /// last that found it progressed, held or based ([`Found::Based`]), or its beginning,
+    /// where its caller took its baseline as it began; and how long its own looks have run
+    /// late since, past when each was meant and after the look before ended: the time its
+    /// host held the judge itself, which no party's window without progress counts (ROOT's
+    /// ruling, 2026-11-13).
+    since: Instant,
+    held: Duration,
 }
 
 impl<'a> Judge<'a> {
-    /// A wait beginning now, learning into and judged by `record`.
+    /// A wait beginning now, learning into and judged by `record`, its caller's first look at
+    /// its party taken as it begins: one taken later says so ([`Found::Based`]).
     pub fn begin(record: &'a Record) -> Judge<'a> {
         let began = Instant::now();
         Judge {
             record,
             judged: matches!(record.seen(), Seen::Learned { .. }),
             began,
+            meant: began,
             last: began,
+            since: began,
+            held: Duration::ZERO,
         }
     }
 
-    /// When its next look is due, W* after the look before: none while it is not judged.
+    /// From when a look made now runs late: its due, or the look before's end where that is
+    /// later; none while it is not judged. Its caller's own work since then is a [`Span`]'s
+    /// `own`.
+    pub fn late_from(&self) -> Option<Instant> {
+        Some(self.due()?.max(self.last))
+    }
+
+    /// When its next look is due, W* after the look before was meant: none while it is not
+    /// judged.
     pub fn due(&self) -> Option<Instant> {
         match self.record.seen() {
-            Seen::Learned { slowest, .. } if self.judged => self.last.checked_add(slowest),
+            Seen::Learned { slowest, .. } if self.judged => self.meant.checked_add(slowest),
             _ => None,
         }
     }
 
     /// What a look at its party found since the look before, made now: refused where the
-    /// party made no progress at all over the time since, a whole W* or more. A look before
-    /// it is due, or of a wait not judged, judges nothing.
+    /// party made no progress at all over a whole W* or more since a look last found it
+    /// progressed or held, the time its own looks ran late not counted. A look before it is
+    /// due, or of a wait not judged, judges nothing.
     pub fn found(&mut self, found: Found) -> Result<(), Stall> {
+        self.found_over(found, Span::at(Instant::now()))
+    }
+
+    /// [`found`](Self::found), of a look made over `span`. Its party is judged still only
+    /// over what the looks saw: from the end of the look from which it has been still to
+    /// this look's beginning, less the time the judge's own looks ran late, and refused only
+    /// where that is a whole window, W* or its counters' resolution where that is coarser
+    /// (#77: a W* below one look's span refused waits whose first look had nothing before it).
+    /// A based look ([`Found::Based`]) starts its evidence anew whether it is due or not.
+    pub fn found_over(&mut self, found: Found, span: Span) -> Result<(), Stall> {
+        if found == Found::Based {
+            (self.since, self.held, self.last) = (span.ended, Duration::ZERO, span.ended);
+        }
         let Some(due) = self.due() else {
             return Ok(());
         };
-        let now = Instant::now();
+        let now = span.began;
         if now < due {
             return Ok(());
         }
         let Seen::Learned { slowest, least } = self.record.seen() else {
             return Ok(());
         };
-        let then = std::mem::replace(&mut self.last, now);
+        // Held from when it was meant, or from the look before's end where that ended later,
+        // but while its caller worked on its own.
+        let late = now
+            .saturating_duration_since(due.max(self.last))
+            .saturating_sub(span.own);
+        self.held = self.held.saturating_add(late);
+        self.meant = Self::latest_meant(due, slowest, now);
+        self.last = span.ended;
         match found {
-            Found::Progressed | Found::Held => Ok(()),
+            Found::Progressed | Found::Held | Found::Based => {
+                (self.since, self.held) = (span.ended, Duration::ZERO);
+                Ok(())
+            }
             Found::Gone => {
                 self.judged = false;
                 Ok(())
             }
-            Found::Still => Err(Stall::new(
-                now.saturating_duration_since(self.began),
-                now.saturating_duration_since(then),
-                least,
-                slowest,
-            )),
+            Found::Still => {
+                let free = now
+                    .saturating_duration_since(self.since)
+                    .saturating_sub(self.held);
+                if free < slowest.max(span.resolution) {
+                    return Ok(());
+                }
+                Err(Stall::new(
+                    now.saturating_duration_since(self.began),
+                    free,
+                    least,
+                    slowest,
+                ))
+            }
         }
+    }
+
+    /// [`found`](Self::found), the look made at `now`: the look clock, which a test sets.
+    #[cfg(test)]
+    fn found_at(&mut self, found: Found, now: Instant) -> Result<(), Stall> {
+        self.found_over(found, Span::at(now))
+    }
+
+    /// The last look's time meant at or before `now`, of those each `slowest` from `due`: a
+    /// judge its host held past several looks makes one, not one at once for each it missed.
+    /// `slowest` is never zero (an answer no time long teaches nothing); past u64's
+    /// nanoseconds, or past what an `Instant` holds, it is `now`.
+    fn latest_meant(due: Instant, slowest: Duration, now: Instant) -> Instant {
+        let behind = now.saturating_duration_since(due).as_nanos();
+        let missed = behind.checked_div(slowest.as_nanos()).unwrap_or(0);
+        let skip = missed.saturating_mul(slowest.as_nanos());
+        u64::try_from(skip)
+            .ok()
+            .and_then(|ns| due.checked_add(Duration::from_nanos(ns)))
+            .unwrap_or(now)
     }
 
     /// Its party answered, having done `work` since the wait began: its kind learns from
@@ -304,30 +423,30 @@ mod tests {
         assert_eq!(judge.found(Found::Still), Ok(()));
     }
 
-    /// A judged wait's first look is due W* past its start and each after it W* past the look
-    /// before; a look before it is due judges nothing; a look that finds progress moves the
-    /// next one on; one that finds none refuses it, with how far into the wait, the time
-    /// looked over, R* and W*; and one that finds its party gone ends its judging (D215).
+    /// A judged wait's first look is due W* past its start and each after it W* past when the
+    /// look before was meant; a look before it is due judges nothing; a look that finds
+    /// progress starts its party's window anew; one that finds none over a whole W* refuses
+    /// it, with how far into the wait, the time looked over, R* and W*; and one that finds its
+    /// party gone ends its judging (D215). Its looks run on an injected clock, on time.
     #[test]
     fn a_learned_wait_is_refused_at_a_look_that_finds_no_progress() {
         let slowest = Duration::from_millis(30);
         let record = Record::new();
         record.teach(slowest, Duration::from_millis(3));
         let mut judge = Judge::begin(&record);
+        let began = judge.began;
         let first = judge.due().unwrap();
-        assert_eq!(first, judge.began + slowest);
-        assert_eq!(judge.found(Found::Still), Ok(()), "before it is due");
+        assert_eq!(first, began + slowest);
+        assert_eq!(
+            judge.found_at(Found::Still, first - Duration::from_nanos(1)),
+            Ok(()),
+            "before it is due"
+        );
         assert_eq!(judge.due(), Some(first));
-        while Instant::now() < first {
-            std::thread::sleep(first.saturating_duration_since(Instant::now()));
-        }
-        assert_eq!(judge.found(Found::Progressed), Ok(()));
+        assert_eq!(judge.found_at(Found::Progressed, first), Ok(()));
         let second = judge.due().unwrap();
-        assert!(second >= first + slowest, "{second:?} {first:?}");
-        while Instant::now() < second {
-            std::thread::sleep(second.saturating_duration_since(Instant::now()));
-        }
-        let stall = judge.found(Found::Still).unwrap_err();
+        assert_eq!(second, first + slowest);
+        let stall = judge.found_at(Found::Still, second).unwrap_err();
         assert_eq!(stall.slowest(), slowest);
         assert_eq!(
             stall.least(),
@@ -336,45 +455,130 @@ mod tests {
                 over: slowest
             }
         );
-        assert!(stall.over() >= slowest, "{stall:?}");
-        assert!(stall.waited() >= slowest * 2, "{stall:?}");
+        assert_eq!((stall.over(), stall.waited()), (slowest, slowest * 2));
         let mut gone = Judge::begin(&record);
         let due = gone.due().unwrap();
-        while Instant::now() < due {
-            std::thread::sleep(due.saturating_duration_since(Instant::now()));
-        }
-        assert_eq!(gone.found(Found::Gone), Ok(()));
+        assert_eq!(gone.found_at(Found::Gone, due), Ok(()));
         assert_eq!(gone.due(), None);
-        assert_eq!(gone.found(Found::Still), Ok(()));
+        assert_eq!(gone.found_at(Found::Still, due + slowest * 9), Ok(()));
     }
 
     /// A party its host holds from running, which made no progress over a whole W*, is live:
-    /// its look refuses nothing and the next is due W* after it; one that, so held no more,
-    /// made none of its own is refused (ROOT's ruling of 2026-11-13).
+    /// its look refuses nothing and the next is due W* after it was meant; one that, so held
+    /// no more, made none of its own over a whole W* since is refused (ROOT's ruling of
+    /// 2026-11-13).
     #[test]
     fn a_party_its_host_holds_is_live_not_stalled() {
         let slowest = Duration::from_millis(20);
         let record = Record::new();
         record.teach(slowest, Duration::from_millis(1));
         let mut judge = Judge::begin(&record);
-        let until = |judge: &Judge<'_>| {
-            let due = judge.due().unwrap();
-            while Instant::now() < due {
-                std::thread::sleep(due.saturating_duration_since(Instant::now()));
-            }
-            due
-        };
         for _ in 0..3 {
-            let due = until(&judge);
-            assert_eq!(judge.found(Found::Held), Ok(()));
-            assert!(judge.due().unwrap() >= due + slowest);
+            let due = judge.due().unwrap();
+            assert_eq!(judge.found_at(Found::Held, due), Ok(()));
+            assert_eq!(judge.due(), Some(due + slowest));
         }
-        until(&judge);
-        let stall = judge.found(Found::Still).unwrap_err();
-        assert!(
-            stall.over() >= slowest && stall.waited() >= slowest * 4,
-            "{stall:?}"
+        let due = judge.due().unwrap();
+        let stall = judge.found_at(Found::Still, due).unwrap_err();
+        assert_eq!((stall.over(), stall.waited()), (slowest, slowest * 4));
+    }
+
+    /// A judge its host held past several of its looks makes one look as it runs, not one at
+    /// once for each it missed, and its next is due at the next W* past its start. The time
+    /// it ran late is held: a party it found progressed at a late look, still since, has had
+    /// less than a whole W* free at the next look however late that ran, and is refused only
+    /// at a look on time once it has had a whole W* free (ROOT's ruling, 2026-11-13).
+    #[test]
+    fn a_judge_held_past_several_looks_looks_once_and_keeps_its_schedule() {
+        let ms = Duration::from_millis;
+        let slowest = ms(10);
+        let record = Record::new();
+        record.teach(slowest, ms(1));
+        let mut judge = Judge::begin(&record);
+        let began = judge.began;
+        assert_eq!(judge.found_at(Found::Progressed, began + ms(14)), Ok(()));
+        assert_eq!(judge.due(), Some(began + ms(20)));
+        assert_eq!(judge.found_at(Found::Still, began + ms(75)), Ok(()), "6 ms free");
+        assert_eq!(judge.due(), Some(began + ms(80)));
+        let stall = judge.found_at(Found::Still, began + ms(80)).unwrap_err();
+        assert_eq!((stall.over(), stall.waited()), (ms(11), ms(80)));
+    }
+
+    /// The start that failed on a loaded host (ROOT's HVF run at d513d0a0b, containers.rs
+    /// `a_runs_log_is_sent_to_gelf_as_its_options_say`: "it ran nothing for 101.091209ms,
+    /// past the slowest start seen (98.915708ms), 202.999ms after it began"), replayed on an
+    /// injected look clock: its first look ran 101.908ms in and found progress, its second
+    /// 202.999ms in found none. That second look was meant W* past the first's meant time
+    /// (D215's looks each W* past the wait's start), and the time the judge ran late past it
+    /// was its host's hold, not the party's window: its party had less than a whole W* free,
+    /// and goes on. A look on time at the next due, its party still, is refused, over the
+    /// window its host did not hold the judge in (ROOT's ruling, 2026-11-13).
+    #[test]
+    fn a_look_its_host_held_late_counts_its_lateness_as_held() {
+        let us = Duration::from_micros;
+        let slowest = Duration::from_nanos(98_915_708);
+        let record = Record::new();
+        record.teach(slowest, Duration::from_millis(3));
+        let mut judge = Judge::begin(&record);
+        let began = judge.began;
+        assert_eq!(judge.found_at(Found::Progressed, began + us(101_908)), Ok(()));
+        assert_eq!(
+            judge.found_at(Found::Still, began + us(202_999)),
+            Ok(()),
+            "the judge's own lateness counted as the party's stillness"
         );
+        let due = judge.due().unwrap();
+        assert_eq!(due, began + slowest * 3, "looks each W* past the wait's start");
+        let stall = judge.found_at(Found::Still, due).unwrap_err();
+        let late = us(202_999) - slowest * 2;
+        assert_eq!(stall.over(), slowest * 3 - us(101_908) - late);
+        assert_eq!(stall.waited(), slowest * 3);
+        assert_eq!(stall.slowest(), slowest);
+    }
+
+    /// A look its caller made late by its own work is not its host's hold (D209 Part 8):
+    /// harness.rs' `a_wait_is_refused_though_its_own_polls_keep_its_daemon_busy` on
+    /// adas-mac-studio-3.local, busy, "not refused 177-197 ms in (W* 59.554375ms)", its
+    /// waiter polling with a command of its own between looks, each poll and look slower than
+    /// when W* was taught. Replayed: a base look 0-33 ms in; a poll 33-93 ms, past the first
+    /// due; a look 93-123 ms that finds its party still. Its lateness its host's hold, as
+    /// a judge whose host held it counts it, the look sees 26 ms of a W* and goes on; its
+    /// lateness its caller's own poll, the look has seen 60 ms, a whole W*, and refuses it.
+    #[test]
+    fn a_look_its_caller_made_late_by_its_own_work_is_not_held() {
+        let ms = Duration::from_millis;
+        let slowest = Duration::from_nanos(59_554_375);
+        let record = Record::new();
+        record.teach(slowest, ms(3));
+        let judged = |own: bool| {
+            let mut judge = Judge::begin(&record);
+            let base = span(&judge, Duration::ZERO, ms(33), Duration::ZERO);
+            assert_eq!(judge.found_over(Found::Based, base), Ok(()));
+            let from = judge.late_from().unwrap();
+            let mut look = span(&judge, ms(93), ms(123), Duration::ZERO);
+            if own {
+                look.own = look.began - from;
+            }
+            judge.found_over(Found::Still, look)
+        };
+        assert_eq!(judged(false), Ok(()), "a host's hold of its judge refused");
+        let stall = judged(true).unwrap_err();
+        assert_eq!(stall.over(), ms(60));
+        assert_eq!(stall.waited(), ms(93));
+    }
+
+    /// A judge that looks on time at each due, its party stopped from the start, refuses it
+    /// at its first look, over a whole W* (ROOT's ruling, 2026-11-13: a host's hold of the
+    /// judge is never one it did not show).
+    #[test]
+    fn a_judge_on_time_refuses_a_stopped_party_at_its_first_look() {
+        let slowest = Duration::from_millis(30);
+        let record = Record::new();
+        record.teach(slowest, Duration::from_millis(3));
+        let mut judge = Judge::begin(&record);
+        let due = judge.due().unwrap();
+        let stall = judge.found_at(Found::Still, due).unwrap_err();
+        assert_eq!((stall.over(), stall.waited()), (slowest, slowest));
     }
 
     /// A wait judged from outside, as one blocked in a write is, is stalled once its party
@@ -405,6 +609,149 @@ mod tests {
             }
         );
         assert_eq!(record.stalled(since + ms(40), since), None, "no time has passed");
+    }
+
+    /// A look over `began..ended` past the judge's start, of counters as fine as
+    /// `resolution`.
+    fn span(judge: &Judge<'_>, began: Duration, ended: Duration, resolution: Duration) -> Span {
+        Span {
+            began: judge.began + began,
+            ended: judge.began + ended,
+            resolution,
+            own: Duration::ZERO,
+        }
+    }
+
+    /// Looks on time at each due, each no earlier than the look before ended, all finding
+    /// its party still, until one refuses it: when that look began past the judge's start,
+    /// and the stall. None in `looks` looks.
+    fn still_until_refused(
+        judge: &mut Judge<'_>,
+        resolution: Duration,
+        looks: usize,
+    ) -> Option<(Duration, Stall)> {
+        for _ in 0..looks {
+            let at = judge.due()?.max(judge.last);
+            let look = Span {
+                began: at,
+                ended: at,
+                resolution,
+                own: Duration::ZERO,
+            };
+            if let Err(stall) = judge.found_over(Found::Still, look) {
+                return Some((at - judge.began, stall));
+            }
+        }
+        None
+    }
+
+    /// #77's stream wait (ROOT's KVM run at c120c8a95, managed_lifecycle.rs:209: "a guest's
+    /// stream made no progress for 3.527µs, past the slowest answer of its kind seen on this
+    /// host (3.527µs), 18.416389ms into its wait ... its last progress its start"), replayed:
+    /// its W* far below what one look at its party takes, its first look, about 18.416 ms
+    /// long, found every process of it anew, with nothing before it to compare with, and the
+    /// look right after refused it. That first look is based and judges nothing, nor does
+    /// the next, which began 1 µs after its end, having seen 1 µs; a wait
+    /// whose looks then see it still is refused, but never before they have seen a whole W*
+    /// past the first look's end.
+    #[test]
+    fn a_first_look_longer_than_w_star_is_based_not_still() {
+        let us = Duration::from_micros;
+        let ns = Duration::from_nanos;
+        let slowest = ns(3_527);
+        let record = Record::new();
+        record.teach(slowest, Duration::ZERO);
+        let mut judge = Judge::begin(&record);
+        let first = span(&judge, Duration::ZERO, us(18_416), ns(1));
+        assert_eq!(
+            judge.found_over(Found::Based, first),
+            Ok(()),
+            "a first look judges nothing"
+        );
+        let next = span(&judge, us(18_417), us(18_418), ns(1));
+        assert_eq!(
+            judge.found_over(Found::Still, next),
+            Ok(()),
+            "1 µs seen of a 3.527 µs W*"
+        );
+        let (at, stall) = still_until_refused(&mut judge, ns(1), 8).unwrap();
+        assert!(stall.over() >= slowest, "{stall:?}");
+        assert!(at >= us(18_416) + slowest, "{at:?}");
+        assert_eq!(stall.waited(), at);
+    }
+
+    /// #77's `shards top` wait (ROOT's KVM run at c120c8a95, common/mod.rs:2601: "made no
+    /// progress for 13.996303ms, past the slowest answer of its kind seen on this host
+    /// (13.996303ms), 31.066531ms into its wait ... its last progress its start"), replayed:
+    /// its first look, which found its processes anew, began as the wait did and ended
+    /// about 29 ms in, past its first due (its judged look began 31.066 ms in, after 2 ms of
+    /// sleep). Those looks saw 2 ms of stillness, all of it the judge's
+    /// own lateness, not a W*: it goes on. Looked at on time from then, it is refused at the
+    /// first look that has seen a whole W* past the first look's end, the lateness not
+    /// counted: its fourth due.
+    #[test]
+    fn a_window_is_judged_from_its_baselines_end() {
+        let us = Duration::from_micros;
+        let slowest = Duration::from_nanos(13_996_303);
+        let record = Record::new();
+        record.teach(slowest, Duration::from_millis(1));
+        let mut judge = Judge::begin(&record);
+        let first = span(&judge, Duration::ZERO, us(29_000), Duration::ZERO);
+        assert_eq!(judge.found_over(Found::Based, first), Ok(()));
+        let second = span(&judge, us(31_066), us(31_100), Duration::ZERO);
+        assert_eq!(
+            judge.found_over(Found::Still, second),
+            Ok(()),
+            "2 ms seen of a 14 ms W*"
+        );
+        let (at, stall) = still_until_refused(&mut judge, Duration::ZERO, 8).unwrap();
+        assert_eq!(at, slowest * 4);
+        let late = us(31_066) - us(29_000);
+        assert_eq!(stall.over(), slowest * 4 - us(29_000) - late);
+        assert_eq!(stall.waited(), slowest * 4);
+    }
+
+    /// A party read by a counter coarser than W* (one that counts clock ticks, as /proc's
+    /// utime does at USER_HZ) is judged over its counter's resolution where that is longer:
+    /// looked at on time each W*, it goes on while its looks have seen less than a whole
+    /// tick of stillness, and is refused at the look that has seen one.
+    #[test]
+    fn a_counter_coarser_than_w_star_widens_the_window_to_its_resolution() {
+        let ms = Duration::from_millis;
+        let slowest = Duration::from_micros(500);
+        let tick = ms(10);
+        let record = Record::new();
+        record.teach(slowest, Duration::ZERO);
+        let mut judge = Judge::begin(&record);
+        let first = span(&judge, Duration::ZERO, Duration::ZERO, tick);
+        assert_eq!(judge.found_over(Found::Based, first), Ok(()));
+        let (at, stall) = still_until_refused(&mut judge, tick, 40).unwrap();
+        assert_eq!(at, tick);
+        assert_eq!((stall.over(), stall.slowest()), (tick, slowest));
+    }
+
+    /// A based look starts the evidence anew whether or not it is due: one that found a
+    /// process of its party first, late in the wait, leaves the time before it unjudged.
+    #[test]
+    fn a_based_look_starts_the_evidence_anew_before_its_due() {
+        let ms = Duration::from_millis;
+        let slowest = ms(10);
+        let record = Record::new();
+        record.teach(slowest, Duration::ZERO);
+        let mut judge = Judge::begin(&record);
+        assert_eq!(
+            judge.found_over(Found::Based, span(&judge, ms(8), ms(9), Duration::ZERO)),
+            Ok(())
+        );
+        assert_eq!(
+            judge.found_over(Found::Still, span(&judge, ms(10), ms(10), Duration::ZERO)),
+            Ok(()),
+            "1 ms seen"
+        );
+        let stall = judge
+            .found_over(Found::Still, span(&judge, ms(20), ms(20), Duration::ZERO))
+            .unwrap_err();
+        assert_eq!(stall.over(), ms(11));
     }
 
     /// An answer teaches its kind the wall time since its wait began and the work done

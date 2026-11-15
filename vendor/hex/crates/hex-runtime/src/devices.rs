@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use hex_api::{BoxId, BoxSpec, DeviceId, DeviceInfo, DeviceKind, Refusal};
-use hex_core::record::{BoxRecord, NativeRecord, NativeStage, PoolRecord};
+use hex_core::record::{BoxRecord, NativeRecord, NativeStage, NodeVmRecord, PoolRecord};
 
 /// One metadata callback's bounded route-count scratch, never stored as inventory or grants.
 /// Retained tuples are real identities; introduced keys describe ONE new lifetime only after
@@ -343,9 +343,14 @@ pub fn managed_scope_id(record: &BoxRecord) -> Result<BoxId, Refusal> {
 }
 
 pub fn managed_native_scope_id(record: NativeRecord<'_>) -> Result<BoxId, Refusal> {
-    let refused = || record.refusal(hex_api::LifecycleCause::Uncertain);
-    let scope = record.scope().ok_or_else(refused)?;
-    let room = scope.bytes().len().checked_mul(2).ok_or_else(refused)?;
+    let scope = record
+        .scope()
+        .ok_or_else(|| record.uncertain("its record names no native scope to name it by"))?;
+    let room = scope
+        .bytes()
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| record.uncertain("its native scope's name overflowed"))?;
     let mut name = String::new();
     name.try_reserve_exact(room)
         .map_err(|_| Refusal::Exhausted {
@@ -357,7 +362,7 @@ pub fn managed_native_scope_id(record: NativeRecord<'_>) -> Result<BoxId, Refusa
             let byte = b"0123456789abcdef"
                 .get(usize::from(digit))
                 .copied()
-                .ok_or_else(refused)?;
+                .ok_or_else(|| record.uncertain("its native scope's name took a digit past hex"))?;
             name.push(char::from(byte));
         }
     }
@@ -408,14 +413,15 @@ impl ManagedLaunch<'_> {
 
 /// Shared pre-effect guard for the existing Node/Recorded native transaction consumers. The
 /// writer's final OS duplication/rendering stays at its native launcher, never in this metadata.
+/// Its answer is the launch's deadline: the caller's, a report's at most, none for a launch that
+/// follows its guest with no report (the review's C-9).
 pub fn check_managed_report(
     catalog: Option<&Catalog>,
     record: NativeRecord<'_>,
     plan: &ManagedLaunch<'_>,
     writer: bool,
-    deadline: Instant,
-) -> Result<Instant, Refusal> {
-    let refused = || record.refusal(hex_api::LifecycleCause::Uncertain);
+    deadline: Option<Instant>,
+) -> Result<Option<Instant>, Refusal> {
     match record {
         NativeRecord::Box(record) => record.spec.check()?,
         NativeRecord::Pool(record) => record.check()?,
@@ -425,7 +431,9 @@ pub fn check_managed_report(
         || record.init().is_some()
         || record.scope().is_none()
     {
-        return Err(refused());
+        return Err(record.uncertain(
+            "its launch plan isn't its record's class, or it isn't a fresh creation with a native scope",
+        ));
     }
     let request = match plan {
         ManagedLaunch::Shards(prepared) => prepared.gpu_report_request(),
@@ -439,12 +447,18 @@ pub fn check_managed_report(
         required,
     )?;
     let deadline = if let Some(request) = request {
-        check_report_selection(catalog.ok_or_else(refused)?, record, request.selected())?;
-        deadline.min(request.deadline())
+        check_report_selection(
+            catalog.ok_or_else(|| {
+                record.uncertain("its node holds no device catalog to check its report by")
+            })?,
+            record,
+            request.selected(),
+        )?;
+        earlier(deadline, request.until().instant())
     } else {
         deadline
     };
-    if deadline <= Instant::now() {
+    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
         return Err(record.refusal(hex_api::LifecycleCause::Pending));
     }
     Ok(deadline)
@@ -464,7 +478,9 @@ fn check_report_scope(
                 .is_none_or(|scope| *scope.bytes() != requested)
         })
     {
-        return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+        return Err(record.uncertain(
+            "its launch's report scope, writer or requirement disagree with its record",
+        ));
     }
     Ok(())
 }
@@ -474,10 +490,10 @@ fn check_report_selection(
     record: NativeRecord<'_>,
     selected: &[shards_api::PhysicalGpu],
 ) -> Result<(), Refusal> {
-    let refused = || record.refusal(hex_api::LifecycleCause::Uncertain);
-    shards_api::physical::check_selection(selected).map_err(|_| refused())?;
+    shards_api::physical::check_selection(selected)
+        .map_err(|_| record.uncertain("its report's GPU selection isn't valid"))?;
     if selected.len() != record.devices().len() {
-        return Err(refused());
+        return Err(record.uncertain("its report selects another count of GPUs than its record's"));
     }
     let mut indexed = Vec::new();
     indexed
@@ -500,9 +516,13 @@ fn check_report_selection(
             .binary_search_by_key(id, |entry| entry.info.id)
             .ok()
             .and_then(|at| indexed.get(at))
-            .ok_or_else(refused)?;
+            .ok_or_else(|| {
+                record.uncertain("its record names a GPU its node's catalog doesn't hold")
+            })?;
         let Some(Binding::ShardsGpu { physical }) = entry.binding(Route::ShardsGpu) else {
-            return Err(refused());
+            return Err(
+                record.uncertain("its record names a GPU its catalog binds to no Shards route")
+            );
         };
         expected.push(*physical);
     }
@@ -514,7 +534,9 @@ fn check_report_selection(
             .iter()
             .any(|physical| expected.binary_search(physical).is_err())
     {
-        return Err(refused());
+        return Err(
+            record.uncertain("its report selects a GPU twice, or one its record doesn't name")
+        );
     }
     Ok(())
 }
@@ -524,6 +546,12 @@ fn check_report_selection(
 /// It performs no implicit commit: every physical/record transition remains explicit to its caller.
 pub trait Books: Send + Sync {
     fn records(&self) -> Result<Records, Refusal>;
+    /// Box `id`'s record alone, as [`Books::records`] holds it: a call about one box reads its record by its id, never
+    /// every record (the review's B-8). By default, from every record; an owner that keeps its records by id reads the
+    /// one.
+    fn record(&self, id: &BoxId) -> Result<Option<Result<BoxRecord, String>>, Refusal> {
+        Ok(self.records()?.remove(id))
+    }
     fn pool_records(&self) -> Result<PoolRecords, Refusal>;
     /// Metadata-only preparation under the SAME family configuration and full conflict turns.
     /// The family tuple is (immutable full-configuration identity, complete alias keys, expected
@@ -557,6 +585,20 @@ pub trait Books: Send + Sync {
         devices: &[DeviceId],
         callback: &mut dyn FnMut(&dyn Transaction) -> Result<(), Refusal>,
     ) -> Result<(), Refusal>;
+    /// Box `id`'s record read and changed by `callback` alone, as [`Books::with_transaction`]'s is, by a transaction
+    /// that makes no native call: [`with_record_transaction`], its one caller, hands `callback` a view of it that
+    /// refuses each (`RecordOnly`). Nothing in it can then call back needing the box again, so its owner may wait for a
+    /// turn of the box under way, following its holder (decision 9), with no holder waiting on it, where a native
+    /// transaction must refuse the overlap (a launch's callback may need the box again): a call writing a box's record
+    /// is never refused because another's write of it is under way (the HVF run's HEX-IMG-4, 2026-11-14: a KILL refused
+    /// Busy where the charge learner's ask settled the same end). By default, as [`Books::with_transaction`].
+    fn with_record_transaction(
+        &self,
+        id: &BoxId,
+        callback: &mut dyn FnMut(&dyn Transaction) -> Result<(), Refusal>,
+    ) -> Result<(), Refusal> {
+        self.with_transaction(id, &[], callback)
+    }
     fn with_pool_transaction(
         &self,
         key: &hex_api::BackingKey,
@@ -572,6 +614,31 @@ pub trait Books: Send + Sync {
         full_conflicts: &[DeviceId],
         callback: &mut dyn FnMut(&dyn Transaction) -> Result<(), Refusal>,
     ) -> Result<(), Refusal>;
+    /// Node VM `run`'s record (joint plan step 39), which lies apart from every box's and pool's, so no box call reads
+    /// it. An owner that keeps no node VM refuses, naming it.
+    fn node_vm(&self, run: &hex_api::NodeRun) -> Result<Option<NodeVmRecord>, Refusal> {
+        let _ = run;
+        Err(no_node_vms())
+    }
+    /// Every node VM's record it keeps, in their runs' order: their receipts' one source, which the node's capacity
+    /// answer carries (joint plan step 39). An owner that keeps no node VM refuses, naming it.
+    fn all_node_vms(&self) -> Result<Vec<NodeVmRecord>, Refusal> {
+        Err(no_node_vms())
+    }
+    /// Writes node VM `record.run`'s record whole, replacing what it held, durable before it returns.
+    fn put_node_vm(&self, record: &NodeVmRecord) -> Result<(), Refusal> {
+        let _ = record;
+        Err(no_node_vms())
+    }
+    /// A run for a node VM about to be booked: named by no record it keeps.
+    fn mint_node_run(&self) -> Result<hex_api::NodeRun, Refusal> {
+        Err(no_node_vms())
+    }
+}
+
+/// An owner's answer for the node VM records it doesn't keep: one of a test's, or of a runtime that runs none.
+fn no_node_vms() -> Refusal {
+    Refusal::Broken("this record owner keeps no node VM's record".to_owned())
 }
 
 pub trait Transaction {
@@ -591,11 +658,13 @@ pub trait Transaction {
     fn remove(&self, id: &BoxId) -> Result<(), Refusal>;
     /// Launch in the original record's admitted native envelope from the first instruction.
     /// The existing native receipt alone owns observation/reaping; no Process record is added.
+    /// `patience` is what is left of a finite create budget (a GPU create's), none for a create that
+    /// follows its guest (the review's C-9), whose launch has no deadline of the caller's.
     fn launch_managed(
         &self,
         plan: &ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: Duration,
+        patience: Option<Duration>,
     ) -> Result<shards_api::ManagedReceipt, Refusal>;
     /// Reattach the exact persisted native identity and envelope without creating a process.
     /// None is cleanup-only for Creating/Deleting before identity publication, never a usable
@@ -622,6 +691,83 @@ pub fn with_transaction<T>(
     transaction(books, operation, |books, callback| {
         books.with_transaction(id, devices, callback)
     })
+}
+
+/// Box `id`'s record read and changed by `operation` alone through its owner's record transaction
+/// ([`Books::with_record_transaction`]), which waits for a turn of the box under way where its owner does: `operation`
+/// sees its records alone (`RecordOnly`), each native call refused.
+pub fn with_record_transaction<T>(
+    books: &std::sync::Weak<dyn Books>,
+    id: &BoxId,
+    operation: impl FnOnce(&dyn Transaction) -> Result<T, Refusal>,
+) -> Result<T, Refusal> {
+    transaction(
+        books,
+        |transaction| operation(&RecordOnly(transaction)),
+        |books, callback| books.with_record_transaction(id, callback),
+    )
+}
+
+/// A record transaction as its operation sees it ([`with_record_transaction`]): its records read and written as its
+/// transaction's are, and every native call refused, typed, before its owner sees it.
+struct RecordOnly<'a>(&'a dyn Transaction);
+
+/// A native call in a record transaction ([`RecordOnly`]): only a fault of Hex's own could make one.
+fn native_in_record() -> Refusal {
+    broken("a record transaction makes no native call")
+}
+
+impl Transaction for RecordOnly<'_> {
+    fn records(&self) -> Result<Records, Refusal> {
+        self.0.records()
+    }
+    fn pool_records(&self) -> Result<PoolRecords, Refusal> {
+        self.0.pool_records()
+    }
+    fn read_pool(&self, key: &hex_api::BackingKey) -> Result<Option<PoolRecord>, Refusal> {
+        self.0.read_pool(key)
+    }
+    fn put_pool(&self, record: &PoolRecord) -> Result<(), Refusal> {
+        self.0.put_pool(record)
+    }
+    fn grant_pool(&self, grant: &hex_api::BackingGrant) -> Result<PoolRecord, Refusal> {
+        self.0.grant_pool(grant)
+    }
+    fn remove_pool(&self, key: &hex_api::BackingKey) -> Result<(), Refusal> {
+        self.0.remove_pool(key)
+    }
+    fn check_unsubmitted_pool(&self) -> Result<(), Refusal> {
+        Err(native_in_record())
+    }
+    fn read(&self, id: &BoxId) -> Result<Option<BoxRecord>, Refusal> {
+        self.0.read(id)
+    }
+    fn put(&self, record: &BoxRecord) -> Result<(), Refusal> {
+        self.0.put(record)
+    }
+    fn remove(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.0.remove(id)
+    }
+    fn launch_managed(
+        &self,
+        _: &ManagedLaunch<'_>,
+        _: shards_api::LaunchIo,
+        _: Option<Duration>,
+    ) -> Result<shards_api::ManagedReceipt, Refusal> {
+        Err(native_in_record())
+    }
+    fn attach_managed(
+        &self,
+        _: Option<&shards_api::Identity>,
+    ) -> Result<shards_api::ManagedReceipt, Refusal> {
+        Err(native_in_record())
+    }
+    fn finalize_managed(&self, _: Option<&shards_api::Identity>) -> Result<(), Refusal> {
+        Err(native_in_record())
+    }
+    fn managed_usage(&self) -> Result<hex_api::Usage, Refusal> {
+        Err(native_in_record())
+    }
 }
 
 pub fn with_pool_transaction<T>(
@@ -1027,10 +1173,15 @@ impl Catalog {
             let record = pools
                 .iter()
                 .find(|record| record.key == key)
-                .ok_or_else(|| record_error(key))?;
+                .ok_or_else(|| {
+                    record_error(key, "its GPU family's current backing has no record")
+                })?;
             record.check()?;
             if record.phase == hex_api::BackingPhase::Released {
-                return Err(record_error(key));
+                return Err(record_error(
+                    key,
+                    "its GPU family's current backing is released",
+                ));
             }
         }
         let aliases = if configured.is_empty() {
@@ -1052,16 +1203,19 @@ impl Catalog {
             Ok(())
         };
         for (id, record) in records {
-            let bad = || match id.try_clone() {
+            let bad = |why: &str| match id.try_clone() {
                 Ok(id) => Refusal::Lifecycle {
                     id,
                     cause: hex_api::LifecycleCause::Uncertain,
+                    why: Some(why.to_owned()),
                 },
                 Err(refusal) => refusal,
             };
-            let record = record.as_ref().map_err(|_| bad())?;
+            let record = record
+                .as_ref()
+                .map_err(|_| bad("its record can't be read"))?;
             if record.spec.id != *id {
-                return Err(bad());
+                return Err(bad("its record names another box"));
             }
             record.spec.check()?;
             if let Some(key) = current
@@ -1073,6 +1227,7 @@ impl Catalog {
                 return Err(Refusal::Backing {
                     key,
                     cause: hex_api::LifecycleCause::Busy,
+                    why: None,
                 });
             }
             for id in &record.spec.devices {
@@ -1250,7 +1405,12 @@ impl Catalog {
                     let boxed = records
                         .get(id)
                         .and_then(|record| record.as_ref().ok())
-                        .ok_or_else(|| record_error(record.key))?;
+                        .ok_or_else(|| {
+                            record_error(
+                                record.key,
+                                "the box holding its devices has no readable record",
+                            )
+                        })?;
                     if !matches!(
                         boxed.phase,
                         hex_core::record::Phase::Creating | hex_core::record::Phase::Deleting
@@ -1259,13 +1419,21 @@ impl Catalog {
                         || boxed.exit.is_some()
                         || !self.handoff(&boxed.spec, record)?
                     {
-                        return Err(record_error(record.key));
+                        return Err(record_error(
+                            record.key,
+                            "the box holding its devices isn't a pending handoff of it",
+                        ));
                     }
                     // The pending Box is only a consuming reference. The original native
                     // observer still owns every full-P conflict until its actual scope Released.
                     holder = Some(hex_api::DeviceHolder::Backing(record.key));
                 }
-                Some(hex_api::DeviceHolder::Backing(_)) => return Err(record_error(record.key)),
+                Some(hex_api::DeviceHolder::Backing(_)) => {
+                    return Err(record_error(
+                        record.key,
+                        "another backing holds its devices",
+                    ));
+                }
             }
         }
         Ok(holder)
@@ -1330,12 +1498,22 @@ impl Catalog {
             let pool = pools
                 .iter()
                 .find(|pool| pool.key == source)
-                .ok_or_else(|| record_error(source))?;
+                .ok_or_else(|| {
+                    record_error(source, "the handoff's source backing has no record")
+                })?;
             if !self.handoff(spec, pool)? {
-                return Err(record_error(source));
+                return Err(record_error(
+                    source,
+                    "the box isn't a handoff its source backing allows",
+                ));
             }
             for (other, record) in records {
-                let record = record.as_ref().map_err(|_| record_error(source))?;
+                let record = record.as_ref().map_err(|_| {
+                    record_error(
+                        source,
+                        "a box record couldn't be read as its handoff was checked",
+                    )
+                })?;
                 if other != &spec.id
                     && record.spec.route.is_some_and(|route| {
                         route.backing == Some(source)
@@ -1345,6 +1523,7 @@ impl Catalog {
                     return Err(Refusal::Backing {
                         key: source,
                         cause: hex_api::LifecycleCause::Busy,
+                        why: None,
                     });
                 }
             }
@@ -1400,10 +1579,12 @@ impl Catalog {
     }
 }
 
-fn record_error(key: hex_api::BackingKey) -> Refusal {
+/// Backing `key` refused Uncertain, and `why` in the refusing site's own words (joint plan step 14, (B)).
+fn record_error(key: hex_api::BackingKey, why: &str) -> Refusal {
     Refusal::Backing {
         key,
         cause: hex_api::LifecycleCause::Uncertain,
+        why: Some(why.to_owned()),
     }
 }
 
@@ -1465,6 +1646,18 @@ fn read_bounded(path: &Path, bound: usize) -> Result<Vec<u8>, Refusal> {
     }
     bytes.truncate(used);
     Ok(bytes)
+}
+
+/// The earlier of two deadlines, either of which may be none (a wait that follows): none where both are.
+pub(crate) fn earlier(
+    a: Option<std::time::Instant>,
+    b: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
 }
 
 #[cfg(test)]
@@ -1597,6 +1790,7 @@ mod native_route_tests {
                 arch: hex_api::ImageArch::Arm64,
             };
             let mut capacity = hex_api::Capacity {
+                own: Default::default(),
                 id: "actual native fixture".into(),
                 total: room,
                 free: room,
@@ -1615,6 +1809,8 @@ mod native_route_tests {
                 backings: Vec::new(),
                 unavailable: Vec::new(),
                 learned: None,
+                node_vms: Vec::new(),
+                unlearned: None,
             };
             native_routes(&mut capacity, hex_api::Class::Oci, image).unwrap();
             assert_eq!(capacity.device_routes, vec![2]);
@@ -1689,7 +1885,7 @@ mod authority_tests {
             &self,
             _: &ManagedLaunch<'_>,
             _: shards_api::LaunchIo,
-            _: Duration,
+            _: Option<Duration>,
         ) -> Result<shards_api::ManagedReceipt, Refusal> {
             Err(invalid("fixture has no native launcher"))
         }
@@ -1750,6 +1946,7 @@ mod authority_tests {
                 Mode::Refused => Err(Refusal::Backing {
                     key: *key,
                     cause: hex_api::LifecycleCause::Busy,
+                    why: None,
                 }),
             }
         }
@@ -1775,6 +1972,54 @@ mod authority_tests {
                 Mode::Refused => Err(Refusal::NoSuchBox(id.try_clone()?)),
             }
         }
+    }
+
+    /// The HVF run's HEX-IMG-4 (ROOT, 2026-11-14; decision 9; AC-T7.4.1): a record transaction makes no native call,
+    /// so its owner may wait for a turn of its box under way with no holder waiting on it: each native call in one is
+    /// refused in its own words before its owner sees it, and its records reach its owner as a transaction's do. Do: in
+    /// a record transaction of a box, read its record, then make each native call. Expect: the read answered by the
+    /// owner, and every native call refused Broken naming a record transaction, never the owner's own refusal.
+    #[test]
+    fn a_record_transaction_refuses_every_native_call_before_its_owner_sees_it() {
+        let owner: Arc<dyn Books> = Arc::new(Owner(Mode::Once));
+        let books = Arc::downgrade(&owner);
+        let id = BoxId::new("record-only").unwrap();
+        let program = hex_api::Program::default();
+        let (_out, stdout) = std::io::pipe().unwrap();
+        let (_err, stderr) = std::io::pipe().unwrap();
+        let (read, natives) = with_record_transaction(&books, &id, |t| {
+            let launch = ManagedLaunch::Firecracker {
+                program: &program,
+                vsock: Path::new("record-only.vsock"),
+                #[cfg(target_os = "linux")]
+                memlock: None,
+            };
+            let io = shards_api::LaunchIo {
+                stdout,
+                stderr,
+                gpu_report: None,
+            };
+            Ok((
+                t.read(&id)?,
+                [
+                    t.launch_managed(&launch, io, Some(Duration::ZERO))
+                        .map(drop),
+                    t.attach_managed(None).map(drop),
+                    t.finalize_managed(None),
+                    t.managed_usage().map(drop),
+                    t.check_unsubmitted_pool(),
+                ],
+            ))
+        })
+        .unwrap();
+        assert_eq!(read, None);
+        let refused = Err(Refusal::Broken(
+            "a record transaction makes no native call".to_owned(),
+        ));
+        assert!(
+            natives.iter().all(|native| *native == refused),
+            "{natives:?}"
+        );
     }
 
     /// AC-T7.4.1: path authority is the canonical incarnation, never the reusable public box id.
@@ -1965,7 +2210,8 @@ mod report_tests {
             (None, false, true),
         ] {
             assert!(
-                matches!(check_report_scope(record, scope, writer, required), Err(Refusal::Backing { key, cause:LifecycleCause::Uncertain }) if key == pool.key)
+                matches!(check_report_scope(record, scope, writer, required), Err(Refusal::Backing { key, cause: LifecycleCause::Uncertain, why: Some(why) })
+                    if key == pool.key && why == "its launch's report scope, writer or requirement disagree with its record")
             );
         }
         // CPU/Firecracker's separate factual RPC path supplies no Shards writer or request.

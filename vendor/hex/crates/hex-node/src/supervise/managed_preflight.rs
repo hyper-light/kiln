@@ -62,10 +62,12 @@ impl Supervisor {
         for native in &natives {
             let position = by_owner
                 .binary_search_by(|entry| entry.record.owner().cmp(&native.owner.as_ref()))
-                .map_err(|_| native.uncertain())?;
+                .map_err(|_| {
+                    native.uncertain("its supervised managed VM has no retained record")
+                })?;
             let record = by_owner
                 .get(position)
-                .ok_or_else(|| native.uncertain())?
+                .ok_or_else(|| native.uncertain("its retained record vanished as it was found"))?
                 .record;
             native.matches_record(record)?;
             if native.identity.get().is_some_and(|identity| {
@@ -75,7 +77,9 @@ impl Supervisor {
                         start_ticks: identity.started,
                     })
             }) {
-                return Err(native.uncertain());
+                return Err(
+                    native.uncertain("its supervised controller isn't the one its record names")
+                );
             }
         }
         preflight(root, &expected)
@@ -83,9 +87,8 @@ impl Supervisor {
 }
 
 fn unsubmitted_pool_name(record: NativeRecord<'_>, present: bool) -> Result<BoxId, Refusal> {
-    let refused = || record.refusal(hex_api::LifecycleCause::Uncertain);
     let NativeRecord::Pool(pool) = record else {
-        return Err(refused());
+        return Err(record.uncertain("an unsubmitted scope's record isn't a pool's"));
     };
     pool.check()?;
     if present
@@ -97,7 +100,9 @@ fn unsubmitted_pool_name(record: NativeRecord<'_>, present: bool) -> Result<BoxI
         || pool.init.is_some()
         || pool.exit.is_some()
     {
-        return Err(refused());
+        return Err(record.uncertain(
+            "its pool has a scope, or is past its preparation with an allocation, controller or end",
+        ));
     }
     managed_native_scope_id(record)
 }
@@ -107,7 +112,6 @@ fn check_unsubmitted_pool_path(
     name: &str,
     record: NativeRecord<'_>,
 ) -> Result<(), Refusal> {
-    let refused = || record.refusal(hex_api::LifecycleCause::Uncertain);
     // Require the initialized owner root itself. NOENT on an intermediate/missing root is not
     // evidence for this exact scope, and neither a symlink nor an empty preexisting scope suffices.
     let root = rustix::fs::open(
@@ -115,10 +119,14 @@ fn check_unsubmitted_pool_path(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|_| refused())?;
+    .map_err(|_| {
+        record.uncertain("its managed root couldn't be opened to prove its scope absent")
+    })?;
     match rustix::fs::statat(&root, name, AtFlags::SYMLINK_NOFOLLOW) {
         Err(Errno::NOENT) => Ok(()),
-        Ok(_) | Err(_) => Err(refused()),
+        Ok(_) | Err(_) => {
+            Err(record.uncertain("its unsubmitted scope's cgroup is on disk, or couldn't be read"))
+        }
     }
 }
 
@@ -134,7 +142,7 @@ fn expected<'a>(
         .map_err(|_| managed_storage())?;
     for (record, bounds) in retained {
         if bounds.is_some() != record.allocation().is_some() {
-            return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+            return Err(record.uncertain("its managed bounds and its allocation disagree"));
         }
         if let Some(bounds) = bounds {
             bounds.check()?;
@@ -178,26 +186,35 @@ fn preflight(root: &Path, expected: &[Expected<'_>]) -> Result<(), Refusal> {
                 match rustix::fs::statat(root_fd, entry.name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
                     Err(Errno::NOENT) => {}
                     Ok(_) | Err(_) => {
-                        return Err(entry.record.refusal(hex_api::LifecycleCause::Uncertain));
+                        return Err(entry.record.uncertain(
+                            "its scope's cgroup is on disk though it has no allocation, or couldn't be read",
+                        ));
                     }
                 }
             }
             check_members(entry.record, false, &[], process_stat)?;
             continue;
         };
-        let refused = || entry.record.refusal(hex_api::LifecycleCause::Uncertain);
-        let bounds = entry.bounds.ok_or_else(refused)?;
+        let refused = |why: &str| entry.record.uncertain(why);
+        let bounds = entry
+            .bounds
+            .ok_or_else(|| refused("its scope's cgroup has no managed bounds to check"))?;
         check_scope(entry.record, bounds, &cgroup)?;
         // Validate pathname still names the same pinned object before ending this observation.
-        let pinned = rustix::fs::fstat(cgroup.open_dir()?).map_err(|_| refused())?;
+        let pinned = rustix::fs::fstat(cgroup.open_dir()?)
+            .map_err(|_| refused("its pinned scope cgroup couldn't be read"))?;
         let named = rustix::fs::statat(
-            root_fd.as_ref().ok_or_else(refused)?,
+            root_fd
+                .as_ref()
+                .ok_or_else(|| refused("its managed root wasn't opened to name its scope by"))?,
             entry.name.as_str(),
             AtFlags::SYMLINK_NOFOLLOW,
         )
-        .map_err(|_| refused())?;
+        .map_err(|_| refused("its scope cgroup's name couldn't be read"))?;
         if pinned.st_dev != named.st_dev || pinned.st_ino != named.st_ino {
-            return Err(refused());
+            return Err(refused(
+                "its scope cgroup's name names another directory than the pinned one",
+            ));
         }
     }
     Ok(())
@@ -208,10 +225,15 @@ fn check_scope(
     bounds: &hex_api::Bounds,
     cgroup: &BoxCgroup,
 ) -> Result<(), Refusal> {
-    let refused = || record.refusal(hex_api::LifecycleCause::Uncertain);
-    cgroup.check_managed_bounds(bounds).map_err(|_| refused())?;
-    let populated = cgroup.managed_populated().map_err(|_| refused())?;
-    let members = cgroup.managed_procs().map_err(|_| refused())?;
+    cgroup
+        .check_managed_bounds(bounds)
+        .map_err(|_| record.uncertain("its scope cgroup's bounds aren't its record's"))?;
+    let populated = cgroup
+        .managed_populated()
+        .map_err(|_| record.uncertain("its scope cgroup's populated flag couldn't be read"))?;
+    let members = cgroup
+        .managed_procs()
+        .map_err(|_| record.uncertain("its scope cgroup's members couldn't be read"))?;
     check_leaf(&cgroup.open_dir()?)?;
     check_members(record, populated, &members, process_stat)
 }
@@ -281,28 +303,37 @@ fn check_members(
     members: &[u32],
     mut stat: impl FnMut(u32) -> Result<Option<(Stat, u32)>, Refusal>,
 ) -> Result<(), Refusal> {
-    let refused = || record.refusal(hex_api::LifecycleCause::Uncertain);
+    let refused = |why: &str| record.uncertain(why);
     // A descendant may remain after the controller exits; cgroup.events is hierarchical.
     // Controller absence alone never certifies that scope is empty or cleanup may proceed.
     if record.stage() == NativeStage::Released && (populated || !members.is_empty()) {
-        return Err(refused());
+        return Err(refused(
+            "it is released, yet its scope cgroup holds members",
+        ));
     }
     if !populated && !members.is_empty() {
-        return Err(refused());
+        return Err(refused(
+            "its scope cgroup lists members though it reads unpopulated",
+        ));
     }
     let Some(init) = record.init() else {
         return if populated || !members.is_empty() {
-            Err(refused())
+            Err(refused(
+                "its scope cgroup holds members before its controller was published",
+            ))
         } else {
             Ok(())
         };
     };
     for member in members {
-        let (actual, policy) = stat(*member)?.ok_or_else(refused)?;
+        let (actual, policy) = stat(*member)?
+            .ok_or_else(|| refused("a member of its scope cgroup vanished as it was read"))?;
         if !matches!(policy, 0 | 3 | 5)
             || (*member == init.pid && actual.start_ticks != init.start_ticks)
         {
-            return Err(refused());
+            return Err(refused(
+                "a member of its scope isn't fair-class, or its controller's start isn't its record's",
+            ));
         }
     }
     match stat(init.pid)? {
@@ -312,10 +343,16 @@ fn check_members(
             let ended = actual.zombie && !populated && members.is_empty();
             if !matches!(policy, 0 | 3 | 5) || (!ended && members.binary_search(&init.pid).is_err())
             {
-                return Err(refused());
+                return Err(refused(
+                    "its controller isn't fair-class, or runs outside its scope cgroup",
+                ));
             }
         }
-        Some(_) | None if populated || !members.is_empty() => return Err(refused()),
+        Some(_) | None if populated || !members.is_empty() => {
+            return Err(refused(
+                "its controller is gone or another process, yet its scope cgroup holds members",
+            ));
+        }
         Some(_) | None => {}
     }
     Ok(())

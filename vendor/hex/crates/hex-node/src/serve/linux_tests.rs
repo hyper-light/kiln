@@ -19,7 +19,8 @@ use hex_api::sim::SimRuntime;
 use hex_api::{Bounds, BoxInfo, BoxSpec, ClassSpec, Signal as HexSignal, Usage};
 use hex_client::Client;
 use hex_core::patience::Patience;
-use hex_testkit::waits::{EMPTYING, EXEC, until};
+use hex_testkit::waits::follow::{self, Party};
+use hex_testkit::waits::{EMPTYING, EXEC};
 
 /// Longest a test waits for the server's answer to a call over its socket: twice the slowest recorded answer of the
 /// kinds these tests ask (hello, inspect, netns counts, exec), an exec's (`client.answer.exec`, the census's debug
@@ -28,10 +29,9 @@ use hex_testkit::waits::{EMPTYING, EXEC, until};
 /// takes its own record.
 const ANSWERED: Duration = EXEC.saturating_mul(2);
 
-/// The server's ending of a program whose client went away: its kill, its reaping and its count in its box, a box's
-/// emptying's work, which the server's own wait for the programs it ends takes the record of (decision 9's table:
-/// `node.emptying`).
-static ABANDONED: Patience = Patience::seeded("test.serve.abandoned", EMPTYING);
+/// The server's ending of a program whose client went away: its kill, its reaping and its count in its box, measuring
+/// (decision 9: no record seeds it).
+static ABANDONED: Patience = Patience::measuring("test.serve.abandoned");
 /// The I/O thread's letting go of a connection that has closed, and its admitting of one that has connected: no
 /// recorded operation makes either, and no census row times them yet, so these wait measuring, for the fact alone, each
 /// answer recorded for the census to come, from the suites run under it.
@@ -450,9 +450,19 @@ fn b() -> BoxId {
     BoxId::new("b").unwrap()
 }
 
-/// Waits for `fact`, the server's, on `wait`, its own record's patience or measuring (hex_testkit::waits).
-fn wait_until(wait: &Patience, what: &str, fact: impl FnMut() -> bool) {
-    until(wait, what, fact).unwrap();
+/// Waits for `fact`, the server's, on `wait`, by the life of `lab`'s server's I/O thread (the review's C-5). A look: the
+/// server tells no event as it lets a connection go, admits one or counts a program it ended, its counts read.
+fn wait_until(lab: &Lab, wait: &Patience, what: &str, fact: impl FnMut() -> bool) {
+    follow::until(
+        wait,
+        what,
+        || match &lab.server.io {
+            Some(io) if !io.is_finished() => Party::Live,
+            _ => Party::Ended,
+        },
+        fact,
+    )
+    .unwrap();
 }
 
 fn alive(pid: u32) -> bool {
@@ -651,7 +661,7 @@ fn a_client_of_another_wire_is_refused_at_its_hello() {
             "the node sent more than its hello"
         );
     }
-    wait_until(&LET_GO, "the refused connections to close", || {
+    wait_until(&lab, &LET_GO, "the refused connections to close", || {
         lab.connections() == 0
     });
     assert_eq!(lab.host.sim.inspect(&b()).unwrap().id, b());
@@ -677,7 +687,7 @@ fn connections_past_the_bound_are_refused_naming_it() {
     assert_eq!(a.inspect(&b()).unwrap().id, b());
     assert_eq!(c.list().unwrap().len(), 1);
     drop(a);
-    wait_until(&LET_GO, "the closed connection to be let go", || {
+    wait_until(&lab, &LET_GO, "the closed connection to be let go", || {
         lab.connections() == 1
     });
     let d = lab.client();
@@ -867,6 +877,7 @@ fn a_program_whose_client_goes_away_is_killed_reaped_and_counted() {
     assert!(alive(pid));
     drop(fd);
     wait_until(
+        &lab,
         &ABANDONED,
         "the abandoned program to be counted in its box",
         || lab.host.abandoned.lock().unwrap().as_slice() == [b()],
@@ -892,7 +903,7 @@ fn a_released_program_runs_on_after_its_client_goes() {
     let pid = proc.pid();
     drop(proc);
     drop(client);
-    wait_until(&LET_GO, "the connection to close", || {
+    wait_until(&lab, &LET_GO, "the connection to close", || {
         lab.connections() == 0
     });
     assert_eq!(lab.watched(), 0);
@@ -1001,7 +1012,7 @@ fn a_release_sent_before_a_reset_is_honoured() {
         );
         drop(fd);
     }
-    wait_until(&LET_GO, "the connection to close", || {
+    wait_until(&lab, &LET_GO, "the connection to close", || {
         lab.connections() == 0
     });
     assert_eq!(lab.watched(), 0);
@@ -1236,11 +1247,11 @@ fn a_client_within_what_it_was_told_is_never_refused() {
     );
     // Each connection holds its one call from its admission, so the hello's is let go first, and both of these are
     // admitted before either asks.
-    wait_until(&LET_GO, "the hello's connection to close", || {
+    wait_until(&lab, &LET_GO, "the hello's connection to close", || {
         lab.connections() == 0
     });
     let (greedy, other) = (lab.raw(), lab.raw());
-    wait_until(&ADMITTED, "both connections to be admitted", || {
+    wait_until(&lab, &ADMITTED, "both connections to be admitted", || {
         lab.connections() == 2
     });
     lab.host.gate.set(true);

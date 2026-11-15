@@ -9,17 +9,11 @@
 use super::*;
 use crate::guest::{self, Duplex, DuplexOwner, Link, own_duplex};
 use hex_testkit::waits::follow::{self, Party};
-use hex_testkit::waits::within;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
-// These are caller-supplied fixture policies, not production calibration or performance targets, and never waits.
-const CAP: Duration = Duration::from_millis(25);
-/// A caller bound longer than [`CAP`], for the claims that need one: a learned wait seeded from it ends after CAP, a
-/// setup under it has room for its steps before CAP is left, and it is a later bound than CAP's.
-const LONG_CAP: Duration = Duration::from_millis(100);
 /// What a learned wait's refusal says, which a caller's own refusal never does: the slowest answer to a call of its
 /// kind this process has seen is its bound (decision 9).
 const LEARNED: &str = "the slowest answer to a call of its kind";
@@ -34,9 +28,37 @@ fn recv_by<T>(from: &mpsc::Receiver<T>, by: Option<Instant>) -> Result<T, mpsc::
     }
 }
 
-/// Waits on `wait`, its fact's own patience, for the next message from `from`.
-fn recv_on<T>(wait: &Patience, from: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvTimeoutError> {
-    within(wait, |by| recv_by(from, by))
+/// Waits on `wait` for `what`, the next message from `from`, by the life of its senders (the review's C-5): the
+/// channel's end, once every sender has dropped with its thread, is the party's, which the receive sees itself.
+fn recv_on<T>(wait: &Patience, what: &str, from: &mpsc::Receiver<T>) -> Result<T, follow::Unmet> {
+    let ended = std::cell::Cell::new(false);
+    follow::within(
+        wait,
+        what,
+        || {
+            if ended.get() {
+                Party::Ended
+            } else {
+                Party::Live
+            }
+        },
+        |by| match recv_by(from, by) {
+            Ok(got) => Some(got),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                ended.set(true);
+                None
+            }
+            Err(_) => None,
+        },
+    )
+}
+
+/// An io call's answer, as a slice of [`follow::within`] takes it: its own deadline passing is no answer yet.
+fn io_slice<T>(got: io::Result<T>) -> Option<io::Result<T>> {
+    match got {
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => None,
+        got => Some(got),
+    }
 }
 
 /// Waits on `wait` for the next message from `from`, following `sender`, the thread that sends it, by its life
@@ -78,6 +100,136 @@ fn timeout_by(by: Option<Instant>) -> io::Result<Option<Duration>> {
 /// connection from now ([`MOST_ONE_WAIT`]), which no answer here comes near, so the call waits for its fact alone.
 fn answer_by(by: Option<Instant>) -> Instant {
     by.unwrap_or_else(|| Instant::now().checked_add(MOST_ONE_WAIT).unwrap())
+}
+
+/// A capped operation's cap as this host measures it, decision 9's W*, and the operation's answer (Ada's rule of
+/// 2026-11-13: no budget of a test's is fixed). `operation` is the capped one carried to its answer under a cap no answer
+/// here comes near ([`MOST_ONE_WAIT`], so it takes the capped path, every deadline step of it), run by a worker thread
+/// of its own; its time from that thread's spawn to its answer heard here is a sample of `steps`, and the cap is the
+/// slowest `steps` has seen, the first sample its cold start. The cap's value is coverage alone (ROOT, 2026-11-14): the
+/// verdict rests on what the client armed, every wait at one instant, and on its refusal never coming before that
+/// instant; a host that holds the capped thread off a core past its cap gives the cut path, told to the census.
+fn measured<T: Send + 'static>(
+    steps: &'static Patience,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> (Duration, T) {
+    /// The measured operation's answer, heard from its worker.
+    static ANSWERED: Patience = Patience::measuring("test.hex_client.budget.measured_answered");
+    let began = Instant::now();
+    let (sent, got) = mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let _ = sent.send(operation());
+    });
+    let answer = recv_from(&ANSWERED, "the measured operation's answer", &got, &worker);
+    let took = began.elapsed();
+    worker.join().unwrap();
+    hex_testkit::waits::answered(steps, took);
+    let cap = steps.deadline().unwrap_or(took);
+    eprintln!("client_budget_cap took={took:?} w_star={cap:?}");
+    (cap, answer.unwrap())
+}
+
+/// The census's line of the path the host gave a capped operation (ROOT, 2026-11-14: coverage, held to no bound):
+/// `progressed`, the steps its claim needs made before its cap, or `cut`, its cap passing first.
+fn told_path(test: &str, progressed: bool) {
+    eprintln!(
+        "client_budget_path test={test} path={}",
+        if progressed { "progressed" } else { "cut" }
+    );
+}
+
+/// The instant an operation's armed waits took, read from its log's first entry that isn't a learned wait's: none where
+/// it armed none.
+fn armed_instant(armed: &[Armed]) -> Option<Instant> {
+    armed
+        .iter()
+        .find(|armed| !armed.learned)
+        .and_then(|armed| armed.at)
+}
+
+/// Whether an operation's armed log reached `what`, a wait or step its claim needs.
+fn reached(armed: &[Armed], what: &str) -> bool {
+    armed.iter().any(|armed| armed.what == what)
+}
+
+/// A [`BootstrapProbe`] whose learned waits are its own, its plain kinds' and every class's box kinds'. The measured
+/// calls' ([`measured`], `SEAM` false): what they teach no wait a capped call has, so an unarmed one stays unarmed. The
+/// armed log's own test's (`SEAM` true): no other test's call touches them, so none's run-out, which has the next wait
+/// follow its party with no learned bound until an answer comes (decision 9), takes away the learned wait it reads.
+struct Apart<const SEAM: bool>(BootstrapProbe);
+impl<const SEAM: bool> Transport for Apart<SEAM> {
+    type Reading = ();
+    fn answers() -> &'static [Patience; KINDS] {
+        static MEASURED: [Patience; KINDS] =
+            [const { Patience::measuring("test.client_measured") }; KINDS];
+        static SEAM_WAITS: [Patience; KINDS] =
+            [const { Patience::measuring("test.client_seam") }; KINDS];
+        if SEAM { &SEAM_WAITS } else { &MEASURED }
+    }
+    fn class_answers(class: Class) -> &'static [Patience; BOX_KINDS] {
+        static MEASURED: [[Patience; BOX_KINDS]; CLASSES] = [
+            class_waits!("test.client_measured", "process", measuring),
+            class_waits!("test.client_measured", "oci", measuring),
+            class_waits!("test.client_measured", "firecracker", measuring),
+            class_waits!("test.client_measured", "shards", measuring),
+        ];
+        static SEAM_WAITS: [[Patience; BOX_KINDS]; CLASSES] = [
+            class_waits!("test.client_seam", "process", measuring),
+            class_waits!("test.client_seam", "oci", measuring),
+            class_waits!("test.client_seam", "firecracker", measuring),
+            class_waits!("test.client_seam", "shards", measuring),
+        ];
+        by_class(if SEAM { &SEAM_WAITS } else { &MEASURED }, class)
+    }
+    fn reply_budget(&self) -> Option<Duration> {
+        self.0.reply_budget()
+    }
+    fn reading(&self) {}
+    fn handle(&self) -> Handle<'_> {
+        self.0.handle()
+    }
+    fn recv(&self, reading: &mut (), take: &mut Take<'_>) -> Result<bool, Refusal> {
+        self.0.recv(reading, take)
+    }
+    fn try_send(&self, bytes: &[u8], at: &mut usize, lent: &[Lent<'_>]) -> Result<bool, Sent> {
+        self.0.try_send(bytes, at, lent)
+    }
+    fn shutdown(&self) {
+        self.0.shutdown();
+    }
+}
+
+/// A probe that answers one call with `reply` as it is asked, and gives each call `budget`, its learned waits apart
+/// ([`Apart`]): a measured call's transport.
+fn answering(reply: Answer, budget: Option<Duration>) -> Apart<false> {
+    let (io, _) = stalled(None);
+    Apart(BootstrapProbe {
+        io: Offers::unobserved(io),
+        reply: Mutex::new(Some(reply)),
+        budget,
+    })
+}
+
+/// No boxes: a list's answer.
+fn no_boxes() -> Answer {
+    Answer::Boxes {
+        infos: Vec::new(),
+        more: false,
+    }
+}
+
+/// The relay's token on every guest connection here.
+const TOKEN: u64 = 11;
+
+/// A guest's control connection made before its dial: the relay's token and `answers` (each a call's id and its
+/// answer) already written by its peer, which the test keeps.
+fn control_pair(answers: Vec<(u64, Answer)>) -> (TcpStream, TcpStream) {
+    let (socket, mut peer) = absolute_pair();
+    peer.write_all(&TOKEN.to_le_bytes()).unwrap();
+    for (id, answer) in answers {
+        answer_to(&mut peer, id, answer).unwrap();
+    }
+    (socket, peer)
 }
 
 struct Stalled {
@@ -141,65 +293,92 @@ impl Transport for Stalled {
     }
 }
 
-/// Do send an actual Core hello with an explicit caller cap and an unarmed learned wait;
-/// expect caller expiry instead of waiting until the external original-control release.
+/// Do send an actual Core hello with an explicit caller cap and an unarmed learned wait; expect caller expiry instead of
+/// waiting until the external original-control release: every wait the hello armed, in its own thread, at its one
+/// deadline (its ask and the cap), and its refusal the caller's, never before that deadline. The cap is this host's own
+/// ([`measured`]: the same hello, answered); whether the host let the hello's send come before it is told to the census.
 #[test]
 fn explicit_budget_caps_an_unarmed_core_hello() {
+    /// The same hello, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.unarmed_hello_steps");
     /// The hello's refusal at its caller's cap.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.unarmed_hello_capped");
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    socket.connect(socket.local_addr().unwrap()).unwrap();
-    socket.set_nonblocking(true).unwrap();
-    let (sent, request) = mpsc::sync_channel(1);
-    let shared = Shared::try_new(Stalled {
-        socket,
-        sent: Mutex::new(Some(sent)),
-        closed: AtomicBool::new(false),
-        budget: Some(CAP),
-    })
-    .unwrap();
+    let (cap, answered) = measured(&STEPS, || {
+        Core::hello(Shared::try_new(answering(
+            agents_hello(),
+            Some(MOST_ONE_WAIT),
+        ))?)
+        .map(drop)
+    });
+    answered.unwrap();
+    let (transport, request) = stalled(Some(cap));
+    let shared = Shared::try_new(transport).unwrap();
     let control = triomphe::Arc::clone(&shared);
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
+        let asked = Instant::now();
         let result = Core::hello(control).map(drop);
-        finished.send(result).unwrap();
+        let _ = finished.send((asked, Instant::now(), result, armed()));
     });
-    // Its send precedes its answer, so it is read once the answer has come: a hello whose cap passed before it sent
-    // leaves the test nothing to wait for.
-    let result = recv_on(&CAPPED, &answer);
+    // Its send precedes its answer, so it is read once the answer has come.
+    let observed = recv_from(&CAPPED, "the capped hello's answer", &answer, &worker);
     let observed_send = request.try_recv();
     // Always release and join the exact owned actor before asserting the original symptom.
     shared.end(Refusal::Broken("owned original-control release".into()));
     worker.join().unwrap();
-    observed_send.unwrap();
+    let (asked, returned, result, log) = observed.unwrap();
+    let sent = observed_send.is_ok();
+    told_path("explicit_budget_caps_an_unarmed_core_hello", sent);
     eprintln!(
-        "client_budget_control phase=unarmed-hello cap={CAP:?} returned={}",
-        result.is_ok()
+        "client_budget_control phase=unarmed-hello cap={cap:?} sent={sent} result={result:?} armed={log:?}"
+    );
+    let at = armed_instant(&log).expect("the hello armed its deadline in its own thread");
+    assert!(asked + cap <= at && at <= returned + cap, "{log:?}");
+    let waits: &[&str] = if sent {
+        &[
+            "starting a client operation",
+            "sending",
+            "the send lock",
+            "the answer",
+        ]
+    } else {
+        &["starting a client operation"]
+    };
+    assert!(armed_at(&log, waits, Some(at)), "{log:?}");
+    assert!(
+        matches!(&result, Err(Refusal::Os { why, .. }) if why.contains("caller") && !why.contains(LEARNED)),
+        "{result:?}"
     );
     assert!(
-        result.is_ok(),
-        "unarmed hello ignored the configured caller cap"
+        returned >= at,
+        "refused {:?} before its deadline",
+        at.saturating_duration_since(returned)
     );
-    assert!(matches!(result.unwrap(), Err(Refusal::Os { .. })));
 }
 
 struct TokenLink {
     address: SocketAddr,
+    budget: Duration,
+    /// Each dial's port and deadline, what the client armed.
+    dials: DialDeadlines,
 }
+
 impl Link for TokenLink {
-    fn reply_budget(&self) -> Option<Duration> {
-        Some(CAP)
+    fn lends_identity(&self) -> bool {
+        false
     }
-    fn dial(&self, _: u32) -> Result<DuplexOwner, Refusal> {
-        TcpStream::connect_timeout(&self.address, CAP)
-            .map_err(|error| Refusal::os("bounded original-control dial", error))
-            .and_then(own_duplex)
+
+    fn reply_budget(&self) -> Option<Duration> {
+        Some(self.budget)
+    }
+    fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
+        self.dial_before(port, None)
     }
     fn dial_before(&self, port: u32, deadline: Option<Instant>) -> Result<DuplexOwner, Refusal> {
-        let Some(deadline) = deadline else {
-            return self.dial(port);
-        };
-        let left = deadline.saturating_duration_since(Instant::now());
+        self.dials.lock().unwrap().push((port, deadline));
+        let left = deadline.map_or(MOST_ONE_WAIT, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
         if left.is_zero() {
             return Err(Refusal::os(
                 "bounded original-control dial",
@@ -212,51 +391,120 @@ impl Link for TokenLink {
     }
 }
 
-/// Do complete a bounded real loopback dial, then withhold the token;
-/// expect the same caller cap to bound setup, rather than the peer's eventual close.
+/// Do complete a bounded real loopback dial, then withhold the token; expect the same caller cap to bound setup, rather
+/// than the peer's eventual close: the dial and every wait the connect armed, in its own thread, at its one deadline,
+/// and its refusal never before it. The cap is this host's own ([`measured`]: the same connect, its token and its
+/// hello's answer written as its dial is accepted); whether the dial came before it is told to the census. The dial is
+/// taken once the connect has ended, from the listener's queue, so no accept waits on a dial that never comes.
 #[test]
 fn explicit_budget_caps_token_after_a_bounded_dial() {
-    /// The connect's dial, accepted.
+    /// The same connect, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.token_steps");
+    /// The measured connect's dial, accepted.
     static DIALED: Patience = Patience::measuring("test.hex_client.budget.token_dialed");
     /// The connect's refusal at its caller's cap, the token withheld.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.token_capped");
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
-    let stop = AtomicBool::new(false);
-    let wake = Wake::new().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(Wake::new().unwrap());
+    let (agent_stop, agent_wake) = (Arc::clone(&stop), Arc::clone(&wake));
+    let agent = std::thread::spawn(move || -> io::Result<TcpStream> {
+        // By the life of the test's stop word, which ends the accept too.
+        let mut peer = follow::within(
+            &DIALED,
+            "the client's dial",
+            || {
+                if agent_stop.load(Ordering::Acquire) {
+                    Party::Ended
+                } else {
+                    Party::Live
+                }
+            },
+            |by| io_slice(accept_before(&listener, &agent_stop, &agent_wake, by)),
+        )
+        .map_err(|unmet| io::Error::other(unmet.to_string()))??;
+        peer.write_all(&TOKEN.to_le_bytes())?;
+        answer_to(&mut peer, 1, agents_hello())?;
+        Ok(peer)
+    });
+    let (cap, connected) = measured(&STEPS, move || {
+        guest::own_link(TokenLink {
+            address,
+            budget: MOST_ONE_WAIT,
+            dials: Arc::default(),
+        })
+        .and_then(guest::Client::connect)
+        .map(drop)
+    });
+    // A connect that never dialed leaves the agent's accept waiting: it is woken first.
+    stop.store(true, Ordering::Release);
+    wake.wake();
+    let measured_peer = agent.join().unwrap();
+    connected.unwrap();
+    drop(measured_peer.unwrap());
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let dials: DialDeadlines = Arc::default();
+    let link = guest::own_link(TokenLink {
+        address: listener.local_addr().unwrap(),
+        budget: cap,
+        dials: Arc::clone(&dials),
+    })
+    .unwrap();
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        finished
-            .send(
-                guest::own_link(TokenLink { address })
-                    .and_then(guest::Client::connect)
-                    .map(drop),
-            )
-            .unwrap();
+        let asked = Instant::now();
+        let result = guest::Client::connect(link).map(drop);
+        let _ = finished.send((asked, Instant::now(), result, armed()));
     });
-    let peer = within(&DIALED, |by| accept_before(&listener, &stop, &wake, by));
-    let result = recv_on(&CAPPED, &answer);
-    // No VM, signal or foreign PID: close only this test's peer and join its worker.
+    let observed = recv_from(&CAPPED, "the capped connect's answer", &answer, &worker);
+    // Its dial, if it made one, waits in the listener's queue: one look takes it.
+    let peer = accept_before(
+        &listener,
+        &AtomicBool::new(false),
+        &Wake::new().unwrap(),
+        Some(Instant::now()),
+    );
     let cleanup = peer.as_ref().map(|peer| peer.shutdown(Shutdown::Both));
     worker.join().unwrap();
-    assert!(
-        peer.is_ok(),
-        "the token control must actually complete its dial"
-    );
-    assert!(
-        matches!(cleanup, Ok(Ok(())))
-            || matches!(cleanup, Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotConnected)
-    );
+    let (asked, returned, result, log) = observed.unwrap();
+    // Its token's read armed: its dial made before its cap passed.
+    let dialed = reached(&log, "reading the relay's token for the connection");
+    told_path("explicit_budget_caps_token_after_a_bounded_dial", dialed);
     eprintln!(
-        "client_budget_control phase=token cap={CAP:?} returned={}",
-        result.is_ok()
+        "client_budget_control phase=token cap={cap:?} dialed={dialed} result={result:?} armed={log:?} dials={:?}",
+        dials.lock().unwrap()
     );
     assert!(
-        result.is_ok(),
-        "token read outlived the configured bounded dial budget"
+        matches!(cleanup, Err(_) | Ok(Ok(())))
+            || matches!(&cleanup, Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotConnected)
     );
-    assert!(matches!(result.unwrap(), Err(Refusal::Os { .. })));
+    let at = armed_instant(&log).expect("the connect armed its deadline in its own thread");
+    assert!(asked + cap <= at && at <= returned + cap, "{log:?}");
+    assert!(
+        dials
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|dial| *dial == (hex_core::stream::CONTROL_PORT, Some(at)))
+    );
+    let waits: &[&str] = if dialed {
+        &[
+            "dialing the guest control connection",
+            "reading the relay's token for the connection",
+        ]
+    } else {
+        &["dialing the guest control connection"]
+    };
+    assert!(armed_at(&log, waits, Some(at)), "{log:?}");
+    assert!(matches!(result, Err(Refusal::Os { .. })), "{result:?}");
+    assert!(
+        returned >= at,
+        "refused {:?} before its deadline",
+        at.saturating_duration_since(returned)
+    );
 }
 
 fn configured<T: Transport>(transport: T) -> Core<T> {
@@ -285,7 +533,12 @@ struct NoDial {
     budget: Duration,
     dials: Arc<AtomicUsize>,
 }
+
 impl Link for NoDial {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn reply_budget(&self) -> Option<Duration> {
         Some(self.budget)
     }
@@ -335,19 +588,31 @@ fn invalid_budgets_refuse_before_call_or_dial_effects() {
     }
 }
 
-/// Do queue an actual API call behind the existing whole-message sender; expect its own cap
-/// to end acquisition with no write and no damage to the held sender or connection.
+/// Do queue an actual API call behind the existing whole-message sender; expect its own cap to end acquisition with no
+/// write and no damage to the held sender or connection: every wait it armed, in its own thread, at its one deadline,
+/// its refusal the caller's, never before that deadline. The cap is this host's own ([`measured`]: the same list,
+/// answered); whether the host let the call reach the send lock before it is told to the census.
 #[test]
 fn queued_sender_consumes_its_own_budget_without_taking_authority() {
+    /// The same list, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.queued_list_steps");
     /// The queued list's refusal at its own cap, the sender held.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.queued_list_capped");
-    let (transport, request) = stalled(Some(CAP));
+    let (cap, answered) = measured(&STEPS, || {
+        configured(answering(no_boxes(), Some(MOST_ONE_WAIT))).list()
+    });
+    answered.unwrap();
+    let (transport, request) = stalled(Some(cap));
     let client = Arc::new(configured(transport));
     let whole = client.conn.shared.sending.lock(None).unwrap().unwrap();
     let control = Arc::clone(&client);
     let (finished, answer) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || finished.send(control.list()).unwrap());
-    let result = recv_on(&CAPPED, &answer);
+    let worker = std::thread::spawn(move || {
+        let asked = Instant::now();
+        let result = control.list();
+        let _ = finished.send((asked, Instant::now(), result, armed()));
+    });
+    let result = recv_from(&CAPPED, "the queued list's answer", &answer, &worker);
     // Release the exact owned guard even if the budget assertion fails, then join its waiter.
     drop(whole);
     if result.is_err() {
@@ -356,9 +621,28 @@ fn queued_sender_consumes_its_own_budget_without_taking_authority() {
         ));
     }
     worker.join().unwrap();
-    let why = result.unwrap().unwrap_err();
+    let (asked, returned, result, log) = result.unwrap();
+    let queued = reached(&log, "the send lock");
+    told_path(
+        "queued_sender_consumes_its_own_budget_without_taking_authority",
+        queued,
+    );
+    let at = armed_instant(&log).expect("the list armed its deadline in its own thread");
+    assert!(asked + cap <= at && at <= returned + cap, "{log:?}");
+    let waits: &[&str] = if queued {
+        &["starting a client operation", "sending", "the send lock"]
+    } else {
+        &["starting a client operation"]
+    };
+    assert!(armed_at(&log, waits, Some(at)), "{log:?}");
+    let why = result.unwrap_err();
     assert!(
         matches!(why, Refusal::Os { ref why, .. } if why.contains("caller") && !why.contains(LEARNED))
+    );
+    assert!(
+        returned >= at,
+        "refused {:?} before its deadline",
+        at.saturating_duration_since(returned)
     );
     assert!(matches!(request.try_recv(), Err(mpsc::TryRecvError::Empty)));
     let state = client.conn.shared.state().unwrap();
@@ -368,8 +652,10 @@ fn queued_sender_consumes_its_own_budget_without_taking_authority() {
     assert!(!client.conn.shared.transport.closed.load(Ordering::Acquire));
 }
 
-/// Do omit the optional cap on an unarmed kind; expect the legacy wait to remain pending
-/// until the exact connection is ended, rather than inheriting another client's cap.
+/// Do omit the optional cap on an unarmed kind; expect the legacy wait to remain pending until the exact connection is
+/// ended, rather than inheriting another client's cap: its send and its answer's wait armed in its own thread with no
+/// deadline at all, so no cap of its own or another's could end it, still waiting once its send went, then refused by
+/// the connection's end. Nothing here waits for a time of the test's own.
 #[test]
 fn default_none_preserves_the_unarmed_wait() {
     /// The uncapped list's send.
@@ -378,32 +664,39 @@ fn default_none_preserves_the_unarmed_wait() {
     let client = Arc::new(configured(transport));
     let control = Arc::clone(&client);
     let (finished, answer) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || finished.send(control.list()).unwrap());
-    let observed_send = recv_on(&SENT, &request);
-    // Not a wait for a fact: CAP is another client's cap, which this call must not inherit, the claim under test.
-    let before = answer.recv_timeout(CAP);
+    let worker = std::thread::spawn(move || {
+        let result = control.list();
+        let _ = finished.send((result, armed()));
+    });
+    let observed_send = recv_on(&SENT, "the request sent", &request);
+    // Pending once its send has gone: nothing it armed has an end of its own.
+    let before = answer.try_recv();
     client
         .conn
         .shared
         .end(Refusal::Broken("owned legacy-wait release".into()));
     worker.join().unwrap();
     observed_send.unwrap();
-    assert!(matches!(before, Err(mpsc::RecvTimeoutError::Timeout)));
-    assert!(matches!(
-        answer.try_recv().unwrap(),
-        Err(Refusal::Broken(_))
-    ));
+    assert!(
+        matches!(before, Err(mpsc::TryRecvError::Empty)),
+        "{before:?}"
+    );
+    let (result, log) = answer.try_recv().unwrap();
+    assert!(matches!(result, Err(Refusal::Broken(_))), "{result:?}");
+    assert!(armed_at(&log, &["sending", "the answer"], None), "{log:?}");
 }
 
-struct Calibrated<const LONG: bool>(Stalled);
+/// A transport whose answers' learned waits are its own, the long one's or the short one's, each measuring (decision 9;
+/// Ada's rule of 2026-11-13: no record seeds them): it answers a call as it is asked where it is given an answer
+/// ([`BootstrapProbe`]), else never.
+struct Calibrated<const LONG: bool>(BootstrapProbe);
 impl<const LONG: bool> Transport for Calibrated<LONG> {
     type Reading = ();
     fn answers() -> &'static [Patience; KINDS] {
         static LONG_WAIT: [Patience; KINDS] =
-            [const { Patience::seeded("test.client_budget.long", LONG_CAP) }; KINDS];
+            [const { Patience::measuring("test.client_budget.long") }; KINDS];
         static SHORT: [Patience; KINDS] =
-            [const { Patience::seeded("test.client_budget.short", Duration::from_millis(1)) };
-                KINDS];
+            [const { Patience::measuring("test.client_budget.short") }; KINDS];
         if LONG { &LONG_WAIT } else { &SHORT }
     }
     fn reply_budget(&self) -> Option<Duration> {
@@ -424,13 +717,89 @@ impl<const LONG: bool> Transport for Calibrated<LONG> {
     }
 }
 
-fn timed_call<T: Transport>(transport: T, request: mpsc::Receiver<()>) -> Refusal {
+/// A [`Calibrated`] transport giving each call `budget`, answering one with `reply` where given, and its first send's
+/// notice.
+fn calibrated<const LONG: bool>(
+    reply: Option<Answer>,
+    budget: Option<Duration>,
+) -> (Calibrated<LONG>, mpsc::Receiver<()>) {
+    let (io, sent) = stalled(None);
+    (
+        Calibrated(BootstrapProbe {
+            io: Offers::unobserved(io),
+            reply: Mutex::new(reply),
+            budget,
+        }),
+        sent,
+    )
+}
+
+/// The short learned wait's W* for `request`'s kind (each kind learns its own, [`kind_of`]): where it has none, its cold
+/// start, handled and told (decision 9: no record seeds it): `request` answered with `reply` as it is asked is its first
+/// answer, the sample its W* starts from.
+fn short_learned(request: &Request, reply: Answer) -> Duration {
+    let learned = || kind_of(Calibrated::<false>::answers(), request).and_then(Patience::deadline);
+    if let Some(wait) = learned() {
+        eprintln!(
+            "client_budget_learned wait=short request={request:?} cold_start=false w_star={wait:?}"
+        );
+        return wait;
+    }
+    let (transport, _) = calibrated::<false>(Some(reply), None);
+    let taught = configured(transport).conn.call_before(
+        wire::MAX_MESSAGE,
+        request,
+        |_, _| Ok(NONE),
+        None,
+        None,
+    );
+    assert!(taught.is_ok(), "{taught:?}");
+    let wait = learned().expect("an answered call teaches its kind's learned wait");
+    eprintln!(
+        "client_budget_learned wait=short request={request:?} cold_start=true w_star={wait:?}"
+    );
+    wait
+}
+
+/// The hello a stand-in agent answers, of this build.
+fn agents_hello() -> Answer {
+    Answer::Hello(wire::Hello {
+        build: wire::build(),
+        classes: vec![Class::Oci],
+        limits: Limits {
+            connections: 1,
+            message_bytes: wire::MAX_MESSAGE,
+            in_flight: 4,
+            programs: 4,
+        },
+        budgets: wire::Budgets {
+            in_flight: 4,
+            programs: 4,
+        },
+    })
+}
+
+/// What a capped list did: when it was asked and returned, its refusal, what it armed in its own thread, and whether its
+/// request went.
+struct Timed {
+    asked: Instant,
+    returned: Instant,
+    refusal: Refusal,
+    armed: Vec<Armed>,
+    sent: bool,
+}
+
+fn timed_call<T: Transport>(transport: T, request: mpsc::Receiver<()>) -> Timed {
     /// The list's refusal at its caller's cap.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.timed_list_capped");
     let client = Arc::new(configured(transport));
     let control = Arc::clone(&client);
     let (finished, answer) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || finished.send(control.list()).unwrap());
+    let worker = std::thread::spawn(move || {
+        let asked = Instant::now();
+        let result = control.list();
+        let _ = finished.send((asked, Instant::now(), result, armed()));
+    });
     // Its send precedes its answer, so it is read once the answer has come.
     let result = recv_from(&CAPPED, "the capped list's answer", &answer, &worker);
     let observed_send = request.try_recv();
@@ -439,14 +808,51 @@ fn timed_call<T: Transport>(transport: T, request: mpsc::Receiver<()>) -> Refusa
         .shared
         .end(Refusal::Broken("owned calibrated control release".into()));
     worker.join().unwrap();
-    observed_send.unwrap();
-    result.unwrap().unwrap_err()
+    let (asked, returned, result, armed) = result.unwrap();
+    Timed {
+        asked,
+        returned,
+        refusal: result.unwrap_err(),
+        armed,
+        sent: observed_send.is_ok(),
+    }
 }
 
-/// Do exhaust a caller's bound in actual Core calls, its learned wait ending once after it and
-/// once before it; expect each refused as the caller's expiry, the learned wait before it a
-/// run-out told to the census and never the call's end (AC-T7.4.1), after it nothing told. The
-/// census runs in a fresh exact-test child so it never competes with the existing
+/// A capped list's verdict, whichever path the host gave it: every wait it armed, in its own thread, at its one deadline
+/// (its ask and `budget`), the refusal the caller's expiry, never before that deadline. Returns that deadline.
+fn caller_expired(timed: &Timed, budget: Duration) -> Instant {
+    let at = armed_instant(&timed.armed).expect("the list armed its deadline in its own thread");
+    assert!(
+        timed.asked + budget <= at && at <= timed.returned + budget,
+        "{:?}",
+        timed.armed
+    );
+    let waits: &[&str] = if timed.sent {
+        &["starting a client operation", "sending", "the answer"]
+    } else {
+        &["starting a client operation"]
+    };
+    assert!(armed_at(&timed.armed, waits, Some(at)), "{:?}", timed.armed);
+    assert!(
+        matches!(&timed.refusal, Refusal::Os { why, .. } if why.contains("caller") && !why.contains(LEARNED)),
+        "{:?}",
+        timed.refusal
+    );
+    assert!(
+        timed.returned >= at,
+        "refused {:?} before its deadline",
+        at.saturating_duration_since(timed.returned)
+    );
+    at
+}
+
+/// Do exhaust a caller's bound in actual Core calls, once with no learned wait under it (the long
+/// one's cold start: nothing answered yet) and once with one learned from an answered list, ending
+/// before it; expect each refused as the caller's expiry, every wait at its one deadline, never
+/// before it; the learned wait before it a run-out told to the census and never the call's end
+/// (AC-T7.4.1), and the caller's expiry teaching no learned wait anything. Each cap is this host's
+/// own ([`measured`]); the short one's is its learned wait's W* and that, strictly past the bound.
+/// The census runs in a fresh exact-test child so it never competes with the existing
 /// refusal-census unit's OnceLock.
 #[test]
 fn timeout_cause_and_learning_keep_caller_authority_separate() {
@@ -468,6 +874,8 @@ fn timeout_cause_and_learning_keep_caller_authority_separate() {
         assert!(status.success());
         return;
     }
+    /// The same list, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.timeout_cause_steps");
     static SAMPLES: AtomicUsize = AtomicUsize::new(0);
     static RUN_OUT: AtomicUsize = AtomicUsize::new(0);
     fn sink(name: &'static str, sample: hex_core::patience::Sample) {
@@ -481,23 +889,60 @@ fn timeout_cause_and_learning_keep_caller_authority_separate() {
         }
     }
     assert!(hex_core::patience::census(sink));
-    let (transport, request) = stalled(Some(CAP));
-    let caller = timed_call(Calibrated::<true>(transport), request);
+    let (cap, answered) = measured(&STEPS, || {
+        configured(answering(no_boxes(), Some(MOST_ONE_WAIT))).list()
+    });
+    answered.unwrap();
+    let unlearned = || {
+        Calibrated::<true>::answers()
+            .iter()
+            .all(|wait| wait.deadline().is_none())
+    };
+    // The long wait's cold start: it has seen no answer, so the caller's cap alone bounds the call.
+    assert!(unlearned());
+    eprintln!("client_budget_learned wait=long cold_start=true");
+    let (transport, request) = calibrated::<true>(None, Some(cap));
+    let long = timed_call(transport, request);
+    told_path(
+        "timeout_cause_and_learning_keep_caller_authority_separate",
+        long.sent,
+    );
+    caller_expired(&long, cap);
     assert!(
-        matches!(caller, Refusal::Os { why, .. } if why.contains("caller") && !why.contains(LEARNED))
+        long.armed.iter().all(|armed| !armed.learned),
+        "{:?}",
+        long.armed
     );
     assert_eq!(
         SAMPLES.load(Ordering::SeqCst),
         0,
         "caller expiry cannot calibrate a learned bound"
     );
-    let (transport, request) = stalled(Some(CAP));
-    let learned = timed_call(Calibrated::<false>(transport), request);
-    assert!(
-        matches!(learned, Refusal::Os { why, .. } if why.contains("caller") && !why.contains(LEARNED))
-    );
+    assert!(unlearned(), "a caller's expiry taught the long wait");
+    // The short wait's cold start, handled and told: its first answer, the census's first sample.
+    let short = short_learned(&Request::Call(Call::List), no_boxes());
     assert_eq!(SAMPLES.load(Ordering::SeqCst), 1);
-    assert_eq!(RUN_OUT.load(Ordering::SeqCst), 1);
+    let budget = short + cap;
+    let (transport, request) = calibrated::<false>(None, Some(budget));
+    let learned = timed_call(transport, request);
+    let at = caller_expired(&learned, budget);
+    // Its learned wait, where the call armed it under its caller's deadline, earlier: a run-out told, never its end.
+    let bound = learned
+        .armed
+        .iter()
+        .find(|armed| armed.learned)
+        .and_then(|armed| armed.at);
+    told_path(
+        "timeout_cause_and_learning_keep_caller_authority_separate",
+        bound.is_some(),
+    );
+    assert!(bound.is_none_or(|bound| bound < at), "{:?}", learned.armed);
+    let run_outs = RUN_OUT.load(Ordering::SeqCst);
+    assert!(run_outs <= 1);
+    assert_eq!(SAMPLES.load(Ordering::SeqCst), 1 + run_outs);
+    if bound.is_some() {
+        assert_eq!(run_outs, 1);
+    }
 }
 
 /// What [`late_census`] was told, by wait name: run-outs at their bounds, answers at their times.
@@ -545,9 +990,10 @@ fn in_late_census_child(name: &str) -> bool {
     false
 }
 
-/// A stand-in agent busy past its record, as the guest's node was initializing its GPU: it answers a hello only once
-/// the hello's learned wait, its record of 1 ms, has run out ([`LATE_DUE`], set by [`late_census`] where it is
-/// installed). `CALLER` names its waits apart.
+/// A stand-in agent busy past what it has answered in before, as the guest's node was initializing its GPU: it answers a
+/// hello only once [`LATE_DUE`] is set, by the test for a first hello (the learned wait's cold start, its first answer)
+/// and then by [`late_census`], where it is installed, as the hello's learned wait, the slowest answer seen (decision 9;
+/// no record seeds it), runs out. `CALLER` names its waits apart.
 struct LateHello<const CALLER: bool> {
     io: UdpSocket,
     asked: Mutex<Option<u64>>,
@@ -567,12 +1013,10 @@ fn late_hello<const CALLER: bool>() -> LateHello<CALLER> {
 impl<const CALLER: bool> Transport for LateHello<CALLER> {
     type Reading = ();
     fn answers() -> &'static [Patience; KINDS] {
-        static UNDER_CALLER: [Patience; KINDS] = [const {
-            Patience::seeded("test.client_budget.late.caller", Duration::from_millis(1))
-        }; KINDS];
+        static UNDER_CALLER: [Patience; KINDS] =
+            [const { Patience::measuring("test.client_budget.late.caller") }; KINDS];
         static ALONE: [Patience; KINDS] =
-            [const { Patience::seeded("test.client_budget.late.alone", Duration::from_millis(1)) };
-                KINDS];
+            [const { Patience::measuring("test.client_budget.late.alone") }; KINDS];
         if CALLER { &UNDER_CALLER } else { &ALONE }
     }
     fn reading(&self) {}
@@ -628,15 +1072,37 @@ impl<const CALLER: bool> Transport for LateHello<CALLER> {
     }
 }
 
-/// A caller's deadline no answer here comes near: the late answer is there to read as the learned wait runs out.
-const LATE_CAP: Duration = Duration::from_secs(30);
+/// The hello's learned wait's cold start, handled and told: it has seen no answer, so the agent answers a first hello
+/// as it is asked ([`LATE_DUE`] set), its time the sample the wait starts from; `cap` is that hello's caller's deadline,
+/// none for none. Returns the hello's client, kept so its connection stays, and the wait's W*: that first answer.
+fn taught_hello<const CALLER: bool>(
+    shared: &SharedOwner<LateHello<CALLER>>,
+    cap: Option<ReplyDeadline>,
+    name: &'static str,
+) -> (Core<LateHello<CALLER>>, Duration) {
+    LATE_DUE.store(true, Ordering::SeqCst);
+    // Its answer is there to read: the agent's connection woken, as a run-out wakes it.
+    LATE_WAKE.get().unwrap().send(&[1]).unwrap();
+    let client = Core::hello_before(triomphe::Arc::clone(shared), cap).unwrap();
+    LATE_DUE.store(false, Ordering::SeqCst);
+    let answered = LATE_ANSWERED.lock().unwrap().clone();
+    let [(taught, first)] = answered.as_slice() else {
+        panic!("one first answer told: {answered:?}");
+    };
+    assert_eq!(*taught, name);
+    eprintln!(
+        "client_late_answer cold_start=true wait={name} taught_by=a_first_hello w_star={first:?}"
+    );
+    (client, *first)
+}
 
 /// AC-T7.4.1 (original): on 00aad a Firecracker guest with the AMD GPU passed through booted, and its relay's hello to
 /// its own node, busy with the GPU's initialization, was refused, "none came in 2.354074ms, twice the slowest answer to
 /// a call of its kind", while the boot had most of its 60 s left: the guest panicked. A learned bound is calibration,
 /// not the caller's authority. Do: say hello under a caller's absolute deadline to an agent that answers only once the
-/// hello's learned wait (its 1 ms record, decision 9) has run out. Expect: the hello answered; its run-out told to the census
-/// once, at the learned bound; its answer told too, later than that bound.
+/// hello's learned wait (the slowest answer it has seen: a first hello's, its cold start; decision 9) has run out.
+/// Expect: the hello answered; its run-out told to the census once, at the learned bound; its answer told too, later
+/// than that bound.
 #[test]
 fn original_a_late_answer_inside_its_callers_deadline_is_taken_its_run_out_recorded() {
     if !in_late_census_child(
@@ -644,8 +1110,11 @@ fn original_a_late_answer_inside_its_callers_deadline_is_taken_its_run_out_recor
     ) {
         return;
     }
+    const NAME: &str = "test.client_budget.late.caller";
     let shared = Shared::try_new(late_hello::<true>()).unwrap();
-    let cap = ReplyDeadline::caller_before(Instant::now().checked_add(LATE_CAP).unwrap()).unwrap();
+    // A caller's deadline no answer here comes near: the late answer is there to read as the learned wait runs out.
+    let cap = ReplyDeadline::caller_before(answer_by(None)).unwrap();
+    let (_taught, bound) = taught_hello(&shared, Some(cap), NAME);
     let result = Core::hello_before(shared, Some(cap)).map(drop);
     let ran_out = LATE_RAN_OUT.lock().unwrap().clone();
     let answered = LATE_ANSWERED.lock().unwrap().clone();
@@ -656,10 +1125,9 @@ fn original_a_late_answer_inside_its_callers_deadline_is_taken_its_run_out_recor
         result.is_ok(),
         "a slow answer inside its caller's deadline was refused: {result:?}"
     );
-    let bound = Duration::from_millis(1);
-    assert_eq!(ran_out, [("test.client_budget.late.caller", bound)]);
+    assert_eq!(ran_out, [(NAME, bound)]);
     assert!(
-        matches!(answered.as_slice(), [("test.client_budget.late.caller", took)] if *took > bound),
+        matches!(answered.as_slice(), [(NAME, first), (NAME, took)] if *first == bound && *took > bound),
         "{answered:?}"
     );
 }
@@ -667,9 +1135,9 @@ fn original_a_late_answer_inside_its_callers_deadline_is_taken_its_run_out_recor
 /// AC-T7.4.1, decision 9 (original; the person's ruling of 2026-11-13: W* is a bound only while answers come within it):
 /// a call with no caller's deadline was refused at its kind's learned wait, "none came in 1ms, the slowest answer to a
 /// call of its kind", so a fresh process's second call was refused whenever it was slower than its first. Do: say hello
-/// with no caller deadline to an agent that answers only once the hello's learned wait (1 ms) has run out. Expect: the
-/// hello answered, the call following its agent past W*; its run-out told to the census once, at the learned bound; its
-/// answer told too, later than that bound.
+/// with no caller deadline to an agent that answers only once the hello's learned wait (a first hello's answer, its cold
+/// start) has run out. Expect: the hello answered, the call following its agent past W*; its run-out told to the census
+/// once, at the learned bound; its answer told too, later than that bound.
 #[test]
 fn original_with_no_callers_deadline_a_call_follows_its_agent_past_the_learned_wait() {
     if !in_late_census_child(
@@ -677,7 +1145,9 @@ fn original_with_no_callers_deadline_a_call_follows_its_agent_past_the_learned_w
     ) {
         return;
     }
+    const NAME: &str = "test.client_budget.late.alone";
     let shared = Shared::try_new(late_hello::<false>()).unwrap();
+    let (_taught, bound) = taught_hello(&shared, None, NAME);
     let result = Core::hello_before(shared, None).map(drop);
     let ran_out = LATE_RAN_OUT.lock().unwrap().clone();
     let answered = LATE_ANSWERED.lock().unwrap().clone();
@@ -688,10 +1158,9 @@ fn original_with_no_callers_deadline_a_call_follows_its_agent_past_the_learned_w
         result.is_ok(),
         "a call with no caller's deadline was refused at its learned wait: {result:?}"
     );
-    let bound = Duration::from_millis(1);
-    assert_eq!(ran_out, [("test.client_budget.late.alone", bound)]);
+    assert_eq!(ran_out, [(NAME, bound)]);
     assert!(
-        matches!(answered.as_slice(), [("test.client_budget.late.alone", took)] if *took > bound),
+        matches!(answered.as_slice(), [(NAME, first), (NAME, took)] if *first == bound && *took > bound),
         "{answered:?}"
     );
 }
@@ -709,29 +1178,45 @@ fn until(at: Instant) -> Result<(), Refusal> {
     }
 }
 
+/// One read the client made of its control connection: the bytes it brought, or why none came.
 #[derive(Clone, Copy, Debug)]
 struct TokenRead {
-    at: Instant,
     result: Result<usize, io::ErrorKind>,
 }
 
+/// The client's control connection in the partial-token test: each read it makes, one byte at a time, recorded in
+/// order; and the token's second byte sent to it, through its peer's half held here, as the client, having read the
+/// first, finds no more and waits again: in that very read, so the byte comes on that fact, in the client's own turn,
+/// with no other thread's inside its deadline.
 struct ReadNotice {
     socket: TcpStream,
-    read: mpsc::SyncSender<TokenRead>,
+    peer: TcpStream,
+    second: Arc<Mutex<Option<u8>>>,
+    reads: Arc<Mutex<Vec<TokenRead>>>,
 }
+
 impl Read for ReadNotice {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let want = bytes.len().min(1);
         let result = self.socket.read(&mut bytes[..want]);
-        self.read
-            .try_send(TokenRead {
-                at: Instant::now(),
-                result: result.as_ref().copied().map_err(io::Error::kind),
-            })
-            .map_err(|error| io::Error::other(format!("token observation queue: {error}")))?;
+        let read = TokenRead {
+            result: result.as_ref().copied().map_err(io::Error::kind),
+        };
+        let mut reads = self.reads.lock().unwrap();
+        let progressed = reads
+            .iter()
+            .any(|read| matches!(read.result, Ok(n) if n > 0));
+        reads.push(read);
+        if progressed
+            && matches!(read.result, Err(io::ErrorKind::WouldBlock))
+            && let Some(byte) = self.second.lock().unwrap().take()
+        {
+            (&self.peer).write_all(&[byte])?;
+        }
         result
     }
 }
+
 impl Write for ReadNotice {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.socket.write(bytes)
@@ -740,11 +1225,14 @@ impl Write for ReadNotice {
         self.socket.flush()
     }
 }
+
 impl Duplex for ReadNotice {
     fn try_clone(&self) -> io::Result<DuplexOwner> {
         own_duplex(Self {
             socket: self.socket.try_clone()?,
-            read: self.read.clone(),
+            peer: self.peer.try_clone()?,
+            second: Arc::clone(&self.second),
+            reads: Arc::clone(&self.reads),
         })
         .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))
     }
@@ -768,46 +1256,128 @@ impl Duplex for ReadNotice {
     }
 }
 
-struct RecordedLink {
-    control: SocketAddr,
-    stdio: SocketAddr,
-    budget: Duration,
-    deadlines: Arc<Mutex<Vec<(u32, Instant)>>>,
-    read: Option<mpsc::SyncSender<TokenRead>>,
+/// What a client set on one of its connections, in order: its blocking mode and its timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Set {
+    Nonblocking(bool),
+    ReadTimeout(Option<Duration>),
+    WriteTimeout(Option<Duration>),
 }
+
+/// What a client set on one connection, in order, shared by its clones and the link that dialed it.
+type SetLog = Arc<Mutex<Vec<Set>>>;
+
+/// A connection whose every option the client sets is recorded, its clones' with it: what the client armed on it.
+struct Watched {
+    socket: TcpStream,
+    set: SetLog,
+}
+
+impl Read for Watched {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.socket.read(bytes)
+    }
+}
+
+impl Write for Watched {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.socket.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+impl Duplex for Watched {
+    fn try_clone(&self) -> io::Result<DuplexOwner> {
+        own_duplex(Self {
+            socket: self.socket.try_clone()?,
+            set: Arc::clone(&self.set),
+        })
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.socket.shutdown(how)
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set.lock().unwrap().push(Set::WriteTimeout(timeout));
+        self.socket.set_write_timeout(timeout)
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set.lock().unwrap().push(Set::ReadTimeout(timeout));
+        self.socket.set_read_timeout(timeout)
+    }
+    fn handle(&self) -> Handle<'_> {
+        #[cfg(unix)]
+        return std::os::fd::AsFd::as_fd(&self.socket);
+        #[cfg(windows)]
+        std::os::windows::io::AsSocket::as_socket(&self.socket)
+    }
+    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        self.set.lock().unwrap().push(Set::Nonblocking(on));
+        self.socket.set_nonblocking(on)
+    }
+}
+
+/// Whether what a client set on a connection leaves no timer on it: no timeout set, and blocking where it last chose.
+fn untimed(set: &[Set]) -> bool {
+    set.iter()
+        .all(|set| !matches!(set, Set::ReadTimeout(Some(_)) | Set::WriteTimeout(Some(_))))
+        && set
+            .iter()
+            .rev()
+            .find_map(|set| match set {
+                Set::Nonblocking(on) => Some(!on),
+                _ => None,
+            })
+            .unwrap_or(true)
+}
+
+/// A guest link whose control connection was made before its dial, its peer the test's, and whose stdio dials connect
+/// to `stdio`, where the kernel queues each for its accept: no thread of the test's runs within a dial. It records each
+/// dial's port and deadline, and what the client set on each stdio connection: what the client armed.
+struct RecordedLink {
+    control: Mutex<Option<DuplexOwner>>,
+    stdio: Option<SocketAddr>,
+    budget: Option<Duration>,
+    deadlines: DialDeadlines,
+    sets: Arc<Mutex<Vec<SetLog>>>,
+}
+
 impl Link for RecordedLink {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn reply_budget(&self) -> Option<Duration> {
-        Some(self.budget)
+        self.budget
     }
     fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
-        self.dial_before(port, Some(Instant::now().checked_add(self.budget).unwrap()))
+        self.dial_before(port, None)
     }
     fn dial_before(&self, port: u32, deadline: Option<Instant>) -> Result<DuplexOwner, Refusal> {
-        let deadline = deadline.unwrap();
         self.deadlines.lock().unwrap().push((port, deadline));
-        let address = if port == hex_core::stream::CONTROL_PORT {
-            self.control
-        } else {
-            self.stdio
-        };
-        let socket = TcpStream::connect_timeout(
-            &address,
-            deadline.saturating_duration_since(Instant::now()),
-        )
+        if port == hex_core::stream::CONTROL_PORT {
+            return self.control.lock().unwrap().take().ok_or_else(|| {
+                Refusal::Broken("the recorded link's control connection was dialed twice".into())
+            });
+        }
+        let address = self
+            .stdio
+            .ok_or_else(|| Refusal::Broken("the recorded link dials no stdio".into()))?;
+        let socket = match deadline {
+            Some(at) => {
+                TcpStream::connect_timeout(&address, at.saturating_duration_since(Instant::now()))
+            }
+            None => TcpStream::connect(address),
+        }
         .map_err(|error| Refusal::os("recorded loopback dial", error))?;
         // These controls deliberately send individual bytes/small frames; TCP coalescing is
         // unrelated to whether protocol progress consumes one deadline.
         socket.set_nodelay(true).unwrap();
-        if port == hex_core::stream::CONTROL_PORT
-            && let Some(read) = &self.read
-        {
-            own_duplex(ReadNotice {
-                socket,
-                read: read.clone(),
-            })
-        } else {
-            own_duplex(socket)
-        }
+        let set = Arc::new(Mutex::new(Vec::new()));
+        self.sets.lock().unwrap().push(Arc::clone(&set));
+        own_duplex(Watched { socket, set })
     }
 }
 
@@ -841,162 +1411,130 @@ fn accept_before(
     }
 }
 
-fn actual_token_read(
-    reads: &mpsc::Receiver<TokenRead>,
-    events: &mut Vec<TokenRead>,
-    at: Option<Instant>,
-) -> Result<Instant, Refusal> {
-    loop {
-        let event = recv_by(reads, at)
-            .map_err(|error| Refusal::os("observing an actual token read", error))?;
-        events.push(event);
-        match event.result {
-            Ok(n) if n > 0 => return Ok(event.at),
-            Err(io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
-            other => return Err(Refusal::Broken(format!("the token probe read {other:?}"))),
-        }
-    }
-}
-
-/// The client's next read, or reads, until one waits (`WouldBlock`): it waits again, all it had read taken. A byte read
-/// first is refused by type: none was sent.
-fn waiting_again(
-    reads: &mpsc::Receiver<TokenRead>,
-    events: &mut Vec<TokenRead>,
-    at: Option<Instant>,
-) -> Result<(), Refusal> {
-    loop {
-        let event = recv_by(reads, at)
-            .map_err(|error| Refusal::os("observing an actual token read", error))?;
-        events.push(event);
-        match event.result {
-            Err(io::ErrorKind::WouldBlock) => return Ok(()),
-            Err(io::ErrorKind::Interrupted) => {}
-            other => {
-                return Err(Refusal::Broken(format!(
-                    "the token probe read {other:?} before a byte was sent"
-                )));
-            }
-        }
-    }
-}
-
 /// Do make real partial token progress before the original deadline, each byte sent on a fact, never at a time of the
-/// test's own: the first once the client dialed, the second once the client, having read the first, waits again;
-/// expect expiry at that deadline, naming it, with no read past it. (Its second byte was sent CAP before the deadline,
-/// a chosen window: a loaded host woke the test past the deadline first, "harness miss", at main 54a896cc and since.)
-/// Whether progress could have reset the deadline rests on the token's read taking its deadline once, by value
-/// (`protocol_read`): a test that sent a byte late enough to tell a reset apart from the deadline's own lateness would
-/// need a time of its own again.
+/// test's own: the first before the client dials, the second as the client, having read the first, waits again, in that
+/// read itself ([`ReadNotice`]); expect every wait the connect armed, in its own thread, at its one deadline, its
+/// progress never re-arming it, and its expiry naming its caller, never before that deadline. The cap is this host's own
+/// ([`measured`]: the same connect, its whole token and its hello's answer there to read); whether the host let both
+/// reads come before it is told to the census.
 #[test]
 fn partial_token_progress_does_not_reset_the_absolute_deadline() {
-    /// The connect's dial, accepted.
-    static DIALED: Patience = Patience::measuring("test.hex_client.budget.partial_token_dialed");
-    /// The client's read of the token's first byte.
-    static FIRST_READ: Patience =
-        Patience::measuring("test.hex_client.budget.partial_token_first_read");
+    /// The same connect, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.partial_token_steps");
     /// The connect's refusal at its original deadline, the token cut short.
     static EXPIRED: Patience = Patience::measuring("test.hex_client.budget.partial_token_expired");
-    /// The client waiting again, its read of the first byte done.
-    static WAITING: Patience = Patience::measuring("test.hex_client.budget.partial_token_waiting");
-    /// The client's read of the token's second byte.
-    static SECOND_READ: Patience =
-        Patience::measuring("test.hex_client.budget.partial_token_second_read");
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let address = listener.local_addr().unwrap();
-    let stop = AtomicBool::new(false);
-    let wake = Wake::new().unwrap();
-    // The fixed token has eight bytes; this two-byte case records positive and WouldBlock reads.
-    let (read, reads) = mpsc::sync_channel(hex_core::stream::TOKEN_BYTES * 2);
-    let recorded_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let (socket, peer) = control_pair(vec![(1, agents_hello())]);
     let link = guest::own_link(RecordedLink {
-        control: address,
-        stdio: address,
-        budget: LONG_CAP,
-        deadlines: Arc::clone(&recorded_deadlines),
-        read: Some(read),
+        control: Mutex::new(Some(own_duplex(socket).unwrap())),
+        stdio: None,
+        budget: Some(MOST_ONE_WAIT),
+        deadlines: Arc::default(),
+        sets: Arc::default(),
+    })
+    .unwrap();
+    let (cap, connected) = measured(&STEPS, move || guest::Client::connect(link).map(drop));
+    drop(peer);
+    connected.unwrap();
+    let token = TOKEN.to_le_bytes();
+    let (socket, mut peer) = absolute_pair();
+    peer.write_all(&token[..1]).unwrap();
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let recorded: DialDeadlines = Arc::default();
+    let link = guest::own_link(RecordedLink {
+        control: Mutex::new(Some(
+            own_duplex(ReadNotice {
+                socket,
+                peer: peer.try_clone().unwrap(),
+                second: Arc::new(Mutex::new(Some(token[1]))),
+                reads: Arc::clone(&reads),
+            })
+            .unwrap(),
+        )),
+        stdio: None,
+        budget: Some(cap),
+        deadlines: Arc::clone(&recorded),
+        sets: Arc::default(),
     })
     .unwrap();
     let (finished, answer) = mpsc::sync_channel(1);
-    // The worker holds the link alone, so a client that gives up takes every read notice's sender with it: a read
-    // wait then finds its sender gone rather than waiting for a read that won't come.
     let worker = std::thread::spawn(move || {
         let result = guest::Client::connect(link).map(drop);
-        finished.send((Instant::now(), result)).unwrap()
+        let _ = finished.send((Instant::now(), result, armed()));
     });
-    let mut peer = None;
-    let mut events = Vec::new();
-    let observation = (|| -> Result<_, Refusal> {
-        peer = Some(
-            within(&DIALED, |by| accept_before(&listener, &stop, &wake, by))
-                .map_err(|error| Refusal::os("accepting the owned token peer", error))?,
-        );
-        let peer = peer.as_mut().unwrap();
-        peer.set_nodelay(true)
-            .map_err(|error| Refusal::os("configuring token probe TCP", error))?;
-        peer.write_all(&[1])
-            .map_err(|error| Refusal::os("writing the first token byte", error))?;
-        let first = within(&FIRST_READ, |by| actual_token_read(&reads, &mut events, by))?;
-        let deadline = recorded_deadlines
-            .lock()
-            .unwrap()
-            .first()
-            .copied()
-            .ok_or_else(|| Refusal::Broken("the token peer had no recorded dial".into()))?
-            .1;
-        // The client waits again, its read of the first byte done: the fact the second byte is sent on.
-        within(&WAITING, |by| waiting_again(&reads, &mut events, by))?;
-        peer.write_all(&[2])
-            .map_err(|error| Refusal::os("writing the second token byte", error))?;
-        let second = within(&SECOND_READ, |by| {
-            actual_token_read(&reads, &mut events, by)
-        })?;
-        Ok((first, second, deadline))
-    })();
-    let completed = recv_on(&EXPIRED, &answer);
-    // Every observation error, including the first event/dial failure, reaches this cleanup.
-    let cleanup = peer.as_ref().map(|peer| peer.shutdown(Shutdown::Both));
+    let completed = recv_from(&EXPIRED, "the connect's refusal", &answer, &worker);
+    // Every observation is taken before any assertion: the peer closed, the worker joined.
+    let cleanup = peer.shutdown(Shutdown::Both);
     drop(peer);
-    stop.store(true, Ordering::Release);
-    wake.wake();
     worker.join().unwrap();
-    let after_cleanup = completed.is_err().then(|| answer.try_recv().ok()).flatten();
-    events.extend(reads.try_iter());
-    let witnessed = observation
-        .as_ref()
-        .is_ok_and(|(first, second, deadline)| first < second && second < deadline);
+    let reads = reads.lock().unwrap().clone();
+    let deadlines = recorded.lock().unwrap().clone();
+    let (returned, result, log) = completed.unwrap();
+    let deadline = armed_instant(&log).expect("the connect armed its deadline in its own thread");
+    // The reads that brought a byte, by their place among all its reads: the token's first and second, where both came.
+    let progress: Vec<usize> = reads
+        .iter()
+        .enumerate()
+        .filter(|(_, read)| matches!(read.result, Ok(n) if n > 0))
+        .map(|(at, _)| at)
+        .collect();
+    let both = progress.len() == 2;
+    told_path(
+        "partial_token_progress_does_not_reset_the_absolute_deadline",
+        both,
+    );
     eprintln!(
-        "client_budget_token harness_miss={} observation={observation:?} actual_reads={events:?} client_before_cleanup={completed:?} client_after_cleanup={after_cleanup:?}",
-        !witnessed
-    );
-    assert!(cleanup.is_none_or(|result| result.is_ok()
-        || matches!(result, Err(error) if error.kind() == io::ErrorKind::NotConnected)));
-    let (first, second, deadline) = observation.unwrap();
-    assert!(
-        first < second && second < deadline,
-        "both actual partial reads must precede the original deadline"
+        "client_budget_token cap={cap:?} deadlines={deadlines:?} actual_reads={reads:?} client={result:?} armed={log:?}"
     );
     assert!(
-        events
+        cleanup.is_ok()
+            || matches!(&cleanup, Err(error) if error.kind() == io::ErrorKind::NotConnected)
+    );
+    // What the client armed: its dial, where it made one, and every wait of the token's read at the one deadline.
+    assert!(
+        deadlines
             .iter()
-            .any(|event| matches!(event.result, Err(io::ErrorKind::WouldBlock)))
+            .all(|dial| *dial == (hex_core::stream::CONTROL_PORT, Some(deadline))),
+        "{deadlines:?}"
     );
-    let (returned, result) = completed.unwrap();
-    assert!(matches!(result, Err(Refusal::Os { why, .. }) if why.contains("caller")));
-    // Refused at its original deadline, never before it, and nothing read past it.
+    let waits: &[&str] = if deadlines.is_empty() {
+        &["dialing the guest control connection"]
+    } else {
+        &[
+            "dialing the guest control connection",
+            "reading the relay's token for the connection",
+        ]
+    };
+    assert!(armed_at(&log, waits, Some(deadline)), "{log:?}");
+    if let [first, second] = progress.as_slice() {
+        // The second byte came only as the client, having read the first, found no more and read again; the rest
+        // never come, so the token's read waited on at the one deadline and was refused by it.
+        assert!(
+            reads[*first + 1..*second]
+                .iter()
+                .any(|read| matches!(read.result, Err(io::ErrorKind::WouldBlock))),
+            "the client waited again between its two reads: {reads:?}"
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(Refusal::Os {
+                    op: "reading the relay's token for the connection",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+    assert!(
+        matches!(&result, Err(Refusal::Os { why, .. }) if why.contains("caller")),
+        "{result:?}"
+    );
+    // Refused at its original deadline, never before it.
     assert!(
         returned >= deadline,
         "refused {:?} before its deadline",
         deadline.saturating_duration_since(returned)
     );
-    assert!(
-        events
-            .iter()
-            .all(|event| event.result.is_err() || event.at < deadline),
-        "a byte read past the deadline: {events:?}"
-    );
-    assert_eq!(recorded_deadlines.lock().unwrap().len(), 1);
 }
 
 fn next_request(peer: &mut TcpStream) -> io::Result<(Header, Request)> {
@@ -1008,6 +1546,7 @@ fn next_request(peer: &mut TcpStream) -> io::Result<(Header, Request)> {
     peer.read_exact(&mut bytes)?;
     Ok(wire::read_request_apart(&bytes, wire::MAX_MESSAGE).unwrap())
 }
+
 fn answer_to(peer: &mut TcpStream, id: u64, answer: Answer) -> io::Result<()> {
     peer.write_all(
         &hex_core::stream::frame(
@@ -1018,148 +1557,111 @@ fn answer_to(peer: &mut TcpStream, id: u64, answer: Answer) -> io::Result<()> {
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ControlPhase {
-    Start,
-    Delete,
-    Disconnected,
-    Stop,
-}
-
-/// Waits for the owner to say `expected` is pending, then for what the client sends for it, read by `read` on that
-/// fact's own patience. Workload idle is not a protocol wait: the owner always sends Stop or closes peers on error, and
-/// the read's wait starts only when a control operation is actually pending.
-fn pending_control<R>(
-    peer: &mut TcpStream,
-    phases: &mpsc::Receiver<ControlPhase>,
-    expected: ControlPhase,
-    read: impl FnOnce(&mut TcpStream) -> io::Result<R>,
-) -> io::Result<R> {
-    /// What the client sends for an announced control operation: its request, or for a disconnect its end.
-    static ASKED: Patience = Patience::measuring("test.hex_client.budget.named_pending_asked");
-    match phases.recv() {
-        Ok(phase) if phase == expected => within(&ASKED, |by| {
-            peer.set_read_timeout(timeout_by(by)?)?;
-            read(peer)
-        }),
-        Ok(ControlPhase::Stop) | Err(_) => Err(io::ErrorKind::Interrupted.into()),
-        Ok(other) => Err(io::Error::other(format!(
-            "expected {expected:?}, got {other:?}"
-        ))),
-    }
-}
-
 enum StreamPhase {
     WriteLate,
     Stop,
 }
 
-/// Do ask for all three streams in one actual guest exec; expect one common setup deadline,
-/// later API use after it expired, and successful stdio/Proc completion beyond the cap.
+/// Every stream an exec can ask for.
+fn all_streams() -> Stdio {
+    Stdio {
+        ask: hex_api::Ask {
+            stdin: true,
+            stdout: true,
+            stderr: true,
+        },
+        ..Stdio::null()
+    }
+}
+
+/// Do ask for all three streams in one actual guest exec, then start the box, read the program's stdout, exec again on
+/// the same connection asking stdin alone, and delete the box; expect, from what the client armed and no clock: the
+/// exec's three named dials, and every wait it armed in its own thread, at one deadline, the exec's own cap (its ask's
+/// instant and the budget); the second exec's dial at its own, later; the start's waits at its own; no timeout and
+/// blocking at hand-off on every named stream, and no timeout on the connection: no workload or connection timer. And
+/// the program pending after its exec, its stdout carrying bytes written after it, both programs ending Exited(0).
+/// The budget is MOST_ONE_WAIT, poll(2)'s int-millisecond ceiling (an API's own bound, the longest one wait the client
+/// arms), so no step here races it (ROOT, 2026-11-14). Every answer a call reads is written before it asks; the agent's
+/// side reads each request after.
 #[test]
 fn named_streams_share_one_operation_cap_without_a_workload_or_connection_timer() {
     use hex_core::stream::{self, Named};
-    /// The client's control dial, accepted by the agent.
-    static CONTROL_DIALED: Patience =
-        Patience::measuring("test.hex_client.budget.named_control_dialed");
-    /// The exec's request, come to the agent.
-    static EXEC_ASKED: Patience = Patience::measuring("test.hex_client.budget.named_exec_asked");
     /// The exec's three named dials, accepted and each named.
     static STREAMS_DIALED: Patience =
         Patience::measuring("test.hex_client.budget.named_streams_dialed");
     /// The late stdout bytes, read through the exec's own stream.
     static LATE_READ: Patience = Patience::measuring("test.hex_client.budget.named_late_read");
+    /// Each request the client sent, read by the agent's side.
+    static ASKED: Patience = Patience::measuring("test.hex_client.budget.named_asked");
     /// The agent's own end, once the last client has gone.
     static AGENT_ENDED: Patience = Patience::measuring("test.hex_client.budget.named_agent_ended");
-    let control = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let budget = MOST_ONE_WAIT;
     let stdio = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    control.set_nonblocking(true).unwrap();
     stdio.set_nonblocking(true).unwrap();
+    let (socket, mut peer) = control_pair(vec![(1, Answer::Started { pid: 7 })]);
+    let control_set = Arc::new(Mutex::new(Vec::new()));
+    let recorded: DialDeadlines = Arc::default();
+    let sets = Arc::default();
+    let link = guest::own_link(RecordedLink {
+        control: Mutex::new(Some(
+            own_duplex(Watched {
+                socket,
+                set: Arc::clone(&control_set),
+            })
+            .unwrap(),
+        )),
+        stdio: Some(stdio.local_addr().unwrap()),
+        budget: Some(budget),
+        deadlines: Arc::clone(&recorded),
+        sets: Arc::clone(&sets),
+    })
+    .unwrap();
+    // The agent's side: each request the client sent, read in turn, then the connection's end.
+    let mut agent_peer = peer.try_clone().unwrap();
+    let agent = std::thread::spawn(move || -> io::Result<(Vec<Request>, usize)> {
+        let mut asked = Vec::new();
+        for _ in 0..4 {
+            // A read that can't be cut: it ends at the client's request or at the connection's end.
+            asked.push(
+                follow::whole(&ASKED, "the client's next request", || {
+                    next_request(&mut agent_peer)
+                })?
+                .1,
+            );
+        }
+        let end = follow::whole(&AGENT_ENDED, "the connection's end", || {
+            agent_peer.read(&mut [0])
+        })?;
+        Ok((asked, end))
+    });
     let stop = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(Wake::new().unwrap());
     let owned = Arc::new(Mutex::new(Vec::<TcpStream>::new()));
-    let recorded_deadlines = Arc::new(Mutex::new(Vec::new()));
-    let link = guest::own_link(RecordedLink {
-        control: control.local_addr().unwrap(),
-        stdio: stdio.local_addr().unwrap(),
-        budget: CAP,
-        deadlines: Arc::clone(&recorded_deadlines),
-        read: None,
-    })
-    .unwrap();
-    let (agent_stop, agent_wake, agent_owned) =
-        (Arc::clone(&stop), Arc::clone(&wake), Arc::clone(&owned));
-    let (agent_finished, agent_done) = mpsc::sync_channel(1);
-    // At most one pending operation followed by Stop can await this actor.
-    let (phase, pending) = mpsc::sync_channel(2);
-    let agent = std::thread::spawn(move || {
-        let result = (|| -> io::Result<()> {
-            let mut peer = within(&CONTROL_DIALED, |by| {
-                accept_before(&control, &agent_stop, &agent_wake, by)
-            })?;
-            agent_owned.lock().unwrap().push(peer.try_clone()?);
-            peer.set_nodelay(true)?;
-            peer.write_all(&11u64.to_le_bytes())?;
-            let (exec, request) = within(&EXEC_ASKED, |by| {
-                peer.set_read_timeout(timeout_by(by)?)?;
-                next_request(&mut peer)
-            })?;
-            eprintln!("client_budget_named phase=agent_exec id={}", exec.id);
-            assert!(matches!(
-                request,
-                Request::Call(Call::Exec {
-                    streams: Streams {
-                        stdin: true,
-                        stdout: true,
-                        stderr: true
-                    },
-                    ..
-                })
-            ));
-            answer_to(&mut peer, exec.id, Answer::Started { pid: 7 })?;
-            let (header, request) =
-                pending_control(&mut peer, &pending, ControlPhase::Start, next_request)?;
-            eprintln!("client_budget_named phase=agent_start id={}", header.id);
-            assert!(matches!(request, Request::Call(Call::Start(_))));
-            answer_to(&mut peer, header.id, Answer::Done)?;
-            let (header, request) =
-                pending_control(&mut peer, &pending, ControlPhase::Delete, next_request)?;
-            assert!(matches!(request, Request::Call(Call::Delete(_))));
-            answer_to(&mut peer, header.id, Answer::Done)?;
-            answer_to(&mut peer, exec.id, Answer::Exited(Exit::Code(0)))?;
-            eprintln!(
-                "client_budget_named phase=agent_exited_written id={}",
-                exec.id
-            );
-            // A completed Proc sends no Release; dropping the last client closes this control.
-            let end = pending_control(&mut peer, &pending, ControlPhase::Disconnected, |peer| {
-                peer.read(&mut [0])
-            })?;
-            assert_eq!(end, 0);
-            Ok(())
-        })();
-        let _ = agent_finished.send(());
-        result
-    });
     // One WriteLate and then Stop; neither idle phase is a workload lifetime timer.
     let (late, stream_phase) = mpsc::sync_channel(2);
     let (streams_stop, streams_wake, streams_owned) =
         (Arc::clone(&stop), Arc::clone(&wake), Arc::clone(&owned));
     let streams = std::thread::spawn(move || -> io::Result<Vec<Named>> {
-        // One setup's three dials, one fact: one wait for all three accepted and named.
-        let mut held = within(&STREAMS_DIALED, |by| -> io::Result<Vec<_>> {
-            let mut held = Vec::new();
-            for _ in 0..3 {
-                let mut peer = accept_before(&stdio, &streams_stop, &streams_wake, by)?;
-                streams_owned.lock().unwrap().push(peer.try_clone()?);
-                peer.set_nodelay(true)?;
-                peer.set_read_timeout(timeout_by(by)?)?;
-                let mut name = [0; stream::NAME_BYTES];
-                peer.read_exact(&mut name)?;
-                held.push((stream::read_name(&name).unwrap(), peer));
-            }
-            Ok(held)
-        })?;
+        // The first exec's three dials, one fact: one wait for all three accepted and named.
+        // One wait that can't be cut: three accepts and their names, made whole, each ending at its stop word.
+        let by = None;
+        let mut held = follow::whole(
+            &STREAMS_DIALED,
+            "the first exec's three dials",
+            || -> io::Result<Vec<_>> {
+                let mut held = Vec::new();
+                for _ in 0..3 {
+                    let mut peer = accept_before(&stdio, &streams_stop, &streams_wake, by)?;
+                    streams_owned.lock().unwrap().push(peer.try_clone()?);
+                    peer.set_nodelay(true)?;
+                    peer.set_read_timeout(timeout_by(by)?)?;
+                    let mut name = [0; stream::NAME_BYTES];
+                    peer.read_exact(&mut name)?;
+                    held.push((stream::read_name(&name).unwrap(), peer));
+                }
+                Ok(held)
+            },
+        )?;
         if matches!(stream_phase.recv(), Ok(StreamPhase::WriteLate)) {
             for (name, peer) in &mut held {
                 if name.stream == stream::Stdio::Out {
@@ -1172,31 +1674,22 @@ fn named_streams_share_one_operation_cap_without_a_workload_or_connection_timer(
     });
     let mut reading = None;
     let result = (|| -> Result<_, Refusal> {
-        let transport = guest::Stream::dial(link.clone())?;
+        let _ = armed();
+        let asked = Instant::now();
+        let transport = guest::Stream::dial(link)?;
+        let dialed = (asked, Instant::now(), armed());
         let client = configured(transport);
         let id = BoxId::new("budget-unit")?;
-        let mut proc = client.exec(
-            &id,
-            Program::of(&["cat"]),
-            Stdio {
-                ask: hex_api::Ask {
-                    stdin: true,
-                    stdout: true,
-                    stderr: true,
-                },
-                ..Stdio::null()
-            },
-        )?;
-        eprintln!("client_budget_named phase=client_started");
-        let deadlines = recorded_deadlines.lock().unwrap().clone();
-        let deadline = deadlines.last().unwrap().1;
-        until(deadline)?;
+        let asked = Instant::now();
+        let mut proc = client.exec(&id, Program::of(&["cat"]), all_streams())?;
+        let execed = (asked, Instant::now(), armed());
         let pending = proc.try_wait()?;
-        eprintln!("client_budget_named phase=client_proc_pending value={pending:?}");
-        phase
-            .send(ControlPhase::Start)
-            .map_err(|error| Refusal::os("announcing pending fixture start", error))?;
+        let _ = armed();
+        answer_to(&mut peer, 2, Answer::Done)
+            .map_err(|error| Refusal::os("answering the start before it is asked", error))?;
+        let asked = Instant::now();
         client.start(&id)?;
+        let started = (asked, Instant::now(), armed());
         late.send(StreamPhase::WriteLate)
             .map_err(|error| Refusal::os("requesting late fixture stdio", error))?;
         let given = proc.streams()?;
@@ -1211,79 +1704,188 @@ fn named_streams_share_one_operation_cap_without_a_workload_or_connection_timer(
             let result = stdout.read_exact(&mut bytes).map(|()| bytes);
             let _ = read.send(result);
         }));
-        let bytes = recv_on(&LATE_READ, &bytes)
+        let bytes = recv_on(&LATE_READ, "the late fixture's bytes", &bytes)
             .map_err(|error| Refusal::os("observing requested late fixture bytes", error))?
             .map_err(|error| Refusal::os("reading late fixture stdio", error))?;
-        eprintln!("client_budget_named phase=client_late_stdio_read");
-        phase
-            .send(ControlPhase::Delete)
-            .map_err(|error| Refusal::os("announcing pending fixture delete", error))?;
+        // A second exec on the same connection, after the first's setup: its own cap.
+        answer_to(&mut peer, 3, Answer::Started { pid: 8 })
+            .map_err(|error| Refusal::os("answering the second exec before it is asked", error))?;
+        let _ = armed();
+        let asked = Instant::now();
+        let mut second = client.exec(
+            &id,
+            Program::of(&["cat"]),
+            Stdio {
+                ask: hex_api::Ask {
+                    stdin: true,
+                    ..hex_api::Ask::default()
+                },
+                ..Stdio::null()
+            },
+        )?;
+        let execed_again = (asked, Instant::now(), armed());
+        answer_to(&mut peer, 4, Answer::Done)
+            .and_then(|()| answer_to(&mut peer, 1, Answer::Exited(Exit::Code(0))))
+            .and_then(|()| answer_to(&mut peer, 3, Answer::Exited(Exit::Code(0))))
+            .map_err(|error| Refusal::os("answering the delete before it is asked", error))?;
         client.delete(&id)?;
         // A program's end through a Proc is followed to it, as the suites follow one.
-        let ended = hex_api::conformance::end_of(&mut proc)?;
-        drop(proc);
+        let ended = (
+            hex_api::conformance::end_of(&mut proc)?,
+            hex_api::conformance::end_of(&mut second)?,
+        );
+        drop((proc, second));
         let clean = {
             let state = client.conn.shared.state()?;
             state.calls.is_empty() && state.programs.is_empty() && state.given.is_empty()
         };
-        phase
-            .send(ControlPhase::Disconnected)
-            .map_err(|error| Refusal::os("announcing fixture disconnect", error))?;
         drop(client);
-        Ok((deadlines, pending, bytes, ended, clean))
+        Ok((
+            dialed,
+            execed,
+            started,
+            execed_again,
+            pending,
+            bytes,
+            ended,
+            clean,
+        ))
     })();
-    let _ = phase.send(ControlPhase::Stop);
     let _ = late.send(StreamPhase::Stop);
-    // A failed dial or setup can leave an accept waiting on a dial that won't come: wake both accept loops before
-    // waiting on the agent's end.
+    // A failed setup can leave an accept waiting on a dial that won't come, and the agent's side on a request that
+    // won't: wake the accepts, and end the connection and the streams, before waiting on either.
     stop.store(true, Ordering::Release);
     wake.wake();
-    let natural_agent_end = recv_on(&AGENT_ENDED, &agent_done);
-    if result.is_err() || natural_agent_end.is_err() {
-        for peer in owned.lock().unwrap().iter() {
-            let _ = peer.shutdown(Shutdown::Both);
+    if result.is_err() {
+        let _ = peer.shutdown(Shutdown::Both);
+        for owned in owned.lock().unwrap().iter() {
+            let _ = owned.shutdown(Shutdown::Both);
         }
     }
+    drop(peer);
     let names = streams.join().unwrap();
     let agent_result = agent.join().unwrap();
     if let Some(reading) = reading {
         reading.join().unwrap();
     }
+    let deadlines = recorded.lock().unwrap().clone();
+    let sets: Vec<Vec<Set>> = sets
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|set| set.lock().unwrap().clone())
+        .collect();
+    let control_set = control_set.lock().unwrap().clone();
     eprintln!(
-        "client_budget_named result={result:?} agent={agent_result:?} named_count={:?}",
+        "client_budget_named result={result:?} agent={agent_result:?} deadlines={deadlines:?} sets={sets:?} control={control_set:?} named_count={:?}",
         names.as_ref().map(Vec::len)
     );
     // No assertion can strand either owned accept/read actor.
-    let (deadlines, pending, bytes, ended, clean) = result.unwrap();
-    natural_agent_end.unwrap();
+    let (dialed, execed, started, execed_again, pending, bytes, ended, clean) = result.unwrap();
+    let (asked, end) = agent_result.unwrap();
     let names = names.unwrap();
-    agent_result.unwrap();
-    assert_eq!(
-        deadlines.len(),
-        4,
-        "one control dial, then three named dials"
+    // Each operation's one deadline, from its own thread's log: its ask's instant and the budget.
+    let deadline_of = |(asked, returned, log): &(Instant, Instant, Vec<Armed>), waits: &[&str]| {
+        let at = armed_instant(log).expect("the operation armed its deadline in this thread");
+        assert!(*asked + budget <= at && at <= *returned + budget, "{log:?}");
+        assert!(armed_at(log, waits, Some(at)), "{log:?}");
+        at
+    };
+    let connection_cap = deadline_of(
+        &dialed,
+        &[
+            "dialing the guest control connection",
+            "reading the relay's token for the connection",
+        ],
+    );
+    let exec_cap = deadline_of(
+        &execed,
+        &[
+            "starting a client operation",
+            "dialing a stdio connection",
+            "naming a stdio connection",
+            "sending",
+            "the answer",
+        ],
+    );
+    let start_cap = deadline_of(&started, &["starting a client operation", "the answer"]);
+    let second_cap = deadline_of(
+        &execed_again,
+        &[
+            "starting a client operation",
+            "dialing a stdio connection",
+            "the answer",
+        ],
     );
     assert!(
-        deadlines[1..]
+        connection_cap < exec_cap && exec_cap < start_cap && start_cap < second_cap,
+        "each operation armed its own cap"
+    );
+    assert_eq!(
+        deadlines,
+        [
+            (stream::CONTROL_PORT, Some(connection_cap)),
+            (stream::STDIO_PORT, Some(exec_cap)),
+            (stream::STDIO_PORT, Some(exec_cap)),
+            (stream::STDIO_PORT, Some(exec_cap)),
+            (stream::STDIO_PORT, Some(second_cap)),
+        ],
+        "the exec's three named dials share its one cap, the second exec's its own"
+    );
+    // No workload or connection timer: nothing timed on any named stream nor on the connection.
+    assert_eq!(sets.len(), 4);
+    assert!(sets.iter().all(|set| untimed(set)), "{sets:?}");
+    assert!(
+        control_set
             .iter()
-            .all(|(port, at)| *port == stream::STDIO_PORT && *at == deadlines[1].1)
+            .all(|set| !matches!(set, Set::ReadTimeout(Some(_)) | Set::WriteTimeout(Some(_)))),
+        "{control_set:?}"
     );
     assert_eq!(pending, None);
     assert_eq!(&bytes, b"late");
-    assert_eq!(ended, Exit::Code(0));
+    assert_eq!(ended, (Exit::Code(0), Exit::Code(0)));
     assert!(clean);
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [
+                Request::Call(Call::Exec {
+                    streams: Streams {
+                        stdin: true,
+                        stdout: true,
+                        stderr: true
+                    },
+                    ..
+                }),
+                Request::Call(Call::Start(_)),
+                Request::Call(Call::Exec {
+                    streams: Streams {
+                        stdin: true,
+                        stdout: false,
+                        stderr: false
+                    },
+                    ..
+                }),
+                Request::Call(Call::Delete(_))
+            ]
+        ),
+        "{asked:?}"
+    );
+    // Completed Procs send no Release; dropping the last client closed the connection.
+    assert_eq!(end, 0);
     assert_eq!(names.len(), 3);
     assert!(
         names
             .iter()
-            .all(|name| name.exec.conn == 11 && name.exec.id == names[0].exec.id)
+            .all(|name| name.exec.conn == TOKEN && name.exec.id == 1)
     );
 }
 
-/// What the offered-expiry control sees happen: its open begin, and its exec end.
+/// What the offered-expiry control sees happen: its open begin, and its exec end: when it was asked and returned, how it
+/// ended, and what it armed in its own thread.
 enum Offered {
     Opening,
-    Ended(Result<(), Refusal>),
+    Ended(Instant, Instant, Result<(), Refusal>, Vec<Armed>),
 }
 
 struct Offers {
@@ -1294,7 +1896,12 @@ struct Offers {
     /// The open holds until the sibling call has completed, a fact the test sends.
     sibling: Mutex<mpsc::Receiver<()>>,
     program: Mutex<Option<Stdio>>,
+    /// Whether an open holds; one that doesn't is refused at once, the steps to it all a measure of it takes.
+    hold: bool,
+    /// The deadline the open was given: what the client armed it with.
+    opened: Mutex<Option<ReplyDeadline>>,
 }
+
 impl Offers {
     /// One whose open no test watches, for the fixtures that wrap it and never open an offer.
     fn unobserved(io: Stalled) -> Self {
@@ -1307,6 +1914,8 @@ impl Offers {
             seen,
             sibling: Mutex::new(sibling),
             program: Mutex::new(None),
+            hold: true,
+            opened: Mutex::new(None),
         }
     }
 
@@ -1318,13 +1927,14 @@ impl Offers {
         self.io.socket.send(&[1]).unwrap();
     }
 }
+
 impl Transport for Offers {
     type Reading = ();
     fn answers() -> &'static [Patience; KINDS] {
         Stalled::answers()
     }
     fn reply_budget(&self) -> Option<Duration> {
-        Some(LONG_CAP)
+        self.io.budget
     }
     fn reading(&self) {}
     fn handle(&self) -> Handle<'_> {
@@ -1364,6 +1974,7 @@ impl Transport for Offers {
                         stdin: true,
                         ..Streams::default()
                     },
+                    setup: None,
                 }),
             ),
             Request::Call(Call::Start(_)) => self.queue(header.id, Answer::Done),
@@ -1379,6 +1990,12 @@ impl Transport for Offers {
         _: &wire::StreamOffer,
         deadline: ReplyDeadline,
     ) -> Result<hex_api::Given, Refusal> {
+        *self.opened.lock().unwrap() = Some(deadline);
+        if !self.hold {
+            return Err(Refusal::Broken(
+                "a measured open, refused as it begins".into(),
+            ));
+        }
         let mut program = Stdio {
             ask: hex_api::Ask {
                 stdin: true,
@@ -1404,65 +2021,104 @@ impl Transport for Offers {
     }
 }
 
-/// Do stall one bounded offered-stream open until a sibling call has completed, then past its
-/// deadline; expect the sibling answered, the open's caller expiry, a same-id Release, its made
-/// ends closed and no call/program/given reservation left. Each step waits on the fact before it,
-/// never on an observation window (AC-T7.4.1).
+/// The ask of an exec or a run that asks for its stdin alone.
+fn stdin_alone() -> Stdio {
+    Stdio {
+        ask: hex_api::Ask {
+            stdin: true,
+            stdout: false,
+            stderr: false,
+        },
+        ..Stdio::null()
+    }
+}
+
+/// Do stall one bounded offered-stream open until a sibling call has completed, then past its deadline; expect the
+/// sibling answered, the open's caller expiry, a same-id Release, its made ends closed and no call/program/given
+/// reservation left. Each step waits on the fact before it, never on an observation window (AC-T7.4.1). Every wait the
+/// exec armed, in its own thread, and its open's deadline, at the exec's one deadline; its refusal never before it. The
+/// cap is this host's own ([`measured`]: the same exec, its open refused as it begins); whether the host let the open
+/// begin before it is told to the census.
 #[test]
 fn offered_expiry_releases_only_its_ownership_while_a_sibling_progresses() {
+    /// The same exec, its open refused as it begins.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.offered_steps");
     /// The worker's first event: its open begun, or its exec ended without one.
     static FIRST: Patience = Patience::measuring("test.hex_client.budget.offered_first");
     /// The exec's end, its open refused at the caller's expiry.
     static ENDED: Patience = Patience::measuring("test.hex_client.budget.offered_ended");
-    let (io, _) = stalled(Some(LONG_CAP));
+    let (cap, measured_exec) = measured(&STEPS, || {
+        let (io, _) = stalled(Some(MOST_ONE_WAIT));
+        configured(Offers {
+            hold: false,
+            ..Offers::unobserved(io)
+        })
+        .exec(
+            &BoxId::new("offered-budget-unit")?,
+            Program::of(&["cat"]),
+            stdin_alone(),
+        )
+        .map(drop)
+    });
+    assert!(
+        matches!(measured_exec, Err(Refusal::Broken(_))),
+        "{measured_exec:?}"
+    );
+    let (io, _) = stalled(Some(cap));
     let (seen, events) = mpsc::channel();
     let (sibling_done, sibling_wait) = mpsc::channel();
     let client = Arc::new(configured(Offers {
-        io,
-        inbound: Mutex::new(VecDeque::new()),
-        outbound: Mutex::new(Vec::new()),
         seen: seen.clone(),
         sibling: Mutex::new(sibling_wait),
-        program: Mutex::new(None),
+        ..Offers::unobserved(io)
     }));
     let control = Arc::clone(&client);
     let id = BoxId::new("offered-budget-unit").unwrap();
     let target = id.clone();
     let worker = std::thread::spawn(move || {
+        let asked = Instant::now();
         // A fixture panic is this worker's end too, so the test's wait for it always ends.
         let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             control
-                .exec(
-                    &target,
-                    Program::of(&["cat"]),
-                    Stdio {
-                        ask: hex_api::Ask {
-                            stdin: true,
-                            stdout: false,
-                            stderr: false,
-                        },
-                        ..Stdio::null()
-                    },
-                )
+                .exec(&target, Program::of(&["cat"]), stdin_alone())
                 .map(drop)
         }))
         .unwrap_or_else(|_| Err(Refusal::Broken("the exec's fixture panicked".into())));
-        seen.send(Offered::Ended(ended)).unwrap();
+        seen.send(Offered::Ended(asked, Instant::now(), ended, armed()))
+            .unwrap();
     });
     // The open began, or the exec ended without one: both are facts the worker sends.
-    let first = recv_on(&FIRST, &events).unwrap();
+    let first = recv_on(&FIRST, "the first event", &events).unwrap();
     let opened = matches!(first, Offered::Opening);
     let reading = client.conn.shared.state().unwrap().reading;
-    let sibling = client.start(&id);
+    // The sibling's own deadline is one no answer here comes near: its answer while the open holds is the fact.
+    let sibling = ReplyDeadline::caller_before(answer_by(None))
+        .and_then(|far| {
+            client.conn.call_before(
+                wire::MAX_MESSAGE,
+                &Request::Call(Call::Start(id.clone())),
+                |_, _| Ok(NONE),
+                None,
+                Some(far),
+            )
+        })
+        .map(|(_, answer)| answer);
     sibling_done.send(()).unwrap();
     let ended = match first {
-        Offered::Ended(ended) => ended,
-        Offered::Opening => match recv_on(&ENDED, &events).unwrap() {
-            Offered::Ended(ended) => ended,
+        Offered::Ended(..) => first,
+        Offered::Opening => match recv_on(&ENDED, "the stream's end", &events).unwrap() {
             Offered::Opening => panic!("the exec opened its offer twice"),
+            ended => ended,
         },
     };
     worker.join().unwrap();
+    let Offered::Ended(asked, returned, ended, log) = ended else {
+        panic!("the exec told no end");
+    };
+    told_path(
+        "offered_expiry_releases_only_its_ownership_while_a_sibling_progresses",
+        opened,
+    );
     let shared = &client.conn.shared;
     let outbound = shared.transport.outbound.lock().unwrap();
     let state = shared.state().unwrap();
@@ -1478,16 +2134,40 @@ fn offered_expiry_releases_only_its_ownership_while_a_sibling_progresses() {
     let closed = program
         .and_then(|program| program.stdin)
         .map(|mut stdin| stdin.read(&mut [0]).unwrap());
-    assert!(opened, "the exec ended before its offered open began");
-    assert!(!reading, "an offered open must relinquish the reader turn");
-    assert_eq!(sibling, Ok(()));
-    assert!(matches!(ended, Err(Refusal::Os { why, .. }) if why.contains("caller")));
+    let open_deadline = *shared.transport.opened.lock().unwrap();
+    eprintln!(
+        "client_budget_offered cap={cap:?} opened={opened} ended={ended:?} armed={log:?} outbound={outbound:?}"
+    );
+    let at = armed_instant(&log).expect("the exec armed its deadline in its own thread");
+    assert!(asked + cap <= at && at <= returned + cap, "{log:?}");
+    let waits: &[&str] = if opened {
+        &["starting a client operation", "sending", "the answer"]
+    } else {
+        &["starting a client operation"]
+    };
+    assert!(armed_at(&log, waits, Some(at)), "{log:?}");
+    assert!(open_deadline.is_none_or(|open| open.at() == at));
+    assert!(matches!(&ended, Err(Refusal::Os { why, .. }) if why.contains("caller")));
+    assert!(
+        returned >= at,
+        "refused {:?} before its deadline",
+        at.saturating_duration_since(returned)
+    );
+    assert!(matches!(sibling, Ok(Answer::Done)), "{sibling:?}");
     assert!(clean);
-    assert_eq!(closed, Some(0));
-    assert_eq!(outbound.len(), 3);
-    assert_eq!(outbound[0].0, outbound[2].0);
-    assert!(matches!(outbound[1].1, Request::Call(Call::Start(_))));
-    assert_eq!(outbound[2].1, Request::Release);
+    let starts: Vec<&(u64, Request)> = outbound
+        .iter()
+        .filter(|(_, request)| matches!(request, Request::Call(Call::Start(_))))
+        .collect();
+    assert_eq!(starts.len(), 1, "{outbound:?}");
+    if opened {
+        assert!(!reading, "an offered open must relinquish the reader turn");
+        assert_eq!(closed, Some(0));
+        assert_eq!(outbound.len(), 3);
+        assert_eq!(outbound[0].0, outbound[2].0);
+        assert!(matches!(outbound[1].1, Request::Call(Call::Start(_))));
+        assert_eq!(outbound[2].1, Request::Release);
+    }
 }
 
 fn absolute_spec() -> BoxSpec {
@@ -1554,32 +2234,54 @@ fn absolute_operations_reject_expired_before_effects() {
     assert!(state.closed.is_none());
 }
 
-/// AC-T7.4.1: run/delete use the actual Core answer path with no configured Link
-/// cap and an unarmed Measuring wait. Caller expiry is not a learned sample.
+/// The run (or the delete) the absolute-operation control asks of `client` by `deadline`.
+fn absolute_operation<T: Transport>(
+    client: &Core<T>,
+    run: bool,
+    deadline: Instant,
+) -> Result<(), Refusal> {
+    if run {
+        client
+            .run_before(
+                absolute_spec(),
+                Program::of(&["unused"]),
+                Stdio::null(),
+                deadline,
+            )
+            .map(drop)
+    } else {
+        client.delete_before(&BoxId::new("absolute-operation-control").unwrap(), deadline)
+    }
+}
+
+/// AC-T7.4.1: run/delete use the actual Core answer path with no configured Link cap and an unarmed Measuring wait.
+/// Caller expiry is not a learned sample. Every wait each armed, in its own thread, at its one absolute deadline, and its
+/// refusal never before it. Each cap is this host's own ([`measured`]: the same call, answered as it is asked), taken as
+/// its call starts; whether the host let the call's request go before it is told to the census.
 #[test]
 fn absolute_operations_cap_unarmed_answers_without_link_defaults() {
+    /// The same run or delete, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.absolute_op_steps");
     /// The run's or the delete's refusal at its absolute cap.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.absolute_op_capped");
     for run in [true, false] {
+        let reply = if run {
+            Answer::Started { pid: 1 }
+        } else {
+            Answer::Done
+        };
+        let (cap, answered) = measured(&STEPS, move || {
+            absolute_operation(&configured(answering(reply, None)), run, answer_by(None))
+        });
+        answered.unwrap();
         let (transport, request) = stalled(None);
         let client = Arc::new(configured(AbsoluteStalled(transport)));
         let control = Arc::clone(&client);
         let (finished, answer) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
-            let deadline = Instant::now().checked_add(CAP).unwrap();
-            let result = if run {
-                control
-                    .run_before(
-                        absolute_spec(),
-                        Program::of(&["unused"]),
-                        Stdio::null(),
-                        deadline,
-                    )
-                    .map(drop)
-            } else {
-                control.delete_before(&BoxId::new("absolute-operation-control").unwrap(), deadline)
-            };
-            let _ = finished.send(result);
+            let deadline = Instant::now().checked_add(cap).unwrap();
+            let result = absolute_operation(&control, run, deadline);
+            let _ = finished.send((deadline, Instant::now(), result, armed()));
         });
         // Its send precedes its answer, so it is read once the answer has come.
         let result = recv_from(&CAPPED, "the capped call's answer", &answer, &worker);
@@ -1590,13 +2292,30 @@ fn absolute_operations_cap_unarmed_answers_without_link_defaults() {
         ));
         let joined = worker.join();
         eprintln!(
-            "client_absolute run={run} observed_send={observed_send:?} result={result:?} joined={}",
+            "client_absolute run={run} cap={cap:?} observed_send={observed_send:?} result={result:?} joined={}",
             joined.is_ok()
         );
         joined.unwrap();
-        observed_send.unwrap();
+        let (deadline, returned, result, log) = result.unwrap();
+        let sent = observed_send.is_ok();
+        told_path(
+            "absolute_operations_cap_unarmed_answers_without_link_defaults",
+            sent,
+        );
+        let waits: &[&str] = if sent {
+            &["starting a client operation", "sending", "the answer"]
+        } else {
+            &["starting a client operation"]
+        };
+        assert!(armed_at(&log, waits, Some(deadline)), "{log:?}");
         assert!(
-            matches!(result.unwrap(), Err(Refusal::Os { why, .. }) if why.contains("absolute") && !why.contains(LEARNED))
+            matches!(&result, Err(Refusal::Os { why, .. }) if why.contains("absolute") && !why.contains(LEARNED)),
+            "{result:?}"
+        );
+        assert!(
+            returned >= deadline,
+            "refused {:?} before its deadline",
+            deadline.saturating_duration_since(returned)
         );
         let state = client.conn.shared.state().unwrap();
         assert!(state.calls.is_empty() && state.programs.is_empty() && state.given.is_empty());
@@ -1608,24 +2327,34 @@ fn absolute_operations_cap_unarmed_answers_without_link_defaults() {
     );
 }
 
-/// AC-T7.4.1: the same caller deadline bounds sender ownership without taking
-/// another sender's guard or positively reporting remote cleanup.
+/// AC-T7.4.1: the same caller deadline bounds sender ownership without taking another sender's guard or positively
+/// reporting remote cleanup: every wait the delete armed, in its own thread, at its one absolute deadline, its refusal
+/// never before it. The cap is this host's own ([`measured`]: the same delete, answered), taken as the delete starts.
 #[test]
 fn absolute_delete_cap_covers_queued_sender() {
+    /// The same delete, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.queued_delete_steps");
     /// The queued delete's refusal at its absolute cap, the sender held.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.queued_delete_capped");
+    let (cap, answered) = measured(&STEPS, || {
+        configured(answering(Answer::Done, None)).delete_before(
+            &BoxId::new("absolute-operation-control").unwrap(),
+            answer_by(None),
+        )
+    });
+    answered.unwrap();
     let (transport, request) = stalled(None);
     let client = Arc::new(configured(AbsoluteStalled(transport)));
     let whole = client.conn.shared.sending.lock(None).unwrap().unwrap();
     let control = Arc::clone(&client);
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        let deadline = Instant::now().checked_add(CAP).unwrap();
-        let _ = finished.send(
-            control.delete_before(&BoxId::new("absolute-operation-control").unwrap(), deadline),
-        );
+        let deadline = Instant::now().checked_add(cap).unwrap();
+        let result =
+            control.delete_before(&BoxId::new("absolute-operation-control").unwrap(), deadline);
+        let _ = finished.send((deadline, Instant::now(), result, armed()));
     });
-    let result = recv_on(&CAPPED, &answer);
+    let result = recv_from(&CAPPED, "the queued delete's answer", &answer, &worker);
     drop(whole);
     if result.is_err() {
         client
@@ -1635,7 +2364,21 @@ fn absolute_delete_cap_covers_queued_sender() {
     }
     let joined = worker.join();
     joined.unwrap();
-    assert!(matches!(result.unwrap(), Err(Refusal::Os { why, .. }) if why.contains("absolute")));
+    let (deadline, returned, result, log) = result.unwrap();
+    let queued = reached(&log, "the send lock");
+    told_path("absolute_delete_cap_covers_queued_sender", queued);
+    let waits: &[&str] = if queued {
+        &["starting a client operation", "sending", "the send lock"]
+    } else {
+        &["starting a client operation"]
+    };
+    assert!(armed_at(&log, waits, Some(deadline)), "{log:?}");
+    assert!(matches!(&result, Err(Refusal::Os { why, .. }) if why.contains("absolute")));
+    assert!(
+        returned >= deadline,
+        "refused {:?} before its deadline",
+        deadline.saturating_duration_since(returned)
+    );
     assert!(matches!(request.try_recv(), Err(mpsc::TryRecvError::Empty)));
     let state = client.conn.shared.state().unwrap();
     assert!(state.calls.is_empty() && state.programs.is_empty() && state.given.is_empty());
@@ -1651,24 +2394,13 @@ fn absolute_delete_cap_covers_queued_sender() {
     );
 }
 
-/// The refusals each deadline test makes, every one held to the bound: three, so std's condition variable, whose
-/// refusal comes inside twice a loaded host's slowest precise wait some of the time, passes only if all three do.
-#[cfg(target_os = "macos")]
-const REFUSALS: usize = 3;
-/// The precise waits before a deadline test's first refusal and after each: six, twenty-four in all. A refusal the host's
-/// load delays past twice the slowest of them needs every one of them to have come quickly: at the load ROOT's red ran
-/// under (load 18.5 on 18 cores, where 5 of 15 refusals came more than 5.5 ms late) that is (2/3)^24, 6e-5, so a run of
-/// three refusals fails that way under one time in ten thousand.
-#[cfg(target_os = "macos")]
-const CONTROLS: usize = 6;
-
-/// How late a precise wait comes past its deadline on this thread now: poll(2) of no descriptors to a deadline `CAP`
+/// How late a precise wait comes past its deadline on this thread now: poll(2) of no descriptors to a deadline `cap`
 /// from now. XNU sleeps it with the kernel's own leeway (an eighth of the wait, at most 1 ms, twice that while the user
 /// is idle) whatever the thread's QoS, and it is none of hex-wait's (docs/design/deadline-waits.md), so what it comes
 /// late by is the host's own: its timer, and the thread's wait for a core under the load the suites run at.
 #[cfg(target_os = "macos")]
-fn precise_lateness() -> Duration {
-    let deadline = Instant::now().checked_add(CAP).unwrap();
+fn precise_lateness(cap: Duration) -> Duration {
+    let deadline = Instant::now().checked_add(cap).unwrap();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -1680,67 +2412,67 @@ fn precise_lateness() -> Duration {
     }
 }
 
-/// `refusal`, a refusal at a deadline (what it gave, and how late past its deadline it came), made [`REFUSALS`] times on
-/// this thread between precise waits: [`CONTROLS`] before the first and after each, each taught to `precise`, so every
-/// refusal has the host's own lateness measured on both sides of it, in the same run and thread.
+/// `refusal`, a refusal at its absolute deadline `cap` from now, then a precise wait as long on the same thread: what
+/// the refusal gave, how late past its deadline it came (`None`: before it), and how late the precise wait came, with
+/// what the thread armed. The census's evidence of the host's lateness beside the refusal's, held to no bound (the waits
+/// audit, ROOT's ruling of 2026-11-13): a loaded host's lateness is its wait for a core, which no bound tells from the
+/// wait's own, and the wait's own is held by what it arms (hex-wait's
+/// `ac_t7_4_1_a_deadline_wait_arms_a_critical_one_shot_timer_at_its_deadline`).
 #[cfg(target_os = "macos")]
-fn beside_precise_waits<T>(
-    precise: &Patience,
-    mut refusal: impl FnMut() -> (T, Duration),
-) -> Vec<(T, Duration)> {
-    let teach = || {
-        for _ in 0..CONTROLS {
-            hex_testkit::waits::answered(precise, precise_lateness());
-        }
-    };
-    teach();
-    let mut refusals = Vec::new();
-    for _ in 0..REFUSALS {
-        refusals.push(refusal());
-        teach();
-    }
-    refusals
+fn beside_a_precise_wait<T>(
+    cap: Duration,
+    refusal: impl FnOnce(Instant) -> T,
+) -> (T, Option<Duration>, Duration, Vec<Armed>) {
+    let deadline = Instant::now().checked_add(cap).unwrap();
+    let refused = refusal(deadline);
+    let late = Instant::now().checked_duration_since(deadline);
+    (refused, late, precise_lateness(cap), armed())
 }
 
-/// The wait the deadline tests hold each refusal to: twice the slowest precise wait recorded or seen, as every test
-/// wait's patience is (hex_core::patience), seeded from `waits::OVERSHOOT` (the NOTE_CRITICAL timer's slowest of 1,000
-/// waits on idle Macs) and taught by the run's own precise waits ([`beside_precise_waits`]), so the bound rises with the
-/// load the suites run at, never past what std's condition variable comes to at utility QoS, four times the wait and
-/// 75 ms. The census gets each precise wait, named `test.hex_client.budget.precise_late`: the record of a precise wait
-/// under the suites' load.
+/// The census's rows of how late a deadline test's refusal came, and a precise wait beside it: each told, held to no
+/// bound.
 #[cfg(target_os = "macos")]
-fn precise_patience() -> Patience {
-    Patience::seeded(
-        "test.hex_client.budget.precise_late",
-        hex_testkit::waits::OVERSHOOT,
-    )
+fn tell_lateness(refusal: &Patience, late: Duration, precise: Duration) {
+    /// A precise wait's lateness under the suites' load, beside each refusal.
+    static PRECISE: Patience = Patience::measuring("test.hex_client.budget.precise_late");
+    hex_testkit::waits::answered(refusal, late);
+    hex_testkit::waits::answered(&PRECISE, precise);
 }
 
-/// AC-T7.4.1: do queue actual deletes behind the held sender, each with an absolute deadline, between precise waits on
-/// the same thread; expect each refused no later than its deadline and twice the slowest precise wait recorded or seen
-/// ([`precise_patience`]). The deadline is the claim under test. macOS times std's condition variable waits by the
-/// waiting thread's QoS: at utility QoS a queued sender capped at 25 ms was refused at 95.1 and 98.6 ms (the waits census
-/// on 75694786, at cb166de1).
+/// AC-T7.4.1: do queue an actual delete behind the held sender, with an absolute deadline; expect it refused as its
+/// absolute deadline refuses it, while the sender is still held, so its deadline is the refusal's one cause, and never
+/// before that deadline, every wait it armed at that one deadline. How late it came, and a precise wait's lateness beside
+/// it, go to the census, held to no bound ([`beside_a_precise_wait`]). The cap is this host's own ([`measured`]: the
+/// same delete, answered). macOS times std's condition variable waits by the waiting thread's QoS: at utility QoS a
+/// queued sender capped at 25 ms was refused at 95.1 and 98.6 ms (the waits census on 75694786, at cb166de1), which
+/// hex-wait's critical timer replaced.
 #[cfg(target_os = "macos")]
 #[test]
 fn ac_t7_4_1_a_queued_sender_is_refused_by_its_deadline() {
-    /// The queued deletes' refusals at their absolute deadlines, the sender held, and the precise waits beside them.
+    /// The same delete, answered.
+    static STEPS: Patience =
+        Patience::measuring("test.hex_client.budget.queued_delete_deadline_steps");
+    /// The queued delete's refusal at its absolute deadline, the sender held.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.queued_delete_deadline");
+    /// How late past its deadline it came.
+    static LATE: Patience = Patience::measuring("test.hex_client.budget.queued_delete_late");
+    let (cap, answered) = measured(&STEPS, || {
+        configured(answering(Answer::Done, None))
+            .delete_before(&BoxId::new("deadline-control").unwrap(), answer_by(None))
+    });
+    answered.unwrap();
     let (transport, request) = stalled(None);
     let client = Arc::new(configured(AbsoluteStalled(transport)));
     let whole = client.conn.shared.sending.lock(None).unwrap().unwrap();
     let control = Arc::clone(&client);
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        let precise = precise_patience();
-        let refusals = beside_precise_waits(&precise, || {
-            let deadline = Instant::now().checked_add(CAP).unwrap();
-            let refused = control.delete_before(&BoxId::new("deadline-control").unwrap(), deadline);
-            (refused, Instant::now().saturating_duration_since(deadline))
-        });
-        let _ = finished.send((refusals, precise.deadline()));
+        let _ = finished.send(beside_a_precise_wait(cap, |deadline| {
+            control.delete_before(&BoxId::new("deadline-control").unwrap(), deadline)
+        }));
     });
-    let result = recv_on(&CAPPED, &answer);
+    let result = recv_from(&CAPPED, "the queued delete's answer", &answer, &worker);
+    // Held until its refusal came: no other cause could refuse it.
     drop(whole);
     if result.is_err() {
         client
@@ -1749,47 +2481,56 @@ fn ac_t7_4_1_a_queued_sender_is_refused_by_its_deadline() {
             .end(Refusal::Broken("deadline queued-send cleanup".into()));
     }
     worker.join().unwrap();
-    let (refusals, bound) = result.unwrap();
-    for (refused, late) in refusals {
-        assert!(matches!(refused, Err(Refusal::Os { why, .. }) if why.contains("absolute")));
-        // None while the waits census measures: each lateness is recorded, held to no bound.
-        if let Some(bound) = bound {
-            assert!(
-                late <= bound,
-                "refused {late:?} past its deadline, past twice the slowest precise wait recorded or seen, {bound:?}"
-            );
-        }
-    }
+    let (refused, late, precise, log) = result.unwrap();
+    assert!(matches!(refused, Err(Refusal::Os { why, .. }) if why.contains("absolute")));
+    let at = armed_instant(&log).expect("the delete armed its deadline in its own thread");
+    let queued = reached(&log, "the send lock");
+    told_path(
+        "ac_t7_4_1_a_queued_sender_is_refused_by_its_deadline",
+        queued,
+    );
+    let waits: &[&str] = if queued {
+        &["starting a client operation", "sending", "the send lock"]
+    } else {
+        &["starting a client operation"]
+    };
+    assert!(armed_at(&log, waits, Some(at)), "{log:?}");
+    tell_lateness(&LATE, late.expect("refused before its deadline"), precise);
     assert!(matches!(request.try_recv(), Err(mpsc::TryRecvError::Empty)));
 }
 
-/// AC-T7.4.1: do send actual deletes, each with an absolute deadline, while another call holds the reader's turn, so
-/// each waits for its answer on its mailbox, between precise waits on the same thread; expect each refused no later than
-/// its deadline and twice the slowest precise wait recorded or seen ([`precise_patience`]). The deadline is the claim
-/// under test. macOS times std's channel receive, a dispatch semaphore's wait, by the waiting thread's QoS, as it times
-/// its condition variable.
+/// AC-T7.4.1: do send an actual delete with an absolute deadline while another call holds the reader's turn, so it
+/// waits for its answer on its mailbox; expect it refused as its absolute deadline refuses it, the turn still held, so
+/// its deadline is the refusal's one cause, and never before that deadline, every wait it armed at that one deadline.
+/// How late it came, and a precise wait's lateness beside it, go to the census, held to no bound
+/// ([`beside_a_precise_wait`]). The cap is this host's own ([`measured`]: the same delete, answered). macOS times std's
+/// channel receive, a dispatch semaphore's wait, by the waiting thread's QoS, as it times its condition variable.
 #[cfg(target_os = "macos")]
 #[test]
 fn ac_t7_4_1_a_call_waiting_for_its_answer_is_refused_by_its_deadline() {
-    /// The deletes' refusals at their absolute deadlines, their answers waited for on their mailboxes, and the precise
-    /// waits beside them.
+    /// The same delete, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.mailbox_deadline_steps");
+    /// The delete's refusal at its absolute deadline, its answer waited for on its mailbox.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.mailbox_deadline");
+    /// How late past its deadline it came.
+    static LATE: Patience = Patience::measuring("test.hex_client.budget.mailbox_late");
+    let (cap, answered) = measured(&STEPS, || {
+        configured(answering(Answer::Done, None))
+            .delete_before(&BoxId::new("mailbox-control").unwrap(), answer_by(None))
+    });
+    answered.unwrap();
     let (transport, request) = stalled(None);
     let client = Arc::new(configured(AbsoluteStalled(transport)));
-    // Held, as another call's would be: no call here can take the turn, so each waits on its mailbox.
+    // Held, as another call's would be: no call here can take the turn, so the delete waits on its mailbox.
     client.conn.shared.state().unwrap().reading = true;
     let control = Arc::clone(&client);
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        let precise = precise_patience();
-        let refusals = beside_precise_waits(&precise, || {
-            let deadline = Instant::now().checked_add(CAP).unwrap();
-            let refused = control.delete_before(&BoxId::new("mailbox-control").unwrap(), deadline);
-            (refused, Instant::now().saturating_duration_since(deadline))
-        });
-        let _ = finished.send((refusals, precise.deadline()));
+        let _ = finished.send(beside_a_precise_wait(cap, |deadline| {
+            control.delete_before(&BoxId::new("mailbox-control").unwrap(), deadline)
+        }));
     });
-    let result = recv_on(&CAPPED, &answer);
+    let result = recv_from(&CAPPED, "the delete's answer", &answer, &worker);
     if result.is_err() {
         client
             .conn
@@ -1797,43 +2538,47 @@ fn ac_t7_4_1_a_call_waiting_for_its_answer_is_refused_by_its_deadline() {
             .end(Refusal::Broken("mailbox deadline cleanup".into()));
     }
     worker.join().unwrap();
-    let (refusals, bound) = result.unwrap();
-    for (refused, late) in refusals {
-        assert!(matches!(refused, Err(Refusal::Os { why, .. }) if why.contains("absolute")));
-        // None while the waits census measures: each lateness is recorded, held to no bound.
-        if let Some(bound) = bound {
-            assert!(
-                late <= bound,
-                "refused {late:?} past its deadline, past twice the slowest precise wait recorded or seen, {bound:?}"
-            );
-        }
-    }
-    // Its requests went, and only their answers were waited for.
-    assert!(matches!(request.try_recv(), Ok(())));
-    assert!(client.conn.shared.state().unwrap().calls.is_empty());
+    let (refused, late, precise, log) = result.unwrap();
+    assert!(matches!(refused, Err(Refusal::Os { why, .. }) if why.contains("absolute")));
+    let at = armed_instant(&log).expect("the delete armed its deadline in its own thread");
+    let sent = request.try_recv().is_ok();
+    told_path(
+        "ac_t7_4_1_a_call_waiting_for_its_answer_is_refused_by_its_deadline",
+        sent,
+    );
+    let waits: &[&str] = if sent {
+        &["starting a client operation", "sending", "the answer"]
+    } else {
+        &["starting a client operation"]
+    };
+    assert!(armed_at(&log, waits, Some(at)), "{log:?}");
+    tell_lateness(&LATE, late.expect("refused before its deadline"), precise);
+    let state = client.conn.shared.state().unwrap();
+    assert!(state.reading && state.calls.is_empty());
 }
 
 /// AC-T7.4.1, decision 9: supplied instants survive unchanged; an earlier transport bound may shorten
 /// authority, no later/default bound can enlarge it, and a learned wait never replaces it:
 /// ending first it is a run-out to record, a tie the caller's; with no caller it bounds nothing,
-/// still the run-out to record as it passes (the person's ruling of 2026-11-13).
+/// still the run-out to record as it passes (the person's ruling of 2026-11-13). Its spans are the
+/// least and the longest one wait can have: none, ending as it is armed, and MOST_ONE_WAIT.
 #[test]
 fn absolute_caller_limit_keeps_original_instant_and_smaller_bounds() {
     let began = Instant::now();
-    let at = began.checked_add(LONG_CAP).unwrap();
+    let at = began.checked_add(MOST_ONE_WAIT).unwrap();
     let absolute = ReplyDeadline::caller_before(at).unwrap();
     assert_eq!(absolute.at(), at);
     assert_eq!(absolute.limited_by(None).at(), at);
-    let earlier = began.checked_add(CAP).unwrap();
+    let earlier = began;
     let configured = ReplyDeadline {
         at: earlier,
-        source: ReplyBound::Caller(CAP),
+        source: ReplyBound::Caller(Duration::ZERO),
     };
     let limited = absolute.limited_by(Some(configured));
     assert_eq!(limited.at(), earlier);
     let later = ReplyDeadline {
         at,
-        source: ReplyBound::Caller(LONG_CAP),
+        source: ReplyBound::Caller(MOST_ONE_WAIT),
     };
     assert_eq!(limited.limited_by(Some(later)).at(), earlier);
     let tied = absolute.limited_by(Some(later));
@@ -1841,16 +2586,16 @@ fn absolute_caller_limit_keeps_original_instant_and_smaller_bounds() {
     let (bound, learned) = ReplyDeadline::combine(Some(absolute), began, None);
     assert_eq!(bound.unwrap().at(), at);
     assert!(learned.is_none());
-    let (bound, learned) = ReplyDeadline::combine(Some(absolute), began, Some(CAP));
+    let (bound, learned) = ReplyDeadline::combine(Some(absolute), began, Some(Duration::ZERO));
     assert_eq!(bound.unwrap().at(), at);
     let learned = learned.unwrap();
     assert_eq!(learned.at(), earlier);
     assert!(matches!(learned.source, ReplyBound::Learned(_)));
-    let (bound, learned) = ReplyDeadline::combine(Some(absolute), began, Some(LONG_CAP));
+    let (bound, learned) = ReplyDeadline::combine(Some(absolute), began, Some(MOST_ONE_WAIT));
     assert_eq!(bound.unwrap().at(), at);
     assert!(learned.is_none(), "a tie belongs to caller authority");
     // With no caller's deadline nothing bounds the call: its learned wait is the run-out it tells as it passes.
-    let (bound, learned) = ReplyDeadline::combine(None, began, Some(CAP));
+    let (bound, learned) = ReplyDeadline::combine(None, began, Some(Duration::ZERO));
     assert!(bound.is_none(), "{bound:?}");
     let learned = learned.unwrap();
     assert_eq!(learned.at(), earlier);
@@ -1868,6 +2613,10 @@ struct AbsoluteNamedLink {
 }
 
 impl Link for AbsoluteNamedLink {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
         self.dial_before(port, None)
     }
@@ -1909,21 +2658,55 @@ fn absolute_pair() -> (TcpStream, TcpStream) {
     (client, peer)
 }
 
-/// AC-T7.4.1: actual guest Stream run setup with no Link default writes all three
-/// native named headers under one caller cap. No server answers the Run, so the
-/// same cap must also bound its unarmed control answer and close the asked ends.
-/// The cap ([`CAP`]) is the claim under test. A host too loaded to run the setup's steps within it has the cap end
-/// the setup instead: the dials made still share the one cap, the run is refused at it, and the streams it dialed
-/// are closed, but the three headers and the request are shown only where the setup came within the cap. No read
-/// here waits on a stream the fixture holds: those the run never dialed are let go before their peers are read (their
-/// peers once waited, with no bound, for an end only the fixture's drop would bring: 16 minutes on goal 12's run).
+/// AC-T7.4.1: actual guest Stream run setup with no Link default writes all three native named headers under one caller
+/// cap. No server answers the Run, so the same cap must also bound its unarmed control answer and close the asked ends.
+/// Every dial and wait the run armed, in its own thread, at its one absolute deadline, its refusal never before it. The
+/// cap is this host's own ([`measured`]: the same run, answered); a host too loaded to run the setup's steps within it
+/// has the cap end the setup instead: the dials made still share the one cap, the run is refused at it, and the streams
+/// it dialed are closed, but the three headers and the request are shown only where the setup came within the cap, the
+/// path told to the census. No read here waits on a stream the fixture holds: those the run never dialed are let go
+/// before their peers are read (their peers once waited, with no bound, for an end only the fixture's drop would
+/// bring: 16 minutes on goal 12's run).
 #[test]
 fn absolute_run_caps_named_stdio_and_preserves_headers() {
     use hex_core::stream::{self, Named};
+    /// The same run, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.absolute_run_steps");
     /// The run's refusal at its caller's cap, no answer come, the run's thread its party.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.absolute_run_capped");
-    let (control, mut control_peer) = absolute_pair();
-    control_peer.write_all(&11u64.to_le_bytes()).unwrap();
+    let (cap, measured_run) = {
+        let (control, peer) = control_pair(vec![
+            (1, Answer::Started { pid: 7 }),
+            (1, Answer::Exited(Exit::Code(0))),
+        ]);
+        let mut named = VecDeque::new();
+        let mut peers = Vec::new();
+        for _ in 0..3 {
+            let (stream, peer) = absolute_pair();
+            named.push_back(stream);
+            peers.push(peer);
+        }
+        let link = guest::own_link(AbsoluteNamedLink {
+            control: Mutex::new(Some(control)),
+            stdio: Arc::new(Mutex::new(named)),
+            deadlines: Arc::default(),
+        })
+        .unwrap();
+        let measured_run = measured(&STEPS, move || -> Result<Exit, Refusal> {
+            let client = configured(guest::Stream::dial(link)?);
+            let mut proc = client.run_before(
+                absolute_spec(),
+                Program::of(&["unused"]),
+                all_streams(),
+                answer_by(None),
+            )?;
+            hex_api::conformance::end_of(&mut proc)
+        });
+        drop((peer, peers));
+        measured_run
+    };
+    assert_eq!(measured_run.unwrap(), Exit::Code(0));
+    let (control, mut control_peer) = control_pair(Vec::new());
     let mut named = VecDeque::new();
     let mut peers = Vec::new();
     for _ in 0..3 {
@@ -1942,31 +2725,20 @@ fn absolute_run_caps_named_stdio_and_preserves_headers() {
     let transport = guest::Stream::dial(link).unwrap();
     let client = Arc::new(configured(transport));
     let control = Arc::clone(&client);
-    let (begun, began) = mpsc::sync_channel(1);
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        let deadline = Instant::now().checked_add(CAP).unwrap();
-        let _ = begun.send(deadline);
+        let deadline = Instant::now().checked_add(cap).unwrap();
         let result = control
             .run_before(
                 absolute_spec(),
                 Program::of(&["unused"]),
-                Stdio {
-                    ask: hex_api::Ask {
-                        stdin: true,
-                        stdout: true,
-                        stderr: true,
-                    },
-                    ..Stdio::null()
-                },
+                all_streams(),
                 deadline,
             )
             .map(drop);
-        let _ = finished.send(result);
+        let _ = finished.send((deadline, Instant::now(), result, armed()));
     });
-    // Its deadline's notice precedes its answer, so it is read once the answer has come.
     let result = recv_from(&CAPPED, "the capped run's answer", &answer, &worker);
-    let original = began.try_recv();
     if result.is_err() {
         client
             .conn
@@ -2005,28 +2777,39 @@ fn absolute_run_caps_named_stdio_and_preserves_headers() {
         .end(Refusal::Broken("absolute named observation over".into()));
     let request_seen = next_request(&mut control_peer);
     joined.unwrap();
-    let original = original.unwrap();
+    let (deadline, returned, result, log) = result.unwrap();
+    let progressed = left == 0 && request_seen.is_ok();
+    told_path(
+        "absolute_run_caps_named_stdio_and_preserves_headers",
+        progressed,
+    );
     eprintln!(
-        "client_absolute named_deadlines={recorded:?} caller={original:?} result={result:?} left={left} observed={observed:?} request={request_seen:?}"
+        "client_absolute named_deadlines={recorded:?} caller={deadline:?} result={result:?} left={left} observed={observed:?} request={request_seen:?} armed={log:?}"
     );
     assert!(matches!(
-        result.unwrap(),
-        Err(Refusal::Os { op, why }) if why.contains("caller") || op == "absolute fixture dial"
+        &result,
+        Err(Refusal::Os { op, why }) if why.contains("caller") || *op == "absolute fixture dial"
     ));
-    assert_eq!(recorded[0], (stream::CONTROL_PORT, None));
-    let stdio = &recorded[1..];
     assert!(
-        stdio.iter().all(|(port, at)| *port == stream::STDIO_PORT
-            && at.is_some_and(|at| at <= original)
-            && *at == stdio[0].1),
-        "the stdio dials share one cap: {recorded:?}"
+        returned >= deadline,
+        "refused {:?} before its deadline",
+        deadline.saturating_duration_since(returned)
+    );
+    assert!(
+        armed_at(&log, &["starting a client operation"], Some(deadline)),
+        "{log:?}"
+    );
+    assert_eq!(recorded[0], (stream::CONTROL_PORT, None));
+    assert!(
+        recorded[1..]
+            .iter()
+            .all(|(port, at)| *port == stream::STDIO_PORT && *at == Some(deadline)),
+        "the stdio dials share the run's one cap: {recorded:?}"
     );
     let observed: Vec<Vec<u8>> = observed.into_iter().map(Result::unwrap).collect();
     // Those never dialed came to their end with nothing.
     assert!(observed[3 - left..].iter().all(Vec::is_empty));
-    if left == 0
-        && let Ok((request_header, request)) = request_seen
-    {
+    if progressed && let Ok((request_header, request)) = request_seen {
         // The setup came within the cap: the request asked for all three, and each stream carries its header alone.
         assert!(matches!(
             request,
@@ -2054,7 +2837,7 @@ fn absolute_run_caps_named_stdio_and_preserves_headers() {
         assert!(
             names
                 .iter()
-                .all(|name| name.exec.conn == 11 && name.exec.id == request_header.id)
+                .all(|name| name.exec.conn == TOKEN && name.exec.id == request_header.id)
         );
         assert_eq!(names[0].stream, stream::Stdio::In);
         assert_eq!(names[1].stream, stream::Stdio::Out);
@@ -2100,22 +2883,62 @@ impl Transport for DropOriginal {
 
 /// AC-T7.4.1 original regression: after run_before's absolute cap expires,
 /// returning an observer error must not renew authority while dropping its actual
-/// unfinished RemoteProc. Only the existing sender guard delays that Drop here.
+/// unfinished RemoteProc. Only the existing sender guard delays that Drop here. Every
+/// wait the run armed, and every one the Proc's release armed in the dropping thread,
+/// at the run's one absolute deadline. The cap is this host's own ([`measured`]: the
+/// same run, answered and its Proc dropped); where the host let the run's answer come
+/// only past it, the run's refusal is checked instead, its path told to the census.
 #[test]
 fn absolute_run_error_return_does_not_renew_drop_sender_budget() {
+    /// The same run, answered and its Proc dropped.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.drop_steps");
     /// The observer's error return, its unfinished Proc dropped with the sender held.
     static RETURNED: Patience = Patience::measuring("test.hex_client.budget.drop_returned");
+    let (cap, answered) = measured(&STEPS, || {
+        let (io, _) = stalled(None);
+        configured(DropOriginal(Offers::unobserved(io)))
+            .run_before(
+                absolute_spec(),
+                Program::of(&["owned-drop-original"]),
+                Stdio::null(),
+                answer_by(None),
+            )
+            .map(drop)
+    });
+    answered.unwrap();
     let (io, _) = stalled(None);
     let client = Arc::new(configured(DropOriginal(Offers::unobserved(io))));
-    let original = Instant::now().checked_add(CAP).unwrap();
-    let mut process = client
-        .run_before(
-            absolute_spec(),
-            Program::of(&["owned-drop-original"]),
-            Stdio::null(),
-            original,
-        )
-        .unwrap();
+    let _ = armed();
+    let original = Instant::now().checked_add(cap).unwrap();
+    let ran = client.run_before(
+        absolute_spec(),
+        Program::of(&["owned-drop-original"]),
+        Stdio::null(),
+        original,
+    );
+    let ran_returned = Instant::now();
+    let run_log = armed();
+    told_path(
+        "absolute_run_error_return_does_not_renew_drop_sender_budget",
+        ran.is_ok(),
+    );
+    assert!(
+        armed_at(&run_log, &["starting a client operation"], Some(original)),
+        "{run_log:?}"
+    );
+    let mut process = match ran {
+        Ok(process) => process,
+        Err(refused) => {
+            // The host held this thread off a core past its cap before the run's answer: its refusal, never early.
+            assert!(
+                matches!(&refused, Refusal::Os { why, .. } if why.contains("absolute")),
+                "{refused:?}"
+            );
+            assert!(ran_returned >= original);
+            assert!(client.conn.shared.state().unwrap().programs.is_empty());
+            return;
+        }
+    };
     let run_id = {
         let sent = client.conn.shared.transport.0.outbound.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -2148,7 +2971,7 @@ fn absolute_run_error_return_does_not_renew_drop_sender_budget() {
             };
             // This return must run RemoteProc::drop before the result can be sent.
             let result = fail_observer();
-            let _ = finished.send((Instant::now(), result));
+            let _ = finished.send((Instant::now(), result, armed()));
         })
         .unwrap();
 
@@ -2159,7 +2982,7 @@ fn absolute_run_error_return_does_not_renew_drop_sender_budget() {
     let expired = until(original);
     let released = release.send(());
     // Its notice that it began precedes its answer, so it is read once the answer has come.
-    let before_cleanup = recv_on(&RETURNED, &answer);
+    let before_cleanup = recv_on(&RETURNED, "the worker's answer", &answer);
     let began = started.try_recv();
     let before_release_at = Instant::now();
     drop(held);
@@ -2187,7 +3010,7 @@ fn absolute_run_error_return_does_not_renew_drop_sender_budget() {
             state.calls.is_empty() && state.programs.is_empty() && state.given.is_empty()
         });
     eprintln!(
-        "client_drop_original run_id={run_id} original={original:?} cap={CAP:?} held={held_exact_guard} expired={expired:?} gate={released:?} began={began:?} before_release={before_release_at:?} before_cleanup={before_cleanup:?} after_cleanup={after_cleanup:?} release_count={release_count} other_count={other_count} joined={} clean={clean:?}",
+        "client_drop_original run_id={run_id} original={original:?} cap={cap:?} held={held_exact_guard} expired={expired:?} gate={released:?} began={began:?} before_release={before_release_at:?} before_cleanup={before_cleanup:?} after_cleanup={after_cleanup:?} release_count={release_count} other_count={other_count} joined={} clean={clean:?}",
         joined.is_ok()
     );
     joined.unwrap();
@@ -2215,7 +3038,12 @@ fn absolute_run_error_return_does_not_renew_drop_sender_budget() {
         before_cleanup.is_ok(),
         "original absolute deadline was lost: the observer's final error return waited in unfinished Proc::drop until its held sender was released"
     );
-    let (returned, result) = before_cleanup.unwrap();
+    let (returned, result, release_log) = before_cleanup.unwrap();
+    // The Proc's release, in the dropping thread, armed at the run's original deadline, never a fresh one.
+    assert!(
+        armed_at(&release_log, &["releasing a program"], Some(original)),
+        "{release_log:?}"
+    );
     assert!(returned <= before_release_at);
     assert!(matches!(
         result,
@@ -2229,6 +3057,8 @@ fn absolute_run_error_return_does_not_renew_drop_sender_budget() {
 struct BootstrapProbe {
     io: Offers,
     reply: Mutex<Option<Answer>>,
+    /// The caller's budget it gives each call, where it gives one.
+    budget: Option<Duration>,
 }
 
 impl Transport for BootstrapProbe {
@@ -2240,6 +3070,9 @@ impl Transport for BootstrapProbe {
         &WAITS
     }
 
+    fn reply_budget(&self) -> Option<Duration> {
+        self.budget
+    }
     fn reading(&self) {}
     fn handle(&self) -> Handle<'_> {
         self.io.handle()
@@ -2266,6 +3099,7 @@ fn bootstrap_probe(reply: Option<Answer>) -> (Core<BootstrapProbe>, mpsc::Receiv
         configured(BootstrapProbe {
             io: Offers::unobserved(io),
             reply: Mutex::new(reply),
+            budget: None,
         }),
         sent,
     )
@@ -2279,7 +3113,7 @@ enum BootstrapCall {
 }
 
 impl BootstrapCall {
-    fn invoke(self, client: &Core<BootstrapProbe>, at: Instant) -> Result<Answer, Refusal> {
+    fn invoke<T: Transport>(self, client: &Core<T>, at: Instant) -> Result<Answer, Refusal> {
         match self {
             Self::Capacity => client.capacity_before(Class::Oci, at).map(Answer::Capacity),
             Self::PhysicalReport => client
@@ -2314,6 +3148,8 @@ impl BootstrapCall {
                     route: None,
                     last_resort: None,
                     ended: None,
+                    control: None,
+                    control_wake: None,
                     credentials: Vec::new(),
                 })
             }
@@ -2328,6 +3164,52 @@ impl BootstrapCall {
             _ => false,
         }
     }
+}
+
+/// AC-T7.4.1, ROOT's seam of 2026-11-14: do make an actual capacity call under an absolute deadline, answered as it is
+/// asked, twice, and once with no deadline, each on this thread, then read this thread's armed log and another's. Expect
+/// the capped call's check, send, send lock and answer wait each armed at the one instant given, every other check of it
+/// too; the second call's learned wait, its kind answered by then, tagged learned and before that instant; the uncapped
+/// call's send and answer wait armed with none; and the other thread's log empty: what a call arms lands in its own
+/// thread's. Its calls' learned waits are its own ([`Apart`]): another test's capacity call that ran its wait out had
+/// the second call here follow its party, no learned wait armed (r378, the whole crate's tests side by side).
+#[test]
+fn the_armed_log_holds_each_deadline_an_operation_arms_in_its_own_thread() {
+    const CAPPED: &[&str] = &[
+        "starting a client operation",
+        "sending",
+        "the send lock",
+        "the answer",
+    ];
+    let (io, _) = stalled(None);
+    let client = configured(Apart::<true>(BootstrapProbe {
+        io: Offers::unobserved(io),
+        reply: Mutex::new(Some(Answer::Capacity(None))),
+        budget: None,
+    }));
+    let _ = armed();
+    let at = answer_by(None);
+    assert_eq!(client.capacity_before(Class::Oci, at), Ok(None));
+    let first = armed();
+    assert!(armed_at(&first, CAPPED, Some(at)), "{first:?}");
+    *client.conn.shared.transport.0.reply.lock().unwrap() = Some(Answer::Capacity(None));
+    assert_eq!(client.capacity_before(Class::Oci, at), Ok(None));
+    let second = armed();
+    assert!(armed_at(&second, CAPPED, Some(at)), "{second:?}");
+    assert!(
+        second.iter().any(|armed| armed.what == "the answer"
+            && armed.learned
+            && armed.at.is_some_and(|learned| learned < at)),
+        "{second:?}"
+    );
+    *client.conn.shared.transport.0.reply.lock().unwrap() = Some(Answer::Capacity(None));
+    assert_eq!(client.capacity(Class::Oci), Ok(None));
+    let uncapped = armed();
+    assert!(
+        armed_at(&uncapped, &["sending", "the answer"], None),
+        "{uncapped:?}"
+    );
+    assert_eq!(std::thread::spawn(armed).join().unwrap(), Vec::new());
 }
 
 /// AC-T7.4.1: all three bootstrap wrappers retain typed request/answer/refusal
@@ -2360,7 +3242,11 @@ fn absolute_bootstrap_preserves_requests_and_typed_answers() {
         let reply = kind.reply();
         let expected = wire::answer(0, &reply, wire::MAX_MESSAGE).unwrap();
         let (client, _) = bootstrap_probe(Some(reply));
-        let got = within(&ANSWERED, |by| kind.invoke(&client, answer_by(by))).unwrap();
+        // A call that can't be cut: its answer, or its refusal, given no deadline.
+        let got = follow::whole(&ANSWERED, "the bootstrap call's answer", || {
+            kind.invoke(&client, answer_by(None))
+        })
+        .unwrap();
         assert_eq!(wire::answer(0, &got, wire::MAX_MESSAGE).unwrap(), expected);
         let outbound = client.conn.shared.transport.io.outbound.lock().unwrap();
         assert_eq!(outbound.len(), 1);
@@ -2370,23 +3256,30 @@ fn absolute_bootstrap_preserves_requests_and_typed_answers() {
 
         let (client, _) = bootstrap_probe(Some(Answer::Done));
         assert!(matches!(
-            within(&ANSWERED, |by| kind.invoke(&client, answer_by(by))),
+            follow::whole(&ANSWERED, "the bootstrap call's answer", || kind
+                .invoke(&client, answer_by(None))),
             Err(Refusal::Broken(_))
         ));
 
         let why = Refusal::Broken("owned typed bootstrap refusal".into());
         let (client, _) = bootstrap_probe(Some(Answer::Refused(why.clone())));
         assert_eq!(
-            within(&ANSWERED, |by| kind.invoke(&client, answer_by(by))),
+            follow::whole(&ANSWERED, "the bootstrap call's answer", || kind
+                .invoke(&client, answer_by(None))),
             Err(why)
         );
     }
 }
 
-/// AC-T7.4.1: even an unarmed answer kind and absent relative transport budget
-/// cannot extend the original bootstrap authority. Cleanup/join precedes assertions.
+/// AC-T7.4.1: even an unarmed answer kind and absent relative transport budget cannot extend the original bootstrap
+/// authority. Cleanup/join precedes assertions. Every wait each call armed, in its own thread, at its one absolute
+/// deadline, its refusal never before it. Each cap is this host's own ([`measured`]: the same call, answered as it is
+/// asked), taken in the call's own thread as it starts; whether the host let its request go before it is told to the
+/// census.
 #[test]
 fn absolute_bootstrap_caps_unarmed_answer_waits() {
+    /// The same bootstrap call, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.bootstrap_steps");
     /// The bootstrap call's refusal at its absolute cap, no answer come.
     static CAPPED: Patience = Patience::measuring("test.hex_client.budget.bootstrap_capped");
     for kind in [
@@ -2394,14 +3287,18 @@ fn absolute_bootstrap_caps_unarmed_answer_waits() {
         BootstrapCall::PhysicalReport,
         BootstrapCall::Create,
     ] {
+        let (cap, answered) = measured(&STEPS, move || {
+            kind.invoke(&configured(answering(kind.reply(), None)), answer_by(None))
+        });
+        answered.unwrap();
         let (client, sent) = bootstrap_probe(None);
         let client = Arc::new(client);
         let control = Arc::clone(&client);
-        let at = Instant::now().checked_add(CAP).unwrap();
         let (finished, answer) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
+            let at = Instant::now().checked_add(cap).unwrap();
             let result = kind.invoke(&control, at);
-            let _ = finished.send(result);
+            let _ = finished.send((at, Instant::now(), result, armed()));
         });
         // Its send precedes its answer, so it is read once the answer has come.
         let observed = recv_from(
@@ -2420,18 +3317,35 @@ fn absolute_bootstrap_caps_unarmed_answer_waits() {
             state.calls.is_empty() && state.programs.is_empty() && state.given.is_empty()
         });
         eprintln!(
-            "client_bootstrap_absolute kind={kind:?} at={at:?} send={observed_send:?} observed={observed:?} joined={} clean={clean:?}",
+            "client_bootstrap_absolute kind={kind:?} cap={cap:?} send={observed_send:?} observed={observed:?} joined={} clean={clean:?}",
             joined.is_ok()
         );
         joined.unwrap();
-        observed_send.unwrap();
-        assert_eq!(outbound.len(), 1);
-        assert!(kind.matches_request(&outbound[0].1));
+        let (at, returned, refused, log) = observed.unwrap();
+        let sent = observed_send.is_ok();
+        told_path("absolute_bootstrap_caps_unarmed_answer_waits", sent);
+        let waits: &[&str] = if sent {
+            &["starting a client operation", "sending", "the answer"]
+        } else {
+            &["starting a client operation"]
+        };
+        assert!(armed_at(&log, waits, Some(at)), "{log:?}");
+        if sent {
+            assert_eq!(outbound.len(), 1);
+            assert!(kind.matches_request(&outbound[0].1));
+        } else {
+            assert!(outbound.is_empty(), "{outbound:?}");
+        }
         assert!(clean.unwrap());
         assert!(matches!(
-            observed.unwrap(),
+            refused,
             Err(Refusal::Os { why, .. }) if why.contains("absolute") && !why.contains(LEARNED)
         ));
+        assert!(
+            returned >= at,
+            "refused {:?} before its deadline",
+            at.saturating_duration_since(returned)
+        );
     }
 }
 
@@ -2567,12 +3481,40 @@ impl Transport for SettleOriginal {
 }
 
 /// AC-T7.4.1 original: an actual Started followed by a bounded stream-settlement
-/// refusal must not replace run_before's authority with a fresh Kill answer wait.
+/// refusal must not replace run_before's authority with a fresh Kill answer wait: the
+/// setup's deadline, and every wait the run and its Kill armed in the run's thread, at
+/// the run's one absolute deadline, its refusal never before it. The cap is this host's
+/// own ([`measured`]: the same run, its Kill answered), taken in the run's own thread;
+/// whether the host let its Kill go before it is told to the census.
 #[test]
 fn absolute_run_settle_error_does_not_renew_kill_answer_budget() {
+    /// The same run, its Kill answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.settle_original_steps");
     /// The run's return, its settle refused and its Kill unanswered within its original authority.
     static RETURNED: Patience =
         Patience::measuring("test.hex_client.budget.settle_original_returned");
+    let (cap, answered) = measured(&STEPS, || {
+        let (io, _) = stalled(None);
+        let (starting, _) = mpsc::sync_channel(1);
+        let (killing, _) = mpsc::sync_channel(1);
+        configured(SettleOriginal {
+            io: Offers::unobserved(io),
+            setup: Mutex::new(None),
+            started: starting,
+            kill: killing,
+            exits: AtomicUsize::new(0),
+            kill_answer: Mutex::new(Some(Answer::Done)),
+            budget: None,
+        })
+        .run_before(
+            absolute_spec(),
+            Program::of(&["owned-settle-original"]),
+            stdin_alone(),
+            answer_by(None),
+        )
+        .map(drop)
+    });
+    assert!(answered.is_err(), "the measured run's settle is refused");
     let (io, _) = stalled(None);
     let (starting, started) = mpsc::sync_channel(1);
     let (killing, killed) = mpsc::sync_channel(1);
@@ -2586,42 +3528,29 @@ fn absolute_run_settle_error_does_not_renew_kill_answer_budget() {
         budget: None,
     }));
     let control = Arc::clone(&client);
-    let original = Instant::now().checked_add(CAP).unwrap();
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
         .name("owned-settle-original".into())
         .spawn(move || {
-            eprintln!("client_settle_phase phase=run_begin original={original:?}");
+            let original = Instant::now().checked_add(cap).unwrap();
             let result = control
                 .run_before(
                     absolute_spec(),
                     Program::of(&["owned-settle-original"]),
-                    Stdio {
-                        ask: hex_api::Ask {
-                            stdin: true,
-                            ..hex_api::Ask::default()
-                        },
-                        ..Stdio::null()
-                    },
+                    stdin_alone(),
                     original,
                 )
                 .map(drop);
-            eprintln!("client_settle_phase phase=worker_return result={result:?}");
-            let _ = finished.send((Instant::now(), result));
+            let _ = finished.send((original, Instant::now(), result, armed()));
         })
         .unwrap();
 
     // Capture every error branch; end ONLY this connection, close its retained
     // pipe, and join this worker BEFORE asserting any result or phase witness. Its Started
     // and its Kill precede its answer, so each is read once the answer has come.
-    let before_cleanup = recv_on(&RETURNED, &answer);
+    let before_cleanup = recv_on(&RETURNED, "the worker's answer", &answer);
     let actual_started = started.try_recv();
     let actual_kill = killed.try_recv();
-    let expired = until(original);
-    let cleanup_at = Instant::now();
-    eprintln!(
-        "client_settle_phase phase=cleanup_begin started={actual_started:?} kill={actual_kill:?} before={before_cleanup:?}"
-    );
     client
         .conn
         .shared
@@ -2666,45 +3595,66 @@ fn absolute_run_settle_error_does_not_renew_kill_answer_budget() {
             && state.waiting.is_empty()
     });
     eprintln!(
-        "client_settle_original original={original:?} cap={CAP:?} setup={setup:?} started={actual_started:?} kill={actual_kill:?} runs={run_ids:?} kills={kills:?} exits={exits} releases={releases} before_cleanup={before_cleanup:?} cleanup_at={cleanup_at:?} after_cleanup={after_cleanup:?} pipe_owned={pipe_was_owned} pipe_poisoned={pipe_poisoned} joined={} clean={clean:?}",
+        "client_settle_original cap={cap:?} setup={setup:?} started={actual_started:?} kill={actual_kill:?} runs={run_ids:?} kills={kills:?} exits={exits} releases={releases} before_cleanup={before_cleanup:?} after_cleanup={after_cleanup:?} pipe_owned={pipe_was_owned} pipe_poisoned={pipe_poisoned} joined={} clean={clean:?}",
         joined.is_ok()
     );
     joined.unwrap();
-    expired.unwrap();
-    assert!(pipe_was_owned);
+    let (original, returned, result, log) = before_cleanup.unwrap();
+    let progressed = !kills.is_empty();
+    told_path(
+        "absolute_run_settle_error_does_not_renew_kill_answer_budget",
+        progressed,
+    );
+    // What the run armed, its Kill's waits among them: its one deadline, never a fresh one.
+    assert!(
+        armed_at(&log, &["starting a client operation"], Some(original)),
+        "{log:?}"
+    );
+    assert!(
+        setup.is_none_or(|(_, _, deadline)| deadline.at() == original),
+        "{setup:?}"
+    );
     assert!(!pipe_poisoned);
     assert!(transport.io.io.closed.load(Ordering::Acquire));
     assert!(transport.io.program.lock().unwrap().is_none());
     assert!(clean.unwrap());
     assert_eq!(transport.reply_budget(), None);
-    assert_eq!(run_ids.len(), 1);
     assert_eq!(exits, 0);
-    let (exec, ask, cap) = setup.unwrap();
-    assert_eq!(exec, run_ids[0]);
-    assert!(ask.stdin && !ask.stdout && !ask.stderr);
-    assert_eq!(cap.at(), original);
-    assert_eq!(actual_started.unwrap().0, exec);
-    if before_cleanup.is_err() {
-        // In the original, this positive witness localizes the delay AFTER the
-        // zero-duration wait(None) poll: it reached the real unarmed Kill call.
-        let (request, target, _) = actual_kill.expect("missing Kill is an unverified phase");
+    assert!(
+        returned >= original,
+        "refused {:?} before its deadline",
+        original.saturating_duration_since(returned)
+    );
+    if progressed {
+        // Its Started, its settle refused, then one Kill, unanswered: its answer's wait at the run's deadline.
+        assert!(pipe_was_owned);
+        assert_eq!(run_ids.len(), 1);
+        let (exec, ask, _) = setup.unwrap();
+        assert_eq!(exec, run_ids[0]);
+        assert!(ask.stdin && !ask.stdout && !ask.stderr);
+        assert_eq!(actual_started.unwrap().0, exec);
+        let (request, target, _) = actual_kill.expect("its Kill went out");
         assert_eq!(target, exec);
         assert_eq!(kills, [(request, exec)]);
+        assert!(armed_at(&log, &["the answer"], Some(original)), "{log:?}");
+        assert!(
+            matches!(&result, Err(Refusal::Lifecycle { id, cause: hex_api::LifecycleCause::Uncertain, .. }) if *id == absolute_spec().id),
+            "a Kill unanswered within the original authority leaves the run's end uncertain: {result:?}"
+        );
+    } else {
+        // Its cap passed first: refused by it, before its Kill, never early.
+        assert!(
+            matches!(&result, Err(Refusal::Os { why, .. }) if why.contains("absolute"))
+                || matches!(
+                    &result,
+                    Err(Refusal::Lifecycle {
+                        cause: hex_api::LifecycleCause::Uncertain,
+                        ..
+                    })
+                ),
+            "{result:?}"
+        );
     }
-    let returned_error = before_cleanup
-        .as_ref()
-        .ok()
-        .or_else(|| after_cleanup.as_ref().ok());
-    assert!(
-        matches!(returned_error, Some((_, Err(Refusal::Lifecycle { id, cause: hex_api::LifecycleCause::Uncertain }))) if *id == absolute_spec().id),
-        "a Kill unanswered within the original authority leaves the run's end uncertain"
-    );
-    assert!(
-        before_cleanup.is_ok(),
-        "original stream-settlement error return exceeded run_before authority while waiting for the ordinary Kill answer"
-    );
-    let (returned, _) = before_cleanup.unwrap();
-    assert!(returned <= cleanup_at);
 }
 
 /// How a settle test starts its program: under run_before's explicit cap, whose failed setup
@@ -2824,8 +3774,9 @@ fn a_settle_failure_whose_kill_is_refused_is_uncertain_and_never_released() {
         .into_iter()
         .map(|start| {
             let refused = Refusal::os("killing the program", "the model agent refuses");
-            within(&SETTLED, |by| {
-                settle_failure(start, Answer::Refused(refused), by)
+            // A whole scenario, which can't be cut: given no deadline, its own waits following their parties.
+            follow::whole(&SETTLED, "a settle failure's scenario", || {
+                settle_failure(start, Answer::Refused(refused), None)
             })
         })
         .collect();
@@ -2839,12 +3790,15 @@ fn a_settle_failure_whose_kill_is_refused_is_uncertain_and_never_released() {
             settled.kills, settled.starts,
             "{start:?}: one Kill, of its exec"
         );
-        assert_eq!(
-            settled.result,
-            Err(Refusal::Lifecycle {
-                id: settled.id,
-                cause: hex_api::LifecycleCause::Uncertain,
-            }),
+        assert!(
+            matches!(
+                &settled.result,
+                Err(Refusal::Lifecycle {
+                    id,
+                    cause: hex_api::LifecycleCause::Uncertain,
+                    ..
+                }) if *id == settled.id
+            ),
             "{start:?}: a refused kill leaves the program's end unproved"
         );
         assert_eq!(
@@ -2861,7 +3815,11 @@ fn a_settle_failure_whose_kill_is_refused_is_uncertain_and_never_released() {
 fn a_settle_failure_whose_kill_is_confirmed_keeps_its_refusal_and_never_releases() {
     let seen: Vec<Settled> = [SettleStart::RunBefore, SettleStart::Run, SettleStart::Exec]
         .into_iter()
-        .map(|start| within(&SETTLED, |by| settle_failure(start, Answer::Done, by)))
+        .map(|start| {
+            follow::whole(&SETTLED, "a settle failure's scenario", || {
+                settle_failure(start, Answer::Done, None)
+            })
+        })
         .collect();
     for settled in &seen {
         eprintln!("client_settle_kill kill=done {settled:?}");
@@ -2888,23 +3846,47 @@ fn a_settle_failure_whose_kill_is_confirmed_keeps_its_refusal_and_never_releases
 
 /// AC-T7.4.1 control A: actual selection lends the setup seam the caller's deadline, never the
 /// existing private smaller learned wait, whose end is a run-out to record, not the call's; that
-/// deadline consumed at setup, no send is attempted and the refusal is the caller's expiry.
+/// deadline consumed at setup, no send is attempted and the refusal is the caller's expiry, never
+/// before it, every wait the hello armed in its own thread at it. The cap is the hello's learned
+/// wait's W* and this host's own time for the hello's steps ([`measured`]: the same hello, its setup
+/// lending nothing, answered), so its learned wait ends inside it; it is taken in the hello's own
+/// thread, and whether the host let its setup begin before it is told to the census.
 #[test]
 fn selected_callers_setup_expiry_prevents_send() {
+    /// The same hello, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.selected_setup_steps");
     /// The hello's return, its selected setup authority consumed before any send.
     static RETURNED: Patience =
         Patience::measuring("test.hex_client.budget.selected_setup_returned");
-    let (transport, writes) = stalled(None);
-    let client = Arc::new(configured(Calibrated::<false>(transport)));
-    let control = Arc::clone(&client);
     let hello = Request::Hello {
         build: wire::build(),
     };
+    // Its existing private smaller learned wait, the hello's: taught where it has none (its cold start, told).
+    let learned = short_learned(&hello, agents_hello());
+    let (steps, answered) = measured(&STEPS, || {
+        configured(answering(agents_hello(), None))
+            .conn
+            .call_before(
+                wire::MAX_MESSAGE,
+                &Request::Hello {
+                    build: wire::build(),
+                },
+                |_, _| Ok(NONE),
+                None,
+                Some(ReplyDeadline::caller_before(answer_by(None)).unwrap()),
+            )
+            .map(drop)
+    });
+    answered.unwrap();
+    let cap = learned + steps;
+    let (transport, writes) = calibrated::<false>(None, None);
+    let client = Arc::new(configured(transport));
+    let control = Arc::clone(&client);
     let (selected, selection) = mpsc::sync_channel(1);
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        let original = Instant::now().checked_add(CAP).unwrap();
-        let cap = ReplyDeadline::caller_before(original).unwrap();
+        let original = Instant::now().checked_add(cap).unwrap();
+        let caller = ReplyDeadline::caller_before(original).unwrap();
         let result = control
             .conn
             .call_before(
@@ -2915,7 +3897,7 @@ fn selected_callers_setup_expiry_prevents_send() {
                         Refusal::Broken("selected setup deadline was absent".into())
                     })?;
                     selected
-                        .try_send((original, deadline))
+                        .try_send(deadline)
                         .map_err(|why| Refusal::os("observing selected setup authority", why))?;
                     // Deliberately consume exactly the selected authority, without
                     // replacing it or changing a seed. Caller::send must now emit nothing.
@@ -2923,13 +3905,13 @@ fn selected_callers_setup_expiry_prevents_send() {
                     Ok(NONE)
                 },
                 None,
-                Some(cap),
+                Some(caller),
             )
             .map(drop);
-        let _ = finished.send((Instant::now(), result));
+        let _ = finished.send((original, Instant::now(), result, armed()));
     });
     // Its selected deadline's notice precedes its answer, so it is read once the answer has come.
-    let observed = recv_on(&RETURNED, &answer);
+    let observed = recv_on(&RETURNED, "the worker's answer", &answer);
     let selected = selection.try_recv();
     client.conn.shared.end(Refusal::Broken(
         "owned selected-deadline observation cleanup".into(),
@@ -2941,38 +3923,62 @@ fn selected_callers_setup_expiry_prevents_send() {
             state.calls.is_empty() && state.programs.is_empty() && state.given.is_empty()
         });
     eprintln!(
-        "client_hello_phase_a selected={selected:?} observed={observed:?} writes={writes:?} joined={} clean={clean:?}",
+        "client_hello_phase_a cap={cap:?} learned={learned:?} selected={selected:?} observed={observed:?} writes={writes:?} joined={} clean={clean:?}",
         joined.is_ok()
     );
     joined.unwrap();
-    let (original, selected) = selected.unwrap();
-    assert!(matches!(selected.source, ReplyBound::CallerAbsolute));
-    assert_eq!(selected.at(), original);
-    let (returned, result) = observed.unwrap();
-    assert!(returned >= selected.at());
-    assert!(matches!(
-        result,
-        Err(Refusal::Os { op: "sending to the node agent", why }) if why.contains("absolute") && !why.contains(LEARNED)
-    ));
+    let (original, returned, result, log) = observed.unwrap();
+    let progressed = selected.is_ok();
+    told_path("selected_callers_setup_expiry_prevents_send", progressed);
+    assert!(
+        armed_at(&log, &["starting a client operation"], Some(original)),
+        "{log:?}"
+    );
+    assert!(
+        returned >= original,
+        "refused {:?} before its deadline",
+        original.saturating_duration_since(returned)
+    );
     // This Stalled transport commits its whole nonempty input on its first try_send;
     // no notification therefore independently witnesses zero send calls/bytes.
     assert!(matches!(writes, Err(mpsc::TryRecvError::Empty)));
     assert!(clean.unwrap());
+    if progressed {
+        // Its setup lent the caller's deadline, consumed there: its send refused by it, nothing sent.
+        let selected = selected.unwrap();
+        assert!(matches!(selected.source, ReplyBound::CallerAbsolute));
+        assert_eq!(selected.at(), original);
+        assert!(armed_at(&log, &["sending"], Some(original)), "{log:?}");
+        assert!(
+            matches!(&result, Err(Refusal::Os { op: "sending to the node agent", why }) if why.contains("absolute") && !why.contains(LEARNED)),
+            "{result:?}"
+        );
+    } else {
+        // Its cap passed first: refused by it as it started, before its setup.
+        assert!(
+            matches!(&result, Err(Refusal::Os { op: "starting a client operation", why }) if why.contains("absolute") && !why.contains(LEARNED)),
+            "{result:?}"
+        );
+    }
 }
 
-struct UnarmedOrdinaryHello {
+/// The ordinary guest Stream, its writes recorded. `MEASURED` names its answers' waits apart: the hello [`measured`]
+/// for the cap learns its own, so the capped hello's stay unarmed.
+struct UnarmedOrdinaryHello<const MEASURED: bool> {
     stream: guest::Stream,
     writes: Arc<Mutex<Vec<(usize, Instant)>>>,
 }
 
-impl Transport for UnarmedOrdinaryHello {
+impl<const MEASURED: bool> Transport for UnarmedOrdinaryHello<MEASURED> {
     type Reading = guest::Reading;
     const MAKES_ASKED: bool = <guest::Stream as Transport>::MAKES_ASKED;
 
     fn answers() -> &'static [Patience; KINDS] {
         static WAITS: [Patience; KINDS] =
             [const { Patience::measuring("test.ordinary_hello_phase.unarmed") }; KINDS];
-        &WAITS
+        static MEASURED_WAITS: [Patience; KINDS] =
+            [const { Patience::measuring("test.ordinary_hello_phase.measured") }; KINDS];
+        if MEASURED { &MEASURED_WAITS } else { &WAITS }
     }
     fn reply_budget(&self) -> Option<Duration> {
         self.stream.reply_budget()
@@ -3068,53 +4074,75 @@ fn ordinary_hello_frame(
     }
 }
 
-/// AC-T7.4.1 control B: the SAME ordinary Stream/Core Hello path under a private
-/// unarmed test census sends a full actual frame, gets no answer, and exhausts the
-/// caller's original cap. This is NOT the public calibrated constructor fixture.
-#[test]
-fn isolated_ordinary_stream_hello_withheld_answer_uses_original_cap() {
-    /// The hello's original deadline, sent as it begins.
-    static BEGAN: Patience = Patience::measuring("test.hex_client.budget.ordinary_hello_began");
-    /// The hello's refusal at its caller's cap, no answer come.
-    static RETURNED: Patience =
-        Patience::measuring("test.hex_client.budget.ordinary_hello_returned");
-    let (socket, mut peer) = absolute_pair();
-    peer.write_all(&11u64.to_le_bytes()).unwrap();
-    let recorded = Arc::new(Mutex::new(Vec::new()));
+/// The control connection of an ordinary guest Stream whose token, and `answers`, came before its dial, with its peer.
+fn ordinary_stream(answers: Vec<(u64, Answer)>) -> (guest::Stream, TcpStream) {
+    let (socket, peer) = control_pair(answers);
     let link = guest::own_link(AbsoluteNamedLink {
         control: Mutex::new(Some(socket)),
         stdio: Arc::new(Mutex::new(VecDeque::new())),
-        deadlines: Arc::clone(&recorded),
+        deadlines: Arc::new(Mutex::new(Vec::new())),
     })
     .unwrap();
     // The existing test-only dial consumes a complete prequeued token before the
     // isolated Hello operation. It makes no claim about the public factory's dial phase.
-    let stream = guest::Stream::dial(link).unwrap();
+    (guest::Stream::dial(link).unwrap(), peer)
+}
+
+/// AC-T7.4.1 control B: the SAME ordinary Stream/Core Hello path under a private
+/// unarmed test census sends a full actual frame, gets no answer, and exhausts the
+/// caller's original cap, never before it, every wait it armed in its own thread at
+/// it. This is NOT the public calibrated constructor fixture. The cap is this host's
+/// own ([`measured`]: the same hello, its answer there to read), taken in the hello's
+/// own thread; whether the host let its frame go before it is told to the census.
+#[test]
+fn isolated_ordinary_stream_hello_withheld_answer_uses_original_cap() {
+    /// The same hello, answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.ordinary_hello_steps");
+    /// The hello's refusal at its caller's cap, no answer come.
+    static RETURNED: Patience =
+        Patience::measuring("test.hex_client.budget.ordinary_hello_returned");
+    let (stream, measured_peer) = ordinary_stream(vec![(1, agents_hello())]);
+    let shared = Shared::try_new(UnarmedOrdinaryHello::<true> {
+        stream,
+        writes: Arc::new(Mutex::new(Vec::new())),
+    })
+    .unwrap();
+    let (cap, answered) = measured(&STEPS, move || {
+        let deadline = ReplyDeadline::caller_before(answer_by(None))?;
+        Core::hello_before(shared, Some(deadline)).map(drop)
+    });
+    drop(measured_peer);
+    answered.unwrap();
+    // The peer sends the token only: no Hello response is queued or synthesized.
+    let (stream, mut peer) = ordinary_stream(Vec::new());
     let writes = Arc::new(Mutex::new(Vec::new()));
-    let shared = Shared::try_new(UnarmedOrdinaryHello {
+    let shared = Shared::try_new(UnarmedOrdinaryHello::<false> {
         stream,
         writes: Arc::clone(&writes),
     })
     .unwrap();
     let control = triomphe::Arc::clone(&shared);
-    let (starting, started) = mpsc::sync_channel(1);
     let (finished, answer) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        let original = Instant::now().checked_add(CAP).unwrap();
-        let deadline = ReplyDeadline::caller_before(original).unwrap();
-        let _ = starting.try_send(deadline);
-        let result = Core::hello_before(control, Some(deadline)).map(drop);
-        let _ = finished.send((Instant::now(), result));
+        let original = Instant::now().checked_add(cap).unwrap();
+        let result = ReplyDeadline::caller_before(original)
+            .and_then(|deadline| Core::hello_before(control, Some(deadline)))
+            .map(drop);
+        let _ = finished.send((original, Instant::now(), result, armed()));
     });
-    let deadline = recv_on(&BEGAN, &started);
-    // Not a wait for a fact: a frame is sent only within the hello's own deadline, so that deadline bounds its
-    // read, and what has come already is read however late.
-    let frame = match &deadline {
-        Ok(deadline) => ordinary_hello_frame(&mut peer, *deadline),
-        Err(why) => Err(Refusal::os("observing isolated Hello authority", why)),
+    let observed = recv_from(&RETURNED, "the hello's refusal", &answer, &worker);
+    // Read once the hello has ended: a frame is sent only within the hello's own deadline, so what it sent is there,
+    // read however late, and a wait for more ends at that deadline, passed.
+    let frame = match &observed {
+        Ok((original, ..)) => ordinary_hello_frame(
+            &mut peer,
+            ReplyDeadline {
+                at: *original,
+                source: ReplyBound::CallerAbsolute,
+            },
+        ),
+        Err(why) => Err(Refusal::Broken(format!("the hello told no end: {why:?}"))),
     };
-    // The peer has sent the token only: no Hello response is queued or synthesized.
-    let observed = recv_on(&RETURNED, &answer);
     let stopped = peer.shutdown(Shutdown::Both);
     drop(peer);
     shared.end(Refusal::Broken("owned ordinary-Hello cleanup".into()));
@@ -3124,28 +4152,52 @@ fn isolated_ordinary_stream_hello_withheld_answer_uses_original_cap() {
         .state()
         .map(|state| state.calls.is_empty() && state.programs.is_empty() && state.given.is_empty());
     eprintln!(
-        "client_hello_phase_b scope=isolated_ordinary_seam public_constructor_proof=false deadline={deadline:?} frame={frame:?} writes={committed:?} observed={observed:?} stopped={stopped:?} joined={} clean={clean:?}",
+        "client_hello_phase_b scope=isolated_ordinary_seam public_constructor_proof=false cap={cap:?} frame={frame:?} writes={committed:?} observed={observed:?} stopped={stopped:?} joined={} clean={clean:?}",
         joined.is_ok()
     );
     joined.unwrap();
-    let deadline = deadline.unwrap();
-    let (header, request, bytes) = frame.expect("full actual Hello is a required phase witness");
-    assert_eq!((header.kind, header.id), (1, 1));
-    assert!(matches!(request, Request::Hello { build } if build == wire::build()));
-    assert_eq!(
-        committed.iter().map(|(n, _)| *n).sum::<usize>(),
-        bytes.len()
+    let (original, returned, result, log) = observed.unwrap();
+    // Its answer's wait armed: its frame went whole before its cap passed.
+    let progressed = reached(&log, "the answer");
+    told_path(
+        "isolated_ordinary_stream_hello_withheld_answer_uses_original_cap",
+        progressed,
     );
-    assert!(!committed.is_empty());
-    let (returned, result) = observed.unwrap();
-    assert!(returned >= deadline.at());
-    assert!(matches!(
-        result,
-        Err(Refusal::Os { op: "waiting for the node agent's answer", why })
-            if why.contains("absolute") && !why.contains(LEARNED)
-    ));
+    assert!(
+        armed_at(&log, &["starting a client operation"], Some(original)),
+        "{log:?}"
+    );
+    assert!(
+        returned >= original,
+        "refused {:?} before its deadline",
+        original.saturating_duration_since(returned)
+    );
     assert_eq!(shared.transport.reply_budget(), None);
     assert!(clean.unwrap());
+    if progressed {
+        // Its whole frame sent, then no answer: its answer's wait at the hello's deadline, refused by it.
+        let (header, request, bytes) = frame.expect("its whole frame went before its cap");
+        assert_eq!((header.kind, header.id), (1, 1));
+        assert!(matches!(request, Request::Hello { build } if build == wire::build()));
+        assert_eq!(
+            committed.iter().map(|(n, _)| *n).sum::<usize>(),
+            bytes.len()
+        );
+        assert!(
+            armed_at(&log, &["sending", "the answer"], Some(original)),
+            "{log:?}"
+        );
+        assert!(
+            matches!(&result, Err(Refusal::Os { op: "waiting for the node agent's answer", why }) if why.contains("absolute") && !why.contains(LEARNED)),
+            "{result:?}"
+        );
+    } else {
+        // Its cap passed first: refused by it as it started or sent, before any answer's wait.
+        assert!(
+            matches!(&result, Err(Refusal::Os { op: "starting a client operation" | "sending to the node agent", why }) if why.contains("absolute") && !why.contains(LEARNED)),
+            "{result:?}"
+        );
+    }
 }
 
 /// Separate successor transport: the same real memory protocol, with all phase diagnostics
@@ -3156,6 +4208,8 @@ struct SettleAligned {
     setup: Mutex<Option<(u64, hex_api::Ask, ReplyDeadline)>>,
     started: mpsc::SyncSender<(u64, Instant)>,
     kill: mpsc::SyncSender<(u64, u64, Instant)>,
+    /// The agent's answer to the Kill, given as it comes (the measured run's); none withholds it (the capped run's).
+    kill_answer: Mutex<Option<Answer>>,
     exits: AtomicUsize,
     other_answers: AtomicUsize,
 }
@@ -3212,7 +4266,7 @@ impl Transport for SettleAligned {
                 self.io.queue(header.id, Answer::Started { pid: 7 });
                 None
             }
-            // Record the actual committed Kill, but never manufacture its answer or an Exit.
+            // Record the actual committed Kill: its answer only the one the test gives, never an Exit.
             Request::Call(Call::Kill { exec }) => Some(*exec),
             Request::Release => None,
             _ => {
@@ -3229,6 +4283,14 @@ impl Transport for SettleAligned {
         *at = bytes.len();
         if let Some(exec) = killed {
             let _ = self.kill.try_send((header.id, exec, Instant::now()));
+            if let Some(answer) = self
+                .kill_answer
+                .lock()
+                .map_err(|why| Sent::Refused(poisoned(why)))?
+                .take()
+            {
+                self.io.queue(header.id, answer);
+            }
         }
         Ok(true)
     }
@@ -3262,24 +4324,21 @@ impl Transport for SettleAligned {
     }
 }
 
-/// AC-T7.4.1 separately pinned successor: start the same cap in an already prepared actor.
-/// ROOT must compare this SAME selector before/after69a and under the missing-Kill-cap mutation.
-#[test]
-fn prepared_actor_settle_error_retains_original_kill_answer_authority() {
-    /// The prepared actor's notice that it is ready.
-    static READY: Patience = Patience::measuring("test.hex_client.budget.prepared_ready");
-    /// The prepared run's return, its settle refused and its Kill unanswered within its original authority.
-    static RETURNED: Patience = Patience::measuring("test.hex_client.budget.prepared_returned");
+/// A run's Started, as its transport read it: its id and when it came.
+type StartedNotice = mpsc::Receiver<(u64, Instant)>;
+/// A run's Kill, as its transport took it: the Kill's id, the exec it names, and when it went.
+type KillNotice = mpsc::Receiver<(u64, u64, Instant)>;
+
+/// A prepared actor's client ([`SettleAligned`]): its run's Started answered as it is asked, the wrong end (stdout's,
+/// where the caller asks for stdin) made before it, and its Kill answered with `kill_answer` or, with none, withheld;
+/// with the receivers of its Started's and its Kill's notices.
+fn settle_aligned(kill_answer: Option<Answer>) -> (Core<SettleAligned>, StartedNotice, KillNotice) {
     let (io, _) = stalled(None);
     let (starting, started) = mpsc::sync_channel(1);
     let (killing, killed) = mpsc::sync_channel(1);
-    let (prepared, readiness) = mpsc::sync_channel(1);
-    let (release, begin) = mpsc::sync_channel(1);
-    let (arming, armed) = mpsc::sync_channel(1);
-    let (finished, answer) = mpsc::sync_channel(1);
-    let observer = Wake::new().unwrap();
+    // Its Started's and its Kill's answers, and its Run and its Kill: room made before its run, so none is made in it.
     let mut inbound = VecDeque::new();
-    inbound.try_reserve(1).unwrap();
+    inbound.try_reserve(2).unwrap();
     let mut outbound = Vec::new();
     outbound.try_reserve_exact(2).unwrap();
     let mut program_ends = Stdio {
@@ -3290,7 +4349,7 @@ fn prepared_actor_settle_error_retains_original_kill_answer_authority() {
         ..Stdio::null()
     };
     let wrong_end = program_ends.make_asked().unwrap();
-    let client = Arc::new(configured(SettleAligned {
+    let client = configured(SettleAligned {
         io: Offers {
             inbound: Mutex::new(inbound),
             outbound: Mutex::new(outbound),
@@ -3301,61 +4360,71 @@ fn prepared_actor_settle_error_retains_original_kill_answer_authority() {
         setup: Mutex::new(None),
         started: starting,
         kill: killing,
+        kill_answer: Mutex::new(kill_answer),
         exits: AtomicUsize::new(0),
         other_answers: AtomicUsize::new(0),
-    }));
+    });
+    (client, started, killed)
+}
+
+/// AC-T7.4.1 separately pinned successor: start the same cap in an already prepared actor, its cap this host's own
+/// ([`measured`]: the same prepared run, its Kill answered), taken in the actor as it is released. Expect the setup's
+/// deadline, and every wait the run and its Kill armed in the actor's thread, at the run's one absolute deadline, its
+/// refusal never before it; whether the host let its Kill go before it is told to the census.
+/// ROOT must compare this SAME selector before/after69a and under the missing-Kill-cap mutation.
+#[test]
+fn prepared_actor_settle_error_retains_original_kill_answer_authority() {
+    /// The same prepared run, its Kill answered.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.prepared_steps");
+    /// The prepared actor's notice that it is ready.
+    static READY: Patience = Patience::measuring("test.hex_client.budget.prepared_ready");
+    /// The prepared run's return, its settle refused and its Kill unanswered within its original authority.
+    static RETURNED: Patience = Patience::measuring("test.hex_client.budget.prepared_returned");
+    let (measured_client, _, _) = settle_aligned(Some(Answer::Done));
+    let (cap, answered) = measured(&STEPS, move || {
+        measured_client
+            .run_before(
+                absolute_spec(),
+                Program::of(&["owned-prepared-settle"]),
+                stdin_alone(),
+                answer_by(None),
+            )
+            .map(drop)
+    });
+    assert!(answered.is_err(), "the measured run's settle is refused");
+    let (client, started, killed) = settle_aligned(None);
+    let client = Arc::new(client);
     let control = Arc::clone(&client);
+    let (prepared, readiness) = mpsc::sync_channel(1);
+    let (release, begin) = mpsc::sync_channel(1);
+    let (finished, answer) = mpsc::sync_channel(1);
     let spec = absolute_spec();
     let program = Program::of(&["owned-prepared-settle"]);
-    let stdio = Stdio {
-        ask: hex_api::Ask {
-            stdin: true,
-            ..hex_api::Ask::default()
-        },
-        ..Stdio::null()
-    };
+    let stdio = stdin_alone();
     let worker = std::thread::Builder::new()
         .name("owned-prepared-settle".into())
         .spawn(move || {
             if prepared.try_send(()).is_err() || begin.recv().is_err() {
                 return;
             }
-            let Some(original) = Instant::now().checked_add(CAP) else {
+            let Some(original) = Instant::now().checked_add(cap) else {
                 return;
             };
-            // Nonblocking notices use preallocated channels; no diagnostics or argument
-            // construction separates this one anchor from the actual Core operation.
-            if arming.try_send(original).is_err() {
-                return;
-            }
+            // No diagnostics or argument construction separates this one anchor from the actual Core operation.
             let result = control.run_before(spec, program, stdio, original).map(drop);
             let returned = Instant::now();
-            let _ = finished.try_send((returned, result));
+            let _ = finished.try_send((original, returned, result, armed()));
         })
         .unwrap();
 
-    let actor_ready = recv_on(&READY, &readiness);
+    let actor_ready = recv_on(&READY, "the actor ready", &readiness);
     let released = actor_ready.is_ok().then(|| release.try_send(()));
     // Every early branch closes this owned barrier so joining can never wait for a lost start.
     drop(release);
-    // Its arming, its Started and its Kill precede its answer, so each is read once the answer has come.
-    let before_cleanup = recv_on(&RETURNED, &answer);
-    let original = armed.try_recv();
+    // Its Started and its Kill precede its answer, so each is read once the answer has come.
+    let before_cleanup = recv_on(&RETURNED, "the worker's answer", &answer);
     let actual_started = started.try_recv();
     let actual_kill = killed.try_recv();
-    let expired = original.as_ref().ok().map(|at| {
-        loop {
-            let left = at.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break Ok(());
-            }
-            // Same existing readiness wait as until(), with its wake prepared before the cap.
-            if let Err(why) = ready(observer.handle(), false, None, Some(left)) {
-                break Err(why);
-            }
-        }
-    });
-    let cleanup_at = Instant::now();
     client
         .conn
         .shared
@@ -3400,69 +4469,77 @@ fn prepared_actor_settle_error_retains_original_kill_answer_authority() {
             && state.given.is_empty()
             && state.waiting.is_empty()
     });
-    let phase = actor_ready.is_ok()
-        && released.as_ref().is_some_and(|sent| sent.is_ok())
-        && original.as_ref().is_ok_and(|at| {
-            runs.len() == 1
-                && setup.is_some_and(|(exec, ask, cap)| {
-                    exec == runs[0] && ask.stdin && !ask.stdout && !ask.stderr && cap.at() == *at
-                })
-                && actual_started
-                    .as_ref()
-                    .is_ok_and(|(exec, seen)| *exec == runs[0] && seen < at)
-                && actual_kill.as_ref().is_ok_and(|(request, exec, seen)| {
-                    *exec == runs[0] && seen < at && kills == [(*request, *exec)]
-                })
-        })
-        && pipe_was_owned
-        && !unused_end;
     // First diagnostics and all assertions occur only after the owned endpoint/ends close and join.
     eprintln!(
-        "client_settle_prepared classification={} scope=separate_successor ready={actor_ready:?} released={released:?} original={original:?} cap={CAP:?} setup={setup:?} started={actual_started:?} kill={actual_kill:?} runs={runs:?} kills={kills:?} exits={exits} other_answers={other_answers} releases={releases} before_cleanup={before_cleanup:?} cleanup_at={cleanup_at:?} after_cleanup={after_cleanup:?} pipe_owned={pipe_was_owned} unused_end={unused_end} pipe_poisoned={pipe_poisoned} end_poisoned={end_poisoned} joined={} clean={clean:?}",
-        if phase {
-            "PHASE_WITNESSED"
-        } else {
-            "UNVERIFIED"
-        },
+        "client_settle_prepared scope=separate_successor cap={cap:?} ready={actor_ready:?} released={released:?} setup={setup:?} started={actual_started:?} kill={actual_kill:?} runs={runs:?} kills={kills:?} exits={exits} other_answers={other_answers} releases={releases} before_cleanup={before_cleanup:?} after_cleanup={after_cleanup:?} pipe_owned={pipe_was_owned} unused_end={unused_end} pipe_poisoned={pipe_poisoned} end_poisoned={end_poisoned} joined={} clean={clean:?}",
         joined.is_ok()
     );
     joined.unwrap();
+    let progressed = !kills.is_empty();
+    told_path(
+        "prepared_actor_settle_error_retains_original_kill_answer_authority",
+        progressed,
+    );
     assert!(!pipe_poisoned && !end_poisoned);
     assert!(transport.io.io.closed.load(Ordering::Acquire));
     assert!(transport.io.program.lock().unwrap().is_none());
     assert!(transport.prepared.lock().unwrap().is_none());
     assert!(clean.unwrap());
     assert_eq!(transport.reply_budget(), None);
-    assert!(
-        phase,
-        "UNVERIFIED: required actual prepared-settle phase missing"
-    );
+    assert!(actor_ready.is_ok() && released.is_some_and(|sent| sent.is_ok()));
+    assert!(pipe_was_owned);
     assert_eq!(exits, 0);
     assert_eq!(other_answers, 0);
     assert_eq!(releases, 0);
-    expired.unwrap().unwrap();
-    let returned_error = before_cleanup
-        .as_ref()
-        .ok()
-        .or_else(|| after_cleanup.as_ref().ok());
+    let (original, returned, result, log) = before_cleanup.unwrap();
+    // What the run armed, its Kill's waits among them: its one deadline, never a fresh one.
     assert!(
-        matches!(returned_error, Some((_, Err(Refusal::Lifecycle { id, cause: hex_api::LifecycleCause::Uncertain }))) if *id == absolute_spec().id),
-        "a Kill unanswered within the original authority leaves the run's end uncertain"
+        armed_at(&log, &["starting a client operation"], Some(original)),
+        "{log:?}"
     );
     assert!(
-        before_cleanup.is_ok(),
-        "prepared-settle original error return exceeded its original authority awaiting Kill answer"
+        setup.is_none_or(|(_, _, deadline)| deadline.at() == original),
+        "{setup:?}"
     );
-    let (returned, _) = before_cleanup.unwrap();
-    assert!(returned >= original.unwrap());
-    assert!(returned <= cleanup_at);
+    assert!(
+        returned >= original,
+        "refused {:?} before its deadline",
+        original.saturating_duration_since(returned)
+    );
+    if progressed {
+        // Its Started, its settle refused, then one Kill, unanswered: its answer's wait at the run's deadline.
+        assert!(!unused_end);
+        assert_eq!(runs.len(), 1);
+        let (exec, ask, _) = setup.unwrap();
+        assert_eq!(exec, runs[0]);
+        assert!(ask.stdin && !ask.stdout && !ask.stderr);
+        assert_eq!(actual_started.unwrap().0, exec);
+        let (request, target, _) = actual_kill.unwrap();
+        assert_eq!(target, exec);
+        assert_eq!(kills, [(request, exec)]);
+        assert!(armed_at(&log, &["the answer"], Some(original)), "{log:?}");
+        assert!(
+            matches!(&result, Err(Refusal::Lifecycle { id, cause: hex_api::LifecycleCause::Uncertain, .. }) if *id == absolute_spec().id),
+            "a Kill unanswered within the original authority leaves the run's end uncertain: {result:?}"
+        );
+    } else {
+        // Its cap passed first: refused by it, before its Kill, never early.
+        assert!(
+            matches!(&result, Err(Refusal::Os { why, .. }) if why.contains("absolute"))
+                || matches!(
+                    &result,
+                    Err(Refusal::Lifecycle {
+                        cause: hex_api::LifecycleCause::Uncertain,
+                        ..
+                    })
+                ),
+            "{result:?}"
+        );
+    }
 }
 
 /// A call that gave up waiting: its late answers have no taker.
 const GAVE_UP: u64 = u64::MAX;
-/// Messages for others before the fuse ends the connection, the only way a poll that keeps reading
-/// comes back: far more than these tests' polls and calls read (one each).
-const FUSE: usize = 1_000;
 
 /// Answers for others that keep coming: each read hands on one message, as one `SOCK_SEQPACKET` read
 /// does, and leaves another ready.
@@ -3476,6 +4553,11 @@ struct Chatter {
     chatting: AtomicBool,
     /// Turns taken: each waits on the connection through its handle once.
     turns: AtomicUsize,
+    /// Whether the turn under way has read: a turn reads once, the claim these tests make.
+    read_in_turn: AtomicBool,
+    /// The fuse: a turn's second read while answers for others keep coming, a poll that keeps reading, ends the
+    /// connection, the only way such a poll comes back. Its basis is that claim, never a count.
+    blown: AtomicBool,
     /// Messages for others handed on.
     others: AtomicUsize,
     sent: Mutex<Vec<(u64, Request)>>,
@@ -3488,6 +4570,8 @@ impl Chatter {
             next: Mutex::new(VecDeque::new()),
             chatting: AtomicBool::new(false),
             turns: AtomicUsize::new(0),
+            read_in_turn: AtomicBool::new(false),
+            blown: AtomicBool::new(false),
             others: AtomicUsize::new(0),
             sent: Mutex::new(Vec::new()),
         }
@@ -3532,19 +4616,21 @@ impl Transport for Chatter {
     fn reading(&self) {}
     fn handle(&self) -> Handle<'_> {
         self.turns.fetch_add(1, Ordering::SeqCst);
+        self.read_in_turn.store(false, Ordering::SeqCst);
         self.socket.handle()
     }
     fn recv(&self, _: &mut (), take: &mut Take<'_>) -> Result<bool, Refusal> {
         self.socket.drain();
+        if self.read_in_turn.swap(true, Ordering::SeqCst) && self.chatting.load(Ordering::SeqCst) {
+            self.blown.store(true, Ordering::SeqCst);
+            return Err(Refusal::Broken(
+                "the fuse: a turn read again while answers for others kept coming".into(),
+            ));
+        }
         let next = self.next.lock().unwrap().pop_front();
         let message = match next {
             Some(message) => message,
             None if self.chatting.load(Ordering::SeqCst) => {
-                if self.others.load(Ordering::SeqCst) >= FUSE {
-                    return Err(Refusal::Broken(
-                        "the fuse: a poll kept reading answers for others".into(),
-                    ));
-                }
                 self.others.fetch_add(1, Ordering::SeqCst);
                 wire::answer(GAVE_UP, &Answer::Done, wire::MAX_MESSAGE).unwrap()
             }
@@ -3613,7 +4699,8 @@ fn a_poll_reads_once_while_answers_for_others_keep_coming() {
     let handed_on = !state.reading && state.waiting.is_empty() && state.closed.is_none();
     drop(state);
     eprintln!(
-        "client_poll_bound phase=try_wait polled={polled:?} zero={zero:?} ended={ended:?} again={again:?} others={others} fuse={FUSE} handed_on={handed_on}"
+        "client_poll_bound phase=try_wait polled={polled:?} zero={zero:?} ended={ended:?} again={again:?} others={others} fuse_blown={} handed_on={handed_on}",
+        chatter.blown.load(Ordering::SeqCst)
     );
     assert_eq!(
         polled,
@@ -3623,7 +4710,10 @@ fn a_poll_reads_once_while_answers_for_others_keep_coming() {
     assert_eq!(zero, (Ok(None), 1, 1));
     assert_eq!(ended, (Ok(Some(Exit::Code(7))), 1, 0));
     assert_eq!(again, (Ok(Some(Exit::Code(7))), 0, 0));
-    assert!(others < FUSE, "answers for others were still coming");
+    assert!(
+        !chatter.blown.load(Ordering::SeqCst),
+        "a turn read on: the fuse ended the connection"
+    );
     assert!(handed_on, "each poll handed the reader's turn on");
 }
 
@@ -3648,7 +4738,8 @@ fn kill_checks_once_for_an_end_while_answers_for_others_keep_coming() {
         .collect();
     let others = chatter.others.load(Ordering::SeqCst);
     eprintln!(
-        "client_poll_bound phase=kill killed={killed:?} kills={kills:?} exec={exec} others={others} fuse={FUSE}"
+        "client_poll_bound phase=kill killed={killed:?} kills={kills:?} exec={exec} others={others} fuse_blown={}",
+        chatter.blown.load(Ordering::SeqCst)
     );
     assert_eq!(
         killed,
@@ -3656,30 +4747,37 @@ fn kill_checks_once_for_an_end_while_answers_for_others_keep_coming() {
         "kill's check for an end must take one turn and read once, then one turn for its answer"
     );
     assert_eq!(kills, [exec]);
-    assert!(others < FUSE, "answers for others were still coming");
+    assert!(
+        !chatter.blown.load(Ordering::SeqCst),
+        "a turn read on: the fuse ended the connection"
+    );
 }
 
-/// AC-T7.4.1: do `wait_for` a microsecond on a remote program while answers for others keep coming;
-/// expect `Ok(None)` once its time is spent, each turn reading once, never reading on until the fuse
-/// ends the connection. Then with its end next: expect a spent wait to take that end from its read.
+/// AC-T7.4.1: do `wait_for` the least positive wait, a nanosecond, Duration's own unit, on a remote
+/// program while answers for others keep coming; expect `Ok(None)` once its time is spent, each turn
+/// reading once, never reading on until the fuse ends the connection. Then with its end next: expect a
+/// spent wait to take that end from its read.
 #[test]
 fn a_timed_wait_ends_at_its_deadline_while_answers_for_others_keep_coming() {
     let client = configured(Chatter::new());
     let (mut proc, exec) = chatting_program(&client);
     let chatter = &client.conn.shared.transport;
     chatter.chat();
-    let wait = Duration::from_micros(1);
+    let wait = Duration::from_nanos(1);
     let waited = chatter.counted(|| proc.wait_for(wait));
     chatter.queue(exec, &Answer::Exited(Exit::Code(3)));
     let ended = proc.wait_for(wait);
-    eprintln!("client_wait_bound phase=wait_for waited={waited:?} ended={ended:?} fuse={FUSE}");
+    eprintln!(
+        "client_wait_bound phase=wait_for waited={waited:?} ended={ended:?} fuse_blown={}",
+        chatter.blown.load(Ordering::SeqCst)
+    );
     assert_eq!(
         waited.0,
         Ok(None),
         "a timed wait came back with its time spent"
     );
     assert!(
-        waited.2 < FUSE,
+        !chatter.blown.load(Ordering::SeqCst),
         "it read on until the fuse ended the connection"
     );
     assert_eq!(waited.1, waited.2, "each turn read once");
@@ -3743,9 +4841,8 @@ fn a_failed_setups_kill_goes_out_while_answers_for_others_keep_coming() {
     let client = configured(WrongEnd(Chatter::new()));
     let chatter = &client.conn.shared.transport.0;
     chatter.chat();
-    let far = Instant::now()
-        .checked_add(Duration::from_secs(3600))
-        .unwrap();
+    // A deadline the test never reaches, the longest one wait ([`answer_by`]).
+    let far = answer_by(None);
     let ran = chatter.counted(|| {
         client
             .run_before(
@@ -3775,7 +4872,8 @@ fn a_failed_setups_kill_goes_out_while_answers_for_others_keep_coming() {
         })
         .collect();
     eprintln!(
-        "client_wait_bound phase=setup_kill ran={ran:?} run={run:?} kills={kills:?} fuse={FUSE}"
+        "client_wait_bound phase=setup_kill ran={ran:?} run={run:?} kills={kills:?} fuse_blown={}",
+        chatter.blown.load(Ordering::SeqCst)
     );
     assert!(
         matches!(&ran.0, Err(Refusal::Broken(why)) if why.contains("stdout")),
@@ -3811,10 +4909,13 @@ fn readerless(program: &std::io::PipeWriter) -> bool {
         }
     }
     let mut room = [PollFd::new(program, PollFlags::OUT)];
-    let polled = within(&READERLESS, |by| {
-        let left = by.map(|by| timespec(by.saturating_duration_since(Instant::now())));
-        rustix::event::poll(&mut room, left.as_ref())
-    });
+    // A poll with no deadline, which ends at its party's end, the pipe's last reader gone (its HUP or ERR), or at its
+    // room.
+    let polled = follow::whole(
+        &READERLESS,
+        "the late end's reader gone or its room",
+        || rustix::event::poll(&mut room, None),
+    );
     polled.unwrap() == 1
         && room[0]
             .revents()
@@ -3889,32 +4990,29 @@ impl Transport for Late {
 
 /// AC-T7.4.1: do give up on a run asking for its stdout at its deadline, the agent answering only
 /// after, with stdout's end, then make a list that reads that late answer before its own; expect
-/// the run's caller expiry, the list answered, nothing kept for the run, the late end closed (its
-/// pipe has no reader left), and the Taken word for it sent, so the agent lets its copy go.
+/// the run's caller expiry, never before its deadline, every wait it armed at it; the list answered,
+/// nothing kept for the run, the late end closed (its pipe has no reader left), and the Taken word
+/// for it sent, so the agent lets its copy go. The cap is this host's own ([`measured`]: the same
+/// run, its end given as it is asked), taken in the run's own thread; whether the host let its
+/// request go before it is told to the census.
 #[test]
 fn a_given_answer_after_its_caller_gave_up_closes_its_ends() {
-    let client = configured(Late {
-        wake: Wake::new().unwrap(),
-        next: Mutex::new(VecDeque::new()),
-        sent: Mutex::new(Vec::new()),
-    });
-    let late = &client.conn.shared.transport;
-    let gave_up = client
-        .run_before(
-            absolute_spec(),
-            Program::of(&["late-given"]),
-            Stdio {
-                ask: hex_api::Ask {
-                    stdout: true,
-                    ..hex_api::Ask::default()
-                },
-                ..Stdio::null()
-            },
-            Instant::now().checked_add(CAP).unwrap(),
-        )
-        .map(drop);
-    let run = late.sent.lock().unwrap()[0].0;
-    let (output, program) = std::io::pipe().unwrap();
+    /// The same run, its stdout's end given as it is asked.
+    static STEPS: Patience = Patience::measuring("test.hex_client.budget.late_given_steps");
+    let late_agent = || {
+        configured(Late {
+            wake: Wake::new().unwrap(),
+            next: Mutex::new(VecDeque::new()),
+            sent: Mutex::new(Vec::new()),
+        })
+    };
+    let stdout_alone = || Stdio {
+        ask: hex_api::Ask {
+            stdout: true,
+            ..hex_api::Ask::default()
+        },
+        ..Stdio::null()
+    };
     let given = Answer::Given {
         pid: 9,
         given: Streams {
@@ -3922,6 +5020,69 @@ fn a_given_answer_after_its_caller_gave_up_closes_its_ends() {
             ..Streams::default()
         },
     };
+    let measured_client = late_agent();
+    let (measured_output, measured_program) = std::io::pipe().unwrap();
+    // Its first call's id, the run's: its end there to read as it is asked.
+    measured_client
+        .conn
+        .shared
+        .transport
+        .queue(1, &given, vec![measured_output.into()]);
+    let measured_stdio = stdout_alone();
+    let (cap, answered) = measured(&STEPS, move || {
+        measured_client
+            .run_before(
+                absolute_spec(),
+                Program::of(&["late-given"]),
+                measured_stdio,
+                answer_by(None),
+            )
+            .map(drop)
+    });
+    drop(measured_program);
+    answered.unwrap();
+    let client = late_agent();
+    let late = &client.conn.shared.transport;
+    // This thread's log, from here on the run's alone.
+    armed();
+    let original = Instant::now().checked_add(cap).unwrap();
+    let gave_up = client
+        .run_before(
+            absolute_spec(),
+            Program::of(&["late-given"]),
+            stdout_alone(),
+            original,
+        )
+        .map(drop);
+    let returned = Instant::now();
+    let log = armed();
+    let sent_run = late.sent.lock().unwrap().first().map(|(id, _)| *id);
+    told_path(
+        "a_given_answer_after_its_caller_gave_up_closes_its_ends",
+        sent_run.is_some(),
+    );
+    eprintln!("client_late_given cap={cap:?} gave_up={gave_up:?} run={sent_run:?} armed={log:?}");
+    assert!(
+        armed_at(&log, &["starting a client operation"], Some(original)),
+        "{log:?}"
+    );
+    assert!(
+        returned >= original,
+        "refused {:?} before its deadline",
+        original.saturating_duration_since(returned)
+    );
+    assert!(
+        matches!(&gave_up, Err(Refusal::Os { why, .. }) if why.contains("absolute")),
+        "{gave_up:?}"
+    );
+    let Some(run) = sent_run else {
+        // Its cap passed before its request went: nothing of it for a late answer to name.
+        assert_eq!(client.list(), Ok(Vec::new()));
+        assert!(client.conn.shared.state().unwrap().given.is_empty());
+        return;
+    };
+    assert!(armed_at(&log, &["the answer"], Some(original)), "{log:?}");
+    let (output, program) = std::io::pipe().unwrap();
     late.queue(run, &given, vec![output.into()]);
     let listed = client.list();
     let kept = client.conn.shared.state().unwrap().given.contains_key(&run);
@@ -3933,13 +5094,7 @@ fn a_given_answer_after_its_caller_gave_up_closes_its_ends() {
         .unwrap()
         .iter()
         .any(|(id, request)| *id == run && *request == Request::Taken);
-    eprintln!(
-        "client_late_given gave_up={gave_up:?} listed={listed:?} kept={kept} closed={closed} taken={taken}"
-    );
-    assert!(
-        matches!(&gave_up, Err(Refusal::Os { why, .. }) if why.contains("absolute")),
-        "{gave_up:?}"
-    );
+    eprintln!("client_late_given listed={listed:?} kept={kept} closed={closed} taken={taken}");
     assert_eq!(listed, Ok(Vec::new()));
     assert!(
         !kept,

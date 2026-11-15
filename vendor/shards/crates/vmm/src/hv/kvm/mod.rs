@@ -32,8 +32,13 @@ use crate::sync::lock;
 /// A failed KVM call, or guest behavior the VMM does not emulate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    Call { op: &'static str, error: String },
+    Call {
+        op: &'static str,
+        error: String,
+    },
     Guest(String),
+    /// A snapshot's XSAVE area this host's cannot take (migrate-07).
+    Xsave(crate::arch::x86_64::xsave::XsaveRefused),
 }
 
 impl fmt::Display for Error {
@@ -41,6 +46,7 @@ impl fmt::Display for Error {
         match self {
             Error::Call { op, error } => write!(f, "{op} failed: {error}"),
             Error::Guest(msg) => f.write_str(msg),
+            Error::Xsave(refused) => refused.fmt(f),
         }
     }
 }
@@ -801,7 +807,8 @@ impl Drop for Vcpu {
 
 /// A vCPU's guest run time, read from any thread: its thread's guest time as Linux keeps it
 /// ([`thread_guest_ns`](crate::platform::thread_guest_ns)), charged as KVM_RUN runs its guest
-/// in whole scheduler ticks, and said in 10 ms steps. Its thread is the one its vCPU names
+/// in whole scheduler ticks, said in 10 ms steps, and never more than its thread's runtime.
+/// Its thread is the one its vCPU names
 /// ([`this_thread`]), until the vCPU drops: reading it costs the vCPU nothing.
 #[derive(Debug, Clone)]
 pub struct GuestClock(Arc<Mutex<Option<Thread>>>);

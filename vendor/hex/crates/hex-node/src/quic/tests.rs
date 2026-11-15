@@ -10,7 +10,7 @@ use hex_core::netns;
 use hex_core::patience::Patience;
 use hex_quic::enroll::{self, sim::SimCa};
 use hex_quic::{CipherSuite, Config, NamedGroup, Shape};
-use hex_testkit::waits::within;
+use hex_testkit::waits::follow::{self, Party};
 
 use crate::serve::{Host, Native, Server};
 
@@ -32,6 +32,100 @@ static READ: Patience = Patience::measuring("test.hex_node.quic.read");
 static ROOM: Patience = Patience::measuring("test.hex_node.quic.room");
 /// A program's stdin connection ended by the node: once its program let its stdin go, or after its peer's end.
 static STDIN_END: Patience = Patience::measuring("test.hex_node.quic.stdin_end");
+
+// Every wait follows the test's own subject (the review's C-5): a call on a connection, by the connection's life, its
+// end ending the call too; a call on an endpoint, by its driver's.
+
+/// A connection as the party of a wait on it: ended once it's gone.
+fn conn_party(conn: &hex_quic::Conn) -> Party {
+    if conn.gone().is_some() {
+        Party::Ended
+    } else {
+        Party::Live
+    }
+}
+
+/// An endpoint as the party of a wait on it: ended once its driver has.
+fn driver_party(end: &Endpoint) -> Party {
+    match end.links() {
+        Err(hex_quic::Refused::Ended) => Party::Ended,
+        _ => Party::Live,
+    }
+}
+
+/// A connection's call's answer, as a slice of [`follow::within`] takes it: its own deadline passing is no answer yet.
+fn io_slice<T>(got: std::io::Result<T>) -> Option<std::io::Result<T>> {
+    match got {
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => None,
+        got => Some(got),
+    }
+}
+
+/// What `conn` reads into `buf`, as `wait` waits, by the connection's life.
+fn read(wait: &Patience, conn: &hex_quic::Conn, buf: &mut [u8]) -> std::io::Result<usize> {
+    follow::within(
+        wait,
+        "bytes or an end come to the reader",
+        || conn_party(conn),
+        |by| io_slice(conn.read(buf, by)),
+    )
+    .unwrap()
+}
+
+/// Writes `bytes` on `conn` a frame at a time, as `wait` waits for room, by the connection's life: a frame's wait cut at
+/// a slice is made again for that frame alone, as its timeout comes only before it is placed, so none goes twice.
+fn write_all(wait: &Patience, conn: &hex_quic::Conn, bytes: &[u8]) -> std::io::Result<()> {
+    for frame in bytes.chunks(hex_core::lanes::DATA_BOUND) {
+        follow::within(
+            wait,
+            "room for a frame",
+            || conn_party(conn),
+            |by| io_slice(conn.write_all(frame, by)),
+        )
+        .unwrap()?;
+    }
+    Ok(())
+}
+
+/// Ends `conn`'s half, waiting for room as `wait` waits, by the connection's life.
+fn end_half(wait: &Patience, conn: &hex_quic::Conn) -> std::io::Result<()> {
+    follow::within(
+        wait,
+        "room for the end",
+        || conn_party(conn),
+        |by| io_slice(conn.end(by)),
+    )
+    .unwrap()
+}
+
+/// The next connection to `port` a peer opened at `node`, as `wait` waits, by the node's driver's life.
+fn accept(
+    wait: &Patience,
+    node: &Endpoint,
+    port: u32,
+) -> Result<(hex_quic::PeerId, hex_quic::Conn), hex_quic::Refused> {
+    follow::within(
+        wait,
+        "a connection a peer opened",
+        || driver_party(node),
+        |by| match node.accept(port, by) {
+            Err(hex_quic::Refused::Deadline { .. }) => None,
+            got => Some(got),
+        },
+    )
+    .unwrap()
+}
+
+/// `from`'s dial of `name` at `addr`, as `wait` waits: one that can't be cut, whose cut would abandon its handshake and
+/// dial again, so given no deadline, ended by its answer or its endpoint's end.
+fn dial(
+    wait: &Patience,
+    from: &Endpoint,
+    name: &str,
+    addr: SocketAddr,
+) -> Result<hex_quic::PeerId, hex_quic::Refused> {
+    follow::whole(wait, "a dial's answer", || from.dial(name, addr, None))
+}
 
 fn limits() -> Limits {
     Limits {
@@ -71,7 +165,7 @@ fn read_line(conn: &hex_quic::Conn, pending: &mut Vec<u8>) -> String {
             let line: Vec<u8> = pending.drain(..=at).collect();
             return String::from_utf8(line).unwrap();
         }
-        let n = within(&READ, |by| conn.read(&mut buf, by)).unwrap();
+        let n = read(&READ, conn, &mut buf).unwrap();
         assert_ne!(n, 0, "the log ended");
         pending.extend_from_slice(&buf[..n]);
     }
@@ -117,23 +211,33 @@ fn hex_quic_16_the_log_lane_sends_lines_and_tells_a_slow_reader_what_it_missed()
         },
     })
     .unwrap();
-    let peer = within(&DIAL, |by| {
-        client.dial("node.log.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = dial(&DIAL, &client, "node.log.test", node.local_addr()).unwrap();
     let reader = client.open(peer, hex_core::lanes::LOG_PORT).unwrap();
-    hex_testkit::waits::until(&READER, "the log's reader", || log.readers() == 1).unwrap();
+    // A look: the node's log tells no event as it takes a reader, its count read.
+    follow::until(
+        &READER,
+        "the log's reader",
+        || driver_party(&node),
+        || log.readers() == 1,
+    )
+    .unwrap();
     let mut pending = Vec::new();
     log.say("hex.node event=first\n");
     assert_eq!(read_line(&reader, &mut pending), "hex.node event=first\n");
     // The reader stops: lines of a frame each fill its lane and QUIC's window behind it, and the node goes on.
     let big = format!("{}\n", "x".repeat(hex_core::lanes::DATA_BOUND - 1));
     let mut said = 0u64;
-    hex_testkit::waits::until(&MISSED, "a missed line", || {
-        log.say(&big);
-        said += 1;
-        log.missed() > 0
-    })
+    // A look that drives its fact: each says a line, until one is missed; a say tells no event, its count read.
+    follow::until(
+        &MISSED,
+        "a missed line",
+        || conn_party(&reader),
+        || {
+            log.say(&big);
+            said += 1;
+            log.missed() > 0
+        },
+    )
     .unwrap();
     let missed = log.missed();
     // Reading again: every line that went, then the count of those missed, then the next line.
@@ -149,10 +253,16 @@ fn hex_quic_16_the_log_lane_sends_lines_and_tells_a_slow_reader_what_it_missed()
         }
         panic!("a line out of order: {} bytes", line.len());
     }
-    hex_testkit::waits::until(&LOG_ROOM, "the reader's room", || {
-        log.say("hex.node event=after\n");
-        log.missed() == 0
-    })
+    // A look that drives its fact, as the missed line's: each says a line, until the lane takes one.
+    follow::until(
+        &LOG_ROOM,
+        "the reader's room",
+        || conn_party(&reader),
+        || {
+            log.say("hex.node event=after\n");
+            log.missed() == 0
+        },
+    )
     .unwrap();
     // The count comes before the next line that went (more than once where a later line missed too), then that line.
     let mut counted = 0u64;
@@ -216,10 +326,7 @@ fn hex_quic_17_a_tree_staged_over_quic_lands_and_unstages() {
         })
         .unwrap(),
     );
-    let peer = within(&DIAL, |by| {
-        client.dial("node.stage.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = dial(&DIAL, &client, "node.stage.test", node.local_addr()).unwrap();
     let link = hex_quic::link::Link::new(Arc::clone(&client), peer);
     let tree = dir.path().join("tree");
     std::fs::create_dir_all(tree.join("etc")).unwrap();
@@ -280,21 +387,18 @@ fn hex_quic_21_a_programs_stdin_connection_ends_with_its_program_or_its_peer() {
         },
     })
     .unwrap();
-    let peer = within(&DIAL, |by| {
-        client.dial("node.stdin.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = dial(&DIAL, &client, "node.stdin.test", node.local_addr()).unwrap();
     let mut buf = [0u8; 64];
 
     // The program lets its stdin go.
     let theirs = client.open(peer, stream::STDIO_PORT).unwrap();
-    let (_, ours) = within(&ACCEPT, |by| node.accept(stream::STDIO_PORT, by)).unwrap();
+    let (_, ours) = accept(&ACCEPT, &node, stream::STDIO_PORT).unwrap();
     let (r, w) = std::io::pipe().unwrap();
     let copier = std::thread::spawn(move || feed(&ours, w));
     drop(r);
     #[cfg(windows)]
-    within(&ROOM, |by| theirs.write_all(b"after its end\n", by)).unwrap();
-    let ended = within(&STDIN_END, |by| theirs.read(&mut buf, by));
+    write_all(&ROOM, &theirs, b"after its end\n").unwrap();
+    let ended = read(&STDIN_END, &theirs, &mut buf);
     assert!(
         matches!(&ended, Ok(0))
             || ended
@@ -306,16 +410,16 @@ fn hex_quic_21_a_programs_stdin_connection_ends_with_its_program_or_its_peer() {
 
     // The peer ends its stdin.
     let theirs = client.open(peer, stream::STDIO_PORT).unwrap();
-    let (_, ours) = within(&ACCEPT, |by| node.accept(stream::STDIO_PORT, by)).unwrap();
+    let (_, ours) = accept(&ACCEPT, &node, stream::STDIO_PORT).unwrap();
     let (mut r, w) = std::io::pipe().unwrap();
     let copier = std::thread::spawn(move || feed(&ours, w));
-    within(&ROOM, |by| theirs.write_all(b"round trip\n", by)).unwrap();
-    within(&ROOM, |by| theirs.end(by)).unwrap();
+    write_all(&ROOM, &theirs, b"round trip\n").unwrap();
+    end_half(&ROOM, &theirs).unwrap();
     let mut got = String::new();
     r.read_to_string(&mut got).unwrap();
     assert_eq!(got, "round trip\n");
     assert_eq!(
-        within(&STDIN_END, |by| theirs.read(&mut buf, by)).unwrap(),
+        read(&STDIN_END, &theirs, &mut buf).unwrap(),
         0,
         "the node's half of a stdin connection didn't end after its peer's"
     );
@@ -359,13 +463,10 @@ fn hex_quic_22_a_node_that_stages_nothing_refuses_staging_by_type() {
         },
     })
     .unwrap();
-    let peer = within(&DIAL, |by| {
-        client.dial("node.nostage.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = dial(&DIAL, &client, "node.nostage.test", node.local_addr()).unwrap();
     let staging = client.open(peer, stream::files::FILES_PORT).unwrap();
     let mut buf = [0u8; 1];
-    let refused = within(&READ, |by| staging.read(&mut buf, by)).unwrap_err();
+    let refused = read(&READ, &staging, &mut buf).unwrap_err();
     assert_eq!(
         refused.kind(),
         std::io::ErrorKind::ConnectionRefused,
@@ -437,9 +538,7 @@ fn a_peer_connects_to_a_node_shaped_by_a_windows_hosts_platform() {
         },
     })
     .unwrap();
-    let dialed = within(&DIAL, |by| {
-        client.dial("node.windows-host.test", node.local_addr(), by)
-    });
+    let dialed = dial(&DIAL, &client, "node.windows-host.test", node.local_addr());
     assert!(dialed.is_ok(), "{:?}", dialed.err());
     let lanes = usize::try_from(shape(&host, false).lanes).unwrap();
     assert_eq!(lanes, 2 * host.in_flight + 1);
@@ -580,4 +679,185 @@ fn hex_quic_29_the_nodes_report_names_each_peer_with_its_suite_and_group() {
         matches!(refused, Refusal::Invalid { what: "links", .. }),
         "{refused:?}"
     );
+}
+
+/// The log's missed line (CLAUDE.md §10; ROOT, 2026-11-14): its count a whole number. Do: form it for three lines.
+/// Expect: `hex.log event=missed lines=3`.
+#[test]
+fn a_readers_missed_line_counts_its_lines() {
+    assert_eq!(super::missed_line(3), "hex.log event=missed lines=3");
+}
+
+/// What the node sends on control connection `conn` once a hello goes with id `id`: each answer in order, through the
+/// hello's answer, or until the connection ends.
+fn through_hello(conn: &hex_quic::Conn, id: u64) -> Vec<wire::Answer> {
+    let hello = wire::request(
+        id,
+        &Request::Hello {
+            build: wire::build(),
+        },
+        wire::MAX_MESSAGE,
+    )
+    .unwrap();
+    let mut answers = Vec::new();
+    if write_all(
+        &ROOM,
+        conn,
+        &stream::frame(&hello, wire::MAX_MESSAGE).unwrap(),
+    )
+    .is_err()
+    {
+        return answers;
+    }
+    let mut deframer = Deframer::new(wire::MAX_MESSAGE);
+    let mut buf = vec![0u8; hex_core::lanes::DATA_BOUND];
+    loop {
+        let n = match read(&READ, conn, &mut buf) {
+            Ok(0) | Err(_) => return answers,
+            Ok(n) => n,
+        };
+        let mut input = &buf[..n];
+        while !input.is_empty() {
+            let (took, whole) = deframer.take(input).unwrap();
+            input = &input[took..];
+            if let Some(message) = whole {
+                let received = wire::Received {
+                    bytes: &message,
+                    size: message.len(),
+                    descriptors: 0,
+                    descriptors_cut: false,
+                };
+                let (_, answer) = wire::read_answer(&received, wire::MAX_MESSAGE).unwrap();
+                let hello = matches!(answer, wire::Answer::Hello(_));
+                answers.push(answer);
+                if hello {
+                    return answers;
+                }
+            }
+        }
+    }
+}
+
+/// HEX-QUIC-33 (Q13; the review's E-6; ROOT's note (3), 2026-11-14; AC-T7.4.1): the node takes a message that carries a
+/// secret over QUIC sealed alone. Do open three control connections to a node over QUIC, read each one's token and have
+/// its hello answered, then send a lease's answer on each: sealed under the connection's seal on the first, unsealed on
+/// the second, and on the third an inspect sealed as a secret is, its kind marked; then a hello again on each. Expect the
+/// first's lease read, named as the node gives it back (no ask waited for it), and its hello answered, its connection
+/// kept; the second and third connections ended by the node with nothing more said, as bytes that aren't the node's wire
+/// end one.
+#[test]
+fn hex_quic_33_the_node_takes_a_secret_over_quic_sealed_alone() {
+    let ca = SimCa::new().unwrap();
+    let limits = limits();
+    let node = Arc::new(
+        Endpoint::start(Config {
+            credentials: enrolled(&ca, "node.seal.test"),
+            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            listen: true,
+            serves: ports(false),
+            shape: shape(&limits, false),
+        })
+        .unwrap(),
+    );
+    let dir = scratch("q-");
+    let socket = dir.path().join("node.sock");
+    let quic = Quic::new(
+        Native::bind(&socket).unwrap(),
+        Arc::clone(&node),
+        Bounds::of(&limits),
+        None,
+    )
+    .unwrap();
+    let host = Arc::new(Simulated(SimRuntime::new()));
+    let _server = Server::with_os(quic, host, limits, limits.in_flight, &socket).unwrap();
+    let client = Endpoint::start(Config {
+        credentials: enrolled(&ca, "client.seal.test"),
+        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        listen: false,
+        serves: Vec::new(),
+        shape: Shape {
+            connections: 1,
+            lanes: 8,
+        },
+    })
+    .unwrap();
+    let peer = dial(&DIAL, &client, "node.seal.test", node.local_addr()).unwrap();
+    let keys = client.keys(peer).unwrap();
+    let leased = wire::request(
+        9,
+        &Request::Leased {
+            run: 1,
+            answer: Ok(hex_api::lease::Lease {
+                lease: "lease-33".to_owned(),
+                value: hex_api::lease::Value::new(b"hex-33-value".to_vec()),
+                life: None,
+            }),
+        },
+        wire::MAX_MESSAGE,
+    )
+    .unwrap();
+    let mut inspect = wire::request(
+        10,
+        &Request::Call(Call::Inspect(BoxId::new("q13-box").unwrap())),
+        wire::MAX_MESSAGE,
+    )
+    .unwrap();
+    // An inspect marked sealed, its body sealed under the connection's seal as a secret's would be.
+    let kind = u16::from_le_bytes([inspect[12], inspect[13]]);
+    inspect[12..14].copy_from_slice(&(kind | wire::SEALED).to_le_bytes());
+    let mut sealed_inspect = inspect[..wire::HEADER_BYTES].to_vec();
+    let mut body = vec![0u8; inspect.len() - wire::HEADER_BYTES];
+    let (nonce, tag) = wire::Seal::seal(
+        &*keys,
+        &inspect[..wire::HEADER_BYTES],
+        &inspect[wire::HEADER_BYTES..],
+        &mut body,
+    )
+    .unwrap();
+    sealed_inspect.extend_from_slice(&nonce);
+    sealed_inspect.extend_from_slice(&body);
+    sealed_inspect.extend_from_slice(&tag);
+    let sends = [
+        (
+            "a lease's answer sealed",
+            wire::seal(&leased, &*keys).unwrap(),
+            true,
+        ),
+        ("a lease's answer unsealed", leased.clone(), false),
+        ("an inspect marked sealed", sealed_inspect, false),
+    ];
+    for (n, (what, message, kept)) in sends.into_iter().enumerate() {
+        let conn = client.open(peer, stream::CONTROL_PORT).unwrap();
+        let mut token = [0u8; stream::TOKEN_BYTES];
+        let mut got = 0;
+        while got < token.len() {
+            let read = read(&READ, &conn, &mut token[got..]).unwrap();
+            assert_ne!(read, 0, "{what}: the token");
+            got += read;
+        }
+        let first = 100 + 10 * n as u64;
+        let hello = through_hello(&conn, first);
+        assert!(
+            matches!(hello.as_slice(), [wire::Answer::Hello(_)]),
+            "{what}: the hello: {hello:?}"
+        );
+        write_all(
+            &ROOM,
+            &conn,
+            &stream::frame(&message, wire::MAX_MESSAGE).unwrap(),
+        )
+        .unwrap();
+        let after = through_hello(&conn, first + 1);
+        if kept {
+            assert!(
+                matches!(
+                    after.as_slice(),
+                    [wire::Answer::LeaseGiven(lease), wire::Answer::Hello(_)] if lease == "lease-33"
+                ),
+                "{what}: its lease read and its connection kept: {after:?}"
+            );
+        } else {
+            assert!(after.is_empty(), "{what}: its connection ended: {after:?}");
+        }
+    }
 }

@@ -819,20 +819,45 @@ impl BoxCgroup {
         .transpose()
     }
 
-    /// Sends `signal` to every process in the box; refused as not running when there is none.
+    /// Sends `signal` to every process in the box; refused as not running when there is none. A signal holds none of
+    /// its box's turns, so a removal under way (a run's claimer, decision 7, or a delete) can remove the cgroup it found
+    /// while it signals. cgroup v2 removes only an empty cgroup: one removed before the KILL's write or the list of its
+    /// processes had none left, so the box isn't running; one removed after the KILL's write was killed. A cgroup still
+    /// there that fails otherwise is refused as it failed.
     pub fn signal(&self, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
-        if !self.populated()? {
+        if self.populated_if_present()? != Some(true) {
             return Err(Refusal::NotRunning(id.clone(), "signal"));
         }
         if signal == Signal::KILL {
-            return self.kill();
+            return self.killed(id, self.write("cgroup.kill", "1"));
         }
         let sig =
             rustix::process::Signal::from_named_raw(signal.number()).ok_or(Refusal::Invalid {
                 what: "signal",
                 why: format!("{} isn't a signal this kernel names", signal.number()),
             })?;
-        for pid in self.procs()? {
+        self.signalled(id, sig, self.procs())
+    }
+
+    /// A signal's KILL once its `cgroup.kill` write went as `written`: what a leaderless group kept swept as
+    /// [`BoxCgroup::kill`] sweeps it. A deterministic test stands in `written` for a write a removal raced.
+    fn killed(&self, id: &BoxId, written: Result<(), Refusal>) -> Result<(), Refusal> {
+        written.map_err(|failed| self.unless_removed(id, failed))?;
+        match self.sweep_killed() {
+            Err(_) if self.removed() => Ok(()),
+            swept => swept,
+        }
+    }
+
+    /// A signal's `sig` sent to each process `listed` names, the box's `cgroup.procs` as read. A deterministic test
+    /// stands in `listed` for a read a removal raced.
+    fn signalled(
+        &self,
+        id: &BoxId,
+        sig: rustix::process::Signal,
+        listed: Result<Vec<u32>, Refusal>,
+    ) -> Result<(), Refusal> {
+        for pid in listed.map_err(|failed| self.unless_removed(id, failed))? {
             // A process that ended since the list was read is no longer the box's to signal.
             if let Some(pid) = i32::try_from(pid)
                 .ok()
@@ -842,6 +867,21 @@ impl BoxCgroup {
             }
         }
         Ok(())
+    }
+
+    /// A signal's `failed`, unless the cgroup it found was removed since: then the box had no process left to signal.
+    fn unless_removed(&self, id: &BoxId, failed: Refusal) -> Refusal {
+        if self.removed() {
+            Refusal::NotRunning(id.clone(), "signal")
+        } else {
+            failed
+        }
+    }
+
+    /// Whether the cgroup was removed since it was found: its events file no longer opens or reads where it was
+    /// ([`BoxCgroup::populated_if_present`]).
+    fn removed(&self) -> bool {
+        matches!(self.populated_if_present(), Ok(None))
     }
 
     /// The most cgroups a walk of this box's subtree meets ([`sweep_budget`]): what the kill's sweep is bounded
@@ -868,9 +908,15 @@ impl BoxCgroup {
     /// *process-directed* SIGKILL through a process pidfd ([`sigkill_box_process`]): the kernel delivers
     /// it to the whole thread group (`PIDTYPE_TGID`), reaching a leaderless group's live worker the
     /// leader-directed `cgroup.kill` missed (probe `delete_flake_point4.c`). [`BoxCgroup::wait_empty`]
-    /// then sees it empty.
+    /// then sees it empty. A removed directory is refused at every step: its removers (a run's claimer, a delete)
+    /// remove its directory by path next, which a box made again under the id may hold by then.
     pub fn kill(&self) -> Result<(), Refusal> {
         self.write("cgroup.kill", "1")?;
+        self.sweep_killed()
+    }
+
+    /// [`BoxCgroup::kill`] once `cgroup.kill` is written: the processes a leaderless group kept, swept.
+    fn sweep_killed(&self) -> Result<(), Refusal> {
         if !self.populated()? {
             return Ok(());
         }
@@ -2173,6 +2219,61 @@ mod tests {
                 "{failed:?}"
             );
         }
+    }
+
+    /// Runtime goal 7 (decision 7), AC-T7.4.1: a signal holds none of its box's turns, so a removal under way (a run's
+    /// claimer, a delete) can remove the cgroup the signal found before the signal reads it. Plain files stand in for
+    /// the cgroup's, its directory pinned as a box's lookup pins it, then removed. Do: signal TERM and KILL through it.
+    /// Expect: each refused as not running, never an OS error.
+    #[test]
+    fn a_signal_whose_cgroup_was_removed_since_it_was_found_is_refused_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("box");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        let found = pinned_managed_cgroup(&dir);
+        fs::remove_file(dir.join("cgroup.events")).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        let id = BoxId::new("removed").unwrap();
+        for signal in [Signal::TERM, Signal::KILL] {
+            assert_eq!(
+                found.signal(&id, signal),
+                Err(Refusal::NotRunning(id.clone(), "signal")),
+                "{signal:?}"
+            );
+        }
+    }
+
+    /// Runtime goal 7 (decision 7), AC-T7.4.1: a signal's steps after its look at the box, met by a removal of its
+    /// cgroup. Plain files stand in for the cgroup's, its directory pinned. Do: end a KILL whose `cgroup.kill` write
+    /// went and one whose write failed, and send a TERM whose list of processes failed, first with the directory there,
+    /// then removed. Expect, there: each failure refused as it failed, never taken for a removal; removed: the KILL
+    /// that went done (it took before the removal), the others not running.
+    #[test]
+    fn a_signal_met_by_its_cgroups_removal_answers_by_when_the_removal_came() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("box");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        let found = pinned_managed_cgroup(&dir);
+        let id = BoxId::new("met").unwrap();
+        let failed = || Refusal::Os {
+            op: "writing a cgroup file",
+            why: "a failure of a cgroup still there".to_owned(),
+        };
+        let term = rustix::process::Signal::TERM;
+        assert_eq!(found.killed(&id, Err(failed())), Err(failed()));
+        assert_eq!(found.signalled(&id, term, Err(failed())), Err(failed()));
+        assert!(
+            matches!(found.killed(&id, Ok(())), Err(Refusal::Os { .. })),
+            "a sweep that fails with the cgroup there"
+        );
+        fs::remove_file(dir.join("cgroup.events")).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        let not_running = Err(Refusal::NotRunning(id.clone(), "signal"));
+        assert_eq!(found.killed(&id, Ok(())), Ok(()), "a KILL that went first");
+        assert_eq!(found.killed(&id, Err(failed())), not_running);
+        assert_eq!(found.signalled(&id, term, Err(failed())), not_running);
     }
 
     /// Goal 5 extended, step 6 (bench/competitive/probes/create_serial.md, run 12): a box's cgroup opened

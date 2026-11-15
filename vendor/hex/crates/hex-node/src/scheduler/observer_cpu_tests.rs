@@ -29,6 +29,7 @@ impl Endpoint {
             return Err(Refusal::Backing {
                 key: self.key,
                 cause: LifecycleCause::Uncertain,
+                why: None,
             });
         }
         Ok(())
@@ -58,6 +59,7 @@ impl Runtime for Endpoint {
         Err(Refusal::Backing {
             key: *key,
             cause: LifecycleCause::Uncertain,
+            why: None,
         })
     }
     fn release_backing(&self, key: BackingKey) -> Result<BackingOffer, Refusal> {
@@ -67,6 +69,7 @@ impl Runtime for Endpoint {
         Err(Refusal::Backing {
             key,
             cause: LifecycleCause::Uncertain,
+            why: None,
         })
     }
     fn create(&self, spec: BoxSpec) -> Result<hex_api::BoxInfo, Refusal> {
@@ -125,6 +128,7 @@ fn failed_firecracker_observation_keeps_real_service_cpu_progress_without_gpu_fa
         generation: [82; 16],
     };
     let mut native = Capacity {
+        own: Default::default(),
         id: "one native physical CPU plane".into(),
         total: room,
         free: room,
@@ -135,6 +139,8 @@ fn failed_firecracker_observation_keeps_real_service_cpu_progress_without_gpu_fa
         backings: Vec::new(),
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     hex_runtime::devices::native_routes(&mut native, hex_api::Class::Process, image).unwrap();
     let cost = RuntimeCost {
@@ -158,6 +164,7 @@ fn failed_firecracker_observation_keeps_real_service_cpu_progress_without_gpu_fa
         overhead: CapacityResources::default(),
     };
     let observer_report = Capacity {
+        own: Default::default(),
         id: native.id.clone(),
         total: room,
         free: room,
@@ -187,6 +194,8 @@ fn failed_firecracker_observation_keeps_real_service_cpu_progress_without_gpu_fa
         }],
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     observer_report.check().unwrap();
     let failed = Arc::new(AtomicBool::new(false));
@@ -367,6 +376,7 @@ fn uncertain_canonical_drain_keeps_cpu_progress_and_retains_original_charge() {
         generation: [82; 16],
     };
     let mut native = Capacity {
+        own: Default::default(),
         id: "one native physical CPU plane".into(),
         total: room,
         free: room,
@@ -377,6 +387,8 @@ fn uncertain_canonical_drain_keeps_cpu_progress_and_retains_original_charge() {
         backings: Vec::new(),
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     hex_runtime::devices::native_routes(&mut native, hex_api::Class::Process, image).unwrap();
     let cost = RuntimeCost {
@@ -400,6 +412,7 @@ fn uncertain_canonical_drain_keeps_cpu_progress_and_retains_original_charge() {
         overhead: CapacityResources::default(),
     };
     let observer_report = Capacity {
+        own: Default::default(),
         id: native.id.clone(),
         total: room,
         free: room,
@@ -429,6 +442,8 @@ fn uncertain_canonical_drain_keeps_cpu_progress_and_retains_original_charge() {
         }],
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     observer_report.check().unwrap();
     let failed = Arc::new(AtomicBool::new(false));
@@ -606,6 +621,7 @@ fn uncertain_canonical_drain_keeps_cpu_progress_and_retains_original_charge() {
     let expected = Refusal::Backing {
         key,
         cause: LifecycleCause::Uncertain,
+        why: None,
     };
     assert_eq!(refreshed.unwrap(), vec![expected.clone()]);
     let reply = service.command(dto::Command::Retry).unwrap();
@@ -636,7 +652,11 @@ fn cleanup_diagnostics_preserve_exact_identity_and_refuse_unqualified_failures()
         LifecycleCause::Busy,
         LifecycleCause::Uncertain,
     ] {
-        let why = Refusal::Backing { key, cause };
+        let why = Refusal::Backing {
+            key,
+            cause,
+            why: None,
+        };
         assert_eq!(drain_failure(key, why.clone()).unwrap(), why);
         let text = cleanup_report(&why).unwrap();
         assert!(text.contains(&"ff".repeat(key.pool.len())));
@@ -646,6 +666,7 @@ fn cleanup_diagnostics_preserve_exact_identity_and_refuse_unqualified_failures()
             LifecycleCause::Busy => "busy",
             LifecycleCause::Uncertain => "uncertain",
             LifecycleCause::Retired => "retired",
+            LifecycleCause::NodeVmEnded => "node-vm-ended",
         };
         assert!(text.ends_with(&format!("cause={name}")));
     }
@@ -657,6 +678,7 @@ fn cleanup_diagnostics_preserve_exact_identity_and_refuse_unqualified_failures()
         Refusal::Backing {
             key: foreign,
             cause: LifecycleCause::Uncertain,
+            why: None,
         },
         Refusal::Invalid {
             what: "native authority",
@@ -666,6 +688,7 @@ fn cleanup_diagnostics_preserve_exact_identity_and_refuse_unqualified_failures()
         Refusal::Lifecycle {
             id: BoxId::new("not-a-pool").unwrap(),
             cause: LifecycleCause::Busy,
+            why: None,
         },
     ];
     for why in errors {

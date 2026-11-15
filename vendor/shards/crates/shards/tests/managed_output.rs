@@ -1,12 +1,11 @@
 //! Supplied AGENT/HARNESS output through the daemon's private owner endpoint.
-#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 mod common;
 
 #[path = "common/managed_capture.rs"]
 mod managed_capture;
-use managed_capture::{Ask, Event, Metadata, Observer};
+use managed_capture::{Ask, Event, Metadata, Observer, Until};
 
 #[path = "managed_output/tenant_exit.rs"]
 mod tenant_exit;
@@ -20,6 +19,9 @@ mod metrics;
 #[path = "managed_output/member_stdin.rs"]
 mod member_stdin;
 
+#[path = "managed_output/log_lanes.rs"]
+mod log_lanes;
+
 #[path = "common/managed_alloc.rs"]
 mod managed_alloc;
 
@@ -29,7 +31,7 @@ static MANAGED_ALLOC: managed_alloc::ManagedAlloc = managed_alloc::ManagedAlloc:
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use shards_abi::run::managed::{Channel, Event as CaptureEvent, Record, StreamState};
@@ -37,8 +39,38 @@ use shards_remote::identity::Identity;
 use shards_remote::managed::{Reason, Scope};
 use shards_remote::net::Command;
 
-// Test patience, matching the neighboring real-VM build fixtures; never runtime policy.
-const WITHIN: Duration = Duration::from_secs(120);
+/// What a fixture's wait is held to: judged on its home's daemon and microVMs (D209), or a
+/// coordinator campaign's own phase deadline, its caller's input.
+#[derive(Clone, Copy)]
+enum Bound {
+    Judged,
+    At(Instant),
+}
+
+impl From<Instant> for Bound {
+    fn from(at: Instant) -> Self {
+        Bound::At(at)
+    }
+}
+
+impl Bound {
+    /// An observer's wait on `home`'s run, held as this is.
+    fn on(self, home: &Path) -> Until<'_> {
+        match self {
+            Bound::Judged => Until::Judged(home),
+            Bound::At(at) => Until::At(at),
+        }
+    }
+
+    /// What a command is given of it: nothing bounds a command's wait, judged already
+    /// (`common::run_command`), so only a campaign's deadline is told.
+    fn left(self) -> Duration {
+        match self {
+            Bound::Judged => Duration::MAX,
+            Bound::At(at) => at.saturating_duration_since(Instant::now()),
+        }
+    }
+}
 
 fn payload(member: &str, channel: Channel) -> Vec<u8> {
     let tail: &[u8] = match channel {
@@ -57,6 +89,7 @@ struct Fixture {
     observers: Vec<Observer>,
     observed: BTreeMap<(u32, u8), (u64, u64)>,
     /// Every socket this fixture's observers opened, checked returned at shutdown.
+    #[cfg(unix)]
     observer_sockets: Vec<managed_capture::Held>,
     /// A whole-process descriptor baseline, compared at shutdown: valid only for a caller that
     /// runs alone in its process, as the coordinator's cost campaign does, which sets it. The
@@ -78,13 +111,17 @@ impl Fixture {
             record: None,
             observers: Vec::new(),
             observed: BTreeMap::new(),
+            #[cfg(unix)]
             observer_sockets: Vec::new(),
             initial_fds: None,
             stdin: None,
         }
     }
 
-    fn command(&self, args: &[&str], within: Duration) -> common::Run {
+    /// `shards ARGS` in its home, waited on as long as it goes on (`common::run_command`):
+    /// `_within`, its callers' share of their case's time, bounds it no more.
+    #[track_caller]
+    fn command(&self, args: &[&str], _within: Duration) -> common::Run {
         common::run_shards_env(
             &[],
             args,
@@ -93,7 +130,6 @@ impl Fixture {
                 ("SHARDS_KERNEL", common::kernel().as_os_str()),
                 ("SHARDS_INIT", common::guest_init().as_os_str()),
             ],
-            within,
         )
     }
 
@@ -104,7 +140,7 @@ impl Fixture {
             "",
             None,
             None,
-            Instant::now() + WITHIN,
+            Bound::Judged,
         );
     }
 
@@ -115,8 +151,9 @@ impl Fixture {
         directives: &str,
         agent_tasks: Option<u32>,
         publish_ports: Option<&[u16]>,
-        until: Instant,
+        until: impl Into<Bound>,
     ) {
+        let until: Bound = until.into();
         let processes = agent_tasks
             .map(|tasks| {
                 assert!(
@@ -141,12 +178,18 @@ impl Fixture {
         std::fs::write(self.context.join("files/asset"), b"files-only").unwrap();
         std::fs::create_dir(self.context.join("agent")).unwrap();
         std::fs::copy(common::test_guest(), self.context.join("agent/member")).unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(
-            self.context.join("agent/member"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        // A context's files keep their modes on a Unix host, as fsutil walks them, and a
+        // copied file is a program only if made one; a Windows host's context gives every
+        // file 0755 (tests/member_exec.rs).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                self.context.join("agent/member"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
         std::fs::write(
             self.context.join("agent/agent.json"),
             serde_json::to_vec(&serde_json::json!({"entrypoint":"member","options":agent})).unwrap(),
@@ -173,10 +216,10 @@ impl Fixture {
                 "owner-output:1",
                 self.context.to_str().unwrap(),
             ],
-            until.saturating_duration_since(Instant::now()),
+            until.left(),
         );
         assert_eq!(built.status, Some(0), "{built}");
-        let run = |args: &[&str]| self.command(args, until.saturating_duration_since(Instant::now()));
+        let run = |args: &[&str]| self.command(args, until.left());
         let stdin = self.stdin.map(|members| format!("shards.stdin={members}"));
         // Its owner reads both members' output (D240): the daemon drains none of it.
         let mut args = vec![
@@ -203,8 +246,9 @@ impl Fixture {
             "unexpected detached run identity"
         );
         let record = self.home.join("containers").join(id).join("managed-output");
-        let metadata = Metadata::parse(&std::fs::read_to_string(&record).unwrap())
-            .unwrap_or_else(|| panic!("published owner metadata"));
+        // Public fingerprints and loopback endpoints alone: shown whole where it is not one.
+        let text = std::fs::read_to_string(&record).unwrap();
+        let metadata = Metadata::parse(&text).unwrap_or_else(|| panic!("published owner metadata:\n{text}"));
         assert_eq!(metadata.run, id);
         assert_eq!(metadata.server, self.owner.fingerprint());
         assert_eq!(metadata.owner, self.owner.fingerprint());
@@ -228,7 +272,7 @@ impl Fixture {
         channel: Channel,
         offered: Option<Scope>,
         outsider: bool,
-        until: Instant,
+        until: impl Into<Bound>,
     ) -> usize {
         let metadata = self.metadata.as_ref().unwrap();
         let _ = writeln!(
@@ -242,8 +286,9 @@ impl Fixture {
             metadata,
             offered.unwrap_or_else(|| metadata.scope(member, channel)),
             metadata.endpoints[&(member, channel as u8)],
-            until,
+            Into::<Bound>::into(until).on(&self.home),
         );
+        #[cfg(unix)]
         self.observer_sockets.extend_from_slice(&observer.held);
         self.observers.push(observer);
         self.observers.len() - 1
@@ -274,12 +319,13 @@ impl Fixture {
         );
     }
 
+    #[track_caller]
     fn consume(&mut self, member: u32, label: &str, channel: Channel) {
-        let observer = self.observe(member, channel, None, false, Instant::now() + WITHIN);
+        let observer = self.observe(member, channel, None, false, Bound::Judged);
         let expected = payload(label, channel);
         let (_, wire) =
-            self.observers[observer].exact(declared_label(member), &expected, Instant::now() + WITHIN);
-        self.observers[observer].ack_and_finish(wire, Instant::now() + WITHIN);
+            self.observers[observer].exact(declared_label(member), &expected, Until::Judged(&self.home));
+        self.observers[observer].ack_and_finish(wire, Until::Judged(&self.home));
         self.observed.insert((member, channel as u8), (wire, wire));
         let _ = writeln!(
             std::io::stdout(),
@@ -289,42 +335,57 @@ impl Fixture {
         );
     }
 
-    fn shutdown(&mut self, until: Instant) -> Result<(), String> {
+    fn shutdown(&mut self, until: impl Into<Bound>) -> Result<(), String> {
+        let until: Bound = until.into();
+        let home = self.home.to_path_buf();
         let _ = writeln!(std::io::stdout(), "managed-owner owner stop");
         let mut errors = Vec::new();
         for observer in &self.observers {
             observer.sender.request_stop();
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.command(
-                &["stop", "daemon"],
-                until.saturating_duration_since(Instant::now()),
-            )
+            self.command(&["stop", "daemon"], until.left())
         })) {
             Ok(stopped) if stopped.status != Some(0) => errors.push(format!("owner stop: {stopped}")),
+            // A stop returns once its daemon has exited (cli/client.rs `stop`), which lets go
+            // of its home's lock last (daemon.rs `finish`), its runs and their managed records
+            // ended before. HVF at 4a426c367 found those records unwritten after a stop.
+            Ok(_) if !daemon_gone(&self.home) => errors.push(
+                "`stop daemon` returned while its daemon still held its home's lock: its runs, and their \
+                 managed records, not yet ended"
+                    .into(),
+            ),
             Err(_) => errors.push("owner-stop CLI helper panicked".into()),
             _ => {}
         }
         for observer in &mut self.observers {
-            if let Err(error) = observer.join(until) {
+            if let Err(error) = observer.join(until.on(&home)) {
                 errors.push(error);
             }
         }
         self.observers.clear();
-        let open = managed_capture::not_returned(&self.observer_sockets);
+        #[cfg(unix)]
+        {
+            let open = managed_capture::not_returned(&self.observer_sockets);
+            let _ = writeln!(
+                std::io::stdout(),
+                "managed-owner observer_sockets opened={} not_returned={}",
+                self.observer_sockets.len(),
+                open.len()
+            );
+            if !open.is_empty() {
+                errors.push(format!("observer sockets not returned: {open:?}"));
+            }
+        }
+        #[cfg(windows)]
         let _ = writeln!(
             std::io::stdout(),
-            "managed-owner observer_sockets opened={} not_returned={}",
-            self.observer_sockets.len(),
-            open.len()
+            "managed-owner observer_sockets unverified: {}",
+            managed_capture::UNIDENTIFIED
         );
-        if !open.is_empty() {
-            errors.push(format!("observer sockets not returned: {open:?}"));
-        }
         if let Some(before) = self.initial_fds {
-            match std::fs::read_dir("/proc/self/fd") {
-                Ok(entries) => {
-                    let after = entries.count();
+            match descriptors() {
+                Ok(after) => {
                     let _ = writeln!(
                         std::io::stdout(),
                         "managed-owner observer_fds before={before} after={after}"
@@ -349,7 +410,12 @@ impl Fixture {
         let terminal = record
             .lines()
             .find_map(|line| line.strip_prefix(&prefix))
-            .unwrap_or_else(|| panic!("terminal channel metadata"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "terminal metadata of member {member} channel {}:\n{record}",
+                    channel as u8
+                )
+            });
         let fields: Vec<_> = terminal.split_whitespace().collect();
         let [
             "aborted",
@@ -373,6 +439,23 @@ impl Fixture {
         );
         cursors
     }
+
+    /// Its observers' sockets as evidence records them: each one's descriptor and identity
+    /// (managed_capture::Held), or why Windows names none.
+    fn sockets_record(&self) -> serde_json::Value {
+        #[cfg(unix)]
+        {
+            self.observer_sockets
+                .iter()
+                .map(|socket| serde_json::json!({"fd":socket.fd,"id":socket.id}))
+                .collect::<Vec<_>>()
+                .into()
+        }
+        #[cfg(windows)]
+        {
+            serde_json::json!({"state":"Unverified","why":managed_capture::UNIDENTIFIED})
+        }
+    }
 }
 
 fn declared_label(member: u32) -> &'static str {
@@ -381,6 +464,81 @@ fn declared_label(member: u32) -> &'static str {
         2 => "harness driver",
         _ => panic!("fixture has no runnable member {member}"),
     }
+}
+
+/// Whether `home`'s daemon has let go of it: its lock (`daemon.lock`), which a daemon holds
+/// from its start until the last of its exit (daemon.rs `finish`), free.
+fn daemon_gone(home: &std::path::Path) -> bool {
+    // A home no daemon took has no lock to hold.
+    let Ok(lock) = std::fs::File::open(home.join("daemon.lock")) else {
+        return true;
+    };
+    let free = lock.try_lock().is_ok();
+    // Let go of before its file closes (M244).
+    let _ = lock.unlock();
+    free
+}
+
+/// This process's open descriptors, counted as the coordinator's cost campaign counts the
+/// baseline it sets ([`Fixture::initial_fds`]): the entries of Linux's /proc/self/fd, or of
+/// macOS's /dev/fd (fdescfs), the listing's own among them; Windows' handles
+/// (GetProcessHandleCount, platform::open_descriptors). A whole-process count, which this
+/// binary's tests running beside each other move: compared only by a caller that runs alone.
+fn descriptors() -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        let listing = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        Ok(std::fs::read_dir(listing)?.count())
+    }
+    #[cfg(windows)]
+    {
+        shards_vmm::platform::open_descriptors()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(std::io::Error::last_os_error)
+    }
+}
+
+/// Stops an observer as the thread holding this unwinds: its reader's wait then ends at once,
+/// with its driver's end, not at its deadline.
+struct StopOnPanic<'a>(&'a shards_remote::net::Sender<Ask>);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.request_stop();
+        }
+    }
+}
+
+/// Runs `help` on a thread of its own while `wait` reads `observer` here. A helper that
+/// panics stops the observer as it unwinds, which ends `wait`'s read at once, and its own
+/// panic, the cause of the read cut short, is the one this fails with, its thread joined.
+/// The KVM run at d5afadbc8 waited out a 120 s deadline behind a writer's panic instead,
+/// then was ended in its cleanup.
+fn beside<H: Send, W>(
+    observer: &Observer,
+    help: impl FnOnce() -> H + Send,
+    wait: impl FnOnce() -> W,
+) -> (H, W) {
+    let sender = &observer.sender;
+    std::thread::scope(|scope| {
+        let helper = scope.spawn(move || {
+            let _stop = StopOnPanic(sender);
+            help()
+        });
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(wait));
+        let helped = helper
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (
+            helped,
+            waited.unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        )
+    })
 }
 
 fn with_fixture(test: impl FnOnce(&mut Fixture)) -> Option<Fixture> {
@@ -392,7 +550,7 @@ fn with_fixture(test: impl FnOnce(&mut Fixture)) -> Option<Fixture> {
         fixture.start();
         test(&mut fixture);
     }));
-    let stopped = fixture.shutdown(Instant::now() + WITHIN);
+    let stopped = fixture.shutdown(Bound::Judged);
     if let Err(error) = result {
         let _ = writeln!(std::io::stderr(), "owner cleanup: {stopped:?}");
         std::panic::resume_unwind(error);
@@ -404,22 +562,24 @@ fn with_fixture(test: impl FnOnce(&mut Fixture)) -> Option<Fixture> {
 #[test]
 fn supplied_owner_output_keeps_bytes_ack_cancel_and_neighbor_progress_independent() {
     let Some(fixture) = with_fixture(|fixture| {
-        let held = fixture.observe(1, Channel::Stdout, None, false, Instant::now() + WITHIN);
+        let held = fixture.observe(1, Channel::Stdout, None, false, Bound::Judged);
         let (start, end) = fixture.observers[held].exact(
             declared_label(1),
             &payload("agent", Channel::Stdout),
-            Instant::now() + WITHIN,
+            Until::Judged(&fixture.home),
         );
         fixture.observed.insert((1, Channel::Stdout as u8), (end, start));
         fixture.consume(1, "agent", Channel::Stderr);
-        fixture.main_progress(WITHIN);
+        fixture.main_progress(Duration::MAX);
         fixture.observers[held]
             .sender
             .send(Command::Handler(Ask::Cancel))
             .unwrap();
-        fixture.observers[held].join(Instant::now() + WITHIN).unwrap();
+        fixture.observers[held]
+            .join(Until::Judged(&fixture.home))
+            .unwrap();
         let _ = writeln!(std::io::stdout(), "managed-owner local cancellation complete");
-        fixture.main_progress(WITHIN);
+        fixture.main_progress(Duration::MAX);
         // The sibling receives its first output credit only after observer loss.
         fixture.consume(2, "harness", Channel::Stdout);
         fixture.consume(2, "harness", Channel::Stderr);
@@ -439,19 +599,19 @@ fn supplied_owner_output_keeps_bytes_ack_cancel_and_neighbor_progress_independen
 #[test]
 fn private_owner_output_refuses_wrong_owner_stale_generation_and_cross_member_scope() {
     let Some(fixture) = with_fixture(|fixture| {
-        let outsider = fixture.observe(1, Channel::Stdout, None, true, Instant::now() + WITHIN);
+        let outsider = fixture.observe(1, Channel::Stdout, None, true, Bound::Judged);
         // The current public Driver erases the typed TLS cause. A peer close without
         // an application code is observed; local errors/deadlines/data are failures.
-        fixture.observers[outsider].refused(None, Instant::now() + WITHIN);
+        fixture.observers[outsider].refused(None, Until::Judged(&fixture.home));
         let mut stale = fixture.metadata.as_ref().unwrap().scope(1, Channel::Stderr);
         stale.generation = stale.generation.checked_add(1).unwrap();
-        let observer = fixture.observe(1, Channel::Stderr, Some(stale), false, Instant::now() + WITHIN);
-        fixture.observers[observer].refused(Some(Reason::Stale), Instant::now() + WITHIN);
+        let observer = fixture.observe(1, Channel::Stderr, Some(stale), false, Bound::Judged);
+        fixture.observers[observer].refused(Some(Reason::Stale), Until::Judged(&fixture.home));
         let other = fixture.metadata.as_ref().unwrap().scope(1, Channel::Stdout);
-        let observer = fixture.observe(2, Channel::Stdout, Some(other), false, Instant::now() + WITHIN);
-        fixture.observers[observer].refused(Some(Reason::Scope), Instant::now() + WITHIN);
+        let observer = fixture.observe(2, Channel::Stdout, Some(other), false, Bound::Judged);
+        fixture.observers[observer].refused(Some(Reason::Scope), Until::Judged(&fixture.home));
         fixture.consume(2, "harness", Channel::Stderr);
-        fixture.main_progress(WITHIN);
+        fixture.main_progress(Duration::MAX);
     }) else {
         return;
     };
@@ -477,10 +637,45 @@ fn metadata_requires_unique_scoped_loopback_endpoints() {
     assert!(Metadata::parse(&format!("{header}member 2 channel 3 address 127.0.0.1:12345\n")).is_none());
 }
 
-/// An observer whose endpoint never answers: a UDP socket on 127.0.0.2, apart from the
-/// 127.0.0.1 sockets observers open.
+/// The record as the daemon goes on writing it (daemon/managed.rs): each channel's end
+/// appended after the endpoints, an output's `canonical` errno and `state`, an input's
+/// `state`. A member that ends at once has its input's end there before its owner reads the
+/// record, which was then no record (HVF at 4a426c367: "published owner metadata").
+#[test]
+fn metadata_keeps_its_endpoints_beside_the_ends_appended_after_them() {
+    let key = "01".repeat(32);
+    let header =
+        format!("shards managed output 1\nserver {key}\nowner {key}\nrun abc\ngeneration 9\ncapacity 64\n");
+    let endpoints =
+        "member 2 channel 0 address 127.0.0.1:12345\nmember 2 channel 1 address 127.0.0.1:12346\n";
+    let ends = "member 2 channel 0 state aborted written 0 errno 32\n\
+        member 2 channel 1 canonical aborted errno 5\n\
+        member 2 channel 1 state aborted accepted 20 consumed 20 tail unknown\n";
+    let metadata = Metadata::parse(&format!("{header}{endpoints}{ends}")).unwrap();
+    assert_eq!(
+        metadata.endpoints.keys().copied().collect::<Vec<_>>(),
+        [(2, 0), (2, 1)]
+    );
+    // An end of a channel it never published, an endpoint after an end, a word the daemon
+    // never writes, and an end that says nothing: none is a record of its.
+    for wrong in [
+        "member 1 channel 1 state ended accepted 7 consumed 7 tail complete\n",
+        "member 2 channel 0 state closed written 4 errno 0\nmember 2 channel 2 address 127.0.0.1:12347\n",
+        "member 2 channel 1 torn\n",
+        "member 2 channel 1 state\n",
+    ] {
+        assert!(
+            Metadata::parse(&format!("{header}{endpoints}{wrong}")).is_none(),
+            "{wrong:?}"
+        );
+    }
+}
+
+/// An observer whose endpoint never answers: a UDP socket on loopback, told apart from the
+/// observer's own as theirs are, by its whole address. 127.0.0.1, which every host's loopback
+/// serves: macOS's lo0 serves no other address of 127.0.0.0/8 without an alias its root adds.
 fn unanswered_observer() -> (std::net::UdpSocket, Observer) {
-    let silent = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let key = "01".repeat(32);
     let metadata = Metadata::parse(&format!(
         "shards managed output 1\nserver {key}\nowner {key}\nrun unanswered\ngeneration 1\ncapacity 64\nmember 1 channel 1 address {}\n",
@@ -492,59 +687,164 @@ fn unanswered_observer() -> (std::net::UdpSocket, Observer) {
         &metadata,
         metadata.scope(1, Channel::Stdout),
         metadata.endpoints[&(1, 1)],
-        Instant::now() + WITHIN,
+        Until::Ordered,
     );
     (silent, observer)
 }
 
 /// Sends `ask` once the observer's one admitted command slot is free: its driver frees it as
-/// it takes the Connect `Observer::start` sent.
+/// it takes the Connect `Observer::start` sent, an order of its own thread's, no bound.
 fn admit(observer: &Observer, ask: Ask) {
-    let until = Instant::now() + WITHIN;
     let mut command = Command::Handler(ask);
     while let Err(std::sync::mpsc::TrySendError::Full(back)) = observer.sender.try_send(command) {
-        assert!(Instant::now() < until, "observer driver took no command");
         command = back;
         std::thread::yield_now();
     }
 }
 
+/// What a caught panic said: a message with arguments is a String, a literal a &'static str.
+fn said(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|said| (*said).to_owned()))
+        .unwrap_or_default()
+}
+
 #[test]
 fn a_lost_observer_stream_says_how_its_driver_ended() {
     let lost = |observer: &Observer| {
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            observer.next(Instant::now() + WITHIN)
-        }))
-        .unwrap_err();
-        // A message with arguments is a String, a literal a &'static str.
-        panic
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| panic.downcast_ref::<&str>().map(|said| (*said).to_owned()))
-            .unwrap_or_default()
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.next(Until::Ordered)))
+            .unwrap_err();
+        said(panic.as_ref())
     };
     // A driver that ends normally: its observer's own cancel.
     let (_silent, mut cancelled) = unanswered_observer();
     admit(&cancelled, Ask::Cancel);
     let said = lost(&cancelled);
     assert!(said.contains("driver ended Ok"), "{said}");
-    cancelled.join(Instant::now() + WITHIN).unwrap();
-    // A driver whose thread panics: a second Connect finds its client config taken.
-    let (silent, mut panicked) = unanswered_observer();
-    admit(&panicked, Ask::Connect(silent.local_addr().unwrap()));
+    cancelled.join(Until::Ordered).unwrap();
+    // A driver whose thread panics, as it is asked to.
+    let (_silent, mut panicked) = unanswered_observer();
+    admit(&panicked, Ask::Panic);
     let said = lost(&panicked);
     assert!(said.contains("panicked"), "{said}");
-    assert!(panicked.join(Instant::now() + WITHIN).is_err());
+    assert!(panicked.join(Until::Ordered).is_err());
 }
 
+/// A helper that panics while the test reads an observer beside it ends that read at once,
+/// and the helper's own panic is what fails: the read is never left to wait it out, as
+/// member_stdin's was behind its writer at d5afadbc8. Its observer and its read have no
+/// deadline at all (`Until::Ordered`), so only the stop the panic sends ends the read.
+#[test]
+fn a_helpers_panic_ends_the_read_beside_it_and_is_what_fails() {
+    fn helper() {
+        panic!("the helper's own failure");
+    }
+    let (_silent, mut observer) = unanswered_observer();
+    let began = Instant::now();
+    let read = std::cell::Cell::new(None);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        beside(&observer, helper, || {
+            let next =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.next(Until::Ordered)));
+            let how = match next {
+                Ok(event) => format!("{event:?}"),
+                Err(panic) => said(panic.as_ref()),
+            };
+            read.set(Some((Instant::now(), how)));
+        })
+    }))
+    .unwrap_err();
+    assert_eq!(said(failed.as_ref()), "the helper's own failure");
+    // Ended by the stop the helper's panic sent, its driver's end, as neither the observer nor
+    // its read has a deadline.
+    let (ended, how) = read.take().unwrap();
+    assert!(
+        how.contains("driver ended Ok"),
+        "the read ended {:?} after it began, by {how}",
+        ended.duration_since(began)
+    );
+    observer.join(Until::Ordered).unwrap();
+}
+
+/// A socket of this process's is found once by its address while other sockets come and go
+/// (`managed_capture::bound`, which finds an observer's): CI's aarch64 musl run 43513425954
+/// found one twice, `[114149, 114149]`. /proc/net/udp is no snapshot: its reader takes the
+/// table as little as each read(2) asks, resuming by position, so a socket inserted or removed
+/// meanwhile has another listed twice or not at all. Do: hold a socket; on as many threads as
+/// this host runs at once, keep twice a page of /proc/net/udp's lines (each 128 bytes,
+/// udp4_format_sock's width) of other sockets, closing and binding them anew; meanwhile find
+/// the held one by its address, as many times as a churner keeps sockets. Expect: found once
+/// each time. (Before, adacachy2 at 54286a668 found 329 of 2,048 twice.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_socket_is_found_once_while_others_come_and_go() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let SocketAddr::V4(at) = held.local_addr().unwrap() else {
+        panic!("an IPv4 socket");
+    };
+    // SAFETY: sysconf(3) reads a value and changes nothing.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let batch = 2 * page / 128;
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    // Its churners hold `threads * batch` sockets at once: the soft descriptor limit raised to
+    // the hard one, as the daemon raises its own (a systemd unit's soft limit is 1024, under
+    // 32 threads' 2,048: KVM c36 refused EMFILE).
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit(2) and setrlimit(2) on a struct of ours.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = limit.rlim_max;
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+    let wanted = u64::try_from(threads * batch).unwrap();
+    assert!(
+        limit.rlim_max > wanted,
+        "its churners need {wanted} descriptors; this host's hard limit is {}",
+        limit.rlim_max
+    );
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut kept = std::collections::VecDeque::new();
+                while !stop.load(Ordering::Relaxed) {
+                    if kept.len() >= batch {
+                        kept.pop_front();
+                    }
+                    kept.push_back(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+                }
+            });
+        }
+        let found: Vec<Vec<u64>> = (0..batch).map(|_| managed_capture::bound(at)).collect();
+        stop.store(true, Ordering::Relaxed);
+        let torn: Vec<_> = found.iter().filter(|ids| ids.len() != 1).collect();
+        assert!(
+            torn.is_empty(),
+            "{} of {} finds not once: {:?}",
+            torn.len(),
+            found.len(),
+            torn.first()
+        );
+    });
+    drop(held);
+}
 /// The binary's tests share this process: another test's descriptors come and go while an
-/// observer lives. Its own sockets, told apart by inode, are what its shutdown checks.
+/// observer lives. Its own sockets, told apart by their kernel identity (managed_capture's
+/// Held), are what its shutdown checks. Unix's alone: Windows names a socket by nothing a
+/// test can read again (managed_capture::UNIDENTIFIED), and has no dup(2).
+#[cfg(unix)]
 #[test]
 fn observer_sockets_are_checked_by_identity_beside_other_tests_descriptors() {
     use std::os::fd::FromRawFd as _;
-    let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let count = || descriptors().unwrap();
     // As another test's would: a descriptor open across the baseline, closed in the window.
-    let neighbor = std::fs::File::open("/proc/self/stat").unwrap();
+    let neighbor = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
     let before = count();
     let (silent, mut observer) = unanswered_observer();
     let held = observer.held.clone();
@@ -553,15 +853,25 @@ fn observer_sockets_are_checked_by_identity_beside_other_tests_descriptors() {
         held,
         "both open while it lives"
     );
-    // A leak: a second descriptor for one of its sockets, kept past the observer's end.
+    // A leak: a second descriptor for one of its sockets, kept past the observer's end. It is
+    // close-on-exec (F_DUPFD_CLOEXEC), as std makes its own: std starts a process with each
+    // descriptor that is not (posix_spawn, no POSIX_SPAWN_CLOEXEC_DEFAULT), and dup(2) clears
+    // the flag, so a process another test started meanwhile held the socket past the copy's
+    // end (HVF at 4a426c367).
     let leaked = held[0];
-    // SAFETY: dup(2) of a descriptor this live observer holds.
-    let copy = unsafe { libc::dup(leaked.fd) };
+    // SAFETY: fcntl(2) duplicating a descriptor this live observer holds.
+    let copy = unsafe { libc::fcntl(leaked.fd, libc::F_DUPFD_CLOEXEC, 0) };
     assert!(copy >= 0, "{}", std::io::Error::last_os_error());
-    // SAFETY: the descriptor dup(2) just returned, owned here once.
+    // SAFETY: the descriptor fcntl(2) just returned, owned here once.
     let copy = unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) };
+    // As another test's would: a process started while the copy lives, until its stdin ends.
+    let mut started = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
     admit(&observer, Ask::Cancel);
-    observer.join(Instant::now() + WITHIN).unwrap();
+    observer.join(Until::Ordered).unwrap();
     drop((silent, observer, neighbor));
     let after = count();
     // Alone in its process this prints equal counts beside the leak; beside the binary's other
@@ -574,8 +884,15 @@ fn observer_sockets_are_checked_by_identity_beside_other_tests_descriptors() {
     assert_eq!(managed_capture::not_returned(&held), [leaked]);
     drop(copy);
     let returned = managed_capture::not_returned(&held);
+    drop(started.stdin.take());
+    started.wait().unwrap();
     assert!(returned.is_empty(), "{returned:?}");
 }
 
+// The coordinator's cost campaign is Linux's: it reads each process's /proc (stat, status,
+// smaps_rollup, cgroup, descriptors and UDP tables) and holds its exit watches as pidfds, whose
+// count its descriptor check adds. macOS's and Windows' twins of those (libproc, kqueue, process
+// handles) it does not have yet; its parsers read Linux's formats alone.
+#[cfg(target_os = "linux")]
 #[path = "../../../docs/research/measurements/managed-output-cost/fixture.rs"]
 mod cost;

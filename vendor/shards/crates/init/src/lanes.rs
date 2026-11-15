@@ -1,7 +1,8 @@
 //! Lanes between the host and sockets inside the microVM (D251), carried over vsock through
 //! the exec port: each one's connection says its token in its HELLO, then its status, then
 //! carries the bytes each way, each way's end that way's half-close (`native_relay::pump`,
-//! `EndPolicy::Independent`).
+//! `EndPolicy::Independent`); a workload's socket gone while its host's way is open ends the
+//! vsock connection both ways at once, D251's cut (`Termination::ClientCut`).
 //!
 //! A lane to a socket of the run's own command is asked by the host ([`open`]): its name must
 //! be a file name in the one directory the run grants (`sockets=`, default deny), and its path
@@ -10,11 +11,12 @@
 //! elsewhere; it is connected through its descriptor (`/proc/self/fd/N`), so that it is not
 //! resolved again. Its status is 0, connected, or the errno it was refused with.
 //!
-//! Each lane runs on a thread of its own, as init's member ports do: a connect that waits on
-//! a full backlog holds that lane alone, never init's loop.
+//! Each lane runs on a thread of its own, as init's member ports do. A full socket backlog
+//! is refused with EAGAIN: no blocking connect may outlive a controller's abandoned ask.
 
 use std::io::{self, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -98,7 +100,45 @@ fn errno_of(e: &io::Error) -> u32 {
 fn connect(root: &Path, path: &[u8]) -> Result<UnixStream, u32> {
     let root = crate::inroot::Root::open(root).map_err(|_| errno::ESRCH)?;
     let at = root.open_at(path, libc::O_PATH).map_err(|e| errno_of(&e))?;
-    UnixStream::connect(crate::inroot::path(&at)).map_err(|e| errno_of(&e))
+    let path = crate::inroot::path(&at);
+    // SAFETY: a zeroed sockaddr_un is valid; the checked pathname leaves its NUL intact.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let path = path.as_os_str().as_bytes();
+    if path.len() >= addr.sun_path.len() {
+        return Err(errno::ENAMETOOLONG);
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in addr.sun_path.iter_mut().zip(path) {
+        *to = *from as libc::c_char;
+    }
+    // Linux connect(2): an AF_UNIX socket with a full listen backlog returns EAGAIN when
+    // nonblocking. Refuse it rather than wait on a workload that may never accept.
+    // SAFETY: socket(2) with constant domain/type, returning a fresh owned descriptor.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(errno_of(&io::Error::last_os_error()));
+    }
+    // SAFETY: the successful socket(2) returned a fresh descriptor, owned here alone.
+    let conn = unsafe { UnixStream::from_raw_fd(fd) };
+    // SAFETY: addr is an initialized sockaddr_un of the exact length passed to connect(2).
+    if unsafe {
+        libc::connect(
+            conn.as_raw_fd(),
+            (&raw const addr).cast(),
+            std::mem::size_of_val(&addr) as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(errno_of(&io::Error::last_os_error()));
+    }
+    conn.set_nonblocking(false).map_err(|e| errno_of(&e))?;
+    Ok(conn)
 }
 
 /// Carries `local` to the host: dials the exec port, says `token` in its HELLO and the lane's
@@ -256,5 +296,115 @@ mod tests {
             connect(&dir.path().join("no-root"), b"/run/s.sock").map(drop),
             Err(errno::ESRCH)
         );
+    }
+
+    /// A workload that does not accept cannot retain a lane worker after its controller
+    /// leaves: a full Unix backlog is refused with the kernel's EAGAIN, never waited on.
+    #[test]
+    fn a_full_socket_backlog_refuses_a_lane_instead_of_holding_its_worker() {
+        use std::os::fd::AsRawFd;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = shards_testdir::TempDir::new("lane-full").unwrap();
+        let listener = UnixListener::bind(dir.path().join("s")).unwrap();
+        // SAFETY: listen(2) on our listener. Zero gives Linux one pending connection,
+        // since unix_stream_connect tests whether the queue length is greater than backlog.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = connect(dir.path(), b"/s").unwrap();
+        let root = dir.path().to_owned();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = connect(&root, b"/s").map(drop);
+            tx.send(result).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        // Release a broken implementation too, so that a red test leaves no worker behind.
+        if result.is_err() {
+            let _accepted = listener.accept().unwrap();
+            let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            result,
+            Ok(Err(libc::EAGAIN as u32)),
+            "a full backlog retained the lane worker"
+        );
+    }
+
+    /// The relay between a workload's socket and a stand-in for its vsock connection, as
+    /// [`carry`] runs it once connected: the workload's end, the host's end and the relay's
+    /// thread, which returns what the pump said.
+    fn relayed() -> (
+        UnixStream,
+        UnixStream,
+        std::thread::JoinHandle<Result<native_relay::Termination, native_relay::Fault>>,
+    ) {
+        let (workload, local) = UnixStream::pair().unwrap();
+        let (host, vsock) = UnixStream::pair().unwrap();
+        let slots = native_relay::Slots::minimum_mapped().unwrap();
+        let relay = std::thread::spawn(move || {
+            let mut report = native_relay::Report::new();
+            native_relay::pump(
+                [local.as_fd(), vsock.as_fd()],
+                slots,
+                [native_relay::ByteLimit::PeerEnd; 2],
+                native_relay::Control::ProcessOwned,
+                native_relay::EndPolicy::Independent,
+                &mut report,
+            )
+        });
+        (workload, host, relay)
+    }
+
+    /// What `sock` reads until its end, and whether it has hung up there: its peer gone both
+    /// ways (POLLHUP asked for POLLOUT at once, PM M559), not only its writes ended.
+    fn read_to_end(sock: &mut UnixStream) -> (Vec<u8>, bool) {
+        let mut got = Vec::new();
+        sock.read_to_end(&mut got).unwrap();
+        let mut fd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(sock),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one pollfd of a socket this test holds; a timeout of 0 waits for none.
+        assert!(unsafe { libc::poll(&raw mut fd, 1, 0) } >= 0);
+        (got, fd.revents & (libc::POLLHUP | libc::POLLERR) != 0)
+    }
+
+    /// A workload that closes its socket while its host still has the lane's other way open
+    /// cuts the lane (D251's cut): its host reads what it sent, whole, then the vsock
+    /// connection ended both ways at once, never its writes' end alone first.
+    #[test]
+    fn a_workload_gone_mid_stream_ends_its_vsock_both_ways() {
+        let (mut workload, mut host, relay) = relayed();
+        host.write_all(b"ask").unwrap();
+        let mut asked = [0u8; 3];
+        workload.read_exact(&mut asked).unwrap();
+        assert_eq!(&asked, b"ask");
+        workload.write_all(b"answer").unwrap();
+        drop(workload);
+        assert_eq!(read_to_end(&mut host), (b"answer".to_vec(), true));
+        drop(host);
+        assert!(relay.join().unwrap().is_ok());
+    }
+
+    /// A workload's half-close stays its way's end alone: its host reads the end with the
+    /// lane's other way open, sends on, and the workload reads it all before its own end.
+    #[test]
+    fn a_workloads_half_close_still_ends_its_way_in_order() {
+        let (mut workload, mut host, relay) = relayed();
+        workload.write_all(b"said").unwrap();
+        workload.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(read_to_end(&mut host), (b"said".to_vec(), false));
+        host.write_all(b"heard").unwrap();
+        host.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut got = Vec::new();
+        workload.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"heard");
+        assert!(matches!(
+            relay.join().unwrap(),
+            Ok(native_relay::Termination::BothHalvesClosed)
+        ));
     }
 }

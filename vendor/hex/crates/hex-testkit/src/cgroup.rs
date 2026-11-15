@@ -122,5 +122,77 @@ fn parent_of(pid: u32) -> Option<u32> {
         .ok()
 }
 
+/// What one thread is doing, as a test following a cgroup's emptying sees it (proc(5)): what can still end it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thread {
+    /// Gone: no `/proc/<tid>` left to read.
+    Gone,
+    /// On its way out: a zombie or dead, exiting (`PF_EXITING` in its `stat` flags, include/linux/sched.h), or with a
+    /// SIGKILL (signal 9) pending for it or its thread group (its `status`'s `SigPnd` and `ShdPnd` masks).
+    Leaving,
+    /// Running, and none of those.
+    Running,
+    /// Asleep, and none of those: nothing under way ends it.
+    Sleeping,
+}
+
+/// Thread `tid` as [`Thread`] says.
+pub fn thread(tid: u32) -> Thread {
+    const PF_EXITING: u64 = 0x4;
+    const SIGKILL: u64 = 1 << (9 - 1);
+    let (Ok(stat), Ok(status)) = (
+        fs::read_to_string(format!("/proc/{tid}/stat")),
+        fs::read_to_string(format!("/proc/{tid}/status")),
+    ) else {
+        return Thread::Gone;
+    };
+    // After the command's closing parenthesis: the state (field 3) first, the flags (field 9) the seventh.
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().collect())
+        .unwrap_or_default();
+    let state = fields.first().copied().unwrap_or("");
+    let flags = fields
+        .get(6)
+        .and_then(|f| f.parse::<u64>().ok())
+        .unwrap_or(0);
+    let pending = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            .unwrap_or(0)
+    };
+    if matches!(state, "Z" | "X" | "x")
+        || flags & PF_EXITING != 0
+        || (pending("SigPnd:") | pending("ShdPnd:")) & SIGKILL != 0
+    {
+        Thread::Leaving
+    } else if state == "R" {
+        Thread::Running
+    } else {
+        Thread::Sleeping
+    }
+}
+
+/// Every thread of the cgroup at `root` and of each cgroup under it, as each one's `cgroup.threads` lists them: none
+/// for a cgroup gone meanwhile.
+pub fn threads(root: &Path) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        let listed = fs::read_to_string(dir.join("cgroup.threads")).unwrap_or_default();
+        found.extend(listed.lines().filter_map(|l| l.trim().parse::<u32>().ok()));
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    queue.push(entry.path());
+                }
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests;

@@ -25,6 +25,12 @@
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 pub mod waits;
+pub mod wipes;
+
+/// This crate's own tests read every block they free (the wipes watch's tests, [`wipes`]).
+#[cfg(test)]
+#[global_allocator]
+static WIPES: wipes::Watch = wipes::Watch;
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};

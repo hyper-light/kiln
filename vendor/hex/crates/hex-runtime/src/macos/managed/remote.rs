@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use hex_api::{Exit, LifecycleCause, Refusal, Usage};
 use hex_core::helper::{VERSION, managed as protocol};
+use hex_core::patience::{Patience, Piece};
 use hex_core::record::{NativeRecord, ProcId};
 use rustix::event::PollFlags;
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
@@ -172,30 +173,17 @@ pub(super) fn diagnostic(error: impl std::fmt::Display) -> Result<String, Refusa
     Ok(text.bytes)
 }
 
-/// Explicit same-binary/private-state startup configuration. Construction performs no I/O.
-/// rpc_budget is the node's configured control patience, never an inferred polling period.
+/// Explicit same-binary/private-state startup configuration. Construction performs no I/O. It
+/// carries no control patience: an ask with no caller's deadline waits as decision 9 waits
+/// ([`ANSWERS`]; the review's C-9).
 #[derive(Debug)]
 pub struct ManagedHelper {
     binary: PathBuf,
     endpoint: PathBuf,
     receipt: PathBuf,
-    rpc_budget: Duration,
 }
 impl ManagedHelper {
-    pub fn new(
-        binary: PathBuf,
-        endpoint: PathBuf,
-        receipt: PathBuf,
-        rpc_budget: Duration,
-    ) -> Result<Self, Refusal> {
-        if rpc_budget.is_zero()
-            || rpc_budget == Duration::MAX
-            || u64::try_from(rpc_budget.as_nanos()).is_err()
-        {
-            return Err(super::configuration(
-                "helper control patience must be positive, finite and representable",
-            ));
-        }
+    pub fn new(binary: PathBuf, endpoint: PathBuf, receipt: PathBuf) -> Result<Self, Refusal> {
         for path in [&binary, &endpoint, &receipt] {
             if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
                 return Err(super::configuration(
@@ -214,7 +202,6 @@ impl ManagedHelper {
             binary,
             endpoint,
             receipt,
-            rpc_budget,
         })
     }
     pub fn binary(&self) -> &Path {
@@ -226,9 +213,53 @@ impl ManagedHelper {
     pub fn receipt(&self) -> &Path {
         &self.receipt
     }
-    pub fn rpc_budget(&self) -> Duration {
-        self.rpc_budget
+}
+
+/// A managed helper's answer to an ask with no caller's deadline, its startup's readiness among them (decision 9; the
+/// review's C-9 (c3)): within W*, the slowest answer this process has seen; past it the run-out told once and the read
+/// following the helper's connection, ended by its answer or the connection's end, the helper's process ending; before
+/// any answer, following from its start, told as it starts.
+static ANSWERS: Patience = Patience::measuring("managed.helper.rpc");
+
+/// `fd`'s next frame, its helper's answer, `party` naming the helper: within `deadline` where its caller gave one; with
+/// none, as [`ANSWERS`] waits.
+fn answer(
+    fd: BorrowedFd<'_>,
+    bound: usize,
+    deadline: Option<Instant>,
+    party: &[Piece<'_>],
+) -> Result<(Vec<u8>, Vec<OwnedFd>), frame::Failure> {
+    if deadline.is_some() {
+        return frame::receive(fd, bound, deadline);
     }
+    let began = Instant::now();
+    match ANSWERS.deadline() {
+        Some(w_star) => {
+            // Within W* its first byte; past it, its run-out told and the read following the connection.
+            match frame::wait(fd, PollFlags::IN, began.checked_add(w_star)) {
+                Ok(()) => {}
+                Err(frame::Failure::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    ANSWERS.ran_out(w_star, began.elapsed(), party);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        None => {
+            ANSWERS.following(party);
+        }
+    }
+    let answered = frame::receive(fd, bound, None)?;
+    ANSWERS.answered(began.elapsed());
+    Ok(answered)
+}
+
+/// The party an ask of helper `process` follows past W*.
+fn helper_party(process: &ProcId) -> [Piece<'static>; 3] {
+    [
+        Piece::Kind("the managed helper, pid "),
+        Piece::Pid(i64::from(process.pid)),
+        Piece::Kind(", its answer on its connection"),
+    ]
 }
 
 enum HelperProcess {
@@ -293,11 +324,7 @@ impl Helper {
         let pools = books.pool_records()?;
         check_restart(completed, &records, &pools)
     }
-    fn start(
-        &self,
-        until: Instant,
-        host_memory: Option<u64>,
-    ) -> Result<(ProcId, OwnedFd), Refusal> {
+    fn start(&self, deadline: Option<Instant>) -> Result<(ProcId, OwnedFd), Refusal> {
         if self
             .books
             .get()
@@ -309,12 +336,6 @@ impl Helper {
             ));
         }
         let prepared = crate::macos::proc::Prepared::new()?;
-        let memory = host_memory.filter(|memory| *memory != 0).ok_or_else(|| {
-            super::configuration("helper startup requires the same admitted host memory envelope")
-        })?;
-        let cap = sys::jetsam_cap_mib(memory).ok_or_else(|| {
-            super::configuration("the admitted helper envelope is not natively representable")
-        })?;
         let (parent, child) = rustix::net::socketpair(
             AddressFamily::UNIX,
             SocketType::STREAM,
@@ -330,9 +351,9 @@ impl Helper {
         rustix::net::sockopt::set_socket_nosigpipe(&parent, true)
             .map_err(|error| Refusal::os("preparing helper startup disconnect", error))?;
         let mut argv = Vec::new();
-        // argv0 and the branch, then three path options, the cost option and five numbers, each
+        // argv0 and the branch, then three path options, the cost option and four numbers, each
         // with its value.
-        const START_WORDS: usize = 2 + 3 * 2 + 2 + 5 * 2;
+        const START_WORDS: usize = 2 + 3 * 2 + 2 + 4 * 2;
         argv.try_reserve_exact(START_WORDS)
             .map_err(|_| native_allocation(START_WORDS))?;
         let cstring = |raw: &[u8]| -> Result<std::ffi::CString, Refusal> {
@@ -376,11 +397,6 @@ impl Helper {
         push(b"--cpu-cost")?;
         push(cost.as_bytes())?;
         for (name, value) in [
-            (
-                b"--rpc-nanos".as_slice(),
-                u64::try_from(self.config.rpc_budget.as_nanos())
-                    .map_err(|_| super::configuration("helper budget width"))?,
-            ),
             (
                 b"--cpu-response-nanos".as_slice(),
                 u64::try_from(self.cpu.response.as_nanos())
@@ -436,9 +452,11 @@ impl Helper {
             ],
             report: None,
             lifeline: None,
-            jetsam_mib: Some(cap),
+            // No jetsam cap (joint plan step 14, ruling B; A-4): the helper holds every managed VM's controller, and a
+            // cap sized by the VM whose launch started it would end them all at a bound of no basis.
+            jetsam_mib: None,
         };
-        if Instant::now() >= until {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(super::configuration(
                 "helper startup expired before native submission",
             ));
@@ -457,8 +475,17 @@ impl Helper {
         drop(spawn);
         // Startup reply is an event on this exact inherited socket, not a socket-path/process probe.
         // No VMM has been requested yet. Failure retains the canonical Creating record and receipt.
-        let (bytes, fds) = frame::receive(parent.as_fd(), protocol::MAX_MESSAGE, Some(until))
-            .map_err(frame::Failure::refusal)?;
+        let (bytes, fds) = answer(
+            parent.as_fd(),
+            protocol::MAX_MESSAGE,
+            deadline,
+            &[
+                Piece::Kind("the managed helper starting, pid "),
+                Piece::Pid(i64::from(pid)),
+                Piece::Kind(", its readiness on its startup channel"),
+            ],
+        )
+        .map_err(frame::Failure::refusal)?;
         if let Ok((version, id, rejected)) = protocol::rejected::read(&bytes, fds.len()) {
             if version == VERSION && id == 0 {
                 return Err(CallFailure::Rejected(rejected).refusal());
@@ -499,24 +526,22 @@ impl Helper {
         })
         .map_err(|_| native_allocation(size_of::<Self>()))
     }
-    fn until(&self, deadline: Option<Instant>) -> Result<Instant, Refusal> {
-        let own = Instant::now()
-            .checked_add(self.config.rpc_budget)
-            .ok_or_else(|| super::configuration("helper deadline is not representable"))?;
-        let until = deadline.map_or(own, |deadline| own.min(deadline));
-        if until <= Instant::now() {
+    /// `deadline`, an ask's caller's, refused where it has passed; none where its caller gave none, the ask then
+    /// waiting as [`ANSWERS`] waits (the review's C-9: no control patience of the helper's config bounds it).
+    fn until(deadline: Option<Instant>) -> Result<Option<Instant>, Refusal> {
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             return Err(super::configuration(
                 "the native helper request budget has expired",
             ));
         }
-        Ok(until)
+        Ok(deadline)
     }
     fn next(&self) -> Result<u64, Refusal> {
         self.next
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| super::configuration("helper request identity is exhausted"))
     }
-    fn finish_helper(&self, process: ProcId, until: Instant) -> Result<(), Refusal> {
+    fn finish_helper(&self, process: ProcId, deadline: Option<Instant>) -> Result<(), Refusal> {
         let mut observer = {
             let mut state = self
                 .process
@@ -601,14 +626,18 @@ impl Helper {
                         }
                     }
                 }
-                let remaining = until
-                    .checked_duration_since(Instant::now())
-                    .filter(|left| !left.is_zero())
-                    .ok_or_else(|| {
-                        super::configuration(
-                            "helper termination exceeded original finalization patience",
-                        )
-                    })?;
+                // With no deadline, its end followed by its process's own (wait_scope's no clock).
+                let remaining = match deadline {
+                    Some(deadline) => deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|left| !left.is_zero())
+                        .ok_or_else(|| {
+                            super::configuration(
+                                "helper termination exceeded original finalization patience",
+                            )
+                        })?,
+                    None => Duration::MAX,
+                };
                 if !native
                     .wait_scope(&[], remaining)
                     .map_err(|error| native_failure("waiting for exact helper", error))?
@@ -675,8 +704,7 @@ impl Helper {
     fn identity(
         &self,
         allow_start: bool,
-        until: Instant,
-        host_memory: Option<u64>,
+        deadline: Option<Instant>,
     ) -> Result<(ProcId, Option<OwnedFd>), Refusal> {
         // Disk/Store observations precede any short helper-state turn. The native Starting state
         // refuses concurrent starts; no helper-global mutex spans I/O or another Books turn.
@@ -686,7 +714,7 @@ impl Helper {
                     return Err(super::configuration("native helper is completed"));
                 }
                 self.restart_fence(completed)?;
-                self.finish_helper(snapshot.process, until)?;
+                self.finish_helper(snapshot.process, deadline)?;
                 snapshot.retire(self)?;
                 self.reset_completed()?;
             } else {
@@ -720,7 +748,7 @@ impl Helper {
                     ));
                 }
             }
-            let (process, connection) = self.start(until, host_memory)?;
+            let (process, connection) = self.start(deadline)?;
             self.remember(process)?;
             if receipt::read(self)?
                 .is_none_or(|snapshot| snapshot.process != process || snapshot.completed.is_some())
@@ -742,7 +770,7 @@ impl Helper {
         }
         result
     }
-    fn connect(&self, process: ProcId, until: Instant) -> Result<OwnedFd, CallFailure> {
+    fn connect(&self, process: ProcId, deadline: Option<Instant>) -> Result<OwnedFd, CallFailure> {
         check_process(process)?;
         let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
             .map_err(|error| CallFailure::io(protocol::Operation::Connect, error))?;
@@ -755,7 +783,7 @@ impl Helper {
         match rustix::net::connect(&fd, &address) {
             Ok(()) => {}
             Err(rustix::io::Errno::INPROGRESS | rustix::io::Errno::AGAIN) => {
-                frame::wait(fd.as_fd(), PollFlags::OUT, Some(until))
+                frame::wait(fd.as_fd(), PollFlags::OUT, deadline)
                     .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
                 rustix::net::sockopt::socket_error(&fd)
                     .map_err(|error| CallFailure::io(protocol::Operation::Connect, error))?
@@ -783,9 +811,10 @@ impl Helper {
         deadline: Option<Instant>,
         connection: Option<BorrowedFd<'_>>,
     ) -> Result<(protocol::Answer, Vec<OwnedFd>), CallFailure> {
-        let until = self.until(deadline)?;
+        let until = Self::until(deadline)?;
         let id = self.next()?;
-        let expires = expiry(until)?;
+        // No expiry where its caller gave no deadline: the helper's waits then follow its connection.
+        let expires = until.map(expiry).transpose()?;
         let bytes = protocol::timed::encode(VERSION, id, expires, request).map_err(|_| {
             super::configuration("the native helper request is invalid or cannot be reserved")
         })?;
@@ -802,12 +831,16 @@ impl Helper {
             &bytes,
             descriptors,
             protocol::timed::MAX_MESSAGE,
-            Some(until),
+            until,
         )
         .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
-        let (bytes, descriptors) =
-            frame::receive(fd.as_fd(), protocol::MAX_MESSAGE, Some(until))
-                .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
+        let (bytes, descriptors) = answer(
+            fd.as_fd(),
+            protocol::MAX_MESSAGE,
+            until,
+            &helper_party(&request.key().helper),
+        )
+        .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
         peer_after_reply(fd, request.key().helper)?;
         if let Ok((version, answer_id, rejected)) =
             protocol::rejected::read(&bytes, descriptors.len())
@@ -832,25 +865,67 @@ impl Helper {
         }
         Ok((answer, descriptors))
     }
-    /// Joint plan step 14 (C4 on macOS): sets `key`'s scope to `rate` milli-CPU, its water-filled share.
-    fn set_rate(&self, key: protocol::Key, rate: u64) -> Result<(), CallFailure> {
-        let until = self.until(None)?;
+    /// Joint plan step 14 (2c-4b; the review's A-14): the stop response the live helper's managed CPU control estimates
+    /// from its own holds, as it answers it (2c-4a's request): none where no helper runs or the one that ran has ended,
+    /// nothing being learned there, and none before its first hold. It starts no helper to ask.
+    fn response(&self) -> Result<Option<protocol::response::Estimate>, CallFailure> {
+        let Some(snapshot) = receipt::read(self)? else {
+            return Ok(None);
+        };
+        if snapshot.completed.is_some() {
+            return Ok(None);
+        }
+        snapshot.check_live()?;
+        let process = snapshot.process;
         let id = self.next()?;
-        let bytes = protocol::rate::encode(VERSION, id, &key, rate)
-            .map_err(|_| super::configuration("the native rate request is invalid"))?;
-        let fd = self.connect(key.helper, until)?;
-        peer(&fd, key.helper)?;
+        let bytes = protocol::response::encode(VERSION, id)
+            .map_err(|_| super::configuration("the native response request is invalid"))?;
+        let fd = self.connect(process, None)?;
+        peer(&fd, process)?;
         frame::send(
             fd.as_fd(),
             &bytes,
             &[],
-            protocol::rate::MAX_MESSAGE,
-            Some(until),
+            protocol::response::MAX_MESSAGE,
+            None,
         )
         .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
-        let (bytes, descriptors) =
-            frame::receive(fd.as_fd(), protocol::MAX_MESSAGE, Some(until))
-                .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
+        let (bytes, descriptors) = answer(
+            fd.as_fd(),
+            protocol::response::MAX_ANSWER,
+            None,
+            &helper_party(&process),
+        )
+        .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
+        peer_after_reply(&fd, process)?;
+        let (version, answer_id, response) =
+            protocol::response::read_answer(&bytes, descriptors.len()).map_err(|_| {
+                super::configuration("the native helper's response answer is invalid")
+            })?;
+        if version != VERSION || answer_id != id {
+            return Err(super::configuration(
+                "the native helper reply belongs to another request or incarnation",
+            )
+            .into());
+        }
+        Ok(response)
+    }
+    /// Joint plan step 14 (C4 on macOS): sets `key`'s scope to `rate` milli-CPU, its water-filled share.
+    fn set_rate(&self, key: protocol::Key, rate: u64) -> Result<(), CallFailure> {
+        let id = self.next()?;
+        let bytes = protocol::rate::encode(VERSION, id, &key, rate)
+            .map_err(|_| super::configuration("the native rate request is invalid"))?;
+        let fd = self.connect(key.helper, None)?;
+        peer(&fd, key.helper)?;
+        frame::send(fd.as_fd(), &bytes, &[], protocol::rate::MAX_MESSAGE, None)
+            .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
+        let (bytes, descriptors) = answer(
+            fd.as_fd(),
+            protocol::MAX_MESSAGE,
+            None,
+            &helper_party(&key.helper),
+        )
+        .map_err(|error| CallFailure::framed(protocol::Operation::Connect, error))?;
         peer_after_reply(&fd, key.helper)?;
         if let Ok((version, answer_id, rejected)) =
             protocol::rejected::read(&bytes, descriptors.len())
@@ -879,24 +954,17 @@ impl Helper {
         }
     }
     pub(in crate::macos) fn census(&self) -> Result<protocol::census::Census, Refusal> {
-        let until = self.until(None)?;
-        let (process, _) = self.identity(false, until, None)?;
+        let (process, _) = self.identity(false, None)?;
         let id = self.next()?;
         let request = protocol::census::encode_request(VERSION, id, process)
             .map_err(|_| super::configuration("invalid native census request"))?;
-        let fd = self.connect(process, until).map_err(CallFailure::refusal)?;
-        frame::send(
-            fd.as_fd(),
-            &request,
-            &[],
-            protocol::MAX_MESSAGE,
-            Some(until),
-        )
-        .map_err(frame::Failure::refusal)?;
+        let fd = self.connect(process, None).map_err(CallFailure::refusal)?;
+        frame::send(fd.as_fd(), &request, &[], protocol::MAX_MESSAGE, None)
+            .map_err(frame::Failure::refusal)?;
         let bound = protocol::census::message_bound(crate::MAX_BOXES)
             .map_err(|_| native_allocation(crate::MAX_BOXES))?;
-        let (bytes, descriptors) =
-            frame::receive(fd.as_fd(), bound, Some(until)).map_err(frame::Failure::refusal)?;
+        let (bytes, descriptors) = answer(fd.as_fd(), bound, None, &helper_party(&process))
+            .map_err(frame::Failure::refusal)?;
         peer_after_reply(&fd, process)?;
         let (version, got, census) =
             protocol::census::read_answer(&bytes, descriptors.len(), crate::MAX_BOXES)
@@ -958,7 +1026,7 @@ fn check_completed_metadata(
             hex_core::record::OwnerRef::Box(id) => match records.get(id) {
                 None => continue,
                 Some(Ok(record)) => NativeRecord::Box(record),
-                Some(Err(_)) => return Err(super::uncertain(id)),
+                Some(Err(_)) => return Err(super::uncertain(id, "its record can't be read")),
             },
             hex_core::record::OwnerRef::Pool(pool) => {
                 match pools.iter().find(|record| record.key.pool == *pool) {
@@ -977,21 +1045,24 @@ fn check_completed_metadata(
             {
                 continue;
             }
-            return Err(current.refusal(LifecycleCause::Uncertain));
+            return Err(current.uncertain("its helper's completed receipt names another native scope, though it is past its preparation"));
         }
         if !entry.key.matches(current, completed.helper)?
             || current
                 .init()
                 .is_some_and(|init| Some(init) != entry.controller)
         {
-            return Err(current.refusal(LifecycleCause::Uncertain));
+            return Err(
+                current.uncertain("its helper's completed receipt names another key or controller")
+            );
         }
         let exit = match current {
             NativeRecord::Box(record) => record.exit,
             NativeRecord::Pool(record) => record.exit,
         };
         if exit.is_some_and(|exit| exit != entry.status) {
-            return Err(current.refusal(LifecycleCause::Uncertain));
+            return Err(current
+                .uncertain("its helper's completed receipt names another end than its record's"));
         }
     }
     Ok(())
@@ -1010,7 +1081,7 @@ fn check_restart(
             hex_core::record::OwnerRef::Box(id) => match records.get(id) {
                 None => continue,
                 Some(Ok(record)) => NativeRecord::Box(record),
-                Some(Err(_)) => return Err(super::uncertain(id)),
+                Some(Err(_)) => return Err(super::uncertain(id, "its record can't be read")),
             },
             hex_core::record::OwnerRef::Pool(pool) => {
                 match pools.iter().find(|record| record.key.pool == *pool) {
@@ -1034,18 +1105,20 @@ fn check_restart(
                 )
             {
                 if current.class()? == hex_api::Class::Shards && current.scope().is_none() {
-                    return Err(current.refusal(LifecycleCause::Uncertain));
+                    return Err(current.uncertain("it holds no native scope yet, though its helper's completed receipt names one"));
                 }
                 continue;
             }
-            return Err(current.refusal(LifecycleCause::Uncertain));
+            return Err(current.uncertain(
+                "its helper's completed receipt names another native scope as its node restarts",
+            ));
         }
         if !entry.key.matches(current, completed.helper)?
             || current
                 .init()
                 .is_some_and(|init| Some(init) != entry.controller)
         {
-            return Err(current.refusal(LifecycleCause::Uncertain));
+            return Err(current.uncertain("its helper's completed receipt names another key or controller as its node restarts"));
         }
         if current.stage() != hex_core::record::NativeStage::Released {
             return Err(current.refusal(LifecycleCause::Busy));
@@ -1053,7 +1126,7 @@ fn check_restart(
         if let NativeRecord::Pool(record) = current
             && record.exit != Some(entry.status)
         {
-            return Err(current.refusal(LifecycleCause::Uncertain));
+            return Err(current.uncertain("its helper's completed receipt names another end than its record's as its node restarts"));
         }
     }
     Ok(())
@@ -1164,14 +1237,16 @@ fn expiry(until: Instant) -> Result<Duration, Refusal> {
         .checked_add(remaining)
         .ok_or_else(|| super::configuration("native raw uptime expiry overflow"))
 }
-fn deadline(expires: Duration, budget: Duration) -> Result<Instant, Refusal> {
+/// The transferred expiry `expires` as this process's own instant, refused once passed: the helper's work for an ask
+/// ends no later than its caller's deadline, and with none follows the ask's connection (the review's C-9).
+fn deadline(expires: Duration) -> Result<Instant, Refusal> {
     let began = Instant::now();
     let remaining = expires
         .checked_sub(uptime()?)
         .filter(|left| !left.is_zero())
         .ok_or_else(|| super::configuration("the transferred native request has expired"))?;
     began
-        .checked_add(remaining.min(budget))
+        .checked_add(remaining)
         .ok_or_else(|| super::configuration("native helper deadline overflow"))
 }
 
@@ -1400,11 +1475,11 @@ pub(super) fn launch(
     record: NativeRecord<'_>,
     launch: &crate::devices::ManagedLaunch<'_>,
     io: shards_api::LaunchIo,
-    patience: Duration,
+    patience: Option<Duration>,
     publish: &mut dyn FnMut(&Identity) -> Result<(), Refusal>,
 ) -> Result<ManagedReceipt, Refusal> {
     let crate::devices::ManagedLaunch::Shards(plan) = launch else {
-        return Err(record.refusal(LifecycleCause::Uncertain));
+        return Err(record.uncertain("its launch isn't a Shards launch"));
     };
     match record {
         NativeRecord::Box(record) => record.spec.check()?,
@@ -1415,12 +1490,17 @@ pub(super) fn launch(
         || record.stage() != hex_core::record::NativeStage::Creating
         || record.init().is_some()
     {
-        return Err(record.refusal(LifecycleCause::Uncertain));
+        return Err(record.uncertain("it isn't a fresh creation as it is launched"));
     }
-    let until = Instant::now()
-        .checked_add(patience)
-        .filter(|_| patience != Duration::MAX && !patience.is_zero())
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
+    // None: a launch that follows its guest, each ask of its helper bounded by the helper's own wait (the review's C-9).
+    let deadline = patience
+        .map(|patience| {
+            Instant::now()
+                .checked_add(patience)
+                .filter(|_| patience != Duration::MAX && !patience.is_zero())
+                .ok_or_else(|| record.uncertain("its launch's patience isn't a finite time"))
+        })
+        .transpose()?;
     let request = plan.gpu_report_request();
     if request.is_some() != io.gpu_report.is_some()
         || request.is_some() != !record.devices().is_empty()
@@ -1428,21 +1508,17 @@ pub(super) fn launch(
             record.scope().map(|scope| *scope.bytes()) != Some(request.scope())
         })
     {
-        return Err(record.refusal(LifecycleCause::Uncertain));
+        return Err(record.uncertain("its launch's report scope isn't its record's"));
     }
-    let until = request.map_or(until, |request| until.min(request.deadline()));
+    let deadline = request.map_or(deadline, |request| {
+        crate::devices::earlier(deadline, request.until().instant())
+    });
     let helper = runtime
         .managed_helper
         .as_ref()
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
+        .ok_or_else(|| record.uncertain("its node runs no managed helper to launch it"))?;
     let launch = make_launch(record, plan, helper.cpu)?;
-    let (process, startup) = helper.identity(
-        true,
-        until,
-        record
-            .allocation()
-            .map(|allocation| allocation.resources.mem_bytes),
-    )?;
+    let (process, startup) = helper.identity(true, Helper::until(deadline)?)?;
     let proxy = Proxy::prepared(
         Arc::clone(helper),
         protocol::Key::from_record(record, process)?,
@@ -1468,7 +1544,7 @@ pub(super) fn launch(
                 launch,
             },
             &descriptors,
-            Some(until),
+            deadline,
             startup.as_ref().map(AsFd::as_fd),
         )
         .map_err(CallFailure::refusal)?;
@@ -1481,16 +1557,19 @@ pub(super) fn launch(
     let identity = proxy
         .identity
         .get()
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
-    if identity.vsock != plan.vsock() || until <= Instant::now() {
-        return Err(record.refusal(LifecycleCause::Uncertain));
+        .ok_or_else(|| record.uncertain("its launched controller published no identity"))?;
+    if identity.vsock != plan.vsock() || deadline.is_some_and(|deadline| deadline <= Instant::now())
+    {
+        return Err(record.uncertain(
+            "its launched controller's vsock isn't its plan's, or its deadline passed",
+        ));
     }
     publish(identity)?;
     let (answer, _) = proxy
-        .control(protocol::Action::Resume, Some(until))
+        .control(protocol::Action::Resume, deadline)
         .map_err(CallFailure::refusal)?;
     if !matches!(answer, protocol::Answer::Done { .. }) {
-        return Err(record.refusal(LifecycleCause::Uncertain));
+        return Err(record.uncertain("its helper answered its resume with another reply"));
     }
     Ok(shards_api::managed_receipt(proxy))
 }
@@ -1503,7 +1582,7 @@ pub(super) fn attach(
     let helper = runtime
         .managed_helper
         .as_ref()
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
+        .ok_or_else(|| record.uncertain("its node runs no managed helper to attach it"))?;
     if let Some(snapshot) = receipt::read(helper)?
         && snapshot.completed.is_some()
     {
@@ -1525,12 +1604,12 @@ pub(super) fn attach(
                         vsock: PathBuf::from(std::ffi::OsString::from_vec(copy_raw(&entry.vsock)?)),
                     };
                     if expected.is_some_and(|expected| expected != &identity) {
-                        return Err(record.refusal(LifecycleCause::Uncertain));
+                        return Err(record.uncertain("its helper's completed controller isn't the one it expected"));
                     }
                     proxy
                         .identity
                         .set(identity)
-                        .map_err(|_| record.refusal(LifecycleCause::Uncertain))?;
+                        .map_err(|_| record.uncertain("its completed controller's identity was published before"))?;
                 }
                 entry.status
             }
@@ -1543,7 +1622,7 @@ pub(super) fn attach(
             {
                 Exit::Unknown
             }
-            _ => return Err(record.refusal(LifecycleCause::Uncertain)),
+            _ => return Err(record.uncertain("its helper's completed receipt doesn't name it, though it is past its creation, as it is attached")),
         };
         proxy
             .completed
@@ -1551,10 +1630,10 @@ pub(super) fn attach(
                 status: super::status(status),
                 scope: TerminalScope::Released,
             })
-            .map_err(|_| record.refusal(LifecycleCause::Uncertain))?;
+            .map_err(|_| record.uncertain("its completed end was published before"))?;
         return Ok(proxy);
     }
-    let (process, _) = helper.identity(false, helper.until(None)?, None)?;
+    let (process, _) = helper.identity(false, None)?;
     let proxy = Proxy::prepared(
         Arc::clone(helper),
         protocol::Key::from_record(record, process)?,
@@ -1564,7 +1643,7 @@ pub(super) fn attach(
         .map_err(CallFailure::refusal)?;
     proxy.attached(answer, notification)?;
     if expected.is_some_and(|expected| proxy.identity.get() != Some(expected)) {
-        return Err(record.refusal(LifecycleCause::Uncertain));
+        return Err(record.uncertain("its attached controller isn't the one it expected"));
     }
     Ok(proxy)
 }
@@ -1578,10 +1657,21 @@ pub(super) fn set_rate(
     let helper = runtime
         .managed_helper
         .as_ref()
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
-    let (process, _) = helper.identity(false, helper.until(None)?, None)?;
+        .ok_or_else(|| record.uncertain("its node runs no managed helper to set its rate"))?;
+    let (process, _) = helper.identity(false, None)?;
     let key = protocol::Key::from_record(record, process)?;
     helper.set_rate(key, rate).map_err(CallFailure::refusal)
+}
+
+/// Joint plan step 14 (2c-4b; the review's A-14): the stop response this node's managed helper estimates from its holds,
+/// as it answers it: none where the node runs no managed helper, none runs now, or it has measured no hold yet.
+pub(super) fn response(
+    runtime: &MacRuntime,
+) -> Result<Option<protocol::response::Estimate>, Refusal> {
+    match runtime.managed_helper.as_ref() {
+        Some(helper) => helper.response().map_err(CallFailure::refusal),
+        None => Ok(None),
+    }
 }
 
 /// Joint plan step 14 (C5 on macOS): the last resort ends the canonical scope through its native helper, as its
@@ -1590,8 +1680,8 @@ pub(super) fn stop(runtime: &MacRuntime, record: NativeRecord<'_>) -> Result<(),
     let helper = runtime
         .managed_helper
         .as_ref()
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
-    let (process, _) = helper.identity(false, helper.until(None)?, None)?;
+        .ok_or_else(|| record.uncertain("its node runs no managed helper to stop it"))?;
+    let (process, _) = helper.identity(false, None)?;
     let key = protocol::Key::from_record(record, process)?;
     let (answer, _) = helper
         .rpc(
@@ -1606,7 +1696,7 @@ pub(super) fn stop(runtime: &MacRuntime, record: NativeRecord<'_>) -> Result<(),
         .map_err(CallFailure::refusal)?;
     match answer {
         protocol::Answer::Done { .. } => Ok(()),
-        _ => Err(record.refusal(LifecycleCause::Uncertain)),
+        _ => Err(record.uncertain("its helper answered its stop with another reply")),
     }
 }
 
@@ -1614,8 +1704,8 @@ pub(super) fn usage(runtime: &MacRuntime, record: NativeRecord<'_>) -> Result<Us
     let helper = runtime
         .managed_helper
         .as_ref()
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
-    let (process, _) = helper.identity(false, helper.until(None)?, None)?;
+        .ok_or_else(|| record.uncertain("its node runs no managed helper to read its usage"))?;
+    let (process, _) = helper.identity(false, None)?;
     let key = protocol::Key::from_record(record, process)?;
     let (answer, _) = helper
         .rpc(
@@ -1630,7 +1720,7 @@ pub(super) fn usage(runtime: &MacRuntime, record: NativeRecord<'_>) -> Result<Us
         .map_err(CallFailure::refusal)?;
     match answer {
         protocol::Answer::Usage { usage, .. } => Ok(usage),
-        _ => Err(record.refusal(LifecycleCause::Uncertain)),
+        _ => Err(record.uncertain("its helper answered its usage with another reply")),
     }
 }
 pub(super) fn finalize(
@@ -1641,8 +1731,7 @@ pub(super) fn finalize(
     let helper = runtime
         .managed_helper
         .as_ref()
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
-    let until = helper.until(None)?;
+        .ok_or_else(|| record.uncertain("its node runs no managed helper to finalize it"))?;
     let controller = identity
         .map(|identity| ProcId {
             pid: identity.pid,
@@ -1663,12 +1752,12 @@ pub(super) fn finalize(
                         | hex_core::record::NativeStage::Deleting
                 ))
         {
-            return Err(record.refusal(LifecycleCause::Uncertain));
+            return Err(record.uncertain("its helper's completed receipt doesn't name it, though it is past its creation, as it is finalized"));
         }
-        helper.finish_helper(snapshot.process, until)?;
+        helper.finish_helper(snapshot.process, None)?;
         return Ok(()); // Receipt retained until canonical Released/remove; new launch fences it.
     }
-    let (process, _) = helper.identity(false, until, None)?;
+    let (process, _) = helper.identity(false, None)?;
     let key = protocol::Key::from_record(record, process)?;
     let result = helper.rpc(
         &protocol::Request::Control {
@@ -1677,21 +1766,21 @@ pub(super) fn finalize(
             controller,
         },
         &[],
-        Some(until),
+        None,
     );
     if let Some(snapshot) = receipt::read(helper)?
         && snapshot.completed.is_some()
         && snapshot.process == process
     {
-        snapshot
-            .completion(&key, controller)?
-            .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
-        helper.finish_helper(process, until)?;
+        snapshot.completion(&key, controller)?.ok_or_else(|| {
+            record.uncertain("its helper's completed receipt doesn't name it after its finalize")
+        })?;
+        helper.finish_helper(process, None)?;
         return Ok(());
     }
     match result.map_err(CallFailure::refusal)?.0 {
         protocol::Answer::Done { .. } => Ok(()),
-        _ => Err(record.refusal(LifecycleCause::Uncertain)),
+        _ => Err(record.uncertain("its helper answered its finalize with another reply")),
     }
 }
 
@@ -1702,10 +1791,9 @@ pub(in crate::macos) fn preflight_unsubmitted(
     record: &hex_core::record::BoxRecord,
 ) -> Result<(), Refusal> {
     let native = NativeRecord::Box(record);
-    let helper = runtime
-        .managed_helper
-        .as_ref()
-        .ok_or_else(|| native.refusal(LifecycleCause::Uncertain))?;
+    let helper = runtime.managed_helper.as_ref().ok_or_else(|| {
+        native.uncertain("its node runs no managed helper to prove it unsubmitted")
+    })?;
     if let Some(snapshot) = receipt::read(helper)?
         && let Some(completed) = &snapshot.completed
     {
@@ -1714,7 +1802,9 @@ pub(in crate::macos) fn preflight_unsubmitted(
             .iter()
             .any(|entry| entry.key.owner.as_ref() == native.owner())
         {
-            return Err(native.refusal(LifecycleCause::Uncertain));
+            return Err(
+                native.uncertain("its helper's completed receipt names it, so it was submitted")
+            );
         }
         return Ok(()); // Positive completed cohort is still not permission to release this Box.
     }
@@ -1735,7 +1825,7 @@ pub(in crate::macos) fn preflight_unsubmitted(
     ) {
         Err(CallFailure::Native(protocol::Failure::UnknownOwner)) => Ok(()),
         Err(error) => Err(error.refusal()),
-        Ok(_) => Err(native.refusal(LifecycleCause::Uncertain)),
+        Ok(_) => Err(native.uncertain("its helper still holds it, so it was submitted")),
     }
 }
 
@@ -1743,17 +1833,20 @@ pub(in crate::macos) fn preflight(
     runtime: &MacRuntime,
     record: NativeRecord<'_>,
 ) -> Result<(), Refusal> {
-    let bad = || record.refusal(LifecycleCause::Uncertain);
+    let bad = |why: &str| record.uncertain(why);
     let cost = match record {
         NativeRecord::Box(record) => record
             .spec
             .allocation
             .map(|allocation| allocation.cost)
-            .ok_or_else(bad)?,
+            .ok_or_else(|| bad("its box record holds no allocation to check its cost by"))?,
         NativeRecord::Pool(record) => record.cost,
     };
     runtime.check_vm_cost(&cost)?;
-    let helper = runtime.managed_helper.as_ref().ok_or_else(bad)?;
+    let helper = runtime
+        .managed_helper
+        .as_ref()
+        .ok_or_else(|| bad("its node runs no managed helper to check it with"))?;
     if let Some(snapshot) = receipt::read(helper)?
         && snapshot.completed.is_some()
     {
@@ -1770,7 +1863,9 @@ pub(in crate::macos) fn preflight(
             ) {
             Ok(())
         } else {
-            Err(bad())
+            Err(bad(
+                "its helper's completed receipt doesn't name it, though it is past its creation",
+            ))
         };
     }
     let Some(census) = helper.census_if_present()? else {
@@ -1780,7 +1875,7 @@ pub(in crate::macos) fn preflight(
         ) {
             Ok(())
         } else {
-            Err(bad())
+            Err(bad("its helper is gone, though it is past its preparation"))
         };
     };
     let key = protocol::Key::from_record(record, census.helper)?;
@@ -1792,7 +1887,9 @@ pub(in crate::macos) fn preflight(
         ) {
             Ok(())
         } else {
-            Err(bad())
+            Err(bad(
+                "its helper doesn't hold it, though it is past its preparation",
+            ))
         };
     }
     let (answer, _) = helper
@@ -1807,10 +1904,10 @@ pub(in crate::macos) fn preflight(
         )
         .map_err(CallFailure::refusal)?;
     let protocol::Answer::Metadata { controller, .. } = answer else {
-        return Err(bad());
+        return Err(bad("its helper answered its inspection with another reply"));
     };
     if record.init().is_some() && record.init() != controller {
-        return Err(bad());
+        return Err(bad("its helper's controller isn't its record's"));
     }
     Ok(())
 }
@@ -1837,7 +1934,7 @@ pub(in crate::macos) fn preflight_retained(
                 records
                     .get(id)
                     .and_then(|row| row.as_ref().ok())
-                    .ok_or_else(|| super::uncertain(id))?,
+                    .ok_or_else(|| super::uncertain(id, "its record is gone or can't be read"))?,
             ),
             hex_core::record::OwnerRef::Pool(pool) => {
                 let at = pools
@@ -1853,7 +1950,7 @@ pub(in crate::macos) fn preflight_retained(
             }
         };
         if !key.matches(record, census.helper)? {
-            return Err(record.refusal(LifecycleCause::Uncertain));
+            return Err(record.uncertain("its helper's census names another key for it"));
         }
     }
     Ok(())
@@ -1866,7 +1963,7 @@ fn make_launch(
 ) -> Result<protocol::Launch, Refusal> {
     let paths = plan
         .runtime_paths()
-        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
+        .ok_or_else(|| record.uncertain("its launch plan has no runtime paths"))?;
     let record_bytes = encode_native(record)?;
     let mut arguments = Vec::new();
     arguments
@@ -1900,7 +1997,7 @@ fn make_launch(
     };
     launch
         .check()
-        .map_err(|_| record.refusal(LifecycleCause::Uncertain))?;
+        .map_err(|_| record.uncertain("its native launch isn't valid"))?;
     Ok(launch)
 }
 
@@ -1937,7 +2034,8 @@ fn encode_native(record: NativeRecord<'_>) -> Result<Vec<u8>, Refusal> {
         bytes: Vec::new(),
         size: 0,
     };
-    write(&mut count).map_err(|_| record.refusal(LifecycleCause::Uncertain))?;
+    write(&mut count)
+        .map_err(|_| record.uncertain("its native launch couldn't be measured as JSON"))?;
     let size = count
         .size
         .checked_add(1)
@@ -1948,9 +2046,10 @@ fn encode_native(record: NativeRecord<'_>) -> Result<Vec<u8>, Refusal> {
         .try_reserve_exact(size)
         .map_err(|_| native_allocation(size))?;
     let mut output = Json { bytes, size: 0 };
-    write(&mut output).map_err(|_| record.refusal(LifecycleCause::Uncertain))?;
+    write(&mut output)
+        .map_err(|_| record.uncertain("its native launch couldn't be written as JSON"))?;
     if output.size != count.size {
-        return Err(record.refusal(LifecycleCause::Uncertain));
+        return Err(record.uncertain("its native launch's JSON wasn't the size it was measured at"));
     }
     output.bytes.push(b'\n');
     Ok(output.bytes)
@@ -1975,8 +2074,6 @@ impl Helper {
             self.rates.processes.get(),
             u64::try_from(self.lateness.as_nanos())
                 .map_err(|_| super::configuration("helper lateness width"))?,
-            u64::try_from(self.config.rpc_budget.as_nanos())
-                .map_err(|_| super::configuration("helper budget width"))?,
             u64::try_from(self.cpu.response.as_nanos())
                 .map_err(|_| super::configuration("helper CPU response width"))?,
         ] {

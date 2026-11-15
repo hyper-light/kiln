@@ -42,7 +42,7 @@ pub use shards_abi::run::nesting::Ready;
 /// binds none refuses the run as it is asked; 16, the host GPUs the run names
 /// ([`Request::gpu_devices`], D232, D234's `gpus=`), so that a side that binds none starts no
 /// run without them; 17, the period the run's governor holds its rate over
-/// ([`Started::rate_period`], D191, D247), so that its orchestrator derives its window from
+/// (`Started`'s, until version 31 moved it to each rate's answer; D191, D247), so that its orchestrator derives its window from
 /// the run's own period, never from a number of its own; 18, each member's run-time arguments
 /// ([`MemberStage::args`], D256), so that a side that passes none starts no member without
 /// the flags its orchestrator asked; 19, how the run's microVM started ([`Started::from`],
@@ -52,8 +52,33 @@ pub use shards_abi::run::nesting::Ready;
 /// (`RELEASED`; D242), so that a side that leases nothing refuses the run as it is asked,
 /// before any lease is: a client of an earlier version ends a run at a frame it has no kind
 /// for; 21, warm run hosts ([`to_host::WARM`], [`to_client::WARMED`], [`Cause::Unfit`],
-/// [`StartedFrom::Warm`]; D253's pools), so that a side that keeps none is never asked to.
-pub const VERSION: u8 = 21;
+/// [`StartedFrom::Warm`]; D253's pools), so that a side that keeps none is never asked to;
+/// 22, each credential grant's placeholder ([`CredentialGrant::placeholder`], D242), what
+/// stands for its credential in a request, so that the run's injector fills a value in where
+/// its own placeholder stands and nowhere else; 23, the run's microVM saved whole for its
+/// owner ([`to_host::SAVE`], answered [`to_client::SAVED`]; D259), so that a side that saves
+/// none refuses the run as it is asked, before any save is; 24, the run's sign-in grants
+/// ([`Request::sign_ins`], D242 step 8) and their words ([`to_client::CAPTURE`],
+/// [`to_client::REFRESH`] and [`to_client::REVOKE`], answered [`to_host::CAPTURED`] and
+/// [`to_host::REFRESHED`]), so that a side that knows no sign-in refuses the run by its version; 25, each member's MCP
+/// bridge ([`MemberStage::mcp`], D254), so that a side that makes none never starts a harness
+/// whose MCP config names one that is not there; 26, the run's upstream roots
+/// ([`Request::upstream_roots`], D242), so that a side that knows none never runs an injector
+/// that trusts fewer roots than its orchestrator named; 27, a member's end typed
+/// ([`MemberEnded::end`]: exited, or killed by a signal), so that no side reads a signal as an
+/// exit of 128 plus it; 28, the run's final use with its end ([`RunEnded::final_use`], D260):
+/// what its microVM used in all, read once its machine was down, or why none was, so that a
+/// side that tells none is never read as having used nothing; 29, the run's GPU report
+/// (D233): the scope its orchestrator names ([`Request::gpu_report`]) and its VM process's
+/// report relayed ([`to_client::GPU_REPORT`]), so that a side that relays none never starts a
+/// GPU run whose orchestrator waits for its renderer's word; 30, every socket the run's
+/// agent-control endpoint holds, each named ([`ControlAt::waker`], [`ControlAt::wake`]; D252),
+/// so that its orchestrator can hold each UDP socket the run holds to exactly those, where its
+/// host's table shows no socket's peer (Windows); 31, each rate's period with its answer
+/// ([`Rated::period`], D191), which the run's governor derives for that rate from what it has
+/// learned of its step, in place of the one period version 17 told as the run started, so that
+/// a host of an earlier version, which tells a period no rate is held over, starts no run.
+pub const VERSION: u8 = 31;
 
 /// What the orchestrator's side sends.
 pub mod to_host {
@@ -90,6 +115,15 @@ pub mod to_host {
     /// exemplar ([`Request::exemplar`](super::Request::exemplar), D253's pools), its microVM
     /// started for runs of it and waiting, `WARMED`, for one, whose `CREATE` follows.
     pub const WARM: u8 = 14;
+    /// A [`SaveAsk`](super::SaveAsk): the run's microVM saved whole into a directory its
+    /// owner names (D259).
+    pub const SAVE: u8 = 15;
+    /// A [`CaptureAnswer`](super::CaptureAnswer): a sign-in's tokens kept and their
+    /// placeholders given, or why not, by its ask's id (D242, step 8).
+    pub const CAPTURED: u8 = 34;
+    /// A [`RefreshAnswer`](super::RefreshAnswer): the token response a sign-in's CLI is to
+    /// have, refreshed outside, or why not, by its ask's id.
+    pub const REFRESHED: u8 = 35;
 }
 
 /// What the run host sends.
@@ -106,7 +140,7 @@ pub mod to_client {
     pub const MEMBER_ENDED: u8 = 20;
     /// [`StatsAnswer`](super::StatsAnswer).
     pub const STATS: u8 = 21;
-    /// [`RunEnd`](super::RunEnd), last: the run has ended.
+    /// [`RunEnded`](super::RunEnded), last: the run has ended, and what it used in all.
     pub const ENDED: u8 = 22;
     /// [`Ready`](super::Ready): the run's own command moved its readiness under the nesting
     /// grant (D234), as its init said it ([`ready`](super::ready) reads it).
@@ -133,6 +167,22 @@ pub mod to_client {
     /// How a warm run host's microVM started ([`StartedFrom`](super::StartedFrom), its one
     /// byte): it is ready, and waits for its run's `CREATE` (D253's pools).
     pub const WARMED: u8 = 32;
+    /// [`SaveAnswer`](super::SaveAnswer): a save's outcome, by its ask's id (D259).
+    pub const SAVED: u8 = 33;
+    /// A [`CaptureAsk`](super::CaptureAsk): a sign-in's tokens, as the run's injector took them
+    /// from its CLI's token response, to keep outside (D242, step 8).
+    pub const CAPTURE: u8 = 36;
+    /// A [`RefreshAsk`](super::RefreshAsk): a sign-in's refresh, as its CLI asked it.
+    pub const REFRESH: u8 = 37;
+    /// [`Revoked`](super::Revoked): the run's VM revoked a sign-in, answered in its network
+    /// process; told, unanswered.
+    pub const REVOKE: u8 = 38;
+    /// The run's VM process's GPU report (D232, D233), its frame's bytes as that process wrote
+    /// them on its private pipe, for a run whose request named a scope
+    /// ([`Request::gpu_report`]): once, before [`STARTED`], or before [`REFUSED`] where its VM
+    /// was refused its selection. Its orchestrator reads it as a managed launch's client reads
+    /// its own (`GpuReport::parse` against its scope and selection).
+    pub const GPU_REPORT: u8 = 39;
 }
 
 /// Why a payload could not be read or written.
@@ -156,6 +206,8 @@ pub enum WireError {
     Unread,
     /// A GPU's identity not in D232's grammar, or a selection D232 refuses (`shards_abi::gpu`).
     Gpu,
+    /// A member's end by a signal no Linux has, out of `1..=run::NSIG` (version 27).
+    Signal(u32),
 }
 
 impl std::fmt::Display for WireError {
@@ -170,6 +222,7 @@ impl std::fmt::Display for WireError {
             Self::Order { what } => write!(f, "{what} out of order"),
             Self::Unread => f.write_str("a vCPU's unread cause this side does not parse"),
             Self::Gpu => f.write_str("a GPU's identity D232's grammar or selection refuses"),
+            Self::Signal(n) => write!(f, "a member's end by signal {n}, which no Linux has"),
         }
     }
 }
@@ -248,6 +301,11 @@ pub struct MemberStage {
     /// Its run-time arguments (D256), on its command line after its config's `run.command`
     /// (its entrypoint and options), in their order; none, its command alone.
     pub args: Vec<String>,
+    /// An MCP bridge of its own (D254): a stdio server at `/run/shards/mcp` that its harness's
+    /// MCP config names, each connection to which reaches the run's controller as a lane of
+    /// its agent-control endpoint ([`Request::control`], which it needs); none, and it has
+    /// neither the bridge nor its socket.
+    pub mcp: bool,
 }
 
 /// A guest port published on the host.
@@ -314,58 +372,13 @@ pub struct MemberReach {
     pub destinations: Vec<String>,
 }
 
-/// A credential grant by reference (D242): the credential named `reference` (a secret's
-/// path in the orchestrator's store, never a value) may be filled in at the VM's egress
-/// toward the hosts in `toward`, and no others. The grant carries no value, so it may
-/// print; the value rides a lease the injector pulls just in time, never this channel.
-///
-/// Each host in `toward` is a DNS name lowered, as a network's `--egress=HOST:PORT` names a
-/// destination's host by name (D236), or [`host.docker.internal`](shards_dns::HOST), the
-/// host itself; never an address (TLS names a server by its DNS name alone, RFC 6066 §3),
-/// never with a port, and never `localhost`. The orchestrator's side checks that where it builds the request
-/// ([`super::request`]); a side reading the wire takes them as bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CredentialGrant {
-    pub reference: String,
-    pub toward: Vec<String>,
-}
-
-/// What the credential injector (a gateway, not a proxy: RFC 9110 §3.7, so it may set the
-/// `Authorization` header a proxy may not, §11.6.2) does with a request it has terminated,
-/// decided by [`decide`] from the TLS name the flow arrived on, the request's host and the
-/// VM's grants (D242). The injector renders the outcome; this enum is the decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fill {
-    /// Fill the credential named `reference` into the request, then forward it.
-    With(String),
-    /// No grant names this host: forward the request with no credential (default deny).
-    Pass,
-    /// The request's host disagrees with the TLS name the flow arrived on, so the flow is
-    /// misdirected (RFC 9110 §7.4): refuse it 421, never guessing which host was meant.
-    Misdirected,
-}
-
-/// Decide what the injector fills into a request to a credential-granted host (D242).
-/// `sni` is the TLS server name the flow was terminated on, `host` the request's host (its
-/// HTTP/1.1 `Host` or HTTP/2 `:authority`, the authority alone, without a port); `grants`
-/// are the VM's. A value is filled only when the SNI, the host and a grant's host all
-/// agree: the SNI alone is not enough (a client picks its `Host` freely; domain fronting),
-/// so a `Host` that differs from the SNI is [`Misdirected`](Fill::Misdirected), and
-/// otherwise the first grant whose `toward` names the host fills it, else
-/// [`Pass`](Fill::Pass). Matching is ASCII case-insensitive, as DNS names compare (RFC
-/// 9549 §2.3); callers that also require the request to carry the credential's placeholder
-/// add that where they substitute.
-pub fn decide(grants: &[CredentialGrant], sni: &str, host: &str) -> Fill {
-    if !sni.eq_ignore_ascii_case(host) {
-        return Fill::Misdirected;
-    }
-    for grant in grants {
-        if grant.toward.iter().any(|h| h.eq_ignore_ascii_case(host)) {
-            return Fill::With(grant.reference.clone());
-        }
-    }
-    Fill::Pass
-}
+/// A run's credential grants and the injector's decision with them (D242): shards-dns's, which
+/// the network process's injector decides with too (both name a grant's hosts by its rules).
+/// A grant rides this channel by reference with the hosts it may be filled in toward and the
+/// placeholder that stands for it; its value rides a lease the injector pulls just in time,
+/// never this channel. The orchestrator's side checks it where it builds the request
+/// ([`super::request`]).
+pub use shards_dns::credential::{CredentialGrant, Fill, decide};
 
 /// A credential's lease, asked by the run's host just in time (D242): the credential its
 /// network process first needs, by reference, one of the run's grants and never a value;
@@ -411,6 +424,80 @@ pub struct LeaseAnswer {
     pub result: Result<Lease, LeaseRefusal>,
 }
 
+/// A run's sign-in grant and what its capture gave (D242, step 8): shards-dns', which the
+/// network process holds too.
+pub use shards_dns::credential::{Captured, Cli, SignInGrant};
+
+/// A sign-in's tokens as its run's injector took them (D242, step 8), each wiped as it drops:
+/// its access token, its refresh token where its response had one, and the access token's
+/// life in seconds where its response said (RFC 6749 §5.1); and, no credential, what its CLI's
+/// own file records beside them, for its orchestrator to stage into a later run's: its ID token
+/// made inert as its CLI was given it (its header and claims, no signature: Codex's `auth.json`
+/// parses it for its account), and the scope its access token was granted (Claude Code's
+/// `scopes`). The real ID token stays nowhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInTokens {
+    pub access: Secret,
+    pub refresh: Option<Secret>,
+    pub expires_in: Option<u64>,
+    pub id_token: Option<Secret>,
+    pub scope: Option<String>,
+}
+
+/// A sign-in's capture, asked by the run's host (D242, step 8): keep its tokens, and give the
+/// placeholders its CLI is to hold in their places; answered by its id ([`CaptureAnswer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureAsk {
+    pub id: u32,
+    pub sign_in: String,
+    pub tokens: SignInTokens,
+}
+
+/// A sign-in's refresh, asked by the run's host as its CLI asked it (D242, step 8): refreshed
+/// by its broker once for every run of it at a time, answered by its id ([`RefreshAnswer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshAsk {
+    pub id: u32,
+    pub sign_in: String,
+}
+
+/// A sign-in the run's VM revoked (its CLI's logout, or a sign-in anew), answered in its
+/// network process and its stored tokens kept (D242, step 8): told, unanswered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revoked {
+    pub sign_in: String,
+}
+
+/// Why a sign-in's ask was not answered (D242, step 8), typed (R04): the run's host relays it
+/// to its network process, whose injector matches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInRefusal {
+    /// The orchestrator's broker refused it, in its words: a sign-in its store does not hold, or
+    /// a refresh its provider refused.
+    Denied(String),
+    /// Its broker could not be asked, or failed, in its words: a later ask may be answered.
+    Unavailable(String),
+    /// The run has ended.
+    Ended,
+    /// The run's orchestrator answers no sign-in.
+    Unanswered,
+}
+
+/// A capture's answer, by its ask's id: the placeholders the sign-in's CLI is to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureAnswer {
+    pub id: u32,
+    pub result: Result<Captured, SignInRefusal>,
+}
+
+/// A refresh's answer, by its ask's id: the token response the sign-in's CLI is to have, its
+/// tokens the placeholders it holds (the run's injector gives them those whatever comes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshAnswer {
+    pub id: u32,
+    pub result: Result<Secret, SignInRefusal>,
+}
+
 /// A host directory the guest sees at a path, as `-v HOST:PATH[:ro]` gives one (D109).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareAt {
@@ -452,6 +539,17 @@ pub struct Request {
     /// The host GPUs its VM renders on, each by its exact identity (D232), which its command
     /// reads under the nesting grant (D234's `gpus=`); none, no GPU. Appended in version 16.
     pub gpu_devices: Vec<shards_abi::gpu::PhysicalGpu>,
+    /// The run's sign-in grants (D242, step 8): each a sign-in its CLI may sign in as, its
+    /// tokens kept outside and its CLI given placeholders. Empty for a run with none. Appended
+    /// in version 24.
+    pub sign_ins: Vec<SignInGrant>,
+    /// The roots the run's injector trusts beside the host's own, each a certificate's DER
+    /// (D242), for its injected flows alone; empty for the host's alone. Appended in version 26.
+    pub upstream_roots: Vec<Vec<u8>>,
+    /// The scope of the run's GPU report (D233): its VM process frames its renderer's report
+    /// with it, which its host relays ([`to_client::GPU_REPORT`]); none, no report. Nonzero,
+    /// and only with [`gpu_devices`](Self::gpu_devices). Appended in version 29.
+    pub gpu_report: Option<[u8; 16]>,
 }
 
 /// What a run's agent-control endpoint takes and serves (D252): the one key it takes, its
@@ -478,11 +576,24 @@ pub struct SocketGrant {
 }
 
 /// Where a run's agent-control endpoint is bound, and the SHA-256 of its microVM's own key,
-/// which its controller pins (D252).
+/// which its controller pins (D252); and the two other sockets it holds (version 30, D252).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlAt {
+    /// Where it serves, which its controller reaches.
     pub address: SocketAddr,
     pub vm: [u8; 32],
+    /// Its driver's waker: a loopback socket connected to `wake`, sending to it alone.
+    pub waker: SocketAddr,
+    /// Its driver's wake: a loopback socket connected to `waker`, taking datagrams from it
+    /// alone.
+    pub wake: SocketAddr,
+}
+
+impl ControlAt {
+    /// Every socket the endpoint holds: its served address, its waker's and its wake's.
+    pub fn sockets(&self) -> [SocketAddr; 3] {
+        [self.address, self.waker, self.wake]
+    }
 }
 
 /// Room for `bytes` more of member `member`'s `channel`.
@@ -550,12 +661,9 @@ pub struct Started {
     pub members: Vec<MemberInfo>,
     pub published: Vec<Bound>,
     /// Where the run's endpoint is bound, where it asked for one (D252); appended in version
-    /// 15.
+    /// 15. Versions 17 to 30 told a rate's period after it, which each rate's answer carries
+    /// from version 31 ([`Rated::period`]).
     pub control: Option<ControlAt>,
-    /// The period its VM's governor holds a rate over (D191, D247), as its host's build
-    /// holds one: on the channel in nanoseconds, never none; appended in
-    /// version 17.
-    pub rate_period: std::time::Duration,
     /// How its microVM started (D253); appended in version 19.
     pub from: StartedFrom,
 }
@@ -612,11 +720,12 @@ pub struct Output {
 }
 
 /// Bytes for a member's stdin, at most the room its host has given and the orchestrator has
-/// not used.
+/// not used: what a person typed into the member, a credential as often as not, so its bytes
+/// are a [`Secret`]'s, wiped as they drop and never printed (D242).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
     pub member: u32,
-    pub bytes: Vec<u8>,
+    pub bytes: Secret,
 }
 
 /// The orchestrator's end of a member's stdin ([`StreamEnd::Closed`]), every byte before it
@@ -662,8 +771,9 @@ pub struct OutputEnd {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemberEnded {
     pub member: u32,
-    /// As `docker run` reports one: its code, or 128 plus a fatal signal's number.
-    pub status: u32,
+    /// How its command ended: exited with its code, or killed by a signal (version 27), as
+    /// its init's reaper saw it.
+    pub end: shards_abi::run::members::End,
 }
 
 /// What init's `STATS` says, each line `None` where it said none; and, for the run, what its
@@ -699,43 +809,19 @@ pub struct Microvm {
     pub guest: Result<GuestTimes, String>,
 }
 
-/// What a VM process uses of its host, as the host counts it (`platform::process_usage`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostUse {
-    /// Its CPU time, user and system together, in ns: its vCPUs' guest time among it.
-    pub cpu_ns: u64,
-    pub resident_bytes: u64,
-    /// Its own memory, as memory per VM is counted (PM M30): macOS's physical footprint,
-    /// Linux's anonymous resident pages, Windows' private working set.
-    pub footprint_bytes: u64,
-}
+/// What a VM process uses of its host, and what a microVM's vCPUs have run of its guest, each
+/// by index, with what those it no longer has ran (guest-cpu-time-v1): one form for the VM
+/// process, an image run's stats and a managed guest's use (D260).
+pub use shards_abi::guest_time::{GuestTimes, HostUse, VcpuTime};
 
-/// What a microVM's vCPUs have run of its guest, as its hypervisor counts it: each by index,
-/// and what those it no longer has ran, which stay its machine's (guest-cpu-time-v1).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct GuestTimes {
-    /// In index order, each index once.
-    pub vcpus: Vec<VcpuTime>,
-    pub departed_ns: u64,
-}
-
-impl GuestTimes {
-    /// Its machine's: what every vCPU it has had ran of its guest.
-    pub fn total_ns(&self) -> u64 {
-        self.vcpus
-            .iter()
-            .fold(self.departed_ns, |total, v| total.saturating_add(v.guest_ns))
+impl Microvm {
+    /// Its VMM's own CPU time, in ns: its VM process's less what its vCPUs ran of its guest,
+    /// none less than none past the clocks' steps (D241, D260); none where either was not read.
+    pub fn vmm_ns(&self) -> Option<u64> {
+        let host = self.host.as_ref().ok()?;
+        let guest = self.guest.as_ref().ok()?;
+        Some(host.cpu_ns.saturating_sub(guest.total_ns()))
     }
-}
-
-/// One vCPU's guest time, as a sample read it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VcpuTime {
-    pub index: u32,
-    /// Nanoseconds, never less than an earlier sample of the same vCPU said.
-    pub guest_ns: u64,
-    /// Why this sample did not read it, typed: `guest_ns` is then the most it read before.
-    pub unread: Option<shards_abi::guest_time::Unread>,
 }
 
 impl Stats {
@@ -816,12 +902,23 @@ pub struct RateAsk {
     pub rate: Option<NonZeroU64>,
 }
 
-/// What the run's VM holds its vCPUs to, by its ask's id: the milli-CPU, none where it lets
-/// them be (no rate, or every vCPU's whole CPU or more), or why it holds them to nothing.
+/// What the run's VM holds its vCPUs to, by its ask's id, and over what period; or why it
+/// holds them to nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateAnswer {
     pub id: u32,
-    pub result: Result<Option<NonZeroU64>, String>,
+    pub result: Result<Rated, String>,
+}
+
+/// What a run's VM holds its vCPUs to (D191, D247): the milli-CPU, none where it lets them be
+/// (no rate, or every vCPU's whole CPU or more); and the period its governor holds that over,
+/// which it derived for the rate from what it has learned of its step (vcpus × g over the
+/// share; where it lets them be, g), on the channel in nanoseconds, never none; appended in
+/// version 31.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rated {
+    pub milli: Option<NonZeroU64>,
+    pub period: std::time::Duration,
 }
 
 /// A host directory plugged into running member `member` as the run goes (D235), as
@@ -895,6 +992,52 @@ pub struct PlugAnswer {
     pub result: Result<(), (PlugRefusal, String)>,
 }
 
+/// The run's microVM saved whole into directory `to`, which the save makes (D259): absolute,
+/// beneath the run's home, beneath no directory its guest reaches, and nothing there yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveAsk {
+    pub id: u32,
+    /// Absolute, UTF-8: the directory the save makes.
+    pub to: String,
+}
+
+/// Why a save was refused, by what refused it (D259).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveRefusal {
+    /// Where it was to be written is not its owner's to name: not absolute, outside the run's
+    /// home, beneath a directory its guest reaches, or something there already.
+    Destination = 0,
+    /// The run is in no state to save: a save of it under way, or its microVM gone.
+    State = 1,
+    /// This host's microVMs take no snapshots (`shards_vmm::vm::SNAPSHOTS`).
+    Unsupported = 2,
+    /// It was not made, in the words of what failed: its VM's (what its snapshot cannot keep
+    /// whole, its guest not going quiet) or its files' writing.
+    Failed = 3,
+}
+
+fn save_refusal(tag: u8) -> Result<SaveRefusal, WireError> {
+    Ok(match tag {
+        0 => SaveRefusal::Destination,
+        1 => SaveRefusal::State,
+        2 => SaveRefusal::Unsupported,
+        3 => SaveRefusal::Failed,
+        tag => {
+            return Err(WireError::Tag {
+                what: "a save's refusal",
+                tag,
+            });
+        }
+    })
+}
+
+/// A save's outcome, by its ask's id: saved, or refused and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveAnswer {
+    pub id: u32,
+    pub result: Result<(), (SaveRefusal, String)>,
+}
+
 /// How the run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunEnd {
@@ -905,6 +1048,109 @@ pub enum RunEnd {
     /// Its VM, its host or its guest failed, or its own command never started, in its VM's
     /// words (D249).
     Failed(String),
+}
+
+/// A run's end and what its microVM used in all (D260's final use): the run host's `ENDED`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEnded {
+    pub end: RunEnd,
+    pub final_use: FinalUse,
+}
+
+/// What a run's microVM used of its host in all (D260's final use): read by its VM process once
+/// its machine was down, every vCPU stopped after its guest's last instruction, and before that
+/// process let go of the machine's memory; or why it was not. A part of it not read is its
+/// words ([`Microvm`]), never a zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalUse {
+    /// Each vCPU's guest time in all, by its index, those gone among them (so
+    /// [`GuestTimes::departed_ns`] 0), then its VM process's own use, read after it.
+    Read(Microvm),
+    /// None read, and why.
+    Unread(Unused),
+}
+
+/// Why a run's end carries no final use of its microVM (R04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unused {
+    /// The run's microVM never started: it was stopped or refused before it did.
+    NotStarted,
+    /// Its VM was killed before its machine was down (`STOP`, or its orchestrator's asks
+    /// ending it): what it used went with it. A run's end awaited before its stop carries it.
+    Killed,
+    /// Its VM ended without telling it: it failed, its link to its run host broke, or its run
+    /// host ended without its run's end or broke its channel.
+    Untold,
+    /// What its VM told of it is none of the protocol's.
+    Broken(UseBroken),
+}
+
+/// Why a VM's use is none of its protocol's (D260).
+pub use shards_abi::rate::UseBroken;
+
+impl RunEnded {
+    /// `end`, its microVM's final use not read for `why`.
+    pub fn unused(end: RunEnd, why: Unused) -> RunEnded {
+        RunEnded {
+            end,
+            final_use: FinalUse::Unread(why),
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let mut w = Writer(self.end.encode()?);
+        match &self.final_use {
+            FinalUse::Read(microvm) => {
+                w.u8(0);
+                w.microvm(Some(microvm))?;
+            }
+            FinalUse::Unread(why) => {
+                w.u8(1);
+                match why {
+                    Unused::NotStarted => w.u8(0),
+                    Unused::Killed => w.u8(1),
+                    Unused::Untold => w.u8(2),
+                    Unused::Broken(broken) => {
+                        w.u8(3);
+                        w.u8(match broken {
+                            UseBroken::Long => 0,
+                            UseBroken::Text => 1,
+                            UseBroken::Word => 2,
+                            UseBroken::Guest => 3,
+                            UseBroken::Host => 4,
+                        });
+                    }
+                }
+            }
+        }
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<RunEnded, WireError> {
+        let mut r = Reader(payload);
+        let end = r.run_end()?;
+        let tag = |what, tag| WireError::Tag { what, tag };
+        let final_use = match r.u8()? {
+            0 => FinalUse::Read(r.microvm()?.ok_or(tag("a microVM's final use", 0))?),
+            1 => FinalUse::Unread(match r.u8()? {
+                0 => Unused::NotStarted,
+                1 => Unused::Killed,
+                2 => Unused::Untold,
+                3 => Unused::Broken(match r.u8()? {
+                    0 => UseBroken::Long,
+                    1 => UseBroken::Text,
+                    2 => UseBroken::Word,
+                    3 => UseBroken::Guest,
+                    4 => UseBroken::Host,
+                    t => return Err(tag("a broken use", t)),
+                }),
+                t => return Err(tag("why no final use", t)),
+            }),
+            t => return Err(tag("a run's final use", t)),
+        };
+        r.end()?;
+        Ok(RunEnded { end, final_use })
+    }
 }
 
 /// A frame's header for `kind` and a payload of `len` bytes, refused past the bound.
@@ -1001,6 +1247,20 @@ impl Writer {
     fn text(&mut self, s: &str) -> Result<(), WireError> {
         self.bytes(s.as_bytes())
     }
+    /// A capture's access reference and its placeholder, then 1 and its refresh token's
+    /// placeholder where it has one, else 0 (D242, step 8).
+    fn captured(&mut self, c: &Captured) -> Result<(), WireError> {
+        self.text(&c.access)?;
+        self.text(&c.access_placeholder)?;
+        match &c.refresh_placeholder {
+            None => self.u8(0),
+            Some(refresh) => {
+                self.u8(1);
+                self.text(refresh)?;
+            }
+        }
+        Ok(())
+    }
     fn ip(&mut self, ip: Option<IpAddr>) {
         match ip {
             None => self.u8(0),
@@ -1090,6 +1350,14 @@ impl Writer {
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
+    /// What [`Writer::captured`] wrote.
+    fn captured(&mut self) -> Result<Captured, WireError> {
+        Ok(Captured {
+            access: self.text()?,
+            access_placeholder: self.text()?,
+            refresh_placeholder: if self.flag()? { Some(self.text()?) } else { None },
+        })
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         let data: &'a [u8] = self.0;
         let (head, rest) = data.split_at_checked(n).ok_or(WireError::Short)?;
@@ -1174,6 +1442,19 @@ impl<'a> Reader<'a> {
             1 => Ok(StreamEnd::Aborted(self.i32()?)),
             tag => Err(WireError::Tag { what, tag }),
         }
+    }
+    fn run_end(&mut self) -> Result<RunEnd, WireError> {
+        Ok(match self.u8()? {
+            0 => RunEnd::Exited(self.u32()?),
+            1 => RunEnd::Stopped,
+            2 => RunEnd::Failed(self.text()?),
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a run's end",
+                    tag,
+                });
+            }
+        })
     }
     fn microvm(&mut self) -> Result<Option<Microvm>, WireError> {
         match self.u8()? {
@@ -1433,6 +1714,46 @@ impl Request {
                 w.text(a)?;
             }
         }
+        // Each credential grant's placeholder, in the grants' order, appended in version 22
+        // (D242).
+        for grant in &self.credentials {
+            w.text(&grant.placeholder)?;
+        }
+        // The run's sign-in grants, appended in version 24 (D242, step 8): each its name, its
+        // CLI's code, its hosts, and whether a capture gave it placeholders, which follow.
+        w.count(self.sign_ins.len())?;
+        for s in &self.sign_ins {
+            w.text(&s.sign_in)?;
+            w.u8(s.cli.code());
+            w.count(s.toward.len())?;
+            for host in &s.toward {
+                w.text(host)?;
+            }
+            match &s.captured {
+                None => w.u8(0),
+                Some(c) => {
+                    w.u8(1);
+                    w.captured(c)?;
+                }
+            }
+        }
+        // Each member's MCP bridge, in the members' order, appended in version 25 (D254).
+        for m in &self.members {
+            w.u8(u8::from(m.mcp));
+        }
+        // The run's upstream roots, appended in version 26 (D242): their count, then each DER.
+        w.count(self.upstream_roots.len())?;
+        for root in &self.upstream_roots {
+            w.bytes(root)?;
+        }
+        // The run's GPU report's scope, appended in version 29 (D233).
+        match &self.gpu_report {
+            None => w.u8(0),
+            Some(scope) => {
+                w.u8(1);
+                w.0.extend_from_slice(scope);
+            }
+        }
         w.done()
     }
 
@@ -1456,8 +1777,9 @@ impl Request {
             None
         };
         // Each member's kind, name, env and files, and, appended last, its working
-        // directory's flag, its input's, its terminal's and its arguments' count.
-        let n = r.count(1 + 4 + 4 + 4 + 1 + 1 + 1 + 4)?;
+        // directory's flag, its input's, its terminal's, its arguments' count and its MCP
+        // bridge's flag.
+        let n = r.count(1 + 4 + 4 + 4 + 1 + 1 + 1 + 4 + 1)?;
         let mut members = Vec::with_capacity(n);
         for _ in 0..n {
             let kind = member_kind(r.u8()?)?;
@@ -1480,12 +1802,13 @@ impl Request {
                 name,
                 env,
                 files,
-                // Read with the members' working directories, inputs, terminals and arguments,
-                // appended last.
+                // Read with the members' working directories, inputs, terminals, arguments and
+                // MCP bridges, appended last.
                 workdir: None,
                 input: false,
                 terminal: false,
                 args: Vec::new(),
+                mcp: false,
             });
         }
         let n = r.count(2 + 1 + 1 + 2)?;
@@ -1540,7 +1863,12 @@ impl Request {
             for _ in 0..toward_n {
                 toward.push(r.text()?);
             }
-            credentials.push(CredentialGrant { reference, toward });
+            // Its placeholder, read with the members' arguments, appended last.
+            credentials.push(CredentialGrant {
+                reference,
+                toward,
+                placeholder: String::new(),
+            });
         }
         // Each member's terminal, in the members' order, appended in version 11 (D244).
         for m in &mut members {
@@ -1604,6 +1932,52 @@ impl Request {
             }
             m.args = args;
         }
+        // Each credential grant's placeholder, in the grants' order, appended in version 22
+        // (D242).
+        for grant in &mut credentials {
+            grant.placeholder = r.text()?;
+        }
+        // The run's sign-in grants, appended in version 24 (D242, step 8): each at least its
+        // name's length (four bytes), its CLI (one), its hosts' count (four) and its flag (one).
+        let n = r.count(4 + 1 + 4 + 1)?;
+        let mut sign_ins = Vec::with_capacity(n);
+        for _ in 0..n {
+            let sign_in = r.text()?;
+            let code = r.u8()?;
+            let cli = Cli::from_code(code).ok_or(WireError::Tag {
+                what: "a sign-in's CLI",
+                tag: code,
+            })?;
+            let k = r.count(4)?;
+            let mut toward = Vec::with_capacity(k);
+            for _ in 0..k {
+                toward.push(r.text()?);
+            }
+            let captured = if r.flag()? { Some(r.captured()?) } else { None };
+            sign_ins.push(SignInGrant {
+                sign_in,
+                cli,
+                toward,
+                captured,
+            });
+        }
+        // Each member's MCP bridge, appended in version 25 (D254).
+        for m in &mut members {
+            m.mcp = r.flag()?;
+        }
+        // The run's upstream roots, appended in version 26 (D242): each at least its length's
+        // four bytes.
+        let n = r.count(4)?;
+        let mut upstream_roots = Vec::with_capacity(n);
+        for _ in 0..n {
+            upstream_roots.push(r.bytes()?.to_vec());
+        }
+        // The run's GPU report's scope, appended in version 29 (D233): nonzero, and of a run
+        // that names its GPUs, as a managed launch's is (`PreparedBoot::with_gpu_report`).
+        let gpu_report = if r.flag()? { Some(r.array::<16>()?) } else { None };
+        if gpu_report.is_some_and(|scope| scope == [0; 16] || gpu_devices.is_empty()) {
+            return Err(WireError::Gpu);
+        }
         r.end()?;
         Ok(Request {
             image,
@@ -1619,7 +1993,235 @@ impl Request {
             credentials,
             control,
             gpu_devices,
+            sign_ins,
+            upstream_roots,
+            gpu_report,
         })
+    }
+}
+
+impl SignInRefusal {
+    fn write(&self, w: &mut Writer) -> Result<(), WireError> {
+        match self {
+            SignInRefusal::Denied(why) => {
+                w.u8(1);
+                w.text(why)
+            }
+            SignInRefusal::Unavailable(why) => {
+                w.u8(2);
+                w.text(why)
+            }
+            SignInRefusal::Ended => {
+                w.u8(3);
+                Ok(())
+            }
+            SignInRefusal::Unanswered => {
+                w.u8(4);
+                Ok(())
+            }
+        }
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<SignInRefusal, WireError> {
+        Ok(match r.u8()? {
+            1 => SignInRefusal::Denied(r.text()?),
+            2 => SignInRefusal::Unavailable(r.text()?),
+            3 => SignInRefusal::Ended,
+            4 => SignInRefusal::Unanswered,
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a sign-in's refusal",
+                    tag,
+                });
+            }
+        })
+    }
+}
+
+impl CaptureAsk {
+    /// Its id, its sign-in, the life and the scope where it has them (1 and each, else 0), then
+    /// its tokens last, the refresh token's and the ID token's flags before them, in one buffer
+    /// made to its length at once: no buffer let go of as one grows holds a part of a token. The
+    /// caller wipes what it returns.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let t = &self.tokens;
+        let sized = |v: Option<usize>| v.map_or(0, |n| n.saturating_add(4));
+        let mut w = Writer(Vec::with_capacity(
+            self.sign_in
+                .len()
+                .saturating_add(t.access.0.len())
+                .saturating_add(sized(t.refresh.as_ref().map(|r| r.0.len())))
+                .saturating_add(sized(t.id_token.as_ref().map(|i| i.0.len())))
+                .saturating_add(sized(t.scope.as_ref().map(String::len)))
+                .saturating_add(4 + 4 + 9 + 1 + 1 + 1 + 4),
+        ));
+        w.u32(self.id);
+        w.text(&self.sign_in)?;
+        match t.expires_in {
+            None => w.u8(0),
+            Some(s) => {
+                w.u8(1);
+                w.u64(s);
+            }
+        }
+        match &t.scope {
+            None => w.u8(0),
+            Some(scope) => {
+                w.u8(1);
+                w.text(scope)?;
+            }
+        }
+        w.u8(u8::from(t.refresh.is_some()));
+        w.u8(u8::from(t.id_token.is_some()));
+        w.bytes(&t.access.0)?;
+        if let Some(r) = &t.refresh {
+            w.bytes(&r.0)?;
+        }
+        if let Some(i) = &t.id_token {
+            w.bytes(&i.0)?;
+        }
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<CaptureAsk, WireError> {
+        let mut r = Reader(payload);
+        let id = r.u32()?;
+        let sign_in = r.text()?;
+        let expires_in = if r.flag()? { Some(r.u64()?) } else { None };
+        let scope = if r.flag()? { Some(r.text()?) } else { None };
+        let (refreshes, identified) = (r.flag()?, r.flag()?);
+        let access = Secret(r.bytes()?.to_vec());
+        let refresh = if refreshes {
+            Some(Secret(r.bytes()?.to_vec()))
+        } else {
+            None
+        };
+        let id_token = if identified {
+            Some(Secret(r.bytes()?.to_vec()))
+        } else {
+            None
+        };
+        r.end()?;
+        Ok(CaptureAsk {
+            id,
+            sign_in,
+            tokens: SignInTokens {
+                access,
+                refresh,
+                expires_in,
+                id_token,
+                scope,
+            },
+        })
+    }
+}
+
+impl RefreshAsk {
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let mut w = Writer(Vec::new());
+        w.u32(self.id);
+        w.text(&self.sign_in)?;
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<RefreshAsk, WireError> {
+        let mut r = Reader(payload);
+        let ask = RefreshAsk {
+            id: r.u32()?,
+            sign_in: r.text()?,
+        };
+        r.end()?;
+        Ok(ask)
+    }
+}
+
+impl Revoked {
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let mut w = Writer(Vec::new());
+        w.text(&self.sign_in)?;
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Revoked, WireError> {
+        let mut r = Reader(payload);
+        let told = Revoked { sign_in: r.text()? };
+        r.end()?;
+        Ok(told)
+    }
+}
+
+impl CaptureAnswer {
+    /// Its id, then 0 and the access token's reference and its placeholder, then 1 and the
+    /// refresh token's where it has one, else 0; or 1 and its refusal.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let mut w = Writer(Vec::new());
+        w.u32(self.id);
+        match &self.result {
+            Ok(c) => {
+                w.u8(0);
+                w.captured(c)?;
+            }
+            Err(refusal) => {
+                w.u8(1);
+                refusal.write(&mut w)?;
+            }
+        }
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<CaptureAnswer, WireError> {
+        let mut r = Reader(payload);
+        let id = r.u32()?;
+        let result = match r.u8()? {
+            0 => Ok(r.captured()?),
+            1 => Err(SignInRefusal::read(&mut r)?),
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a capture's answer",
+                    tag,
+                });
+            }
+        };
+        r.end()?;
+        Ok(CaptureAnswer { id, result })
+    }
+}
+
+impl RefreshAnswer {
+    /// Its id, then 0 and the token response, last, in one buffer made to its length at once;
+    /// or 1 and its refusal. The caller wipes what it returns.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let body = self.result.as_ref().map_or(0, |b| b.0.len());
+        let mut w = Writer(Vec::with_capacity(body.saturating_add(4 + 1 + 4)));
+        w.u32(self.id);
+        match &self.result {
+            Ok(body) => {
+                w.u8(0);
+                w.bytes(&body.0)?;
+            }
+            Err(refusal) => {
+                w.u8(1);
+                refusal.write(&mut w)?;
+            }
+        }
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<RefreshAnswer, WireError> {
+        let mut r = Reader(payload);
+        let id = r.u32()?;
+        let result = match r.u8()? {
+            0 => Ok(Secret(r.bytes()?.to_vec())),
+            1 => Err(SignInRefusal::read(&mut r)?),
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a refresh's answer",
+                    tag,
+                });
+            }
+        };
+        r.end()?;
+        Ok(RefreshAnswer { id, result })
     }
 }
 
@@ -1722,6 +2324,59 @@ impl PlugAnswer {
     }
 }
 
+impl SaveAsk {
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let mut w = Writer(Vec::new());
+        w.u32(self.id);
+        w.text(&self.to)?;
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<SaveAsk, WireError> {
+        let mut r = Reader(payload);
+        let ask = SaveAsk {
+            id: r.u32()?,
+            to: r.text()?,
+        };
+        r.end()?;
+        Ok(ask)
+    }
+}
+
+impl SaveAnswer {
+    /// Its id, then 0, or 1, its refusal's tag and why.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let mut w = Writer(Vec::new());
+        w.u32(self.id);
+        match &self.result {
+            Ok(()) => w.u8(0),
+            Err((cause, why)) => {
+                w.u8(1);
+                w.u8(*cause as u8);
+                w.text(why)?;
+            }
+        }
+        w.done()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<SaveAnswer, WireError> {
+        let mut r = Reader(payload);
+        let id = r.u32()?;
+        let result = match r.u8()? {
+            0 => Ok(()),
+            1 => Err((save_refusal(r.u8()?)?, r.text()?)),
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a save's answer",
+                    tag,
+                });
+            }
+        };
+        r.end()?;
+        Ok(SaveAnswer { id, result })
+    }
+}
+
 impl StatsAsk {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
@@ -1786,10 +2441,13 @@ impl Started {
                 w.ip(Some(at.address.ip()));
                 w.u16(at.address.port());
                 w.0.extend_from_slice(&at.vm);
+                // Its waker's and its wake's, in version 30 (D252).
+                for held in [at.waker, at.wake] {
+                    w.ip(Some(held.ip()));
+                    w.u16(held.port());
+                }
             }
         }
-        // The rate's period, appended in version 17 (D247).
-        w.u64(u64::try_from(self.rate_period.as_nanos()).map_err(|_| WireError::TooLong)?);
         // How its microVM started, appended in version 19 (D253).
         w.u8(self.from as u8);
         w.done()
@@ -1838,27 +2496,26 @@ impl Started {
                 tag: 0,
             })?;
             let port = r.u16()?;
+            let vm = r.array::<32>()?;
+            let mut held = |what| -> Result<SocketAddr, WireError> {
+                let ip = r.ip()?.ok_or(WireError::Tag { what, tag: 0 })?;
+                Ok(SocketAddr::new(ip, r.u16()?))
+            };
             Some(ControlAt {
                 address: SocketAddr::new(ip, port),
-                vm: r.array::<32>()?,
+                vm,
+                waker: held("an endpoint's waker")?,
+                wake: held("an endpoint's wake")?,
             })
         } else {
             None
         };
-        // A governor holds over some time: a period of none is no period.
-        let rate_period = NonZeroU64::new(r.u64()?)
-            .map(|ns| std::time::Duration::from_nanos(ns.get()))
-            .ok_or(WireError::Tag {
-                what: "a rate period",
-                tag: 0,
-            })?;
         let from = started_from(r.u8()?)?;
         r.end()?;
         Ok(Started {
             members,
             published,
             control,
-            rate_period,
             from,
         })
     }
@@ -1866,8 +2523,9 @@ impl Started {
 
 impl Request {
     /// What a warm run host is started with and holds each run it is handed to (D253's
-    /// pools): this request with its members' stages, its deadline and its control ask taken
-    /// out, what alone may differ between the runs of one microVM; none of a run's secrets
+    /// pools): this request with its members' stages, its deadline, its control ask and its GPU
+    /// report's scope (D233) taken out, what alone may differ between the runs of one microVM;
+    /// none of a run's secrets
     /// is in it. Everything else is the microVM's: its image, size, command, ports, network,
     /// shares, nesting, credential grants and GPUs.
     pub fn exemplar(&self) -> Request {
@@ -1875,6 +2533,7 @@ impl Request {
             members: Vec::new(),
             ready_by: None,
             control: None,
+            gpu_report: None,
             ..self.clone()
         }
     }
@@ -1955,7 +2614,7 @@ impl Input {
         let (head, bytes) = payload.split_first_chunk::<4>().ok_or(WireError::Short)?;
         Ok(Input {
             member: u32::from_be_bytes(*head),
-            bytes: bytes.to_vec(),
+            bytes: Secret(bytes.to_vec()),
         })
     }
 }
@@ -2050,21 +2709,34 @@ impl OutputEnd {
 }
 
 impl MemberEnded {
+    /// Its member, then its end as the guest's `MEMBER_ENDED` carries it
+    /// (`run::members::End`: a tag, exited 0 or signaled 1, and its code or signal).
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
         w.u32(self.member);
-        w.u32(self.status);
+        w.0.extend_from_slice(&self.end.encode());
         w.0
     }
 
     pub fn decode(payload: &[u8]) -> Result<MemberEnded, WireError> {
+        use shards_abi::run::members::End;
         let mut r = Reader(payload);
-        let e = MemberEnded {
-            member: r.u32()?,
-            status: r.u32()?,
-        };
+        let member = r.u32()?;
+        let tag = r.u8()?;
+        let word = r.u32()?;
         r.end()?;
-        Ok(e)
+        let end = match tag {
+            0 => End::Exited(word),
+            1 if (1..=shards_abi::run::NSIG).contains(&word) => End::Signaled(word),
+            1 => return Err(WireError::Signal(word)),
+            _ => {
+                return Err(WireError::Tag {
+                    what: "a member's end",
+                    tag,
+                });
+            }
+        };
+        Ok(MemberEnded { member, end })
     }
 }
 
@@ -2256,14 +2928,16 @@ impl RateAsk {
 }
 
 impl RateAnswer {
-    /// Its id, then 0 and the milli-CPU the vCPUs are held to (0 for none), or 1 and why.
+    /// Its id, then 0, the milli-CPU the vCPUs are held to (0 for none) and the period in
+    /// nanoseconds (version 31), or 1 and why.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
         let mut w = Writer(Vec::new());
         w.u32(self.id);
         match &self.result {
             Ok(held) => {
                 w.u8(0);
-                w.u64(held.map_or(0, NonZeroU64::get));
+                w.u64(held.milli.map_or(0, NonZeroU64::get));
+                w.u64(u64::try_from(held.period.as_nanos()).map_err(|_| WireError::TooLong)?);
             }
             Err(why) => {
                 w.u8(1);
@@ -2277,7 +2951,18 @@ impl RateAnswer {
         let mut r = Reader(payload);
         let id = r.u32()?;
         let result = match r.u8()? {
-            0 => Ok(NonZeroU64::new(r.u64()?)),
+            0 => {
+                let milli = NonZeroU64::new(r.u64()?);
+                // A governor holds over some time: a period of none is no period.
+                let period = NonZeroU64::new(r.u64()?).ok_or(WireError::Tag {
+                    what: "a rate period",
+                    tag: 0,
+                })?;
+                Ok(Rated {
+                    milli,
+                    period: std::time::Duration::from_nanos(period.get()),
+                })
+            }
             1 => Err(r.text()?),
             tag => {
                 return Err(WireError::Tag {
@@ -2412,17 +3097,7 @@ impl RunEnd {
 
     pub fn decode(payload: &[u8]) -> Result<RunEnd, WireError> {
         let mut r = Reader(payload);
-        let end = match r.u8()? {
-            0 => RunEnd::Exited(r.u32()?),
-            1 => RunEnd::Stopped,
-            2 => RunEnd::Failed(r.text()?),
-            tag => {
-                return Err(WireError::Tag {
-                    what: "a run's end",
-                    tag,
-                });
-            }
-        };
+        let end = r.run_end()?;
         r.end()?;
         Ok(end)
     }
@@ -2496,55 +3171,49 @@ mod tests {
         ));
     }
 
-    /// The injector fills a credential only when the TLS name, the request's host and a
-    /// grant's host all agree (D242): a grant toward one host does not fill a request to
-    /// another, a host that differs from the SNI is misdirected, and matching ignores
-    /// ASCII case.
+    /// A save's ask and its answer come back as they went, each refusal by its tag (D259); a
+    /// truncated, trailing or unknown-tagged one is refused, never a default.
     #[test]
-    fn decide_fills_only_on_an_agreed_granted_host() {
-        let grants = vec![
-            CredentialGrant {
-                reference: "anthropic/claude-max".into(),
-                toward: vec!["api.anthropic.com".into(), "platform.claude.com".into()],
-            },
-            CredentialGrant {
-                reference: "openai/chatgpt".into(),
-                toward: vec!["chatgpt.com".into()],
-            },
-        ];
-        // SNI == Host == a grant's host: filled, the first grant that names it.
+    fn saves_round_trip_and_bad_ones_are_refused() {
+        let ask = SaveAsk {
+            id: 7,
+            to: "/Users/u/Library/Application Support/shards/saves/s1".into(),
+        };
+        let bytes = ask.encode().unwrap();
+        assert_eq!(SaveAsk::decode(&bytes).unwrap(), ask);
+        assert_eq!(SaveAsk::decode(&bytes[..bytes.len() - 1]), Err(WireError::Short));
         assert_eq!(
-            decide(&grants, "api.anthropic.com", "api.anthropic.com"),
-            Fill::With("anthropic/claude-max".into())
+            SaveAsk::decode(&[bytes.as_slice(), &[0]].concat()),
+            Err(WireError::Trailing)
         );
         assert_eq!(
-            decide(&grants, "chatgpt.com", "chatgpt.com"),
-            Fill::With("openai/chatgpt".into())
+            SaveAsk::decode(&[0, 0, 0, 7, 0, 0, 0, 1, 0xff]),
+            Err(WireError::Text)
         );
-        // Case folds, as DNS names compare (RFC 9549 §2.3).
-        assert_eq!(
-            decide(&grants, "API.Anthropic.Com", "api.anthropic.com"),
-            Fill::With("anthropic/claude-max".into())
-        );
-        // A host no grant names: forwarded bare (default deny).
-        assert_eq!(decide(&grants, "example.com", "example.com"), Fill::Pass);
-        assert_eq!(decide(&[], "api.anthropic.com", "api.anthropic.com"), Fill::Pass);
-        // A grant toward host A does not fill a request whose host is B.
-        assert_eq!(decide(&grants, "evil.example", "evil.example"), Fill::Pass);
-        // The request's host disagrees with the TLS name it arrived on: misdirected, and
-        // never filled even though the SNI is a granted host (the SNI alone is not enough).
-        assert_eq!(
-            decide(&grants, "api.anthropic.com", "evil.example"),
-            Fill::Misdirected
-        );
-        assert_eq!(
-            decide(&grants, "chatgpt.com", "api.anthropic.com"),
-            Fill::Misdirected
-        );
+        for result in [
+            Ok(()),
+            Err((SaveRefusal::Destination, "outside the run's home".to_string())),
+            Err((SaveRefusal::State, String::new())),
+            Err((SaveRefusal::Unsupported, String::new())),
+            Err((SaveRefusal::Failed, "its guest did not go quiet".into())),
+        ] {
+            let answer = SaveAnswer { id: 9, result };
+            assert_eq!(SaveAnswer::decode(&answer.encode().unwrap()).unwrap(), answer);
+        }
+        assert!(matches!(
+            SaveAnswer::decode(&[0, 0, 0, 9, 1, 4, 0, 0, 0, 0]),
+            Err(WireError::Tag { .. })
+        ));
+        assert!(matches!(
+            SaveAnswer::decode(&[0, 0, 0, 9, 2]),
+            Err(WireError::Tag { .. })
+        ));
+        assert_eq!(SaveAnswer::decode(&[0, 0, 0, 9, 0, 0]), Err(WireError::Trailing));
     }
 
     /// A credential's value never prints: a [`Secret`]'s `Debug` says only its length, and
-    /// a [`CredentialGrant`] carries no value to print (reference and hosts alone).
+    /// a [`CredentialGrant`] carries no value to print (its reference and hosts; of its
+    /// placeholder, its length alone).
     #[test]
     fn a_value_never_prints() {
         let secret = Secret(b"sk-ant-very-secret-value".to_vec());
@@ -2557,8 +3226,13 @@ mod tests {
         let grant = CredentialGrant {
             reference: "anthropic/claude-max".into(),
             toward: vec!["api.anthropic.com".into()],
+            placeholder: "kiln-placeholder-5ec2e7".into(),
         };
         let shown = format!("{grant:?}");
+        assert!(
+            !shown.contains("5ec2e7"),
+            "a grant's Debug showed its placeholder: {shown}"
+        );
         assert!(
             shown.contains("anthropic/claude-max"),
             "the reference is a name, not a value"
@@ -2578,6 +3252,7 @@ mod tests {
             input: false,
             terminal: false,
             args: Vec::new(),
+            mcp: false,
         };
         let shown = format!("{staged:?}");
         assert!(
@@ -2711,6 +3386,7 @@ mod tests {
                 input: true,
                 terminal: false,
                 args: Vec::new(),
+                mcp: false,
             }],
             publish: vec![
                 Publish {
@@ -2743,6 +3419,9 @@ mod tests {
             credentials: Vec::new(),
             control: None,
             gpu_devices: Vec::new(),
+            sign_ins: Vec::new(),
+            upstream_roots: Vec::new(),
+            gpu_report: None,
         }
     }
 
@@ -2752,19 +3431,26 @@ mod tests {
         let r = request();
         assert_eq!(Request::decode(&r.encode().unwrap()).unwrap(), r);
         // The run's credential grants (version 8, D242): none, one with several hosts, and
-        // one with none, each reading back as written.
+        // one with none, each reading back as written, with its placeholder (version 22).
         let mut credited = request();
         credited.credentials = vec![
             CredentialGrant {
                 reference: "anthropic/claude-max".into(),
                 toward: vec!["api.anthropic.com".into(), "platform.claude.com".into()],
+                placeholder: "kiln-placeholder-0a1b".into(),
             },
             CredentialGrant {
                 reference: "openai/chatgpt".into(),
                 toward: Vec::new(),
+                placeholder: String::new(),
             },
         ];
         assert_eq!(Request::decode(&credited.encode().unwrap()).unwrap(), credited);
+        // A placeholder is the grants' last field, before the sign-ins' count (version 24), the
+        // member's MCP bridge's flag (version 25), the upstream roots' count (version 26) and
+        // the GPU report's flag (version 29): a request cut in it is refused.
+        let bytes = credited.encode().unwrap();
+        assert!(Request::decode(&bytes[..bytes.len() - 1 - 4 - 1 - 4 - 1]).is_err());
         // Each member's working directory, or none, in the members' order (version 5),
         // whether its input is the orchestrator's (version 6), and its run-time arguments, none,
         // several, or an empty one among others (version 18).
@@ -2780,12 +3466,15 @@ mod tests {
             input: false,
             terminal: false,
             args: Vec::new(),
+            mcp: false,
         });
+        // ... and its MCP bridge (version 25, D254).
         worked.members.push(MemberStage {
             workdir: Some("/".into()),
             input: true,
             terminal: true,
             args: vec![String::new(), "two words".into(), "--model=opüs".into()],
+            mcp: true,
             ..worked.members[1].clone()
         });
         assert_eq!(Request::decode(&worked.encode().unwrap()).unwrap(), worked);
@@ -2819,18 +3508,24 @@ mod tests {
         }
         .encode()
         .unwrap();
-        // ... the control ask's absence (version 15), the GPUs' count (version 16) and the
-        // member's arguments' count (version 18) last.
+        // ... the control ask's absence (version 15), the GPUs' count (version 16), the
+        // member's arguments' count (version 18), the sign-ins' count (version 24), the
+        // member's MCP bridge (version 25), the upstream roots' count (version 26) and the GPU
+        // report's flag (version 29) last.
         assert_eq!(
-            asked.get(asked.len() - 28..).unwrap(),
+            asked.get(asked.len() - 38..).unwrap(),
             [
-                1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0
             ],
             "appended: the grant's flag, the deadline's, the destinations kept (all), the one \
              member's working directory (none) and its input, the credential grants' count \
              (zero, version 8), the member's terminal (none, version 11), whether the members \
              are held apart (no, version 12), the control ask (none, version 15), the GPUs' \
-             count (zero, version 16), then the member's arguments' count (zero, version 18)"
+             count (zero, version 16), the member's arguments' count (zero, version 18), then \
+             the sign-ins' count (zero, version 24), then its MCP bridge (none, version 25), then \
+             the upstream roots' count (zero, version 26), then the GPU report's flag (none, \
+             version 29)"
         );
         // Destinations kept by name, the host itself among them (D236), and none.
         for destinations in [
@@ -2903,7 +3598,6 @@ mod tests {
                 },
             ],
             control: None,
-            rate_period: std::time::Duration::from_millis(100),
             from: StartedFrom::Saved,
         };
         assert_eq!(Started::decode(&started.encode().unwrap()).unwrap(), started);
@@ -2937,11 +3631,30 @@ mod tests {
             };
             assert_eq!(OutputEnd::decode(&e.encode()).unwrap(), e);
         }
-        let ended = MemberEnded {
-            member: 2,
-            status: 137,
-        };
-        assert_eq!(MemberEnded::decode(&ended.encode()).unwrap(), ended);
+        for end in [
+            shards_abi::run::members::End::Exited(137),
+            shards_abi::run::members::End::Exited(143),
+            shards_abi::run::members::End::Signaled(15),
+        ] {
+            let ended = MemberEnded { member: 2, end };
+            assert_eq!(MemberEnded::decode(&ended.encode()).unwrap(), ended);
+        }
+        // A tag of neither end, or a signal no Linux has, is no end.
+        assert_eq!(
+            MemberEnded::decode(&[0, 0, 0, 2, 2, 0, 0, 0, 1]),
+            Err(WireError::Tag {
+                what: "a member's end",
+                tag: 2
+            })
+        );
+        assert_eq!(
+            MemberEnded::decode(&[0, 0, 0, 2, 1, 0, 0, 0, 0]),
+            Err(WireError::Signal(0))
+        );
+        assert_eq!(
+            MemberEnded::decode(&[0, 0, 0, 2, 0, 0, 0, 1]),
+            Err(WireError::Short)
+        );
         for end in [RunEnd::Exited(0), RunEnd::Stopped, RunEnd::Failed("x".into())] {
             assert_eq!(RunEnd::decode(&end.encode().unwrap()).unwrap(), end);
         }
@@ -2971,7 +3684,7 @@ mod tests {
             Input::decode(&bytes).unwrap(),
             Input {
                 member: 7,
-                bytes: b"\0\xff\x80{\"id\":1}\nno-newline".to_vec()
+                bytes: Secret(b"\0\xff\x80{\"id\":1}\nno-newline".to_vec())
             }
         );
         assert_eq!(Input::decode(&[0, 0, 1]), Err(WireError::Short));
@@ -2999,11 +3712,12 @@ mod tests {
         ));
         // A member's input flag, before the credential grants' count (version 8), its
         // terminal's flag (version 11) and the members' reach (version 12), that is no flag.
-        // One member, so its input is the sixteenth byte from the end (the count's four, its
-        // terminal's one, the reach's flag, the control ask's, the GPUs' count and its
-        // arguments' count follow it).
+        // One member, so its input is the twenty-sixth byte from the end (the count's four, its
+        // terminal's one, the reach's flag, the control ask's, the GPUs' count, its arguments'
+        // count, the sign-ins' count, its MCP bridge, the upstream roots' count and the GPU
+        // report's flag follow it).
         let mut bad = request().encode().unwrap();
-        let at = bad.len() - 16;
+        let at = bad.len() - 26;
         assert_eq!(
             bad[at], 1,
             "the member's input flag precedes the credentials' count"
@@ -3082,10 +3796,11 @@ mod tests {
                 );
             }
         }
-        // The reach's flag, before the control ask's, the GPUs' count and the member's
-        // arguments' count where none is held apart.
+        // The reach's flag, before the control ask's, the GPUs' count, the member's arguments'
+        // count, the sign-ins' count, the MCP bridges, the upstream roots' count and the GPU
+        // report's flag where none is held apart.
         let mut flag = held(None).encode().unwrap();
-        let at = flag.len() - 10;
+        let at = flag.len() - 20;
         flag[at] = 2;
         assert_eq!(
             Request::decode(&flag),
@@ -3098,9 +3813,11 @@ mod tests {
         let mut kindless = held(Some(vec![reach(MemberKind::Agent, "helper", &[])]))
             .encode()
             .unwrap();
-        // ... then the control ask's absence (version 15), the GPUs' count (version 16) and
-        // the one member's arguments' count (version 18).
-        let at = kindless.len() - (1 + 4 + "helper".len() + 4 + 1 + 4 + 4);
+        // ... then the control ask's absence (version 15), the GPUs' count (version 16), the
+        // one member's arguments' count (version 18), the sign-ins' count (version 24), its MCP
+        // bridge (version 25), the upstream roots' count (version 26) and the GPU report's flag
+        // (version 29).
+        let at = kindless.len() - (1 + 4 + "helper".len() + 4 + 1 + 4 + 4 + 4 + 1 + 4 + 1);
         assert_eq!(kindless[at], MemberKind::Agent as u8);
         kindless[at] = 2;
         assert_eq!(
@@ -3113,7 +3830,7 @@ mod tests {
         // Held apart, with four billion members in a few bytes, in place of the reach's flag
         // and what follows it.
         let mut hostile = held(None).encode().unwrap();
-        hostile.truncate(hostile.len() - 10);
+        hostile.truncate(hostile.len() - 20);
         hostile.push(1);
         hostile.extend_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(Request::decode(&hostile), Err(WireError::Short));
@@ -3162,13 +3879,16 @@ mod tests {
                 );
             }
         }
-        // The second member's one argument, "ü", last: its bytes made no UTF-8.
+        // The second member's one argument, "ü", last before the sign-ins' count (version 24),
+        // the MCP bridges, the upstream roots' count (version 26) and the GPU report's flag
+        // (version 29): its bytes made no UTF-8.
         let mut bad = with(&["--resume"], &["ü"]).encode().unwrap();
-        let at = bad.len() - "ü".len();
+        let at = bad.len() - 1 - 4 - 2 - 4 - "ü".len();
         bad[at] = 0xff;
         assert_eq!(Request::decode(&bad), Err(WireError::Text));
-        // The second member's count, last, said as four billion in no bytes.
+        // The second member's count, before the sign-ins', said as four billion in no bytes.
         let mut hostile = with(&[], &[]).encode().unwrap();
+        hostile.truncate(hostile.len() - 1 - 4 - 2 - 4);
         let at = hostile.len() - 4;
         hostile[at..].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(Request::decode(&hostile), Err(WireError::Short));
@@ -3190,74 +3910,105 @@ mod tests {
         // A request of version 1, without the nesting grant's fields and the destinations',
         // of version 4, without its members' working directories, or of version 5, without
         // their inputs, is no request of this one's: refused by its version, never read with
-        // them defaulted. The request's one member makes each of those one byte, and its
-        // arguments' count (version 18) four bytes, which every version before 18 lacks.
+        // them defaulted. The request's one member makes each of those one byte, its
+        // arguments' count (version 18) four bytes, which every version before 18 lacks, and the
+        // sign-ins' count (version 24) four, which every version before 24 lacks.
         let mut v1 = request().encode().unwrap();
-        v1.truncate(v1.len() - 20);
+        v1.truncate(v1.len() - 25);
         v1[0] = 1;
         assert_eq!(Request::decode(&v1), Err(WireError::Version(1)));
         let mut v4 = request().encode().unwrap();
-        v4.truncate(v4.len() - 17);
+        v4.truncate(v4.len() - 22);
         v4[0] = 4;
         assert_eq!(Request::decode(&v4), Err(WireError::Version(4)));
         let mut v5 = request().encode().unwrap();
-        v5.truncate(v5.len() - 16);
+        v5.truncate(v5.len() - 21);
         v5[0] = 5;
         assert_eq!(Request::decode(&v5), Err(WireError::Version(5)));
         // One of version 6 carries every field version 7 does, but its host ends the run at
         // a room: refused by its version, before any room is told (D241).
         let mut v6 = request().encode().unwrap();
-        v6.truncate(v6.len() - 15);
+        v6.truncate(v6.len() - 20);
         v6[0] = 6;
         assert_eq!(Request::decode(&v6), Err(WireError::Version(6)));
         // One of version 7, without the credential grants' count: refused by its version
         // (D242), so an older reader never reads a grant with its field defaulted.
         let mut v7 = request().encode().unwrap();
-        v7.truncate(v7.len() - 15);
+        v7.truncate(v7.len() - 20);
         v7[0] = 7;
         assert_eq!(Request::decode(&v7), Err(WireError::Version(7)));
         // One of version 8, without its members' terminals: refused by its version (D244), so
         // an older reader never starts a member with pipes where its owner asked a terminal.
         let mut v8 = request().encode().unwrap();
-        v8.truncate(v8.len() - 11);
+        v8.truncate(v8.len() - 16);
         v8[0] = 8;
         assert_eq!(Request::decode(&v8), Err(WireError::Version(8)));
         // One of version 11, without the members' reach: refused by its version (D246), so a
         // run host never takes a request that holds its members apart as one that holds none.
         let mut v11 = request().encode().unwrap();
-        v11.truncate(v11.len() - 10);
+        v11.truncate(v11.len() - 15);
         v11[0] = 11;
         assert_eq!(Request::decode(&v11), Err(WireError::Version(11)));
         // One of version 12 carries every field version 13 does, but its host ends the run at
         // a rate: refused by its version, before any rate is told (D247).
         let mut v12 = request().encode().unwrap();
-        v12.truncate(v12.len() - 9);
+        v12.truncate(v12.len() - 14);
         v12[0] = 12;
         assert_eq!(Request::decode(&v12), Err(WireError::Version(12)));
         // One of version 14, without the control ask: refused by its version (D252), so a run
         // host never takes a run that asked an endpoint as one that asked none.
         let mut v14 = request().encode().unwrap();
-        v14.truncate(v14.len() - 9);
+        v14.truncate(v14.len() - 14);
         v14[0] = 14;
         assert_eq!(Request::decode(&v14), Err(WireError::Version(14)));
         // One of version 15, without the GPUs it names: refused by its version (D232), so a run
         // host never starts a run without the GPUs its orchestrator asked.
         let mut v15 = request().encode().unwrap();
-        v15.truncate(v15.len() - 8);
+        v15.truncate(v15.len() - 13);
         v15[0] = 15;
         assert_eq!(Request::decode(&v15), Err(WireError::Version(15)));
         // One of version 16 asks what version 17 does, but its host tells no rate's period as
         // the run starts: refused by its version, so no orchestrator waits on one (D247).
         let mut v16 = request().encode().unwrap();
-        v16.truncate(v16.len() - 4);
+        v16.truncate(v16.len() - 9);
         v16[0] = 16;
         assert_eq!(Request::decode(&v16), Err(WireError::Version(16)));
         // One of version 17, without its members' arguments: refused by its version (D256), so
         // a run host never starts a member without the flags its orchestrator asked.
         let mut v17 = request().encode().unwrap();
-        v17.truncate(v17.len() - 4);
+        v17.truncate(v17.len() - 9);
         v17[0] = 17;
         assert_eq!(Request::decode(&v17), Err(WireError::Version(17)));
+        // One of version 23, without the sign-ins' count: refused by its version (D242 step 8),
+        // so a run host never takes a run that signs in as one that signs nothing in.
+        let mut v23 = request().encode().unwrap();
+        v23.truncate(v23.len() - 1 - 4);
+        v23[0] = 23;
+        assert_eq!(Request::decode(&v23), Err(WireError::Version(23)));
+        // One of version 24, without its members' MCP bridges: refused by its version (D254),
+        // so a run host never starts a harness without the bridge its MCP config names.
+        let mut v24 = request().encode().unwrap();
+        v24.truncate(v24.len() - 1);
+        v24[0] = 24;
+        assert_eq!(Request::decode(&v24), Err(WireError::Version(24)));
+        // One of version 28, without its GPU report's scope: refused by its version (D233), so a
+        // run host never starts a GPU run whose orchestrator waits for a report none relays.
+        let mut v28 = request().encode().unwrap();
+        v28.truncate(v28.len() - 1);
+        v28[0] = 28;
+        assert_eq!(Request::decode(&v28), Err(WireError::Version(28)));
+        // One of version 29 asks as version 30 does, but its host tells its endpoint's address
+        // alone, where this side reads its waker's and its wake's after it: refused by its
+        // version (D252), so no orchestrator reads a `Started` laid out otherwise.
+        let mut v29 = request().encode().unwrap();
+        v29[0] = 29;
+        assert_eq!(Request::decode(&v29), Err(WireError::Version(29)));
+        // One of version 30 asks as version 31 does, but its host tells a period with `Started`
+        // that no rate is held over, and none with a rate's answer: refused by its version
+        // (D191), so no orchestrator reads a `RATED` laid out otherwise.
+        let mut v30 = request().encode().unwrap();
+        v30[0] = 30;
+        assert_eq!(Request::decode(&v30), Err(WireError::Version(30)));
         // One of version 13 reads a vCPU's unread guest time as free words
         // (guest-cpu-time-v1), and one of 19 carries every field version 20 does, but its
         // client ends the run at a lease its host asks: each refused by its version, before
@@ -3270,10 +4021,11 @@ mod tests {
         // The nesting flag, before the deadline's tag, the destinations', the one member's
         // working directory's and input's, the credential grants' count (version 8), the
         // member's terminal's (version 11), the members' reach (version 12), the control ask
-        // (version 15), the GPUs' count (version 16) and its arguments' count (version 18): no
-        // flag.
+        // (version 15), the GPUs' count (version 16), its arguments' count (version 18), the
+        // sign-ins' count (version 24), its MCP bridge (version 25), the upstream roots' count
+        // (version 26) and the GPU report's flag (version 29): no flag.
         let mut flag = request().encode().unwrap();
-        let at = flag.len() - 20;
+        let at = flag.len() - 30;
         flag[at] = 2;
         assert_eq!(
             Request::decode(&flag),
@@ -3284,9 +4036,10 @@ mod tests {
         );
         // The destinations' list, before the member's working directory and input, the
         // credential grants' count, the member's terminal, the members' reach, the control ask,
-        // the GPUs' count and the member's arguments' count: no list of version 3's and on.
+        // the GPUs' count, the member's arguments' count, the sign-ins' count, its MCP bridge and
+        // the upstream roots' count and the GPU report's flag: no list of version 3's and on.
         let mut list = request().encode().unwrap();
-        let at = list.len() - 18;
+        let at = list.len() - 28;
         list[at] = 2;
         assert_eq!(
             Request::decode(&list),
@@ -3498,11 +4251,11 @@ mod tests {
         };
         assert_eq!(long.encode(), Err(WireError::TooLong));
         let mut bad = request().encode().unwrap();
-        let at = bad.len() - 11;
+        let at = bad.len() - 21;
         assert_eq!(
             bad[at], 0,
-            "the member's terminal flag precedes the members' reach, the control ask, the GPUs \
-             and its arguments"
+            "the member's terminal flag precedes the members' reach, the control ask, the GPUs, \
+             its arguments, the sign-ins, its MCP bridge, the upstream roots and the GPU report"
         );
         bad[at] = 2;
         assert_eq!(
@@ -3528,10 +4281,16 @@ mod tests {
             let ask = RateAsk { id: 7, rate };
             assert_eq!(RateAsk::decode(&ask.encode()), Ok(ask));
         }
+        let rated = |milli, ns| {
+            Ok(Rated {
+                milli: NonZeroU64::new(milli),
+                period: std::time::Duration::from_nanos(ns),
+            })
+        };
         for result in [
-            Ok(None),
-            Ok(NonZeroU64::new(1)),
-            Ok(NonZeroU64::new(u64::MAX)),
+            rated(0, 1_050_000),
+            rated(1, 1),
+            rated(u64::MAX, u64::MAX),
             Err("the microVM has not started".to_string()),
         ] {
             let answer = RateAnswer { id: u32::MAX, result };
@@ -3559,7 +4318,7 @@ mod tests {
         assert_eq!(RateAsk::decode(&padded), Err(WireError::Trailing));
         let answer = RateAnswer {
             id: 1,
-            result: Ok(NonZeroU64::new(250)),
+            result: rated(250, 31_250_000),
         }
         .encode()
         .unwrap();
@@ -3587,45 +4346,51 @@ mod tests {
         assert_eq!(long.encode(), Err(WireError::TooLong));
     }
 
-    /// The period a run's rate is held over reads back as its host said it, from a
-    /// nanosecond to the most a u64 counts (D247), its eight bytes last; a period of none, or
-    /// one past what a u64 counts in nanoseconds, is no period, refused each way.
+    /// The period a rate is held over reads back with its answer as its VM said it, from a
+    /// nanosecond to the most a u64 counts (D191, version 31), its eight bytes last; a period
+    /// of none, or one past what a u64 counts in nanoseconds, is no period, refused each way.
     #[test]
-    fn a_runs_rate_period_reads_back_as_its_host_said_it() {
+    fn a_rates_period_reads_back_as_its_vm_said_it() {
         use std::time::Duration;
-        let started = |rate_period| Started {
-            members: Vec::new(),
-            published: Vec::new(),
-            control: None,
-            rate_period,
-            from: StartedFrom::Booted,
+        const {
+            assert!(
+                VERSION >= 31,
+                "the channel's version 31 carries each rate's period"
+            )
+        };
+        let answer = |period| RateAnswer {
+            id: 9,
+            result: Ok(Rated {
+                milli: NonZeroU64::new(625),
+                period,
+            }),
         };
         for period in [
             Duration::from_nanos(1),
-            Duration::from_millis(100),
+            Duration::from_micros(31_250),
             Duration::from_nanos(u64::MAX),
         ] {
-            let said = started(period);
+            let said = answer(period);
             let bytes = said.encode().unwrap();
-            let last = bytes.get(bytes.len() - 9..bytes.len() - 1).unwrap();
+            let last = bytes.get(bytes.len() - 8..).unwrap();
             assert_eq!(last, u64::try_from(period.as_nanos()).unwrap().to_be_bytes());
-            assert_eq!(Started::decode(&bytes).unwrap(), said);
+            assert_eq!(RateAnswer::decode(&bytes).unwrap(), said);
         }
-        let mut none = started(Duration::from_millis(100)).encode().unwrap();
-        let at = none.len() - 9;
-        none.get_mut(at..at + 8).unwrap().fill(0);
+        let mut none = answer(Duration::from_millis(100)).encode().unwrap();
+        let at = none.len() - 8;
+        none.get_mut(at..).unwrap().fill(0);
         assert_eq!(
-            Started::decode(&none),
+            RateAnswer::decode(&none),
             Err(WireError::Tag {
                 what: "a rate period",
                 tag: 0
             })
         );
         assert_eq!(
-            started(Duration::from_nanos(u64::MAX) + Duration::from_nanos(1)).encode(),
+            answer(Duration::from_nanos(u64::MAX) + Duration::from_nanos(1)).encode(),
             Err(WireError::TooLong)
         );
-        assert_eq!(started(Duration::MAX).encode(), Err(WireError::TooLong));
+        assert_eq!(answer(Duration::MAX).encode(), Err(WireError::TooLong));
     }
 
     /// How a run's microVM started (D253) reads back as its host said it, its byte last; a
@@ -3649,7 +4414,6 @@ mod tests {
                 members: Vec::new(),
                 published: Vec::new(),
                 control: None,
-                rate_period: std::time::Duration::from_millis(100),
                 from,
             };
             let mut bytes = said.encode().unwrap();
@@ -3689,6 +4453,7 @@ mod tests {
                 input: false,
                 terminal: false,
                 args: Vec::new(),
+                mcp: false,
             }],
             publish: Vec::new(),
             egress: Narrowing::default(),
@@ -3701,6 +4466,9 @@ mod tests {
                 sockets: None,
             }),
             gpu_devices: Vec::new(),
+            sign_ins: Vec::new(),
+            upstream_roots: Vec::new(),
+            gpu_report: None,
         };
         let exemplar = full.exemplar();
         assert!(exemplar.members.is_empty() && exemplar.ready_by.is_none() && exemplar.control.is_none());
@@ -3745,6 +4513,82 @@ mod tests {
     /// why, the largest numbers a u64 holds. vCPUs out of index order, a part's unknown tag, a count
     /// past what the bytes left could hold, cut short or padded: refused, never read as a
     /// cost.
+    /// A run's end reads back with its final use (D260), each end's with every final use and
+    /// each reason for none, and a tag no version has, or bytes past it, refused.
+    #[test]
+    fn a_runs_end_reads_back_with_its_final_use() {
+        let read = FinalUse::Read(Microvm {
+            host: Ok(HostUse {
+                cpu_ns: 90,
+                resident_bytes: 4096,
+                footprint_bytes: 8192,
+            }),
+            guest: Ok(GuestTimes {
+                vcpus: vec![
+                    VcpuTime {
+                        index: 0,
+                        guest_ns: 50,
+                        unread: None,
+                    },
+                    VcpuTime {
+                        index: 1,
+                        guest_ns: 30,
+                        unread: Some(shards_abi::guest_time::Unread::Gone),
+                    },
+                ],
+                departed_ns: 0,
+            }),
+        });
+        let words = FinalUse::Read(Microvm {
+            host: Err("its VM process: denied".into()),
+            guest: Err("the microVM has not started".into()),
+        });
+        let mut uses = vec![read, words];
+        uses.extend(
+            [Unused::NotStarted, Unused::Killed, Unused::Untold]
+                .into_iter()
+                .chain(
+                    [
+                        UseBroken::Long,
+                        UseBroken::Text,
+                        UseBroken::Word,
+                        UseBroken::Guest,
+                        UseBroken::Host,
+                    ]
+                    .map(Unused::Broken),
+                )
+                .map(FinalUse::Unread),
+        );
+        for end in [RunEnd::Exited(3), RunEnd::Stopped, RunEnd::Failed("x".into())] {
+            for final_use in &uses {
+                let ended = RunEnded {
+                    end: end.clone(),
+                    final_use: final_use.clone(),
+                };
+                let bytes = ended.encode().unwrap();
+                assert_eq!(RunEnded::decode(&bytes), Ok(ended));
+                assert_eq!(
+                    RunEnded::decode(&[&bytes[..], &[0]].concat()),
+                    Err(WireError::Trailing)
+                );
+                assert_eq!(RunEnded::decode(&bytes[..bytes.len() - 1]), Err(WireError::Short));
+            }
+        }
+        // An end alone, as a host of version 27 said it, is short of its final use.
+        assert_eq!(
+            RunEnded::decode(&RunEnd::Stopped.encode().unwrap()),
+            Err(WireError::Short)
+        );
+        let tagged = |tail: &[u8]| RunEnded::decode(&[&[1u8][..], tail].concat());
+        assert!(matches!(tagged(&[2]), Err(WireError::Tag { tag: 2, .. })));
+        assert!(matches!(tagged(&[1, 4]), Err(WireError::Tag { tag: 4, .. })));
+        assert!(matches!(tagged(&[1, 3, 5]), Err(WireError::Tag { tag: 5, .. })));
+        assert!(
+            matches!(tagged(&[0, 0]), Err(WireError::Tag { tag: 0, .. })),
+            "no cost read"
+        );
+    }
+
     #[test]
     fn a_runs_microvm_reads_back_as_its_host_said_it() {
         let times = GuestTimes {
@@ -3876,6 +4720,9 @@ mod tests {
             credentials: Vec::new(),
             control,
             gpu_devices: Vec::new(),
+            sign_ins: Vec::new(),
+            upstream_roots: Vec::new(),
+            gpu_report: None,
         }
     }
 
@@ -3910,29 +4757,70 @@ mod tests {
     }
 
     /// Step 11 (b), D252: a started run tells where its endpoint is bound and the microVM's own
-    /// key, which the controller pins; a run asked for no endpoint tells none.
+    /// key, which the controller pins, and (version 30) its waker's and its wake's addresses,
+    /// each read back by its name; a run asked for no endpoint tells none.
     #[test]
     fn a_started_run_tells_where_its_endpoint_is_and_its_vms_key() {
+        const {
+            assert!(
+                VERSION >= 30,
+                "the channel's version 30 carries the waker and the wake"
+            )
+        };
         for control in [
             None,
             Some(ControlAt {
                 address: "127.0.0.1:40123".parse().unwrap(),
                 vm: [3u8; 32],
+                waker: "127.0.0.1:50001".parse().unwrap(),
+                wake: "127.0.0.1:50002".parse().unwrap(),
             }),
             Some(ControlAt {
                 address: "[::1]:40123".parse().unwrap(),
                 vm: [4u8; 32],
+                waker: "[::1]:50001".parse().unwrap(),
+                wake: "[::1]:50002".parse().unwrap(),
             }),
         ] {
             let started = Started {
                 members: Vec::new(),
                 published: Vec::new(),
                 control,
-                rate_period: std::time::Duration::from_millis(100),
                 from: StartedFrom::Restored,
             };
-            assert_eq!(Started::decode(&started.encode().unwrap()).unwrap(), started);
+            let read = Started::decode(&started.encode().unwrap()).unwrap();
+            assert_eq!(read, started);
+            if let Some(at) = read.control {
+                assert_eq!(at.sockets(), [at.address, at.waker, at.wake]);
+                assert!(at.waker.port() == 50001 && at.wake.port() == 50002, "{at:?}");
+            }
         }
+        // Each of the two cut short, or its address's tag none, is refused, never defaulted.
+        let started = Started {
+            members: Vec::new(),
+            published: Vec::new(),
+            control: Some(ControlAt {
+                address: "127.0.0.1:40123".parse().unwrap(),
+                vm: [3u8; 32],
+                waker: "127.0.0.1:50001".parse().unwrap(),
+                wake: "127.0.0.1:50002".parse().unwrap(),
+            }),
+            from: StartedFrom::Restored,
+        };
+        let bytes = started.encode().unwrap();
+        // The wake's address (a tag, four octets and a port), then how it started (1), last:
+        // since v31 the hold's period rides each rate's answer (`Rated`), not `Started`.
+        let wake = bytes.len() - 1 - (1 + 4 + 2);
+        let waker = wake - (1 + 4 + 2);
+        assert_eq!(bytes[waker], 4);
+        assert_eq!(bytes[waker + 1..waker + 5], [127, 0, 0, 1]);
+        assert_eq!(bytes[wake + 5..wake + 7], 50002u16.to_be_bytes());
+        for (at, what) in [(waker, "an endpoint's waker"), (wake, "an endpoint's wake")] {
+            let mut none = bytes.clone();
+            none[at] = 0;
+            assert_eq!(Started::decode(&none), Err(WireError::Tag { what, tag: 0 }));
+        }
+        assert!(Started::decode(&bytes[..wake + 3]).is_err());
     }
 
     /// D232 through D231 (D234's `gpus=`): the GPUs a run names cross the image channel in
@@ -3957,9 +4845,12 @@ mod tests {
         let bytes = named.encode().unwrap();
         assert_eq!(Request::decode(&bytes).unwrap().gpu_devices, gpus);
         // The last identity's text, "metal:00000001000002a1", before the one member's arguments'
-        // count (version 18), made one D232's grammar refuses.
+        // count (version 18), the sign-ins' (version 24), its MCP bridge (version 25), the
+        // upstream roots' count (version 26) and the GPU report's flag (version 29), made one
+        // D232's grammar refuses.
         let mut unnamed = bytes.clone();
-        let at = unnamed.len() - 4 - "metal:00000001000002a1".len();
+        let at = unnamed.len() - 1 - 4 - 1 - 4 - 4 - "metal:00000001000002a1".len();
+        assert_eq!(unnamed[at], b'm');
         unnamed[at] = b'x';
         assert_eq!(Request::decode(&unnamed), Err(WireError::Gpu));
         let twice = Request {
@@ -3967,5 +4858,181 @@ mod tests {
             ..request()
         };
         assert_eq!(Request::decode(&twice.encode().unwrap()), Err(WireError::Gpu));
+    }
+
+    /// D233 through D231: a run's GPU report's scope (version 29). Expect: a scope read back
+    /// whole, none as none; a zero scope, or one of a run that names no GPU, refused as a
+    /// managed launch's is; a request cut in it refused; and no warm host's exemplar keeps it.
+    #[test]
+    fn a_runs_gpu_report_scope_crosses_the_channel_with_its_gpus_alone() {
+        let gpus = vec![shards_abi::gpu::PhysicalGpu::MetalRegistry(7)];
+        let scoped = Request {
+            gpu_devices: gpus.clone(),
+            gpu_report: Some([3; 16]),
+            ..request()
+        };
+        let bytes = scoped.encode().unwrap();
+        assert_eq!(Request::decode(&bytes).unwrap(), scoped);
+        for cut in 1..=16 {
+            assert!(Request::decode(&bytes[..bytes.len() - cut]).is_err(), "cut {cut}");
+        }
+        let unscoped = Request {
+            gpu_devices: gpus.clone(),
+            ..request()
+        };
+        assert_eq!(
+            Request::decode(&unscoped.encode().unwrap()).unwrap().gpu_report,
+            None
+        );
+        let zero = Request {
+            gpu_report: Some([0; 16]),
+            ..scoped.clone()
+        };
+        assert_eq!(Request::decode(&zero.encode().unwrap()), Err(WireError::Gpu));
+        let gpuless = Request {
+            gpu_devices: Vec::new(),
+            ..scoped.clone()
+        };
+        assert_eq!(Request::decode(&gpuless.encode().unwrap()), Err(WireError::Gpu));
+        assert_eq!(scoped.exemplar().gpu_report, None);
+        assert_eq!(scoped.exemplar().gpu_devices, gpus);
+    }
+
+    /// A run's upstream roots (version 26, D242). Expect: each DER read back, in order; a request
+    /// cut anywhere in them refused.
+    #[test]
+    fn a_runs_upstream_roots_cross_the_channel() {
+        let rooted = Request {
+            upstream_roots: vec![vec![0x30, 0x01, 0x02], vec![0x30; 300]],
+            ..request()
+        };
+        let bytes = rooted.encode().unwrap();
+        assert_eq!(Request::decode(&bytes).unwrap(), rooted);
+        for cut in 1..=bytes.len() - request().encode().unwrap().len() {
+            assert!(Request::decode(&bytes[..bytes.len() - cut]).is_err(), "cut {cut}");
+        }
+    }
+
+    /// A run's sign-ins and their words (version 24, D242 step 8). Do: carry a sign-in captured
+    /// before, with and without a refresh token's placeholder, and one never captured; each word
+    /// of a capture (its tokens, its ID token made inert and its scope where it has them), a
+    /// refresh, a revocation and their answers, given and refused each way; cut each, and give a
+    /// CLI or a refusal no version has. Expect: each read back exactly; each cut and each unknown
+    /// tag refused; no token or placeholder in any `Debug`.
+    #[test]
+    fn a_runs_sign_ins_and_their_words_cross_the_channel() {
+        let captured = |refresh: Option<&str>| Captured {
+            access: "sign-ins/claude/acct-1/access".into(),
+            access_placeholder: "kiln-placeholder-access-0123".into(),
+            refresh_placeholder: refresh.map(Into::into),
+        };
+        let signed = Request {
+            sign_ins: vec![
+                SignInGrant {
+                    sign_in: "claude/acct-1".into(),
+                    cli: Cli::ClaudeCode,
+                    toward: vec!["api.anthropic.com".into()],
+                    captured: Some(captured(Some("kiln-placeholder-refresh-4567"))),
+                },
+                SignInGrant {
+                    sign_in: "codex/acct-2".into(),
+                    cli: Cli::Codex,
+                    toward: vec!["chatgpt.com".into(), "api.openai.com".into()],
+                    captured: None,
+                },
+            ],
+            ..request()
+        };
+        let bytes = signed.encode().unwrap();
+        assert_eq!(Request::decode(&bytes).unwrap(), signed);
+        let unrefreshed = Request {
+            sign_ins: vec![SignInGrant {
+                captured: Some(captured(None)),
+                ..signed.sign_ins[0].clone()
+            }],
+            ..request()
+        };
+        assert_eq!(
+            Request::decode(&unrefreshed.encode().unwrap()).unwrap(),
+            unrefreshed
+        );
+        for cut in 1..=bytes.len() - request().encode().unwrap().len() {
+            assert!(Request::decode(&bytes[..bytes.len() - cut]).is_err(), "cut {cut}");
+        }
+        // The second sign-in's CLI, its code after its name, made one no version has; the one
+        // member's MCP bridge's flag (version 25), the upstream roots' count (version 26) and
+        // the GPU report's flag (version 29) after it.
+        let mut cli = bytes.clone();
+        let at = cli.len() - (4 + "chatgpt.com".len() + 4 + "api.openai.com".len() + 4 + 1 + 1 + 1 + 4 + 1);
+        assert_eq!(cli[at], Cli::Codex.code());
+        cli[at] = 9;
+        assert!(matches!(Request::decode(&cli), Err(WireError::Tag { .. })));
+        let tokens = |refresh: bool, id: bool, scope: bool| SignInTokens {
+            access: Secret::from("sk-ant-oat01-access"),
+            refresh: refresh.then(|| Secret::from("sk-ant-ort01-refresh")),
+            expires_in: refresh.then_some(28800),
+            id_token: id.then(|| Secret::from("eyJh.eyJw.shards-placeholder")),
+            scope: scope.then(|| "user:inference user:profile".into()),
+        };
+        for (refresh, id, scope) in [(true, true, true), (false, false, false), (true, false, true)] {
+            let ask = CaptureAsk {
+                id: 7,
+                sign_in: "claude/acct-1".into(),
+                tokens: tokens(refresh, id, scope),
+            };
+            let bytes = ask.encode().unwrap();
+            assert_eq!(CaptureAsk::decode(&bytes).unwrap(), ask);
+            assert!(CaptureAsk::decode(&bytes[..bytes.len() - 1]).is_err());
+            let shown = format!("{ask:?}");
+            assert!(!shown.contains("sk-ant") && !shown.contains("eyJ"), "{shown}");
+        }
+        let refresh = RefreshAsk {
+            id: 8,
+            sign_in: "claude/acct-1".into(),
+        };
+        assert_eq!(RefreshAsk::decode(&refresh.encode().unwrap()).unwrap(), refresh);
+        let revoked = Revoked {
+            sign_in: "claude/acct-1".into(),
+        };
+        assert_eq!(Revoked::decode(&revoked.encode().unwrap()).unwrap(), revoked);
+        let refusals = [
+            SignInRefusal::Denied("no such sign-in".into()),
+            SignInRefusal::Unavailable("the broker is down".into()),
+            SignInRefusal::Ended,
+            SignInRefusal::Unanswered,
+        ];
+        for result in [
+            Ok(captured(Some("kiln-placeholder-refresh-4567"))),
+            Ok(captured(None)),
+        ]
+        .into_iter()
+        .chain(refusals.iter().cloned().map(Err))
+        {
+            let answer = CaptureAnswer { id: 9, result };
+            let bytes = answer.encode().unwrap();
+            assert_eq!(CaptureAnswer::decode(&bytes).unwrap(), answer);
+            assert!(CaptureAnswer::decode(&bytes[..bytes.len() - 1]).is_err());
+            let shown = format!("{answer:?}");
+            assert!(!shown.contains("kiln-placeholder"), "{shown}");
+        }
+        for result in [Ok(Secret::from(r#"{"access_token":"sk-ant-oat01-rotated"}"#))]
+            .into_iter()
+            .chain(refusals.iter().cloned().map(Err))
+        {
+            let answer = RefreshAnswer { id: 10, result };
+            let bytes = answer.encode().unwrap();
+            assert_eq!(RefreshAnswer::decode(&bytes).unwrap(), answer);
+            assert!(RefreshAnswer::decode(&bytes[..bytes.len() - 1]).is_err());
+            assert!(!format!("{answer:?}").contains("sk-ant"));
+        }
+        // A refusal's tag no version has.
+        let mut bad = CaptureAnswer {
+            id: 9,
+            result: Err(SignInRefusal::Ended),
+        }
+        .encode()
+        .unwrap();
+        *bad.last_mut().unwrap() = 9;
+        assert!(matches!(CaptureAnswer::decode(&bad), Err(WireError::Tag { .. })));
     }
 }

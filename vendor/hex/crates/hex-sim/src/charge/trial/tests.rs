@@ -52,6 +52,43 @@ fn w14_a_runs_windows_say_where_the_guarantee_held() {
     assert_eq!(report.jain_mean_ppm, (1_000_000 + 941_176) / 2);
 }
 
+/// Joint plan step 14 (AC-T7.4.1): the run's own floor, what its VMs were given of what they asked where nothing
+/// contended. Do reckon a window within its 4-CPU budget where vm 1 is given 900 of the 1,000 milli-CPU it asked, vm 2
+/// all of its 1,000 and vm 3, asking nothing, 50; then a contended window where vm 1 is given 1,500 of 3,000. Expect the
+/// floor of the uncontended window's two VM-windows that asked, 900 per mille the least and, by nearest rank of two, its
+/// p1 and p50: the contended window's and the VM asking nothing none of it.
+#[test]
+fn w14_a_runs_floor_is_what_its_uncontended_windows_gave_of_what_they_asked() {
+    let windows = vec![
+        Window {
+            budget: 4_000,
+            readings: vec![
+                reading(1, 1_000, 900, 2_000),
+                reading(2, 1_000, 1_000, 2_000),
+                reading(3, 0, 50, 2_000),
+            ],
+        },
+        Window {
+            budget: 4_000,
+            readings: vec![
+                reading(1, 3_000, 1_500, 2_000),
+                reading(2, 3_000, 2_500, 2_000),
+            ],
+        },
+    ];
+    let report = report(&Cast::default(), &windows);
+    assert_eq!(
+        report.floor,
+        Ratios {
+            n: 2,
+            least: 900,
+            p1: 900,
+            p50: 900,
+        }
+    );
+    assert_eq!(report.ratios.n, 2);
+}
+
 /// Joint plan step 14 (AC-T7.4.1): a guarantee that can't hold isn't missed. Do reckon a contended window whose bookings
 /// pass its budget, vm 1 given less than it is booked. Expect no miss: C4 keeps each VM's booking only while the
 /// bookings fit.

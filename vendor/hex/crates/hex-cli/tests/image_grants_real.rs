@@ -12,15 +12,19 @@
 //!   (no DNS answer, T-T7.7.1) and none of its targets connected, the host's service and the image's port egress
 //!   among them; inspect shows no grant and nothing published, and the host's service took nothing. Its image links
 //!   its harness past the microVM, so its run keeps its network, whose network process (Shards' `shards-net`, D36),
-//!   told nothing kept, lets nothing past (D250): one network process, no process of its run holding a listening
-//!   TCP or UDP socket or a flow past the host's loopback.
+//!   told nothing kept, lets nothing past (D250): one network process, no process of its run holding a socket that
+//!   takes what comes in (a listening TCP socket, a UDP socket with no peer) but its run's agent-control endpoint's,
+//!   all three held (Hex's own, on the host's loopback, where inspect says: `BoxInfo.control` and `control_wake`, its
+//!   served socket, its waker and its wake, which Windows' table shows with no peer), and no flow past the host's
+//!   loopback.
 //! - **One publish, published alone, to its member.** A VM of its members alone is granted one publish: the probe's
 //!   port at the host's loopback, on a host port the OS picks. Inspect shows that one grant, and its one published
-//!   port at 127.0.0.1 reaching the probe at that port, as Shards names it. Its run listens there alone: at no
-//!   wildcard address, and not on the image's other port coming in. A connection there reaches the probe, which says
-//!   it came in on that port and that none of its own egress connected: its provider and an ungranted name, the
-//!   host's service, and the image's port egress, every one its image grants dropped by Hex's narrowing. No process of
-//!   the run holds a flow past the host's loopback, and the host's service, a listener of this test's, took nothing.
+//!   port at 127.0.0.1 reaching the probe at that port, as Shards names it. Its run listens there alone, past its
+//!   agent-control endpoint: at no wildcard address, and not on the image's other port coming in. A connection there
+//!   reaches the probe, which says it came in on that port and that none of its own egress connected: its provider and
+//!   an ungranted name, the host's service, and the image's port egress, every one its image grants dropped by Hex's
+//!   narrowing. No process of the run holds a flow past the host's loopback, and the host's service, a listener of
+//!   this test's, took nothing.
 //! - **Its granted destinations alone, reached.** A VM of its members alone is granted that publish and, by TCP, the
 //!   probe's provider by name and the host's service (kiln's endpoint, `host.docker.internal`): the probe says it
 //!   reached both, its ungranted name and the image's port egress nowhere, and the host's service, this test's
@@ -30,9 +34,9 @@
 //!   the run's own command, the VM is stopped, and no run host is left.
 //!
 //! What the host shows of a run (its processes, under its run host `shards api-run`, which the node starts, D231; and
-//! the TCP and UDP sockets they hold) is read from /proc on Linux (`host`). There a descriptor list this test can't
-//! read fails it: what can't be seen isn't passed. macOS and Windows keep no /proc: there those readings are owed, and
-//! the run says so (`GRANTS-OWED`), while every check of the VM itself, its inspect and the host's service runs alike.
+//! the TCP and UDP sockets they hold) is read by one reader for each OS (`image_grants_host`), each saying how it reads:
+//! /proc on Linux, `ps` and `lsof` on macOS, CIM's `Win32_Process` and the NetTCPIP module's tables on Windows. What a
+//! reader can't read fails the test: what can't be seen isn't passed.
 //!
 //! Every wait measures as the run goes, with no deadline picked for it: each waits for its fact while its party lives
 //! (the node's ready line while the node runs; the probe's hand-over, asked again while its box answers Pending as its
@@ -82,6 +86,8 @@ use hex_core::patience::Patience;
 mod image_node;
 use image_node::{Node, allocation, built, input, number, pull, records, step};
 
+#[path = "image_grants_host/mod.rs"]
+mod host;
 #[path = "image_grants_probe/probe.rs"]
 mod probe;
 use probe::{Ingress, Outcome, Report};
@@ -92,6 +98,8 @@ static MEMBER_ANSWERED: Patience = Patience::measuring("test.hex_cli.image_grant
 /// The probe's hand-over to its caller, while its box settles ([`handed_over`]): measuring alike.
 static MEMBER_HANDED_OVER: Patience =
     Patience::measuring("test.hex_cli.image_grants_member_handed_over");
+/// A box's end after a KILL whose stop outlasted its W* ([`stop_and_delete`]): measuring alike.
+static KILLED: Patience = Patience::measuring("test.hex_cli.image_grants_killed");
 
 /// The name the probe image is tagged with where this test builds it into the node's Shards home.
 const BUILT: &str = "hex-image-grants/probe";
@@ -149,407 +157,60 @@ fn publish(probe: &Probe, port: u16) -> Grant {
     }
 }
 
-/// What the host shows of a run, from /proc: its processes, under the one run host the node `node` started
-/// (`shards api-run`, D231), and the TCP and UDP sockets they hold, from their network namespace's tables.
-#[cfg(target_os = "linux")]
-mod host {
-    use std::fs;
-    use std::io::ErrorKind;
-    use std::net::{IpAddr, SocketAddr};
-
-    /// TCP_LISTEN, a listening TCP socket's state in /proc/net's tables (include/net/tcp_states.h).
-    const TCP_LISTEN: u8 = 10;
-
-    /// A process as /proc shows it now.
-    #[derive(Debug)]
-    struct Process {
-        pid: u32,
-        parent: u32,
-        /// Its name (`comm`): its program's file name, as the kernel keeps it.
-        name: String,
-        /// Its arguments, its program's first.
-        args: Vec<String>,
-    }
-
-    /// Every process /proc lists now. One that ends while this reads it is left out: it is no running run's.
-    fn processes() -> Vec<Process> {
-        let mut out = Vec::new();
-        for entry in fs::read_dir("/proc").unwrap() {
-            let entry = entry.unwrap();
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|n| n.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let (Ok(stat), Ok(name), Ok(args)) = (
-                fs::read_to_string(format!("/proc/{pid}/stat")),
-                fs::read_to_string(format!("/proc/{pid}/comm")),
-                fs::read(format!("/proc/{pid}/cmdline")),
-            ) else {
-                continue;
-            };
-            // The name sits in parentheses and may hold any byte, so the state, then the parent, follow the last
-            // ')'.
-            let parent = stat
-                .rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().nth(1))
-                .and_then(|p| p.parse().ok())
-                .unwrap_or_else(|| panic!("/proc/{pid}/stat: {stat}"));
-            out.push(Process {
-                pid,
-                parent,
-                name: name.trim_end().to_owned(),
-                args: args
-                    .split(|b| *b == 0)
-                    .filter(|a| !a.is_empty())
-                    .map(|a| String::from_utf8_lossy(a).into_owned())
-                    .collect(),
-            });
-        }
-        out
-    }
-
-    /// The roots and every process under them, each found by its parent, breadth first, with no recursion
-    /// (CLAUDE.md §11).
-    fn under(all: &[Process], roots: Vec<u32>) -> Vec<u32> {
-        let mut found = roots;
-        let mut at = 0;
-        while let Some(&parent) = found.get(at) {
-            found.extend(all.iter().filter(|p| p.parent == parent).map(|p| p.pid));
-            at += 1;
-        }
-        found
-    }
-
-    /// The run hosts under the node `node`.
-    fn run_hosts(all: &[Process], node: u32) -> Vec<u32> {
-        let of_node = under(all, vec![node]);
-        all.iter()
-            .filter(|p| of_node.contains(&p.pid) && p.args.get(1).is_some_and(|a| a == "api-run"))
-            .map(|p| p.pid)
-            .collect()
-    }
-
-    /// The run's processes: the one run host under the node `node` and every process under it.
-    fn run_of(node: u32) -> Vec<Process> {
-        let all = processes();
-        let hosts = run_hosts(&all, node);
-        assert_eq!(hosts.len(), 1, "the node's run hosts: {hosts:?}");
-        let pids = under(&all, hosts);
-        let mut run: Vec<Process> = all.into_iter().filter(|p| pids.contains(&p.pid)).collect();
-        run.sort_by_key(|p| p.pid);
-        for p in &run {
-            eprintln!("GRANTS-PROCESS {} {} {:?}", p.pid, p.name, p.args);
-        }
-        run
-    }
-
-    /// A TCP or UDP socket as its network namespace's table shows it.
-    #[derive(Debug)]
-    struct Socket {
-        tcp: bool,
-        local: SocketAddr,
-        remote: SocketAddr,
-        /// Its state number in the table (include/net/tcp_states.h).
-        state: u8,
-        inode: u64,
-    }
-
-    impl Socket {
-        /// It takes what comes in: a listening TCP socket, or a UDP socket with no peer.
-        fn listens(&self) -> bool {
-            if self.tcp {
-                self.state == TCP_LISTEN
-            } else {
-                self.remote.ip().is_unspecified()
-            }
-        }
-
-        /// It carries a flow to a peer past the host's own loopback.
-        fn leaves(&self) -> bool {
-            let peer = self.remote.ip().to_canonical();
-            !self.listens() && !peer.is_loopback() && !peer.is_unspecified()
-        }
-    }
-
-    /// An address as /proc/net's tables write it: the address's bytes as the host's 32-bit words in hex, then the
-    /// port in hex (net/ipv4/tcp_ipv4.c `get_tcp4_sock`, net/ipv6/tcp_ipv6.c `get_tcp6_sock`).
-    fn address(text: &str) -> SocketAddr {
-        let (ip, port) = text.split_once(':').unwrap();
-        let bytes: Vec<u8> = ip
-            .as_bytes()
-            .chunks(8)
-            .flat_map(|word| {
-                u32::from_str_radix(std::str::from_utf8(word).unwrap(), 16)
-                    .unwrap()
-                    .to_ne_bytes()
-            })
-            .collect();
-        let ip = match bytes.len() {
-            4 => IpAddr::from(<[u8; 4]>::try_from(bytes).unwrap()),
-            16 => IpAddr::from(<[u8; 16]>::try_from(bytes).unwrap()),
-            n => panic!("an address of {n} bytes: {text}"),
-        };
-        SocketAddr::new(ip, u16::from_str_radix(port, 16).unwrap())
-    }
-
-    /// The TCP and UDP sockets of the network namespace the process `pid` is in, from its tables. A kernel with no
-    /// IPv6 has no IPv6 tables, and so no IPv6 socket.
-    fn sockets_seen_by(pid: u32) -> Vec<Socket> {
-        let mut out = Vec::new();
-        for (table, tcp) in [
-            ("tcp", true),
-            ("tcp6", true),
-            ("udp", false),
-            ("udp6", false),
-        ] {
-            let path = format!("/proc/{pid}/net/{table}");
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(e) if e.kind() == ErrorKind::NotFound && table.ends_with('6') => continue,
-                Err(e) => panic!("{path}: {e}"),
-            };
-            for row in text.lines().skip(1) {
-                let fields: Vec<&str> = row.split_whitespace().collect();
-                // sl, local, remote, state, tx_queue:rx_queue, tr:tm->when, retrnsmt, uid, timeout, inode, ...
-                let [_, local, remote, state, _, _, _, _, _, inode, ..] = fields.as_slice() else {
-                    panic!("{path}: a row of {} fields: {row}", fields.len());
-                };
-                out.push(Socket {
-                    tcp,
-                    local: address(local),
-                    remote: address(remote),
-                    state: u8::from_str_radix(state, 16).unwrap(),
-                    inode: inode.parse().unwrap(),
-                });
-            }
-        }
-        out
-    }
-
-    /// The inodes of the sockets the process `pid`'s descriptors hold.
-    fn socket_inodes(pid: u32) -> Vec<u64> {
-        let dir = format!("/proc/{pid}/fd");
-        let mut out = Vec::new();
-        let entries = fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("{dir}: {e}: a run's descriptors this test can't read"));
-        for entry in entries {
-            // A descriptor closed while this reads the list is no longer held.
-            let Ok(target) = fs::read_link(entry.unwrap().path()) else {
-                continue;
-            };
-            if let Some(inode) = target
-                .to_str()
-                .and_then(|t| t.strip_prefix("socket:["))
-                .and_then(|t| t.strip_suffix(']'))
-            {
-                out.push(inode.parse().unwrap());
-            }
-        }
-        out
-    }
-
-    /// The TCP and UDP sockets the run's processes hold, each once.
-    fn sockets_of(run: &[Process]) -> Vec<Socket> {
-        let mut out: Vec<Socket> = Vec::new();
-        for p in run {
-            let held = socket_inodes(p.pid);
-            if held.is_empty() {
-                continue;
-            }
-            for socket in sockets_seen_by(p.pid) {
-                if held.contains(&socket.inode) && out.iter().all(|s| s.inode != socket.inode) {
-                    out.push(socket);
-                }
-            }
-        }
-        for s in &out {
-            eprintln!(
-                "GRANTS-SOCKET {} {} -> {} state {} inode {}",
-                if s.tcp { "tcp" } else { "udp" },
-                s.local,
-                s.remote,
-                s.state,
-                s.inode
-            );
-        }
-        out
-    }
-
-    /// How many of the run's processes are named `name`.
-    fn named(run: &[Process], name: &str) -> usize {
-        run.iter().filter(|p| p.name == name).count()
-    }
-
-    /// A VM granted nothing whose image links its harness past the microVM: its run's VM process beside its run host,
-    /// and one network process (D250: the run keeps its network, the network process told nothing kept, so it lets
-    /// nothing past), and no socket that listens or leaves the host.
-    pub fn granted_nothing(node: u32) {
-        let run = run_of(node);
-        assert_eq!(
-            named(&run, "shards-vm"),
-            1,
-            "the run's VM process: {run:#?}"
-        );
-        assert_eq!(
-            named(&run, "shards-net"),
-            1,
-            "the run's network process (D250): {run:#?}"
-        );
-        let sockets = sockets_of(&run);
-        let listening: Vec<&Socket> = sockets.iter().filter(|s| s.listens()).collect();
-        assert!(
-            listening.is_empty(),
-            "the run of a VM granted nothing listens: {listening:#?}"
-        );
-        let leaving: Vec<&Socket> = sockets.iter().filter(|s| s.leaves()).collect();
-        assert!(
-            leaving.is_empty(),
-            "the run of a VM granted nothing holds a flow past the host's loopback: {leaving:#?}"
-        );
-    }
-
-    /// A VM granted one publish, bound at `at`: its network process there (D36: so a VM granted nothing, which had
-    /// none, had a real one to lack), and its run listening at `at` alone, at no wildcard address and not on the
-    /// image's port `ungranted`.
-    pub fn listens_alone(node: u32, at: SocketAddr, ungranted: u16) {
-        let run = run_of(node);
-        assert_eq!(
-            named(&run, "shards-net"),
-            1,
-            "the run's network process: {run:#?}"
-        );
-        let sockets = sockets_of(&run);
-        let listening: Vec<&Socket> = sockets.iter().filter(|s| s.listens()).collect();
-        assert!(
-            listening.iter().all(|s| !s.local.ip().is_unspecified()),
-            "the run listens at a wildcard address: {listening:#?}"
-        );
-        assert!(
-            listening.iter().all(|s| s.local.port() != ungranted),
-            "the run listens on the ungranted port {ungranted}: {listening:#?}"
-        );
-        assert!(
-            matches!(listening.as_slice(), [only] if only.tcp && only.local == at),
-            "the run listens other than at {at} alone: {listening:#?}"
-        );
-    }
-
-    /// No process of the run holds a flow past the host's loopback.
-    pub fn nothing_leaves(node: u32) {
-        let leaving: Vec<Socket> = sockets_of(&run_of(node))
-            .into_iter()
-            .filter(Socket::leaves)
-            .collect();
-        assert!(
-            leaving.is_empty(),
-            "the run holds a flow past the host's loopback: {leaving:#?}"
-        );
-    }
-
-    /// No run host is left under the node `node`.
-    pub fn no_run_left(node: u32) {
-        let left = run_hosts(&processes(), node);
-        assert!(left.is_empty(), "run hosts left under the node: {left:?}");
-    }
-
-    /// The /proc reading's address form (no VM): do read addresses as a little-endian kernel writes them, an IPv4
-    /// loopback port, IPv6's loopback, and an IPv4-mapped one; expect each as it is.
-    #[cfg(target_endian = "little")]
-    #[test]
-    fn proc_net_addresses_read_as_the_kernel_writes_them() {
-        assert_eq!(address("0100007F:1F90"), "127.0.0.1:8080".parse().unwrap());
-        assert_eq!(
-            address("00000000000000000000000001000000:01BB"),
-            "[::1]:443".parse().unwrap()
-        );
-        assert_eq!(
-            address("0000000000000000FFFF00000100007F:0035"),
-            "[::ffff:127.0.0.1]:53".parse().unwrap()
-        );
-    }
-
-    /// Non-vacuity of the /proc reading (no VM): do hold, in this process, a TCP listener and a UDP socket on the
-    /// loopback and a TCP connection to the listener; expect the reading to find each at its address, the listener
-    /// and the UDP socket listening, and the connection neither listening nor leaving the host. Do judge sockets
-    /// whose peers are past the loopback, at it and unset; expect only those past it to leave.
-    #[test]
-    fn the_proc_reading_finds_a_processs_own_sockets() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let connection = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let this = Process {
-            pid: std::process::id(),
-            parent: 0,
-            name: String::new(),
-            args: Vec::new(),
-        };
-        let sockets = sockets_of(&[this]);
-        let found = |at: SocketAddr, tcp: bool| {
-            sockets
-                .iter()
-                .find(|s| s.local == at && s.tcp == tcp)
-                .unwrap_or_else(|| panic!("no socket at {at} (tcp {tcp}) in {sockets:#?}"))
-        };
-        assert!(found(listener.local_addr().unwrap(), true).listens());
-        assert!(found(udp.local_addr().unwrap(), false).listens());
-        let near = found(connection.local_addr().unwrap(), true);
-        assert_eq!(near.remote, listener.local_addr().unwrap());
-        assert!(!near.listens() && !near.leaves());
-        // States from include/net/tcp_states.h: 1 TCP_ESTABLISHED, 2 TCP_SYN_SENT.
-        let tcp = |remote: &str, state| Socket {
-            tcp: true,
-            local: "10.0.0.2:40000".parse().unwrap(),
-            remote: remote.parse().unwrap(),
-            state,
-            inode: 0,
-        };
-        assert!(tcp("192.0.2.1:443", 1).leaves());
-        assert!(tcp("192.0.2.1:443", 2).leaves());
-        assert!(!tcp("127.0.0.1:443", 1).leaves());
-        assert!(!tcp("[::ffff:127.0.0.1]:443", 1).leaves());
-        assert!(!tcp("0.0.0.0:0", TCP_LISTEN).leaves());
+/// Starts box `id`, its boot followed to its answer: a start past its boot's W* answers `Lifecycle { Pending }`, the
+/// boot going on, and `Runtime::started` follows it to its run (decision 9, the person's ruling of 2026-11-13; kiln's
+/// HexVms adapter waits the same way). Says the start's refusal, or `started`'s.
+fn start(client: &Client, id: &BoxId) -> Result<(), Refusal> {
+    match client.start(id) {
+        Err(Refusal::Lifecycle {
+            cause: LifecycleCause::Pending,
+            ..
+        }) => client.started(id).map(drop),
+        started => started,
     }
 }
 
-/// What the host shows of a run is /proc's on Linux alone: here each of those readings is owed, and the run says so.
-#[cfg(not(target_os = "linux"))]
-mod host {
-    use std::net::SocketAddr;
-
-    fn owed(what: &str) {
-        eprintln!(
-            "GRANTS-OWED {what}: this host keeps no /proc, and this test reads a run's processes and sockets there alone"
-        );
-    }
-
-    pub fn granted_nothing(_: u32) {
-        owed(
-            "a VM granted nothing: its one network process, no listening socket, no flow past the host's loopback",
-        );
-    }
-
-    pub fn listens_alone(_: u32, at: SocketAddr, ungranted: u16) {
-        owed(&format!(
-            "a VM granted one publish: its run listening at {at} alone, not on {ungranted}"
-        ));
-    }
-
-    pub fn nothing_leaves(_: u32) {
-        owed("no flow of the run's past the host's loopback");
-    }
-
-    pub fn no_run_left(_: u32) {
-        owed("no run host left under the node");
-    }
+/// Every socket running box `id`'s run's agent-control endpoint holds, as its inspect `shown` says (`BoxInfo.control`
+/// and `control_wake`, Shards' `ControlAt::sockets`, image channel v30): its served address, its waker's and its wake's,
+/// told on stderr. Hex asks every image run for an endpoint, so a running VM that says none, or its address alone, fails.
+fn agent_control(id: &BoxId, shown: &hex_api::BoxInfo) -> [SocketAddr; 3] {
+    let control = shown.control_sockets().unwrap_or_else(|| {
+        panic!("{id} runs and says no agent-control endpoint's sockets: {shown:?}")
+    });
+    let [address, waker, wake] = control;
+    eprintln!(
+        "GRANTS {id}'s agent-control endpoint at {address}, its waker at {waker}, its wake at {wake}"
+    );
+    control
 }
 
-/// Stops box `id` with KILL, Hex's stop of an image VM, and deletes it; expects it ended by that signal.
+/// Stops box `id` with KILL, Hex's stop of an image VM, and deletes it; expects it ended by that signal. A KILL whose
+/// stop outlasts its W* answers `Lifecycle { Pending }`, the stop going on (the person's ruling of 2026-11-13): the box
+/// is then looked at, each look the node's own answer, until it shows its end.
 fn stop_and_delete(client: &Client, id: &BoxId) {
-    client.signal(id, Signal::KILL).unwrap();
-    let ended = client.inspect(id).unwrap();
+    match client.signal(id, Signal::KILL) {
+        Ok(())
+        | Err(Refusal::Lifecycle {
+            cause: LifecycleCause::Pending,
+            ..
+        }) => {}
+        Err(why) => panic!("{id}'s KILL: {why:?}"),
+    }
+    let mut ended = None;
+    // A look: the node tells no event as a stop ends. Its party, the box, ends the wait in the fact itself.
+    hex_testkit::waits::follow::until(
+        &KILLED,
+        &format!("{id} ended by its KILL"),
+        || hex_testkit::waits::follow::Party::Live,
+        || {
+            let shown = client.inspect(id).unwrap();
+            let reached = shown.state == BoxState::Empty;
+            ended = Some(shown);
+            reached
+        },
+    )
+    .unwrap();
+    let ended = ended.unwrap();
     assert_eq!(
         (ended.state, ended.exit),
         (BoxState::Empty, Some(Exit::Signal(9)))
@@ -582,6 +243,7 @@ fn a_destination_its_image_grants_not_refuses_the_boot(
     );
     let id = spec.id.clone();
     client.create(spec).unwrap();
+    // The node's first boot: its start follows the boot to its answer, no W* learned yet (decision 9).
     let refused = client.start(&id);
     eprintln!("GRANTS-CHECK-1 {id} start: {refused:?}");
     assert!(
@@ -605,9 +267,12 @@ fn handed_over<P>(
     mut shown: impl FnMut() -> Result<(BoxState, Option<Exit>, Option<String>), Refusal>,
 ) -> Result<(P, u64), String> {
     let mut answer = None;
-    let asks = hex_testkit::waits::until(
+    // A look: the node tells no event as a member is handed over, asked again. Its party, the box, ends the wait in
+    // the fact itself (a box that ends first, or any other refusal).
+    let asks = hex_testkit::waits::follow::until(
         &MEMBER_HANDED_OVER,
         &format!("{id}'s member handed over"),
+        || hex_testkit::waits::follow::Party::Live,
         || {
             answer = Some(match ask() {
                 Err(Refusal::Lifecycle {
@@ -664,12 +329,13 @@ fn asked_on_stdin(client: &Client, id: &BoxId, probe: &Probe) -> Report {
 
 /// Joint plan step 15, T-T7.7.1 (N4, D250): do run a VM of its members alone granted nothing, its probe driven by this
 /// test, while this test listens on the host's loopback at the service port the image grants as
-/// `host.docker.internal`, and ask the probe on its stdin. Expect: inspect shows no grant and nothing published; on
-/// Linux its run holds its VM process and one network process (D250: its image links its harness past the microVM,
-/// so the run keeps its network, whose network process, told nothing kept, lets nothing past), no listening socket and
-/// no flow past the host's loopback; the probe says it was asked on its stdin, its provider's name and its ungranted
-/// name unresolved (no DNS answer), and none of its targets connected (no packet past the microVM: the host's service
-/// by the name its image grants it, and the image's port egress, among them); and the host's service took nothing.
+/// `host.docker.internal`, and ask the probe on its stdin. Expect: inspect shows no grant and nothing published, and
+/// where its run's agent-control endpoint is bound; its run holds its VM process and one network process (D250: its
+/// image links its harness past the microVM, so the run keeps its network, whose network process, told nothing kept,
+/// lets nothing past), no socket taking what comes in but that endpoint, and no flow past the host's loopback; the
+/// probe says it was asked on its stdin, its provider's name and its ungranted name unresolved (no DNS answer), and
+/// none of its targets connected (no packet past the microVM: the host's service by the name its image grants it, and
+/// the image's port egress, among them); and the host's service took nothing.
 fn no_grant_lets_nothing_past(client: &Client, node: u32, probe: &Probe, allocation: Allocation) {
     let service = TcpListener::bind((Ipv4Addr::LOCALHOST, probe.host_port)).unwrap();
     service.set_nonblocking(true).unwrap();
@@ -679,13 +345,14 @@ fn no_grant_lets_nothing_past(client: &Client, node: u32, probe: &Probe, allocat
     }
     let id = spec.id.clone();
     client.create(spec).unwrap();
-    client.start(&id).unwrap();
+    start(client, &id).unwrap();
     let shown = client.inspect(&id).unwrap();
     assert!(
         shown.grants.is_empty() && shown.published.is_empty(),
         "{shown:?}"
     );
-    host::granted_nothing(node);
+    let control = agent_control(&id, &shown);
+    host::granted_nothing(node, control);
     let report = asked_on_stdin(client, &id, probe);
     eprintln!("GRANTS-CHECK-2 {id}: the probe said {report:?}");
     assert_eq!(report.ingress, Ingress::Stdin);
@@ -756,9 +423,11 @@ fn outcome_of(report: &Report, label: &str) -> Outcome {
 /// answering party while that lives); says the answer and how many looks it took.
 fn answered_at(client: &Client, id: &BoxId, at: SocketAddr) -> (String, u64) {
     let mut answer = String::new();
-    let looks = hex_testkit::waits::until(
+    // A look: each is one connection read to its end. Its party, the VM, ends the wait in the fact itself.
+    let looks = hex_testkit::waits::follow::until(
         &MEMBER_ANSWERED,
         &format!("the probe's answer at {at}"),
+        || hex_testkit::waits::follow::Party::Live,
         || {
             answer.clear();
             if TcpStream::connect(at)
@@ -784,10 +453,11 @@ fn answered_at(client: &Client, id: &BoxId, at: SocketAddr) -> (String, u64) {
 /// Joint plan step 15, AC-T7.7.2: do run a VM of its members alone granted one publish, the probe's port at the host's
 /// loopback, the OS picking the host's port, while this test listens on the host's loopback at the service port the
 /// image grants as `host.docker.internal`. Expect: inspect shows that one grant and its one published port at
-/// 127.0.0.1, reaching the probe at that port; the run listens there alone, at no wildcard address and not on the
-/// image's other port coming in; a connection there reaches the probe, which says it came in on that port and that
-/// none of its egress connected (its provider, an ungranted name, the host's service, the image's port egress), each
-/// outcome typed; the run holds no flow past the host's loopback; and the host's service took nothing.
+/// 127.0.0.1, reaching the probe at that port; the run listens there alone past its agent-control endpoint, at no
+/// wildcard address and not on the image's other port coming in; a connection there reaches the probe, which says it
+/// came in on that port and that none of its egress connected (its provider, an ungranted name, the host's service,
+/// the image's port egress), each outcome typed; the run holds no flow past the host's loopback; and the host's service
+/// took nothing.
 fn one_publish_published_alone(client: &Client, node: u32, probe: &Probe, allocation: Allocation) {
     let service = TcpListener::bind((Ipv4Addr::LOCALHOST, probe.host_port)).unwrap();
     service.set_nonblocking(true).unwrap();
@@ -801,7 +471,7 @@ fn one_publish_published_alone(client: &Client, node: u32, probe: &Probe, alloca
     );
     let id = spec.id.clone();
     client.create(spec).unwrap();
-    client.start(&id).unwrap();
+    start(client, &id).unwrap();
     let shown = client.inspect(&id).unwrap();
     eprintln!(
         "GRANTS-CHECK-3 {id} granted {:?}, published {:?}",
@@ -821,7 +491,7 @@ fn one_publish_published_alone(client: &Client, node: u32, probe: &Probe, alloca
         )
     );
     let at = published.at;
-    host::listens_alone(node, at, probe.ungranted_port);
+    host::listens_alone(node, at, probe.ungranted_port, agent_control(&id, &shown));
     let (answer, looks) = answered_at(client, &id, at);
     eprintln!("GRANTS-CHECK-3 the probe said {answer:?} after {looks} looks");
     let report = Report::parse(&answer).unwrap();
@@ -890,7 +560,7 @@ fn granted_destinations_are_reached_alone(client: &Client, probe: &Probe, alloca
     );
     let id = spec.id.clone();
     client.create(spec).unwrap();
-    client.start(&id).unwrap();
+    start(client, &id).unwrap();
     let shown = client.inspect(&id).unwrap();
     eprintln!(
         "GRANTS-CHECK-4 {id} granted {:?}, published {:?}",
@@ -938,7 +608,8 @@ fn granted_destinations_are_reached_alone(client: &Client, probe: &Probe, alloca
 
 /// Joint plan step 15 (N6): do create, then start, a VM with a command of its own granted a publish of a port its
 /// image gives no member, which Shards gives that command (D122). Expect: the start refused Invalid naming the run's
-/// own command, the box ended by KILL with nothing published, and no run host left under the node.
+/// own command (beside its run's stop still pending, Uncertain, where that stop outlasts its W*), the box followed to
+/// its end by KILL with nothing published, and no run host left under the node.
 fn a_publish_reaching_the_runs_own_command_stops_it(
     client: &Client,
     node: u32,
@@ -957,13 +628,45 @@ fn a_publish_reaching_the_runs_own_command_stops_it(
     );
     let id = spec.id.clone();
     client.create(spec).unwrap();
-    let refused = client.start(&id);
+    let refused = start(client, &id);
     eprintln!("GRANTS-CHECK-5 {id} start: {refused:?}");
+    // The grants' refusal, its run's stop begun: where that stop outlasts its W* the start says so beside it (Uncertain,
+    // its cleanup Lifecycle Pending) and the stop goes on (decision 9; B-4's stop answers once its run is released).
+    let grants = match &refused {
+        Err(Refusal::Uncertain {
+            refusal, cleanup, ..
+        }) if matches!(
+            cleanup.as_ref(),
+            Refusal::Lifecycle {
+                cause: LifecycleCause::Pending,
+                ..
+            }
+        ) =>
+        {
+            refusal.as_ref()
+        }
+        Err(why) => why,
+        Ok(()) => panic!("{id} started past its grants"),
+    };
     assert!(
-        matches!(&refused, Err(Refusal::Invalid { what: "grants", why }) if why.contains("the run's own command")),
+        matches!(grants, Refusal::Invalid { what: "grants", why } if why.contains("the run's own command")),
         "{refused:?}"
     );
-    let ended = client.inspect(&id).unwrap();
+    // Its end followed: the box looked at, each look the node's own answer, until it shows it.
+    let mut ended = None;
+    hex_testkit::waits::follow::until(
+        &KILLED,
+        &format!("{id} ended by its grants' stop"),
+        || hex_testkit::waits::follow::Party::Live,
+        || {
+            let shown = client.inspect(&id).unwrap();
+            let reached = shown.state == BoxState::Empty;
+            ended = Some(shown);
+            reached
+        },
+    )
+    .unwrap();
+    let ended = ended.unwrap();
     assert_eq!(
         (ended.state, ended.exit),
         (BoxState::Empty, Some(Exit::Signal(9)))
@@ -975,11 +678,69 @@ fn a_publish_reaching_the_runs_own_command_stops_it(
 
 /// The probe's arguments for three targets: a listener of this test's, a port nothing holds and a name RFC 6761 §6.4
 /// reserves as never resolving, the probe listening at the host's loopback on a port the OS picks.
-fn three_targets(open: &TcpListener) -> Vec<std::ffi::OsString> {
-    let closed = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
+/// The closed target's port: a listener of this test's on a port below the range this host gives a connection's source
+/// port and a bind to port 0 from ([`ephemeral_first`]), held while the probe binds its own listener and let go
+/// (dropped) just before the probe connects to its targets. No bind to port 0 is given it, the probe's own listener's
+/// among them, and no connection takes it as its source port and meets itself: a port from bind(0) let go could be
+/// both (goal 5's r878 on Linux; ROOT's macOS gate at 45fc1605, where the probe's connection was given the port just let
+/// go, the one after its open target's, and met itself: "closed connected"). Held without listening it would do no
+/// better: macOS drops a connection to a port bound but not listening, so it times out, never refused.
+fn closed_port() -> TcpListener {
+    // Each port picked once in this process, so a test running beside another never binds the port the other let go
+    // for its probe to find closed.
+    static PICKED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let first = ephemeral_first();
+    let mut picked = PICKED.lock().unwrap();
+    let listener = (1..first)
+        .rev()
+        .filter(|port| !picked.contains(port))
+        .find_map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok())
+        .unwrap_or_else(|| panic!("no port below this host's ephemeral range, {first}, is free"));
+    picked.insert(listener.local_addr().unwrap().port());
+    listener
+}
+
+/// The first port of the range this host gives a connection's source port and a bind to port 0 from, as its OS is
+/// configured: Linux's `net.ipv4.ip_local_port_range`, macOS's `net.inet.ip.portrange.first`, Windows' TCP dynamic port
+/// range.
+fn ephemeral_first() -> u16 {
+    #[cfg(target_os = "linux")]
+    let said = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    #[cfg(target_os = "macos")]
+    let said = String::from_utf8(
+        std::process::Command::new("sysctl")
+            .args(["-n", "net.inet.ip.portrange.first"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    #[cfg(windows)]
+    let said = {
+        let shown = String::from_utf8(
+            std::process::Command::new("netsh")
+                .args(["int", "ipv4", "show", "dynamicport", "tcp"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
         .unwrap();
+        shown
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Start Port"))
+            .and_then(|rest| rest.split(':').nth(1))
+            .unwrap_or_else(|| panic!("netsh shows no TCP start port: {shown}"))
+            .to_owned()
+    };
+    said.split_whitespace()
+        .next()
+        .and_then(|first| first.parse().ok())
+        .unwrap_or_else(|| panic!("no first ephemeral port in {said:?}"))
+}
+
+fn three_targets(open: &TcpListener, closed: &TcpListener) -> Vec<std::ffi::OsString> {
+    let closed = closed.local_addr().unwrap();
     [
         "--address".to_owned(),
         "127.0.0.1".to_owned(),
@@ -1004,11 +765,14 @@ fn three_targets(open: &TcpListener) -> Vec<std::ffi::OsString> {
 #[test]
 fn the_probe_answers_each_connection_with_its_targets_outcomes() {
     let open = TcpListener::bind("127.0.0.1:0").unwrap();
-    let told = probe::Told::read(&three_targets(&open)).unwrap();
+    let closed = closed_port();
+    let told = probe::Told::read(&three_targets(&open, &closed)).unwrap();
     let started = probe::start(&told).unwrap();
     let [at] = started.at.as_slice() else {
         panic!("{:?}", started.at);
     };
+    // The probe's listener is bound: the closed target's port is let go now, before the probe connects to it.
+    drop(closed);
     let mut answer = String::new();
     TcpStream::connect(at)
         .unwrap()
@@ -1044,6 +808,7 @@ fn a_members_hand_over_is_asked_again_while_its_box_settles() {
     let pending = || Refusal::Lifecycle {
         id: id.clone(),
         cause: LifecycleCause::Pending,
+        why: None,
     };
     let mut answers = vec![Err(pending()), Err(pending()), Ok("the probe")].into_iter();
     let handed = handed_over(
@@ -1092,7 +857,9 @@ fn a_members_hand_over_is_asked_again_while_its_box_settles() {
 #[test]
 fn the_probe_answers_each_line_on_its_stdin_with_its_targets_outcomes() {
     let open = TcpListener::bind("127.0.0.1:0").unwrap();
-    let told = probe::Told::read(&three_targets(&open)).unwrap();
+    let closed = closed_port();
+    let told = probe::Told::read(&three_targets(&open, &closed)).unwrap();
+    drop(closed);
     let mut out = Vec::new();
     probe::answer("\nagain\n".as_bytes(), &mut out, &told.targets).unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -1234,10 +1001,8 @@ fn a_vms_network_is_its_grants_alone_on_a_real_node() {
         open: input("HEX_GRANTS_OPEN"),
         command_port: port("HEX_GRANTS_COMMAND_PORT"),
     };
-    // A VM's start boots it, which the client's learned bounds (an OCI box's records) would refuse first: every wait
-    // measures, learned as the run goes, and each waits for its answer while its party lives (the person's rule of
-    // 2026-11-13), the run's whole with no deadline of its own.
-    hex_core::patience::measure_all();
+    // A VM's start boots it: each wait is learned as the run goes, and past its W* tells its run-out and waits for its
+    // answer while its party lives (the person's rule of 2026-11-13), the run's whole with no deadline of its own.
     assert!(
         hex_core::patience::census(step),
         "a census sink was installed before this one"

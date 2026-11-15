@@ -419,6 +419,11 @@ pub struct RuntimeRoutes {
     pub device_routes: Vec<u64>,
     #[serde(deserialize_with = "hex_api::Capacity::deserialize_backings")]
     pub backings: Vec<hex_api::BackingOffer>,
+    /// The guest envelope of its node's Ready node VM (joint plan step 39, V2): the room its `NodeVm` routes admit
+    /// within, as a shared backing's guest is its routes' (`BackingOffer::check_inner`). None where no node VM is
+    /// Ready: a `NodeVm` route admits nothing. Added after the backings, so absent means none (append-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_vm_room: Option<hex_api::CapacityResources>,
 }
 
 pub type SharedRoutes = triomphe::Arc<RuntimeRoutes>;

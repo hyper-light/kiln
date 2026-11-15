@@ -22,14 +22,19 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use hex_api::conformance::{Act, Fixture};
 use hex_api::differential;
 use hex_api::{Bounds, BoxId, BoxSpec, ClassSpec, Exit, Program, Refusal, Runtime, Signal, Stdio};
 use hex_core::patience::Patience;
 use hex_node::Node;
-use hex_testkit::waits::until;
+use hex_testkit::waits::follow::{self, Party};
+
+/// The in-process node this test holds, as the party of a wait on what its own threads do (its supervision, its
+/// removals): it lives while held, and its threads are its own (the review's C-5). A look reads its state.
+fn held_node() -> Party {
+    Party::Live
+}
 
 struct BinFixture {
     exe: String,
@@ -111,6 +116,8 @@ fn process_boxes_hold_the_contract_and_recover() {
             exercise_recovery(&own, &cache, &exe);
             exercise_clone_into_cgroup(&own);
             exercise_a_delete_beside_a_runs_removal(&own, &cache, &exe);
+            exercise_a_signal_beside_a_runs_removal(&own, &cache, &exe);
+            exercise_a_runs_emptying_followed_beside_the_others(&own, &cache, &exe);
         }
         Err(direct) if std::env::var_os("HEX_DELEGATED").is_none() => {
             let has_systemd = Command::new("systemd-run")
@@ -160,7 +167,7 @@ fn exercise_clone_into_cgroup(own: &Path) {
     use std::io::Read;
     use std::os::fd::{AsFd, OwnedFd};
 
-    use hex_api::{Exit, Proc};
+    use hex_api::Exit;
     use hex_runtime::linux::sys::{Cloned, Spawn, clone_into_cgroup};
 
     let root = hex_runtime::linux::cgroup::BoxRoot::open(&own.join("hex-clone"), Vec::new())
@@ -194,10 +201,7 @@ fn exercise_clone_into_cgroup(own: &Path) {
     match clone_into_cgroup(dir.as_fd(), spawn).expect("clone3 into the box") {
         Cloned::Started { pid, pidfd } => {
             let mut p = hex_runtime::linux::proc::PidfdProc::of_clone(pid, pidfd);
-            assert_eq!(
-                p.wait_for(Duration::from_secs(10)).unwrap(),
-                Some(Exit::Code(0))
-            );
+            assert_eq!(hex_api::conformance::end_of(&mut p), Ok(Exit::Code(0)));
             let mut seen = String::new();
             out.read_to_string(&mut seen).unwrap();
             let rel = cg.dir().strip_prefix("/sys/fs/cgroup").unwrap();
@@ -226,10 +230,22 @@ fn exercise_clone_into_cgroup(own: &Path) {
             );
             // The lead's ruling of 2026-11-11 (AC-T7.4.1): the locked-memory limit given a spawn is the one its program
             // starts under, as a VMM that pins its guest's RAM for DMA has its soft limit raised to its hard one
-            // (hex-runtime's firecracker vfio): here half this process's soft limit, in whole KiB, so it can't be the
-            // one the program would inherit.
+            // (hex-runtime's firecracker vfio): here half the limit this process's programs lock under, in whole KiB, so it
+            // can't be the one the program would inherit: its soft RLIMIT_MEMLOCK, or where that is unlimited what the
+            // box's cgroups let a program lock ([`lockable`]); with neither finite there is no limit to halve, said.
             let memlock = rustix::process::getrlimit(rustix::process::Resource::Memlock);
-            let soft = memlock.current.unwrap_or(64 << 20) / 2 / 1024 * 1024;
+            let Some(limit) = memlock.current.or_else(|| lockable(cg.dir())) else {
+                hex_testkit::skip(
+                    "process_boxes_hold_the_contract_and_recover",
+                    "a finite locked-memory limit",
+                    "RLIMIT_MEMLOCK is unlimited and every cgroup from the box up has memory.max max",
+                )
+                .expect("recording the skip");
+                cg.remove().unwrap();
+                std::fs::remove_dir(root.dir()).unwrap();
+                return;
+            };
+            let soft = limit / 2 / 1024 * 1024;
             let (mut out, w) = std::io::pipe().unwrap();
             let limited = Spawn::new(
                 vec![c("/bin/sh")],
@@ -250,10 +266,7 @@ fn exercise_clone_into_cgroup(own: &Path) {
                 panic!("clone3 served the first program, so it serves this one")
             };
             let mut p = hex_runtime::linux::proc::PidfdProc::of_clone(pid, pidfd);
-            assert_eq!(
-                p.wait_for(Duration::from_secs(10)).unwrap(),
-                Some(Exit::Code(0))
-            );
+            assert_eq!(hex_api::conformance::end_of(&mut p), Ok(Exit::Code(0)));
             let mut seen = String::new();
             out.read_to_string(&mut seen).unwrap();
             assert_eq!(
@@ -307,14 +320,21 @@ fn exercise_recovery(own: &Path, cache: &Path, exe: &str) {
     let mut proc = node
         .exec(&live, fx.wait(), Stdio::null())
         .expect("exec wait");
-    wait_until(
+    // Followed by its program's life (decision 9): a program that ended leaves the box never to run.
+    follow::until(
+        &RUNS,
+        "the live box running",
+        || match proc.try_wait() {
+            Ok(None) => Party::Live,
+            Ok(Some(_)) | Err(_) => Party::Ended,
+        },
         || {
             node.inspect(&live)
                 .map(|i| i.state == hex_api::BoxState::Running)
                 .unwrap_or(false)
         },
-        "live box runs",
-    );
+    )
+    .expect("the live box runs");
 
     // A leftover cgroup with no record (a crash after the cgroup was made, before the record).
     std::fs::create_dir_all(box_root.join("orphan")).expect("orphan cgroup");
@@ -376,7 +396,10 @@ fn exercise_recovery(own: &Path, cache: &Path, exe: &str) {
         .expect("a run's record");
     }
 
-    // The restart: a fresh node on the same directories recovers.
+    // The restart: the agent's process ends (`Node::crash`: its store's hold of the state let go, as the kernel lets a
+    // dead process's lock go, and none of its code run; one store writes a state directory), and a fresh node on the
+    // same directories recovers.
+    node.crash();
     let restarted = Node::open(&box_root, state.path(), state.path()).expect("restart");
     let summary = restarted.recover().expect("recover");
 
@@ -398,10 +421,15 @@ fn exercise_recovery(own: &Path, cache: &Path, exe: &str) {
         "the running run's box wasn't taken back: {summary:?}"
     );
     running.kill().expect("end the run's program");
-    wait_until(
-        || restarted.inspect(&ran_live) == Err(hex_api::Refusal::NoSuchBox(ran_live.clone())),
+    // Its party is the restarted node, whose supervision removes the box and which lives while this test holds it: the
+    // wait follows the fact alone, its run-out past W* told (decision 9).
+    follow::until(
+        &REMOVED,
         "the taken-back run's box removed once its program ended",
-    );
+        held_node,
+        || restarted.inspect(&ran_live) == Err(hex_api::Refusal::NoSuchBox(ran_live.clone())),
+    )
+    .expect("the taken-back run's box removed");
     assert!(
         !box_root.join("ran-live").exists(),
         "the taken-back run's cgroup leaked"
@@ -453,6 +481,9 @@ fn exercise_recovery(own: &Path, cache: &Path, exe: &str) {
 /// A claimer's stop at the hold on the runs' removals, and a delete's wait on that removal or its answer beside it:
 /// facts no recorded operation makes, each waited for measuring (`hex_testkit::waits`).
 static STOPPED: Patience = Patience::measuring("test.hex_cli.process_box.removal_stopped");
+/// A live box shown running once its program runs, and a taken-back run's box removed once its program ended: the same.
+static RUNS: Patience = Patience::measuring("test.hex_cli.process_box.live_runs");
+static REMOVED: Patience = Patience::measuring("test.hex_cli.process_box.taken_back_removed");
 static BESIDE: Patience = Patience::measuring("test.hex_cli.process_box.delete_beside_removal");
 
 /// Runtime goal 7 (decision 7), AC-T7.4.1: a delete of a run's box that its program's end is removing answers as that
@@ -481,17 +512,25 @@ fn exercise_a_delete_beside_a_runs_removal(own: &Path, cache: &Path, exe: &str) 
         .expect("run a waiting program");
     let held = node.hold_run_removals().expect("hold the runs' removals");
     run.kill().expect("kill the run's program");
-    until(
+    follow::until(
         &STOPPED,
         "the supervising thread's claim of the run, stopped at the hold",
+        held_node,
         || held.stopped().unwrap() == 1,
     )
     .unwrap();
     std::thread::scope(|s| {
         let deleting = s.spawn(|| node.delete(&id));
-        until(
+        follow::until(
             &BESIDE,
             "the delete's wait on the removal, or its answer",
+            || {
+                if deleting.is_finished() {
+                    Party::Ended
+                } else {
+                    Party::Live
+                }
+            },
             || held.waiting().unwrap() == 1 || deleting.is_finished(),
         )
         .unwrap();
@@ -513,17 +552,200 @@ fn exercise_a_delete_beside_a_runs_removal(own: &Path, cache: &Path, exe: &str) 
     assert_eq!(node.inspect(&id), Err(Refusal::NoSuchBox(id.clone())));
 }
 
-fn orphan_id() -> BoxId {
-    BoxId::new("orphan").unwrap()
+/// Runtime goal 7 (decision 7), AC-T7.4.1: a signal to a run's box whose removal is under way is refused typed, never
+/// with an OS error. A signal holds none of the box's turns, so the run's claimer can remove the cgroup a signal has
+/// found before the signal reads it. Do: run a waiting program; hold the node's run removals at their start; kill the
+/// program through its run, so the supervising thread claims the run and stops before it removes the box; take the
+/// box's cgroup as a signal finds it, its directory pinned (`Node::signal`'s lookup, `BoxRoot::child`); let the removal
+/// go and follow the run to its end, which it reports once the box is gone; then signal TERM and KILL through what was
+/// found. Expect: each refused as not running (cgroup v2 removes only an empty cgroup), and the node's own signal of the
+/// box, gone, refused as no such box.
+fn exercise_a_signal_beside_a_runs_removal(own: &Path, cache: &Path, exe: &str) {
+    let state = tempfile::Builder::new()
+        .prefix("runsig-")
+        .tempdir_in(cache)
+        .expect("state dir");
+    let root = own.join("hex-boxes-runsig");
+    let node = Node::open(&root, state.path(), state.path()).expect("open a node");
+    let fx = BinFixture {
+        exe: exe.to_owned(),
+    };
+    let id = BoxId::new("runsig").unwrap();
+    let mut run = node
+        .run(
+            fx.spec(id.clone(), Bounds::default()),
+            fx.wait(),
+            Stdio::null(),
+        )
+        .expect("run a waiting program");
+    let held = node.hold_run_removals().expect("hold the runs' removals");
+    run.kill().expect("kill the run's program");
+    follow::until(
+        &STOPPED,
+        "the supervising thread's claim of the run, stopped at the hold",
+        held_node,
+        || held.stopped().unwrap() == 1,
+    )
+    .unwrap();
+    let found = hex_runtime::linux::cgroup::BoxCgroup::observe_managed(root.join(id.as_str()))
+        .expect("the box's cgroup, looked up")
+        .expect("the box's cgroup, still there while its removal is held");
+    drop(held);
+    assert_eq!(
+        hex_api::conformance::end_of(&mut *run),
+        Ok(Exit::Signal(Signal::KILL.number())),
+        "the run's end, reported once its box is gone"
+    );
+    for signal in [Signal::TERM, Signal::KILL] {
+        assert_eq!(
+            found.signal(&id, signal),
+            Err(Refusal::NotRunning(id.clone(), "signal")),
+            "{signal:?} through the cgroup a signal found before the run's removal took it"
+        );
+    }
+    assert_eq!(
+        node.signal(&id, Signal::TERM),
+        Err(Refusal::NoSuchBox(id.clone()))
+    );
 }
 
-fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if cond() {
-            return;
-        }
-        std::thread::yield_now();
+/// A run's box past W*, followed (the review's E-3): its program's leaving a process in the box, its emptying's follow,
+/// the node's other box's removal beside it, and a delete's wait on its follower: facts no recorded operation makes,
+/// each waited for measuring.
+static LEFT: Patience = Patience::measuring("test.hex_cli.process_box.program_left_a_process");
+static FOLLOWED: Patience = Patience::measuring("test.hex_cli.process_box.emptying_followed");
+static REMOVED_BESIDE: Patience =
+    Patience::measuring("test.hex_cli.process_box.removed_beside_a_follow");
+static WAITS_ON_FOLLOWER: Patience =
+    Patience::measuring("test.hex_cli.process_box.delete_waits_on_a_follower");
+
+/// The review's E-3 (decision 9: a wait follows its party by its life, never on a thread other parties share), runtime
+/// goal 7, AC-T7.4.1: a run's box that doesn't empty within W* is followed to its emptying by a thread of its own, the
+/// supervising thread removing the node's other boxes meanwhile, and a delete of the followed box waits for that
+/// thread's word. Do: hold box A's emptying (its cgroup reads as not yet empty, as one whose last process sleeps
+/// uninterruptibly in the kernel past W* reads); run A, a shell that leaves a waiting process of its own in the box, and
+/// B, a waiting program; once A's box holds both, kill A's shell through its run and leave the run to the supervising
+/// thread; once A's emptying is followed, name the thread that follows it; kill B's program the same way; then hold the
+/// runs' removals, delete A from another thread, and let A's emptying go once the delete waits. Expect: A followed by a
+/// thread of its own, never the supervising thread; B's box removed while A's emptying is held; the delete of A waiting
+/// on the follower rather than answering beside it, then Ok; A's box gone.
+fn exercise_a_runs_emptying_followed_beside_the_others(own: &Path, cache: &Path, exe: &str) {
+    let state = tempfile::Builder::new()
+        .prefix("runfol-")
+        .tempdir_in(cache)
+        .expect("state dir");
+    let root = own.join("hex-boxes-runfol");
+    let node = Node::open(&root, state.path(), state.path()).expect("open a node");
+    let fx = BinFixture {
+        exe: exe.to_owned(),
+    };
+    let a = BoxId::new("runfol-a").unwrap();
+    let b = BoxId::new("runfol-b").unwrap();
+    let emptying = node.hold_emptying(&a).expect("hold A's emptying");
+    let leaves = Program::of(&["/bin/sh", "-c", "\"$0\" selftest-box wait & wait", exe]);
+    let mut run_a = node
+        .run(fx.spec(a.clone(), Bounds::default()), leaves, Stdio::null())
+        .expect("run A's shell");
+    let mut run_b = node
+        .run(
+            fx.spec(b.clone(), Bounds::default()),
+            fx.wait(),
+            Stdio::null(),
+        )
+        .expect("run B's waiting program");
+    let procs = root.join(a.as_str()).join("cgroup.procs");
+    follow::until(
+        &LEFT,
+        "A's shell and the process it leaves, in A's box",
+        || life(&mut *run_a),
+        || std::fs::read_to_string(&procs).is_ok_and(|p| p.lines().count() >= 2),
+    )
+    .unwrap();
+    run_a.kill().expect("kill A's shell");
+    drop(run_a);
+    follow::until(
+        &FOLLOWED,
+        "A's emptying followed past W*",
+        || there(&node, &a),
+        || !emptying.following().unwrap().is_empty(),
+    )
+    .unwrap();
+    assert_eq!(
+        emptying.following().unwrap(),
+        ["hex-run-follow"],
+        "the thread following A's emptying: one of its own, never the supervising thread every box shares"
+    );
+    run_b.kill().expect("kill B's program");
+    drop(run_b);
+    follow::until(
+        &REMOVED_BESIDE,
+        "B's box removed while A's emptying is held",
+        || {
+            if emptying
+                .following()
+                .unwrap()
+                .iter()
+                .any(|t| t == "hex-supervisor")
+            {
+                Party::Ended
+            } else {
+                Party::Live
+            }
+        },
+        || node.inspect(&b) == Err(Refusal::NoSuchBox(b.clone())),
+    )
+    .unwrap();
+    let removals = node.hold_run_removals().expect("hold the runs' removals");
+    std::thread::scope(|s| {
+        let deleting = s.spawn(|| node.delete(&a));
+        follow::until(
+            &WAITS_ON_FOLLOWER,
+            "the delete's wait on A's follower, or its answer",
+            || there(&node, &a),
+            || removals.waiting().unwrap() == 1 || deleting.is_finished(),
+        )
+        .unwrap();
+        assert!(
+            !deleting.is_finished(),
+            "the delete of A answered beside its follower"
+        );
+        drop(emptying);
+        assert_eq!(
+            deleting.join().unwrap(),
+            Ok(()),
+            "the delete once A's follower took the box apart"
+        );
+    });
+    drop(removals);
+    assert_eq!(node.inspect(&a), Err(Refusal::NoSuchBox(a.clone())));
+}
+
+/// A run's program as a party: live until it ends.
+fn life(proc: &mut dyn hex_api::Proc) -> Party {
+    match proc.try_wait() {
+        Ok(None) => Party::Live,
+        Ok(Some(_)) | Err(_) => Party::Ended,
     }
-    panic!("timed out waiting for: {what}");
+}
+
+/// Box `id` as a party: live while the node holds it, so what's waited for of it may yet come.
+fn there(node: &Node, id: &BoxId) -> Party {
+    match node.inspect(id) {
+        Ok(_) => Party::Live,
+        Err(_) => Party::Ended,
+    }
+}
+
+/// What a program in the box at `dir` can lock at most where its soft RLIMIT_MEMLOCK is unlimited: the tightest
+/// `memory.max` of the box's cgroup and every cgroup above it; none where each is `max`.
+fn lockable(dir: &Path) -> Option<u64> {
+    dir.ancestors()
+        .take_while(|d| d.starts_with("/sys/fs/cgroup"))
+        .filter_map(|d| std::fs::read_to_string(d.join("memory.max")).ok())
+        .filter_map(|text| text.trim().parse::<u64>().ok())
+        .min()
+}
+
+fn orphan_id() -> BoxId {
+    BoxId::new("orphan").unwrap()
 }

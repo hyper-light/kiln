@@ -13,7 +13,7 @@
 //! command line names (`hex.shares=rw,ro,…`, §4a) at `/run/hex/shares/<i>`, gives the node the descriptor
 //! limit `hex node --descriptors` counts (soft and hard, `fs.nr_open` raised to it where lower), starts `hex node`
 //! and then `hex guest relay --vsock`, each within the boot's deadline where its host gave one (Firecracker's
-//! `hex.firecracker-ready-ms`, a Shards host's `hex.ready-ms`), which it hands them (`BOOT_READY_BY`), says
+//! `hex.firecracker-ready-ms`; a Shards host gives none), which it hands them (`BOOT_READY_BY`), says
 //! `hex guest ready` on the console, and reaps every process that ends,
 //! as PID 1 must. When the node or the relay ends, it says why and powers the guest off, so the host sees
 //! the guest end.
@@ -108,6 +108,13 @@ fn parse(args: &[String]) -> Result<Args, String> {
     })
 }
 
+/// The socket in `dir` the relay listens on for `port` ([`stream::socket_name`]).
+fn socket(dir: &Path, port: u32) -> Result<PathBuf, (u8, String)> {
+    stream::socket_name(port)
+        .map(|name| dir.join(name))
+        .ok_or_else(|| (1, format!("the relay names no socket for port {port:#x}")))
+}
+
 fn relay(args: &[String]) -> Result<(), (u8, String)> {
     let Args { node, on, staged } = parse(args).map_err(|why| (2, why))?;
     std::fs::create_dir_all(&staged)
@@ -120,14 +127,14 @@ fn relay(args: &[String]) -> Result<(), (u8, String)> {
             Box::new(vsock(stream::files::FILES_PORT).map_err(|e| (1, e))?),
         ),
         On::Unix(dir) => (
-            Box::new(unix(&dir.join("control.sock")).map_err(|e| (1, e))?),
-            Box::new(unix(&dir.join("stdio.sock")).map_err(|e| (1, e))?),
-            Box::new(unix(&dir.join("files.sock")).map_err(|e| (1, e))?),
+            Box::new(unix(&socket(dir, stream::CONTROL_PORT)?).map_err(|e| (1, e))?),
+            Box::new(unix(&socket(dir, stream::STDIO_PORT)?).map_err(|e| (1, e))?),
+            Box::new(unix(&socket(dir, stream::files::FILES_PORT)?).map_err(|e| (1, e))?),
         ),
     };
     let stamps: Box<dyn Listen> = match &on {
         On::Vsock => Box::new(vsock(stream::STAMPS_PORT).map_err(|e| (1, e))?),
-        On::Unix(dir) => Box::new(unix(&dir.join("stamps.sock")).map_err(|e| (1, e))?),
+        On::Unix(dir) => Box::new(unix(&socket(dir, stream::STAMPS_PORT)?).map_err(|e| (1, e))?),
     };
     let line = stamps_line(std::env::var(BOOT_STAMPS).ok().as_deref(), boottime_ns());
     std::thread::Builder::new()
@@ -240,7 +247,7 @@ const BOOT_T0: &str = "HEX_BOOT_T0";
 const BOOT_STAMPS: &str = "HEX_BOOT_STAMPS";
 /// The variable that carries the boot's deadline from init to each child it starts before the guest is ready, the
 /// node and the relay (AC-T7.4.1): the instant on the guest's own clock, `CLOCK_BOOTTIME` nanoseconds, by which its
-/// host waits for it to be ready, its readiness bound ([`boot_budget`]) counted from the kernel's start, so the time
+/// host waits for it to be ready, its readiness bound ([`firecracker_ready_budget`]) counted from the kernel's start, so the time
 /// the boot has spent is what the clock reads. The relay's calls to its node take it as their caller's.
 const BOOT_READY_BY: &str = "HEX_BOOT_READY_BY";
 
@@ -433,7 +440,7 @@ impl Duty {
 /// Where init takes the boot's deadline from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Deadline {
-    /// The kernel's command line: `hex.ready-ms` or Firecracker's, counted from the kernel's start ([`boot_budget`]).
+    /// The kernel's command line: Firecracker's, counted from the kernel's start ([`firecracker_ready_budget`]).
     Kernel,
     /// What its service manager told it ([`SHARDS_READY_BY`]), none where it told none.
     Told(Option<u128>),
@@ -578,9 +585,9 @@ impl Boot {
             Duty::Deadline(Deadline::Kernel) => {
                 let cmdline = kernel_cmdline()?;
                 self.firecracker = firecracker_ready_budget(&cmdline)?;
-                // AC-T7.4.1: its host's readiness bound from the kernel's start, an instant on the guest's clock.
-                self.ready_by =
-                    boot_budget(&cmdline, self.firecracker)?.map(|budget| budget.as_nanos());
+                // AC-T7.4.1: its host's readiness bound from the kernel's start, an instant on the guest's clock. A
+                // Shards host tells none (the review's C-9): its guest keeps its learned bounds.
+                self.ready_by = self.firecracker.map(|budget| budget.as_nanos());
                 Ok(())
             }
             Duty::Deadline(Deadline::Told(ready_by)) => {
@@ -955,36 +962,6 @@ fn firecracker_ready_budget(cmdline: &str) -> Result<Option<Duration>, String> {
     }
 }
 
-/// The boot's readiness bound its host told the guest on its kernel command line, counted from the kernel's start
-/// (AC-T7.4.1): Firecracker's, `firecracker` ([`firecracker_ready_budget`]), or a Shards host's,
-/// [`hex_runtime::guest::READY_MS`]; none where the host told none, whose guest keeps its learned bounds. Refused where
-/// both are told, or the Shards word is malformed or told twice.
-fn boot_budget(cmdline: &str, firecracker: Option<Duration>) -> Result<Option<Duration>, String> {
-    use hex_runtime::guest::READY_MS;
-    let mut told = None;
-    for word in cmdline.split_whitespace().take_while(|word| *word != "--") {
-        let Some(rest) = word.strip_prefix(READY_MS) else {
-            continue;
-        };
-        let millis = rest
-            .strip_prefix('=')
-            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|ms| *ms != 0)
-            .ok_or_else(|| format!("{READY_MS} needs positive milliseconds, not {word:?}"))?;
-        if told.replace(Duration::from_millis(millis)).is_some() {
-            return Err(format!("{READY_MS} is given twice"));
-        }
-    }
-    match (firecracker, told) {
-        (Some(_), Some(_)) => Err(format!(
-            "hex.firecracker-ready-ms and {READY_MS} both name the boot's deadline"
-        )),
-        (Some(budget), None) => Ok(Some(budget)),
-        (None, told) => Ok(told),
-    }
-}
-
 fn kernel_cmdline() -> Result<String, String> {
     let bound = usize::try_from(CMDLINE_BOUND)
         .map_err(|_| "kernel command line bound exceeds usize".to_owned())?;
@@ -1148,6 +1125,19 @@ fn mount_each(mounts: &[Mount]) -> Result<(), String> {
     Ok(())
 }
 
+/// The command init starts `exe` by, none of the words init's host gave init alone in its environment
+/// (sd_notify(3)'s `unset_environment`; ROOT's rule from Shards' D234 of 2026-11-13): a service manager's socket
+/// ([`NOTIFY_SOCKET`]), which runc would take as its own supervisor's and then wait on its box's READY=1 forever, and
+/// its deadline ([`SHARDS_READY_BY`]); and init's own deadline ([`BOOT_READY_BY`]), which [`start`] gives a child itself.
+/// Init keeps what it read of them (its [`Host`]), and says READY=1 itself.
+fn child(exe: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    for word in [NOTIFY_SOCKET, SHARDS_READY_BY, BOOT_READY_BY] {
+        command.env_remove(word);
+    }
+    command
+}
+
 /// Starts `/init` with `args` and waits for its first line, `ready`: read as far as its length and no
 /// further, as nothing else is that line, and, where init has the boot's deadline `ready_by`, within what is left of
 /// it, refused past it with the child ended (AC-T7.4.1).
@@ -1174,11 +1164,10 @@ fn start(
             })
         })
         .transpose()?;
-    let mut command = std::process::Command::new(exe);
+    let mut command = child(exe);
     if let Some(stamps) = stamps {
         command.env(BOOT_STAMPS, stamps);
     }
-    command.env_remove(BOOT_READY_BY);
     if let Some(at) = ready_by {
         command.env(BOOT_READY_BY, at.to_string());
     }
@@ -1405,39 +1394,6 @@ mod tests {
         assert!(boot_deadline(Some(OsStr::from_bytes(b"\xff1")), now, 0).is_err());
     }
 
-    /// AC-T7.4.1: the boot's deadline is its host's readiness bound, Firecracker's (`hex.firecracker-ready-ms`) or a
-    /// Shards host's (`hex.ready-ms`), and a guest told none keeps its learned bounds. Do: read command lines that name
-    /// either, neither or both, malformed or repeated Shards words, and one after `--`. Expect each bound as told, none
-    /// for neither or init's own arguments, and a refusal for the rest.
-    #[test]
-    fn the_boots_deadline_is_its_hosts_readiness_bound_either_way() {
-        let firecracker = Some(Duration::from_secs(60));
-        assert_eq!(boot_budget("console=ttyS0 panic=-1", None), Ok(None));
-        assert_eq!(boot_budget("console=ttyS0", firecracker), Ok(firecracker));
-        assert_eq!(
-            boot_budget(
-                "console=ttyS0 panic=-1 hex.shares=rw hex.ready-ms=21056",
-                None
-            ),
-            Ok(Some(Duration::from_millis(21_056)))
-        );
-        assert_eq!(boot_budget("quiet -- hex.ready-ms=5", None), Ok(None));
-        for bad in [
-            "hex.ready-ms",
-            "hex.ready-ms=",
-            "hex.ready-ms=0",
-            "hex.ready-ms=-1",
-            "hex.ready-ms=+1",
-            "hex.ready-ms=1.5",
-            "hex.ready-msx=1",
-            "hex.ready-ms=18446744073709551616",
-            "hex.ready-ms=1 hex.ready-ms=2",
-        ] {
-            assert!(boot_budget(bad, None).is_err(), "{bad}");
-        }
-        assert!(boot_budget("hex.ready-ms=5", firecracker).is_err());
-    }
-
     /// AC-T7.4.1 (original): init waited for each child's ready line with no bound, so a node or relay that never
     /// said it was ready held the boot past its deadline. Do: start a child that says nothing and never ends on its
     /// own (`sleep infinity`), handed the boot's deadline as init hands it. Expect: refused at the deadline, naming
@@ -1628,6 +1584,31 @@ mod tests {
             SHARDS_READY_BY => ready_by.map(Into::into),
             _ => None,
         }
+    }
+
+    /// AC-T7.4.1, joint plan step 39 (ROOT's rule from Shards' D234, 2026-11-13; sd_notify(3)'s `unset_environment`):
+    /// under shards-init, init's children (the node, the relay, and the runc or crun the node runs for an oci box)
+    /// mustn't take shards-init's words as their own: runc v1.5.2 takes an inherited `NOTIFY_SOCKET` as its own
+    /// supervisor's and waits for its box's READY=1 before its signal loop, so a foreground run never reaps its box's
+    /// init. Do: build the command init starts a child by, and read init's duties under shards-init. Expect:
+    /// shards-init's socket and deadline, and init's own deadline, each removed from the child's environment; and
+    /// init still saying READY=1 on the socket it read.
+    #[test]
+    fn w39_init_starts_its_children_without_shards_inits_words() {
+        let command = child(Path::new("/init"));
+        let removed: Vec<&std::ffi::OsStr> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key)
+            .collect();
+        for word in [NOTIFY_SOCKET, SHARDS_READY_BY, BOOT_READY_BY] {
+            assert!(
+                removed.contains(&std::ffi::OsStr::new(word)),
+                "{word} reaches init's children: {removed:?}"
+            );
+        }
+        let host = host(shards_inits(None)).unwrap();
+        assert!(duties(&host).contains(&Duty::Notify(PathBuf::from("/run/shards/notify"))));
     }
 
     /// AC-T7.4.1, joint plan step 39 (original; docs/design/node-under-shards-init.md §2, §3): under shards-init,

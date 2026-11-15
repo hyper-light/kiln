@@ -599,6 +599,7 @@ fn write_route(
         hex_api::Execution::ShardsShared => "shared",
         hex_api::Execution::ShardsDedicated => "dedicated",
         hex_api::Execution::Firecracker => "firecracker",
+        hex_api::Execution::NodeVm => "node-vm",
     };
     let gpu = match route.key.gpu {
         hex_api::GpuEligibility::Any => "any",
@@ -661,6 +662,8 @@ fn route_of<'a>(
         Some("shared") => hex_api::Execution::ShardsShared,
         Some("dedicated") => hex_api::Execution::ShardsDedicated,
         Some("firecracker") => hex_api::Execution::Firecracker,
+        // V2: appended, so a row written before it names none of it and reads as it was written.
+        Some("node-vm") => hex_api::Execution::NodeVm,
         _ => return Err(damaged("route execution")),
     };
     let gpu = match fields.next() {
@@ -1044,9 +1047,12 @@ pub struct Node {
     pick: Pick,
     owned: BTreeMap<Key, Owned>,
     ran: BTreeMap<Key, Ran>,
-    /// What each box it runs holds now, where its shell said so ([`Node::rebook`]): its learned booking and
-    /// the memory and disk it holds past it (joint plan steps 13 and 14). A box not said holds its receipt.
-    holds: BTreeMap<Key, Resources>,
+    /// What each holder holds now, where its shell said so ([`Node::rebook`]): a box's or a node VM's learned
+    /// booking and the memory and disk it holds past it (joint plan steps 13, 14 and 39). One not said holds its
+    /// receipt.
+    holds: BTreeMap<Holder, Resources>,
+    /// Each node VM it runs for itself, by its run, at its receipt: its admitted size ([`Node::book_node`]).
+    nodes: BTreeMap<hex_api::NodeRun, Resources>,
     /// For the shell: what the node told its clients and its runtime.
     pub told: Vec<Told>,
 }
@@ -1356,6 +1362,7 @@ impl Node {
             owned,
             ran: recovered,
             holds: BTreeMap::new(),
+            nodes: BTreeMap::new(),
             told: Vec::new(),
         })
     }
@@ -2328,7 +2335,8 @@ impl Node {
     }
 
     /// What this node's own admissions book of its room, each box at its receipt: in each dimension the
-    /// larger of what its ledger admitted and what its admission index holds, which charges backings too.
+    /// larger of what its ledger admitted and what its admission index holds, which charges backings too; and
+    /// beside them each node VM it runs for itself at its receipt ([`Node::book_node`]).
     pub fn booked(&self) -> Result<lb::Amounts, Stop> {
         let index = self
             .admission
@@ -2339,19 +2347,51 @@ impl Node {
         for (b, i) in booked.iter_mut().zip(index) {
             *b = (*b).max(i);
         }
+        for receipt in self.nodes.values() {
+            for (b, r) in booked.iter_mut().zip(amounts(receipt)) {
+                *b = b
+                    .checked_add(r)
+                    .ok_or_else(|| damaged("a node VM's receipt past what is booked"))?;
+            }
+        }
+        Ok(booked)
+    }
+
+    /// What the node VMs it runs for itself book of its room, each at its receipt ([`Node::book_node`]; V2): the room
+    /// its own admissions don't have, as no box's admission books it.
+    pub fn nodes_booked(&self) -> Result<lb::Amounts, Stop> {
+        let mut booked = [0u64; lb::DIMS];
+        for receipt in self.nodes.values() {
+            for (b, r) in booked.iter_mut().zip(amounts(receipt)) {
+                *b = b
+                    .checked_add(r)
+                    .ok_or_else(|| damaged("node VM receipts past what is booked"))?;
+            }
+        }
         Ok(booked)
     }
 
     /// What this node's own admissions hold of its room now, for the machine's capacity view (joint plan
     /// step 13, `docs/design/capacity-view.md` CV2; step 14's C8): what they book ([`Node::booked`]), each
-    /// box its shell rebooked held at what it said instead of its receipt. GPUs stay their receipts'.
+    /// holder its shell rebooked (a box, a node VM) held at what it said instead of its receipt. GPUs stay their
+    /// receipts'.
     pub fn held(&self) -> Result<lb::Amounts, Stop> {
         let mut held = self.booked()?;
-        for (key, holds) in &self.holds {
-            let Some(r) = self.ran.get(key).filter(|r| !r.ended) else {
-                continue;
+        for (holder, holds) in &self.holds {
+            let receipt = match holder {
+                Holder::Box(key) => {
+                    let Some(r) = self.ran.get(key).filter(|r| !r.ended) else {
+                        continue;
+                    };
+                    amounts(&assignment(&r.demand, r.allocation, r.route)?)
+                }
+                Holder::Node(run) => {
+                    let Some(receipt) = self.nodes.get(run) else {
+                        continue;
+                    };
+                    amounts(receipt)
+                }
             };
-            let receipt = amounts(&assignment(&r.demand, r.allocation, r.route)?);
             let holds = amounts(&Resources { gpus: 0, ..*holds });
             for ((h, receipt), holds) in held.iter_mut().zip(receipt).zip(holds).take(3) {
                 *h = h
@@ -2363,18 +2403,40 @@ impl Node {
         Ok(held)
     }
 
-    /// What each box this node runs holds now, as its shell learned it (joint plan step 14, C8): its learned
-    /// booking, and the memory and disk it holds past it. Replaces what was said before; a box not named
-    /// holds its receipt again, and one that no longer runs here holds nothing, so it is not kept. Returns
-    /// how many it kept.
-    pub fn rebook(&mut self, holds: impl IntoIterator<Item = (Key, Resources)>) -> usize {
+    /// What each holder this node runs holds now, as its shell learned it (joint plan steps 14 and 39, C8): a box's
+    /// or a node VM's learned booking, and the memory and disk it holds past it. Replaces what was said before; one
+    /// not named holds its receipt again, and a box that no longer runs here, or a node VM no longer booked, holds
+    /// nothing, so it is not kept. Returns how many it kept.
+    pub fn rebook(&mut self, holds: impl IntoIterator<Item = (Holder, Resources)>) -> usize {
         self.holds.clear();
-        for (key, holding) in holds {
-            if self.ran.get(&key).is_some_and(|r| !r.ended) {
-                self.holds.insert(key, holding);
+        for (holder, holding) in holds {
+            let runs = match holder {
+                Holder::Box(key) => self.ran.get(&key).is_some_and(|r| !r.ended),
+                Holder::Node(run) => self.nodes.contains_key(&run),
+            };
+            if runs {
+                self.holds.insert(holder, holding);
             }
         }
         self.holds.len()
+    }
+
+    /// Books node VM `run`, which the node runs for itself, at `receipt`, its admitted size (joint plan step 39):
+    /// a holder of its own beside the boxes, never one of them, so no box path ([`Node::owned`],
+    /// [`Node::records`]) counts it. Booked again, its receipt is the later one.
+    pub fn book_node(&mut self, run: hex_api::NodeRun, receipt: Resources) {
+        self.nodes.insert(run, receipt);
+    }
+
+    /// Releases node VM `run`'s receipt and what it was said to hold, saying whether it was booked.
+    pub fn release_node(&mut self, run: hex_api::NodeRun) -> bool {
+        self.holds.remove(&Holder::Node(run));
+        self.nodes.remove(&run).is_some()
+    }
+
+    /// The node VMs it books ([`Node::book_node`]), by their runs, in order.
+    pub fn booked_nodes(&self) -> impl Iterator<Item = hex_api::NodeRun> + '_ {
+        self.nodes.keys().copied()
     }
 
     /// The boxes this node owns that wait for room, run, or have ended unforgotten.
@@ -2386,6 +2448,14 @@ impl Node {
     pub fn records(&self) -> usize {
         self.ran.len()
     }
+}
+
+/// Who holds room in a node's ledger (joint plan step 39, ROOT's ruling of 2026-11-13; goal 13's ledger): a box it
+/// runs, by its placement key, or a node VM it runs for itself, by its run, a holder of its own beside the boxes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Holder {
+    Box(Key),
+    Node(hex_api::NodeRun),
 }
 
 fn own_text(
@@ -3213,6 +3283,58 @@ mod adversarial_device_recovery_tests;
 mod tests {
     use super::*;
 
+    /// V2 (ROOT, 2026-11-13: placement rows written before NodeVm still read): a row names its route's execution by
+    /// word, so one written before NodeVm, naming only the executions there were, reads as it was written, and one
+    /// naming NodeVm reads back. Do write an owner's row for an oci box routed natively and one for an oci box routed
+    /// NodeVm, then read each. Expect the native row's route word the one a build before NodeVm wrote,
+    /// "r1:oci:linux:amd64:native:none:-", the NodeVm row's "r1:oci:linux:amd64:node-vm:none:-", and each read back to
+    /// its demand and route.
+    #[test]
+    fn v2_placement_rows_written_before_node_vm_routes_still_read() {
+        let demand = Demand {
+            need: Resources {
+                cpu_milli: 1_000,
+                mem_bytes: hex_api::MIN_MEMORY,
+                ..Resources::default()
+            },
+            kind: Kind::Plain,
+            class: Class::Oci,
+            ask: Ask {
+                runtime_class: Some(hex_api::Class::Oci),
+                ..Ask::default()
+            },
+        };
+        for (execution, word) in [
+            (
+                hex_api::Execution::Native,
+                "r1:oci:linux:amd64:native:none:-",
+            ),
+            (
+                hex_api::Execution::NodeVm,
+                "r1:oci:linux:amd64:node-vm:none:-",
+            ),
+        ] {
+            let route = hex_api::RouteReceipt {
+                key: hex_api::RouteKey {
+                    class: hex_api::Class::Oci,
+                    image: hex_api::ImagePlatform {
+                        os: hex_api::ImageOs::Linux,
+                        arch: hex_api::ImageArch::Amd64,
+                    },
+                    execution,
+                    gpu: hex_api::GpuEligibility::None,
+                },
+                backing: None,
+            };
+            let row = own_text(State::Asked, &demand, &[], None, Some(route)).unwrap();
+            assert!(row.split(' ').any(|said| said == word), "{row}");
+            assert_eq!(
+                recorded_assignment(&row, &[]).unwrap(),
+                (demand, None, Some(route))
+            );
+        }
+    }
+
     /// AC-T7.4.1: an original OCI payload keeps its actual guest route through commit, wire and
     /// recovery. These are model callbacks/rows, not native VM receipts or execution evidence.
     #[test]
@@ -3261,12 +3383,18 @@ mod tests {
                 offers: vec![native, shared],
                 device_routes: Vec::new(),
                 backings: vec![BackingOffer {
-                    guest: Default::default(),
+                    // Measured as it went Live (joint plan step 14, C7, pin 1): nothing of its own.
+                    guest: hex_api::LearnedOverhead {
+                        cpu_milli: Some(0),
+                        mem_bytes: Some(0),
+                        disk_bytes: Some(0),
+                    },
                     key,
                     cost: cost_fixture(),
                     phase: BackingPhase::Live,
                     devices: Vec::new(),
                 }],
+                node_vm_room: None,
             }
             .share()
             .unwrap(),
@@ -3373,6 +3501,7 @@ mod tests {
                     phase: BackingPhase::Live,
                     devices: Vec::new(),
                 }],
+                node_vm_room: None,
             }
             .share()
             .unwrap(),
@@ -3445,6 +3574,7 @@ mod tests {
                 offers: vec![offer],
                 device_routes: vec![1; 2],
                 backings: vec![parent.try_clone().unwrap()],
+                node_vm_room: None,
             }
             .share()
             .unwrap(),
@@ -3556,6 +3686,7 @@ mod tests {
                 ],
                 device_routes: vec![1, 0],
                 backings: vec![parent.try_clone().unwrap(), current.try_clone().unwrap()],
+                node_vm_room: None,
             }
             .share()
             .unwrap(),
@@ -3901,6 +4032,64 @@ mod tests {
         assert_eq!(out, vec![(NodeId(0), Msg::Refused { key })]);
         assert!(node.told.is_empty());
         assert_eq!(node.admitted(), [0; lb::DIMS]);
+    }
+
+    /// Joint plan step 39 (ROOT's ledger ruling of 2026-11-13; goal 13's ledger): a node VM the node runs for itself,
+    /// never a box, is a holder of its own beside its boxes. Do: book one at an admitted size, say what it holds, then
+    /// release it. Expect: booked carries its receipt; held its holding in the receipt's place; the box paths (owned,
+    /// records) count no box; rebook keeps it while it is booked and nothing of it once released.
+    #[test]
+    fn a_node_vm_is_a_holder_booked_at_its_receipt_and_held_at_what_it_holds() {
+        let mut rows = Memory::default();
+        let mut node = boot_test(&[NodeSpec::new(NodeId(0), CAP)], &[], &mut rows);
+        let before = node.booked().unwrap();
+        let run = hex_api::NodeRun::from_bytes([7; 16]);
+        let receipt = Resources {
+            cpu_milli: 2_000,
+            mem_bytes: 1 << 30,
+            ..Resources::default()
+        };
+        node.book_node(run, receipt);
+        let more = |after: lb::Amounts| [after[0] - before[0], after[1] - before[1]];
+        assert_eq!(
+            more(node.booked().unwrap()),
+            [2_000, 1 << 30],
+            "booked at its receipt"
+        );
+        assert_eq!(
+            more(node.held().unwrap()),
+            [2_000, 1 << 30],
+            "held at its receipt, none said"
+        );
+        assert_eq!(
+            (node.owned(), node.records()),
+            (0, 0),
+            "the box paths count no box"
+        );
+        let holding = Resources {
+            cpu_milli: 500,
+            mem_bytes: 1 << 29,
+            ..Resources::default()
+        };
+        assert_eq!(node.rebook([(Holder::Node(run), holding)]), 1);
+        assert_eq!(
+            more(node.held().unwrap()),
+            [500, 1 << 29],
+            "held at what it holds"
+        );
+        assert_eq!(
+            more(node.booked().unwrap()),
+            [2_000, 1 << 30],
+            "still booked at its receipt"
+        );
+        assert!(node.release_node(run));
+        assert_eq!(node.booked().unwrap(), before);
+        assert_eq!(
+            node.rebook([(Holder::Node(run), holding)]),
+            0,
+            "a released run holds nothing"
+        );
+        assert_eq!(node.held().unwrap(), before);
     }
 
     fn boot_test(specs: &[NodeSpec], models: &[String], records: &mut Memory) -> Node {

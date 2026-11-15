@@ -20,6 +20,10 @@ struct Loopback {
 }
 
 impl Link for Loopback {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
         let addr = match port {
             stream::CONTROL_PORT => self.control,
@@ -56,6 +60,10 @@ fn link_owner_retains_one_instance_without_dial_effects() {
         drops: Arc<AtomicUsize>,
     }
     impl Link for Counted {
+        fn lends_identity(&self) -> bool {
+            false
+        }
+
         fn dial(&self, _: u32) -> Result<DuplexOwner, Refusal> {
             self.dials.fetch_add(1, Ordering::SeqCst);
             Err(Refusal::Broken("owned test dial".into()))
@@ -418,6 +426,10 @@ struct Recording {
 }
 
 impl Link for Recording {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
         let addr = if port == stream::CONTROL_PORT {
             self.control
@@ -510,6 +522,21 @@ impl Write for Looped {
 impl shards_api::Stream for Looped {
     fn try_clone(&self) -> std::io::Result<Box<dyn shards_api::Stream>> {
         Ok(Box::new(Looped(self.0.try_clone()?)))
+    }
+
+    fn read_shared(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut &self.0, buf)
+    }
+
+    fn write_shared(&self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut &self.0, buf)
+    }
+
+    fn into_socket(self: Box<Self>) -> shards_api::OwnedSocket {
+        #[cfg(unix)]
+        return std::os::fd::OwnedFd::from(self.0);
+        #[cfg(windows)]
+        std::os::windows::io::OwnedSocket::from(self.0)
     }
 
     fn handle(&self) -> shards_api::Handle<'_> {
@@ -678,6 +705,214 @@ impl shards_api::Guest for GoneRelay {
     }
 }
 
+/// A Shards simulator guest whose dials are each told, as they reach it, by their port on `dials`.
+struct Counted {
+    inner: Box<dyn shards_api::Guest>,
+    dials: std::sync::Mutex<std::sync::mpsc::Sender<u32>>,
+}
+
+impl Counted {
+    fn told(&self, port: u32) {
+        let _ = self.dials.lock().unwrap().send(port);
+    }
+}
+
+impl shards_api::Guest for Counted {
+    fn process_exited(&self) -> Result<bool, shards_api::Refusal> {
+        self.inner.process_exited()
+    }
+
+    fn connect(
+        &self,
+        port: u32,
+        patience: Duration,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        self.inner.connect(port, patience)
+    }
+
+    fn connect_before(
+        &self,
+        port: u32,
+        at: Instant,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        self.told(port);
+        self.inner.connect_before(port, at)
+    }
+
+    fn connect_once_before(
+        &self,
+        port: u32,
+        at: Instant,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        self.told(port);
+        self.inner.connect_once_before(port, at)
+    }
+
+    fn connect_while_runs(
+        &self,
+        port: u32,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        self.told(port);
+        self.inner.connect_while_runs(port)
+    }
+
+    fn stop(&self) -> Result<(), shards_api::Refusal> {
+        self.inner.stop()
+    }
+
+    fn wait_for(&self, timeout: Duration) -> Result<Option<shards_api::End>, shards_api::Refusal> {
+        self.inner.wait_for(timeout)
+    }
+
+    fn identity(&self) -> Result<shards_api::Identity, shards_api::Refusal> {
+        self.inner.identity()
+    }
+}
+
+/// What a dialing thread tells the dials' channel as it ends, a port no guest serves: no dial is waited for past it.
+const DIALING_ENDED: u32 = u32::MAX;
+
+/// A simulator guest booted with `program`, its dials told on the returned receiver, and a sender for its dialing
+/// thread to tell its end ([`DIALING_ENDED`]).
+fn counted_guest(
+    program: impl Fn(&shards_api::sim::SimHost) -> shards_api::End + Send + Sync + 'static,
+) -> (
+    Arc<Counted>,
+    std::sync::mpsc::Sender<u32>,
+    std::sync::mpsc::Receiver<u32>,
+) {
+    use shards_api::Guests;
+    let inner = shards_api::sim::SimGuests::new(program)
+        .boot(&shards_api::GuestSpec {
+            kernel: "kernel".into(),
+            init: shards_api::Init::Executable("init".into()),
+            cmdline: String::new(),
+            vcpus: 1,
+            gpu: false,
+            gpu_devices: Vec::new(),
+            memory_mib: shards_api::min_memory_mib(std::env::consts::ARCH),
+            disks: vec![],
+            shares: vec![],
+            ports: vec![stream::CONTROL_PORT, stream::STDIO_PORT],
+            binary: None,
+        })
+        .unwrap();
+    let (dials, dialed) = std::sync::mpsc::channel();
+    let ended = dials.clone();
+    let guest = Arc::new(Counted {
+        inner,
+        dials: std::sync::Mutex::new(dials),
+    });
+    (guest, ended, dialed)
+}
+
+/// The `n`th dial `dialed` tells, waited for while `dialing` lives (decision 9), never for a window of the test's own:
+/// its count, or the wait's end with none, `dialing` having told its own end ([`DIALING_ENDED`]).
+fn nth_dial(
+    wait: &hex_core::patience::Patience,
+    dialed: &std::sync::mpsc::Receiver<u32>,
+    dialing: &std::thread::JoinHandle<Result<(), Refusal>>,
+    n: usize,
+) -> Result<usize, hex_testkit::waits::follow::Unmet> {
+    use hex_testkit::waits::follow::{self, Party};
+    let mut seen = 0usize;
+    follow::within(
+        wait,
+        "a dial made again past its link's bound",
+        || {
+            if dialing.is_finished() {
+                Party::Ended
+            } else {
+                Party::Live
+            }
+        },
+        |by| loop {
+            let got = match by {
+                None => dialed.recv().ok(),
+                Some(at) => dialed
+                    .recv_timeout(at.saturating_duration_since(Instant::now()))
+                    .ok(),
+            };
+            match got {
+                Some(DIALING_ENDED) | None => return None,
+                Some(_) => {
+                    seen += 1;
+                    if seen >= n {
+                        return Some(seen);
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// Decision 9 (the person's ruling of 2026-11-13; the review's C-9; AC-T7.4.1), on every OS: dial, with no caller
+/// deadline, a Shards simulator guest that listens on the port only once the dial follows it, its link's bound past.
+/// Expect the dial connected: past the bound, the run-out told and one dial that follows the guest
+/// (`connect_while_runs`), never refused there.
+#[test]
+fn a_dial_with_no_deadline_follows_its_guest_past_the_links_bound() {
+    static AGAIN: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("test.hex_client.guest.link_dialed_again");
+    let (go, listen) = std::sync::mpsc::channel::<()>();
+    let listen = std::sync::Mutex::new(listen);
+    let (guest, ended, dialed) = counted_guest(move |host| {
+        if listen.lock().unwrap().recv().is_ok() {
+            host.listen(stream::CONTROL_PORT);
+            let _ = host.accept();
+        }
+        shards_api::End::PowerOff
+    });
+    let link = shards::ShardsLink::new(guest, Some(CONNECT_CAP));
+    let dialing = std::thread::spawn(move || {
+        let dialed = link.dial(stream::CONTROL_PORT).map(drop);
+        let _ = ended.send(DIALING_ENDED);
+        dialed
+    });
+    let again = nth_dial(&AGAIN, &dialed, &dialing, 2);
+    let _ = go.send(());
+    let connected = dialing.join().unwrap();
+    eprintln!("link_follow_past_bound again={again:?} connected={connected:?}");
+    assert!(again.is_ok(), "{again:?}: the dial wasn't made again");
+    assert_eq!(connected, Ok(()));
+}
+
+/// Decision 9 (AC-T7.4.1), on every OS: dial, with no caller deadline, a Shards simulator guest that never listens on
+/// the port, and stop the guest once the dial follows it past its link's bound. Expect the dial refused at the guest's
+/// end, by its end as Shards' own kind (the review's B-15), never at a bound.
+#[test]
+fn a_dial_with_no_deadline_is_refused_at_its_guests_end() {
+    static AGAIN: hex_core::patience::Patience = hex_core::patience::Patience::measuring(
+        "test.hex_client.guest.link_dialed_again_to_its_end",
+    );
+    let (guest, ended, dialed) = counted_guest(|host| {
+        // No port listened on: an accept ends only with the guest.
+        let _ = host.accept();
+        shards_api::End::PowerOff
+    });
+    let link = shards::ShardsLink::new(guest.clone(), Some(CONNECT_CAP));
+    let dialing = std::thread::spawn(move || {
+        let dialed = link.dial(stream::STDIO_PORT).map(drop);
+        let _ = ended.send(DIALING_ENDED);
+        dialed
+    });
+    let again = nth_dial(&AGAIN, &dialed, &dialing, 2);
+    let stopped = guest.inner.stop();
+    let refused = dialing.join().unwrap();
+    eprintln!("link_follow_to_end again={again:?} stopped={stopped:?} refused={refused:?}");
+    assert!(again.is_ok(), "{again:?}: the dial wasn't made again");
+    assert!(
+        matches!(
+            &refused,
+            Err(Refusal::Guest {
+                op: "connecting to the guest",
+                failure: hex_api::GuestFailure::Ended(_),
+            })
+        ),
+        "{refused:?}"
+    );
+}
+
 /// AC-T7.4.1: dial a guest whose relay answered the first dial and is then gone; expect the first dial
 /// through `connect_before`, which waits for the relay to listen, and each later dial one
 /// `connect_once_before` attempt, refused at once as closed unanswered, by type. The relay binds every
@@ -689,7 +924,7 @@ fn a_later_dial_to_a_gone_relay_is_one_attempt_refused_at_once() {
         before: std::sync::Mutex::new(Vec::new()),
         once: std::sync::Mutex::new(Vec::new()),
     });
-    let link = shards::ShardsLink::new(guest.clone(), Duration::from_secs(60));
+    let link = shards::ShardsLink::new(guest.clone(), Some(Duration::from_secs(60)));
     link.dial(stream::CONTROL_PORT).unwrap();
     for port in [stream::STDIO_PORT, stream::CONTROL_PORT] {
         let refused = link.dial(port).err().unwrap();
@@ -723,7 +958,7 @@ fn every_dial_carries_a_finite_deadline_after_the_first_listen() {
         absolute: std::sync::Mutex::new(Vec::new()),
     });
     let bound = Duration::from_millis(354);
-    let link = shards::ShardsLink::new(guest.clone(), bound);
+    let link = shards::ShardsLink::new(guest.clone(), Some(bound));
     let mut windows = Vec::new();
     for port in [stream::CONTROL_PORT, stream::STDIO_PORT, stream::STDIO_PORT] {
         let began = Instant::now();
@@ -746,12 +981,12 @@ fn every_dial_carries_a_finite_deadline_after_the_first_listen() {
     }
 }
 
-/// HEX-GUEST-33, AC-T7.4.1 (CLAUDE.md §2): connect with no caller deadline, plainly and in the event form, through a
-/// Shards link whose guest takes the control connection and holds its relay's token until the link's bound has
-/// surely passed, then sends it and answers the hello: expect each connect refused by type at the link's own setup
-/// bound, the token's read with the dial, never connected late, as a relay that stays silent would hold it forever.
+/// Decision 9 (the person's ruling of 2026-11-13; AC-T7.4.1): connect with no caller deadline, plainly and in the
+/// event form, through a Shards link whose guest takes the control connection and holds its relay's token until the
+/// link's bound has surely passed, then sends it and answers the hello: expect each connect made, its token read late,
+/// waited for as long as the link's transport takes, never refused at the link's bound.
 #[test]
-fn a_relay_token_held_past_the_links_bound_refuses_the_connect() {
+fn a_relay_token_held_past_the_links_bound_is_waited_for() {
     let mut seen = Vec::new();
     for evented in [false, true] {
         let guest = Arc::new(Patient {
@@ -799,7 +1034,7 @@ fn a_relay_token_held_past_the_links_bound_refuses_the_connect() {
             let _ = conn.read(&mut [0u8; 1]);
             true
         });
-        let link = own_link(shards::ShardsLink::new(guest.clone(), bound)).unwrap();
+        let link = own_link(shards::ShardsLink::new(guest.clone(), Some(bound))).unwrap();
         let connected = if evented {
             Client::connect_evented(link, Arc::new(|| {})).map(drop)
         } else {
@@ -812,14 +1047,8 @@ fn a_relay_token_held_past_the_links_bound_refuses_the_connect() {
         seen.push((evented, connected, late));
     }
     for (evented, connected, late) in seen {
-        assert!(
-            matches!(&connected, Err(Refusal::Os { op, why }) if op.contains("token") && why.contains("setup bound")),
-            "evented={evented}: {connected:?}"
-        );
-        assert!(
-            !late,
-            "evented={evented}: connected on a token past its bound"
-        );
+        assert!(connected.is_ok(), "evented={evented}: {connected:?}");
+        assert!(late, "evented={evented}: its token wasn't read late");
     }
 }
 
@@ -834,7 +1063,7 @@ fn a_link_bound_with_no_finite_deadline_is_refused_before_shards() {
             given: std::sync::Mutex::new(Vec::new()),
             absolute: std::sync::Mutex::new(Vec::new()),
         });
-        let link = shards::ShardsLink::new(guest.clone(), bound);
+        let link = shards::ShardsLink::new(guest.clone(), Some(bound));
         let dialed = link.dial(stream::CONTROL_PORT).map(drop);
         let given = guest.given.lock().unwrap().clone();
         let absolute = guest.absolute.lock().unwrap().clone();
@@ -859,11 +1088,11 @@ fn a_link_bound_with_no_finite_deadline_is_refused_before_shards() {
 }
 
 /// HEX-GUEST-33, AC-T7.4.1 (CLAUDE.md §2, §3): through Shards' own client, a guest whose muxer answers the first
-/// CONNECT, then takes the next and never answers it: expect that dial refused by type at its deadline, the link's
-/// bound from its start, not held for as long as the guest is silent. A child `cat` stands in for the guest's VM
-/// process, which Shards holds by its pidfd and kills as the guest drops. The bound is the caller's own deadline for the
-/// dial, the case's input; the dial's answer is waited for while the thread that dials lives (decision 9), never for a
-/// window of the test's own, and the muxer is released once it has come, as Shards'
+/// CONNECT, then takes the next and never answers it: expect that dial, given its caller's deadline, refused by type at
+/// it, not held for as long as the guest is silent. A child `cat` stands in for the guest's VM process, which Shards
+/// holds by its pidfd and kills as the guest drops. The deadline is the caller's own, the case's input (with none, the
+/// dial follows the guest past its link's bound, decision 9); the dial's answer is waited for while the thread that
+/// dials lives, never for a window of the test's own, and the muxer is released once it has come, as Shards'
 /// `withheld_reply_expires_before_fixture_release` releases its fixture.
 #[cfg(target_os = "linux")]
 #[test]
@@ -930,15 +1159,18 @@ fn a_dial_the_guest_takes_and_never_answers_is_refused_at_its_deadline() {
         let _ = held.recv();
         (first, second)
     });
-    // The caller's own deadline for its first dial (`ShardsLink::new`'s bound), the case's input: whatever it is, a dial
-    // the guest takes and never answers is refused at it, and not before. Short, so the case is.
+    // The caller's own deadline for its dial, the case's input: whatever it is, a dial the guest takes and never
+    // answers is refused at it, and not before. Short, so the case is.
     let bound = Duration::from_millis(200);
-    let link = shards::ShardsLink::new(Arc::from(guest), bound);
+    let link = shards::ShardsLink::new(Arc::from(guest), Some(bound));
     let control = link.dial(stream::CONTROL_PORT).unwrap();
     let (sent, answer) = std::sync::mpsc::channel();
     let began = Instant::now();
+    let deadline = began.checked_add(bound).unwrap();
     let dialing = std::thread::spawn(move || {
-        let dialed = link.dial(stream::STDIO_PORT).map(drop);
+        let dialed = link
+            .dial_before(stream::STDIO_PORT, Some(deadline))
+            .map(drop);
         let _ = sent.send((dialed, Instant::now()));
         link
     });
@@ -985,6 +1217,117 @@ fn a_dial_the_guest_takes_and_never_answers_is_refused_at_its_deadline() {
     );
 }
 
+/// A stand-in VM process for an offer to name: a `cat` waiting on its stdin, and its start time as proc(5) gives it
+/// (starttime, field 22, the 20th after the command's closing parenthesis).
+#[cfg(target_os = "linux")]
+fn offered_vm() -> (std::process::Child, u64) {
+    use std::process::{Command, Stdio};
+    let vm = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stat = std::fs::read(format!("/proc/{}/stat", vm.id())).unwrap();
+    let after = stat.iter().rposition(|b| *b == b')').unwrap() + 1;
+    let started: u64 = std::str::from_utf8(&stat[after..])
+        .unwrap()
+        .split_ascii_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    (vm, started)
+}
+
+/// An offer of stdin and stdout of exec 9 in the stand-in VM `vm` started at `started`, at `vsock`, its link's setup
+/// bound `setup`.
+#[cfg(target_os = "linux")]
+fn offered(
+    vm: &std::process::Child,
+    started: u64,
+    vsock: std::path::PathBuf,
+    setup: Option<Duration>,
+) -> wire::StreamOffer {
+    wire::StreamOffer {
+        pid: vm.id(),
+        started,
+        vsock,
+        token: TOKEN,
+        exec: 9,
+        streams: wire::Streams {
+            stdin: true,
+            stdout: true,
+            stderr: false,
+        },
+        setup,
+    }
+}
+
+/// What a muxer hears of an offered stream opened and named for exec 9: its CONNECT line, then its name.
+#[cfg(target_os = "linux")]
+fn offered_named(stream: stream::Stdio) -> Vec<u8> {
+    let mut line = format!("CONNECT {}\n", stream::STDIO_PORT).into_bytes();
+    line.extend_from_slice(&stream::name(Named {
+        exec: Exec { conn: TOKEN, id: 9 },
+        stream,
+    }));
+    line
+}
+
+/// What a stand-in muxer did with a connection: answered its CONNECT and read the name that followed (the line and
+/// the name), or never answered it, the client giving it up and closing it (the line).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Muxed {
+    Named(Vec<u8>),
+    GivenUp(Vec<u8>),
+}
+
+/// A stand-in vsock muxer for an offer's CONNECTs, its connections taken one at a time, `nth` called with each one's
+/// count once its CONNECT line is read: with `silent` of that count, no answer until the client gives it up and closes
+/// it; else OK at once and the stream's name read. A `STOP` line, the test's own, ends it: what it did with each, and
+/// the named ones, held open.
+#[cfg(target_os = "linux")]
+fn offered_muxer(
+    listener: std::os::unix::net::UnixListener,
+    silent: fn(usize) -> bool,
+    mut nth: impl FnMut(usize) + Send + 'static,
+) -> std::thread::JoinHandle<(Vec<Muxed>, Vec<std::os::unix::net::UnixStream>)> {
+    std::thread::spawn(move || {
+        let (mut did, mut held) = (Vec::new(), Vec::new());
+        for n in 0.. {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut line = Vec::new();
+            while line.last() != Some(&b'\n') {
+                let mut byte = [0u8; 1];
+                conn.read_exact(&mut byte).unwrap();
+                line.push(byte[0]);
+            }
+            if line == b"STOP\n" {
+                break;
+            }
+            nth(n);
+            if silent(n) {
+                // Held until the client gives it up and closes.
+                let _ = conn.read(&mut [0u8; 1]);
+                did.push(Muxed::GivenUp(line));
+                continue;
+            }
+            conn.write_all(b"OK 1\n").unwrap();
+            let mut name = [0u8; stream::NAME_BYTES];
+            match conn.read_exact(&mut name) {
+                Ok(()) => {
+                    line.extend_from_slice(&name);
+                    did.push(Muxed::Named(line));
+                    held.push(conn);
+                }
+                Err(_) => did.push(Muxed::GivenUp(line)),
+            }
+        }
+        (did, held)
+    })
+}
+
 /// HEX-RT-17, AC-T7.4.1 (CLAUDE.md §2): open an offered guest exec's stdin and stdout as a Windows caller does,
 /// through Shards' borrowed connector, against a stand-in VM process and its vsock muxer. One muxer answers each
 /// CONNECT with OK a moment after reading it, under a deadline the test never reaches; another never answers, under
@@ -994,7 +1337,6 @@ fn a_dial_the_guest_takes_and_never_answers_is_refused_at_its_deadline() {
 #[test]
 fn an_offered_streams_connect_waits_for_its_ok_within_the_calls_deadline() {
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::process::{Command, Stdio};
 
     // Each connection's CONNECT line and, once it is answered, its name; the answered ones, held open.
     fn muxer(
@@ -1050,33 +1392,8 @@ fn an_offered_streams_connect_waits_for_its_ok_within_the_calls_deadline() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let mut vm = Command::new("cat")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    // proc(5): starttime is field 22, the 20th after the command's closing parenthesis.
-    let stat = std::fs::read(format!("/proc/{}/stat", vm.id())).unwrap();
-    let after = stat.iter().rposition(|b| *b == b')').unwrap() + 1;
-    let started: u64 = std::str::from_utf8(&stat[after..])
-        .unwrap()
-        .split_ascii_whitespace()
-        .nth(19)
-        .unwrap()
-        .parse()
-        .unwrap();
-    let offer = |vsock: std::path::PathBuf| wire::StreamOffer {
-        pid: vm.id(),
-        started,
-        vsock,
-        token: TOKEN,
-        exec: 9,
-        streams: wire::Streams {
-            stdin: true,
-            stdout: true,
-            stderr: false,
-        },
-    };
+    let (mut vm, started) = offered_vm();
+    let offer = |vsock: std::path::PathBuf| offered(&vm, started, vsock, None);
     let answering = dir.path().join("a");
     let answered = muxer(UnixListener::bind(&answering).unwrap(), Some(CONNECT_CAP));
     let far = ReplyDeadline::caller_before(Instant::now() + Duration::from_secs(30)).unwrap();
@@ -1089,14 +1406,6 @@ fn an_offered_streams_connect_waits_for_its_ok_within_the_calls_deadline() {
     let (unanswered, _) = silent.join().unwrap();
     drop(vm.stdin.take());
     let reaped = vm.wait();
-    let named = |stream| {
-        let mut line = format!("CONNECT {}\n", stream::STDIO_PORT).into_bytes();
-        line.extend_from_slice(&stream::name(Named {
-            exec: Exec { conn: TOKEN, id: 9 },
-            stream,
-        }));
-        line
-    };
     let blocking = |end: &Option<hex_api::End>| {
         end.as_ref().is_some_and(|end| {
             !rustix::fs::fcntl_getfl(end)
@@ -1111,7 +1420,13 @@ fn an_offered_streams_connect_waits_for_its_ok_within_the_calls_deadline() {
     );
     let given = opened.expect("an answered offer's streams, opened");
     assert!(blocking(&given.stdin) && blocking(&given.stdout) && given.stderr.is_none());
-    assert_eq!(heard, [named(stream::Stdio::In), named(stream::Stdio::Out)]);
+    assert_eq!(
+        heard,
+        [
+            offered_named(stream::Stdio::In),
+            offered_named(stream::Stdio::Out)
+        ]
+    );
     assert!(
         matches!(
             refused,
@@ -1131,6 +1446,180 @@ fn an_offered_streams_connect_waits_for_its_ok_within_the_calls_deadline() {
         unanswered,
         [format!("CONNECT {}\n", stream::STDIO_PORT).into_bytes()]
     );
+    drop(held);
+}
+
+/// HEX-RT-17, decision 9 (AC-T7.4.1; the review's D-3): open an offered guest exec's stdin and stdout as a Windows
+/// caller does for an exec with no deadline of its own (a plain exec, which HEX-RT-17 holds), its link with no setup
+/// bound, so each CONNECT follows its VM from its start. The muxer answers each CONNECT at once. Expect the streams
+/// opened, each on one CONNECT and named for the exec in its turn.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_offered_streams_connect_with_no_deadline_is_one_connect_each_named() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut vm, started) = offered_vm();
+    let path = dir.path().join("m");
+    let muxer = offered_muxer(UnixListener::bind(&path).unwrap(), |_| false, drop);
+    let opened = open_offered(&offered(&vm, started, path.clone(), None), None);
+    eprintln!("hex_rt_17_offered_following opened={opened:?}");
+    let given = opened.expect("an offer's streams, each on one CONNECT");
+    UnixStream::connect(&path)
+        .unwrap()
+        .write_all(b"STOP\n")
+        .unwrap();
+    let (did, held) = muxer.join().unwrap();
+    drop(vm.stdin.take());
+    let reaped = vm.wait();
+    eprintln!("hex_rt_17_offered_following did={did:?} reaped={reaped:?}");
+    assert!(given.stdin.is_some() && given.stdout.is_some() && given.stderr.is_none());
+    assert_eq!(
+        did,
+        [
+            Muxed::Named(offered_named(stream::Stdio::In)),
+            Muxed::Named(offered_named(stream::Stdio::Out)),
+        ]
+    );
+    drop(held);
+}
+
+/// HEX-RT-17, decision 9 (AC-T7.4.1; the review's D-3): an offered stream's CONNECT for an exec with no deadline, its
+/// muxer never answering, the VM killed as its CONNECT comes. Expect the open refused by type at the VM's end (its
+/// process, which the dial waits on beside its socket, never a deadline), and no CONNECT made after it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_offered_streams_connect_with_no_deadline_is_refused_at_its_vms_end() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (vm, started) = offered_vm();
+    let path = dir.path().join("m");
+    let offer = offered(&vm, started, path.clone(), None);
+    let vm = Arc::new(Mutex::new(vm));
+    let killed = Arc::clone(&vm);
+    let muxer = offered_muxer(
+        UnixListener::bind(&path).unwrap(),
+        |_| true,
+        move |n| {
+            if n == 0 {
+                killed.lock().unwrap().kill().unwrap();
+            }
+        },
+    );
+    let refused = open_offered(&offer, None);
+    eprintln!("hex_rt_17_offered_vm_end refused={refused:?}");
+    assert!(
+        matches!(
+            &refused,
+            Err(Refusal::Os {
+                op: "opening an offered guest stream",
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    UnixStream::connect(&path)
+        .unwrap()
+        .write_all(b"STOP\n")
+        .unwrap();
+    let (did, _) = muxer.join().unwrap();
+    let reaped = vm.lock().unwrap().wait();
+    eprintln!("hex_rt_17_offered_vm_end did={did:?} reaped={reaped:?}");
+    let connect = format!("CONNECT {}\n", stream::STDIO_PORT).into_bytes();
+    assert_eq!(did, [Muxed::GivenUp(connect)]);
+}
+
+/// The review's D-3 (decision 9; AC-T7.4.1): an offered stream's CONNECT with no deadline is one dial, its OK taken
+/// however late. Past W*, the guest link's setup bound the offer carries, the run-out is told once, and the dial goes on
+/// with no clock of its own, ending at its OK, its connection's end or its VM's: it is never given up and made again,
+/// which would drop an answer coming late and redial a slow guest forever. Do measure one CONNECT and its OK against a
+/// stand-in VM's muxer, the W* the offer then carries; open a stream for that offer, the muxer answering its first
+/// CONNECT only once the run-out has been told, and killing the stand-in VM at any CONNECT after it. Expect the stream
+/// opened on its one CONNECT, none made after it, and its late OK the wait's sample.
+#[cfg(target_os = "linux")]
+#[test]
+fn d3_an_offered_connect_with_no_deadline_is_one_dial_its_late_ok_taken() {
+    use hex_testkit::waits::follow::{self, Party};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Mutex;
+
+    static TOLD: Patience = Patience::measuring("test.hex_client.guest.offered_run_out_told");
+    let dir = tempfile::tempdir().unwrap();
+    let (vm, started) = offered_vm();
+    let path = dir.path().join("m");
+    let identity = shards_api::Identity {
+        pid: vm.id(),
+        started,
+        vsock: path.clone(),
+    };
+    let vm = Arc::new(Mutex::new(vm));
+    let listener = UnixListener::bind(&path).unwrap();
+    // Set once W* is measured: the wait whose run-out the muxer waits to see told.
+    let wait: Arc<std::sync::OnceLock<Patience>> = Arc::default();
+    let (told, killed) = (Arc::clone(&wait), Arc::clone(&vm));
+    let muxer = std::thread::spawn(move || {
+        let (mut did, mut held) = (Vec::new(), Vec::new());
+        for n in 0.. {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while line.last() != Some(&b'\n') && conn.read(&mut byte).unwrap_or(0) == 1 {
+                line.push(byte[0]);
+            }
+            if line == b"STOP\n" {
+                break;
+            }
+            if n > 1 {
+                // A CONNECT after the open's first: that one was given up. Its VM ends, which ends the dial.
+                killed.lock().unwrap().kill().unwrap();
+                did.push(Muxed::GivenUp(line));
+                continue;
+            }
+            if n == 1 {
+                // The open's first CONNECT: its OK only once the run-out has been told, past W*.
+                follow::until(
+                    &TOLD,
+                    "the offered CONNECT's run-out, told",
+                    || Party::Live,
+                    || told.get().is_some_and(|wait| wait.deadline().is_none()),
+                )
+                .unwrap();
+            }
+            // Answered (the test names nothing after an OK).
+            if conn.write_all(b"OK 1\n").is_ok() {
+                did.push(Muxed::Named(line));
+                held.push(conn);
+            } else {
+                did.push(Muxed::GivenUp(line));
+            }
+        }
+        (did, held)
+    });
+    // W*: one CONNECT and its OK, answered at once, measured as the link learns its setup bound.
+    let began = std::time::Instant::now();
+    drop(shards_api::connect_borrowed_before(&identity, stream::STDIO_PORT, None).unwrap());
+    let w_star = began.elapsed();
+    let wait =
+        wait.get_or_init(|| Patience::seeded("test.hex_client.guest.offered_connect", w_star));
+    let opened = connect_following(&identity, Some(w_star), wait);
+    eprintln!(
+        "d3_offered_one_dial w_star={w_star:?} opened={:?}",
+        opened.as_ref().map(|_| ())
+    );
+    UnixStream::connect(&path)
+        .unwrap()
+        .write_all(b"STOP\n")
+        .unwrap();
+    let (did, held) = muxer.join().unwrap();
+    drop(vm.lock().unwrap().stdin.take());
+    let reaped = vm.lock().unwrap().wait();
+    eprintln!("d3_offered_one_dial did={did:?} reaped={reaped:?}");
+    assert!(opened.is_ok(), "{:?}", opened.map(|_| ()));
+    let connect = format!("CONNECT {}\n", stream::STDIO_PORT).into_bytes();
+    assert_eq!(did, [Muxed::Named(connect.clone()), Muxed::Named(connect)]);
+    assert!(wait.slowest() >= Some(w_star), "its late OK learned");
     drop(held);
 }
 
@@ -1177,11 +1666,10 @@ fn asked_shards_streams_wait_as_the_callers_files_do() {
             binary: None,
         })
         .unwrap();
-    // A link's bound names a finite deadline (HEX-GUEST-33): the first dial's, as the node gives it before any boot
-    // (`first_dial_bound`), the guest's recorded boot to ready, the boot and listen it waits on (decision 9).
-    let bound = shards::recorded_boot().unwrap();
+    // A first dial as the node makes one before any boot: no record's bound, its W* its own (decision 9; the
+    // review's C-9).
     let transport =
-        Stream::dial(own_link(shards::ShardsLink::new(Arc::from(guest), bound)).unwrap()).unwrap();
+        Stream::dial(own_link(shards::ShardsLink::new(Arc::from(guest), None)).unwrap()).unwrap();
     let given = transport
         .asks(
             1,
@@ -1212,6 +1700,29 @@ fn asked_shards_streams_wait_as_the_callers_files_do() {
     {
         assert!(stdin.socket().is_some());
         assert!(stdout.socket().is_some());
+        // AC-T7.4.1: no handle of these connections passes to a process this one starts with every inheritable
+        // handle (std's `Command`): the caller's ends, nor the control connection's handles the stream holds.
+        let write = transport.write.lock().unwrap();
+        let read = transport.read.lock().unwrap();
+        for (what, socket) in [
+            ("the caller's stdin end", stdin.socket().unwrap()),
+            ("the caller's stdout end", stdout.socket().unwrap()),
+            ("the control connection's writing handle", write.handle()),
+            (
+                "the control connection's waiting handle",
+                transport.handle(),
+            ),
+            (
+                "the control connection's reading handle",
+                read.as_ref().unwrap().handle(),
+            ),
+        ] {
+            assert!(
+                !hex_afunix::inheritable(socket).unwrap(),
+                "{what} passes to processes this one starts"
+            );
+        }
+        drop((write, read));
         // A retained transfer copy closing must not shut down the caller's socket stream.
         let retained: hex_api::End = stdin.socket().unwrap().try_clone_to_owned().unwrap().into();
         drop(retained);
@@ -1226,6 +1737,315 @@ fn asked_shards_streams_wait_as_the_callers_files_do() {
         .read_to_string(&mut output)
         .unwrap();
     assert_eq!(output, "round trip\n");
+}
+
+/// A socket's own number in this process: a file descriptor on Unix, a Winsock socket on Windows. A duplicate is
+/// another number, made while the original is open.
+#[cfg(unix)]
+type RawNumber = std::os::fd::RawFd;
+#[cfg(windows)]
+type RawNumber = std::os::windows::io::RawSocket;
+
+#[cfg(unix)]
+fn raw_number(handle: shards_api::Handle<'_>) -> RawNumber {
+    std::os::fd::AsRawFd::as_raw_fd(&handle)
+}
+
+#[cfg(windows)]
+fn raw_number(handle: shards_api::Handle<'_>) -> RawNumber {
+    std::os::windows::io::AsRawSocket::as_raw_socket(&handle)
+}
+
+#[cfg(unix)]
+fn end_number(end: &hex_api::End) -> RawNumber {
+    std::os::fd::AsRawFd::as_raw_fd(end)
+}
+
+#[cfg(windows)]
+fn end_number(end: &hex_api::End) -> RawNumber {
+    std::os::windows::io::AsRawSocket::as_raw_socket(&end.socket().unwrap())
+}
+
+/// A Shards guest that hands out its connections as they are dialed, each recorded by its socket's own number and
+/// counted at each clone of it (the review's D-5).
+struct RecordingGuest {
+    guest: Box<dyn shards_api::Guest>,
+    dialed: Arc<std::sync::Mutex<Vec<RawNumber>>>,
+    clones: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RecordingGuest {
+    fn record(
+        &self,
+        stream: Result<Box<dyn shards_api::Stream>, shards_api::Refusal>,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        let stream = stream?;
+        self.dialed
+            .lock()
+            .unwrap()
+            .push(raw_number(stream.handle()));
+        Ok(Box::new(Cloned {
+            stream,
+            clones: Arc::clone(&self.clones),
+        }))
+    }
+}
+
+impl shards_api::Guest for RecordingGuest {
+    fn process_exited(&self) -> Result<bool, shards_api::Refusal> {
+        self.guest.process_exited()
+    }
+
+    fn connect(
+        &self,
+        port: u32,
+        patience: Duration,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        self.record(self.guest.connect(port, patience))
+    }
+
+    fn connect_before(
+        &self,
+        port: u32,
+        at: std::time::Instant,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        self.record(self.guest.connect_before(port, at))
+    }
+
+    fn connect_once_before(
+        &self,
+        port: u32,
+        at: std::time::Instant,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        self.record(self.guest.connect_once_before(port, at))
+    }
+
+    fn connect_while_runs(
+        &self,
+        port: u32,
+    ) -> Result<Box<dyn shards_api::Stream>, shards_api::Refusal> {
+        self.record(self.guest.connect_while_runs(port))
+    }
+
+    fn stop(&self) -> Result<(), shards_api::Refusal> {
+        self.guest.stop()
+    }
+
+    fn wait_for(&self, timeout: Duration) -> Result<Option<shards_api::End>, shards_api::Refusal> {
+        self.guest.wait_for(timeout)
+    }
+
+    fn identity(&self) -> Result<shards_api::Identity, shards_api::Refusal> {
+        self.guest.identity()
+    }
+}
+
+/// A Shards connection whose clones are counted.
+struct Cloned {
+    stream: Box<dyn shards_api::Stream>,
+    clones: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Read for Cloned {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for Cloned {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl shards_api::Stream for Cloned {
+    fn try_clone(&self) -> std::io::Result<Box<dyn shards_api::Stream>> {
+        self.clones
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(Cloned {
+            stream: self.stream.try_clone()?,
+            clones: Arc::clone(&self.clones),
+        }))
+    }
+
+    fn read_shared(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read_shared(buf)
+    }
+
+    fn write_shared(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write_shared(buf)
+    }
+
+    fn into_socket(self: Box<Self>) -> shards_api::OwnedSocket {
+        self.stream.into_socket()
+    }
+
+    fn handle(&self) -> shards_api::Handle<'_> {
+        self.stream.handle()
+    }
+
+    fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
+        self.stream.set_nonblocking(on)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+        self.stream.shutdown(how)
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream.set_write_timeout(timeout)
+    }
+
+    fn buffer_sizes(&self) -> std::io::Result<(usize, usize)> {
+        self.stream.buffer_sizes()
+    }
+}
+
+/// A Shards simulator guest whose relay hands out its token, then echoes an exec's stdin to its stdout, booted, as
+/// [`RecordingGuest`] sees it: what it dialed and how often a connection was cloned.
+fn recorded_echo() -> (
+    RecordingGuest,
+    Arc<std::sync::Mutex<Vec<RawNumber>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use shards_api::Guests;
+
+    let guests = shards_api::sim::SimGuests::new(|host| {
+        host.listen(stream::CONTROL_PORT);
+        host.listen(stream::STDIO_PORT);
+        let (port, mut control) = host.accept().unwrap();
+        assert_eq!(port, stream::CONTROL_PORT);
+        control.write_all(&TOKEN.to_le_bytes()).unwrap();
+        let mut named = std::collections::BTreeMap::new();
+        for _ in 0..2 {
+            let Some((_, mut conn)) = host.accept() else {
+                return shards_api::End::PowerOff;
+            };
+            let mut name = [0u8; stream::NAME_BYTES];
+            conn.read_exact(&mut name).unwrap();
+            named.insert(stream::read_name(&name).unwrap().stream, conn);
+        }
+        let mut stdin = named.remove(&stream::Stdio::In).unwrap();
+        let mut stdout = named.remove(&stream::Stdio::Out).unwrap();
+        std::io::copy(&mut stdin, &mut stdout).unwrap();
+        shards_api::End::PowerOff
+    });
+    let guest = guests
+        .boot(&shards_api::GuestSpec {
+            kernel: "kernel".into(),
+            init: shards_api::Init::Executable("init".into()),
+            cmdline: String::new(),
+            vcpus: 1,
+            gpu: false,
+            gpu_devices: Vec::new(),
+            memory_mib: shards_api::min_memory_mib(std::env::consts::ARCH),
+            disks: vec![],
+            shares: vec![],
+            ports: vec![stream::CONTROL_PORT, stream::STDIO_PORT],
+            binary: None,
+        })
+        .unwrap();
+    let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (
+        RecordingGuest {
+            guest,
+            dialed: Arc::clone(&dialed),
+            clones: Arc::clone(&clones),
+        },
+        dialed,
+        clones,
+    )
+}
+
+/// The review's D-5 (part 2), AC-T7.4.1: a Shards guest's control connection is read, written and waited on through
+/// one socket, never a clone of it: on Windows a duplicate socket is inheritable until it is cleared, so a process
+/// another thread starts then would hold the connection. Do: dial a node's control connection over a Shards link.
+/// Expect: no clone of the dialed connection.
+#[test]
+fn d5_a_shards_control_connection_is_shared_never_cloned() {
+    let (guest, dialed, clones) = recorded_echo();
+    let transport =
+        Stream::dial(own_link(shards::ShardsLink::new(Arc::new(guest), None)).unwrap()).unwrap();
+    assert_eq!(dialed.lock().unwrap().len(), 1, "one control connection");
+    assert_eq!(
+        clones.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the control connection was cloned"
+    );
+    drop(transport);
+}
+
+/// The review's D-5 (part 2), AC-T7.4.1: an exec's stream asked over a Shards link is handed to its caller as its
+/// connection's own socket, moved, never a duplicate (Shards' `Stream::into_socket`). Do: ask stdin and stdout over a
+/// Shards link, and echo through the caller's ends. Expect: each end is the socket dialed for it, by its number, and
+/// the echo comes back whole.
+#[test]
+fn d5_an_asked_shards_stream_is_its_connections_own_socket() {
+    let (guest, dialed, _) = recorded_echo();
+    let transport =
+        Stream::dial(own_link(shards::ShardsLink::new(Arc::new(guest), None)).unwrap()).unwrap();
+    let given = transport
+        .asks(
+            1,
+            hex_api::Ask {
+                stdin: true,
+                stdout: true,
+                stderr: false,
+            },
+        )
+        .unwrap();
+    let (stdin, stdout) = (given.stdin.unwrap(), given.stdout.unwrap());
+    let dialed = dialed.lock().unwrap().clone();
+    assert_eq!(
+        dialed.len(),
+        3,
+        "the control connection, then stdin's, then stdout's"
+    );
+    assert_eq!(
+        (end_number(&stdin), end_number(&stdout)),
+        (dialed[1], dialed[2]),
+        "a caller's end is a duplicate of its connection, not the connection's own socket"
+    );
+    let mut stdin = hex_api::OwnedStream::from(stdin);
+    stdin.write_all(b"handed over\n").unwrap();
+    drop(stdin);
+    let mut output = String::new();
+    hex_api::OwnedStream::from(stdout)
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(output, "handed over\n");
+}
+
+/// AC-T7.4.1: do hand a guest stdio connection's end to its caller and take a connection's handle as the guest stream
+/// holds its control's, over TCP; expect neither to pass to a process this one starts with every inheritable handle
+/// (std's `Command`). A socket duplicated for this process comes back inheritable (std's `try_clone` and
+/// `try_clone_to_owned`, by `WSADuplicateSocketW`; jupiter, Rust 1.99.1), so a process another thread started held the
+/// connection past its owner and reset it as it ended: the budget tests' `10054`, beside a test that starts one.
+#[cfg(windows)]
+#[test]
+fn a_tcp_connections_duplicates_pass_to_no_process_this_one_starts() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (_peer, _) = listener.accept().unwrap();
+    let end = caller_end(&conn).unwrap();
+    let held = Duplex::try_clone(&conn).unwrap();
+    assert!(
+        !hex_afunix::inheritable(end.socket().unwrap()).unwrap(),
+        "the caller's end passes to processes this one starts"
+    );
+    assert!(
+        !hex_afunix::inheritable(held.handle()).unwrap(),
+        "a connection's held handle passes to processes this one starts"
+    );
 }
 
 /// Native plan step 8 (1), CLAUDE.md §2: the event form's writes queue behind a backlog bounded in bytes.
@@ -1598,6 +2418,10 @@ struct ConnectLink {
 }
 
 impl Link for ConnectLink {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn reply_budget(&self) -> Option<Duration> {
         self.budget
     }
@@ -1760,6 +2584,39 @@ fn constructor_hello(trace: &ConnectTrace) -> ConstructorHello {
     }
 }
 
+/// `form`'s connect's cap as this host measures it, decision 9's W* (Ada's rule of 2026-11-13: no budget of a test's is
+/// fixed): the same connect carried to its answer under a cap no answer here comes near ([`crate::calls::MOST_ONE_WAIT`],
+/// so it takes the capped path, every deadline step of it), its token and its hello's answer there to read, run by a
+/// worker thread of its own; its time from that thread's spawn to its answer heard here is a sample of `steps`, and the
+/// cap is the slowest `steps` has seen, the first sample its cold start. The cap's value is coverage alone (ROOT,
+/// 2026-11-14): the verdict rests on what the connect armed and on its refusal never coming before its deadline.
+fn connect_cap(form: ConnectForm, steps: &'static hex_core::patience::Patience) -> Duration {
+    /// The measured connect's answer, heard from its worker.
+    static ANSWERED: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("test.hex_client.guest.connect_measured_answered");
+    let (socket, mut peer) = connect_pair();
+    peer.write_all(&TOKEN.to_le_bytes()).unwrap();
+    send_answer(&mut peer, 1, &Answer::Hello(agents_hello()));
+    let (link, _) = connect_link(Some(socket), None);
+    let began = Instant::now();
+    let (finished, answer) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let far = Instant::now()
+            .checked_add(crate::calls::MOST_ONE_WAIT)
+            .unwrap();
+        let _ = finished.send(connect_form(form, link, far).map(drop));
+    });
+    let connected = connected_by(&ANSWERED, &answer, &worker);
+    let took = began.elapsed();
+    worker.join().unwrap();
+    drop(peer);
+    connected.unwrap().unwrap();
+    hex_testkit::waits::answered(steps, took);
+    let cap = steps.deadline().unwrap_or(took);
+    eprintln!("client_budget_cap form={form:?} took={took:?} w_star={cap:?}");
+    cap
+}
+
 /// AC-T7.4.1: both public constructors reject expired/invalid authority before dial,
 /// preserve an exact absolute instant with no Link budget, and honor a smaller configured cap.
 #[test]
@@ -1815,28 +2672,38 @@ fn absolute_connect_rejects_before_dial_and_preserves_smaller_caps() {
 
 /// AC-T7.4.1: actual partial token reads and the hello send/wait consume the same
 /// original cap even when Link has no default budget. Both constructor forms are covered.
+/// Expect every wait each connect armed, in its own thread, at its one deadline, the dial's
+/// too, and its refusal its caller's, never before that deadline. Each form's cap is this
+/// host's own ([`connect_cap`]), taken in the connect's own worker as it starts; whether the
+/// host let it read its token's first byte (a partial token) or send its whole hello (a whole
+/// token) before its cap is told to the census.
 #[test]
 fn absolute_connect_caps_partial_token_and_unanswered_hello() {
+    use crate::calls::{armed, armed_at};
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
+    /// The same connect, answered.
+    static STEPS: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("test.hex_client.guest.connect_steps");
+    static CAPPED: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("test.hex_client.guest.connect_capped");
 
     let mut observations = Vec::with_capacity(4);
     for form in [ConnectForm::Ordinary, ConnectForm::Evented] {
+        let cap = connect_cap(form, &STEPS);
         for whole_token in [false, true] {
             let (socket, mut peer) = connect_pair();
             let token = TOKEN.to_le_bytes();
             let prefix = if whole_token { &token[..] } else { &token[..1] };
             peer.write_all(prefix).unwrap();
             let (link, trace) = connect_link(Some(socket), None);
-            let at = Instant::now().checked_add(CONNECT_CAP).unwrap();
             let (finished, answer) = mpsc::sync_channel(1);
             let worker = std::thread::spawn(move || {
+                let at = Instant::now().checked_add(cap).unwrap();
                 let result = connect_form(form, link, at).map(drop);
-                let _ = finished.send((Instant::now(), result));
+                let _ = finished.send((at, Instant::now(), result, armed()));
             });
             // No assertion may bypass this owned socket close and actor join.
-            static CAPPED: hex_core::patience::Patience =
-                hex_core::patience::Patience::measuring("test.hex_client.guest.connect_capped");
             let observed = connected_by(&CAPPED, &answer, &worker);
             let stopped = peer.shutdown(Shutdown::Both);
             drop(peer);
@@ -1845,7 +2712,7 @@ fn absolute_connect_caps_partial_token_and_unanswered_hello() {
             observations.push((
                 form,
                 whole_token,
-                at,
+                cap,
                 observed,
                 stopped,
                 joined.is_ok(),
@@ -1854,60 +2721,115 @@ fn absolute_connect_caps_partial_token_and_unanswered_hello() {
             ));
         }
     }
-    let mut uncommitted = Vec::with_capacity(2);
     // All four owned peers are closed and actors joined before any assertion.
-    for (form, whole_token, at, observed, stopped, joined, read, trace) in observations {
+    for (form, whole_token, cap, observed, stopped, joined, read, trace) in observations {
         let hello = constructor_hello(&trace);
         eprintln!(
-            "client_connect_absolute form={form:?} whole_token={whole_token} at={at:?} observed={observed:?} read={read} stopped={stopped:?} joined={joined} hello={hello:?}"
+            "client_connect_absolute form={form:?} whole_token={whole_token} cap={cap:?} observed={observed:?} read={read} stopped={stopped:?} joined={joined} hello={hello:?}"
         );
         assert!(joined);
-        let (returned, result) = observed.expect("constructor did not return before owned cleanup");
-        assert_eq!(
-            read,
-            if whole_token { stream::TOKEN_BYTES } else { 1 },
-            "missing actual read progress is a harness miss"
-        );
-        assert!(matches!(result, Err(Refusal::Os { .. })), "{result:?}");
-        assert_eq!(
-            *trace.dials.lock().unwrap(),
-            [(stream::CONTROL_PORT, Some(at))]
-        );
-        if whole_token {
-            if let Some(header) = hello.header {
-                assert_eq!(header.id, 1);
-                assert!(!hello.pending && hello.buffered == 0);
-                eprintln!(
-                    "client_connect_hello form={form:?} phase=committed_hello withheld_answer_proof=true"
-                );
+        let (at, returned, result, log) =
+            observed.expect("constructor did not return before owned cleanup");
+        // A partial token's path: its first byte read before its cap. A whole one's: its hello sent whole, its
+        // answer's wait armed.
+        let progressed = if whole_token {
+            log.iter().any(|armed| armed.what == "the answer")
+        } else {
+            read == 1
+        };
+        eprintln!(
+            "client_budget_path test=absolute_connect_caps_partial_token_and_unanswered_hello/{form:?}/{} path={}",
+            if whole_token {
+                "whole_token"
             } else {
-                let phase = if hello.written.is_empty() {
-                    "learned_before_send"
-                } else {
-                    "learned_during_incomplete_send"
-                };
-                eprintln!(
-                    "client_connect_hello form={form:?} phase={phase} withheld_answer_proof=false status=UNVERIFIED written={:02x?}",
-                    hello.written
+                "partial_token"
+            },
+            if progressed { "progressed" } else { "cut" }
+        );
+        assert!(
+            armed_at(&log, &["starting a client operation"], Some(at)),
+            "{log:?}"
+        );
+        let dials = trace.dials.lock().unwrap();
+        assert!(
+            dials.is_empty() || *dials == [(stream::CONTROL_PORT, Some(at))],
+            "{dials:?}"
+        );
+        assert!(
+            matches!(&result, Err(Refusal::Os { why, .. }) if why.contains("absolute")),
+            "{result:?}"
+        );
+        assert!(
+            returned >= at,
+            "refused {:?} before its deadline",
+            at.saturating_duration_since(returned)
+        );
+        match (whole_token, progressed) {
+            (false, true) => {
+                // Its first byte read, the rest never come: its token's read waited at the one deadline, refused by it.
+                assert_eq!(*dials, [(stream::CONTROL_PORT, Some(at))]);
+                assert!(
+                    armed_at(
+                        &log,
+                        &["reading the relay's token for the connection"],
+                        Some(at)
+                    ),
+                    "{log:?}"
                 );
                 assert!(
-                    matches!(&result, Err(Refusal::Os { op: "sending to the node agent", why }) if why.contains("twice")),
-                    "uncommitted Hello must be explained by its smaller learned send bound: {result:?}"
+                    matches!(
+                        &result,
+                        Err(Refusal::Os {
+                            op: "reading the relay's token for the connection",
+                            ..
+                        })
+                    ),
+                    "{result:?}"
                 );
-                uncommitted.push((form, phase));
+                assert!(hello.written.is_empty());
             }
-        } else {
-            assert!(hello.written.is_empty());
-            assert!(
-                matches!(&result, Err(Refusal::Os { why, .. }) if why.contains("absolute"))
-                    && returned >= at
-            );
+            (true, true) => {
+                // Its token read, its hello sent whole, no answer: its answer's wait at the one deadline, refused by it.
+                assert_eq!(*dials, [(stream::CONTROL_PORT, Some(at))]);
+                assert_eq!(read, stream::TOKEN_BYTES);
+                let header = hello.header.expect("its hello went whole before its cap");
+                assert_eq!(header.id, 1);
+                assert!(!hello.pending && hello.buffered == 0);
+                assert!(
+                    armed_at(
+                        &log,
+                        &[
+                            "reading the relay's token for the connection",
+                            "sending",
+                            "the answer"
+                        ],
+                        Some(at)
+                    ),
+                    "{log:?}"
+                );
+                assert!(
+                    matches!(
+                        &result,
+                        Err(Refusal::Os {
+                            op: "waiting for the node agent's answer",
+                            ..
+                        })
+                    ),
+                    "{result:?}"
+                );
+            }
+            (false, false) => {
+                // Its cap passed before its token's first byte was read: nothing read, nothing sent.
+                assert_eq!(read, 0);
+                assert!(hello.written.is_empty());
+            }
+            (true, false) => {
+                // Its cap passed before its hello went whole: no answer's wait armed.
+                assert!(read <= stream::TOKEN_BYTES);
+                assert!(hello.header.is_none());
+            }
         }
     }
-    assert!(
-        uncommitted.is_empty(),
-        "UNVERIFIED withheld-answer phase: no complete actual Hello; harness witness miss, not a production timeout failure: {uncommitted:?}"
-    );
 }
 
 /// AC-T7.4.1: a complete real hello reaches both constructors; the event form keeps
@@ -1981,7 +2903,7 @@ fn shards_link_carries_the_original_absolute_deadline_and_bytes() {
         given: std::sync::Mutex::new(Vec::new()),
         absolute: std::sync::Mutex::new(Vec::new()),
     });
-    let link = shards::ShardsLink::new(guest.clone(), Duration::from_secs(1));
+    let link = shards::ShardsLink::new(guest.clone(), Some(Duration::from_secs(1)));
     assert!(
         link.dial_before(stream::CONTROL_PORT, Some(Instant::now()))
             .is_err()
@@ -2064,6 +2986,119 @@ fn duplex_owner_preserves_io_and_explicit_native_clone_lifetime() {
     assert_eq!(eof.unwrap(), 0);
 }
 
+/// The relay's token on a control connection whose caller gave no deadline, as decision 9 waits (the review's D-2).
+mod relay_token {
+    use std::net::Shutdown;
+    use std::thread::JoinHandle;
+
+    use hex_core::patience::Patience;
+    use hex_testkit::waits::follow::{self, Party, Unmet};
+
+    use super::*;
+
+    /// A transport of this test's own: the guest's answer tables, and a token wait no other test's tokens move.
+    struct Own;
+
+    static OWN_TOKEN: Patience = Patience::measuring("test.hex_client.guest.relay_token");
+    /// The relay's wait for the token wait's run-out to be told, the connecting thread its party.
+    static TOLD: Patience = Patience::measuring("test.hex_client.guest.relay_token_told");
+
+    impl Waits for Own {
+        fn answers() -> &'static [Patience; KINDS] {
+            Guest::answers()
+        }
+
+        fn class_answers(class: Class) -> &'static [Patience; BOX_KINDS] {
+            Guest::class_answers(class)
+        }
+
+        fn token() -> &'static Patience {
+            &OWN_TOKEN
+        }
+    }
+
+    /// A connect through `link` with no caller deadline, on a thread of its own: its relay's token, or its refusal.
+    fn connecting(link: &LinkOwner) -> JoinHandle<Result<u64, Refusal>> {
+        let link = triomphe::Arc::clone(link);
+        std::thread::spawn(move || Stream::<Own>::dial_before(link, None, None).map(|s| s.token))
+    }
+
+    /// The token wait's run-out told (its W* gone), waited for while `connect` runs.
+    fn told(connect: &JoinHandle<Result<u64, Refusal>>) -> Result<u64, Unmet> {
+        follow::until(
+            &TOLD,
+            "the relay token's run-out told",
+            || {
+                if connect.is_finished() {
+                    Party::Ended
+                } else {
+                    Party::Live
+                }
+            },
+            || OWN_TOKEN.deadline().is_none(),
+        )
+    }
+
+    /// The review's D-2 (decision 9; AC-T7.4.1), on every OS: connect three times with no caller deadline. The relay
+    /// sends the first connect's token at once; the second's first half at once, and its second half once the token
+    /// wait's run-out has been told; the third's first half, then ends its sending once the run-out has been told.
+    /// Expect the first token its wait's first sample, W*; the second read past W*, its run-out told and the read
+    /// following the connection to the token, the half read before kept, and W* risen to that late token; the third
+    /// refused at the connection's end, typed, naming the token, and no sample.
+    #[test]
+    fn ac_t7_4_1_a_relay_token_with_no_deadline_is_waited_for_past_w_star_by_its_connection() {
+        let (control, _stdio, link) = listeners();
+        let token = TOKEN.to_le_bytes();
+        let (head, tail) = token.split_at(stream::TOKEN_BYTES / 2);
+
+        let connect = connecting(&link);
+        let (mut relay, _) = control.accept().unwrap();
+        relay.write_all(&token).unwrap();
+        let first = connect.join().unwrap();
+        let w_star = OWN_TOKEN.slowest();
+        eprintln!("d_2_relay_token first={first:?} w_star={w_star:?}");
+        assert_eq!(first, Ok(TOKEN));
+        assert!(
+            w_star.is_some(),
+            "the first token was no sample of its wait"
+        );
+
+        let connect = connecting(&link);
+        let (mut relay, _) = control.accept().unwrap();
+        relay.write_all(head).unwrap();
+        let past = told(&connect);
+        relay.write_all(tail).unwrap();
+        let second = connect.join().unwrap();
+        let risen = OWN_TOKEN.slowest();
+        eprintln!("d_2_relay_token past={past:?} second={second:?} risen={risen:?}");
+        assert!(past.is_ok(), "{past:?}: no run-out was told past W*");
+        assert_eq!(
+            second,
+            Ok(TOKEN),
+            "the half read before W* passed wasn't kept"
+        );
+        assert!(
+            risen > w_star,
+            "W* didn't rise to the late token: {w_star:?}, then {risen:?}"
+        );
+
+        let connect = connecting(&link);
+        let (mut relay, _) = control.accept().unwrap();
+        relay.write_all(head).unwrap();
+        let past = told(&connect);
+        relay.shutdown(Shutdown::Write).unwrap();
+        let third = connect.join().unwrap();
+        let after = OWN_TOKEN.slowest();
+        eprintln!("d_2_relay_token past={past:?} third={third:?} after={after:?}");
+        assert!(past.is_ok(), "{past:?}: no run-out was told past W*");
+        assert!(
+            matches!(&third, Err(Refusal::Os { op, .. }) if op.contains("token")),
+            "{third:?}"
+        );
+        assert_eq!(after, risen, "a refusal moved W*");
+    }
+}
+
 /// The relay token's read on a link with no setup bound of its own, as QUIC's bridged socket is (`hex_quic::link`),
 /// against XNU's lost half-close wakeup (joint plan step 4, 2(a); Shards M236, D175).
 #[cfg(unix)]
@@ -2099,6 +3134,10 @@ mod token_end {
     struct Paired(Mutex<Option<UnixStream>>);
 
     impl Link for Paired {
+        fn lends_identity(&self) -> bool {
+            false
+        }
+
         fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
             assert_eq!(port, stream::CONTROL_PORT);
             own_duplex(self.0.lock().unwrap().take().expect("dialed once"))
@@ -2176,7 +3215,7 @@ mod token_end {
 /// An output stream's own half (joint plan step 4: ROOT's decision of 2026-11-12, 1-2).
 mod output_end {
     use hex_core::patience::Patience;
-    use hex_testkit::waits::until;
+    use hex_testkit::waits::follow;
 
     use super::*;
 
@@ -2212,12 +3251,12 @@ mod output_end {
             send_answer(&mut conn, h.id, &Answer::Started { pid: 9 });
             check.recv().unwrap();
             for (which, s) in &mut named {
-                s.set_nonblocking(true).unwrap();
-                until(&ENDED, "an output connection's End after its name", || {
-                    matches!(s.read(&mut [0u8; 1]), Ok(0))
-                })
-                .unwrap();
-                s.set_nonblocking(false).unwrap();
+                // A read that ends on the connection's own event: the End after its name, or the client's close.
+                let ended =
+                    follow::whole(&ENDED, "an output connection's End after its name", || {
+                        s.read(&mut [0u8; 1])
+                    });
+                assert!(matches!(ended, Ok(0)), "{ended:?}");
                 s.write_all(format!("{which:?}\n").as_bytes()).unwrap();
             }
             drop(named);
@@ -2333,6 +3372,10 @@ mod cut_short {
     }
 
     impl Link for Cuttables {
+        fn lends_identity(&self) -> bool {
+            false
+        }
+
         fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
             if port == stream::CONTROL_PORT {
                 return own_duplex(TcpStream::connect(self.control).unwrap());

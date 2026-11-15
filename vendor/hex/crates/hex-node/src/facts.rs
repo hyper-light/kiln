@@ -651,6 +651,11 @@ pub fn capacity(dir: &Path, id: String) -> Result<hex_api::Capacity, Refusal> {
         .unwrap_or(0);
     #[cfg(target_os = "linux")]
     let cpu = here::cpu_milli(cpu);
+    // What its machine has run and how long it has been up (joint plan step 14, C7), where its platform reads them.
+    #[cfg(target_os = "linux")]
+    let own = here::machine_time();
+    #[cfg(not(target_os = "linux"))]
+    let own = hex_api::MachineTime::default();
     let total = hex_api::CapacityResources {
         cpu_milli: cpu,
         mem_bytes: memory.total,
@@ -662,6 +667,7 @@ pub fn capacity(dir: &Path, id: String) -> Result<hex_api::Capacity, Refusal> {
         disk_bytes: disk.free.min(disk.total),
     };
     let capacity = hex_api::Capacity {
+        own,
         routes: Vec::new(),
         device_routes: Vec::new(),
         backings: Vec::new(),
@@ -672,6 +678,8 @@ pub fn capacity(dir: &Path, id: String) -> Result<hex_api::Capacity, Refusal> {
         free,
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     capacity.check()?;
     Ok(capacity)
@@ -762,6 +770,16 @@ mod here {
             }
         }
         memory
+    }
+
+    /// This machine's CPU time since its boot and its uptime (joint plan step 14, C7): `/proc/stat` and `/proc/uptime`
+    /// at the kernel's clock ticks a second, each none where it doesn't read.
+    pub fn machine_time() -> hex_api::MachineTime {
+        facts::machine_time(
+            &read("/proc/stat").unwrap_or_default(),
+            &read("/proc/uptime").unwrap_or_default(),
+            rustix::param::clock_ticks_per_second(),
+        )
     }
 
     /// cgroup v2 cpu.max is quota/period, in microseconds; keep fractional CPUs as milli,
@@ -1035,6 +1053,29 @@ fn statvfs(dir: &Path) -> Disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Joint plan step 14 (C7; ROOT, 2026-11-13): a Linux node's capacity answer says what its machine has run and how
+    /// long it has been up, as a shared backing's runtime learns its guest's own CPU from its agent's answer; another
+    /// platform's says neither. Do answer this machine's capacity twice. Expect, on Linux, both read, its CPU time and
+    /// uptime never falling from one answer to the next; elsewhere, neither.
+    #[test]
+    fn w14_a_linux_nodes_capacity_answer_says_its_machines_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = capacity(dir.path(), "node".into()).unwrap().own;
+        let next = capacity(dir.path(), "node".into()).unwrap().own;
+        if cfg!(target_os = "linux") {
+            let (Some(cpu), Some(up)) = (first.cpu_ns, first.uptime_ns) else {
+                panic!("{first:?}");
+            };
+            assert!(up > 0, "{first:?}");
+            assert!(
+                next.cpu_ns >= Some(cpu) && next.uptime_ns >= Some(up),
+                "{first:?} then {next:?}"
+            );
+        } else {
+            assert_eq!((first, next), Default::default());
+        }
+    }
 
     /// CP-T7.4, the per-OS facts: do probe this machine; expect its platform the build's, threads
     /// and memory and the volume's size read (each OS's own interface: `/proc` and statvfs on Linux,
@@ -1566,6 +1607,7 @@ mod physical_merge_tests {
             Err(Refusal::Backing {
                 key,
                 cause: LifecycleCause::Uncertain,
+                why: None,
             }),
         )
         .unwrap();
@@ -1576,7 +1618,8 @@ mod physical_merge_tests {
             report.unavailable[0].cause,
             Refusal::Backing {
                 key,
-                cause: LifecycleCause::Uncertain
+                cause: LifecycleCause::Uncertain,
+                why: None,
             }
         );
         let mut readiness = reading();
@@ -1606,7 +1649,8 @@ mod physical_merge_tests {
                 Class::Firecracker,
                 Err(Refusal::Backing {
                     key,
-                    cause: LifecycleCause::Pending
+                    cause: LifecycleCause::Pending,
+                    why: None,
                 })
             )
             .is_err()
@@ -1635,6 +1679,7 @@ mod physical_merge_tests {
             Err(Refusal::Backing {
                 key,
                 cause: LifecycleCause::Pending,
+                why: None,
             }),
         )
         .unwrap();

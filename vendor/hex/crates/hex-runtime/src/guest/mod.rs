@@ -12,10 +12,12 @@ mod family;
 pub mod gpu;
 mod gpu_pool;
 pub mod held;
-pub mod hosted;
 mod image;
 mod leases;
 mod managed;
+#[cfg(target_os = "linux")]
+pub(crate) use managed::wait_stopped;
+pub use managed::{CapCycle, ManagedGuestTime, ManagedRate};
 #[cfg(any(test, feature = "native-trusted-entry-measurement"))]
 pub(crate) mod native_fixture;
 mod observer;
@@ -23,11 +25,12 @@ mod physical;
 mod pool;
 pub mod rewrite;
 mod route;
+mod run_out;
 pub mod selected;
 mod shared;
 pub mod shares;
 
-pub use image::{ImageClass, ImageWaits, host_images};
+pub use image::{ImageClass, ImageWaits, NodeBooted, NodeVm, host_images};
 pub use observer::config::{
     ENV_GPU_OBSERVER_FILE, ENV_GPU_OBSERVER_SHA256, GpuArtifact, GpuArtifactRole, GpuObserver,
     GpuObserverInput,
@@ -35,7 +38,8 @@ pub use observer::config::{
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -43,7 +47,6 @@ use hex_api::{
     BoxId, BoxInfo, BoxSpec, Class, ClassSpec, Proc, Program, Refusal, Rootfs, Runtime, Signal,
     Stdio, Usage,
 };
-#[cfg(test)]
 use hex_client::guest::Link;
 use hex_client::guest::shards::{ShardsLink, refusal};
 use hex_client::guest::stage::{self, Item};
@@ -54,6 +57,8 @@ use shares::Share;
 
 /// The existing evented connection owner, shared without an unchecked new Arc.
 pub type EventedClient = triomphe::Arc<Client>;
+
+pub use dedicated::ExecClient;
 
 fn evented_owner(client: Client) -> Result<EventedClient, Refusal> {
     triomphe::Arc::try_new(client).map_err(|_| Refusal::Exhausted {
@@ -74,8 +79,8 @@ pub use cost::{
 pub struct GuestConfig {
     /// The `shards` binary that boots it (on macOS the signed build, run where it is installed).
     pub binary: PathBuf,
-    pub kernel: PathBuf,
-    pub initrd: PathBuf,
+    /// Which form of the guest it boots: the one, never both.
+    pub boot: Boot,
     pub vcpus: u32,
     pub memory_mib: u64,
     /// Enable Shards' existing shared Venus GPU; physical reservations still require mapping.
@@ -83,6 +88,18 @@ pub struct GuestConfig {
     pub shares: Vec<Share>,
     /// Where the guest's relay stages each box's root: [`stage::STAGED`], the guest's tmpfs.
     pub staged: String,
+}
+
+/// How a node boots its guest, one form or the other (docs/design/node-under-shards-init.md §4), so that both can't
+/// be configured at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Boot {
+    /// Shards' direct boot of Hex's own kernel and initramfs, whose `/init` is `hex`, the guest's PID 1
+    /// (`HEX_GUEST_KERNEL`, `HEX_GUEST_INITRD`).
+    Kernel { kernel: PathBuf, initrd: PathBuf },
+    /// Hex's node image, pinned by digest, booted through Shards' image boot under shards-init with its nesting grant
+    /// (`HEX_GUEST_IMAGE`).
+    Image(String),
 }
 
 /// The environment variables a node reads its guest from.
@@ -104,46 +121,48 @@ impl GuestConfig {
         Self::from_vars(|name| std::env::var_os(name))
     }
 
-    /// The guest named by `var`: `SHARDS_BIN`, `HEX_GUEST_KERNEL`, `HEX_GUEST_INITRD`,
-    /// `HEX_GUEST_CPUS` and `HEX_GUEST_MEMORY_MIB`, each needed (Shards is never taken from `PATH`
-    /// unasked, and the guest's vCPUs and memory are the node's to give from its budget, §1, so none is
-    /// guessed), and `HEX_GUEST_SHARES` (else [`shares::defaults`]). Every one missing is named in one
-    /// refusal, read before anything boots, so an operator fixes them in one go. Shards refuses vCPUs or
-    /// memory past the host's (its `Bounds`) when it boots.
+    /// The guest named by `var`: `SHARDS_BIN`, its form (`HEX_GUEST_KERNEL` and `HEX_GUEST_INITRD`, or
+    /// `HEX_GUEST_IMAGE`), `HEX_GUEST_CPUS` and `HEX_GUEST_MEMORY_MIB`, each needed (Shards is never taken from
+    /// `PATH` unasked, and the guest's vCPUs and memory are the node's to give from its budget, §1, so none is
+    /// guessed), and `HEX_GUEST_SHARES` (else [`shares::defaults`]). Every one missing is named in one refusal, read
+    /// before anything boots, so an operator fixes them in one go. Shards refuses vCPUs or memory past the host's (its
+    /// `Bounds`) when it boots.
     ///
-    /// A guest under shards-init ([`ENV_IMAGE`]) is refused `Awaits(NestedChannel)` before anything else is read
-    /// or booted: its host would reach its node only through a lane of Shards' agent-control endpoint to the node's
-    /// sockets, which Shards doesn't give yet (docs/design/node-under-shards-init.md §5). Named beside the kernel or
-    /// the initramfs, it is refused naming both forms.
+    /// A guest under shards-init ([`ENV_IMAGE`]) boots through the image class and is reached through its run's
+    /// agent-control endpoint (docs/design/node-under-shards-init.md §5). Named beside the kernel or the initramfs, it
+    /// is refused naming both forms; asked a GPU, it awaits D234's `gpus=` ([`hex_api::Upstream::NestedRuntime`]).
     pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, Refusal> {
-        if var(ENV_IMAGE).is_some() {
+        let image = var(ENV_IMAGE);
+        if image.is_some() {
             let direct: Vec<&str> = [ENV_KERNEL, ENV_INITRD]
                 .into_iter()
                 .filter(|name| var(name).is_some())
                 .collect();
-            if direct.is_empty() {
-                return Err(Refusal::Awaits {
-                    needs: hex_api::Upstream::NestedChannel,
+            if !direct.is_empty() {
+                return Err(Refusal::Invalid {
+                    what: "the oci class's guest",
+                    why: format!(
+                        "{ENV_IMAGE} and {} are both set: a node boots one form of its guest, the image under \
+                         shards-init or the kernel and initramfs",
+                        direct.join(", ")
+                    ),
                 });
             }
-            return Err(Refusal::Invalid {
-                what: "the oci class's guest",
-                why: format!(
-                    "{ENV_IMAGE} and {} are both set: a node boots one form of its guest, the image under \
-                     shards-init or the kernel and initramfs",
-                    direct.join(", ")
-                ),
-            });
         }
-        let needed = [
-            ENV_SHARDS_BIN,
-            ENV_KERNEL,
-            ENV_INITRD,
-            ENV_CPUS,
-            ENV_MEMORY_MIB,
-        ];
+        let needed: &[&str] = if image.is_some() {
+            &[ENV_SHARDS_BIN, ENV_IMAGE, ENV_CPUS, ENV_MEMORY_MIB]
+        } else {
+            &[
+                ENV_SHARDS_BIN,
+                ENV_KERNEL,
+                ENV_INITRD,
+                ENV_CPUS,
+                ENV_MEMORY_MIB,
+            ]
+        };
         let missing: Vec<&str> = needed
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|name| var(name).is_none_or(|v| v.is_empty()))
             .collect();
         if !missing.is_empty() {
@@ -156,23 +175,44 @@ impl GuestConfig {
             });
         }
         let path = |name: &str| PathBuf::from(var(name).unwrap_or_default());
-        Ok(Self {
-            binary: path(ENV_SHARDS_BIN),
-            kernel: path(ENV_KERNEL),
-            initrd: path(ENV_INITRD),
-            vcpus: number(&var, ENV_CPUS)?,
-            memory_mib: number(&var, ENV_MEMORY_MIB)?,
-            gpu: match var(ENV_GPU) {
-                None => false,
-                Some(value) if value == "false" => false,
-                Some(value) if value == "true" => true,
-                Some(_) => {
-                    return Err(Refusal::Invalid {
-                        what: ENV_GPU,
-                        why: "expected true or false".to_owned(),
+        let gpu = match var(ENV_GPU) {
+            None => false,
+            Some(value) if value == "false" => false,
+            Some(value) if value == "true" => true,
+            Some(_) => {
+                return Err(Refusal::Invalid {
+                    what: ENV_GPU,
+                    why: "expected true or false".to_owned(),
+                });
+            }
+        };
+        let boot = match image {
+            Some(image) => {
+                if gpu {
+                    return Err(Refusal::Awaits {
+                        needs: hex_api::Upstream::NestedRuntime,
                     });
                 }
+                let image = image.into_string().map_err(|given| Refusal::Invalid {
+                    what: ENV_IMAGE,
+                    why: format!("{given:?} is not UTF-8, as an image's reference is"),
+                })?;
+                // Pinned by its digest (§4; the review's C-17), so a tag that moved never boots another image as the
+                // node boots its guest again.
+                hex_api::check_pinned(ENV_IMAGE, &image)?;
+                Boot::Image(image)
+            }
+            None => Boot::Kernel {
+                kernel: path(ENV_KERNEL),
+                initrd: path(ENV_INITRD),
             },
+        };
+        Ok(Self {
+            binary: path(ENV_SHARDS_BIN),
+            boot,
+            vcpus: number(&var, ENV_CPUS)?,
+            memory_mib: number(&var, ENV_MEMORY_MIB)?,
+            gpu,
             shares: shares::from_var(var(shares::ENV))?,
             staged: stage::STAGED.to_owned(),
         })
@@ -182,11 +222,12 @@ impl GuestConfig {
     /// whatever words the kernel passes it (HEX-GUEST-12); its command line the serial console, a panic
     /// resetting the guest so the host sees it end, and `hex.shares=` naming each share's mode in tag
     /// order, none when there are none (HEX-GUEST-11). The guest is reached on the channel's three
-    /// ports alone.
-    pub fn spec(&self) -> shards_api::GuestSpec {
-        shards_api::GuestSpec {
-            kernel: self.kernel.clone(),
-            init: shards_api::Init::Initrd(self.initrd.clone()),
+    /// ports alone. An image's boot has none: it boots through Shards' image boot ([`ImageClass::boot_node`]).
+    pub fn spec(&self) -> Result<shards_api::GuestSpec, Refusal> {
+        let (kernel, initrd) = self.direct()?;
+        Ok(shards_api::GuestSpec {
+            kernel: kernel.to_path_buf(),
+            init: shards_api::Init::Initrd(initrd.to_path_buf()),
             cmdline: self.cmdline(),
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
@@ -203,6 +244,19 @@ impl GuestConfig {
                     read_only: s.read_only,
                 })
                 .collect(),
+        })
+    }
+
+    /// The direct boot's kernel and initramfs; refused for an image, which has neither.
+    pub fn direct(&self) -> Result<(&std::path::Path, &std::path::Path), Refusal> {
+        match &self.boot {
+            Boot::Kernel { kernel, initrd } => Ok((kernel, initrd)),
+            Boot::Image(_) => Err(Refusal::Invalid {
+                what: "the oci class's guest",
+                why: "an image under shards-init boots through Shards' image boot, not its direct boot of a kernel and \
+                      initramfs"
+                    .to_owned(),
+            }),
         }
     }
 }
@@ -278,9 +332,10 @@ impl GuestConfig {
             .try_reserve_exact(allowed.len())
             .map_err(|_| exhausted(allowed.len()))?;
         ports.extend_from_slice(&allowed);
+        let (kernel, initrd) = self.direct()?;
         Ok(shards_api::GuestSpec {
-            kernel: path(&self.kernel)?,
-            init: shards_api::Init::Initrd(path(&self.initrd)?),
+            kernel: path(kernel)?,
+            init: shards_api::Init::Initrd(path(initrd)?),
             cmdline,
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
@@ -342,15 +397,29 @@ where
 enum GuestHandle {
     Shared(Arc<dyn shards_api::Guest>),
     Managed(shards_api::ManagedGuest),
+    /// The node's guest under shards-init: a node VM, the image class's run (joint plan step 39), whose end and stop
+    /// are the class's.
+    Node(hex_api::NodeRun),
 }
 
-impl std::ops::Deref for GuestHandle {
-    type Target = dyn shards_api::Guest;
-    fn deref(&self) -> &Self::Target {
+impl GuestHandle {
+    /// The Shards guest it is, where it is one: a node VM under shards-init is the image class's run instead.
+    fn shards(&self) -> Option<&dyn shards_api::Guest> {
         match self {
-            Self::Shared(guest) => guest.as_ref(),
-            Self::Managed(guest) => guest,
+            Self::Shared(guest) => Some(guest.as_ref()),
+            Self::Managed(guest) => Some(guest),
+            Self::Node(_) => None,
         }
+    }
+
+    /// The Shards guest `call` needs: a dedicated or shared guest's, never the node VM under shards-init, which no such
+    /// call reaches, refused by name if one did.
+    fn shards_for(&self, call: &'static str) -> Result<&dyn shards_api::Guest, Refusal> {
+        self.shards().ok_or_else(|| {
+            Refusal::Broken(format!(
+                "{call}: the node's guest under shards-init is no Shards guest"
+            ))
+        })
     }
 }
 
@@ -378,74 +447,52 @@ fn booted_owner(booted: Booted) -> Result<triomphe::Arc<Booted>, Refusal> {
     })
 }
 
-// The guest's records live beside the link whose first dial their boot record bounds.
-pub use hex_client::guest::shards::{CLASS, recorded, recorded_boot, seed_in, slowest_in};
+// This host's class, as the records name it (records.tsv, evidence alone; the review's C-9).
+pub use hex_client::guest::shards::CLASS;
 
-/// The first dial's bound before this node has seen a boot ([`GuestRuntime::first_dial_bound`] with nothing
-/// learned): the record's slowest boot to ready ([`recorded_boot`]), the managed helper's control patience at the
-/// node's start, and the bound the macOS CPU response's producer measures up to (hex-cli's example
-/// `macos_cpu_response`, AC-T7.4.1).
-pub fn recorded_dial_bound() -> Result<Duration, Refusal> {
-    dial_bound(Duration::ZERO)
-}
-
-/// The slowest of the record's boot and `seen`, the slowest boot this node has seen. The record is the build's one
-/// remaining read of `bench/native/guest/records.tsv` (decision 9): a first boot that follows the guest's liveness
-/// needs a dial sliced against Shards' finite deadlines (HEX-GUEST-33), owed.
-fn dial_bound(seen: Duration) -> Result<Duration, Refusal> {
-    Ok(recorded_boot()?.max(seen))
-}
-
-/// The word that tells a Shards guest its boot's deadline on its kernel command line (AC-T7.4.1), as a Firecracker
-/// guest is told its own (`hex.firecracker-ready-ms`): `hex.ready-ms=` and what is left of the boot's bound as it
-/// boots, in whole milliseconds rounded up, so the guest, counting from its kernel's start, ends no sooner than its
-/// host. Guest init hands it to the relay, whose calls to its node before the guest is ready take it as their
-/// caller's (hex-cli's `guest`); a guest told none keeps their learned bounds.
-pub const READY_MS: &str = "hex.ready-ms";
-
-/// Tells the guest booted with `cmdline` that `left` is what remains of its boot's deadline ([`READY_MS`]), within the
-/// kernel's command-line bound; refused where nothing is left, the word is there already, or init's arguments (`--`)
-/// begin, past which no word is the kernel's. Public for the guest-cost producer, which boots its guests as the node
-/// does (AC-T7.4.1).
-pub fn tell_ready(cmdline: &mut String, left: Duration) -> Result<(), Refusal> {
-    let invalid = |why: &str| Refusal::Invalid {
-        what: "the guest's boot deadline",
-        why: why.to_owned(),
+/// The managed plan of guest `spec` booted with `binary` on `socket`: the native plan where `images` declare its images
+/// (its cost evidence's), else Shards' own plan with the runtime folders `paths`. Its guest is told no boot deadline, so
+/// its relay keeps its own learned bounds (decision 9; the review's C-9). A node's guests prepare theirs here, and so
+/// does the guest-cost producer (crates/hex-cli/examples/guest_cost), so it measures what a node runs (AC-T7.4.1).
+pub fn managed_plan(
+    spec: &shards_api::GuestSpec,
+    binary: &std::path::Path,
+    socket: &std::path::Path,
+    paths: &shards_api::RuntimePaths,
+    images: Option<shards_api::NativeImages>,
+) -> Result<shards_api::PreparedBoot, Refusal> {
+    let plan = if let Some(images) = images {
+        shards_api::prepare_native_boot(
+            spec,
+            binary,
+            socket,
+            shards_api::NativeBoot {
+                paths,
+                images,
+                console_kept: shards_api::recorded_console_bytes_at(&spec.kernel, paths),
+            },
+        )
+    } else {
+        shards_api::prepare_boot(
+            spec,
+            binary,
+            socket,
+            shards_api::recorded_console_bytes(&spec.kernel),
+        )
+        .and_then(|plan| plan.with_runtime_paths(paths))
     };
-    let millis = left.as_nanos().div_ceil(1_000_000);
-    if millis == 0 {
-        return Err(invalid("nothing of it is left to boot in"));
-    }
-    if cmdline
-        .split_whitespace()
-        .any(|word| word == "--" || word.starts_with(READY_MS))
-    {
-        return Err(invalid(
-            "the command line names it already, or passes init its arguments",
-        ));
-    }
-    let word = format!(" {READY_MS}={millis}");
-    let exhausted = Refusal::Exhausted {
-        what: "guest kernel command line",
-        bound: gpu::CMDLINE_BYTES,
-    };
-    if cmdline
-        .len()
-        .checked_add(word.len())
-        .is_none_or(|len| len >= gpu::CMDLINE_BYTES)
-    {
-        return Err(exhausted);
-    }
-    cmdline
-        .try_reserve_exact(word.len())
-        .map_err(|_| exhausted)?;
-    cmdline.push_str(&word);
-    Ok(())
+    plan.map_err(|why| refusal("preparing admitted Shards scope", &why))
 }
 
-/// Boots of one guest: the first, and one more where the first hung alive past its bound, as a hung
-/// boot has another guest to try before its caller is refused.
-const BOOTS: usize = 2;
+/// A managed guest booted from `plan` through `transaction`'s native owner, following its guest with no deadline (the
+/// review's C-9): the one managed launch a node's guests take ([`managed::boot`]), public so the guest-cost producer
+/// boots its guests as a node does (AC-T7.4.1).
+pub fn boot_managed(
+    transaction: &dyn crate::devices::Transaction,
+    plan: shards_api::PreparedBoot,
+) -> Result<shards_api::ManagedGuest, Refusal> {
+    managed::boot(transaction, plan)
+}
 
 /// What tells a node's loop that bytes wait to be written on a connection it watches.
 pub type Room = Arc<dyn Fn() + Send + Sync>;
@@ -466,11 +513,9 @@ pub struct GuestRuntime {
     booted: Mutex<Option<triomphe::Arc<Booted>>>,
     /// The shared backing's guest overhead as its capacity answers measured it, by its generation (joint plan step 14,
     /// C7): none before the first.
-    guest_overhead: Mutex<Option<(hex_api::BackingKey, hex_api::LearnedOverhead)>>,
-    /// The slowest boot to ready this node has seen, the learned half of the first dial's bound.
-    slowest: Mutex<Duration>,
-    /// Guests stopped for hanging alive past the bound, never ready.
-    retired: AtomicU64,
+    guest_overhead: Mutex<Option<(hex_api::BackingKey, shared::Seen)>>,
+    /// The slowest boot to ready this node has seen, its guest's boots' W* (decision 9): none before its first.
+    slowest: Mutex<Option<Duration>>,
     /// The digests learned for layer tarballs not named by theirs, as they crossed (§4a).
     digests: Mutex<Digests>,
     /// The Shards binary's identity when the running guest booted it.
@@ -493,6 +538,12 @@ pub struct GuestRuntime {
     joins: Mutex<Option<Arc<dyn Joins>>>,
     /// The Shards class on Agentfile images ([`GuestRuntime::with_images`]), its boot none until given.
     images: image::ImageClass,
+    /// The lanes its guest under shards-init admits at once to its relay's sockets, as its node fitted them
+    /// ([`GuestRuntime::set_lanes`]); none until given, and that guest is refused without them.
+    lanes: OnceLock<u32>,
+    /// The key it controls its guest under shards-init by (D252), made at that guest's first boot from the OS's
+    /// random numbers: its run's endpoint takes it alone.
+    control: Mutex<Option<Arc<shards_api::control::Identity>>>,
 }
 
 /// A throwaway guest booted on a Shards binary that changed while the node's guest ran, so the node's next boot
@@ -504,6 +555,65 @@ struct Warm {
     /// The binary warmed, or being warmed.
     identity: Option<stage::Identity>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Its throwaway guest, as its thread boots and follows it ([`GuestRuntime::finish_warm`]).
+    guest: Arc<Mutex<Throwaway>>,
+}
+
+/// A warm-up's throwaway guest, as the runtime's end finds it. Its readiness is followed by its VM's life past W*
+/// (decision 9), so the runtime's end stops it rather than wait on a boot nobody needs: a stop ends the wait that follows
+/// it (Shards' `Ended(Stopped)`).
+#[derive(Default)]
+enum Throwaway {
+    /// Not booted yet.
+    #[default]
+    Booting,
+    /// Booted, its readiness followed.
+    Booted(Arc<dyn shards_api::Guest>),
+    /// Stopped, by its warm-up once ready or by the runtime's end: one booted after that end is stopped at once.
+    Stopped,
+}
+
+impl Throwaway {
+    /// Stops the throwaway in `slot` once, whoever asks first: its warm-up once it is ready, or the runtime's end.
+    fn stop(slot: &Mutex<Self>) {
+        let Ok(mut held) = slot.lock() else {
+            return;
+        };
+        if let Self::Booted(guest) = std::mem::replace(&mut *held, Self::Stopped) {
+            let _ = guest.stop();
+        }
+    }
+}
+
+/// Boots a throwaway guest of `spec` on `guests` and follows it to ready as the node's own boot does (decision 9: within
+/// `bound`, the slowest boot this node has seen, counted from the boot's start; past it the run-out told and the dial
+/// following its VM by its life), then stops it, or at once where the runtime ended first (`slot`). Ready, so its VM
+/// process ran too. A warm-up that fails leaves the next boot to pay the first run, as it would have.
+fn warm_up(
+    guests: &dyn shards_api::Guests,
+    spec: &shards_api::GuestSpec,
+    bound: Option<Duration>,
+    slot: &Mutex<Throwaway>,
+) {
+    let began = Instant::now();
+    let Ok(guest) = guests.boot(spec) else {
+        return;
+    };
+    let guest: Arc<dyn shards_api::Guest> = guest.into();
+    let booted = match slot.lock() {
+        Ok(mut held) if matches!(*held, Throwaway::Booting) => {
+            *held = Throwaway::Booted(Arc::clone(&guest));
+            true
+        }
+        _ => false,
+    };
+    if !booted {
+        let _ = guest.stop();
+        return;
+    }
+    let link = ShardsLink::new(Arc::clone(&guest), bound).booted_at(began);
+    let _ = link.dial(stream::CONTROL_PORT);
+    Throwaway::stop(slot);
 }
 
 /// The Shards binary's identity, if it can be read (a binary that can't is the next boot's to refuse).
@@ -574,13 +684,13 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> Refusal {
 }
 
 impl GuestRuntime {
-    fn cpu_spec(&self) -> shards_api::GuestSpec {
-        let mut spec = self.config.spec();
+    fn cpu_spec(&self) -> Result<shards_api::GuestSpec, Refusal> {
+        let mut spec = self.config.spec()?;
         spec.gpu = false;
-        spec
+        Ok(spec)
     }
-    /// The class over `guests`, booting `config`'s guest when first asked. A boot's first dial waits at
-    /// most [`Self::first_dial_bound`] for the guest to listen ([`ShardsLink`]).
+    /// The class over `guests`, booting `config`'s guest when first asked. A boot's first dial waits within
+    /// [`Self::boot_bound`], and past it follows the guest ([`ShardsLink`]).
     pub fn new(guests: Arc<dyn shards_api::Guests>, config: GuestConfig) -> Self {
         let images = image::ImageClass::new(config.binary.clone());
         Self {
@@ -588,8 +698,7 @@ impl GuestRuntime {
             config,
             booted: Mutex::new(None),
             guest_overhead: Mutex::new(None),
-            slowest: Mutex::new(Duration::ZERO),
-            retired: AtomicU64::new(0),
+            slowest: Mutex::new(None),
             digests: Mutex::new(Digests::default()),
             booted_binary: Mutex::new(None),
             warm: Mutex::new(Warm::default()),
@@ -604,6 +713,21 @@ impl GuestRuntime {
             gpu_observer: None,
             joins: Mutex::new(None),
             images,
+            lanes: OnceLock::new(),
+            control: Mutex::new(None),
+        }
+    }
+
+    /// The lanes its guest under shards-init admits at once to its relay's sockets: what its node fitted to its
+    /// descriptors with that guest's among them (hex-node's `serve::fit`), each a guest frame wide each way. Set once,
+    /// as the node fits itself before that guest boots; set again, the same or refused.
+    pub fn set_lanes(&self, lanes: u32) -> Result<(), Refusal> {
+        match self.lanes.set(lanes) {
+            Ok(()) => Ok(()),
+            Err(again) if self.lanes.get() == Some(&again) => Ok(()),
+            Err(_) => Err(Refusal::Broken(
+                "the guest's lanes are fitted once, as its node starts".to_owned(),
+            )),
         }
     }
 
@@ -644,7 +768,7 @@ impl GuestRuntime {
             return Ok(());
         };
         let guest: Arc<dyn shards_api::Guest> =
-            match self.guests.attach(&identity, &self.cpu_spec()) {
+            match self.guests.attach(&identity, &self.cpu_spec()?) {
                 Ok(guest) => guest.into(),
                 Err(
                     shards_api::Refusal::Gone { .. }
@@ -660,10 +784,7 @@ impl GuestRuntime {
                 }
                 Err(why) => return Err(refusal("taking back the node's guest", &why)),
             };
-        let link: LinkOwner = own_link(ShardsLink::new(
-            Arc::clone(&guest),
-            self.first_dial_bound()?,
-        ))?;
+        let link: LinkOwner = own_link(ShardsLink::new(Arc::clone(&guest), self.boot_bound()?))?;
         match Client::connect(triomphe::Arc::clone(&link)) {
             Ok(client) => {
                 // The binary that booted it isn't known here: no warm-up is asked for it.
@@ -711,35 +832,16 @@ impl GuestRuntime {
         Ok(())
     }
 
-    /// Opens booted guest `b`'s evented connection and joins it to the loop, where one is given.
+    /// Opens booted guest `b`'s evented connection and joins it to the loop, where one is given: with no deadline, its
+    /// connection follows its guest (the review's C-9).
     fn join(&self, b: &Booted) -> Result<(), Refusal> {
-        self.join_with_deadline(b, None)
-    }
-
-    fn join_before(&self, b: &Booted, budget: managed::Budget) -> Result<(), Refusal> {
-        budget.remaining()?;
-        self.join_with_deadline(b, Some(budget.deadline()))?;
-        budget.remaining()?;
-        Ok(())
-    }
-
-    fn join_with_deadline(&self, b: &Booted, deadline: Option<Instant>) -> Result<(), Refusal> {
         let joins = self.joins.lock().map_err(poisoned)?.clone();
         let Some(joins) = joins else {
             return Ok(());
         };
         let (token, room) = joins.reserve()?;
-        let (client, pump) = match deadline {
-            Some(at) => Client::connect_evented_before(triomphe::Arc::clone(&b.link), room, at)?,
-            None => Client::connect_evented(triomphe::Arc::clone(&b.link), room)?,
-        };
+        let (client, pump) = Client::connect_evented(triomphe::Arc::clone(&b.link), room)?;
         let client = evented_owner(client)?;
-        if deadline.is_some_and(|at| Instant::now() >= at) {
-            return Err(Refusal::os(
-                "joining the guest within its original create budget",
-                std::io::ErrorKind::TimedOut,
-            ));
-        }
         *b.evented.lock().map_err(poisoned)? = Some(client);
         joins.join(token, pump)
     }
@@ -818,138 +920,305 @@ impl GuestRuntime {
         least.memory_mib = shards_api::min_memory_mib(std::env::consts::ARCH);
         least.shares.clear();
         least.gpu = false;
-        let mut spec = least.spec();
+        // Told no boot deadline, as the node's own guest is (the review's C-9).
+        let spec = least.spec()?;
         let guests = Arc::clone(&self.guests);
-        let bound = self.first_dial_bound()?;
-        tell_ready(&mut spec.cmdline, bound)?;
+        let bound = self.boot_bound()?;
+        let slot = Arc::new(Mutex::new(Throwaway::Booting));
+        let held = Arc::clone(&slot);
         let thread = std::thread::Builder::new()
             .name("hex-guest-warm".to_owned())
-            .spawn(move || {
-                // Ready, so its VM process ran too; then gone. A warm-up that fails leaves the next boot to
-                // pay the first run, as it would have.
-                if let Ok(guest) = guests.boot(&spec) {
-                    let _ = guest.connect(stream::CONTROL_PORT, bound);
-                    let _ = guest.stop();
-                }
-            })
+            .spawn(move || warm_up(guests.as_ref(), &spec, bound, &held))
             .map_err(|e| Refusal::os("starting a guest warm-up", e))?;
         warm.identity = Some(now);
         warm.thread = Some(thread);
+        warm.guest = slot;
         Ok(())
     }
 
-    /// Waits for a warm-up in flight to end: its boot and dial are bounded by the first dial's bound.
+    /// Ends a warm-up in flight: its throwaway guest stopped, which ends its boot's wait, and its thread joined.
     fn finish_warm(&self) {
-        let thread = self.warm.lock().ok().and_then(|mut w| w.thread.take());
+        let Ok((slot, thread)) = self
+            .warm
+            .lock()
+            .map(|mut w| (Arc::clone(&w.guest), w.thread.take()))
+        else {
+            return;
+        };
+        Throwaway::stop(&slot);
         if let Some(t) = thread {
             let _ = t.join();
         }
     }
 
-    /// How long a boot may take to be ready (decision 9, learned waits): the slowest of the record's and this node's
-    /// own, so it only rises; before any boot here, the record's ([`dial_bound`]).
-    pub fn first_dial_bound(&self) -> Result<Duration, Refusal> {
-        dial_bound(*self.slowest.lock().map_err(poisoned)?)
+    /// The W* of the guest's boots (decision 9; the review's C-9): the slowest boot to ready this node has seen; none
+    /// before its first, whose dial then follows its guest from its start.
+    pub fn boot_bound(&self) -> Result<Option<Duration>, Refusal> {
+        Ok(*self.slowest.lock().map_err(poisoned)?)
     }
 
     /// A boot to ready this node has seen, taking `took`: the bound rises with it, never falls.
     pub fn learn(&self, took: Duration) {
         if let Ok(mut slowest) = self.slowest.lock() {
-            *slowest = (*slowest).max(took);
+            *slowest = Some(slowest.map_or(took, |slowest| slowest.max(took)));
         }
-    }
-
-    /// Guests stopped because they stayed alive past the bound without being ready.
-    pub fn retired(&self) -> u64 {
-        self.retired.load(Ordering::Relaxed)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Option<triomphe::Arc<Booted>>>, Refusal> {
         self.booted.lock().map_err(poisoned)
     }
 
-    /// The guest, booted now if it isn't, or booted again if it ended (every box in it ended with it).
+    /// The guest, booted now if it isn't, or booted again if it ended (every box in it ended with it). One boot, its
+    /// first dial the boot's wait (decision 9; the review's C-9): within W*, the slowest boot to ready this node has
+    /// seen, counted from the boot's start (HEX-GUEST-34); past it the run-out told once and the dial following the
+    /// guest's VM by its life ([`ShardsLink`]); before any boot is seen, following from its start, told once as it
+    /// starts. It is refused at the guest's end, at its VM's stall as Shards judges it, or by a refusal of its own,
+    /// never at a bound, and never stopped and booted again. The guest is told no boot deadline: its relay keeps its
+    /// own learned bounds.
     fn guest(&self) -> Result<triomphe::Arc<Booted>, Refusal> {
         if self.managed_shared() {
             return self.shared_running();
         }
         let mut booted = self.lock()?;
         if let Some(b) = booted.as_ref() {
-            match b.guest.wait_for(Duration::ZERO) {
-                Ok(None) => return Ok(triomphe::Arc::clone(b)),
-                Ok(Some(_)) | Err(_) => *booted = None,
+            if self.still_runs(&b.guest)? {
+                return Ok(triomphe::Arc::clone(b));
             }
+            *booted = None;
+        }
+        if let Boot::Image(image) = &self.config.boot {
+            let b = self.boot_image(image)?;
+            *booted = Some(triomphe::Arc::clone(&b));
+            return Ok(b);
         }
         // Refused by name before anything boots where Shards has no backend (§5).
         self.guests
             .backend()
             .map_err(|why| refusal("finding Shards' backend", &why))?;
         let binary = binary_identity(&self.config.binary);
-        let mut hung = Vec::with_capacity(BOOTS);
-        for _ in 0..BOOTS {
-            let bound = self.first_dial_bound()?;
-            let began = Instant::now();
-            // HEX-GUEST-34: the boot and its first dial spend one deadline: a boot that spends it is refused
-            // by type before a dial, never left a zero patience, whose answer Shards awaits without a bound.
-            let ready_by = began.checked_add(bound).ok_or_else(|| Refusal::Invalid {
+        let bound = self.boot_bound()?;
+        let began = Instant::now();
+        // HEX-GUEST-34: a W* past any monotonic deadline is refused by type before anything boots.
+        if let Some(bound) = bound
+            && began.checked_add(bound).is_none()
+        {
+            return Err(Refusal::Invalid {
                 what: "the guest's boot bound",
                 why: format!("{bound:?} from now is past a monotonic deadline"),
-            })?;
-            // AC-T7.4.1: the guest is told what is left of it, which its relay's hello to its node takes.
-            let mut spec = self.cpu_spec();
-            tell_ready(
-                &mut spec.cmdline,
-                ready_by.saturating_duration_since(Instant::now()),
-            )?;
-            let guest: Arc<dyn shards_api::Guest> = self
-                .guests
-                .boot(&spec)
-                .map_err(|why| refusal("booting the node's guest", &why))?
-                .into();
-            let link: LinkOwner = own_link(ShardsLink::new(Arc::clone(&guest), bound))?;
-            match Client::connect_before(triomphe::Arc::clone(&link), ready_by) {
-                Ok(client) => {
-                    self.learn(began.elapsed());
-                    if let Err(why) = self.record(guest.as_ref()) {
-                        // Unrecorded, a crash would leave it an orphan: ended, and the boot refused.
-                        let _ = guest.stop();
-                        return Err(why);
-                    }
-                    *self.booted_binary.lock().map_err(poisoned)? = binary;
-                    let b = booted_owner(Booted {
-                        guest: GuestHandle::Shared(guest),
-                        link,
-                        client,
-                        evented: Mutex::new(None),
-                        owner: None,
-                        backing: None,
-                    })?;
-                    // The new guest's control connection joins the loop as the one before's did.
-                    self.join(&b)?;
-                    *booted = Some(triomphe::Arc::clone(&b));
-                    return Ok(b);
-                }
-                Err(why) => {
-                    // Alive and not ready within the bound: a hang, retired for another boot. Ended,
-                    // or refused otherwise, the boot's failure is its caller's.
-                    let alive = matches!(guest.wait_for(Duration::ZERO), Ok(None));
-                    let _ = guest.stop();
-                    if !alive {
-                        return Err(why);
-                    }
-                    self.retired.fetch_add(1, Ordering::Relaxed);
-                    hung.push(format!("not ready within {bound:?}: {why}"));
-                }
-            }
+            });
         }
-        Err(Refusal::Os {
-            op: "booting the node's guest",
-            why: format!(
-                "{BOOTS} guests booted, each alive and not ready within its bound, the slowest boot to \
-                 ready recorded or seen (bench/native/guest/boot-ready/RECORD.md): {}",
-                hung.join("; ")
-            ),
-        })
+        let guest: Arc<dyn shards_api::Guest> = self
+            .guests
+            .boot(&self.cpu_spec()?)
+            .map_err(|why| refusal("booting the node's guest", &why))?
+            .into();
+        let link: LinkOwner =
+            own_link(ShardsLink::new(Arc::clone(&guest), bound).booted_at(began))?;
+        let client = match Client::connect(triomphe::Arc::clone(&link)) {
+            Ok(client) => client,
+            Err(why) => {
+                // Refused at its end, its VM's stall, or by a refusal of its own: none is left beside the next boot.
+                let _ = guest.stop();
+                return Err(why);
+            }
+        };
+        self.learn(began.elapsed());
+        if let Err(why) = self.record(guest.as_ref()) {
+            // Unrecorded, a crash would leave it an orphan: ended, and the boot refused.
+            let _ = guest.stop();
+            return Err(why);
+        }
+        *self.booted_binary.lock().map_err(poisoned)? = binary;
+        let b = booted_owner(Booted {
+            guest: GuestHandle::Shared(guest),
+            link,
+            client,
+            evented: Mutex::new(None),
+            owner: None,
+            backing: None,
+        })?;
+        // The new guest's control connection joins the loop as the one before's did.
+        self.join(&b)?;
+        *booted = Some(triomphe::Arc::clone(&b));
+        Ok(b)
+    }
+
+    /// Whether `guest` still runs: a Shards guest by its own word, the node VM under shards-init by its run's, which
+    /// is reaped through its stop where it ended on its own, its end kept in its row. A node VM whose end can't be read
+    /// or kept is refused, typed (the review's C-4): a guest booted beside it would leave its row Ready, locked and
+    /// booked, so the next ask tries its end again first.
+    fn still_runs(&self, guest: &GuestHandle) -> Result<bool, Refusal> {
+        match guest {
+            GuestHandle::Node(run) => self.images.node_runs(*run),
+            other => Ok(other
+                .shards()
+                .is_some_and(|guest| matches!(guest.wait_for(Duration::ZERO), Ok(None)))),
+        }
+    }
+
+    /// Boots the node's guest under shards-init through the image class, and connects to its node through its run's
+    /// agent-control endpoint (docs/design/node-under-shards-init.md §4, §5; ROOT, 2026-11-13: one code path).
+    /// - **Its run** is minted by the node's store, and it is charged: its receipt is the configured VM's allocation
+    ///   under its cost profile, as the direct boot's guest is charged, so no node VM runs uncharged.
+    /// - **The image class** boots it and follows it to its init's READY, its node and relay then ready.
+    /// - **Its relay** is dialed through a lane of its run's endpoint, which takes this runtime's key alone, at most
+    ///   the lanes its node fitted at once, each a guest frame wide each way; its node's hello is its answer.
+    /// - **A node that won't greet it** has its run stopped, and the boot is refused in its words.
+    fn boot_image(&self, image: &str) -> Result<triomphe::Arc<Booted>, Refusal> {
+        let lanes = self.lanes.get().copied().ok_or_else(|| Refusal::Invalid {
+            what: "the oci class's guest",
+            why: "its node fitted no lanes for its guest under shards-init".to_owned(),
+        })?;
+        let cost = self.runtime_cost.ok_or_else(|| Refusal::Invalid {
+            what: "the oci class's guest",
+            why: "its guest under shards-init has no cost profile to charge it by".to_owned(),
+        })?;
+        let identity = self.control_identity()?;
+        let vm = image::NodeVm {
+            run: self.authority()?.mint_node_run()?,
+            image: image.to_owned(),
+            allocation: self.config.checked_runtime_allocation(cost)?,
+            shares: self
+                .config
+                .shares
+                .iter()
+                .map(|share| shards_api::image::ImageShare {
+                    host: share.dir.clone(),
+                    at: share.at.clone(),
+                    read_only: share.read_only,
+                })
+                .collect(),
+            controller: identity.fingerprint(),
+            lanes,
+        };
+        let booted = self.images.boot_node(&vm)?;
+        let window = u32::try_from(stream::MAX_FRAME).map_err(|_| {
+            Refusal::Broken("a guest frame is wider than a lane's window".to_owned())
+        })?;
+        let link: LinkOwner = match hex_client::guest::lanes::Lanes::dial(
+            &identity,
+            booted.control.vm,
+            booted.control.address,
+            shards_api::control::SocketAdmission { lanes, window },
+        )
+        .and_then(own_link)
+        {
+            Ok(link) => link,
+            Err(why) => return Err(self.stopped_for(vm.run, why)),
+        };
+        let client = match Client::connect(triomphe::Arc::clone(&link)) {
+            Ok(client) => client,
+            Err(why) => return Err(self.stopped_for(vm.run, why)),
+        };
+        let b = match booted_owner(Booted {
+            guest: GuestHandle::Node(vm.run),
+            link,
+            client,
+            evented: Mutex::new(None),
+            owner: None,
+            backing: None,
+        }) {
+            Ok(b) => b,
+            Err(why) => return Err(self.stopped_for(vm.run, why)),
+        };
+        // Its control connection joins the loop as a direct boot's does; a node VM whose connection can't join is
+        // stopped, so no run is left beside the next boot's.
+        if let Err(why) = self.join(&b) {
+            return Err(self.stopped_for(vm.run, why));
+        }
+        Ok(b)
+    }
+
+    /// Each node VM's receipt as its record keeps it (joint plan step 39): its run, what its allocation books, where
+    /// its run stands and what its guest is admitted at (V2), from its record owner's rows.
+    fn node_vm_receipts(&self) -> Result<Vec<hex_api::NodeVmReceipt>, Refusal> {
+        let records = self.authority()?.all_node_vms()?;
+        let mut receipts = Vec::new();
+        receipts
+            .try_reserve_exact(records.len())
+            .map_err(|_| Refusal::Exhausted {
+                what: "node VM receipts",
+                bound: records.len(),
+            })?;
+        for record in records {
+            receipts.push(hex_api::NodeVmReceipt {
+                run: record.run,
+                booking: record.allocation.booking(),
+                phase: record.phase,
+                guest: record.allocation.guest()?,
+            });
+        }
+        Ok(receipts)
+    }
+
+    /// Whether its guest is its node's node VM under shards-init (joint plan step 39): booted through the image class.
+    pub(super) fn node_vm_form(&self) -> bool {
+        matches!(self.config.boot, Boot::Image(_))
+    }
+
+    /// Gives `capacity`, its host's answer for its oci class, its node VM's route and receipts (joint plan step 39;
+    /// ROOT, 2026-11-13, V2): one route, NodeVm, for a Linux image of its host's architecture with no GPU, charged
+    /// nothing at the host as its node VM's receipt pays the host envelope once; and each node VM's receipt, its guest
+    /// the room the scheduler holds that route's boxes to, which the node's ledger books while it boots and runs.
+    pub(super) fn add_node_vm_offers(
+        &self,
+        capacity: &mut hex_api::Capacity,
+    ) -> Result<(), Refusal> {
+        capacity.check()?;
+        if capacity.routes.is_empty() {
+            capacity
+                .device_routes
+                .try_reserve_exact(capacity.devices.len())
+                .map_err(|_| Refusal::Exhausted {
+                    what: "physical route eligibility",
+                    bound: hex_api::MAX_DEVICES,
+                })?;
+            capacity.device_routes.resize(capacity.devices.len(), 0);
+        }
+        shared::push_offer(
+            capacity,
+            hex_api::RouteOffer {
+                key: hex_api::RouteKey {
+                    class: Class::Oci,
+                    image: hex_api::ImagePlatform {
+                        os: hex_api::ImageOs::Linux,
+                        arch: route::host_platform()?.arch,
+                    },
+                    execution: hex_api::Execution::NodeVm,
+                    gpu: hex_api::GpuEligibility::None,
+                },
+                cost: None,
+                backing: None,
+            },
+            &[],
+        )?;
+        capacity.node_vms = self.node_vm_receipts()?;
+        capacity.check()
+    }
+
+    /// `why` a node VM's boot failed past its READY, its run stopped first; where its stop fails too, both.
+    fn stopped_for(&self, run: hex_api::NodeRun, why: Refusal) -> Refusal {
+        match self.images.stop_node(run) {
+            Ok(_) => why,
+            Err(cleanup) => Refusal::Broken(format!("{why}; and stopping its node VM: {cleanup}")),
+        }
+    }
+
+    /// This runtime's control key, made once from the OS's random numbers.
+    fn control_identity(&self) -> Result<Arc<shards_api::control::Identity>, Refusal> {
+        let mut kept = self.control.lock().map_err(poisoned)?;
+        if let Some(identity) = kept.as_ref() {
+            return Ok(Arc::clone(identity));
+        }
+        let identity =
+            Arc::new(
+                shards_api::control::Identity::generate().map_err(|why| Refusal::Os {
+                    op: "making the key the node controls its guest under shards-init by",
+                    why: why.to_string(),
+                })?,
+            );
+        *kept = Some(Arc::clone(&identity));
+        Ok(identity)
     }
 
     /// The guest if it is booted: a call about a box needs no boot, as there's no box before one.
@@ -993,7 +1262,14 @@ impl Drop for GuestRuntime {
     fn drop(&mut self) {
         self.finish_warm();
         if let Ok(Some(b)) = self.booted.get_mut().map(Option::take) {
-            let _ = b.guest.stop();
+            match &b.guest {
+                GuestHandle::Node(run) => self.images.stop_node_told(*run),
+                other => {
+                    if let Some(guest) = other.shards() {
+                        let _ = guest.stop();
+                    }
+                }
+            }
             if matches!(&b.guest, GuestHandle::Shared(_))
                 && let Some(path) = &self.record
             {
@@ -1008,7 +1284,7 @@ impl Drop for GuestRuntime {
 fn guest_capacity(
     mut capacity: hex_api::Capacity,
     config: &GuestConfig,
-    identity: &shards_api::Identity,
+    fence: String,
 ) -> Result<hex_api::Capacity, Refusal> {
     capacity.check()?;
     let cpu = u64::from(config.vcpus)
@@ -1018,7 +1294,7 @@ fn guest_capacity(
         .memory_mib
         .checked_mul(1 << 20)
         .ok_or_else(|| Refusal::Broken("guest memory bytes overflow".to_owned()))?;
-    capacity.id = format!("guest:{}:{}", identity.pid, identity.started);
+    capacity.id = fence;
     capacity.total.cpu_milli = capacity.total.cpu_milli.min(cpu);
     capacity.total.mem_bytes = capacity.total.mem_bytes.min(memory);
     capacity.free.cpu_milli = capacity.free.cpu_milli.min(capacity.total.cpu_milli);
@@ -1069,15 +1345,36 @@ impl Runtime for GuestRuntime {
             return Ok(Some(capacity));
         }
         let booted = self.guest()?;
+        // A node whose guest is a node VM under shards-init answers its oci class on its host's plane, as a node whose
+        // guest is shared does, its route its node VM's (joint plan step 39; ROOT, 2026-11-13, V2): never the guest's
+        // own pool, which the scheduler would take for its whole node's.
+        if class == Class::Oci && matches!(booted.guest, GuestHandle::Node(_)) {
+            let mut capacity = self.authority()?.capacity()?;
+            self.add_node_vm_offers(&mut capacity)?;
+            return Ok(Some(capacity));
+        }
         let capacity = booted.client.capacity(Class::Oci)?.ok_or_else(|| {
             Refusal::Broken("the guest node reported no resource pool".to_owned())
         })?;
-        let identity = booted
-            .guest
-            .identity()
-            .map_err(|why| refusal("reading the guest pool identity", &why))?;
-        let capacity = guest_capacity(capacity, &self.config, &identity)?;
-        Ok(Some(capacity))
+        // A replacement guest's pool is fenced by its boot: a Shards guest's process and its start, the node VM under
+        // shards-init's run.
+        let fence = match &booted.guest {
+            GuestHandle::Node(run) => format!(
+                "node-vm:{}",
+                run.bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+            other => {
+                let identity = other
+                    .shards_for("reading the guest pool identity")?
+                    .identity()
+                    .map_err(|why| refusal("reading the guest pool identity", &why))?;
+                format!("guest:{}:{}", identity.pid, identity.started)
+            }
+        };
+        Ok(Some(guest_capacity(capacity, &self.config, fence)?))
     }
 
     fn classes(&self) -> Vec<Class> {
@@ -1171,6 +1468,41 @@ impl Runtime for GuestRuntime {
         }
     }
 
+    /// Goal 2's item 3: an image VM's member's next MCP connection (D254); any other box's refused as the trait refuses
+    /// it.
+    fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        match self.routed(id)? {
+            books::Routed::Retired(record) => Err(record.retired_refusal()?),
+            books::Routed::Image(record) => self.images.mcp_image(record, member),
+            books::Routed::Other(_) => Err(Refusal::Invalid {
+                what: "mcp",
+                why: format!(
+                    "box {id} isn't a Shards image box: only one has members with an MCP bridge"
+                ),
+            }),
+        }
+    }
+
+    /// Goal 2's item 2: a signal to an image VM's member alone, on its own lane; any other box's refused as the trait
+    /// refuses it.
+    fn signal_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        signal: Signal,
+    ) -> Result<(), Refusal> {
+        match self.routed(id)? {
+            books::Routed::Retired(record) => Err(record.retired_refusal()?),
+            books::Routed::Image(record) => self.images.signal_member_image(record, member, signal),
+            books::Routed::Other(_) => Err(Refusal::Invalid {
+                what: "member",
+                why: format!(
+                    "box {id} isn't a Shards image box: only one has members a signal reaches"
+                ),
+            }),
+        }
+    }
+
     /// Joint plan step 14 (C7): an image VM's guest told its room (D241); a Shards guest VM's awaits its room call, its
     /// guest's init having none from Hex; any other box's refused as the trait refuses it.
     fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
@@ -1243,18 +1575,16 @@ impl Runtime for GuestRuntime {
     }
 
     fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        let routed = self.routed(id)?;
+        self.inspect_routed(routed, id)
+    }
+
+    /// An image box followed to its start's end as its class follows it (kiln's HexVms adapter); every other box as its
+    /// inspect answers it, its one read of the node's records carried on.
+    fn started(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
         match self.routed(id)? {
-            // A retired box says why from its record, with no backing or VM to ask (joint plan step 14).
-            books::Routed::Retired(record) => record.retired_info(),
-            books::Routed::Image(record) => self.images.inspect_image(record),
-            books::Routed::Other(snapshot) => {
-                let snapshot = snapshot.as_ref();
-                self.call_recorded(snapshot, id, false, || {
-                    self.with(snapshot, id, |b| {
-                        self.project_info(b, b.client.inspect(id)?)
-                    })
-                })
-            }
+            books::Routed::Image(record) => self.images.started_image(record),
+            routed => self.inspect_routed(routed, id),
         }
     }
 
@@ -1305,14 +1635,17 @@ impl Runtime for GuestRuntime {
                 }
             }
         }
-        let images = self.images.image_infos()?;
+        let images = self.images.image_infos(image::Unread::Unlisted)?;
+        // Each oci box its node retired with its node VM (A-6), from its record, as its inspect answers it.
+        let retired = self.retired_infos()?;
         boxes
-            .try_reserve_exact(images.len())
+            .try_reserve_exact(images.len().saturating_add(retired.len()))
             .map_err(|_| Refusal::Exhausted {
                 what: "guest box listing",
                 bound: crate::MAX_BOXES,
             })?;
         boxes.extend(images);
+        boxes.extend(retired);
         Ok(boxes)
     }
 
@@ -1336,6 +1669,232 @@ impl Runtime for GuestRuntime {
 }
 
 impl GuestRuntime {
+    /// Joint plan step 14 (D255; ROOT, 2026-11-13): asks the governor of managed box `record`'s VM to hold its vCPUs to
+    /// `rate` milli-CPU, through its booted managed guest ([`managed::rate`]). A box whose guest this runtime holds
+    /// through no managed guest of its own has no governor of its own to ask: its platform's cap is to hold it, told.
+    pub fn managed_rate(
+        &self,
+        record: &hex_core::record::BoxRecord,
+        rate: u64,
+    ) -> Result<ManagedRate, Refusal> {
+        let id = &record.spec.id;
+        let Some(booted) = self.booted_for_record(Some(record), id)? else {
+            return Err(Refusal::NoSuchBox(id.try_clone()?));
+        };
+        match &booted.guest {
+            GuestHandle::Managed(guest) => managed::rate(guest, id, rate),
+            GuestHandle::Shared(_) | GuestHandle::Node(_) => {
+                Ok(ManagedRate::Platform(Refusal::Platform {
+                    what: "a managed VM's governor",
+                    platform: std::env::consts::OS,
+                    why: "its guest is held through no managed guest of its own".to_owned(),
+                }))
+            }
+        }
+    }
+
+    /// Joint plan step 14 (D260; ROOT, 2026-11-13): managed box `record`'s VM's vCPUs' guest time, as its VM process
+    /// answers its use through its booted managed guest ([`managed::guest_time`]), each held to the VM's size: none apart
+    /// for a box whose guest is held through no managed guest of its own, told why.
+    pub fn managed_guest_time(
+        &self,
+        record: &hex_core::record::BoxRecord,
+    ) -> Result<ManagedGuestTime, Refusal> {
+        let id = &record.spec.id;
+        let Some(booted) = self.booted_for_record(Some(record), id)? else {
+            return Err(Refusal::NoSuchBox(id.try_clone()?));
+        };
+        match &booted.guest {
+            GuestHandle::Managed(guest) => {
+                let vcpus = record
+                    .spec
+                    .allocation
+                    .ok_or_else(|| Refusal::Invalid {
+                        what: "a managed VM's guest time",
+                        why: format!("box {id} holds no allocation to size its vCPUs by"),
+                    })?
+                    .vm_size()?
+                    .vcpus;
+                managed::guest_time(guest, id, vcpus)
+            }
+            GuestHandle::Shared(_) | GuestHandle::Node(_) => Ok(ManagedGuestTime::Unheld(
+                "its guest is held through no managed guest of its own".to_owned(),
+            )),
+        }
+    }
+
+    /// Joint plan step 14 (D255): the period managed box `record`'s VM's governor holds its rate over, as its VM process
+    /// last answered: none before its first answer, and none for a box whose guest is held through no managed guest of
+    /// its own.
+    pub fn managed_rate_period(
+        &self,
+        record: &hex_core::record::BoxRecord,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        let id = &record.spec.id;
+        let Some(booted) = self.booted_for_record(Some(record), id)? else {
+            return Err(Refusal::NoSuchBox(id.try_clone()?));
+        };
+        Ok(match &booted.guest {
+            GuestHandle::Managed(guest) => guest.rate_period(),
+            GuestHandle::Shared(_) | GuestHandle::Node(_) => None,
+        })
+    }
+
+    /// Joint plan step 39 (place 3): what node VM `run` costs its host (D241), its node's charge learner's read of it.
+    pub fn node_vm_host_use(&self, run: hex_api::NodeRun) -> Result<hex_api::HostUse, Refusal> {
+        self.images.host_use_node(run)
+    }
+
+    /// Joint plan step 39 (place 3): the period node VM `run`'s governor holds its rate over (D247), its run's own, as
+    /// its last rate's answer said it: none before its first (Shards' image channel v31).
+    pub fn node_vm_rate_period(
+        &self,
+        run: hex_api::NodeRun,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        self.images.rate_period_node(run)
+    }
+
+    /// Joint plan step 39 (place 3): holds node VM `run`'s vCPUs together to `rate` milli-CPU through its run's rate
+    /// (D247), its node's charge learner's cap.
+    pub fn node_vm_rate(
+        &self,
+        run: hex_api::NodeRun,
+        rate: Option<std::num::NonZeroU64>,
+    ) -> Result<Option<std::num::NonZeroU64>, Refusal> {
+        self.images.rate_node(run, rate)
+    }
+
+    /// Joint plan step 39 (place 3): stops node VM `run`'s run, its node's charge learner's last resort (C5), its end kept
+    /// in its row; the guest it was is booted again at the next ask, its run ended.
+    pub fn stop_node_vm(&self, run: hex_api::NodeRun) -> Result<(), Refusal> {
+        self.images.stop_node(run).map(|_| ())
+    }
+
+    /// Joint plan step 39: tells node VM `run`'s guest its room, `room` bytes past what it holds (D188), its node's charge
+    /// learner's word, as an image box's guest is told.
+    pub fn node_vm_room(&self, run: hex_api::NodeRun, room: i64) -> Result<(), Refusal> {
+        self.images.room_node(run, Some(room)).map(|_| ())
+    }
+
+    /// Joint plan step 14 (C1): the period running image box `id`'s VM's governor holds its rate over, its run's own as
+    /// its VM said it with its last rate's answer (D191, D247's `ImageGuest::rate_period`; Shards' image channel v31),
+    /// none before its first: the window the node's charge learner caps it over. Any other box's refused as
+    /// `Runtime::rate` refuses it.
+    pub fn rate_period(&self, id: &BoxId) -> Result<Option<std::time::Duration>, Refusal> {
+        match self.routed(id)? {
+            books::Routed::Retired(record) => Err(record.retired_refusal()?),
+            books::Routed::Image(record) => self.images.rate_period_image(record),
+            books::Routed::Other(None) => Err(Refusal::NoSuchBox(id.try_clone()?)),
+            books::Routed::Other(Some(_)) => Err(Refusal::Invalid {
+                what: "rate_period",
+                why: format!(
+                    "box {id} isn't a Shards image box: only its VM's governor holds a rate over a period"
+                ),
+            }),
+        }
+    }
+
+    /// Box `id` as its route says it is, its record read once by the caller.
+    fn inspect_routed(&self, routed: books::Routed, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        match routed {
+            // A retired box says why from its record, with no backing or VM to ask (joint plan step 14).
+            books::Routed::Retired(record) => record.retired_info(),
+            books::Routed::Image(record) => self.images.inspect_image(record),
+            books::Routed::Other(snapshot) => {
+                let snapshot = snapshot.as_ref();
+                self.call_recorded(snapshot, id, false, || {
+                    self.with(snapshot, id, |b| {
+                        self.project_info(b, b.client.inspect(id)?)
+                    })
+                })
+            }
+        }
+    }
+
+    /// What a node VM's guest refusing room for a box its host's pool admitted is told as (V2; ROOT, 2026-11-13: a
+    /// basis to fix, never a retry): the guest's refusal, with the host's pool's numbers beside the guest's own.
+    fn guest_room_refusal(
+        refusal: Refusal,
+        pool: hex_api::CapacityResources,
+        booked: hex_api::CapacityResources,
+        free: Option<hex_api::CapacityResources>,
+    ) -> Refusal {
+        let guest = free.map_or_else(
+            || "its own room unread".to_owned(),
+            |free| {
+                format!(
+                    "{} milli-CPU and {} bytes free by its own answer",
+                    free.cpu_milli, free.mem_bytes
+                )
+            },
+        );
+        Refusal::Invalid {
+            what: "a node VM's guest's room",
+            why: format!(
+                "its guest refused a box its host's pool admitted: the pool holds {} milli-CPU and {} bytes \
+                 for its node VM's boxes, {} milli-CPU and {} bytes booked with this one; its guest has \
+                 {guest}, and says: {refusal}",
+                pool.cpu_milli, pool.mem_bytes, booked.cpu_milli, booked.mem_bytes
+            ),
+        }
+    }
+
+    /// Box `refused`'s create refusal, its spec routed `NodeVm`, as [`GuestRuntime::guest_room_refusal`] tells it
+    /// where its guest refused it for room (Full or Exhausted): the pool its Ready node VM's guest is, what that pool
+    /// books of its node VM's oci boxes with this one (their caps, as each record keeps them), and what the guest says
+    /// is free. Any other refusal is the guest's as it gave it.
+    fn told_guest_refusal(&self, b: &Booted, refused: &BoxSpec, refusal: Refusal) -> Refusal {
+        if !matches!(refusal, Refusal::Full(_) | Refusal::Exhausted { .. }) {
+            return refusal;
+        }
+        match self.node_vm_pool(refused) {
+            Ok((pool, booked)) => {
+                let free = b
+                    .client
+                    .capacity(Class::Oci)
+                    .ok()
+                    .flatten()
+                    .map(|capacity| capacity.free);
+                Self::guest_room_refusal(refusal, pool, booked, free)
+            }
+            Err(_) => refusal,
+        }
+    }
+
+    /// Its node VM's pool as its host's scheduler holds it (V2): its Ready node VM's guest, and what the pool books of
+    /// its node VM's oci boxes with `refused` (each one's caps as its record keeps them).
+    fn node_vm_pool(
+        &self,
+        refused: &BoxSpec,
+    ) -> Result<(hex_api::CapacityResources, hex_api::CapacityResources), Refusal> {
+        let books = self.authority()?;
+        let pool = books
+            .all_node_vms()?
+            .into_iter()
+            .find(|row| row.phase == hex_api::NodeVmPhase::Ready && row.exit.is_none())
+            .map(|row| row.allocation.guest())
+            .transpose()?
+            .unwrap_or_default();
+        let caps = |spec: &BoxSpec| hex_api::CapacityResources {
+            cpu_milli: spec.bounds.cpu_max_milli.map_or(0, u64::from),
+            mem_bytes: spec.bounds.memory_max.unwrap_or(0),
+            disk_bytes: 0,
+        };
+        let mut booked = caps(refused);
+        for record in books.records()?.into_values().flatten() {
+            let hosted = record.exit.is_none()
+                && record.spec.id != refused.id
+                && record
+                    .spec
+                    .route
+                    .is_some_and(|route| route.key.execution == hex_api::Execution::NodeVm);
+            if hosted {
+                booked = booked.checked_add(caps(&record.spec)).unwrap_or(booked);
+            }
+        }
+        Ok((pool, booked))
+    }
+
     fn create_payload(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
         if !spec.devices.is_empty() || matches!(spec.class, ClassSpec::Shards(_)) {
             return Err(Refusal::Broken(
@@ -1345,10 +1904,23 @@ impl GuestRuntime {
         if self.managed_shared() {
             return self.create_shared(spec);
         }
+        // Its route, kept to tell a refusal of what its host's pool admitted (V2): the guest sees none.
+        let routed = if spec
+            .route
+            .is_some_and(|route| route.key.execution == hex_api::Execution::NodeVm)
+        {
+            Some(spec.clone())
+        } else {
+            None
+        };
         let rewritten = self.rewrite_spec(spec)?;
         let b = self.guest()?;
         self.warm_if_changed()?;
         self.create_in(&b, rewritten)
+            .map_err(|refusal| match &routed {
+                Some(spec) => self.told_guest_refusal(&b, spec, refusal),
+                None => refusal,
+            })
     }
 
     /// Deletes box `id` from the guest that holds it, `snapshot` the call's one read of its record.
@@ -1625,7 +2197,22 @@ impl<P: Runtime> Runtime for WithGuest<P> {
     }
     fn capacity(&self, class: Class) -> Result<Option<hex_api::Capacity>, Refusal> {
         match class {
-            Class::Process => self.process.capacity(class),
+            // A host whose process class answers no pool of its own (macOS's) answers it on its host's plane, the one
+            // its oci answer is on, with its native process route (V2; ROOT, 2026-11-13): so its process boxes keep a
+            // route beside its guest's, as Windows' own answer keeps one.
+            Class::Process => match self.process.capacity(class)? {
+                Some(report) => Ok(Some(report)),
+                None if self.oci.uses_books() => {
+                    let mut capacity = self.oci.authority()?.capacity()?;
+                    crate::devices::native_routes(
+                        &mut capacity,
+                        Class::Process,
+                        route::host_platform()?,
+                    )?;
+                    Ok(Some(capacity))
+                }
+                None => Ok(None),
+            },
             Class::Oci => {
                 // Windows runs its own OCI images as well as guest Linux images. Its initialized
                 // native pool (including exact device holders) must not disappear behind the guest.
@@ -1642,6 +2229,10 @@ impl<P: Runtime> Runtime for WithGuest<P> {
                             )?;
                         }
                         self.oci.add_offers(&mut native, class)?;
+                    } else if self.oci.node_vm_form() {
+                        // Its Linux images go to its node VM, beside its own (Windows'): its route and receipts
+                        // with them (joint plan step 39, V2), so its scheduler sees the node VM.
+                        self.oci.add_node_vm_offers(&mut native)?;
                     }
                     return Ok(Some(native));
                 }
@@ -1688,6 +2279,19 @@ impl<P: Runtime> Runtime for WithGuest<P> {
         self.holder(id)?.member(id, member)
     }
 
+    fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        self.holder(id)?.mcp(id, member)
+    }
+
+    fn signal_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        signal: Signal,
+    ) -> Result<(), Refusal> {
+        self.holder(id)?.signal_member(id, member, signal)
+    }
+
     fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
         self.holder(id)?.room(id, room)
     }
@@ -1708,6 +2312,12 @@ impl<P: Runtime> Runtime for WithGuest<P> {
         self.holder(id)?.inspect(id)
     }
 
+    /// The runtime holding the box answers it, as it answers `host_use` (the review's B-6): an image VM's start
+    /// followed to its end, never the trait's inspect at once.
+    fn started(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        self.holder(id)?.started(id)
+    }
+
     fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
         self.holder(id)?.usage(id)
     }
@@ -1720,6 +2330,12 @@ impl<P: Runtime> Runtime for WithGuest<P> {
 
     fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
         self.holder(id)?.delete(id)
+    }
+
+    /// The runtime holding the box deletes it and answers its VM's final use (the review's B-6), never the trait's
+    /// plain delete answering none, read as a run that never started.
+    fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<hex_api::HostUse>, Refusal> {
+        self.holder(id)?.delete_with_host_use(id)
     }
 }
 

@@ -79,6 +79,7 @@ impl Runtime for RelayRuntime {
         let need = hex_sim::model::capacity_resources(relay_need());
         let room = need.checked_add(need).unwrap();
         Ok(relay_cost().map(|cost| Capacity {
+            own: Default::default(),
             id: "relay-fixture-pool".into(),
             total: room,
             free: room,
@@ -89,6 +90,8 @@ impl Runtime for RelayRuntime {
             backings: Vec::new(),
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         }))
     }
     fn classes(&self) -> Vec<hex_api::Class> {

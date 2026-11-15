@@ -9,6 +9,7 @@
 use alloc::vec::Vec;
 
 pub mod managed;
+pub mod mcp;
 pub mod members;
 pub mod nesting;
 pub mod notice;
@@ -38,6 +39,9 @@ pub const EXEC_PORT: u32 = 1027;
 pub const ENGINE_PORT: u32 = 1029;
 /// Where the command finds its microVM's engine: a socket shards-init listens on.
 pub const ENGINE_SOCKET: &str = "/run/shards/engine.sock";
+/// The port the guest dials for each connection a member makes to its MCP socket (D254),
+/// which its HELLO's token, the run's `mcp=`, admits: after the run's and the builder's ports.
+pub const MCP_PORT: u32 = 1031;
 /// The bytes of an exec's token.
 pub const TOKEN: usize = 16;
 pub const HEADER: usize = 8;
@@ -188,7 +192,7 @@ pub mod kind {
     /// Guest to host, on the signal connection: the managed control scope ended normally.
     pub const MANAGED_CONTROL_END: u8 = 47;
     /// Guest to host, on the workload's connection, once a member's population has ended
-    /// (D231): its member index and its status, as
+    /// (D231): its member index and how its command ended, exited or signaled, as
     /// [`members::Ended`](super::members::Ended) encodes them; once a member.
     pub const MEMBER_ENDED: u8 = 48;
     /// Guest to host, on the workload's connection of a run given the nesting grant (D234):
@@ -717,8 +721,14 @@ pub mod builtin {
     /// it uses than the room a run needs to go on, which a room short of it raises no hold
     /// past. Answered with the bytes the run is held within past what it uses, in decimal.
     /// Without one, it has no budget, is held only as its memory is (D148), and nothing is
-    /// answered.
+    /// answered. A second word, a group's (D183), says in decimal the footprint its VM
+    /// process held as that room was read: the room is held as of its footprint now
+    /// ([`room_now`](super::room_now)), and where its VMM cannot say that, as said, its
+    /// answer then followed by a space and [`ROOM_UNREAD`].
     pub const ROOM: u8 = 16;
+    /// [`ROOM`]'s answer's second word where it held a group's room as said, its VMM unable to
+    /// say its VM process's footprint now (`control::FOOTPRINT` 0).
+    pub const ROOM_UNREAD: &str = "unread";
     /// A device plugged into the running microVM, or let go of, or a disk grown (D214;
     /// shards-init hotplug.rs): `disk ADDR DST [ro]`, `share ADDR TAG DST [ro]`, `unmount
     /// ADDR DST`, `grow ADDR DST SECTORS`, ADDR the function's PCI address.
@@ -746,6 +756,21 @@ pub mod builtin {
     /// columns. TIOCSWINSZ on the terminal init holds for it, which tells the terminal's
     /// foreground process group SIGWINCH where its size changed (TIOCSWINSZ(2const)).
     pub const RESIZE: u8 = 21;
+    /// A member's command signalled (D238, goal 58's step 5), its arguments
+    /// [`members::signal_args`](super::members::signal_args)': its index and a signal by its
+    /// Linux number. Its command is PID 2 under its reaper, as an OCI runtime's kill signals its
+    /// container's process (runtime-spec runtime.md, "kill"): from init's namespace a signal
+    /// reaches the reaper, its namespace's init, only for a handler it has (pid_namespaces(7)),
+    /// and it has SIGCHLD's alone.
+    pub const SIGNAL: u8 = 22;
+    /// [`SIGNAL`]'s exit status where the member's command has ended, its population with it or
+    /// going: ESRCH's number (include/uapi/asm-generic/errno-base.h), as kill(2) refuses a
+    /// process that has, so that its host says why by its kind; [`SIGNAL_UNKNOWN`] where no
+    /// member of that index started; 1 for any other failure.
+    pub const SIGNAL_ENDED: u8 = 3;
+    /// [`SIGNAL`]'s exit status where no member of that index started in this run: ENOENT's
+    /// number (errno-base.h), as [`RESIZE`] says it of one.
+    pub const SIGNAL_UNKNOWN: u8 = 2;
 
     /// [`STATS`]'s one argument, whose cgroup it reads (D231): none for the workload's, as
     /// `stats` reads it; [`RUN`](stats::RUN) for the run's, its command's and every
@@ -779,6 +804,20 @@ impl Size {
             cols: u16::from_be_bytes([c, d]),
         })
     }
+}
+
+/// The room a group's word leaves a run now (D183, [`builtin::ROOM`]'s second word): `room`
+/// bytes, read as its VM process's footprint was `at` bytes, as of its footprint `now`, read
+/// with what the run uses. What its VM process came to hold past `at` since is no room, and
+/// what it let go of is room, so a room read before the run grew counts that growth once,
+/// whenever the word arrives. None where `now` is 0, its VMM unable to say it
+/// (`control::FOOTPRINT`): the room is then held as said, and the answer says so.
+pub fn room_now(room: i64, at: u64, now: u64) -> Option<i64> {
+    if now == 0 {
+        return None;
+    }
+    let signed = |b: u64| i64::try_from(b).unwrap_or(i64::MAX);
+    Some(room.saturating_sub(signed(now).saturating_sub(signed(at))))
 }
 
 /// Whether `name` is a terminal type a run's TERM may be given ([`Spec::terms`]): a name
@@ -1016,6 +1055,26 @@ impl Cursor<'_> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    /// A group's room is held as of its VM process's footprint now (D183): a run that grew by
+    /// 200 MiB before its room was read, and one that grew as much after it, before its word
+    /// came, are held alike, at what it used before it grew and the room then; one that let
+    /// memory go meanwhile has that much more room; and a footprint its VMM cannot say
+    /// leaves the room as said, typed.
+    #[test]
+    fn a_groups_room_is_held_as_of_the_footprint_it_was_read_with() {
+        let mib = |n: i64| n << 20;
+        let at = |n: u64| n << 20;
+        // Read after it grew: 100 MiB of room, at 600; now 600.
+        let before = room_now(mib(100), at(600), at(600)).unwrap();
+        // Read before it grew: 300 MiB of room, at 400; now 600.
+        let after = room_now(mib(300), at(400), at(600)).unwrap();
+        assert_eq!((before, after), (mib(100), mib(100)));
+        assert_eq!(room_now(mib(300), at(400), at(350)), Some(mib(350)));
+        assert_eq!(room_now(mib(-50), at(400), at(450)), Some(mib(-100)));
+        assert_eq!(room_now(mib(300), at(400), 0), None);
+        assert_eq!(room_now(i64::MIN, 0, u64::MAX), Some(i64::MIN));
+    }
+
     /// The host's network's bind and answer (D124), each as the other side reads it.
     #[test]
     fn host_binds_are_read_as_written() {

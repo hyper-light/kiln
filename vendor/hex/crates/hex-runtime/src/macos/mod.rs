@@ -65,6 +65,8 @@ const RESERVE_BYTES: u64 = 16 << 20;
 struct UserBox {
     bounds: Bounds,
     leader_started: bool,
+    /// A run's box's claim on its removal, carried from its making ([`crate::run::Claim`]); none for any other box.
+    run: Option<Arc<crate::run::Claim>>,
 }
 
 /// The node's box-user backend (native plan step 2): a connection to the privileged helper and the boxes
@@ -72,7 +74,7 @@ struct UserBox {
 struct BoxUser {
     /// Shared with each program it starts, which asks the helper for its end ([`proc::UserProc`]).
     helper: Arc<helper_client::Helper>,
-    /// Shared with a run's thread, which removes its box through [`remove_user_box`] as `delete` does.
+    /// Shared with a run's thread, which removes its box through [`remove_user_run`] as a delete of it does.
     boxes: Arc<Mutex<BTreeMap<BoxId, UserBox>>>,
 }
 
@@ -112,9 +114,19 @@ pub fn cpu_control_cycle(
     })
 }
 
+/// AC-T7.4.1 (the review's C-9 (c)): the longest the managed CPU control arms its watcher's timer for with the measured
+/// stop `response`: its hold at the least rate it holds a scope at ([`cpu::LEAST_RATE`]; [`cpu_control_cycle`]), twice
+/// its burst over that rate, longer than any run, whose longest, near the ceiling, is its burst over one milli-CPU. The
+/// CPU-response producer measures the timer's waits up to it.
+pub fn cpu_control_longest_hold(
+    response: std::time::Duration,
+) -> Result<std::time::Duration, Refusal> {
+    cpu_control_cycle(cpu::LEAST_RATE, response).map(|(_, hold)| hold)
+}
+
 pub struct MacRuntime {
     shared: NativeArc<Shared>,
-    /// Shared with a run's thread, which removes its box through [`remove_process_box`] as `delete` does.
+    /// Shared with a run's thread, which removes its box through [`remove_process_run`] as a delete of it does.
     boxes: NativeArc<NativeBoxes>,
     helper: Option<BoxUser>,
     /// The kernel's bound on a program's arguments and environment, read at start (`kern.argmax`).
@@ -252,7 +264,7 @@ impl MacRuntime {
         record: NativeRecord<'_>,
         plan: &crate::devices::ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: std::time::Duration,
+        patience: Option<std::time::Duration>,
         publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         managed::launch(self, record, plan, io, patience, publish)
@@ -275,19 +287,32 @@ impl MacRuntime {
     pub fn managed_usage(&self, record: NativeRecord<'_>) -> Result<Usage, Refusal> {
         managed::usage(self, record)
     }
-    /// Joint plan step 14 (C1 on macOS): the charge learner's window, the longest cycle this control runs at any rate the
-    /// learner sets: its cycle at Hex's least CPU bound (`hex_api::MIN_CPU_MILLI`, the least the learner caps a VM at),
-    /// so each VM's rate holds on average over one window. Refused where no measured control is configured.
-    pub fn charge_window(&self) -> Result<std::time::Duration, Refusal> {
-        let (control, ceiling) = self
+    /// Joint plan step 14 (C1 on macOS; ROOT, 2026-11-13; 2c-4b): the cycle this control holds a scope at `rate`
+    /// milli-CPU over, its run and then its hold ([`cpu::cycle`]) at the stop response its managed helper estimates from
+    /// its own holds, asked of it each time ([`cycle_of`]), so a VM it holds there keeps its rate on average over one:
+    /// the charge learner's window takes it for each VM the control holds. Never at the control's ceiling or past it;
+    /// cold, told, until its helper has measured a hold, or where none runs; used and told cold while its estimate is
+    /// (the review's A-14). Refused where no control is configured.
+    pub fn cap_cycle(&self, rate: u64) -> Result<crate::guest::CapCycle, Refusal> {
+        let (_, ceiling) = self
             .cpu_control
             .ok_or_else(|| managed::configuration("managed VM CPU control is not initialized"))?;
-        let (run, hold) = cpu::cycle(u64::from(hex_api::MIN_CPU_MILLI), ceiling, control.response)
-            .map_err(|_| {
-                managed::configuration("the CPU control has no cycle at Hex's least CPU bound")
-            })?;
-        run.checked_add(hold)
-            .ok_or_else(|| managed::configuration("the CPU control's cycle overflows"))
+        if rate >= ceiling {
+            return Ok(crate::guest::CapCycle::Never);
+        }
+        cycle_of(rate, ceiling, managed::response(self)?)
+    }
+
+    /// Joint plan step 14 (C4 on macOS; ROOT, 2026-11-13): the least share a managed VM's CPU control holds it at, its
+    /// rate's unit.
+    pub fn managed_least(&self) -> u64 {
+        cpu::LEAST_RATE
+    }
+
+    /// Joint plan step 14 (D260): how long the process that started at `started` has run, a managed VM's VM process by
+    /// its record's `init` ([`process_life`]).
+    pub fn managed_life(&self, started: u64) -> Result<std::time::Duration, Refusal> {
+        process_life(started)
     }
 
     /// Joint plan step 14 (C4 on macOS): the managed scope's CPU rate becomes `rate` milli-CPU, its share as the node's
@@ -308,9 +333,11 @@ impl MacRuntime {
         self.shared.rates()
     }
 
-    /// The slowest stop response the managed CPU control has seen in its own holds (joint plan step 14, 2c): none
-    /// before its first.
-    pub fn cpu_response(&self) -> Result<Option<std::time::Duration>, Refusal> {
+    /// The stop response the managed CPU control estimates from its own holds (joint plan step 14, 2c; the review's
+    /// A-14): none before its first.
+    pub fn cpu_response(
+        &self,
+    ) -> Result<Option<hex_core::helper::managed::response::Estimate>, Refusal> {
         self.shared.cpu_response()
     }
 
@@ -408,26 +435,104 @@ impl MacRuntime {
     }
 
     /// Hands run box `id`'s program to its own thread ([`crate::run::Run`]), with the box's KILL and its removal,
-    /// each the mode's own.
-    fn watch_run(&self, proc: Box<dyn Proc>, id: &BoxId) -> Result<crate::run::Run, Refusal> {
+    /// each the mode's own, the removal touching the box that carries `claim` alone.
+    fn watch_run(
+        &self,
+        proc: Box<dyn Proc>,
+        id: &BoxId,
+        claim: &Arc<crate::run::Claim>,
+    ) -> Result<crate::run::Run, Refusal> {
         if let Some(bu) = &self.helper {
             let (killer, kill_id) = (Arc::clone(&bu.helper), id.clone());
             let (helper, boxes, gone) = (Arc::clone(&bu.helper), Arc::clone(&bu.boxes), id.clone());
+            let carried = Arc::clone(claim);
             return crate::run::Run::start(
                 proc,
                 id,
+                claim,
                 Box::new(move || killer.signal(&kill_id, Signal::KILL.number())),
-                Box::new(move || remove_user_box(&helper, &boxes, &gone)),
+                Box::new(move || remove_user_run(&helper, &boxes, &gone, &carried)),
             );
         }
         let b = self.get(id)?;
         let (boxes, gone) = (NativeArc::clone(&self.boxes), id.clone());
+        let carried = Arc::clone(claim);
         crate::run::Run::start(
             proc,
             id,
+            claim,
             Box::new(move || b.signal(Signal::KILL)),
-            Box::new(move || remove_process_box(&boxes, &gone)),
+            Box::new(move || remove_process_run(&boxes, &gone, &carried)),
         )
+    }
+
+    /// Removes run box `id`, which carries `claim`, as a delete of it does ([`crate::run::delete`]), touching no other
+    /// box: a run that couldn't start removes what it made so.
+    fn delete_run(&self, id: &BoxId, claim: &Arc<crate::run::Claim>) -> Result<(), Refusal> {
+        match &self.helper {
+            Some(bu) => crate::run::delete(claim, id, || {
+                remove_user_run(&bu.helper, &bu.boxes, id, claim)
+            }),
+            None => crate::run::delete(claim, id, || remove_process_run(&self.boxes, id, claim)),
+        }
+    }
+
+    /// Makes box `spec`, a run's carrying `run`, its removal's claim, from its making ([`crate::run::Claim`]).
+    fn create_with(
+        &self,
+        spec: BoxSpec,
+        run: Option<&Arc<crate::run::Claim>>,
+    ) -> Result<BoxInfo, Refusal> {
+        spec.check_no_devices("macos")?;
+        if spec.allocation.is_some() {
+            let text = "this ordinary native route advertises identity cost";
+            let mut why = String::new();
+            why.try_reserve_exact(text.len())
+                .map_err(|_| Refusal::Exhausted {
+                    what: "native allocation refusal bytes",
+                    bound: text.len(),
+                })?;
+            why.push_str(text);
+            return Err(Refusal::Invalid {
+                what: "native runtime allocation",
+                why,
+            });
+        }
+        let ClassSpec::Process = spec.class else {
+            return Err(Refusal::Platform {
+                what: "the oci class",
+                platform: "macos",
+                why: "a Linux image needs a Linux kernel: the node's Shards guest carries it \
+                      (hex_runtime::guest::WithGuest routes the class there)"
+                    .to_owned(),
+            });
+        };
+        // A bound macOS can't hold of a process box is refused, typed, never dropped, in either mode (CLAUDE.md §3).
+        hex_core::watch::check(&spec.bounds)?;
+        if let Some(bu) = &self.helper {
+            return bu.create(&spec, run);
+        }
+        let mut boxes = self.boxes()?;
+        let at = native_index(&boxes, &spec.id)
+            .map_or_else(Ok, |_| Err(Refusal::Exists(spec.id.clone())))?;
+        if boxes.len() >= crate::MAX_BOXES {
+            return Err(Refusal::Full(crate::MAX_BOXES));
+        }
+        boxes
+            .try_reserve(1)
+            .map_err(|_| native_allocation(crate::MAX_BOXES))?;
+        let b = NativeArc::try_new(ProcessBox::create(
+            spec.id.clone(),
+            &spec.bounds,
+            self.shared.as_ref(),
+        )?)
+        .map_err(|_| native_allocation(std::mem::size_of::<ProcessBox>()))?;
+        if let Some(claim) = run {
+            b.carry(claim)?;
+        }
+        let info = self.info(&b)?;
+        boxes.insert(at, (OwnerKey::Box(spec.id), b));
+        Ok(info)
     }
 
     fn boxes(&self) -> Result<std::sync::MutexGuard<'_, NativeBoxEntries>, Refusal> {
@@ -445,7 +550,9 @@ impl MacRuntime {
     fn get(&self, id: &BoxId) -> Result<NativeArc<ProcessBox>, Refusal> {
         let boxes = self.boxes()?;
         let at = native_index(&boxes, id).map_err(|_| Refusal::NoSuchBox(id.clone()))?;
-        let (_, boxed) = boxes.get(at).ok_or_else(|| managed::uncertain(id))?;
+        let (_, boxed) = boxes.get(at).ok_or_else(|| {
+            managed::uncertain(id, "its native slot is gone from where its index found it")
+        })?;
         if boxed.is_managed() {
             return Err(Refusal::NoSuchBox(id.try_clone()?));
         }
@@ -474,6 +581,8 @@ impl MacRuntime {
             allocation: None,
             last_resort: None,
             ended: None,
+            control: None,
+            control_wake: None,
             credentials: Vec::new(),
         })
     }
@@ -486,8 +595,12 @@ impl BoxUser {
             .map_err(|_| Refusal::Broken("the node's box-user map lock is poisoned".to_owned()))
     }
 
-    /// Acquires a pool user for the box and remembers its bounds.
-    fn create(&self, spec: &BoxSpec) -> Result<BoxInfo, Refusal> {
+    /// Acquires a pool user for the box and remembers its bounds, and the claim it carries where it is a run's box.
+    fn create(
+        &self,
+        spec: &BoxSpec,
+        run: Option<&Arc<crate::run::Claim>>,
+    ) -> Result<BoxInfo, Refusal> {
         let mut boxes = self.boxes()?;
         if boxes.contains_key(&spec.id) {
             return Err(Refusal::Exists(spec.id.clone()));
@@ -501,6 +614,7 @@ impl BoxUser {
             UserBox {
                 bounds: spec.bounds.clone(),
                 leader_started: false,
+                run: run.map(Arc::clone),
             },
         );
         Ok(info(spec.id.clone(), spec.bounds.clone(), BoxState::Empty))
@@ -556,39 +670,123 @@ impl BoxUser {
         })
     }
 
+    /// A run's box is its removal's claimer's ([`crate::run::delete`]); any other is ended and forgotten here.
     fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
-        remove_user_box(&self.helper, &self.boxes, id)
+        let claim = self.boxes()?.get(id).and_then(|b| b.run.clone());
+        match claim {
+            Some(claim) => crate::run::delete(&claim, id, || {
+                remove_user_run(&self.helper, &self.boxes, id, &claim)
+            }),
+            None => remove_user_box(&self.helper, &self.boxes, id),
+        }
     }
 }
 
-/// Ends box-user box `id` through the helper and forgets it: the runtime's delete and a run's thread take this one
-/// path.
+fn user_boxes(
+    boxes: &Mutex<BTreeMap<BoxId, UserBox>>,
+) -> Result<std::sync::MutexGuard<'_, BTreeMap<BoxId, UserBox>>, Refusal> {
+    boxes
+        .lock()
+        .map_err(|_| Refusal::Broken("the node's box-user map lock is poisoned".to_owned()))
+}
+
+/// Ends box-user box `id` through the helper and forgets it.
 fn remove_user_box(
     helper: &helper_client::Helper,
     boxes: &Mutex<BTreeMap<BoxId, UserBox>>,
     id: &BoxId,
 ) -> Result<(), Refusal> {
     helper.end(id)?;
-    boxes
-        .lock()
-        .map_err(|_| Refusal::Broken("the node's box-user map lock is poisoned".to_owned()))?
-        .remove(id);
+    user_boxes(boxes)?.remove(id);
     Ok(())
 }
 
-/// Removes rootless box `id` and ends it (kill, drain, stop its watcher): the runtime's delete and a run's thread
-/// take this one path. Dropping the last Arc does the same, so removing a box a caller still holds through
-/// `list` is safe.
+/// Ends box-user run box `id` where it still carries `claim`, its removal's claimer's (the run's end or a delete):
+/// ended through the helper while it stays in view, so a delete beside it waits for the claimer's word and no box
+/// takes its id meanwhile, then forgotten. A box under the id that carries no such claim is another, which this
+/// touches not: the claimer's box is gone.
+fn remove_user_run(
+    helper: &helper_client::Helper,
+    boxes: &Mutex<BTreeMap<BoxId, UserBox>>,
+    id: &BoxId,
+    claim: &Arc<crate::run::Claim>,
+) -> Result<(), Refusal> {
+    let carries = |b: &UserBox| b.run.as_ref().is_some_and(|run| Arc::ptr_eq(run, claim));
+    if !user_boxes(boxes)?.get(id).is_some_and(carries) {
+        return Ok(());
+    }
+    helper.end(id)?;
+    let mut held = user_boxes(boxes)?;
+    if held.get(id).is_some_and(carries) {
+        held.remove(id);
+    }
+    Ok(())
+}
+
+fn native_boxes<'a>(
+    boxes: &'a NativeBoxes,
+    id: &BoxId,
+) -> Result<std::sync::MutexGuard<'a, NativeBoxEntries>, Refusal> {
+    boxes
+        .lock()
+        .map_err(|_| managed::uncertain(id, "its node's native boxes' lock is poisoned"))
+}
+
+/// The runtime's delete of rootless box `id`: a run's box is its removal's claimer's ([`crate::run::delete`]); any
+/// other is removed and ended here (kill, drain, stop its watcher). Dropping the last Arc does the same, so removing a
+/// box a caller still holds through `list` is safe.
 fn remove_process_box(boxes: &NativeBoxes, id: &BoxId) -> Result<(), Refusal> {
     let b = {
-        let mut boxes = boxes.lock().map_err(|_| managed::uncertain(id))?;
-        let at = native_index(&boxes, id).map_err(|_| Refusal::NoSuchBox(id.clone()))?;
-        if boxes.get(at).is_some_and(|(_, boxed)| boxed.is_managed()) {
-            return Err(managed::uncertain(id));
+        let mut held = native_boxes(boxes, id)?;
+        let at = native_index(&held, id).map_err(|_| Refusal::NoSuchBox(id.clone()))?;
+        let boxed = held.get(at).map(|(_, boxed)| boxed).ok_or_else(|| {
+            managed::uncertain(id, "its native slot is gone from where its index found it")
+        })?;
+        if boxed.is_managed() {
+            return Err(managed::uncertain(
+                id,
+                "its box is a managed VM's, which only its own scope's stop removes",
+            ));
         }
-        boxes.remove(at).1
+        if let Some(claim) = boxed.claim().cloned() {
+            drop(held);
+            return crate::run::delete(&claim, id, || remove_process_run(boxes, id, &claim));
+        }
+        held.remove(at).1
     };
     b.delete()
+}
+
+/// Removes rootless run box `id` where it still carries `claim`, its removal's claimer's (the run's end or a delete):
+/// ended (kill, drain, stop its watcher) while it stays in view, so a delete beside it waits for the claimer's word and
+/// no box takes its id meanwhile, then taken out. A box under the id that carries no such claim is another, which this
+/// touches not: the claimer's box is gone.
+fn remove_process_run(
+    boxes: &NativeBoxes,
+    id: &BoxId,
+    claim: &Arc<crate::run::Claim>,
+) -> Result<(), Refusal> {
+    let carries = |b: &NativeArc<ProcessBox>| b.claim().is_some_and(|run| Arc::ptr_eq(run, claim));
+    let b = {
+        let held = native_boxes(boxes, id)?;
+        let Some(b) = native_index(&held, id)
+            .ok()
+            .and_then(|at| held.get(at))
+            .map(|(_, boxed)| boxed)
+            .filter(|boxed| carries(boxed))
+        else {
+            return Ok(());
+        };
+        NativeArc::clone(b)
+    };
+    let ended = b.delete();
+    let mut held = native_boxes(boxes, id)?;
+    if let Ok(at) = native_index(&held, id)
+        && held.get(at).is_some_and(|(_, boxed)| carries(boxed))
+    {
+        held.remove(at);
+    }
+    ended
 }
 
 /// A box-user box's [`BoxInfo`]: a `process` box, with box-user membership (the helper holds it), no init
@@ -609,6 +807,8 @@ fn info(id: BoxId, bounds: Bounds, state: BoxState) -> BoxInfo {
         allocation: None,
         last_resort: None,
         ended: None,
+        control: None,
+        control_wake: None,
         credentials: Vec::new(),
     }
 }
@@ -619,53 +819,7 @@ impl Runtime for MacRuntime {
     }
 
     fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
-        spec.check_no_devices("macos")?;
-        if spec.allocation.is_some() {
-            let text = "this ordinary native route advertises identity cost";
-            let mut why = String::new();
-            why.try_reserve_exact(text.len())
-                .map_err(|_| Refusal::Exhausted {
-                    what: "native allocation refusal bytes",
-                    bound: text.len(),
-                })?;
-            why.push_str(text);
-            return Err(Refusal::Invalid {
-                what: "native runtime allocation",
-                why,
-            });
-        }
-        let ClassSpec::Process = spec.class else {
-            return Err(Refusal::Platform {
-                what: "the oci class",
-                platform: "macos",
-                why: "a Linux image needs a Linux kernel: the node's Shards guest carries it \
-                      (hex_runtime::guest::WithGuest routes the class there)"
-                    .to_owned(),
-            });
-        };
-        // A bound macOS can't hold of a process box is refused, typed, never dropped, in either mode (CLAUDE.md §3).
-        hex_core::watch::check(&spec.bounds)?;
-        if let Some(bu) = &self.helper {
-            return bu.create(&spec);
-        }
-        let mut boxes = self.boxes()?;
-        let at = native_index(&boxes, &spec.id)
-            .map_or_else(Ok, |_| Err(Refusal::Exists(spec.id.clone())))?;
-        if boxes.len() >= crate::MAX_BOXES {
-            return Err(Refusal::Full(crate::MAX_BOXES));
-        }
-        boxes
-            .try_reserve(1)
-            .map_err(|_| native_allocation(crate::MAX_BOXES))?;
-        let b = NativeArc::try_new(ProcessBox::create(
-            spec.id.clone(),
-            &spec.bounds,
-            self.shared.as_ref(),
-        )?)
-        .map_err(|_| native_allocation(std::mem::size_of::<ProcessBox>()))?;
-        let info = self.info(&b)?;
-        boxes.insert(at, (OwnerKey::Box(spec.id), b));
-        Ok(info)
+        self.create_with(spec, None)
     }
 
     fn start(&self, id: &BoxId) -> Result<(), Refusal> {
@@ -719,18 +873,22 @@ impl Runtime for MacRuntime {
     /// A run's box goes once its program ends (decision 7): a thread of the run's own waits for the end and
     /// removes the box through the delete's own path ([`crate::run::Run`]), whether or not its caller still holds
     /// the run, and only then gives the caller the end. Its kill is the box's KILL, the box holding that program
-    /// alone. In both modes: a process group's and a box user's.
+    /// alone. In both modes: a process group's and a box user's. The box carries its removal's claim from its making,
+    /// held here until it is whole and its program watched, so no delete moves it meanwhile, and it is removed once,
+    /// by the run's end or a delete, never after another box has taken its id (runtime goal 7).
     fn run(&self, spec: BoxSpec, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, Refusal> {
         spec.check_no_devices("macos")?;
         spec.check_run()?;
         let id = spec.id.clone();
-        self.create(spec)?;
+        let (claim, making) = crate::run::Claim::making();
+        self.create_with(spec, Some(&claim))?;
         let begun = self
             .exec(&id, program, stdio)
-            .and_then(|proc| self.watch_run(proc, &id));
+            .and_then(|proc| self.watch_run(proc, &id, &claim));
+        making.made();
         match begun {
             Ok(run) => Ok(Box::new(run)),
-            Err(why) => Err(crate::run::undone(why, self.delete(&id), &id)),
+            Err(why) => Err(crate::run::undone(why, self.delete_run(&id, &claim), &id)),
         }
     }
 
@@ -906,4 +1064,53 @@ fn c_string(s: &str) -> Result<CString, Refusal> {
 fn null(flags: OFlags) -> Result<OwnedFd, Refusal> {
     rustix::fs::open("/dev/null", flags | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| Refusal::os("opening /dev/null", e))
+}
+
+/// Joint plan step 14 (C1 on macOS; 2c-4b): the managed control's cycle at `rate` milli-CPU below its `ceiling`, its run
+/// and its hold at the stop `response` its helper estimates ([`cpu::cycle`]); cold, told, where it has learned none, as
+/// no response is guessed (decision 9's cold start); and while its estimate is cold, the slowest of too few holds or an
+/// older helper's slowest seen, that cycle used and told cold (the review's A-14).
+pub(crate) fn cycle_of(
+    rate: u64,
+    ceiling: u64,
+    response: Option<hex_core::helper::managed::response::Estimate>,
+) -> Result<crate::guest::CapCycle, Refusal> {
+    let Some(response) = response else {
+        return Ok(crate::guest::CapCycle::Cold(
+            "its control's cycle is unknown until its managed helper measures a stop".to_owned(),
+        ));
+    };
+    let (run, hold) = cpu::cycle(rate, ceiling, response.response).map_err(|_| {
+        managed::configuration("the CPU control has no cycle at the rate it is asked")
+    })?;
+    let cycle = run
+        .checked_add(hold)
+        .ok_or_else(|| managed::configuration("the CPU control's cycle overflows"))?;
+    Ok(if response.cold {
+        crate::guest::CapCycle::ColdOf {
+            cycle,
+            why: "its control's cycle is at the slowest stop its managed helper has measured, not their p99.9"
+                .to_owned(),
+        }
+    } else {
+        crate::guest::CapCycle::Of(cycle)
+    })
+}
+
+/// Joint plan step 14 (D260): how long the process that started at `started` has run: from its start, as `proc_pid_rusage`
+/// reads it (`ri_proc_start_abstime`, Mach absolute time: a managed VM's `init`, Shards' `Identity::started`), to now on
+/// the same clock (`CLOCK_UPTIME_RAW`, Mach absolute time in nanoseconds). Refused where a clock can't be read, or where
+/// the start is past now, which no process's is.
+pub fn process_life(started: u64) -> Result<std::time::Duration, Refusal> {
+    let timebase = sys::Timebase::get()
+        .map_err(|why| Refusal::os("reading Mach absolute time's units", why))?;
+    let now = sys::uptime_raw().map_err(|why| Refusal::Os {
+        op: "reading the clock a process's life is reckoned on",
+        why: why.to_string(),
+    })?;
+    now.checked_sub(std::time::Duration::from_nanos(timebase.nanos(started)))
+        .ok_or_else(|| Refusal::Invalid {
+            what: "a process's start",
+            why: format!("{started} Mach ticks is past now on its own clock"),
+        })
 }

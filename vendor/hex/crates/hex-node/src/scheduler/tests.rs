@@ -116,11 +116,8 @@ fn replayed_deletion_does_not_interrupt_the_reconnected_peer() {
     assert!(child.lock().unwrap().try_wait().unwrap().is_some());
 }
 
-/// LB03/AC-T7.4.1: the production laptop dispatch drains the same durable messages that a peer
-/// transport would send. Then the real common socket/client observes and deletes the actual box.
-#[test]
-fn laptop_dispatch_and_common_wire_keep_the_box_until_explicit_delete() {
-    let dir = tempfile::tempdir().unwrap();
+/// A laptop's scheduler over `dir`, its one node the sim runtime's, built as `Service::open` builds one; its runtime too.
+fn laptop_service(dir: &Path) -> (Arc<Service>, Arc<hex_api::sim::SimRuntime>, Resources) {
     let runtime = Arc::new(hex_api::sim::SimRuntime::default());
     let need = Resources {
         cpu_milli: u64::from(hex_api::MIN_CPU_MILLI),
@@ -137,7 +134,7 @@ fn laptop_dispatch_and_common_wire_keep_the_box_until_explicit_delete() {
             ran: hex_runtime::MAX_BOXES,
         },
         Pick::default(),
-        &dir.path().join("placements"),
+        &dir.join("placements"),
         Runtimes::new([(
             hex_sim::model::Class::Oci,
             runtime.clone() as Arc<dyn Runtime>,
@@ -146,7 +143,7 @@ fn laptop_dispatch_and_common_wire_keep_the_box_until_explicit_delete() {
     )
     .unwrap();
     let cache = cache::Cache::open(
-        &dir.path().join("peers"),
+        &dir.join("peers"),
         &std::collections::BTreeSet::new(),
         &mut cluster.clone(),
         no_aside,
@@ -158,10 +155,10 @@ fn laptop_dispatch_and_common_wire_keep_the_box_until_explicit_delete() {
         command: Mutex::new(()),
         fault: Mutex::new(None),
         cache: Mutex::new(cache),
-        _lease: std::fs::File::create(dir.path().join("lease")).unwrap(),
+        _lease: std::fs::File::create(dir.join("lease")).unwrap(),
         order: Mutex::new(
             order::Order::open_with_peers(
-                &dir.path().join("transport"),
+                &dir.join("transport"),
                 &std::collections::BTreeSet::from([]),
             )
             .unwrap(),
@@ -170,7 +167,7 @@ fn laptop_dispatch_and_common_wire_keep_the_box_until_explicit_delete() {
         lane: None,
         runtimes: Runtimes::default(),
         cluster: Mutex::new(cluster),
-        facts_dir: dir.path().to_path_buf(),
+        facts_dir: dir.to_path_buf(),
         initialized: Classes::NONE,
         physical_authority: None,
         stopping: Arc::new(Stopping::default()),
@@ -179,6 +176,15 @@ fn laptop_dispatch_and_common_wire_keep_the_box_until_explicit_delete() {
         senders: BTreeMap::new(),
         refreshing: BTreeMap::new(),
     });
+    (service, runtime, need)
+}
+
+/// LB03/AC-T7.4.1: the production laptop dispatch drains the same durable messages that a peer
+/// transport would send. Then the real common socket/client observes and deletes the actual box.
+#[test]
+fn laptop_dispatch_and_common_wire_keep_the_box_until_explicit_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, runtime, need) = laptop_service(dir.path());
     let demand = Demand {
         need,
         kind: Kind::Plain,
@@ -629,6 +635,47 @@ fn advertise_capacity(service: &Service, peer: &NodeSpec) -> Result<dto::Reply, 
         offer: offer::from_local(peer, &[]).unwrap(),
         observations: Vec::new(),
     })
+}
+
+/// The review's E-10 (AC-T7.4.1; crash-only, capacity-view.md CV11): a scheduler whose placement core stops ends its
+/// server, its wait saying why, so `hex schedule serve` exits naming the stop and its next start recovers from the
+/// records. Do serve a scheduler on its socket, its server ended by its shell on a stop ([`Service::end_with`]); then
+/// submit a box and fail the write of its create's acknowledgement (its temp file's name a directory). Expect the
+/// dispatch refused, and the server's wait to return, naming the stop.
+#[test]
+fn e10_a_scheduler_whose_core_stops_ends_its_server_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, _runtime, _need) = laptop_service(dir.path());
+    #[cfg(target_os = "linux")]
+    let platform = crate::sizes::Sizes::now().unwrap().platform();
+    #[cfg(target_os = "macos")]
+    let platform = crate::serve::macos::platform().unwrap();
+    #[cfg(windows)]
+    let platform = crate::serve::windows::platform().unwrap();
+    let mut server = crate::serve::Server::bind(
+        &dir.path().join("scheduler.sock"),
+        service.clone() as Arc<dyn Host>,
+        crate::serve::limits(&platform),
+        platform.threads,
+    )
+    .unwrap();
+    let stopper = server.stopper();
+    service.end_with(move |why| stopper.stop(why)).unwrap();
+    let (demand, payload) = capacity_budget_request(1);
+    let (key, step) = service.driver.submit(demand, payload).unwrap();
+    // The create's acknowledgement can't be written: its temp file's name is a directory.
+    std::fs::create_dir(
+        dir.path()
+            .join("placements")
+            .join(format!("ran-{}-{}-{}.tmp", key.owner, key.epoch, key.seq)),
+    )
+    .unwrap();
+    assert!(service.dispatch(step).is_err());
+    let fault = server.wait().unwrap_or_default();
+    assert!(
+        fault.contains("its placement core stopped") && fault.contains("Io("),
+        "{fault}"
+    );
 }
 
 fn capacity_budget_service(
@@ -1224,6 +1271,7 @@ fn canonical_draining_action_is_not_filtered_by_unavailable_fresh_gpu_observatio
         }],
     };
     let report = hex_api::Capacity {
+        own: Default::default(),
         id: "same-owner".into(),
         total: fixed,
         free: fixed,
@@ -1246,6 +1294,8 @@ fn canonical_draining_action_is_not_filtered_by_unavailable_fresh_gpu_observatio
         }],
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     report.check().unwrap();
     let reports = vec![(hex_sim::model::Class::Firecracker, Some(report))];
@@ -1255,6 +1305,7 @@ fn canonical_draining_action_is_not_filtered_by_unavailable_fresh_gpu_observatio
         Refusal::Backing {
             key,
             cause: hex_api::LifecycleCause::Uncertain,
+            why: None,
         },
     )
     .unwrap();
@@ -1269,5 +1320,40 @@ fn canonical_draining_action_is_not_filtered_by_unavailable_fresh_gpu_observatio
             kind: hex_api::DeviceKind::Gpu,
             key: 7
         }]
+    );
+}
+
+/// The capacity lane's event lines (CLAUDE.md §10; ROOT, 2026-11-14): each value a JSON string or a whole number, through
+/// `hex_api::event`. Do: form the lane's end and a failed hint with words holding a quote, a backslash and a newline,
+/// and a release for such a holder's name. Expect: each one line, its words JSON strings, its counts whole numbers.
+#[test]
+fn the_capacity_lanes_event_lines_are_one_line_their_values_json() {
+    let why = hex_quic::Refused::Os {
+        op: "reading",
+        why: "a \"b\" \\ c\nd".into(),
+    };
+    let words = "why=\"reading failed: a \\\"b\\\" \\\\ c\\nd\"";
+    assert_eq!(
+        lane_ended_line(&why),
+        format!("hex.capacity event=lane_ended {words}")
+    );
+    assert_eq!(
+        hint_failed_line(&why),
+        format!("hex.capacity event=hint_failed {words}")
+    );
+    let released = hex_api::capacity::Forgotten {
+        epoch: 3,
+        count: 2,
+        sum: hex_api::capacity::Amounts {
+            cpu_milli: 1500,
+            mem_bytes: 1 << 20,
+            disk_bytes: 7,
+            gpus: 1,
+        },
+    };
+    assert_eq!(
+        forgotten_line("kiln \"a\"\n", &released),
+        "hex.capacity event=forgotten holder=\"kiln \\\"a\\\"\\n\" epoch=3 count=2 cpu_milli=1500 \
+         mem_bytes=1048576 disk_bytes=7 gpus=1"
     );
 }

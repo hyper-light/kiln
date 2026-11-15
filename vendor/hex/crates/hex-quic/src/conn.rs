@@ -15,10 +15,12 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
+use hex_api::lease::Wiped;
 use hex_core::lanes::{self, Why};
 use hex_wait::{Condvar, Mutex, MutexGuard};
 
 use crate::driver::{Command, Commands};
+use crate::seal::Keys;
 
 /// The frames that wait for the owner at most: its credit's worth, one being read and the next
 /// ([`hex_core::lanes::INITIAL_CREDIT`]).
@@ -36,12 +38,13 @@ enum There {
 
 #[derive(Debug)]
 struct State {
-    inbound: std::collections::VecDeque<Vec<u8>>,
+    /// The frames come and not yet read, each wiped as it goes on a connection that carries the node's wire.
+    inbound: std::collections::VecDeque<Wiped>,
     /// How far into the front frame the owner has read.
     read: usize,
     there: There,
-    /// A data frame waiting for the driver.
-    outbox: Option<Vec<u8>>,
+    /// A data frame waiting for the driver, wiped as it goes on a connection that carries the node's wire.
+    outbox: Option<Wiped>,
     /// This side's half ended (its End sent), or its owner reset it.
     here_ended: bool,
     /// The connection is gone both ways: why.
@@ -53,11 +56,17 @@ pub(crate) struct Shared {
     pub(crate) peer: hyper_transport::PeerId,
     pub(crate) key: lanes::Conn,
     pub(crate) port: u32,
+    /// Whether what it holds is wiped as it goes: on a port whose bytes travel as control data, the node's wire among
+    /// them, whose messages may carry a lease's value or a sign-in's tokens (docs/design/credential-grants.md C7, C8;
+    /// the review's E-6). The stream and bulk lanes carry no secret, and their frames go unwiped.
+    wipes: bool,
     state: Mutex<State>,
     changed: Condvar,
     commands: Commands,
     /// Told whenever what the owner may do changed: an owner that waits in an event loop of its own.
     notify: Mutex<Option<Notify>>,
+    /// Its QUIC connection's seal, which the node's wire's secrets go under on it (docs/design/hex-quic.md Q13).
+    keys: Arc<Keys>,
 }
 
 /// What an evented owner is told when a connection's state changes.
@@ -88,7 +97,7 @@ fn take(state: &mut MutexGuard<'_, State>, buf: &mut [u8]) -> io::Result<Option<
             (There::Open, None) => Ok(None),
         };
     };
-    let rest = front.get(at..).unwrap_or_default();
+    let rest = front.bytes().get(at..).unwrap_or_default();
     let n = rest.len().min(buf.len());
     if let (Some(to), Some(from)) = (buf.get_mut(..n), rest.get(..n)) {
         to.copy_from_slice(from);
@@ -112,11 +121,14 @@ impl Shared {
         key: lanes::Conn,
         port: u32,
         commands: Commands,
+        keys: Arc<Keys>,
     ) -> Self {
         Self {
             peer,
             key,
             port,
+            keys,
+            wipes: lanes::data_kind(port) == Some(lanes::Kind::ControlData),
             state: Mutex::new(State {
                 inbound: std::collections::VecDeque::with_capacity(HELD_AT),
                 read: 0,
@@ -150,7 +162,7 @@ impl Shared {
             if state.gone.is_some() {
                 return;
             }
-            state.inbound.push_back(bytes);
+            state.inbound.push_back(Wiped::new(bytes, self.wipes));
         }
         self.told();
     }
@@ -175,7 +187,7 @@ impl Shared {
     }
 
     /// The driver: the frame waiting for it, if any.
-    pub(crate) fn take_outbox(&self) -> Option<Vec<u8>> {
+    pub(crate) fn take_outbox(&self) -> Option<Wiped> {
         self.state.lock().ok()?.outbox.take()
     }
 
@@ -186,7 +198,7 @@ impl Shared {
 
     /// The driver: the length of the frame waiting for it, if any.
     pub(crate) fn outbox_len(&self) -> Option<usize> {
-        self.state.lock().ok()?.outbox.as_ref().map(Vec::len)
+        self.state.lock().ok()?.outbox.as_ref().map(Wiped::len)
     }
 
     /// The driver: the frame it took went (or the connection is gone): a writer may place the next.
@@ -205,6 +217,14 @@ impl Shared {
 /// reset: the peer hears its owner let it go ([`Why::Gone`]).
 pub struct Conn {
     pub(crate) shared: Arc<Shared>,
+}
+
+impl Conn {
+    /// Whether what it carries is wiped where it is held: a port whose bytes travel as control data ([`Shared`]'s
+    /// `wipes`), so a copy its bridge makes is wiped too.
+    pub(crate) fn wipes(&self) -> bool {
+        self.shared.wipes
+    }
 }
 
 impl std::fmt::Debug for Conn {
@@ -313,7 +333,7 @@ impl Conn {
                 }
                 state = self.wait(state, deadline)?;
             }
-            state.outbox = Some(chunk.to_vec());
+            state.outbox = Some(Wiped::new(chunk.to_vec(), self.shared.wipes));
             drop(state);
             self.shared.command(Command::Send {
                 peer: self.shared.peer,
@@ -344,7 +364,7 @@ impl Conn {
         if state.outbox.is_some() {
             return Ok(false);
         }
-        state.outbox = Some(bytes.to_vec());
+        state.outbox = Some(Wiped::new(bytes.to_vec(), self.shared.wipes));
         drop(state);
         self.shared.command(Command::Send {
             peer: self.shared.peer,
@@ -375,6 +395,12 @@ impl Conn {
     /// The peer it is with.
     pub fn peer(&self) -> hyper_transport::PeerId {
         self.shared.peer
+    }
+
+    /// Its QUIC connection's seal, which a message of the node's wire that carries a secret goes under on it
+    /// ([`hex_core::wire::seal`], [`hex_core::wire::open`]; docs/design/hex-quic.md Q13).
+    pub fn keys(&self) -> &Keys {
+        &self.shared.keys
     }
 
     /// Whether the peer is done: its half ended and all of it was read, or the connection went while its half was

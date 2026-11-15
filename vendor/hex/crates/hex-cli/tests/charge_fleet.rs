@@ -5,46 +5,75 @@
 //! each at its class's learned prior where the node's capacity answer carries one (a cold class's its admission), else
 //! its whole receipt (C2, C6), whenever the node's room has changed since it last refused one; every window (the node's
 //! learner's as the node says it, each read at least that long after the last), it reads each VM's CPU given (its
-//! usage), asked (its trace's over the same span) and booked (its holding on the capacity answer), and reckons the run
-//! as hex-sim reckons its own (`hex_sim::charge::trial`). A VM whose trace has played is deleted, freeing its room. It
-//! prints `HEX-CHARGE-FLEET` lines and keeps every reading in `HEX_CHARGE_OUT/windows.tsv`.
+//! usage), asked (what its trace asked for certain over the same span) and booked (its holding on the capacity answer),
+//! and reckons the run as hex-sim reckons its own (`hex_sim::charge::trial`). A VM whose trace has played is deleted,
+//! freeing its room. It prints `HEX-CHARGE-FLEET` lines and keeps every reading in `HEX_CHARGE_OUT/windows.tsv`.
 //!
 //! What it measures, each from the run's own windows: the most VMs admitted at once against what envelope charging
 //! admits; each VM-window's given over min(asked, booked), the guarantee's misses and Jain's index of the contended
-//! windows; the riser's windows past its booking, its neighbours' and the process box's shortfalls while it rises, the
-//! starts refused for room while it rises, and whether the last resort ended it (its inspect's why); each VM's windows
-//! past its charge, the violation rate; and the learner's own CPU (Linux: the node's `hex-charges` thread; macOS and
-//! Windows: the node's whole CPU, an upper bound, no thread named there).
+//! windows, and the same ratio of given over asked where nothing contended, the run's own floor; the riser's windows
+//! past its booking, its neighbours' and the process box's shortfalls while it rises, the starts refused for room while
+//! it rises, and whether the last resort ended it (its inspect's why); each VM that ended before its trace had played,
+//! by name, with its inspect's exit and why; each VM's windows past its charge, the violation rate; and the learner's
+//! own CPU (Linux: the node's `hex-charges` thread; macOS and Windows: the node's whole CPU, an upper bound, no thread
+//! named there).
 //!
-//! The riser rises once its charge has warmed, SEEDABLE windows after its start, to every vCPU and the most any trace
-//! holds; the run lasts its longest trace. Each VM's guest plays its trace with its `/bin/sh` (busybox's `sleep`, `head`,
-//! `truncate`, `grep` and `kill` in an Alpine root), each step until its deadline from the trace's start (read from
-//! `/proc/uptime`, so the play doesn't drift from the trace), holding its memory in a file of the first of `/dev/shm`,
-//! `/tmp` and `/run` that `/proc/mounts` says is a tmpfs, else of a tmpfs it mounts: guest RAM, never a file a shared
-//! root would put on the host. Equal steps in a row are one; a trace whose player's arguments pass Linux's least
-//! `ARG_MAX` (the guest's exec bound, `hex_api::sim::SIM_EXEC_LIMIT`) is refused, naming it.
+//! The riser plays the longest trace, which its warm-up fits: it rises once its charge has warmed, SEEDABLE windows
+//! after its start, to every vCPU and the most any trace holds; the run lasts its longest trace. Each VM's guest plays
+//! its trace with its `/bin/sh` (busybox's `sleep`, `head`, `truncate`, `grep`, `mount` and `kill` in an Alpine root),
+//! the trace's time from its player's own start (`/proc/self/stat`'s start time, on `/proc/uptime`'s clock and tick,
+//! proc(5)), each step until its deadline in that time, so the play keeps to the trace (a step already past is passed
+//! over). Its CPU: a spinner a vCPU its trace uses, made before it plays and held stopped, each step continuing as many
+//! as the step's threads and stopping the rest (a signal, so a step's edge waits on no fork). Its memory, played beside
+//! its CPU by the same deadlines, so no step's hold makes the next step's CPU late: a file of a tmpfs it mounts, as
+//! large as its trace's most MiB, else of the first of `/dev/shm`, `/tmp` and `/run` that `/proc/mounts` says is a
+//! tmpfs: guest RAM, never a file a shared root would put on the host. Equal steps in a row are one; a trace whose
+//! player's arguments pass Linux's least `ARG_MAX` (the guest's exec bound, `hex_api::sim::SIM_EXEC_LIMIT`) is refused,
+//! naming it.
+//!
+//! What a VM asked for certain ([`Asked`]): no clock of the driver's reads the guest's, so a window's ask is the least
+//! its trace can have asked over the span its reading can't have missed. The trace's zero, its player's start, came
+//! within the VM's start: after its create was sent, before its start's answer, which every class gives once its
+//! program has started (a start past its W* answering Pending is followed to its run, its window ending where the
+//! driver first reads it running). A step's edge comes from two ticks of `/proc/uptime` (hundredths of a second) before
+//! its time, its deadline and the trace's zero each read rounded down to a tick, to a tick after it, the player's sleep
+//! reckoned from a clock read rounded down. What the guest's own turns add past that (a sleep's overshoot, the shell's
+//! turn) no reading places: the run's floor, given over asked where nothing contended, says how far it went. A
+//! reading's span runs from the last read's answer to this read's sending, where each usage was read somewhere between
+//! its call's sending and its answer; its given is its usage over the span between the two answers, and its ask and
+//! booking are what the trace and its holding certainly asked over the shorter span, over that one. A VM's first
+//! reading spans its player's own start, its spinners' making, which no clock of the driver's places: it is given, and
+//! owed nothing.
 //!
 //! Every number it runs with is derived, none picked:
-//! - each VM's workload, what it is admitted for and the class's cost sizes: the most busy threads (a CPU each) and the
-//!   most MiB any step of any trace asks, so every trace and the riser fit their VM's envelope;
+//! - each VM's workload, what it is admitted for and the class's cost sizes: the most busy threads (a CPU each, at most
+//!   the host's CPUs, all a VM is given: D191) and the most MiB any step of any trace asks, so every trace and the
+//!   riser fit their VM's envelope;
 //! - the process box's CPU cap and memory bound, which it books (the run's admission leaves it both) and of which it
 //!   asks the CPU whole: the median CPU (mean cores, in milli-CPU) and the median peak memory, each by nearest rank, of
 //!   the `build` legs kiln's CI ran from 2026-10-22 to 2026-11-05 (bench/sched/kiln-ci-20261022-20261105.trace), a CI
 //!   job's box beside the agents. macOS holds a process box at no CPU cap (refused, typed): there the box books its
 //!   memory alone and its spinners ask a CPU each, taking what the scheduler gives them;
 //! - no wait of its own is a timer (the person's rule, 2026-11-13, and Shards' R03 for test waits): each call waits
-//!   for its answer while the node's connection stands, every wait of the run unarmed
-//!   (`hex_core::patience::measure_all`), and the node's start waits for its ready line while the node runs, its end
-//!   the refusal; the node's own waits refuse, typed, as theirs do. No boot record is read;
-//! - the run's window: the node's learner's, as the node says it.
+//!   for its answer while the node's connection stands, a wait past its W* telling its run-out and following its party
+//!   (decision 9), and the node's start waits for its ready line while the node runs, its end the refusal; the node's
+//!   own waits refuse, typed, as theirs do. No boot record is read;
+//! - the run's window: the node's learner's, as the node says it at its start, or as the class's capacity answers tell
+//!   it as the caps it holds move;
+//! - what a VM asked for certain: the tick of `/proc/uptime` and `/proc/self/stat` and the instants of the run's own
+//!   calls;
+//! - the riser's warm-up, SEEDABLE windows, and its player's tmpfs, its trace's most MiB.
 //!
 //! Inputs, each by its own variable, a missing one failing by name:
-//! - `HEX_CHARGE_CLASS`: `shards-image` (Agentfile image VMs of `HEX_IMAGE`, `NAME@sha256:...`, which the driver pulls
-//!   into the node's Shards home first: Linux, its run host awaiting `RunHostStdioOnly` on macOS and Windows), `shards`
-//!   (Shards guest VMs whose box plays the trace from `HEX_CHARGE_ROOTFS`) or `firecracker` (Linux, `HEX_CHARGE_ROOTFS`
-//!   a root directory). The root: Alpine 3.24.4's minirootfs of the guest's architecture, pinned by its SHA-256 in
+//! - `HEX_CHARGE_CLASS`: `shards-image` (Agentfile image VMs, on Linux, macOS and Windows), `shards` (Shards guest VMs
+//!   whose box plays the trace from `HEX_CHARGE_ROOTFS`) or `firecracker` (Linux, `HEX_CHARGE_ROOTFS` a root directory).
+//!   The root: Alpine 3.24.4's minirootfs of the guest's architecture, pinned by its SHA-256 in
 //!   bench/native/oci-validation/inputs.txt (fetched there by fetch.sh), unpacked to a directory, or the tarball itself
 //!   where the node stages a root from one (Windows);
+//! - the image VMs' image, put in the node's Shards home before the node starts, as image_real takes it: either
+//!   `HEX_IMAGE_CONTEXT`, an Agentfile image's build context, built there and pinned by the manifest digest its build
+//!   says (no registry need serve it: `crates/hex-cli/tests/image_harness`, the in-tree harness image any arch builds,
+//!   has the Alpine base's `/bin/sh` and busybox), or else `HEX_IMAGE`, `NAME@sha256:...`, pulled there by its digest;
 //! - the class's configuration as `hex node` reads it, passed through to it: `SHARDS_BIN`, `SHARDS_KERNEL` and
 //!   `SHARDS_INIT` (the image class's run hosts), `HEX_GUEST_KERNEL`, `HEX_GUEST_INITRD`, `HEX_GUEST_CPUS`,
 //!   `HEX_GUEST_MEMORY_MIB`, `HEX_GUEST_COST_FILE`, `HEX_GUEST_COST_SHA256`, `HEX_GUEST_COST_EVIDENCE`; Firecracker's
@@ -80,8 +109,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use hex_api::{
-    Allocation, Bounds, BoxId, BoxSpec, BoxState, CapacityResources, Class, ClassSpec, Network,
-    OciSpec, Program, Rootfs, Runtime, ShardsImage, Stdio,
+    Allocation, Bounds, BoxId, BoxSpec, BoxState, CapacityResources, Class, ClassSpec, Exit,
+    LifecycleCause, Network, OciSpec, Program, Refusal, Rootfs, Runtime, ShardsImage, Stdio,
 };
 use hex_client::Client;
 use hex_sim::charge::SEEDABLE;
@@ -143,24 +172,98 @@ fn length(steps: &[Step]) -> Duration {
     Duration::from_millis(steps.iter().map(|s| s.millis).sum())
 }
 
-/// What a trace asks over `from..to` of its time, in milli-CPU: its busy threads, each a CPU, at most `vcpus` of them,
-/// averaged over the span; nothing past its end.
-fn asked_over(steps: &[Step], from: Duration, to: Duration, vcpus: u64) -> u64 {
-    let span = to.saturating_sub(from).as_nanos();
-    if span == 0 {
-        return 0;
-    }
-    let (mut at, mut busy) = (Duration::ZERO, 0u128);
-    for step in steps {
-        let end = at + Duration::from_millis(step.millis);
-        let overlap = end.min(to).saturating_sub(at.max(from));
-        busy += overlap.as_nanos() * u128::from(step.threads.min(vcpus));
-        at = end;
-        if at >= to {
-            break;
+/// A tick of the guest's clock as its player reads it: hundredths of a second, `/proc/uptime`'s resolution and the unit
+/// of `/proc/self/stat`'s start time (USER_HZ, 100 on every Linux ABI; proc(5)).
+const UPTIME_TICK: Duration = Duration::from_millis(10);
+
+/// Nanoseconds, as the driver reckons instants and a trace's time: signed, a span before a trace's start reaching
+/// below its zero.
+fn ns(span: Duration) -> i128 {
+    i128::try_from(span.as_nanos()).unwrap()
+}
+
+/// What a VM's trace asked at the least (module docs, "what a VM asked for certain"): at each moment of its time, the
+/// fewest threads of any step its player may be playing then, a step's edge coming from two ticks of `/proc/uptime`
+/// before its time to a tick after it (none before the trace's start or after its end), each step's threads at most
+/// `vcpus`; kept as its breakpoints, the threads from each to the next, and the busy thread-time before each, so a
+/// span's least is read in the log of its steps.
+struct Asked {
+    at: Vec<i128>,
+    threads: Vec<u64>,
+    busy: Vec<u128>,
+}
+
+impl Asked {
+    fn of(steps: &[Step], vcpus: u64) -> Self {
+        // Each step may be playing from two ticks before its start, its deadline and the trace's zero each read rounded
+        // down, to a tick past its end, the player's sleep reckoned from a clock read rounded down; before its first step
+        // and after its last, nothing plays.
+        let (early, late) = (2 * ns(UPTIME_TICK), ns(UPTIME_TICK));
+        let mut edges: Vec<(i128, bool, u64)> = Vec::new();
+        let mut start = 0i128;
+        for step in steps {
+            let end = start + i128::from(step.millis) * 1_000_000;
+            let threads = step.threads.min(vcpus);
+            edges.push((start - early, true, threads));
+            edges.push((end + late, false, threads));
+            start = end;
         }
+        edges.push((late, false, 0));
+        edges.push((start - early, true, 0));
+        edges.sort_by_key(|(at, _, _)| *at);
+        let mut playing: BTreeMap<u64, u64> = BTreeMap::from([(0, 1)]);
+        let (mut at, mut threads, mut busy) = (Vec::new(), Vec::new(), Vec::new());
+        let mut sum = 0u128;
+        let mut i = 0;
+        while i < edges.len() {
+            let here = edges[i].0;
+            while i < edges.len() && edges[i].0 == here {
+                let (_, begins, n) = edges[i];
+                if begins {
+                    *playing.entry(n).or_insert(0) += 1;
+                } else if let Some(count) = playing.get_mut(&n) {
+                    *count -= 1;
+                    if *count == 0 {
+                        playing.remove(&n);
+                    }
+                }
+                i += 1;
+            }
+            if let (Some(&last_at), Some(&last_threads)) = (at.last(), threads.last()) {
+                sum += u128::try_from(here - last_at).unwrap() * u128::from(last_threads);
+            }
+            at.push(here);
+            threads.push(playing.keys().next().copied().unwrap_or(0));
+            busy.push(sum);
+        }
+        Self { at, threads, busy }
     }
-    u64::try_from(busy * 1000 / span).unwrap()
+
+    /// The least busy thread-time up to `t` of the trace's time.
+    fn until(&self, t: i128) -> u128 {
+        let after = self.at.partition_point(|&at| at <= t);
+        if after == 0 {
+            return 0;
+        }
+        let i = after - 1;
+        self.busy[i] + u128::try_from(t - self.at[i]).unwrap() * u128::from(self.threads[i])
+    }
+
+    /// The least busy thread-time over `len` of the trace's time from any instant of `from_lo..=from_hi`: the least of a
+    /// sum piecewise linear in where it starts, so at an end of the range or where its start or its end meets a
+    /// breakpoint.
+    fn least(&self, from_lo: i128, from_hi: i128, len: i128) -> u128 {
+        let over = |from: i128| self.until(from + len) - self.until(from);
+        let mut least = over(from_lo).min(over(from_hi));
+        for shift in [0, len] {
+            let lo = self.at.partition_point(|&at| at < from_lo + shift);
+            let hi = self.at.partition_point(|&at| at <= from_hi + shift);
+            for &at in &self.at[lo..hi] {
+                least = least.min(over(at - shift));
+            }
+        }
+        least
+    }
 }
 
 /// `usec` of CPU over `span`, in milli-CPU.
@@ -168,41 +271,94 @@ fn milli(usec: u64, span: Duration) -> u64 {
     u64::try_from(u128::from(usec) * 1000 / span.as_micros().max(1)).unwrap()
 }
 
-/// The guest's player, given `millis threads mib` triples: each step its threads busy and its MiB held, until the
-/// step's deadline from the trace's start (`/proc/uptime`, in centiseconds), so a slow step doesn't push the next. Its
-/// memory is held in a tmpfs file, grown and cut in place: `/dev/shm`, `/tmp` or `/run` where `/proc/mounts` says one is
-/// a tmpfs, else one it mounts; with none, or no `/proc/uptime`, it says so and ends.
+/// So much of `milli` milli-CPU as `part` is of `whole`: what a rate held over the span a reading is certain of comes
+/// to over the span its given is reckoned over.
+fn scaled(milli: u64, part: i128, whole: i128) -> u64 {
+    if part <= 0 || whole <= 0 {
+        return 0;
+    }
+    u64::try_from(
+        u128::from(milli) * u128::try_from(part).unwrap() / u128::try_from(whole).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The guest's player, given its spinners' number, its trace's most MiB, then `millis threads mib` triples (module
+/// docs): the trace's time from its own start (`/proc/self/stat`'s start time, its 22nd field, in ticks since boot on
+/// `/proc/uptime`'s clock), each step until its deadline in that time, a step whose end is past passed over. Its CPU:
+/// its spinners, made and held stopped, each step continuing as many as its threads and stopping the rest. Its memory,
+/// played beside by the same deadlines: a file grown and cut in place in a tmpfs it mounts as large as the most MiB,
+/// else in `/dev/shm`, `/tmp` or `/run` where `/proc/mounts` says one is a tmpfs. Where it can't, it says why and ends
+/// (its memory's play, failing, ends its CPU's by a signal).
 const PLAYER: &str = r#"fail() { echo "hex-charge player: $*" >&2; exit 2; }
 [ -r /proc/uptime ] || fail "no /proc/uptime to keep the trace's time by"
+now() { read -r up _ < /proc/uptime; ticks=$((${up%.*} * 100 + 1${up#*.} - 100)); }
+read -r stat < /proc/self/stat || fail "no /proc/self/stat to start the trace's time from"
+n=0; base=
+for f in ${stat##*)}; do
+  n=$((n + 1))
+  if [ "$n" -eq 20 ]; then base=$f; break; fi
+done
+[ -n "$base" ] || fail "no start time in /proc/self/stat: $stat"
+most=$1; peak=$2; shift 2
 hold=
-for d in /dev/shm /tmp /run; do
-  if grep -qs "^[^ ]* $d tmpfs " /proc/mounts; then hold=$d/hex-charge-hold; break; fi
-done
-if [ -z "$hold" ]; then
-  mkdir -p /run/hex-charge && mount -t tmpfs tmpfs /run/hex-charge 2>/dev/null && hold=/run/hex-charge/hold ||
-    fail "no tmpfs to hold memory in (/dev/shm, /tmp, /run), and none could be mounted"
+if mkdir -p /run/hex-charge && mount -t tmpfs -o "size=${peak}m" hex-charge /run/hex-charge 2>/dev/null; then
+  hold=/run/hex-charge/hold
+else
+  for d in /dev/shm /tmp /run; do
+    if grep -qs "^[^ ]* $d tmpfs " /proc/mounts; then hold=$d/hex-charge-hold; break; fi
+  done
 fi
+[ -n "$hold" ] || fail "no tmpfs to hold memory in: none of $peak MiB could be mounted, and /dev/shm, /tmp and /run are none"
 : > "$hold" || fail "can't write $hold"
-cs() { read -r up _ < /proc/uptime; echo "${up%.*}${up#*.}"; }
-start=$(cs); spent=0; held=0
+lost() { echo "hex-charge player: $*" >&2; kill -TERM $$; exit 2; }
+memory() {
+  spent=0; held=0
+  while [ $# -ge 3 ]; do
+    spent=$((spent + $1)); mib=$3; shift 3
+    end=$((base + spent / 10))
+    now
+    [ "$ticks" -lt "$end" ] || continue
+    if [ "$mib" -gt "$held" ]; then
+      head -c "$(((mib - held) * 1048576))" /dev/zero >> "$hold" || lost "can't hold $mib MiB in $hold"
+    elif [ "$mib" -lt "$held" ]; then
+      truncate -s "$((mib * 1048576))" "$hold" || lost "can't let go to $mib MiB in $hold"
+    fi
+    held=$mib
+    now
+    left=$((end - ticks))
+    if [ "$left" -gt 0 ]; then sleep "$((left / 100)).$(printf %02d $((left % 100)))"; fi
+  done
+}
 spin() { while :; do :; done; }
-while [ $# -ge 3 ]; do
-  ms=$1; threads=$2; mib=$3; shift 3
-  pids=
-  i=0
-  while [ "$i" -lt "$threads" ]; do spin & pids="$pids $!"; i=$((i + 1)); done
-  if [ "$mib" -gt "$held" ]; then
-    head -c "$(((mib - held) * 1048576))" /dev/zero >> "$hold" || fail "can't hold $mib MiB"
-  elif [ "$mib" -lt "$held" ]; then
-    truncate -s "$((mib * 1048576))" "$hold" || fail "can't let go to $mib MiB"
-  fi
-  held=$mib
-  spent=$((spent + ms))
-  left=$((start + spent / 10 - $(cs)))
-  if [ "$left" -gt 0 ]; then sleep "$((left / 100)).$(printf %02d $((left % 100)))"; fi
-  if [ -n "$pids" ]; then kill $pids 2>/dev/null; fi
-  wait 2>/dev/null
+pool=; i=0
+while [ "$i" -lt "$most" ]; do
+  spin &
+  pool="$pool $!"
+  kill -STOP $! || fail "can't hold a spinner stopped"
+  i=$((i + 1))
 done
+trap 'if [ -n "$pool" ]; then kill -KILL $pool; fi; exit 2' TERM
+memory "$@" &
+spent=0
+while [ $# -ge 3 ]; do
+  spent=$((spent + $1)); threads=$2; shift 3
+  end=$((base + spent / 10))
+  now
+  [ "$ticks" -lt "$end" ] || continue
+  run=; rest=; i=0
+  for p in $pool; do
+    if [ "$i" -lt "$threads" ]; then run="$run $p"; else rest="$rest $p"; fi
+    i=$((i + 1))
+  done
+  if [ -n "$rest" ]; then kill -STOP $rest; fi
+  if [ -n "$run" ]; then kill -CONT $run; fi
+  now
+  left=$((end - ticks))
+  if [ "$left" -gt 0 ]; then sleep "$((left / 100)).$(printf %02d $((left % 100)))"; fi
+done
+if [ -n "$pool" ]; then kill -KILL $pool; fi
+wait
 rm -f "$hold"
 "#;
 
@@ -220,14 +376,24 @@ fn merged(steps: &[Step]) -> Vec<Step> {
     out
 }
 
-/// The player's command for `steps`, refused, naming `trace`, where it passes the guest's exec bound: Linux's least
-/// `ARG_MAX`, whatever its stack limit (`hex_api::sim::SIM_EXEC_LIMIT`).
-fn player(trace: &str, steps: &[Step]) -> Vec<String> {
+/// The player's command for `steps`, its spinners as many as its most threads up to `vcpus` and its tmpfs as large as
+/// its most MiB, refused, naming `trace`, where it passes the guest's exec bound: Linux's least `ARG_MAX`, whatever its
+/// stack limit (`hex_api::sim::SIM_EXEC_LIMIT`).
+fn player(trace: &str, steps: &[Step], vcpus: u64) -> Vec<String> {
+    let most = steps
+        .iter()
+        .map(|s| s.threads)
+        .max()
+        .unwrap_or(0)
+        .min(vcpus);
+    let peak = steps.iter().map(|s| s.mib).max().unwrap_or(0);
     let mut args = vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
         PLAYER.to_owned(),
         "player".to_owned(),
+        most.to_string(),
+        peak.to_string(),
     ];
     for step in merged(steps) {
         args.push(step.millis.to_string());
@@ -247,11 +413,12 @@ fn player(trace: &str, steps: &[Step]) -> Vec<String> {
     args
 }
 
-/// Each VM's workload (what it is admitted for, which the class's cost sizes): the most busy threads (a CPU each) and
-/// the most MiB any step of any of `traces` asks, so every trace and the riser fit their VM.
-fn workload(traces: &[(String, Vec<Step>)]) -> CapacityResources {
+/// Each VM's workload (what it is admitted for, which the class's cost sizes): the most busy threads (a CPU each, at
+/// most `host_cpus`, every CPU a VM is given, D191) and the most MiB any step of any of `traces` asks, so every trace
+/// and the riser fit their VM.
+fn workload(traces: &[(String, Vec<Step>)], host_cpus: u64) -> CapacityResources {
     let steps = || traces.iter().flat_map(|(_, steps)| steps);
-    let threads = steps().map(|s| s.threads).max().unwrap_or(0);
+    let threads = steps().map(|s| s.threads).max().unwrap_or(0).min(host_cpus);
     let mib = steps().map(|s| s.mib).max().unwrap_or(0);
     assert!(threads > 0, "no step of the traces asks for a CPU");
     CapacityResources {
@@ -343,13 +510,14 @@ impl Kind {
         }
     }
 
-    /// A VM playing `args`, admitted with `allocation` for the run's workload `workload`.
+    /// A VM playing `args`, admitted with `allocation` for the run's workload `workload`; an image VM of `image`.
     fn spec(
         self,
         id: BoxId,
         args: &[String],
         allocation: Allocation,
         workload: CapacityResources,
+        image: Option<&str>,
     ) -> BoxSpec {
         let words: Vec<&str> = args.iter().map(String::as_str).collect();
         let oci = || {
@@ -370,7 +538,9 @@ impl Kind {
         let class = match self {
             Self::Image => ClassSpec::ShardsImage(Box::new(ShardsImage {
                 command: Some(args.to_vec()),
-                ..ShardsImage::new(&input("HEX_IMAGE"))
+                ..ShardsImage::new(
+                    image.expect("the image VMs' image, put in the node's Shards home"),
+                )
             })),
             Self::Shards => ClassSpec::Shards(oci()),
             Self::Firecracker => ClassSpec::Firecracker(oci()),
@@ -392,29 +562,48 @@ impl Kind {
     }
 }
 
-/// Pulls `HEX_IMAGE` into the node's Shards home and cache (`hex-node`'s `shards_native_paths`: beside its records in
-/// `state`), whose store its image VMs boot from, then ends the daemon the pull started there, so no process of the
-/// pull's runs beside the node (as `image_node::pull` does for the image class's own tests).
-fn pull_image(state: &Path) {
+// The image class's real-node helpers, of which the driver takes its image's build and pull alone.
+#[allow(dead_code)]
+#[path = "image_node/mod.rs"]
+mod image_node;
+
+/// The name an image built from `HEX_IMAGE_CONTEXT` is tagged with in the node's Shards home; its VMs pin it by its
+/// digest.
+const BUILT: &str = "hex-charge-fleet/harness";
+
+/// The image VMs' image, put in the node's Shards home before the node starts, as image_real takes it: built from
+/// `HEX_IMAGE_CONTEXT`, an Agentfile image's build context, and pinned by the manifest digest its build says
+/// (`image_node::built`); or else `HEX_IMAGE`, pulled there by its digest (`image_node::pull`). Either way the daemon it
+/// started there is ended, so no process of it runs beside the node.
+fn put_image(out: &Path) -> String {
     let shards = PathBuf::from(input("SHARDS_BIN"));
-    let image = input("HEX_IMAGE");
-    for args in [vec!["pull", image.as_str()], vec!["daemon", "stop"]] {
-        let status = Command::new(&shards)
-            .args(&args)
-            .env("SHARDS_HOME", state.join("shards-native-home"))
-            .env("SHARDS_CACHE", state.join("shards-native-cache"))
-            .stdin(HostStdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "shards {args:?}: {status}");
-    }
+    let image = match std::env::var_os("HEX_IMAGE_CONTEXT") {
+        Some(context) => {
+            assert!(
+                std::env::var_os("HEX_IMAGE").is_none(),
+                "HEX_IMAGE_CONTEXT and HEX_IMAGE are both set: the image comes from one"
+            );
+            image_node::built(&shards, Path::new(&context), out, BUILT)
+        }
+        None => {
+            let image = input("HEX_IMAGE");
+            image_node::pull(&shards, &image, &out.join("state"));
+            image
+        }
+    };
+    eprintln!("CHARGE image {image}");
+    image
 }
 
-/// A `hex node` of the run's own, ended by its pid as it drops; what it said on stderr is kept in `stderr`.
+/// A `hex node` of the run's own, ended by its pid as it drops, on Windows with its keeper (image_node's
+/// `end_keeper`); what it said on stderr is kept in `stderr`.
 struct Node {
     child: Child,
     socket: PathBuf,
     stderr: PathBuf,
+    /// The node's keeper's folder (`state\keeper`, hex-cli's `node.rs`), whose `keeper.owner` names it.
+    #[cfg(windows)]
+    keeping: PathBuf,
 }
 
 impl Node {
@@ -438,13 +627,15 @@ impl Node {
             .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
             .unwrap();
+        // Its stdout is read for its whole life, every line after the wait shown, so the node never writes to a pipe no
+        // one reads (as image_node's).
         let (tx, rx) = mpsc::channel();
         let stdout = child.stdout.take().unwrap();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
+                if let Err(mpsc::SendError(line)) = tx.send(line) {
+                    eprintln!("node: {line}");
                 }
             }
         });
@@ -465,12 +656,15 @@ impl Node {
             child,
             socket,
             stderr,
+            #[cfg(windows)]
+            keeping: work.join("state").join("keeper"),
         }
     }
 
-    /// The window the node's charge learner reads over, as the node said it; the run is refused where its learner
-    /// doesn't run (Windows until its window is measured: docs/design/learned-charge.md C1).
-    fn window(&self) -> Duration {
+    /// The window the node's charge learner reads its VMs over as the node said it at its start: Linux's, `cpu.max`'s
+    /// period; on macOS and Windows none until it holds a cap, the longest period of the caps it holds then being told on
+    /// the class's capacity answers (docs/design/learned-charge.md C1). The run is refused where its learner doesn't run.
+    fn window(&self) -> Option<Duration> {
         let said = fs::read_to_string(&self.stderr).unwrap();
         if let Some(why) = said
             .lines()
@@ -478,12 +672,13 @@ impl Node {
         {
             panic!("REFUSED: the node's charge learner doesn't run: {why}");
         }
-        let ns = said
+        let window = said
             .lines()
             .find_map(|l| l.strip_prefix("hex node: the charge learner's window is "))
-            .and_then(|rest| rest.strip_suffix(" ns"))
             .unwrap_or_else(|| panic!("the node named no charge window; stderr: {said}"));
-        Duration::from_nanos(ns.parse().unwrap())
+        window
+            .strip_suffix(" ns")
+            .map(|ns| Duration::from_nanos(ns.parse().unwrap()))
     }
 }
 
@@ -494,6 +689,8 @@ impl Drop for Node {
         }
         let status = self.child.wait().unwrap();
         eprintln!("CHARGE node ended: {status}");
+        #[cfg(windows)]
+        image_node::end_keeper(&self.keeping);
     }
 }
 
@@ -593,17 +790,65 @@ fn spinner(cpu_milli: u64) -> Program {
     }
 }
 
-/// One VM of the fleet: its number in admission order, which its readings carry, and its CPU at its last reading and
-/// when it was read (none before its first: a window's given is what it used since the one before, over its own span).
+/// One usage read: what the box had used, in µs, and when its call was sent and answered (its usage was read somewhere
+/// between).
+#[derive(Debug, Clone, Copy)]
+struct Read {
+    cpu_usec: u64,
+    sent: Instant,
+    answered: Instant,
+}
+
+/// What a reading between `last` and `this` reckons over (module docs, "what a VM asked for certain"): its given's span,
+/// between the two reads' answers, and the span within it the reading is certain of, from the last read's answer to
+/// this read's sending (none where they cross), each in ns.
+fn spans(last: &Read, this: &Read) -> (i128, i128) {
+    (
+        ns(this.answered.duration_since(last.answered)),
+        ns(this.sent.saturating_duration_since(last.answered)),
+    )
+}
+
+/// One VM of the fleet: its number in admission order, which its readings carry; its trace, and what it asked for
+/// certain; when its create was sent (its trace's zero came after) and when it started (came before: its start's
+/// answer, or where its start answered Pending the read that first found it running; none while it boots); and its
+/// last read and how many readings it has given (none before its second read: a window's given is what it used since
+/// the one before, over its own span).
 struct Vm {
     n: u32,
     id: BoxId,
     trace: String,
     steps: Vec<Step>,
+    asked: Asked,
     receipt: Allocation,
-    started: Instant,
-    last: Option<(u64, Instant)>,
+    from: Instant,
+    started: Option<Instant>,
+    last: Option<Read>,
+    readings: u64,
 }
+
+impl Vm {
+    /// What it asked for certain over the reading between `last` and `this`, in milli-CPU over its given's span: none
+    /// for its first, which spans its player's own start.
+    fn asked_for_certain(&self, started: Instant, last: &Read, this: &Read) -> u64 {
+        let (nominal, certain) = spans(last, this);
+        if self.readings == 0 || certain <= 0 {
+            return 0;
+        }
+        // The trace's time at the span's start: its zero came after `from` and before `started`.
+        let least = self.asked.least(
+            ns(last.answered.duration_since(started)),
+            ns(last.answered.duration_since(self.from)),
+            certain,
+        );
+        u64::try_from(least * 1000 / u128::try_from(nominal.max(1)).unwrap()).unwrap()
+    }
+}
+
+/// The learner's first window over the fleet's first VM, told on the class's capacity answer (C1): a fact no recorded
+/// operation makes, so its wait measures (hex_testkit::waits).
+static TOLD_WINDOW: hex_core::patience::Patience =
+    hex_core::patience::Patience::measuring("test.hex_cli.charge_fleet.told_window");
 
 /// Each VM's holding on the class's capacity answer, by box: its booking and what it holds past it (C8).
 fn holdings(capacity: &hex_api::Capacity) -> BTreeMap<String, CapacityResources> {
@@ -611,7 +856,11 @@ fn holdings(capacity: &hex_api::Capacity) -> BTreeMap<String, CapacityResources>
         .learned
         .iter()
         .flat_map(|learned| &learned.holdings)
-        .map(|h| (h.id.as_str().to_owned(), h.holding))
+        .filter_map(|h| match &h.id {
+            hex_api::LearnedHolder::Box(id) => Some((id.as_str().to_owned(), h.holding)),
+            // A node VM's own: no box of the fleet's.
+            hex_api::LearnedHolder::Node(_) => None,
+        })
         .collect()
 }
 
@@ -640,8 +889,8 @@ const BOX: u32 = u32::MAX;
 #[test]
 #[ignore = "ROOT's run on a real host: VMs, a delegated cgroup on Linux, recorded traces (module docs)"]
 fn the_learned_charge_holds_density_and_fairness_on_this_host() {
-    // Every wait of the run measures, unarmed: each call waits for its answer while the node's connection stands.
-    hex_core::patience::measure_all();
+    // Each call waits for its answer while the node's connection stands: past its W*, its run-out told and its party
+    // followed (decision 9).
     let kind = Kind::named();
     let class = kind.class();
     let out = PathBuf::from(input("HEX_CHARGE_OUT"));
@@ -653,17 +902,18 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
     );
     fs::create_dir_all(&out).unwrap();
     let traces = traces(Path::new(&input("HEX_CHARGE_TRACES")));
-    let workload = workload(&traces);
-    if kind == Kind::Image {
-        pull_image(&out.join("state"));
-    }
+    let image = (kind == Kind::Image).then(|| put_image(&out));
     let node = Node::start(&out);
-    let window = node.window();
+    let mut window = node.window();
+    // The riser: the first VM admitted where the node told its window at its start; else the second, once its first
+    // VM's cap has given its learner a window to warm the riser's charge over.
+    let riser: u32 = if window.is_some() { 0 } else { 1 };
     let client = Client::connect(&node.socket).unwrap();
     let capacity = client
         .capacity(class)
         .unwrap()
         .expect("the class's capacity");
+    let workload = workload(&traces, capacity.total.cpu_milli / 1000);
     let cost = capacity.cost.expect("the class's cost profile");
     let allocation = cost.allocate(workload).unwrap();
     let vcpus = allocation.guest().unwrap().cpu_milli.div_ceil(1000);
@@ -700,12 +950,23 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
         )
         .unwrap();
     let begun = Instant::now();
-    let run = traces.iter().map(|(_, steps)| length(steps)).max().unwrap();
-    let rises_after = window * u32::try_from(SEEDABLE).unwrap();
-    assert!(
-        rises_after < run,
-        "the longest trace ({run:?}) is shorter than a riser's warm-up, SEEDABLE windows ({rises_after:?})"
-    );
+    // The riser's trace, the longest: the run's length, which its warm-up must fit.
+    let longest = traces
+        .iter()
+        .max_by_key(|(_, steps)| length(steps))
+        .unwrap();
+    let run = length(&longest.1);
+    let warm_up = |window: Duration| {
+        let rises_after = window * u32::try_from(SEEDABLE).unwrap();
+        assert!(
+            rises_after < run,
+            "the longest trace ({run:?}) is shorter than a riser's warm-up, SEEDABLE windows ({rises_after:?})"
+        );
+        rises_after
+    };
+    if let Some(window) = window {
+        warm_up(window);
+    }
     let peak_mib = traces
         .iter()
         .flat_map(|(_, steps)| steps)
@@ -714,16 +975,21 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
         .unwrap();
     let mut vms: Vec<Vm> = Vec::new();
     let mut windows: Vec<Window> = Vec::new();
-    let mut tsv =
-        String::from("window\tvm\ttrace\tspan_us\tasked_milli\tgiven_milli\tbooked_milli\n");
+    let mut tsv = String::from(
+        "window\tvm\ttrace\tspan_us\tcertain_us\tasked_milli\tgiven_milli\tbooked_milli\n",
+    );
     let (mut admitted, mut refused, mut refused_rising, mut peak) = (0u64, 0u64, 0u64, 0usize);
     let mut refused_at: Option<CapacityResources> = None;
     let mut rise_window = None;
-    let mut box_last: Option<(u64, Instant)> = None;
-    let (mut played, mut gone_otherwise) = (0u64, 0u64);
+    // When the riser rises in its trace's time, placed at its admission (the window it warms over then).
+    let mut rises_after: Option<Duration> = None;
+    let mut box_last: Option<Read> = None;
+    let (mut played, mut gone_otherwise, mut pending) = (0u64, 0u64, 0u64);
+    // Each VM's start, from its create's sending to its start: the span its guest's uptime began in.
+    let mut starts: Vec<Duration> = Vec::new();
     // Each window's readings come at least a window after the last's, however long an admission's create took: a
     // window is never a sliver caught up after a slow one.
-    let mut next = Instant::now() + window;
+    let mut next = Instant::now() + window.unwrap_or_default();
     while begun.elapsed() < run {
         hex_wait::rest_until(next).unwrap();
         let capacity = client
@@ -731,6 +997,10 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
             .unwrap()
             .expect("the class's capacity");
         let held = holdings(&capacity);
+        // The learner's window as the class's capacity answer tells it, as the caps it holds move (C1).
+        if let Some(told) = capacity.learned.as_ref().and_then(|l| l.window.as_ref()) {
+            window = Some(Duration::from_nanos(told.window_ns));
+        }
         // Admission (C6): the next VM's booking against the budget less every VM's holding, its receipt where none.
         let taken = vms.iter().fold(CapacityResources::default(), |sum, vm| {
             sum.checked_add(
@@ -744,13 +1014,21 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
         let next_receipt = booked(&capacity, allocation);
         if refused_at != Some(room) {
             if fits(room, next_receipt.booking()) {
-                let (trace, steps) = &traces[usize::try_from(admitted).unwrap() % traces.len()];
+                let is_riser = admitted == u64::from(riser);
+                let (trace, steps) = if is_riser {
+                    longest
+                } else {
+                    &traces[usize::try_from(admitted).unwrap() % traces.len()]
+                };
                 let mut steps = steps.clone();
-                if admitted == 0 {
+                if is_riser {
                     // The riser: its trace until its charge has warmed, then every vCPU and the most any trace holds.
                     let mut kept = Vec::new();
                     let mut spent = 0u64;
-                    let rise = u64::try_from(rises_after.as_millis()).unwrap();
+                    let after =
+                        warm_up(window.expect("the learner's window, told before the riser"));
+                    rises_after = Some(after);
+                    let rise = u64::try_from(after.as_millis()).unwrap();
                     for step in &steps {
                         if spent >= rise {
                             break;
@@ -768,23 +1046,82 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
                 }
                 let n = u32::try_from(admitted).unwrap();
                 let id = BoxId::new(&format!("charge-vm-{n}")).unwrap();
+                let from = Instant::now();
                 let info = client
-                    .create(kind.spec(id.clone(), &player(trace, &steps), next_receipt, workload))
+                    .create(kind.spec(
+                        id.clone(),
+                        &player(trace, &steps, vcpus),
+                        next_receipt,
+                        workload,
+                        image.as_deref(),
+                    ))
                     .unwrap();
-                if info.state == BoxState::Created {
-                    client.start(&id).unwrap();
+                let started = if info.state == BoxState::Created {
+                    match client.start(&id) {
+                        Ok(()) => Some(Instant::now()),
+                        // A boot past its W* answers Pending (decision 9): it goes on, and a window to come finds it
+                        // running.
+                        Err(Refusal::Lifecycle {
+                            cause: LifecycleCause::Pending,
+                            ..
+                        }) => {
+                            pending += 1;
+                            None
+                        }
+                        Err(why) => panic!("start {id}: {why}"),
+                    }
+                } else {
+                    Some(Instant::now())
+                };
+                if let Some(started) = started {
+                    starts.push(started.duration_since(from));
                 }
                 vms.push(Vm {
                     n,
                     id,
                     trace: trace.clone(),
+                    asked: Asked::of(&steps, vcpus),
                     steps,
                     receipt: next_receipt,
-                    started: Instant::now(),
+                    from,
+                    started,
                     last: None,
+                    readings: 0,
                 });
                 admitted += 1;
                 refused_at = None;
+                if window.is_none() {
+                    // No window told yet: the learner gives one once it holds this VM's cap, which the class's capacity
+                    // answer then tells; the riser waits for it.
+                    // A look: the class tells no event as its window moves, its capacity asked. Its party, the node,
+                    // ends where an ask is refused, the node gone (the review's C-5).
+                    let refused = std::cell::Cell::new(false);
+                    hex_testkit::waits::follow::until(
+                        &TOLD_WINDOW,
+                        "the learner's window, told on the class's capacity answer",
+                        || {
+                            if refused.get() {
+                                hex_testkit::waits::follow::Party::Ended
+                            } else {
+                                hex_testkit::waits::follow::Party::Live
+                            }
+                        },
+                        || {
+                            window = match client.capacity(class) {
+                                Ok(capacity) => capacity
+                                    .and_then(|c| c.learned)
+                                    .and_then(|l| l.window)
+                                    .map(|told| Duration::from_nanos(told.window_ns)),
+                                Err(_) => {
+                                    refused.set(true);
+                                    None
+                                }
+                            };
+                            window.is_some()
+                        },
+                    )
+                    .unwrap();
+                }
             } else {
                 refused += 1;
                 if rise_window.is_some() {
@@ -795,53 +1132,87 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
         }
         let at = windows.len();
         if rise_window.is_none()
-            && vms
-                .iter()
-                .any(|vm| vm.n == 0 && vm.started.elapsed() >= rises_after)
+            && let Some(after) = rises_after
+            && vms.iter().any(|vm| {
+                vm.n == riser && vm.started.is_some_and(|started| started.elapsed() >= after)
+            })
         {
             rise_window = Some(at);
         }
         let mut readings = Vec::new();
         let mut ending = Vec::new();
-        let running: BTreeMap<String, bool> = client
+        let listed: BTreeMap<String, hex_api::BoxInfo> = client
             .list()
             .unwrap()
             .into_iter()
-            .map(|info| (info.id.as_str().to_owned(), info.state == BoxState::Running))
+            .map(|info| (info.id.as_str().to_owned(), info))
             .collect();
+        let seen = Instant::now();
         for vm in &mut vms {
+            let info = listed.get(vm.id.as_str());
+            let running = info.is_some_and(|info| info.state == BoxState::Running);
+            let over = info.is_none_or(|info| {
+                info.exit.is_some() || info.ended.is_some() || info.last_resort.is_some()
+            });
+            let started = match vm.started {
+                Some(started) => started,
+                // Its start answered Pending: it boots on until a window finds it running, or its end.
+                None if running => {
+                    vm.started = Some(seen);
+                    starts.push(seen.duration_since(vm.from));
+                    continue;
+                }
+                None if over => {
+                    ending.push((vm.id.clone(), false));
+                    continue;
+                }
+                None => continue,
+            };
             // A VM whose trace has played ends with it: the driver deletes it, freeing its room. The riser's trace
             // lasts the run.
-            if vm.started.elapsed() >= length(&vm.steps) {
+            if started.elapsed() >= length(&vm.steps) {
                 ending.push((vm.id.clone(), true));
                 continue;
             }
-            // A VM that ended otherwise (the last resort's end, or its player's own) is read no more.
-            let usage = match running.get(vm.id.as_str()) {
-                Some(true) => client.usage(&vm.id).ok(),
-                _ => None,
-            };
-            let Some(usage) = usage else {
+            // A VM that ended: its player's own end, having played (its exit 0, no last resort), else otherwise (the
+            // last resort's end, its player's failure, or its run's).
+            if !running {
+                let own = info.is_some_and(|info| {
+                    info.exit == Some(Exit::Code(0))
+                        && info.last_resort.is_none()
+                        && info.ended.is_none()
+                });
+                ending.push((vm.id.clone(), own));
+                continue;
+            }
+            let sent = Instant::now();
+            let Ok(usage) = client.usage(&vm.id) else {
                 ending.push((vm.id.clone(), false));
                 continue;
             };
-            let read = Instant::now();
-            let Some((before, then)) = vm.last.replace((usage.cpu_usec, read)) else {
+            let this = Read {
+                cpu_usec: usage.cpu_usec,
+                sent,
+                answered: Instant::now(),
+            };
+            let Some(last) = vm.last.replace(this) else {
                 continue;
             };
-            let span = read.duration_since(then);
-            let given = milli(usage.cpu_usec.saturating_sub(before), span);
-            let asked = asked_over(
-                &vm.steps,
-                then.saturating_duration_since(vm.started),
-                read.saturating_duration_since(vm.started),
-                vcpus,
+            let (nominal, certain) = spans(&last, &this);
+            let given = milli(
+                this.cpu_usec.saturating_sub(last.cpu_usec),
+                this.answered.duration_since(last.answered),
             );
-            let booked = held
-                .get(vm.id.as_str())
-                .copied()
-                .unwrap_or(vm.receipt.booking())
-                .cpu_milli;
+            let asked = vm.asked_for_certain(started, &last, &this);
+            let booked = scaled(
+                held.get(vm.id.as_str())
+                    .copied()
+                    .unwrap_or(vm.receipt.booking())
+                    .cpu_milli,
+                certain,
+                nominal,
+            );
+            vm.readings += 1;
             let vm_n = vm.n;
             readings.push(Reading {
                 vm: vm_n,
@@ -851,28 +1222,40 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
             });
             writeln!(
                 tsv,
-                "{at}\t{vm_n}\t{}\t{}\t{asked}\t{given}\t{booked}",
+                "{at}\t{vm_n}\t{}\t{}\t{}\t{asked}\t{given}\t{booked}",
                 vm.trace,
-                span.as_micros()
+                nominal / 1000,
+                certain.max(0) / 1000
             )
             .unwrap();
         }
+        let sent = Instant::now();
         let usage = client.usage(&boxed).unwrap();
-        let read = Instant::now();
-        if let Some((before, then)) = box_last.replace((usage.cpu_usec, read)) {
-            let span = read.duration_since(then);
-            let given = milli(usage.cpu_usec.saturating_sub(before), span);
+        let this = Read {
+            cpu_usec: usage.cpu_usec,
+            sent,
+            answered: Instant::now(),
+        };
+        if let Some(last) = box_last.replace(this) {
+            let (nominal, certain) = spans(&last, &this);
+            let given = milli(
+                this.cpu_usec.saturating_sub(last.cpu_usec),
+                this.answered.duration_since(last.answered),
+            );
+            // Its spinners ask its CPU whole from before the run's start.
+            let asked = scaled(box_cpu, certain, nominal);
+            let booked = scaled(box_booked.cpu_milli, certain, nominal);
             readings.push(Reading {
                 vm: BOX,
-                asked: box_cpu,
+                asked,
                 given,
-                booked: box_booked.cpu_milli,
+                booked,
             });
             writeln!(
                 tsv,
-                "{at}\tbox\t-\t{}\t{box_cpu}\t{given}\t{}",
-                span.as_micros(),
-                box_booked.cpu_milli
+                "{at}\tbox\t-\t{}\t{}\t{asked}\t{given}\t{booked}",
+                nominal / 1000,
+                certain.max(0) / 1000
             )
             .unwrap();
         }
@@ -881,9 +1264,24 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
                 played += 1;
             } else {
                 gone_otherwise += 1;
+                // Each VM that ended before its trace had played, by name, in its inspect's words.
+                let info = client.inspect(&id).ok();
+                let vm = vms.iter().find(|vm| vm.id == id);
+                println!(
+                    "HEX-CHARGE-FLEET ended vm={:?} id={id} trace={:?} riser={} after_ms={:?} exit={:?} \
+                     last_resort={:?} ended={:?}",
+                    vm.map(|vm| vm.n),
+                    vm.map(|vm| vm.trace.as_str()),
+                    vm.is_some_and(|vm| vm.n == riser),
+                    vm.and_then(|vm| vm.started)
+                        .map(|started| started.elapsed().as_millis()),
+                    info.as_ref().and_then(|info| info.exit),
+                    info.as_ref().and_then(|info| info.last_resort.as_ref()),
+                    info.as_ref().and_then(|info| info.ended.as_ref()),
+                );
             }
             // The riser is kept to the end, for its inspect.
-            if id.as_str() != "charge-vm-0"
+            if id.as_str() != format!("charge-vm-{riser}")
                 && let Err(why) = client.delete(&id)
             {
                 eprintln!("CHARGE delete {id}: {why}");
@@ -895,20 +1293,21 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
             budget: capacity.total.cpu_milli,
             readings,
         });
-        next = Instant::now() + window;
+        next = Instant::now() + window.unwrap_or_default();
     }
     let ran = begun.elapsed();
     let (learner, measured) = learner_cpu(node.child.id());
-    let riser = client.inspect(&BoxId::new("charge-vm-0").unwrap()).ok();
+    let riser_id = BoxId::new(&format!("charge-vm-{riser}")).unwrap();
+    let riser_info = client.inspect(&riser_id).ok();
     for vm in &vms {
         let _ = client.delete(&vm.id);
     }
-    let _ = client.delete(&BoxId::new("charge-vm-0").unwrap());
+    let _ = client.delete(&riser_id);
     let _ = client.delete(&boxed);
     fs::write(out.join("windows.tsv"), tsv).unwrap();
 
     let cast = Cast {
-        riser: rise_window.map(|at| (0, at)),
+        riser: rise_window.map(|at| (riser, at)),
         boxed: Some(BOX),
     };
     let report = trial::report(&cast, &windows);
@@ -923,18 +1322,22 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
         past += p;
         counted += c;
     }
+    starts.sort_unstable();
+    let median = starts
+        .get(starts.len().div_ceil(2).saturating_sub(1))
+        .map(Duration::as_millis);
     let os = std::env::consts::OS;
     println!(
         "HEX-CHARGE-FLEET os={os} class={kind:?} window_ns={} windows={} ran_ms={} vms_peak={peak} \
          envelope_density={envelope} admitted={admitted} refused_for_room={refused} ended_with_their_traces={played} \
          ended_otherwise={gone_otherwise}",
-        window.as_nanos(),
+        window.unwrap_or_default().as_nanos(),
         report.windows,
         ran.as_millis()
     );
     println!(
-        "HEX-CHARGE-FLEET inputs workload_cpu_milli={} workload_mem_bytes={} allocation={:?} box_asks_milli={box_cpu} \
-         box_booked={:?} traces={}",
+        "HEX-CHARGE-FLEET inputs workload_cpu_milli={} workload_mem_bytes={} allocation={:?} vcpus={vcpus} \
+         box_asks_milli={box_cpu} box_booked={:?} traces={} image={image:?}",
         workload.cpu_milli,
         workload.mem_bytes,
         allocation.resources,
@@ -942,8 +1345,15 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
         traces.len()
     );
     println!(
+        "HEX-CHARGE-FLEET starts n={} pending={pending} uncertainty_ms_least={:?} median={median:?} most={:?}",
+        starts.len(),
+        starts.first().map(Duration::as_millis),
+        starts.last().map(Duration::as_millis)
+    );
+    println!(
         "HEX-CHARGE-FLEET fairness contended={} ratio_n={} ratio_least_per_mille={} ratio_p1={} ratio_p50={} \
-         misses={} jain_least_ppm={} jain_mean_ppm={} box_short={}",
+         misses={} jain_least_ppm={} jain_mean_ppm={} box_short={} floor_n={} floor_least_per_mille={} floor_p1={} \
+         floor_p50={}",
         report.contended,
         report.ratios.n,
         report.ratios.least,
@@ -952,9 +1362,15 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
         report.misses,
         report.jain_least_ppm,
         report.jain_mean_ppm,
-        report.box_short
+        report.box_short,
+        report.floor.n,
+        report.floor.least,
+        report.floor.p1,
+        report.floor.p50
     );
-    let ended = riser.as_ref().and_then(|info| info.last_resort.as_ref());
+    let ended = riser_info
+        .as_ref()
+        .and_then(|info| info.last_resort.as_ref());
     println!(
         "HEX-CHARGE-FLEET riser rise_window={rise_window:?} windows={} over_booking={} given_of_asked_ppm={} \
          neighbours_short={} refused_while_rising={refused_rising} exit={:?} last_resort={ended:?}",
@@ -962,7 +1378,7 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
         report.riser_over,
         report.riser_given_ppm,
         report.neighbours_short,
-        riser.as_ref().and_then(|info| info.exit)
+        riser_info.as_ref().and_then(|info| info.exit)
     );
     println!(
         "HEX-CHARGE-FLEET violations os={os} past={past} counted={counted} per_million={}",
@@ -1006,9 +1422,12 @@ fn w14_the_box_beside_the_fleet_runs_its_spinners_under_its_bounds() {
     // The shell and one member a CPU of its cap.
     let members = caps.cpu_milli.div_ceil(1000) + 1;
     let mut ended = None;
-    hex_testkit::waits::until(
+    // A look: the box tells no event as its members start, its usage read. Its party, the program, ends the wait in
+    // the fact itself.
+    hex_testkit::waits::follow::until(
         &RUNNING,
         "the box's spinners running, or its program's end",
+        || hex_testkit::waits::follow::Party::Live,
         || {
             if let Ok(Some(exit)) = program.try_wait() {
                 ended = Some(exit);
@@ -1029,8 +1448,9 @@ fn w14_the_box_beside_the_fleet_runs_its_spinners_under_its_bounds() {
 }
 
 /// Joint plan step 14 (AC-T7.4.1; the person's rule, 2026-11-13, and Shards' R03 for test waits): the driver times
-/// none of its waits and reads no record. Each client call waits for its answer while the node's connection stands, its
-/// waits unarmed (`hex_core::patience::measure_all`), and the node's start for its ready line while the node runs.
+/// none of its waits and reads no record. Each client call waits for its answer while the node's connection stands, past
+/// its W* telling its run-out and following it (decision 9), and the node's start for its ready line while the node
+/// runs.
 /// Do read the driver's own source; expect no caller deadline, no timed receive and no record of boots read.
 #[test]
 fn w14_the_driver_times_no_wait_and_reads_no_record() {
@@ -1059,5 +1479,54 @@ fn w14_the_box_beside_the_fleet_is_a_median_ci_build_leg() {
             mem_bytes: 2_228_883_456,
             disk_bytes: 0,
         }
+    );
+}
+
+/// A millisecond of a trace's time, in its ns.
+const MS: i128 = 1_000_000;
+
+/// Steps of `(millis, threads)`, holding no memory.
+fn steps_of(pairs: &[(u64, u64)]) -> Vec<Step> {
+    pairs
+        .iter()
+        .map(|&(millis, threads)| Step {
+            millis,
+            threads,
+            mib: 0,
+        })
+        .collect()
+}
+
+/// Joint plan step 14 (AC-T7.4.1): a reading's ask is what its VM's trace asked for certain, the trace's zero placed
+/// anywhere its VM's start allows (module docs). Do reckon a 100 ms reading of a trace that falls from 2 busy threads to
+/// none at 1 s, the reading's start in the trace's time anywhere from 950 ms to 1 s; expect nothing asked for certain:
+/// from 1 s, the trace may have fallen already.
+#[test]
+fn w14_a_reading_whose_start_spans_a_falling_edge_asks_nothing_for_certain() {
+    let asked = Asked::of(&steps_of(&[(1_000, 2), (1_000, 0)]), 2);
+    assert_eq!(asked.least(950 * MS, 1_000 * MS, 100 * MS), 0);
+}
+
+/// Joint plan step 14 (AC-T7.4.1): a step's end may come up to two ticks of `/proc/uptime` before its time, its deadline
+/// and the trace's zero each read rounded down to a tick (module docs). Do reckon a 100 ms reading from 900 ms of a
+/// trace falling from 2 busy threads to none at 1 s, its start certain; expect its 2 threads for the 80 ms before 980 ms.
+#[test]
+fn w14_a_falling_edge_is_certain_only_two_ticks_before_its_time() {
+    let asked = Asked::of(&steps_of(&[(1_000, 2), (1_000, 0)]), 2);
+    assert_eq!(
+        asked.least(900 * MS, 900 * MS, 100 * MS),
+        u128::try_from(2 * 80 * MS).unwrap()
+    );
+}
+
+/// Joint plan step 14 (AC-T7.4.1): a step's start may come up to a tick of `/proc/uptime` past its time, the player's
+/// sleep reckoned from a clock read rounded down (module docs). Do reckon a 100 ms reading from 1 s of a trace rising
+/// from none to 2 busy threads at 1 s, its start certain; expect its 2 threads for the 90 ms from 1,010 ms.
+#[test]
+fn w14_a_rising_edge_is_certain_only_a_tick_after_its_time() {
+    let asked = Asked::of(&steps_of(&[(1_000, 0), (1_000, 2)]), 2);
+    assert_eq!(
+        asked.least(1_000 * MS, 1_000 * MS, 100 * MS),
+        u128::try_from(2 * 90 * MS).unwrap()
     );
 }

@@ -23,6 +23,10 @@
 //! - the workload's device program, attached BPF_F_ALLOW_MULTI: `a_granted_runs_boxes_
 //!   reach_its_gpu_as_their_rules_and_its_own_say` (box `beyond`);
 //! - AF_VSOCK still refused: `a_granted_workload_still_reaches_no_host_port_over_vsock`.
+//! - D251's cut through the guest's legs, init's hang-up probe and the vsock muxer's `Cut`:
+//!   `a_nested_workloads_socket_cut_mid_stream_resets_its_lane_at_the_controller` (`Ok(0)`
+//!   where `ConnectionReset` is due); a half-close taken for a cut by either:
+//!   `a_nested_workloads_half_close_ends_its_way_in_order_while_the_controllers_goes_on`.
 
 #![allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -31,11 +35,27 @@ mod common;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::{Artifact, Run, TempDir, cannot_run_vms, guest_init, kernel, run_shards_env, served};
+/// A lane's ask, its answer waited for as long as it takes (`Duration::MAX`), as a caller
+/// with no bound of its own waits: what it answered, or why not.
+macro_rules! answered {
+    ($ask:expr) => {
+        $ask.and_then(|mut ask| ask.wait(std::time::Duration::MAX))
+            .map(|got| got.expect("Duration::MAX waits until the answer"))
+    };
+}
 
-const TIMEOUT: Duration = Duration::from_secs(180);
+use common::{
+    Artifact, Patience, Run, TempDir, ask, booted, cannot_run_vms, guest_init, kernel, run_shards_env, served,
+};
+
+/// A budget every run meets: half the reach of the guest's clock its deadline is held on
+/// (CLOCK_BOOTTIME's i64 of nanoseconds, init's readiness.rs `deadline`), which leaves as
+/// much room for the guest's uptime and its host's delay as for its ready past its boot.
+fn met() -> Duration {
+    Duration::from_nanos(i64::MAX.unsigned_abs() / 2)
+}
 
 /// What a run asks to be given the grant with, beside a tmpfs at `/run` for runc's state
 /// and its boxes' bundles (D234's own example).
@@ -101,8 +121,9 @@ impl Home {
         env
     }
 
+    #[track_caller]
     fn shards(&self, command: &[&str], args: &[&str]) -> Run {
-        run_shards_env(command, args, &self.env(), TIMEOUT)
+        run_shards_env(command, args, &self.env())
     }
 
     /// Builds the test image with runc at /usr/local/bin/runc, its command run as root, then
@@ -144,7 +165,7 @@ impl Home {
 
 impl Drop for Home {
     fn drop(&mut self) {
-        let _ = run_shards_env(&["stop", "daemon"], &[] as &[&str], &self.env(), TIMEOUT);
+        let _ = run_shards_env(&["stop", "daemon"], &[] as &[&str], &self.env());
     }
 }
 
@@ -282,6 +303,53 @@ fn a_granted_workload_is_held_to_its_subtree() {
     );
 }
 
+/// Case (g): the workload cannot take its device program off (inithex-01). Root, with
+/// CAP_SYS_ADMIN and the default seccomp profile's bpf(2), it queries the BPF_CGROUP_DEVICE
+/// programs of its cgroup namespace's root and those that bound it, takes each one's
+/// descriptor and detaches it from that root: none detaches, as init attaches the workload's
+/// above that root, in a cgroup no process of the workload's can name; and a node of the
+/// microVM's own disk, which its device rules never give it, is refused it before and
+/// after (EPERM). The node is made in the run's /dev, a mount without nodev (`ceiling
+/// mount: dev`), where nothing before the device program refuses an open (the run's
+/// `--tmpfs /run` is nodev, which refuses it EACCES first) and nothing after it says EPERM:
+/// the program alone refuses it, and a detached one lets it open. Guard: the command's
+/// cgroup namespace rooted beneath the workload's cgroup (`setup::delegate`).
+#[test]
+fn a_granted_workload_cannot_detach_its_device_program() {
+    if cannot_run_vms() {
+        eprintln!("SKIP: this host cannot run VMs");
+        return;
+    }
+    let home = Home::new("nesting-g");
+    home.nesting_image();
+    let ran = home.granted(&["nesting", "ceiling"]);
+    assert_eq!(ran.status, Some(0), "{}", shown(&ran));
+    said(
+        &ran,
+        &[
+            "ceiling mount: dev",
+            "ceiling before: errno 1",
+            "ceiling query attached: 0",
+            "ceiling after: errno 1",
+        ],
+    );
+    assert!(
+        ran.stdout
+            .lines()
+            .any(|l| l.starts_with("ceiling disk ") && l.ends_with(": mknod done")),
+        "{}",
+        shown(&ran)
+    );
+    let detached = ran
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("ceiling detached: "))
+        .unwrap_or_else(|| panic!("no detach said in\n{}", shown(&ran)));
+    let (done, of) = detached.split_once(" of ").unwrap();
+    assert_eq!(done, "0", "{}", shown(&ran));
+    assert_ne!(of, "0", "no program bounds the workload\n{}", shown(&ran));
+}
+
 /// Case (c): no box without both words, and none beside a domain. Given the grant, a nested
 /// runtime's first steps are done (the probe works). Without the run's consent, an image
 /// declaring the grant runs without it, and says so; its first cgroup step fails EROFS, its
@@ -414,7 +482,7 @@ fn a_granted_workloads_readiness_reaches_the_host() {
             .filter_map(|l| l.split(' ').nth(2).map(str::to_string))
             .collect()
     };
-    let begun = Instant::now();
+    let mut patience = Patience::of(&home.dir);
     let told = loop {
         let until = now();
         let events = home.shards(
@@ -433,13 +501,10 @@ fn a_granted_workloads_readiness_reaches_the_host() {
         if told.iter().any(|a| a == "ready") {
             break told;
         }
-        assert!(
-            begun.elapsed() < TIMEOUT,
-            "no ready event in {TIMEOUT:?}: {}",
-            shown(&events)
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        assert!(patience.holds(), "no ready event: {}", shown(&events));
+        std::thread::sleep(patience.next_look());
     };
+    patience.done();
     assert!(!told.iter().any(|a| a == "ready-by-passed"), "{told:?}");
     let logs = home.shards(&["read", "logs"], &["nesting-ready"]);
     said(
@@ -473,7 +538,7 @@ fn host_env(home: &Home) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
 /// the budget's conversion and passthrough, and READY's relay to the run host.
 #[test]
 fn a_deadline_given_through_shards_api_is_met_or_said_passed() {
-    use shards_api::image::{ImageShards, ImageSpec, Images as _, Narrowing, Ready};
+    use shards_api::image::{ImageShards, ImageSpec, Narrowing, Ready};
     if cannot_run_vms() {
         eprintln!("SKIP: this host cannot run VMs");
         return;
@@ -503,14 +568,20 @@ fn a_deadline_given_through_shards_api_is_met_or_said_passed() {
         ready_by: Some(ready_by),
         control: None,
         gpu_devices: Vec::new(),
+        sign_ins: Vec::new(),
+        upstream_roots: Vec::new(),
+        gpu_report: None,
     };
-    let guest = ImageShards::new().boot(&spec(TIMEOUT), TIMEOUT).unwrap();
-    assert_eq!(guest.wait_ready(None, TIMEOUT).unwrap(), Some(Ready::OnTime));
+    let guest = booted(&ImageShards::new(), &spec(met())).unwrap();
+    assert_eq!(
+        ask(&*guest, |g| g.wait_ready(None, Duration::MAX)).unwrap(),
+        Some(Ready::OnTime)
+    );
     drop(guest);
-    let guest = ImageShards::new().boot(&spec(Duration::ZERO), TIMEOUT).unwrap();
-    let passed = guest.wait_ready(None, TIMEOUT).unwrap();
+    let guest = booted(&ImageShards::new(), &spec(Duration::ZERO)).unwrap();
+    let passed = ask(&*guest, |g| g.wait_ready(None, Duration::MAX)).unwrap();
     assert!(matches!(passed, Some(Ready::Passed(_))), "{passed:?}");
-    let late = guest.wait_ready(passed, TIMEOUT).unwrap();
+    let late = ask(&*guest, |g| g.wait_ready(passed, Duration::MAX)).unwrap();
     assert!(matches!(late, Some(Ready::Late(_))), "{late:?}");
 }
 
@@ -668,7 +739,7 @@ fn a_nested_workloads_sockets_are_lanes_of_its_orchestrators_controller() {
     use std::num::NonZeroU16;
 
     use shards_api::control::{Controller, Ended, Fault, Identity, Reason, SocketAdmission, Subscriptions};
-    use shards_api::image::{ControlAsk, ImageShards, ImageSpec, Images as _, Narrowing, Ready, SocketGrant};
+    use shards_api::image::{ControlAsk, ImageShards, ImageSpec, Narrowing, Ready, SocketGrant};
     if cannot_run_vms() {
         eprintln!("SKIP: this host cannot run VMs");
         return;
@@ -707,10 +778,16 @@ fn a_nested_workloads_sockets_are_lanes_of_its_orchestrators_controller() {
             }),
         }),
         gpu_devices: Vec::new(),
+        sign_ins: Vec::new(),
+        upstream_roots: Vec::new(),
+        gpu_report: None,
     };
-    let guest = ImageShards::new().boot(&spec, TIMEOUT).unwrap();
+    let guest = booted(&ImageShards::new(), &spec).unwrap();
     // READY=1 comes once every socket listens: no lane below races its bind.
-    assert_eq!(guest.wait_ready(None, TIMEOUT).unwrap(), Some(Ready::OnTime));
+    assert_eq!(
+        ask(&*guest, |g| g.wait_ready(None, Duration::MAX)).unwrap(),
+        Some(Ready::OnTime)
+    );
     let at = *guest.control().expect("the run's agent-control endpoint");
     assert!(at.address.ip().is_loopback(), "{:?}", at.address);
     let (controller, dialed) = Controller::dial(
@@ -730,7 +807,7 @@ fn a_nested_workloads_sockets_are_lanes_of_its_orchestrators_controller() {
     // Four lanes open at once, as Hex holds a control connection while an exec's three open.
     let open: Vec<_> = names
         .iter()
-        .map(|name| (*name, sockets.connect(name).unwrap()))
+        .map(|name| (*name, answered!(sockets.connect(name)).unwrap()))
         .collect();
     for (i, (name, mut lane)) in open.into_iter().enumerate() {
         let sent: Vec<u8> = (0..=255u8)
@@ -750,22 +827,189 @@ fn a_nested_workloads_sockets_are_lanes_of_its_orchestrators_controller() {
     // The guest's errno: Linux's ENOENT (include/uapi/asm-generic/errno-base.h), whatever the
     // host's.
     assert_eq!(
-        sockets.connect("absent.sock").map(|_| ()),
+        answered!(sockets.connect("absent.sock")).map(|_| ()),
         Err(Fault::Unreached(NonZeroU16::new(2).unwrap()))
     );
     assert_eq!(
-        sockets.connect("../node.sock").map(|_| ()),
+        answered!(sockets.connect("../node.sock")).map(|_| ()),
         Err(Fault::Refused(Reason::Protocol))
     );
     guest.stop().unwrap();
     // The run's end ends its endpoint, and the controller's connection with it, typed: never
     // Silent, which would be its idle timeout's guess rather than the run's end told.
-    let after = sockets.connect("control.sock").map(|_| ());
+    let after = answered!(sockets.connect("control.sock")).map(|_| ());
     assert!(
         matches!(after, Err(Fault::Lost(ended)) if ended != Ended::Silent),
         "{after:?}"
     );
     let _ = driver.join().unwrap();
+}
+
+/// D251's cut through a real microVM's legs (*Its cut through the guest's legs*): runs
+/// testguest's `nesting ends` with its socket directory granted to an orchestrator's key, dials
+/// the run's endpoint, and gives `case` the run's lanes and the bytes the workload reads to its
+/// cut (testguest's `cut.sock`), more than three of the admitted windows.
+#[track_caller]
+fn over_lanes(home: &str, case: impl FnOnce(&shards_api::control::Sockets, &[u8])) {
+    use shards_api::control::{Controller, Identity, SocketAdmission, Subscriptions};
+    use shards_api::image::{ControlAsk, ImageShards, ImageSpec, Narrowing, Ready, SocketGrant};
+    let home = Home::new(home);
+    home.nesting_image();
+    let hex = Identity::generate().unwrap();
+    // The orchestrator's admission (R03: its numbers): a lane to an end and one to its `.said`
+    // open at once, and the window of case (f).
+    let (lanes, window) = (2u32, 64 * 1024u32);
+    let sent: Vec<u8> = (0..=255u8).cycle().take(3 * window as usize + 1).collect();
+    let command = ["/bin/testguest", "nesting", "ends", "/run/hex/channel"]
+        .into_iter()
+        .map(String::from)
+        .chain([sent.len().to_string()])
+        .collect();
+    let spec = ImageSpec {
+        image: "nesting:1".into(),
+        vcpus: 1,
+        memory_mib: 512,
+        command: Some(command),
+        members: Vec::new(),
+        publish: Vec::new(),
+        egress: Narrowing::default(),
+        credentials: Vec::new(),
+        lessor: None,
+        shares: Vec::new(),
+        binary: Some(common::shards().to_path_buf()),
+        env: host_env(&home),
+        nesting: true,
+        ready_by: None,
+        control: Some(ControlAsk {
+            controller: hex.fingerprint(),
+            sockets: Some(SocketGrant {
+                dir: "/run/hex/channel".into(),
+                lanes,
+                window,
+            }),
+        }),
+        gpu_devices: Vec::new(),
+        sign_ins: Vec::new(),
+        upstream_roots: Vec::new(),
+        gpu_report: None,
+    };
+    let guest = booted(&ImageShards::new(), &spec).unwrap();
+    // READY=1 comes once every socket listens: no lane below races its bind.
+    assert_eq!(
+        ask(&*guest, |g| g.wait_ready(None, Duration::MAX)).unwrap(),
+        Some(Ready::OnTime)
+    );
+    let Some(&at) = guest.control() else {
+        panic!("no agent-control endpoint for the run")
+    };
+    let (controller, dialed) = Controller::dial(
+        &hex,
+        at.vm,
+        at.address,
+        Subscriptions {
+            outputs: &[],
+            inputs: &[],
+            execs: None,
+            sockets: Some(SocketAdmission { lanes, window }),
+        },
+    )
+    .unwrap();
+    let driver = std::thread::spawn(move || controller.run());
+    let Some(sockets) = &dialed.sockets else {
+        panic!("no socket lanes for the subscription")
+    };
+    case(sockets, &sent);
+    guest.stop().unwrap();
+    let _ = driver.join().unwrap();
+}
+
+/// What reached the workload over the end `said` tells of (testguest's `NAME.said`): the
+/// controller's half-close first, so that the workload's close after it ends the lane in order.
+fn told(sockets: &shards_api::control::Sockets, said: &str) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut lane = answered!(sockets.connect(said)).unwrap();
+    lane.shutdown_write().unwrap();
+    let mut got = Vec::new();
+    lane.read_to_end(&mut got).unwrap();
+    got
+}
+
+/// D251's cut, mid-stream, through init's relay, the VM process's vsock muxer and the endpoint
+/// (Windows: `warm.rs`'s `pass` too): the workload reads all its controller sends, answers, and
+/// closes its socket while the controller's way is still open. The controller reads
+/// `ConnectionReset`, never `Ok(0)`, after no byte but a prefix of the answer (a cut promises
+/// none before it), and its write after the cut is refused the same. Guards: init's hang-up probe
+/// (`ClientCut`), the muxer's `Cut`, and the endpoint's.
+#[test]
+fn a_nested_workloads_socket_cut_mid_stream_resets_its_lane_at_the_controller() {
+    use std::io::{ErrorKind, Read as _, Write as _};
+    if cannot_run_vms() {
+        eprintln!("SKIP: this host cannot run VMs");
+        return;
+    }
+    over_lanes("nesting-f-cut", |sockets, sent| {
+        let mut lane = answered!(sockets.connect("cut.sock")).unwrap();
+        // All the workload reads, and no half-close: the controller's way stays open.
+        lane.write_all(sent).unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(
+            lane.read_to_end(&mut rest).map_err(|e| e.kind()),
+            Err(ErrorKind::ConnectionReset),
+            "a socket cut short read as its end in order"
+        );
+        let mut answer = b"cut.sock\n".to_vec();
+        answer.extend(sent.iter().rev());
+        assert!(
+            answer.starts_with(&rest),
+            "{} bytes read before the cut are no prefix of the workload's answer",
+            rest.len()
+        );
+        assert_eq!(
+            lane.write_all(b"after").map_err(|e| e.kind()),
+            Err(ErrorKind::ConnectionReset),
+            "a write after the cut"
+        );
+        let read = told(sockets, "cut.said");
+        assert!(
+            read == sent,
+            "the workload read {} bytes before its close, not the {} sent: {:?}",
+            read.len(),
+            sent.len(),
+            String::from_utf8_lossy(read.get(..64).unwrap_or(&read))
+        );
+    });
+}
+
+/// The cut's twin: the workload half-closes its way (SHUT_WR) and keeps reading. The controller
+/// reads its bytes, then `Ok(0)` in order, never a reset, and every byte it writes after reaches
+/// the workload, to its own half-close. Guards: the same legs' half-close, kept beside the cut.
+#[test]
+fn a_nested_workloads_half_close_ends_its_way_in_order_while_the_controllers_goes_on() {
+    use std::io::{Read as _, Write as _};
+    if cannot_run_vms() {
+        eprintln!("SKIP: this host cannot run VMs");
+        return;
+    }
+    over_lanes("nesting-f-half", |sockets, sent| {
+        let mut lane = answered!(sockets.connect("half.sock")).unwrap();
+        let mut said = Vec::new();
+        assert_eq!(
+            lane.read_to_end(&mut said).map_err(|e| e.kind()),
+            Ok(b"half.sock\n".len()),
+            "a half-close read as a cut"
+        );
+        assert_eq!(said, b"half.sock\n");
+        lane.write_all(sent).unwrap();
+        lane.shutdown_write().unwrap();
+        let read = told(sockets, "half.said");
+        assert!(
+            read == sent,
+            "the workload read {} bytes after its half-close, not the {} sent: {:?}",
+            read.len(),
+            sent.len(),
+            String::from_utf8_lossy(read.get(..64).unwrap_or(&read))
+        );
+    });
 }
 
 /// Case (g), D252 (Hex's step 39 acceptance): an orchestrator's run is bound an agent-control
@@ -782,7 +1026,7 @@ fn a_nested_workloads_sockets_are_lanes_of_its_orchestrators_controller() {
 #[test]
 fn an_orchestrators_run_binds_its_own_agent_control_endpoint() {
     use shards_api::control::{Controller, Ended, Fault, Identity, SocketAdmission, Subscriptions};
-    use shards_api::image::{ControlAsk, ImageShards, ImageSpec, Images as _, Narrowing, SocketGrant};
+    use shards_api::image::{ControlAsk, ImageShards, ImageSpec, Narrowing, SocketGrant};
     if cannot_run_vms() {
         eprintln!("SKIP: this host cannot run VMs");
         return;
@@ -812,8 +1056,11 @@ fn an_orchestrators_run_binds_its_own_agent_control_endpoint() {
             ready_by: None,
             control,
             gpu_devices: Vec::new(),
+            sign_ins: Vec::new(),
+            upstream_roots: Vec::new(),
+            gpu_report: None,
         };
-        ImageShards::new().boot(&spec, TIMEOUT).unwrap()
+        booted(&ImageShards::new(), &spec).unwrap()
     };
     let ask = || {
         Some(ControlAsk {
@@ -857,7 +1104,7 @@ fn an_orchestrators_run_binds_its_own_agent_control_endpoint() {
 
     first.stop().unwrap();
     let sockets = dialed.sockets.take().expect("socket lanes subscribed");
-    let after = sockets.connect("control.sock").map(|_| ());
+    let after = answered!(sockets.connect("control.sock")).map(|_| ());
     assert!(
         matches!(after, Err(Fault::Lost(ended)) if ended != Ended::Silent),
         "{after:?}"

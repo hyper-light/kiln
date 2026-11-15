@@ -37,6 +37,8 @@ const BOOT: Duration = Duration::from_secs(60);
 // no record making them.
 static CONNECTED: Patience = Patience::measuring("test.hex_cli.guest_boot.connected");
 static HELLO: Patience = Patience::measuring("test.hex_cli.guest_boot.hello");
+/// A busy node's hold of a relay's hello, to past the slowest hello answer seen: a look at the time it has held.
+static BUSY: Patience = Patience::measuring("test.hex_cli.guest_boot.busy");
 
 /// A stand-in node agent's listening socket, in a directory of its own.
 fn agent_socket() -> (tempfile::TempDir, PathBuf, OwnedFd) {
@@ -157,12 +159,14 @@ fn relay(node: &Path, dir: &Path, ready_by: Option<u128>) -> Reaped {
     Reaped(command.spawn().unwrap())
 }
 
-/// The relay's first line on stdout, then, once it has ended (ended here if it still runs), its stderr.
-fn said(mut relay: Reaped) -> (String, String) {
+/// The relay's first line on stdout and when it came, then, once it has ended (ended here if it still runs), its
+/// stderr.
+fn said(mut relay: Reaped) -> (String, Instant, String) {
     let mut line = String::new();
     BufReader::new(relay.0.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
+    let came = Instant::now();
     let _ = relay.0.kill();
     let _ = relay.0.wait();
     let mut err = String::new();
@@ -173,7 +177,25 @@ fn said(mut relay: Reaped) -> (String, String) {
         .unwrap()
         .read_to_string(&mut err)
         .unwrap();
-    (line, err)
+    (line, came, err)
+}
+
+/// Holds the hello read at `read` as a busy node does, answering nothing, until `slowest` has passed since: past the
+/// slowest hello answer seen, the W* a relay that had seen it would wait within. Followed by `relay`'s life, which must
+/// last it.
+fn busy(relay: &mut Reaped, read: Instant, slowest: Duration) {
+    follow::until(
+        &BUSY,
+        "the node busy past the slowest hello answer seen",
+        || relay.party(),
+        || read.elapsed() > slowest,
+    )
+    .unwrap();
+    assert_eq!(
+        relay.party(),
+        Party::Live,
+        "the relay ended while its node was busy"
+    );
 }
 
 /// Now on the guest's clock, CLOCK_BOOTTIME, in nanoseconds.
@@ -183,27 +205,34 @@ fn boottime() -> u128 {
 }
 
 /// AC-T7.4.1 (original), under decision 9 (the person's ruling of 2026-11-13: a wait with no bound follows its party,
-/// refused only at its end): do start `hex guest relay` with no boot deadline to a stand-in node that takes its hello
-/// and doesn't answer, and once the relay waits on, alive and silent, let the node go (its socket closed); then start
-/// it again with the boot's deadline as init hands it, to a node that answers only once the relay waits on. Expect:
-/// the first waiting while its node lives, its hello bound by no learned wait (a fresh relay has seen no answer: no
-/// record seeds one) and no caller's deadline, then refused at its node's end, asking the node its bounds, never at
-/// "the slowest answer to a call of its kind"; the second ready.
+/// refused only at its end; the review's C-16: the node is busy). The 00aad node answered its relay's hello after the
+/// hello's learned wait. A relay learns its hello's W* from the hellos it has seen answered, so a busy node here is one
+/// that answers only past the slowest hello answer seen. Do: start `hex guest relay` to a stand-in node that answers its
+/// hello at once, the hello's answer timed from its read to the relay's ready; start it again with no boot deadline, to
+/// a node busy past that answer, then gone (its socket closed); and again with the boot's deadline as init hands it, to
+/// a node busy past it, then answering. Expect: the first ready; the second waiting while its node lives, past the
+/// slowest answer seen, then refused at its node's end, asking the node its bounds, never at "the slowest answer to a
+/// call of its kind"; the third waiting out its busy node within the boot's deadline, then ready.
 #[test]
 fn original_the_relays_hello_waits_out_a_busy_node_within_the_boots_deadline() {
     let (dir, node, listener) = agent_socket();
+    let mut quiet = relay(&node, &dir.path().join("quiet"), None);
+    let (conn, id, read) = hello(&listener, &mut quiet);
+    answer_hello(&conn, id);
+    let (line, came, err) = said(quiet);
+    drop(conn);
+    assert_eq!(line, "ready\n", "{err}");
+    let slowest = came.duration_since(read);
     let mut first = relay(&node, &dir.path().join("first"), None);
     let (conn, _, read) = hello(&listener, &mut first);
-    assert_eq!(
-        first.party(),
-        Party::Live,
-        "the relay ended while its node lived"
-    );
+    busy(&mut first, read, slowest);
     let held = read.elapsed();
     // The node goes: the relay's hello, waiting on, is refused at its end.
     drop(conn);
-    let (line, err) = said(first);
-    eprintln!("guest_boot_deadline ready_by=none held={held:?} said={line:?} stderr={err:?}");
+    let (line, _, err) = said(first);
+    eprintln!(
+        "guest_boot_deadline ready_by=none slowest={slowest:?} held={held:?} said={line:?} stderr={err:?}"
+    );
     assert_eq!(line, "", "{err}");
     assert!(
         err.contains("asking the node its bounds")
@@ -213,18 +242,13 @@ fn original_the_relays_hello_waits_out_a_busy_node_within_the_boots_deadline() {
     let ready_by = boottime() + BOOT.as_nanos();
     let mut second = relay(&node, &dir.path().join("second"), Some(ready_by));
     let (conn, id, read) = hello(&listener, &mut second);
-    // Answered once the relay waits on, alive, past its hello: it sends nothing in that span.
-    assert_eq!(
-        second.party(),
-        Party::Live,
-        "the relay ended before its node answered"
-    );
+    busy(&mut second, read, slowest);
+    let held = read.elapsed();
     answer_hello(&conn, id);
-    let (line, err) = said(second);
+    let (line, _, err) = said(second);
     drop(conn);
     eprintln!(
-        "guest_boot_deadline ready_by={ready_by} held={:?} said={line:?} stderr={err:?}",
-        read.elapsed()
+        "guest_boot_deadline ready_by={ready_by} slowest={slowest:?} held={held:?} said={line:?} stderr={err:?}"
     );
     assert_eq!(line, "ready\n", "{err}");
 }

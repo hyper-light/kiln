@@ -2,7 +2,9 @@
 //! supervisor's epoll set, and removed once the program has ended (decision 7 of
 //! docs/design/runtime-architecture.md). Whoever meets the end first removes the box: the caller's own
 //! wait, which spares the hop through the supervising thread, the supervising thread when no caller
-//! waits, or a delete. Each run is claimed once, under the supervisor's lock, and the others wait for what
+//! waits, or a delete. The supervising thread, which every box shares, waits for a box's emptying within W*
+//! alone and hands one that hasn't emptied by then to a thread of its own (the review's E-3). Each run is
+//! claimed once, under the supervisor's lock, and the others wait for what
 //! the claimer says, so a box is removed once and never after another box has taken its id: a claimed run
 //! stays in view until its claimer has said how the removal went, and a delete of its box waits for that
 //! word rather than remove the box beside it (runtime goal 7). The word comes on every path, the claim's
@@ -15,6 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use hex_api::{BoxId, Exit, Proc, Refusal};
+use hex_core::patience::{Patience, Piece};
 use hex_core::record::ProcId;
 use hex_runtime::linux::cgroup::{BoxCgroup, Names};
 use rustix::event::epoll::{self, EventData, EventFlags};
@@ -23,7 +26,14 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, WaitId, WaitIdOptions};
 
 use super::{Slot, Stat, Supervisor, exit_of, owned, poisoned};
+use crate::emptying::Within;
 use crate::store::Store;
+
+/// A delete's wait for the word of the run's claimer, whose removal is under way (decision 9; the person's ruling of
+/// 2026-11-13): within the slowest word seen, the word; past it, its run-out told once and the claimer followed, its
+/// word coming on every path ([`Claimed`]'s and [`Following`]'s drops saying it where they unwound). Its word, however
+/// late, is the sample W* rises to.
+static SAID: Patience = Patience::measuring("node.run_said");
 
 /// The runs a node watches, by box and by the epoll token each program's pidfd carries, and those claimed and
 /// not yet done with, by box: each claimer's removal under way, which a delete of the same box waits for
@@ -95,16 +105,35 @@ impl Run {
         self.program
     }
 
-    /// What its claimer said once done with the box, waited for. The claimer's removal is bounded by its own waits
-    /// (the box's kill, the node's learned emptying wait, the record's turn) and its word comes on every path, its
-    /// [`Claimed`]'s drop saying [`Said::Abandoned`] where it unwound, so the wait follows the claimer and needs no
-    /// timer (decision 9).
+    /// What its claimer said once done with the box, waited for as decision 9 waits ([`SAID`]): within the slowest
+    /// word seen; past it, its run-out told once, the claimer followed to its word, which comes on every path, its
+    /// [`Claimed`]'s or [`Following`]'s drop saying [`Said::Abandoned`] where it unwound, so the wait needs no timer.
     pub fn said(&self) -> Result<Said, Refusal> {
-        let end = self.end()?;
+        let asked = Instant::now();
+        let mut end = self.end()?;
+        if let Some(window) = SAID.deadline() {
+            let (within, _) = self
+                .published
+                .wait_timeout_while(end, window, |end| end.is_none())
+                .map_err(poisoned)?;
+            end = within;
+            if end.is_none() {
+                SAID.ran_out(
+                    window,
+                    asked.elapsed(),
+                    &[
+                        Piece::Kind("the claimer removing the box of program pid "),
+                        Piece::Pid(i64::from(self.program.pid)),
+                        Piece::Kind(", its word"),
+                    ],
+                );
+            }
+        }
         let end = self
             .published
             .wait_while(end, |end| end.is_none())
             .map_err(poisoned)?;
+        SAID.answered(asked.elapsed());
         end.clone().ok_or_else(|| {
             Refusal::Broken(format!(
                 "box {}'s run's claimer was waited for and said nothing",
@@ -164,6 +193,114 @@ impl Claimed<'_> {
             Err(why) => Said::Failed(why),
         })?;
         failed.map_or(Ok(()), Err)
+    }
+
+    /// [`Claimed::finish`] on the supervising thread, which every other box's end and removal shares: the box waited
+    /// for within W* alone; one that hasn't emptied by then, its run-out told once, is followed and taken apart by a
+    /// thread of its own, which then says how the removal went (decision 9 follows a party by its life, never on a
+    /// thread other parties share: the review's E-3, 2026-11-14). Those threads are at most the boxes the node holds:
+    /// a followed box's cgroup stays under its root until it's taken apart, and a root holds at most its bound of them,
+    /// past which a create is refused (`BoxRoot::count`, [`hex_runtime::MAX_BOXES`] or fewer).
+    fn finish_supervised(self, supervisor: &Arc<Supervisor>) -> Result<(), Refusal> {
+        #[cfg(all(debug_assertions, feature = "test-controls"))]
+        self.supervisor.removals.stop_here()?;
+        let run = Arc::clone(&self.run);
+        let exit = match reap(&run, WaitIdOptions::EXITED | WaitIdOptions::NOHANG) {
+            Ok(exit) => exit,
+            Err(why) => return self.failed(why),
+        };
+        let killed = match kill_left(&run.cgroup) {
+            Ok(None) => return self.taken_apart(exit),
+            Ok(Some(killed)) => killed,
+            Err(why) => return self.failed(why),
+        };
+        match crate::node::empties_within_bound(&run.cgroup, killed) {
+            Ok(Within::Came) => self.taken_apart(exit),
+            Ok(Within::Follow) => self.follow_apart(supervisor, exit, killed),
+            Err(why) => self.failed(why),
+        }
+    }
+
+    /// Says the removal failed for `why`, which it also returns.
+    fn failed(self, why: Refusal) -> Result<(), Refusal> {
+        self.say(Said::Failed(why.clone()))?;
+        Err(why)
+    }
+
+    /// The emptied box taken apart, and that said with the program's end `exit`.
+    fn taken_apart(self, exit: Exit) -> Result<(), Refusal> {
+        let run = Arc::clone(&self.run);
+        match take_apart(&run.id, &run.cgroup, &run.names, &self.supervisor.store) {
+            Ok(()) => self.say(Said::Removed(exit)),
+            Err(why) => self.failed(why),
+        }
+    }
+
+    /// The box, killed at `killed` and not empty within W*, handed with the claim to a thread of its own
+    /// ([`Following`]). A thread that can't be started drops the claim it was handed, which says the claimer stopped,
+    /// so a delete removes the box itself; the refusal is the supervising thread's to note.
+    fn follow_apart(
+        mut self,
+        supervisor: &Arc<Supervisor>,
+        exit: Exit,
+        killed: Instant,
+    ) -> Result<(), Refusal> {
+        let following = Following {
+            supervisor: Arc::clone(supervisor),
+            run: Arc::clone(&self.run),
+            said: false,
+        };
+        // The word is the follower's to say from here.
+        self.said = true;
+        drop(self);
+        std::thread::Builder::new()
+            .name("hex-run-follow".to_owned())
+            .spawn(move || following.finish(exit, killed))
+            .map(drop)
+            .map_err(|e| Refusal::os("starting a run's follower", e))
+    }
+}
+
+/// A claimed run whose box didn't empty within W*, followed to its emptying and taken apart by a thread of its own
+/// ([`Claimed::finish_supervised`]): its word goes to every waiter as a claim's does, and where it stops without one
+/// its drop says [`Said::Abandoned`].
+struct Following {
+    supervisor: Arc<Supervisor>,
+    run: Arc<Run>,
+    said: bool,
+}
+
+impl Following {
+    /// Follows the box, killed at `killed`, by its life alone to its emptying, then takes it apart and says the
+    /// program's end `exit`, or why the box couldn't be removed, which the supervisor also keeps as its fault (§3).
+    fn finish(mut self, exit: Exit, killed: Instant) {
+        let run = Arc::clone(&self.run);
+        let removed = crate::node::follow_to_empty(&run.cgroup, killed).and_then(|emptied| {
+            if emptied {
+                take_apart(&run.id, &run.cgroup, &run.names, &self.supervisor.store)
+            } else {
+                Err(still_holds(&run.id, &run.cgroup, killed.elapsed()))
+            }
+        });
+        let said = match removed {
+            Ok(()) => Said::Removed(exit),
+            Err(why) => {
+                self.supervisor.note(Err(why.clone()));
+                Said::Failed(why)
+            }
+        };
+        self.said = true;
+        if let Err(why) = self.supervisor.done_with(&run, said) {
+            self.supervisor.note(Err(why));
+        }
+    }
+}
+
+impl Drop for Following {
+    fn drop(&mut self) {
+        if !self.said {
+            let _ = self.supervisor.done_with(&self.run, Said::Abandoned);
+        }
     }
 }
 
@@ -349,11 +486,11 @@ impl Supervisor {
     }
 
     /// The supervising thread's pass over the runs whose programs ended.
-    pub(super) fn runs_ready(&self, ready: &[Arc<Run>]) -> Result<(), Refusal> {
+    pub(super) fn runs_ready(self: &Arc<Self>, ready: &[Arc<Run>]) -> Result<(), Refusal> {
         let mut first_error = None;
         for run in ready {
             let done = match self.claim_run(run) {
-                Ok(Some(claimed)) => claimed.finish(),
+                Ok(Some(claimed)) => claimed.finish_supervised(self),
                 Ok(None) => Ok(()),
                 Err(e) => Err(e),
             };
@@ -385,24 +522,43 @@ fn reap(run: &Run, options: WaitIdOptions) -> Result<Exit, Refusal> {
 /// Ends what a run's program left in its box `id`, then removes the box's cgroup, its name from its root's
 /// `names`, and its record: as a delete ends and removes a `process` box, `cgroup.kill` and the node's learned
 /// wait for the box to empty, what still holds it named past that.
+/// On the caller's own thread, which follows the box past W* there.
 fn remove(id: &BoxId, cgroup: &BoxCgroup, names: &Names, store: &Store) -> Result<(), Refusal> {
-    if cgroup.populated()? {
-        let killed = Instant::now();
-        cgroup.kill()?;
+    if let Some(killed) = kill_left(cgroup)? {
         let (emptied, patience) = crate::node::wait_empty(cgroup, killed)?;
         if !emptied {
-            let op = "removing a run's box";
-            let mut why = format!("box {id} still holds processes {patience:?} after cgroup.kill:");
-            why.push_str(&crate::node::survivors(
-                cgroup,
-                crate::node::why_room(op, &why),
-            ));
-            return Err(Refusal::Os { op, why });
+            return Err(still_holds(id, cgroup, patience));
         }
     }
+    take_apart(id, cgroup, names, store)
+}
+
+/// What a run's program left in its box `cgroup`, ended: when it was killed, or none where nothing was left.
+fn kill_left(cgroup: &BoxCgroup) -> Result<Option<Instant>, Refusal> {
+    if !cgroup.populated()? {
+        return Ok(None);
+    }
+    let killed = Instant::now();
+    cgroup.kill()?;
+    Ok(Some(killed))
+}
+
+/// Box `id`'s emptied `cgroup` removed, its name from its root's `names`, and its record.
+fn take_apart(id: &BoxId, cgroup: &BoxCgroup, names: &Names, store: &Store) -> Result<(), Refusal> {
     cgroup.remove()?;
     names.forget(id.as_str());
     store.remove(id)
+}
+
+/// Box `id`'s cgroup still held processes `waited` after `cgroup.kill`: what still holds it, named.
+fn still_holds(id: &BoxId, cgroup: &BoxCgroup, waited: Duration) -> Refusal {
+    let op = "removing a run's box";
+    let mut why = format!("box {id} still holds processes {waited:?} after cgroup.kill:");
+    why.push_str(&crate::node::survivors(
+        cgroup,
+        crate::node::why_room(op, &why),
+    ));
+    Refusal::Os { op, why }
 }
 
 /// A debug build's hold on the runs' removals (runtime goal 7), armed by the node's caller alone

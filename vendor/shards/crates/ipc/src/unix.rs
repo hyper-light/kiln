@@ -374,6 +374,136 @@ fn space(fds: usize) -> usize {
 
 /// Sends one message with `fds` attached. Blocks until all of it is written.
 pub fn send(sock: &UnixStream, kind: u8, payload: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+    send_with(sock, kind, payload, fds, None)
+}
+
+/// When a judged wait ([`send_judged`], [`recv_judged`]) next asks its judge, and whether it
+/// goes on: asked as the wait begins and each time the time it named passes with the socket
+/// not ready; `Ok(None)` waits on the socket's readiness alone, an error ends the wait with it.
+pub type Judge<'a> = dyn FnMut() -> io::Result<Option<Instant>> + 'a;
+
+/// [`send`], judged (runs-11 `TAKE_TIMEOUT`): written as room comes, by sendmsg(2) and send(2)
+/// with `MSG_DONTWAIT`, which leave the socket's own mode and timeouts to its other users, and
+/// waiting for room in poll(2) until the time `judge` names, where it is asked again. Never a
+/// socket's send timeout, whose expiry mid-message loses how much of it went (POSIX send(2):
+/// a partial count, or `EAGAIN` once nothing more fits). An error `judge` ends it with leaves
+/// the message cut short where it was: its peer never had all of it.
+pub fn send_judged(
+    sock: &UnixStream,
+    kind: u8,
+    payload: &[u8],
+    fds: &[BorrowedFd<'_>],
+    judge: &mut Judge<'_>,
+) -> io::Result<()> {
+    send_with(sock, kind, payload, fds, Some(judge))
+}
+
+/// [`recv`], judged: the next message taken whole as it comes ([`Incoming`]), waiting for more
+/// in poll(2) until the time `judge` names, where it is asked again. `None` for the peer's
+/// end between messages.
+pub fn recv_judged(sock: &UnixStream, judge: &mut Judge<'_>) -> io::Result<Option<Message>> {
+    let mut due = judge()?;
+    let mut incoming = Incoming::default();
+    loop {
+        match incoming.take(sock)? {
+            Took::Message(m) => return Ok(Some(m)),
+            Took::Ended => return Ok(None),
+            Took::Partial => {
+                while !await_events(sock.as_fd(), libc::POLLIN, due)? {
+                    due = judge()?;
+                }
+            }
+        }
+    }
+}
+
+/// Waits in poll(2) until `fd` has one of `events`, its end or an error, or `due` passes (none:
+/// as long as that takes): whether it came. A wait a signal cut short is made again.
+fn await_events(fd: BorrowedFd<'_>, events: libc::c_short, due: Option<Instant>) -> io::Result<bool> {
+    loop {
+        let ms = match due {
+            None => -1,
+            Some(due) => {
+                let left = due.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(false);
+                }
+                // Rounded up: a wait of 0 ms would return at once, and spin.
+                libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
+            }
+        };
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: poll(2) on one valid pollfd.
+        match unsafe { libc::poll(&mut pfd, 1, ms) } {
+            n if n > 0 => return Ok(true),
+            0 => {}
+            _ => {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// The most a judged send writes at once to `sock`. On macOS a send(2) larger than its
+/// socket's room waits for the rest, `MSG_DONTWAIT` or not: a 9,000-byte send with it to an
+/// empty socketpair (8 KiB buffers) waited on, where one of 4,000 bytes went at once
+/// (docs/research/measurements/runs-fixes/msg-dontwait.c, macOS 26 arm64, runs-11). There a
+/// socket is writable, by the definition poll(2) and select(2) follow, once its room is at
+/// least its send low-water mark (SO_SNDLOWAT, XNU's `sowriteable`; 2,048 bytes by default),
+/// and a write of no more than that waits for nothing: so a judged send writes that much at
+/// most, each time once poll(2) says there is room. Elsewhere `MSG_DONTWAIT` writes what fits
+/// and returns (Linux, unix_stream_sendmsg): no bound.
+fn send_most(sock: &UnixStream) -> io::Result<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut lowat: libc::c_int = 0;
+        let mut len = libc::socklen_t::try_from(size_of::<libc::c_int>()).map_err(io::Error::other)?;
+        // SAFETY: getsockopt(2) of an int option into a local int, its length given.
+        if unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDLOWAT,
+                (&raw mut lowat).cast(),
+                &mut len,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(usize::try_from(lowat).unwrap_or(1).max(1))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = sock;
+        Ok(usize::MAX)
+    }
+}
+
+/// Waits for room on `sock` to write, asking `judge` each time `due` passes without it.
+fn await_room(sock: &UnixStream, judge: &mut Judge<'_>, due: &mut Option<Instant>) -> io::Result<()> {
+    while !await_events(sock.as_fd(), libc::POLLOUT, *due)? {
+        *due = judge()?;
+    }
+    Ok(())
+}
+
+/// [`send`]'s and [`send_judged`]'s message: blocking where no `judge` is given, as `send`
+/// always has; else as `send_judged` says.
+fn send_with(
+    sock: &UnixStream,
+    kind: u8,
+    payload: &[u8],
+    fds: &[BorrowedFd<'_>],
+    mut judge: Option<&mut Judge<'_>>,
+) -> io::Result<()> {
     if payload.len() > MAX_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -389,14 +519,23 @@ pub fn send(sock: &UnixStream, kind: u8, payload: &[u8], fds: &[BorrowedFd<'_>])
     let len = u32::try_from(payload.len()).map_err(|_| io::Error::other("payload length"))?;
     let [l0, l1, l2, l3] = len.to_be_bytes();
     let mut header = [kind, l0, l1, l2, l3];
+    // A judged send's first write, on macOS no more than its socket's send low-water mark
+    // ([`send_most`]), less its descriptors' control data; else all of it.
+    let most = match judge {
+        Some(_) => send_most(sock)?,
+        None => usize::MAX,
+    };
+    let control_len = if fds.is_empty() { 0 } else { space(fds.len()) };
+    let first = most.saturating_sub(control_len).max(1);
+    let head_len = HEADER.min(first);
     let mut iov = [
         libc::iovec {
             iov_base: header.as_mut_ptr().cast(),
-            iov_len: HEADER,
+            iov_len: head_len,
         },
         libc::iovec {
             iov_base: payload.as_ptr() as *mut libc::c_void,
-            iov_len: payload.len(),
+            iov_len: payload.len().min(first.saturating_sub(head_len)),
         },
     ];
     let mut control = Control::new();
@@ -425,20 +564,77 @@ pub fn send(sock: &UnixStream, kind: u8, payload: &[u8], fds: &[BorrowedFd<'_>])
         }
     }
     let total = HEADER + payload.len();
+    let mut due = match judge.as_deref_mut() {
+        Some(judge) => judge()?,
+        None => None,
+    };
+    let flags = if judge.is_some() { libc::MSG_DONTWAIT } else { 0 };
+    #[cfg(target_os = "macos")]
+    if let Some(judge) = judge.as_deref_mut() {
+        await_room(sock, judge, &mut due)?;
+    }
     let sent = loop {
         // SAFETY: a fully initialized msghdr over live buffers.
-        let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
+        let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, flags) };
         if let Ok(n) = usize::try_from(n) {
             break n;
         }
         let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
+        match (e.kind(), judge.as_deref_mut()) {
+            (io::ErrorKind::Interrupted, _) => {}
+            (io::ErrorKind::WouldBlock, Some(judge)) => await_room(sock, judge, &mut due)?,
+            _ => return Err(e),
         }
     };
     // The descriptors went with the first byte; the rest follows as plain bytes.
     if sent < total {
-        write_rest(&mut &*sock, [&header, payload], sent)?;
+        match judge {
+            None => write_rest(&mut &*sock, [&header, payload], sent)?,
+            Some(judge) => send_rest(sock, [&header, payload], sent, most, judge, &mut due)?,
+        }
+    }
+    Ok(())
+}
+
+/// [`write_rest`], judged: what follows the first `sent` bytes of `parts`, by send(2) with
+/// `MSG_DONTWAIT`, at most `most` bytes a write, waiting for room as [`send_judged`] does.
+fn send_rest(
+    sock: &UnixStream,
+    parts: [&[u8]; 2],
+    sent: usize,
+    most: usize,
+    judge: &mut Judge<'_>,
+    due: &mut Option<Instant>,
+) -> io::Result<()> {
+    let mut skip = sent;
+    for part in parts {
+        let mut rest = part.get(skip.min(part.len())..).unwrap_or_default();
+        skip = skip.saturating_sub(part.len());
+        while !rest.is_empty() {
+            #[cfg(target_os = "macos")]
+            await_room(sock, judge, due)?;
+            // SAFETY: send(2) of `rest`'s first bytes, a live buffer, at most its length.
+            let n = unsafe {
+                libc::send(
+                    sock.as_raw_fd(),
+                    rest.as_ptr().cast(),
+                    rest.len().min(most),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            match usize::try_from(n) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => rest = rest.get(n..).unwrap_or_default(),
+                Err(_) => {
+                    let e = io::Error::last_os_error();
+                    match e.kind() {
+                        io::ErrorKind::Interrupted => {}
+                        io::ErrorKind::WouldBlock => await_room(sock, judge, due)?,
+                        _ => return Err(e),
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -608,6 +804,35 @@ impl<S: AsFd> io::Read for Polled<S> {
 pub fn end(sock: &UnixStream) {
     let _ = sock.shutdown(Shutdown::Write);
     let _ = sock.shutdown(Shutdown::Read);
+}
+
+/// Whether `sock` has hung up, asked at once: it takes no more writes, its peer gone (its
+/// close; on Linux its reads shut too) or this side's own writes ended (on Linux, once its
+/// reads have ended as well), poll(2)'s POLLHUP or POLLERR for a socket asked for POLLOUT. A
+/// peer that ended only its writes, a half-close, leaves it POLLOUT alone: so what a read's
+/// end was, measured on macOS 26 and Linux 7.3 (PM M559). XNU shows no peer's
+/// shutdown(SHUT_RDWR), whose socket takes writes on (M236).
+pub fn hung_up(sock: &UnixStream) -> io::Result<bool> {
+    let mut fds = [libc::pollfd {
+        fd: sock.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    }];
+    loop {
+        // SAFETY: one pollfd of a descriptor `sock` holds open; a timeout of 0 waits for none.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) } >= 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    let revents = fds.first().map_or(0, |fd| fd.revents);
+    if revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    Ok(revents & (libc::POLLHUP | libc::POLLERR) != 0)
 }
 
 /// Waits in poll(2) until `fd` has something to read, or has ended: until `deadline`
@@ -1118,24 +1343,49 @@ fn take_fds(msg: &libc::msghdr, fds: &mut Vec<OwnedFd>) -> io::Result<()> {
     Ok(())
 }
 
-/// The socket of a daemon of a build from before request slots (D185): `daemon.sock` in
-/// shards' home, named relative to the working directory, which each process that uses it
-/// makes the home first. A client reaches such a daemon there only to have it step aside
-/// for its own build's, and a daemon starting removes one left. A relative name fits a
-/// socket address (`sun_path`: 104 bytes on macOS, 108 on Linux, NUL included) whatever
-/// the home's path (PM M26).
-pub const SOCKET: &str = "daemon.sock";
-
 /// Whether process `pid` lives: kill(2) with signal 0 asks, one of another user's among
-/// those that do (EPERM).
+/// those that do (EPERM), and one that has exited does not, whether or not its parent has
+/// reaped it (waits-08): a zombie answers kill(2) and keeps its start, so a client that
+/// waits on a daemon while it lives would wait for ever on one its supervisor leaves
+/// unreaped. Windows' twin asks its handle whether it has ended.
 pub(crate) fn alive(pid: u32) -> bool {
     // Zero or less would name a process group, or every process.
-    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|&pid| pid > 0) else {
+    let Some(id) = libc::pid_t::try_from(pid).ok().filter(|&pid| pid > 0) else {
         return false;
     };
     // SAFETY: kill(2) with signal 0 only asks whether the process exists.
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
-    alive || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let exists =
+        unsafe { libc::kill(id, 0) } == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    exists && !exited(pid)
+}
+
+/// Whether process `pid` has exited, unreaped: on Linux its `/proc/<pid>/stat` state, field
+/// 3, after the last ')', `Z` (zombie) or `X` (dead, proc(5)). One whose state cannot be read
+/// (gone meanwhile, or hidden) is not known to have.
+#[cfg(target_os = "linux")]
+fn exited(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rfind(')')
+            .and_then(|i| stat.get(i.saturating_add(1)..))
+            .and_then(|fields| fields.split_ascii_whitespace().next())
+            .is_some_and(|state| matches!(state, "Z" | "X"))
+    })
+}
+
+/// Whether process `pid` has exited, unreaped: on macOS `proc_pid_rusage`'s
+/// `ri_proc_exit_abstime`, set as it exits (XNU's `proc_exit`), as crates/api's judge reads
+/// a process ending. One whose rusage cannot be read (another user's) is not known to have.
+#[cfg(not(target_os = "linux"))]
+fn exited(pid: u32) -> bool {
+    let Ok(pid) = libc::c_int::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: a rusage_info_v0, plain data, for proc_pid_rusage to fill.
+    let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+    // SAFETY: proc_pid_rusage(3) of `pid` into a rusage_info_v0 of ours, which RUSAGE_INFO_V0
+    // names.
+    let r = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, (&raw mut info).cast()) };
+    r == 0 && info.ri_proc_exit_abstime != 0
 }
 
 /// When process `pid` started ([`crate::started`]): on Linux its `/proc/<pid>/stat`
@@ -1208,21 +1458,31 @@ pub fn peak_commit_kib() -> u64 {
     0
 }
 
-/// This process's own memory now, in KiB, as memory per VM is counted (PM M30's
+/// This process's own memory now, in KiB ([`footprint`]); 0 where unknown.
+pub fn footprint_kib() -> u64 {
+    footprint().map_or(0, |bytes| bytes / 1024)
+}
+
+/// This process's own memory now, in bytes, as memory per VM is counted (PM M30's
 /// `phys_footprint`): macOS's physical footprint, its private and copied pages, without the
 /// file pages it shares with every process mapping them, a template's among them; Linux's
 /// anonymous resident pages (`RssAnon`, proc(5)), which a written page of a private file
-/// mapping becomes. 0 where unknown.
-pub fn footprint_kib() -> u64 {
+/// mapping becomes. As the daemon reads a VM process's (`platform::process_usage`). None
+/// where it cannot be read.
+pub fn footprint() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|status| {
                 let line = status.lines().find_map(|l| l.strip_prefix("RssAnon:"))?;
-                line.trim().strip_suffix("kB")?.trim().parse().ok()
+                line.trim()
+                    .strip_suffix("kB")?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()?
+                    .checked_mul(1024)
             })
-            .unwrap_or(0)
     }
     #[cfg(target_vendor = "apple")]
     {
@@ -1237,13 +1497,10 @@ pub fn footprint_kib() -> u64 {
                 (&raw mut info).cast::<libc::rusage_info_t>(),
             )
         };
-        if got != 0 {
-            return 0;
-        }
-        info.ri_phys_footprint / 1024
+        (got == 0).then_some(info.ri_phys_footprint)
     }
     #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    0
+    None
 }
 
 /// The effective user ID of the process at the other end of `sock`, as it connected:
@@ -1328,15 +1585,24 @@ impl Child {
     }
 
     /// Waits for the child to end: its exit status, or 128 plus the signal that ended it.
+    /// Its end is waited for first, holding nothing; then it is reaped under the lock that
+    /// [`kill`](Self::kill) takes, which waits on nothing: a child of this process's own is
+    /// reaped without waiting (WNOHANG), and one its end was wrongly said of is waited for
+    /// again, the lock let go of. So a signal is never held behind a reap that waits
+    /// (PM M583).
     pub fn wait(&self) -> io::Result<i32> {
-        self.ended()?;
-        let mut reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
-        let status = match self.by {
-            Some(by) => crate::spawner::reap(by, self.pid)?,
-            None => reap(self.pid)?,
-        };
-        *reaped = true;
-        Ok(status)
+        loop {
+            self.ended()?;
+            let mut reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
+            let status = match self.by {
+                Some(by) => Some(crate::spawner::reap(by, self.pid)?),
+                None => reap_now(self.pid)?,
+            };
+            if let Some(status) = status {
+                *reaped = true;
+                return Ok(status);
+            }
+        }
     }
 
     /// Whether the child has ended, without waiting: its status as [`Child::wait`] gives
@@ -1409,6 +1675,198 @@ impl Child {
         };
         matches!(ended, Ok(Some(_)))
     }
+
+    /// Ends the process group a detached child leads, as [`kill_group`](Self::kill_group)
+    /// does, and returns once every process of it has exited, as Windows' twin returns
+    /// (D231): followed by the kernel's word of each one's exit, its pidfd on Linux (readable
+    /// from `exit_notify`, after `exit_task_work` has run each of its files' last release),
+    /// its kqueue's `NOTE_EXIT` on macOS (posted by `proc_exit` after `fdt_invalidate`; a
+    /// pipe it held was seen ending up to microseconds after it, PM M583). Never a pipe's
+    /// end, which any process holding a write end of it, one a spawn elsewhere let inherit
+    /// it, holds back. Each round signals the group, lists the processes in it that have not
+    /// exited and waits on each one's exit, until a round lists none: a process made as a
+    /// round signalled is signalled by the next. Never timed (D215): every wait is on a
+    /// process SIGKILL has begun to end. Called before the child is reaped, its pid, the
+    /// group's ID, no other process's or group's while it holds the lock that reaping takes;
+    /// a reaped child's group is gone or another's, and is left be.
+    pub fn end_group(&self) -> io::Result<()> {
+        let reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
+        if *reaped {
+            return Ok(());
+        }
+        if let Some(by) = self.by
+            && !crate::spawner::serving(by)
+        {
+            return Err(io::Error::other("the spawner that made it has gone"));
+        }
+        loop {
+            // SAFETY: kill(2) of the group our unreaped child leads, as `kill_group`'s.
+            let signalled = if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            // A group of exited processes alone has none to signal: Linux says ESRCH, XNU
+            // EPERM. One that lists a running process it could not signal is refused.
+            let members = group_members(self.pid)?;
+            if members.is_empty() {
+                return Ok(());
+            }
+            signalled?;
+            for pid in members {
+                // Its end watched first, then seen still the group's and running: a pid freed
+                // and taken by another process meanwhile is not waited on, and one that ends
+                // after the look is the one watched.
+                let Some(end) = exit_watch(pid)? else {
+                    continue;
+                };
+                if member(pid, self.pid) {
+                    await_any(&[end.as_fd()])?;
+                }
+            }
+        }
+    }
+}
+
+/// A descriptor readable once process `pid` has ended: a kqueue of its `EVFILT_PROC`
+/// `NOTE_EXIT` on macOS (kqueue(2); a kqueue's descriptor is selectable), its pidfd on
+/// Linux (pidfd_open(2), readable once it has exited, Linux 5.3). `None` where no process
+/// has that pid. Neither is inherited by a child.
+pub(crate) fn exit_watch(pid: libc::pid_t) -> io::Result<Option<OwnedFd>> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: kqueue(2) takes no arguments.
+        let raw = unsafe { libc::kqueue() };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor nothing else owns.
+        let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+        let change = libc::kevent {
+            ident: pid.unsigned_abs() as libc::uintptr_t,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: kevent(2) reading one change, writing no event.
+        if unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(e);
+        }
+        Ok(Some(queue))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // SAFETY: pidfd_open(2) of a process, without flags: its descriptor is close-on-exec.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if raw < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(e);
+        }
+        let raw = RawFd::try_from(raw).map_err(|_| io::Error::other("a descriptor out of range"))?;
+        // SAFETY: a descriptor just made, owned by nothing else.
+        Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
+    }
+}
+
+/// The processes of group `pgid` that have not exited: on Linux each of `/proc`'s whose
+/// `stat` says so ([`member`]); one that cannot be read (gone meanwhile) is not one.
+#[cfg(target_os = "linux")]
+fn group_members(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Some(pid) = entry
+            .ok()
+            .and_then(|e| e.file_name().to_str().and_then(|n| n.parse::<libc::pid_t>().ok()))
+        else {
+            continue;
+        };
+        if member(pid, pgid) {
+            found.push(pid);
+        }
+    }
+    Ok(found)
+}
+
+/// The processes of group `pgid` that have not exited: on macOS those proc_listpids(3)
+/// lists by group (`PROC_PGRP_ONLY`, sys/proc_info.h), asked again with twice the room
+/// while its answer fills all it was given, each then seen a member ([`member`]).
+#[cfg(not(target_os = "linux"))]
+fn group_members(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    /// sys/proc_info.h's `PROC_PGRP_ONLY`.
+    const PROC_PGRP_ONLY: u32 = 2;
+    let group = u32::try_from(pgid).map_err(io::Error::other)?;
+    let mut room = 64usize;
+    loop {
+        let mut pids: Vec<libc::pid_t> = vec![0; room];
+        let bytes = room
+            .checked_mul(size_of::<libc::pid_t>())
+            .and_then(|b| libc::c_int::try_from(b).ok())
+            .ok_or_else(|| io::Error::other("a process group past what a listing holds"))?;
+        // SAFETY: proc_listpids(3) into `pids`, `bytes` long, of the pids of group `group`.
+        let n = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, pids.as_mut_ptr().cast(), bytes) };
+        let filled = usize::try_from(n).map_err(|_| io::Error::last_os_error())? / size_of::<libc::pid_t>();
+        if filled < room {
+            pids.truncate(filled);
+            pids.retain(|&pid| pid > 0 && member(pid, pgid));
+            return Ok(pids);
+        }
+        room = room
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("a process group past what a listing holds"))?;
+    }
+}
+
+/// Whether process `pid` is in group `pgid` and has not exited: on Linux its
+/// `/proc/<pid>/stat`, after the last ')', its state (field 3) neither `Z` nor `X` and its
+/// group (field 5) `pgid` (proc(5)).
+#[cfg(target_os = "linux")]
+fn member(pid: libc::pid_t, pgid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        let mut fields = stat
+            .rfind(')')
+            .and_then(|i| stat.get(i.saturating_add(1)..))
+            .unwrap_or_default()
+            .split_ascii_whitespace();
+        let state = fields.next();
+        let group = fields.nth(1).and_then(|g| g.parse::<libc::pid_t>().ok());
+        !matches!(state, None | Some("Z" | "X")) && group == Some(pgid)
+    })
+}
+
+/// Whether process `pid` is in group `pgid` and has not exited: on macOS its
+/// `proc_bsdinfo` (proc_pidinfo(3), `PROC_PIDTBSDINFO`) names that group and no zombie. Not
+/// its rusage's exit ([`exited`]): XNU sets that as `proc_exit` begins, before it closes the
+/// process's descriptors (`fdt_invalidate`) and posts `NOTE_EXIT`, which is what is waited on.
+#[cfg(not(target_os = "linux"))]
+fn member(pid: libc::pid_t, pgid: libc::pid_t) -> bool {
+    // SAFETY: a proc_bsdinfo, plain data, for proc_pidinfo to fill.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let Ok(size) = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()) else {
+        return false;
+    };
+    // SAFETY: proc_pidinfo(3) of `pid` into a proc_bsdinfo of ours, `size` long, as
+    // PROC_PIDTBSDINFO names.
+    let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    n == size && u32::try_from(pgid).is_ok_and(|g| info.pbi_pgid == g) && info.pbi_status != libc::SZOMB
 }
 
 /// Whether this process's child `pid` has ended, waiting for it to if `wait`: its status
@@ -1424,6 +1882,20 @@ pub(crate) fn status_of(pid: libc::pid_t, wait: bool) -> io::Result<Option<i32>>
             let (ended, status) = unsafe { (info.si_pid(), info.si_status()) };
             if ended == 0 {
                 return Ok(None);
+            }
+            // XNU's waitid(2) says a stopped child under WEXITED alone (PM M442, M583): no end.
+            // Its end is then waited for by the kernel's own word of it, and asked again.
+            if !matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            ) {
+                if !wait {
+                    return Ok(None);
+                }
+                if let Some(end) = exit_watch(pid)? {
+                    await_any(&[end.as_fd()])?;
+                }
+                continue;
             }
             return Ok(Some(if info.si_code == libc::CLD_EXITED {
                 status
@@ -1738,6 +2210,85 @@ pub(crate) mod tests {
     use std::fs::File;
     use std::io::Read;
     use std::os::fd::AsFd;
+
+    /// A judge that asks again `every` from now, counting how often it was asked, and ends the
+    /// wait at its `refuse`th ask, where it has one.
+    fn judge_every(
+        every: std::time::Duration,
+        asked: &std::sync::atomic::AtomicUsize,
+        refuse: Option<usize>,
+    ) -> impl FnMut() -> std::io::Result<Option<std::time::Instant>> + '_ {
+        move || {
+            let n = asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if refuse.is_some_and(|at| n >= at) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "judged stalled",
+                ));
+            }
+            Ok(std::time::Instant::now().checked_add(every))
+        }
+    }
+
+    /// A judged send to a peer that reads late goes on where it was as room comes, asking its
+    /// judge at each due, and its peer reads the message whole (runs-11 `TAKE_TIMEOUT`). Red
+    /// before, with a send timeout in its judge's place: a write cut short mid-message by the
+    /// timeout returned `WouldBlock` with no word of how much went, so the message was lost.
+    #[test]
+    fn a_judged_send_goes_on_where_it_was_as_its_peer_reads() {
+        let (ours, theirs) = super::UnixStream::pair().unwrap();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let payload: Vec<u8> = (0..super::MAX_PAYLOAD).map(|i| (i % 251) as u8).collect();
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                super::recv(&theirs).unwrap().unwrap()
+            });
+            let mut judge = judge_every(std::time::Duration::from_millis(10), &asked, None);
+            super::send_judged(&ours, 7, &payload, &[], &mut judge).unwrap();
+            let m = reader.join().unwrap();
+            assert_eq!((m.kind, m.payload == payload), (7, true));
+        });
+        assert!(
+            asked.load(std::sync::atomic::Ordering::Relaxed) > 2,
+            "its judge was not asked at its dues"
+        );
+        // Its judge's refusal ends it, the message cut short.
+        let (ours, _theirs) = super::UnixStream::pair().unwrap();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let mut judge = judge_every(std::time::Duration::from_millis(10), &asked, Some(3));
+        let e = super::send_judged(&ours, 7, &payload, &[], &mut judge).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+    }
+
+    /// A judged receive waits for its message past its judge's dues while its judge says go on,
+    /// takes it whole as it comes in parts, and ends with its judge's refusal or its peer's end.
+    #[test]
+    fn a_judged_receive_waits_while_its_judge_says_go_on() {
+        use std::io::Write as _;
+        let (ours, mut theirs) = super::UnixStream::pair().unwrap();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                // Its header first, then its payload.
+                theirs.write_all(&[9, 0, 0, 0, 3]).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                theirs.write_all(b"abc").unwrap();
+            });
+            let mut judge = judge_every(std::time::Duration::from_millis(10), &asked, None);
+            let m = super::recv_judged(&ours, &mut judge).unwrap().unwrap();
+            assert_eq!((m.kind, m.payload.as_slice()), (9, &b"abc"[..]));
+        });
+        assert!(asked.load(std::sync::atomic::Ordering::Relaxed) > 2);
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let mut judge = judge_every(std::time::Duration::from_millis(10), &asked, Some(3));
+        let e = super::recv_judged(&ours, &mut judge).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        drop(theirs);
+        let mut judge = judge_every(std::time::Duration::from_millis(10), &asked, None);
+        assert!(super::recv_judged(&ours, &mut judge).unwrap().is_none());
+    }
 
     /// What a filesystem without F_FULLFSYNC holds is made durable with fsync instead:
     /// /dev/null refuses F_FULLFSYNC and takes fsync, as an SMB share does, where std's
@@ -2126,6 +2677,35 @@ pub(crate) mod tests {
         assert!(recv_by(&b, deadline).unwrap().is_none(), "a clean end");
     }
 
+    /// A socket whose peer has gone has hung up, and one whose peer ended its writes alone has
+    /// not, its reads ending alike (D251's cut and half-close); this side's own end of writes
+    /// before its peer's hangs it up too.
+    #[test]
+    fn hung_up_tells_a_peer_gone_from_a_half_close() {
+        let mut byte = [0u8; 1];
+        let (here, peer) = UnixStream::pair().unwrap();
+        assert!(!hung_up(&here).unwrap(), "open both ways");
+        peer.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(read(&here, &mut byte).unwrap(), 0, "its end");
+        assert!(!hung_up(&here).unwrap(), "a half-close");
+        (&here).write_all(b"on").unwrap();
+
+        let (here, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        assert_eq!(read(&here, &mut byte).unwrap(), 0, "its end");
+        assert!(hung_up(&here).unwrap(), "its peer gone");
+        assert_eq!(
+            (&here).write_all(b"x").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+
+        let (here, peer) = UnixStream::pair().unwrap();
+        here.shutdown(Shutdown::Write).unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(read(&here, &mut byte).unwrap(), 0, "its end");
+        assert!(hung_up(&here).unwrap(), "its own writes ended, then its peer's");
+    }
+
     #[test]
     fn an_end_inside_a_message_is_an_error() {
         let (a, b) = UnixStream::pair().unwrap();
@@ -2299,6 +2879,75 @@ pub(crate) mod tests {
         let child = spawn(Path::new("/bin/sleep"), &["30".as_ref()], &[], false).unwrap();
         child.kill(libc::SIGTERM).unwrap();
         assert_eq!(child.wait().unwrap(), 128 + libc::SIGTERM);
+    }
+
+    /// Waits until the kernel says child `child` has stopped, leaving it to be waited for.
+    fn stopped(child: &Child) {
+        loop {
+            // SAFETY: an all-zero siginfo_t, for waitid(2) to fill for our child.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: waitid(2) of our child's stop, which it leaves to be waited for again.
+            let r =
+                unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, libc::WSTOPPED | libc::WNOWAIT) };
+            if r == 0 && info.si_code == libc::CLD_STOPPED {
+                return;
+            }
+            assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::Interrupted);
+        }
+    }
+
+    /// Do wait for a child's end on another thread, stop the child (SIGSTOP) and see it
+    /// stopped, then ask whether it has ended and kill its group. Expect: a stopped child
+    /// has not ended, the kill is sent though a reaper waits, and the wait returns once the
+    /// child has ended, its status SIGKILL's. Red on macOS where `ended`'s waitid(2), asked
+    /// for exits alone, woke at the stop and took it for an end (PM M442, M583), and `wait`
+    /// then reaped in a wait4(2) that waited, holding the lock `kill_group` takes: the kill
+    /// was never sent, and the test hangs.
+    #[test]
+    fn a_stopped_child_waited_for_is_killed_at_once_and_reaped_at_its_end() {
+        let child = spawn(Path::new("/bin/sleep"), &["600".as_ref()], &[], true).unwrap();
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| child.wait());
+            child.kill(libc::SIGSTOP).unwrap();
+            stopped(&child);
+            let (ended, waited) = (child.has_ended(), child.try_wait());
+            child.kill_group(libc::SIGKILL).unwrap();
+            assert_eq!(waiting.join().unwrap().unwrap(), 128 + libc::SIGKILL);
+            assert!(!ended, "a stopped child was said to have ended");
+            assert_eq!(waited, None);
+        });
+    }
+
+    /// Do start a child of a group of its own that starts another and tells its pid, stop
+    /// the child, then end its group (`end_group`) before it is reaped. Expect: `end_group`
+    /// returns once both have exited, and the child's status is SIGKILL's.
+    #[test]
+    fn a_groups_end_follows_every_process_of_it_to_its_end() {
+        let (read, write) = io::pipe().unwrap();
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &[
+                "-c".as_ref(),
+                "sleep 600 3>&- & echo $! >&3; exec 3>&-; wait".as_ref(),
+            ],
+            &[(write.as_fd(), 3)],
+            true,
+        )
+        .unwrap();
+        drop(write);
+        let mut said = String::new();
+        (&read).read_to_string(&mut said).unwrap();
+        let other: u32 = said.trim().parse().unwrap();
+        child.kill(libc::SIGSTOP).unwrap();
+        stopped(&child);
+        assert!(alive(other));
+        child.end_group().unwrap();
+        assert!(
+            !alive(other),
+            "end_group returned while a process of its group ran"
+        );
+        assert!(child.has_ended());
+        assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
     }
 
     #[test]
@@ -2595,5 +3244,50 @@ pub(crate) mod tests {
             end(&a);
             assert_eq!(waiting.join().unwrap(), Ok(0));
         });
+    }
+}
+
+/// Names this process after the file it runs, as ps(1), top(1) and pgrep(1) show it (its
+/// `comm`, prctl(2) PR_SET_NAME): a helper `shards` starts through its own descriptor,
+/// `/proc/PID/fd/N` (shards `helpers::Program::path`), is named `N` by its exec, which takes the
+/// name from the path's last part (fs/exec.c `__set_task_comm` of `bprm->filename`'s
+/// basename). Its file's own name is `/proc/self/exe`'s; Linux keeps the first 15 bytes of
+/// it (TASK_COMM_LEN, 16 with its NUL).
+#[cfg(target_os = "linux")]
+pub fn name_after_executable() -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let exe = std::env::current_exe()?;
+    let name = exe
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "an executable with no name"))?;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "an executable's name with NUL"))?;
+    // SAFETY: prctl(2) PR_SET_NAME reads a NUL-terminated string, which it copies.
+    if unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::unwrap_used)]
+mod name_tests {
+    /// A thread that names itself after its executable is shown by that name, as much of it
+    /// as Linux keeps (15 bytes): a helper started through `/proc/PID/fd/N` is shown as `N`
+    /// until it does (the VM process at 8cdbf4a05, whose `comm` read `5`, so the tests' VM
+    /// processes, found by name, were none). Do: name a thread of this test process, whose
+    /// own name the harness set to the test's. Expect: its comm is this executable's name.
+    #[test]
+    fn a_process_named_after_its_executable_shows_its_files_name() {
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_str().unwrap();
+        let want = name.get(..name.len().min(15)).unwrap().to_string();
+        let shown = std::thread::spawn(|| {
+            super::name_after_executable().unwrap();
+            std::fs::read_to_string("/proc/thread-self/comm").unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(shown.trim_end(), want);
     }
 }

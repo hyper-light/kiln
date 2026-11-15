@@ -20,7 +20,8 @@
 //!   `HEX_IMAGE_CONTEXT`, an Agentfile image's build context (a harness image, which no registry need serve), built
 //!   there and pinned by the manifest digest its build says, as Shards' store finds a pinned image by content
 //!   (`Store::holding`): `crates/hex-cli/tests/image_harness` is one any arch builds, its base pinned by its digest
-//!   and its one harness `/bin/sh -c cat`, so a run of its members alone has a member on every host; or else
+//!   and its one harness `cat` and then a sleep until a signal ends it, so a run of its members alone has a member that
+//!   runs on every host (HEX-IMG-5's TERM reaches it); or else
 //!   `HEX_IMAGE`, `NAME@sha256:...`, pulled there by its digest;
 //! - `SHARDS_BIN`: the `shards` binary, the node's and the pull's or build's; `SHARDS_KERNEL` and `SHARDS_INIT`: the
 //!   kernel the run hosts boot (D231's own, as `shards run` takes it), so no first boot downloads one, and the
@@ -58,7 +59,8 @@ use std::time::{Duration, Instant};
 
 use hex_api::conformance::{self, Act, Fixture};
 use hex_api::{
-    Allocation, Bounds, BoxId, BoxSpec, Class, ClassSpec, Program, Runtime, ShardsImage,
+    Allocation, Bounds, BoxId, BoxSpec, Class, ClassSpec, LifecycleCause, Program, Refusal,
+    Runtime, ShardsImage,
 };
 use hex_client::Client;
 
@@ -256,7 +258,18 @@ fn release(client: &Client, fixture: &ImageBoxes, node: u32) -> Result<(), Strin
     client
         .create(fixture.spec(id.clone(), Bounds::default()))
         .map_err(|e| format!("create: {e}"))?;
-    client.start(&id).map_err(|e| format!("start: {e}"))?;
+    // A start past its boot's W* is answered Pending, the boot going on (the 11-13 ruling), and followed through
+    // `started` to its answer, as the image cases follow theirs (ROOT, 2026-11-14).
+    match client.start(&id) {
+        Ok(()) => {}
+        Err(Refusal::Lifecycle {
+            cause: LifecycleCause::Pending,
+            ..
+        }) => {
+            client.started(&id).map_err(|e| format!("started: {e}"))?;
+        }
+        Err(e) => return Err(format!("start: {e}")),
+    }
     let run: Vec<Listed> = descendants(node)
         .into_iter()
         .filter(|p| !idle.contains(p))
@@ -306,9 +319,8 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
     let work = PathBuf::from(input("HEX_IMAGE_WORK"));
     assert!(!work.exists(), "a run's own directory: {work:?} exists");
     fs::create_dir_all(work.join("state")).unwrap();
-    // A VM's start boots it, which the client's learned bounds (an OCI box's records) would refuse first: every
-    // wait here measures, and the run's deadline bounds the whole suite instead.
-    hex_core::patience::measure_all();
+    // A VM's start boots it: a wait past its W* tells its run-out and follows its party (decision 9), and the run's
+    // deadline bounds the whole suite.
     assert!(
         hex_core::patience::census(step),
         "a census sink was installed before this one"
@@ -379,10 +391,13 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
 /// Joint plan step 12 (AC-T7.4.1; ROOT's HVF run at c8b4ce6b, whose cases were refused for an image with no member): the
 /// in-tree harness context, `image_harness/`, which `HEX_IMAGE_CONTEXT` and image_record's home take on any host, an
 /// aarch64 one's (macOS on HVF, Windows on arm64) among them, where no harness build of its arch is at hand. Its base is
-/// pinned by its digest, an index each home pulls its own arch's image of as a node's does, and its one harness runs
-/// `/bin/sh -c cat`, so a run of the image's members alone has a member. Do read its Agentfile and its harness's startup
-/// descriptor. Expect one FROM, pinned (`NAME@sha256:<64 hex>`); one HARNESS, from its own directory; and that
-/// harness's descriptor in Shards' simple form (`entrypoint` and `options`), saying `/bin/sh -c cat`.
+/// pinned by its digest, an index each home pulls its own arch's image of as a node's does, and its one harness is
+/// `cat` and then holds until a signal ends it, so a run of the image's members alone has a member that runs: a member
+/// whose stdin nothing drives reads `/dev/null` (Shards' `MemberSpec::stdin`), where `cat` alone ended at once, and
+/// HEX-IMG-5's TERM then reached no member (goal 2's item 2; ROOT's HVF run at cf0ca967). Do read its Agentfile and its
+/// harness's startup descriptor. Expect one FROM, pinned (`NAME@sha256:<64 hex>`); one HARNESS, from its own directory;
+/// and that harness's descriptor in Shards' simple form (`entrypoint` and `options`), saying
+/// `/bin/sh -c 'cat; exec sleep infinity'`.
 #[test]
 fn the_in_tree_harness_context_pins_its_base_and_runs_one_member() {
     let context = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/image_harness");
@@ -415,23 +430,19 @@ fn the_in_tree_harness_context_pins_its_base_and_runs_one_member() {
         serde_json::from_slice(&fs::read(context.join("cat/harness.json")).unwrap()).unwrap();
     assert_eq!(
         descriptor,
-        serde_json::json!({"entrypoint": "/bin/sh -c", "options": ["cat"]})
+        serde_json::json!({"entrypoint": "/bin/sh -c", "options": ["cat; exec sleep infinity"]})
     );
 }
 
 /// HVF (a) (ROOT's HVF run of image_real at c8b4ce6b: the build in the node's home exited 1 after 285 s, its error naming
 /// only its command): a build or pull in the node's Shards home that fails says why in its own words. Do build with a
-/// `shards` that says why on its stderr and exits 1. Expect the build refused naming its command, its exit and those
-/// words.
-#[cfg(unix)]
+/// `shards` that says why on its stderr and exits 1 ([`failing_shards`]). Expect the build refused naming its command,
+/// its exit as its platform says it, and those words.
 #[test]
 fn a_failed_build_in_the_nodes_home_says_why_in_its_own_words() {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
-    let shards = dir.path().join("shards");
     let words = "registry-1.docker.io: resolving: nodename nor servname provided, or not known";
-    fs::write(&shards, format!("#!/bin/sh\necho '{words}' >&2\nexit 1\n")).unwrap();
-    fs::set_permissions(&shards, fs::Permissions::from_mode(0o755)).unwrap();
+    let (shards, exited) = failing_shards(dir.path(), words);
     let work = dir.path().join("work");
     fs::create_dir_all(work.join("state")).unwrap();
     let context = dir.path().join("context");
@@ -446,7 +457,35 @@ fn a_failed_build_in_the_nodes_home_says_why_in_its_own_words() {
             .unwrap_or_default(),
     };
     assert!(
-        why.contains("build") && why.contains("exit status: 1") && why.contains(words),
+        why.contains("build") && why.contains(&exited) && why.contains(words),
         "{why}"
     );
+}
+
+/// A `shards` in `dir` that says `words` on its stderr and exits 1, and that exit as its platform says it: a shell
+/// script, whose exit is the second byte of its wait status.
+#[cfg(unix)]
+fn failing_shards(dir: &Path, words: &str) -> (PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    let shards = dir.join("shards");
+    fs::write(&shards, format!("#!/bin/sh\necho '{words}' >&2\nexit 1\n")).unwrap();
+    fs::set_permissions(&shards, fs::Permissions::from_mode(0o755)).unwrap();
+    (
+        shards,
+        std::process::ExitStatus::from_raw(1 << 8).to_string(),
+    )
+}
+
+/// The same `shards` on Windows: a batch file, which a `Command` runs through cmd.exe, its exit code its process's.
+#[cfg(windows)]
+fn failing_shards(dir: &Path, words: &str) -> (PathBuf, String) {
+    use std::os::windows::process::ExitStatusExt as _;
+    let shards = dir.join("shards.cmd");
+    fs::write(
+        &shards,
+        format!("@echo off\r\necho {words}>&2\r\nexit /b 1\r\n"),
+    )
+    .unwrap();
+    (shards, std::process::ExitStatus::from_raw(1).to_string())
 }

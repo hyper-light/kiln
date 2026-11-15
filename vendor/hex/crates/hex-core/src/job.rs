@@ -122,6 +122,15 @@ pub fn committed_peak(peak: u64, limits: &Limits) -> u64 {
     limits.memory.map_or(peak, |limit| peak.min(limit))
 }
 
+/// The least CPU rate, in thousandths of a CPU, a job's hard cap holds on a machine of `processors` (joint plan step 14,
+/// C4; ROOT, 2026-11-13): its least unit, one cycle per [`RATE_SCALE`] of the whole machine, `processors / 10` of a
+/// thousandth, rounded up to a whole thousandth, the learner's unit: the least whose [`cap`] isn't refused.
+pub fn least_milli(processors: NonZeroU32) -> u64 {
+    u64::from(processors.get())
+        .saturating_mul(1_000)
+        .div_ceil(u64::from(RATE_SCALE))
+}
+
 /// The hard cap for `milli` thousandths of a CPU on a machine of `processors`: cycles per
 /// [`RATE_SCALE`] of the whole machine, as Docker's Windows runtime maps `--cpus`
 /// (`moby/moby` daemon/oci_windows.go:438, `NanoCPUs / NumCPU / (1e9/10000)` = `cpus × 10000 / cpus`,
@@ -326,6 +335,23 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+
+    /// Joint plan step 14 (C4; ROOT, 2026-11-13; AC-T7.4.1): a job's least CPU rate is its cap's least unit, one cycle
+    /// per 10,000 of the machine, in whole thousandths of a CPU. Do take the least on machines of 1, 7, 32 and 128
+    /// processors and cap each at it, and at a thousandth less. Expect 1, 1, 4 and 13 thousandths; each capped at one
+    /// cycle per 10,000 or more, and a thousandth less refused wherever that is something.
+    #[test]
+    fn w14_a_jobs_least_rate_is_its_caps_least_unit() {
+        for (processors, least) in [(1, 1), (7, 1), (32, 4), (128, 13)] {
+            let processors = NonZeroU32::new(processors).unwrap();
+            assert_eq!(least_milli(processors), least);
+            let milli = u32::try_from(least).unwrap();
+            assert!(cap(milli, processors).unwrap() >= 1);
+            if milli > 1 {
+                assert!(cap(milli - 1, processors).is_err());
+            }
+        }
+    }
 
     fn cpus(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).unwrap()

@@ -69,3 +69,79 @@ fn an_endpoint_that_names_its_peers_admits_their_connections_alone() {
     );
     assert_eq!(identify(&mut enrolled, &kiln, Some(peer_id(MALLORY))), None);
 }
+
+/// The review's E-1 (a holder that stops reading, then reads again), AC-T7.4.1, Q3: a lane whose owner reads faster than
+/// the lane carries holds back the Credit its reads grant, and keeps its peer. Do: hold back on one lane what the driver
+/// holds back while QUIC hasn't taken the lane's last frame as its owner reads frame after frame: a Credit each, of
+/// each frame's bytes, two more than the lane holds back of other frames ([`super::WAITING`]). Expect: none refused, and
+/// what the lane holds back grants the peer every byte read.
+#[test]
+fn a_lane_its_owner_reads_faster_than_it_carries_holds_back_its_credit_and_keeps_its_peer() {
+    use std::collections::VecDeque;
+
+    use hex_core::lanes::{DATA_BOUND, Kind};
+
+    use super::{WAITING, control_frame, hold_back};
+
+    let frame = u64::try_from(DATA_BOUND).unwrap();
+    let reads = WAITING + 2;
+    let mut waiting = VecDeque::new();
+    for read in 0..reads {
+        assert_eq!(
+            hold_back(
+                &mut waiting,
+                Kind::Credit,
+                control_frame(Kind::Credit, frame.to_be_bytes().to_vec())
+            ),
+            Ok(()),
+            "the Credit of read {read} refused: its peer would be refused Busy and the connection closed"
+        );
+    }
+    let granted: u64 = waiting
+        .iter()
+        .map(|(kind, payload)| {
+            assert_eq!(*kind, Kind::Credit);
+            u64::from_be_bytes(payload.bytes().try_into().unwrap())
+        })
+        .sum();
+    assert_eq!(granted, frame * u64::try_from(reads).unwrap());
+}
+
+/// The review's E-1 path, AC-T7.4.1, Q3: a Credit held back takes in the later grants of its own connection alone. Do:
+/// on one lane, hold back a Credit, the connection's End and a second Credit (its owner still reads once its half has
+/// ended); then its Reset, the next connection's Accept, and a Credit of that one. Expect: the first connection's two
+/// Credits one, before its End; the next connection's Credit apart, after its Accept, never added to the first's.
+#[test]
+fn a_held_back_credit_takes_in_its_own_connections_grants_alone() {
+    use std::collections::VecDeque;
+
+    use hex_core::lanes::Kind;
+
+    use super::{control_frame, hold_back};
+
+    let credit = |bytes: u64| bytes.to_be_bytes().to_vec();
+    let mut waiting = VecDeque::new();
+    for (kind, payload) in [
+        (Kind::Credit, credit(3)),
+        (Kind::End, Vec::new()),
+        (Kind::Credit, credit(4)),
+        (Kind::Reset, vec![0]),
+        (Kind::Accept, 9u64.to_be_bytes().to_vec()),
+        (Kind::Credit, credit(5)),
+    ] {
+        hold_back(&mut waiting, kind, control_frame(kind, payload)).unwrap();
+    }
+    assert_eq!(
+        waiting
+            .iter()
+            .map(|(kind, payload)| (*kind, payload.bytes().to_vec()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Kind::Credit, credit(7)),
+            (Kind::End, Vec::new()),
+            (Kind::Reset, vec![0]),
+            (Kind::Accept, 9u64.to_be_bytes().to_vec()),
+            (Kind::Credit, credit(5)),
+        ]
+    );
+}

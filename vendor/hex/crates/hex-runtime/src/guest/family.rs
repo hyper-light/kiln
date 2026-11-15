@@ -4,7 +4,7 @@
 use hex_api::{BackingOffer, BackingPhase, Execution, LifecycleCause, Refusal};
 use hex_core::record::{BoxRecord, PoolRecord};
 
-use super::pool::refused;
+use super::pool::{refused, uncertain};
 use super::shared::GpuBacking;
 use super::{GuestRuntime, route};
 use crate::devices::Records;
@@ -99,10 +99,10 @@ impl GuestRuntime {
         for (id, boxed) in records {
             let boxed = match boxed {
                 Ok(boxed) => boxed,
-                Err(_) => return Err(super::books::uncertain(id)?),
+                Err(_) => return Err(super::books::uncertain(id, "its record can't be read")?),
             };
             if boxed.spec.id != *id {
-                return Err(super::books::uncertain(id)?);
+                return Err(super::books::uncertain(id, "its record names another box")?);
             }
             boxed.spec.check()?;
             let Some(receipt) = boxed.spec.route else {
@@ -117,7 +117,12 @@ impl GuestRuntime {
                 .ok()
                 .and_then(|at| sorted.get(at))
                 .copied()
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                .ok_or_else(|| {
+                    uncertain(
+                        key,
+                        "a box's route names a backing its family holds no record of",
+                    )
+                })?;
             self.backing_configuration(source)?;
             receipt.check_backing_parts(
                 boxed.spec.allocation.map(|allocation| allocation.cost),
@@ -139,9 +144,9 @@ impl GuestRuntime {
             self.backing_configuration(row)?;
             let begin = references.partition_point(|key| *key < row.key);
             let end = references.partition_point(|key| *key <= row.key);
-            let count = end
-                .checked_sub(begin)
-                .ok_or_else(|| refused(row.key, LifecycleCause::Uncertain))?;
+            let count = end.checked_sub(begin).ok_or_else(|| {
+                uncertain(row.key, "its family's references aren't sorted by key")
+            })?;
             if count > 1 {
                 return Err(refused(row.key, LifecycleCause::Busy));
             }
@@ -154,7 +159,10 @@ impl GuestRuntime {
                     pending_ack = Some(row);
                 }
             } else if current.replace(row).is_some() {
-                return Err(refused(row.key, LifecycleCause::Uncertain));
+                return Err(uncertain(
+                    row.key,
+                    "its family holds a second current backing",
+                ));
             }
         }
         Ok((current, pending_ack))
@@ -239,7 +247,10 @@ impl GuestRuntime {
                 Ok(())
             } else {
                 Err(match current {
-                    Some(row) => refused(row.key, LifecycleCause::Uncertain),
+                    Some(row) => uncertain(
+                        row.key,
+                        "its GPU complement changed before its guarded publication",
+                    ),
                     None => route::invalid("GPU complement changed before guarded publication"),
                 })
             }
@@ -254,7 +265,7 @@ impl GuestRuntime {
         )?;
         self.preflight_backing(&row)?;
         if row.key.pool != pool {
-            let original = current.ok_or_else(|| refused(row.key, LifecycleCause::Uncertain))?;
+            let original = current.ok_or_else(|| uncertain(row.key, "its family's backing moved to another pool with no current one to answer for it"))?;
             original.accepts(&row)?;
             if row.phase == BackingPhase::Prepared {
                 // Changed uncharged Prepared cannot be booted as the new set.
@@ -280,6 +291,9 @@ fn check_pending_reference(boxed: &BoxRecord, source: &PoolRecord) -> Result<(),
             Ok(())
         }
         BackingPhase::Released => Ok(()),
-        _ => Err(refused(source.key, LifecycleCause::Uncertain)),
+        _ => Err(uncertain(
+            source.key,
+            "a box pending on it is past its creation, or it isn't live, draining or released",
+        )),
     }
 }

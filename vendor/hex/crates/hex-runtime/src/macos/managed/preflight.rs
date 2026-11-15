@@ -7,30 +7,36 @@ use super::*;
 impl MacRuntime {
     pub fn preflight_record(&self, record: &BoxRecord) -> Result<(), Refusal> {
         record.spec.check()?;
-        let bad = || NativeRecord::Box(record).refusal(LifecycleCause::Uncertain);
+        let bad = |why: &str| NativeRecord::Box(record).uncertain(why);
         if record.spec.class.class() != Class::Process
             || !record.spec.devices.is_empty()
             || record.native_scope.is_some()
         {
-            return Err(bad());
+            return Err(bad(
+                "its record isn't a host process's with no devices and no native scope",
+            ));
         }
         if let Some(route) = record.spec.route
             && (route.key.execution != Execution::Native
                 || route.key.image.os != ImageOs::Macos
                 || route.key.image.arch != ImageArch::Arm64)
         {
-            return Err(bad());
+            return Err(bad("its route isn't a native macOS arm64 one"));
         }
         let boxes = self.boxes()?;
         if let Ok(at) = native_owner_index(&boxes, OwnerRef::Box(&record.spec.id)) {
-            let boxed = boxes.get(at).map(|(_, boxed)| boxed).ok_or_else(bad)?;
+            let boxed = boxes
+                .get(at)
+                .map(|(_, boxed)| boxed)
+                .ok_or_else(|| bad("its process box's slot vanished as it was checked"))?;
             if boxed.scope().is_some() {
-                return Err(bad());
+                return Err(bad("its process box holds a native scope"));
             }
             if let Some(init) = record.init {
-                let pid = i32::try_from(init.pid).map_err(|_| bad())?;
+                let pid = i32::try_from(init.pid)
+                    .map_err(|_| bad("its record's leader pid is past an i32"))?;
                 if boxed.group()? != Some((pid, init.start_ticks)) {
-                    return Err(bad());
+                    return Err(bad("its process box's group isn't its record's leader"));
                 }
             }
         }
@@ -43,7 +49,7 @@ impl MacRuntime {
     /// nothing. Nothing is opened, adopted or stopped; absence is not a Released fact.
     pub fn preflight_unsubmitted(&self, record: &BoxRecord) -> Result<(), Refusal> {
         let native = NativeRecord::Box(record);
-        let bad = || native.refusal(LifecycleCause::Uncertain);
+        let bad = |why: &str| native.uncertain(why);
         if !matches!(
             native.stage(),
             NativeStage::Creating | NativeStage::Deleting
@@ -52,26 +58,38 @@ impl MacRuntime {
             || record.run.is_some()
             || record.exit.is_some()
         {
-            return Err(bad());
+            return Err(bad(
+                "its handoff box isn't pending with a native scope and nothing run",
+            ));
         }
         // The envelope a launch of this row would take: Shards, its admitted allocation and cost,
         // checked against the measured CPU control and the configured persistent owner.
         host_bounds(native)?;
-        self.check_vm_cost(&record.spec.allocation.ok_or_else(bad)?.cost)?;
+        self.check_vm_cost(
+            &record
+                .spec
+                .allocation
+                .ok_or_else(|| bad("its handoff box holds no allocation"))?
+                .cost,
+        )?;
         {
-            let boxes = self.boxes().map_err(|_| bad())?;
+            let boxes = self
+                .boxes()
+                .map_err(|_| bad("its native table couldn't be read for its handoff"))?;
             if native_owner_index(&boxes, native.owner()).is_ok() {
-                return Err(bad());
+                return Err(bad("its native table holds a slot of its handoff box"));
             }
         }
         super::remote::preflight_unsubmitted(self, record)
     }
 
     pub fn preflight_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
-        let bad = || record.refusal(LifecycleCause::Uncertain);
-        record.scope().ok_or_else(bad)?;
+        let bad = |why: &str| record.uncertain(why);
+        record
+            .scope()
+            .ok_or_else(|| bad("its record names no native scope to preflight"))?;
         if record.class()? != Class::Shards {
-            return Err(bad());
+            return Err(bad("its record isn't a Shards VM's to preflight"));
         }
         if self.managed_helper.is_some() {
             return super::remote::preflight(self, record);
@@ -88,23 +106,35 @@ impl MacRuntime {
             } else {
                 // Cold PGID/controller observation supplies no persistent native cleanup owner.
                 // Until the same helper receipt is available, retain uncertainty BEFORE siblings.
-                Err(bad())
+                Err(bad(
+                    "its native table holds no slot of it, though it is past its preparation",
+                ))
             };
         };
-        let boxed = boxes.get(at).map(|(_, boxed)| boxed).ok_or_else(bad)?;
-        let scope = boxed.scope().ok_or_else(bad)?;
+        let boxed = boxes
+            .get(at)
+            .map(|(_, boxed)| boxed)
+            .ok_or_else(|| bad("its native slot vanished as it was preflighted"))?;
+        let scope = boxed
+            .scope()
+            .ok_or_else(|| bad("its native slot holds no scope"))?;
         if !scope.matches(record, record.commitment()?) {
-            return Err(bad());
+            return Err(bad("its native scope or commitment isn't its record's"));
         }
         if let Some(init) = record.init()
             && boxed.identity.get().is_none_or(|identity| {
                 identity.pid != init.pid || identity.started != init.start_ticks
             })
         {
-            return Err(bad());
+            return Err(bad("its native controller isn't its record's"));
         }
-        if matches!(*scope.lock().map_err(|_| bad())?, Phase::Uncertain(_)) {
-            return Err(bad());
+        if matches!(
+            *scope
+                .lock()
+                .map_err(|_| bad("its native scope's phase is poisoned as it is preflighted"))?,
+            Phase::Uncertain(_)
+        ) {
+            return Err(bad("its native scope failed before"));
         }
         Ok(())
     }
@@ -123,7 +153,7 @@ impl MacRuntime {
                     records
                         .get(id)
                         .and_then(|record| record.as_ref().ok())
-                        .ok_or_else(|| uncertain(id))?,
+                        .ok_or_else(|| uncertain(id, "its record is gone or can't be read"))?,
                 ),
                 OwnerRef::Pool(pool) => {
                     let generation = *boxed
@@ -139,6 +169,10 @@ impl MacRuntime {
                                 generation,
                             },
                             cause: LifecycleCause::Uncertain,
+                            why: Some(
+                                "its native table retains a pool its node holds no record of"
+                                    .to_owned(),
+                            ),
                         })?;
                     NativeRecord::Pool(
                         pools
@@ -151,7 +185,10 @@ impl MacRuntime {
                 Some(scope) if scope.matches(record, record.commitment()?) => {}
                 None if matches!(record, NativeRecord::Box(record) if record.spec.class.class() == Class::Process && record.native_scope.is_none()) =>
                     {}
-                _ => return Err(record.refusal(LifecycleCause::Uncertain)),
+                _ => {
+                    return Err(record
+                        .uncertain("its retained native scope or commitment isn't its record's"));
+                }
             }
         }
         drop(boxes);
@@ -204,7 +241,6 @@ mod tests {
                 dir.join("hex"),
                 dir.join("helper.sock"),
                 dir.join("helper.receipt"),
-                std::time::Duration::from_secs(1),
             )
             .unwrap(),
         )
@@ -315,7 +351,24 @@ mod tests {
     }
 
     fn uncertain(result: Result<(), Refusal>, record: &BoxRecord) -> bool {
-        matches!(result, Err(Refusal::Lifecycle { id, cause: LifecycleCause::Uncertain }) if id == record.spec.id)
+        matches!(result, Err(Refusal::Lifecycle { id, cause: LifecycleCause::Uncertain, .. }) if id == record.spec.id)
+    }
+
+    /// AC-T7.4.1, joint plan step 14 (ROOT, 2026-11-13, ruling B; A-4): do prepare a managed VM's scope as its
+    /// launch does, from its record's host bounds. Expect them to hold its CPU at its allocation's and its memory
+    /// at no bound: no jetsam cap at its VMM's spawn and none for its watcher to end it past, so what its VMM
+    /// takes beside its guest's RAM is its budget's to hold, as on Linux, where a VM has no `memory.max`.
+    #[test]
+    fn w14_a4_a_managed_vms_scope_holds_its_cpu_and_no_memory_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source();
+        let native = runtime(root.path());
+        let record = NativeRecord::Pool(&source);
+        let cpu = record.allocation().unwrap().resources.cpu_milli;
+        let bounds = host_bounds(record).unwrap();
+        assert_eq!(bounds.cpu_max_milli, Some(u32::try_from(cpu).unwrap()));
+        assert_eq!(bounds.memory_max, None);
+        assert_eq!(retained(&native, record).bounds().memory_max, None);
     }
 
     /// AC-T7.4.1: with the Box's launch retained (its scope prepared, before any spawn) and then its

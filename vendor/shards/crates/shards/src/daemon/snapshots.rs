@@ -41,6 +41,10 @@ pub(super) struct Resume {
     /// each connection, as it did before the save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) engine: Option<String>,
+    /// The token its members' MCP connections are carried by (D254), in hex, which its
+    /// guest's relay says on each, as it did before the save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) mcp: Option<String>,
 }
 
 /// A microVM's addresses on a user network (D46).
@@ -67,6 +71,21 @@ pub(super) fn unhex(text: &str) -> Option<Vec<u8>> {
         .chunks(2)
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
         .collect()
+}
+
+/// `SAVE`'s payload, as its VM reads it (warm.rs `save_request`): its `SAVE_*` flags, the
+/// save's tokens, then the generation's, the snapshot's and the microVM's names, each after a
+/// NUL but the first. The daemon's saves and an orchestrator's run host's (D259) alike.
+pub(crate) fn save_ask(flags: u8, tokens: &[u8], names: [&str; 3]) -> Vec<u8> {
+    let mut payload = vec![flags];
+    payload.extend_from_slice(tokens);
+    for (i, name) in names.into_iter().enumerate() {
+        if i > 0 {
+            payload.push(0);
+        }
+        payload.extend_from_slice(name.as_bytes());
+    }
+    payload
 }
 
 /// A save a run's VM was asked for (`kind::SAVE`), waiting for its answer
@@ -344,10 +363,11 @@ pub(super) struct Resumable {
     pub(super) resume: Resume,
     pub(super) tokens: Vec<u8>,
     pub(super) engine: Option<[u8; shards_abi::run::TOKEN]>,
+    pub(super) mcp: Option<[u8; shards_abi::run::TOKEN]>,
 }
 
 /// The most a resume record holds: the longest this build writes, each of its fields at its
-/// longest: its tokens and its engine's in hex; a MAC as [`shards_net::Mac`] spells one; a
+/// longest: its tokens, its engine's and its MCP connections' in hex; a MAC as [`shards_net::Mac`] spells one; a
 /// network's ID, as [`crate::containers::new_id`] makes one; and the longest text of an IPv4
 /// address and of an IPv6 one (eight groups of four digits). A record a VM's save left past
 /// it is none of this build's.
@@ -362,6 +382,7 @@ fn max_resume() -> u64 {
             ipv6: std::net::Ipv6Addr::from([0xffff_u16; 8]).to_string(),
         }),
         engine: Some(hex(&vec![0xff; token])),
+        mcp: Some(hex(&vec![0xff; token])),
     };
     serde_json::to_vec(&longest).map_or(u64::MAX, |v| u64::try_from(v.len()).unwrap_or(u64::MAX))
 }
@@ -395,6 +416,9 @@ impl<D: Disk> Daemon<D> {
         let generation = shards_vmm::snapshot::generation(&dir)
             .map_err(|_| format!("{given} has no snapshot named {name}"))?;
         let unusable = |e: &dyn std::fmt::Display| format!("{given}'s snapshot {name}: {e}");
+        // Its guest's init, frozen in its memory, speaks this build's contract, or it is
+        // refused before anything restores it (D176).
+        shards_vmm::snapshot::resumable(&dir).map_err(|e| unusable(&e))?;
         let record = shards_vmm::platform::read_input(&generation.join(RESUME), max_resume())
             .map_err(|e| unusable(&e))?
             .ok_or_else(|| unusable(&"it was saved by no run"))?;
@@ -402,20 +426,22 @@ impl<D: Disk> Daemon<D> {
         let tokens = unhex(&resume.tokens)
             .filter(|t| t.len() == 2 * shards_abi::run::TOKEN)
             .ok_or_else(|| unusable(&"its tokens"))?;
-        let engine = match &resume.engine {
-            Some(hex) => Some(
-                unhex(hex)
-                    .and_then(|t| <[u8; shards_abi::run::TOKEN]>::try_from(t).ok())
-                    .ok_or_else(|| unusable(&"its engine's token"))?,
-            ),
-            None => None,
+        let token = |kept: &Option<String>, what: &str| match kept {
+            Some(hex) => unhex(hex)
+                .and_then(|t| <[u8; shards_abi::run::TOKEN]>::try_from(t).ok())
+                .map(Some)
+                .ok_or_else(|| unusable(&what)),
+            None => Ok(None),
         };
+        let engine = token(&resume.engine, "its engine's token")?;
+        let mcp = token(&resume.mcp, "its MCP connections' token")?;
         Ok(Resumable {
             dir,
             generation,
             resume,
             tokens,
             engine,
+            mcp,
         })
     }
 
@@ -704,6 +730,7 @@ impl<D: Disk> Daemon<D> {
         let resume = Resume {
             tokens: hex(&tokens),
             engine,
+            mcp: self.managed.mcp_token(&id).map(|token| hex(&token)),
             mac: mac.map(|m| shards_net::Mac(m).to_string()),
             network: self.membership(&id).map(|(network, me)| Address {
                 network: network.id,
@@ -806,14 +833,7 @@ impl<D: Disk> Daemon<D> {
         } else {
             0
         };
-        let mut payload = vec![flags];
-        payload.extend_from_slice(tokens);
-        for (i, name) in [staged.name(), snapshot, &microvm].into_iter().enumerate() {
-            if i > 0 {
-                payload.push(0);
-            }
-            payload.extend_from_slice(name.as_bytes());
-        }
+        let payload = save_ask(flags, tokens, [staged.name(), snapshot, &microvm]);
         if let Err(e) = socket.send(kind::SAVE, &payload, &fds) {
             lock(&inbox).saving = None;
             return Err(format!("asking its microVM: {e}"));
@@ -840,6 +860,20 @@ impl<D: Disk> Daemon<D> {
 mod tests {
     use super::*;
 
+    /// `SAVE`'s payload reads as its VM reads it (warm.rs `save_request`): its flags, then the
+    /// save's tokens, then exactly its three names, each whole, an empty one too.
+    #[test]
+    fn a_saves_ask_reads_as_its_vm_reads_it() {
+        let tokens = [7u8; 2 * shards_abi::run::TOKEN];
+        let payload = save_ask(shards_ipc::SAVE_LEAVE_RUNNING, &tokens, ["g-1", "s1", ""]);
+        let (flags, rest) = payload.split_first().unwrap();
+        assert_eq!(*flags, shards_ipc::SAVE_LEAVE_RUNNING);
+        let (read, names) = rest.split_at_checked(2 * shards_abi::run::TOKEN).unwrap();
+        assert_eq!(read, tokens);
+        let names: Vec<&[u8]> = names.split(|&b| b == 0).collect();
+        assert_eq!(names, [&b"g-1"[..], b"s1", b""]);
+    }
+
     /// A record of a run on an IPv6 network, every field there, is within the most read, which
     /// is a few hundred bytes, not a figure picked.
     #[test]
@@ -853,10 +887,29 @@ mod tests {
                 ipv6: "fd00:dead:beef:1234:5678:9abc:def0:1".into(),
             }),
             engine: Some(hex(&[9; shards_abi::run::TOKEN])),
+            mcp: Some(hex(&[0xa5; shards_abi::run::TOKEN])),
         };
         let written = serde_json::to_vec(&resume).unwrap().len() as u64;
         assert!(written <= max_resume(), "{written} > {}", max_resume());
         assert!(max_resume() < 1024, "{}", max_resume());
+    }
+
+    /// A save keeps its run's MCP connections' token beside its engine's (D254, D176), and its
+    /// restore reads both back whole; a record without them, an older build's, reads none.
+    #[test]
+    fn a_saves_mcp_token_reads_back_beside_its_engines() {
+        let kept = Resume {
+            tokens: hex(&[7; 2 * shards_abi::run::TOKEN]),
+            mac: None,
+            network: None,
+            engine: None,
+            mcp: Some(hex(&[0xa5; shards_abi::run::TOKEN])),
+        };
+        let record = serde_json::to_vec(&kept).unwrap();
+        let read: Resume = serde_json::from_slice(&record).unwrap();
+        assert_eq!(read, kept);
+        let older: Resume = serde_json::from_slice(br#"{"tokens":"07"}"#).unwrap();
+        assert_eq!((older.engine, older.mcp), (None, None));
     }
 
     /// A daemon's start removes the ghost files a crash left in the home's private

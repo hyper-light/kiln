@@ -37,6 +37,10 @@ struct Loopback {
 }
 
 impl Link for Loopback {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<hex_client::guest::DuplexOwner, Refusal> {
         let addr = if port == stream::CONTROL_PORT {
             self.control

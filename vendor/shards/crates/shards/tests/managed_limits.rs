@@ -145,12 +145,12 @@ fn tree(rows: &[Process], held: u32) -> Process {
 
 struct Run<'a> {
     env: &'a [(&'a str, &'a std::ffi::OsStr)],
-    patience: Duration,
     running: bool,
 }
 impl Run<'_> {
+    #[track_caller]
     fn command(&self, words: &[&str]) -> common::Run {
-        run_shards_env(&[], words, self.env, self.patience)
+        run_shards_env(&[], words, self.env)
     }
     fn snapshot(&self, phase: &str, budget: Budget, held: u32) -> Process {
         let result = self.command(&["top", "managed-limits", "-o", "pid,ppid,uid,nlwp"]);
@@ -333,8 +333,8 @@ fn campaign(end_at: EndAt) {
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
     ];
-    let actor_port = ports[0].local_addr().unwrap().port();
-    let healthy_port = ports[1].local_addr().unwrap().port();
+    let actor_port = crate::common::minted_port(ports[0].local_addr().unwrap().port());
+    let healthy_port = crate::common::minted_port(ports[1].local_addr().unwrap().port());
     let env = [
         ("SHARDS_HOME", home.as_os_str()),
         ("SHARDS_KERNEL", common::kernel().as_os_str()),
@@ -342,7 +342,6 @@ fn campaign(end_at: EndAt) {
     ];
     let mut run = Run {
         env: &env,
-        patience,
         running: false,
     };
     for (kind, name, options) in [
@@ -371,7 +370,7 @@ fn campaign(end_at: EndAt) {
         ),
     ] {
         std::fs::create_dir(context.join(name)).unwrap();
-        common::program_copy(common::test_guest(), &context.join(name).join("probe"));
+        shards_testdir::program_copy(common::test_guest(), &context.join(name).join("probe")).unwrap();
         std::fs::write(
             context.join(name).join(format!("{kind}.json")),
             serde_json::json!({"entrypoint":"probe", "options":options}).to_string(),

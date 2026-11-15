@@ -6,12 +6,11 @@
 //! Bounds (CLAUDE.md §2): a box holds at most its `cap` programs (its process cap, given when it is
 //! opened), live or ended and unread. A start past
 //! that drops the box's oldest unread end first (a later wait on it reads [`Exit::Unknown`], as an end
-//! no one collected), and is refused when all `cap` still run. An ended box's unread ends are kept for
-//! the node's waits on them (a delete's programs end by its kill), at most `graves` boxes' worth, the
-//! oldest ended box dropped first; acquiring its id again drops them too.
+//! no one collected), and is refused when all `cap` still run. An ended box's unread ends, and its programs not yet
+//! reaped, are kept for the node's waits on them (a delete's programs end by its kill), at most `graves` boxes' worth,
+//! the oldest ended box dropped first; acquiring its id again drops them too.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, Instant};
 
 use hex_api::{BoxId, Exit, Proc};
 
@@ -157,26 +156,16 @@ impl Kids {
         }
     }
 
-    /// Box `id` ended (its user killed and empty): reaps each of its programs, waiting at most until
-    /// `deadline` for each zombie, and keeps their ends as a grave. Returns how many it couldn't reap.
-    pub fn close(&mut self, id: &BoxId, deadline: Option<Instant>) -> usize {
+    /// Box `id` ended (its user killed and empty, the review's E-12): reaps each of its programs whose end has come, and
+    /// keeps the box as a grave, its programs' ends and those still to be reaped (one whose exit hasn't yet made it
+    /// reapable, or one that left its user by running a set-user-ID program), each reaped by the sweep or a node's wait
+    /// as its own end comes, never an end made up at a time. It waited for each until a deadline from the killscale
+    /// record (hex_core::drain) and kept `Exit::Unknown` for one it hadn't reaped by then.
+    pub fn close(&mut self, id: &BoxId) {
         let Some(b) = self.boxes.get_mut(id) else {
-            return 0;
+            return;
         };
-        let live = std::mem::take(&mut b.live);
-        let mut unreaped = 0usize;
-        for (pid, mut p) in live {
-            let left = deadline.map_or(Duration::ZERO, |d| {
-                d.saturating_duration_since(Instant::now())
-            });
-            match p.wait_for(left) {
-                Ok(Some(exit)) => b.ended.push_back((pid, exit)),
-                _ => {
-                    unreaped = unreaped.saturating_add(1);
-                    b.ended.push_back((pid, Exit::Unknown));
-                }
-            }
-        }
+        b.sweep();
         self.graves.retain(|g| g != id);
         self.graves.push_back(id.clone());
         while self.graves.len() > self.graves_max {
@@ -184,6 +173,5 @@ impl Kids {
                 self.boxes.remove(&old);
             }
         }
-        unreaped
     }
 }

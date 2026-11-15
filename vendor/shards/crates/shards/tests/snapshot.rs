@@ -10,7 +10,6 @@ use std::time::Duration;
 use common::{Run, cannot_run_vms, cannot_snapshot, kernel, run_shards, run_shards_in, test_guest};
 use shards_testguest::fill;
 
-const TIMEOUT: Duration = Duration::from_secs(120);
 const RO_SALT: u64 = 1;
 const RO_BYTES: usize = 4 << 20;
 const RESUMED: u32 = 2;
@@ -43,6 +42,7 @@ fn boot_and_snapshot(s: &Scratch, then: &str) -> Run {
 }
 
 /// Boots the snapshot guest in the working directory `dir`, with `disk` as its disk.
+#[track_caller]
 fn boot_and_snapshot_in(dir: &Path, disk: &str, s: &Scratch, then: &str) -> Run {
     let cmdline = format!("console=ttyS0 quiet panic=-1 shards_test=snapshot shards_vda_bytes={RO_BYTES}");
     let snapshot = s.snapshot().display().to_string();
@@ -67,23 +67,19 @@ fn boot_and_snapshot_in(dir: &Path, disk: &str, s: &Scratch, then: &str) -> Run 
             "--snapshot-then",
             then,
         ],
-        TIMEOUT,
     )
 }
 
+#[track_caller]
 fn restore(dir: &Path) -> Run {
-    run_shards(&["restore"], &[dir.to_str().unwrap()], TIMEOUT)
+    run_shards(&["restore"], &[dir.to_str().unwrap()])
 }
 
 /// [`restore`], logging at `info`, which says what the restore dropped once set up.
+#[track_caller]
 fn restore_logged(dir: &Path) -> Run {
     let info = std::ffi::OsStr::new("info");
-    common::run_shards_env(
-        &["restore"],
-        &[dir.to_str().unwrap()],
-        &[("SHARDS_LOG", info)],
-        TIMEOUT,
-    )
+    common::run_shards_env(&["restore"], &[dir.to_str().unwrap()], &[("SHARDS_LOG", info)])
 }
 
 /// KVM's counters of a restored VM, as the Firecracker comparison reads them from debugfs
@@ -215,11 +211,7 @@ fn a_restore_given_its_files_refuses_a_snapshot_naming_others() {
     assert_eq!(r.status, Some(0), "{r}");
     let dir = s.snapshot();
     let ours = s.disk();
-    let given = run_shards(
-        &["restore"],
-        &[dir.to_str().unwrap(), "--backing", &ours],
-        TIMEOUT,
-    );
+    let given = run_shards(&["restore"], &[dir.to_str().unwrap(), "--backing", &ours]);
     assert!(given.stdout.contains("SHARDS-TEST PASS"), "{given}");
     // Given through a link, it is the file the snapshot names, which it named resolved:
     // macOS's temporary directory, under /var, a link to /private/var, is one such path.
@@ -234,7 +226,6 @@ fn a_restore_given_its_files_refuses_a_snapshot_naming_others() {
                 "--backing",
                 &format!("{}:ro", link.display()),
             ],
-            TIMEOUT,
         );
         assert!(through.stdout.contains("SHARDS-TEST PASS"), "{through}");
     }
@@ -242,11 +233,7 @@ fn a_restore_given_its_files_refuses_a_snapshot_naming_others() {
     // which then names one it was not given.
     std::fs::copy(s.0.join("ro.img"), s.0.join("other.img")).unwrap();
     let other = format!("{}:ro", s.0.join("other.img").display());
-    let refused = run_shards(
-        &["restore"],
-        &[dir.to_str().unwrap(), "--backing", &other],
-        TIMEOUT,
-    );
+    let refused = run_shards(&["restore"], &[dir.to_str().unwrap(), "--backing", &other]);
     assert_ne!(refused.status, Some(0), "{refused}");
     let named = format!(
         "{}:ro",
@@ -355,7 +342,7 @@ fn restores_elsewhere_read_the_disks_the_snapshot_was_taken_with() {
     assert_eq!(original.status, Some(0), "{original}");
 
     let snapshot = s.snapshot();
-    let moved = run_shards_in(&elsewhere, &["restore"], &[snapshot.as_os_str()], TIMEOUT);
+    let moved = run_shards_in(&elsewhere, &["restore"], &[snapshot.as_os_str()]);
     assert_eq!(moved.status, Some(0), "{moved}");
     assert!(moved.stdout.contains("SHARDS-TEST PASS"), "{moved}");
 
@@ -382,7 +369,7 @@ mod storm {
     use std::time::Duration;
 
     use super::common::{self, Vm, echo};
-    use super::{RO_BYTES, Scratch, TIMEOUT, cannot_run_vms, cannot_snapshot, kernel, test_guest};
+    use super::{RO_BYTES, Scratch, cannot_run_vms, cannot_snapshot, kernel, test_guest};
 
     /// The writable disk of a storm: 256 records of 4 KiB.
     const RW_BYTES: usize = 1 << 20;
@@ -427,11 +414,8 @@ mod storm {
             sock.as_os_str().to_owned(),
             "--cmdline".into(),
             format!(
-                "console=ttyS0 quiet panic=-1 shards_test=storm shards_vda_bytes={RO_BYTES} shards_vdb_bytes={RW_BYTES} shards_storm_ms={} shards_quiet_ms={}",
+                "console=ttyS0 quiet panic=-1 shards_test=storm shards_vda_bytes={RO_BYTES} shards_vdb_bytes={RW_BYTES} shards_storm_ms={}",
                 std::env::var("SHARDS_STORM_MS").unwrap_or_else(|_| "0".into()),
-                // The host's own quiet, which the guest's waits are (the test guest's
-                // `host_quiet`).
-                common::DAEMON_QUIET.as_millis()
             )
             .into(),
             "--snapshot-dir".into(),
@@ -447,10 +431,11 @@ mod storm {
     /// Streams rounds of 4 MiB through the echo of the VM at `sock` until `stop`, from when
     /// it answers, counting what comes back in `carried`; returns each round's result.
     ///
-    /// No wall clock bounds a storm: each read of a round waits a minute for its next byte
-    /// ([`common::Following`]), and each wait on its guest past `TIMEOUT` a minute for its
-    /// next new line or byte of the stream ([`Vm::wait_exit_within`]), so a stream that
-    /// stops fails a minute after its last byte, and one that goes on is waited for. At the
+    /// No wall clock bounds a storm: each round's reads are a wait judged by its kind's
+    /// slowest round seen ([`common::Following`]), and each wait on its guest by its next new
+    /// line or byte of the stream ([`Vm::wait_exit_streamed`]), so a stream that stops fails
+    /// a whole window past the slowest of its kind after its last byte, and one that goes on
+    /// is waited for (D209). At the
     /// slowest rate measured, 196,608 bytes in 120 s (1,638.4 B/s: 64 vCPUs on an arm64
     /// Windows host nested under QEMU's TCG on 4 CPUs, the parity plan's step 10), a busy
     /// machine's restores carry 13 MiB, 1 MiB before its snapshot (the guest's own wait) and
@@ -484,6 +469,7 @@ mod storm {
     /// Lets a storm that has done its checks (`storm checked`) give its verdict once the host
     /// has stopped streaming through it, so every round ends with the guest alive. Returns
     /// the rounds.
+    #[track_caller]
     fn storm_done(
         vm: &mut Vm,
         sock: &Path,
@@ -492,18 +478,18 @@ mod storm {
         carried: &AtomicU64,
     ) -> Rounds {
         // As long as its guest gets on with its storm, saying something new or carrying the
-        // stream: 64 vCPUs on a host of 4 TCG CPUs ran past TIMEOUT (the parity plan's step
-        // 10).
-        let line = vm.wait_for_any_within(&["storm checked", "SHARDS-TEST FAIL"], TIMEOUT, Some(carried));
+        // stream: 64 vCPUs on a host of 4 TCG CPUs ran past two minutes (the parity plan's
+        // step 10).
+        let line = vm.wait_for_any_streamed(&["storm checked", "SHARDS-TEST FAIL"], Some(carried));
         stop.store(true, Ordering::Relaxed);
         let rounds = streamer.join().unwrap();
         assert!(line.contains("storm checked"), "{}", vm.seen.join("\n"));
         // Connected, then a byte: the guest waits for it, so it lives until the host has
         // read its OK.
-        let told = common::vsock_connect(sock, DONE_PORT, common::DAEMON_QUIET)
+        let told = common::vsock_connect(sock, DONE_PORT)
             .and_then(|mut s| s.write_all(b"\n").map_err(|e| e.to_string()));
         if let Err(e) = told {
-            vm.wait_exit_within(TIMEOUT, None);
+            vm.wait_exit_streamed(None);
             panic!("telling the guest it may finish: {e}\n{}", vm.seen.join("\n"));
         }
         rounds
@@ -538,7 +524,8 @@ mod storm {
     /// The most a host takes is what it is held to, however slowly it runs them: 64 vCPUs
     /// on the nested arm64 Windows host's 4 TCG CPUs left woken threads unrun for 15 s
     /// before any snapshot, and lost no interrupt (M427); the guest's watchdog gives the
-    /// kernel's account of a stall only once it has lasted `STREAM_QUIET`.
+    /// kernel's account of a stall only once its main thread and the stream through its
+    /// echo have both stood still past their own pace (the test guest's `stall::Watch`).
     fn storm_cpus() -> Vec<u32> {
         let max = shards_vmm::vm::max_vcpus().unwrap().min(common::kernel_nr_cpus());
         if let Ok(only) = std::env::var("SHARDS_STORM_CPUS") {
@@ -567,7 +554,7 @@ mod storm {
             let carried = Arc::new(AtomicU64::new(0));
             let mut original = Vm::spawn(&storm_args(&s, cpus, &sock, "stop"));
             let streamer = stream(sock.clone(), stop.clone(), carried.clone());
-            let code = original.wait_exit_within(TIMEOUT, Some(&carried));
+            let code = original.wait_exit_streamed(Some(&carried));
             // Its stream breaks where it stopped, at the snapshot.
             stop.store(true, Ordering::Relaxed);
             drop(streamer.join().unwrap());
@@ -590,7 +577,7 @@ mod storm {
                 ]);
                 let streamer = stream(sock.clone(), stop.clone(), carried.clone());
                 let rounds = storm_done(&mut copy, &sock, &stop, streamer, &carried);
-                let code = copy.wait_exit_within(TIMEOUT, Some(&carried));
+                let code = copy.wait_exit_streamed(Some(&carried));
                 let what = format!("{cpus} vCPUs, restore {i}");
                 let said = copy.seen.join("\n");
                 assert_eq!(code, Some(0), "{what}: {said}");
@@ -619,7 +606,7 @@ mod storm {
             let mut vm = Vm::spawn(&storm_args(&s, cpus, &sock, "resume"));
             let streamer = stream(sock.clone(), stop.clone(), carried.clone());
             let rounds = storm_done(&mut vm, &sock, &stop, streamer, &carried);
-            let code = vm.wait_exit_within(TIMEOUT, Some(&carried));
+            let code = vm.wait_exit_streamed(Some(&carried));
             let said = vm.seen.join("\n");
             assert_eq!(code, Some(0), "{cpus} vCPUs: {said}");
             assert!(said.contains("SHARDS-TEST PASS"), "{cpus} vCPUs: {said}");

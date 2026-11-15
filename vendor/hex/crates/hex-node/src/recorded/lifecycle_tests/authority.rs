@@ -34,6 +34,8 @@ fn info(record: &BoxRecord) -> BoxInfo {
         allocation: record.spec.allocation,
         last_resort: None,
         ended: None,
+        control: None,
+        control_wake: None,
         credentials: Vec::new(),
     }
 }
@@ -365,6 +367,7 @@ fn native_offers_require_same_provider_identity_and_use_actual_metadata_without_
         holder: None,
     };
     let capacity = || Capacity {
+        own: Default::default(),
         routes: Vec::new(),
         device_routes: Vec::new(),
         backings: Vec::new(),
@@ -380,6 +383,8 @@ fn native_offers_require_same_provider_identity_and_use_actual_metadata_without_
         }],
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     let mut report = capacity();
     native_metadata(&mut report, vec![native.try_clone().unwrap()]).unwrap();

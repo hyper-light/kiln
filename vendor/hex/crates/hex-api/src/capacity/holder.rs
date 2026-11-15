@@ -4,8 +4,8 @@
 //! its whole live set, and checks the keeper's count and sum against its own.
 //!
 //! Its shell persists its epoch (one more at every start of its process), carries the messages, follows
-//! each wait for an answer by its patience (CV6, decision 9) and says when one ended unanswered
-//! ([`Holder::ran_out`]), and says when the link dropped ([`Holder::link_down`]).
+//! each wait for an answer by its patience and its link (CV6, decision 9), and says when the link ended or
+//! was reset ([`Holder::link_down`]), the one end of a wait unanswered: no stall of the keeper is judged.
 
 use std::collections::BTreeMap;
 
@@ -49,8 +49,8 @@ pub enum Event {
     Granted(ReservationId),
     /// Not granted, and why: its work doesn't start.
     Refused(ReservationId, Why),
-    /// No answer came (the link dropped, or its wait ran out): its work doesn't start, and the keeper
-    /// frees it.
+    /// No answer came (the link ended or was reset, or the keeper closed the session): its work doesn't
+    /// start, and the keeper frees it.
     Unanswered(ReservationId),
     /// Its release is done.
     Released(ReservationId),
@@ -244,18 +244,6 @@ impl Holder {
             }
             // The keeper may grant it yet: freed at once where the link is up, else by the next sync.
             (State::Asking, _) => self.abandon(id, out),
-        }
-    }
-
-    /// The wait for `id`'s answer ended unanswered: it is abandoned, never started, and freed (CV5, CV6).
-    pub fn ran_out(&mut self, id: ReservationId, out: &mut Out) {
-        if self
-            .entries
-            .get(&id)
-            .is_some_and(|entry| entry.state == State::Asking)
-        {
-            self.abandon(id, out);
-            out.events.push(Event::Unanswered(id));
         }
     }
 

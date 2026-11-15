@@ -1,4 +1,5 @@
-//! Original for typed CONNECT cause loss at the real ShardsLink/wire seam.
+//! Originals for typed cause loss at the real ShardsLink/wire seam: CONNECT's, and the guest's own failures (the
+//! review's B-15).
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,7 @@ use hex_api::Refusal;
 use hex_core::{stream, wire};
 use shards_api::{HandshakeError, HandshakePhase, Refusal as SdkRefusal};
 
-use super::{Link, ShardsLink};
+use super::{Link, ShardsLink, refusal};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Attempt {
@@ -86,7 +87,7 @@ struct Roundtrip {
 
 fn roundtrip(label: &str, model: &Arc<ModelGuest>, caller: Instant) -> Roundtrip {
     // The relative dial path must remain unused; this model performs no I/O.
-    let link = ShardsLink::new(model.clone(), Duration::ZERO);
+    let link = ShardsLink::new(model.clone(), None);
     let result = link.dial_before(stream::CONTROL_PORT, Some(caller));
     let trace = model.trace.lock().unwrap();
     eprintln!(
@@ -181,5 +182,78 @@ fn shards_link_connect_cause_remains_distinct_from_legacy_channel_text_on_wire()
         connect.bytes, legacy.bytes,
         "typed cause loss: SDK Connect(Read, ConnectionRefused, Some(111)) and legacy Channel text became the same canonical Hex refusal; decoded Connect={:?}, Channel={:?}",
         connect.decoded, legacy.decoded
+    );
+}
+
+/// `adapted` through the node's wire as a refused answer, as a client reads it.
+fn on_the_wire(adapted: &Refusal) -> Refusal {
+    let bytes = wire::snapshot_refusal(adapted, wire::MAX_MESSAGE).unwrap();
+    let received = wire::Received {
+        bytes: &bytes,
+        size: bytes.len(),
+        descriptors: 0,
+        descriptors_cut: false,
+    };
+    let (_, answer) = wire::read_answer(&received, wire::MAX_MESSAGE).unwrap();
+    let wire::Answer::Refused(decoded) = answer else {
+        panic!("snapshot did not decode as a refused answer");
+    };
+    decoded
+}
+
+/// The review's B-15 (AC-T7.4.1; Shards R04): each of Shards' own kinds of a guest's failure is its own typed refusal,
+/// never an OS error's text: its VM stalled (Part B's judge), it ended, it went, or its VM process answered a rate or a
+/// use none of the protocol's. Do: map each, a stall found by Shards' own judge, through the adapter and the node's
+/// wire. Expect: none an `Os` refusal, and each the same refusal after the wire.
+#[test]
+fn b15_each_of_shards_guest_failures_is_its_own_typed_refusal() {
+    let judge = shards_api::Record::new();
+    judge.teach(Duration::from_nanos(1), Duration::ZERO);
+    let since = Instant::now();
+    let stall = judge
+        .stalled(since, since.checked_add(Duration::from_millis(1)).unwrap())
+        .expect("a learned judge finds a whole W* with no progress a stall");
+    let kinds = [
+        SdkRefusal::Stalled(stall),
+        SdkRefusal::Ended(shards_api::End::Failed("its VMM exited".to_owned())),
+        SdkRefusal::Ended(shards_api::End::Stopped),
+        SdkRefusal::Gone {
+            pid: 4242,
+            why: "no process has its pid".to_owned(),
+        },
+        SdkRefusal::Rate("its governor's thread wasn't made".to_owned()),
+        SdkRefusal::HostUse(shards_abi::rate::UseBroken::Word),
+    ];
+    let mut told = Vec::new();
+    for kind in &kinds {
+        let adapted = refusal("booting the node's guest", kind);
+        assert!(
+            !matches!(adapted, Refusal::Os { .. }),
+            "Shards' {kind:?} became an OS error: {adapted:?}"
+        );
+        assert_eq!(on_the_wire(&adapted), adapted, "{kind:?}");
+        let Refusal::Guest { op, failure } = adapted else {
+            panic!("Shards' {kind:?} is no guest's failure: {adapted:?}");
+        };
+        assert_eq!(op, "booting the node's guest");
+        told.push(failure);
+    }
+    assert_eq!(
+        told[0],
+        hex_api::GuestFailure::Stalled {
+            waited: stall.waited(),
+            over: stall.over(),
+            slowest: stall.slowest(),
+        },
+        "the stall as Shards' judge found it"
+    );
+    let distinct: std::collections::BTreeSet<String> = told
+        .iter()
+        .map(|failure| format!("{:?}", std::mem::discriminant(failure)))
+        .collect();
+    assert_eq!(
+        distinct.len(),
+        5,
+        "Shards' five kinds, each its own: {told:?}"
     );
 }

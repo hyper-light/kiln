@@ -46,7 +46,7 @@ pub fn main() -> ! {
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or_default();
     let code = match arg(0) {
         "report" => report(),
-        "cleanup" => crate::cleanup::main(arg(1), arg(2), arg(3), arg(4)),
+        "cleanup" => crate::cleanup::main(arg(1), arg(2), arg(3)),
         "cleanup-control" => crate::cleanup::control(args.get(1..).unwrap_or_default()),
         "managed-lifecycle" => crate::managed_lifecycle::probe(arg(1)),
         "managed-limits" => crate::managed_limits::actor(arg(1), arg(2), arg(3), arg(4), arg(5), arg(6)),
@@ -54,7 +54,7 @@ pub fn main() -> ! {
         "managed-limits-nonce" => crate::managed_limits::nonce(arg(1)),
         "managed-lifecycle-exit" => crate::managed_lifecycle::exit_after_report(arg(1)),
         "managed-lifecycle-challenge" => crate::managed_lifecycle::challenge(arg(1), arg(2)),
-        "managed-reap" => crate::managed_reap::run(arg(1), arg(2), arg(3)),
+        "managed-reap" => crate::managed_reap::run(arg(1), arg(2)),
         "managed-reap-child" => crate::managed_reap::child(arg(1), arg(2)),
         "cat" => cat(),
         "plugged" => crate::plugged::main(args.get(1..).unwrap_or_default()),
@@ -265,6 +265,10 @@ pub fn main() -> ! {
         // Reads each file named through, a megabyte at a time, and says how much: what it
         // read stays in the page cache, the reader's own memory one megabyte.
         "read" => read_through(args.get(1..).unwrap_or_default()),
+        // Reads a file through as `read` does, saying as it opens it and as it crosses each
+        // MiB how far it has read (`at BYTES`), each line as it comes, for a host to follow
+        // its progress; then its total and time as `read` says them.
+        "read-marked" => read_marked(arg(1)),
         // What a share costs its guest (D228's relay): N opens of FILE, each reading its
         // first 4 KiB and closing it, timed one by one, said as their n, p50, p90, p99 and
         // max in µs; then FILE read through and a copy of it written and synced beside it,
@@ -487,6 +491,7 @@ pub fn main() -> ! {
         "spawns" => spawns(arg(1).parse().unwrap_or(1), args.get(2..).unwrap_or_default()),
         "tcp" => tcp(arg(1)),
         "fetch" => fetch(args.get(1..).unwrap_or_default()),
+        "tls-ask" => crate::tls_ask::main(args.get(1..).unwrap_or_default()),
         // One call of the Engine API at $DOCKER_HOST, as a program in a run reaches its
         // microVM's own engine (D181): `api METHOD PATH [BODY [upgrade]]`, `upgrade` asking
         // for the connection to be taken over for a stream, as attaches and execs ask.
@@ -697,6 +702,37 @@ pub fn main() -> ! {
         // the line read back and printed: a file a guest holds that no path reaches, whose
         // bytes a save keeps and a restore of it holds again (D176).
         "unlinked-held" => unlinked_held(arg(1), arg(2).parse().ok()),
+        // A harness that starts as an MCP client does (D254): runs its member's MCP bridge, its
+        // stdio piped, writes `initialize` into it and holds it open; says `ready`, then sleeps
+        // until a signal ends it.
+        "mcp-hello" => 'hello: {
+            let bridge = std::process::Command::new(shards_abi::run::mcp::BRIDGE)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn();
+            let mut bridge = match bridge {
+                Ok(bridge) => bridge,
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "its MCP bridge: {e}");
+                    break 'hello 1;
+                }
+            };
+            let sent = match bridge.stdin.as_mut() {
+                Some(to) => to
+                    .write_all(shards_testguest::MCP_INITIALIZE)
+                    .and_then(|()| to.flush()),
+                None => Err(io::Error::other("no stdin")),
+            };
+            if let Err(e) = sent {
+                let _ = writeln!(io::stderr(), "its MCP bridge's stdin: {e}");
+                break 'hello 1;
+            }
+            let _ = writeln!(io::stdout(), "ready");
+            loop {
+                // SAFETY: blocks until a signal arrives.
+                unsafe { libc::pause() };
+            }
+        }
         "sleep" => {
             let _ = writeln!(io::stdout(), "ready");
             loop {
@@ -3780,6 +3816,45 @@ fn read_through(paths: &[String]) -> i32 {
             began.elapsed().as_millis()
         );
     }
+    0
+}
+
+/// [`read_through`] of `path`, its progress said as it goes: `at 0` once it is open, and
+/// `at BYTES` each time what it has read crosses a MiB, its reader's block (as large as a
+/// share's largest request, `shards_abi::SHARE_MAX_PAGES` of 4 KiB pages), each line written
+/// as it comes (Rust's stdout is line-buffered).
+fn read_marked(path: &str) -> i32 {
+    const BLOCK: u64 = 1 << 20;
+    let mut buf = vec![0u8; 1 << 20];
+    let began = std::time::Instant::now();
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "{path}: {e}");
+            return 1;
+        }
+    };
+    let mut out = io::stdout();
+    let _ = writeln!(out, "at 0");
+    let mut total = 0u64;
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let before = total / BLOCK;
+                total += n as u64;
+                if total / BLOCK > before {
+                    let _ = writeln!(out, "at {total}");
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "{path}: {e}");
+                return 1;
+            }
+        }
+    }
+    let _ = writeln!(out, "read {path} {total} in {} ms", began.elapsed().as_millis());
     0
 }
 

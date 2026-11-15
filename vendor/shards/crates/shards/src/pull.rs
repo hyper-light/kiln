@@ -161,6 +161,11 @@ pub fn command(
                     // What a pull that seems stuck waits on, said quiet or not, on stderr
                     // where docker pull's lines go to stdout (D184).
                     Event::Waiting(notice) => (out.err)(notice),
+                    // A trouble that ran out, told once, as the pull goes on (D222).
+                    Event::RanOut(run_out) => {
+                        crate::daemon::log(run_out);
+                        (out.err)(&run_out.to_string());
+                    }
                     Event::Manifest(..)
                     | Event::Progress(..)
                     | Event::Building
@@ -415,6 +420,10 @@ fn shown(event: &Event<'_>, arrived: &Mutex<HashMap<String, (u64, Option<Instant
         Event::Unpacking(i) => Progress::Unpacking(*i),
         Event::Pulling => return None,
         Event::Waiting(notice) => Progress::Waiting((*notice).to_string()),
+        Event::RanOut(run_out) => {
+            crate::daemon::log(run_out);
+            Progress::Waiting(run_out.to_string())
+        }
         Event::Progress(d, n) => {
             let key = d.to_string();
             let mut held = arrived.lock().unwrap_or_else(PoisonError::into_inner);
@@ -644,11 +653,18 @@ pub(crate) fn short(digest: &str) -> &str {
 #[cfg(test)]
 mod tests {
     /// The client sends every name a registry is reached by: its proxies' among them, so a
-    /// daemon reaches registries through the proxies of the client that asks.
+    /// daemon reaches registries through the proxies of the client that asks, and the
+    /// daemon.json and certs.d it was given (D194, D23).
     #[test]
     fn clients_send_every_name_registries_are_reached_by() {
         for name in shards_registry::proxy::ENV {
             assert!(shards_ipc::REGISTRY_ENV.contains(&name), "{name}");
+        }
+        for named in [
+            shards_registry::registries::DAEMON_JSON,
+            shards_registry::certs::CERTS_D,
+        ] {
+            assert!(shards_ipc::REGISTRY_ENV.contains(&named), "{named}");
         }
     }
 }

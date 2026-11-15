@@ -38,12 +38,12 @@ use std::time::{Duration, Instant};
 
 use hex_api::Refusal;
 use hex_core::demand::Learned;
+use hex_core::patience::Piece;
 use hex_core::seed::{Answer, Create, Failed, Fixed, MountNamespace, Park};
 use hex_core::seeds::{Admit, Claim, Counts, Limits, Refused, SeedId, Seeds, Stale};
-use hex_runtime::linux::oci::run::{ClassicReason, CloneInit, CloneReq, Parked};
+use hex_runtime::linux::oci::run::{ClassicReason, CloneInit, CloneReq, Parked, first_readable};
 use hex_runtime::linux::oci::seed as rt_seed;
 use hex_runtime::linux::oci::{OciError, mntns};
-use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions};
 
 /// Where a node's create seeds work (goal 5 plan step 2): in the one mount namespace the node prunes at `At`'s
@@ -400,7 +400,15 @@ impl CreatePool {
         let patience = CLAIMS.deadline();
         let past = || {
             if let Some(window) = patience {
-                CLAIMS.ran_out(window);
+                CLAIMS.ran_out(
+                    window,
+                    began.elapsed(),
+                    &[
+                        Piece::Kind("parked init pid "),
+                        Piece::Pid(i64::from(pid)),
+                        Piece::Kind(", by its sync pipe, claim socket and pidfd"),
+                    ],
+                );
             }
         };
         match claim_round(
@@ -473,13 +481,25 @@ impl Parker {
                 shared.done(id, proc);
                 let pid = i32::try_from(pid)
                     .map_err(|_| OciError::Broken("a parked init's pid out of range".to_owned()))?;
-                // Held from here, so ended and reaped if it never says it is parked, which it does within
-                // the hang bound the seeds' answers taught.
+                // Held from here, so ended and reaped if it ends before it says it is parked, as it does within
+                // PARKS's W* and past it by its life (decision 9).
                 let parked = Parked::new(pid, pidfd, ours, flags);
-                // The hang bound once a seed has answered; before, and from a run-out to the next, the wait follows
-                // the init, ending at its word or its end (decision 9).
-                let patience = shared.lock()?.seeds.deadlines().1;
-                parked.wait_parked(patience.unwrap_or(Duration::MAX))?;
+                let began = Instant::now();
+                let patience = PARKS.deadline();
+                parked.wait_parked(patience, || {
+                    if let Some(window) = patience {
+                        PARKS.ran_out(
+                            window,
+                            began.elapsed(),
+                            &[
+                                Piece::Kind("parked init pid "),
+                                Piece::Pid(i64::from(pid)),
+                                Piece::Kind(", by its socket and pidfd"),
+                            ],
+                        );
+                    }
+                })?;
+                PARKS.answered(began.elapsed());
                 Ok(parked)
             }
             Ok((Answer::Refused { failed, why }, _)) => {
@@ -996,6 +1016,12 @@ fn wait_answer(
     }
 }
 
+/// A park's wait for its init's word that it is parked, from the seed's answer that cloned it: W*, the slowest such word
+/// this node has seen (decision 9), a bound only while words come within it; past it the run-out is told and the wait
+/// follows the init by its life alone, on its socket and pidfd, to its word or its end ([`Parked::wait_parked`]). Its
+/// own wait, never the seeds' hang bound it borrowed until 2026-11-13. No record is read.
+static PARKS: hex_core::patience::Patience = hex_core::patience::Patience::measuring("parked.park");
+
 /// A claim's wait for its parked init's first word on its sync pipe, from the claim's send (the lead's (A) of
 /// 2026-11-09: no early answer): the init's ready on a root node's pruned path, its ask for its user namespace's maps
 /// on a rootless node's classic one. W*, the slowest such word this node has seen (decision 9), is a bound only while
@@ -1045,34 +1071,6 @@ fn claim_round(
         _ => Err(Trip::Broken(OciError::Broken(
             "a claimed init ended before its first word".to_owned(),
         ))),
-    }
-}
-
-/// Which of `fds` turns readable first within `patience`, the earliest in the list where several have: `None` past it,
-/// and with none (a wait following its party) it waits until one does. A peer's end (`POLLHUP`) counts, for the read
-/// that says so, as does a process's end on its pidfd. `op` names the poll in its error.
-fn first_readable(
-    fds: &[BorrowedFd<'_>],
-    patience: Option<Duration>,
-    op: &'static str,
-) -> Result<Option<usize>, OciError> {
-    let deadline = patience.and_then(|p| Instant::now().checked_add(p));
-    loop {
-        let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        let ts = left.map(|left| Timespec {
-            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: i64::from(left.subsec_nanos()),
-        });
-        let mut polled: Vec<PollFd<'_>> = fds
-            .iter()
-            .map(|fd| PollFd::new(fd, PollFlags::IN))
-            .collect();
-        match rustix::event::poll(&mut polled, ts.as_ref()) {
-            Ok(n) if n > 0 => return Ok(polled.iter().position(|p| !p.revents().is_empty())),
-            Ok(_) if left.is_some_and(|l| l.is_zero()) => return Ok(None),
-            Ok(_) | Err(rustix::io::Errno::INTR) => {}
-            Err(e) => return Err(OciError::os(op, e)),
-        }
     }
 }
 
@@ -1128,17 +1126,24 @@ fn stale(s: Stale) -> OciError {
 mod tests {
     use super::*;
     use hex_core::patience::Patience;
-    use hex_testkit::waits::until;
+    use hex_testkit::waits::follow::{self, Party};
 
     /// The calls this host's node runs at once, the line's room ([`crate::sizes::Sizes::workers`]).
     fn workers() -> usize {
         crate::sizes::Sizes::now().unwrap().workers
     }
 
-    /// A create's wait in line for a seed, on the line's own record for this build: the seeds' answers'
-    /// (`hex_core::seeds`, decision 9), as the pool's line wait starts from.
+    /// A create's wait in line for a seed, measuring, as the pool's line wait starts (decision 9: no record seeds it).
     fn in_line() -> Patience {
-        Patience::seeded("test.createpool.in_line", hex_testkit::waits::SEEDS)
+        Patience::measuring("test.createpool.in_line")
+    }
+
+    /// The pool's starting thread, as the party of a wait on what it makes: ended once it has finished, or with none.
+    fn starter(pool: &CreatePool) -> Party {
+        match &pool.starter {
+            Some(thread) if !thread.is_finished() => Party::Live,
+            _ => Party::Ended,
+        }
     }
 
     /// Goal 5 plan step 2 (AC-T7.1.4; CLAUDE.md §10): classic-path creates are counted by a fixed set
@@ -1209,9 +1214,13 @@ mod tests {
         // The pool's starting thread tries its first start once the pool opens, no recorded operation making it:
         // measuring, for the fact alone (the census's row is to come, from the suites run under it).
         let tried = Patience::measuring("test.createpool.start_tried");
-        until(&tried, "the pool's first start tried", || {
-            pool.counts().unwrap().start_failed > 0
-        })
+        // A look: the pool tells no event as a start fails, its counts read.
+        follow::until(
+            &tried,
+            "the pool's first start tried",
+            || starter(&pool),
+            || pool.counts().unwrap().start_failed > 0,
+        )
         .unwrap();
         let Err(OciError::Os { why, .. }) = pool.shared.acquire() else {
             panic!("a pool with no seed refuses its create by type, naming why");
@@ -1255,11 +1264,18 @@ mod tests {
         // The starting thread brings the seeds up as the takes ask for them, no recorded operation making both: measuring,
         // for the fact alone (the census's row is to come, from the suites run under it).
         let up = Patience::measuring("test.createpool.seeds_up");
-        until(&up, "both of the pool's seeds up", || {
-            let (id, proc, _) = shared.acquire().unwrap();
-            shared.done(id, proc);
-            shared.lock().unwrap().seeds.idle() == 2
-        })
+        // A look that drives its fact: each takes a seed and gives it back, which asks for the next, until both are up;
+        // the pool tells no event as a seed comes up, its idle count read.
+        follow::until(
+            &up,
+            "both of the pool's seeds up",
+            || starter(&pool),
+            || {
+                let (id, proc, _) = shared.acquire().unwrap();
+                shared.done(id, proc);
+                shared.lock().unwrap().seeds.idle() == 2
+            },
+        )
         .unwrap();
         let (starter, line) = (
             shared.woke[0].load(Ordering::Relaxed),
@@ -1412,8 +1428,9 @@ mod tests {
         };
         let cgroup = BoxCgroup::at(lab.path().to_owned());
         let config = open();
-        let before =
-            Patience::seeded("test.createpool.claim_before", hex_testkit::waits::SEEDS).deadline();
+        // The cold start, explicitly: with nothing learned, a claim follows its init from its start, as a node's first
+        // claim does (decision 9: no record bounds it).
+        let before = None;
         // A claim of a stand-in that does `then` with its claim's sync pipe end and its end of the claim socket: what
         // came of it, and what is left on the sync pipe.
         let claim = |then: fn(OwnedFd, OwnedFd), patience: Option<Duration>| {
@@ -1713,17 +1730,24 @@ mod tests {
         let (id, proc, _) = pool.shared.acquire().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let shared = Arc::clone(&pool.shared);
-        std::thread::spawn(move || {
+        let creating = std::thread::spawn(move || {
             let handed = shared.acquire().map(|(id, proc, _)| {
                 shared.done(id, proc);
                 id
             });
             tx.send(handed).unwrap();
         });
+        let creating = || {
+            if creating.is_finished() {
+                Party::Ended
+            } else {
+                Party::Live
+            }
+        };
         // The second create joins the line within its own call, and is handed the seed given back as the line's wait
-        // answers: both within the line's record.
+        // answers. A look: the pool tells no event as a create joins its line, its count read.
         let line = in_line();
-        until(&line, "the second create waiting in line", || {
+        follow::until(&line, "the second create waiting in line", creating, || {
             pool.shared.lock().unwrap().seeds.waiting() > 0
         })
         .unwrap();
@@ -1732,9 +1756,18 @@ mod tests {
             "a create in line is handed no seed before one is given back"
         );
         pool.shared.done(id, proc);
-        let handed = rx
-            .recv_timeout(line.deadline().unwrap_or(Duration::MAX))
-            .expect("the create in line was handed the seed given back");
+        let handed = follow::within(
+            &line,
+            "the create in line handed the seed given back",
+            creating,
+            |by| match by {
+                Some(at) => rx
+                    .recv_timeout(at.saturating_duration_since(std::time::Instant::now()))
+                    .ok(),
+                None => rx.recv().ok(),
+            },
+        )
+        .unwrap();
         assert_eq!(handed.unwrap(), id);
     }
 

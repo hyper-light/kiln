@@ -46,6 +46,7 @@ fn device_spec(devices: Vec<DeviceId>) -> BoxSpec {
 
 fn device_capacity(devices: Vec<DeviceInfo>) -> Capacity {
     Capacity {
+        own: Default::default(),
         cost: None,
         routes: Vec::new(),
         device_routes: Vec::new(),
@@ -56,6 +57,8 @@ fn device_capacity(devices: Vec<DeviceInfo>) -> Capacity {
         devices,
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     }
 }
 
@@ -86,10 +89,11 @@ fn with_device_tail(offer: bool, tail: &[u8]) -> Vec<u8> {
         .unwrap()
     };
     // Replace the device list while retaining valid absent charge/route receipts. Capacity
-    // additionally ends with four empty u32 lists and no learned use (joint plan step 14); a spec
+    // additionally ends with four empty u32 lists, no learned use and its machine's time unread (joint plan step 14,
+    // C7), no node VM's receipt (joint plan step 39), no learner's why (A-3) and its boxes' CPU time unread (A-8); a spec
     // ends with one route option and its band, 0 here (joint plan step 14).
     let following = if offer {
-        1 + 4 * size_of::<u32>() + 1
+        1 + 4 * size_of::<u32>() + 1 + 2 + size_of::<u32>() + 1 + 1
     } else {
         3
     };
@@ -157,8 +161,9 @@ fn device_claims_and_offers_roundtrip_with_explicit_tags_and_catalog_order() {
 }
 
 /// AC-T7.4.1: a capacity's devices it lists but won't offer, each with why, cross the wire after its routes, before
-/// only what the node learned (joint plan step 14). Do: encode a capacity listing one of its two devices unavailable;
-/// cut the same capacity, listing none and no learned use, before that list's count; read an
+/// only what the node learned (joint plan step 14) and its node VMs (joint plan step 39). Do: encode a capacity listing
+/// one of its two devices unavailable; cut the same capacity, listing none, no learned use and no node VM, before that
+/// list's count; read an
 /// older JSON report, which has no such field; and encode one listing a device it doesn't hold. Expect the first back
 /// exactly, the cut refused as truncated, as every truncation is (only this same wire's builds talk: IDENTITY), the
 /// JSON report listing none, and the last refused by the capacity's own check before any byte is written.
@@ -205,11 +210,12 @@ fn a_capacitys_unavailable_devices_cross_the_wire_last() {
     )
     .unwrap();
     assert_eq!(
-        cut[cut.len() - 5..],
-        [0; 5],
-        "the empty list's count, then no learned use, ends it"
+        cut[cut.len() - 13..],
+        [0; 13],
+        "the empty list's count, then no learned use, its machine's time unread, no node VM's count, no learner's why \
+         and its boxes' CPU time unread, ends it"
     );
-    cut.truncate(cut.len() - 5);
+    cut.truncate(cut.len() - 13);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -468,6 +474,12 @@ fn runtime_capacity_roundtrip_and_invalid_room_refused() {
         request
     );
     let capacity = hex_api::Capacity {
+        // Its machine's time and its boxes' together (joint plan step 14, C7; the review's A-8) cross with it.
+        own: hex_api::MachineTime {
+            cpu_ns: Some(4_000_000_000),
+            uptime_ns: Some(10_000_000_000),
+            boxes_cpu_ns: Some(1_000_000_000),
+        },
         cost: None,
         routes: Vec::new(),
         device_routes: Vec::new(),
@@ -486,6 +498,8 @@ fn runtime_capacity_roundtrip_and_invalid_room_refused() {
         },
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     for value in [None, Some(capacity.try_clone().unwrap())] {
         let expected = Answer::Capacity(value);
@@ -644,6 +658,8 @@ fn info() -> BoxInfo {
         abandoned: 2,
         last_resort: None,
         ended: None,
+        control: None,
+        control_wake: None,
         credentials: Vec::new(),
     }
 }
@@ -782,6 +798,202 @@ fn requests() -> Vec<(u64, Request, usize)> {
             3,
         ),
         (206, Request::Call(Call::Links), 0),
+        // Goal 2's item 2: a member's own signal, appended.
+        (
+            208,
+            Request::Call(Call::MemberSignal {
+                id: id("image"),
+                member: Member {
+                    kind: MemberKind::Harness,
+                    name: "claude".to_owned(),
+                },
+                signal: Signal::TERM,
+            }),
+            0,
+        ),
+        // A start followed to its end (`Runtime::started`), appended (ROOT, 2026-11-14).
+        (209, Request::Call(Call::Started(id("image"))), 0),
+        // The machine's capacity view's word to its node (the review's A-10), appended (ROOT, 2026-11-14).
+        (
+            210,
+            Request::Call(Call::Reserved(hex_api::Reserved {
+                keeper: 7,
+                reserved: CapacityResources {
+                    cpu_milli: 1_500,
+                    mem_bytes: 3 << 30,
+                    disk_bytes: 9 << 30,
+                },
+            })),
+            0,
+        ),
+        // Goal 2's item 3: a member's next MCP connection, its stdin carried and its stdout asked for, appended.
+        (
+            211,
+            Request::Call(Call::Mcp {
+                id: id("image"),
+                member: Member {
+                    kind: MemberKind::Agent,
+                    name: "helper".to_owned(),
+                },
+                streams: Streams {
+                    stdin: true,
+                    stdout: false,
+                    stderr: false,
+                },
+                ask: Streams {
+                    stdin: false,
+                    stdout: true,
+                    stderr: false,
+                },
+            }),
+            1,
+        ),
+        // docs/design/credential-grants.md C7: a connection's lessors, and its answers to the node's lease asks.
+        (205, Request::Call(Call::Lessors), 0),
+        (206, Request::Lessor(Ok(())), 0),
+        (
+            207,
+            Request::Lessor(Err(Refusal::Unconfigured {
+                what: "lessors for its image VMs' credentials",
+                why: "no broker answers this run".to_owned(),
+            })),
+            0,
+        ),
+        (
+            208,
+            Request::Leased {
+                run: 206,
+                answer: Ok(Lease {
+                    lease: "lease-1".to_owned(),
+                    value: Value::new(b"a credential's value".to_vec()),
+                    life: Some(std::time::Duration::from_secs(90)),
+                }),
+            },
+            0,
+        ),
+        (
+            209,
+            Request::Leased {
+                run: 206,
+                answer: Ok(Lease {
+                    lease: "lease-2".to_owned(),
+                    value: Value::new(Vec::new()),
+                    life: None,
+                }),
+            },
+            0,
+        ),
+        (
+            210,
+            Request::Leased {
+                run: 206,
+                answer: Err(LeaseRefused::Denied("not this run's".to_owned())),
+            },
+            0,
+        ),
+        (
+            211,
+            Request::Leased {
+                run: 206,
+                answer: Err(LeaseRefused::KeyReplaced {
+                    asked: "ab".repeat(32),
+                    current: Some("cd".repeat(32)),
+                }),
+            },
+            0,
+        ),
+        (
+            212,
+            Request::Leased {
+                run: 206,
+                answer: Err(LeaseRefused::KeyReplaced {
+                    asked: "ab".repeat(32),
+                    current: None,
+                }),
+            },
+            0,
+        ),
+        (
+            213,
+            Request::Leased {
+                run: 206,
+                answer: Err(LeaseRefused::Unavailable("its broker is away".to_owned())),
+            },
+            0,
+        ),
+        (
+            214,
+            Request::Leased {
+                run: 206,
+                answer: Err(LeaseRefused::Ended),
+            },
+            0,
+        ),
+        (
+            215,
+            Request::Leased {
+                run: 206,
+                answer: Err(LeaseRefused::Lapsed),
+            },
+            0,
+        ),
+        // docs/design/credential-grants.md C8: a connection's answers to the node's sign-in asks.
+        (
+            216,
+            Request::Captured {
+                run: 206,
+                answer: Ok(hex_api::Captured {
+                    access: "kiln/sign-ins/claude/access".to_owned(),
+                    access_placeholder: "kiln-placeholder-61".to_owned(),
+                    refresh_placeholder: Some("kiln-placeholder-62".to_owned()),
+                }),
+            },
+            0,
+        ),
+        (
+            217,
+            Request::Captured {
+                run: 206,
+                answer: Err(SignInRefused::Denied("no such sign-in".to_owned())),
+            },
+            0,
+        ),
+        (
+            218,
+            Request::Refreshed {
+                run: 206,
+                answer: Ok(Value::new(
+                    b"{\"access_token\":\"kiln-placeholder-61\"}".to_vec(),
+                )),
+            },
+            0,
+        ),
+        (
+            219,
+            Request::Refreshed {
+                run: 206,
+                answer: Err(SignInRefused::Unanswered),
+            },
+            0,
+        ),
+        (
+            220,
+            Request::Refreshed {
+                run: 206,
+                answer: Err(SignInRefused::Unavailable(
+                    "its provider is away".to_owned(),
+                )),
+            },
+            0,
+        ),
+        (
+            221,
+            Request::Refreshed {
+                run: 206,
+                answer: Err(SignInRefused::Ended),
+            },
+            0,
+        ),
     ]
 }
 
@@ -865,14 +1077,17 @@ fn refusals() -> Vec<Refusal> {
         Refusal::Lifecycle {
             id: id("retained-box"),
             cause: LifecycleCause::Pending,
+            why: None,
         },
         Refusal::Lifecycle {
             id: id("retained-box"),
             cause: LifecycleCause::Uncertain,
+            why: Some("its record names another native scope".to_owned()),
         },
         Refusal::Lifecycle {
             id: id("retained-box"),
             cause: LifecycleCause::Busy,
+            why: None,
         },
         Refusal::Uncertain {
             id: id("unclean-box"),
@@ -1042,6 +1257,8 @@ fn answers() -> Vec<(u64, Answer)> {
                         abandoned: 0,
                         last_resort: None,
                         ended: None,
+                        control: None,
+                        control_wake: None,
                         credentials: Vec::new(),
                     },
                 ],
@@ -1064,21 +1281,24 @@ fn answers() -> Vec<(u64, Answer)> {
             },
         ),
     ];
-    out.push((
-        16,
-        Answer::Offered(StreamOffer {
-            pid: 42,
-            started: u64::MAX,
-            vsock: PathBuf::from("guest/vsock"),
-            token: 7,
-            exec: 19,
-            streams: Streams {
-                stdin: true,
-                stdout: true,
-                stderr: false,
-            },
-        }),
-    ));
+    for setup in [None, Some(std::time::Duration::from_nanos(u64::MAX))] {
+        out.push((
+            16,
+            Answer::Offered(StreamOffer {
+                pid: 42,
+                started: u64::MAX,
+                vsock: PathBuf::from("guest/vsock"),
+                token: 7,
+                exec: 19,
+                streams: Streams {
+                    stdin: true,
+                    stdout: true,
+                    stderr: false,
+                },
+                setup,
+            }),
+        ));
+    }
     out.extend(refusals().into_iter().map(|r| (11, Answer::Refused(r))));
     for exit in [
         Exit::Code(0),
@@ -1118,6 +1338,74 @@ fn answers() -> Vec<(u64, Answer)> {
         Answer::Links {
             links: Vec::new(),
             more: false,
+        },
+    ));
+    // docs/design/credential-grants.md C7: the node's lease asks of a connection's orchestrator, and its word that a
+    // lease or a run's lessor is let go.
+    out.push((206, Answer::LessorAsk(id("leasing-1"))));
+    out.push((
+        207,
+        Answer::LeaseAsk {
+            run: 206,
+            reference: "providers/anthropic".to_owned(),
+            key: Some([7; 32]),
+        },
+    ));
+    out.push((
+        208,
+        Answer::LeaseAsk {
+            run: 206,
+            reference: "providers/openai".to_owned(),
+            key: None,
+        },
+    ));
+    out.push((206, Answer::LeaseGiven("lease-1".to_owned())));
+    out.push((206, Answer::LessorEnded));
+    // docs/design/credential-grants.md C8: the node's sign-in asks.
+    out.push((
+        209,
+        Answer::CaptureAsk {
+            run: 206,
+            sign_in: "claude/ada".to_owned(),
+            tokens: SignInTokens {
+                access: Value::new(b"sk-ant-oat01-access".to_vec()),
+                refresh: Some(Value::new(b"sk-ant-ort01-refresh".to_vec())),
+                expires_in: Some(28_800),
+                id_token: None,
+                scope: Some("user:inference".to_owned()),
+            },
+            key: Some([3; 32]),
+        },
+    ));
+    out.push((
+        210,
+        Answer::CaptureAsk {
+            run: 206,
+            sign_in: "openai/ada".to_owned(),
+            tokens: SignInTokens {
+                access: Value::new(b"at".to_vec()),
+                refresh: None,
+                expires_in: None,
+                id_token: Some(Value::new(b"eyJhbGciOiJub25lIn0.e30.".to_vec())),
+                scope: None,
+            },
+            key: None,
+        },
+    ));
+    out.push((
+        211,
+        Answer::RefreshAsk {
+            run: 206,
+            sign_in: "claude/ada".to_owned(),
+            key: None,
+        },
+    ));
+    out.push((
+        206,
+        Answer::SignInRevoked {
+            run: 206,
+            sign_in: "claude/ada".to_owned(),
+            key: Some([3; 32]),
         },
     ));
     out
@@ -1411,28 +1699,74 @@ fn retained_box_allocations_survive_inspect_and_mixed_list_messages() {
     ));
 }
 
+/// Joint plan step 12 (ROOT, 2026-11-13: every Lifecycle Uncertain gets its reason, as a Backing one does): do answer a
+/// box's Lifecycle refusal with its refusing site's words, and one with none. Expect each read back whole, the words
+/// after the cause as an option, and the message ending ": <words>", or at its cause where there are none.
+#[test]
+fn w12_a_lifecycle_refusal_carries_its_reason() {
+    let words = "its record names another native scope";
+    let worded = Refusal::Lifecycle {
+        id: id("retained-box"),
+        cause: LifecycleCause::Uncertain,
+        why: Some(words.to_owned()),
+    };
+    let bare = Refusal::Lifecycle {
+        id: id("retained-box"),
+        cause: LifecycleCause::Uncertain,
+        why: None,
+    };
+    for refused in [&worded, &bare] {
+        let answered = Answer::Refused(refused.clone());
+        let bytes = answer(42, &answered, MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            answered
+        );
+    }
+    assert!(
+        worded.to_string().ends_with(&format!(": {words}")),
+        "{worded}"
+    );
+    assert!(
+        bare.to_string()
+            .ends_with("physical termination or absence has not been proved"),
+        "{bare}"
+    );
+}
+
 /// AC-T7.4.1: retained-resource lifecycle causes survive the wire as distinct typed outcomes;
 /// an unknown cause cannot become absence, success or a default retry decision.
 #[test]
 fn lifecycle_causes_preserve_box_identity_and_reject_unknown_tags() {
-    for cause in [
-        LifecycleCause::Pending,
-        LifecycleCause::Uncertain,
-        LifecycleCause::Busy,
+    for (cause, why) in [
+        (LifecycleCause::Pending, None),
+        (
+            LifecycleCause::Uncertain,
+            Some("its record names another native scope".to_owned()),
+        ),
+        (LifecycleCause::Busy, None),
+        (LifecycleCause::NodeVmEnded, None),
     ] {
+        let worded = why.is_some();
         let refused = Answer::Refused(Refusal::Lifecycle {
             id: id("retained-box"),
             cause,
+            why,
         });
         let bytes = answer(41, &refused, MAX_MESSAGE).unwrap();
         assert_eq!(
             read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
             refused
         );
-        // 3 is Retired (joint plan step 14); the next tag is unknown.
-        for tag in [4, u8::MAX] {
+        if worded {
+            continue;
+        }
+        // 3 is Retired (joint plan step 14), 4 NodeVmEnded (joint plan step 39, A-6); the next tag is unknown. The
+        // cause is the byte before its reason's option, a 0 where it gives none (joint plan step 12).
+        for tag in [5, u8::MAX] {
             let mut invalid = bytes.clone();
-            *invalid.last_mut().unwrap() = tag;
+            let at = invalid.len() - 2;
+            invalid[at] = tag;
             let error = read_answer(&received(&invalid, 0), MAX_MESSAGE).unwrap_err();
             assert!(matches!(
                 error,
@@ -1623,9 +1957,10 @@ fn a_message_of_another_wire_is_refused_naming_both_wires() {
 }
 
 /// One wire (the lead's word of 2026-11-09): the identity is FNV-1a of the wire definitions' source, this module's
-/// and the stream module's, with no number to bump, and a checkout's line endings don't split it. Do: digest the two
-/// files as read now, then with every line ended `\r\n`. Expect: both [`IDENTITY`]; and a source with one byte more
-/// another identity.
+/// and the stream module's, with no number to bump, and a checkout's line endings don't split it. Do: digest the
+/// sources as read now, then with every line ended `\r\n` (a CRLF checkout's, Windows' by default), then with every
+/// line ended `\n` alone (an LF checkout's). Expect: each [`IDENTITY`]; and a source with one byte more another
+/// identity.
 #[test]
 fn the_wire_identity_is_its_definitions_digest_line_endings_aside() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1633,6 +1968,7 @@ fn the_wire_identity_is_its_definitions_digest_line_endings_aside() {
         "wire.rs",
         "stream.rs",
         "schedule.rs",
+        "netns.rs",
         "../../hex-sim/src/peer.rs",
         "../../hex-sim/src/model.rs",
         "../../hex-api/src/spec.rs",
@@ -1642,6 +1978,7 @@ fn the_wire_identity_is_its_definitions_digest_line_endings_aside() {
         "../../hex-api/src/runtime.rs",
         "../../hex-api/src/grants.rs",
         "../../hex-api/src/credentials.rs",
+        "../../hex-api/src/lease.rs",
     ];
     let mut sources: Vec<Vec<u8>> = paths
         .iter()
@@ -1662,6 +1999,11 @@ fn the_wire_identity_is_its_definitions_digest_line_endings_aside() {
     };
     assert_eq!(
         digest(&sources.iter().map(|s| crlf(s)).collect::<Vec<_>>()),
+        IDENTITY
+    );
+    let lf = |bytes: &[u8]| -> Vec<u8> { bytes.iter().copied().filter(|&b| b != b'\r').collect() };
+    assert_eq!(
+        digest(&sources.iter().map(|s| lf(s)).collect::<Vec<_>>()),
         IDENTITY
     );
     for changed in 0..sources.len() {
@@ -1881,7 +2223,7 @@ fn a_run_is_a_create_and_an_exec_in_one_request() {
 #[test]
 fn unknown_kinds_are_refused() {
     let hello = request(5, &Request::Hello { build: build() }, MAX_MESSAGE).unwrap();
-    for kind in [0u16, 0x0019, 0x7fff, 0x8001, 0x8009, 0xffff] {
+    for kind in [0u16, 0x0022, 0x7fff, 0x8001, 0x8009, 0xffff] {
         let mut bytes = hello.clone();
         bytes[12..14].copy_from_slice(&kind.to_le_bytes());
         let got = read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap_err();
@@ -2009,9 +2351,19 @@ fn hostile_values_are_refused_by_name() {
     ));
     let mut info = answer(2, &Answer::Info(info()), MAX_MESSAGE).unwrap();
     // None route/allocation tags follow abandoned's eight bytes and the exit's five plus tag, and the
-    // empty grant and published lists' counts, the last resort's and the run's words' none tags and the empty
-    // credential list's count end the info.
-    let adopted = info.len() - NO_GRANTS - NO_END - NO_WORDS - NO_CREDENTIALS - 2 - 8 - 6 - 1;
+    // empty grant and published lists' counts, the last resort's and the run's words' none tags, the empty
+    // credential list's count and the agent-control endpoint's none tag end the info.
+    let adopted = info.len()
+        - NO_GRANTS
+        - NO_END
+        - NO_WORDS
+        - NO_CREDENTIALS
+        - NO_CONTROL
+        - NO_WAKE
+        - 2
+        - 8
+        - 6
+        - 1;
     info[adopted] = 2;
     assert!(matches!(
         read_answer(&received(&info, 0), MAX_MESSAGE),
@@ -2227,6 +2579,8 @@ fn any_info() -> impl Strategy<Value = BoxInfo> {
                 abandoned,
                 last_resort: None,
                 ended: None,
+                control: None,
+                control_wake: None,
                 credentials: Vec::new(),
             },
         )
@@ -2277,9 +2631,10 @@ fn any_cause() -> impl Strategy<Value = Refusal> {
                 LifecycleCause::Pending,
                 LifecycleCause::Uncertain,
                 LifecycleCause::Busy
-            ])
+            ]),
+            proptest::option::of(any_text())
         )
-            .prop_map(|(id, cause)| Refusal::Lifecycle { id, cause }),
+            .prop_map(|(id, cause, why)| Refusal::Lifecycle { id, cause, why }),
         (any::<u32>(), any_connect_failure())
             .prop_map(|(port, failure)| Refusal::Connect { port, failure }),
         proptest::sample::select(Upstream::ALL.to_vec())
@@ -2287,6 +2642,34 @@ fn any_cause() -> impl Strategy<Value = Refusal> {
         (any_id(), any_text()).prop_map(|(id, why)| Refusal::Failed { id, why }),
         (proptest::sample::select(&SOME_NAMES[..]), any_text())
             .prop_map(|(what, why)| Refusal::Unconfigured { what, why }),
+        (
+            proptest::sample::select(&SOME_NAMES[..]),
+            any_guest_failure()
+        )
+            .prop_map(|(op, failure)| Refusal::Guest { op, failure }),
+    ]
+}
+
+/// Each of a Shards guest's failures (the review's B-15), its durations whole nanoseconds of a u64, as Shards keeps
+/// them.
+fn any_guest_failure() -> impl Strategy<Value = GuestFailure> {
+    let nanos = || any::<u64>().prop_map(std::time::Duration::from_nanos);
+    prop_oneof![
+        (nanos(), nanos(), nanos()).prop_map(|(waited, over, slowest)| GuestFailure::Stalled {
+            waited,
+            over,
+            slowest
+        }),
+        prop_oneof![
+            Just(GuestEnd::PowerOff),
+            Just(GuestEnd::Reset),
+            Just(GuestEnd::Stopped),
+            any_text().prop_map(GuestEnd::Failed),
+        ]
+        .prop_map(GuestFailure::Ended),
+        (any::<u32>(), any_text()).prop_map(|(pid, why)| GuestFailure::Gone { pid, why }),
+        any_text().prop_map(GuestFailure::Rate),
+        any_text().prop_map(GuestFailure::HostUse),
     ]
 }
 
@@ -2536,7 +2919,7 @@ fn route_wire_route(execution: Execution) -> RouteOffer {
             execution,
             gpu: match execution {
                 Execution::ShardsDedicated => GpuEligibility::Required,
-                Execution::ShardsShared => GpuEligibility::None,
+                Execution::ShardsShared | Execution::NodeVm => GpuEligibility::None,
                 _ => GpuEligibility::Any,
             },
         },
@@ -2547,7 +2930,7 @@ fn route_wire_route(execution: Execution) -> RouteOffer {
         backing: match execution {
             Execution::ShardsShared => Some(route_wire_shared_key()),
             Execution::ShardsDedicated => Some(route_wire_key()),
-            Execution::Native | Execution::Firecracker => None,
+            Execution::Native | Execution::Firecracker | Execution::NodeVm => None,
         },
     }
 }
@@ -2632,8 +3015,9 @@ fn route_wire_capacity_bytes(
     )
     .unwrap();
     // Its three route lists and its unavailable devices' count, all empty, then no learned use (joint plan step 14),
-    // end it.
-    prefix.truncate(prefix.len() - 4 * size_of::<u32>() - 1);
+    // its machine's time unread (C7), no node VM's count (joint plan step 39), no learner's why (A-3) and its boxes' CPU
+    // time unread (A-8), end it.
+    prefix.truncate(prefix.len() - 4 * size_of::<u32>() - 1 - 2 - size_of::<u32>() - 1 - 1);
     let mut w = Writer::new(MAX_MESSAGE);
     w.raw(&prefix);
     w.u32(u32::try_from(routes.len()).unwrap());
@@ -2649,6 +3033,13 @@ fn route_wire_capacity_bytes(
         put_backing_offer(&mut w, backing).unwrap();
     }
     w.u32(0);
+    w.u8(0);
+    // Its machine's time unread (joint plan step 14, C7), then no node VM's receipt (joint plan step 39), then no
+    // learner's why (A-3), then its boxes' CPU time unread (A-8).
+    w.u8(0);
+    w.u8(0);
+    w.u32(0);
+    w.u8(0);
     w.u8(0);
     w.done().unwrap()
 }
@@ -2961,11 +3352,13 @@ fn route_wire_backing_refusals_preserve_key_and_cause() {
         let expected = Answer::Refused(Refusal::Backing {
             key: route_wire_key(),
             cause,
+            why: None,
         });
         let bytes = answer(207, &expected, MAX_MESSAGE).unwrap();
-        assert_eq!(bytes.len(), HEADER_BYTES + 1 + BACKING_KEY_BYTES + 1);
+        assert_eq!(bytes.len(), HEADER_BYTES + 1 + BACKING_KEY_BYTES + 1 + 1);
         assert_eq!(bytes[HEADER_BYTES], 10);
-        assert_eq!(bytes.last(), Some(&tag));
+        assert_eq!(bytes[bytes.len() - 2], tag);
+        assert_eq!(bytes.last(), Some(&0), "no reason, a byte 0");
         assert_eq!(
             read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
             expected
@@ -3103,8 +3496,9 @@ fn route_wire_hostile_counts_and_minimum_bytes_refuse_before_parse() {
     )
     .unwrap();
     // Its three route lists and its unavailable devices' count, all empty, then no learned use (joint plan step 14),
-    // end it.
-    prefix.truncate(prefix.len() - 4 * size_of::<u32>() - 1);
+    // its machine's time unread (C7), no node VM's count (joint plan step 39), no learner's why (A-3) and its boxes' CPU
+    // time unread (A-8), end it.
+    prefix.truncate(prefix.len() - 4 * size_of::<u32>() - 1 - 2 - size_of::<u32>() - 1 - 1);
     for count in [1u32, 65, u32::MAX] {
         let mut bytes = prefix.clone();
         bytes.extend(count.to_le_bytes());
@@ -3162,12 +3556,15 @@ fn route_wire_hostile_route_and_backing_tags_are_redacted() {
         &Answer::Refused(Refusal::Backing {
             key: route_wire_key(),
             cause: LifecycleCause::Uncertain,
+            why: None,
         }),
         MAX_MESSAGE,
     )
     .unwrap();
-    // 3 is Retired (joint plan step 14); 4 is no cause.
-    *bytes.last_mut().unwrap() = 4;
+    // 3 is Retired (joint plan step 14), 4 NodeVmEnded (joint plan step 39, A-6); 5 is no cause. The cause is the byte
+    // before its reason's option tag.
+    let cause = bytes.len() - 2;
+    bytes[cause] = 5;
     let fault = read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap_err();
     assert!(matches!(
         fault,
@@ -3350,8 +3747,15 @@ fn route_wire_spec_and_info_inconsistent_route_receipts_refuse() {
         valid_info
     );
     // The info's route comes before its empty grant and published lists' counts, its last resort's and its run's
-    // words' none tags, and its empty credential list's count.
-    let route_at = bad.len() - NO_GRANTS - NO_END - NO_WORDS - NO_CREDENTIALS - route_bytes;
+    // words' none tags, its empty credential list's count and its agent-control endpoint's none tag.
+    let route_at = bad.len()
+        - NO_GRANTS
+        - NO_END
+        - NO_WORDS
+        - NO_CREDENTIALS
+        - NO_CONTROL
+        - NO_WAKE
+        - route_bytes;
     assert_eq!(bad[route_at], 1);
     assert_eq!(bad[route_at + 1], class_tag(Class::Oci));
     assert_eq!(bad[route_at + 1 + ROUTE_KEY_BYTES], 1);
@@ -3413,6 +3817,12 @@ fn route_wire_new_messages_enforce_exact_bounds_truncation_and_trailing_bytes() 
         Answer::Refused(Refusal::Backing {
             key: route_wire_key(),
             cause: LifecycleCause::Pending,
+            why: None,
+        }),
+        Answer::Refused(Refusal::Backing {
+            key: route_wire_key(),
+            cause: LifecycleCause::Uncertain,
+            why: Some("its stop's end wasn't seen".to_owned()),
         }),
     ] {
         let bytes = answer(214, &expected, MAX_MESSAGE).unwrap();
@@ -3628,8 +4038,14 @@ fn snapshot_refusal_and_exit_match_canonical_answer_bytes() {
         inputs.push(Refusal::Backing {
             key: route_wire_key(),
             cause,
+            why: None,
         });
     }
+    inputs.push(Refusal::Backing {
+        key: route_wire_key(),
+        cause: LifecycleCause::Uncertain,
+        why: Some("its record names another generation".to_owned()),
+    });
     for refusal in inputs {
         let ordinary = Answer::Refused(refusal);
         let expected = answer(0, &ordinary, MAX_MESSAGE).unwrap();
@@ -3661,6 +4077,12 @@ fn snapshot_bounds_include_scalar_trailers_before_allocation() {
     inputs.push(Refusal::Backing {
         key: route_wire_key(),
         cause: LifecycleCause::Uncertain,
+        why: None,
+    });
+    inputs.push(Refusal::Backing {
+        key: route_wire_key(),
+        cause: LifecycleCause::Uncertain,
+        why: Some("its receipt is missing".to_owned()),
     });
     for refusal in inputs {
         let ordinary = Answer::Refused(refusal);
@@ -3736,15 +4158,84 @@ fn physical_unavailable(backend: Class, cause: LifecycleCause) -> BackendUnavail
         Refusal::Backing {
             key: route_wire_key(),
             cause,
+            why: None,
         },
     )
     .unwrap()
 }
 
+/// Joint plan step 14, (B) (ROOT, 2026-11-13: an Uncertain with no reason is a CLAUDE.md §3 gap): a backing's refusal
+/// carries the refusing site's reason, appended after its cause, and its message says it. Do send a Backing refusal,
+/// Uncertain, with a reason. Expect it read back as sent; the reason's option tag (1) after the cause, then its length
+/// and bytes, so one with none (a byte 0) is a byte longer than before; and its message ending with the reason.
+#[test]
+fn w14_b_a_backing_refusal_carries_its_reason() {
+    let why = "its scope's end wasn't seen after its stop";
+    let reasoned = Answer::Refused(Refusal::Backing {
+        key: route_wire_key(),
+        cause: LifecycleCause::Uncertain,
+        why: Some(why.to_owned()),
+    });
+    let bytes = answer(216, &reasoned, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        bytes.len(),
+        HEADER_BYTES + 1 + BACKING_KEY_BYTES + 1 + 1 + 4 + why.len()
+    );
+    let reason = bytes.len() - why.len() - 4 - 1;
+    assert_eq!(bytes[reason], 1, "its reason's option tag");
+    assert_eq!(&bytes[bytes.len() - why.len()..], why.as_bytes());
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        reasoned
+    );
+    let Answer::Refused(refusal) = &reasoned else {
+        panic!("owned refusal fixture changed its variant");
+    };
+    assert!(
+        refusal.to_string().ends_with(&format!("Uncertain: {why}")),
+        "{refusal}"
+    );
+}
+
+/// Joint plan step 14, (B): an unavailable VM backend's refusal keeps its reason in the physical report. Do report a
+/// Firecracker backend unavailable, Uncertain, with a reason. Expect the report read back as sent, the observation's
+/// bytes its class tag and its refusal's own.
+#[test]
+fn w14_b_an_unavailable_backends_reason_travels_in_the_physical_report() {
+    let mut report = example_physical_report();
+    report.unavailable = vec![
+        BackendUnavailable::from_refusal(
+            Class::Firecracker,
+            Refusal::Backing {
+                key: route_wire_key(),
+                cause: LifecycleCause::Uncertain,
+                why: Some("its pool record names another generation".to_owned()),
+            },
+        )
+        .unwrap(),
+    ];
+    let expected = Answer::PhysicalReport(report);
+    let bytes = answer(221, &expected, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        expected
+    );
+    let Answer::PhysicalReport(report) = &expected else {
+        panic!("owned physical report changed its variant");
+    };
+    let canonical = snapshot_refusal(&report.unavailable[0].cause, MAX_MESSAGE).unwrap();
+    assert!(bytes.ends_with(&canonical[HEADER_BYTES..]));
+    assert_eq!(answer(221, &expected, bytes.len()).unwrap(), bytes);
+    assert!(matches!(
+        answer(221, &expected, bytes.len() - 1),
+        Err(Fault::Oversized { .. })
+    ));
+}
+
 /// Qualified observer failures append to, rather than replace, actual native identity and load.
 #[test]
 fn physical_report_unavailable_roundtrips_qualified_backing_causes() {
-    assert_eq!(PHYSICAL_UNAVAILABLE_BYTES, 51);
+    assert_eq!(PHYSICAL_UNAVAILABLE_BYTES, 52);
     for cause in [
         LifecycleCause::Pending,
         LifecycleCause::Busy,
@@ -3874,10 +4365,11 @@ fn physical_report_unavailable_rejects_hostile_counts_and_entries() {
         ));
     }
     assert!(!KEPT.lock().unwrap().contains(PRIVATE_NAME));
-    // 3 is Retired (joint plan step 14); the next cause is unknown.
-    for cause in [4, u8::MAX] {
+    // 3 is Retired (joint plan step 14), 4 NodeVmEnded (joint plan step 39, A-6); the next cause is unknown. The
+    // cause is the byte before its reason's option tag, an entry's last (joint plan step 14, (B)).
+    for cause in [5, u8::MAX] {
         let mut raw = bytes.clone();
-        raw[entry + PHYSICAL_UNAVAILABLE_BYTES - 1] = cause;
+        raw[entry + PHYSICAL_UNAVAILABLE_BYTES - 2] = cause;
         assert!(matches!(
             refused(&raw),
             Fault::Value {
@@ -3885,6 +4377,12 @@ fn physical_report_unavailable_rejects_hostile_counts_and_entries() {
                 ..
             }
         ));
+    }
+    // A reason's option tag that is neither 0 nor 1.
+    for tag in [2, u8::MAX] {
+        let mut raw = bytes.clone();
+        raw[entry + PHYSICAL_UNAVAILABLE_BYTES - 1] = tag;
+        assert!(matches!(refused(&raw), Fault::Value { what: "option", .. }));
     }
     let mut duplicate = bytes.clone();
     duplicate[entry + PHYSICAL_UNAVAILABLE_BYTES] = duplicate[entry];
@@ -3901,6 +4399,7 @@ fn physical_report_unavailable_rejects_hostile_counts_and_entries() {
             cause: Refusal::Backing {
                 key: route_wire_key(),
                 cause: LifecycleCause::Pending,
+                why: None,
             },
         },
         BackendUnavailable {
@@ -4050,6 +4549,12 @@ fn connect_refusal_reserves_its_whole_body_before_writing() {
     refusals.push(Refusal::Backing {
         key: route_wire_key(),
         cause: LifecycleCause::Busy,
+        why: None,
+    });
+    refusals.push(Refusal::Backing {
+        key: route_wire_key(),
+        cause: LifecycleCause::Uncertain,
+        why: Some("its scope's end wasn't seen after its stop".to_owned()),
     });
     for refusal in &refusals {
         let mut sized = Writer::new(MAX_MESSAGE);
@@ -4333,14 +4838,14 @@ fn learned_resources(cpu_milli: u64, gib: u64) -> CapacityResources {
 
 fn learned_holding(id: &str, cpu_milli: u64, gib: u64) -> LearnedHolding {
     LearnedHolding {
-        id: BoxId::new(id).unwrap(),
+        id: LearnedHolder::Box(BoxId::new(id).unwrap()),
         holding: learned_resources(cpu_milli, gib),
     }
 }
 
 fn learned_end(id: &str, gib: u64) -> LearnedEnd {
     LearnedEnd {
-        id: BoxId::new(id).unwrap(),
+        id: LearnedHolder::Box(BoxId::new(id).unwrap()),
         held: gib << 30,
         budget: (gib - 1) << 30,
         band: 0,
@@ -4377,15 +4882,81 @@ fn learned_capacity() -> Capacity {
                 disk_bytes: Some(0),
             },
         }],
+        rates: Vec::new(),
+        window: None,
+        unread: Vec::new(),
+        awaits: Vec::new(),
+        ranked: Vec::new(),
+        unrecorded: Vec::new(),
+        unacted: Vec::new(),
+        reservations: None,
     });
     capacity
 }
 
-/// Joint plan step 14 (AC-T7.4.1, C2, C5 and C8): what a node learned of a class's microVMs crosses the wire last on
-/// its capacity answer. Do: encode a capacity with its priors, learned use, holdings and the VMs its last resort
-/// ended, and one with none; cut the second before its last byte; read and write both as JSON, and read the first's
-/// JSON without its ends. Expect both back exactly, the second ending with its none tag and refused once cut, as every
-/// truncation is, JSON without the field reading as none, and JSON without the ends as none ended.
+/// The review's A-10 (AC-T7.4.1; ROOT, 2026-11-14): what a node's learner takes off its fleet's budget for the capacity
+/// view's holders crosses the wire last on a class's learned answer, each state told. Do encode a capacity answer telling
+/// none served, kiln's reservations unheard, and a keeper's word heard with and without the node's configuration naming
+/// it; then one whose state byte names no state. Expect each back exactly, and the last refused, naming the field.
+#[test]
+fn a10_kilns_reservations_cross_the_wire_on_a_learned_answer() {
+    for told in [
+        LearnedReservations::Unserved,
+        LearnedReservations::Unheard,
+        LearnedReservations::Heard {
+            keeper: 3,
+            reserved: learned_resources(1_500, 6),
+            unconfigured: false,
+        },
+        LearnedReservations::Heard {
+            keeper: u64::MAX,
+            reserved: learned_resources(0, 0),
+            unconfigured: true,
+        },
+    ] {
+        let mut capacity = learned_capacity();
+        if let Some(learned) = capacity.learned.as_mut() {
+            learned.reservations = Some(told);
+        }
+        let offered = Answer::Capacity(Some(capacity));
+        let bytes = answer(14, &offered, MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            offered
+        );
+    }
+    // The state's byte: where an answer telling it unheard and one telling none served differ, and only there.
+    let encoded = |told| {
+        let mut capacity = learned_capacity();
+        if let Some(learned) = capacity.learned.as_mut() {
+            learned.reservations = Some(told);
+        }
+        answer(14, &Answer::Capacity(Some(capacity)), MAX_MESSAGE).unwrap()
+    };
+    let mut bytes = encoded(LearnedReservations::Unheard);
+    let unserved = encoded(LearnedReservations::Unserved);
+    let apart: Vec<usize> = bytes
+        .iter()
+        .zip(&unserved)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(apart.len(), 1, "one state byte apart: {apart:?}");
+    bytes[apart[0]] = 9;
+    let refused = read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap_err();
+    assert!(
+        refused.to_string().contains("learned reservations"),
+        "{refused}"
+    );
+}
+
+/// Joint plan step 14 (AC-T7.4.1, C2, C5 and C8): what a node learned of a class's microVMs crosses the wire on its
+/// capacity answer, before only its node VMs (joint plan step 39). Do: encode a capacity with its priors, learned use,
+/// holdings and the VMs its last resort ended, and one with none; cut the second before its last byte; read and write
+/// both as JSON, and read the first's JSON without its ends. Expect both back exactly, the second ending with its none
+/// tag, its machine's time unread and no node VM's count, and refused once cut, as every truncation is, JSON without the
+/// field reading as none, and JSON without the ends as none ended.
 #[test]
 fn w14_a_capacitys_learned_use_crosses_the_wire_last() {
     let learned = learned_capacity();
@@ -4402,7 +4973,12 @@ fn w14_a_capacitys_learned_use_crosses_the_wire_last() {
         MAX_MESSAGE,
     )
     .unwrap();
-    assert_eq!(cut.last(), Some(&0), "no learned use ends it");
+    assert_eq!(
+        cut[cut.len() - 9..],
+        [0; 9],
+        "no learned use, its machine's time unread, then no node VM's count, no learner's why and its boxes' CPU time \
+         unread, ends it"
+    );
     cut.truncate(cut.len() - 1);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
@@ -4419,6 +4995,189 @@ fn w14_a_capacitys_learned_use_crosses_the_wire_last() {
     json["learned"].as_object_mut().unwrap().remove("ended");
     let unended = serde_json::from_value::<Capacity>(json).unwrap();
     assert!(unended.learned.unwrap().ended.is_empty());
+}
+
+/// Joint plan step 39 (ROOT's ruling of 2026-11-13; goal 14's wire): a node VM the node runs for itself is a holder in
+/// its learned capacity beside its boxes. Do: encode a capacity whose holdings and ends name a node VM beside a box, and
+/// read it back. Expect it back exactly.
+#[test]
+fn a_node_vms_learned_holding_and_end_cross_the_wire() {
+    let mut capacity = learned_capacity();
+    let run = LearnedHolder::Node(hex_api::NodeRun::from_bytes([5; 16]));
+    if let Some(learned) = capacity.learned.as_mut() {
+        learned.holdings.push(LearnedHolding {
+            id: run.clone(),
+            holding: learned_resources(1_000, 2),
+        });
+        learned.ended.push(LearnedEnd {
+            id: run,
+            ..learned_end("unused", 3)
+        });
+    }
+    let offered = Answer::Capacity(Some(capacity));
+    let bytes = answer(14, &offered, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        offered
+    );
+}
+
+fn node_vm_receipt(run: u8, phase: NodeVmPhase) -> NodeVmReceipt {
+    NodeVmReceipt {
+        run: hex_api::NodeRun::from_bytes([run; 16]),
+        booking: learned_resources(2_000, 4),
+        phase,
+        guest: learned_resources(1_500, 3),
+    }
+}
+
+/// Joint plan step 39 (AC-T7.4.1; ROOT, 2026-11-13: a node VM's receipt reaches the scheduler on its node's capacity
+/// answer, its record the one source): the node VMs a node runs for itself cross the wire on its capacity answer, last.
+/// Do: encode a capacity naming one node VM in each phase and read it back; read its JSON without them; check one naming
+/// a run twice; read one whose receipts' count says one more than a node's boxes, and one whose last phase is past the
+/// phases. Expect the first back exactly, the JSON read as naming none, and the other three refused.
+#[test]
+fn w39_a_capacitys_node_vms_cross_the_wire_last() {
+    let mut capacity = learned_capacity();
+    capacity.node_vms = vec![
+        node_vm_receipt(1, NodeVmPhase::Booting),
+        node_vm_receipt(2, NodeVmPhase::Ready),
+        node_vm_receipt(3, NodeVmPhase::Ended),
+    ];
+    let offered = Answer::Capacity(Some(capacity.try_clone().unwrap()));
+    let bytes = answer(39, &offered, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        offered
+    );
+    let mut json = serde_json::to_value(&capacity).unwrap();
+    json.as_object_mut().unwrap().remove("node_vms");
+    assert!(
+        serde_json::from_value::<Capacity>(json)
+            .unwrap()
+            .node_vms
+            .is_empty()
+    );
+    let mut twice = capacity.try_clone().unwrap();
+    twice.node_vms[1].run = twice.node_vms[0].run;
+    assert!(twice.check().is_err());
+    // The receipts' count, then each receipt: its run, its booking, its phase and its guest's room (V2), the last of
+    // which comes just before the learner's why, none here (A-3), and its boxes' CPU time, unread here (A-8), which
+    // ends it.
+    let receipt = 16 + 3 * size_of::<u64>() + 1 + 3 * size_of::<u64>();
+    let at = bytes.len() - (size_of::<u32>() + 3 * receipt + 1 + 1);
+    let mut past = bytes.clone();
+    let count = u32::try_from(MAX_LEARNED_HOLDINGS + 1).unwrap();
+    past[at..at + size_of::<u32>()].copy_from_slice(&count.to_le_bytes());
+    assert!(matches!(
+        read_answer(&received(&past, 0), MAX_MESSAGE),
+        Err(Fault::Value { .. })
+    ));
+    let mut unknown = bytes;
+    // The last receipt's phase: before its guest's room, the learner's why and the boxes' CPU time.
+    let phase = unknown.len() - 3 - 3 * size_of::<u64>();
+    unknown[phase] = 3;
+    assert!(matches!(
+        read_answer(&received(&unknown, 0), MAX_MESSAGE),
+        Err(Fault::Value { .. })
+    ));
+}
+
+/// Joint plan step 14 (D255; ROOT, 2026-11-13): what holds each running managed VM's CPU to its rate crosses the wire
+/// on its class's capacity answer, after the ceilings, where its node tells it. Do: encode a capacity whose learned
+/// rates name a box its platform's cap holds, with why, one its governor holds under its job, and a node VM its
+/// governor holds; read it back, and write and read it as JSON. Expect it back exactly each way.
+#[test]
+fn w14_d255_what_holds_each_managed_vms_rate_crosses_the_wire() {
+    let mut capacity = learned_capacity();
+    if let Some(learned) = capacity.learned.as_mut() {
+        learned.rates = vec![
+            hex_api::LearnedRate {
+                id: LearnedHolder::Box(BoxId::new("hex-place-a-1-0-7").unwrap()),
+                held: hex_api::RateHeld::Platform("its VM process takes no rate".into()),
+            },
+            hex_api::LearnedRate {
+                id: LearnedHolder::Box(BoxId::new("hex-place-a-1-0-8").unwrap()),
+                held: hex_api::RateHeld::GovernorUnderJob,
+            },
+            hex_api::LearnedRate {
+                id: LearnedHolder::Node(hex_api::NodeRun::from_bytes([5; 16])),
+                held: hex_api::RateHeld::Governor,
+            },
+        ];
+    }
+    let offered = Answer::Capacity(Some(capacity.try_clone().unwrap()));
+    let bytes = answer(14, &offered, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        offered
+    );
+    let json = serde_json::to_value(&capacity).unwrap();
+    assert_eq!(serde_json::from_value::<Capacity>(json).unwrap(), capacity);
+}
+
+/// Joint plan step 14 (C1; ROOT, 2026-11-13): the learner's window crosses the wire on a class's capacity answer, after
+/// the rates, and the VM whose platform cap's cycle sets it where one does. Do encode a capacity whose learned window is
+/// 2 s, set by a node VM's cap, then one whose window no VM's cap sets; read each back, and write and read each as JSON.
+/// Expect each back exactly each way.
+#[test]
+fn w14_the_learners_window_and_the_vm_that_sets_it_cross_the_wire() {
+    for slowed_by in [
+        Some(LearnedHolder::Node(hex_api::NodeRun::from_bytes([5; 16]))),
+        None,
+    ] {
+        let mut capacity = learned_capacity();
+        if let Some(learned) = capacity.learned.as_mut() {
+            learned.window = Some(hex_api::LearnedWindow {
+                window_ns: 2_000_000_000,
+                slowed_by,
+            });
+        }
+        let offered = Answer::Capacity(Some(capacity.try_clone().unwrap()));
+        let bytes = answer(14, &offered, MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            offered
+        );
+        let json = serde_json::to_value(&capacity).unwrap();
+        assert_eq!(serde_json::from_value::<Capacity>(json).unwrap(), capacity);
+    }
+}
+
+/// Joint plan step 14 (D260; ROOT, 2026-11-13): a VM whose VMM's own CPU isn't read apart from its vCPUs', told why, and
+/// one whose VMM's own took its whole share cross the wire on its class's capacity answer, appended after D255's. Do
+/// encode a capacity whose learned rates name each, beside one its governor holds; read it back, and write and read it
+/// as JSON. Expect it back exactly each way.
+#[test]
+fn w14_d260_a_vms_own_unheld_and_its_own_taking_its_share_cross_the_wire() {
+    let mut capacity = learned_capacity();
+    if let Some(learned) = capacity.learned.as_mut() {
+        learned.rates = vec![
+            hex_api::LearnedRate {
+                id: LearnedHolder::Box(BoxId::new("hex-place-a-1-0-7").unwrap()),
+                held: hex_api::RateHeld::OwnTakesShare {
+                    own: 4_200,
+                    share: 4_000,
+                },
+            },
+            hex_api::LearnedRate {
+                id: LearnedHolder::Box(BoxId::new("hex-place-a-1-0-8").unwrap()),
+                held: hex_api::RateHeld::GovernorOwnUnheld("the microVM has not started".into()),
+            },
+            hex_api::LearnedRate {
+                id: LearnedHolder::Node(hex_api::NodeRun::from_bytes([5; 16])),
+                held: hex_api::RateHeld::Governor,
+            },
+        ];
+    }
+    let offered = Answer::Capacity(Some(capacity.try_clone().unwrap()));
+    let bytes = answer(14, &offered, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        offered
+    );
+    let json = serde_json::to_value(&capacity).unwrap();
+    assert_eq!(serde_json::from_value::<Capacity>(json).unwrap(), capacity);
 }
 
 /// Joint plan step 14 (AC-T7.4.1): a capacity's learned use is held to its bounds on both sides. Do: encode one with
@@ -4455,9 +5214,11 @@ fn w14_a_capacitys_learned_use_is_held_to_its_bounds() {
         learned.ceilings = Vec::new();
     }
     let mut bytes = answer(14, &Answer::Capacity(Some(one)), MAX_MESSAGE).unwrap();
-    // The holdings' count, then the one holding (its id's length, the id and its resources), then no end's count and
-    // no ceiling's.
-    let at = bytes.len() - (4 * size_of::<u32>() + 1 + 3 * size_of::<u64>());
+    // The holdings' count, then the one holding (its holder's tag, its id's length, the id and its resources), then no
+    // end's count, no ceiling's and no rate's, no window (C1), no unread VM's count, no await's and no ranked VM's
+    // (place 4), no unrecorded box's (the review's dropped records), no unacted VM's (A-7), its machine's time unread,
+    // no node VM's count, no learner's why (A-3) and its boxes' CPU time unread (A-8).
+    let at = bytes.len() - (11 * size_of::<u32>() + 1 + 1 + 3 * size_of::<u64>() + 1 + 2 + 1 + 1);
     let count = u32::try_from(MAX_LEARNED_HOLDINGS + 1).unwrap();
     bytes[at..at + size_of::<u32>()].copy_from_slice(&count.to_le_bytes());
     assert!(matches!(
@@ -4551,9 +5312,13 @@ fn w14_a_capacitys_ends_are_held_to_its_bounds_and_fitted_after_its_holdings() {
         learned.ceilings = Vec::new();
     }
     let mut bytes = answer(14, &Answer::Capacity(Some(one)), MAX_MESSAGE).unwrap();
-    // The ends' count, then the one end: its id's length, the id, five u64s, its band and its unmoved capability's
-    // option and tag; then no ceiling's count.
-    let at = bytes.len() - (3 * size_of::<u32>() + 1 + 5 * size_of::<u64>() + 1 + 2);
+    // The ends' count, then the one end: its holder's tag, its id's length, the id, five u64s, its band and its unmoved
+    // capability's option and tag; then no ceiling's count and no rate's, no window (C1), no unread VM's count, no
+    // await's and no ranked VM's (place 4), no unrecorded box's (the review's dropped records), no unacted VM's (A-7),
+    // its machine's time unread, no node VM's count, no learner's why (A-3) and its boxes' CPU time unread (A-8): five
+    // counts and lengths besides place 4's three, the unrecorded boxes' one and the unacted VMs' one.
+    let counts = 5 * size_of::<u32>() + 3 * size_of::<u32>() + 2 * size_of::<u32>();
+    let at = bytes.len() - (counts + 1 + 1 + 5 * size_of::<u64>() + 1 + 2 + 1 + 2 + 1 + 1);
     let count = u32::try_from(MAX_LEARNED_HOLDINGS + 1).unwrap();
     bytes[at..at + size_of::<u32>()].copy_from_slice(&count.to_le_bytes());
     assert!(matches!(
@@ -4591,6 +5356,12 @@ const NO_WORDS: usize = 1;
 /// What ends an info granting no credential (joint plan step 33): its empty credential list's u32 count, after its
 /// words' tag.
 const NO_CREDENTIALS: usize = size_of::<u32>();
+/// What ends an info whose run told no agent-control endpoint (joint plan step 15, N6): its none tag, after its
+/// credentials.
+const NO_CONTROL: usize = 1;
+/// What ends an info whose run told no agent-control endpoint's waker and wake (Shards' D252 amended, image channel
+/// v30): its none tag, after the endpoint's.
+const NO_WAKE: usize = 1;
 
 /// Joint plan step 14 (AC-T7.4.1, C5): why a node's last resort ended a VM crosses the wire after its info's grants. Do:
 /// encode an info with an end and one with none, cut the second before its end's none tag, and read and write both as
@@ -4610,11 +5381,11 @@ fn w14_an_infos_last_resort_crosses_the_wire_after_its_grants() {
     let plain = info();
     let mut cut = answer(3, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
     assert_eq!(
-        cut[cut.len() - NO_CREDENTIALS - NO_WORDS - NO_END],
+        cut[cut.len() - NO_WAKE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END],
         0,
         "no end's tag"
     );
-    cut.truncate(cut.len() - NO_CREDENTIALS - NO_WORDS - NO_END);
+    cut.truncate(cut.len() - NO_WAKE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -4645,9 +5416,11 @@ fn w12_an_infos_run_words_cross_the_wire_last() {
         read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
         Answer::Info(failed.clone())
     );
-    assert!(bytes[..bytes.len() - NO_CREDENTIALS].ends_with(words.as_bytes()));
+    assert!(
+        bytes[..bytes.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE].ends_with(words.as_bytes())
+    );
     let mut garbled = bytes.clone();
-    let last = garbled.len() - NO_CREDENTIALS - 1;
+    let last = garbled.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - 1;
     garbled[last] = 0xff;
     assert!(matches!(
         read_answer(&received(&garbled, 0), MAX_MESSAGE),
@@ -4656,11 +5429,11 @@ fn w12_an_infos_run_words_cross_the_wire_last() {
     let plain = info();
     let mut cut = answer(5, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
     assert_eq!(
-        cut[cut.len() - NO_CREDENTIALS - 1],
+        cut[cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - 1],
         0,
-        "no words' tag ends it, but for its credentials"
+        "no words' tag ends it, but for its credentials and its agent-control endpoint"
     );
-    cut.truncate(cut.len() - NO_CREDENTIALS - NO_WORDS);
+    cut.truncate(cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_WORDS);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -4946,6 +5719,7 @@ fn a_shards_image_vm_carries_the_members_its_caller_drives_on_the_wire() {
                 "--model".to_owned(),
                 "claude-opus-4".to_owned(),
             ],
+            mcp: false,
         },
         hex_api::ImageMember::new(Member {
             kind: MemberKind::Agent,
@@ -4970,6 +5744,51 @@ fn a_shards_image_vm_carries_the_members_its_caller_drives_on_the_wire() {
         read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
         create
     );
+}
+
+/// Joint plan step 12, Shards' D254 (AC-T7.4.1): do create a Shards image VM driving a harness that asks an MCP bridge
+/// of its own, with run-time arguments, and an agent that asks none; then the same VM whose harness asks none. Expect
+/// the first read back whole, and its bytes the second's but for one: each member's ask is one byte after its
+/// run-time arguments.
+#[test]
+fn w12_a_members_mcp_bridge_crosses_the_wire_after_its_arguments() {
+    let create = |mcp: bool| {
+        Request::Call(Call::Create(Box::new(BoxSpec {
+            id: id("image-mcp"),
+            bounds: Bounds::default(),
+            class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+                members: vec![
+                    hex_api::ImageMember {
+                        args: vec!["--model".to_owned(), "claude-opus-4".to_owned()],
+                        mcp,
+                        ..hex_api::ImageMember::new(Member {
+                            kind: MemberKind::Harness,
+                            name: "claude".to_owned(),
+                        })
+                    },
+                    hex_api::ImageMember::new(Member {
+                        kind: MemberKind::Agent,
+                        name: "helper".to_owned(),
+                    }),
+                ],
+                ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
+            })),
+            owner: None,
+            devices: Vec::new(),
+            allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+            route: None,
+            band: 0,
+        })))
+    };
+    let asked = create(true);
+    let bytes = request(94, &asked, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        asked
+    );
+    let none = request(94, &create(false), MAX_MESSAGE).unwrap();
+    assert_eq!(none.len(), bytes.len());
+    assert_eq!(none.iter().zip(&bytes).filter(|(a, b)| a != b).count(), 1);
 }
 
 /// Joint plan step 12 for kiln's step 18 (AC-T7.4.1): do create a Shards image VM sharing two host directories, one
@@ -5100,7 +5919,7 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
     tail.extend(49152u16.to_le_bytes());
     tail.push(1);
     tail.extend(1455u16.to_le_bytes());
-    tail.extend([0; NO_END + NO_WORDS + NO_CREDENTIALS]);
+    tail.extend([0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE]);
     assert!(bytes.ends_with(&tail));
     let declared = Answer::Info(BoxInfo {
         class: Class::Shards,
@@ -5116,7 +5935,15 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
         read_answer(&received(&older, 0), MAX_MESSAGE).unwrap().1,
         declared
     );
-    assert!(older.ends_with(&[&[0][..], &[0; NO_END + NO_WORDS + NO_CREDENTIALS][..]].concat()));
+    assert!(
+        older.ends_with(
+            &[
+                &[0][..],
+                &[0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE][..]
+            ]
+            .concat()
+        )
+    );
     let wrong = Answer::Info(BoxInfo {
         class: Class::Shards,
         grants: each_way(),
@@ -5134,7 +5961,14 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
         })
     ));
     let mut hostile = bytes.clone();
-    let receiver = hostile.len() - 1 - size_of::<u16>() - NO_END - NO_WORDS - NO_CREDENTIALS;
+    let receiver = hostile.len()
+        - 1
+        - size_of::<u16>()
+        - NO_END
+        - NO_WORDS
+        - NO_CREDENTIALS
+        - NO_CONTROL
+        - NO_WAKE;
     hostile[receiver] = 2;
     assert!(matches!(
         read_answer(&received(&hostile, 0), MAX_MESSAGE),
@@ -5222,12 +6056,17 @@ proptest! {
     }
 }
 
+/// A placeholder as kiln's broker mints one (Shards' D242): a visible marker, then 256 random bits in hex.
+const OPENAI_PLACEHOLDER: &str =
+    "kiln-placeholder-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// Joint plan step 33's credential grants: one toward the provider `each_way` grants its harness by name, by TCP.
 fn openai_credential(toward: &str) -> Vec<CredentialGrant> {
     vec![CredentialGrant {
         member: harness(),
         reference: "openai/ada".to_owned(),
         toward: vec![toward.to_owned()],
+        placeholder: OPENAI_PLACEHOLDER.to_owned(),
     }]
 }
 
@@ -5237,7 +6076,8 @@ fn unchecked_credentials(list: &[CredentialGrant]) -> Vec<u8> {
     w.list(list, |w, grant| {
         put_member(w, &grant.member)?;
         w.string(&grant.reference)?;
-        w.list(&grant.toward, |w, host| w.string(host))
+        w.list(&grant.toward, |w, host| w.string(host))?;
+        w.string(&grant.placeholder)
     })
     .unwrap();
     w.done().unwrap()
@@ -5305,8 +6145,8 @@ fn w33_a_shards_image_vms_credential_grants_cross_the_wire_after_its_shares() {
 }
 
 /// Joint plan step 33 (C4): do answer an inspect of a Shards image VM with its grants and its credential grants. Expect
-/// it read back whole, its credentials its last bytes. Do answer one whose credential its grants don't reach. Expect it
-/// refused as "credentials" written.
+/// it read back whole, its credentials its last bytes but for its agent-control endpoint's none tag (joint plan step 15).
+/// Do answer one whose credential its grants don't reach. Expect it refused as "credentials" written.
 #[test]
 fn w33_an_inspect_carries_its_credential_grants_last() {
     let credentials = openai_credential("api.openai.com");
@@ -5323,7 +6163,7 @@ fn w33_an_inspect_carries_its_credential_grants_last() {
     );
     let mut listed = Writer::new(MAX_MESSAGE);
     put_credentials(&mut listed, &credentials, &each_way()).unwrap();
-    assert!(bytes.ends_with(&listed.done().unwrap()));
+    assert!(bytes[..bytes.len() - NO_CONTROL - NO_WAKE].ends_with(&listed.done().unwrap()));
     let unreached = Answer::Info(BoxInfo {
         class: Class::Shards,
         grants: Vec::new(),
@@ -5337,4 +6177,825 @@ fn w33_an_inspect_carries_its_credential_grants_last() {
             ..
         })
     ));
+}
+
+/// Joint plan step 15 (N6; AC-T7.7.2): do answer an inspect of a running Shards image VM with its run's agent-control
+/// endpoint, at an IPv4 loopback address and at IPv6's, and one with none; read each back, and write each as JSON. Expect
+/// each back exactly, the endpoint its info's last bytes but its waker's and wake's none tag (tag 1, its address as a
+/// grant's is written, its port), none a 0 there and refused once cut, as every truncation is, and JSON without the
+/// field reading as none. Do read one whose
+/// endpoint's address family is none, and one whose tag is neither 0 nor 1; expect each refused by name.
+#[test]
+fn an_inspect_carries_its_runs_agent_control_endpoint_last() {
+    for (at, address) in [
+        ("127.0.0.1:43471", [&[4u8][..], &[127, 0, 0, 1]].concat()),
+        (
+            "[::1]:43471",
+            [&[6u8][..], &std::net::Ipv6Addr::LOCALHOST.octets()].concat(),
+        ),
+    ] {
+        let shown = BoxInfo {
+            class: Class::Shards,
+            control: Some(at.parse().unwrap()),
+            control_wake: None,
+            ..info()
+        };
+        let bytes = answer(99, &Answer::Info(shown.clone()), MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            Answer::Info(shown.clone()),
+            "{at}"
+        );
+        let tail = [&[1u8][..], &address, &43471u16.to_le_bytes(), &[0u8]].concat();
+        assert!(bytes.ends_with(&tail), "{at}");
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(serde_json::from_value::<BoxInfo>(json).unwrap(), shown);
+        let (tag, family) = (bytes.len() - tail.len(), bytes.len() - tail.len() + 1);
+        for (at_byte, byte, what) in [(family, 5, "grant address"), (tag, 2, "option")] {
+            let mut hostile = bytes.clone();
+            hostile[at_byte] = byte;
+            assert!(
+                matches!(
+                    read_answer(&received(&hostile, 0), MAX_MESSAGE),
+                    Err(Fault::Value { what: said, .. }) if said == what
+                ),
+                "{at}: byte {byte} at {at_byte}"
+            );
+        }
+    }
+    let plain = info();
+    let mut cut = answer(99, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
+    assert_eq!(cut.last(), Some(&0), "no waker's and wake's tag ends it");
+    cut.truncate(cut.len() - NO_WAKE);
+    assert!(matches!(
+        read_answer(&received(&cut, 0), MAX_MESSAGE),
+        Err(Fault::Truncated { .. })
+    ));
+    let older = serde_json::to_value(&plain).unwrap();
+    assert!(older.get("control").is_none(), "skipped when none");
+    assert_eq!(serde_json::from_value::<BoxInfo>(older).unwrap(), plain);
+}
+
+/// Shards' D252 amended (image channel v30; AC-T7.7.2): do answer an inspect of a running Shards image VM with its run's
+/// agent-control endpoint and that endpoint's waker and wake, at IPv4 loopback addresses and at IPv6's; read each back,
+/// and write each as JSON. Expect each back exactly, the waker and the wake its info's last bytes (tag 1, then each
+/// address as a grant's is written and its port), every socket the endpoint holds its `control_sockets`, and JSON
+/// without the field reading as none. Do read one telling a waker and wake with no endpoint; expect it refused by name.
+#[test]
+fn v30_an_inspect_carries_its_endpoints_waker_and_wake_after_it() {
+    let v6 = |port: u16| std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    let v4 = |port: u16| std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    for (control, waker, wake) in [
+        (v4(43471), v4(50001), v4(50002)),
+        (v6(43471), v6(50001), v6(50002)),
+    ] {
+        let shown = BoxInfo {
+            class: Class::Shards,
+            control: Some(control),
+            control_wake: Some(ControlWake { waker, wake }),
+            ..info()
+        };
+        assert_eq!(shown.control_sockets(), Some([control, waker, wake]));
+        let bytes = answer(99, &Answer::Info(shown.clone()), MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            Answer::Info(shown.clone()),
+            "{control}"
+        );
+        let address = |at: std::net::SocketAddr| match at.ip() {
+            std::net::IpAddr::V4(ip) => [&[4u8][..], &ip.octets()].concat(),
+            std::net::IpAddr::V6(ip) => [&[6u8][..], &ip.octets()].concat(),
+        };
+        let tail = [
+            &[1u8][..],
+            &address(waker),
+            &waker.port().to_le_bytes(),
+            &address(wake),
+            &wake.port().to_le_bytes(),
+        ]
+        .concat();
+        assert!(bytes.ends_with(&tail), "{control}");
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(serde_json::from_value::<BoxInfo>(json).unwrap(), shown);
+    }
+    let unbound = BoxInfo {
+        class: Class::Shards,
+        control: None,
+        control_wake: Some(ControlWake {
+            waker: v4(50001),
+            wake: v4(50002),
+        }),
+        ..info()
+    };
+    assert_eq!(unbound.control_sockets(), None);
+    let bytes = answer(99, &Answer::Info(unbound), MAX_MESSAGE).unwrap();
+    assert!(
+        matches!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE),
+            Err(Fault::Value {
+                what: "control_wake",
+                ..
+            })
+        ),
+        "a waker and wake with no endpoint"
+    );
+    let older = serde_json::to_value(info()).unwrap();
+    assert!(older.get("control_wake").is_none(), "skipped when none");
+}
+
+/// docs/design/credential-grants.md C7: a lease's value crosses the wire in its own message alone, which says it carries
+/// one so its holder wipes it ([`carries_secret`]); what reads it holds the value in a `Value`, and neither side prints it.
+#[test]
+fn s33_a_leases_value_crosses_marked_and_never_printed() {
+    let value = b"hex-s33-a-credential-value";
+    let leased = Request::Leased {
+        run: 3,
+        answer: Ok(Lease {
+            lease: "lease-3".to_owned(),
+            value: Value::new(value.to_vec()),
+            life: None,
+        }),
+    };
+    let bytes = request(4, &leased, MAX_MESSAGE).unwrap();
+    assert!(
+        carries_secret(&bytes),
+        "a leased message says it carries a value"
+    );
+    for (n, other, _) in requests() {
+        if !matches!(other, Request::Leased { answer: Ok(_), .. }) {
+            let other = request(n, &other, MAX_MESSAGE).unwrap();
+            let kind = other.get(12..14).map(|k| u16::from_le_bytes([k[0], k[1]]));
+            assert_eq!(
+                carries_secret(&other),
+                matches!(kind, Some(0x001b..=0x001d)),
+                "only a leased, captured or refreshed message says it carries a value"
+            );
+        }
+    }
+    for (n, other) in answers() {
+        assert_eq!(
+            carries_secret(&answer(n, &other, MAX_MESSAGE).unwrap()),
+            matches!(other, Answer::CaptureAsk { .. }),
+            "only a capture's ask carries tokens among the node's messages"
+        );
+    }
+    let (_, back) = read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap();
+    assert_eq!(back, leased);
+    let printed = format!("{back:?} {leased:?}");
+    assert!(!printed.contains("hex-s33"), "a value printed: {printed}");
+    assert!(
+        printed.contains(&format!("Value({} bytes)", value.len())),
+        "{printed}"
+    );
+}
+
+/// docs/design/credential-grants.md C7: an answer to a lease ask names a lease or a refusal of Shards' kinds, and a
+/// lessor's answer one made or a refusal: any other byte there is refused by type, naming it.
+#[test]
+fn s33_a_lease_answer_of_no_defined_kind_is_refused() {
+    let undefined = |kind: u16, body: &[u8]| {
+        let mut w = Writer::new(MAX_MESSAGE);
+        w.header(kind, 5);
+        w.raw(body);
+        let bytes = w.done().unwrap();
+        read_request(&received(&bytes, 0), MAX_MESSAGE)
+    };
+    for (kind, body) in [
+        (0x001b_u16, [1u8, 0, 0, 0, 0, 0, 0, 0, 2].as_slice()),
+        (0x001b, [1, 0, 0, 0, 0, 0, 0, 0, 1, 5].as_slice()),
+        (0x001a, [2].as_slice()),
+    ] {
+        match undefined(kind, body) {
+            Err(Bad {
+                id: 5,
+                fault: Fault::Value { .. },
+            }) => {}
+            other => panic!("kind {kind:#06x} body {body:?}: {other:?}"),
+        }
+    }
+}
+
+/// Place 4 (ROOT, 2026-11-13: what Hex decides on its own says why): what a learner couldn't read and why, what each
+/// guest's room awaits, and each node VM ranked above every box and why cross the wire on a class's capacity answer,
+/// last, after its window, a box and a node VM alike. Do encode a learned capacity naming a box and a node VM unread, a box
+/// awaiting `GuestRoom` and a node VM ranked, and read it back; then its JSON without the three. Expect it back exactly,
+/// and the JSON read as none of them.
+#[test]
+fn w39_what_a_learner_couldnt_read_awaits_and_ranks_crosses_the_wire_last() {
+    let run = LearnedHolder::Node(hex_api::NodeRun::from_bytes([5; 16]));
+    let boxed = LearnedHolder::Box(BoxId::new("hex-place-a-1-0-9").unwrap());
+    let mut capacity = learned_capacity();
+    if let Some(learned) = capacity.learned.as_mut() {
+        learned.unread = vec![
+            hex_api::LearnedUnread {
+                id: boxed.clone(),
+                why: "its cgroup's use can't be read".to_owned(),
+            },
+            hex_api::LearnedUnread {
+                id: run.clone(),
+                why: "its run isn't running here".to_owned(),
+            },
+        ];
+        learned.awaits = vec![hex_api::LearnedAwait {
+            id: boxed,
+            needs: Upstream::GuestRoom,
+        }];
+        learned.ranked = vec![hex_api::LearnedRank {
+            run: hex_api::NodeRun::from_bytes([5; 16]),
+            why: "box torn-1's record can't be read: its record is torn".to_owned(),
+        }];
+    }
+    let offered = Answer::Capacity(Some(capacity.try_clone().unwrap()));
+    let bytes = answer(39, &offered, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        offered
+    );
+    let mut json = serde_json::to_value(&capacity).unwrap();
+    for field in ["unread", "awaits", "ranked"] {
+        json["learned"].as_object_mut().unwrap().remove(field);
+    }
+    let older = serde_json::from_value::<Capacity>(json)
+        .unwrap()
+        .learned
+        .unwrap();
+    assert!(older.unread.is_empty() && older.awaits.is_empty() && older.ranked.is_empty());
+}
+
+/// Place 4 (ROOT, 2026-11-13: neither exceeds its bound under the most holders): what a learner couldn't read, what each
+/// guest's room awaits and each node VM it ranks are each held to a node's boxes, one for each running VM, and fitted to
+/// one message after its holdings, ends and rates, in their order. Do check learned uses naming one past a node's boxes of each; then fit a
+/// capacity naming a node's boxes of each, and encode it. Expect each refused, typed, naming what passed its bound; the
+/// fitted capacity within one message, each list a prefix of what it named, the first cut, and refused with one more.
+#[test]
+fn w39_what_a_learner_couldnt_read_awaits_and_ranks_is_held_to_a_nodes_boxes() {
+    let holder =
+        |n: usize| LearnedHolder::Box(BoxId::new(&format!("hex-place-a-1-0-{n}")).unwrap());
+    let unread: Vec<hex_api::LearnedUnread> = (0..=MAX_LEARNED_HOLDINGS)
+        .map(|n| hex_api::LearnedUnread {
+            id: holder(n),
+            why: "its cgroup's use can't be read".to_owned(),
+        })
+        .collect();
+    let awaits: Vec<hex_api::LearnedAwait> = (0..=MAX_LEARNED_HOLDINGS)
+        .map(|n| hex_api::LearnedAwait {
+            id: holder(n),
+            needs: Upstream::GuestRoom,
+        })
+        .collect();
+    let ranked: Vec<hex_api::LearnedRank> = (0..=MAX_LEARNED_HOLDINGS)
+        .map(|n| hex_api::LearnedRank {
+            run: hex_api::NodeRun::from_bytes(u128::try_from(n).unwrap().to_le_bytes()),
+            why: "box torn-1's record can't be read: its record is torn".to_owned(),
+        })
+        .collect();
+    let learned = || learned_capacity().learned.unwrap();
+    for (what, past) in [
+        (
+            "learned unread VMs",
+            Learned {
+                unread: unread.clone(),
+                ..learned()
+            },
+        ),
+        (
+            "learned awaits",
+            Learned {
+                awaits: awaits.clone(),
+                ..learned()
+            },
+        ),
+        (
+            "learned ranked VMs",
+            Learned {
+                ranked: ranked.clone(),
+                ..learned()
+            },
+        ),
+    ] {
+        assert!(
+            matches!(past.check(), Err(Refusal::Exhausted { what: named, bound }) if named == what && bound == MAX_LEARNED_HOLDINGS),
+            "{what}: {:?}",
+            past.check()
+        );
+    }
+    let mut capacity = learned_capacity();
+    capacity.learned = Some(Learned {
+        unread: unread[..MAX_LEARNED_HOLDINGS].to_vec(),
+        awaits: awaits[..MAX_LEARNED_HOLDINGS].to_vec(),
+        ranked: ranked[..MAX_LEARNED_HOLDINGS].to_vec(),
+        ..learned()
+    });
+    fit_learned(&mut capacity).unwrap();
+    let fitted = capacity.learned.as_ref().unwrap();
+    assert!(fitted.check().is_ok(), "{:?}", fitted.check());
+    assert!(
+        !fitted.unread.is_empty() && fitted.unread.len() < MAX_LEARNED_HOLDINGS,
+        "{} of a node's boxes",
+        fitted.unread.len()
+    );
+    assert_eq!(fitted.unread, unread[..fitted.unread.len()]);
+    assert_eq!(fitted.awaits, awaits[..fitted.awaits.len()]);
+    assert_eq!(fitted.ranked, ranked[..fitted.ranked.len()]);
+    let bytes = answer(
+        39,
+        &Answer::Capacity(Some(capacity.try_clone().unwrap())),
+        MAX_MESSAGE,
+    )
+    .unwrap();
+    assert!(bytes.len() <= MAX_MESSAGE);
+    let mut more = capacity;
+    if let Some(learned) = more.learned.as_mut() {
+        let next = learned.unread.len();
+        learned.unread.push(unread[next].clone());
+    }
+    assert!(answer(39, &Answer::Capacity(Some(more)), MAX_MESSAGE).is_err());
+}
+
+/// The review's dropped records (ROOT, 2026-11-14; AC-T7.4.1): each box whose record its node can't read, and why,
+/// crosses the wire on a class's capacity answer, last, after the node VMs it ranks above every box. Do encode a learned
+/// capacity naming two such boxes and a node VM ranked, and read it back; then its JSON without the boxes. Expect it back
+/// exactly, and the JSON read as naming none.
+#[test]
+fn w14_dropped_the_boxes_whose_records_cant_be_read_cross_the_wire_last() {
+    let why = "its record can't be read: EOF while parsing a value; counted at its machine";
+    let mut capacity = learned_capacity();
+    if let Some(learned) = capacity.learned.as_mut() {
+        learned.ranked = vec![hex_api::LearnedRank {
+            run: hex_api::NodeRun::from_bytes([5; 16]),
+            why: "box torn-1's record can't be read: EOF while parsing a value".to_owned(),
+        }];
+        learned.unrecorded = ["torn-1", "torn-2"]
+            .map(|id| hex_api::LearnedUnrecorded {
+                id: LearnedHolder::Box(BoxId::new(id).unwrap()),
+                why: why.to_owned(),
+            })
+            .to_vec();
+    }
+    let offered = Answer::Capacity(Some(capacity.try_clone().unwrap()));
+    let bytes = answer(14, &offered, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        offered
+    );
+    let mut json = serde_json::to_value(&capacity).unwrap();
+    json["learned"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unrecorded");
+    let older = serde_json::from_value::<Capacity>(json)
+        .unwrap()
+        .learned
+        .unwrap();
+    assert!(older.unrecorded.is_empty());
+}
+
+/// The review's dropped records (ROOT, 2026-11-14: as place 4's lists are, each box once): the boxes whose records a
+/// node can't read are held to a node's boxes, each named once, and fitted to one message after its ranked node VMs. Do
+/// check learned uses naming one past a node's boxes, and one box twice; then fit a capacity naming a node's boxes, and
+/// encode it. Expect the first refused, typed, naming its bound, and the second naming the repeat; the fitted capacity
+/// within one message, its list a prefix of what it named, the first cut, and refused with one more.
+#[test]
+fn w14_dropped_the_boxes_whose_records_cant_be_read_are_held_to_a_nodes_boxes_each_once() {
+    let told = |n: usize| hex_api::LearnedUnrecorded {
+        id: LearnedHolder::Box(BoxId::new(&format!("hex-place-a-1-0-{n}")).unwrap()),
+        why: "its record can't be read: EOF while parsing a value; counted at its machine"
+            .to_owned(),
+    };
+    let unrecorded: Vec<hex_api::LearnedUnrecorded> =
+        (0..=MAX_LEARNED_HOLDINGS).map(told).collect();
+    let learned = || learned_capacity().learned.unwrap();
+    let past = Learned {
+        unrecorded: unrecorded.clone(),
+        ..learned()
+    };
+    assert!(
+        matches!(past.check(), Err(Refusal::Exhausted { what, bound }) if what == "learned unrecorded boxes" && bound == MAX_LEARNED_HOLDINGS),
+        "{:?}",
+        past.check()
+    );
+    let twice = Learned {
+        unrecorded: vec![told(1), told(2), told(1)],
+        ..learned()
+    };
+    assert!(
+        matches!(twice.check(), Err(Refusal::Invalid { what, .. }) if what == "learned unrecorded boxes"),
+        "{:?}",
+        twice.check()
+    );
+    let mut capacity = learned_capacity();
+    capacity.learned = Some(Learned {
+        unrecorded: unrecorded[..MAX_LEARNED_HOLDINGS].to_vec(),
+        ..learned()
+    });
+    fit_learned(&mut capacity).unwrap();
+    let fitted = capacity.learned.as_ref().unwrap();
+    assert!(fitted.check().is_ok(), "{:?}", fitted.check());
+    assert!(
+        !fitted.unrecorded.is_empty() && fitted.unrecorded.len() < MAX_LEARNED_HOLDINGS,
+        "{} of a node's boxes",
+        fitted.unrecorded.len()
+    );
+    assert_eq!(fitted.unrecorded, unrecorded[..fitted.unrecorded.len()]);
+    let bytes = answer(
+        14,
+        &Answer::Capacity(Some(capacity.try_clone().unwrap())),
+        MAX_MESSAGE,
+    )
+    .unwrap();
+    assert!(bytes.len() <= MAX_MESSAGE);
+    let mut more = capacity;
+    if let Some(learned) = more.learned.as_mut() {
+        let next = learned.unrecorded.len();
+        learned.unrecorded.push(unrecorded[next].clone());
+    }
+    assert!(answer(14, &Answer::Capacity(Some(more)), MAX_MESSAGE).is_err());
+}
+
+/// A-7 (the review's, 2026-11-14; ROOT's ruling; AC-T7.4.1): each VM its node's window couldn't cap or tell its room,
+/// held at what was last set, and why, crosses the wire on its class's capacity answer, last, after the boxes whose
+/// records can't be read. Do encode a learned capacity naming two such VMs and an unrecorded box, and read it back;
+/// then its JSON without the VMs. Expect it back exactly, and the JSON read as naming none.
+#[test]
+fn a7_the_vms_a_window_couldnt_act_on_cross_the_wire_last() {
+    let mut capacity = learned_capacity();
+    if let Some(learned) = capacity.learned.as_mut() {
+        learned.unrecorded = vec![hex_api::LearnedUnrecorded {
+            id: LearnedHolder::Box(BoxId::new("torn-1").unwrap()),
+            why: "its record can't be read: EOF while parsing a value; counted at its machine"
+                .to_owned(),
+        }];
+        learned.unacted = ["vm-1", "vm-2"]
+            .map(|id| hex_api::LearnedUnacted {
+                id: LearnedHolder::Box(BoxId::new(id).unwrap()),
+                why: "its cap couldn't be set: the rate was refused; held at its last, 8000 milli-CPU".to_owned(),
+            })
+            .to_vec();
+    }
+    let offered = Answer::Capacity(Some(capacity.try_clone().unwrap()));
+    let bytes = answer(14, &offered, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        offered
+    );
+    let mut json = serde_json::to_value(&capacity).unwrap();
+    json["learned"].as_object_mut().unwrap().remove("unacted");
+    let older = serde_json::from_value::<Capacity>(json)
+        .unwrap()
+        .learned
+        .unwrap();
+    assert!(older.unacted.is_empty());
+}
+
+/// A-7 (ROOT, 2026-11-14: as place 4's lists are, each VM once): the VMs a window couldn't act on are held to a node's
+/// VMs, each named once, and fitted to one message after its unrecorded boxes. Do check learned uses naming one past a
+/// node's VMs, and one VM twice; then fit a capacity naming a node's VMs, and encode it. Expect the first refused,
+/// typed, naming its bound, and the second naming the repeat; the fitted capacity within one message, its list a prefix
+/// of what it named, the first cut, and refused with one more.
+#[test]
+fn a7_the_vms_a_window_couldnt_act_on_are_held_to_a_nodes_vms_each_once() {
+    let told = |n: usize| hex_api::LearnedUnacted {
+        id: LearnedHolder::Box(BoxId::new(&format!("hex-place-a-1-0-{n}")).unwrap()),
+        why: "its cap couldn't be set: the rate was refused; held at its last, 8000 milli-CPU"
+            .to_owned(),
+    };
+    let unacted: Vec<hex_api::LearnedUnacted> = (0..=MAX_LEARNED_HOLDINGS).map(told).collect();
+    let learned = || learned_capacity().learned.unwrap();
+    let past = Learned {
+        unacted: unacted.clone(),
+        ..learned()
+    };
+    assert!(
+        matches!(past.check(), Err(Refusal::Exhausted { what, bound }) if what == "learned unacted VMs" && bound == MAX_LEARNED_HOLDINGS),
+        "{:?}",
+        past.check()
+    );
+    let twice = Learned {
+        unacted: vec![told(1), told(2), told(1)],
+        ..learned()
+    };
+    assert!(
+        matches!(twice.check(), Err(Refusal::Invalid { what, .. }) if what == "learned unacted VMs"),
+        "{:?}",
+        twice.check()
+    );
+    let mut capacity = learned_capacity();
+    capacity.learned = Some(Learned {
+        unacted: unacted[..MAX_LEARNED_HOLDINGS].to_vec(),
+        ..learned()
+    });
+    fit_learned(&mut capacity).unwrap();
+    let fitted = capacity.learned.as_ref().unwrap();
+    assert!(fitted.check().is_ok(), "{:?}", fitted.check());
+    assert!(
+        !fitted.unacted.is_empty() && fitted.unacted.len() < MAX_LEARNED_HOLDINGS,
+        "{} of a node's VMs",
+        fitted.unacted.len()
+    );
+    assert_eq!(fitted.unacted, unacted[..fitted.unacted.len()]);
+    let bytes = answer(
+        14,
+        &Answer::Capacity(Some(capacity.try_clone().unwrap())),
+        MAX_MESSAGE,
+    )
+    .unwrap();
+    assert!(bytes.len() <= MAX_MESSAGE);
+    let mut more = capacity;
+    if let Some(learned) = more.learned.as_mut() {
+        let next = learned.unacted.len();
+        learned.unacted.push(unacted[next].clone());
+    }
+    assert!(answer(14, &Answer::Capacity(Some(more)), MAX_MESSAGE).is_err());
+}
+
+/// A-3 (ROOT's audit, 2026-11-13: a failed window was told nowhere): why a node's learner learned nothing for a class
+/// crosses the wire on its capacity answer, last. Do encode a capacity naming why, and one naming none, and read both
+/// back; then read the first's JSON without the field. Expect both back exactly, and the JSON read as naming none.
+#[test]
+fn w14_a3_why_a_learner_learned_nothing_crosses_the_wire_last() {
+    let mut capacity = device_capacity(Vec::new());
+    capacity.unlearned =
+        Some(Refusal::Broken("the node's records can't be read".into()).to_string());
+    for offered in [capacity.try_clone().unwrap(), device_capacity(Vec::new())] {
+        let offered = Answer::Capacity(Some(offered));
+        let bytes = answer(14, &offered, MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            offered
+        );
+    }
+    let mut json = serde_json::to_value(&capacity).unwrap();
+    json.as_object_mut().unwrap().remove("unlearned");
+    assert_eq!(
+        serde_json::from_value::<Capacity>(json).unwrap().unlearned,
+        None
+    );
+}
+
+/// V2 (ROOT, 2026-11-13: a node VM's route's room is its guest): a node VM's receipt carries what its guest is admitted
+/// at, after its phase, and a route naming NodeVm crosses the wire by its own tag. Do encode a capacity answer naming a
+/// node VM whose guest is admitted at 1.5 CPUs and 3 GiB, and a route offer naming NodeVm, and read both back. Expect
+/// each back exactly.
+#[test]
+fn v2_a_node_vms_receipt_carries_its_guests_room_and_its_route_its_own_tag() {
+    let mut capacity = device_capacity(Vec::new());
+    capacity.node_vms = vec![node_vm_receipt(7, NodeVmPhase::Ready)];
+    capacity.routes = vec![RouteOffer {
+        key: RouteKey {
+            class: Class::Oci,
+            image: ImagePlatform {
+                os: ImageOs::Linux,
+                arch: ImageArch::Arm64,
+            },
+            execution: Execution::NodeVm,
+            gpu: GpuEligibility::None,
+        },
+        cost: None,
+        backing: None,
+    }];
+    let offered = Answer::Capacity(Some(capacity));
+    let bytes = answer(39, &offered, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        offered
+    );
+}
+
+/// A stand-in for hex-quic's AES-256-GCM, for the seal's format and rules (docs/design/hex-quic.md Q13), not its cipher:
+/// a body sealed by XOR with a key byte, its tag the first 16 bytes of SHA-256 over that byte, the nonce, the bound header
+/// and the sealed body, its nonces a counter as hex-quic's are; opened under the peer's byte.
+struct ToySeal {
+    mine: u8,
+    theirs: u8,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl ToySeal {
+    /// Two ends of one connection: what one seals, the other opens.
+    fn pair() -> (Self, Self) {
+        let end = |mine, theirs| ToySeal {
+            mine,
+            theirs,
+            next: std::sync::atomic::AtomicU64::new(0),
+        };
+        (end(0x5a, 0xa5), end(0xa5, 0x5a))
+    }
+
+    fn tag(key: u8, nonce: &[u8; NONCE_BYTES], aad: &[u8], sealed: &[u8]) -> [u8; TAG_BYTES] {
+        use sha2::Digest;
+        let digest = sha2::Sha256::new()
+            .chain_update([key])
+            .chain_update(nonce)
+            .chain_update(aad)
+            .chain_update(sealed)
+            .finalize();
+        let mut tag = [0u8; TAG_BYTES];
+        tag.copy_from_slice(&digest[..TAG_BYTES]);
+        tag
+    }
+}
+
+impl Seal for ToySeal {
+    fn seal(
+        &self,
+        aad: &[u8],
+        body: &[u8],
+        sealed: &mut [u8],
+    ) -> Result<([u8; NONCE_BYTES], [u8; TAG_BYTES]), SealFault> {
+        let n = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut nonce = [0u8; NONCE_BYTES];
+        nonce[4..].copy_from_slice(&n.to_be_bytes());
+        for (to, from) in sealed.iter_mut().zip(body) {
+            *to = from ^ self.mine;
+        }
+        Ok((nonce, Self::tag(self.mine, &nonce, aad, sealed)))
+    }
+
+    fn open(
+        &self,
+        aad: &[u8],
+        nonce: &[u8; NONCE_BYTES],
+        sealed: &[u8],
+        tag: &[u8; TAG_BYTES],
+        body: &mut [u8],
+    ) -> Result<(), SealFault> {
+        if Self::tag(self.theirs, nonce, aad, sealed) != *tag {
+            return Err(SealFault::Broken);
+        }
+        for (to, from) in body.iter_mut().zip(sealed) {
+            *to = from ^ self.theirs;
+        }
+        Ok(())
+    }
+}
+
+/// Every message the wire's tests write that carries a secret, a client's and the node's, with its kind.
+fn secret_messages() -> Vec<(u16, Vec<u8>)> {
+    let requests = requests()
+        .into_iter()
+        .map(|(n, r, _)| request(n, &r, MAX_MESSAGE).unwrap());
+    let answers = answers()
+        .into_iter()
+        .map(|(n, a)| answer(n, &a, MAX_MESSAGE).unwrap());
+    requests
+        .chain(answers)
+        .filter(|bytes| carries_secret(bytes))
+        .map(|bytes| (u16::from_le_bytes([bytes[12], bytes[13]]), bytes))
+        .collect()
+}
+
+/// docs/design/hex-quic.md Q13 (the review's E-6; AC-T7.4.1): do seal each message the wire writes that carries a secret
+/// (a lease's value, a sign-in's tokens, a capture's and a refresh's answers) at one end of a connection, and open it at
+/// the other. Expect each sealed one marked so by its kind alone, its header otherwise its own, longer by its nonce and
+/// tag alone, holding none of its body in the clear and saying it carries no secret in the clear; each opened one the
+/// message sealed, byte for byte, read back as it was written; and each nonce one end took never taken again.
+#[test]
+fn q13_a_message_that_carries_a_secret_goes_sealed_and_opens_to_itself() {
+    let (here, there) = ToySeal::pair();
+    let secrets = secret_messages();
+    let kinds: BTreeSet<u16> = secrets.iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(
+        kinds,
+        BTreeSet::from([0x001b, 0x001c, 0x001d, 0x8015]),
+        "the leased, captured and refreshed answers and the capture's ask carry secrets"
+    );
+    let mut nonces = BTreeSet::new();
+    for (kind, message) in &secrets {
+        let sealed = seal(message, &here).unwrap();
+        assert!(super::sealed(&sealed) && !super::sealed(message));
+        assert!(
+            !carries_secret(&sealed),
+            "a sealed message holds no secret in the clear"
+        );
+        assert_eq!(sealed.len(), message.len() + SEAL_BYTES);
+        assert_eq!(&sealed[..12], &message[..12], "its magic and wire identity");
+        assert_eq!(u16::from_le_bytes([sealed[12], sealed[13]]), kind | SEALED);
+        assert_eq!(&sealed[14..22], &message[14..22], "its id");
+        let body = &message[HEADER_BYTES..];
+        assert!(
+            body.len() < 8 || !sealed.windows(body.len()).any(|w| w == body),
+            "kind {kind:#06x}'s body in the clear"
+        );
+        assert!(nonces.insert(sealed[HEADER_BYTES..HEADER_BYTES + NONCE_BYTES].to_vec()));
+        assert_eq!(&open(sealed, Some(&there)).unwrap(), message);
+    }
+    assert_eq!(nonces.len(), secrets.len());
+}
+
+/// docs/design/hex-quic.md Q13 (AC-T7.4.1): do open, at a connection that seals, each message that carries a secret as
+/// it came unsealed, and every other message unsealed. Expect each secret refused `Unsealed`, naming its kind, and every
+/// other message back as it came; and none of those sealed, their kinds carrying no secret (`NoSecret`).
+#[test]
+fn q13_a_connection_that_seals_refuses_a_secret_that_came_unsealed() {
+    let (here, there) = ToySeal::pair();
+    for (kind, message) in secret_messages() {
+        assert_eq!(
+            open(message, Some(&there)),
+            Err(Fault::Seal(SealFault::Unsealed { kind }))
+        );
+    }
+    let plain = requests()
+        .into_iter()
+        .map(|(n, r, _)| request(n, &r, MAX_MESSAGE).unwrap())
+        .chain(
+            answers()
+                .into_iter()
+                .map(|(n, a)| answer(n, &a, MAX_MESSAGE).unwrap()),
+        )
+        .filter(|bytes| !carries_secret(bytes));
+    let mut seen = 0;
+    for message in plain {
+        let kind = u16::from_le_bytes([message[12], message[13]]);
+        assert_eq!(
+            seal(&message, &here),
+            Err(Fault::Seal(SealFault::NoSecret { kind }))
+        );
+        assert_eq!(open(message.clone(), Some(&there)).unwrap(), message);
+        seen += 1;
+    }
+    assert!(seen > 100, "the wire's other messages: {seen}");
+}
+
+/// docs/design/hex-quic.md Q13 (AC-T7.4.1): do open a sealed lease whose kind was turned to an inspect's, sealed mark
+/// kept, and the same sealed lease at a connection that seals nothing. Expect the first refused `NoSecret`, naming the
+/// inspect's kind; the second refused `Unsealing`, naming the lease's; and a lease in the clear taken there as it came
+/// (a link that seals nothing carries secrets as the node's socket does, each copy wiped: credential-grants.md C7).
+#[test]
+fn q13_a_sealed_body_is_refused_where_its_kind_or_connection_takes_none() {
+    let (here, there) = ToySeal::pair();
+    let (kind, lease) = secret_messages().remove(0);
+    let sealed = seal(&lease, &here).unwrap();
+    let mut inspect = sealed.clone();
+    inspect[12..14].copy_from_slice(&(kind::INSPECT | SEALED).to_le_bytes());
+    assert_eq!(
+        open(inspect, Some(&there)),
+        Err(Fault::Seal(SealFault::NoSecret {
+            kind: kind::INSPECT
+        }))
+    );
+    assert_eq!(
+        open(sealed, None),
+        Err(Fault::Seal(SealFault::Unsealing { kind }))
+    );
+    assert_eq!(open(lease.clone(), None).unwrap(), lease);
+}
+
+/// docs/design/hex-quic.md Q13 (AC-T7.4.1): the header is bound to the sealed body. Do flip each bit of a sealed lease
+/// in turn, its header's, its nonce's, its body's and its tag's, and cut it short at every length, and open each at the
+/// other end. Expect every one refused, typed: `Broken` where its kind still names a secret, the kind's own mark or a
+/// secret's kind turned to another caught as such, and each cut `Truncated` or `Broken`; none opened.
+#[test]
+fn q13_a_seal_whose_header_nonce_body_or_tag_changed_is_refused() {
+    let (here, there) = ToySeal::pair();
+    let (_, lease) = secret_messages().remove(0);
+    let sealed = seal(&lease, &here).unwrap();
+    for at in 0..sealed.len() {
+        for bit in 0..8 {
+            let mut changed = sealed.clone();
+            changed[at] ^= 1 << bit;
+            match open(changed, Some(&there)) {
+                Err(Fault::Seal(SealFault::Broken)) => {}
+                Err(Fault::Seal(SealFault::Unsealed { .. } | SealFault::NoSecret { .. }))
+                    if (12..14).contains(&at) => {}
+                other => panic!("byte {at} bit {bit}: {other:?}"),
+            }
+        }
+    }
+    for len in HEADER_BYTES..sealed.len() {
+        match open(sealed[..len].to_vec(), Some(&there)) {
+            Err(Fault::Truncated { .. } | Fault::Seal(SealFault::Broken)) => {}
+            other => panic!("cut at {len}: {other:?}"),
+        }
+    }
+}
+
+/// docs/design/hex-quic.md Q13 (AC-T7.4.1): a sealed message is held to one message's bound. Do seal a lease whose
+/// message is exactly the bound less what sealing adds, and one a byte longer. Expect the first sealed at the bound
+/// exactly, and the second refused `Oversized`, naming the bound, before anything is sealed.
+#[test]
+fn q13_a_sealed_message_is_held_to_one_messages_bound() {
+    let (here, _) = ToySeal::pair();
+    let leased = |len: usize| {
+        let leased = Request::Leased {
+            run: 1,
+            answer: Ok(Lease {
+                lease: "lease-1".to_owned(),
+                value: Value::new(vec![7; len]),
+                life: None,
+            }),
+        };
+        request(2, &leased, MAX_MESSAGE).unwrap()
+    };
+    let base = leased(0).len();
+    let fits = leased(MAX_MESSAGE - SEAL_BYTES - base);
+    assert_eq!(seal(&fits, &here).unwrap().len(), MAX_MESSAGE);
+    let over = leased(MAX_MESSAGE - SEAL_BYTES - base + 1);
+    assert_eq!(
+        seal(&over, &here),
+        Err(Fault::Oversized {
+            bytes: MAX_MESSAGE + 1,
+            bound: MAX_MESSAGE
+        })
+    );
+    assert_eq!(here.next.load(std::sync::atomic::Ordering::Relaxed), 1);
 }

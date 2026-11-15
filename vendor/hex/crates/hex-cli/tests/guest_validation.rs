@@ -40,16 +40,6 @@ use hex_runtime::guest::{GuestConfig, GuestRuntime};
 /// (HEX-GUEST-20 on adas-mac-studio.local-2, aarch64 HVF, 2026-11-06; bench/native/guest/peak-rss/RECORD.md).
 const PEAK_MIB: u64 = 975;
 
-/// How long the lab may run before the test fails: the slowest run of this test on record for this host's class
-/// (its `validation_run` row in bench/native/guest/records.tsv; the runs in
-/// bench/native/guest/validation-runs/RECORD.md), or with none, the slowest of any class's, with no margin past it
-/// (decision 9), the rule for a wait that can't end on a fact alone. Each run's time includes its boot and staging,
-/// so the lab's own is less. A run slower than every one on record fails here, and its time is the next record's. A
-/// measure no class records fails here by name.
-fn suite() -> Duration {
-    hex_runtime::guest::recorded("validation_run").unwrap_or_else(|why| panic!("{why}"))
-}
-
 /// Every capability Hex's runtime names (crates/hex-runtime/src/linux/oci/caps.rs), as a privileged
 /// container holds them.
 const CAPS: &[&str] = &[
@@ -256,8 +246,10 @@ fn the_oci_runtime_spec_validation_passes_in_the_guest_as_on_linux() {
     // The run's two shares and nothing else (§6a): the suite's /etc binds name the lab's own /etc.
     let config = GuestConfig {
         binary: given("SHARDS_BIN").unwrap(),
-        kernel: given("HEX_GUEST_KERNEL").unwrap(),
-        initrd: given("HEX_GUEST_INITRD").unwrap(),
+        boot: hex_runtime::guest::Boot::Kernel {
+            kernel: given("HEX_GUEST_KERNEL").unwrap(),
+            initrd: given("HEX_GUEST_INITRD").unwrap(),
+        },
         // Unset, the host's CPUs (`host_cpus`): the fastest run, as a vCPU costs nothing while it
         // idles.
         vcpus: std::env::var("HEX_GUEST_CPUS").map_or_else(|_| host_cpus(), |v| v.parse().unwrap()),
@@ -300,11 +292,11 @@ fn the_oci_runtime_spec_validation_passes_in_the_guest_as_on_linux() {
     })
     .expect("create the lab in the guest");
     node.start(&id).expect("start the lab");
-    // The fact waited on is the lab's end, which the node reports with its exit.
-    let suite = suite();
+    // The fact waited on is the lab's end, which the node reports with its exit: followed by the lab's own life, its
+    // inspect read again until it ends, refused only where the lab can't be read (decision 9; the review's C-9: no
+    // record bounds it).
     let read = || node.inspect(&id).expect("inspect the lab").exit;
-    let exit =
-        reread(suite, read).unwrap_or_else(|| panic!("the lab ran past the suite's {suite:?}"));
+    let exit = reread(None, read).expect("a re-read with no bound returns only what it saw");
     eprintln!("the lab ended: {exit:?}");
     node.delete(&id).expect("delete the lab");
 
@@ -389,17 +381,18 @@ fn rest(d: Duration) {
     }
 }
 
-/// Reads with `look` until it shows something, or `patience` has passed. The seam has no wait for a box's
-/// end (`hex_api::Runtime`: `inspect` reports it once it has come), so it is read again after waiting as
-/// long as the last read took, step 7's learned re-read (cp/t7-native-s7 `hex_api::differential::until`):
-/// at most half the time reading, at whatever a read costs here, and no picked interval.
-fn reread<T>(patience: Duration, mut look: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = Instant::now().checked_add(patience);
+/// Reads with `look` until it shows something, or `patience` has passed where one is given; with none, or one past a
+/// monotonic deadline, until it shows something. The seam has no wait for a box's end (`hex_api::Runtime`: `inspect`
+/// reports it once it has come), so it is read again after waiting as long as the last read took, step 7's learned
+/// re-read (cp/t7-native-s7 `hex_api::differential::until`): at most half the time reading, at whatever a read costs
+/// here, and no picked interval.
+fn reread<T>(patience: Option<Duration>, mut look: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = patience.and_then(|patience| Instant::now().checked_add(patience));
     loop {
         let read = Instant::now();
         let seen = look();
         let took = read.elapsed();
-        if seen.is_some() || deadline.is_none_or(|d| Instant::now() >= d) {
+        if seen.is_some() || deadline.is_some_and(|d| Instant::now() >= d) {
             return seen;
         }
         rest(took);
@@ -415,7 +408,7 @@ fn a_reread_waits_as_long_as_the_last_read_took() {
     // waits as long as the long one without the test seeing it.
     let costs = [1200, 50, 1200, 50].map(Duration::from_millis);
     let mut reads = Vec::new();
-    let got = reread(Duration::from_secs(60), || {
+    let got = reread(Some(Duration::from_secs(60)), || {
         let start = Instant::now();
         let cost = costs[reads.len()];
         let mut x = 0u64;

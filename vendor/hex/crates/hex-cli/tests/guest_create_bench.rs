@@ -98,8 +98,7 @@ fn a_multi_layer_create_through_a_real_guest_is_timed() {
         .sum();
     let config = GuestConfig {
         binary,
-        kernel,
-        initrd,
+        boot: hex_runtime::guest::Boot::Kernel { kernel, initrd },
         vcpus: 1,
         gpu: false,
         memory_mib: (shards_api::min_memory_mib(std::env::consts::ARCH)

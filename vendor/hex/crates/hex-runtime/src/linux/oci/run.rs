@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hex_api::Refusal;
+use hex_core::patience::{Patience, Piece};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{Mode, OFlags};
 use rustix::mount::OpenTreeFlags;
@@ -654,26 +655,31 @@ impl Parked {
         self.held.as_ref().map(|h| h.0)
     }
 
-    /// Waits up to `patience` for the init to say on its socket that it is parked: its effective capabilities
-    /// emptied, waiting for its claim (`seed::parked`).
-    pub fn wait_parked(&self, patience: std::time::Duration) -> Result<(), OciError> {
-        let Some((_, _, socket)) = &self.held else {
+    /// Waits for the init to say on its socket that it is parked (its effective capabilities emptied, waiting for its
+    /// claim: `seed::parked`), as decision 9 waits (the person's ruling of 2026-11-13: W* is a bound only while answers
+    /// come within it): within `patience`, and past it, `past` told (the run-out, once), by the init's life alone, on
+    /// its socket and its pidfd, until its word or its end, refused then. With no `patience` it follows the init from
+    /// the start.
+    pub fn wait_parked(
+        &self,
+        patience: Option<std::time::Duration>,
+        past: impl FnOnce(),
+    ) -> Result<(), OciError> {
+        let Some((_, pidfd, socket)) = &self.held else {
             return Err(OciError::Broken("a parked init no longer held".to_owned()));
         };
-        let mut fds = [rustix::event::PollFd::new(
-            socket,
-            rustix::event::PollFlags::IN,
-        )];
-        let timeout = rustix::event::Timespec {
-            tv_sec: i64::try_from(patience.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: patience.subsec_nanos().into(),
-        };
-        let ready = rustix::event::poll(&mut fds, Some(&timeout))
-            .map_err(|e| OciError::os("waiting for an init to park", e))?;
-        if ready == 0 {
-            return Err(OciError::Broken(format!(
-                "an init didn't say it was parked within {patience:?}"
-            )));
+        const OP: &str = "waiting for an init to park";
+        let watched = [socket.as_fd(), pidfd.as_fd()];
+        let mut first = first_readable(&watched, patience, OP)?;
+        if first.is_none() {
+            // Past its bound: no sample (Karn's point), the run-out told once, and the init followed by its life.
+            past();
+            first = first_readable(&watched, None, OP)?;
+        }
+        if first != Some(0) {
+            return Err(OciError::Broken(
+                "an init ended before it said it was parked".to_owned(),
+            ));
         }
         match super::seed::recv_answer(socket.as_fd())? {
             (hex_core::seed::Answer::Started { .. }, Some(_)) => Ok(()),
@@ -686,6 +692,33 @@ impl Parked {
     /// The init's pid, pidfd and claim socket, the caller's from here.
     pub fn take(mut self) -> Option<(i32, OwnedFd, OwnedFd)> {
         self.held.take()
+    }
+}
+
+/// Which of `fds` turns readable first within `patience`, the earliest in the list where several have: `None` past it,
+/// and with none (a wait following its party) it waits until one does. A peer's end (`POLLHUP`) counts, for the read
+/// that says so, as does a process's end on its pidfd. `op` names the poll in its error. Its poll set is an array on
+/// the stack, made again for each poll: nothing is allocated (the review's C-7).
+pub fn first_readable<const N: usize>(
+    fds: &[BorrowedFd<'_>; N],
+    patience: Option<std::time::Duration>,
+    op: &'static str,
+) -> Result<Option<usize>, OciError> {
+    let deadline = patience.and_then(|p| std::time::Instant::now().checked_add(p));
+    loop {
+        let left = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+        let ts = left.map(|left| rustix::event::Timespec {
+            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(left.subsec_nanos()),
+        });
+        let mut polled =
+            fds.map(|fd| rustix::event::PollFd::from_borrowed_fd(fd, rustix::event::PollFlags::IN));
+        match rustix::event::poll(&mut polled, ts.as_ref()) {
+            Ok(n) if n > 0 => return Ok(polled.iter().position(|p| !p.revents().is_empty())),
+            Ok(_) if left.is_some_and(|l| l.is_zero()) => return Ok(None),
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(OciError::os(op, e)),
+        }
     }
 }
 
@@ -1006,7 +1039,7 @@ impl Runtime {
         });
         if result.is_err() && !caller_owns {
             // A create that fails leaves no cgroup behind either: whatever ran in it is killed first.
-            let _ = end_cgroup(&cgroup, id);
+            let _ = end_cgroup(&cgroup);
         }
         result
     }
@@ -1834,20 +1867,12 @@ impl Runtime {
         }
         // The init writes one byte as it takes the start. An init that ended without it (killed, or
         // OOM'd, before or after it opened its end) is stopped, not running: refused, never reported
-        // running (CLAUDE.md §3); the FIFO stays, and the init's end says stopped.
-        // The init runs its startContainer hooks before it writes, so the start waits for them too, as
-        // long as they may take, saturating where that is past what a Duration holds.
-        let patience = state.start_container.map_or(START_PATIENCE, |secs| {
-            START_PATIENCE.saturating_add(Duration::from_secs(secs))
-        });
-        match wait_for_byte(&fifo, &init, patience)? {
+        // running (CLAUDE.md §3); the FIFO stays, and the init's end says stopped. The init runs its
+        // startContainer hooks before it writes, so the start waits for them too: past the slowest take
+        // seen the init is followed by its life to its byte or its end, never refused at a time ([`STARTS`]).
+        match take_start(&fifo, &init, &STARTS, id)? {
             Took::Byte => {}
             Took::End => return Err(stopped()),
-            Took::Nothing => {
-                return Err(OciError::Broken(format!(
-                    "container {id} did not take the start within {patience:?}"
-                )));
-            }
         }
         // A startContainer hook that failed wrote why in place of the byte, and its init ends: the start
         // fails, naming it (runtime.md:69-70). Read without taking it, as another start may be waiting.
@@ -1983,20 +2008,28 @@ impl Runtime {
         }
         if let Some(cg) = &state.cgroup {
             // Its state is kept when the cgroup won't empty, so a later delete can finish this one.
-            end_cgroup(&BoxCgroup::at(PathBuf::from(cg)), id)?;
+            end_cgroup(&BoxCgroup::at(PathBuf::from(cg)))?;
         } else if running {
             // The pidfd is opened before the kill, so the wait below is for this container and
             // not a later process given its pid; a container already gone has none to wait on.
             let pidfd = rustix::process::Pid::from_raw(state.pid)
                 .and_then(|p| rustix::process::pidfd_open(p, PidfdFlags::empty()).ok());
+            let killed = Instant::now();
             sys::kill(state.pid, 9, true)?;
-            if let Some(pidfd) = pidfd
-                && !wait_exited(&pidfd, DELETE_PATIENCE)?
-            {
-                // Its state is kept, so a later delete can finish what this one could not.
-                return Err(OciError::Broken(format!(
-                    "container {id} did not exit within {DELETE_PATIENCE:?} of SIGKILL"
-                )));
+            // Followed past the slowest exit seen by its life, to its exit ([`EXITS`]).
+            if let Some(pidfd) = pidfd {
+                followed(
+                    &EXITS,
+                    killed,
+                    &[
+                        Piece::Kind("the init of container "),
+                        Piece::Name(id),
+                        Piece::Kind(", pid "),
+                        Piece::Pid(i64::from(state.pid)),
+                        Piece::Kind(", by its pidfd"),
+                    ],
+                    |slice| Ok(came(wait_exited(&pidfd, slice)?)),
+                )?;
             }
         }
         // poststop hooks run after the container is stopped, before its directory is removed.
@@ -2009,28 +2042,93 @@ impl Runtime {
     }
 }
 
-/// How long `delete --force` waits for the killed container to exit: `hex box run`'s cleanup patience
-/// (`crates/hex-cli/src/box_run.rs`, `CLEANUP_PATIENCE`). A SIGKILLed process exits once it is
-/// scheduled unless it is blocked in uninterruptible I/O; past this the delete is refused, typed.
-const DELETE_PATIENCE: Duration = Duration::from_secs(10);
+/// A start's wait for its init's byte on the exec FIFO, from its open of the FIFO (decision 9; the review's (c),
+/// 2026-11-14): within W*, the slowest take this process has seen, the byte or the init's end; past it, its run-out told
+/// once, the init followed by its life, its pidfd, to either, however long its startContainer hooks take, never refused
+/// at a time. It was 10 s, `delete --force`'s patience copied, and a stopped init (SIGSTOP) was refused Broken there.
+static STARTS: Patience = Patience::measuring("oci.start");
 
-/// How long `start` waits for the init's byte on the exec FIFO, and `create` for the shim to exit once
-/// it has forked the container: delete's patience. Both are already blocked or done when the wait
-/// begins, so missing it is a fault to report, typed.
-const START_PATIENCE: Duration = DELETE_PATIENCE;
+/// `delete --force`'s wait for a killed container with no cgroup to exit, from its SIGKILL: within W*, the slowest exit
+/// seen; past it, its run-out told once and the init followed by its life, its pidfd, to its exit. A SIGKILLed process
+/// exits once it is scheduled unless it sleeps uninterruptibly in the kernel, which its exit, however late, ends. It was
+/// 10 s, `hex box run`'s cleanup patience copied, and refused Broken past it.
+static EXITS: Patience = Patience::measuring("oci.delete.exit");
 
-/// Ends the shim once the container is forked and ready: it exits by itself (init.rs), and is reaped
-/// here; one that outlives [`START_PATIENCE`] is killed first.
+/// A delete's wait for its container's cgroup to empty, from its `cgroup.kill`: within W*, the slowest emptying seen;
+/// past it, its run-out told once and the cgroup followed by its life, its `cgroup.events`, to its emptying. It was
+/// 10 s, refused Broken past it.
+static EMPTIES: Patience = Patience::measuring("oci.delete.emptying");
+
+/// A create's wait for its shim to exit once it has forked the container and the container is ready: within W*, the
+/// slowest end seen; past it, its run-out told once and the shim followed by its life, its pidfd, to its exit, which it
+/// makes by itself (init.rs). It was 10 s, past which the shim was killed.
+static SHIMS: Patience = Patience::measuring("oci.shim.exit");
+
+/// Waits for `fact`, given each slice of the wait as a time (`Duration::MAX`: until its party gives it), from `began`, as
+/// decision 9 waits on `wait`: within W* the fact; past W* its run-out told once, naming `party`, and the fact followed
+/// by its party's life; with no W* (before its first answer, and from a run-out to the next) followed from the start.
+/// The fact, however late, is the sample W* rises to.
+fn followed<T>(
+    wait: &Patience,
+    began: Instant,
+    party: &[Piece<'_>],
+    mut fact: impl FnMut(Duration) -> Result<Option<T>, OciError>,
+) -> Result<T, OciError> {
+    if let Some(window) = wait.deadline() {
+        if let Some(answer) = fact(window.saturating_sub(began.elapsed()))? {
+            wait.answered(began.elapsed());
+            return Ok(answer);
+        }
+        wait.ran_out(window, began.elapsed(), party);
+    }
+    loop {
+        if let Some(answer) = fact(Duration::MAX)? {
+            wait.answered(began.elapsed());
+            return Ok(answer);
+        }
+    }
+}
+
+/// A fact that says only whether it came, as [`followed`] takes one.
+fn came(came: bool) -> Option<()> {
+    if came { Some(()) } else { None }
+}
+
+/// A start's take of its init's byte on the exec FIFO `fifo`, its init's pidfd `init`, waited for on `wait`
+/// ([`STARTS`]): the byte, or the init's end without it. `id` names the container.
+fn take_start(fifo: &OwnedFd, init: &OwnedFd, wait: &Patience, id: &str) -> Result<Took, OciError> {
+    followed(
+        wait,
+        Instant::now(),
+        &[
+            Piece::Kind("the init of container "),
+            Piece::Name(id),
+            Piece::Kind(", by its pidfd and exec FIFO"),
+        ],
+        |slice| wait_for_byte(fifo, init, slice),
+    )
+}
+
+/// Ends the shim once the container is forked and ready: it exits by itself (init.rs), followed by its life to its exit
+/// ([`SHIMS`]), and is reaped here.
 fn end_shim(shim: &mut std::process::Child) -> Result<(), OciError> {
+    let ready = Instant::now();
     let pid = i32::try_from(shim.id())
         .ok()
         .and_then(rustix::process::Pid::from_raw)
         .ok_or_else(|| OciError::Broken("the shim's pid".to_owned()))?;
     let pidfd = rustix::process::pidfd_open(pid, PidfdFlags::empty())
         .map_err(|e| OciError::os("pidfd_open of the shim", e))?;
-    if !wait_exited(&pidfd, START_PATIENCE)? {
-        let _ = shim.kill();
-    }
+    followed(
+        &SHIMS,
+        ready,
+        &[
+            Piece::Kind("the shim, pid "),
+            Piece::Pid(i64::from(shim.id())),
+            Piece::Kind(", by its pidfd"),
+        ],
+        |slice| Ok(came(wait_exited(&pidfd, slice)?)),
+    )?;
     shim.wait()
         .map_err(|e| OciError::os("reaping the shim", e))?;
     Ok(())
@@ -2043,8 +2141,6 @@ enum Took {
     Byte,
     /// The init ended without its byte, before or after it opened its end.
     End,
-    /// Neither, within the start's patience.
-    Nothing,
 }
 
 /// The start's end of the exec FIFO, opened to read and to write. Linux never blocks such an open and
@@ -2079,16 +2175,20 @@ fn init_pidfd(state: &State) -> Result<Option<OwnedFd>, OciError> {
     }
 }
 
-/// Waits up to `patience` in all for the init's byte on the exec FIFO, or the init's end, and says
-/// which came. The start holds its end of the FIFO to read and to write ([`open_start_end`]), so the
-/// FIFO always has a writer and a reader, and Linux's `pipe_poll` reports neither a hang-up nor an
-/// error on it (v6.19 `fs/pipe.c:691-692`, `:702-703`), only input: no poll can report the hang-up an
+/// Waits up to `patience` in all (`Duration::MAX`: until one comes) for the init's byte on the exec FIFO, or the init's
+/// end, and says which came: `None` where `patience` passed first. The start holds its end of the FIFO to read and to
+/// write ([`open_start_end`]), so the FIFO always has a writer and a reader, and Linux's `pipe_poll` reports neither a
+/// hang-up nor an error on it (v6.19 `fs/pipe.c:691-692`, `:702-703`), only input: no poll can report the hang-up an
 /// open for writing races with (`probes/fifo_hup.md`). The byte is counted, under the pipe's lock
 /// (`FIONREAD`, `:625-637`), and never read: it stays for every start that holds the FIFO, so two
 /// starts at once both see it, and the FIFO's removal says which of them reports the start. The init's
 /// pidfd turns readable once it has ended (pidfd_open(2)); the init writes before it ends, so a FIFO
 /// counted empty after that is an init that ended without taking the start.
-fn wait_for_byte(fifo: &OwnedFd, init: &OwnedFd, patience: Duration) -> Result<Took, OciError> {
+fn wait_for_byte(
+    fifo: &OwnedFd,
+    init: &OwnedFd,
+    patience: Duration,
+) -> Result<Option<Took>, OciError> {
     let deadline = Instant::now().checked_add(patience);
     loop {
         let left = match deadline {
@@ -2119,13 +2219,13 @@ fn wait_for_byte(fifo: &OwnedFd, init: &OwnedFd, patience: Duration) -> Result<T
         let bytes = rustix::io::ioctl_fionread(fifo)
             .map_err(|e| OciError::os("counting the exec fifo's bytes", e))?;
         if bytes > 0 {
-            return Ok(Took::Byte);
+            return Ok(Some(Took::Byte));
         }
         if ended {
-            return Ok(Took::End);
+            return Ok(Some(Took::End));
         }
         if left.is_zero() {
-            return Ok(Took::Nothing);
+            return Ok(None);
         }
     }
 }
@@ -2408,18 +2508,24 @@ fn enable_controllers(
     Ok(())
 }
 
-/// Ends what runs in the container's cgroup and removes it: `cgroup.kill`, a wait bounded by
-/// [`DELETE_PATIENCE`] for it to empty, then `rmdir`. A cgroup already gone is done.
-fn end_cgroup(cg: &BoxCgroup, id: &str) -> Result<(), OciError> {
+/// Ends what runs in the container's cgroup and removes it: `cgroup.kill`, its emptying followed past the slowest seen
+/// by its life ([`EMPTIES`]), then `rmdir`. A cgroup already gone is done.
+fn end_cgroup(cg: &BoxCgroup) -> Result<(), OciError> {
     if !cg.dir().is_dir() {
         return Ok(());
     }
+    let killed = Instant::now();
     cg.kill().map_err(from_refusal)?;
-    if !cg.wait_empty(DELETE_PATIENCE).map_err(from_refusal)? {
-        return Err(OciError::Broken(format!(
-            "container {id}'s cgroup still held processes {DELETE_PATIENCE:?} after cgroup.kill"
-        )));
-    }
+    followed(
+        &EMPTIES,
+        killed,
+        &[
+            Piece::Kind("container cgroup "),
+            Piece::Path(cg.dir()),
+            Piece::Kind(", by its cgroup.events"),
+        ],
+        |slice| Ok(came(cg.wait_empty(slice).map_err(from_refusal)?)),
+    )?;
     cg.remove().map_err(from_refusal)
 }
 
@@ -2744,6 +2850,49 @@ mod tests {
 
     use super::*;
 
+    /// Decision 9 (original; the person's ruling of 2026-11-13: W* is a bound only while answers come within it): a
+    /// park's wait for its init's word that it is parked ended at the seeds' hang W*, and the park failed, its init
+    /// killed, though the init went on to say it. Do: a parked stand-in, a sleeping child of the test's, whose word
+    /// comes on its socket only once the wait has passed its bound, a nanosecond, and told its run-out. Expect: the
+    /// wait answered.
+    #[test]
+    fn original_a_parks_wait_past_its_bound_follows_its_init_to_its_word() {
+        use std::sync::mpsc::channel;
+        #[expect(
+            clippy::zombie_processes,
+            reason = "reaped by its pidfd through the Parked made of it, dropped at the test's end"
+        )]
+        let sleeper = std::process::Command::new("sleep")
+            .arg("infinity")
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(sleeper.id()).unwrap();
+        let pidfd = rustix::process::pidfd_open(
+            rustix::process::Pid::from_child(&sleeper),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .unwrap();
+        let (ours, theirs) = super::super::seed::socketpair().unwrap();
+        let parked = Parked::new(pid, pidfd, ours, 0);
+        let (told, heard) = channel::<()>();
+        // It says it is parked once told, a descriptor riding with its word as an init's does; a wait that never tells
+        // drops `told`, and the stand-in says nothing.
+        let init = std::thread::spawn(move || {
+            if heard.recv().is_ok() {
+                let (rides, _kept) = super::super::seed::socketpair().unwrap();
+                let parked = hex_core::seed::Answer::Started { pid: 1 };
+                super::super::seed::send_answer(theirs.as_fd(), &parked, Some(rides.as_fd()))
+                    .unwrap();
+            }
+            theirs
+        });
+        let got = parked.wait_parked(Some(std::time::Duration::from_nanos(1)), move || {
+            let _ = told.send(());
+        });
+        let _theirs = init.join().unwrap();
+        assert!(got.is_ok(), "the park refused at its bound: {got:?}");
+    }
+
     // Hostile input (CLAUDE.md §6): a container id is a directory name under the state root, so one
     // that could name another place is refused before anything is touched; `delete ../../x` would
     // otherwise remove a directory outside the root. runc takes ids of [\w+.-] alone.
@@ -2899,7 +3048,7 @@ mod tests {
     fn a_killed_process_is_seen_to_exit() {
         let (mut child, pidfd) = sleeper();
         child.kill().unwrap();
-        assert!(wait_exited(&pidfd, DELETE_PATIENCE).unwrap());
+        assert!(wait_exited(&pidfd, Duration::MAX).unwrap());
         child.wait().unwrap();
     }
 
@@ -2934,8 +3083,8 @@ mod tests {
         let (_dir, path, start) = exec_fifo();
         let end = open_to_write(&path);
         assert_eq!(rustix::io::write(&end, b"0").unwrap(), 1);
-        let took = wait_for_byte(&start, &pidfd, START_PATIENCE);
-        assert!(matches!(took, Ok(Took::Byte)), "{took:?}");
+        let took = wait_for_byte(&start, &pidfd, Duration::MAX);
+        assert!(matches!(took, Ok(Some(Took::Byte))), "{took:?}");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("exec.fifo");
         make_fifo(&path).unwrap();
@@ -2945,8 +3094,8 @@ mod tests {
                 assert_eq!(rustix::io::write(&end, b"0").unwrap(), 1);
             });
             let start = open_start_end(&path).unwrap();
-            let took = wait_for_byte(&start, &pidfd, START_PATIENCE);
-            assert!(matches!(took, Ok(Took::Byte)), "{took:?}");
+            let took = wait_for_byte(&start, &pidfd, Duration::MAX);
+            assert!(matches!(took, Ok(Some(Took::Byte))), "{took:?}");
             writer.join().unwrap();
         });
         init.kill().unwrap();
@@ -2971,11 +3120,11 @@ mod tests {
         };
         assert_eq!(rustix::event::poll(&mut fds, Some(&none)).unwrap(), 0);
         let took = wait_for_byte(&start, &pidfd, Duration::ZERO);
-        assert!(matches!(took, Ok(Took::Nothing)), "{took:?}");
+        assert!(matches!(took, Ok(None)), "{took:?}");
         let end = open_to_write(&path);
         assert_eq!(rustix::io::write(&end, b"0").unwrap(), 1);
-        let took = wait_for_byte(&start, &pidfd, START_PATIENCE);
-        assert!(matches!(took, Ok(Took::Byte)), "{took:?}");
+        let took = wait_for_byte(&start, &pidfd, Duration::MAX);
+        assert!(matches!(took, Ok(Some(Took::Byte))), "{took:?}");
         init.kill().unwrap();
         init.wait().unwrap();
     }
@@ -2992,8 +3141,11 @@ mod tests {
             init.kill().unwrap();
             init.wait().unwrap();
             drop(end);
-            let took = wait_for_byte(&start, &pidfd, START_PATIENCE);
-            assert!(matches!(took, Ok(Took::End)), "opened {opened}: {took:?}");
+            let took = wait_for_byte(&start, &pidfd, Duration::MAX);
+            assert!(
+                matches!(took, Ok(Some(Took::End))),
+                "opened {opened}: {took:?}"
+            );
         }
     }
 
@@ -3008,8 +3160,94 @@ mod tests {
         drop(end);
         init.kill().unwrap();
         init.wait().unwrap();
-        let took = wait_for_byte(&start, &pidfd, START_PATIENCE);
-        assert!(matches!(took, Ok(Took::Byte)), "{took:?}");
+        let took = wait_for_byte(&start, &pidfd, Duration::MAX);
+        assert!(matches!(took, Ok(Some(Took::Byte))), "{took:?}");
+    }
+
+    /// A start's run-out past its W*, which lets the test go on: a fact no recorded operation makes, waited for
+    /// measuring (`hex_testkit::waits`).
+    static START_RAN_OUT: Patience = Patience::measuring("test.hex_runtime.oci_start_ran_out");
+
+    /// The review's (c) (decision 9: past W* a wait tells its run-out and follows its party, never refused at a time),
+    /// AC-T7.1.4: a start whose init hasn't taken it within W* follows the init by its life, its pidfd, to its byte or
+    /// its end; it was refused Broken at 10 s, a stopped init (SIGSTOP) among them. Do: a start whose wait's W* is
+    /// 1 ns, its init alive and silent; once its run-out is told, the init writes its byte. Then the same with the init
+    /// stopped; once the run-out is told, the init killed. Expect: the byte taken, then the init's end, each past W*.
+    #[test]
+    fn c_a_start_past_its_wait_follows_its_init_to_its_byte_or_its_end() {
+        for stopped in [false, true] {
+            let (mut init, pidfd) = sleeper();
+            if stopped {
+                rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::STOP).unwrap();
+            }
+            let (_dir, path, start) = exec_fifo();
+            let wait = Patience::measuring("test.hex_runtime.oci_start");
+            wait.answered(Duration::from_nanos(1));
+            let took = std::thread::scope(|scope| {
+                let taking = scope.spawn(|| take_start(&start, &pidfd, &wait, "the test's"));
+                hex_testkit::waits::follow::until(
+                    &START_RAN_OUT,
+                    "the start's run-out past its W*",
+                    || {
+                        if taking.is_finished() {
+                            hex_testkit::waits::follow::Party::Ended
+                        } else {
+                            hex_testkit::waits::follow::Party::Live
+                        }
+                    },
+                    || wait.deadline().is_none(),
+                )
+                .unwrap();
+                if stopped {
+                    init.kill().unwrap();
+                } else {
+                    let end = open_to_write(&path);
+                    assert_eq!(rustix::io::write(&end, b"0").unwrap(), 1);
+                }
+                taking.join().unwrap()
+            });
+            assert!(
+                matches!(
+                    (stopped, &took),
+                    (false, Ok(Took::Byte)) | (true, Ok(Took::End))
+                ),
+                "stopped {stopped}: {took:?}"
+            );
+            if !stopped {
+                init.kill().unwrap();
+            }
+            init.wait().unwrap();
+        }
+    }
+
+    /// The review's (c), decision 9: a wait past its W* tells its run-out once, before it follows its party, and its
+    /// answer, however late, is the sample W* rises to. Do: a wait whose W* is 1 ns; a fact that comes only for a wait
+    /// that follows it (`Duration::MAX`), looking at each look whether the run-out was told. Expect: one look within W*,
+    /// then one following, the run-out told by then; the answer; and W* risen to it.
+    #[test]
+    fn c_a_wait_past_its_w_star_tells_its_run_out_and_follows_its_party() {
+        let wait = Patience::measuring("test.hex_runtime.oci_followed");
+        wait.answered(Duration::from_nanos(1));
+        let mut looks = Vec::new();
+        let got = followed(
+            &wait,
+            Instant::now(),
+            &[Piece::Kind("the test's fact")],
+            |slice| {
+                looks.push((slice == Duration::MAX, wait.deadline().is_none()));
+                Ok(if slice == Duration::MAX {
+                    Some(7)
+                } else {
+                    None
+                })
+            },
+        );
+        assert_eq!(got.unwrap(), 7);
+        assert_eq!(looks, [(false, false), (true, true)]);
+        assert!(
+            wait.slowest()
+                .is_some_and(|slowest| slowest > Duration::from_nanos(1))
+        );
     }
 
     /// A created container's state directory as create leaves it: its exec FIFO, and its state naming
@@ -3311,6 +3549,10 @@ sed -n 's/^flags:[[:space:]]*/flags /p' "$(echo "$HEX_OCI_NETWORK" | sed 's#/fd/
         );
     }
 
+    /// The bystander's exec showing its arguments: a fact no recorded operation makes, waited for measuring
+    /// (`hex_testkit::waits`). It was a 10 s deadline, picked (ROOT, 2026-11-14).
+    static BYSTANDER: Patience = Patience::measuring("test.hex_runtime.oci_bystander_sleeps");
+
     /// A process another of the agent's threads starts while a create starts its shim (another create's
     /// shim, an exec'd program, a hook) inherits none of the create's descriptors: the shim's pipes stay
     /// close-on-exec in the agent (CVE-2024-21626's class: runc v1.5.2 `libcontainer/container_linux.go:341-349`).
@@ -3342,15 +3584,18 @@ sed -n 's/^flags:[[:space:]]*/flags /p' "$(echo "$HEX_OCI_NETWORK" | sed 's#/fd/
             // Linux lets a vfork parent go before the exec closes what is close-on-exec (v6.19
             // `fs/exec.c:1156`, `:1194`, `kernel/fork.c:1488`), and sets the new program's arguments after
             // that (`fs/binfmt_elf.c:1296`): what it holds is read once it shows them.
+            // Followed by its life (decision 9: never a time's verdict): one that ends before it shows them fails.
             let cmdline = format!("/proc/{}/cmdline", bystander.id());
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !std::fs::read(&cmdline)?.starts_with(b"sleep\0") {
-                assert!(
-                    Instant::now() < deadline,
-                    "the bystander never became sleep"
-                );
-                std::thread::yield_now();
-            }
+            hex_testkit::waits::follow::until(
+                &BYSTANDER,
+                "the bystander's arguments, sleep's",
+                || match bystander.try_wait() {
+                    Ok(None) => hex_testkit::waits::follow::Party::Live,
+                    Ok(Some(_)) | Err(_) => hex_testkit::waits::follow::Party::Ended,
+                },
+                || std::fs::read(&cmdline).is_ok_and(|args| args.starts_with(b"sleep\0")),
+            )
+            .unwrap_or_else(|unmet| panic!("the bystander never became sleep: {unmet}"));
             for fd in std::fs::read_dir(format!("/proc/{}/fd", bystander.id()))? {
                 let fd = fd?;
                 let stdio = ["0", "1", "2"].contains(&fd.file_name().to_string_lossy().as_ref());

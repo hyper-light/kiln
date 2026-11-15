@@ -102,11 +102,6 @@ const FDS_THE_SOCKET: u64 = 3;
 /// The supervisor's epoll set ([`crate::supervise::Supervisor::start`]), made once the node's bounds are fitted, as its
 /// budget is the inits'.
 const FDS_THE_SUPERVISOR: u64 = 1;
-/// A program place's streams at their most ([`crate::serve`]): for each of the [`hex_core::wire::MAX_FDS`] an exec
-/// carries, the one passed, or the pipe of two the node makes for one asked for (`hex_api::Stdio::make_asked`),
-/// until its program starts; then each asked for's given end, kept until its client takes it, or, for a program in a
-/// guest, each stream's connection to the guest and the passed pipe copied through it.
-const FDS_A_PLACE_STREAM: u64 = 2;
 /// A VM box's besides a box's (a Firecracker VM or a Shards guest, a row of the supervisor's inits): its cgroup's
 /// directory and `cgroup.events` (`crate::supervise`'s `ManagedVm`), its guest's control connections (a call's and the
 /// evented one, `hex_runtime::guest`'s `Booted`), and while it is made its readiness listener, the VMM's output pipe
@@ -150,6 +145,9 @@ pub struct Pools {
     /// Whether the node runs VM boxes (a Firecracker VM's or a Shards guest's), each holding descriptors of the node's
     /// past a box's ([`Pools::running_vms`]).
     pub vms: bool,
+    /// The node VMs under shards-init its guest runtime can hold at once, each with its lanes and controller among the
+    /// node's own descriptors ([`Pools::hosting`]; `crate::serve::fit::hosted_descriptors`).
+    pub hosted: usize,
 }
 
 impl Pools {
@@ -164,6 +162,7 @@ impl Pools {
             sizes,
             files_ahead,
             vms: false,
+            hosted: 0,
         }
     }
 
@@ -177,6 +176,7 @@ impl Pools {
             sizes,
             files_ahead,
             vms: false,
+            hosted: 0,
         }
     }
 
@@ -184,6 +184,12 @@ impl Pools {
     /// descriptors among its own (`crate::node::Runs`).
     pub fn running_vms(self, vms: bool) -> Self {
         Self { vms, ..self }
+    }
+
+    /// These pools for a node whose guest runtime can hold `hosted` node VMs under shards-init: its start counts each
+    /// one's lanes and controller among its own (`crate::node::Runs`).
+    pub fn hosting(self, hosted: usize) -> Self {
+        Self { hosted, ..self }
     }
 
     /// The descriptors the pools hold at their bounds, each pool's refill thread's beside, and the takes of every
@@ -238,11 +244,13 @@ fn kept_at_most(sizes: Sizes) -> u64 {
 /// serves no socket; each program place's streams, and the message read past the places, refused with its streams
 /// closed ([`crate::serve`] takes a program's place as it reads its call); the exec'd programs' pidfds the supervisor
 /// keeps to reap, at the same budget, which it holds for every caller; where the node runs VM boxes, each one's past a
-/// box's and their root's; the supervisor's epoll set; and `beside`, what the process held open as the bound was taken
+/// box's and their root's; where its guest runtime holds node VMs under shards-init, each one's lanes and controller
+/// at the program places (`crate::serve::fit::hosted_descriptors`); the supervisor's epoll set; and `beside`, what the
+/// process held open as the bound was taken
 /// (its standard streams, the node's store, keeper and roots, and the GPU handles of a prober made before it). Each
 /// bound among them is fitted to the hard limit as the node starts ([`hold_descriptors`]), so they hold no more than
 /// it (the lead, 2026-11-11, over 2026-11-06's connections taking what these left).
-fn descriptor_terms(pools: Pools, beside: u64) -> [(&'static str, u64); 17] {
+fn descriptor_terms(pools: Pools, beside: u64) -> [(&'static str, u64); 18] {
     let parked = if pools.devfs {
         FDS_A_PARKED.saturating_add(FDS_A_PARKED_PROC)
     } else {
@@ -252,7 +260,6 @@ fn descriptor_terms(pools: Pools, beside: u64) -> [(&'static str, u64); 17] {
         .saturating_add(u64::try_from(pools.files_ahead).unwrap_or(u64::MAX))
         .saturating_add(parked);
     let places = crate::serve::limits(&pools.sizes.platform()).programs;
-    let streams = u64::try_from(hex_core::wire::MAX_FDS).unwrap_or(u64::MAX);
     let (vm_boxes, vm_root) = if pools.vms {
         (of(pools.sizes.inits, FDS_A_VM), FDS_THE_VM_ROOT)
     } else {
@@ -291,11 +298,15 @@ fn descriptor_terms(pools: Pools, beside: u64) -> [(&'static str, u64); 17] {
         ),
         (
             "the program places' streams",
-            of(places, FDS_A_PLACE_STREAM.saturating_mul(streams)).saturating_add(streams),
+            crate::serve::fit::place_streams(places),
         ),
         ("the exec'd programs the supervisor keeps", of(places, 1)),
         ("VM boxes", vm_boxes),
         ("the VM boxes' root", vm_root),
+        (
+            "the hosted VMs' lanes",
+            crate::serve::fit::hosted_descriptors(pools.hosted, places),
+        ),
         ("the supervisor's epoll set", FDS_THE_SUPERVISOR),
         ("beside those", beside),
     ]
@@ -306,11 +317,7 @@ fn descriptor_terms(pools: Pools, beside: u64) -> [(&'static str, u64); 17] {
 /// ([`crate::serve::limits`]).
 fn connections(sizes: &Sizes) -> usize {
     let limits = crate::serve::limits(&sizes.platform());
-    let admitted = |budget: usize| budget.checked_div(crate::serve::KEPT).unwrap_or(budget);
-    limits
-        .connections
-        .min(admitted(limits.programs))
-        .min(admitted(limits.in_flight))
+    crate::serve::fit::connections(limits.connections, limits.programs, limits.in_flight)
 }
 
 /// All the descriptors this node may hold at once without the namespaces' files ([`descriptor_terms`]).
@@ -412,7 +419,8 @@ pub fn needed_on_this_host(state: &std::path::Path, runs: crate::Runs) -> Result
     } else {
         Pools::rootless(sizes, files_ahead)
     }
-    .running_vms(runs.vms);
+    .running_vms(runs.vms)
+    .hosting(runs.hosted);
     let _prober = crate::facts::shared_prober(state, crate::facts::Declared::default())?;
     let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
     Ok(FilesBound::needed(pools, open_descriptors(&limit)?))
@@ -530,6 +538,7 @@ fn shrunk(pools: Pools, num: u64, den: u64) -> Pools {
         sizes,
         files_ahead: pools.files_ahead,
         vms: pools.vms,
+        hosted: pools.hosted,
     }
 }
 

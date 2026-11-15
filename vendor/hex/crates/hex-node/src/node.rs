@@ -28,7 +28,7 @@ use hex_api::{
 use hex_core::bundle::{self, Bundle, Owner, Place};
 use hex_core::cgroup::Dev;
 use hex_core::netns;
-use hex_core::patience::Patience;
+use hex_core::patience::{Patience, Piece};
 use hex_core::record::{BoxRecord, Phase, ProcId, Slot};
 use hex_core::recovery::{self, Decision, Parts, Seen};
 use hex_core::reuse;
@@ -46,7 +46,7 @@ use crate::abandoned::Abandoned;
 use crate::cgroups::{self, Cgroups, Choice, Made};
 use crate::createpool::{CreatePool, Prune};
 use crate::devfs::Devfs;
-use crate::emptying::{EMPTYING, follow_kill};
+use crate::emptying::{EMPTYING, Emptying as _, Within, follow_rest, wait_killed, within_kill};
 use crate::ipcuts::IpcUtsPool;
 use crate::netns::{Netns, Pools};
 use crate::recorded::{RecoverySummary, why_text};
@@ -65,37 +65,72 @@ mod charges;
 /// keep a layered box's writable layer there, since overlayfs can't be an overlay's upper layer.
 const OVERLAYFS_SUPER_MAGIC: i128 = 0x794c_7630;
 
-/// Waits for `cg`, killed at `killed`, to empty, as [`follow_kill`] waits on the learned wait ([`EMPTYING`]), which
+/// Waits for `cg`, killed at `killed`, to empty, as [`wait_empty_with`] waits on the learned wait ([`EMPTYING`]), which
 /// it teaches when it empties: the time from its kill. Says whether it emptied, and how long it waited from the kill.
 pub(crate) fn wait_empty(cg: &BoxCgroup, killed: Instant) -> Result<(bool, Duration), Refusal> {
-    wait_empty_with(cg, killed, &EMPTYING)
+    wait_empty_with(
+        cg,
+        killed,
+        &EMPTYING,
+        &[
+            Piece::Kind("box cgroup "),
+            Piece::Path(cg.dir()),
+            Piece::Kind(", by its cgroup.events"),
+        ],
+    )
 }
 
-/// [`wait_empty`] on any box that empties ([`crate::emptying::Emptying`]), its wait as `wait` has learned it. Past W*
-/// the census is told the run-out, once and with no sample, and the box is waited for by its life alone; its
-/// emptying, however late, is the sample W* rises to.
+/// [`wait_empty`]'s bounded half, for a thread other boxes share ([`within_kill`]): `cg`, killed at `killed`, waited for
+/// within W* alone.
+pub(crate) fn empties_within_bound(cg: &BoxCgroup, killed: Instant) -> Result<Within, Refusal> {
+    within_kill(
+        &EMPTYING,
+        killed,
+        &[
+            Piece::Kind("box cgroup "),
+            Piece::Path(cg.dir()),
+            Piece::Kind(", by its cgroup.events"),
+        ],
+        |slice| cg.empties_within(slice),
+    )
+}
+
+/// [`wait_empty`]'s following half, on a thread of the box's own ([`follow_rest`]): whether `cg` emptied.
+pub(crate) fn follow_to_empty(cg: &BoxCgroup, killed: Instant) -> Result<bool, Refusal> {
+    follow_rest(&EMPTYING, killed, |slice| cg.empties_within(slice))
+}
+
+/// [`wait_empty`] on any box that empties ([`crate::emptying::Emptying`]), its wait as `wait` has learned it, on the
+/// caller's own thread ([`wait_killed`]): within W*; past it, the census told the run-out as W* passes, once and with
+/// no sample, never only once the follow ends, which a box that never empties never reaches (the review's E-3), and the
+/// box waited for by its life alone; its emptying, however late, is the sample W* rises to.
 fn wait_empty_with(
     cg: &impl crate::emptying::Emptying,
     killed: Instant,
     wait: &Patience,
+    party: &[Piece<'_>],
 ) -> Result<(bool, Duration), Refusal> {
-    let followed = follow_kill(wait, killed, |slice| cg.empties_within(slice))?;
-    if let Some(window) = followed.past {
-        wait.ran_out(window);
-    }
-    if followed.came {
-        wait.answered(killed.elapsed());
-    }
-    Ok((followed.came, killed.elapsed()))
+    let came = wait_killed(wait, killed, party, |slice| cg.empties_within(slice))?;
+    Ok((came, killed.elapsed()))
 }
 
-/// Whether a program of a box killed at `killed` has ended, its pidfd `pidfd`: waited for as [`follow_kill`] waits on
-/// the learned wait for a box to empty ([`EMPTYING`]), by its life alone past it.
-fn ended_after_kill(killed: Instant, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<bool, Refusal> {
-    Ok(follow_kill(&EMPTYING, killed, |slice| {
-        supervise::pidfd_ends_within(pidfd, slice)
-    })?
-    .came)
+/// Whether a program of box `id`, killed at `killed`, has ended, its pidfd `pidfd`: waited for as [`wait_killed`] waits
+/// on the learned wait for a box to empty ([`EMPTYING`]), by its life alone past it.
+fn ended_after_kill(
+    id: &BoxId,
+    killed: Instant,
+    pidfd: std::os::fd::BorrowedFd<'_>,
+) -> Result<bool, Refusal> {
+    wait_killed(
+        &EMPTYING,
+        killed,
+        &[
+            Piece::Kind("a killed program of box "),
+            Piece::Name(id.as_str()),
+            Piece::Kind(", by its pidfd"),
+        ],
+        |slice| supervise::pidfd_ends_within(pidfd, slice),
+    )
 }
 
 /// How long [`Runtime::delete`] spends taking a box's directories apart before it refuses, leaving
@@ -153,10 +188,20 @@ pub const OCI_BOXES: &str = ".oci";
 pub struct Runs {
     /// VM boxes, a Firecracker VM's or a Shards guest's, whose backends [`Node::install_backends`] installs.
     pub vms: bool,
+    /// Node VMs under shards-init its guest runtime can hold at once, each with its lanes (`crate::serve::fit`).
+    pub hosted: usize,
 }
 
 /// A node agent over the `process` and `oci` classes.
 pub struct Node {
+    /// Its lessors over its wire, where its image VMs lease through them ([`Node::lease_over_wire`]).
+    wire_lessors: OnceLock<Arc<crate::serve::WireLessors>>,
+    /// Whether the machine's capacity view serves this node's machine, as its configuration says (`--capacity-view`; the
+    /// review's A-10): its keeper's word is then awaited before its charge learner learns ([`Node::with_capacity_view`]).
+    capacity_view: bool,
+    /// The machine's capacity view's latest word, what every holder has reserved through its keeper (the review's A-10),
+    /// kept for its charge learner: none until its keeper speaks ([`Runtime::reserved`]).
+    reserved: Mutex<Option<hex_api::Reserved>>,
     attachments: hex_runtime::devices::SharedCatalog,
     attachment_turns: Turns,
     backends: OnceLock<backends::Backends>,
@@ -253,6 +298,18 @@ enum Source {
 }
 
 impl Node {
+    /// Its image VMs' credentials leased over its wire (joint plan step 33; docs/design/credential-grants.md C7):
+    /// `lessors`, which its guest runtime's image class was built with, each box's route kept by its socket as the box is
+    /// created. Given once.
+    pub fn lease_over_wire(&self, lessors: Arc<crate::serve::WireLessors>) -> Result<(), Refusal> {
+        self.wire_lessors
+            .set(lessors)
+            .map_err(|_| Refusal::Invalid {
+                what: "lessors over the node's wire",
+                why: "the node was given them already".to_owned(),
+            })
+    }
+
     /// The program started, its stdio as given: an oci box whose init runs is known to the supervisor,
     /// with what its exec needs, so the hot path reads nothing from disk; any other box's record says what
     /// it is.
@@ -281,7 +338,10 @@ impl Node {
                 }
                 Some(
                     ClassSpec::Firecracker(_) | ClassSpec::Shards(_) | ClassSpec::ShardsImage(_),
-                ) => Err(backends::uncertain(id)),
+                ) => Err(backends::uncertain(
+                    id,
+                    "its VM class has no backend on this node to exec in it",
+                )),
             },
         }
     }
@@ -361,7 +421,8 @@ impl Node {
             Owner::Root => Pools::root(sizes, files_ahead),
             Owner::Rootless { .. } => Pools::rootless(sizes, files_ahead),
         }
-        .running_vms(runs.vms);
+        .running_vms(runs.vms)
+        .hosting(runs.hosted);
         // Once every descriptor the node holds for its life beside its bounds is open (its store, keeper, roots and
         // /dev/null), and before any thread or pool holds one: every bound that holds them fitted to the hard limit,
         // past which the node's own budgets refuse by type (crate::netns::hold_descriptors).
@@ -387,6 +448,9 @@ impl Node {
         // devfs makes none, so it parks none.
         let (attachments, attachment_turns) = attachments::catalog(&state_dir.join("devices"))?;
         let node = Self {
+            wire_lessors: OnceLock::new(),
+            capacity_view: false,
+            reserved: Mutex::new(None),
             attachments: hex_runtime::devices::SharedCatalog::try_new(attachments).map_err(
                 |_| Refusal::Exhausted {
                     what: "shared runtime device catalog owners",
@@ -531,6 +595,27 @@ impl Node {
         self.supervisor.hold_removals()
     }
 
+    /// Holds box `id`'s emptying until the returned guard goes (the review's E-3): its cgroup reads as not yet empty,
+    /// as a box whose last process sleeps uninterruptibly in the kernel past W* reads, so a test meets a removal past W*
+    /// beside the node's other work; the guard names the threads whose following waits are stopped at it. A test
+    /// control of debug builds alone, armed by the node's caller alone.
+    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
+    pub fn hold_emptying(&self, id: &BoxId) -> Result<crate::EmptyingHold, Refusal> {
+        crate::emptying::HOLD.hold(id.as_str())
+    }
+
+    /// Ends the node as its process's end would, in this process (T-T7.1.2: a test's crash): its store's hold of its
+    /// directory let go, as the kernel lets a dead process's lock go, so a node opened after over its state takes it;
+    /// its store, every clone its threads keep, writes nothing more; and none of its own code runs, nothing of it
+    /// dropped. A test control of debug builds alone, armed by the node's caller alone.
+    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
+    pub fn crash(self) {
+        self.store.end_as_a_crash();
+        let _ended = std::mem::ManuallyDrop::new(self);
+    }
+
     /// Arms a debug-only crash point on this node's create seeds (goal 5 plan step 2): the pruned init
     /// ends at the named point, as a kill would, so a test proves the agent cleans up a container whose
     /// init dies mid-build (CLAUDE.md §6). Must come before [`Node::with_oci_helper`], which builds the
@@ -557,6 +642,27 @@ impl Node {
     pub fn with_lsm(mut self, policy: hex_runtime::linux::oci::lsm::Policy) -> Self {
         self.lsm = policy;
         self
+    }
+
+    /// Whether the machine's capacity view serves this node's machine, as its configuration says (`--capacity-view`; the
+    /// review's A-10, CV10's configured form): where one does, its charge learner learns nothing until its keeper has
+    /// spoken since the node started, its VMs booked whole meanwhile, told; where none does, no holder reserves room there.
+    pub fn with_capacity_view(mut self, served: bool) -> Self {
+        self.capacity_view = served;
+        self
+    }
+
+    /// What its charge learner takes off its fleet's budget for the capacity view's holders now (the review's A-10), as
+    /// its configuration and its keeper's latest word say.
+    fn reservations(&self) -> Result<hex_api::LearnedReservations, Refusal> {
+        let word = *self
+            .reserved
+            .lock()
+            .map_err(|_| Refusal::Broken("the keeper's word's lock was poisoned".into()))?;
+        Ok(crate::recorded::charges::reservations(
+            self.capacity_view,
+            word,
+        ))
     }
 
     /// Names the `hex` binary the `oci` class re-execs for a container's init and `exec` helper, for
@@ -727,6 +833,13 @@ impl Node {
     /// The node's pools' bounds on its host, and where their learned sizes start (Ada's rule, 2026-11-06).
     pub fn sizes(&self) -> Sizes {
         self.pools.sizes
+    }
+
+    /// Each hosted VM's lanes (`crate::serve::fit::lanes`) at the program places its start fitted: what a node VM under
+    /// shards-init's run grants its controller (Shards' D251), counted among the node's descriptors
+    /// ([`Runs::hosted`]).
+    pub fn hosted_lanes(&self) -> usize {
+        crate::serve::fit::lanes(crate::serve::limits(&self.pools.sizes.platform()).programs)
     }
 
     /// The node's pools as its start fitted them to its descriptor limit (`netns::hold_descriptors`): what its own
@@ -965,17 +1078,30 @@ impl Node {
     }
 
     fn info(&self, record: &BoxRecord, adopted: bool) -> Result<BoxInfo, Refusal> {
+        self.info_by(record, adopted, |backend, id| backend.inspect(id))
+    }
+
+    /// [`Node::info`], a VM box's answer its backend's `answer`: its inspect, or its start followed to its end
+    /// (`Runtime::started`, the review's B-6), held to its record as an inspect is.
+    fn info_by(
+        &self,
+        record: &BoxRecord,
+        adopted: bool,
+        answer: impl FnOnce(&dyn Runtime, &BoxId) -> Result<BoxInfo, Refusal>,
+    ) -> Result<BoxInfo, Refusal> {
         let id = &record.spec.id;
-        if let Some(backend) = self
-            .backend(record.spec.backend_class()?)
-            .map_err(|_| backends::uncertain(id))?
-        {
-            let mut info = backend.inspect(id)?;
+        if let Some(backend) = self.backend(record.spec.backend_class()?).map_err(|_| {
+            backends::uncertain(id, "this node has no backend for its record's class")
+        })? {
+            let mut info = answer(backend, id)?;
             if info.class != record.spec.class.class()
                 || info.allocation != record.spec.allocation
                 || info.route != record.spec.route
             {
-                return Err(backends::uncertain(id));
+                return Err(backends::uncertain(
+                    id,
+                    "its backend's VM's class, allocation or route isn't its record's",
+                ));
             }
             info.adopted = adopted;
             crate::recorded::charges::with_last_resort(&mut info, record)?;
@@ -999,7 +1125,10 @@ impl Node {
                 }
             }
             ClassSpec::Firecracker(_) | ClassSpec::Shards(_) | ClassSpec::ShardsImage(_) => {
-                return Err(backends::uncertain(id));
+                return Err(backends::uncertain(
+                    id,
+                    "its VM class has no backend on this node to say its state",
+                ));
             }
         };
         let exit = match record.spec.class {
@@ -1007,7 +1136,10 @@ impl Node {
             // Read after the state, so an init that ended since is reaped here and reported.
             ClassSpec::Oci(_) | ClassSpec::Bundle(_) => self.init_exit(record, state)?,
             ClassSpec::Firecracker(_) | ClassSpec::Shards(_) | ClassSpec::ShardsImage(_) => {
-                return Err(backends::uncertain(id));
+                return Err(backends::uncertain(
+                    id,
+                    "its VM class has no backend on this node to say its end",
+                ));
             }
         };
         Ok(BoxInfo {
@@ -1032,6 +1164,8 @@ impl Node {
                 .saturating_add(self.abandoned.unrecorded(id)?),
             last_resort: None,
             ended: None,
+            control: None,
+            control_wake: None,
             credentials: Vec::new(),
         })
     }
@@ -1082,6 +1216,16 @@ impl Node {
         // has been dispatched through the same Store/turn authority.
         let mut summary = self.recover_backends(&records)?;
         summary.boot_unknown = self.store.boot_unread().map(str::to_owned);
+        let settled = self.store.settle_node_vms()?;
+        summary.node_vms = settled.rows;
+        summary.node_vm_ends = crate::store::NodeVmEnds::of(&settled.ends)?;
+        // Its learner, made with its backends above, carries what the rows kept (joint plan step 39, place 1).
+        if let Some(learner) = self.backends.get().and_then(|b| b.learner.as_ref()) {
+            learner
+                .lock()
+                .map_err(|_| Refusal::Broken("the charge learner's lock was poisoned".into()))?
+                .carry_ended(settled.ends)?;
+        }
         // What a crash at a record write left: a temp file never renamed into place.
         self.store.remove_strays()?;
         let mut seen: BTreeMap<BoxId, Seen> = BTreeMap::new();
@@ -1316,9 +1460,18 @@ impl Node {
         {
             init.kill()?;
             self.supervisor
-                .reap_programs(id, &mut |pidfd| ended_after_kill(killed, pidfd))?;
-            let ended = follow_kill(&EMPTYING, killed, |slice| init.ended_within(slice))?;
-            if !ended.came {
+                .reap_programs(id, &mut |pidfd| ended_after_kill(id, killed, pidfd))?;
+            let ended = wait_killed(
+                &EMPTYING,
+                killed,
+                &[
+                    Piece::Kind("the killed init of box "),
+                    Piece::Name(id.as_str()),
+                    Piece::Kind(", by its pidfd"),
+                ],
+                |slice| init.ended_within(slice),
+            )?;
+            if !ended {
                 return Err(Refusal::Os {
                     op: "emptying a box",
                     why: format!(
@@ -1345,7 +1498,7 @@ impl Node {
         // it, so an `oci` box's init — which the kernel holds in its pid-namespace teardown until the
         // programs in that namespace are reaped — can finish exiting and the box empty.
         self.supervisor
-            .reap_programs(id, &mut |pidfd| ended_after_kill(killed, pidfd))?;
+            .reap_programs(id, &mut |pidfd| ended_after_kill(id, killed, pidfd))?;
         let (emptied, patience) = wait_empty(cg, killed)?;
         if !emptied {
             let op = "emptying a box";
@@ -1536,6 +1689,8 @@ impl Node {
             abandoned: 0,
             last_resort: None,
             ended: None,
+            control: None,
+            control_wake: None,
             credentials: Vec::new(),
         })
     }
@@ -1807,6 +1962,12 @@ impl Runtime for Node {
         }
         // node_key is stable across this state directory's recovery, shared by both native classes.
         let mut capacity = self.native_capacity()?;
+        // Its boxes' CPU time together, everything under its box root since the root was made (the review's A-8), so
+        // a host reading this node's own CPU (a shared guest's) measures over intervals its boxes come and go in.
+        capacity.own.boxes_cpu_ns = std::fs::read_to_string(self.root.dir().join("cpu.stat"))
+            .ok()
+            .as_deref()
+            .and_then(hex_sim::facts::cgroup_usage_ns);
         if class == Class::Oci {
             capacity.devices = self.attachment_capacity()?;
         }
@@ -1854,7 +2015,9 @@ impl Runtime for Node {
         }
         if spec.route.is_some() {
             self.capacity(spec.class.class())?
-                .ok_or_else(|| backends::uncertain(&spec.id))?
+                .ok_or_else(|| {
+                    backends::uncertain(&spec.id, "this node has no capacity of its routed class")
+                })?
                 .validate_route(&spec)?;
         }
         if !spec.devices.is_empty() && !matches!(&spec.class, ClassSpec::Oci(_)) {
@@ -1883,7 +2046,10 @@ impl Runtime for Node {
             ClassSpec::Bundle(bundle) => Source::Given(bundle.clone()),
             ClassSpec::Oci(oci) => self.render(&spec, oci)?,
             ClassSpec::Firecracker(_) | ClassSpec::Shards(_) | ClassSpec::ShardsImage(_) => {
-                return Err(backends::uncertain(&spec.id));
+                return Err(backends::uncertain(
+                    &spec.id,
+                    "its VM class has no backend on this node to make it",
+                ));
             }
         };
         let id = spec.id.clone();
@@ -1947,7 +2113,10 @@ impl Runtime for Node {
                 }
                 Some(
                     ClassSpec::Firecracker(_) | ClassSpec::Shards(_) | ClassSpec::ShardsImage(_),
-                ) => Err(backends::uncertain(id)),
+                ) => Err(backends::uncertain(
+                    id,
+                    "its VM class has no backend on this node to start it",
+                )),
             },
             Err(e) => Err(e.into()),
         }
@@ -2053,6 +2222,16 @@ impl Runtime for Node {
         self.info(&record, false)
     }
 
+    /// A VM box's backend answers it, held to its record as its inspect is (the review's B-6): an image VM's start
+    /// followed to its end, never the trait's inspect at once. Any other box's start answers only once it runs, so it is
+    /// answered as its inspect is.
+    fn started(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        let record = self
+            .record(id)?
+            .ok_or_else(|| Refusal::NoSuchBox(id.clone()))?;
+        self.info_by(&record, false, |backend, id| backend.started(id))
+    }
+
     fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
         if let Some(backend) = self.backend_record(id)? {
             return backend.member(id, member);
@@ -2064,6 +2243,44 @@ impl Runtime for Node {
             what: "member",
             why: format!(
                 "box {id} isn't a Shards image box: only one has members its caller drives"
+            ),
+        })
+    }
+
+    /// A VM box's backend gives its member's next MCP connection (goal 2's item 3); any other box has none, refused as the
+    /// trait refuses it.
+    fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.mcp(id, member);
+        }
+        if self.cgroup(id).is_none() {
+            return Err(Refusal::NoSuchBox(id.clone()));
+        }
+        Err(Refusal::Invalid {
+            what: "mcp",
+            why: format!(
+                "box {id} isn't a Shards image box: only one has members with an MCP bridge"
+            ),
+        })
+    }
+
+    /// A VM box's backend signals its member (goal 2's item 2); any other box has none, refused as the trait refuses it.
+    fn signal_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        signal: Signal,
+    ) -> Result<(), Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.signal_member(id, member, signal);
+        }
+        if self.cgroup(id).is_none() {
+            return Err(Refusal::NoSuchBox(id.clone()));
+        }
+        Err(Refusal::Invalid {
+            what: "member",
+            why: format!(
+                "box {id} isn't a Shards image box: only one has members a signal reaches"
             ),
         })
     }
@@ -2161,6 +2378,8 @@ impl Runtime for Node {
                         abandoned: 0,
                         last_resort: None,
                         ended: None,
+                        control: None,
+                        control_wake: None,
                         credentials: Vec::new(),
                     }),
                     Err(why) => return Err(why),
@@ -2183,11 +2402,22 @@ impl Runtime for Node {
                     abandoned: 0,
                     last_resort: None,
                     ended: None,
+                    control: None,
+                    control_wake: None,
                     credentials: Vec::new(),
                 });
             }
         }
         Ok(out)
+    }
+
+    /// A VM box's backend deletes it and answers its VM's final use (the review's B-6), never the trait's plain delete
+    /// answering none, read as a run that never started; any other box runs no VM process of its own, so none.
+    fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<hex_api::HostUse>, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.delete_with_host_use(id);
+        }
+        self.delete(id).map(|()| None)
     }
 
     fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
@@ -2223,6 +2453,18 @@ impl Runtime for Node {
             }
             supervise::Taken::NoRun => self.delete_box(id),
         }
+    }
+
+    /// The machine's capacity view's word, kept for its charge learner (the review's A-10): the latest keeper's, an older
+    /// keeper's refused, typed. Its learner reads it at its next window, each `cpu.max` period.
+    fn reserved(&self, word: hex_api::Reserved) -> Result<(), Refusal> {
+        crate::recorded::charges::keep_word(
+            &mut *self
+                .reserved
+                .lock()
+                .map_err(|_| Refusal::Broken("the keeper's word's lock was poisoned".into()))?,
+            word,
+        )
     }
 }
 
@@ -2266,6 +2508,10 @@ impl Node {
 impl crate::serve::Host for Node {
     fn abandoned(&self, id: &BoxId) -> Result<(), Refusal> {
         Node::abandoned(self, id)
+    }
+
+    fn lessors(&self) -> Option<Arc<crate::serve::WireLessors>> {
+        self.wire_lessors.get().cloned()
     }
 
     /// Its VM backends' evented connections to their guests join the core's loop ([`Node::forward_vm`]).
@@ -2576,8 +2822,17 @@ fn ids_with(dir: &Path, prefix: &str, learned: &Patience) -> Result<BTreeSet<Box
             && !ran_out
             && began.elapsed() > per_entry.saturating_mul(listed)
         {
-            // Past W*: no sample (Karn's point), but the census is told, once, and the listing goes on.
-            learned.ran_out(per_entry);
+            // Past W*: no sample (Karn's point), but the run-out is told, once, and the listing goes on.
+            learned.ran_out(
+                per_entry,
+                began.elapsed(),
+                &[
+                    Piece::Kind("the listing of "),
+                    Piece::Path(dir),
+                    Piece::Kind(", at entry "),
+                    Piece::Number(u64::from(listed)),
+                ],
+            );
             ran_out = true;
         }
         let entry = entry.map_err(listing)?;
@@ -2839,10 +3094,93 @@ mod tests {
         let killed = Killed {
             looks: std::cell::Cell::new(0),
         };
-        let (emptied, _) = wait_empty_with(&killed, Instant::now(), &wait).unwrap();
+        let (emptied, _) = wait_empty_with(
+            &killed,
+            Instant::now(),
+            &wait,
+            &[Piece::Kind("the test's killed box")],
+        )
+        .unwrap();
         assert!(emptied, "refused at W*");
         assert_eq!(killed.looks.get(), 2);
         assert!(wait.slowest().is_some_and(|slowest| slowest > learned));
+    }
+
+    /// The review's E-3 (decision 9: a wait follows its party by its life, never on a thread other parties share): a
+    /// shared thread's wait for a killed box's emptying ends at W*, the box then its caller's to hand to a thread of its
+    /// own. Do: a wait whose W* is 1 ns, then one with no W*; a killed box slower to empty than any wait of a time.
+    /// Expect: with W*, one look bounded by a time, never one until the box empties, the run-out told, and the box to
+    /// follow; with none, no look at all, and the box to follow.
+    #[test]
+    fn e3_a_shared_threads_wait_for_an_emptying_ends_at_w_star() {
+        use crate::emptying::Emptying;
+        let wait = Patience::measuring("test.node.emptying.shared");
+        wait.answered(Duration::from_nanos(1));
+        let killed = Killed {
+            looks: std::cell::Cell::new(0),
+        };
+        let within = within_kill(
+            &wait,
+            Instant::now(),
+            &[Piece::Kind("the test's killed box")],
+            |slice| killed.empties_within(slice),
+        );
+        assert_eq!(within, Ok(Within::Follow));
+        assert_eq!(killed.looks.get(), 1, "looked until the box emptied");
+        assert_eq!(wait.deadline(), None, "the run-out untold");
+        let cold = Patience::measuring("test.node.emptying.shared_cold");
+        let within = within_kill(
+            &cold,
+            Instant::now(),
+            &[Piece::Kind("the test's killed box")],
+            |slice| killed.empties_within(slice),
+        );
+        assert_eq!(within, Ok(Within::Follow));
+        assert_eq!(killed.looks.get(), 1, "a wait with no W* looked");
+    }
+
+    /// A killed box slower to empty than W*, as [`Killed`] is, that looks at its follow (`Duration::MAX`) whether its
+    /// wait's run-out was told by then: its wait following, with no deadline.
+    struct Told<'a> {
+        wait: &'a Patience,
+        at_follow: std::cell::Cell<Option<bool>>,
+    }
+
+    impl crate::emptying::Emptying for Told<'_> {
+        fn empties_within(&self, timeout: Duration) -> Result<bool, Refusal> {
+            if timeout == Duration::MAX {
+                self.at_follow.set(Some(self.wait.deadline().is_none()));
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
+    /// The review's E-3 (decision 9: past W* the run-out is told once): a killed box's emptying past W* has its run-out
+    /// told as W* passes, before the box is followed, so a box that never empties, its follow never ending, is told
+    /// all the same. Do: a wait whose W* is 1 ns; a killed box slower to empty than that, which looks at its follow
+    /// whether the run-out was told. Expect: told by the follow; the box emptied.
+    #[test]
+    fn e3_an_emptying_past_w_star_tells_its_run_out_before_it_is_followed() {
+        let wait = Patience::measuring("test.node.emptying.told");
+        wait.answered(Duration::from_nanos(1));
+        let killed = Told {
+            wait: &wait,
+            at_follow: std::cell::Cell::new(None),
+        };
+        let (emptied, _) = wait_empty_with(
+            &killed,
+            Instant::now(),
+            &wait,
+            &[Piece::Kind("the test's killed box")],
+        )
+        .unwrap();
+        assert!(emptied, "refused at W*");
+        assert_eq!(
+            killed.at_follow.get(),
+            Some(true),
+            "the run-out told only once the follow ended, or never"
+        );
     }
 
     /// AC-T7.1.3, decision 8: deleting an OCI box after its init was reaped still waits for that init's cgroup to

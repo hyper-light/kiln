@@ -14,6 +14,11 @@ struct Native {
     stops: AtomicUsize,
     /// A stop ends what of the scope outlived its controller, as the helper's does, so the scope is Released.
     stop_releases: AtomicBool,
+    /// The scope ends only once its wait follows it with no bound, as a scope's own observer ends such a wait at its
+    /// end (decision 9's following wait): any bounded wait for it sees no end.
+    released_when_followed: AtomicBool,
+    /// Each patience a wait for the scope was asked with.
+    asked: Mutex<Vec<Duration>>,
     /// The controller a launch published, where the model has one.
     identity: std::sync::OnceLock<shards_api::Identity>,
 }
@@ -41,7 +46,14 @@ impl shards_api::ManagedProcess for Native {
             },
         }))
     }
-    fn wait_for(&self, _: Duration) -> Result<Option<shards_api::ManagedEnd>, shards_api::Refusal> {
+    fn wait_for(
+        &self,
+        patience: Duration,
+    ) -> Result<Option<shards_api::ManagedEnd>, shards_api::Refusal> {
+        self.asked.lock().unwrap().push(patience);
+        if patience == Duration::MAX && self.released_when_followed.load(Ordering::SeqCst) {
+            self.released.store(true, Ordering::SeqCst);
+        }
         Ok(self
             .terminal()?
             .filter(|end| end.scope == shards_api::TerminalScope::Released))
@@ -54,6 +66,8 @@ struct Owner {
     launches: AtomicUsize,
     /// Each launch's kernel command line.
     cmdlines: Mutex<Vec<String>>,
+    /// Each launch's deadline, as what is left of it: none for one that follows its guest.
+    patience: Mutex<Vec<Option<Duration>>>,
     preparations: AtomicUsize,
     removals: AtomicUsize,
     submission: Mutex<Submission>,
@@ -78,6 +92,7 @@ impl Owner {
             boxes: Mutex::new(Records::new()),
             launches: AtomicUsize::new(0),
             cmdlines: Mutex::new(Vec::new()),
+            patience: Mutex::new(Vec::new()),
             preparations: AtomicUsize::new(0),
             removals: AtomicUsize::new(0),
             submission: Mutex::new(Submission::Absent),
@@ -202,8 +217,9 @@ impl Transaction for Owner {
         &self,
         plan: &devices::ManagedLaunch<'_>,
         _: shards_api::LaunchIo,
-        _: Duration,
+        patience: Option<Duration>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
+        self.patience.lock().unwrap().push(patience);
         let devices::ManagedLaunch::Shards(prepared) = plan else {
             panic!("a shared backing launches Shards")
         };
@@ -309,6 +325,7 @@ impl Books for Owner {
             disk_bytes: 1 << 30,
         };
         Ok(Capacity {
+            own: Default::default(),
             id: "same-model-native-owner".into(),
             total: room,
             free: room,
@@ -319,6 +336,8 @@ impl Books for Owner {
             backings: Vec::new(),
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         })
     }
     fn with_transaction(
@@ -350,8 +369,10 @@ fn configured(path: &Path) -> (GuestRuntime, Arc<Owner>) {
 fn configured_for(path: &Path, owner: &Arc<Owner>) -> GuestRuntime {
     let mut config = super::super::tests::config();
     config.binary = path.join("shards");
-    config.kernel = path.join("kernel");
-    config.initrd = path.join("initrd");
+    config.boot = crate::guest::Boot::Kernel {
+        kernel: path.join("kernel"),
+        initrd: path.join("initrd"),
+    };
     config.shares.clear();
     let floor = selected::resources(&config).unwrap();
     let cost = hex_api::RuntimeCost {
@@ -491,28 +512,39 @@ fn retained_backing_refuses_a_replaced_initialized_cost_without_inner_boxes() {
     assert!(owner.boxes.lock().unwrap().is_empty());
 }
 
-/// AC-T7.4.1 (original): a managed Shards boot tells its guest the boot's deadline as a CPU boot does, so its relay's
-/// hello to its node takes it as its caller's. Do: initialize a shared backing, whose launch the owner reads, then
-/// refuses. Expect the launch's kernel command line to name the boot's deadline once (`hex.ready-ms=`): what is left
-/// of the create's budget, the first dial's bound, in milliseconds rounded up.
+/// The review's C-9 (1) (decision 9): a managed Shards boot tells its guest no boot deadline, as the node's own guest is
+/// told none, so its relay keeps its own learned bounds. Do: initialize a shared backing, whose launch the owner reads,
+/// then refuses. Expect the launch's kernel command line to name no boot deadline (`hex.ready-ms`).
 #[test]
-fn original_a_managed_shards_boot_tells_its_guest_the_boots_deadline() {
+fn c9_a_managed_shards_boot_tells_its_guest_no_boot_deadline() {
     let dir = socket_fixture();
     let (runtime, owner) = configured(dir.path());
-    let bound = runtime.first_dial_bound().unwrap();
     let offer = runtime.prepare_backing().unwrap();
     let initialized = runtime.initialize_backing(grant(&offer)).map(drop);
     let cmdlines = owner.cmdlines.lock().unwrap().clone();
     eprintln!(
-        "hex_guest_ready_word boot=managed bound={bound:?} initialized={initialized:?} cmdlines={cmdlines:?}"
+        "hex_guest_ready_word boot=managed initialized={initialized:?} cmdlines={cmdlines:?}"
     );
     assert_eq!(owner.launches.load(Ordering::SeqCst), 1);
     assert_eq!(cmdlines.len(), 1);
-    let given = super::super::tests::ready_ms(&cmdlines[0]);
     assert!(
-        !given.is_zero() && given <= bound + Duration::from_millis(1),
-        "{given:?} isn't what is left of the boot's bound {bound:?}"
+        !cmdlines[0].contains(super::super::tests::READY_MS),
+        "{cmdlines:?}"
     );
+}
+
+/// The review's C-9 (1) (decision 9; ROOT's (c1)): a managed create that isn't a GPU create follows its guest, its
+/// budget no deadline of the record's, each wait in it within its own W* and past it following its party. Do: initialize
+/// a shared backing, whose launch the owner reads, then refuses. Expect its native launch given no deadline.
+#[test]
+fn c9_a_shared_backings_launch_is_given_no_deadline() {
+    let dir = socket_fixture();
+    let (runtime, owner) = configured(dir.path());
+    let offer = runtime.prepare_backing().unwrap();
+    let initialized = runtime.initialize_backing(grant(&offer)).map(drop);
+    let patience = owner.patience.lock().unwrap().clone();
+    eprintln!("c9_shared_launch initialized={initialized:?} patience={patience:?}");
+    assert_eq!(patience, [None], "its launch was given a deadline");
 }
 
 #[test]
@@ -612,6 +644,7 @@ fn w14_a_census_backing_is_retired_at_start_and_its_box_says_why() {
         Err(Refusal::Backing {
             key: offer.key,
             cause: LifecycleCause::Retired,
+            why: None,
         })
     );
     let kept = Transaction::read(owner.as_ref(), &id).unwrap().unwrap();
@@ -626,6 +659,40 @@ fn w14_a_census_backing_is_retired_at_start_and_its_box_says_why() {
     assert_eq!(owner.removals.load(Ordering::SeqCst), 1);
     assert!(pool::read(&dir.path().join("@guest")).unwrap().is_none());
     restarted.delete(&id).unwrap();
+}
+
+/// A-6 (ROOT's audit, 2026-11-13: an oci box its node VM's last-resort end ended vanished from its node's list): an oci
+/// box its node retired with its node VM is listed from its record, as its inspect answers it, until its owner's
+/// delete. Do keep, in a guest runtime's books, an oci box retired for NodeVmEnded; list the runtime's boxes, inspect
+/// the box, then delete it and list again. Expect it listed, ended, its end unknown and its `ended` the cause's words,
+/// as its inspect says; then gone.
+#[test]
+fn a6_an_oci_box_retired_with_its_node_vm_is_listed_from_its_record() {
+    let dir = socket_fixture();
+    let (runtime, owner) = configured(dir.path());
+    let spec = super::super::tests::oci(
+        hex_api::Rootfs::Dir(dir.path().join("rootfs.tar")),
+        Vec::new(),
+    );
+    let id = spec.id.clone();
+    let mut record = BoxRecord::new(spec, hex_core::record::Phase::Ready, Vec::new());
+    record.retire_for(LifecycleCause::NodeVmEnded);
+    Transaction::put(owner.as_ref(), &record).unwrap();
+    let inspected = runtime.inspect(&id).unwrap();
+    assert_eq!(
+        inspected.ended,
+        Some(LifecycleCause::NodeVmEnded.to_string())
+    );
+    assert_eq!(inspected.exit, Some(hex_api::Exit::Unknown));
+    let listed: Vec<hex_api::BoxInfo> = runtime
+        .list()
+        .unwrap()
+        .into_iter()
+        .filter(|info| info.id == id)
+        .collect();
+    assert_eq!(listed, [inspected]);
+    runtime.delete(&id).unwrap();
+    assert!(runtime.list().unwrap().iter().all(|info| info.id != id));
 }
 
 /// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13: no legacy receipt runs on with a census number as its bound): a
@@ -967,6 +1034,7 @@ fn empty_native_oci_prefix_adds_guest_route_without_native_facts_query() {
         arch: route::host_platform().unwrap().arch,
     };
     let native = Capacity {
+        own: Default::default(),
         id: "native-cpu-only-prefix".into(),
         total: CapacityResources {
             cpu_milli: 8000,
@@ -1006,6 +1074,8 @@ fn empty_native_oci_prefix_adds_guest_route_without_native_facts_query() {
         ],
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     native.check().unwrap();
     assert_eq!(owner.capacity_calls.load(Ordering::SeqCst), 0);
@@ -1101,6 +1171,61 @@ fn shared_backing_rearms_only_after_original_scope_release_and_index_ack() {
     assert!(owner.boxes.lock().unwrap().is_empty());
 }
 
+/// Joint plan step 14 (ROOT, 2026-11-13, (C); decision 9): a managed scope's stop is a wait of its own, measuring,
+/// never a boot's record. Before its first stop, and past the slowest stop seen (the run-out told), it follows the
+/// scope by its own party to its end (Studio r201: a release's stop waited the guest's first boot's 5.26 s record and
+/// was refused Uncertain at it). Do grant a shared backing whose launch's scope ends only once a wait follows it with
+/// no bound; then release it. Expect it Released at once, its end recorded and its native scope
+/// finalized; its stop's wait followed with no bound; and the boot's bound never asked.
+#[test]
+fn w14_c_a_pools_stop_follows_its_scope_and_never_waits_a_boots_record() {
+    let dir = socket_fixture();
+    let (runtime, owner) = configured(dir.path());
+    let offer = runtime.prepare_backing().unwrap();
+    assert!(runtime.initialize_backing(grant(&offer)).is_err());
+    owner
+        .native
+        .released_when_followed
+        .store(true, Ordering::SeqCst);
+    let released = runtime.release_backing(offer.key);
+    let asked = owner.native.asked.lock().unwrap().clone();
+    let released = released.unwrap_or_else(|why| panic!("{why:?}; its waits asked {asked:?}"));
+    assert_eq!(released.phase, BackingPhase::Released);
+    assert_eq!(owner.row().exit, Some(hex_api::Exit::Code(7)));
+    assert_eq!(owner.finalized.load(Ordering::SeqCst), 1);
+    assert!(
+        asked.contains(&Duration::MAX),
+        "its stop never followed its scope: {asked:?}"
+    );
+}
+
+/// Joint plan step 14, (B) (ROOT, 2026-11-13: an Uncertain with no reason is a CLAUDE.md §3 gap): a backing's refusal
+/// says why, in its refusing site's own words. Do prepare the shared backing, then release another generation of its
+/// pool, one its guest holds no record of. Expect it refused Uncertain, its key the one asked, and its reason that its
+/// guest holds no record of it.
+#[test]
+fn w14_b_a_release_of_a_backing_its_guest_holds_no_record_of_says_why() {
+    let dir = socket_fixture();
+    let (runtime, _owner) = configured(dir.path());
+    let offer = runtime.prepare_backing().unwrap();
+    let other = BackingKey {
+        pool: offer.key.pool,
+        generation: [9; 16],
+    };
+    let refused = runtime.release_backing(other).unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            Refusal::Backing {
+                key,
+                cause: LifecycleCause::Uncertain,
+                why: Some(why),
+            } if *key == other && why == "its guest holds no record of it"
+        ),
+        "{refused:?}"
+    );
+}
+
 /// AC-T7.4.1: explicit Index ACK cannot erase a remaining shared workload or
 /// remove a later incarnation when the original key is replayed.
 #[test]
@@ -1146,7 +1271,7 @@ fn shared_index_ack_preserves_references_and_refuses_a_stale_generation() {
         )),
     );
     assert!(
-        matches!(runtime.release_backing(original.key), Err(Refusal::Backing { key, cause: LifecycleCause::Busy }) if key == original.key)
+        matches!(runtime.release_backing(original.key), Err(Refusal::Backing { key, cause: LifecycleCause::Busy, why: None }) if key == original.key)
     );
     assert_eq!(owner.removals.load(Ordering::SeqCst), 0);
     assert_eq!(owner.row().key, original.key);
@@ -1240,6 +1365,7 @@ fn w14_a_shared_guests_own_overhead_is_its_use_past_its_boxes_the_most_seen() {
     let gib = 1u64 << 30;
     let guest = |free: u64| {
         let mut capacity = hex_api::Capacity {
+            own: Default::default(),
             id: "guest".into(),
             total: CapacityResources {
                 cpu_milli: 2_000,
@@ -1258,25 +1384,338 @@ fn w14_a_shared_guests_own_overhead_is_its_use_past_its_boxes_the_most_seen() {
             backings: Vec::new(),
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         };
         capacity.free.mem_bytes = free;
         capacity
     };
+    let boxes = |memory: u64| super::Boxes { memory };
+    let first = super::guest_seen(super::Seen::default(), &guest(5 * gib), boxes(2 * gib));
+    assert_eq!(first.overhead.mem_bytes, Some(gib));
+    let second = super::guest_seen(first, &guest(6 * gib), boxes(3 * gib / 2));
+    assert_eq!(second.overhead.mem_bytes, Some(gib));
+    let third = super::guest_seen(second, &guest(5 * gib), boxes(4 * gib));
+    assert_eq!(third.overhead.mem_bytes, Some(gib));
+}
+
+/// Joint plan step 14 (C7; ROOT, 2026-11-13, pin 2; the review's A-8): a shared guest's own CPU is its machine's CPU
+/// time past its boxes': at its first answer over its uptime, its boot's work among it, which the first interval its
+/// counters resolve replaces; then the most of such intervals. For a guest of 2 CPUs an interval resolves once it spans
+/// 1000 x (5 + 3 x 2) ticks of 10 ms, 110 s. Its disk is its used bytes, its boxes' disk no usage reads. Do measure a
+/// guest of 100 GiB of disk with 40 GiB free, up 10 s with 4 s of CPU and its boxes 1 s; then 1 s on with 0.5 s more and
+/// its boxes 0.3 s more; then 110 s after the first with 55 s more and its boxes 33 s more; then 110 s on with 11 s more
+/// and its boxes none. Expect 300 milli-CPU from boot (3 s over 10 s), still so after 1 s, which no interval resolves;
+/// then 200 (110 s's, in the boot's place); then 200 still (100 is less); and 60 GiB of disk throughout.
+#[test]
+fn w14_a_shared_guests_own_cpu_is_its_resolved_intervals_past_its_boxes_and_its_disk_its_use() {
+    let gib = 1u64 << 30;
+    let second = 1_000_000_000u64;
+    let guest = |cpu_ns: u64, uptime_ns: u64, boxes_cpu_ns: u64| hex_api::Capacity {
+        id: "guest".into(),
+        total: CapacityResources {
+            cpu_milli: 2_000,
+            mem_bytes: 8 * gib,
+            disk_bytes: 100 * gib,
+        },
+        free: CapacityResources {
+            cpu_milli: 2_000,
+            mem_bytes: 8 * gib,
+            disk_bytes: 40 * gib,
+        },
+        devices: Vec::new(),
+        cost: None,
+        routes: Vec::new(),
+        device_routes: Vec::new(),
+        backings: Vec::new(),
+        unavailable: Vec::new(),
+        learned: None,
+        own: hex_api::MachineTime {
+            cpu_ns: Some(cpu_ns),
+            uptime_ns: Some(uptime_ns),
+            boxes_cpu_ns: Some(boxes_cpu_ns),
+        },
+        node_vms: Vec::new(),
+        unlearned: None,
+    };
+    let boxes = super::Boxes::default();
     let first = super::guest_seen(
-        hex_api::LearnedOverhead::default(),
-        &guest(5 * gib),
-        2 * gib,
+        super::Seen::default(),
+        &guest(4 * second, 10 * second, second),
+        boxes,
     );
     assert_eq!(
+        (first.overhead.cpu_milli, first.cpu_from_boot),
+        (Some(300), true)
+    );
+    assert_eq!(first.overhead.disk_bytes, Some(60 * gib));
+    let soon = super::guest_seen(
         first,
+        &guest(
+            4 * second + second / 2,
+            11 * second,
+            second + 3 * second / 10,
+        ),
+        boxes,
+    );
+    assert_eq!(
+        (soon.overhead.cpu_milli, soon.cpu_from_boot),
+        (Some(300), true)
+    );
+    let next = super::guest_seen(soon, &guest(59 * second, 120 * second, 34 * second), boxes);
+    assert_eq!(
+        (next.overhead.cpu_milli, next.cpu_from_boot),
+        (Some(200), false)
+    );
+    let last = super::guest_seen(next, &guest(70 * second, 230 * second, 34 * second), boxes);
+    assert_eq!(last.overhead.cpu_milli, Some(200));
+    assert_eq!(last.overhead.disk_bytes, Some(60 * gib));
+}
+
+/// The review's A-8 (AC-T7.4.1; ROOT, 2026-11-14: no silent hold): an interval spans its guest's boxes' coming and
+/// going, since their CPU time is the guest's own count of everything under its box root, which keeps an ended box's
+/// work (cgroup v2 flushes a removed cgroup's counts into its parent's). Do measure a 2-CPU guest up 10 s with 4 s of
+/// CPU, its boxes 1 s; then 110 s on with 60 s more, its boxes 38 s more, a box having started and another ended
+/// meanwhile (the boxes on its backing read 1 GiB, then 3 GiB). Expect the interval's 200 milli-CPU in place of the boot
+/// reading's 300, the boxes' change no break in it.
+#[test]
+fn a8_an_interval_spans_its_guests_boxes_coming_and_going() {
+    let gib = 1u64 << 30;
+    let second = 1_000_000_000u64;
+    let guest = |cpu_ns: u64, uptime_ns: u64, boxes_cpu_ns: u64| hex_api::Capacity {
+        id: "guest".into(),
+        total: CapacityResources {
+            cpu_milli: 2_000,
+            mem_bytes: 8 * gib,
+            disk_bytes: 100 * gib,
+        },
+        free: CapacityResources {
+            cpu_milli: 2_000,
+            mem_bytes: 4 * gib,
+            disk_bytes: 40 * gib,
+        },
+        devices: Vec::new(),
+        cost: None,
+        routes: Vec::new(),
+        device_routes: Vec::new(),
+        backings: Vec::new(),
+        unavailable: Vec::new(),
+        learned: None,
+        own: hex_api::MachineTime {
+            cpu_ns: Some(cpu_ns),
+            uptime_ns: Some(uptime_ns),
+            boxes_cpu_ns: Some(boxes_cpu_ns),
+        },
+        node_vms: Vec::new(),
+        unlearned: None,
+    };
+    let first = super::guest_seen(
+        super::Seen::default(),
+        &guest(4 * second, 10 * second, second),
+        super::Boxes { memory: gib },
+    );
+    assert_eq!(
+        (first.overhead.cpu_milli, first.cpu_from_boot),
+        (Some(300), true)
+    );
+    let next = super::guest_seen(
+        first,
+        &guest(64 * second, 120 * second, 39 * second),
+        super::Boxes { memory: 3 * gib },
+    );
+    assert_eq!(
+        (next.overhead.cpu_milli, next.cpu_from_boot),
+        (Some(200), false)
+    );
+}
+
+/// The review's A-8 (AC-T7.4.1): a shared guest's counters move in 10 ms ticks (`/proc/stat` in USER_HZ, `/proc/uptime`
+/// in hundredths), so an interval of a few ticks says nothing of its share, and the most of such intervals only climbs
+/// on their noise. Do measure a 2-CPU guest up 10 s with 4 s of CPU and its boxes 1 s; then an answer 20 ms on in which
+/// its CPU time moved one tick, its boxes' none. Expect 300 milli-CPU read since its boot, and still that, from its
+/// boot, after the 20 ms interval (which read 500 milli-CPU, and kept it).
+#[test]
+fn a8_an_interval_its_counters_cant_resolve_reads_nothing() {
+    let gib = 1u64 << 30;
+    let second = 1_000_000_000u64;
+    let tick = 10_000_000u64;
+    let guest = |cpu_ns: u64, uptime_ns: u64| hex_api::Capacity {
+        id: "guest".into(),
+        total: CapacityResources {
+            cpu_milli: 2_000,
+            mem_bytes: 8 * gib,
+            disk_bytes: 100 * gib,
+        },
+        free: CapacityResources {
+            cpu_milli: 2_000,
+            mem_bytes: 8 * gib,
+            disk_bytes: 40 * gib,
+        },
+        devices: Vec::new(),
+        cost: None,
+        routes: Vec::new(),
+        device_routes: Vec::new(),
+        backings: Vec::new(),
+        unavailable: Vec::new(),
+        learned: None,
+        own: hex_api::MachineTime {
+            cpu_ns: Some(cpu_ns),
+            uptime_ns: Some(uptime_ns),
+            boxes_cpu_ns: Some(second),
+        },
+        node_vms: Vec::new(),
+        unlearned: None,
+    };
+    let boxes = super::Boxes::default();
+    let first = super::guest_seen(
+        super::Seen::default(),
+        &guest(4 * second, 10 * second),
+        boxes,
+    );
+    assert_eq!(
+        (first.overhead.cpu_milli, first.cpu_from_boot),
+        (Some(300), true)
+    );
+    let next = super::guest_seen(
+        first,
+        &guest(4 * second + tick, 10 * second + 2 * tick),
+        boxes,
+    );
+    assert_eq!(
+        (next.overhead.cpu_milli, next.cpu_from_boot),
+        (Some(300), true),
+        "an interval of two ticks read as a share"
+    );
+}
+
+/// Joint plan step 14 (C7; ROOT, 2026-11-13, pin 2): two answers that measured a shared guest at once keep pin 2 as one
+/// does: the guest's CPU read since its boot gives way to the first interval, whichever answer stored first, and the
+/// intervals keep their most. Do merge an answer's first interval, 200 milli-CPU, with a kept boot reading of 300, each
+/// way round; an interval of 150 with a kept interval of 250; and a boot reading of 300 with a guest still cold. Expect
+/// 200 each way, no longer read from boot; 250; and 300, still from boot, which the next interval replaces.
+#[test]
+fn w14_answers_that_measured_a_shared_guest_at_once_keep_its_boot_reading_until_an_interval() {
+    let cpu = |milli: Option<u64>, from_boot: bool| super::Seen {
+        overhead: hex_api::LearnedOverhead {
+            cpu_milli: milli,
+            mem_bytes: Some(1 << 30),
+            disk_bytes: Some(0),
+        },
+        start: None,
+        cpu_from_boot: from_boot,
+    };
+    let boot = cpu(Some(300), true);
+    let interval = cpu(Some(200), false);
+    for (measured, other) in [(interval, boot), (boot, interval)] {
+        let kept = super::merged(measured, other);
+        assert_eq!(
+            (kept.overhead.cpu_milli, kept.cpu_from_boot),
+            (Some(200), false),
+            "{measured:?} after {other:?}"
+        );
+    }
+    let kept = super::merged(cpu(Some(150), false), cpu(Some(250), false));
+    assert_eq!(
+        (kept.overhead.cpu_milli, kept.cpu_from_boot),
+        (Some(250), false)
+    );
+    let kept = super::merged(boot, cpu(None, false));
+    assert_eq!(
+        (kept.overhead.cpu_milli, kept.cpu_from_boot),
+        (Some(300), true)
+    );
+    let next = super::merged(cpu(Some(100), false), kept);
+    assert_eq!(
+        (next.overhead.cpu_milli, next.cpu_from_boot),
+        (Some(100), false)
+    );
+}
+
+/// Joint plan step 14 (C7; AC-T7.4.1; ROOT, 2026-11-13, pin 1): a shared backing goes Live only measured: its runtime
+/// takes its guest's first measurement from its agent's capacity answer before its record says Live, and leaves it
+/// Granted, saying why, without one. Do grant a backing whose launch published its controller and whose guest runs (a
+/// node that restarted with it up takes it back), its agent answering no capacity; then again, its agent answering 8
+/// GiB with 7 free and 100 GiB of disk with 40 free, up 10 s with 4 s of CPU, no box on it. Expect the first refused,
+/// the backing Granted; the second Live, its offer's guest measured: 1 GiB, 60 GiB of disk, and 400 milli-CPU read
+/// since its boot.
+#[test]
+fn w14_a_shared_backing_goes_live_only_measured() {
+    let dir = socket_fixture();
+    let (runtime, owner) = configured(dir.path());
+    let offer = runtime.prepare_backing().unwrap();
+    // The model's launch refuses after its intent; the row and receipt then say what a launch that published its
+    // controller leaves, the backing still Granted.
+    assert!(runtime.initialize_backing(grant(&offer)).is_err());
+    let identity = shards_api::Identity {
+        pid: 41,
+        started: 43,
+        vsock: runtime.pool_socket(offer.key).unwrap(),
+    };
+    let mut row = owner.row();
+    row.init = Some(controller(&identity));
+    Transaction::put_pool(owner.as_ref(), &row).unwrap();
+    let path = dir.path().join("@guest");
+    let mut receipt = pool::read(&path).unwrap().unwrap();
+    receipt.phase = Phase::Running(copy_identity(&identity).unwrap());
+    pool::write(&path, &receipt).unwrap();
+    let binding = super::Binding {
+        key: offer.key,
+        commitment: owner.row().native_commitment().unwrap(),
+    };
+    *runtime.booted.lock().unwrap() = Some(super::super::tests::running_guest(None, Some(binding)));
+    let refused = runtime.initialize_backing(grant(&offer));
+    assert!(
+        matches!(
+            &refused,
+            Err(Refusal::Backing {
+                cause: LifecycleCause::Uncertain,
+                why: Some(why),
+                ..
+            }) if why.contains("measured")
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(owner.row().phase, BackingPhase::Granted);
+    let gib = 1u64 << 30;
+    let answer = Capacity {
+        id: "guest".into(),
+        total: CapacityResources {
+            cpu_milli: 2_000,
+            mem_bytes: 8 * gib,
+            disk_bytes: 100 * gib,
+        },
+        free: CapacityResources {
+            cpu_milli: 2_000,
+            mem_bytes: 7 * gib,
+            disk_bytes: 40 * gib,
+        },
+        devices: Vec::new(),
+        cost: None,
+        routes: Vec::new(),
+        device_routes: Vec::new(),
+        backings: Vec::new(),
+        unavailable: Vec::new(),
+        learned: None,
+        own: hex_api::MachineTime {
+            cpu_ns: Some(4_000_000_000),
+            uptime_ns: Some(10_000_000_000),
+            boxes_cpu_ns: Some(0),
+        },
+        node_vms: Vec::new(),
+        unlearned: None,
+    };
+    *runtime.booted.lock().unwrap() = Some(super::super::tests::running_guest(
+        Some(answer),
+        Some(binding),
+    ));
+    let live = runtime.initialize_backing(grant(&offer)).unwrap();
+    assert_eq!(live.phase, BackingPhase::Live);
+    assert_eq!(
+        live.guest,
         hex_api::LearnedOverhead {
-            cpu_milli: None,
+            cpu_milli: Some(400),
             mem_bytes: Some(gib),
-            disk_bytes: None,
+            disk_bytes: Some(60 * gib),
         }
     );
-    let second = super::guest_seen(first, &guest(6 * gib), 3 * gib / 2);
-    assert_eq!(second.mem_bytes, Some(gib));
-    let third = super::guest_seen(second, &guest(5 * gib), 4 * gib);
-    assert_eq!(third.mem_bytes, Some(gib));
 }

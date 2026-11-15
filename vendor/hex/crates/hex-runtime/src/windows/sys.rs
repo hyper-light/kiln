@@ -3,8 +3,10 @@
 //! `PROC_THREAD_ATTRIBUTE_JOB_LIST`/`_HANDLE_LIST` process-creation support is unstable. Each `unsafe`
 //! block states the invariant that makes it sound. A box is a job object: this file creates one, sets
 //! its limits, starts a member suspended inside it (`PROC_THREAD_ATTRIBUTE_JOB_LIST`, so nothing runs
-//! outside it) and resumes it, reads the job's accounting, and ends the job. Names, structures and
-//! flags are Windows' own (`windows-sys`; docs/research/runtime/windows-job-objects.md).
+//! outside it) and resumes it, reads the job's accounting, and ends the job. It also counts the handles
+//! the process holds (`GetProcessHandleCount`): what a node holds at its start beside its bounds as it
+//! fits them (`hex_node::serve::fit`). Names, structures and flags are Windows' own (`windows-sys`;
+//! docs/research/runtime/windows-job-objects.md).
 
 // The Windows class's one place `unsafe` is allowed (CLAUDE.md §12); every block below carries its
 // SAFETY comment.
@@ -42,11 +44,11 @@ use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW,
     CreateProcessW, CreateWaitableTimerExW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetActiveProcessorCount, GetCurrentProcess, GetCurrentThread,
-    GetExitCodeProcess, GetProcessTimes, GetSystemTimes, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_DUP_HANDLE, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResetEvent, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, SetPriorityClass,
+    GetExitCodeProcess, GetProcessHandleCount, GetProcessTimes, GetSystemTimes,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_DUP_HANDLE,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResetEvent,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, SetPriorityClass,
     SetThreadPriority, SetWaitableTimer, THREAD_PRIORITY_TIME_CRITICAL, TIMER_ALL_ACCESS,
     TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
@@ -95,6 +97,20 @@ pub fn thread_stack_bytes() -> io::Result<usize> {
     high.checked_sub(low)
         .filter(|bytes| *bytes > 0)
         .ok_or_else(|| io::Error::other("Windows reported no thread stack extent"))
+}
+
+/// How many handles this process holds now: `GetProcessHandleCount` of its own pseudo-handle
+/// (learn.microsoft.com, "GetProcessHandleCount function"), what a node held at its start beside its
+/// bounds as it fits them (`hex_node::serve::fit`), as Linux's node reads `/proc/self/fd`.
+pub fn open_handles() -> io::Result<u64> {
+    let mut count: u32 = 0;
+    // SAFETY: GetCurrentProcess returns this process's pseudo-handle, which needs no closing;
+    // GetProcessHandleCount writes one u32 to `count`, a local that outlives the call.
+    let held = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+    if held == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(count))
 }
 
 /// The enclosing job's declared process ceiling, if it sets one. Kernel allocation failures remain
@@ -321,16 +337,20 @@ fn pair_timeout(left: std::time::Duration) -> io::Result<i32> {
 /// stream entirely from the native wait. No data is consumed, physical socket
 /// mode/timeout changed, handle duplicated or asynchronous I/O left pending. HUP/ERR is read-ready
 /// so the same caller observes its actual EOF/error; neither is a whole-scope termination fact.
+/// `patience` None waits with no deadline, as its caller's budget follows its guest (the review's C-9, (c2)): until an
+/// endpoint is ready, the native wait's finite width at a time; one past what an instant holds is refused.
 pub fn readable_pair(
     sockets: [Option<BorrowedSocket<'_>>; 2],
-    patience: std::time::Duration,
+    patience: Option<std::time::Duration>,
 ) -> io::Result<[bool; 2]> {
-    if patience == std::time::Duration::MAX {
-        return Err(io::ErrorKind::InvalidInput.into());
-    }
-    let deadline = std::time::Instant::now()
-        .checked_add(patience)
-        .ok_or(io::ErrorKind::InvalidInput)?;
+    let deadline = match patience {
+        None => None,
+        Some(patience) => Some(
+            std::time::Instant::now()
+                .checked_add(patience)
+                .ok_or(io::ErrorKind::InvalidInput)?,
+        ),
+    };
     let mut descriptors = [WSAPOLLFD {
         fd: INVALID_SOCKET,
         events: POLLRDNORM,
@@ -362,7 +382,9 @@ pub fn readable_pair(
     let native_count = u32::try_from(count).map_err(|_| io::ErrorKind::InvalidInput)?;
     let mut initial = true;
     loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let left = deadline.map_or(std::time::Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(std::time::Instant::now())
+        });
         if !initial && left.is_zero() {
             return Ok([false; 2]);
         }
@@ -525,10 +547,21 @@ impl Job {
         self.0.raw()
     }
 
-    /// Sets the job's limits: a hard commit cap, an active-process cap, kill-on-close (so closing the
-    /// last handle ends the tree), and the CPU weight or hard cap. Breakaway is never allowed (neither
-    /// `BREAKAWAY_OK` nor `SILENT_BREAKAWAY_OK` is set), so no member can leave the job.
+    /// Sets the job's limits: its bounds ([`Job::set_bounds`]) and the CPU weight or hard cap.
     pub fn configure(&self, limits: &Limits) -> io::Result<()> {
+        self.set_bounds(limits)?;
+        if let Some(cpu) = limits.cpu {
+            self.set_cpu(cpu)?;
+        }
+        Ok(())
+    }
+
+    /// Sets the job's bounds alone, its CPU control left as it is: a hard commit cap, an active-process cap and
+    /// kill-on-close (so closing the last handle ends the tree). Its limit flags replace the job's, so a bound
+    /// `limits` doesn't name is lifted. Breakaway is never allowed (neither `BREAKAWAY_OK` nor
+    /// `SILENT_BREAKAWAY_OK` is set), so no member can leave the job. A node adopting a VM's job writes them
+    /// (joint plan step 14, ruling B), where the learner holds its CPU rate.
+    pub fn set_bounds(&self, limits: &Limits) -> io::Result<()> {
         let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed_struct();
         let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if let Some(bytes) = limits.memory {
@@ -540,11 +573,7 @@ impl Job {
             ext.BasicLimitInformation.ActiveProcessLimit = n;
         }
         ext.BasicLimitInformation.LimitFlags = flags;
-        self.set(JobObjectExtendedLimitInformation, &ext)?;
-        if let Some(cpu) = limits.cpu {
-            self.set_cpu(cpu)?;
-        }
-        Ok(())
+        self.set(JobObjectExtendedLimitInformation, &ext)
     }
 
     /// Sets the job's CPU weight or hard cap, as [`Job::configure`] does; also the charge learner's, which caps a
@@ -564,6 +593,16 @@ impl Job {
             }
         }
         self.set(JobObjectCpuRateControlInformation, &rate)
+    }
+
+    /// The job's commit limit, where it holds one (`JOB_OBJECT_LIMIT_JOB_MEMORY` set): its tests read back what
+    /// a configure or an adoption wrote.
+    #[cfg(test)]
+    pub fn memory_limit(&self) -> io::Result<Option<u64>> {
+        let ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+            self.query(JobObjectExtendedLimitInformation)?;
+        let held = (ext.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_JOB_MEMORY) != 0;
+        Ok(held.then(|| u64::try_from(ext.JobMemoryLimit).unwrap_or(u64::MAX)))
     }
 
     fn set<T>(&self, class: i32, value: &T) -> io::Result<()> {
@@ -622,19 +661,26 @@ impl Job {
     /// (`ERROR_MORE_DATA`; jobobject_basic_process_id_list.md: "The number of process identifiers to be
     /// stored in ProcessIdList"), so one read with room for one id learns the job's whole count at any
     /// size (CLAUDE.md §2: bounded by the job's own count, not a picked one). An ended member leaves the
-    /// list though the node still holds its process handle, and this count agrees with the ids listed
-    /// (`an_ended_member_whose_handle_is_held_leaves_the_id_list`, run on jupiter), so a box whose member
-    /// has exited reads as empty. The job's accounting `ActiveProcesses` is not used.
+    /// list though the node still holds its process handle, before it leaves the count (HEX-WIN-1's lag), so a
+    /// read listing none counts none ([`live`]) and a box whose members have exited reads as empty. The job's
+    /// accounting `ActiveProcesses` is not used.
     pub fn live_processes(&self) -> io::Result<u64> {
-        self.process_list()
-            .map(|list| u64::from(list.NumberOfAssignedProcesses))
+        self.process_list().map(|list| {
+            live(
+                list.NumberOfAssignedProcesses,
+                list.NumberOfProcessIdsInList,
+            )
+        })
     }
 
     /// An event to wait on for this same nested scope, or positive emptiness. A recycled snapshot
     /// PID is checked against the held job before its observation handle can be used.
     pub(crate) fn member(&self) -> io::Result<Member> {
         let list = self.process_list()?;
-        if list.NumberOfAssignedProcesses == 0 {
+        if empty(
+            list.NumberOfAssignedProcesses,
+            list.NumberOfProcessIdsInList,
+        ) {
             return Ok(Member::Empty);
         }
         let pid = list
@@ -642,7 +688,7 @@ impl Job {
             .first()
             .copied()
             .and_then(|pid| u32::try_from(pid).ok())
-            .filter(|pid| *pid != 0 && list.NumberOfProcessIdsInList != 0)
+            .filter(|pid| *pid != 0)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
         let process =
             process_with_rights(pid, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)?;
@@ -693,6 +739,20 @@ impl Job {
 pub(crate) enum Member {
     Empty,
     Process(Handle),
+}
+
+/// A job's live members as one id-list read gives them, `assigned` its `NumberOfAssignedProcesses` and `listed` its
+/// `NumberOfProcessIdsInList` ([`Job::live_processes`]): none where it lists none, though its assigned count may still
+/// hold members that have ended (Windows drops an ended member from the list before its count: HEX-WIN-1's lag, 2
+/// assigned and 1 listed in one read); else its assigned count, every listed member live and the rest unlisted only
+/// past the read's room of one id.
+fn live(assigned: u32, listed: u32) -> u64 {
+    if listed == 0 { 0 } else { u64::from(assigned) }
+}
+
+/// Whether one id-list read says the job holds no live member ([`Job::member`]): none assigned, or none listed.
+fn empty(assigned: u32, listed: u32) -> bool {
+    assigned == 0 || listed == 0
 }
 
 /// A job's resource accounting, read whole.
@@ -1167,6 +1227,35 @@ pub fn wait(process: &Handle, timeout_ms: u32) -> io::Result<bool> {
     }
 }
 
+/// The host's boot sequence: `KUSER_SHARED_DATA`'s `BootId`, "Boot sequence, incremented for each boot attempt by the
+/// OS loader" (ntddk.h; learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data), so no two
+/// boots of a host share one. Read where the kernel maps that structure read-only into every process, ntddk.h's
+/// `MM_SHARED_USER_DATA_VA` (0x7FFE0000): `BootId` is at 0x2C4 in the header's layout, after `ProcessorFeatures`' 64
+/// bytes from 0x274 and the four 32-bit members `Reserved1`, `Reserved3`, `TimeSlip` and `AlternativeArchitecture`.
+/// No call is made and no handle opened, so no program another thread starts can inherit one.
+pub fn boot_id() -> u32 {
+    /// `MM_SHARED_USER_DATA_VA` and `BootId`'s offset in `KUSER_SHARED_DATA`, 0x7FFE0000 + 0x2C4.
+    const BOOT_ID: usize = 0x7FFE_02C4;
+    // SAFETY: the kernel maps KUSER_SHARED_DATA read-only at MM_SHARED_USER_DATA_VA into every user-mode process, on
+    // every architecture Windows runs, for the process's whole life and before any of its code runs. BootId is a
+    // ULONG at a 4-aligned offset inside that page, initialized at boot; this process never writes it.
+    unsafe { std::ptr::with_exposed_provenance::<u32>(BOOT_ID).read_volatile() }
+}
+
+/// Flushes directory `dir` (FlushFileBuffers on its handle), so a rename or removal in it outlives a host crash.
+/// CreateFileW opens a directory only with `FILE_FLAG_BACKUP_SEMANTICS`, and FlushFileBuffers needs a handle with
+/// `GENERIC_WRITE` (both in their Win32 reference pages), so it is opened for writing: std's `File::open` opens it
+/// for reading alone, refused "Access is denied" (os error 5). No `unsafe`: std's open takes the flag.
+pub fn flush_directory(dir: &std::path::Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?
+        .sync_all()
+}
+
 /// Publish a flushed temp file beside its final name. MoveFileExW documents write-through move
 /// completion; this is not by itself a hardware power-loss proof (managed-native.md).
 pub fn replace_durable(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
@@ -1230,6 +1319,185 @@ pub fn exit_code(process: &Handle) -> io::Result<u32> {
     Ok(code)
 }
 
+// The guest-cost producer's reads (crates/hex-cli/examples/guest_cost, AC-T7.4.1), beside what a node reads of a
+// managed VM (its job's accounting, `JobBox::usage`, and its vCPUs' guest time from Shards' answer): where a VM
+// process's guest RAM lies and what it has committed, so its VMM's own memory is told from its guest's; the memory and
+// disk quanta; and what its folders hold.
+
+/// `ERROR_INVALID_PARAMETER`: what Windows answers for a process id no process has now, or an address past a process's
+/// highest.
+const INVALID_PARAMETER: i32 = 87;
+
+/// Process `pid` opened for the guest-cost producer's reads of its address space's regions
+/// (`PROCESS_QUERY_INFORMATION`, what `VirtualQueryEx` asks); `None` where no process has the pid.
+pub fn open_for_reading(pid: u32) -> io::Result<Option<Handle>> {
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION;
+    match process_with_rights(pid, PROCESS_QUERY_INFORMATION) {
+        Ok(process) => Ok(Some(process)),
+        Err(error) if error.raw_os_error() == Some(INVALID_PARAMETER) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// One region of a process's address space, as `VirtualQueryEx` reads it: where it starts, how long it is, and whether
+/// it is committed private read/write memory (`MEM_COMMIT`, `MEM_PRIVATE`, `PAGE_READWRITE`), as Shards' WHP guest RAM
+/// is (its `reserve_ram`: a placeholder replaced at once by committed read/write memory, its whole commit charged from
+/// the start, which its job's accounting counts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub base: u64,
+    pub size: u64,
+    pub private_rw: bool,
+}
+
+/// The region of `process`'s address space holding address `at`; `None` past its last.
+pub fn region(process: &Handle, at: u64) -> io::Result<Option<Region>> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQueryEx,
+    };
+    let address = usize::try_from(at).map_err(|_| io::Error::other("an address past usize"))?;
+    let mut info: MEMORY_BASIC_INFORMATION = zeroed_struct();
+    // SAFETY: a process handle with query rights; `address` names a place in its space, an integer the call reads and
+    // never dereferences here; `info` of the size given, written by the call.
+    let wrote = unsafe {
+        VirtualQueryEx(
+            process.raw(),
+            std::ptr::without_provenance(address),
+            &raw mut info,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if wrote == 0 {
+        let error = last_error();
+        // An address past the process's highest.
+        return if error.raw_os_error() == Some(INVALID_PARAMETER) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(Some(Region {
+        base: u64::try_from(info.BaseAddress.addr())
+            .map_err(|_| io::Error::other("an address past u64"))?,
+        size: u64::try_from(info.RegionSize).map_err(|_| io::Error::other("a region past u64"))?,
+        private_rw: info.State == MEM_COMMIT
+            && info.Type == MEM_PRIVATE
+            && info.Protect == PAGE_READWRITE,
+    }))
+}
+
+/// This machine's page size (`GetSystemInfo`'s `dwPageSize`).
+pub fn page_size() -> u32 {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    let mut info: SYSTEM_INFO = zeroed_struct();
+    // SAFETY: GetSystemInfo writes one SYSTEM_INFO this frame owns, and can't fail.
+    unsafe { GetSystemInfo(&raw mut info) };
+    info.dwPageSize
+}
+
+/// The allocation unit of the volume that holds `path`: its mount point (`GetVolumePathNameW`, never longer than the
+/// path it holds and its trailing separator), then that volume's sectors per cluster times bytes per sector
+/// (`GetDiskFreeSpaceW`): the disk's quantum, as statvfs's `f_frsize` is elsewhere.
+pub fn cluster_bytes(path: &std::path::Path) -> io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceW, GetVolumePathNameW};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let room = wide
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("a path past usize"))?;
+    let mut volume = vec![0u16; room];
+    let units = u32::try_from(volume.len()).map_err(|_| io::Error::other("a path past u32"))?;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call; `volume` holds `units` u16s, which the
+    // call writes a NUL-terminated mount point into.
+    if unsafe { GetVolumePathNameW(wide.as_ptr(), volume.as_mut_ptr(), units) } == 0 {
+        return Err(last_error());
+    }
+    let (mut sectors, mut bytes, mut free, mut total) = (0u32, 0u32, 0u32, 0u32);
+    // SAFETY: `volume` is the NUL-terminated mount point the call above wrote; four u32s this frame owns, each written.
+    let ok = unsafe {
+        GetDiskFreeSpaceW(
+            volume.as_ptr(),
+            &raw mut sectors,
+            &raw mut bytes,
+            &raw mut free,
+            &raw mut total,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    u64::from(sectors)
+        .checked_mul(u64::from(bytes))
+        .filter(|unit| *unit > 0)
+        .ok_or_else(|| io::Error::other("a volume that names no allocation unit"))
+}
+
+/// The file at `path` as the guest-cost producer counts what its folders hold: the file it names (its volume's serial
+/// number and its file index, which a rename keeps: `GetFileInformationByHandle`) and its allocated bytes
+/// (`FileStandardInfo`'s `AllocationSize`), opened for its attributes alone (`FILE_READ_ATTRIBUTES`, which no sharing
+/// mode refuses), a link read as itself. `None` where nothing is at `path` now.
+pub fn file_held(path: &std::path::Path) -> io::Result<Option<((u64, u64), u64)>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, OPEN_EXISTING,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call; no security attributes or template; the
+    // handle returned is owned below.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        let error = last_error();
+        let gone = [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND]
+            .iter()
+            .any(|code| error.raw_os_error() == i32::try_from(*code).ok());
+        return if gone { Ok(None) } else { Err(error) };
+    }
+    // SAFETY: a handle just opened, owned from here and closed as `file` drops.
+    let file = unsafe { Handle::own(raw) };
+    let mut info: BY_HANDLE_FILE_INFORMATION = zeroed_struct();
+    // SAFETY: the file's handle; one BY_HANDLE_FILE_INFORMATION this frame owns, written by the call.
+    if unsafe { GetFileInformationByHandle(file.raw(), &raw mut info) } == 0 {
+        return Err(last_error());
+    }
+    let mut standard: FILE_STANDARD_INFO = zeroed_struct();
+    let size = u32::try_from(size_of::<FILE_STANDARD_INFO>())
+        .map_err(|_| io::Error::other("FILE_STANDARD_INFO's size past u32"))?;
+    // SAFETY: the file's handle; one FILE_STANDARD_INFO of the size given, which this frame owns, written by the call.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.raw(),
+            FileStandardInfo,
+            (&raw mut standard).cast(),
+            size,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    let allocated = u64::try_from(standard.AllocationSize)
+        .map_err(|_| io::Error::other("a file's allocation below none"))?;
+    Ok(Some((
+        (u64::from(info.dwVolumeSerialNumber), index),
+        allocated,
+    )))
+}
+
 /// A zeroed `T` of a plain Windows structure (every field an integer, pointer or union of them, for
 /// which all-zero is a valid, inert value). Used for the job-info and startup structures this file
 /// fills before a call.
@@ -1285,11 +1553,33 @@ mod tests {
         (assigned, listed, buf[1..=listed as usize].to_vec())
     }
 
+    /// HEX-WIN-1's lag (ROOT's native run of 2026-11-14 at 211292c80: 2 assigned, 1 listed in one read): Windows drops
+    /// an ended member from a job's id list before its assigned count, so the list is the live truth. Do read the
+    /// lagging counts as one read gives them. Expect: a read listing no member is empty and counts none live, whatever
+    /// its assigned count still holds; one listing any counts its assigned (each listed member live, the rest unlisted
+    /// only past the read's room); none of each, empty.
+    #[test]
+    fn a_job_listing_no_member_is_empty_though_its_assigned_count_lags() {
+        assert_eq!(
+            (live(2, 0), empty(2, 0)),
+            (0, true),
+            "lagging: ended members alone"
+        );
+        assert_eq!((live(1, 0), empty(1, 0)), (0, true));
+        assert_eq!(
+            (live(2, 1), empty(2, 1)),
+            (2, false),
+            "a live member listed"
+        );
+        assert_eq!((live(0, 0), empty(0, 0)), (0, true));
+    }
+
     /// HEX-WIN-1 (native plan step 3): a member that has ended leaves the job's id list, which
     /// `live_processes` counts, though the node still holds its process handle. Do: run `cmd /c exit 0`
     /// in a job, wait for its end, keep its handle, read the list with room for every id. Expect: the
-    /// member's id isn't listed, and the list's two counts agree in one read (so
-    /// `NumberOfAssignedProcesses`, the count `live_processes` returns, keeps no ended member either).
+    /// member's id isn't listed, and the read's assigned count is at least what it lists: Windows drops an ended
+    /// member from the list before its count (HEX-WIN-1's lag, seen natively), so `live_processes` counts from the
+    /// list ([`live`]).
     /// Another id may be listed: the console host Windows starts for a console program with no console,
     /// which ends after its client.
     #[test]
@@ -1314,7 +1604,8 @@ mod tests {
             "ended member {} still listed: {ids:?}",
             started.pid
         );
-        assert_eq!(assigned, listed);
+        // Its count may still hold it a moment (HEX-WIN-1's lag): the list is the live truth.
+        assert!(assigned >= listed, "{assigned} assigned, {listed} listed");
         drop(started);
     }
 
@@ -1652,7 +1943,7 @@ mod observer_socket_tests {
         assert_eq!(
             readable_pair(
                 [Some(stdout.as_socket()), Some(stderr.as_socket())],
-                Duration::ZERO
+                Some(Duration::ZERO)
             )
             .unwrap(),
             [false, false]
@@ -1660,24 +1951,22 @@ mod observer_socket_tests {
         assert!(
             readable_pair(
                 [Some(stdout.as_socket()), Some(stdout.as_socket())],
-                Duration::ZERO
+                Some(Duration::ZERO)
             )
             .is_err()
         );
         assert!(
             readable_pair(
                 [Some(stdout.as_socket()), Some(stderr.as_socket())],
-                Duration::MAX
+                Some(Duration::MAX)
             )
             .is_err()
         );
         stderr_peer.write_all(b"R").unwrap();
+        // A wait with no deadline (its caller's budget follows its guest: the review's C-9, (c2)) returns as an endpoint
+        // is ready.
         assert_eq!(
-            readable_pair(
-                [Some(stdout.as_socket()), Some(stderr.as_socket())],
-                Duration::from_secs(10)
-            )
-            .unwrap(),
+            readable_pair([Some(stdout.as_socket()), Some(stderr.as_socket())], None).unwrap(),
             [false, true]
         );
         let mut byte = [0u8; 1];
@@ -1686,7 +1975,7 @@ mod observer_socket_tests {
         assert_eq!(
             readable_pair(
                 [Some(stdout.as_socket()), Some(stderr.as_socket())],
-                Duration::ZERO
+                Some(Duration::ZERO)
             )
             .unwrap(),
             [false, false]
@@ -1694,23 +1983,101 @@ mod observer_socket_tests {
         stdout_peer.shutdown(std::net::Shutdown::Write).unwrap();
         let ready = readable_pair(
             [Some(stdout.as_socket()), Some(stderr.as_socket())],
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         assert_eq!(ready, [true, false]);
         assert_eq!(stdout.read(&mut byte).unwrap(), 0);
         assert_eq!(
-            readable_pair([None, Some(stderr.as_socket())], Duration::ZERO).unwrap(),
+            readable_pair([None, Some(stderr.as_socket())], Some(Duration::ZERO)).unwrap(),
             [false, false],
             "completed stdout HUP must be unwatched"
         );
         stderr_peer.write_all(b"S").unwrap();
         assert_eq!(
-            readable_pair([None, Some(stderr.as_socket())], Duration::from_secs(10)).unwrap(),
+            readable_pair(
+                [None, Some(stderr.as_socket())],
+                Some(Duration::from_secs(10))
+            )
+            .unwrap(),
             [false, true]
         );
         stderr.read_exact(&mut byte).unwrap();
         assert_eq!(byte, *b"S");
-        assert!(readable_pair([None, None], Duration::ZERO).is_err());
+        assert!(readable_pair([None, None], Some(Duration::ZERO)).is_err());
+    }
+
+    /// AC-T7.4.1 (the guest-cost producer's readers): do: commit 64 pages of read/write memory as Shards' WHP guest RAM
+    /// is committed (`VirtualAlloc`, `MEM_RESERVE | MEM_COMMIT`), reserve 64 more uncommitted, and read this process from
+    /// outside as the producer reads a VM process (`open_for_reading` by its own pid). Expect: the committed run one
+    /// region, exactly the allocation, committed private read/write memory; the reserved run one region of its own,
+    /// not committed read/write memory; and no process at a pid none has.
+    #[test]
+    fn a_committed_run_is_read_as_one_private_read_write_region() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let page = u64::from(page_size());
+        let len = usize::try_from(64 * page).unwrap();
+        // SAFETY: two fresh allocations of `len` bytes this test owns, each released below.
+        let (committed, reserved) = unsafe {
+            (
+                VirtualAlloc(null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE),
+                VirtualAlloc(null(), len, MEM_RESERVE, PAGE_READWRITE),
+            )
+        };
+        assert!(
+            !committed.is_null() && !reserved.is_null(),
+            "{}",
+            last_error()
+        );
+        let me = open_for_reading(std::process::id()).unwrap().unwrap();
+        let at = |base: *mut std::ffi::c_void| u64::try_from(base.addr()).unwrap();
+        let read = (region(&me, at(committed)), region(&me, at(reserved)));
+        // SAFETY: the allocations above, each released once and not used after.
+        unsafe {
+            VirtualFree(committed, 0, MEM_RELEASE);
+            VirtualFree(reserved, 0, MEM_RELEASE);
+        }
+        let size = 64 * page;
+        assert_eq!(
+            read.0.unwrap().unwrap(),
+            Region {
+                base: at(committed),
+                size,
+                private_rw: true
+            }
+        );
+        assert_eq!(
+            read.1.unwrap().unwrap(),
+            Region {
+                base: at(reserved),
+                size,
+                private_rw: false
+            }
+        );
+        // Process ids are multiples of four (Windows Internals, 7th ed., ch. 3): none has an odd one.
+        assert!(open_for_reading(1).unwrap().is_none());
+    }
+
+    /// AC-T7.4.1 (the guest-cost producer's readers): do: write a file one byte past its volume's allocation unit
+    /// (`cluster_bytes` of its folder) and read it as the producer reads what a folder holds (`file_held`), then rename
+    /// it, link it and read it again. Expect: two units allocated to it; the same file (its volume and index) by its
+    /// new name and through its link; and nothing at its old name.
+    #[test]
+    fn a_file_is_held_in_its_volumes_units_and_named_by_its_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = cluster_bytes(dir.path()).unwrap();
+        let path = dir.path().join("held");
+        std::fs::write(&path, vec![7u8; usize::try_from(unit + 1).unwrap()]).unwrap();
+        let (file, bytes) = file_held(&path).unwrap().unwrap();
+        assert_eq!(bytes, 2 * unit, "{unit}-byte units");
+        let moved = dir.path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        assert_eq!(file_held(&moved).unwrap().unwrap().0, file);
+        let linked = dir.path().join("linked");
+        std::fs::hard_link(&moved, &linked).unwrap();
+        assert_eq!(file_held(&linked).unwrap().unwrap().0, file);
+        assert_eq!(file_held(&path).unwrap(), None);
     }
 }

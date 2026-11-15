@@ -24,10 +24,12 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use triomphe::Arc;
 
 use hex_api::{Bounds, BoxId, Class, Refusal, Signal, Usage};
 use hex_core::job::{self, Sent};
+use hex_core::patience::Piece;
 use hex_core::record::{NativeRecord, OwnerKey, OwnerRef};
 
 use super::sys::{self, Job, Spawn, Started};
@@ -157,12 +159,24 @@ impl JobBox {
         }
     }
 
-    /// Ends what runs in the box a node before this one made as `name`, for a box recovery removes. One no
+    /// Ends what runs in the box a node before this one made as `name`, for a box recovery removes, and waits for its
+    /// job to empty as decision 9 waits ([`follow_emptying`]): TerminateJobObject only begins its members' ends. One no
     /// job holds has nothing left to end.
     pub fn end_named(name: &str) -> Result<(), Refusal> {
         if let Some(job) = Job::open(name).map_err(|e| Refusal::os("opening a box's job", e))? {
+            let killed = Instant::now();
             job.terminate(job::terminated_code(Signal::KILL))
                 .map_err(|e| Refusal::os("ending a box's job", e))?;
+            follow_emptying(
+                &job,
+                killed,
+                &[
+                    Piece::Kind("the killed job "),
+                    Piece::Name(name),
+                    Piece::Kind(" of a box recovery removes, by its members' process handles"),
+                ],
+                name,
+            )?;
         }
         Ok(())
     }
@@ -199,7 +213,7 @@ impl JobBox {
     pub fn id(&self) -> Result<&BoxId, Refusal> {
         match &self.state.id {
             OwnerKey::Box(id) => Ok(id),
-            OwnerKey::Pool(_) => Err(self.uncertain()),
+            OwnerKey::Pool(_) => Err(self.uncertain("a pool's job box has no box id")),
         }
     }
 
@@ -234,10 +248,9 @@ impl JobBox {
             .allocation()
             .ok_or_else(|| super::pending("VM allocation is absent"))?;
         allocation.guest()?;
-        if record.class()? != Class::Shards
-            || bounds.memory_max != Some(allocation.resources.mem_bytes)
-            || bounds.cpu_max_milli.map(u64::from) != Some(allocation.resources.cpu_milli)
-        {
+        // Its bounds are exactly what its allocation gives a VM's host (`managed::host_bounds`): its CPU, and no commit
+        // limit since ruling B (A-4), which left this check asking for its guest's RAM and refusing every VM.
+        if record.class()? != Class::Shards || bounds != super::managed::host_bounds(record)? {
             return Err(super::pending(
                 "VM native bounds differ from its allocation",
             ));
@@ -273,7 +286,7 @@ impl JobBox {
     /// non-submission; it is never inferred from an absent process or textual job name.
     pub(super) fn bind_vm(&self, name: Option<&str>) -> Result<(), Refusal> {
         if !self.is_vm() || self.state.job.get().is_some() {
-            return Err(self.uncertain());
+            return Err(self.uncertain("it isn't a VM's job box, or its job was bound before"));
         }
         let result = (|| {
             let job = match name {
@@ -290,12 +303,12 @@ impl JobBox {
                 .state
                 .job
                 .set(NativeScope::Bound(job))
-                .map_err(|_| self.uncertain()),
+                .map_err(|_| self.uncertain("its job was bound before")),
             Err(error) => {
                 self.state
                     .job
                     .set(NativeScope::NotSubmitted)
-                    .map_err(|_| self.uncertain())?;
+                    .map_err(|_| self.uncertain("its job was marked unsubmitted before"))?;
                 Err(error)
             }
         }
@@ -303,12 +316,12 @@ impl JobBox {
 
     pub(super) fn not_submitted(&self) -> Result<(), Refusal> {
         if !self.is_vm() {
-            return Err(self.uncertain());
+            return Err(self.uncertain("it isn't a VM's job box as its submission is refused"));
         }
         self.state
             .job
             .set(NativeScope::NotSubmitted)
-            .map_err(|_| self.uncertain())
+            .map_err(|_| self.uncertain("its job was bound before its submission was refused"))
     }
 
     pub(super) fn is_vm(&self) -> bool {
@@ -317,12 +330,18 @@ impl JobBox {
 
     pub(super) fn adopt_vm(&self, job: Job) -> Result<(), Refusal> {
         if !self.is_vm() || self.state.job.get().is_some() {
-            return Err(self.uncertain());
+            return Err(self
+                .uncertain("it isn't a VM's job box, or its job was bound before it was adopted"));
         }
+        // Its bounds as its record gives them now, its CPU rate left as the learner holds it: a commit limit a create
+        // before ruling B wrote at its guest's RAM is lifted (joint plan step 14, A-4), as Linux lifts a VM's
+        // memory.max at its first window.
+        job.set_bounds(&sys_limits(&self.state.limits))
+            .map_err(|error| Refusal::os("setting the adopted VM's native job bounds", error))?;
         self.state
             .job
             .set(NativeScope::Adopted(job))
-            .map_err(|_| self.uncertain())
+            .map_err(|_| self.uncertain("its job was bound before it was adopted"))
     }
 
     pub(super) fn recovered(&self) -> bool {
@@ -358,31 +377,34 @@ impl JobBox {
 
     pub(super) fn release_scope(&self) -> Result<(), Refusal> {
         let Purpose::Vm { owner, .. } = &self.purpose else {
-            return Err(self.uncertain());
+            return Err(self.uncertain("it isn't a VM's job box as its scope is released"));
         };
         if self.released() {
             return Ok(());
         }
         owner
             .upgrade()
-            .ok_or_else(|| self.uncertain())?
+            .ok_or_else(|| self.uncertain("its VM's owner is gone as its scope is released"))?
             .release_vm(self)
     }
 
     pub(super) fn mark_released(&self) -> Result<(), Refusal> {
         let Purpose::Vm { released, .. } = &self.purpose else {
-            return Err(self.uncertain());
+            return Err(self.uncertain("it isn't a VM's job box as it is marked released"));
         };
         let _ = released.set(());
         Ok(())
     }
 
-    fn uncertain(&self) -> Refusal {
+    /// Its owner refused Uncertain, and `why` in the refusing site's own words (joint plan steps 14 and 12): a pool's
+    /// backing refusal and a box's Lifecycle refusal carry them alike.
+    fn uncertain(&self, why: &str) -> Refusal {
         match self.owner() {
             OwnerRef::Box(id) => match id.try_clone() {
                 Ok(id) => Refusal::Lifecycle {
                     id,
                     cause: hex_api::LifecycleCause::Uncertain,
+                    why: Some(why.to_owned()),
                 },
                 Err(error) => error,
             },
@@ -393,6 +415,7 @@ impl JobBox {
                         generation: *scope.bytes(),
                     },
                     cause: hex_api::LifecycleCause::Uncertain,
+                    why: Some(why.to_owned()),
                 },
                 None => super::inconsistent_slots(),
             },
@@ -402,7 +425,7 @@ impl JobBox {
     fn native_job(&self) -> Result<&Job, Refusal> {
         match self.state.job.get() {
             Some(NativeScope::Bound(job) | NativeScope::Adopted(job)) => Ok(job),
-            _ => Err(self.uncertain()),
+            _ => Err(self.uncertain("its job isn't bound or adopted")),
         }
     }
 
@@ -426,27 +449,26 @@ impl JobBox {
         report: Option<&sys::InheritedHandle>,
     ) -> Result<Started, Refusal> {
         if self.state.stopping.load(Ordering::SeqCst) || !self.is_vm() {
-            return Err(self.uncertain());
+            return Err(self.uncertain(
+                "it is stopping, or isn't a VM's job box, as its controller is created",
+            ));
         }
         sys::create_with_report(spawn, &[self.native_job()?.raw()], report)
             .map_err(|error| Refusal::os("creating a suspended bound VM controller", error))
     }
 
     /// Joint plan step 14 (C4 on Windows): the VM job's CPU hard cap becomes `milli` thousandths of a CPU, its
-    /// water-filled share, at least the machine's least cap (one cycle per [`job::RATE_SCALE`] of it).
+    /// water-filled share, which its learner holds at least at the job's least ([`job::least_milli`]); a rate below
+    /// it is refused, typed ([`job::cap`]), never raised quietly.
     pub(super) fn set_cpu_cap(
         &self,
         milli: u64,
         processors: std::num::NonZeroU32,
     ) -> Result<(), Refusal> {
         if !self.is_vm() {
-            return Err(self.uncertain());
+            return Err(self.uncertain("it isn't a VM's job box as its CPU cap is set"));
         }
-        let least = u64::from(processors.get())
-            .checked_mul(1000)
-            .map(|n| n.div_ceil(u64::from(job::RATE_SCALE)))
-            .ok_or_else(|| self.uncertain())?;
-        let milli = u32::try_from(milli.max(least)).map_err(|_| Refusal::Invalid {
+        let milli = u32::try_from(milli).map_err(|_| Refusal::Invalid {
             what: "a VM's CPU rate",
             why: "it passes a u32 of thousandths of a CPU".to_owned(),
         })?;
@@ -601,9 +623,10 @@ impl JobBox {
     }
 
     /// Ends the box: marks it stopping, records that it ended the job for KILL (so a member's exit reads
-    /// as Signal(9)), and requests termination. Acceptance is not scope completion: the same native
-    /// job must positively report no members before deletion succeeds. An OS error retains retry
-    /// authority; a previously accepted request is observed rather than dispatched again.
+    /// as Signal(9)), requests termination, and waits for the job to empty as decision 9 waits
+    /// ([`follow_emptying`]). Acceptance is not scope completion: TerminateJobObject only begins its members'
+    /// ends, and the same native job must positively report no members before deletion succeeds. An OS error
+    /// retains retry authority; a previously accepted request is observed rather than dispatched again.
     pub fn delete(&self) -> Result<(), Refusal> {
         self.state.stopping.store(true, Ordering::SeqCst);
         let request = {
@@ -617,6 +640,7 @@ impl JobBox {
                 }
             }
         };
+        let killed = Instant::now();
         if request {
             self.native_job()?
                 .terminate(job::terminated_code(Signal::KILL))
@@ -626,12 +650,103 @@ impl JobBox {
                 c.deletion = Deletion::Requested;
             }
         }
-        if self.live_processes()? != 0 {
-            return Err(self.uncertain());
+        match self.state.job.get() {
+            Some(NativeScope::Bound(job) | NativeScope::Adopted(job)) => {
+                let id = match self.owner() {
+                    OwnerRef::Box(id) => id.as_str(),
+                    OwnerRef::Pool(_) => "",
+                };
+                follow_emptying(
+                    job,
+                    killed,
+                    &[
+                        Piece::Kind("the killed job of box "),
+                        Piece::Name(id),
+                        Piece::Kind(", by its members' process handles"),
+                    ],
+                    id,
+                )?;
+            }
+            Some(NativeScope::NotSubmitted) => {}
+            None => return Err(super::proc::ObserveError::Unpublished.refusal()),
         }
         self.state.counts()?.deletion = Deletion::Released;
         Ok(())
     }
+}
+
+/// Waits for killed job `job` to empty, as decision 9 waits on [`crate::emptying::EMPTYING`] (the review's E-12): within
+/// W*, the slowest emptying seen, its emptying; past it, its run-out told once, naming `party`, and the job followed by
+/// its members' own ends ([`empties_within`]) however late, never refused at a time, nor said done before it is: it
+/// refused at once while TerminateJobObject's members were still ending, and a recovery's end didn't wait at all.
+/// `held` names the box to the test hold ([`crate::emptying::hold`]).
+fn follow_emptying(
+    job: &Job,
+    killed: Instant,
+    party: &[Piece<'_>],
+    held: &str,
+) -> Result<(), Refusal> {
+    crate::emptying::followed(&crate::emptying::EMPTYING, killed, party, |slice| {
+        empties_within(job, slice, held)
+    })
+}
+
+/// Whether killed job `job` empties within `slice` (`Duration::MAX`: until it does): the first member it lists waited
+/// for by its process handle, which the kernel signals at the member's end (WaitForSingleObject, no poll), and the job
+/// looked at again, until it lists none (`JobObjectBasicProcessIdList`'s count, which an ended member leaves though its
+/// handle is held). The job is terminated again before each member's wait, so a process a member started as the job was
+/// terminated, which may have joined it after the termination reached the rest, is ended too (terminating members already
+/// ending changes nothing). A member listed that ended before it could be opened (its process gone, or its id another's)
+/// is looked past. The job's completion port isn't the event:
+/// Microsoft documents its messages as not guaranteed to arrive (`JOBOBJECT_ASSOCIATE_COMPLETION_PORT`), and its
+/// active-process count lingers while a terminated member's handle is held ([`Job::live_processes`]).
+fn empties_within(job: &Job, slice: Duration, held: &str) -> Result<bool, Refusal> {
+    #[cfg(test)]
+    if !crate::emptying::hold::lets_empty(held, slice) {
+        return Ok(false);
+    }
+    #[cfg(not(test))]
+    let _ = held;
+    let by = Instant::now().checked_add(slice);
+    loop {
+        let process = match job.member() {
+            Ok(sys::Member::Empty) => return Ok(true),
+            Ok(sys::Member::Process(process)) => process,
+            Err(e) if gone_before_its_open(&e) => continue,
+            Err(e) => return Err(Refusal::os("reading a killed box's job", e)),
+        };
+        job.terminate(job::terminated_code(Signal::KILL))
+            .map_err(|e| Refusal::os("ending a box's job", e))?;
+        let timeout = match by {
+            None => u32::MAX,
+            Some(by) => match by.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => ceil_millis(left),
+                _ => return Ok(false),
+            },
+        };
+        if !sys::wait(&process, timeout)
+            .map_err(|e| Refusal::os("waiting on a killed box's member", e))?
+        {
+            return Ok(false);
+        }
+    }
+}
+
+/// Whether a member the job listed ended before it could be opened: its process gone (OpenProcess's
+/// `ERROR_INVALID_PARAMETER`, no handle keeping it), or its id another process's, outside the job ([`Job::member`]'s
+/// `WouldBlock`). Either way the job lists it no more.
+fn gone_before_its_open(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+        || e.raw_os_error()
+            == i32::try_from(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER).ok()
+}
+
+/// `left` in WaitForSingleObject's whole milliseconds, rounded up so a slice's wait never ends before its time, at most
+/// the longest finite wait (`INFINITE`, `u32::MAX`, less one).
+fn ceil_millis(left: Duration) -> u32 {
+    u32::try_from(left.as_nanos().div_ceil(1_000_000))
+        .unwrap_or(0xFFFF_FFFE)
+        .min(0xFFFF_FFFE)
 }
 
 impl Drop for JobBox {

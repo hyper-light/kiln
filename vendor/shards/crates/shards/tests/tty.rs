@@ -18,13 +18,11 @@ mod common;
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::time::Duration;
 
 use common::terminal::{Terminal, cooked};
 use common::{Run, TempDir, cannot_run_vms, guest_init, kernel, run_shards_env, served};
 
-const TIMEOUT: Duration = Duration::from_secs(60);
-
+#[track_caller]
 fn shards_in(home: &Path, args: &[&str]) -> Run {
     let (kernel, init) = (kernel(), guest_init());
     let env: [(&str, &OsStr); 3] = [
@@ -32,7 +30,7 @@ fn shards_in(home: &Path, args: &[&str]) -> Run {
         ("SHARDS_KERNEL", kernel.as_os_str()),
         ("SHARDS_INIT", init.as_os_str()),
     ];
-    run_shards_env(&[], args, &env, TIMEOUT)
+    run_shards_env(&[], args, &env)
 }
 
 /// A home with the test image pulled, and the image's name.
@@ -118,7 +116,7 @@ fn a_terminal_is_told_its_clients_type_where_its_image_describes_it() {
             ("TERM", term.as_ref()),
             ("COLORTERM", colorterm.as_ref()),
         ];
-        let r = run_shards_env(&[], args, &env, TIMEOUT);
+        let r = run_shards_env(&[], args, &env);
         assert_eq!(r.status, Some(0), "{args:?}: {}", r.stderr);
         r.stdout
             .lines()

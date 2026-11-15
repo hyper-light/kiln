@@ -75,7 +75,7 @@ impl Handle {
         _file: std::fs::File,
         _read_only: bool,
         _serial: &str,
-    ) -> Result<super::Plugged, String> {
+    ) -> Result<super::Plugged, shards_ipc::device::Refusal> {
         match self.0 {}
     }
 
@@ -83,11 +83,11 @@ impl Handle {
         &self,
         _tag: &str,
         _slot: crate::devices::virtio::fs::Share,
-    ) -> Result<super::Plugged, String> {
+    ) -> Result<super::Plugged, shards_ipc::device::Refusal> {
         match self.0 {}
     }
 
-    pub fn unplug(&self, _devfn: u8) -> Result<(), String> {
+    pub fn unplug(&self, _devfn: u8) -> Result<(), shards_ipc::device::Refusal> {
         match self.0 {}
     }
 
@@ -103,7 +103,7 @@ impl Handle {
         match self.0 {}
     }
 
-    pub fn hold_rate(&self, _milli: u64) -> Result<Option<std::num::NonZeroU64>, String> {
+    pub fn hold_rate(&self, _milli: u64) -> Result<super::Rated, String> {
         match self.0 {}
     }
 
@@ -206,6 +206,10 @@ impl Handle {
     }
 
     pub fn guest_times(&self) -> super::GuestTimes {
+        match self.0 {}
+    }
+
+    pub fn whole_guest_times(&self) -> super::GuestTimes {
         match self.0 {}
     }
 }

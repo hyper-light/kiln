@@ -42,6 +42,10 @@ static ANSWERS: [Patience; KINDS] = [
     Patience::measuring("client.answer.schedule.forget"),
     // MEASURING until a waits census records the node's links (docs/design/hex-quic.md Q12).
     Patience::measuring("client.answer.links"),
+    // MEASURING until a waits census records a connection's lessors (docs/design/credential-grants.md C7).
+    Patience::measuring("client.answer.lessors"),
+    // MEASURING until a waits census records a keeper's word to its node (the review's A-10).
+    Patience::measuring("client.answer.reserved"),
 ];
 
 /// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`,
@@ -125,36 +129,68 @@ impl Transport for Socket {
                 Refusal::Broken("the node agent closed the connection".to_owned())
             }));
         }
-        let mut input = reading.buf.get(..n).unwrap_or_default();
-        while !input.is_empty() {
-            let (took, whole) = reading.deframer.take(input).map_err(|fault| {
-                Refusal::Broken(format!("the node agent's stream can't be read: {fault}"))
-            })?;
-            input = input.get(took..).unwrap_or_default();
-            let Some(payload) = whole else { continue };
-            // The server keeps its copies until the common core sends Taken. The duplicated ends named by
-            // this envelope become ours here, and drop with an answer that doesn't take them.
-            let (ends, message) = socket::take_given(&payload)
-                .map_err(|e| Refusal::os("taking the node agent's given stream handles", e))?;
-            let received = Received {
-                bytes: message,
-                size: message.len(),
-                descriptors: ends.len(),
-                descriptors_cut: false,
-            };
-            take(
-                &received,
-                ends.into_iter().map(hex_api::End::from).collect(),
-            )?;
+        let framed: Result<(), Refusal> = 'framed: {
+            let mut input = reading.buf.get(..n).unwrap_or_default();
+            while !input.is_empty() {
+                let (took, whole) = match reading.deframer.take(input) {
+                    Ok(taken) => taken,
+                    Err(fault) => {
+                        break 'framed Err(Refusal::Broken(format!(
+                            "the node agent's stream can't be read: {fault}"
+                        )));
+                    }
+                };
+                input = input.get(took..).unwrap_or_default();
+                let Some(payload) = whole else { continue };
+                // The message's bytes, its envelope's among them, wiped as they drop where it carries a lease's value or
+                // a sign-in's tokens, taken or refused (docs/design/credential-grants.md C7, C8; the review's E-6).
+                let secret = socket::unenvelope(&payload)
+                    .ok()
+                    .is_some_and(|(_, message)| wire::carries_secret(message));
+                let payload = hex_api::lease::Wiped::new(payload, secret);
+                // The server keeps its copies until the common core sends Taken. The duplicated ends named by
+                // this envelope become ours here, and drop with an answer that doesn't take them.
+                let (ends, message) = match socket::take_given(payload.bytes()) {
+                    Ok(given) => given,
+                    Err(e) => {
+                        break 'framed Err(Refusal::os(
+                            "taking the node agent's given stream handles",
+                            e,
+                        ));
+                    }
+                };
+                let received = Received {
+                    bytes: message,
+                    size: message.len(),
+                    descriptors: ends.len(),
+                    descriptors_cut: false,
+                };
+                if let Err(why) = take(
+                    &received,
+                    ends.into_iter().map(hex_api::End::from).collect(),
+                ) {
+                    break 'framed Err(why);
+                }
+            }
+            Ok(())
+        };
+        // Framed into the messages handed on, or refused: what was read here wiped either way (the review's E-6).
+        if let Some(held) = reading.buf.get_mut(..n) {
+            hex_api::lease::wipe_in_place(held);
         }
-        Ok(true)
+        framed.map(|()| true)
     }
 
-    fn frame(message: Vec<u8>) -> Result<Vec<u8>, Refusal> {
-        stream::frame(&message, wire::MAX_MESSAGE).map_err(|fault| Refusal::Invalid {
+    fn frame(mut message: Vec<u8>) -> Result<Vec<u8>, Refusal> {
+        let framed = stream::frame(&message, wire::MAX_MESSAGE).map_err(|fault| Refusal::Invalid {
             what: "message",
             why: fault.to_string(),
-        })
+        });
+        // A lease's value crosses in its framed copy alone (docs/design/credential-grants.md C7).
+        if wire::carries_secret(&message) {
+            hex_api::lease::wipe(&mut message);
+        }
+        framed
     }
 
     fn try_send(&self, bytes: &[u8], at: &mut usize, lent: &[Lent<'_>]) -> Result<bool, Sent> {

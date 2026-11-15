@@ -144,6 +144,7 @@ fn example(name: &str, file: &str) -> String {
 /// however long it runs, until the test removes it; reads the harness's stdout, then its
 /// stderr, from the run's owner endpoint; then the kernel's record of the microVM's processes.
 /// None where this host runs no VMs.
+#[track_caller]
 fn bring_up(case: &Case<'_>) -> Option<Seen> {
     if cannot_run_vms() {
         return None;
@@ -161,6 +162,8 @@ fn bring_up(case: &Case<'_>) -> Option<Seen> {
         .agentfile
         .clone()
         .unwrap_or_else(|| example(name, "Agentfile"));
+    // Its base, pinned by digest, from the tests' own registry: never Docker Hub's as it runs.
+    let file = common::hub_bases(&file);
     std::fs::write(ctx.join("Agentfile"), &file).unwrap();
     save("Agentfile", file.as_bytes());
     std::fs::create_dir_all(ctx.join(name)).unwrap();
@@ -198,7 +201,7 @@ fn bring_up(case: &Case<'_>) -> Option<Seen> {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, NO_CLOCK);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let image = format!("harness-{name}:1");
     let built = shards(&[
         "build",

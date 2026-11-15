@@ -45,8 +45,9 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle,
-    ERROR_OPERATION_ABORTED, FALSE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, STATUS_PENDING,
-    TRUE, WAIT_TIMEOUT,
+    ERROR_OPERATION_ABORTED, FALSE, GetHandleInformation, GetLastError, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STATUS_PENDING, SetHandleInformation, TRUE,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_UNIX, AcceptEx, FD_CLOSE, FD_READ, FD_WRITE, FIONBIO, INVALID_SOCKET, LINGER, SD_BOTH,
@@ -193,6 +194,42 @@ pub fn set_nonblocking(socket: BorrowedSocket<'_>, on: bool) -> io::Result<()> {
     let rc = unsafe { ioctlsocket(raw, FIONBIO, &raw mut mode) };
     if rc == SOCKET_ERROR {
         return Err(wsa_error());
+    }
+    Ok(())
+}
+
+/// A socket's kernel handle: Winsock's base provider's sockets are handles (IFS), the same value.
+fn socket_handle(socket: BorrowedSocket<'_>) -> io::Result<HANDLE> {
+    let raw = usize::try_from(socket.as_raw_socket()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a socket value past a handle's width",
+        )
+    })?;
+    Ok(raw as HANDLE)
+}
+
+/// Whether `socket`'s handle passes to a process this one starts with its inheritable handles
+/// (`GetHandleInformation`'s `HANDLE_FLAG_INHERIT`; std's `Command` starts every process so).
+pub fn inheritable(socket: BorrowedSocket<'_>) -> io::Result<bool> {
+    let handle = socket_handle(socket)?;
+    let mut flags = 0u32;
+    // SAFETY: the borrowed socket's handle stays open through the call, and `flags` is a u32 of ours it writes.
+    if unsafe { GetHandleInformation(handle, &raw mut flags) } == 0 {
+        return Err(last_error());
+    }
+    Ok((flags & HANDLE_FLAG_INHERIT) != 0)
+}
+
+/// Keeps `socket`'s handle from passing to a process this one starts. A socket Winsock duplicates for this process
+/// (`WSADuplicateSocketW`, under std's and Shards' `try_clone`) comes back inheritable, and a process another thread
+/// starts with every inheritable handle (std's `Command`) would hold the connection past its owner and reset it as it
+/// ends.
+pub fn no_inherit(socket: BorrowedSocket<'_>) -> io::Result<()> {
+    let handle = socket_handle(socket)?;
+    // SAFETY: the borrowed socket's handle stays open through the call, which clears its inheritance flag alone.
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(last_error());
     }
     Ok(())
 }

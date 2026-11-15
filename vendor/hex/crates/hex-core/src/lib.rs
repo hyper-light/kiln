@@ -8,7 +8,7 @@
 //! ([`patience`]), the node agent's socket as bytes ([`wire`]), the rule a Windows `oci` box is made by
 //! ([`hcs`]), the rules a macOS box is bounded by — rootless by polling ([`watch`]) and under a privileged helper
 //! by the kernel ([`boxuser`]) — how its memory bound is apportioned across its members for the kernel to enforce
-//! ([`ledger`]), macOS's signal numbers ([`darwin`]), how long a killed group gets to empty ([`drain`]), the macOS
+//! ([`ledger`]), macOS's signal numbers ([`darwin`]), the macOS
 //! box helper's protocol ([`helper`]) and the box users' pool it grows ([`pool`]), the
 //! descriptor limit a box gets where its spec names none ([`limits`]) and what each OS's installer sets
 //! up and the refusal where it is missing ([`setup`]). Shells in `hex-runtime`, `hex-node` and
@@ -34,7 +34,6 @@ pub mod cgroup;
 pub mod darwin;
 pub mod demand;
 pub mod devfs;
-pub mod drain;
 pub mod hcs;
 pub mod helper;
 pub mod job;

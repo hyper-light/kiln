@@ -40,7 +40,10 @@ pub struct IoRates {
 /// Smallest `memory.max` Hex accepts: below a mebibyte no process starts, so a smaller bound is a
 /// mistake to refuse rather than a box that dies at once.
 pub const MIN_MEMORY: u64 = 1 << 20;
-/// Smallest `cpu.max` in thousandths of a CPU: the kernel's least quota is 1 ms per 100 ms period.
+/// Smallest `cpu.max` in thousandths of a CPU: the kernel's least quota, 1 ms (kernel/sched/core.c's least bandwidth
+/// quota, `min_bw_quota_period_us`, at Linux 1590cf03), over Hex's 100 ms period (`hex_core::cgroup::CPU_PERIOD_US`),
+/// pinned by hex-core's `w14_hexs_least_cpu_bound_is_the_kernels_least_quota_at_its_period`. A cgroup's bound alone: a
+/// microVM's governor takes any milli-CPU (hex-node's `recorded::charges::GOVERNOR_LEAST`).
 pub const MIN_CPU_MILLI: u32 = 10;
 
 impl Bounds {

@@ -123,8 +123,21 @@ struct Reading {
 }
 
 struct Ready {
-    message: Vec<u8>,
+    /// Its bytes, wiped as they drop if it carries a lease's value or a sign-in's tokens, read or not.
+    message: hex_api::lease::Wiped,
     pipes: Vec<PipeEnd>,
+}
+
+impl Ready {
+    /// Whole message `message`, ready for the server with `pipes`: wiped as it drops where it carries a secret
+    /// (docs/design/credential-grants.md C7, C8; the review's E-6).
+    fn new(message: Vec<u8>, pipes: Vec<PipeEnd>) -> Self {
+        let secret = wire::carries_secret(&message);
+        Self {
+            message: hex_api::lease::Wiped::new(message, secret),
+            pipes,
+        }
+    }
 }
 
 /// Execs and their streams waiting for each other, and the execs parked until their streams have all come, under one
@@ -312,9 +325,13 @@ impl<N: Os> Quic<N> {
             if let Some(ready) = control.ready.lock().ok().and_then(|mut r| r.pop_front()) {
                 let size = ready.message.len();
                 let got = size.min(buf.len());
-                if let (Some(to), Some(from)) = (buf.get_mut(..got), ready.message.get(..got)) {
+                if let (Some(to), Some(from)) =
+                    (buf.get_mut(..got), ready.message.bytes().get(..got))
+                {
                     to.copy_from_slice(from);
                 }
+                // A lease's value crosses in the core's buffer alone from here: the message's bytes here are wiped as
+                // they drop (docs/design/credential-grants.md C7).
                 return Recv::Message {
                     size,
                     got,
@@ -335,15 +352,33 @@ impl<N: Os> Quic<N> {
                 Ok(None) => return Recv::WouldBlock,
             };
             let mut input = chunk.get(..n).unwrap_or_default();
+            let mut gone = false;
             while !input.is_empty() {
                 let Ok((took, whole)) = deframer.take(input) else {
                     // Bytes that aren't a frame: the connection can't be read further, so it ends.
-                    return Recv::Gone;
+                    gone = true;
+                    break;
                 };
                 input = input.get(took..).unwrap_or_default();
-                if let Some(message) = whole {
-                    self.route(control, message);
+                // Opened where it came sealed under its connection's seal (docs/design/hex-quic.md Q13). One that
+                // carries a secret and came unsealed, came sealed carrying none, or whose seal doesn't open breaks the
+                // node's wire as bytes that aren't a frame do: the connection ends, every ask waiting on it told so.
+                match whole.map(|message| wire::open(message, Some(control.conn.keys()))) {
+                    Some(Ok(message)) => self.route(control, message),
+                    Some(Err(_)) => {
+                        gone = true;
+                        break;
+                    }
+                    None => {}
                 }
+            }
+            // Framed into the messages it holds now, or refused: what was read here, which may carry a lease's value,
+            // wiped (docs/design/credential-grants.md C7).
+            if let Some(held) = chunk.get_mut(..n) {
+                hex_api::lease::wipe_in_place(held);
+            }
+            if gone {
+                return Recv::Gone;
             }
         }
         Recv::WouldBlock
@@ -358,16 +393,14 @@ impl<N: Os> Quic<N> {
                 Request::Call(
                     Call::Exec { streams, .. }
                     | Call::Run { streams, .. }
-                    | Call::Member { streams, .. },
+                    | Call::Member { streams, .. }
+                    | Call::Mcp { streams, .. },
                 ),
             )) if streams != Streams::default() => Some((header.id, streams)),
             _ => None,
         };
         let ready = match streams {
-            None => Some(Ready {
-                message,
-                pipes: Vec::new(),
-            }),
+            None => Some(Ready::new(message, Vec::new())),
             Some((id, streams)) => {
                 let exec = Exec {
                     conn: control.token,
@@ -375,7 +408,7 @@ impl<N: Os> Quic<N> {
                 };
                 match self.shared.sets.lock() {
                     Ok(mut sets) => match sets.gather.expect(exec, streams) {
-                        Ok(Some((_, pipes))) => Some(Ready { message, pipes }),
+                        Ok(Some((_, pipes))) => Some(Ready::new(message, pipes)),
                         Ok(None) => {
                             let me = self
                                 .shared
@@ -389,15 +422,9 @@ impl<N: Os> Quic<N> {
                         }
                         // Refused (its streams' set past the bound, or one came twice or unasked): the exec goes
                         // with no stream, and the server refuses it by type for want of them.
-                        Err(_) => Some(Ready {
-                            message,
-                            pipes: Vec::new(),
-                        }),
+                        Err(_) => Some(Ready::new(message, Vec::new())),
                     },
-                    Err(_) => Some(Ready {
-                        message,
-                        pipes: Vec::new(),
-                    }),
+                    Err(_) => Some(Ready::new(message, Vec::new())),
                 }
             }
         };
@@ -691,7 +718,7 @@ fn gathered(shared: &Arc<Shared>, named: Named, program: PipeEnd) -> bool {
                 && let Some(control) = control.upgrade()
                 && let Ok(mut ready) = control.ready.lock()
             {
-                ready.push_back(Ready { message, pipes });
+                ready.push_back(Ready::new(message, pipes));
                 drop(ready);
                 drop(sets);
                 (shared.wake)();
@@ -792,9 +819,7 @@ impl Log {
         readers.retain_mut(|reader| {
             let mut frame = Vec::new();
             if reader.missed > 0 {
-                frame.extend_from_slice(
-                    format!("hex.log event=missed lines={}\n", reader.missed).as_bytes(),
-                );
+                frame.extend_from_slice(format!("{}\n", missed_line(reader.missed)).as_bytes());
             }
             frame.extend_from_slice(line.as_bytes());
             if frame.len() > bound {
@@ -814,6 +839,15 @@ impl Log {
             }
         });
     }
+}
+
+/// `hex.log event=missed lines=<n>`: the lines a log's reader missed before the next it was sent.
+fn missed_line(lines: u64) -> String {
+    hex_api::event::line(
+        "hex.log",
+        "missed",
+        &[("lines", hex_api::event::Value::Number(u128::from(lines)))],
+    )
 }
 
 impl<N: Os> Os for Quic<N> {
@@ -949,7 +983,21 @@ impl<N: Os> Os for Quic<N> {
                 if !fds.is_empty() {
                     return Sent::Gone;
                 }
-                let Ok(framed) = stream::frame(bytes, wire::MAX_MESSAGE) else {
+                // A message that carries a lease's value or a sign-in's tokens goes sealed under its connection's
+                // seal, so its framed copy, and what the transport beneath holds of it, is ciphertext; the message is
+                // the server's to wipe (docs/design/hex-quic.md Q13; credential-grants.md C7, C8; the review's E-6).
+                // A send the connection has no room for now seals again as it is sent again, under its next nonce.
+                let sealed;
+                let message = if wire::carries_secret(bytes) {
+                    let Ok(made) = wire::seal(bytes, control.conn.keys()) else {
+                        return Sent::Gone;
+                    };
+                    sealed = made;
+                    sealed.as_slice()
+                } else {
+                    bytes
+                };
+                let Ok(framed) = stream::frame(message, wire::MAX_MESSAGE) else {
                     return Sent::Gone;
                 };
                 match control.conn.try_write(&framed) {

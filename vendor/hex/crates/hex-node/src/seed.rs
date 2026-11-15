@@ -24,7 +24,7 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use hex_api::Refusal;
-use hex_core::patience::Patience;
+use hex_core::patience::{Patience, Piece};
 use hex_core::seed::{Answer, Failed, Request};
 use hex_runtime::linux::oci::OciError;
 use hex_runtime::linux::oci::seed as rt_seed;
@@ -172,8 +172,12 @@ impl SeedPool {
             if let Some(within) = bound
                 && now >= within
             {
-                // Past W*: no sample (Karn's point), but the census is told, once, and the exec waits on.
-                self.answers.ran_out(within);
+                // Past W*: no sample (Karn's point), but the run-out is told, once, and the exec waits on.
+                self.answers.ran_out(
+                    within,
+                    now,
+                    &[Piece::Kind("the exec seeds, all busy, freeing one")],
+                );
                 bound = None;
             }
             fn poisoned<T>(_: T) -> Refusal {

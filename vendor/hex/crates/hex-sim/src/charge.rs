@@ -93,7 +93,8 @@ impl Cpu {
 pub struct Sample {
     /// The VMM's CPU over the reading's span.
     pub cpu: Cpu,
-    /// The time since the reading before. A reading is never charged over less than the window.
+    /// The time since the reading before. A reading is never charged over less than the window its node reads over
+    /// ([`Node::set_window`]).
     pub span: Duration,
     /// The most memory the VMM held in the window, as the census reads it, its guest's touched RAM included.
     pub mem_bytes: u64,
@@ -264,8 +265,9 @@ impl Tail {
     }
 }
 
-/// A VM's class (C2): VMs of one runtime class and cost profile, admitted at one envelope: one Agentfile image and
-/// size. Its ceiling is no part of it: learned from its VMs' windows (C1), it would split the class as it rose.
+/// A VM's class (C2): VMs of one runtime class and cost profile, admitted at one envelope, that run one kind of thing:
+/// one Agentfile image and size. Its ceiling is no part of it: learned from its VMs' windows (C1), it would split the
+/// class as it rose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClassKey {
     class: Class,
@@ -273,22 +275,42 @@ pub struct ClassKey {
     /// What its VMs' workload is admitted at, their guest envelope: a cold class's prior, and its ceiling until its
     /// VMs' windows show their VMM's own past it (C1; ROOT, 2026-11-13: no census number is a ceiling).
     admission: [u64; 3],
+    runs: Runs,
+}
+
+/// What a class's VMs run (joint plan step 39; ROOT, 2026-11-13): a box's workload, or a node's own guest, its node VM,
+/// which runs every oci box of its node. A node VM's windows are a container host's use, no box's workload, so it
+/// learns apart from the box VMs of its profile and envelope, never raising their priors or ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Runs {
+    Box,
+    Node,
 }
 
 impl ClassKey {
-    /// The class of VMs of `class` and cost `profile`, each admitted at `admission`.
+    /// The class of box VMs of `class` and cost `profile`, each admitted at `admission`.
     pub fn new(class: Class, profile: [u8; 32], admission: Amounts) -> Self {
         Self {
             class,
             profile,
             admission: dims(admission),
+            runs: Runs::Box,
         }
     }
 
-    /// The class of the VMs `allocation` admits for `class`: its cost profile, and its guest envelope
+    /// The class of the box VMs `allocation` admits for `class`: its cost profile, and its guest envelope
     /// ([`hex_api::Allocation::guest`]) the admission. Refused where the receipt holds no envelope.
     pub fn of(class: Class, allocation: hex_api::Allocation) -> Result<Self, hex_api::Refusal> {
         Ok(Self::new(class, allocation.cost.id, allocation.guest()?))
+    }
+
+    /// The class of node VMs `allocation` admits for `class` (joint plan step 39): as [`ClassKey::of`], apart from
+    /// every class of box VMs, as a node VM runs every oci box of its node.
+    pub fn node(class: Class, allocation: hex_api::Allocation) -> Result<Self, hex_api::Refusal> {
+        Ok(Self {
+            runs: Runs::Node,
+            ..Self::of(class, allocation)?
+        })
     }
 
     /// What its VMs are admitted at.
@@ -308,6 +330,17 @@ fn ceiling_of(classes: &BTreeMap<ClassKey, Record>, class: &ClassKey) -> [u64; 3
     [past(a0, o0), past(a1, o1), past(a2, o2)]
 }
 
+/// A node's window (C1): some time, where it has one.
+fn check_window(window: Option<Duration>) -> Result<(), ChargeError> {
+    if window.is_some_and(|window| window.is_zero()) {
+        return Err(ChargeError::Invalid {
+            what: "a node's window",
+            why: "a window of no time",
+        });
+    }
+    Ok(())
+}
+
 /// `cpu` over `over` nanoseconds, in milli-CPU, rounded up.
 fn milli_of(cpu: Duration, over: u128) -> Result<u64, ChargeError> {
     cpu.as_nanos()
@@ -324,12 +357,19 @@ struct Vm {
     band: u8,
     vcpus: u32,
     booking: [u64; 3],
-    /// Its last reading: CPU in milli-CPU over the window, memory's and disk's high-water marks.
-    held: [u64; 3],
+    /// Its last reading: CPU in milli-CPU over the window, memory's and disk's high-water marks; none before its first,
+    /// what it holds being no fact yet (ROOT, 2026-11-13: its first reading is a baseline, never a window's growth).
+    held: Option<[u64; 3]>,
     tail: Tail,
 }
 
 impl Vm {
+    /// What it holds of memory and disk as the rule counts it: its last reading; before its first, its booking, what
+    /// the ledger holds of it, so a VM never read is never past its budget nor counted as nothing.
+    fn holding(&self) -> [u64; 3] {
+        self.held.unwrap_or(self.booking)
+    }
+
     /// Its charge (C1): the p99.9 of its last SEEDABLE windows, no less than its booking while it is cold, each at
     /// most `ceiling`, its class's now ([`ceiling_of`]).
     fn charge(&self, ceiling: [u64; 3]) -> [u64; 3] {
@@ -376,8 +416,8 @@ pub struct Budget {
     pub room: i64,
 }
 
-/// A fleet's memory against its budget (C5): what its VMs hold, the fastest growth of that on record in one window,
-/// and the budget, in bytes.
+/// A fleet's memory against its budget (C5): what its VMs hold, the fastest growth of that on record over one window,
+/// the one its node reads over now ([`Node::growth`]), and the budget, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pressure {
     pub held: u64,
@@ -404,6 +444,16 @@ pub enum Resort<K> {
     End { vm: K, why: Excess },
     /// It isn't, and every VM holds within its own budget, so none may be ended: growth is no fact yet.
     Within(Pressure),
+}
+
+/// What holds a VM its shell couldn't move from what it last set (A-7; ROOT, 2026-11-14: the budget is the contract):
+/// the CPU cap ([`Node::rates`]) and the memory budget ([`Node::budgets`]) it runs under as last set, where its shell
+/// holds it at one. The node counts it there and shares the rest among the others, so the caps and budgets hold the
+/// fleet's whether or not its next setting takes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Held {
+    pub cpu_milli: Option<u64>,
+    pub mem_bytes: Option<u64>,
 }
 
 /// The bounds that hold the rule on Linux (C4, C5): the fleet's parent's, and each of its VMs'. A weight means a
@@ -458,35 +508,42 @@ pub fn with_mutant<T>(m: Option<Mutant>, f: impl FnOnce() -> T) -> T {
 /// each VM by its record's place in the node's start order (`hex-node`'s `Lifetime`), never by anything random.
 #[derive(Debug, Clone)]
 pub struct Node<K> {
-    window: Duration,
+    /// The window it reads over now (C1), none while its shell holds no cap whose period sets one.
+    window: Option<Duration>,
     budget: [u64; 3],
     bounds: Bounds,
     vms: BTreeMap<K, Vm>,
+    /// The VMs its shell couldn't move from what it last set, each at what holds it (A-7, [`Node::set_held`]): each of
+    /// its VMs at most.
+    held: BTreeMap<K, Held>,
     classes: BTreeMap<ClassKey, Record>,
     clock: u64,
-    /// The fastest growth of what its VMs hold, over one window, on its record (C5): learned, only rising.
-    growth: u64,
+    /// The fastest growth of what its VMs hold on its record (C5), as the bytes one window grew by and that window's
+    /// length: learned, only rising as a rate, so a window that changes with the caps its node holds (C1) neither
+    /// shrinks nor swells it ([`Node::growth`]).
+    growth: Option<(u64, Duration)>,
     /// This window's growth so far.
     grew: u64,
 }
 
 impl<K: Ord + Copy> Node<K> {
-    /// A node enforcing CPU over `window` (C1), its fleet's budget `budget` (C7).
-    pub fn new(window: Duration, budget: Amounts, bounds: Bounds) -> Result<Self, ChargeError> {
-        if window.is_zero() {
-            return Err(ChargeError::Invalid {
-                what: "a node's window",
-                why: "a window of no time",
-            });
-        }
+    /// A node reading its VMs over `window` (C1), none until its shell holds a cap whose period sets one, its fleet's
+    /// budget `budget` (C7). Refused for a window of no time.
+    pub fn new(
+        window: Option<Duration>,
+        budget: Amounts,
+        bounds: Bounds,
+    ) -> Result<Self, ChargeError> {
+        check_window(window)?;
         Ok(Self {
             window,
             budget: dims(budget),
             bounds,
             vms: BTreeMap::new(),
+            held: BTreeMap::new(),
             classes: BTreeMap::new(),
             clock: 0,
-            growth: 0,
+            growth: None,
             grew: 0,
         })
     }
@@ -495,6 +552,40 @@ impl<K: Ord + Copy> Node<K> {
     /// admitted until they fit.
     pub fn set_budget(&mut self, budget: Amounts) {
         self.budget = dims(budget);
+    }
+
+    /// The VMs its shell couldn't move from what it last set (A-7; ROOT, 2026-11-14), each window's afresh: each is
+    /// counted at what holds it ([`Held`]) in [`Node::rates`] and [`Node::budgets`], and the rest share what it leaves.
+    /// Only the VMs it tracks are kept.
+    pub fn set_held(&mut self, mut held: BTreeMap<K, Held>) {
+        let vms = &self.vms;
+        held.retain(|id, _| vms.contains_key(id));
+        self.held = held;
+    }
+
+    /// The CPU cap `id` is held at, where its shell holds it at one ([`Node::set_held`]).
+    fn held_cpu(&self, id: &K) -> Option<u64> {
+        self.held.get(id).and_then(|held| held.cpu_milli)
+    }
+
+    /// The memory budget `id` is held at, where its shell holds it at one ([`Node::set_held`]).
+    fn held_mem(&self, id: &K) -> Option<u64> {
+        self.held.get(id).and_then(|held| held.mem_bytes)
+    }
+
+    /// The window the node reads over from now (C1: a learner's window is the longest period of the caps it holds, an
+    /// image VM's its run's own, re-read each window; none while it holds none): each reading after it is charged over
+    /// at least it, and the fastest growth on record is projected over it (C5). Its shell sets it after a window's
+    /// readings and their settling, before the window's last resort. Refused for a window of no time.
+    pub fn set_window(&mut self, window: Option<Duration>) -> Result<(), ChargeError> {
+        check_window(window)?;
+        self.window = window;
+        Ok(())
+    }
+
+    /// The window the node reads over now (C1).
+    pub fn window(&self) -> Option<Duration> {
+        self.window
     }
 
     pub fn budget(&self) -> Amounts {
@@ -561,7 +652,7 @@ impl<K: Ord + Copy> Node<K> {
                 band,
                 vcpus,
                 booking: dims(booking),
-                held: [0; 3],
+                held: None,
                 tail: Tail::new()?,
             },
         );
@@ -599,10 +690,26 @@ impl<K: Ord + Copy> Node<K> {
                 band,
                 vcpus,
                 booking: each(dims(booking), ceiling, u64::min),
-                held: [0; 3],
+                held: None,
                 tail: Tail::new()?,
             },
         );
+        Ok(())
+    }
+
+    /// Takes VM `id`'s first reading, `mem_bytes` of memory held as its learner first meets it, as its baseline (C1, C5;
+    /// ROOT, 2026-11-13): what it holds from then, which its room and its budget's hold reckon with, and what its next
+    /// reading's growth is counted from, never a window's growth itself. Refused for a VM read before.
+    pub fn baseline(&mut self, id: &K, mem_bytes: u64) -> Result<(), ChargeError> {
+        let vm = self.vms.get_mut(id).ok_or(ChargeError::Unknown)?;
+        if vm.held.is_some() {
+            return Err(ChargeError::Invalid {
+                what: "a VM's baseline",
+                why: "it was read before: a baseline is its first reading",
+            });
+        }
+        let [_, _, booked_disk] = vm.booking;
+        vm.held = Some([0, mem_bytes, booked_disk]);
         Ok(())
     }
 
@@ -653,7 +760,10 @@ impl<K: Ord + Copy> Node<K> {
 
     /// The VM `id`'s reading for a window (C1).
     pub fn observe(&mut self, id: K, sample: &Sample) -> Result<(), ChargeError> {
-        let window = self.window;
+        let window = self.window.ok_or(ChargeError::Invalid {
+            what: "a VM's reading",
+            why: "its node reads over no window",
+        })?;
         let vm = self.vms.get_mut(&id).ok_or(ChargeError::Unknown)?;
         let cpu = sample.cpu.total(vm.vcpus)?;
         let over = sample.span.max(window).as_nanos();
@@ -677,8 +787,9 @@ impl<K: Ord + Copy> Node<K> {
             sample.mem_bytes,
             sample.disk_bytes.unwrap_or(booked_disk),
         ];
-        let [_, before, _] = vm.held;
-        vm.held = reading;
+        // Growth is what it holds past its reading before; a first reading is a baseline, none (ROOT, 2026-11-13).
+        let before = vm.held.map(|[_, mem, _]| mem);
+        vm.held = Some(reading);
         let was_cold = !vm.tail.full();
         vm.tail.push(reading)?;
         // A warmed VM's windows are its class's evidence (C2): its whole tail as it warms, then each window.
@@ -688,9 +799,11 @@ impl<K: Ord + Copy> Node<K> {
             _ => Evidence::None,
         };
         let class = vm.class;
-        self.grew = self
-            .grew
-            .saturating_add(sample.mem_bytes.saturating_sub(before));
+        if let Some(before) = before {
+            self.grew = self
+                .grew
+                .saturating_add(sample.mem_bytes.saturating_sub(before));
+        }
         // A held VM's class is never forgotten (`remember`), so its record is there.
         let record = self.classes.get_mut(&class).ok_or(ChargeError::Invalid {
             what: "a class's record",
@@ -730,7 +843,18 @@ impl<K: Ord + Copy> Node<K> {
     /// then raised toward it only into room no booking holds and, for memory and disk, no VM holds, higher bands
     /// first and, within a band, the earliest begun first (by `K`).
     pub fn settle(&mut self) -> Result<(), ChargeError> {
-        self.growth = self.growth.max(self.grew);
+        // This window's growth, over the window its readings were charged over, where it is the fastest on record.
+        if let Some(window) = self.window
+            && self.grew > 0
+        {
+            let faster = self.growth.is_none_or(|(bytes, over)| {
+                u128::from(self.grew).saturating_mul(over.as_nanos())
+                    > u128::from(bytes).saturating_mul(window.as_nanos())
+            });
+            if faster {
+                self.growth = Some((self.grew, window));
+            }
+        }
         self.grew = 0;
         for vm in self.vms.values_mut() {
             vm.booking = each(
@@ -847,12 +971,13 @@ impl<K: Ord + Copy> Node<K> {
     /// last window. `used` says what each used against the cap it ran under: one that used its whole cap, or has run no
     /// window yet, may ask its ceiling. So every VM keeps at least its booking, the caps sum to at most `capacity`
     /// where the bookings fit it (C3; bookings past it stay, as C3 keeps them), and each cap is at most its ceiling and
-    /// at least `least`, the least rate the platform holds.
+    /// at least `least` of it, the least rate the actuator holding it takes (its governor's, its platform's cap's). A
+    /// VM held at its last cap ([`Node::set_held`], A-7) keeps it, counted there, and the rest share what it leaves.
     pub fn rates(
         &self,
         capacity: u64,
         used: &BTreeMap<K, (u64, u64)>,
-        least: u64,
+        least: impl Fn(&K) -> u64,
     ) -> Result<Vec<(K, u64)>, ChargeError> {
         let mut entries = Vec::new();
         entries
@@ -862,7 +987,14 @@ impl<K: Ord + Copy> Node<K> {
                 bound: self.vms.len(),
             })?;
         let mut booked = 0u64;
+        let mut kept = 0u64;
         for (id, vm) in &self.vms {
+            if let Some(cap) = self.held_cpu(id) {
+                kept = kept
+                    .checked_add(cap)
+                    .ok_or(ChargeError::Overflow("a fleet's held CPU caps"))?;
+                continue;
+            }
             let [ceiling, _, _] = ceiling_of(&self.classes, &vm.class);
             let [booking, _, _] = vm.booking;
             let asked = match used.get(id) {
@@ -874,16 +1006,26 @@ impl<K: Ord + Copy> Node<K> {
                 .ok_or(ChargeError::Overflow("a fleet's CPU bookings"))?;
             entries.push((booking.max(1), asked.min(ceiling).saturating_sub(booking)));
         }
-        let extra = shares(capacity.saturating_sub(booked), &entries)?;
+        let mut extra = shares(
+            capacity.saturating_sub(kept).saturating_sub(booked),
+            &entries,
+        )?
+        .into_iter();
         self.vms
             .iter()
-            .zip(extra)
-            .map(|((id, vm), extra)| {
+            .map(|(id, vm)| {
+                if let Some(cap) = self.held_cpu(id) {
+                    return Ok((*id, cap));
+                }
                 let [booking, _, _] = vm.booking;
+                let extra = extra.next().ok_or(ChargeError::Invalid {
+                    what: "a window's rates",
+                    why: "a VM with no share",
+                })?;
                 let cap = booking
                     .checked_add(extra)
                     .ok_or(ChargeError::Overflow("a VM's CPU cap"))?;
-                Ok((*id, cap.max(least)))
+                Ok((*id, cap.max(least(id))))
             })
             .collect()
     }
@@ -950,20 +1092,29 @@ impl<K: Ord + Copy> Node<K> {
     }
 
     /// Each VM's memory budget and room (C5): its booking and a share of the slack in proportion to its booking,
-    /// the remainder a byte each to the first VMs, so the budgets sum to the fleet's budget.
+    /// the remainder a byte each to the first VMs, so the budgets sum to the fleet's budget. A VM held at its last
+    /// budget ([`Node::set_held`], A-7) keeps it, counted there, and the rest share what it leaves.
     pub fn budgets(&self) -> Result<Vec<(K, Budget)>, ChargeError> {
         let [_, budget, _] = self.budget;
-        let booked = self
-            .vms
-            .values()
-            .try_fold(0u64, |total, vm| {
-                let [_, mem, _] = vm.booking;
-                total.checked_add(mem)
-            })
-            .ok_or(ChargeError::Overflow("a node's memory bookings"))?;
-        let slack = budget.saturating_sub(booked);
-        let count = u64::try_from(self.vms.len())
-            .map_err(|_| ChargeError::Overflow("a node's VM count"))?;
+        let mut booked = 0u64;
+        let mut kept = 0u64;
+        let mut count = 0u64;
+        for (id, vm) in &self.vms {
+            if let Some(bytes) = self.held_mem(id) {
+                kept = kept
+                    .checked_add(bytes)
+                    .ok_or(ChargeError::Overflow("a node's held memory budgets"))?;
+                continue;
+            }
+            let [_, mem, _] = vm.booking;
+            booked = booked
+                .checked_add(mem)
+                .ok_or(ChargeError::Overflow("a node's memory bookings"))?;
+            count = count
+                .checked_add(1)
+                .ok_or(ChargeError::Overflow("a node's VM count"))?;
+        }
+        let slack = budget.saturating_sub(kept).saturating_sub(booked);
         let share = |mem: u64| -> Result<u64, ChargeError> {
             let parts = if booked == 0 {
                 Some(slack.checked_div(count).unwrap_or(0))
@@ -977,7 +1128,10 @@ impl<K: Ord + Copy> Node<K> {
         };
         let mut given = 0u64;
         let mut out = Vec::new();
-        for vm in self.vms.values() {
+        for (id, vm) in &self.vms {
+            if self.held_mem(id).is_some() {
+                continue;
+            }
             let [_, mem, _] = vm.booking;
             given = given
                 .checked_add(share(mem)?)
@@ -985,14 +1139,18 @@ impl<K: Ord + Copy> Node<K> {
         }
         let mut left = slack.saturating_sub(given);
         for (id, vm) in &self.vms {
-            let [_, mem, _] = vm.booking;
-            let extra = u64::from(left > 0);
-            left = left.saturating_sub(extra);
-            let bytes = mem
-                .checked_add(share(mem)?)
-                .and_then(|b| b.checked_add(extra))
-                .ok_or(ChargeError::Overflow("a VM's memory budget"))?;
-            let [_, held, _] = vm.held;
+            let bytes = match self.held_mem(id) {
+                Some(bytes) => bytes,
+                None => {
+                    let [_, mem, _] = vm.booking;
+                    let extra = u64::from(left > 0);
+                    left = left.saturating_sub(extra);
+                    mem.checked_add(share(mem)?)
+                        .and_then(|b| b.checked_add(extra))
+                        .ok_or(ChargeError::Overflow("a VM's memory budget"))?
+                }
+            };
+            let [_, held, _] = vm.holding();
             let room = i64::try_from(bytes)
                 .ok()
                 .zip(i64::try_from(held).ok())
@@ -1049,20 +1207,21 @@ impl<K: Ord + Copy> Node<K> {
         let held = self
             .vms
             .values()
-            .map(|vm| vm.held)
+            .map(Vm::holding)
             .fold(0u64, |total, [_, mem, _]| total.saturating_add(mem));
+        let growth = self.growth();
         let fleet = Pressure {
             held,
-            growth: self.growth,
+            growth,
             budget,
         };
-        if held.saturating_add(self.growth) <= budget {
+        if held.saturating_add(growth) <= budget {
             return Ok(Resort::Held);
         }
         let budgets = self.budgets()?;
         let excess = |id: &K, bytes: u64| {
             self.vms.get(id).map(|vm| {
-                let [_, held, _] = vm.held;
+                let [_, held, _] = vm.holding();
                 Excess {
                     held,
                     budget: bytes,
@@ -1075,7 +1234,7 @@ impl<K: Ord + Copy> Node<K> {
         if planted(Mutant::EndLargestHolder) {
             let largest = budgets.iter().max_by_key(|(id, _)| {
                 self.vms.get(id).map_or(0, |vm| {
-                    let [_, mem, _] = vm.held;
+                    let [_, mem, _] = vm.holding();
                     mem
                 })
             });
@@ -1107,13 +1266,24 @@ impl<K: Ord + Copy> Node<K> {
             .unwrap_or(Resort::Within(fleet)))
     }
 
-    /// The fastest growth of what the fleet's VMs hold over one window, on this node's record.
+    /// The fastest growth of what the fleet's VMs hold on this node's record (C5), over the window it reads over now:
+    /// the rate on record over that window's length, rounded up; as it was seen where the node reads over none.
     pub fn growth(&self) -> u64 {
-        self.growth
+        let Some((bytes, over)) = self.growth else {
+            return 0;
+        };
+        let Some(now) = self.window else {
+            return bytes;
+        };
+        let projected = u128::from(bytes)
+            .saturating_mul(now.as_nanos())
+            .div_ceil(over.as_nanos().max(1));
+        u64::try_from(projected).unwrap_or(u64::MAX)
     }
 
     /// The VM ended or was deleted: its booking frees; its class keeps what it learned.
     pub fn end(&mut self, id: &K) -> Result<(), ChargeError> {
+        self.held.remove(id);
         self.vms.remove(id).map(drop).ok_or(ChargeError::Unknown)
     }
 
@@ -1129,7 +1299,7 @@ impl<K: Ord + Copy> Node<K> {
 /// What a VM takes of its node: its booking, and for memory and disk what it holds past it.
 fn physical(vm: &Vm) -> [u64; 3] {
     let [b0, b1, b2] = vm.booking;
-    let [_, h1, h2] = vm.held;
+    let [_, h1, h2] = vm.holding();
     [b0, b1.max(h1), b2.max(h2)]
 }
 

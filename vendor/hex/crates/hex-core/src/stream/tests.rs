@@ -447,6 +447,20 @@ fn the_channel_formats_are_the_design_docs() {
     assert_eq!(port("STDIO_PORT"), STDIO_PORT);
     assert_eq!(port("FILES_PORT"), files::FILES_PORT);
     assert_eq!(port("STAMPS_PORT"), STAMPS_PORT);
+    // Each port's listener as the relay's `--unix` names it, the doc's socket column.
+    for row in &ports {
+        let name = row[0].trim_matches('`');
+        assert_eq!(
+            socket_name(port(name)),
+            Some(row[2].trim_matches('`')),
+            "{name}'s socket"
+        );
+    }
+    assert_eq!(
+        socket_name(GUEST_READY_PORT),
+        None,
+        "a port the relay doesn't listen on"
+    );
     let control = table_after(doc, "**Control.**");
     assert_eq!(control[0][1], TOKEN_BYTES.to_string());
     assert_eq!(control[1][1], PREFIX.to_string());

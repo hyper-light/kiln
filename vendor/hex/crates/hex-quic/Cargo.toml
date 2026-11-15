@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Each connection's seal, AES-256-GCM a key each way (src/seal.rs; docs/design/hex-quic.md Q13).
+aws-lc-rs.workspace = true
 hex-api.workspace = true
 # The node agent's client, which runs over a link of QUIC connections (src/link.rs).
 hex-client.workspace = true

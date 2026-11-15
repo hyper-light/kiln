@@ -19,23 +19,36 @@ use std::time::{Duration, Instant};
 use hex_api::conformance::{self, Act, Fixture};
 use hex_api::differential;
 use hex_api::{Bounds, BoxId, BoxSpec, ClassSpec, Exit, Program, Runtime, Signal, Stdio};
+use hex_core::patience::Patience;
 use hex_core::watch::{lateness_seed, seed};
 use hex_core::{stream, wire};
 use hex_runtime::macos::{MacRuntime, machine_model};
+use hex_testkit::waits::follow::{self, Party};
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
-/// How long a test waits for a fact before calling it a hang: twice the slowest recorded run of the tests that
-/// wait (19.753 s, a kiln pacing stall, which stops a whole run tree and so can meet any wait;
-/// bench/native/macos/records/test-waits-macos.txt), as hex-runtime's macOS tests use. A guard only ends a
-/// hang; a passing test waits on its fact (Ada's rule, 2026-11-06).
-const HANG_GUARD: Duration = Duration::from_millis(39_507);
-/// How long the exec-to-exit measurement waits on one sample: twice (x 2) the slowest sample recorded, the
-/// hog's 465.469 ms (bench/native/macos/records/execexit-a82ce7b-20261106T161405Z.txt). A sample past it
-/// prints `None`, recorded as slower than every earlier run, never waited out (the lead's call #4, 2026-11-06).
-const SAMPLE_GUARD: Duration = Duration::from_micros(2 * 465_469);
+/// The facts these tests wait for that no recorded operation makes, each waited for as decision 9 waits (the person's
+/// ruling of 2026-11-13; `hex_testkit::waits::follow`): measured, past the slowest answer seen its run-out told once, and
+/// followed by its party's life (the program, the hog, the members whose box it is, or the runtime's watcher, which lives
+/// while the test holds the runtime), never a timer's verdict. A program's own end is followed to it as the suites follow
+/// one (`conformance::end_of`).
+static RUNS: Patience = Patience::measuring("test.hex_cli.macos_process_box.runs");
+static HELD: Patience = Patience::measuring("test.hex_cli.macos_process_box.hog_held");
+static READ: Patience = Patience::measuring("test.hex_cli.macos_process_box.watcher_read");
+static READS: Patience = Patience::measuring("test.hex_cli.macos_process_box.watcher_reads");
+static WATCHED: Patience =
+    Patience::measuring("test.hex_cli.macos_process_box.watcher_found_empty");
+static FILLING: Patience = Patience::measuring("test.hex_cli.macos_process_box.hogs_filling");
+static ABANDONED: Patience = Patience::measuring("test.hex_cli.macos_process_box.abandoned");
 
+/// A program as a party: live until it has ended.
+fn life(p: &mut dyn hex_api::Proc) -> Party {
+    match p.try_wait() {
+        Ok(None) => Party::Live,
+        Ok(Some(_)) | Err(_) => Party::Ended,
+    }
+}
 struct BinFixture {
     exe: String,
 }
@@ -151,7 +164,7 @@ fn box_user_boxes_hold_the_contract() {
         .expect("exec in the probe box");
     let mut seen = String::new();
     std::io::Read::read_to_string(&mut out, &mut seen).expect("read");
-    assert_eq!(p.wait_for(HANG_GUARD).expect("wait"), Some(Exit::Code(0)));
+    assert_eq!(conformance::end_of(&mut *p), Ok(Exit::Code(0)));
     let want = hex_core::limits::default_nofile(None);
     assert_eq!(
         seen.trim(),
@@ -249,7 +262,7 @@ fn a_box_past_its_bound_is_ended_as_memory() {
     let mut p = rt
         .exec(&id, fx.act(&Act::Hog(2 * GIB)), Stdio::null())
         .expect("exec hog");
-    let exit = p.wait_for(HANG_GUARD).expect("wait").expect("the hog ends");
+    let exit = conformance::end_of(&mut *p).expect("the hog ends");
     let usage = rt.usage(&id).expect("usage");
     rt.delete(&id).expect("delete");
     assert!(matches!(exit, Exit::Signal(_)), "the hog exited {exit:?}");
@@ -287,10 +300,7 @@ fn a_box_under_its_bound_runs_and_reports_its_exit() {
     let mut p = rt
         .exec(&id, fx.act(&Act::Fail(7)), Stdio::null())
         .expect("exec");
-    let exit = p
-        .wait_for(HANG_GUARD)
-        .expect("wait")
-        .expect("the program ends");
+    let exit = conformance::end_of(&mut *p).expect("the program ends");
     assert_eq!(exit, Exit::Code(7));
     // Nothing runs now, so the box is empty, and delete leaves no member.
     assert_eq!(rt.inspect(&id).unwrap().state, hex_api::BoxState::Empty);
@@ -311,19 +321,19 @@ fn delete_ends_a_running_box() {
         .exec(&id, fx.act(&Act::Wait), Stdio::null())
         .expect("exec wait");
     // It is running before the delete.
-    wait_until(
+    follow::until(
+        &RUNS,
+        "the box running",
+        || life(&mut *p),
         || {
             rt.inspect(&id)
                 .map(|i| i.state == hex_api::BoxState::Running)
                 .unwrap_or(false)
         },
-        "the box runs",
-    );
+    )
+    .expect("the box runs");
     rt.delete(&id).expect("delete");
-    let exit = p
-        .wait_for(HANG_GUARD)
-        .expect("wait")
-        .expect("the program ends");
+    let exit = conformance::end_of(&mut *p).expect("the program ends");
     assert!(
         matches!(exit, Exit::Signal(_)),
         "a deleted box's program: {exit:?}"
@@ -355,23 +365,12 @@ fn the_end_reason_is_memory() {
     let mut p = rt
         .exec(&id, fx.act(&Act::Hog(2 * GIB)), Stdio::null())
         .expect("exec hog");
-    let _ = p.wait_for(HANG_GUARD).expect("wait");
+    conformance::end_of(&mut *p).expect("the hog ends");
     // The box map still holds it until delete; its status names why it ended.
     let b = rt.inspect(&id).expect("inspect");
     assert_eq!(b.state, hex_api::BoxState::Empty);
     rt.delete(&id).expect("delete");
     let _ = b;
-}
-
-fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-    let deadline = Instant::now() + HANG_GUARD;
-    while Instant::now() < deadline {
-        if cond() {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    panic!("timed out waiting for: {what}");
 }
 
 /// A signal both kernels name round-trips to macOS and back (uses the class's own signalling on a box).
@@ -386,19 +385,19 @@ fn a_box_takes_a_named_signal() {
     let mut p = rt
         .exec(&id, fx.act(&Act::Wait), Stdio::null())
         .expect("exec wait");
-    wait_until(
+    follow::until(
+        &RUNS,
+        "the box running",
+        || life(&mut *p),
         || {
             rt.inspect(&id)
                 .map(|i| i.state == hex_api::BoxState::Running)
                 .unwrap_or(false)
         },
-        "the box runs",
-    );
+    )
+    .expect("the box runs");
     rt.signal(&id, Signal::TERM).expect("signal TERM");
-    let exit = p
-        .wait_for(HANG_GUARD)
-        .expect("wait")
-        .expect("the program ends");
+    let exit = conformance::end_of(&mut *p).expect("the program ends");
     rt.delete(&id).expect("delete");
     assert_eq!(exit, Exit::Signal(15), "TERM is 15 on both kernels");
 }
@@ -470,13 +469,16 @@ fn hex_rt_6_one_process_tree_reports_its_bound_and_deletes() {
     deleted.expect("delete");
 }
 
-/// HEX-RT-3, HEX-DIFF-5 (AC-T7.1.1): do 60 programs killed at their box's bound, one after another, expect each wait
-/// to return when the program ends, its end the bound's kill. XNU posts a child's `NOTE_EXIT` before it is a zombie
-/// (`bsd/kern/kern_exit.c:2594-2595`, then `p_stat = SZOMB` at :2664), so a reap made on the event can find nothing
-/// yet; the native bench saw 3 of 60 such ends reported 60 s late (bench/native/RESULT.md). A wait now follows its
-/// program by its own events until its end (decision 9), so such a missed end leaves it waiting for an event that
-/// won't come: the test doesn't return, its own deadline the gate's. Sixty runs, from that measured rate: without the
-/// fix 3/60, 7/60 and 3/60 missed, at least 5%, so sixty runs see none with probability at most 0.95^60 = 4.6%.
+/// HEX-RT-3, HEX-DIFF-5 (AC-T7.1.1; the review's E-5): do 60 programs killed at their box's bound, one after another,
+/// expect each end seen on its own exit, never late, and each the bound's kill. XNU posts a child's `NOTE_EXIT` before
+/// it is a zombie (`bsd/kern/kern_exit.c:2594-2595`, then `p_stat = SZOMB` at :2664), so a reap made on the event can
+/// find nothing yet; the native bench saw 3 of 60 such ends reported 60 s late (bench/native/RESULT.md). Such an end
+/// is seen only on a later wakeup (its wait's slice, or another child's SIGCHLD), which the box counts
+/// (`Status::late_ends`), a fact and not a clock: the count is 0 over the runs, and each end's sighting after its exit
+/// (from the exit's own time on its zombie) is the test's trace. Sixty runs, from the rate measured then: without the
+/// fix 3/60, 7/60 and 3/60 missed, at least 5%, so sixty runs saw none with probability at most 0.95^60 = 4.6%. With
+/// the fix undone on 2026-11-14 (this laptop, e30189ea, a scratch mutation), 1 of 120 ends was late: one run of sixty
+/// caught it, the next didn't.
 #[test]
 fn a_programs_end_is_seen_when_it_ends_not_at_the_waits_budget() {
     let rt = runtime();
@@ -500,23 +502,33 @@ fn a_programs_end_is_seen_when_it_ends_not_at_the_waits_budget() {
     const RUNS: usize = 60;
     // A refused exec's SIGKILL is no bound's end (bound_end): each end must be the bound's kill.
     let mut other = Vec::new();
+    let mut after_exit = Vec::with_capacity(RUNS);
     for i in 0..RUNS {
-        if let Err(why) = bound_end(&rt, &id, fx.act(&Act::Hog(GIB))) {
-            other.push((i, why));
+        match bound_end(&rt, &id, fx.act(&Act::Hog(GIB))) {
+            Ok(seen) => after_exit.push(seen),
+            Err(why) => other.push((i, why)),
         }
     }
+    let status = rt.status(&id).expect("status");
     rt.delete(&id).expect("delete");
+    println!("SEEN_AFTER_EXIT {after_exit:?}");
     assert!(
         other.is_empty(),
         "ends that weren't the bound's kill: {other:?}"
     );
+    assert_eq!(
+        status.late_ends, 0,
+        "ends seen only on a later wakeup, their exit event's reap having found nothing; each end seen after its exit: \
+         {after_exit:?}"
+    );
 }
 
-/// Ada's rule (2026-11-06): the waits in this file are 2 x the measured exec-to-exit of what each waits on,
-/// not picked budgets. This measures them, on this Mac, through the class's own path: 30 of each of a program
-/// that exits at once, a hog ended at its 256 MiB bound, a waiting program ended by TERM, and the shell that
-/// prints its limits; each line is one exec-to-exit in seconds. Ignored: a measurement, not a check; its
-/// output is the record (bench/native/macos/records/execexit-*.txt).
+/// The exec-to-exit of what this file's tests run, on this Mac, through the class's own path: 30 of each of a program
+/// that exits at once, a hog ended at its 256 MiB bound, a waiting program ended by TERM, and the shell that prints its
+/// limits; each line is one exec-to-exit in seconds, each sample followed to its end (decision 9: a sample is the
+/// quantity it measures, so none is cut at a time; it was cut at twice the slowest recorded, a picked multiple, and
+/// printed `None` past it). Ignored: a measurement, not a check; its output is the record
+/// (bench/native/macos/records/execexit-*.txt), evidence alone, since the file's waits follow their programs.
 #[test]
 #[ignore = "a measurement; run by hand and recorded in bench/native/macos/records"]
 fn measure_exec_to_exit() {
@@ -551,7 +563,7 @@ fn measure_exec_to_exit() {
             if term {
                 rt.signal(&id, Signal::TERM).expect("signal TERM");
             }
-            let exit = p.wait_for(SAMPLE_GUARD).expect("wait");
+            let exit = conformance::end_of(&mut *p).expect("a sample's end, followed to it");
             println!("EXEC_EXIT {what} {:.6} {exit:?}", t.elapsed().as_secs_f64());
         }
     }
@@ -588,11 +600,7 @@ fn overshoot(rt: &MacRuntime, fx: &BinFixture, what: &str, members: usize, pass:
     let mut peak = 0;
     let mut exits = Vec::with_capacity(members);
     for mut p in procs {
-        let exit = p.wait_for(HANG_GUARD).expect("wait");
-        assert!(
-            exit.is_some(),
-            "a hog never ended: the box didn't end for memory"
-        );
+        let exit = conformance::end_of(&mut *p).expect("a hog's end: the box ended for memory");
         exits.push(exit);
         peak = peak.max(rt.usage(&id).expect("usage").memory_peak_bytes);
     }
@@ -608,21 +616,24 @@ fn overshoot(rt: &MacRuntime, fx: &BinFixture, what: &str, members: usize, pass:
     // that ended it. A box the kernel's cap ended (its one member armed) has no such read: the last read
     // finds no member running and no end decided.
     if rt.status(&id).is_ok() {
-        let deadline = Instant::now() + HANG_GUARD;
-        let (trace, holds) = loop {
-            let status = rt.status(&id).expect("status");
-            match status.end_trace {
-                Some(t) if t.to_empty.is_some() => break (Some(t), status.holds),
-                None if status.running == 0 => break (None, status.holds),
-                _ => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the watcher never found the box empty"
-                    );
-                    std::thread::yield_now();
+        // Its party is the runtime's watcher, which lives while this test holds the runtime: the wait follows the fact.
+        let mut found = None;
+        follow::until(
+            &WATCHED,
+            "the watcher's read that found the box empty",
+            || Party::Live,
+            || {
+                let status = rt.status(&id).expect("status");
+                match status.end_trace {
+                    Some(t) if t.to_empty.is_some() => found = Some((Some(t), status.holds)),
+                    None if status.running == 0 => found = Some((None, status.holds)),
+                    _ => {}
                 }
-            }
-        };
+                found.is_some()
+            },
+        )
+        .expect("the watcher finds the box empty");
+        let (trace, holds) = found.expect("what the watcher found");
         let mib = |b: u64| b as f64 / MIB as f64;
         let lateness_us = rt.lateness().expect("lateness").as_micros();
         match trace {
@@ -709,10 +720,9 @@ fn hex_mac_4_a_fast_grower_near_its_bound_is_held_while_its_idle_members_run() {
         band: 0,
     })
     .expect("create");
-    let guard = HANG_GUARD.as_secs().to_string();
     let sleepers: Vec<_> = (0..3)
         .map(|_| {
-            rt.exec(&id, Program::of(&["/bin/sleep", &guard]), Stdio::null())
+            rt.exec(&id, fx.act(&Act::Wait), Stdio::null())
                 .expect("exec a sleeper")
         })
         .collect();
@@ -724,29 +734,26 @@ fn hex_mac_4_a_fast_grower_near_its_bound_is_held_while_its_idle_members_run() {
         .iter()
         .map(|p| i32::try_from(p.pid()).expect("a pid"))
         .collect();
-    let deadline = Instant::now() + HANG_GUARD;
-    let held_beside_runners = loop {
-        assert!(
-            Instant::now() < deadline,
-            "the hog was never held while the sleepers ran"
-        );
-        let Some(r) = sys::rusage(hog_pid).expect("rusage") else {
-            break false;
-        };
-        if r.ended {
-            break false;
-        }
-        if r.footprint >= 128 * MIB
-            && sys::run_state(hog_pid).expect("run state") == Some(sys::Run::Stopped)
-            && sleeping
-                .iter()
-                .all(|&pid| sys::run_state(pid).expect("run state") == Some(sys::Run::Live))
-        {
-            break true;
-        }
-        std::thread::yield_now();
-    };
-    let exit = hog.wait_for(HANG_GUARD).expect("wait");
+    // Followed by the hog's life: a hog that ended was never held.
+    let held_beside_runners = follow::until(
+        &HELD,
+        "the hog held while the sleepers ran",
+        || match sys::rusage(hog_pid).expect("rusage") {
+            Some(r) if !r.ended => Party::Live,
+            _ => Party::Ended,
+        },
+        || {
+            sys::rusage(hog_pid)
+                .expect("rusage")
+                .is_some_and(|r| !r.ended && r.footprint >= 128 * MIB)
+                && sys::run_state(hog_pid).expect("run state") == Some(sys::Run::Stopped)
+                && sleeping
+                    .iter()
+                    .all(|&pid| sys::run_state(pid).expect("run state") == Some(sys::Run::Live))
+        },
+    )
+    .is_ok();
+    let exit = conformance::end_of(&mut *hog);
     let usage = rt.usage(&id).expect("usage");
     rt.delete(&id).expect("delete");
     drop(sleepers);
@@ -754,7 +761,7 @@ fn hex_mac_4_a_fast_grower_near_its_bound_is_held_while_its_idle_members_run() {
         held_beside_runners,
         "the hog ended before it was seen held while the sleepers ran"
     );
-    assert!(exit.is_some(), "the hog never ended: the box didn't end");
+    assert!(exit.is_ok(), "the hog's end: {exit:?}");
     assert!(usage.oom_kills >= 1, "the box didn't end for memory");
     assert!(
         usage.memory_peak_bytes <= 256 * MIB + 64 * MIB,
@@ -828,18 +835,20 @@ fn the_watcher_takes_no_priority_over_other_programs() {
         .exec(&id, fx.act(&Act::Wait), Stdio::null())
         .expect("exec");
     // The watcher has read the box once a read has recorded its member.
-    let deadline = Instant::now() + HANG_GUARD;
-    while rt.status(&id).expect("status").running == 0 {
-        assert!(Instant::now() < deadline, "the watcher never read the box");
-        std::thread::yield_now();
-    }
+    follow::until(
+        &READ,
+        "the watcher's read of the box",
+        || life(&mut *p),
+        || rt.status(&id).expect("status").running > 0,
+    )
+    .expect("the watcher reads the box");
     let out = std::process::Command::new("/bin/ps")
         .args(["-M", "-p", &std::process::id().to_string()])
         .output()
         .expect("ps -M");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     rt.delete(&id).expect("delete");
-    let _ = p.wait_for(HANG_GUARD);
+    let _ = conformance::end_of(&mut *p);
     // Each thread's PRI is the token after its STAT: digits and a policy letter.
     let policies: Vec<char> = text
         .lines()
@@ -892,18 +901,31 @@ fn a_steady_box_redoes_no_membership_work_per_read() {
                 .expect("exec")
         })
         .collect();
-    let deadline = Instant::now() + HANG_GUARD;
-    let status = loop {
-        let s = rt.status(&id).expect("status");
-        if s.reads >= 50 {
-            break s;
-        }
-        assert!(Instant::now() < deadline, "the watcher never made 50 reads");
-        std::thread::yield_now();
-    };
+    let mut met = None;
+    follow::until(
+        &READS,
+        "the watcher's 50 reads of a steady box",
+        || {
+            if procs.iter_mut().all(|p| life(&mut **p) == Party::Live) {
+                Party::Live
+            } else {
+                Party::Ended
+            }
+        },
+        || {
+            let s = rt.status(&id).expect("status");
+            let done = s.reads >= 50;
+            if done {
+                met = Some(s);
+            }
+            done
+        },
+    )
+    .expect("the watcher makes 50 reads");
+    let status = met.expect("the status that made them");
     rt.delete(&id).expect("delete");
     for p in &mut procs {
-        let _ = p.wait_for(HANG_GUARD);
+        let _ = conformance::end_of(&mut **p);
     }
     assert!(
         status.membership_passes <= 3,
@@ -967,7 +989,7 @@ fn a_box_runs_at_the_qos_its_declared_weight_asks() {
             .expect("exec");
         member_pri.push(pri(p.pid()));
         rt.delete(&id).expect("delete");
-        let _ = p.wait_for(HANG_GUARD);
+        let _ = conformance::end_of(&mut *p);
     }
     let _ = sibling.kill();
     let _ = sibling.wait();
@@ -986,7 +1008,10 @@ fn a_box_runs_at_the_qos_its_declared_weight_asks() {
 }
 
 /// The lead's call (2026-11-06): what a CPU-bound member gets, on a machine whose every core is busy with
-/// unclamped programs, in a box of the default weight: the CPU it was given over 2 s, in cores. Ignored: a
+/// unclamped programs, in a box of the default weight, in cores, beside what each of those programs gets. Its
+/// window follows what it measures (ROOT, 2026-11-14: no picked window, no multiple): it runs until the member and
+/// every load program have each risen in CPU since it opened, one scheduling round, the least that holds every
+/// share, read at the reads' own cadence, whose count and spacing it prints. It was 2 s, picked. Ignored: a
 /// measurement, run by hand before and after the clamp follows the declared weight.
 #[test]
 #[ignore = "a measurement; run by hand and recorded in bench/native/macos/records"]
@@ -1017,28 +1042,51 @@ fn measure_a_cpu_bound_members_work_rate() {
     let mut p = rt
         .exec(&id, Program::of(&["/usr/bin/yes"]), Stdio::null())
         .expect("exec yes");
-    let c0 = rt.usage(&id).expect("usage").cpu_usec;
+    let tb = hex_runtime::macos::sys::Timebase::get().expect("Mach absolute time's units");
+    // A load program's CPU so far, in nanoseconds (its rusage is Mach absolute time).
+    let load_cpu = |pid: u32| {
+        i32::try_from(pid)
+            .ok()
+            .and_then(|pid| hex_runtime::macos::sys::rusage(pid).ok().flatten())
+            .map_or(0, |r| tb.nanos(r.cpu))
+    };
+    let pids: Vec<u32> = load.iter().map(std::process::Child::id).collect();
+    let member0 = rt.usage(&id).expect("usage").cpu_usec;
+    let load0: Vec<u64> = pids.iter().map(|pid| load_cpu(*pid)).collect();
     let t0 = Instant::now();
-    std::thread::park_timeout(Duration::from_secs(2));
-    let used = rt.usage(&id).expect("usage").cpu_usec.saturating_sub(c0);
+    let mut reads = 0u64;
+    let (member, loads) = loop {
+        reads += 1;
+        let member = rt.usage(&id).expect("usage").cpu_usec;
+        let loads: Vec<u64> = pids.iter().map(|pid| load_cpu(*pid)).collect();
+        if member > member0 && loads.iter().zip(&load0).all(|(now, then)| now > then) {
+            break (member, loads);
+        }
+        std::thread::yield_now();
+    };
     let secs = t0.elapsed().as_secs_f64();
     rt.delete(&id).expect("delete");
-    let _ = p.wait_for(HANG_GUARD);
+    let _ = conformance::end_of(&mut *p);
     for l in &mut load {
         let _ = l.kill();
         let _ = l.wait();
     }
+    let load_ns: u64 = loads.iter().zip(&load0).map(|(now, then)| now - then).sum();
     println!(
-        "CPU_BOUND cores={cores} member_cores={:.3}",
-        used as f64 / 1e6 / secs
+        "CPU_BOUND cores={cores} member_cores={:.3} load_cores_each={:.3} window_s={secs:.6} reads={reads} \
+         read_every_s={:.6}",
+        (member - member0) as f64 / 1e6 / secs,
+        load_ns as f64 / 1e9 / secs / pids.len() as f64,
+        secs / reads as f64
     );
 }
 
-/// Starts `program` in box `id` and follows it to its end ([`conformance::end_of`]); returns how long it took when its
-/// end was the box's bound's kill: a signal, with the box's memory kills risen by one. Anything else (a program
-/// that ended on its own, or one killed by another hand, as the kernel's AppleSystemPolicy kills a refused
-/// exec with SIGKILL before it runs) is an error saying so, so a refused spawn can't pass for a bound's kill.
-fn bound_end(rt: &MacRuntime, id: &BoxId, program: Program) -> Result<Duration, String> {
+/// Starts `program` in box `id` and follows it to its end ([`conformance::end_of`]); returns how long after its exit
+/// its end was seen (the box's `last_seen_after_exit`, from the exit's own time on its zombie) when its end was the
+/// box's bound's kill: a signal, with the box's memory kills risen by one. Anything else (a program that ended on its
+/// own, or one killed by another hand, as the kernel's AppleSystemPolicy kills a refused exec with SIGKILL before it
+/// runs) is an error saying so, so a refused spawn can't pass for a bound's kill.
+fn bound_end(rt: &MacRuntime, id: &BoxId, program: Program) -> Result<Option<Duration>, String> {
     let kills = |rt: &MacRuntime| {
         rt.usage(id)
             .map(|u| u.oom_kills)
@@ -1053,7 +1101,10 @@ fn bound_end(rt: &MacRuntime, id: &BoxId, program: Program) -> Result<Duration, 
     let took = t.elapsed();
     let after = kills(rt)?;
     match exit {
-        Exit::Signal(_) if after == before + 1 => Ok(took),
+        Exit::Signal(_) if after == before + 1 => rt
+            .status(id)
+            .map(|status| status.last_seen_after_exit)
+            .map_err(|e| format!("status: {e}")),
         other => {
             let pid = i32::try_from(p.pid()).map_err(|_| "pid past i32".to_owned())?;
             let run = hex_runtime::macos::sys::run_state(pid);
@@ -1243,11 +1294,20 @@ fn stopped_hogs(exe: &str, members: usize) -> (Kids, i32, Vec<i32>) {
         .iter()
         .map(|k| i32::try_from(k.id()).expect("a pid"))
         .collect();
-    let deadline = Instant::now() + HANG_GUARD;
-    while footprints(&pids).iter().any(|&f| f < 16 * MIB) {
-        assert!(Instant::now() < deadline, "the hogs never began filling");
-        std::thread::park_timeout(hex_core::watch::FLOOR);
-    }
+    let mut kids = kids;
+    follow::until(
+        &FILLING,
+        "the hogs' filling",
+        || {
+            if kids.0.iter_mut().all(|k| matches!(k.try_wait(), Ok(None))) {
+                Party::Live
+            } else {
+                Party::Ended
+            }
+        },
+        || footprints(&pids).iter().all(|&f| f >= 16 * MIB),
+    )
+    .expect("the hogs begin filling");
     rustix::process::kill_process_group(
         rustix::process::Pid::from_raw(pgid).expect("a group id"),
         rustix::process::Signal::STOP,
@@ -1457,10 +1517,14 @@ fn a_program_whose_caller_goes_is_no_memory_end_of_its_box() {
         "{started:?}"
     );
     drop(caller);
-    wait_until(
+    // Its party is the node, which lives while this test holds it: the wait follows the fact.
+    follow::until(
+        &ABANDONED,
+        "the box counting its abandoned program",
+        || Party::Live,
         || client.inspect(&id).is_ok_and(|i| i.abandoned == 1),
-        "the box counts its abandoned program",
-    );
+    )
+    .expect("the box counts its abandoned program");
     let usage = client.usage(&id).expect("usage");
     client.delete(&id).expect("delete");
     assert_eq!(

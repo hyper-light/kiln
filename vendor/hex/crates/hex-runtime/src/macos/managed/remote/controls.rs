@@ -1,14 +1,11 @@
 //! Source-only controls: no helper/controller spawn, signal, native scope or GPU call.
 use super::*;
 use hex_api::{BackingKey, BackingPhase, CapacityResources, Execution, RuntimeCost};
+use hex_core::helper::managed::response::Estimate;
 use hex_core::record::{PoolRecord, RECORD_VERSION};
 use std::num::NonZeroU64;
 
 pub(super) fn helper(directory: &Path) -> Arc<Helper> {
-    helper_with(directory, Duration::from_secs(1))
-}
-/// The same helper, each request bounded by `rpc`.
-fn helper_with(directory: &Path, rpc: Duration) -> Arc<Helper> {
     // The helper's endpoint and receipt parents are private to its UID (0700).
     std::fs::set_permissions(
         directory,
@@ -20,7 +17,6 @@ fn helper_with(directory: &Path, rpc: Duration) -> Arc<Helper> {
             directory.join("hex"),
             directory.join("s"),
             directory.join("r"),
-            rpc,
         )
         .unwrap(),
         protocol::CpuControl {
@@ -278,7 +274,7 @@ pub(super) fn around_peer_read(fd: BorrowedFd<'_>, now: Read) {
 fn a_whole_reply_holds_wherever_the_helpers_close_lands_against_the_nodes_peer_reads() {
     for at in [Read::Before, Read::After] {
         let dir = tempfile::tempdir().unwrap();
-        let helper = helper_with(dir.path(), Duration::from_secs(60));
+        let helper = helper(dir.path());
         let pid = rustix::process::getpid().as_raw_nonzero().get();
         let own = ProcId {
             pid: u32::try_from(pid).unwrap(),
@@ -350,4 +346,213 @@ fn a_whole_reply_holds_wherever_the_helpers_close_lands_against_the_nodes_peer_r
             }
         }
     }
+}
+
+/// The review's C-9 (1), (c3) (decision 9; ROOT, 2026-11-14): an ask with no caller's deadline carries no expiry, its
+/// helper's waits following its connection, and its answer, however late, is the ask's: no control patience of the
+/// helper's config bounds it. Do: a helper (this test's process, the live incarnation its key names) asked to inspect a
+/// scope on a private connection, with no deadline. Expect the request read with no expiry, and its answer taken.
+#[test]
+fn c9_an_ask_with_no_deadline_carries_no_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = helper(dir.path());
+    let pid = rustix::process::getpid().as_raw_nonzero().get();
+    let own = ProcId {
+        pid: u32::try_from(pid).unwrap(),
+        start_ticks: sys::rusage(pid).unwrap().unwrap().started,
+    };
+    let key = protocol::Key::from_record(NativeRecord::Pool(&pool()), own).unwrap();
+    let (node, end) = rustix::net::socketpair(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::empty(),
+        None,
+    )
+    .unwrap();
+    for fd in [&node, &end] {
+        crate::macos::private_descriptor(fd, true).unwrap();
+    }
+    let answering = std::thread::spawn(move || {
+        let (bytes, fds) = frame::receive(end.as_fd(), protocol::timed::MAX_MESSAGE, None).unwrap();
+        let (_, id, expires, request) = protocol::timed::read(&bytes, fds.len()).unwrap();
+        let answer = protocol::Answer::Done {
+            key: request.key().try_clone().unwrap(),
+        };
+        let bytes = protocol::encode_answer(VERSION, id, &answer).unwrap();
+        frame::send(end.as_fd(), &bytes, &[], protocol::MAX_MESSAGE, None).unwrap();
+        expires
+    });
+    let result = helper.rpc_on(
+        &protocol::Request::Control {
+            key,
+            action: protocol::Action::Inspect,
+            controller: None,
+        },
+        &[],
+        None,
+        Some(node.as_fd()),
+    );
+    let expires = answering.join().unwrap();
+    assert_eq!(expires, None, "an ask with no deadline carried an expiry");
+    assert!(
+        matches!(
+            result.map_err(CallFailure::refusal),
+            Ok((protocol::Answer::Done { .. }, _))
+        ),
+        "its answer wasn't taken"
+    );
+}
+
+/// How the played helper answers a response ask: with its estimate, as this helper's server does, or as an older helper
+/// does, its slowest seen with no field after it (the review's A-14).
+enum Says {
+    Estimate(Estimate),
+    Older(Duration),
+}
+
+/// A runtime whose node's control is cold, as it sends it, and the live helper it asks played in this process, its
+/// receipt naming this process and its endpoint bound here, answering each response ask in turn as `answers` say.
+fn playing_helper(
+    answers: Vec<Says>,
+) -> (
+    tempfile::TempDir,
+    MacRuntime,
+    receipt::Publisher,
+    std::thread::JoinHandle<()>,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        directory.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let model = crate::macos::machine_model().unwrap();
+    let rates = hex_core::watch::seed(&model);
+    let runtime = MacRuntime::new(
+        rates.bytes,
+        rates.processes,
+        hex_core::watch::lateness_seed(&model),
+    )
+    .unwrap()
+    .with_cpu_control(crate::macos::CpuControl::cold([3; 32]))
+    .unwrap()
+    .with_managed_helper(
+        ManagedHelper::new(
+            directory.path().join("hex"),
+            directory.path().join("s"),
+            directory.path().join("r"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let helper = runtime.managed_helper.as_ref().unwrap();
+    let pid = rustix::process::getpid().as_raw_nonzero().get();
+    let own = ProcId {
+        pid: u32::try_from(pid).unwrap(),
+        start_ticks: sys::rusage(pid).unwrap().unwrap().started,
+    };
+    let mut publisher = receipt::Publisher::new(helper, own).unwrap();
+    let listener = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    crate::macos::private_descriptor(&listener, false).unwrap();
+    rustix::net::bind(
+        &listener,
+        &SocketAddrUnix::new(&helper.config.endpoint).unwrap(),
+    )
+    .unwrap();
+    rustix::fs::chmod(
+        &helper.config.endpoint,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .unwrap();
+    rustix::net::listen(&listener, libc::SOMAXCONN).unwrap();
+    publisher.bound(helper).unwrap();
+    let answering = std::thread::spawn(move || {
+        for says in answers {
+            let connection = rustix::net::accept(&listener).unwrap();
+            let (bytes, descriptors) =
+                frame::receive(connection.as_fd(), protocol::response::MAX_MESSAGE, None).unwrap();
+            let (version, id) = protocol::response::read(&bytes, descriptors.len()).unwrap();
+            let answer = match says {
+                Says::Estimate(estimate) => {
+                    protocol::response::encode_answer(version, id, Some(estimate)).unwrap()
+                }
+                Says::Older(slowest) => {
+                    let estimate = Estimate {
+                        response: slowest,
+                        cold: false,
+                    };
+                    let mut answer =
+                        protocol::response::encode_answer(version, id, Some(estimate)).unwrap();
+                    // The cold field, which an older helper's answer predates.
+                    answer.pop();
+                    answer
+                }
+            };
+            frame::send(
+                connection.as_fd(),
+                &answer,
+                &[],
+                protocol::response::MAX_ANSWER,
+                None,
+            )
+            .unwrap();
+        }
+    });
+    (directory, runtime, publisher, answering)
+}
+
+/// The review's A-14 (2c-4b; ROOT, 2026-11-13: no record seeds): the node's managed control takes its cycle at a rate
+/// from the stop response its live helper learned in its own holds, asked of it each time, never the response its node
+/// configured. Do play the live helper in this process (its receipt naming this process, its endpoint bound here), its
+/// control having learned a 1 ms stop and then a slower 3 ms one, and take the node's cycle at a thousandth of a CPU
+/// after each, its node's control cold as it sends it. Expect each the control's cycle at the helper's answer then.
+#[test]
+fn w14_2c4b_the_controls_cycle_follows_its_helpers_learned_response() {
+    let learned = [Duration::from_millis(1), Duration::from_millis(3)].map(|response| Estimate {
+        response,
+        cold: false,
+    });
+    let (_directory, runtime, publisher, answering) =
+        playing_helper(learned.map(Says::Estimate).into());
+    let (_, ceiling) = runtime.cpu_control.unwrap();
+    for estimate in learned {
+        assert_eq!(
+            runtime.cap_cycle(1).unwrap(),
+            crate::macos::cycle_of(1, ceiling, Some(estimate)).unwrap(),
+            "the cycle at the helper's {estimate:?}"
+        );
+    }
+    answering.join().unwrap();
+    publisher.close_result(Ok(())).unwrap();
+}
+
+/// The review's A-14 (ROOT, 2026-11-14; AC-T7.4.1): the node's control takes its cycle at its live helper's estimate
+/// whether or not it is cold, and says so where it is: the slowest of too few holds, or an older helper's slowest seen,
+/// whose answer predates the field that says it. Do play the live helper answering a cold 2 ms estimate, then as an
+/// older helper its 4 ms slowest seen, and take the node's cycle at a thousandth of a CPU after each. Expect each the
+/// control's run and hold at the helper's response, used, and told cold.
+#[test]
+fn a14_the_controls_cycle_at_a_cold_estimate_or_an_older_helpers_is_used_and_told_cold() {
+    let (cold, older) = (Duration::from_millis(2), Duration::from_millis(4));
+    let (_directory, runtime, publisher, answering) = playing_helper(vec![
+        Says::Estimate(Estimate {
+            response: cold,
+            cold: true,
+        }),
+        Says::Older(older),
+    ]);
+    let (_, ceiling) = runtime.cpu_control.unwrap();
+    for response in [cold, older] {
+        let (run, hold) = crate::macos::cpu::cycle(1, ceiling, response).unwrap();
+        let cycle = runtime.cap_cycle(1).unwrap();
+        assert!(
+            matches!(
+                &cycle,
+                crate::guest::CapCycle::ColdOf { cycle, .. } if *cycle == run + hold
+            ),
+            "the cycle at the helper's {response:?}: {cycle:?}"
+        );
+    }
+    answering.join().unwrap();
+    publisher.close_result(Ok(())).unwrap();
 }

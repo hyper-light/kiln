@@ -143,8 +143,10 @@ fn the_oci_class_holds_its_contract_through_a_real_shards_guest() {
         |name: &str, default: u64| std::env::var(name).map_or(default, |v| v.parse().unwrap());
     let config = GuestConfig {
         binary: given("SHARDS_BIN").unwrap(),
-        kernel: given("HEX_GUEST_KERNEL").unwrap(),
-        initrd: given("HEX_GUEST_INITRD").unwrap(),
+        boot: hex_runtime::guest::Boot::Kernel {
+            kernel: given("HEX_GUEST_KERNEL").unwrap(),
+            initrd: given("HEX_GUEST_INITRD").unwrap(),
+        },
         // Unset, the host's CPUs (`host_cpus`): the fastest run, as a vCPU costs nothing while it
         // idles.
         vcpus: std::env::var("HEX_GUEST_CPUS").map_or_else(|_| host_cpus(), |v| v.parse().unwrap()),
@@ -169,16 +171,11 @@ fn the_oci_class_holds_its_contract_through_a_real_shards_guest() {
         "oci boxes through a real Shards guest: {failures:#?}"
     );
     assert!(node.list().unwrap().is_empty(), "a box is left");
-    // One guest per node (docs/design/shards-guest.md §1): every box of the suite went to one guest. A
-    // boot not ready within its learned bound is retired and booted again (HEX-GUEST-34), which a loaded
-    // host may ask of the first: those are counted and said, never a guest that served a box.
-    let (boots, retired) = (guests.boots.load(Ordering::SeqCst), node.retired());
-    eprintln!("guest boots {boots}, retired before ready {retired}");
-    assert_eq!(
-        boots - usize::try_from(retired).unwrap(),
-        1,
-        "the node's boxes went to more than one guest ({boots} boots, {retired} retired)"
-    );
+    // One guest per node (docs/design/shards-guest.md §1): every box of the suite went to one guest, booted once. A
+    // boot slower than its W* is followed to its answer, never stopped and booted again (the review's C-9).
+    let boots = guests.boots.load(Ordering::SeqCst);
+    eprintln!("guest boots {boots}");
+    assert_eq!(boots, 1, "the node booted more than one guest");
 }
 
 /// Shards, counting each guest it is asked to boot.

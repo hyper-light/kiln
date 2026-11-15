@@ -52,6 +52,10 @@ static ANSWERS: [Patience; KINDS] = [
     Patience::measuring("client.answer.schedule.forget"),
     // MEASURING until a waits census records the node's links (docs/design/hex-quic.md Q12).
     Patience::measuring("client.answer.links"),
+    // MEASURING until a waits census records a connection's lessors (docs/design/credential-grants.md C7).
+    Patience::measuring("client.answer.lessors"),
+    // MEASURING until a waits census records a keeper's word to its node (the review's A-10).
+    Patience::measuring("client.answer.reserved"),
 ];
 
 /// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`,
@@ -162,7 +166,14 @@ impl Transport for Socket {
             descriptors: fds.len(),
             descriptors_cut: msg.flags.contains(ReturnFlags::CTRUNC),
         };
-        take(&received, fds)?;
+        // A sign-in's tokens cross in their message alone: its bytes here are wiped once it is read
+        // (docs/design/credential-grants.md C8).
+        let secret = wire::carries_secret(received.bytes);
+        let taken = take(&received, fds);
+        if secret && let Some(held) = reading.buf.get_mut(..msg.bytes) {
+            hex_api::lease::wipe_in_place(held);
+        }
+        taken?;
         Ok(true)
     }
 

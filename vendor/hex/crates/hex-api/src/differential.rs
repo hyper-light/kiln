@@ -5,15 +5,16 @@
 //! step (a refusal's kind, a box's state and exit, a program's end and output) is what the simulator
 //! shows for the same class. A step that reads the runtime follows it for the oracle's answer as decision 9 waits
 //! ([`follow`]): within the suite's W* ([`conformance::ENDS`]), and past it, its run-out told, while the runtime's
-//! party lives, the life that can still change its answer. So a runtime that reports a fact late passes; one that
-//! differs fails at its party's end, naming the step; and a real runtime that differs and stays alive is followed, its
-//! run-out told, until its caller's own deadline. Each scenario cites `HEX-DIFF-n`.
+//! party lives, the life that can still change its answer. So a runtime that reports a fact late passes; one whose
+//! reading can't change any more and differs (a program's end) fails at once, naming the step; one that differs
+//! otherwise fails at its party's end; and a real runtime that differs so and stays alive is followed while it lives,
+//! its run-out told. Each scenario cites `HEX-DIFF-n`.
 
 use std::io::{PipeReader, PipeWriter, Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::conformance::{self, Act, Failure, Fixture};
-use crate::patience::Party;
+use crate::patience::{Party, Piece};
 use crate::sim::{SimFixture, SimRuntime};
 use crate::{
     Bounds, BoxId, BoxState, Class, ClassSpec, Exit, Proc, Refusal, Runtime, Signal, Stdio,
@@ -107,6 +108,24 @@ pub enum Seen {
     Out(String),
     Listed(bool),
     Killed(bool),
+}
+
+impl Seen {
+    /// Whether no later reading can differ unless a step of the scenario's changes it, so one that differs from the
+    /// simulator's is the step's verdict at once (the review's E-4): a program's end; an `oci` box whose init has ended
+    /// ([`crate::BoxInfo::exit`]) with nothing left running in it; a memory kill counted, a count that only grows. The
+    /// runtime's own work may still change every other reading (a program still running, a box's state settling, a
+    /// refusal), so that one is followed while the runtime lives.
+    fn last(&self) -> bool {
+        matches!(
+            self,
+            Seen::Exit(_)
+                | Seen::Ok(_)
+                | Seen::Signalled(_)
+                | Seen::Box(BoxState::Empty, Some(_))
+                | Seen::Killed(true)
+        )
+    }
 }
 
 /// A script of calls, played on the class under test and on the simulator.
@@ -580,9 +599,10 @@ enum Reads {
 /// says, waiting at most the slice it is given for one (`None`: until its own next event); within W*
 /// ([`conformance::ENDS`]) a slice is what is left of W*, and past it the run-out is told once, to the census and to
 /// the test ([`Fixture::told`]), naming the step, the simulator's answer and the runtime's last, and slices have no
-/// end. `party` is looked at before each reading: once it has ended, nothing can change the runtime's answer, so that
-/// reading is the last, and what it shows is the step's, the difference the scenario then fails at. The answer, however
-/// long it took, is the sample W* rises to.
+/// end. A reading that can't change any more ([`Seen::last`]) is the step's at once, the difference the scenario then
+/// fails at where it differs (the review's E-4). `party` is looked at before each reading: once it has ended, nothing
+/// can change the runtime's answer, so that reading is the last, and what it shows is the step's. An answer or a
+/// reading that can't change, however long it took, is the sample W* rises to.
 fn follow(
     fx: &dyn Fixture,
     at: (usize, &Step),
@@ -606,7 +626,7 @@ fn follow(
         let reading = Instant::now();
         let seen = read(slice)?;
         let took = reading.elapsed();
-        if seen == *want {
+        if seen == *want || seen.last() {
             conformance::ENDS.answered(asked.elapsed());
             return Ok(seen);
         }
@@ -618,8 +638,15 @@ fn follow(
             && asked.elapsed() >= within
         {
             // Past W*: no sample (Karn's point), the run-out told once, and the runtime followed while it lives.
-            conformance::ENDS.ran_out(within);
             let (i, step) = at;
+            conformance::ENDS.ran_out(
+                within,
+                asked.elapsed(),
+                &[
+                    Piece::Kind("the runtime under test, at step "),
+                    Piece::Number(u64::try_from(i).unwrap_or(u64::MAX)),
+                ],
+            );
             fx.told(&format!(
                 "at step {i} ({step:?}) the simulator showed {want:?} and the runtime {seen:?}, past {within:?}: \
                  following the runtime while it lives"
@@ -677,6 +704,7 @@ fn kind(r: &Refusal) -> &'static str {
         },
         Refusal::Failed { .. } => "Failed",
         Refusal::Unconfigured { .. } => "Unconfigured",
+        Refusal::Guest { .. } => "Guest",
     }
 }
 
@@ -705,6 +733,8 @@ mod tests {
         sim: SimRuntime,
         lie: Lie,
         ran: std::sync::Mutex<Vec<BoxId>>,
+        /// How often a program's end, once told, was asked for again ([`Lie::EndsOtherwise`]).
+        asked_again: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -717,6 +747,54 @@ mod tests {
         StuckRunning,
         /// Exec is refused in a box whose programs have all ended (macOS's first class did this).
         NoExecAfterEnd,
+        /// A program that exits 0 is told to have exited 7: a final reading, a program's end, that differs.
+        EndsOtherwise,
+    }
+
+    /// A program whose end is told otherwise ([`Lie::EndsOtherwise`]): exit 0 as 7. Each ask for its end once it has
+    /// been told is counted in `asked_again`: a final reading read again.
+    struct Misreported {
+        inner: Box<dyn Proc>,
+        told: bool,
+        asked_again: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl Misreported {
+        fn tell(&mut self, end: Option<Exit>) -> Option<Exit> {
+            if self.told {
+                self.asked_again
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let end = end.map(|exit| {
+                if exit == Exit::Code(0) {
+                    Exit::Code(7)
+                } else {
+                    exit
+                }
+            });
+            self.told |= end.is_some();
+            end
+        }
+    }
+
+    impl Proc for Misreported {
+        fn pid(&self) -> u32 {
+            self.inner.pid()
+        }
+        fn try_wait(&mut self) -> Result<Option<Exit>, Refusal> {
+            let end = self.inner.try_wait()?;
+            Ok(self.tell(end))
+        }
+        fn wait_for(&mut self, timeout: Duration) -> Result<Option<Exit>, Refusal> {
+            let end = self.inner.wait_for(timeout)?;
+            Ok(self.tell(end))
+        }
+        fn kill(&mut self) -> Result<(), Refusal> {
+            self.inner.kill()
+        }
+        fn streams(&mut self) -> Result<crate::Given, Refusal> {
+            self.inner.streams()
+        }
     }
 
     impl Runtime for Liar {
@@ -738,7 +816,15 @@ mod tests {
                 return Err(Refusal::os("spawning a program in a box", "EPERM"));
             }
             ran.push(id.clone());
-            self.sim.exec(id, p, s)
+            let proc = self.sim.exec(id, p, s)?;
+            Ok(match self.lie {
+                Lie::EndsOtherwise => Box::new(Misreported {
+                    inner: proc,
+                    told: false,
+                    asked_again: std::sync::Arc::clone(&self.asked_again),
+                }),
+                _ => proc,
+            })
         }
         fn run(
             &self,
@@ -794,6 +880,7 @@ mod tests {
                 sim: SimRuntime::new(),
                 lie,
                 ran: std::sync::Mutex::default(),
+                asked_again: std::sync::Arc::default(),
             };
             let s = SCENARIOS.iter().find(|s| s.id == scenario).unwrap();
             // A double's answers can't change: its party has ended, so each reading is its last, and the scenario
@@ -807,6 +894,87 @@ mod tests {
             )
             .unwrap_err();
             assert!(why.contains(step), "{lie:?}: {why}");
+        }
+    }
+
+    /// The review's E-4 (decision 9; AC-T7.4.1): a followed step's final reading that differs from the simulator's is
+    /// the step's verdict at once, as it was before the follow (565b2d335). A real fixture's runtime lives as long as its
+    /// test, so a follow that waits for its party's end to judge a program's end never judges it, and reads it again for
+    /// good. Do: run HEX-DIFF-1 on a runtime whose programs that exit 0 tell 7, its party alive until a program's told
+    /// end is asked for again. Expect: the scenario fails at its first Wait, naming it, and no told end asked again.
+    #[test]
+    fn e4_a_final_reading_that_differs_is_the_steps_verdict_at_once() {
+        let asked_again = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let liar = Liar {
+            sim: SimRuntime::new(),
+            lie: Lie::EndsOtherwise,
+            ran: std::sync::Mutex::default(),
+            asked_again: std::sync::Arc::clone(&asked_again),
+        };
+        let again = || asked_again.load(std::sync::atomic::Ordering::SeqCst);
+        let s = SCENARIOS.iter().find(|s| s.id == "HEX-DIFF-1").unwrap();
+        let why = differ(
+            &liar,
+            &SimFixture::Process,
+            &SimFixture::Process,
+            s,
+            &|| {
+                if again() == 0 {
+                    Party::Live
+                } else {
+                    Party::Ended
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(why.contains("at step 4 (Wait(0, Exact))"), "{why}");
+        assert_eq!(
+            again(),
+            0,
+            "a program's told end was asked for again while its runtime lived: {why}"
+        );
+    }
+
+    /// The review's E-4, on the polled reads: what can't change is judged at once there too. Do: follow a Look whose
+    /// runtime shows its `oci` box's init ended otherwise than the simulator's, and a Killed whose runtime counted a
+    /// memory kill the simulator didn't, each party alive until a second read. Expect: each the step's reading after one
+    /// read.
+    #[test]
+    fn e4_a_box_ended_or_killed_otherwise_is_judged_at_one_read() {
+        let cases = [
+            (
+                Step::Look(0),
+                Seen::Box(BoxState::Empty, Some(Exit::Code(0))),
+                Seen::Box(BoxState::Empty, Some(Exit::Code(7))),
+            ),
+            (Step::Killed(0), Seen::Killed(false), Seen::Killed(true)),
+        ];
+        for (step, want, shown) in cases {
+            let reads = std::cell::Cell::new(0u32);
+            let party = || {
+                if reads.get() > 1 {
+                    Party::Ended
+                } else {
+                    Party::Live
+                }
+            };
+            let got = follow(
+                &SimFixture::Bundle,
+                (0, &step),
+                &want,
+                &party,
+                Reads::Polled,
+                |_| {
+                    reads.set(reads.get() + 1);
+                    Ok(shown.clone())
+                },
+            );
+            assert_eq!(got, Ok(shown.clone()), "{step:?}");
+            assert_eq!(
+                reads.get(),
+                1,
+                "{step:?} was read again while its runtime lived"
+            );
         }
     }
 

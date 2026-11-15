@@ -11,26 +11,42 @@
 
 mod common;
 
-use std::io::{BufRead, Read as _};
+use std::io::{BufRead, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use common::terminal::{Terminal, cooked};
 use common::{TempDir, cannot_run_vms, guest_init, kernel, run_shards_env, run_shards_env_in, served};
-
-const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// SIGINT, as Linux numbers it, which a client ended by an interrupt exits by (128 + it), on
 /// every host: Windows' clients exit by Linux's numbers.
 const SIGINT: i32 = 2;
 
 /// A connection to the engine served at `socket`: its Unix socket; on Windows the named pipe
-/// the file there names.
+/// the file there names. Read through [`reading`].
 #[cfg(unix)]
 fn connect(socket: &Path) -> std::os::unix::net::UnixStream {
-    let conn = std::os::unix::net::UnixStream::connect(socket).unwrap();
-    conn.set_read_timeout(Some(TIMEOUT)).unwrap();
+    std::os::unix::net::UnixStream::connect(socket).unwrap()
+}
+
+/// A secret-looking value a test's command carries, which the machine's log never says.
+const PLANTED: &str = "SHARDS_PLANTED=sk-ant-planted-0d6f1c";
+
+/// What is read of `conn`, a connection to an engine `home`'s daemon serves: on Unix a read
+/// judged as the tests' waits are (`common::Following::of_home`), its kind its call site, its
+/// bytes its progress; on Windows, whose pipes take no timeout to read by, the pipe itself,
+/// which the daemon closes as it ends.
+#[cfg(unix)]
+#[track_caller]
+fn reading<'a>(
+    conn: &'a std::os::unix::net::UnixStream,
+    home: &Path,
+) -> common::Following<'a, std::os::unix::net::UnixStream> {
+    common::Following::of_home(conn, home)
+}
+
+#[cfg(windows)]
+fn reading<'a>(conn: &'a std::fs::File, _home: &Path) -> &'a std::fs::File {
     conn
 }
 
@@ -72,17 +88,13 @@ struct Listening(PathBuf);
 
 impl Drop for Listening {
     fn drop(&mut self) {
-        let _ = run_shards_env(
-            &["daemon"],
-            &["stop"],
-            &[("SHARDS_HOME", self.0.as_os_str())],
-            TIMEOUT,
-        );
+        let _ = run_shards_env(&["daemon"], &["stop"], &[("SHARDS_HOME", self.0.as_os_str())]);
     }
 }
 
 /// Two homes: a machine whose daemon listens on loopback, the test image pulled there, and a
 /// laptop joined to it as context `gpu`.
+#[track_caller]
 fn joined(name: &str) -> Option<(TempDir, Listening, TempDir, String)> {
     // It says why it skips.
     if cannot_run_vms() {
@@ -102,20 +114,21 @@ fn joined(name: &str) -> Option<(TempDir, Listening, TempDir, String)> {
     let mut daemons = on_machine.to_vec();
     daemons.push(("OWNERS_SECRET", "the owner's own".as_ref()));
     daemons.push(("DOCKER_CONFIG", owners.as_os_str()));
-    let started = run_shards_env(
-        &["daemon"],
-        &["--detached", "--listen", "127.0.0.1:0"],
-        &daemons,
-        TIMEOUT,
-    );
+    let started = run_shards_env(&["daemon"], &["--detached", "--listen", "127.0.0.1:0"], &daemons);
     assert_eq!(started.status, Some(0), "{started}");
     let listening = Listening(machine.to_path_buf());
     let invite = machine.join("laptop.invite");
     let invited = run_shards_env(
         &["invite", "client"],
-        &["--name", "laptop", "--output", invite.to_str().unwrap()],
+        &[
+            "--name",
+            "laptop",
+            "--output",
+            invite.to_str().unwrap(),
+            "--valid",
+            "10m",
+        ],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(invited.status, Some(0), "{invited}");
     let on_laptop = [("SHARDS_HOME", laptop.as_os_str())];
@@ -123,15 +136,9 @@ fn joined(name: &str) -> Option<(TempDir, Listening, TempDir, String)> {
         &["create", "context"],
         &["gpu", "--invite-file", invite.to_str().unwrap()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(joined.status, Some(0), "{joined}");
-    let pulled = run_shards_env(
-        &["--context", "gpu", "pull"],
-        &["-q", image.as_str()],
-        &on_laptop,
-        TIMEOUT,
-    );
+    let pulled = run_shards_env(&["--context", "gpu", "pull"], &["-q", image.as_str()], &on_laptop);
     assert_eq!(pulled.status, Some(0), "{pulled}");
     Some((machine, listening, laptop, image))
 }
@@ -205,9 +212,9 @@ fn ctrl_c_and_the_detach_keys_cross_a_context() {
     let (shown, status, restored) = term.exit();
     assert_eq!((shown.as_str(), status, restored), ("", 0, true));
     let on_laptop = [("SHARDS_HOME", laptop.as_os_str())];
-    let listed = run_shards_env(&["--context", "gpu", "ps"], &[] as &[&str], &on_laptop, TIMEOUT);
+    let listed = run_shards_env(&["--context", "gpu", "ps"], &[] as &[&str], &on_laptop);
     assert!(listed.stdout.contains(" left\n"), "{listed}");
-    let removed = run_shards_env(&["--context", "gpu", "rm"], &["-f", "left"], &on_laptop, TIMEOUT);
+    let removed = run_shards_env(&["--context", "gpu", "rm"], &["-f", "left"], &on_laptop);
     assert_eq!(removed.status, Some(0), "{removed}");
 }
 
@@ -223,7 +230,6 @@ fn exec_and_attach_take_the_terminal_through_a_context() {
         &["--context", "gpu", "run"],
         &["--pull", "never", "-d", "--name", "box", &image, "sleep"],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(made.status, Some(0), "{made}");
     let mut term = Terminal::run(
@@ -255,7 +261,6 @@ fn exec_and_attach_take_the_terminal_through_a_context() {
             "--pull", "never", "-d", "-it", "--name", "held", &image, "tty", "read",
         ],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(made.status, Some(0), "{made}");
     let mut term = Terminal::run(&laptop, &["--context", "gpu", "attach", "held"], 24, 80);
@@ -263,12 +268,7 @@ fn exec_and_attach_take_the_terminal_through_a_context() {
     term.wait_for("read again\r\n");
     let (_, status, restored) = term.exit();
     assert_eq!((status, restored), (0, true));
-    let removed = run_shards_env(
-        &["--context", "gpu", "rm"],
-        &["-f", "box", "held"],
-        &on_laptop,
-        TIMEOUT,
-    );
+    let removed = run_shards_env(&["--context", "gpu", "rm"], &["-f", "box", "held"], &on_laptop);
     assert_eq!(removed.status, Some(0), "{removed}");
 }
 
@@ -303,7 +303,6 @@ fn a_clients_command_has_the_clients_environment_not_the_owners() {
             ("CLIENTS_OWN", "mine".as_ref()),
             ("CLIENTS_TOO", "also mine".as_ref()),
         ],
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{ran}");
     let vars: Vec<&str> = ran.stdout.split('\0').collect();
@@ -333,7 +332,6 @@ fn a_clients_command_has_the_clients_environment_not_the_owners() {
             "mkdir:/made",
         ],
         &[("SHARDS_HOME", laptop.as_os_str())],
-        TIMEOUT,
     );
     assert_ne!(confined.status, Some(0), "{confined}");
     assert!(confined.stderr.contains("Operation not permitted"), "{confined}");
@@ -343,7 +341,6 @@ fn a_clients_command_has_the_clients_environment_not_the_owners() {
         &["--context", "gpu", "run"],
         &["--rm", "--security-opt", "seccomp=gone.json", &image, "true"],
         &[("SHARDS_HOME", laptop.as_os_str())],
-        TIMEOUT,
     );
     assert_eq!(missing.status, Some(125), "{missing}");
     // Its system's own words for a file not there, as Go's os.Open says them on each.
@@ -376,7 +373,7 @@ fn a_clients_archives_are_its_own_files() {
     let there = |command: &[&str], args: &[&str]| {
         let mut words = vec!["--context", "gpu"];
         words.extend_from_slice(command);
-        let ran = run_shards_env_in(&here, &words, args, &on_laptop, TIMEOUT);
+        let ran = run_shards_env_in(&here, &words, args, &on_laptop);
         assert_eq!(ran.status, Some(0), "{command:?} {args:?}: {ran}");
         ran
     };
@@ -417,7 +414,6 @@ fn a_clients_archives_are_its_own_files() {
         &["--context", "gpu", "save"],
         &["-o", "none.tar", "no-such-image:1"],
         &on_laptop,
-        TIMEOUT,
     );
     assert_ne!(failed.status, Some(0), "{failed}");
     assert_eq!(names(), ["Agentfile", "files.tar", "image.tar"]);
@@ -489,7 +485,7 @@ fn a_build_through_a_context_is_of_the_clients_context_kept_in_step() {
     let shards = |command: &[&str], args: &[&str]| {
         let mut words = vec!["--context", "gpu"];
         words.extend_from_slice(command);
-        run_shards_env_in(&laptop, &words, args, &on_laptop, TIMEOUT)
+        run_shards_env_in(&laptop, &words, args, &on_laptop)
     };
     // What the machine's daemon last said came of a context's files.
     let came = || -> u64 {
@@ -599,7 +595,6 @@ fn a_build_through_a_context_is_of_the_clients_context_kept_in_step() {
             ("SHARDS_HOME", laptop.as_os_str()),
             ("MSG", "from the client".as_ref()),
         ],
-        TIMEOUT,
     );
     assert_eq!(labelled.status, Some(0), "{labelled}");
     let label = shards(
@@ -612,19 +607,20 @@ fn a_build_through_a_context_is_of_the_clients_context_kept_in_step() {
         &["remove", "client"],
         &["laptop"],
         &[("SHARDS_HOME", machine.as_os_str())],
-        TIMEOUT,
     );
     assert_eq!(removed.status, Some(0), "{removed}");
     assert!(!machine.join("synced/laptop").exists(), "its copies kept");
 }
 
-/// What a client of Docker's API reads of `path` on the engine socket `socket`, on a
-/// connection of its own: the answer's status, and its body, a length's or a chunked one's.
-fn engine_get(socket: &Path, path: &str) -> (u16, String) {
+/// What a client of Docker's API reads of `path` on the engine socket `socket`, which
+/// `home`'s daemon serves, on a connection of its own: the answer's status, and its body, a
+/// length's or a chunked one's.
+#[track_caller]
+fn engine_get(home: &Path, socket: &Path, path: &str) -> (u16, String) {
     use std::io::{BufRead as _, Write as _};
     let mut conn = connect(socket);
     write!(conn, "GET {path} HTTP/1.1\r\nHost: api\r\n\r\n").unwrap();
-    let mut reader = std::io::BufReader::new(conn);
+    let mut reader = std::io::BufReader::new(reading(&conn, home));
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     let status = line.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -668,10 +664,10 @@ fn a_contexts_engine_is_its_machines() {
         return;
     };
     let on_laptop = [("SHARDS_HOME", laptop.as_os_str())];
-    let started = run_shards_env(&["daemon"], &["--detached"], &on_laptop, TIMEOUT);
+    let started = run_shards_env(&["daemon"], &["--detached"], &on_laptop);
     assert_eq!(started.status, Some(0), "{started}");
     let _laptops = Listening(laptop.to_path_buf());
-    let inspected = run_shards_env(&["inspect", "context"], &["gpu"], &on_laptop, TIMEOUT);
+    let inspected = run_shards_env(&["inspect", "context"], &["gpu"], &on_laptop);
     assert_eq!(inspected.status, Some(0), "{inspected}");
     let doc: serde_json::Value = serde_json::from_str(&inspected.stdout).unwrap();
     // On Windows the file of the home that names the pipe, which the endpoint names once the
@@ -690,20 +686,22 @@ fn a_contexts_engine_is_its_machines() {
         let short: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
         laptop.join("e").join(format!("{short}.sock"))
     };
-    // Served as the daemon starts, for the contexts its home joined.
+    // Served as the daemon starts, for the contexts its home joined: waited for while that
+    // daemon goes on.
     let served = |engine: &Path| {
-        let start = std::time::Instant::now();
+        let mut patience = common::Patience::of(&laptop);
         while !engine.exists() {
-            assert!(start.elapsed() < TIMEOUT, "{} never served", engine.display());
-            std::thread::sleep(Duration::from_millis(5));
+            assert!(patience.holds(), "{} never served", engine.display());
+            std::thread::sleep(patience.next_look());
         }
+        patience.done();
     };
     served(&engine);
     // On Windows, once served, the endpoint names its pipe, as `npipe://` (D180 part 3k).
     #[cfg(windows)]
     {
         let _ = doc;
-        let inspected = run_shards_env(&["inspect", "context"], &["gpu"], &on_laptop, TIMEOUT);
+        let inspected = run_shards_env(&["inspect", "context"], &["gpu"], &on_laptop);
         let doc: serde_json::Value = serde_json::from_str(&inspected.stdout).unwrap();
         assert_eq!(
             doc[0]["Engine"].as_str(),
@@ -711,7 +709,7 @@ fn a_contexts_engine_is_its_machines() {
             "{doc}"
         );
     }
-    assert_eq!(engine_get(&engine, "/_ping"), (200, "OK".into()));
+    assert_eq!(engine_get(&laptop, &engine, "/_ping"), (200, "OK".into()));
     // A client that reads to the end, as one asking to close does: the API's end of its
     // answer is the client's end of reading, through the relay.
     {
@@ -720,7 +718,7 @@ fn a_contexts_engine_is_its_machines() {
         conn.write_all(b"GET /_ping HTTP/1.1\r\nHost: api\r\nConnection: close\r\n\r\n")
             .unwrap();
         let mut answer = String::new();
-        conn.read_to_string(&mut answer).unwrap();
+        reading(&conn, &laptop).read_to_string(&mut answer).unwrap();
         assert!(
             answer.starts_with("HTTP/1.1 200 OK\r\n") && answer.ends_with("OK"),
             "{answer:?}"
@@ -730,10 +728,9 @@ fn a_contexts_engine_is_its_machines() {
         &["--context", "gpu", "create"],
         &["--name", "relayed", image.as_str()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(made.status, Some(0), "{made}");
-    let (status, there) = engine_get(&engine, "/containers/json?all=1");
+    let (status, there) = engine_get(&laptop, &engine, "/containers/json?all=1");
     assert_eq!(status, 200, "{there}");
     assert!(there.contains("\"/relayed\""), "{there}");
     // A bind through the context's engine names a path, which is the client's, and Docker's
@@ -754,11 +751,11 @@ fn a_contexts_engine_is_its_machines() {
         )
         .unwrap();
         let mut answer = String::new();
-        conn.read_to_string(&mut answer).unwrap();
+        reading(&conn, &laptop).read_to_string(&mut answer).unwrap();
         assert!(!answer.starts_with("HTTP/1.1 201"), "{answer}");
         assert!(answer.contains("its own directory"), "{answer}");
     }
-    let (status, here) = engine_get(&laptop.join(OWN_ENGINE), "/containers/json?all=1");
+    let (status, here) = engine_get(&laptop, &laptop.join(OWN_ENGINE), "/containers/json?all=1");
     assert_eq!(status, 200, "{here}");
     assert!(!here.contains("relayed"), "{here}");
     // Docker's own CLI, where this host has one: its listing, and a run, whose attach takes
@@ -779,7 +776,7 @@ fn a_contexts_engine_is_its_machines() {
     // a new name.
     let docker = |args: &[&str], stdin: Stdio| {
         docker.as_ref().map(|docker| {
-            let out = common::output_within(
+            let out = common::client_output(
                 std::process::Command::new(docker)
                     .args(args)
                     .env("DOCKER_HOST", docker_host(&engine))
@@ -788,7 +785,7 @@ fn a_contexts_engine_is_its_machines() {
                     .env_remove("DOCKER_CONTEXT")
                     .env("DOCKER_CLI_HINTS", "false")
                     .stdin(stdin),
-                TIMEOUT,
+                Some(&*laptop),
             );
             (
                 out.status.code(),
@@ -819,7 +816,7 @@ fn a_contexts_engine_is_its_machines() {
     if let Some((status, out, err)) = catted {
         assert_eq!((status, out.as_str()), (Some(0), "relayed through\n"), "{err}");
     }
-    let removed = run_shards_env(&["remove", "context"], &["gpu"], &on_laptop, TIMEOUT);
+    let removed = run_shards_env(&["remove", "context"], &["gpu"], &on_laptop);
     assert_eq!(removed.status, Some(0), "{removed}");
     assert!(!engine.exists(), "its engine's socket kept");
     // Joined while the daemon runs: served as the daemon sees it come, no command asked of
@@ -828,22 +825,27 @@ fn a_contexts_engine_is_its_machines() {
     let invite = machine.join("again.invite");
     let invited = run_shards_env(
         &["invite", "client"],
-        &["--name", "again", "--output", invite.to_str().unwrap()],
+        &[
+            "--name",
+            "again",
+            "--output",
+            invite.to_str().unwrap(),
+            "--valid",
+            "10m",
+        ],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(invited.status, Some(0), "{invited}");
     let rejoined = run_shards_env(
         &["create", "context"],
         &["gpu", "--invite-file", invite.to_str().unwrap()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(rejoined.status, Some(0), "{rejoined}");
     served(&engine);
-    assert_eq!(engine_get(&engine, "/_ping"), (200, "OK".into()));
+    assert_eq!(engine_get(&laptop, &engine, "/_ping"), (200, "OK".into()));
     // Joined again as it was enrolled: one client of its key, the invitation redeemed.
-    let clients = run_shards_env(&["list", "clients"], &[] as &[&str], &on_machine, TIMEOUT);
+    let clients = run_shards_env(&["list", "clients"], &[] as &[&str], &on_machine);
     let named: Vec<&str> = clients
         .stdout
         .lines()
@@ -854,10 +856,10 @@ fn a_contexts_engine_is_its_machines() {
     assert!(!machine.join("invitations/again").exists(), "the invitation kept");
     // A socket someone removed is served again as the daemon next looks.
     std::fs::remove_file(&engine).unwrap();
-    let listed = run_shards_env(&["ps"], &["-a"], &on_laptop, TIMEOUT);
+    let listed = run_shards_env(&["ps"], &["-a"], &on_laptop);
     assert_eq!(listed.status, Some(0), "{listed}");
     served(&engine);
-    assert_eq!(engine_get(&engine, "/_ping"), (200, "OK".into()));
+    assert_eq!(engine_get(&laptop, &engine, "/_ping"), (200, "OK".into()));
     // A stream held open through it ends as the daemon stops, which takes the contexts'
     // sockets with it as it closes: an attach to a microVM there, which the end of its
     // client's writing would not end.
@@ -865,7 +867,6 @@ fn a_contexts_engine_is_its_machines() {
         &["--context", "gpu", "run"],
         &["-d", "--name", "held", image.as_str(), "sleep"],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(held.status, Some(0), "{held}");
     {
@@ -876,26 +877,26 @@ fn a_contexts_engine_is_its_machines() {
                 b"POST /containers/held/attach?stream=1&stdout=1&stderr=1 HTTP/1.1\r\nHost: api\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n",
             )
             .unwrap();
-        let mut reader = std::io::BufReader::new(&attach);
+        let mut reader = std::io::BufReader::new(reading(&attach, &laptop));
         let mut status = String::new();
         reader.read_line(&mut status).unwrap();
         assert!(status.starts_with("HTTP/1.1 101 "), "{status:?}");
-        let stopped = run_shards_env(&["stop", "daemon"], &[] as &[&str], &on_laptop, TIMEOUT);
+        let stopped = run_shards_env(&["stop", "daemon"], &[] as &[&str], &on_laptop);
         assert_eq!(stopped.status, Some(0), "{stopped}");
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).unwrap();
         assert!(!engine.exists(), "its engine's socket kept by a daemon gone");
     }
-    let removed = run_shards_env(&["--context", "gpu", "rm"], &["-f", "held"], &on_laptop, TIMEOUT);
+    let removed = run_shards_env(&["--context", "gpu", "rm"], &["-f", "held"], &on_laptop);
     assert_eq!(removed.status, Some(0), "{removed}");
     // Served again by the next daemon; and a machine that refuses the client is said so
     // there, as the API says an error, which Docker's clients print.
-    let started = run_shards_env(&["daemon"], &["--detached"], &on_laptop, TIMEOUT);
+    let started = run_shards_env(&["daemon"], &["--detached"], &on_laptop);
     assert_eq!(started.status, Some(0), "{started}");
     served(&engine);
-    let gone = run_shards_env(&["remove", "client"], &["laptop"], &on_machine, TIMEOUT);
+    let gone = run_shards_env(&["remove", "client"], &["laptop"], &on_machine);
     assert_eq!(gone.status, Some(0), "{gone}");
-    let (status, said) = engine_get(&engine, "/_ping");
+    let (status, said) = engine_get(&laptop, &engine, "/_ping");
     assert_eq!(status, 502, "{said}");
     let said: serde_json::Value = serde_json::from_str(&said).unwrap();
     assert_eq!(
@@ -931,7 +932,7 @@ fn a_microvms_files_are_copied_to_and_from_the_client() {
     let there = |command: &[&str], args: &[&str]| {
         let mut words = vec!["--context", "gpu"];
         words.extend_from_slice(command);
-        run_shards_env_in(&here, &words, args, &on_laptop, TIMEOUT)
+        run_shards_env_in(&here, &words, args, &on_laptop)
     };
     let started = there(
         &["run"],
@@ -1023,7 +1024,7 @@ fn a_policy_through_a_context_is_the_clients_its_builder_the_machine() {
         };
         argv.extend(["buildx", "policy"]);
         argv.extend_from_slice(args);
-        let out = run_shards_env_in(&dir.join(sub), &[], &argv, env, TIMEOUT);
+        let out = run_shards_env_in(&dir.join(sub), &[], &argv, env);
         (out.status, out.stdout, out.stderr)
     };
     std::fs::create_dir_all(&dir).unwrap();
@@ -1097,22 +1098,22 @@ fn a_policy_through_a_context_is_the_clients_its_builder_the_machine() {
     let registry = format!("127.0.0.1:{port}");
     let target = format!("{registry}/team/app:1");
     let login = ["-u", "pusher", "-p", "secret", registry.as_str()];
-    let owner_in = run_shards_env(&["login"], &login, &on_machine, TIMEOUT);
+    let owner_in = run_shards_env(&["login"], &login, &on_machine);
     assert_eq!(owner_in.status, Some(0), "{owner_in}");
-    let tagged = run_shards_env(&["tag"], &[image.as_str(), target.as_str()], &on_machine, TIMEOUT);
+    let tagged = run_shards_env(&["tag"], &[image.as_str(), target.as_str()], &on_machine);
     assert_eq!(tagged.status, Some(0), "{tagged}");
-    let pushed = run_shards_env(&["push"], &[target.as_str()], &on_machine, TIMEOUT);
+    let pushed = run_shards_env(&["push"], &[target.as_str()], &on_machine);
     assert_eq!(pushed.status, Some(0), "{pushed}");
     // Its name gone from the machine's store, which would answer for it, as a build there
     // finds an image it holds: the registry alone knows it.
-    let untagged = run_shards_env(&["rmi"], &[target.as_str()], &on_machine, TIMEOUT);
+    let untagged = run_shards_env(&["rmi"], &[target.as_str()], &on_machine);
     assert_eq!(untagged.status, Some(0), "{untagged}");
     let behind = format!("docker-image://{target}");
     let print = ["eval", "--print", "--fields", "image.checksum", behind.as_str()];
     let refused = policy("", &print, &on_laptop, true);
     assert_eq!(refused.0, Some(1), "{refused:?}");
     assert!(refused.2.starts_with("ERROR: "), "{refused:?}");
-    let client_in = run_shards_env(&["--context", "gpu", "login"], &login, &on_laptop, TIMEOUT);
+    let client_in = run_shards_env(&["--context", "gpu", "login"], &login, &on_laptop);
     assert_eq!(client_in.status, Some(0), "{client_in}");
     let printed = policy("", &print, &on_laptop, true);
     assert_eq!(printed.0, Some(0), "{printed:?}");
@@ -1121,8 +1122,12 @@ fn a_policy_through_a_context_is_the_clients_its_builder_the_machine() {
     // Evaluated here: the machine was asked its steps alone, never to run the commands, and
     // none of the client's paths.
     let log = std::fs::read_to_string(machine.join("daemon.log")).unwrap();
-    assert!(log.contains("client laptop: policy step platform"), "{log}");
-    assert!(log.contains("client laptop: policy step resolve"), "{log}");
+    assert!(log.contains("client laptop: policy step platform\n"), "{log}");
+    assert!(log.contains("client laptop: policy step resolve\n"), "{log}");
+    assert!(
+        log.contains("client laptop: policy step resolve ended, status 0"),
+        "{log}"
+    );
     assert!(!log.contains("client laptop: shards buildx policy"), "{log}");
     assert!(!log.contains(dir.to_str().unwrap()), "{log}");
 }
@@ -1165,11 +1170,11 @@ fn a_clients_logins_are_its_own() {
     ];
     // The owner logs in on the machine, and pushes the image there.
     let login = ["-u", "pusher", "-p", "secret", registry.as_str()];
-    let owner_in = run_shards_env(&["login"], &login, &on_machine, TIMEOUT);
+    let owner_in = run_shards_env(&["login"], &login, &on_machine);
     assert_eq!(owner_in.status, Some(0), "{owner_in}");
-    let tagged = run_shards_env(&["tag"], &[image.as_str(), target.as_str()], &on_machine, TIMEOUT);
+    let tagged = run_shards_env(&["tag"], &[image.as_str(), target.as_str()], &on_machine);
     assert_eq!(tagged.status, Some(0), "{tagged}");
-    let pushed = run_shards_env(&["push"], &[target.as_str()], &on_machine, TIMEOUT);
+    let pushed = run_shards_env(&["push"], &[target.as_str()], &on_machine);
     assert_eq!(pushed.status, Some(0), "{pushed}");
     // And builds an agent there, to push.
     let agent_dir = machine.join("agent");
@@ -1185,7 +1190,6 @@ fn a_clients_logins_are_its_own() {
         &["build", "agent"],
         &[agent_dir.to_str().unwrap(), "-t", agent.as_str()],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(built.status, Some(0), "{built}");
     let owners_kept = std::fs::read(owners.join("config.json")).unwrap();
@@ -1194,18 +1198,16 @@ fn a_clients_logins_are_its_own() {
         &["--context", "gpu", "pull"],
         &["-q", target.as_str()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_ne!(refused.status, Some(0), "{refused}");
     let agent_refused = run_shards_env(
         &["--context", "gpu", "push", "agent"],
         &[agent.as_str()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_ne!(agent_refused.status, Some(0), "{agent_refused}");
     // Logged in through the context: kept here, the owner's store as it was.
-    let client_in = run_shards_env(&["--context", "gpu", "login"], &login, &on_laptop, TIMEOUT);
+    let client_in = run_shards_env(&["--context", "gpu", "login"], &login, &on_laptop);
     assert_eq!(client_in.status, Some(0), "{client_in}");
     let kept: serde_json::Value =
         serde_json::from_slice(&std::fs::read(laptops.join("config.json")).unwrap()).unwrap();
@@ -1216,7 +1218,6 @@ fn a_clients_logins_are_its_own() {
         &["--context", "gpu", "pull"],
         &["-q", target.as_str()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(pulled.status, Some(0), "{pulled}");
     // As shards' own commands reach it: an agent pushed, and an image's Agentfile made of
@@ -1225,21 +1226,14 @@ fn a_clients_logins_are_its_own() {
         &["--context", "gpu", "push", "agent"],
         &[agent.as_str()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(agent_pushed.status, Some(0), "{agent_pushed}");
-    let removed = run_shards_env(
-        &["--context", "gpu", "rmi"],
-        &[target.as_str()],
-        &on_laptop,
-        TIMEOUT,
-    );
+    let removed = run_shards_env(&["--context", "gpu", "rmi"], &[target.as_str()], &on_laptop);
     assert_eq!(removed.status, Some(0), "{removed}");
     let made = run_shards_env(
         &["--context", "gpu", "make", "agentfile"],
         &[target.as_str()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(made.status, Some(0), "{made}");
     assert!(
@@ -1250,41 +1244,24 @@ fn a_clients_logins_are_its_own() {
     let app = laptop.join("app");
     std::fs::create_dir_all(&app).unwrap();
     std::fs::write(app.join("Dockerfile"), format!("FROM {target}\n")).unwrap();
-    let removed = run_shards_env(
-        &["--context", "gpu", "rmi"],
-        &[target.as_str()],
-        &on_laptop,
-        TIMEOUT,
-    );
+    let removed = run_shards_env(&["--context", "gpu", "rmi"], &[target.as_str()], &on_laptop);
     assert_eq!(removed.status, Some(0), "{removed}");
     let built = run_shards_env(
         &["--context", "gpu", "build"],
         &["--progress=plain", "-t", "on-a-login:1", app.to_str().unwrap()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(built.status, Some(0), "{built}");
     // Logged out here: the next pull there is refused again.
-    let client_out = run_shards_env(
-        &["--context", "gpu", "logout"],
-        &[registry.as_str()],
-        &on_laptop,
-        TIMEOUT,
-    );
+    let client_out = run_shards_env(&["--context", "gpu", "logout"], &[registry.as_str()], &on_laptop);
     assert_eq!(client_out.status, Some(0), "{client_out}");
     assert_eq!(std::fs::read(owners.join("config.json")).unwrap(), owners_kept);
-    let gone = run_shards_env(
-        &["--context", "gpu", "rmi"],
-        &[target.as_str()],
-        &on_laptop,
-        TIMEOUT,
-    );
+    let gone = run_shards_env(&["--context", "gpu", "rmi"], &[target.as_str()], &on_laptop);
     assert_eq!(gone.status, Some(0), "{gone}");
     let again = run_shards_env(
         &["--context", "gpu", "pull"],
         &["-q", target.as_str()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_ne!(again.status, Some(0), "{again}");
 }
@@ -1311,12 +1288,25 @@ fn a_signal_to_the_client_reaches_the_command_there() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = common::interruptible(&mut command).spawn().unwrap();
-        // A regression fails the test instead of hanging it.
+        // A regression fails the test instead of hanging it: its run, waited on as the tests'
+        // waits are (`common::Wait`, its client and the laptop's daemon its party), is ended
+        // where its judge refuses it.
         let ender = Ender::of(&child);
         let (done, watch) = std::sync::mpsc::channel::<()>();
+        let (client, home) = (child.id(), laptop.to_path_buf());
         std::thread::spawn(move || {
-            if watch.recv_timeout(TIMEOUT).is_err() {
-                ender.end();
+            let kind = common::WaitKind::at(std::panic::Location::caller());
+            let mut wait = common::Wait::begin(kind, client, Some(&home), "a run's signal");
+            loop {
+                match watch.recv_timeout(wait.next_look()) {
+                    Ok(()) => return wait.answered(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if let Err(stall) = wait.look(false) {
+                    let _ = writeln!(std::io::stderr(), "{}", wait.refused(&stall));
+                    return ender.end();
+                }
             }
         });
         let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
@@ -1414,9 +1404,15 @@ fn a_context_runs_commands_on_its_machine_whole() {
     let invite = machine.join("laptop.invite");
     let early = run_shards_env(
         &["invite", "client"],
-        &["--name", "laptop", "--output", invite.to_str().unwrap()],
+        &[
+            "--name",
+            "laptop",
+            "--output",
+            invite.to_str().unwrap(),
+            "--valid",
+            "10m",
+        ],
         &on_machine,
-        TIMEOUT,
     );
     assert_ne!(early.status, Some(0), "{early}");
     assert!(early.stderr.contains("does not listen for clients"), "{early}");
@@ -1425,14 +1421,19 @@ fn a_context_runs_commands_on_its_machine_whole() {
         &["daemon"],
         &["--detached", "--listen", "127.0.0.1:0"],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(started.status, Some(0), "{started}");
     let invited = run_shards_env(
         &["invite", "client"],
-        &["--name", "laptop", "--output", invite.to_str().unwrap()],
+        &[
+            "--name",
+            "laptop",
+            "--output",
+            invite.to_str().unwrap(),
+            "--valid",
+            "10m",
+        ],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(invited.status, Some(0), "{invited}");
     {
@@ -1457,7 +1458,6 @@ fn a_context_runs_commands_on_its_machine_whole() {
         &["create", "context"],
         &["gpu", "--invite-file", invite.to_str().unwrap()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(joined.status, Some(0), "{joined}");
     assert_eq!(joined.stdout, "gpu\n");
@@ -1470,7 +1470,6 @@ fn a_context_runs_commands_on_its_machine_whole() {
         &["create", "context"],
         &["gpu", "--invite-file", invite.to_str().unwrap()],
         &on_stranger,
-        TIMEOUT,
     );
     assert_ne!(again.status, Some(0), "{again}");
     assert!(
@@ -1480,13 +1479,37 @@ fn a_context_runs_commands_on_its_machine_whole() {
         "{again}"
     );
 
-    // An invitation an hour old enrolls no one.
+    // An invitation is made only with the lifetime its owner gives it: none is assumed.
+    let unstated = run_shards_env(
+        &["invite", "client"],
+        &[
+            "--name",
+            "unstated",
+            "--output",
+            machine.join("unstated.invite").to_str().unwrap(),
+        ],
+        &on_machine,
+    );
+    assert_ne!(unstated.status, Some(0), "{unstated}");
+    assert!(
+        unstated.stderr.contains("flag needed: --valid DURATION"),
+        "{unstated}"
+    );
+    assert!(!machine.join("invitations/unstated").exists());
+
+    // An invitation older than the lifetime its owner gave it enrolls no one.
     let late = machine.join("late.invite");
     let made = run_shards_env(
         &["invite", "client"],
-        &["--name", "late", "--output", late.to_str().unwrap()],
+        &[
+            "--name",
+            "late",
+            "--output",
+            late.to_str().unwrap(),
+            "--valid",
+            "10m",
+        ],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(made.status, Some(0), "{made}");
     let record = machine.join("invitations/late");
@@ -1506,7 +1529,6 @@ fn a_context_runs_commands_on_its_machine_whole() {
         &["create", "context"],
         &["late", "--invite-file", late.to_str().unwrap()],
         &on_stranger,
-        TIMEOUT,
     );
     assert_ne!(lapsed.status, Some(0), "{lapsed}");
     assert!(
@@ -1520,9 +1542,15 @@ fn a_context_runs_commands_on_its_machine_whole() {
     let forged = machine.join("forged.invite");
     let made = run_shards_env(
         &["invite", "client"],
-        &["--name", "forged", "--output", forged.to_str().unwrap()],
+        &[
+            "--name",
+            "forged",
+            "--output",
+            forged.to_str().unwrap(),
+            "--valid",
+            "10m",
+        ],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(made.status, Some(0), "{made}");
     let text = std::fs::read_to_string(&forged).unwrap();
@@ -1545,7 +1573,6 @@ fn a_context_runs_commands_on_its_machine_whole() {
         &["create", "context"],
         &["forged", "--invite-file", altered.to_str().unwrap()],
         &on_stranger,
-        TIMEOUT,
     );
     assert_ne!(refused.status, Some(0), "{refused}");
     assert!(
@@ -1571,7 +1598,7 @@ fn a_context_runs_commands_on_its_machine_whole() {
     )
     .unwrap();
     std::fs::write(machine.join("context"), "away\n").unwrap();
-    let kept = run_shards_env(&["--context", "gpu", "ps"], &["-a"], &on_laptop, TIMEOUT);
+    let kept = run_shards_env(&["--context", "gpu", "ps"], &["-a"], &on_laptop);
     assert_eq!(kept.status, Some(0), "{kept}");
     std::fs::remove_file(machine.join("context")).unwrap();
 
@@ -1580,15 +1607,13 @@ fn a_context_runs_commands_on_its_machine_whole() {
         &["--context", "gpu", "run"],
         &["--rm", image.as_str()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{ran}");
     assert!(ran.stdout.lines().any(|l| l == "uid 1000"), "{ran}");
     let exited = run_shards_env(
         &["--context", "gpu", "run"],
-        &["--rm", image.as_str(), "exit", "3"],
+        &["--rm", "-e", PLANTED, image.as_str(), "exit", "3"],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(exited.status, Some(3), "{exited}");
     // The image is there, not here.
@@ -1599,7 +1624,6 @@ fn a_context_runs_commands_on_its_machine_whole() {
             ("SHARDS_HOME", laptop.as_os_str()),
             ("SHARDS_CONTEXT", "gpu".as_ref()),
         ],
-        TIMEOUT,
     );
     assert_eq!(there.status, Some(0), "{there}");
     assert!(there.stdout.contains("test/image"), "{there}");
@@ -1607,21 +1631,20 @@ fn a_context_runs_commands_on_its_machine_whole() {
         &["--context", "default", "images"],
         &["--format", "{{.Repository}}"],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(here.status, Some(0), "{here}");
     assert!(!here.stdout.contains("test/image"), "{here}");
     // Chosen for every command: `use context`.
-    let used = run_shards_env(&["use", "context"], &["gpu"], &on_laptop, TIMEOUT);
+    let used = run_shards_env(&["use", "context"], &["gpu"], &on_laptop);
     assert_eq!(used.status, Some(0), "{used}");
-    let listed = run_shards_env(&["list", "contexts"], &[] as &[&str], &on_laptop, TIMEOUT);
+    let listed = run_shards_env(&["list", "contexts"], &[] as &[&str], &on_laptop);
     assert!(listed.stdout.lines().any(|l| l.starts_with("gpu *")), "{listed}");
-    let ps = run_shards_env(&["ps"], &["-a"], &on_laptop, TIMEOUT);
+    let ps = run_shards_env(&["ps"], &["-a"], &on_laptop);
     assert_eq!(ps.status, Some(0), "{ps}");
     assert!(ps.stdout.starts_with("CONTAINER ID"), "{ps}");
 
     // `-it` with no terminal here is refused there, in the words a run here would say.
-    let terminal = run_shards_env(&["run"], &["-it", image.as_str()], &on_laptop, TIMEOUT);
+    let terminal = run_shards_env(&["run"], &["-it", image.as_str()], &on_laptop);
     assert_eq!(terminal.status, Some(1), "{terminal}");
     assert!(
         terminal
@@ -1632,7 +1655,7 @@ fn a_context_runs_commands_on_its_machine_whole() {
     // A build of a context with no build file is the build's to refuse, in its words.
     let empty = laptop.join("empty");
     std::fs::create_dir_all(&empty).unwrap();
-    let unfiled = run_shards_env(&["build"], &[empty.to_str().unwrap()], &on_laptop, TIMEOUT);
+    let unfiled = run_shards_env(&["build"], &[empty.to_str().unwrap()], &on_laptop);
     assert_eq!(unfiled.status, Some(1), "{unfiled}");
     assert!(
         unfiled
@@ -1641,7 +1664,7 @@ fn a_context_runs_commands_on_its_machine_whole() {
         "{unfiled}"
     );
     // The machine's own: not a client's.
-    let owners = run_shards_env(&["stop", "daemon"], &[] as &[&str], &on_laptop, TIMEOUT);
+    let owners = run_shards_env(&["stop", "daemon"], &[] as &[&str], &on_laptop);
     assert_ne!(owners.status, Some(0), "{owners}");
     assert!(
         owners
@@ -1651,30 +1674,30 @@ fn a_context_runs_commands_on_its_machine_whole() {
     );
 
     // Removed there, a client runs nothing more.
-    let clients = run_shards_env(&["list", "clients"], &[] as &[&str], &on_machine, TIMEOUT);
+    let clients = run_shards_env(&["list", "clients"], &[] as &[&str], &on_machine);
     assert!(
         clients.stdout.lines().any(|l| l.starts_with("laptop\t")),
         "{clients}"
     );
-    let removed = run_shards_env(&["remove", "client"], &["laptop"], &on_machine, TIMEOUT);
+    let removed = run_shards_env(&["remove", "client"], &["laptop"], &on_machine);
     assert_eq!(removed.status, Some(0), "{removed}");
-    let refused = run_shards_env(&["ps"], &[] as &[&str], &on_laptop, TIMEOUT);
+    let refused = run_shards_env(&["ps"], &[] as &[&str], &on_laptop);
     assert_eq!(refused.status, Some(125), "{refused}");
     assert!(
         refused.stderr.contains("this machine has not enrolled you"),
         "{refused}"
     );
-    let back = run_shards_env(&["use", "context"], &["default"], &on_laptop, TIMEOUT);
+    let back = run_shards_env(&["use", "context"], &["default"], &on_laptop);
     assert_eq!(back.status, Some(0), "{back}");
 
-    // The machine's log says what its client ran.
+    // The machine's log says what its client ran, by its command's name and its status, and
+    // nothing of its flags' values or arguments (remote-05, D180).
     let log = std::fs::read_to_string(machine.join("daemon.log")).unwrap();
     assert!(log.contains("client laptop joined"), "{log}");
-    assert!(
-        log.contains(&format!("client laptop: shards run --rm {image} exit 3")),
-        "{log}"
-    );
-    let stopped = run_shards_env(&["daemon"], &["stop"], &on_machine, TIMEOUT);
+    assert!(log.contains("client laptop: shards run\n"), "{log}");
+    assert!(log.contains("client laptop: shards run ended, status 3"), "{log}");
+    assert!(!log.contains(PLANTED), "{log}");
+    let stopped = run_shards_env(&["daemon"], &["stop"], &on_machine);
     assert_eq!(stopped.status, Some(0), "{stopped}");
 }
 
@@ -1730,8 +1753,8 @@ fn an_artifact_through_a_context_is_made_of_the_clients_files_and_signed_by_its_
         ("SHARDS_HOME", laptop.as_os_str()),
         ("COSIGN_PASSWORD", std::ffi::OsStr::new(&password)),
     ];
-    let here = |args: &[&str]| run_shards_env(&[], args, &on_laptop, TIMEOUT);
-    let there = |args: &[&str]| run_shards_env(&["--context", "gpu"], args, &on_laptop, TIMEOUT);
+    let here = |args: &[&str]| run_shards_env(&[], args, &on_laptop);
+    let there = |args: &[&str]| run_shards_env(&["--context", "gpu"], args, &on_laptop);
     let made = |run: common::Run| {
         assert_eq!(run.status, Some(0), "{run}");
         run.stdout.trim().to_string()
@@ -1908,7 +1931,6 @@ fn a_builds_secrets_through_a_context_are_the_clients_held_in_memory_alone() {
             app.to_str().unwrap(),
         ],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(built.status, Some(0), "{built}");
     let digest = |b: &str| format!("{:016x}", shards_testguest::fnv1a(b.as_bytes()));
@@ -1935,7 +1957,6 @@ fn a_builds_secrets_through_a_context_are_the_clients_held_in_memory_alone() {
         &["--context", "gpu", "build"],
         &["--secret", "id=tok,src=/nowhere/token", app.to_str().unwrap()],
         &on_laptop,
-        TIMEOUT,
     );
     assert_eq!(missing.status, Some(1), "{missing}");
     assert!(
@@ -1963,7 +1984,7 @@ fn a_builds_outputs_through_a_context_are_the_clients_files() {
     let build = |args: &[&str]| {
         let mut all = args.to_vec();
         all.push(app.to_str().unwrap());
-        let built = run_shards_env(&["--context", "gpu", "build"], &all, &on_laptop, TIMEOUT);
+        let built = run_shards_env(&["--context", "gpu", "build"], &all, &on_laptop);
         assert_eq!(built.status, Some(0), "{built}");
         built
     };
@@ -2035,7 +2056,7 @@ fn what_a_build_names_of_the_clients_is_carried_through_a_context() {
     let build = |dir: &Path, args: &[&str]| {
         let mut all = args.to_vec();
         all.push(dir.to_str().unwrap());
-        run_shards_env(&["--context", "gpu", "build"], &all, &on_laptop, TIMEOUT)
+        run_shards_env(&["--context", "gpu", "build"], &all, &on_laptop)
     };
     let app = laptop.join("app");
     std::fs::create_dir_all(&app).unwrap();
@@ -2180,12 +2201,16 @@ fn a_builds_ssh_agents_through_a_context_are_the_clients() {
             }
         }
         let agent = Ended(common::ssh_agent(&sock));
-        for _ in 0..100 {
-            if sock.exists() {
-                break;
+        // Its socket, waited for while the agent goes on.
+        let kind = common::WaitKind::at(std::panic::Location::caller());
+        let mut wait = common::Wait::begin(kind, agent.0.id(), None, "ssh-agent's socket");
+        while !sock.exists() {
+            if let Err(stall) = wait.look(false) {
+                panic!("{}", wait.refused(&stall));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(wait.next_look());
         }
+        wait.answered();
         let made = std::process::Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "shards-test-key", "-f"])
             .arg(&key)
@@ -2233,7 +2258,6 @@ fn a_builds_ssh_agents_through_a_context_are_the_clients() {
                 app.to_str().unwrap(),
             ],
             &on_laptop,
-            TIMEOUT,
         )
     };
     let built = build("default");
@@ -2416,7 +2440,7 @@ fn a_cidfile_through_a_context_is_the_clients() {
         return;
     };
     let on_laptop = [("SHARDS_HOME", laptop.as_os_str())];
-    let there = |args: &[&str]| run_shards_env_in(&laptop, &["--context", "gpu"], args, &on_laptop, TIMEOUT);
+    let there = |args: &[&str]| run_shards_env_in(&laptop, &["--context", "gpu"], args, &on_laptop);
     let made = there(&[
         "run",
         "--pull",
@@ -2495,12 +2519,16 @@ fn a_cidfile_through_a_context_is_the_clients() {
         .spawn()
         .unwrap();
     let attached_id = laptop.join("attached.id");
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let kind = common::WaitKind::at(std::panic::Location::caller());
+    let mut wait = common::Wait::begin(kind, attached.id(), Some(&laptop), "its run's ID");
     while std::fs::read_to_string(&attached_id).map_or(0, |id| id.len()) != 64 {
         assert!(attached.try_wait().unwrap().is_none(), "the run ended first");
-        assert!(std::time::Instant::now() < deadline, "no ID while the run runs");
-        std::thread::sleep(Duration::from_millis(20));
+        if let Err(stall) = wait.look(false) {
+            panic!("no ID while the run runs: {}", wait.refused(&stall));
+        }
+        std::thread::sleep(wait.next_look());
     }
+    wait.answered();
     let removed = there(&["rm", "-f", "held", "attached", created.stdout.trim()]);
     assert_eq!(removed.status, Some(0), "{removed}");
     let _ = attached.wait();
@@ -2541,7 +2569,7 @@ fn a_clients_binds_are_its_own_files_and_the_machines_its_owners_to_grant() {
     let there = |args: &[&str]| {
         let mut all = vec!["run", "--pull", "never"];
         all.extend_from_slice(args);
-        run_shards_env(&["--context", "gpu"], &all, &on_laptop, TIMEOUT)
+        run_shards_env(&["--context", "gpu"], &all, &on_laptop)
     };
     let src = laptop.join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -2590,17 +2618,18 @@ fn a_clients_binds_are_its_own_files_and_the_machines_its_owners_to_grant() {
         "write:/data/c=detached",
     ]);
     assert_eq!(detached.status, Some(0), "{detached}");
-    let waited = std::time::Instant::now();
-    while !src.join("c").exists() && waited.elapsed() < TIMEOUT {
-        std::thread::sleep(Duration::from_millis(100));
+    let mut patience = common::Patience::of(&laptop);
+    while !src.join("c").exists() && patience.holds() {
+        std::thread::sleep(patience.next_look());
     }
+    patience.done();
     assert_eq!(std::fs::read_to_string(src.join("c")).unwrap(), "detached");
     // A directory of the laptop's plugged into a running microVM there: its files read and
     // written there, until it is unplugged.
     let via = |command: &[&str], args: &[&str]| {
         let mut words = vec!["--context", "gpu"];
         words.extend_from_slice(command);
-        run_shards_env(&words, args, &on_laptop, TIMEOUT)
+        run_shards_env(&words, args, &on_laptop)
     };
     let started = via(
         &["run"],
@@ -2642,12 +2671,7 @@ fn a_clients_binds_are_its_own_files_and_the_machines_its_owners_to_grant() {
     let volume_opts = ["--opt", "type=none", "--opt", "o=bind", "--opt", device.as_str()];
     let mut made: Vec<&str> = volume_opts.to_vec();
     made.push("theirs");
-    let theirs = run_shards_env(
-        &["--context", "gpu", "volume", "create"],
-        &made,
-        &on_laptop,
-        TIMEOUT,
-    );
+    let theirs = run_shards_env(&["--context", "gpu", "volume", "create"], &made, &on_laptop);
     assert_ne!(theirs.status, Some(0), "{theirs}");
     assert!(
         theirs.stderr.contains("holds no grant")
@@ -2656,7 +2680,7 @@ fn a_clients_binds_are_its_own_files_and_the_machines_its_owners_to_grant() {
     );
     let mut owners: Vec<&str> = volume_opts.to_vec();
     owners.push("owners");
-    let made = run_shards_env(&["volume", "create"], &owners, &on_machine, TIMEOUT);
+    let made = run_shards_env(&["volume", "create"], &owners, &on_machine);
     assert_eq!(made.status, Some(0), "{made}");
     let ungranted = there(&["--rm", "-v", "owners:/srv:ro", &image, "stat", "/srv/a"]);
     assert_ne!(ungranted.status, Some(0), "{ungranted}");
@@ -2665,10 +2689,9 @@ fn a_clients_binds_are_its_own_files_and_the_machines_its_owners_to_grant() {
         &["grant", "client"],
         &["laptop", "--dir", &format!("{}:ro", srv.display())],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(granted.status, Some(0), "{granted}");
-    let shown = run_shards_env(&["inspect", "client"], &["laptop"], &on_machine, TIMEOUT);
+    let shown = run_shards_env(&["inspect", "client"], &["laptop"], &on_machine);
     assert!(shown.stdout.contains("(read-only)"), "{shown}");
     let read = there(&["--rm", "-v", "owners:/srv:ro", &image, "stat", "/srv/a"]);
     assert_eq!(read.status, Some(0), "{read}");
@@ -2680,7 +2703,6 @@ fn a_clients_binds_are_its_own_files_and_the_machines_its_owners_to_grant() {
         &["revoke", "client"],
         &["laptop", "--dir", srv.to_str().unwrap()],
         &on_machine,
-        TIMEOUT,
     );
     assert_eq!(revoked.status, Some(0), "{revoked}");
     let again = there(&["--rm", "-v", "owners:/srv:ro", &image, "stat", "/srv/a"]);
@@ -2750,7 +2772,6 @@ fn what_a_clients_bind_costs() {
                     "2000",
                 ],
                 env,
-                Duration::from_secs(600),
             );
             assert_eq!(ran.status, Some(0), "{ran}");
             for line in ran.stdout.lines() {

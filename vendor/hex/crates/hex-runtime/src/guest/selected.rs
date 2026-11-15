@@ -93,9 +93,10 @@ impl Record {
     }
 
     pub fn retained(record: &BoxRecord) -> Result<Self, Refusal> {
-        let scope = record
-            .native_scope
-            .ok_or(super::books::uncertain(&record.spec.id)?)?;
+        let scope = record.native_scope.ok_or(super::books::uncertain(
+            &record.spec.id,
+            "its record names no native scope for its selected guest",
+        )?)?;
         let spec = &record.spec;
         spec.check()?;
         if spec
@@ -201,7 +202,10 @@ impl Record {
     pub fn matches_record(&self, record: &BoxRecord) -> Result<(), Refusal> {
         self.matches(&record.spec)?;
         if self.scope.is_none() || self.scope != record.native_scope {
-            return Err(super::books::uncertain(&record.spec.id)?);
+            return Err(super::books::uncertain(
+                &record.spec.id,
+                "its selected guest's scope isn't its record's",
+            )?);
         }
         Ok(())
     }
@@ -230,29 +234,47 @@ impl Record {
                 Err(invalid("CPU-only receipt cannot carry a GPU report"))
             };
         }
-        let report = self
-            .report
-            .as_ref()
-            .ok_or(super::books::uncertain(&self.id)?)?;
-        let scope = self.scope.ok_or(super::books::uncertain(&self.id)?)?;
+        let report = self.report.as_ref().ok_or(super::books::uncertain(
+            &self.id,
+            "its selected guest has no native report",
+        )?)?;
+        let scope = self.scope.ok_or(super::books::uncertain(
+            &self.id,
+            "its selected guest has no scope",
+        )?)?;
         super::physical::check_report(&self.devices, &self.physical, scope, report)?;
         Ok(Some(report))
     }
 
     pub fn checked_readiness(&self) -> Result<&super::observer::Evidence, Refusal> {
-        let bad = || super::books::uncertain(&self.id).unwrap_or_else(std::convert::identity);
+        let bad = |why: &str| {
+            super::books::uncertain(&self.id, why).unwrap_or_else(std::convert::identity)
+        };
         if self.physical.is_empty() || !matches!(self.phase, Phase::Running(_)) {
-            return Err(bad());
+            return Err(bad("its selected guest holds no device, or isn't running"));
         }
-        self.checked_report()?.ok_or_else(bad)?;
-        let readiness = self.readiness.as_ref().ok_or_else(bad)?;
-        readiness.check(self.scope.ok_or_else(bad)?, self.physical.len())?;
-        let attempt = self.attempt.as_ref().ok_or_else(bad)?;
+        self.checked_report()?
+            .ok_or_else(|| bad("its selected guest has no native report"))?;
+        let readiness = self
+            .readiness
+            .as_ref()
+            .ok_or_else(|| bad("its selected guest has no readiness"))?;
+        readiness.check(
+            self.scope
+                .ok_or_else(|| bad("its selected guest has no scope"))?,
+            self.physical.len(),
+        )?;
+        let attempt = self
+            .attempt
+            .as_ref()
+            .ok_or_else(|| bad("its selected guest has no attempt"))?;
         if !attempt.has_facts()
             || !attempt.matches_readiness(readiness)?
             || !attempt.ready_facts()?
         {
-            return Err(bad());
+            return Err(bad(
+                "its selected guest's attempt has no facts, or none its readiness matches",
+            ));
         }
         Ok(readiness)
     }
@@ -265,7 +287,11 @@ impl Record {
             .report
             .require_work_ready(self.physical.len(), readiness.max_queues)
             .map_err(|_| {
-                super::books::uncertain(&self.id).unwrap_or_else(std::convert::identity)
+                super::books::uncertain(
+                    &self.id,
+                    "its selected guest's queues aren't ready for its work",
+                )
+                .unwrap_or_else(std::convert::identity)
             })?;
         Ok(readiness)
     }
@@ -739,6 +765,7 @@ fn render_route(out: &mut impl std::fmt::Write, receipt: Option<RouteReceipt>) -
         Execution::ShardsShared => "shards-shared",
         Execution::ShardsDedicated => "shards-dedicated",
         Execution::Firecracker => "firecracker",
+        Execution::NodeVm => "node-vm",
     };
     let gpu = match key.gpu {
         GpuEligibility::Any => "any",

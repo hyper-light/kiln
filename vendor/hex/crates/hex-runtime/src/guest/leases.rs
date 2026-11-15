@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hex_api::lease::{Lease, LeaseRefused, Lessor, Lessors};
+use hex_api::lease::{Lease, LeaseRefused, Lessor, Lessors, SignInRefused, SignInTokens, Value};
 use hex_api::{BoxId, Refusal, ShardsImage};
-use shards_api::image::{CredentialGrant, LeaseRefusal, Leased, RunLessor, Secret};
+use shards_api::image::{CredentialGrant, LeaseRefusal, Leased, RunLessor, Secret, SignInRefusal};
 
 use super::{GuestRuntime, ImageClass};
 
@@ -39,7 +39,7 @@ impl ImageClass {
 
     /// Whether this node can lease `image`'s credentials: none asks nothing; any asks for its lessors.
     pub(super) fn can_lease(&self, image: &ShardsImage) -> Result<(), Refusal> {
-        if image.credentials.is_empty() || self.lessors.is_some() {
+        if !leases(image) || self.lessors.is_some() {
             return Ok(());
         }
         Err(unconfigured())
@@ -52,13 +52,52 @@ impl ImageClass {
         id: &BoxId,
         image: &ShardsImage,
     ) -> Result<Option<RunLessor>, Refusal> {
-        if image.credentials.is_empty() {
+        if !leases(image) {
             return Ok(None);
         }
         let lessors = self.lessors.as_ref().ok_or_else(unconfigured)?;
         let run = lessors.lessor(id)?;
         Ok(Some(RunLessor(Arc::new(RunLeases(run)))))
     }
+}
+
+/// Whether a run of `image` asks its orchestrator anything: a credential's lease or a sign-in's capture (C3, C8).
+fn leases(image: &ShardsImage) -> bool {
+    !image.credentials.is_empty() || !image.sign_ins.is_empty()
+}
+
+/// `image`'s sign-in grants as Shards' run host takes them (C8): run-wide, each its name, its CLI, its hosts and an
+/// earlier capture's placeholders, checked again here (C2, C8) so no boot asks for one the check refuses; Hex adds none.
+pub(super) fn sign_ins(
+    image: &ShardsImage,
+) -> Result<Vec<shards_api::image::SignInGrant>, Refusal> {
+    hex_api::check_sign_ins(&image.sign_ins, &image.credentials, &image.grants)?;
+    let mut lowered = Vec::new();
+    lowered
+        .try_reserve_exact(image.sign_ins.len())
+        .map_err(|_| Refusal::Exhausted {
+            what: "sign-ins",
+            bound: image.sign_ins.len(),
+        })?;
+    for grant in &image.sign_ins {
+        lowered.push(shards_api::image::SignInGrant {
+            sign_in: grant.sign_in.clone(),
+            cli: match grant.cli {
+                hex_api::SignInCli::ClaudeCode => shards_api::image::Cli::ClaudeCode,
+                hex_api::SignInCli::Codex => shards_api::image::Cli::Codex,
+            },
+            toward: grant.toward.clone(),
+            captured: grant
+                .captured
+                .as_ref()
+                .map(|captured| shards_api::image::Captured {
+                    access: captured.access.clone(),
+                    access_placeholder: captured.access_placeholder.clone(),
+                    refresh_placeholder: captured.refresh_placeholder.clone(),
+                }),
+        });
+    }
+    Ok(lowered)
 }
 
 fn unconfigured() -> Refusal {
@@ -70,10 +109,11 @@ fn unconfigured() -> Refusal {
     }
 }
 
-/// `image`'s credential grants as Shards' run host takes them (C4): one for each credential, toward every host its
-/// grants name, each once, in order. Shards' grant is its run's, its network process ending the TLS of a granted host's
-/// flows whichever member's they are (D242), so each member's grant of a credential is one of the run's. Checked again
-/// here (C2), so no boot asks for one the check refuses; each the box's, Hex adding none.
+/// `image`'s credential grants as Shards' run host takes them (C4): one for each credential and placeholder, toward
+/// every host its grants with that placeholder name, each once, in order. Shards' grant is its run's, its network
+/// process ending the TLS of a granted host's flows whichever member's they are and filling a value in only where its
+/// grant's placeholder stands (D242), so each member's grant of a credential is one of the run's, by its placeholder.
+/// Checked again here (C2), so no boot asks for one the check refuses; each the box's, Hex adding none.
 pub(super) fn lowered(image: &ShardsImage) -> Result<Vec<CredentialGrant>, Refusal> {
     hex_api::check_credentials(&image.credentials, &image.grants)?;
     let exhausted = |bound: usize| Refusal::Exhausted {
@@ -85,20 +125,24 @@ pub(super) fn lowered(image: &ShardsImage) -> Result<Vec<CredentialGrant>, Refus
         .iter()
         .try_fold(0usize, |n, grant| n.checked_add(grant.toward.len()))
         .ok_or_else(|| exhausted(usize::MAX))?;
-    let mut each: Vec<(&str, &str)> = Vec::new();
+    let mut each: Vec<(&str, &str, &str)> = Vec::new();
     each.try_reserve_exact(hosts)
         .map_err(|_| exhausted(hosts))?;
     for grant in &image.credentials {
         for host in &grant.toward {
-            each.push((grant.reference.as_str(), host.as_str()));
+            each.push((
+                grant.reference.as_str(),
+                grant.placeholder.as_str(),
+                host.as_str(),
+            ));
         }
     }
     each.sort_unstable();
     each.dedup();
     let mut lowered: Vec<CredentialGrant> = Vec::new();
-    for (reference, host) in each {
+    for (reference, placeholder, host) in each {
         match lowered.last_mut() {
-            Some(last) if last.reference == reference => {
+            Some(last) if last.reference == reference && last.placeholder == placeholder => {
                 last.toward.try_reserve(1).map_err(|_| exhausted(hosts))?;
                 last.toward.push(host.to_owned());
             }
@@ -107,6 +151,7 @@ pub(super) fn lowered(image: &ShardsImage) -> Result<Vec<CredentialGrant>, Refus
                 lowered.push(CredentialGrant {
                     reference: reference.to_owned(),
                     toward: vec![host.to_owned()],
+                    placeholder: placeholder.to_owned(),
                 });
             }
         }
@@ -138,6 +183,60 @@ impl shards_api::image::Lessor for RunLeases {
 
     fn release(&self, lease: &str) {
         self.0.release(lease);
+    }
+
+    /// A sign-in's tokens handed on whole to the run's lessor, each moved into a [`Value`] that wipes it, nothing of
+    /// them kept here; its placeholders answered back, or its refusal of Shards' kind and words (C8).
+    fn capture(
+        &self,
+        sign_in: &str,
+        tokens: shards_api::image::SignInTokens,
+        key: Option<[u8; 32]>,
+    ) -> Result<shards_api::image::Captured, SignInRefusal> {
+        let shards_api::image::SignInTokens {
+            mut access,
+            refresh,
+            expires_in,
+            id_token,
+            scope,
+        } = tokens;
+        let moved = |mut secret: Secret| Value::new(std::mem::take(&mut secret.0));
+        let tokens = SignInTokens {
+            access: Value::new(std::mem::take(&mut access.0)),
+            refresh: refresh.map(moved),
+            expires_in,
+            id_token: id_token.map(moved),
+            scope,
+        };
+        let captured = self
+            .0
+            .capture(sign_in, tokens, key)
+            .map_err(sign_in_refusal)?;
+        Ok(shards_api::image::Captured {
+            access: captured.access.clone(),
+            access_placeholder: captured.access_placeholder.clone(),
+            refresh_placeholder: captured.refresh_placeholder.clone(),
+        })
+    }
+
+    /// A sign-in refreshed by the run's lessor: its token response handed on whole into Shards' `Secret` (C8).
+    fn refresh(&self, sign_in: &str, key: Option<[u8; 32]>) -> Result<Secret, SignInRefusal> {
+        let response = self.0.refresh(sign_in, key).map_err(sign_in_refusal)?;
+        Ok(Secret(response.into_bytes()))
+    }
+
+    fn revoked(&self, sign_in: &str, key: Option<[u8; 32]>) {
+        self.0.revoked(sign_in, key);
+    }
+}
+
+/// The orchestrator's refusal of a sign-in as Shards' run host takes it: kind for kind, its words kept.
+fn sign_in_refusal(why: SignInRefused) -> SignInRefusal {
+    match why {
+        SignInRefused::Denied(why) => SignInRefusal::Denied(why),
+        SignInRefused::Unavailable(why) => SignInRefusal::Unavailable(why),
+        SignInRefused::Ended => SignInRefusal::Ended,
+        SignInRefused::Unanswered => SignInRefusal::Unanswered,
     }
 }
 

@@ -25,12 +25,8 @@ use shards_api::{
     prepare_boot,
 };
 
-// One managed attempt's bound, as the node gives `managed::Budget` before any boot (`first_dial_bound`): the
-// guest's recorded boot to ready (decision 9: no margin). Each wait is for a fact the attempt makes within itself, its
-// observer's entry or its end once published, and returns at that event.
-fn guard() -> Duration {
-    hex_runtime::guest::recorded_dial_bound().unwrap()
-}
+// Each wait is for a fact the attempt makes within itself, its observer's entry or its end once published, and returns
+// at that event: no bound of a record's (decision 9; the review's C-9), the attempt itself followed to it.
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -94,18 +90,12 @@ impl Control {
     }
 
     fn await_event(&self, expected: &Event) -> bool {
-        let deadline = Instant::now().checked_add(guard()).unwrap();
         let mut state = lock(&self.state);
         while !state.events.contains(expected) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
             state = self
                 .changed
-                .wait_timeout(state, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
         }
         true
     }
@@ -457,7 +447,7 @@ fn observer_uncertainty_remains_typed_and_stops_the_same_owner() {
     let guest = harness.guest.as_ref().unwrap();
     let exited = guest.process_exited();
     let scope = guest.terminal_scope();
-    let result = guest.wait_for(guard());
+    let result = guest.wait_for(Duration::MAX);
     let repeated = guest.wait_for(Duration::ZERO);
     let cleanup = harness.cleanup();
     clean(&cleanup);
@@ -496,7 +486,7 @@ fn terminal_output_is_bounded_drained_and_releases_native_receipt_refs() {
     };
     harness.control.publish(released(ManagedStatus::Code(17)));
     let guest = harness.guest.as_ref().unwrap();
-    let result = guest.wait_for(guard());
+    let result = guest.wait_for(Duration::MAX);
     let exited = guest.process_exited();
     let scope = guest.terminal_scope();
     let writers_still_open = lock(&harness.control.state).output.is_some();

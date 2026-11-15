@@ -2,7 +2,7 @@
 //! to callers that don't link Hex (decision 3 of docs/design/runtime-architecture.md):
 //!
 //!   hex node --socket <path> --state <dir> [--box-root <cgroup dir>]
-//!            [--quic <address> --credentials <dir> [--staged <dir>]]
+//!            [--quic <address> --credentials <dir> [--staged <dir>]] [--capacity-view]
 //!   hex node enroll --name <name> --credentials <dir>
 //!   hex node links --socket <path>
 //!
@@ -152,9 +152,9 @@ fn link_line(link: &hex_core::wire::Link) -> String {
 }
 
 #[cfg(target_os = "linux")]
-const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--box-root <cgroup dir>] [--quic <address> --credentials <dir> [--staged <dir>]] | hex node --descriptors [--state <dir>] | hex node enroll --name <name> --credentials <dir> | hex node links --socket <path>";
+const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--box-root <cgroup dir>] [--quic <address> --credentials <dir> [--staged <dir>]] [--capacity-view] | hex node --descriptors [--state <dir>] | hex node enroll --name <name> --credentials <dir> | hex node links --socket <path>";
 #[cfg(not(target_os = "linux"))]
-const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--quic <address> --credentials <dir>] | hex node enroll --name <name> --credentials <dir> | hex node links --socket <path>";
+const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--quic <address> --credentials <dir>] [--capacity-view] | hex node enroll --name <name> --credentials <dir> | hex node links --socket <path>";
 
 /// `hex node --descriptors [--state <dir>]`: what a node of this process's owner, its state under `state` (`/` where
 /// none is named), running VM boxes where a backend is configured as `hex node` reads it, needs of its soft
@@ -165,6 +165,7 @@ const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--quic <addr
 fn descriptors(state: &Path) -> u8 {
     let runs = hex_node::Runs {
         vms: guest_requested() || std::env::var_os("HEX_FIRECRACKER_CONFIG").is_some(),
+        hosted: 0,
     };
     let needed = hex_node::netns::needed_on_this_host(state, runs);
     match needed {
@@ -189,6 +190,10 @@ struct Args {
     state: PathBuf,
     box_root: Option<PathBuf>,
     quic: Option<QuicArgs>,
+    /// Whether the machine's capacity view serves this node's machine, a keeper its scheduler's capacity lane keeps
+    /// (`--capacity-view`; docs/design/capacity-view.md CV10's configured form; the review's A-10): its charge learner
+    /// then learns nothing until that keeper has spoken since the node started.
+    capacity_view: bool,
     #[cfg(all(target_os = "linux", debug_assertions))]
     crash_at: Option<CrashPoint>,
 }
@@ -206,10 +211,18 @@ struct QuicArgs {
 fn parse(args: &[String]) -> Result<Args, String> {
     let (mut socket, mut state, mut box_root) = (None, None, None);
     let (mut quic, mut credentials, mut staged) = (None, None, None);
+    let mut capacity_view = false;
     #[cfg(all(target_os = "linux", debug_assertions))]
     let mut crash_at = None;
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
+        if flag == "--capacity-view" {
+            if capacity_view {
+                return Err(format!("{flag} is given twice\n{USAGE}"));
+            }
+            capacity_view = true;
+            continue;
+        }
         if flag == "--quic" {
             let value = rest
                 .next()
@@ -276,6 +289,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         state: state.ok_or_else(|| format!("--state is needed\n{USAGE}"))?,
         box_root,
         quic,
+        capacity_view,
         #[cfg(all(target_os = "linux", debug_assertions))]
         crash_at,
     })
@@ -432,24 +446,32 @@ fn tell_the_service_manager() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Says on stderr each box a recovery removed and why, each idle cgroup it removed that no box's record named, each
-/// torn record it held, why and what to do, why its guest couldn't say which boxes it holds, and why the host's
-/// boot session couldn't be read, so nothing is dropped unseen (CLAUDE.md §3), before the socket opens.
-/// Starts the node's charge learner (joint plan step 14) and says what of the rule its platform can't hold, or says
-/// why it doesn't run: a platform whose window nothing derives yet refuses it, typed, and the node runs on with its
-/// VMs booked whole.
+/// Starts the node's charge learner (joint plan step 14) and says its platform's window and what of the rule its
+/// platform can't hold, or says why it doesn't run, the node running on with its VMs booked whole.
 #[cfg(any(target_os = "macos", windows))]
 fn charges<R: hex_node::recorded::Recover + Send + Sync + 'static>(
     node: &Arc<hex_node::recorded::Recorded<R>>,
+    capacity_view: bool,
 ) {
+    // Whether a capacity view serves this machine, as `--capacity-view` says (the review's A-10): set before it starts.
+    node.set_capacity_view(capacity_view);
     let mut err = std::io::stderr().lock();
     match node.start_charges() {
         Ok((window, unheld)) => {
-            let _ = writeln!(
-                err,
-                "hex node: the charge learner's window is {} ns",
-                window.as_nanos()
-            );
+            // Its window is the longest period of the caps it holds, which its classes' capacity answers tell as it
+            // moves (docs/design/learned-charge.md C1).
+            let _ = match window {
+                Some(window) => writeln!(
+                    err,
+                    "hex node: the charge learner's window is {} ns",
+                    window.as_nanos()
+                ),
+                None => writeln!(
+                    err,
+                    "hex node: the charge learner's window is the longest period of the caps it holds, told on its \
+                     classes' capacity answers; none while it holds none"
+                ),
+            };
             for why in unheld {
                 let _ = writeln!(err, "hex node: the charge learner can't hold this: {why}");
             }
@@ -460,6 +482,10 @@ fn charges<R: hex_node::recorded::Recover + Send + Sync + 'static>(
     }
 }
 
+/// Says on stderr each box a recovery removed and why, each idle cgroup it removed that no box's record named, each
+/// torn record it held, why and what to do, why its guest couldn't say which boxes it holds, why the host's boot
+/// session couldn't be read, what it did with each node VM row an earlier node left, and the last-resort ends those
+/// rows kept, none on record told, so nothing is dropped unseen (CLAUDE.md §3), before the socket opens.
 fn say_recovered(recovered: &RecoverySummary) {
     let mut err = std::io::stderr().lock();
     // Slots are Linux's node's alone: no other OS's hands a box's cgroup on.
@@ -491,6 +517,16 @@ fn say_recovered(recovered: &RecoverySummary) {
              an earlier boot's, and the records written now carry none"
         );
     }
+    for (run, settled) in &recovered.node_vms {
+        let run: String = run
+            .bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let _ = writeln!(err, "hex node: recovered: node VM {run}: {settled}");
+    }
+    // What the charge learner's node VM ends begin from (joint plan step 39, place 1): a cold start is told.
+    let _ = writeln!(err, "hex node: recovered: {}", recovered.node_vm_ends);
 }
 
 /// The Linux node: its boxes in cgroups under `--box-root` (else beside its own cgroup), recovered, its socket's
@@ -515,6 +551,7 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
     // Its start counts what it runs past its own boxes among its own descriptors: VM boxes where a backend is configured.
     let runs = hex_node::Runs {
         vms: guest_config.is_some() || firecracker_config.is_some(),
+        hosted: 0,
     };
     // Made before the node's start, so the GPU handles it holds are among what the start counts as held.
     let prober = hex_node::facts::shared_prober(&args.state, hex_node::facts::Declared::default())
@@ -527,7 +564,8 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
     // What a label whose module the host's kernel doesn't run does: its owner's word, else skipped with a
     // warning.
     let node = node
-        .with_lsm(hex_runtime::linux::oci::lsm::Policy::from_env().map_err(|e| failed(e.into()))?);
+        .with_lsm(hex_runtime::linux::oci::lsm::Policy::from_env().map_err(|e| failed(e.into()))?)
+        .with_capacity_view(args.capacity_view);
     #[cfg(debug_assertions)]
     let node = match args.crash_at {
         Some(point) => node.with_crash_point(point),
@@ -538,13 +576,18 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
     }
     let node = Arc::new(node);
     node.bind_prober(prober).map_err(failed)?;
+    let lessors = hex_node::serve::WireLessors::new();
     let shards = configured_guest(
         guest_config,
         &args.state,
         node.device_catalog(),
         node.shards_native_paths().map_err(failed)?,
+        Arc::clone(&lessors),
     )?
     .map(Arc::new);
+    if shards.is_some() {
+        node.lease_over_wire(lessors).map_err(failed)?;
+    }
     let firecracker = firecracker_config
         .map(|config| {
             hex_runtime::firecracker::FirecrackerRuntime::open(
@@ -637,40 +680,61 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
         hex_core::watch::lateness_seed(&model),
     )
     .map_err(failed)?;
+    let under_shards_init = under_shards_init(guest_config.as_ref());
+    // A guest under shards-init is Shards' run host's VM, not one Hex's helper runs: no managed control of its own
+    // (ROOT, 2026-11-13: none of the managed shared-backing machinery applies).
     let managed = guest_config
         .as_ref()
-        .map(|inputs| managed_control(inputs, &model))
-        .transpose()
-        .map_err(failed)?;
+        .filter(|_| !under_shards_init)
+        .map(managed_control);
     let prober = hex_node::facts::shared_prober(&args.state, hex_node::facts::Declared::default())
         .map_err(failed)?;
     let catalog = hex_runtime::devices::shared_catalog(
         &backend_path(&args.state, "devices").map_err(failed)?,
     )
     .map_err(failed)?;
+    let lessors = hex_node::serve::WireLessors::new();
+    let platform = hex_node::serve::macos::platform().map_err(failed)?;
+    let mut hosted_fit = None;
     let host: Arc<dyn Host> = match configured_guest(
         guest_config,
         &args.state,
         catalog,
         runtime_paths(&args.state).map_err(failed)?,
+        Arc::clone(&lessors),
     )? {
+        Some(guest) if under_shards_init => {
+            let routed = WithGuest::configured(process, guest, hex_runtime::guest::by_class);
+            let node =
+                Arc::new(Recorded::open_with_prober(routed, &args.state, prober).map_err(failed)?);
+            node.lease_over_wire(lessors).map_err(failed)?;
+            node.bind_guest_books().map_err(failed)?;
+            // Joint plan step 14: what this node recorded under a census cost is retired first.
+            node.retire_census().map_err(failed)?;
+            let fit = fitted(
+                &platform,
+                1,
+                hex_node::serve::fit::MACOS,
+                Some(hex_node::serve::macos::open_descriptors().map_err(failed)?),
+            )
+            .map_err(failed)?;
+            boot_under_shards_init(&node, &fit).map_err(failed)?;
+            say_recovered(&node.recover().map_err(failed)?);
+            charges(&node, args.capacity_view);
+            hosted_fit = Some(fit);
+            node
+        }
         Some(guest) => {
             let (control, cost) = managed.ok_or_else(|| {
                 failed(Refusal::Broken(
                     "a configured guest lost its managed CPU control".to_owned(),
                 ))
             })?;
-            let process = managed_host(
-                process,
-                &args.state,
-                control,
-                &cost,
-                guest.first_dial_bound().map_err(failed)?,
-            )
-            .map_err(failed)?;
+            let process = managed_host(process, &args.state, control, &cost).map_err(failed)?;
             let routed = WithGuest::configured(process, guest, hex_runtime::guest::by_class);
             let node =
                 Arc::new(Recorded::open_with_prober(routed, &args.state, prober).map_err(failed)?);
+            node.lease_over_wire(lessors).map_err(failed)?;
             node.bind_guest_books().map_err(failed)?;
             // Joint plan step 14: what this node recorded under a census cost is retired first.
             node.retire_census().map_err(failed)?;
@@ -682,7 +746,7 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
                 .map_err(failed)?;
             node.recover_guest_backing().map_err(failed)?;
             say_recovered(&node.recover().map_err(failed)?);
-            charges(&node);
+            charges(&node, args.capacity_view);
             node
         }
         None => {
@@ -691,10 +755,18 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
             Arc::new(node)
         }
     };
-    let platform = hex_node::serve::macos::platform().map_err(failed)?;
+    let fitted = match hosted_fit {
+        Some(fit) => fit,
+        None => {
+            // Every descriptor the node holds for its life beside its bounds is open now: its store's, its keeper's and
+            // its guest's.
+            let beside = hex_node::serve::macos::open_descriptors().map_err(failed)?;
+            fitted(&platform, 0, hex_node::serve::fit::MACOS, Some(beside)).map_err(failed)?
+        }
+    };
     Ok(Hosted {
         host,
-        limits: hex_node::serve::limits(&platform),
+        limits: fitted.limits,
         workers: platform.threads,
     })
 }
@@ -781,17 +853,45 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
         .map_err(failed)?;
     let prober = hex_node::facts::shared_prober(&args.state, hex_node::facts::Declared::default())
         .map_err(failed)?;
+    let lessors = hex_node::serve::WireLessors::new();
+    let under_shards_init = under_shards_init(guest_config.as_ref());
+    let platform = hex_node::serve::windows::platform().map_err(failed)?;
+    let mut hosted_fit = None;
     let host: Arc<dyn Host> = match configured_guest(
         guest_config,
         &args.state,
         catalog,
         runtime_paths(&args.state).map_err(failed)?,
+        Arc::clone(&lessors),
     )? {
+        Some(guest) if under_shards_init => {
+            let routed =
+                hex_runtime::guest::WithGuest::configured(runtime, guest, WinRuntime::oci_side);
+            let node =
+                Arc::new(Recorded::open_with_prober(routed, &args.state, prober).map_err(failed)?);
+            node.lease_over_wire(lessors).map_err(failed)?;
+            node.bind_guest_books().map_err(failed)?;
+            // Joint plan step 14: what this node recorded under a census cost is retired first.
+            node.retire_census().map_err(failed)?;
+            let fit = fitted(
+                &platform,
+                1,
+                hex_node::serve::fit::WINDOWS,
+                Some(hex_node::serve::windows::open_descriptors().map_err(failed)?),
+            )
+            .map_err(failed)?;
+            boot_under_shards_init(&node, &fit).map_err(failed)?;
+            say_recovered(&node.recover().map_err(failed)?);
+            charges(&node, args.capacity_view);
+            hosted_fit = Some(fit);
+            node
+        }
         Some(guest) => {
             let routed =
                 hex_runtime::guest::WithGuest::configured(runtime, guest, WinRuntime::oci_side);
             let node =
                 Arc::new(Recorded::open_with_prober(routed, &args.state, prober).map_err(failed)?);
+            node.lease_over_wire(lessors).map_err(failed)?;
             node.bind_guest_books().map_err(failed)?;
             // Joint plan step 14: what this node recorded under a census cost is retired first.
             node.retire_census().map_err(failed)?;
@@ -803,7 +903,7 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
                 .map_err(failed)?;
             node.recover_guest_backing().map_err(failed)?;
             say_recovered(&node.recover().map_err(failed)?);
-            charges(&node);
+            charges(&node, args.capacity_view);
             node
         }
         None => {
@@ -812,12 +912,65 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
             Arc::new(node)
         }
     };
-    let platform = hex_node::serve::windows::platform().map_err(failed)?;
+    let fitted = match hosted_fit {
+        Some(fit) => fit,
+        None => {
+            // Every handle the node holds for its life beside its bounds is open now: its store's, its keeper's and
+            // its guest's.
+            let beside = hex_node::serve::windows::open_descriptors().map_err(failed)?;
+            fitted(&platform, 0, hex_node::serve::fit::WINDOWS, Some(beside)).map_err(failed)?
+        }
+    };
     Ok(Hosted {
         host,
-        limits: hex_node::serve::limits(&platform),
+        limits: fitted.limits,
         workers: platform.threads,
     })
+}
+
+/// The node's socket bounds fitted to its platform's descriptors with everything else it holds, as Linux's node fits
+/// its own (ROOT's one accounting of 2026-11-13; `hex_node::serve::fit`), or its start refused by type where its limit
+/// can't hold the least node. Before, a macOS or Windows node's connections were its raw descriptor limit.
+#[cfg(any(target_os = "macos", windows))]
+fn fitted(
+    platform: &hex_node::serve::Platform,
+    hosted: usize,
+    own: hex_node::serve::fit::Own,
+    beside: Option<u64>,
+) -> Result<hex_node::serve::fit::Fitted, Refusal> {
+    hex_node::serve::fit::fit(platform, hosted, own, beside).map_err(|least| Refusal::Platform {
+        what: "a node within its descriptor limit",
+        platform: std::env::consts::OS,
+        why: format!(
+            "the least node, one program place and one connection, holds {least} descriptors, past the {} its \
+             platform gives",
+            platform.descriptors
+        ),
+    })
+}
+
+/// Whether the node's guest is its image under shards-init (`HEX_GUEST_IMAGE`; joint plan step 39), which Shards' run
+/// host runs rather than Hex's helper.
+#[cfg(any(target_os = "macos", windows))]
+fn under_shards_init(configuration: Option<&hex_runtime::guest::GuestInputs>) -> bool {
+    configuration
+        .is_some_and(|inputs| matches!(inputs.config.boot, hex_runtime::guest::Boot::Image(_)))
+}
+
+/// Boots the node's guest under shards-init before recovery reads it, its lanes the ones `fit` admits: fitted with
+/// every descriptor the node holds open now, its store's and its keeper's, and with that guest's lanes and controller
+/// counted as a hosted VM's (joint plan step 39), so none is counted twice.
+#[cfg(any(target_os = "macos", windows))]
+fn boot_under_shards_init<P: hex_node::recorded::Recover + 'static>(
+    node: &hex_node::recorded::Recorded<hex_runtime::guest::WithGuest<P>>,
+    fit: &hex_node::serve::fit::Fitted,
+) -> Result<(), Refusal> {
+    let lanes = u32::try_from(fit.lanes).map_err(|_| Refusal::Invalid {
+        what: "the node VM's lanes",
+        why: format!("{} lanes is more than a run admits", fit.lanes),
+    })?;
+    node.set_guest_lanes(lanes)?;
+    node.boot_guest()
 }
 
 /// AC-T7.4.1: configure the actual renderer and its verified cost before recovery.
@@ -854,6 +1007,7 @@ fn configured_guest(
     state: &Path,
     catalog: hex_runtime::devices::SharedCatalog,
     paths: (PathBuf, PathBuf),
+    lessors: Arc<hex_node::serve::WireLessors>,
 ) -> Result<Option<hex_runtime::guest::GuestRuntime>, (u8, String)> {
     use hex_runtime::guest::{GuestInputs, GuestRuntime};
     let Some(GuestInputs {
@@ -892,7 +1046,10 @@ fn configured_guest(
             backend_path(state, "image-diagnostics").map_err(failed)?,
         )
         .with_runtime_cost(cost)
-        .map_err(failed)?;
+        .map_err(failed)?
+        // Its image VMs' credentials leased from the connection that created each (joint plan step 33): the socket
+        // keeps each box's route (docs/design/credential-grants.md C7).
+        .with_lessors(lessors);
     if let Some(images) = native_images {
         guest = guest.with_native_images(images).map_err(failed)?;
     }
@@ -902,38 +1059,18 @@ fn configured_guest(
     Ok(Some(guest))
 }
 
-/// AC-T7.4.1: a managed VM on macOS runs only under its measured CPU control. The response is the cost
-/// evidence's row for this host class (the same evidence the cost id hashes); a host with none is
-/// refused, typed, naming the evidence it lacks. Nothing is defaulted.
+/// AC-T7.4.1: a managed VM on macOS runs only under its CPU control, which its persistent helper runs at the stop
+/// response it learns from its own holds, probing at its first (joint plan step 14, 2c; the review's A-14): the node
+/// sends the cold control, never a census row's response, which would be a record seed (ROOT, 2026-11-13), and takes
+/// its control's cycle from what its helper learned (`MacRuntime::cap_cycle`).
 #[cfg(target_os = "macos")]
 fn managed_control(
     inputs: &hex_runtime::guest::GuestInputs,
-    model: &str,
-) -> Result<(hex_runtime::macos::CpuControl, hex_api::RuntimeCost), Refusal> {
-    let row = inputs
-        .cpu_responses
-        .iter()
-        .find(|row| row.host == model)
-        .ok_or_else(|| {
-            let mut id = String::new();
-            for byte in inputs.cost.id {
-                use std::fmt::Write as _;
-                let _ = write!(id, "{byte:02x}");
-            }
-            Refusal::Invalid {
-                what: "managed VM CPU response evidence",
-                why: format!(
-                    "cost evidence {id} has no measured CPU-response row for host class {model}"
-                ),
-            }
-        })?;
-    Ok((
-        hex_runtime::macos::CpuControl {
-            cost_id: inputs.cost.id,
-            response: row.response(),
-        },
+) -> (hex_runtime::macos::CpuControl, hex_api::RuntimeCost) {
+    (
+        hex_runtime::macos::CpuControl::cold(inputs.cost.id),
         inputs.cost,
-    ))
+    )
 }
 
 /// The macOS runtime with its measured CPU control and its persistent managed-VM owner: this same
@@ -946,7 +1083,6 @@ fn managed_host(
     state: &Path,
     control: hex_runtime::macos::CpuControl,
     cost: &hex_api::RuntimeCost,
-    patience: std::time::Duration,
 ) -> Result<hex_runtime::macos::MacRuntime, Refusal> {
     use std::os::unix::fs::DirBuilderExt;
     let directory = backend_path(state, "managed-helper")?;
@@ -961,7 +1097,6 @@ fn managed_host(
         binary,
         directory.join("helper.sock"),
         directory.join("helper.receipt"),
-        patience,
     )?;
     let runtime = process
         .with_cpu_control(control)?
@@ -1058,6 +1193,19 @@ mod tests {
         }
     }
 
+    /// The review's A-10 (AC-T7.4.1; docs/design/capacity-view.md CV10's configured form): `--capacity-view` says a capacity
+    /// view serves the node's machine, a word of no value. Do parse without it, with it, and with it twice. Expect no
+    /// view, a view, then a refusal naming it given twice.
+    #[test]
+    fn a10_capacity_view_says_a_keeper_serves_the_machine() {
+        assert!(!parse(&args(&[])).unwrap().capacity_view);
+        assert!(parse(&args(&["--capacity-view"])).unwrap().capacity_view);
+        let why = parse(&args(&["--capacity-view", "--capacity-view"]))
+            .err()
+            .unwrap();
+        assert!(why.starts_with("--capacity-view is given twice"), "{why}");
+    }
+
     /// HEX-QUIC-24 (docs/design/hex-quic.md Q9), as parsed: `--quic` asks for a listener only with the enrollment it
     /// presents, and the enrollment's flags only with `--quic`; `--staged` is a Linux node's. Do: parse each half of the
     /// pair, a bad address, both, and `--staged`. Expect: each half refused naming what it lacks, the address refused,
@@ -1137,6 +1285,67 @@ mod tests {
             "{}",
             why.1
         );
+    }
+
+    /// The review's A-14 (2c-4b; ROOT, 2026-11-13: no record seeds): a managed VM on macOS runs under the cold control its
+    /// node sends, its helper learning its stop response in its own holds, never a census row's response, so its node
+    /// needs no row. Do take the managed control of guest inputs whose evidence has no CPU-response row, and of inputs
+    /// with a row for this host's class. Expect each the cold control of its cost, its cost beside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn w14_2c4b_a_managed_control_is_cold_and_needs_no_census_row() {
+        let unit = hex_api::CapacityResources {
+            cpu_milli: 1,
+            mem_bytes: 1,
+            disk_bytes: 1,
+        };
+        let fixed = hex_api::CapacityResources {
+            cpu_milli: 1_000,
+            mem_bytes: hex_api::MIN_MEMORY,
+            disk_bytes: 0,
+        };
+        let cost = hex_api::RuntimeCost {
+            id: [3; 32],
+            floor: fixed,
+            ceiling: fixed,
+            quantum: unit,
+            guest_overhead: hex_api::CapacityResources::default(),
+            overhead: hex_api::CapacityResources::default(),
+        };
+        let row = hex_runtime::guest::CpuResponse {
+            host: "Mac15,1".to_owned(),
+            samples: 1,
+            p50: std::time::Duration::from_millis(1),
+            p90: std::time::Duration::from_millis(1),
+            p99: std::time::Duration::from_millis(1),
+            max: std::time::Duration::from_millis(2),
+            raw: [1; 32],
+        };
+        for rows in [Vec::new(), vec![row]] {
+            let inputs = hex_runtime::guest::GuestInputs {
+                config: hex_runtime::guest::GuestConfig {
+                    binary: PathBuf::from("/shards"),
+                    boot: hex_runtime::guest::Boot::Kernel {
+                        kernel: PathBuf::from("/k"),
+                        initrd: PathBuf::from("/i"),
+                    },
+                    vcpus: 1,
+                    memory_mib: shards_api::min_memory_mib(std::env::consts::ARCH),
+                    gpu: false,
+                    shares: Vec::new(),
+                    staged: String::new(),
+                },
+                cost,
+                native_images: None,
+                cpu_responses: rows,
+            };
+            assert_eq!(
+                managed_control(&inputs),
+                (hex_runtime::macos::CpuControl::cold(cost.id), cost),
+                "{} rows",
+                inputs.cpu_responses.len()
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

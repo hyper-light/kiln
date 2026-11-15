@@ -196,6 +196,10 @@ struct Budgeted {
 
 #[cfg(unix)]
 impl super::super::Link for Budgeted {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, _port: u32) -> Result<DuplexOwner, Refusal> {
         use std::os::unix::net::UnixStream;
         let (near, far) = UnixStream::pair().unwrap();
@@ -224,6 +228,10 @@ struct Held {
 
 #[cfg(unix)]
 impl super::super::Link for Held {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, _port: u32) -> Result<DuplexOwner, Refusal> {
         use std::os::unix::net::UnixStream;
         let (near, far) = UnixStream::pair().unwrap();
@@ -425,6 +433,10 @@ struct RefusesAtOpening {
 
 #[cfg(unix)]
 impl super::super::Link for RefusesAtOpening {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, _port: u32) -> Result<DuplexOwner, Refusal> {
         use std::os::unix::net::UnixStream;
         let (near, mut far) = UnixStream::pair().unwrap();

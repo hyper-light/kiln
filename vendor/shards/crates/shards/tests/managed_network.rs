@@ -99,6 +99,7 @@ impl Inputs {
         .unwrap();
         record
     }
+    #[track_caller]
     fn boot(&self, name: &str, probe: &[&str]) -> common::Run {
         let identity = self.identity(name);
         let _ = writeln!(std::io::stdout(), "NETWORK_GUEST_IDENTITY {identity}");
@@ -122,7 +123,6 @@ impl Inputs {
                 &cmdline,
             ],
             &[("SHARDS_HOME", home.as_os_str())],
-            self.boot,
         );
         std::fs::write(self.records.join(format!("{name}.stdout")), &run.stdout).unwrap();
         std::fs::write(self.records.join(format!("{name}.stderr")), &run.stderr).unwrap();

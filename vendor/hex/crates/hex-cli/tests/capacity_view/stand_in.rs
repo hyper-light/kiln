@@ -123,10 +123,6 @@ impl StandIn {
         stand_in
     }
 
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
     /// The runs whose work may run: its ledger's, as its sync lists them.
     pub fn held(&self) -> Vec<Held> {
         self.runs
@@ -216,17 +212,23 @@ impl StandIn {
 
     /// The keeper's next word, checked and given to the core; what the core says back is said in turn. The events.
     fn hear_one(&mut self) -> Result<(ToHolder, Vec<Event>), Lost> {
+        // By the life of the keeper's link, as this end lists it (the review's C-5), and its end, which the read says
+        // itself; a link gone before the read said so is lost as one that said so.
+        let (end, keeper) = (self.end.as_ref(), self.keeper.as_str());
         let link = self.link.as_mut().unwrap();
         let heard = follow::within(
             &HEAR,
             "the keeper's next word",
-            || Party::Live,
+            || match end.map(Endpoint::links) {
+                Some(Ok(links)) if links.iter().any(|link| link.peer == keeper) => Party::Live,
+                _ => Party::Ended,
+            },
             |by| match link.hear(by) {
                 Err(Refused::Deadline { .. }) => None,
                 heard => Some(heard),
             },
         )
-        .unwrap();
+        .unwrap_or(Err(Refused::Closed { refusal: None }));
         let msg = heard.map_err(|why| self.lose(why))?;
         if let Some(view) = view_of(&msg) {
             self.tally.views += 1;
@@ -374,58 +376,53 @@ fn view_of(msg: &ToHolder) -> Option<View> {
     }
 }
 
-/// A run's ask, shaped like a kiln run's (a leg's `needs: cpus=N,mem=M`): CPU and memory together, never a GPU, which
-/// a holder can't reserve by count (CV3); one `share`-th of the machine's CPUs, and of its memory a quarter of that, so
-/// a holder meets the room's edge within a few runs on a machine of any size. The shares are a test generator's.
-pub fn run_of(room: Amounts, share: u64) -> Amounts {
-    Amounts {
-        cpu_milli: room.cpu_milli / share,
-        mem_bytes: (room.mem_bytes / share / 4).max(hex_api::MIN_MEMORY),
-        disk_bytes: 0,
-        gpus: 0,
-    }
+/// kiln's runs as kiln recorded them, one after another in recorded order (hex-sim's `kiln_needs`: each a leg's CPU and
+/// memory, a leg below their resolution one unit of it; ROOT's ruling 7, 2026-11-14), which the stand-in asks.
+pub fn kiln_runs() -> impl Iterator<Item = Amounts> {
+    hex_sim::capacity::kiln_needs()
 }
 
-/// SplitMix64 (Steele, Lea and Flood, OOPSLA 2014), as hex-sim's: one seed names a workload.
-pub struct Rng(u64);
-
-impl Rng {
-    pub fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    pub fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// In `low..=high`.
-    pub fn range(&mut self, low: u64, high: u64) -> u64 {
-        low + self.next() % (high - low + 1)
-    }
-}
-
-/// `steps` steps of kiln-shaped work: with the runs it holds below the room's edge, it asks for one run more (a share
-/// of 2 to 8 of the machine), else it ends one of its runs; every answer is checked as it comes (module docs). Ends at
-/// its count, or when the link goes.
-pub fn workload(stand_in: &mut StandIn, rng: &mut Rng, steps: u64) -> Result<(), Lost> {
-    for _ in 0..steps {
-        let view = stand_in
-            .view()
-            .expect("a synced stand-in has the keeper's view");
-        let ask = run_of(view.room, rng.range(2, 8));
-        let held = stand_in.held();
-        let end = !held.is_empty() && (rng.range(0, 2) == 0 || !ask.fits(view.free()));
-        if end {
-            let last = u64::try_from(held.len()).unwrap() - 1;
-            let at = usize::try_from(rng.range(0, last)).unwrap();
-            stand_in.release(held[at].id)?;
-        } else {
-            stand_in.reserve(ask)?;
+/// Asks the next of `runs` until the room refuses one (its edge), every answer checked as it comes (module docs): how
+/// many it was granted. Ends there, or when the link goes.
+pub fn fill(stand_in: &mut StandIn, runs: &mut impl Iterator<Item = Amounts>) -> Result<u64, Lost> {
+    let mut granted = 0;
+    loop {
+        let run = runs
+            .next()
+            .expect("the recorded runs ended before the room refused one");
+        match stand_in.reserve(run)? {
+            Asked::Granted => granted += 1,
+            Asked::Refused(why) => {
+                assert_eq!(
+                    why,
+                    Why::Room,
+                    "{}: a run refused past its room",
+                    stand_in.name
+                );
+                return Ok(granted);
+            }
         }
     }
+}
+
+/// Ends every run it holds, oldest first, until it holds none. Ends there, or when the link goes.
+pub fn drain(stand_in: &mut StandIn) -> Result<(), Lost> {
+    for held in stand_in.held() {
+        stand_in.release(held.id)?;
+    }
+    assert!(stand_in.held().is_empty());
+    Ok(())
+}
+
+/// kiln-shaped work with no count of steps (ROOT's ruling 7, 2026-11-14): `runs` asked until the room refuses one, every
+/// run then ended, and the next asked again until the room refuses one. It ends holding that set rather than nothing:
+/// what a loss after it reconciles, and the books it ends with, are then the holder's runs, never an empty set.
+pub fn workload(
+    stand_in: &mut StandIn,
+    runs: &mut impl Iterator<Item = Amounts>,
+) -> Result<(), Lost> {
+    fill(stand_in, runs)?;
+    drain(stand_in)?;
+    fill(stand_in, runs)?;
     Ok(())
 }

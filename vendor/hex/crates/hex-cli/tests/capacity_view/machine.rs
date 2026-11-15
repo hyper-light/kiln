@@ -236,14 +236,14 @@ pub fn places_process_boxes(dir: &Path) -> bool {
     routes.contains(&Class::Process)
 }
 
-/// A box of Hex's own of `cpu_milli` and the least memory a box holds, placed through the scheduler, its program not
-/// started: what it reserves is all it does. The scheduler's answer.
-pub fn place(dir: &Path, id: &str, cpu_milli: u64) -> dto::Reply {
+/// A box of Hex's own asking `need`'s CPU and memory, placed through the scheduler, its program not started: what it
+/// reserves is all it does. The scheduler's answer.
+pub fn place(dir: &Path, id: &str, need: Amounts) -> dto::Reply {
     let spec = BoxSpec {
         id: BoxId::new(id).unwrap(),
         bounds: Bounds {
-            cpu_max_milli: Some(u32::try_from(cpu_milli).unwrap()),
-            memory_max: Some(hex_api::MIN_MEMORY),
+            cpu_max_milli: Some(u32::try_from(need.cpu_milli).unwrap()),
+            memory_max: Some(need.mem_bytes),
             ..Bounds::default()
         },
         class: ClassSpec::Process,
@@ -253,7 +253,7 @@ pub fn place(dir: &Path, id: &str, cpu_milli: u64) -> dto::Reply {
         route: None,
         band: 0,
     };
-    let demand = format!("cpus={cpu_milli}m,mem={},class:oci", hex_api::MIN_MEMORY);
+    let demand = format!("cpus={}m,mem={},class:oci", need.cpu_milli, need.mem_bytes);
     hex_client::Client::connect(&dir.join("s.sock"))
         .unwrap()
         .schedule(Ask::Submit {

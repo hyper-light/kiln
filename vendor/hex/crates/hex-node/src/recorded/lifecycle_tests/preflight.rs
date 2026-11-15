@@ -82,6 +82,23 @@ fn retained(state: &Path) -> (Recorded<CountedRecovery>, Arc<AtomicUsize>, BoxId
     (node, effects, ready.id)
 }
 
+/// [`retained`]'s node over `state` once `plant` has left its files beside the node's record, as a crash leaves them,
+/// and the node has started again: a store reads its directory once, as it opens.
+fn retained_beside(
+    state: &Path,
+    plant: impl FnOnce(),
+) -> (Recorded<CountedRecovery>, Arc<AtomicUsize>, BoxId) {
+    let (node, effects, id) = retained(state);
+    drop(node);
+    plant();
+    let (gate, _, _) = fixture(0);
+    let runtime = CountedRecovery {
+        programs: Backend(gate),
+        effects: Arc::clone(&effects),
+    };
+    (Recorded::open(runtime, state).unwrap(), effects, id)
+}
+
 #[test]
 fn retained_malformed_pool_prevents_any_backend_recovery_effect() {
     let dir = tempfile::tempdir().unwrap();
@@ -271,10 +288,11 @@ fn t_t7_1_2_a_damaged_state_record_refuses_naming_its_file_and_the_remedy() {
 #[test]
 fn t_t7_1_2_a_torn_record_beside_no_guest_is_kept_and_the_node_starts() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, _, sibling) = retained(dir.path());
     let torn = BoxId::new("ab-torn").unwrap();
     let path = crate::store::runtime_record(&dir.path().join("@records"), &torn);
-    std::fs::write(&path, b"{\"version\":").unwrap();
+    let (node, _, sibling) = retained_beside(dir.path(), || {
+        std::fs::write(&path, b"{\"version\":").unwrap();
+    });
     let recovered = node
         .recover()
         .expect("the node starts beside a torn record");

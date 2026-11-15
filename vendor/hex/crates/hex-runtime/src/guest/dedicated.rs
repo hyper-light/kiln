@@ -171,7 +171,10 @@ mod tests {
         }
         fn finalize_managed(&self, _: Option<&shards_api::Identity>) -> Result<(), Refusal> {
             if self.fail_finalize.load(Ordering::SeqCst) {
-                return Err(super::super::books::uncertain(&self.record.spec.id)?);
+                return Err(super::super::books::uncertain(
+                    &self.record.spec.id,
+                    "the test's managed finalize fails",
+                )?);
             }
             Ok(())
         }
@@ -184,7 +187,7 @@ mod tests {
             &self,
             _: &crate::devices::ManagedLaunch<'_>,
             _: shards_api::LaunchIo,
-            _: Duration,
+            _: Option<Duration>,
         ) -> Result<shards_api::ManagedReceipt, Refusal> {
             panic!("cleanup cannot launch")
         }
@@ -253,8 +256,10 @@ mod tests {
                 })),
                 GuestConfig {
                     binary: "/model/shards".into(),
-                    kernel: "/model/kernel".into(),
-                    initrd: "/model/initrd".into(),
+                    boot: Boot::Kernel {
+                        kernel: "/model/kernel".into(),
+                        initrd: "/model/initrd".into(),
+                    },
                     vcpus: 1,
                     memory_mib: 256,
                     gpu: false,
@@ -303,6 +308,8 @@ mod tests {
             abandoned: 0,
             last_resort: None,
             ended: None,
+            control: None,
+            control_wake: None,
             credentials: Vec::new(),
         }
     }
@@ -732,7 +739,7 @@ mod tests {
             &self,
             plan: &crate::devices::ManagedLaunch<'_>,
             _: shards_api::LaunchIo,
-            _: Duration,
+            _: Option<Duration>,
         ) -> Result<shards_api::ManagedReceipt, Refusal> {
             assert!(matches!(plan, crate::devices::ManagedLaunch::Shards(_)));
             self.launches.fetch_add(1, Ordering::SeqCst);
@@ -865,8 +872,7 @@ mod tests {
             });
             let books: Arc<dyn crate::devices::Books> = owner.clone();
             runtime.bind_books(Arc::downgrade(&books)).unwrap();
-            let budget = managed::Budget::new(runtime.first_dial_bound().unwrap()).unwrap();
-            let result = runtime.create_selected(spec.clone(), owner.as_ref(), budget);
+            let result = runtime.create_selected(spec.clone(), owner.as_ref());
             let allowed = current == Some(9u64.to_le_bytes());
             assert_eq!(
                 owner.launches.load(Ordering::SeqCst),
@@ -897,6 +903,9 @@ mod tests {
                     Some(Refusal::Lifecycle {
                         id: spec.id.clone(),
                         cause: hex_api::LifecycleCause::Uncertain,
+                        why: Some(
+                            "its selected guest's devices aren't the ones it holds now".to_owned(),
+                        ),
                     })
                 );
                 assert!(
@@ -1135,7 +1144,10 @@ impl GuestRuntime {
         };
         route::guest_spec(&record.spec)?;
         if self.owns_record(&record.spec) {
-            return Err(super::books::uncertain(&info.id)?);
+            return Err(super::books::uncertain(
+                &info.id,
+                "its record is this guest's own, which no shared guest's inspect answers for",
+            )?);
         }
         let owner = Owner {
             class: record.spec.class.class(),
@@ -1168,7 +1180,11 @@ impl GuestRuntime {
             // recovery/create installs the native route before accepting forwards.
             self.cached_selected(id)
         } else if self.managed_shared() {
-            let record = snapshot.ok_or(super::books::uncertain(id)?)?;
+            // A box its guest keeps no record of is no box of its guest's: a macOS or Windows node forwards a call
+            // on an id its host doesn't hold here, which then answers NoSuchBox (HVF image_real's HEX-IMG-1, 6 and 7).
+            let Some(record) = snapshot else {
+                return Ok(None);
+            };
             self.shared_for_record(record)
         } else {
             self.running()
@@ -1356,20 +1372,26 @@ impl GuestRuntime {
         if receipt.physical.is_empty() {
             return Ok(());
         }
-        let observer = self
-            .gpu_observer
-            .as_ref()
-            .ok_or(super::books::uncertain(&receipt.id)?)?;
+        let observer = self.gpu_observer.as_ref().ok_or(super::books::uncertain(
+            &receipt.id,
+            "its selected receipt has no observer",
+        )?)?;
         let readiness = receipt.checked_work_ready()?;
         if readiness.configuration != observer.identity()
             || readiness.max_queues != observer.queues()
         {
-            return Err(super::books::uncertain(&receipt.id)?);
+            return Err(super::books::uncertain(
+                &receipt.id,
+                "its selected guest's readiness isn't its observer's",
+            )?);
         }
         receipt
             .attempt
             .as_ref()
-            .ok_or(super::books::uncertain(&receipt.id)?)?
+            .ok_or(super::books::uncertain(
+                &receipt.id,
+                "its selected receipt has no report writer",
+            )?)?
             .check_config(observer, receipt.physical.len())
     }
 
@@ -1386,7 +1408,7 @@ impl GuestRuntime {
     }
 
     fn receipt_spec(&self, receipt: &Record) -> Result<shards_api::GuestSpec, Refusal> {
-        let mut spec = self.config.spec();
+        let mut spec = self.config.spec()?;
         spec.gpu = !receipt.devices.is_empty();
         spec.vcpus = receipt.vcpus;
         spec.memory_mib = receipt.memory_mib;
@@ -1428,6 +1450,7 @@ impl GuestRuntime {
             selected::read(&self.selected_path(&spec.id)?)?.ok_or(Refusal::Lifecycle {
                 id: spec.id.try_clone()?,
                 cause: hex_api::LifecycleCause::Uncertain,
+                why: Some("it has devices or is a Shards box, and no selected receipt".to_owned()),
             })?;
         receipt.matches(spec)?;
         self.selected_spec(&receipt)?;
@@ -1439,7 +1462,6 @@ impl GuestRuntime {
         guest: shards_api::ManagedGuest,
         receipt: &Record,
         record: &BoxRecord,
-        budget: managed::Budget,
     ) -> Result<triomphe::Arc<Booted>, Refusal> {
         let owner = Owner {
             id: receipt.id.try_clone()?,
@@ -1447,7 +1469,7 @@ impl GuestRuntime {
             allocation: record.spec.allocation,
             route: record.spec.route,
         };
-        self.connect_managed(guest, Some(owner), None, budget)
+        self.connect_managed(guest, Some(owner), None)
     }
 
     pub(super) fn connect_managed(
@@ -1455,17 +1477,16 @@ impl GuestRuntime {
         guest: shards_api::ManagedGuest,
         owner: Option<Owner>,
         backing: Option<shared::Binding>,
-        budget: managed::Budget,
     ) -> Result<triomphe::Arc<Booted>, Refusal> {
         let link: LinkOwner = own_link(ShardsLink::managed(
             guest
                 .try_clone()
                 .map_err(|why| refusal("retaining managed guest connection", &why))?,
-            // HEX-GUEST-33: a later dial without its caller's deadline spends the whole learned bound,
-            // not what this create had left; the create's own dials carry its deadline.
-            budget.remaining().and_then(|_| self.first_dial_bound())?,
+            // HEX-GUEST-33: a dial without its caller's deadline waits its own W*, and past it follows the guest.
+            self.boot_bound()?,
         ))?;
-        let client = Client::connect_before(triomphe::Arc::clone(&link), budget.deadline())?;
+        // With no deadline its first dial, token and hello follow the guest (the review's C-9).
+        let client = Client::connect(triomphe::Arc::clone(&link))?;
         let booted = booted_owner(Booted {
             guest: GuestHandle::Managed(guest),
             link,
@@ -1474,8 +1495,7 @@ impl GuestRuntime {
             owner,
             backing,
         })?;
-        budget.remaining()?;
-        self.join_before(&booted, budget)?;
+        self.join(&booted)?;
         Ok(booted)
     }
 
@@ -1484,7 +1504,10 @@ impl GuestRuntime {
         let Some(known) = reservation.previous.take() else {
             reservation.publish(None)?;
             return if self.uses_books() {
-                Err(super::books::uncertain(id)?)
+                Err(super::books::uncertain(
+                    id,
+                    "its reservation holds no load of it, though its guest keeps records",
+                )?)
             } else {
                 Ok(None)
             };
@@ -1493,10 +1516,12 @@ impl GuestRuntime {
         reservation.previous = Some(known);
         let terminal = booted
             .guest
+            .shards_for("observing selected guest lifetime")?
             .wait_for(Duration::ZERO)
             .map_err(|why| refusal("observing selected guest lifetime", &why))?;
         let scope = booted
             .guest
+            .shards_for("observing selected native scope")?
             .terminal_scope()
             .map_err(|why| refusal("observing selected native scope", &why))?;
         if terminal.is_some() || scope.is_some() {
@@ -1505,30 +1530,43 @@ impl GuestRuntime {
                 reservation.publish(known)?;
                 return Ok(None);
             }
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its guest holds no record of it",
+            )?);
         }
         // The durable VM receipt is authoritative. It was already reread by the
         // old binding check; retain only the actual native/client owner in RAM.
-        let receipt =
-            selected::read(&self.selected_path(id)?)?.ok_or(super::books::uncertain(id)?)?;
+        let receipt = selected::read(&self.selected_path(id)?)?
+            .ok_or(super::books::uncertain(id, "it has no selected receipt")?)?;
         if !matches!(receipt.phase, Phase::Running(_)) {
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its selected receipt isn't running",
+            )?);
         }
         if let Some(report) = receipt.checked_report()? {
             self.check_native_report(
                 &receipt.devices,
                 &receipt.physical,
-                receipt.scope.ok_or(super::books::uncertain(id)?)?,
+                receipt.scope.ok_or(super::books::uncertain(
+                    id,
+                    "its selected receipt has no scope",
+                )?)?,
                 report,
             )?;
         }
         self.check_selected_observer(&receipt)?;
         if self.uses_books() {
-            let record = self.recorded_box(id)?.ok_or(super::books::uncertain(id)?)?;
+            let record = self.recorded_box(id)?.ok_or(super::books::uncertain(
+                id,
+                "its guest holds no record of it",
+            )?)?;
             receipt.matches_record(&record)?;
             self.selected_spec(&receipt)?;
             let identity = booted
                 .guest
+                .shards_for("validating selected route identity")?
                 .identity()
                 .map_err(|why| refusal("validating selected route identity", &why))?;
             managed::same_init(&record, &identity)?;
@@ -1537,7 +1575,10 @@ impl GuestRuntime {
                     || owner.class != record.spec.class.class()
                     || owner.route != record.spec.route
             }) {
-                return Err(super::books::uncertain(id)?);
+                return Err(super::books::uncertain(
+                    id,
+                    "its guest's owner of it isn't its record's: another allocation, class or route",
+                )?);
             }
         }
         let known = reservation.previous.take();
@@ -1561,16 +1602,27 @@ impl GuestRuntime {
         if !self.uses_books() {
             return self.cached_selected(id);
         }
-        let record = self.recorded_box(id)?.ok_or(super::books::uncertain(id)?)?;
+        let record = self.recorded_box(id)?.ok_or(super::books::uncertain(
+            id,
+            "its guest holds no record of it",
+        )?)?;
         let keys = self.turn_keys(&record.spec.devices)?;
-        let books = self.books.get().ok_or(super::books::uncertain(id)?)?;
+        let books = self.books.get().ok_or(super::books::uncertain(
+            id,
+            "its guest is bound to no books",
+        )?)?;
         crate::devices::with_transaction(books, id, &keys, |transaction| {
-            let current = transaction.read(id)?.ok_or(super::books::uncertain(id)?)?;
+            let current = transaction
+                .read(id)?
+                .ok_or(super::books::uncertain(id, "its record is gone")?)?;
             if current.spec != record.spec
                 || current.init != record.init
                 || current.native_scope != record.native_scope
             {
-                return Err(super::books::uncertain(id)?);
+                return Err(super::books::uncertain(
+                    id,
+                    "its record's spec, init or native scope changed",
+                )?);
             }
             self.selected_running_in(id, transaction, &current)
         })
@@ -1585,7 +1637,10 @@ impl GuestRuntime {
         }
         self.validate_binding(spec)?;
         self.selected_running(&spec.id)?
-            .ok_or(super::books::uncertain(&spec.id)?)?;
+            .ok_or(super::books::uncertain(
+                &spec.id,
+                "its selected guest isn't running it",
+            )?)?;
         Ok(())
     }
 
@@ -1599,81 +1654,67 @@ impl GuestRuntime {
             return self.cached_selected(id);
         }
         let reservation = self.reserve(id, Operation::Loading)?;
-        let budget = managed::Budget::new(self.first_dial_bound()?)?;
-        let receipt =
-            selected::read(&self.selected_path(id)?)?.ok_or(super::books::uncertain(id)?)?;
+        let receipt = selected::read(&self.selected_path(id)?)?
+            .ok_or(super::books::uncertain(id, "it has no selected receipt")?)?;
         receipt.matches_record(record)?;
         let identity = receipt.identity()?;
         managed::same_init(record, identity)?;
         if !matches!(receipt.phase, Phase::Running(_)) {
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its selected receipt isn't running",
+            )?);
         }
         let spec = self.selected_spec(&receipt)?;
         if let Some(report) = receipt.checked_report()? {
             self.check_native_report(
                 &receipt.devices,
                 &receipt.physical,
-                receipt.scope.ok_or(super::books::uncertain(id)?)?,
+                receipt.scope.ok_or(super::books::uncertain(
+                    id,
+                    "its selected receipt has no scope",
+                )?)?,
                 report,
             )?;
         }
-        let plan = self.managed_plan(&spec, &identity.vsock, budget)?;
+        let plan = self.managed_plan(&spec, &identity.vsock)?;
         self.check_selected_observer(&receipt)?;
-        let guest = managed::attach(transaction, plan, identity, budget)?;
-        let booted = self.booted(guest, &receipt, record, budget)?;
+        let guest = managed::attach(transaction, plan, identity)?;
+        let booted = self.booted(guest, &receipt, record)?;
         reservation.publish(Some(Guest {
             booted: triomphe::Arc::clone(&booted),
         }))?;
         Ok(Some(booted))
     }
 
-    /// The managed plan of `spec` on `socket`, its guest told what is left of the create's `budget`, its boot's deadline
-    /// (AC-T7.4.1, [`super::READY_MS`]); an attach's plan launches nothing, so its guest hears nothing of it.
+    /// The managed plan of `spec` on `socket`, its guest told no boot deadline (the review's C-9).
     pub(super) fn managed_plan(
         &self,
         spec: &shards_api::GuestSpec,
         socket: &std::path::Path,
-        budget: managed::Budget,
     ) -> Result<shards_api::PreparedBoot, Refusal> {
-        let mut spec = spec.clone();
-        super::tell_ready(&mut spec.cmdline, budget.remaining()?)?;
-        let spec = &spec;
         let paths = self.native_paths.as_ref().ok_or_else(|| Refusal::Invalid {
             what: "managed Shards runtime paths",
             why: "the node's configured probe and native launch require the same explicit paths"
                 .into(),
         })?;
-        let plan = if let Some(images) = self.native_images {
-            shards_api::prepare_native_boot(
-                spec,
-                &self.config.binary,
-                socket,
-                shards_api::NativeBoot {
-                    paths,
-                    images,
-                    console_kept: shards_api::recorded_console_bytes_at(&spec.kernel, paths),
-                },
-            )
-        } else {
-            shards_api::prepare_boot(
-                spec,
-                &self.config.binary,
-                socket,
-                shards_api::recorded_console_bytes(&spec.kernel),
-            )
-            .and_then(|plan| plan.with_runtime_paths(paths))
-        };
-        plan.map_err(|why| refusal("preparing admitted Shards scope", &why))
+        super::managed_plan(spec, &self.config.binary, socket, paths, self.native_images)
     }
 
     pub(super) fn prepare_selected_create(&self, id: &BoxId) -> Result<(), Refusal> {
         if self.has_selected_route(id)? {
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its selected route is still held",
+            )?);
         }
         let path = self.selected_path(id)?;
         if let Some(receipt) = selected::read(&path)? {
             if receipt.id != *id || !matches!(receipt.phase, Phase::Released { .. }) {
-                return Err(super::books::uncertain(id)?);
+                return Err(super::books::uncertain(
+                    id,
+                    "its selected receipt names another box, or isn't released",
+                )?);
             }
             // The caller proved the sole canonical record absent under its turn.
             // This is a completed removal whose final receipt unlink was interrupted.
@@ -1705,7 +1746,10 @@ impl GuestRuntime {
             || source.execution != Execution::ShardsDedicated
             || !matches!(source.phase, BackingPhase::Live | BackingPhase::Draining)
         {
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its backing isn't the dedicated live or draining one its route names",
+            )?);
         }
         self.check_allocation(&record.spec)?;
         selected::Record::intent(record, &self.config)?;
@@ -1713,7 +1757,10 @@ impl GuestRuntime {
         record
             .spec
             .route
-            .ok_or(super::books::uncertain(id)?)?
+            .ok_or(super::books::uncertain(
+                id,
+                "its record routes it on no backing",
+            )?)?
             .check_backing_parts(
                 record.spec.allocation.map(|allocation| allocation.cost),
                 source.key,
@@ -1725,12 +1772,18 @@ impl GuestRuntime {
         record.native_commitment()?;
         self.catalog_physical(&record.spec.devices)?;
         if self.has_selected_route(id)? {
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its selected route is still held",
+            )?);
         }
         // The caller retains the canonical Box/full-source guard across both
         // reads; no native/Store callback, route allocation or table mutation.
         if selected::read(&self.selected_path(id)?)?.is_some() {
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its selected receipt is still kept",
+            )?);
         }
         Ok(())
     }
@@ -1739,9 +1792,7 @@ impl GuestRuntime {
         &self,
         spec: BoxSpec,
         transaction: &dyn Transaction,
-        budget: managed::Budget,
     ) -> Result<BoxInfo, Refusal> {
-        budget.remaining()?;
         self.check_allocation(&spec)?;
         let reservation = self.reserve(&spec.id, Operation::Creating)?;
         let path = self.selected_path(&spec.id)?;
@@ -1752,20 +1803,23 @@ impl GuestRuntime {
         // pre-put shell cannot supply it, and a reusable BoxId socket is no proof.
         let canonical = transaction
             .read(&spec.id)?
-            .ok_or(super::books::uncertain(&spec.id)?)?;
+            .ok_or(super::books::uncertain(&spec.id, "it has no record")?)?;
         if canonical.phase != hex_core::record::Phase::Creating
             || canonical.spec != spec
             || canonical.init.is_some()
         {
-            return Err(super::books::uncertain(&spec.id)?);
+            return Err(super::books::uncertain(
+                &spec.id,
+                "its record isn't Creating, isn't its spec, or names an init",
+            )?);
         }
         let mut receipt = Record::intent(&canonical, &self.config)?;
         receipt.physical = self.physical_for(&receipt.devices)?;
         if !receipt.physical.is_empty() {
-            let observer = self
-                .gpu_observer
-                .as_ref()
-                .ok_or(super::books::uncertain(&receipt.id)?)?;
+            let observer = self.gpu_observer.as_ref().ok_or(super::books::uncertain(
+                &receipt.id,
+                "its selected receipt has no observer",
+            )?)?;
             observer.verify(&self.config)?;
             observer.check_allocation(self.configured_allocation()?)?;
             observer.output_bytes(receipt.physical.len())?;
@@ -1780,58 +1834,67 @@ impl GuestRuntime {
                 .map_err(|e| Refusal::os("syncing selected guest receipt directory", e))?;
         }
         let socket = self.selected_socket(&receipt.id)?;
-        let mut plan = self.managed_plan(&guest_spec, &socket, budget)?;
+        let mut plan = self.managed_plan(&guest_spec, &socket)?;
         if !receipt.physical.is_empty() {
             self.check_current_luids(
                 &receipt.devices,
                 &receipt.physical,
-                super::books::uncertain(&receipt.id)?,
+                super::books::uncertain(
+                    &receipt.id,
+                    "its selected guest's devices aren't the ones it holds now",
+                )?,
             )?;
-            let scope = receipt.scope.ok_or(super::books::uncertain(&receipt.id)?)?;
+            let scope = receipt.scope.ok_or(super::books::uncertain(
+                &receipt.id,
+                "its selected receipt has no scope",
+            )?)?;
             plan = plan
-                .with_gpu_report(*scope.bytes(), budget.deadline())
+                .with_gpu_report(*scope.bytes(), shards_api::Until::Released)
                 .map_err(|why| refusal("preparing selected renderer report", &why))?;
         }
-        budget.remaining()?;
         selected::write(&path, &receipt)?;
-        let guest = managed::boot(transaction, plan, budget)?;
+        let guest = managed::boot(transaction, plan)?;
         let identity = shards_api::Guest::identity(&guest)
             .map_err(|why| refusal("recording selected guest identity", &why))?;
         let record = transaction
             .read(&receipt.id)?
-            .ok_or(super::books::uncertain(&receipt.id)?)?;
+            .ok_or(super::books::uncertain(&receipt.id, "its record is gone")?)?;
         managed::same_init(&record, &identity)?;
         receipt.matches_record(&record)?;
         if !receipt.physical.is_empty() {
-            let report = guest.take_gpu_report(budget.remaining()?).map_err(|why| {
+            // Its report comes or its VM process ends: Shards waits with no clock (`Until::Released`; the review's C-9).
+            let report = guest.take_gpu_report(Duration::MAX).map_err(|why| {
                 refusal(
                     "observing the selected renderer in its original scope",
                     &why,
                 )
             })?;
             receipt.report = Some(report);
-            let report = receipt
-                .checked_report()?
-                .ok_or(super::books::uncertain(&receipt.id)?)?;
+            let report = receipt.checked_report()?.ok_or(super::books::uncertain(
+                &receipt.id,
+                "its selected guest has no native report",
+            )?)?;
             self.check_native_report(
                 &receipt.devices,
                 &receipt.physical,
-                receipt.scope.ok_or(super::books::uncertain(&receipt.id)?)?,
+                receipt.scope.ok_or(super::books::uncertain(
+                    &receipt.id,
+                    "its selected receipt has no scope",
+                )?)?,
                 report,
             )?;
         }
         receipt.phase = Phase::Running(identity);
         selected::write(&path, &receipt)?;
-        let booted = self.booted(guest, &receipt, &record, budget)?;
+        let booted = self.booted(guest, &receipt, &record)?;
         if !receipt.physical.is_empty() {
-            let observer = self
-                .gpu_observer
-                .as_ref()
-                .ok_or(super::books::uncertain(&receipt.id)?)?;
-            super::observer::observe_selected(observer, &booted, &mut receipt, &path, budget)?;
+            let observer = self.gpu_observer.as_ref().ok_or(super::books::uncertain(
+                &receipt.id,
+                "its selected receipt has no report writer",
+            )?)?;
+            super::observer::observe_selected(observer, &booted, &mut receipt, &path)?;
             self.check_selected_observer(&receipt)?;
         }
-        budget.remaining()?;
         let created = self.create_in(&booted, rewritten);
         reservation.publish(Some(Guest { booted }))?;
         created
@@ -1845,9 +1908,14 @@ impl GuestRuntime {
         let reservation = self.reserve(id, Operation::Stopping)?;
         let path = self.selected_path(id)?;
         let receipt = selected::read(&path)?;
-        let record = transaction.read(id)?.ok_or(super::books::uncertain(id)?)?;
+        let record = transaction
+            .read(id)?
+            .ok_or(super::books::uncertain(id, "its record is gone")?)?;
         if record.native_scope.is_none() {
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its record names no native scope",
+            )?);
         }
         let identity = match receipt.as_ref() {
             Some(receipt) => {
@@ -1870,16 +1938,25 @@ impl GuestRuntime {
                         return Ok(());
                     }
                     Phase::Released { identity: None, .. } => {
-                        return Err(super::books::uncertain(id)?);
+                        return Err(super::books::uncertain(
+                            id,
+                            "its selected receipt was released with no identity",
+                        )?);
                     }
                     Phase::Intent => None,
                 }
             }
-            None if reservation.previous.is_some() => return Err(super::books::uncertain(id)?),
+            None if reservation.previous.is_some() => {
+                return Err(super::books::uncertain(
+                    id,
+                    "its reservation names a load of it, but no selected receipt remains",
+                )?);
+            }
             None => None,
         };
         if let Some(identity) = identity {
-            let mut stopping = selected::read(&path)?.ok_or(super::books::uncertain(id)?)?;
+            let mut stopping = selected::read(&path)?
+                .ok_or(super::books::uncertain(id, "it has no selected receipt")?)?;
             stopping.phase = Phase::Stopping(shards_api::Identity {
                 pid: identity.pid,
                 started: identity.started,
@@ -1889,7 +1966,7 @@ impl GuestRuntime {
         }
         // The native transaction names the original scope even before publication.
         // PID exit/Gone/observer error never substitutes for complete scope release.
-        let terminal = managed::stop(transaction, id, identity, self.first_dial_bound()?)?;
+        let terminal = managed::stop(transaction, id, identity)?;
         let released_identity = identity
             .map(|identity| -> Result<_, Refusal> {
                 Ok(shards_api::Identity {
@@ -1922,17 +1999,27 @@ impl GuestRuntime {
         id: &BoxId,
         transaction: &dyn Transaction,
     ) -> Result<(), Refusal> {
-        let receipt =
-            selected::read(&self.selected_path(id)?)?.ok_or(super::books::uncertain(id)?)?;
-        let record = transaction.read(id)?.ok_or(super::books::uncertain(id)?)?;
+        let receipt = selected::read(&self.selected_path(id)?)?
+            .ok_or(super::books::uncertain(id, "it has no selected receipt")?)?;
+        let record = transaction
+            .read(id)?
+            .ok_or(super::books::uncertain(id, "its record is gone")?)?;
         receipt.matches_record(&record)?;
         let Phase::Released { identity, .. } = &receipt.phase else {
-            return Err(super::books::uncertain(id)?);
+            return Err(super::books::uncertain(
+                id,
+                "its selected receipt isn't released",
+            )?);
         };
         match identity {
             Some(identity) => managed::same_init(&record, identity)?,
             None if record.init.is_none() => {}
-            None => return Err(super::books::uncertain(id)?),
+            None => {
+                return Err(super::books::uncertain(
+                    id,
+                    "its record names no init, though its released receipt names an identity",
+                )?);
+            }
         }
         transaction.finalize_managed(identity.as_ref())
     }
@@ -1946,19 +2033,31 @@ impl GuestRuntime {
         let Some(booted) = booted else {
             return Ok(None);
         };
+        self.evented_of(&booted)
+    }
+
+    /// `booted`'s evented connection, joined to the node's loop where it isn't yet.
+    fn evented_of(&self, booted: &Booted) -> Result<Option<EventedClient>, Refusal> {
         let cached = booted.evented.lock().map_err(poisoned)?.clone();
         if let Some(client) = cached.filter(|client| !client.closed()) {
             return Ok(Some(client));
         }
-        self.join(&booted)?;
+        self.join(booted)?;
         Ok(booted.evented.lock().map_err(poisoned)?.clone())
     }
 
-    pub fn program_client_for(&self, id: &BoxId) -> Result<Option<EventedClient>, Refusal> {
-        let booted = self.booted_for(id)?;
-        let Some(booted) = booted else {
+    /// The client a forwarded exec into box `id`'s guest goes through, from one read of its record (HEX-RT-17): where
+    /// its caller would `offer` the exec's streams (a Windows node's exec with streams) and the guest's link lends its
+    /// VM's identity, a control connection of the exec's own, whose streams the caller opens itself; else the guest's
+    /// evented connection, which makes the exec's asked streams here: a node VM's lanes lend none (the review's D-10).
+    /// None: no guest holds `id`.
+    pub fn exec_client_for(&self, id: &BoxId, offer: bool) -> Result<Option<ExecClient>, Refusal> {
+        let Some(booted) = self.booted_for(id)? else {
             return Ok(None);
         };
+        if !(offer && booted.link.lends_identity()) {
+            return Ok(self.evented_of(&booted)?.map(ExecClient::Evented));
+        }
         let joins = self
             .joins
             .lock()
@@ -1969,6 +2068,14 @@ impl GuestRuntime {
         let (client, pump) = Client::connect_evented(triomphe::Arc::clone(&booted.link), room)?;
         let client = evented_owner(client)?;
         joins.join(token, pump)?;
-        Ok(Some(client))
+        Ok(Some(ExecClient::Offered(client)))
     }
+}
+
+/// How a forwarded exec reaches its guest ([`GuestRuntime::exec_client_for`]).
+pub enum ExecClient {
+    /// A control connection of the exec's own: its streams offered to its caller, which opens them itself.
+    Offered(EventedClient),
+    /// The guest's evented connection: its asked streams made by this node, their ends handed to the caller.
+    Evented(EventedClient),
 }

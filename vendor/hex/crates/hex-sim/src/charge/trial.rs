@@ -49,6 +49,10 @@ pub struct Report {
     /// min(asked, booked), per mille: a thousand or more is C4's guarantee kept. Where a window isn't contended, a VM
     /// given less than it asked is given less than its guest could use, which is no share's.
     pub ratios: Ratios,
+    /// Of each VM-window of the windows nothing contended that asked anything, what it was given over what it asked,
+    /// per mille: the run's own floor, how far a reading falls short of its ask with nothing taking its share (its
+    /// node's reading of it, its guest's play), against which the contended windows' ratios are read.
+    pub floor: Ratios,
     /// VM-windows of the contended windows given less than min(asked, booked) while the bookings fit the budget: C4's
     /// guarantee broken, its falsifier's own words.
     pub misses: u64,
@@ -77,6 +81,17 @@ fn part(of: u64, whole: u64, scale: u128) -> u64 {
         })
 }
 
+/// `ratios`' count, least and nearest-rank quantiles.
+fn quantiles(mut ratios: Vec<u64>) -> Ratios {
+    ratios.sort_unstable();
+    Ratios {
+        n: u64::try_from(ratios.len()).unwrap_or(u64::MAX),
+        least: ratios.first().copied().unwrap_or(0),
+        p1: rank(&ratios, 10),
+        p50: rank(&ratios, 500),
+    }
+}
+
 /// The nearest-rank `q`-quantile, per mille, of `sorted`: its ceil(q n / 1,000)-th smallest.
 fn rank(sorted: &[u64], q: usize) -> u64 {
     let at = q
@@ -93,7 +108,7 @@ pub fn report(cast: &Cast, windows: &[Window]) -> Report {
         jain_least_ppm: 1_000_000,
         ..Report::default()
     };
-    let mut ratios = Vec::new();
+    let (mut ratios, mut floor) = (Vec::new(), Vec::new());
     let (mut jain_sum, mut riser_sum) = (0u128, 0u128);
     for (at, window) in windows.iter().enumerate() {
         let asked = window
@@ -112,6 +127,9 @@ pub fn report(cast: &Cast, windows: &[Window]) -> Report {
             let short = contended && fits && r.given < guard;
             if contended && guard > 0 {
                 ratios.push(part(r.given, guard, 1_000));
+            }
+            if !contended && r.asked > 0 {
+                floor.push(part(r.given, r.asked, 1_000));
             }
             if short {
                 out.misses = out.misses.saturating_add(1);
@@ -142,13 +160,8 @@ pub fn report(cast: &Cast, windows: &[Window]) -> Report {
             jain_sum = jain_sum.saturating_add(u128::from(index));
         }
     }
-    ratios.sort_unstable();
-    out.ratios = Ratios {
-        n: u64::try_from(ratios.len()).unwrap_or(u64::MAX),
-        least: ratios.first().copied().unwrap_or(0),
-        p1: rank(&ratios, 10),
-        p50: rank(&ratios, 500),
-    };
+    out.ratios = quantiles(ratios);
+    out.floor = quantiles(floor);
     let mean = |sum: u128, n: u64| {
         u64::try_from(sum.checked_div(u128::from(n)).unwrap_or(0)).unwrap_or(u64::MAX)
     };

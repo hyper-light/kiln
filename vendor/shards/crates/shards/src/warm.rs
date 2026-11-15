@@ -42,6 +42,11 @@ impl Link {
         Link { daemon }
     }
 
+    /// Another handle of the same link, which keeps it open as long as it lives.
+    pub fn try_clone(&self) -> io::Result<Link> {
+        Ok(Link::new(self.daemon.try_clone()?))
+    }
+
     /// The daemon's socket at `fd`, which must be an open Unix socket other than stdio.
     #[cfg(unix)]
     pub fn from_fd(fd: RawFd) -> Result<Link, String> {
@@ -119,6 +124,7 @@ static HOST: Host = Host {
     daemon: std::sync::OnceLock::new(),
     asked: std::sync::Mutex::new(Vec::new()),
     released: std::sync::Mutex::new(Vec::new()),
+    gone: std::sync::atomic::AtomicBool::new(false),
     said: std::sync::Condvar::new(),
 };
 
@@ -126,6 +132,9 @@ struct Host {
     daemon: std::sync::OnceLock<UnixStream>,
     asked: std::sync::Mutex<Vec<u32>>,
     released: std::sync::Mutex<Vec<u32>>,
+    /// Its daemon's connection has ended: no let-go waits on it more ([`release_host`]).
+    /// Set under `released`'s lock, so that no wait misses it.
+    gone: std::sync::atomic::AtomicBool,
     said: std::sync::Condvar,
 }
 
@@ -153,11 +162,11 @@ pub fn adopt_release(socket: shards_vmm::platform::UnixStream) -> Result<(), Str
 
 /// Has the network process close the run's published ports, and waits until it has, so
 /// that they are free once the run's end is told: a script's next run of the same port
-/// finds it free (`run --rm -p 80 …; run -p 80 …`). A network
-/// process that does not answer within a second is ended with the VM, and frees them then,
-/// as the daemon follows one to its end (`netproc::reap`). That second was the one a
-/// network process was given to end (`netproc::GRACE`, until PM M546); its own basis is owed
-/// (R03).
+/// finds it free (`run --rm -p 80 …; run -p 80 …`). Its daemon is told it waits
+/// (`UNPUBLISHING`), and the wait follows that process's liveness alone: confined, the VM
+/// process sees nothing of its progress, which the daemon follows from here and ends where
+/// it goes on with nothing (D217's helper slice, ROOT's (A), 2026-11-13), and its end ends
+/// the wait. It was a second, picked (`netproc::GRACE`'s, until PM M546).
 ///
 /// First, what the guest sent before its command ended goes into the network process's
 /// ring, which it takes before UNPUBLISH: a datagram a command sends just before it exits
@@ -165,10 +174,9 @@ pub fn adopt_release(socket: shards_vmm::platform::UnixStream) -> Result<(), Str
 /// VM (the published UDP flake of 2026-10-06 and 2026-10-10: the guest answered its last
 /// datagram and exited, and the answer never came). Whether it published ports and its
 /// network process has closed them, as it answered.
-fn release_ports() -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+fn release_ports(daemon: &UnixStream) -> bool {
     if let Some(flush) = FLUSH.get() {
-        flush.flush(deadline);
+        flush.flush(None);
     }
     if !PUBLISHED.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
@@ -176,24 +184,30 @@ fn release_ports() -> bool {
     let Some(release) = RELEASE.get() else {
         return false;
     };
+    unpublish(release, || {
+        let _ = to_daemon(daemon, kind::UNPUBLISHING, &[], &[]);
+    })
+}
+
+/// Asks the network process on `release` to close the run's published ports (`UNPUBLISH`),
+/// tells `asked` once it has, and waits for its answer while it lives, its socket's end the
+/// wait's: whether it answered.
+fn unpublish(release: &shards_vmm::platform::UnixStream, asked: impl FnOnce()) -> bool {
     #[cfg(unix)]
     {
         if shards_ipc::send(release, kind::UNPUBLISH, &[], &[]).is_err() {
             return false;
         }
-        // Bounded by poll(2), not a socket option: the VM process's seccomp filter refuses
-        // setsockopt(2) (confine.rs).
-        matches!(shards_ipc::recv_by(release, deadline), Ok(Some(m)) if m.kind == kind::UNPUBLISH)
+        asked();
+        matches!(shards_ipc::recv(release), Ok(Some(m)) if m.kind == kind::UNPUBLISH)
     }
     #[cfg(windows)]
     {
         if shards_ipc::write_message(release, kind::UNPUBLISH, &[]).is_err() {
             return false;
         }
-        // Bounded by a poll before the read (shards_afunix's read timeout).
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        !left.is_zero()
-            && release.set_read_timeout(Some(left)).is_ok()
+        asked();
+        shards_ipc::timeout_set(release.set_read_timeout(None)).is_ok()
             && matches!(shards_ipc::read_message(release), Ok(Some(m)) if m.kind == kind::UNPUBLISH)
     }
 }
@@ -228,11 +242,10 @@ pub fn inherited_socket(flag: &str, fd: RawFd) -> Result<UnixStream, String> {
     Ok(socket)
 }
 
-/// A request, as the daemon hands it over.
+/// A request, as the daemon hands it over. Its client, once the VM takes it, is the run's
+/// [`Taken`]'s.
 pub struct Request {
     pub capture: Option<workload::capture::Given>,
-    /// None for a detached run.
-    pub client: Option<UnixStream>,
     pub spec: Spec,
     /// The command reads the client's stdin.
     pub interactive: bool,
@@ -266,6 +279,48 @@ pub struct Request {
     /// A run its microVM was restored from a save of (D176): the save's tokens, which its
     /// guest dials the host again with; its request brings them in place of a command.
     pub tokens: Option<Vec<u8>>,
+}
+
+/// A run this VM took: TAKEN said, its one way out of untaken (R04). From then on its owner
+/// reads exactly one end of it on its link, its `DONE` ([`Taken::end`]), whatever fails
+/// after: its setup, here or in the VM process, its guest's refusal, its serving. A VM that
+/// takes none ends, which its owner reads where TAKEN would be.
+pub struct Taken {
+    /// Its client, which hears its end after its owner: none for a detached run.
+    client: Option<UnixStream>,
+    /// The handle of its link its final use goes on (D260), where the VM could clone it.
+    final_link: Option<Link>,
+    /// Its end told: by whichever comes first of its workload's end and its serving's.
+    told: std::sync::atomic::AtomicBool,
+}
+
+impl Taken {
+    /// The handle of its link its final use goes on ([`final_use`]).
+    pub fn final_link(&self) -> Option<&Link> {
+        self.final_link.as_ref()
+    }
+
+    /// Tells its owner on `link`, then its client, how it ended, `served` ([`finish`]), the
+    /// first time alone: a later call tells nothing. `facts` reads, for the call that tells
+    /// it alone, its timing line and the working set its VM recorded.
+    pub fn end(
+        &self,
+        link: &Link,
+        served: &Result<workload::Ended, String>,
+        facts: impl FnOnce() -> (Option<String>, Option<(String, Vec<u8>)>),
+    ) {
+        if self.told.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let (timing, working_set) = facts();
+        finish(
+            link,
+            self.client.as_ref(),
+            served,
+            timing.as_deref(),
+            working_set.as_ref(),
+        );
+    }
 }
 
 /// Tells the daemon of the files a share's DAX window maps (D189), for it to watch them
@@ -449,12 +504,18 @@ fn reserve_descriptors(daemon: &UnixStream) -> Result<(), String> {
 }
 
 /// A run its microVM was restored from a save of (`resumed`, D176) is asked for as any
-/// other, its request bringing the save's tokens in place of a command.
+/// other, its request bringing the save's tokens in place of a command. `took` gets the run
+/// ([`Taken`]: its client, and a handle of `link` for its final use) as the VM tells its
+/// daemon TAKEN, and only then, whatever fails after: a taken run's failure is its end,
+/// told ([`Taken::end`]); a VM that took no run tells no end and no final use
+/// ([`final_use`]), so that its daemon or run host reads its end, not a message, where TAKEN
+/// would be.
 pub fn receive(
     link: &Link,
     to: &'static ToGuest,
     may_take: &dyn Fn() -> Result<(), String>,
     resumed: bool,
+    took: &std::sync::OnceLock<Taken>,
 ) -> Result<Request, String> {
     let daemon = &link.daemon;
     // The relays' threads start while the VM is idle, so that none starts on a request's
@@ -580,6 +641,18 @@ pub fn receive(
     // What must hold for this VM to take a run, checked while the daemon may still give
     // it to another.
     may_take()?;
+    // One run a VM: a second is refused untaken, and so is never told as the first.
+    if took.get().is_some() {
+        return Err("this VM has taken a run already".into());
+    }
+    // Made before TAKEN, so that nothing fails between the VM taking the run and its final
+    // use's link being there; a VM that cannot clone it serves the run, telling no final use.
+    let final_link = link
+        .try_clone()
+        .inspect_err(|e| {
+            let _ = writeln!(io::stderr(), "shards: its final use's link: {e}");
+        })
+        .ok();
     // TAKEN before anything of the client's is touched or anything starts: a VM that ends
     // without it never started the run, which the daemon may then hand to another VM
     // (daemon.rs, hand_over). A daemon gone by now has no copies left to close, and hands
@@ -593,6 +666,11 @@ pub fn receive(
     {
         return Err(format!("telling the daemon the request is taken: {e}"));
     }
+    let taken = took.get_or_init(|| Taken {
+        client,
+        final_link,
+        told: std::sync::atomic::AtomicBool::new(false),
+    });
     // Its windows' files watched by the daemon from their first mapping on (D189), a
     // restored run's among them, which its shares map again as they are given.
     #[cfg(target_os = "linux")]
@@ -621,7 +699,7 @@ pub fn receive(
         .map_err(|e| format!("the daemon's connection: {e}"))?;
     daemon_relay.relay(from_daemon, From::Daemon(segments));
     // A detached run's client has no relay: its thread ends as its handle goes.
-    if let Some(client) = &client {
+    if let Some(client) = &taken.client {
         let signals = client
             .try_clone()
             .map_err(|e| format!("the client's connection: {e}"))?;
@@ -629,7 +707,6 @@ pub fn receive(
     }
     Ok(Request {
         capture,
-        client,
         plug,
         io,
         cpus,
@@ -836,10 +913,14 @@ fn relay_signals(conn: &UnixStream, to: &'static ToGuest, from: From<'_>) {
             // at once: what its daemon tells its guest of comes after.
             kind::DEVICE if matches!(from, From::Daemon(_)) => {
                 if let Some((number, step)) = message.payload.split_first_chunk::<8>() {
-                    let answer = match crate::vm_run::device(step, message.fds) {
-                        Ok(text) => [&number[..], &[0], text.as_bytes()].concat(),
-                        Err(e) => [&number[..], &[1], e.as_bytes()].concat(),
+                    let outcome = crate::vm_run::device(step, message.fds);
+                    // An answer it has no memory for ends its link: its asker reads that
+                    // as a step that may have been done (`Refusal::ConnectionEnded`).
+                    let Ok(body) = shards_ipc::device::encode(&outcome) else {
+                        shards_ipc::end(conn);
+                        break;
                     };
+                    let answer = [&number[..], &body].concat();
                     if let Err(e) = to_daemon(conn, kind::DEVICED, &answer, &[]) {
                         let _ = writeln!(io::stderr(), "shards: answering a device step: {e}");
                     }
@@ -860,9 +941,14 @@ fn relay_signals(conn: &UnixStream, to: &'static ToGuest, from: From<'_>) {
             // what it holds them to, or why not.
             kind::RATE if matches!(from, From::Daemon(_)) => {
                 if let Some((number, milli)) = rate_asked(&message.payload) {
-                    let answer = match crate::vm_run::hold_rate(milli) {
-                        Ok(held) => {
-                            let held = held.map(|m| m.to_string()).unwrap_or_default();
+                    // Its line a managed machine's (`shards_abi::rate`): what it holds them to
+                    // and the period it derived for them (D191).
+                    let answer = match crate::vm_run::rate_answer(|| crate::vm_run::hold_rate(milli)) {
+                        Ok((milli, period_ns)) => {
+                            let held = shards_abi::rate::answer(&shards_abi::rate::Answer::Held {
+                                milli,
+                                period_ns,
+                            });
                             [&number[..], &[0], held.as_bytes()].concat()
                         }
                         Err(e) => [&number[..], &[1], e.as_bytes()].concat(),
@@ -916,8 +1002,11 @@ fn relay_signals(conn: &UnixStream, to: &'static ToGuest, from: From<'_>) {
                         .get()
                         .and_then(|s| s.get(u32::from_be_bytes(*share) as usize))
                         .and_then(|slot| slot.window());
+                    // A cut its window cannot follow tells its guest nothing here: the next
+                    // request about the file follows it again, and is refused its reply
+                    // where it still cannot (memory-01's twin).
                     if let Some(window) = window {
-                        window.cut(u64::from_be_bytes(*node));
+                        let _ = window.cut(u64::from_be_bytes(*node));
                     }
                 }
             }
@@ -1133,6 +1222,15 @@ fn relay_signals(conn: &UnixStream, to: &'static ToGuest, from: From<'_>) {
     }
     if client && let Ok(null) = workload::null() {
         let_go(&null);
+    }
+    // Its daemon's connection ended: no let-go of a port of the host's waits on it more.
+    if matches!(from, From::Daemon(_)) {
+        let _held = HOST
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HOST.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+        HOST.said.notify_all();
     }
     // The daemon gone with the run going: its stop, its signal and then SIGKILL once its
     // grace is up, so that no run outlives its daemon unreachable. A run already over
@@ -1763,6 +1861,98 @@ pub fn serve_engine(
         .map_err(|e| format!("its engine's thread: {e}"))
 }
 
+/// A resumed run's tokens (D176) as its request brings them after its head: its save's own,
+/// which its guest dials the host again with; then what the save kept of its tokens' entries,
+/// its engine's (`engine=`, D181) and its members' MCP connections' (`mcp=`, D254), as a fresh
+/// run's spec carries them, in a spec of those entries alone. None for a request that is not
+/// one.
+pub fn resumed_tokens(brought: &[u8]) -> Option<(&[u8], Spec)> {
+    let (tokens, kept) = brought.split_at_checked(2 * shards_abi::run::TOKEN)?;
+    Some((tokens, Spec::decode(kept)?))
+}
+
+/// The token the run's members' MCP connections are carried by (D254), its spec's `mcp=`
+/// entry, where it has one whole: its guest's init refuses a run whose entry is not.
+pub fn mcp_token(spec: &Spec) -> Option<[u8; shards_abi::run::TOKEN]> {
+    shards_abi::run::mcp::token(&spec.setup).ok().flatten()
+}
+
+/// Serves the run's MCP port (D254) on a thread of its own: each guest connection whose
+/// hello says `token`, which only the guest's init was given, is a member's connection to
+/// its MCP socket ([`mcp_heard`]); any other is closed.
+pub fn serve_mcp(
+    link: &Link,
+    token: [u8; shards_abi::run::TOKEN],
+    port: workload::EnginePort,
+) -> Result<(), String> {
+    let owner = link
+        .daemon
+        .try_clone()
+        .map_err(|e| format!("the owner's connection: {e}"))?;
+    let heard = move |conn: GuestConn,
+                      _: shards_vmm::devices::virtio::vsock::ring::RingHandle,
+                      hello: workload::Hello| drop(mcp_heard(&owner, conn, hello));
+    std::thread::Builder::new()
+        .name("mcp".into())
+        .spawn(move || workload::accept_hellos(port, "mcp-hellos", token, heard))
+        .map(drop)
+        .map_err(|e| format!("its MCP port's thread: {e}"))
+}
+
+/// The next number this VM gives a member's MCP connection (D254): its own, from
+/// `ACCEPTED_FIRST` up, apart from every lane its owner opens. One workload a process (M34).
+static ACCEPTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(shards_abi::run::mcp::ACCEPTED_FIRST);
+
+/// What a connection to the run's MCP port, its hello saying the run's token, comes to: a
+/// plain one is its owner's, unprompted ([`accept_mcp`]), on the thread returned, as its
+/// member is said after its hello and a relay slow to say it holds no other connection up;
+/// one whose hello offers a ring, which its guest's relay never does on this port, is closed.
+fn mcp_heard(
+    owner: &UnixStream,
+    conn: GuestConn,
+    hello: workload::Hello,
+) -> Option<std::thread::JoinHandle<()>> {
+    let (workload::Hello::Plain, Ok(owner)) = (hello, owner.try_clone()) else {
+        return None;
+    };
+    let number = ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::thread::Builder::new()
+        .name("mcp-accepted".into())
+        .spawn(move || accept_mcp(&owner, number, conn))
+        .ok()
+}
+
+/// Hands lane `number`, a member's MCP connection whose hello has been heard, to the run's
+/// owner (`LANE_ACCEPTED`): its number, then the member its guest's relay names after its
+/// hello. Beside the message on Unix, a copy held until the owner says it has it
+/// (`LANE_HELD`, M24); on Windows held until the owner's `LANE_HELD` brings the socket it is
+/// relayed onto. One that names no member, or whose owner cannot be told, is closed.
+fn accept_mcp(owner: &UnixStream, number: u64, conn: GuestConn) {
+    use std::io::Read as _;
+    let mut said = [0u8; shards_abi::run::mcp::PREAMBLE];
+    // Read as a lane's status is (`workload::open_socket`): a relay's half-close a read
+    // sleeps through on macOS is seen (M236).
+    let read = conn
+        .set_nonblocking(false)
+        .and_then(|()| shards_ipc::Polled(&conn).read_exact(&mut said));
+    if read.is_err() {
+        return;
+    }
+    let member = shards_abi::run::mcp::read_preamble(said);
+    let payload = shards_ipc::Accepted { number, member }.encode();
+    #[cfg(unix)]
+    let (Ok(held), handed) = (conn.try_clone(), [std::os::fd::AsFd::as_fd(&conn)]) else {
+        return;
+    };
+    #[cfg(windows)]
+    let (held, handed) = (conn, []);
+    lanes_held().insert(number, held);
+    if to_daemon(owner, kind::LANE_ACCEPTED, &payload, &handed).is_err() {
+        lanes_held().remove(&number);
+    }
+}
+
 /// Relays a guest's connection to its run's engine, or a member's input connection, onto the
 /// pipe its daemon gave for it (Windows, where a VM gives its daemon no handle): each way on
 /// a thread of its own, the
@@ -1784,6 +1974,9 @@ fn relay_engine(guest: GuestConn, pipe: OwnedFd) {
                 &pipe_down,
                 &guest_down,
                 |guest| guest.shutdown(std::net::Shutdown::Write),
+                |guest| {
+                    let _ = guest.shutdown(std::net::Shutdown::Both);
+                },
                 shards_ipc::end,
             )
         });
@@ -1798,6 +1991,7 @@ fn relay_engine(guest: GuestConn, pipe: OwnedFd) {
                     &guest,
                     &pipe,
                     |pipe| pipe.shutdown(std::net::Shutdown::Write),
+                    shards_ipc::end,
                     |guest| {
                         let _ = guest.shutdown(std::net::Shutdown::Both);
                     },
@@ -1812,12 +2006,16 @@ fn relay_engine(guest: GuestConn, pipe: OwnedFd) {
 }
 
 /// Copies what `from` reads to `to` until `from` ends, then ends `to`'s writes
-/// (`ended`); where `to` takes no more, ends `from` (`refused`), so that its writer stops.
+/// (`ended`); where `from`'s read fails, its peer gone rather than its writes ended (a cut
+/// WinSock socket reads WSAECONNRESET, PM M358), ends `to` both ways (`cut`), so that its
+/// reader finds it hung up, never a half-close (D251); where `to` takes no more, ends
+/// `from` (`refused`), so that its writer stops.
 #[cfg(windows)]
 fn pass<F: ?Sized, T: ?Sized>(
     from: &F,
     to: &T,
     ended: impl FnOnce(&T) -> io::Result<()>,
+    cut: impl FnOnce(&T),
     refused: impl FnOnce(&F),
 ) where
     for<'a> &'a F: io::Read,
@@ -1826,8 +2024,12 @@ fn pass<F: ?Sized, T: ?Sized>(
     let mut buf = vec![0u8; 64 << 10];
     loop {
         match shards_ipc::read(from, &mut buf) {
-            Ok(0) | Err(_) => {
+            Ok(0) => {
                 let _ = ended(to);
+                return;
+            }
+            Err(_) => {
+                cut(to);
                 return;
             }
             Ok(n) => {
@@ -1926,7 +2128,7 @@ pub fn finish(
     }
     // Its ports closed, the daemon frees them before it hears the run is done, so that they
     // are free by the time its client returns.
-    if release_ports() {
+    if release_ports(&link.daemon) {
         let _ = to_daemon(&link.daemon, kind::PORTS_FREE, &[], &[]);
     }
     release_host(0);
@@ -1972,7 +2174,7 @@ pub fn host_net(link: &Link, frame: &[u8]) {
     if frame.first() == Some(&shards_abi::run::kind::UNBIND)
         && let Some(flush) = FLUSH.get()
     {
-        flush.flush(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        flush.flush(None);
     }
     // Whose processes have ports of the host's, to be let go as each ends.
     if let Some((&shards_abi::run::kind::BIND, bind)) = frame.split_first()
@@ -1995,9 +2197,11 @@ pub fn host_net(link: &Link, frame: &[u8]) {
 }
 
 /// Has the daemon let go of microVM `owner`'s ports of the host's (D124) as it ends,
-/// before its end is told, waiting up to a second for it to say it has: the daemon's
-/// copies and its network process's closed, so that the host may bind them again once
-/// the end is told, as dockerd's may (PM M181). Nothing to do for one that asked for none.
+/// before its end is told, waiting while the daemon lives for it to say it has: the
+/// daemon's copies and its network process's closed, so that the host may bind them again
+/// once the end is told, as dockerd's may (PM M181). Nothing to do for one that asked for
+/// none. The VM process, confined, sees nothing of the daemon's progress; its connection's
+/// end ends the wait (ROOT's (A), 2026-11-13). It was a second, picked.
 fn release_host(owner: u32) {
     {
         let mut asked = HOST
@@ -2015,25 +2219,28 @@ fn release_host(owner: u32) {
     if to_daemon(daemon, kind::HOST_RELEASE, &owner.to_be_bytes(), &[]).is_err() {
         return;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    let mut released = HOST
+    await_release(&HOST, owner);
+}
+
+/// Waits until `host`'s daemon has said it let go of microVM `owner`'s ports
+/// (`HOST_RELEASE`), or its connection has ended: whether it said so.
+fn await_release(host: &Host, owner: u32) -> bool {
+    let mut released = host
         .released
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
         if let Some(at) = released.iter().position(|&o| o == owner) {
             released.swap_remove(at);
-            return;
+            return true;
         }
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return;
+        if host.gone.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
         }
-        released = HOST
+        released = host
             .said
-            .wait_timeout(released, left)
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0;
+            .wait(released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
@@ -2077,6 +2284,16 @@ pub fn tell_kept() {
             payload.as_ref().map_or(&[][..], |p| p),
             &[],
         );
+    }
+}
+
+/// Tells its owner what the machine used in all (`FINAL_USE`, D260's final use): `used`, a
+/// use's answer as `shards_abi::rate::used` writes it, on the link [`receive`] kept as the VM
+/// took its run. Its owner reads it until the link closes, which it does as this process
+/// ends.
+pub fn final_use(link: &Link, used: &str) {
+    if let Err(e) = to_daemon(&link.daemon, kind::FINAL_USE, used.as_bytes(), &[]) {
+        let _ = writeln!(io::stderr(), "shards: telling its final use: {e}");
     }
 }
 
@@ -2297,6 +2514,149 @@ fn open_lane(owner: &UnixStream, to: &'static ToGuest, number: [u8; 8], name: Ve
 mod tests {
     use super::*;
 
+    /// A side [`pass`] reads: its bytes, then how it ends (`Ok(0)`, its writes' end, or an
+    /// error).
+    #[cfg(windows)]
+    struct Side(std::cell::RefCell<Vec<io::Result<Vec<u8>>>>);
+
+    #[cfg(windows)]
+    impl io::Read for &Side {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut said = self.0.borrow_mut();
+            if said.is_empty() {
+                return Ok(0);
+            }
+            let bytes = said.remove(0)?;
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    /// A side [`pass`] writes: what it took, and how its writes ended.
+    #[cfg(windows)]
+    #[derive(Default)]
+    struct Taken(std::cell::RefCell<(Vec<u8>, Vec<&'static str>)>);
+
+    #[cfg(windows)]
+    impl Write for &Taken {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `pass` makes of a side that says `said`: the bytes the other side took and how
+    /// its writes were ended.
+    #[cfg(windows)]
+    fn passed(said: Vec<io::Result<Vec<u8>>>) -> (Vec<u8>, Vec<&'static str>) {
+        let from = Side(std::cell::RefCell::new(said));
+        let to = Taken::default();
+        pass(
+            &from,
+            &to,
+            |to| {
+                to.0.borrow_mut().1.push("half-closed");
+                Ok(())
+            },
+            |to| to.0.borrow_mut().1.push("ended both ways"),
+            |_| panic!("refused"),
+        );
+        to.0.into_inner()
+    }
+
+    /// A guest connection whose read fails (WSAECONNRESET: its muxer closed it with no end
+    /// of its writes first, D251's cut, PM M358) ends the owner's pipe both ways, never its
+    /// writes alone; one whose read ends (its writes' end) still half-closes it.
+    #[cfg(windows)]
+    #[test]
+    fn a_read_that_fails_ends_the_other_side_both_ways() {
+        let reset = || io::Error::from(io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            passed(vec![Ok(b"said".to_vec()), Err(reset())]),
+            (b"said".to_vec(), vec!["ended both ways"])
+        );
+        assert_eq!(
+            passed(vec![Ok(b"said".to_vec())]),
+            (b"said".to_vec(), vec!["half-closed"])
+        );
+    }
+
+    /// A run's ports' closing is waited for while its network process lives, however long
+    /// its answer takes (a second and a half here), its daemon told it waits first
+    /// (`UNPUBLISHING`); a network process that goes ends the wait, unanswered. Before, the VM
+    /// process gave up a second on, picked, and the run's end was told with its ports held
+    /// (ROOT's (A), 2026-11-13).
+    #[cfg(unix)]
+    #[test]
+    fn a_runs_ports_closing_is_waited_for_while_its_network_process_lives() {
+        let late = std::time::Duration::from_millis(1500);
+        let (vm, net) = UnixStream::pair().unwrap();
+        let told = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let m = shards_ipc::recv(&net).unwrap().unwrap();
+                assert_eq!(m.kind, kind::UNPUBLISH);
+                std::thread::sleep(late);
+                shards_ipc::send(&net, kind::UNPUBLISH, &[], &[]).unwrap();
+            });
+            let began = std::time::Instant::now();
+            assert!(unpublish(&vm, || told.store(true, std::sync::atomic::Ordering::Relaxed)));
+            assert!(began.elapsed() >= late, "{:?}", began.elapsed());
+            assert!(
+                told.load(std::sync::atomic::Ordering::Relaxed),
+                "its daemon not told"
+            );
+        });
+        // Its network process gone, unanswered.
+        let (vm, net) = UnixStream::pair().unwrap();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let _ = shards_ipc::recv(&net);
+                drop(net);
+            });
+            assert!(!unpublish(&vm, || {}));
+        });
+    }
+
+    /// A port of the host's let go is waited for while the daemon lives, however long its
+    /// word takes (a second and a half here); its connection's end ends the wait, unsaid.
+    /// Before, the VM process gave up a second on, picked (ROOT's (A), 2026-11-13).
+    #[test]
+    fn a_host_ports_release_is_waited_for_while_its_daemon_lives() {
+        let host = || Host {
+            daemon: std::sync::OnceLock::new(),
+            asked: std::sync::Mutex::new(Vec::new()),
+            released: std::sync::Mutex::new(Vec::new()),
+            gone: std::sync::atomic::AtomicBool::new(false),
+            said: std::sync::Condvar::new(),
+        };
+        let late = std::time::Duration::from_millis(1500);
+        let said = host();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(late);
+                said.released.lock().unwrap().push(7);
+                said.said.notify_all();
+            });
+            let began = std::time::Instant::now();
+            assert!(await_release(&said, 7));
+            assert!(began.elapsed() >= late, "{:?}", began.elapsed());
+        });
+        let unsaid = host();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(late);
+                let _held = unsaid.released.lock().unwrap();
+                unsaid.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+                unsaid.said.notify_all();
+            });
+            assert!(!await_release(&unsaid, 7));
+        });
+    }
+
     /// A lane's answer (D251) by its number: 0 for connected, the guest's errno for a refusal,
     /// and ESRCH with why for a lane its guest could not be asked for or never answered.
     #[test]
@@ -2355,9 +2715,10 @@ mod tests {
         ] {
             let (ours, daemon) = UnixStream::pair().unwrap();
             let link = Link::new(ours);
+            let took = std::sync::OnceLock::new();
             let fds = vec![file.as_fd(); given];
             let refused = std::thread::scope(|s| {
-                let receiving = s.spawn(|| receive(&link, &TO_GUEST, &|| Ok(()), false));
+                let receiving = s.spawn(|| receive(&link, &TO_GUEST, &|| Ok(()), false, &took));
                 assert_eq!(shards_ipc::recv(&daemon).unwrap().unwrap().kind, kind::READY);
                 let mut payload = Vec::new();
                 // Its log's first segment, and memory to plug: none (D148).
@@ -2373,9 +2734,17 @@ mod tests {
                 receiving.join().unwrap().err()
             });
             assert_eq!(refused.as_deref(), Some(said));
-            // Nothing taken.
+            // Nothing taken, and no final use's link kept: the VM's end is all its daemon
+            // reads where TAKEN would be.
+            assert!(took.get().is_none(), "a final use's link for a run not taken");
             daemon.set_nonblocking(true).unwrap();
             assert!(shards_ipc::recv(&daemon).is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock));
+            drop(link);
+            daemon.set_nonblocking(false).unwrap();
+            assert!(
+                shards_ipc::recv(&daemon).unwrap().is_none(),
+                "the link held past the VM's end"
+            );
         }
     }
 
@@ -2440,5 +2809,272 @@ mod tests {
             read
         });
         assert_eq!(read, Ok(()));
+    }
+
+    /// D254: what a relay's connection to the MCP port, its hello heard, comes to on this side.
+    #[cfg(unix)]
+    mod mcp {
+        use super::*;
+        use std::io::Read as _;
+
+        /// A resumed run's request brings its save's tokens, then what its save kept of its
+        /// engine's and its MCP connections' tokens as a fresh run's spec carries them (D176):
+        /// each read back as it was kept, either alone, or neither; one cut short is none.
+        #[test]
+        fn a_resumed_runs_tokens_bring_its_engines_and_its_mcp_connections() {
+            let token = |b: u8| [b; shards_abi::run::TOKEN];
+            let hex = |t: [u8; shards_abi::run::TOKEN]| -> Vec<u8> {
+                let digits: String = t.iter().map(|b| format!("{b:02x}")).collect();
+                format!("engine={digits}").into_bytes()
+            };
+            let saved = [7u8; 2 * shards_abi::run::TOKEN];
+            for (engine, mcp) in [
+                (Some(token(1)), Some(token(2))),
+                (None, Some(token(2))),
+                (Some(token(1)), None),
+                (None, None),
+            ] {
+                let mut kept = Spec::default();
+                kept.setup.extend(engine.map(hex));
+                kept.setup
+                    .extend(mcp.as_ref().map(shards_abi::run::mcp::token_entry));
+                let mut brought = saved.to_vec();
+                kept.encode_into(&mut brought);
+                let (tokens, read) = resumed_tokens(&brought).unwrap();
+                assert_eq!(tokens, saved);
+                assert_eq!((engine_token(&read), mcp_token(&read)), (engine, mcp));
+            }
+            assert!(resumed_tokens(&saved[1..]).is_none());
+        }
+
+        /// Closed: its far end reads its end, nothing of it unread there.
+        fn closed(mut relay: GuestConn) {
+            let mut rest = Vec::new();
+            relay.read_to_end(&mut rest).unwrap();
+            assert_eq!(rest, b"");
+        }
+
+        /// Nothing said to the owner, whose end is `ours`, of what was done before this.
+        fn told_nothing(ours: &UnixStream) {
+            ours.set_nonblocking(true).unwrap();
+            let said = shards_ipc::recv(ours);
+            assert!(
+                matches!(&said, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                "{said:?}"
+            );
+            ours.set_nonblocking(false).unwrap();
+        }
+
+        /// A member's connection goes to the run's owner as its relay named it, numbered as the
+        /// VM's own (`LANE_ACCEPTED`), the connection itself beside it and a copy held until
+        /// its owner says it has it (M24); one whose relay ends before naming its member is
+        /// closed, its owner told nothing.
+        #[test]
+        fn a_members_connection_goes_to_its_owner_as_its_relay_named_it() {
+            let first = shards_abi::run::mcp::ACCEPTED_FIRST;
+            let (owner, ours) = UnixStream::pair().unwrap();
+            let (conn, relay) = GuestConn::pair().unwrap();
+            relay.shutdown(std::net::Shutdown::Write).unwrap();
+            accept_mcp(&owner, first + 10, conn);
+            assert!(!lanes_held().contains_key(&(first + 10)));
+            told_nothing(&ours);
+            closed(relay);
+            let (conn, mut relay) = GuestConn::pair().unwrap();
+            relay.write_all(&shards_abi::run::mcp::preamble(3)).unwrap();
+            accept_mcp(&owner, first + 11, conn);
+            let m = shards_ipc::recv(&ours).unwrap().unwrap();
+            assert_eq!(
+                (m.kind, shards_ipc::Accepted::decode(&m.payload)),
+                (
+                    kind::LANE_ACCEPTED,
+                    Some(shards_ipc::Accepted {
+                        number: first + 11,
+                        member: 3
+                    })
+                )
+            );
+            let [handed] = <[OwnedFd; 1]>::try_from(m.fds).unwrap();
+            let handed = UnixStream::from(handed);
+            (&handed).write_all(b"{}\n").unwrap();
+            let mut said = [0u8; 3];
+            relay.read_exact(&mut said).unwrap();
+            assert_eq!(&said, b"{}\n");
+            // Its VM's copy held until its owner has it, and the connection gone with both.
+            let held = lanes_held().remove(&(first + 11));
+            assert!(held.is_some());
+            drop((held, handed));
+            closed(relay);
+        }
+
+        /// A connection whose hello offers a ring, which its guest's relay never does on this
+        /// port, is closed, its owner told nothing; a plain one is its owner's.
+        #[test]
+        fn a_hello_offering_a_ring_is_closed_and_a_plain_one_handed() {
+            let (owner, ours) = UnixStream::pair().unwrap();
+            let (conn, relay) = GuestConn::pair().unwrap();
+            let offered = workload::Hello::Offered(Err(shards_abi::ring::Malformed::Length));
+            assert!(mcp_heard(&owner, conn, offered).is_none());
+            told_nothing(&ours);
+            closed(relay);
+            let (conn, mut relay) = GuestConn::pair().unwrap();
+            relay.write_all(&shards_abi::run::mcp::preamble(0)).unwrap();
+            mcp_heard(&owner, conn, workload::Hello::Plain)
+                .unwrap()
+                .join()
+                .unwrap();
+            let m = shards_ipc::recv(&ours).unwrap().unwrap();
+            let accepted = shards_ipc::Accepted::decode(&m.payload).unwrap();
+            assert_eq!(
+                (m.kind, accepted.member, m.fds.len()),
+                (kind::LANE_ACCEPTED, 0, 1)
+            );
+            drop((lanes_held().remove(&accepted.number), m.fds));
+            closed(relay);
+        }
+
+        /// The run's MCP port takes its relay's connections by the run's token: what its relay
+        /// says after its hello reaches the owner as said.
+        #[test]
+        fn the_runs_mcp_port_hands_its_relays_connections_to_its_owner() {
+            use shards_abi::run;
+            let token = [5u8; run::TOKEN];
+            let (link, ours) = UnixStream::pair().unwrap();
+            let (port, connections) = std::sync::mpsc::channel();
+            serve_mcp(&Link::new(link), token, connections).unwrap();
+            let memory =
+                std::sync::Arc::new(shards_vmm::memory::GuestMemory::anonymous(&[(0, 1 << 20)]).unwrap());
+            let (conn, mut relay) = GuestConn::pair().unwrap();
+            port.send((
+                conn,
+                shards_vmm::devices::virtio::vsock::ring::RingHandle::new(memory),
+            ))
+            .unwrap();
+            let hello = run::header(run::kind::HELLO, run::TOKEN as u32);
+            relay
+                .write_all(&[&hello[..], &token, &run::mcp::preamble(2)].concat())
+                .unwrap();
+            let m = shards_ipc::recv(&ours).unwrap().unwrap();
+            let accepted = shards_ipc::Accepted::decode(&m.payload).unwrap();
+            assert_eq!(
+                (m.kind, accepted.member, m.fds.len()),
+                (kind::LANE_ACCEPTED, 2, 1)
+            );
+            drop((lanes_held().remove(&accepted.number), m.fds));
+            closed(relay);
+        }
+    }
+
+    /// A VM's final use (D260) goes to its owner on a handle of its link of its own, as said,
+    /// the link open until that handle goes too.
+    #[cfg(unix)]
+    #[test]
+    fn a_final_use_reaches_its_owner_on_its_link_as_said() {
+        let (vm, owner) = UnixStream::pair().unwrap();
+        let link = Link::new(vm);
+        let held = link.try_clone().unwrap();
+        drop(link);
+        let used = shards_abi::rate::used(Err("the microVM has not started"), Err("its VM process: x"));
+        final_use(&held, &used);
+        drop(held);
+        let m = shards_ipc::recv(&owner).unwrap().unwrap();
+        assert_eq!((m.kind, m.payload.as_slice()), (kind::FINAL_USE, used.as_bytes()));
+        assert!(
+            shards_ipc::recv(&owner).unwrap().is_none(),
+            "closed with its last handle"
+        );
+    }
+
+    /// Whose process is the VM's side of
+    /// [`a_run_taken_is_told_exactly_one_end_whatever_fails_after`], its link at descriptor 3.
+    #[cfg(unix)]
+    const TAKEN_CHILD: &str = "SHARDS_WARM_TAKEN_CHILD";
+
+    /// A run the VM took is told exactly one end on its link, whatever fails after TAKEN:
+    /// here its setup's failure, as the VM process's own setup returns it once [`receive`]
+    /// has taken the run, then told as the VM process tells a taken run's end after its
+    /// serving, twice, as its workload's end and its serving's may both tell it. Its owner
+    /// reads TAKEN, why (`UNSERVED`) and one `DONE` of the status its client exits with, then
+    /// its link's end; its client reads that status, and its stderr why. The VM's side runs
+    /// in a process of its own, as `receive` makes its client's stdio its process's.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_taken_is_told_exactly_one_end_whatever_fails_after() {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+        let why = "its group's CPU budget: a group's CPU budget of 0 bytes, short of its 65536";
+        if std::env::var_os(TAKEN_CHILD).is_some() {
+            static TO_GUEST: ToGuest = ToGuest::new(workload::Signals::new());
+            static TAKEN: std::sync::OnceLock<Taken> = std::sync::OnceLock::new();
+            workload::hold_null(File::open(NULL).unwrap());
+            let link = Link::from_fd(3).unwrap();
+            let served = receive(&link, &TO_GUEST, &|| Ok(()), false, &TAKEN)
+                .and_then(|_| Err::<workload::Ended, String>(why.into()));
+            let taken = TAKEN.get().expect("the run taken");
+            taken.end(&link, &served, || (None, None));
+            taken.end(&link, &served, || panic!("its end told twice"));
+            std::process::exit(0);
+        }
+        let (daemon, theirs) = UnixStream::pair().unwrap();
+        let fd = theirs.as_raw_fd();
+        let name = concat!(
+            module_path!(),
+            "::a_run_taken_is_told_exactly_one_end_whatever_fails_after"
+        );
+        let name = name.split_once("::").map_or(name, |(_, test)| test);
+        let mut vm = std::process::Command::new(std::env::current_exe().unwrap());
+        vm.args(["--exact", name, "--nocapture"])
+            .env(TAKEN_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+        // SAFETY: runs in the child between fork and exec, calling only dup2(2) and fcntl(2),
+        // which are async-signal-safe.
+        unsafe {
+            vm.pre_exec(move || {
+                if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut vm = vm.spawn().unwrap();
+        drop(theirs);
+        assert_eq!(shards_ipc::recv(&daemon).unwrap().unwrap().kind, kind::READY);
+        let (client, theirs) = UnixStream::pair().unwrap();
+        let (stdin, _stdin) = io::pipe().unwrap();
+        let (_stdout, stdout) = io::pipe().unwrap();
+        let (mut stderr_r, stderr) = io::pipe().unwrap();
+        let mut payload = Vec::new();
+        shards_ipc::RunHead {
+            log_size: 1,
+            log_files: 1,
+            ..Default::default()
+        }
+        .encode_into(&mut payload);
+        Spec::default().encode_into(&mut payload);
+        let fds = [theirs.as_fd(), stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
+        shards_ipc::send(&daemon, kind::RUN, &payload, &fds).unwrap();
+        drop((theirs, stdin, stdout, stderr));
+        let mut said = Vec::new();
+        while let Some(m) = shards_ipc::recv(&daemon).unwrap() {
+            said.push((m.kind, m.payload));
+        }
+        assert_eq!(
+            said,
+            [
+                (kind::TAKEN, Vec::new()),
+                (kind::UNSERVED, why.as_bytes().to_vec()),
+                (kind::DONE, vec![NOT_RUN]),
+            ]
+        );
+        let exit = shards_ipc::recv(&client).unwrap().unwrap();
+        assert_eq!((exit.kind, exit.payload.as_slice()), (kind::EXIT, &[NOT_RUN][..]));
+        assert!(
+            shards_ipc::recv(&client).unwrap().is_none(),
+            "a second word to its client"
+        );
+        let mut err = String::new();
+        stderr_r.read_to_string(&mut err).unwrap();
+        assert!(err.contains(&format!("shards: {why}\n")), "{err:?}");
+        assert!(vm.wait().unwrap().success());
     }
 }

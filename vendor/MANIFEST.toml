@@ -107,7 +107,7 @@ own = ["UPSTREAM.md"]
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
+commit = "e0613f524b0df198cc61dc1e82b33c22d604cf7b"
 path = "vendor/hyper-raft"
 take = [
   "Cargo.toml",
@@ -213,7 +213,7 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "740fa37268c9200616f6fd543d96625953e23b81"
+commit = "fa953e3cef311caedee3155d0dcbbfe4243bc504"
 path = "vendor/shards"
 take = [
   ".cargo",
@@ -258,21 +258,23 @@ own = ["UPSTREAM.md"]
 # Hex, the runtime and scheduler kiln's harness microVMs run under (its docs/design; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
 # steps 12 and 16), built on kiln's one Shards and hyper-raft: its upstream pins kiln's Shards and an older hyper-raft,
 # and a recorded change moves that pin to kiln's (vendor/hex/UPSTREAM.md). The pair kiln builds:
-# Hex daa36e99 on Shards e82b9403 (and hyper-raft fb74b595), the one Shards revision Hex and kiln both build on. Its
-# crates, the two records they include as they build, and the record of what it vendors (its vendor/MANIFEST.toml and
+# Hex e19198bd on Shards fa953e3c (and hyper-raft e0613f52), the one Shards revision Hex and kiln both build on. Its
+# crates, the four records they include as they build (two probes', and hex-sim's two recorded traces), and the record of what it vendors (its vendor/MANIFEST.toml and
 # vendor/patches, which kiln's pins are checked against) with seccompiler, the third-party code only Hex vendors; less
 # its copies of what kiln vendors itself (hyper-raft, Shards, cuda-rust, all-smi), the GPU renderer and Firecracker
 # sources only its own scripts build, and its docs, benchmarks and CI, which are Hex's.
 [projects.hex]
 kind = "git"
 repository = "https://github.com/hyper-light/hex"
-commit = "c7603b0b821d7e1700aacded9849fb0fceb220e6"
+commit = "e19198bdb451e3f0cd1d3a19de1484e887ca18be"
 path = "vendor/hex"
 take = [
   "Cargo.toml",
   "LICENSE",
   "bench/competitive/probes/mntns_default.txt",
   "bench/native/guest/records.tsv",
+  "bench/sched/huawei-r5-day30.fleet.trace",
+  "bench/sched/kiln-ci-20261022-20261105.trace",
   "clippy.toml",
   "crates",
   "vendor/MANIFEST.toml",

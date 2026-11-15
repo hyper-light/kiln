@@ -624,3 +624,187 @@ fn a_publish_reaching_anyone_but_its_member_is_refused() {
         }]
     );
 }
+
+/// The bytes D231's channel writes for a narrowing's destinations kept and its members' reach of them (shards-api's
+/// `Request::encode`, vendor/shards/crates/api/src/image/wire.rs: `keep`'s tag, count and each destination as a u32
+/// length and its text; the members' tag and count, then each one's kind, name, count and destinations alike): a model
+/// apart from the program's, counted from the strings themselves.
+fn written(narrowing: &Narrowing) -> usize {
+    let text = |s: &str| 4 + s.len();
+    let kept = match &narrowing.destinations {
+        Keep::Only(kept) => 1 + 4 + kept.iter().map(|d| text(d)).sum::<usize>(),
+        Keep::All => 1,
+    };
+    let members = narrowing.members.as_ref().map_or(1, |members| {
+        1 + 4
+            + members
+                .iter()
+                .map(|m| {
+                    1 + text(&m.name) + 4 + m.destinations.iter().map(|d| text(d)).sum::<usize>()
+                })
+                .sum::<usize>()
+    });
+    kept + members
+}
+
+/// Codex's egress by TCP to `name`, ports `first` to `last`.
+fn egress_to(name: &str, first: u16, last: u16) -> Grant {
+    Grant::Egress {
+        member: codex(),
+        to: Destination::Name(name.to_owned()),
+        ports: Ports {
+            proto: Proto::Tcp,
+            first,
+            last,
+        },
+    }
+}
+
+/// The review's D-9 (joint plan step 15, N7; AC-T7.7.2): do program three grants of every TCP port, each to a name of
+/// its own, well within the node's wire, naming 196,605 destinations, which as D231's channel writes them, kept and in
+/// codex's reach, take more than a boot's request carries (`shards_abi::run::MAX_PAYLOAD`).
+/// Expect it refused Invalid, naming those bytes and the bound, as no boot could carry it. Do program two such grants;
+/// expect them programmed whole, every port kept and held, as a boot carries them.
+#[test]
+fn d9_grants_naming_more_destinations_than_a_boot_carries_are_refused_by_their_bytes() {
+    let most = shards_abi::run::MAX_PAYLOAD as usize;
+    let three: Vec<Grant> = (0..3)
+        .map(|i| egress_to(&format!("d{i}.example"), 1, u16::MAX))
+        .collect();
+    assert!(written(&reach_of(&three)) > most);
+    let refused = program(&members_alone(&three));
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { what: "grants", why })
+            if why.contains(&written(&reach_of(&three)).to_string()) && why.contains(&most.to_string())),
+        "{refused:?}"
+    );
+    let two = &three[..2];
+    assert!(written(&reach_of(two)) <= most);
+    let made = program(&members_alone(two)).unwrap();
+    assert_eq!(made.egress, reach_of(two));
+    assert!(matches!(&made.egress.destinations, Keep::Only(kept) if kept.len() == 2 * 65_535));
+}
+
+/// The review's D-9 (N7): do program two grants of every TCP port, each to a name of its own, and a third to another
+/// name over ports 1 to k, k the most whose destinations, as D231's channel writes them (`written`, a model counting the
+/// strings), still fit a boot's request; then the same over ports 1 to k + 1. Expect the first programmed, every port
+/// kept, and the second refused Invalid: the refusal falls exactly where a boot could no longer carry them.
+#[test]
+fn d9_the_refusal_falls_exactly_where_a_boot_could_no_longer_carry_the_destinations() {
+    let most = shards_abi::run::MAX_PAYLOAD as usize;
+    let base: Vec<Grant> = (0..2)
+        .map(|i| egress_to(&format!("d{i}.example"), 1, u16::MAX))
+        .collect();
+    // The third name's ports add their destinations to the kept list and to codex's reach, which holds them already:
+    // each port twice its text's bytes.
+    let mut room = most - written(&reach_of(&base));
+    let mut k = 0u16;
+    for port in 1..=u16::MAX {
+        let each = 2 * (4 + format!("d2.example:{port}").len());
+        if each > room {
+            break;
+        }
+        room -= each;
+        k = port;
+    }
+    assert!(
+        k > 0 && k < u16::MAX,
+        "k = {k}: the bound falls within the third name's ports"
+    );
+    let with = |last: u16| {
+        let mut list = base.clone();
+        list.push(egress_to("d2.example", 1, last));
+        list
+    };
+    assert!(written(&reach_of(&with(k))) <= most);
+    assert!(written(&reach_of(&with(k + 1))) > most);
+    let made = program(&members_alone(&with(k))).unwrap();
+    assert_eq!(made.egress, reach_of(&with(k)));
+    let refused = program(&members_alone(&with(k + 1)));
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { what: "grants", .. })),
+        "{refused:?}"
+    );
+}
+
+/// The review's D-9 (N7): do count, from their ranges, the bytes the destinations of lists at every edge take as D231's
+/// channel writes them: ranges across each decimal width's edge (9 and 10, 99 and 100, 999 and 1000, 9999 and 10000,
+/// and the last port), two members' ranges that meet on one host and two that touch, an address, the host itself, and
+/// a member with grants to two hosts. Expect each count the model's (`written`), which counts the strings themselves.
+#[test]
+fn d9_a_lists_bytes_are_counted_from_its_ranges_as_the_channel_writes_them() {
+    let agent = |name: &str| Member {
+        kind: MemberKind::Agent,
+        name: name.to_owned(),
+    };
+    let to = |member: Member, host: &str, first: u16, last: u16| Grant::Egress {
+        member,
+        to: Destination::Name(host.to_owned()),
+        ports: Ports {
+            proto: Proto::Tcp,
+            first,
+            last,
+        },
+    };
+    let lists = vec![
+        vec![],
+        vec![to(codex(), "a.example", 1, 1)],
+        vec![to(codex(), "a.example", 8, 11)],
+        vec![to(codex(), "a.example", 98, 101)],
+        vec![to(codex(), "a.example", 998, 1_001)],
+        vec![to(codex(), "a.example", 9_998, 10_001)],
+        vec![to(codex(), "a.example", 65_530, u16::MAX)],
+        vec![to(codex(), "a.example", 1, u16::MAX)],
+        vec![
+            to(codex(), "a.example", 10, 40),
+            to(agent("probe"), "a.example", 30, 60),
+        ],
+        vec![
+            to(codex(), "a.example", 10, 40),
+            to(agent("probe"), "a.example", 41, 60),
+        ],
+        vec![
+            to(codex(), "a.example", 10, 40),
+            to(codex(), "b.example", 10, 40),
+            to(agent("probe"), "b.example", 1, 12),
+        ],
+        vec![Grant::Egress {
+            member: codex(),
+            to: Destination::Address("10.0.0.2".parse().unwrap()),
+            ports: Ports {
+                proto: Proto::Tcp,
+                first: 440,
+                last: 450,
+            },
+        }],
+        vec![Grant::Host {
+            member: agent("probe"),
+            ports: Ports {
+                proto: Proto::Tcp,
+                first: 7070,
+                last: 7071,
+            },
+        }],
+    ];
+    for list in lists {
+        hex_api::check_grants(&list).unwrap();
+        assert_eq!(
+            request_bytes(&list).unwrap(),
+            written(&reach_of(&list)) as u64,
+            "{list:?}"
+        );
+    }
+}
+
+proptest! {
+    /// The review's D-9 (N7): do count the bytes of any list a program takes, from its ranges. Expect the count the
+    /// model's, which counts the strings it expands (`written` of `reach_of`).
+    #[test]
+    fn d9_any_lists_bytes_are_the_models(
+        list in proptest::collection::vec(any_grant(), 0..6)
+            .prop_filter("each flow named once", |l| hex_api::check_grants(l).is_ok())
+            .prop_filter("a list a program takes", |l| awaited(l).is_none()),
+    ) {
+        prop_assert_eq!(request_bytes(&list).unwrap(), written(&reach_of(&list)) as u64);
+    }
+}

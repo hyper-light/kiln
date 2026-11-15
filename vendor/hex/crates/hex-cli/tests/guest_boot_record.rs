@@ -39,8 +39,10 @@ fn given(name: &str) -> PathBuf {
 fn boot_to_ready_and_stop() {
     let config = GuestConfig {
         binary: given("SHARDS_BIN"),
-        kernel: given("HEX_GUEST_KERNEL"),
-        initrd: given("HEX_GUEST_INITRD"),
+        boot: hex_runtime::guest::Boot::Kernel {
+            kernel: given("HEX_GUEST_KERNEL"),
+            initrd: given("HEX_GUEST_INITRD"),
+        },
         vcpus: host_cpus(),
         gpu: false,
         // Shards' least guest and twice HEX-GUEST-19's measured peak, as guest_real sizes it.
@@ -55,7 +57,7 @@ fn boot_to_ready_and_stop() {
         "RECORD class={CLASS} n={n} dial={}",
         if tight { "tight" } else { "paced" }
     );
-    let mut spec = config.spec();
+    let mut spec = config.spec().unwrap();
     spec.ports.push(stream::STAMPS_PORT);
     for i in 1..=n {
         let began = Instant::now();

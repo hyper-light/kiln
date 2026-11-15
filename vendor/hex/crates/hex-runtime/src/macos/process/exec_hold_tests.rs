@@ -80,7 +80,14 @@ impl Held {
             life: Life::Running,
             armed: false,
         };
-        assert_eq!(boxed.state.apply(&[child.id()], &[], &[member]).unwrap(), 1);
+        assert_eq!(
+            boxed
+                .state
+                .apply(&[child.id()], &[], &[member])
+                .unwrap()
+                .held,
+            1
+        );
         let held = Self {
             leader,
             child,
@@ -329,4 +336,67 @@ fn a_member_that_ends_before_its_fresh_tokens_signal_is_gone_and_the_scope_stays
         scope.watchable(held.boxed.state.id.as_ref()).unwrap(),
         "the scope left Running"
     );
+}
+
+impl Held {
+    /// The member as the watcher's read lists it.
+    fn member(&self) -> Member {
+        Member {
+            pid: self.child.id(),
+            started: self.started,
+            footprint: 0,
+            life: Life::Running,
+            armed: false,
+        }
+    }
+}
+
+/// Joint plan step 14 (ROOT, 2026-11-13, the hold's hole): a held member whose stop didn't take runs past its charge on
+/// its neighbours' CPU (Studio r214: one read live 76 µs after its SIGSTOP returned, and for the 5 s after), so the
+/// watcher's next read of the hold finds it running and stops it again, by its hold's token, never waiting on it. Do
+/// hold the member, then apply the hold again with the member's run state read live, as a stop that didn't take reads.
+/// Expect it stopped again and still held, the re-stop counted, and the scope Running.
+#[test]
+fn w14_a_held_member_read_running_is_stopped_again_and_counted() {
+    let held = Held::new();
+    let live = |_: i32| -> std::io::Result<Option<sys::Run>> { Ok(Some(sys::Run::Live)) };
+    let applied = held
+        .boxed
+        .state
+        .apply_by(&[held.child.id()], &[], &[held.member()], live)
+        .unwrap();
+    assert_eq!(
+        applied,
+        Applied {
+            held: 1,
+            restopped: 1
+        }
+    );
+    assert_eq!(held.boxed.state.status().unwrap().restops, 1);
+    held.wait_until(sys::Run::Stopped);
+    held.still_held();
+}
+
+/// Joint plan step 14 (ROOT, 2026-11-13, the hold's hole): a held member continued from outside its watcher (another
+/// process's CONT, or the kernel's) reads running, and the watcher's next read stops it again. Do hold the member,
+/// continue it from this test, then apply the hold again. Expect it found running, stopped again, still held, the
+/// re-stop counted.
+#[test]
+fn w14_a_held_member_continued_from_elsewhere_is_stopped_again() {
+    let held = Held::new();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(held.pid).unwrap(),
+        rustix::process::Signal::CONT,
+    )
+    .unwrap();
+    held.wait_until(sys::Run::Live);
+    let applied = held
+        .boxed
+        .state
+        .apply(&[held.child.id()], &[], &[held.member()])
+        .unwrap();
+    assert_eq!(applied.restopped, 1, "the running held member wasn't found");
+    held.wait_until(sys::Run::Stopped);
+    assert_eq!(held.boxed.state.status().unwrap().restops, 1);
+    held.still_held();
 }

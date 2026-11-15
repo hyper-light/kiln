@@ -59,7 +59,7 @@ impl Args {
 /// its node with no timer. When the keeper is gone (stopped, or killed with the node gone too), each box's
 /// job has no handle left and kill-on-close ends it.
 pub fn run(args: &Args) -> Result<(), Refusal> {
-    let stop = sys::named_event(&stop_name(&args.state))
+    let stop = sys::named_event(&stop_name(&args.state)?)
         .map_err(|e| Refusal::os("making the keeper's stop", e))?;
     let me = sys::open_process(std::process::id())
         .map_err(|e| Refusal::os("reading the keeper's own identity", e))?
@@ -100,11 +100,15 @@ pub fn run(args: &Args) -> Result<(), Refusal> {
 }
 
 /// The keeper's stop event's name, one per state folder (`Local\hex-keep-<hash of path>-stop`): the node
-/// and its keeper reach the same event by the folder they share.
-fn stop_name(state: &Path) -> Vec<u16> {
-    format!("Local\\hex-keep-{:016x}-stop\0", path_hash(state))
+/// and its keeper reach the same event by the folder they share, named by its canonical path, so every spelling
+/// of the folder (the canonical one `hex node` gives its keeper, the one a test that started the node made it by)
+/// reaches the one stop.
+fn stop_name(state: &Path) -> Result<Vec<u16>, Refusal> {
+    let state = std::fs::canonicalize(state)
+        .map_err(|e| Refusal::os("naming the keeper's stop by its state folder", e))?;
+    Ok(format!("Local\\hex-keep-{:016x}-stop\0", path_hash(&state))
         .encode_utf16()
-        .collect()
+        .collect())
 }
 
 /// A name for the node keeping its state in `dir`, apart from another node's in the session: a hash of the
@@ -147,7 +151,7 @@ impl NodeKeeper {
                 what: "keeper",
                 why: format!("keeper pid {pid} is gone or reused"),
             })?;
-        let stop = sys::named_event(&stop_name(state))
+        let stop = sys::named_event(&stop_name(state)?)
             .map_err(|e| Refusal::os("opening the keeper's stop", e))?;
         Ok(Self {
             process,
@@ -341,3 +345,27 @@ pub fn forget_held(state: &Path, id: &str) {
     let _ = std::fs::remove_file(held_file(state, id));
 }
 pub(super) mod vm;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-T7.1.2 (the keeper leak of ROOT's native Windows test run, 2026-11-14: 13 `hex keep` left behind): `hex node`
+    /// names its keeper's state folder canonically (it canonicalizes `--state`), and a test that started the node
+    /// names the same folder as it made it. Do name a keeper's stop by a folder's spelling as made and by its
+    /// canonical one; expect one stop, so a stop asked through either reaches the keeper.
+    #[test]
+    fn a_keepers_stop_is_one_whatever_spelling_names_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert_ne!(
+            canonical.as_os_str(),
+            dir.path().as_os_str(),
+            "the folder as made is a spelling apart from its canonical one"
+        );
+        assert_eq!(
+            stop_name(dir.path()).unwrap(),
+            stop_name(&canonical).unwrap()
+        );
+    }
+}

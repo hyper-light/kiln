@@ -1,6 +1,6 @@
 //! `hex native-managed-helper --binary <path> --endpoint <path> --receipt <path> --cpu-cost <64 hex>
-//! --rpc-nanos <u64> --cpu-response-nanos <u64> --rate-bytes <u64> --rate-processes <u64>
-//! --lateness-nanos <u64>`: the macOS node's persistent managed-VM owner, the same Hex binary
+//! --cpu-response-nanos <u64> --rate-bytes <u64> --rate-processes <u64> --lateness-nanos <u64>`:
+//! the macOS node's persistent managed-VM owner, the same Hex binary
 //! (hex_runtime::macos::run_managed_helper). Only a node starts it, inside an admitted Creating scope,
 //! with its startup socket on stdout; each option comes once, in any order, and nothing else is taken
 //! (AC-T7.4.1). It opens no Store, provider or catalog.
@@ -45,12 +45,11 @@ pub fn main(args: &[OsString]) -> u8 {
     }
 }
 
-const OPTIONS: [&str; 9] = [
+const OPTIONS: [&str; 8] = [
     "--binary",
     "--endpoint",
     "--receipt",
     "--cpu-cost",
-    "--rpc-nanos",
     "--cpu-response-nanos",
     "--rate-bytes",
     "--rate-processes",
@@ -104,21 +103,20 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         PathBuf::from(value(0)?),
         PathBuf::from(value(1)?),
         PathBuf::from(value(2)?),
-        Duration::from_nanos(positive(4)?.get()),
     )
     .map_err(|refusal| refusal.to_string())?;
     let cpu = CpuControl {
         cost_id: cost_id(value(3)?)?,
-        response: Duration::from_nanos(positive(5)?.get()),
+        response: Duration::from_nanos(positive(4)?.get()),
     };
     Ok(Invocation {
         config,
         cpu,
         rates: hex_core::watch::Rates {
-            bytes: positive(6)?,
-            processes: positive(7)?,
+            bytes: positive(5)?,
+            processes: positive(6)?,
         },
-        lateness: Duration::from_nanos(number(8)?),
+        lateness: Duration::from_nanos(number(7)?),
     })
 }
 
@@ -164,8 +162,6 @@ mod tests {
             "/private/h/helper.receipt",
             "--cpu-cost",
             "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-            "--rpc-nanos",
-            "7",
             "--cpu-response-nanos",
             "11",
             "--rate-bytes",
@@ -182,7 +178,6 @@ mod tests {
     fn the_nodes_startup_words_parse_exactly() {
         let parsed = parse(&args(&whole())).unwrap();
         assert_eq!(parsed.config.binary(), std::path::Path::new("/private/hex"));
-        assert_eq!(parsed.config.rpc_budget(), Duration::from_nanos(7));
         assert_eq!(parsed.cpu.cost_id[0], 1);
         assert_eq!(parsed.cpu.cost_id[31], 0x20);
         assert_eq!(parsed.cpu.response, Duration::from_nanos(11));
@@ -207,9 +202,9 @@ mod tests {
         let mut bad_digit = whole();
         bad_digit[7] = "zz02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
         let mut zero_rate = whole();
-        zero_rate[13] = "0";
-        let mut zero_budget = whole();
-        zero_budget[9] = "0";
+        zero_rate[11] = "0";
+        let mut zero_response = whole();
+        zero_response[9] = "0";
         let mut relative = whole();
         relative[3] = "helper.sock";
         for (what, words) in [
@@ -220,7 +215,7 @@ mod tests {
             ("short cost", short_cost),
             ("bad digit", bad_digit),
             ("zero rate", zero_rate),
-            ("zero budget", zero_budget),
+            ("zero response", zero_response),
             ("relative path", relative),
         ] {
             assert!(parse(&args(&words)).is_err(), "{what} was accepted");

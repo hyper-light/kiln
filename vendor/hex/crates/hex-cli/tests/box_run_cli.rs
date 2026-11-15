@@ -19,19 +19,40 @@
     clippy::disallowed_macros
 )]
 
+use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use hex_api::{Bounds, BoxId};
+use hex_core::patience::Patience;
 use hex_runtime::linux::cgroup::BoxRoot;
+use hex_testkit::cgroup::Thread;
+use hex_testkit::waits::follow::{self, Party};
 
 const HEX: &str = env!("CARGO_BIN_EXE_hex");
 
-/// How long a run's child cgroup may take to read empty once its wrapper is reaped (it stays a member
-/// until the kernel's last switch away from it, box_run.rs): `hex box run`'s own CLEANUP_PATIENCE.
-const EMPTY_PATIENCE: Duration = Duration::from_secs(10);
+/// A run's child cgroup reading empty once its wrapper is reaped (it stays a member until the kernel's last switch away
+/// from it, box_run.rs): a fact no recorded operation makes, waited for measuring (`hex_testkit::waits`). It was 10 s,
+/// `hex box run`'s old cleanup patience, picked (ROOT, 2026-11-14).
+static EMPTIED: Patience = Patience::measuring("test.hex_cli.box_run_cli.child_emptied");
+
+/// The child cgroup's threads as its emptying's party, once its wrapper is reaped: live while every thread left is on
+/// its way out or gone, the wrapper's own last switch among them; ended once one runs or sleeps with nothing under way
+/// to end it, a stray the wrapper left behind.
+fn leaving(root: &Path) -> Party {
+    let threads = hex_testkit::cgroup::threads(root);
+    if threads.iter().all(|tid| {
+        matches!(
+            hex_testkit::cgroup::thread(*tid),
+            Thread::Gone | Thread::Leaving
+        )
+    }) {
+        Party::Live
+    } else {
+        Party::Ended
+    }
+}
 
 fn have_systemd() -> bool {
     Command::new("systemd-run")
@@ -125,13 +146,14 @@ fn run_in_scope(program: &str, args: &[&str]) -> std::process::Output {
             let out = cmd
                 .output()
                 .expect("run in a child of this binary's cgroup");
-            assert!(
-                child
-                    .wait_empty(EMPTY_PATIENCE)
-                    .expect("waiting on the child"),
-                "{} still holds a process {EMPTY_PATIENCE:?} after its wrapper ended",
-                child.dir().display()
-            );
+            if let Err(unmet) = follow::until(
+                &EMPTIED,
+                "the run's cgroup empty once its wrapper ended",
+                || leaving(child.dir()),
+                || matches!(child.populated(), Ok(false)),
+            ) {
+                panic!("{}: {unmet}", child.dir().display());
+            }
             child.remove().expect("removing the child");
             out
         }

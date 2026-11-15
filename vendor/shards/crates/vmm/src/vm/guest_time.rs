@@ -5,94 +5,7 @@
 //! machine's, which never falls. The sources, their resolution and costs:
 //! docs/research/measurements/guest-cpu-time-v1/README.md.
 
-use std::fmt::Write as _;
-
-pub use shards_abi::guest_time::Unread;
-
-/// One vCPU's guest time, as a sample read it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VcpuTime {
-    pub index: u32,
-    /// Nanoseconds, never less than an earlier sample of the same vCPU said.
-    pub guest_ns: u64,
-    /// Why this sample did not read it, typed: `guest_ns` is then the most it read before.
-    pub unread: Option<Unread>,
-}
-
-/// A machine's vCPUs' guest time, as one sample read it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GuestTimes {
-    /// The vCPUs it has, by index.
-    pub vcpus: Vec<VcpuTime>,
-    /// What the vCPUs it had and no longer has ran of their guest: still its machine's.
-    pub departed_ns: u64,
-}
-
-impl GuestTimes {
-    /// Its machine's: what every vCPU it has had ran of its guest.
-    pub fn total_ns(&self) -> u64 {
-        self.vcpus
-            .iter()
-            .fold(self.departed_ns, |total, v| total.saturating_add(v.guest_ns))
-    }
-
-    /// As text, a line each, in decimal: `departed NS`, then `vcpu INDEX NS` for each vCPU,
-    /// ` unread CAUSE [CODE]` after where this sample did not read it ([`Unread::write`]), as a
-    /// VM process answers its daemon.
-    pub fn encode(&self) -> String {
-        let mut text = format!("departed {}\n", self.departed_ns);
-        for v in &self.vcpus {
-            let _ = write!(text, "vcpu {} {}", v.index, v.guest_ns);
-            if let Some(why) = &v.unread {
-                text.push_str(" unread ");
-                let _ = why.write(&mut text);
-            }
-            text.push('\n');
-        }
-        text
-    }
-
-    /// What [`encode`](Self::encode) wrote; `None` for anything else: a line of its keys
-    /// malformed, its departed time missing or said twice, or its vCPUs out of index
-    /// order. Lines of other keys are passed over, for a later VM's to come.
-    pub fn decode(text: &str) -> Option<GuestTimes> {
-        let mut departed = None;
-        let mut vcpus: Vec<VcpuTime> = Vec::new();
-        for line in text.lines() {
-            let mut words = line.splitn(5, ' ');
-            match words.next() {
-                Some("departed") => {
-                    let ns = words.next()?.parse().ok()?;
-                    if departed.replace(ns).is_some() || words.next().is_some() {
-                        return None;
-                    }
-                }
-                Some("vcpu") => {
-                    let index = words.next()?.parse().ok()?;
-                    let guest_ns = words.next()?.parse().ok()?;
-                    let unread = match (words.next(), words.next()) {
-                        (None, _) => None,
-                        (Some("unread"), Some(cause)) => Some(Unread::parse(cause)?),
-                        _ => return None,
-                    };
-                    if vcpus.last().is_some_and(|v| v.index >= index) {
-                        return None;
-                    }
-                    vcpus.push(VcpuTime {
-                        index,
-                        guest_ns,
-                        unread,
-                    });
-                }
-                _ => {}
-            }
-        }
-        Some(GuestTimes {
-            vcpus,
-            departed_ns: departed?,
-        })
-    }
-}
+pub use shards_abi::guest_time::{GuestTimes, Unread, VcpuTime};
 
 #[cfg(any(hv, test))]
 pub(super) use clocks::{GuestClocks, Read};
@@ -125,6 +38,10 @@ mod clocks {
     struct Clocks {
         vcpus: BTreeMap<u32, Clock>,
         departed: u64,
+        /// What those gone ran, by index, summed over each index's vCPUs, the last one's
+        /// leaving read beside it: `departed` is their total. One entry an index the machine
+        /// has had, so as many as its vCPUs.
+        left: BTreeMap<u32, VcpuTime>,
         /// Joins so far, which tell a vCPU from a later one of its index.
         joins: u64,
     }
@@ -163,7 +80,7 @@ mod clocks {
                 last: 0,
             };
             if let Some(stale) = clocks.vcpus.insert(index, clock) {
-                clocks.departed = clocks.departed.saturating_add(stale.last);
+                clocks.gone(index, stale.last, None);
             }
             Joined {
                 clocks: self,
@@ -197,9 +114,46 @@ mod clocks {
                 return;
             }
             if let Some(mut clock) = clocks.vcpus.remove(&index) {
-                let (ns, _) = clock.sample();
-                clocks.departed = clocks.departed.saturating_add(ns);
+                let (ns, unread) = clock.sample();
+                clocks.gone(index, ns, unread);
             }
+        }
+
+        /// Every vCPU's guest time by its index, those gone at what they read as they left,
+        /// summed with any of the index's since, and none departed apart from them: what a
+        /// machine ran of its guest in all once its vCPUs have stopped (D260's final use).
+        /// Its total is a sample's ([`sample`](Self::sample)).
+        pub(in crate::vm) fn whole(&self) -> GuestTimes {
+            let mut clocks = lock(&self.0);
+            let mut vcpus = clocks.left.clone();
+            for (&index, clock) in &mut clocks.vcpus {
+                let (guest_ns, unread) = clock.sample();
+                let v = vcpus.entry(index).or_insert(VcpuTime {
+                    index,
+                    guest_ns: 0,
+                    unread: None,
+                });
+                v.guest_ns = v.guest_ns.saturating_add(guest_ns);
+                v.unread = unread;
+            }
+            GuestTimes {
+                vcpus: vcpus.into_values().collect(),
+                departed_ns: 0,
+            }
+        }
+    }
+
+    impl Clocks {
+        /// vCPU `index` gone, having read `ns`, its last reading refused as `unread` says.
+        fn gone(&mut self, index: u32, ns: u64, unread: Option<Unread>) {
+            self.departed = self.departed.saturating_add(ns);
+            let v = self.left.entry(index).or_insert(VcpuTime {
+                index,
+                guest_ns: 0,
+                unread: None,
+            });
+            v.guest_ns = v.guest_ns.saturating_add(ns);
+            v.unread = unread;
         }
     }
 
@@ -292,6 +246,36 @@ mod tests {
         assert!(t.vcpus.is_empty());
         assert_eq!((t.departed_ns, t.total_ns()), (42, 42));
         assert_eq!(GuestClocks::default().sample(), GuestTimes::default());
+    }
+
+    /// Once its vCPUs have gone, a machine's whole guest time is each one's by its index, an
+    /// index's vCPUs summed and its last one's unread kept, with the total a sample says.
+    #[test]
+    fn a_machines_whole_guest_time_keeps_each_vcpu_by_its_index() {
+        let clocks = GuestClocks::default();
+        let at: Vec<_> = [10u64, 20, 30].map(|ns| Arc::new(AtomicU64::new(ns))).into();
+        let zero = clocks.join(0, clock(&at[0]));
+        let one = clocks.join(1, clock(&at[1]));
+        drop(one);
+        // Index 1 again, a later vCPU of it: its time adds to the first's.
+        let one = clocks.join(1, clock(&at[2]));
+        let t = clocks.whole();
+        assert_eq!(
+            (times(&t), t.departed_ns, t.total_ns()),
+            (vec![(0, 10), (1, 50)], 0, 60)
+        );
+        assert_eq!(t.total_ns(), clocks.sample().total_ns());
+        drop(zero);
+        let refused: Read = Box::new(|| Err(Unread::HvfExecTime(-1)));
+        drop(one);
+        let two = clocks.join(2, refused);
+        drop(two);
+        let t = clocks.whole();
+        assert_eq!((times(&t), t.departed_ns), (vec![(0, 10), (1, 50), (2, 0)], 0));
+        assert_eq!(t.vcpus[2].unread, Some(Unread::HvfExecTime(-1)));
+        assert_eq!(t.total_ns(), clocks.sample().total_ns());
+        assert!(clocks.sample().vcpus.is_empty());
+        assert_eq!(GuestClocks::default().whole(), GuestTimes::default());
     }
 
     /// A clock that reads less than it did before is not believed: the vCPU's time, and its
@@ -421,66 +405,5 @@ mod tests {
             t.vcpus.is_empty() && t.departed_ns > 0,
             "{t:?} after {samples} samples, the vCPUs' rounds {rounds:?}"
         );
-    }
-
-    /// Times encoded decode as they were: a vCPU unread, its cause and code whole; one unread
-    /// with no code; none; and the most a u64 holds.
-    #[test]
-    fn encoded_times_decode_as_they_were() {
-        let t = GuestTimes {
-            vcpus: vec![
-                VcpuTime {
-                    index: 0,
-                    guest_ns: 123_456_789,
-                    unread: None,
-                },
-                VcpuTime {
-                    index: 5,
-                    guest_ns: u64::MAX,
-                    unread: Some(Unread::WhpCounters(-2147024891)),
-                },
-                VcpuTime {
-                    index: 6,
-                    guest_ns: 0,
-                    unread: Some(Unread::ThreadStat(None)),
-                },
-            ],
-            departed_ns: 99,
-        };
-        let text = t.encode();
-        assert_eq!(
-            text,
-            "departed 99\nvcpu 0 123456789\nvcpu 5 18446744073709551615 unread whp-counters \
-             -2147024891\nvcpu 6 0 unread thread-stat malformed\n"
-        );
-        assert_eq!(GuestTimes::decode(&text), Some(t.clone()));
-        assert_eq!(t.total_ns(), u64::MAX, "the total saturates");
-        let none = GuestTimes::default();
-        assert_eq!(GuestTimes::decode(&none.encode()), Some(none));
-    }
-
-    /// Text that is not encoded times is refused; lines of keys a later VM may add are not.
-    #[test]
-    fn text_other_than_encoded_times_is_refused() {
-        for bad in [
-            "",
-            "vcpu 0 1\n",
-            "departed\n",
-            "departed x\n",
-            "departed 1 2\n",
-            "departed 1\ndeparted 2\n",
-            "departed 1\nvcpu 0\n",
-            "departed 1\nvcpu 0 -1\n",
-            "departed 1\nvcpu 0 1 lost\n",
-            "departed 1\nvcpu 0 1 unread\n",
-            "departed 1\nvcpu 0 1 unread its thread's stat: gone\n",
-            "departed 1\nvcpu 0 1 unread whp-counters\n",
-            "departed 1\nvcpu 1 5\nvcpu 0 5\n",
-            "departed 1\nvcpu 0 5\nvcpu 0 6\n",
-        ] {
-            assert_eq!(GuestTimes::decode(bad), None, "{bad:?}");
-        }
-        let later = GuestTimes::decode("departed 4\nsteal 9\nvcpu 1 6\n").unwrap();
-        assert_eq!((later.total_ns(), later.vcpus.len()), (10, 1));
     }
 }

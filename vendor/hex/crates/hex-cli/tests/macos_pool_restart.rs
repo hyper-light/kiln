@@ -69,6 +69,7 @@ impl Runtime for GuestNode {
     }
     fn capacity(&self, class: Class) -> Result<Option<Capacity>, Refusal> {
         Ok((class == Class::Oci).then(|| Capacity {
+            own: Default::default(),
             id: "guest".to_owned(),
             total: self.room,
             free: self.room,
@@ -79,6 +80,8 @@ impl Runtime for GuestNode {
             backings: Vec::new(),
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         }))
     }
     fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
@@ -218,10 +221,9 @@ struct Lab {
 
 impl Lab {
     fn new() -> Self {
-        // A grant boots the pool's controller and dials its guest, which the client's learned bound on
-        // an answer doesn't cover: every client wait here measures, and each call carries this test's
-        // own bound instead (`capacity_before`, [`within`]).
-        hex_core::patience::measure_all();
+        // A grant boots the pool's controller and dials its guest: a client wait past its W* tells its run-out
+        // and follows its connection (decision 9), and each call carries this test's own bound
+        // (`capacity_before`, [`within`]).
         let cache = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache");
         std::fs::create_dir_all(&cache).unwrap();
         let dir = tempfile::Builder::new()

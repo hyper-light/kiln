@@ -28,6 +28,10 @@ struct Ports {
 }
 
 impl Link for Ports {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<hex_client::guest::DuplexOwner, Refusal> {
         let path = match port {
             stream::CONTROL_PORT => &self.control,
@@ -313,6 +317,10 @@ struct Held {
 }
 
 impl Link for Held {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<hex_client::guest::DuplexOwner, Refusal> {
         if port != stream::CONTROL_PORT {
             return hex_client::guest::own_duplex(UnixStream::connect(&self.stdio).unwrap());
@@ -661,6 +669,10 @@ struct LatePorts {
 }
 
 impl Link for LatePorts {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<hex_client::guest::DuplexOwner, Refusal> {
         if port == stream::CONTROL_PORT {
             return hex_client::guest::own_duplex(
@@ -2344,6 +2356,10 @@ impl Duplex for Muxed {
 struct MuxedPorts(PathBuf);
 
 impl Link for MuxedPorts {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<hex_client::guest::DuplexOwner, Refusal> {
         assert_eq!(port, hf::FILES_PORT);
         hex_client::guest::own_duplex(Muxed(UnixStream::connect(&self.0).unwrap()))
@@ -2372,4 +2388,16 @@ fn original_staging_through_a_port_whose_half_close_is_a_full_shutdown_is_answer
         (Ok(0), Some(b"{}".to_vec()), Ok(()))
     );
     assert!(!staged.join("box-1").exists());
+}
+
+/// The relay's stdio_unnamed line (CLAUDE.md §10; ROOT, 2026-11-14): its why a JSON string, so a refusal's words can't
+/// split it. Do: form it for a refusal whose words hold a quote, a backslash and a newline. Expect: one line, the words
+/// a JSON string.
+#[test]
+fn an_unnamed_stdio_connections_line_is_one_line_its_why_a_json_string() {
+    let why = hex_api::Refusal::Broken("a \"b\" \\ c\nd".into());
+    assert_eq!(
+        super::unnamed_line(&why),
+        "hex.guest event=stdio_unnamed why=\"the node agent's state is unusable: a \\\"b\\\" \\\\ c\\nd\""
+    );
 }

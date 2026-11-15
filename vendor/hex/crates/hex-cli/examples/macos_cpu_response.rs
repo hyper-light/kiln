@@ -17,11 +17,15 @@
 //! No input of the measurement is chosen; each is derived, and the samples file's `#` lines say how:
 //! - samples: the census rule's `SEEDABLE` (bench/competitive/probes/waits_census.py, decision 9), the
 //!   fewest a row seeds from, read from the census itself;
-//! - bound: the guest's recorded first dial bound (`hex_runtime::guest::recorded_dial_bound`), the
-//!   node's managed helper's control patience; a stop not seen within it refuses the run;
-//! - waits: the watcher arms its timer for whatever credit is left, so the arms run from the timer's own
-//!   resolution up to the bound, one per binary order of magnitude of its microsecond count, then the
-//!   bound, each taken the same number of times, round-robin. The row's max covers every arm.
+//! - waits: the watcher arms its timer for whatever credit is left, so the arms run from the timer's own resolution
+//!   up to the longest the control arms it for, its hold at the least rate with the slowest stop seen so far
+//!   (`hex_runtime::macos::cpu_control_longest_hold`), one per binary order of magnitude of its microsecond count,
+//!   then that hold: found in a first round, one sample each, as the slowest stop raises it, then each taken the
+//!   same number of times, round-robin. The row's max covers every arm. No record bounds any of it (the review's
+//!   C-9 (c));
+//! - its waits follow their parties (decision 9): a timer's event and a member's stop each within W*, the slowest
+//!   sample seen so far, and past it told once and waited for on, never refused at a bound; a member that ends
+//!   refuses the run.
 // A measurement example, not production code (CLAUDE.md): the test crates' opt-outs.
 #![allow(
     clippy::unwrap_used,
@@ -59,12 +63,9 @@ mod producer {
     /// The watcher timer's resolution: `Kqueue::wait` arms it in whole microseconds (`NOTE_USECONDS`).
     const RESOLUTION: Duration = Duration::from_micros(1);
 
-    /// A run's samples, derived as the head of this file says, never an argument.
+    /// A run's samples, derived as the head of this file says, never an argument: at least SEEDABLE of them.
     struct Plan {
         seedable: usize,
-        bound: Duration,
-        arms: Vec<Duration>,
-        per_arm: usize,
     }
 
     impl Plan {
@@ -74,59 +75,47 @@ mod producer {
                 .find_map(|line| line.strip_prefix("SEEDABLE = "))
                 .and_then(|n| n.trim().replace('_', "").parse::<usize>().ok())
                 .ok_or("bench/competitive/probes/waits_census.py names no SEEDABLE")?;
-            let bound = hex_runtime::guest::recorded_dial_bound().map_err(|e| e.to_string())?;
-            Self::new(seedable, bound)
+            Self::new(seedable)
         }
 
-        /// Arms from [`RESOLUTION`] doubling while below `bound`, then `bound`: at most one per bit of the
-        /// bound's count of resolutions, so the loop ends.
-        fn new(seedable: usize, bound: Duration) -> Result<Self, String> {
-            if seedable == 0 || bound < RESOLUTION {
-                return Err(format!(
-                    "no samples to take for SEEDABLE {seedable} and bound {bound:?}"
-                ));
+        fn new(seedable: usize) -> Result<Self, String> {
+            if seedable == 0 {
+                return Err("no samples to take for SEEDABLE 0".to_owned());
             }
-            let mut arms = Vec::new();
-            let mut arm = RESOLUTION;
-            while arm < bound {
-                arms.push(arm);
-                arm = arm.saturating_mul(2);
-            }
-            arms.push(bound);
-            Ok(Self {
-                seedable,
-                bound,
-                per_arm: seedable.div_ceil(arms.len()),
-                arms,
-            })
+            Ok(Self { seedable })
         }
+    }
 
-        fn samples(&self) -> usize {
-            self.per_arm * self.arms.len()
-        }
+    /// What a run took: its arms, found as its first round raised the control's longest hold, each taken `per_arm` times
+    /// in all, and each sample, its arm and the time from the timer's due instant to the member seen stopped.
+    struct Sampled {
+        arms: Vec<Duration>,
+        per_arm: usize,
+        /// The slowest sample of the first round, the longest hold the last arm is.
+        slowest: Duration,
+        taken: Vec<(Duration, Duration)>,
+    }
 
+    impl Sampled {
         /// The samples file's head: how each input was derived.
-        fn head(&self, host: &str) -> Result<String, String> {
-            let boot = hex_runtime::guest::recorded_boot().map_err(|e| e.to_string())?;
-            Ok(format!(
+        fn head(&self, plan: &Plan, host: &str) -> String {
+            format!(
                 "# hex-macos-cpu-response samples, host {host}\n\
                  # samples {}: {} arms taken {} times each, round-robin, at least SEEDABLE {} \
                  (bench/competitive/probes/waits_census.py, decision 9)\n\
-                 # bound_nanos {}: the guest's recorded first dial bound over boot_ready {} ns of class {} \
-                 (bench/native/guest/records.tsv; hex_runtime::guest::recorded_dial_bound), the managed \
-                 helper's control patience\n\
-                 # waits: from the watcher timer's resolution {} ns (NOTE_USECONDS) doubling below the bound, \
-                 then the bound\n\
+                 # waits: from the watcher timer's resolution {} ns (NOTE_USECONDS) doubling while below the \
+                 longest the control arms it for, its hold at the least rate with the slowest stop seen \
+                 (hex_runtime::macos::cpu_control_longest_hold), then that hold, {} ns at the first round's \
+                 slowest stop, {} ns; no record read\n\
                  # wait_nanos sample_nanos\n",
-                self.samples(),
+                self.taken.len(),
                 self.arms.len(),
                 self.per_arm,
-                self.seedable,
-                self.bound.as_nanos(),
-                boot.as_nanos(),
-                hex_runtime::guest::CLASS,
+                plan.seedable,
                 RESOLUTION.as_nanos(),
-            ))
+                self.arms.last().copied().unwrap_or_default().as_nanos(),
+                self.slowest.as_nanos(),
+            )
         }
     }
 
@@ -207,13 +196,8 @@ mod producer {
             let args = Args::parse(&words)?;
             let plan = Plan::derived()?;
             println!(
-                "plan: {} samples over {} arms ({:?} to {:?}), {} each; SEEDABLE {}",
-                plan.samples(),
-                plan.arms.len(),
-                RESOLUTION,
-                plan.bound,
-                plan.per_arm,
-                plan.seedable
+                "plan: at least SEEDABLE {} samples, over arms from {:?} doubling to the control's longest hold",
+                plan.seedable, RESOLUTION
             );
             produce(&args, &plan)
         });
@@ -305,13 +289,12 @@ mod producer {
             })
             .transpose()?;
         let host = hex_runtime::macos::machine_model().map_err(|e| e.to_string())?;
-        let mut raw = plan.head(&host)?;
-
-        let taken = sample(plan)?;
-        for (wait, took) in &taken {
+        let sampled = sample(plan)?;
+        let mut raw = sampled.head(plan, &host);
+        for (wait, took) in &sampled.taken {
             raw.push_str(&format!("{} {}\n", wait.as_nanos(), took.as_nanos()));
         }
-        let mut sorted: Vec<Duration> = taken.iter().map(|(_, took)| *took).collect();
+        let mut sorted: Vec<Duration> = sampled.taken.iter().map(|(_, took)| *took).collect();
         sorted.sort_unstable();
         // Nearest rank: the smallest sample with at least that share of samples at or below it.
         let rank = |share: usize| -> Duration {
@@ -372,88 +355,175 @@ mod producer {
         })
     }
 
-    /// Each arm `plan.per_arm` times, round-robin, on a busy member: its wait and the time from the timer's
-    /// due instant to the member seen stopped.
-    fn sample(plan: &Plan) -> Result<Vec<(Duration, Duration)>, String> {
-        use hex_runtime::macos::sys::{self, Event, Kqueue, Run};
-        use rustix::process::{Pid, Signal, kill_process};
-        use std::time::Instant;
+    /// A sample's wait, from its timer's due instant to its member seen stopped: within W*, the slowest sample this run has
+    /// seen, its answer; past it told once and waited for on (decision 9), never refused at a bound. No record seeds it.
+    static STOPPED: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("macos_cpu_response.stopped");
 
+    /// The run's samples on a busy member, each its wait and the time from the timer's due instant to the member seen
+    /// stopped: a first round over arms from [`RESOLUTION`] doubling while below the control's longest hold at the
+    /// slowest sample seen, then that hold, then rounds over those arms, round-robin, until at least SEEDABLE.
+    fn sample(plan: &Plan) -> Result<Sampled, String> {
         let mut member = std::process::Command::new("/usr/bin/yes")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| format!("starting the busy member: {e}"))?;
-        let pid = i32::try_from(member.id()).map_err(|e| e.to_string())?;
-        let target = Pid::from_raw(pid).ok_or("member pid")?;
-        let kq = Kqueue::new().map_err(|e| e.to_string())?;
-        let mut events = Vec::new();
-        let mut taken = Vec::with_capacity(plan.samples());
-        let result = (|| -> Result<(), String> {
-            for _ in 0..plan.per_arm {
-                for &wait in &plan.arms {
-                    let due = Instant::now() + wait;
-                    let deadline = due + plan.bound;
-                    let mut timer = Some(wait);
-                    events.clear();
-                    // The timer's own event ends the wait, never an interrupted kevent's empty return.
-                    while !events.iter().any(|event| matches!(event, Event::Timer)) {
-                        let left = deadline
-                            .checked_duration_since(Instant::now())
-                            .ok_or_else(|| format!("the timer armed for {wait:?} never fired"))?;
-                        kq.wait(timer.take(), Some(left), &mut events)
-                            .map_err(|e| format!("the watcher timer: {e}"))?;
-                    }
-                    kill_process(target, Signal::STOP)
-                        .map_err(|e| format!("stopping the member: {e}"))?;
-                    while sys::run_state(pid).map_err(|e| e.to_string())? != Some(Run::Stopped) {
-                        if Instant::now() > deadline {
-                            return Err(format!("no stop seen within the bound {:?}", plan.bound));
-                        }
-                        std::thread::yield_now();
-                    }
-                    taken.push((wait, Instant::now().saturating_duration_since(due)));
-                    kill_process(target, Signal::CONT)
-                        .map_err(|e| format!("continuing the member: {e}"))?;
+        let result = (|| -> Result<Sampled, String> {
+            let pid = i32::try_from(member.id()).map_err(|e| e.to_string())?;
+            let mut once = Once::new(pid)?;
+            let mut taken = Vec::new();
+            let mut arms = Vec::new();
+            let mut slowest = Duration::ZERO;
+            let mut arm = RESOLUTION;
+            loop {
+                let took = once.take(arm)?;
+                taken.push((arm, took));
+                arms.push(arm);
+                slowest = slowest.max(took);
+                let longest = hex_runtime::macos::cpu_control_longest_hold(slowest)
+                    .map_err(|e| e.to_string())?;
+                if arm >= longest {
+                    break;
+                }
+                arm = arm.saturating_mul(2).min(longest);
+            }
+            let per_arm = plan.seedable.div_ceil(arms.len());
+            for _ in 1..per_arm {
+                for &arm in &arms {
+                    taken.push((arm, once.take(arm)?));
                 }
             }
-            Ok(())
+            Ok(Sampled {
+                arms,
+                per_arm,
+                slowest,
+                taken,
+            })
         })();
         let _ = member.kill();
         let _ = member.wait();
-        result.map(|()| taken)
+        result
+    }
+
+    /// One sample's means: the member, by its pid, and the watcher's kqueue.
+    struct Once {
+        pid: i32,
+        kq: hex_runtime::macos::sys::Kqueue,
+        events: Vec<hex_runtime::macos::sys::Event>,
+    }
+
+    impl Once {
+        fn new(pid: i32) -> Result<Self, String> {
+            Ok(Self {
+                pid,
+                kq: hex_runtime::macos::sys::Kqueue::new().map_err(|e| e.to_string())?,
+                events: Vec::new(),
+            })
+        }
+
+        /// The timer armed for `wait`, and once it fires the member stopped and read until the kernel reports it stopped:
+        /// the time from the timer's due instant to that. Past W* ([`STOPPED`]) told once, and waited for on.
+        fn take(&mut self, wait: Duration) -> Result<Duration, String> {
+            use hex_core::patience::Piece;
+            use hex_runtime::macos::sys::{self, Event, Run};
+            use rustix::process::{Pid, Signal, kill_process};
+            use std::time::Instant;
+
+            let pid = self.pid;
+            let target = Pid::from_raw(pid).ok_or("member pid")?;
+            let due = Instant::now() + wait;
+            let w_star = STOPPED.deadline();
+            let mut told = false;
+            let tell = |told: &mut bool| {
+                if let Some(w_star) = w_star
+                    && !*told
+                    && due.elapsed() > w_star
+                {
+                    STOPPED.ran_out(
+                        w_star,
+                        due.elapsed(),
+                        &[
+                            Piece::Kind("the busy member, pid "),
+                            Piece::Pid(i64::from(pid)),
+                            Piece::Kind(", its timer's event and its stop"),
+                        ],
+                    );
+                    *told = true;
+                }
+            };
+            let mut timer = Some(wait);
+            self.events.clear();
+            // The timer's own event ends the wait, never an interrupted kevent's empty return: within W* past its due
+            // instant, then with no bound.
+            while !self
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Timer))
+            {
+                let slice = w_star
+                    .filter(|_| !told)
+                    .and_then(|w_star| (due + w_star).checked_duration_since(Instant::now()));
+                self.kq
+                    .wait(timer.take(), slice, &mut self.events)
+                    .map_err(|e| format!("the watcher timer: {e}"))?;
+                tell(&mut told);
+            }
+            kill_process(target, Signal::STOP).map_err(|e| format!("stopping the member: {e}"))?;
+            loop {
+                match sys::run_state(pid).map_err(|e| e.to_string())? {
+                    Some(Run::Stopped) => break,
+                    Some(_) => {}
+                    None => return Err("the busy member ended before its stop was seen".to_owned()),
+                }
+                tell(&mut told);
+                std::thread::yield_now();
+            }
+            let took = due.elapsed();
+            STOPPED.answered(took);
+            kill_process(target, Signal::CONT)
+                .map_err(|e| format!("continuing the member: {e}"))?;
+            Ok(took)
+        }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
-        /// AC-T7.4.1: derive the producer's plan: expect the census's SEEDABLE, the guest's recorded first dial
-        /// bound, arms from the timer's resolution doubling below that bound and then the bound, and each arm
-        /// taken equally, together at least SEEDABLE and short of one more round.
+        /// AC-T7.4.1 (the review's C-9 (c): no record read): derive the producer's plan: expect the census's SEEDABLE
+        /// alone, and no argument naming a wait.
         #[test]
-        fn the_plan_is_derived_from_the_census_the_record_and_the_timer() {
+        fn the_plan_is_derived_from_the_census() {
             let plan = Plan::derived().unwrap();
             assert_eq!(plan.seedable, 1_000);
-            assert_eq!(
-                plan.bound,
-                hex_runtime::guest::recorded_dial_bound().unwrap()
-            );
-            assert_eq!(plan.arms.first(), Some(&RESOLUTION));
-            assert_eq!(plan.arms.last(), Some(&plan.bound));
-            for pair in plan.arms.windows(2) {
-                assert!(pair[0] < pair[1] && pair[1] <= pair[0] * 2, "{pair:?}");
-                assert!(pair[1] == pair[0] * 2 || pair[1] == plan.bound, "{pair:?}");
-            }
-            assert!(plan.samples() >= plan.seedable, "{}", plan.samples());
-            assert!(plan.samples() < plan.seedable + plan.arms.len());
+            assert!(Plan::new(0).is_err());
             assert!(Args::parse(&["--wait-nanos".to_owned(), "1".to_owned()]).is_err());
         }
 
-        /// AC-T7.4.1: run the producer once over every arm of the derived plan, on a cost and its evidence:
-        /// expect the samples file to hold the plan's head and each sample beside its arm, in arm order; the
-        /// evidence's row for this host to count and hash them, ahead of the original evidence; and the
-        /// re-keyed cost to load with that row as the node loads it.
+        /// A run's arms as its samples file holds them, in order: from the timer's resolution, each twice the one
+        /// before, or less where the control's longest hold, rising with the slowest stop seen, is less.
+        fn arms_of(text: &str) -> Vec<Duration> {
+            let waits: Vec<Duration> = text
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| {
+                    let (wait, took) = line.split_once(' ').unwrap();
+                    assert!(took.parse::<u64>().unwrap() > 0, "{line}");
+                    Duration::from_nanos(wait.parse().unwrap())
+                })
+                .collect();
+            assert_eq!(waits.first(), Some(&RESOLUTION));
+            for pair in waits.windows(2) {
+                assert!(pair[0] < pair[1] && pair[1] <= pair[0] * 2, "{pair:?}");
+            }
+            waits
+        }
+
+        /// AC-T7.4.1: run the producer's first round alone (SEEDABLE 1), on a cost and its evidence: expect the samples
+        /// file to hold its head and each sample beside its arm, the arms from the timer's resolution doubling to the
+        /// control's longest hold; the evidence's row for this host to count and hash them, ahead of the original
+        /// evidence; and the re-keyed cost to load with that row as the node loads it.
         #[test]
         fn one_round_writes_its_samples_its_row_and_the_rekeyed_cost() {
             use sha2::{Digest, Sha256};
@@ -492,27 +562,19 @@ mod producer {
                 dir.path().join("out").display().to_string(),
             ])
             .unwrap();
-            let derived = Plan::derived().unwrap();
-            let plan = Plan::new(1, derived.bound).unwrap();
-            assert_eq!(plan.arms, derived.arms);
+            let plan = Plan::new(1).unwrap();
 
             let made = produce(&args, &plan).unwrap();
             let samples = std::fs::read(&made.samples_file).unwrap();
             let text = std::str::from_utf8(&samples).unwrap();
-            assert!(text.starts_with(&plan.head(&made.row.host).unwrap()));
-            let waits: Vec<Duration> = text
-                .lines()
-                .filter(|line| !line.starts_with('#'))
-                .map(|line| {
-                    let (wait, took) = line.split_once(' ').unwrap();
-                    assert!(took.parse::<u64>().unwrap() > 0, "{line}");
-                    Duration::from_nanos(wait.parse().unwrap())
-                })
-                .collect();
-            assert_eq!(waits, plan.arms);
+            assert!(text.starts_with(&format!(
+                "# hex-macos-cpu-response samples, host {}\n",
+                made.row.host
+            )));
+            let arms = arms_of(text);
             let digest: [u8; 32] = Sha256::digest(&samples).into();
             assert_eq!(made.row.raw, digest);
-            assert_eq!(made.row.samples, u64::try_from(plan.arms.len()).unwrap());
+            assert_eq!(made.row.samples, u64::try_from(arms.len()).unwrap());
             assert_eq!(made.row.host, hex_runtime::macos::machine_model().unwrap());
 
             let Wrote::Pair {
@@ -535,8 +597,8 @@ mod producer {
             assert_eq!(responses, vec![made.row]);
         }
 
-        /// AC-T7.4.1 (ROOT's Mac order: the row, then guest_cost): run the producer with `--out` alone, once
-        /// over every arm: expect a row file of its own, the CPU-response section holding this host's one row
+        /// AC-T7.4.1 (ROOT's Mac order: the row, then guest_cost): run the producer with `--out` alone, its first round
+        /// alone: expect a row file of its own, the CPU-response section holding this host's one row
         /// and nothing after it, its SHA-256 the one reported, the row hashing its samples; and the pair's
         /// options given in part refused.
         #[test]
@@ -546,7 +608,7 @@ mod producer {
             let out = dir.path().join("out");
             let args = Args::parse(&["--out".to_owned(), out.display().to_string()]).unwrap();
             assert!(args.pair.is_none());
-            let plan = Plan::new(1, Plan::derived().unwrap().bound).unwrap();
+            let plan = Plan::new(1).unwrap();
             let made = produce(&args, &plan).unwrap();
             let Wrote::Row { file, sha256 } = &made.wrote else {
                 panic!("--out alone wrote a pair");

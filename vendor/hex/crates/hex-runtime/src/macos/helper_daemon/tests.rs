@@ -65,6 +65,8 @@ struct Sim {
     inner: Arc<Mutex<SimState>>,
     /// Signalled when a member event is posted (`fork`).
     posted: Arc<Condvar>,
+    /// Signalled when a box user's lingering processes may end ([`SimState::linger`]).
+    emptied: Arc<Condvar>,
 }
 
 #[derive(Default)]
@@ -96,6 +98,11 @@ struct SimState {
     listed: BTreeMap<u32, u32>,
     /// A member that forks between the daemon's listing and its watch, once (the race the re-list closes).
     fork_in_watch: Option<i32>,
+    /// A KILL leaves a user's processes running while this stands, as a member whose teardown runs long does: they
+    /// end once it is let go (the review's E-12).
+    linger: bool,
+    /// The waits that followed a user's lingering processes past W* (the review's E-12).
+    following: u32,
 }
 
 /// The stand-in's fork: member `child` joins user `uid`'s box, and its parent's watch posts the event.
@@ -247,13 +254,38 @@ impl Privileged for Sim {
         ))
     }
 
+    /// The user's lingering processes end once let go ([`SimState::linger`]): a slice's wait comes back empty-handed while
+    /// they linger, and a following wait (`Duration::MAX`) is counted and waits for them.
+    fn empties_within(&self, uid: u32, slice: Duration) -> Result<bool, hex_api::Refusal> {
+        let mut s = self.inner.lock().expect("sim lock");
+        if s.linger && slice == Duration::MAX {
+            s.following += 1;
+            while s.linger {
+                s = self.emptied.wait(s).expect("sim lock");
+            }
+        } else if s.linger {
+            s = self
+                .emptied
+                .wait_timeout_while(s, slice, |s| s.linger)
+                .expect("sim lock")
+                .0;
+            if s.linger {
+                return Ok(false);
+            }
+        }
+        let owner = s.owner.clone();
+        s.members.retain(|m| owner.get(&m.pid) != Some(&uid));
+        Ok(true)
+    }
+
     fn kill(&self, uid: u32, signal: i32) -> std::io::Result<usize> {
         let mut s = self.inner.lock().expect("sim lock");
         let owner = s.owner.clone();
         let mine = |m: &Member| owner.get(&m.pid) == Some(&uid);
         let n = s.members.iter().filter(|m| mine(m)).count();
-        // KILL (9) ends them; another signal is delivered but leaves them running (the stand-in's model).
-        if signal == 9 {
+        // KILL (9) ends them, unless they linger; another signal is delivered but leaves them running (the
+        // stand-in's model).
+        if signal == 9 && !s.linger {
             s.members.retain(|m| !mine(m));
         }
         Ok(n)
@@ -390,6 +422,15 @@ fn a_box_with_no_live_member_refuses_a_signal_and_takes_a_program() {
 /// A connected client to a daemon over the stand-in, with `pool` users under a per-uid process ceiling
 /// `per_uid`, the daemon serving on its own thread until the client closes.
 fn served(pool: Vec<u32>, per_uid: u32) -> (Helper, thread::JoinHandle<Daemon<Sim>>) {
+    served_with(Sim::default(), pool, per_uid)
+}
+
+/// [`served`] over the stand-in `sim`, whose state the test holds too.
+fn served_with(
+    sim: Sim,
+    pool: Vec<u32>,
+    per_uid: u32,
+) -> (Helper, thread::JoinHandle<Daemon<Sim>>) {
     let (client, server) = rustix::net::socketpair(
         AddressFamily::UNIX,
         SocketType::STREAM,
@@ -400,7 +441,7 @@ fn served(pool: Vec<u32>, per_uid: u32) -> (Helper, thread::JoinHandle<Daemon<Si
     let _ = rustix::net::sockopt::set_socket_nosigpipe(&client, true);
     let _ = rustix::net::sockopt::set_socket_nosigpipe(&server, true);
     let handle = thread::spawn(move || {
-        let daemon = Daemon::new(Sim::default(), pool, per_uid);
+        let daemon = Daemon::new(sim, pool, per_uid);
         let _ = daemon.serve(server.as_fd());
         daemon
     });
@@ -783,4 +824,63 @@ fn the_pool_is_grown_to_the_kept_peak_and_the_peak_is_kept() {
     let s = state.lock().unwrap();
     assert_eq!(s.made.len(), 3);
     assert_eq!(s.peak, 4);
+}
+
+/// A box end's wait following its user's processes past W*, or its answer: a fact no recorded operation makes, waited
+/// for measuring, following the ending thread.
+static USER_FOLLOWED: hex_core::patience::Patience =
+    hex_core::patience::Patience::measuring("test.hex_runtime.box_user_emptying_followed");
+
+/// The review's E-12 (decision 9), AC-T7.4.1, box-user mode: a box whose user's processes outlive its end's KILL for a
+/// while is followed to its emptying, never refused at a bound. Do: start a program in a box; let the user's processes
+/// linger past a KILL, as a member whose teardown runs long does; end the box from another thread; once that end follows
+/// the user past W* or answers, let them end. Expect: the end hadn't answered while the user held a process, then
+/// answers Ok; the program's end kept, Signal(9); and the user freed for the next box.
+#[test]
+fn e12_a_box_users_end_follows_its_late_emptying_to_its_end() {
+    let sim = Sim::default();
+    let (state, emptied) = (Arc::clone(&sim.inner), Arc::clone(&sim.emptied));
+    let (client, handle) = served_with(sim, vec![7000], 64);
+    let b1 = BoxId::new("b1").expect("box id");
+    client.acquire(&b1, 256 * MIB, 16 * MIB, None).unwrap();
+    let pid = start(&client, &b1, true);
+    state.lock().unwrap().linger = true;
+    thread::scope(|s| {
+        let ending = s.spawn(|| client.end(&b1));
+        hex_testkit::waits::follow::until(
+            &USER_FOLLOWED,
+            "the end's wait following the user past W*, or its answer",
+            || {
+                if ending.is_finished() {
+                    hex_core::patience::Party::Ended
+                } else {
+                    hex_core::patience::Party::Live
+                }
+            },
+            || state.lock().unwrap().following > 0 || ending.is_finished(),
+        )
+        .unwrap();
+        if ending.is_finished() {
+            panic!(
+                "the end answered while its user held a process: {:?}",
+                ending.join()
+            );
+        }
+        state.lock().unwrap().linger = false;
+        emptied.notify_all();
+        assert_eq!(
+            ending.join().unwrap(),
+            Ok(()),
+            "the end once its user emptied"
+        );
+    });
+    assert_eq!(client.wait(&b1, pid).unwrap(), Some(Exit::Signal(9)));
+    let b2 = BoxId::new("b2").expect("box id");
+    assert_eq!(
+        client.acquire(&b2, 256 * MIB, 16 * MIB, None).unwrap(),
+        7000,
+        "the user freed for the next box"
+    );
+    drop(client);
+    handle.join().expect("daemon thread");
 }

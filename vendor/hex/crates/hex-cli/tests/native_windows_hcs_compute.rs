@@ -61,8 +61,8 @@ mod native {
         Bounds, BoxId, BoxSpec, BoxState, Class, ClassSpec, DeviceId, DeviceKind, Exit, Program,
         Refusal, Runtime, Stdio,
     };
+    use hex_core::record::BoxRecord;
     use hex_node::recorded::Recorded;
-    use hex_node::store::Store;
     use hex_runtime::devices::{Binding, Catalog, Route};
     use hex_runtime::windows::{WinRuntime, keeper, oci, sys};
     use serde_json::{Value, json};
@@ -472,8 +472,52 @@ mod native {
             self.runtime.as_ref().expect("an open runtime")
         }
 
-        fn store(&self) -> Store {
-            Store::open(&self.state, &self.state.join("@records")).unwrap()
+        /// Box `id`'s record as the node's files hold it, read-only: the runtime place's, else the state directory's, each
+        /// read no further than the record bound. The node's store is its directory's one writer, so no second store opens it
+        /// (the review's per-window reads, step 2).
+        fn record(&self, id: &BoxId) -> Option<Result<BoxRecord, String>> {
+            let places = [
+                hex_node::store::runtime_record(&self.state.join("@records"), id),
+                self.state.join(format!("{id}.json")),
+            ];
+            for place in places {
+                match fs::File::open(&place) {
+                    Ok(file) => {
+                        let mut bytes = Vec::new();
+                        let bound = u64::try_from(hex_core::record::MAX_RECORD_BYTES).unwrap() + 1;
+                        return Some(match file.take(bound).read_to_end(&mut bytes) {
+                            Ok(_) => BoxRecord::decode(&bytes),
+                            Err(error) => Err(format!("reading {}: {error}", place.display())),
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Some(Err(format!("opening {}: {error}", place.display())));
+                    }
+                }
+            }
+            None
+        }
+
+        /// Every box record file the node's directories hold, read-only: the state directory's and each runtime shard's.
+        fn record_files(&self) -> Vec<PathBuf> {
+            let shards = fs::read_dir(self.state.join("@records"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir());
+            std::iter::once(self.state.clone())
+                .chain(shards)
+                .flat_map(|dir| fs::read_dir(dir).into_iter().flatten().flatten())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "json")
+                })
+                .collect()
         }
 
         fn spec(&mut self, label: &str, selected: bool) -> BoxSpec {
@@ -708,17 +752,16 @@ mod native {
                         errors.push(format!("HCS absence unknown {}: {error:?}", owned.id))
                     }
                 }
-                match self.store().get(&owned.id) {
-                    Ok(None) => {}
-                    other => errors.push(format!("record remains/unknown {}: {other:?}", owned.id)),
+                if let Some(left) = self.record(&owned.id) {
+                    errors.push(format!("record remains/unknown {}: {left:?}", owned.id));
                 }
                 if self.marker(&owned.id).exists() || owned.scratch.exists() {
                     errors.push(format!("native marker/scratch remains for {}", owned.id));
                 }
             }
-            match self.store().all() {
-                Ok(records) if records.is_empty() => {}
-                other => errors.push(format!("private box records remain/unknown: {other:?}")),
+            let left = self.record_files();
+            if !left.is_empty() {
+                errors.push(format!("private box records remain/unknown: {left:?}"));
             }
             if errors.is_empty() {
                 // Only our private keeper owner identity, never a process chosen by command/name.
@@ -898,7 +941,7 @@ mod native {
             &marker_before,
         )
         .unwrap();
-        let before = lab.store().get(&selected_id).unwrap().unwrap().unwrap();
+        let before = lab.record(&selected_id).unwrap().unwrap();
         fs::write(
             lab.results.join("selected-record-before.json"),
             serde_json::to_vec_pretty(&before).unwrap(),
@@ -921,11 +964,8 @@ mod native {
             marker_before,
             "overlap changed native durable bytes"
         );
-        assert_eq!(
-            lab.store().get(&selected_id).unwrap().unwrap().unwrap(),
-            before
-        );
-        assert!(lab.store().get(&overlap_id).unwrap().is_none());
+        assert_eq!(lab.record(&selected_id).unwrap().unwrap(), before);
+        assert!(lab.record(&overlap_id).is_none());
         assert!(!lab.marker(&overlap_id).exists());
         assert!(
             oci::sys::open_system(overlap_id.as_str())
@@ -980,10 +1020,7 @@ mod native {
             native_after.init, native_before.init,
             "recovery restarted/substituted init"
         );
-        assert_eq!(
-            lab.store().get(&selected_id).unwrap().unwrap().unwrap(),
-            before
-        );
+        assert_eq!(lab.record(&selected_id).unwrap().unwrap(), before);
         lab.probe(&selected_id, "recovered", true);
         if let Some(cpu_id) = &cpu_id {
             lab.progress(cpu_id, "after-restart");
@@ -997,7 +1034,7 @@ mod native {
                 .unwrap()
                 .is_none()
         );
-        assert!(lab.store().get(&selected_id).unwrap().is_none() && !marker_path.exists());
+        assert!(lab.record(&selected_id).is_none() && !marker_path.exists());
         if let Some(cpu_id) = &cpu_id {
             lab.progress(cpu_id, "after-release");
             lab.rt()
@@ -1087,7 +1124,7 @@ mod native {
             let before = oci::read_marker(&lab.marker(&id)).unwrap();
             assert_eq!(before.storage, hex_core::hcs::RecordStorage::OwnedFolder);
             assert!(before.devices.is_empty() && before.init.is_some());
-            let record = lab.store().get(&id).unwrap().unwrap().unwrap();
+            let record = lab.record(&id).unwrap().unwrap();
             fs::write(
                 lab.results.join("cpu-marker-before.json"),
                 fs::read(lab.marker(&id)).unwrap(),
@@ -1100,14 +1137,14 @@ mod native {
             assert!(summary.removed.is_empty());
             let after = oci::read_marker(&lab.marker(&id)).unwrap();
             assert_eq!(after, before, "CPU recovery changed native identity/marker");
-            assert_eq!(lab.store().get(&id).unwrap().unwrap().unwrap(), record);
+            assert_eq!(lab.record(&id).unwrap().unwrap(), record);
             lab.progress(&id, "cpu-recovered");
             lab.rt()
                 .delete(&id)
                 .expect("ordinary CPU HCS physical delete");
             assert!(oci::sys::open_system(id.as_str()).unwrap().is_none());
             assert!(!lab.marker(&id).exists());
-            assert!(lab.store().get(&id).unwrap().is_none());
+            assert!(lab.record(&id).is_none());
             eprintln!(
                 "CPU_HCS_RECOVERY verified native_init={:?} physical_absence=true",
                 before.init

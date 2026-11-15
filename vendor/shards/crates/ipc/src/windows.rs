@@ -39,15 +39,16 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle, RawHandle};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{OnceLock, PoisonError, RwLock};
+use std::sync::{Mutex, OnceLock, PoisonError, RwLock};
 
 use crate::pipe::Message;
 use crate::signal::SIGKILL;
 
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
-    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE,
@@ -65,9 +66,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -102,9 +104,41 @@ const WIN32K_DISABLED: u64 = 1 << 28;
 /// meanwhile would have been made on that one.
 static STATION_SWITCH: RwLock<()> = RwLock::new(());
 
+/// Held to read by each of shards' spawns while it holds a handle inheritable, made so for
+/// its child's handle list alone (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), and to write by each
+/// spawn of std's ([`spawn_std`]): a child std makes inherits every inheritable handle of this
+/// process (CreateProcessW's bInheritHandles, TRUE in std, whose own lock, CREATE_PROCESS_LOCK,
+/// is private to it), so one made meanwhile took another child's handles with it (platform-07).
+static INHERITING: RwLock<()> = RwLock::new(());
+
+/// [`crate::spawn_std`] on Windows: `command` spawned while none of shards' own spawns holds a
+/// handle inheritable ([`INHERITING`]).
+pub fn spawn_std(command: &mut std::process::Command) -> io::Result<std::process::Child> {
+    let _alone = INHERITING.write().unwrap_or_else(PoisonError::into_inner);
+    command.spawn()
+}
+
+/// [`INHERITING`] held to read: while a spawn of shards' holds a handle inheritable.
+fn inheriting() -> std::sync::RwLockReadGuard<'static, ()> {
+    INHERITING.read().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Whether this Windows refuses the second mitigation word (windows-2022, M201): found by
 /// the first child made, which then goes without it.
 static NO_SECOND_WORD: AtomicBool = AtomicBool::new(false);
+
+/// The status a process `signal` ends has, 128 and `signal`, as a Unix child's that `signal`
+/// ended: Windows sends a process no signal but its end. SIGSTOP and SIGCONT, which end no
+/// process, are refused: Windows stops a process no documented way.
+fn ending_code(signal: i32) -> io::Result<u32> {
+    if matches!(signal, crate::signal::SIGSTOP | crate::signal::SIGCONT) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a process is not stopped or continued on Windows",
+        ));
+    }
+    Ok(128u32.saturating_add(u32::try_from(signal).unwrap_or(0)))
+}
 
 fn last() -> io::Error {
     io::Error::last_os_error()
@@ -327,6 +361,105 @@ impl GroupJob {
     }
 }
 
+/// A grouped child's group ([`spawn_grouped`]): the job it is made in, which every process it
+/// starts is made in too, and a handle of each process of the job's taken as the group is
+/// ended, for each to be followed to its end ([`Child::end_group`]).
+#[derive(Debug)]
+struct ProcessGroup {
+    job: GroupJob,
+    /// The processes of the job's held, by their IDs: only added to while the group lives,
+    /// so that each handle stays open, and its ID its process's, until the group drops.
+    held: Mutex<Vec<(u32, OwnedHandle)>>,
+}
+
+impl ProcessGroup {
+    fn new(job: GroupJob) -> ProcessGroup {
+        ProcessGroup {
+            job,
+            held: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Holds a handle of each process in the job now that is not held yet: how many it
+    /// newly holds.
+    fn hold(&self) -> io::Result<usize> {
+        let listed = self.job.processes()?;
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = held.len();
+        for pid in listed {
+            if held.iter().any(|(id, _)| *id == pid) {
+                continue;
+            }
+            if let Some(process) = self.member(pid)? {
+                held.push((pid, process));
+            }
+        }
+        Ok(held.len().saturating_sub(before))
+    }
+
+    /// Process `pid`, opened to wait on, while it is still the job's: none where it has
+    /// ended and gone, its ID free (OpenProcess's ERROR_INVALID_PARAMETER), or the ID is
+    /// another process's since (IsProcessInJob: not in the job).
+    fn member(&self, pid: u32) -> io::Result<Option<OwnedHandle>> {
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        // SAFETY: a process handle of waiting and querying access, owned below.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if raw.is_null() {
+            let e = last();
+            if e.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
+                return Ok(None);
+            }
+            return Err(e);
+        }
+        // SAFETY: the handle just opened, which nothing else owns.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut within = 0;
+        // SAFETY: a process handle and a job handle this holds, and a BOOL to write.
+        if unsafe {
+            IsProcessInJob(
+                process.as_raw_handle(),
+                self.job.handle.as_raw_handle(),
+                &raw mut within,
+            )
+        } == 0
+        {
+            return Err(last());
+        }
+        Ok((within != 0).then_some(process))
+    }
+
+    /// Terminates every process in the job, its nested jobs' among them ("Nested Jobs"):
+    /// TerminateJobObject, "as if TerminateProcess were called for each process", which
+    /// "initiates termination and returns immediately".
+    fn terminate(&self, code: u32) -> io::Result<()> {
+        // SAFETY: a job this holds.
+        if unsafe { TerminateJobObject(self.job.handle.as_raw_handle(), code) } == 0 {
+            return Err(last());
+        }
+        Ok(())
+    }
+
+    /// How many processes of the job, its nested jobs' among them, have not yet exited
+    /// (JOBOBJECT_BASIC_ACCOUNTING_INFORMATION's ActiveProcesses).
+    fn active(&self) -> io::Result<u32> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: accounting information of its own size, from a job this holds.
+        if unsafe {
+            QueryInformationJobObject(
+                self.job.handle.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut info).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(last());
+        }
+        Ok(info.ActiveProcesses)
+    }
+}
+
 /// A child made by [`spawn_confined`], ended as this drops, its Job's last handle going
 /// with it; or by [`spawn`], which runs on.
 #[derive(Debug)]
@@ -335,6 +468,8 @@ pub struct Child {
     pid: u32,
     /// A confined child's Job; none for one of [`spawn`]'s.
     job: Option<Job>,
+    /// A grouped child's group ([`spawn_grouped`]): none for any other.
+    processes: Option<ProcessGroup>,
     /// Its window station and desktop, a GPU's child's ([`Spawn::graphics`]): closed after
     /// its Job has ended it.
     _station: Option<Station>,
@@ -370,10 +505,63 @@ impl Child {
         self.try_wait().is_some()
     }
 
-    /// As [`kill`](Self::kill): a Windows child leads no group of processes, and its Job,
-    /// where it has one, is ended with it.
+    /// Ends it and every process of its group where it has one ([`spawn_grouped`]), as a Unix
+    /// child leading its process group is ended whole: each process of the group held first,
+    /// for [`end_group`](Self::end_group) to follow each to its end. Else as
+    /// [`kill`](Self::kill), its Job, where it has one, ended with it.
     pub fn kill_group(&self, signal: i32) -> io::Result<()> {
-        self.kill(signal)
+        let Some(group) = &self.processes else {
+            return self.kill(signal);
+        };
+        let code = ending_code(signal)?;
+        // Ended whatever the hold met: a process it could not open ends all the same.
+        let held = group.hold();
+        if let Err(e) = group.terminate(code) {
+            let _ = self.kill(signal);
+            return Err(e);
+        }
+        // Those made between the hold and the end, ended with it, held where they are still
+        // the job's.
+        held.and(group.hold()).map(drop)
+    }
+
+    /// Ends its group whole, as [`kill_group`](Self::kill_group) does, and returns once every
+    /// process of it has ended: its handle signalled. TerminateProcess "initiates termination
+    /// and returns immediately", and to "be sure the process has terminated", its handle is
+    /// waited on (TerminateProcess's documentation): a process's handles close as it exits,
+    /// before its own is signalled, so a pipe it held ending says nothing of it (D231, WHP at
+    /// 21c59efa7). Each round ends what the job holds, holds each process in it not held yet
+    /// and waits on every one held, until a round holds none new and the job has none active.
+    /// Never timed (D215): each round waits on processes their termination has begun to end,
+    /// and goes again only where one joined the job meanwhile. A child of no group: ended
+    /// and waited on.
+    pub fn end_group(&self) -> io::Result<()> {
+        let Some(group) = &self.processes else {
+            self.kill(SIGKILL)?;
+            return self.ended();
+        };
+        let code = ending_code(SIGKILL)?;
+        loop {
+            group.terminate(code)?;
+            let new = group.hold()?;
+            let held: Vec<RawHandle> = group
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|(_, process)| process.as_raw_handle())
+                .collect();
+            for process in held {
+                // SAFETY: a handle the group keeps open while it lives (`held` is only added
+                // to), and the group is this child's, borrowed here.
+                if unsafe { WaitForSingleObject(process, INFINITE) } != WAIT_OBJECT_0 {
+                    return Err(last());
+                }
+            }
+            if new == 0 && group.active()? == 0 {
+                return Ok(());
+            }
+        }
     }
 
     /// Its exit code, once it has ended.
@@ -408,13 +596,7 @@ impl Child {
     /// no error. SIGSTOP and SIGCONT, which end no process, are refused: Windows stops a
     /// process no documented way.
     pub fn kill(&self, signal: i32) -> io::Result<()> {
-        if matches!(signal, crate::signal::SIGSTOP | crate::signal::SIGCONT) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "a process is not stopped or continued on Windows",
-            ));
-        }
-        let code = 128u32.saturating_add(u32::try_from(signal).unwrap_or(0));
+        let code = ending_code(signal)?;
         // SAFETY: our own job, and our own process.
         let ended = unsafe {
             self.job
@@ -602,12 +784,94 @@ pub fn sweep(records: &Path) {
         let Ok(held) = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path) else {
             continue;
         };
-        let profile = wide(&name);
-        // SAFETY: a NUL-terminated name. A profile already gone is no error of ours.
-        unsafe { DeleteAppContainerProfile(profile.as_ptr()) };
+        // A profile already gone is no error of ours.
+        let _ = delete_profile(&name);
         drop(held);
         let _ = std::fs::remove_file(&path);
     }
+}
+
+/// What [`release`] did with the profiles one process made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Released {
+    /// Each profile it had recorded deleted, and its record: how many. None where it recorded
+    /// none in these records (another cache's, or none made) or a spawner's [`sweep`] deleted
+    /// them first.
+    Deleted(usize),
+    /// A record of its is held, so nothing was deleted: it lives, a process given its pid
+    /// since holds one of its own, or a spawner sweeping holds it this moment.
+    Held,
+}
+
+/// Deletes the profiles process `maker` made, recorded in `records`, now that it has ended:
+/// what the next spawner's [`sweep`] would, for this maker alone, so that a VM its owner ended
+/// (its job killed, its `shards` with it) leaves no profile for as long as no other starts.
+/// Each record is opened as `sweep` opens one, shared with none, and all are held while their
+/// profiles go; a profile whose deletion fails keeps its record, for a later sweep.
+pub fn release(records: &Path, maker: u32) -> io::Result<Released> {
+    let entries = match std::fs::read_dir(records) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Released::Deleted(0)),
+        Err(e) => return Err(e),
+    };
+    let mut taken = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if made_by(&name) != Some(maker) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::OpenOptions::new().read(true).share_mode(0).open(&path) {
+            Ok(file) => taken.push((name, path, file)),
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => {
+                return Ok(Released::Held);
+            }
+            // Swept between the listing and the open.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let deleted = taken.len();
+    for (name, path, file) in taken {
+        delete_profile(&name)?;
+        drop(file);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(Released::Deleted(deleted))
+}
+
+/// The process that made the profile named `name`, `shards.<role>.<pid>.<n>`
+/// ([`AppContainer::new`]); None for any other name.
+fn made_by(name: &OsStr) -> Option<u32> {
+    let mut parts = name.to_str()?.split('.');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("shards"), Some(_role), Some(pid), Some(n), None) if n.parse::<u64>().is_ok() => {
+            pid.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Deletes the profile named `name`; one that is not there is not an error.
+fn delete_profile(name: &OsStr) -> io::Result<()> {
+    let profile = wide(name);
+    // SAFETY: a NUL-terminated name.
+    let hr = unsafe { DeleteAppContainerProfile(profile.as_ptr()) };
+    let gone = [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_NOT_FOUND].map(hresult);
+    if hr < 0 && !gone.contains(&hr) {
+        return Err(io::Error::from_raw_os_error(hr));
+    }
+    Ok(())
 }
 
 /// Whether this process runs in an AppContainer (TokenIsAppContainer): a VM process
@@ -1360,10 +1624,13 @@ pub fn peak_commit_kib() -> u64 {
 /// set. Not its private bytes committed (PrivateUsage), which stay as they are whatever it
 /// gives back (PM M371); 0 where unknown.
 pub fn footprint_kib() -> u64 {
+    footprint().map_or(0, |bytes| bytes / 1024)
+}
+
+/// [`footprint_kib`]'s, in bytes; none where it cannot be read.
+pub fn footprint() -> Option<u64> {
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX2};
-    let Ok(cb) = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS_EX2>()) else {
-        return 0;
-    };
+    let cb = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS_EX2>()).ok()?;
     let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
         cb,
         ..Default::default()
@@ -1372,9 +1639,9 @@ pub fn footprint_kib() -> u64 {
     if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), cb) } != 0
         && counters.PrivateWorkingSetSize != 0
     {
-        return (counters.PrivateWorkingSetSize / 1024) as u64;
+        return Some(counters.PrivateWorkingSetSize as u64);
     }
-    memory().map_or(0, |m| (m.WorkingSetSize / 1024) as u64)
+    memory().map(|m| m.WorkingSetSize as u64)
 }
 
 /// What process `pid` has done so far, for a log that says why it seems stuck: its CPU time
@@ -1613,21 +1880,36 @@ pub fn spawn_with(
     detach: bool,
     set: &[(&str, &OsStr)],
 ) -> io::Result<Child> {
+    spawn_env(program, args, fds, detach, this_env_with(set), None, None)
+}
+
+/// [`spawn_with`]'s child, not detached, made in a job of its own, its group: nested under
+/// any job this process is in, and holding every process the child starts, as the job lets
+/// none break away (no JOB_OBJECT_LIMIT_BREAKAWAY_OK: `spawn_env` makes a child that asks to
+/// in it all the same). Ended whole by [`Child::kill_group`], as a Unix child leading a
+/// process group of its own is, and followed to its end by [`Child::end_group`] (a run host,
+/// D231).
+pub fn spawn_grouped(
+    program: &Path,
+    args: &[&OsStr],
+    fds: &[(BorrowedHandle<'_>, i32)],
+    set: &[(&str, &OsStr)],
+) -> io::Result<Child> {
+    let job = GroupJob::new()?;
+    let mut child = spawn_env(program, args, fds, false, this_env_with(set), Some(&job), None)?;
+    child.processes = Some(ProcessGroup::new(job));
+    Ok(child)
+}
+
+/// This process's environment, with `set` over it, and no grants pipe of its own.
+fn this_env_with(set: &[(&str, &OsStr)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let inherited = std::env::vars_os().filter(|(k, _)| {
         !k.eq_ignore_ascii_case(GIVEN) && !set.iter().any(|(name, _)| k.eq_ignore_ascii_case(name))
     });
     let given = set
         .iter()
         .map(|(k, v)| (OsStr::new(k).to_os_string(), v.to_os_string()));
-    spawn_env(
-        program,
-        args,
-        fds,
-        detach,
-        inherited.chain(given).collect(),
-        None,
-        None,
-    )
+    inherited.chain(given).collect()
 }
 
 /// [`spawn`], with the variables `env` alone for the child's environment, and what Windows
@@ -1939,7 +2221,9 @@ fn spawn_env(
         }
     }
     // Copies of its standard handles made to be inherited, the caller's own left as they
-    // are: no spawn by std meanwhile takes them.
+    // are; no spawn by std meanwhile takes them, nor its grants pipe's read end
+    // ([`INHERITING`]).
+    let inheriting = inheriting();
     let copies: Vec<(usize, OwnedHandle)> = stdio
         .iter()
         .enumerate()
@@ -2011,6 +2295,11 @@ fn spawn_env(
         made => made,
     }?;
     drop(copies);
+    let grants = grants.map(|(read, write)| {
+        drop(read);
+        write
+    });
+    drop(inheriting);
     // SAFETY: the handles CreateProcessW returned, owned from here on.
     let (process, thread) = unsafe {
         (
@@ -2022,6 +2311,7 @@ fn spawn_env(
         process,
         pid: made.dwProcessId,
         job: None,
+        processes: None,
         _station: None,
         container: None,
     };
@@ -2036,8 +2326,7 @@ fn spawn_env(
             return Err(e);
         }
     }
-    if let Some((read, write)) = grants {
-        drop(read);
+    if let Some(write) = grants {
         let mut told = String::new();
         for (handle, n) in past {
             let theirs = child.give(handle).inspect_err(|_| {
@@ -2216,6 +2505,7 @@ pub fn given_fd(n: i32) -> io::Result<Option<OwnedHandle>> {
 /// [`spawn`], left suspended: for a spawner that hands another child this one's process
 /// before either runs.
 pub fn spawn_suspended(s: &Spawn<'_>) -> io::Result<Suspended> {
+    let inheriting = inheriting();
     let (pipe_read, pipe_write) = pipe()?;
     let pipe_value = pipe_read.as_raw_handle() as usize;
     let pipe_arg = pipe_value.to_string();
@@ -2270,10 +2560,12 @@ pub fn spawn_suspended(s: &Spawn<'_>) -> io::Result<Suspended> {
         process,
         pid: made.dwProcessId,
         job: Some(job),
+        processes: None,
         _station: station,
         container: None,
     };
     drop(pipe_read);
+    drop(inheriting);
     let mut told = String::new();
     for g in s.given {
         let theirs = child.give(g.handle).map_err(|e| {
@@ -2443,23 +2735,20 @@ fn create(
     second: bool,
     desktop: Option<&[u16]>,
 ) -> io::Result<PROCESS_INFORMATION> {
-    // Standard input, output and error are inherited, made inheritable as std makes them;
-    // one this process lacks (a null or invalid handle) the child lacks too.
-    let mut inherited: Vec<RawHandle> = vec![pipe_read.as_raw_handle()];
+    // Standard input, output and error are inherited, each by a copy made inheritable for the
+    // child's handle list alone, closed once it is made: the caller's own are left as they
+    // are lent (platform-07). One this process lacks (a null or invalid handle) the child
+    // lacks too.
     let stdio = |h: Option<BorrowedHandle<'_>>| {
         h.map(|h| h.as_raw_handle())
             .filter(|&h| !h.is_null() && h != INVALID_HANDLE_VALUE)
+            .map(inheritable_copy)
+            .transpose()
     };
-    let (stdin, stdout, stderr) = (stdio(s.stdin), stdio(Some(s.stdout)), stdio(Some(s.stderr)));
-    for h in [stdin, stdout, stderr].into_iter().flatten() {
-        // SAFETY: a handle the caller lends us, for the child's handle list alone.
-        if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
-            return Err(last());
-        }
-        if !inherited.contains(&h) {
-            inherited.push(h);
-        }
-    }
+    let copies = [stdio(s.stdin)?, stdio(Some(s.stdout))?, stdio(Some(s.stderr))?];
+    let [stdin, stdout, stderr] = copies.each_ref().map(|c| c.as_ref().map(|c| c.as_raw_handle()));
+    let mut inherited: Vec<RawHandle> = vec![pipe_read.as_raw_handle()];
+    inherited.extend([stdin, stdout, stderr].into_iter().flatten());
     // The group's job first, the outermost, then its own (PROC_THREAD_ATTRIBUTE_JOB_LIST).
     let jobs: Vec<HANDLE> = s
         .group
@@ -2674,6 +2963,110 @@ pub fn given(pipe: usize) -> io::Result<Vec<(String, Handed)>> {
 mod tests {
     use super::*;
 
+    /// Whether `handle` is inheritable (GetHandleInformation).
+    fn inheritable(handle: RawHandle) -> bool {
+        let mut flags = 0u32;
+        // SAFETY: a handle the caller holds, and a word for its flags.
+        let ok = unsafe { windows_sys::Win32::Foundation::GetHandleInformation(handle, &raw mut flags) };
+        assert_ne!(ok, 0, "{}", last());
+        flags & HANDLE_FLAG_INHERIT != 0
+    }
+
+    /// Do: make a confined child, suspended, whose standard output and error are a file this
+    /// process opened, not inheritable, as std opens every file. Expect the file's handle not
+    /// inheritable still once the child is made: a copy made for the child alone was, the
+    /// lender's handle left as it lent it (platform-07).
+    #[test]
+    fn a_confined_childs_standard_handles_are_left_as_their_lender_has_them() {
+        use std::os::windows::io::AsHandle as _;
+        let dir = shards_testdir::TempDir::new("stdio-lent").unwrap();
+        let out = File::create(dir.join("out")).unwrap();
+        assert!(!inheritable(out.as_raw_handle()));
+        let shell = std::env::var_os("ComSpec").unwrap();
+        let args = [OsStr::new("/c"), OsStr::new("exit 0")];
+        let made = spawn_suspended(&Spawn {
+            program: Path::new(&shell),
+            args: &args,
+            grants_at: args.len(),
+            given: &[],
+            stdin: None,
+            stdout: out.as_handle(),
+            stderr: out.as_handle(),
+            sockets: &[],
+            env: &[],
+            container: None,
+            holds: Holds::Nothing,
+            group: None,
+            graphics: false,
+        })
+        .unwrap();
+        let after = inheritable(out.as_raw_handle());
+        drop(made);
+        assert!(!after, "the lent handle left inheritable");
+    }
+
+    /// Do: hold a pipe's write end inheritable, as a spawn of shards' holds its child's
+    /// handles until it is made, while another thread starts a child by std's Command
+    /// ([`spawn_std`]) that runs for seconds; then close every write end this process holds.
+    /// Expect the pipe's writers all gone while that child runs: std's child, made once the
+    /// spawn let go of its inheritable handles, took none of them; one made meanwhile kept a
+    /// write end, and the pipe open, until it ended (platform-07).
+    #[test]
+    fn a_child_of_stds_takes_no_handle_held_inheritable_for_another() {
+        use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, GetLastError};
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        let (read, write) = pipe().unwrap();
+        // The read end pipe() makes inheritable; the write end the child would hold.
+        // SAFETY: our own handle, made not inheritable again.
+        let set = unsafe { SetHandleInformation(read.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) };
+        assert_ne!(set, 0);
+        let (started, start) = std::sync::mpsc::channel();
+        let child = std::thread::scope(|s| {
+            let held = INHERITING.read().unwrap_or_else(PoisonError::into_inner);
+            let copy = inheritable_copy(write.as_raw_handle()).unwrap();
+            let std_child = s.spawn(move || {
+                started.send(()).unwrap();
+                let shell = std::env::var_os("ComSpec").unwrap();
+                spawn_std(
+                    std::process::Command::new(shell)
+                        .args(["/c", "ping -n 4 127.0.0.1 >NUL"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null()),
+                )
+                .unwrap()
+            });
+            start.recv().unwrap();
+            // Long enough for a spawn that does not wait to have made its child.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(copy);
+            drop(held);
+            std_child.join().unwrap()
+        });
+        drop(write);
+        let mut ready = 0u32;
+        // SAFETY: a pipe handle `read` holds; only the count asked for.
+        let ok = unsafe {
+            PeekNamedPipe(
+                read.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut ready,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: no arguments.
+        let broken = ok == 0 && unsafe { GetLastError() } == ERROR_BROKEN_PIPE;
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            broken,
+            "std's child holds a write end made inheritable for another"
+        );
+    }
+
     /// A detached child runs, its end and status seen as any child's, though it is in no
     /// console, process group nor Job of this process's.
     #[test]
@@ -2727,6 +3120,32 @@ mod tests {
             "it outlived the outer job's last handle"
         );
         drop(own);
+    }
+
+    /// A grouped child that starts a process of its own (cmd running ping, or the console
+    /// host a cmd with no console of this process's has), made in its group: its group
+    /// ended, `end_group` returns with both ended, their handles signalled, and none of the
+    /// group's processes active.
+    #[test]
+    fn a_groups_end_follows_every_process_of_it_to_its_end() {
+        let shell = std::env::var_os("ComSpec").unwrap();
+        let args = [OsStr::new("/c"), OsStr::new("ping -n 600 127.0.0.1 >NUL")];
+        let child = spawn_grouped(Path::new(&shell), &args, &[], &[]).unwrap();
+        let group = child.processes.as_ref().unwrap();
+        let ping = loop {
+            let others = group.job.processes().unwrap();
+            if let Some(&pid) = others.iter().find(|&&pid| pid != child.id()) {
+                break group.member(pid).unwrap().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        child.kill_group(SIGKILL).unwrap();
+        child.end_group().unwrap();
+        assert!(child.has_ended(), "the grouped child outlived its group's end");
+        // SAFETY: a process handle this test holds.
+        let ping_ended = unsafe { WaitForSingleObject(ping.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+        assert!(ping_ended, "the process it started outlived its group's end");
+        assert_eq!(group.active().unwrap(), 0);
     }
 
     /// A memory limit set on a job ending with this process keeps it ending so: the limits
@@ -2902,6 +3321,115 @@ mod tests {
     #[test]
     fn this_process_is_in_no_app_container() {
         assert!(!in_app_container());
+    }
+
+    /// CreateAppContainerProfile of `name`: its HRESULT, the SID it made freed.
+    fn make_profile(name: &str) -> i32 {
+        let name = wide(OsStr::new(name));
+        let mut sid: PSID = std::ptr::null_mut();
+        // SAFETY: NUL-terminated names of ours; the SID made is freed as it drops.
+        let hr = unsafe {
+            CreateAppContainerProfile(
+                name.as_ptr(),
+                name.as_ptr(),
+                name.as_ptr(),
+                std::ptr::null(),
+                0,
+                &raw mut sid,
+            )
+        };
+        if hr >= 0 {
+            drop(Sid(sid));
+        }
+        hr
+    }
+
+    /// The folder Windows keeps a profile's data in, `%LOCALAPPDATA%\Packages\<name>`.
+    fn profile_folder(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Packages")
+            .join(name)
+    }
+
+    /// Do: leave what a killed maker leaves (D141): two profiles of one gone pid with their
+    /// records, unheld, one of them a record whose profile has gone already; another gone
+    /// pid's profile and record; and a third pid's record held open. Expect `release` of the
+    /// first pid to delete its profiles (each name makes a new profile again, where it said
+    /// ERROR_ALREADY_EXISTS, and its folder is gone) and its records, and to leave the
+    /// other's; of the third, `Held`, nothing deleted; of a pid with none, nothing.
+    #[test]
+    fn release_deletes_one_ended_makers_profiles_and_records() {
+        let dir = shards_testdir::TempDir::new("release").unwrap();
+        let records = dir.path();
+        // Odd: no process has the pid (Windows' are multiples of four), and no other test
+        // process's names are these.
+        let me = std::process::id();
+        let (gone, other, live) = (me + 1, me + 3, me + 5);
+        let name = |pid: u32, n: u32| format!("shards.test.{pid}.{n}");
+        let (ours, already, others, held) = (name(gone, 0), name(gone, 1), name(other, 0), name(live, 0));
+        for made in [&ours, &others, &held] {
+            assert_eq!(make_profile(made), 0, "{made}");
+            assert!(profile_folder(made).is_dir(), "{made}");
+        }
+        for recorded in [&ours, &already, &others, &held] {
+            std::fs::write(records.join(recorded), b"").unwrap();
+        }
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(records.join(&held))
+            .unwrap();
+
+        assert_eq!(release(records, gone).unwrap(), Released::Deleted(2));
+        assert_eq!(
+            make_profile(&ours),
+            0,
+            "its profile is gone: its name makes one anew"
+        );
+        assert!(delete_profile(OsStr::new(&ours)).is_ok());
+        assert!(!profile_folder(&ours).exists());
+        assert!(!records.join(&ours).exists() && !records.join(&already).exists());
+        assert_eq!(
+            make_profile(&others),
+            hresult(ERROR_ALREADY_EXISTS),
+            "another's is left"
+        );
+        assert!(records.join(&others).exists());
+
+        assert_eq!(release(records, live).unwrap(), Released::Held);
+        assert_eq!(
+            make_profile(&held),
+            hresult(ERROR_ALREADY_EXISTS),
+            "a held one is left"
+        );
+        assert!(records.join(&held).exists());
+        drop(holding);
+        assert_eq!(release(records, live).unwrap(), Released::Deleted(1));
+        assert_eq!(release(records, me + 7).unwrap(), Released::Deleted(0));
+        assert_eq!(
+            release(&records.join("none"), gone).unwrap(),
+            Released::Deleted(0)
+        );
+
+        assert_eq!(release(records, other).unwrap(), Released::Deleted(1));
+        assert!(std::fs::read_dir(records).unwrap().next().is_none());
+    }
+
+    /// Only a profile's name as [`AppContainer::new`] makes it names its maker.
+    #[test]
+    fn a_profiles_maker_is_read_from_its_name_alone() {
+        assert_eq!(made_by(OsStr::new("shards.vm.1234.0")), Some(1234));
+        assert_eq!(made_by(OsStr::new("shards.net.8.17")), Some(8));
+        for not in [
+            "shards.vm.1234",
+            "shards.vm.x.0",
+            "shards.vm.1.0.2",
+            "other.vm.1.0",
+            "shards.vm.1.y",
+        ] {
+            assert_eq!(made_by(OsStr::new(not)), None, "{not}");
+        }
     }
 
     /// Arguments are quoted as CommandLineToArgvW reads them back: plain ones alone; ones

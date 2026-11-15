@@ -1,7 +1,7 @@
 //! The condition variable's waits, on every platform (AC-T7.4.1). Each wait here is for its fact alone (a thread's
-//! end, joined), but where a deadline is the claim under test, which says so; how late a wait returns past its
-//! deadline is held by the client's queued-sender test against the platform's recorded overshoot
-//! (`hex_testkit::waits::OVERSHOOT`).
+//! end, joined), but where a deadline is the claim under test, which says so. How late a wait returns past its
+//! deadline is the host's, which the client's deadline tests tell the census and hold to no bound; what a deadline
+//! wait arms on macOS is held by the kernel's read-back of it (`macos::tests`).
 
 use super::*;
 use std::sync::Arc;

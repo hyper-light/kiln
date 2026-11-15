@@ -13,7 +13,7 @@
 //!
 //! Pure (CLAUDE.md §9): no clock, disk, network or randomness. The keeper's records go through
 //! [`Records`]; its shell carries the messages and times nothing; a holder's shell follows its waits
-//! (Patience, CV6) and says when one ended unanswered ([`Holder::ran_out`]).
+//! (Patience, CV6) by its link, and says when the link ended ([`Holder::link_down`]).
 
 pub mod conformance;
 mod holder;

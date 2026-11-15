@@ -531,6 +531,29 @@ mod tests {
     use hex_api::IoRates;
     use proptest::prelude::*;
 
+    /// Joint plan step 14 (ROOT, 2026-11-13; AC-T7.4.1): Hex's least CPU bound, `hex_api::MIN_CPU_MILLI`, is the least
+    /// `cpu.max` the kernel holds at Hex's period: its least quota, 1 ms (kernel/sched/core.c's least bandwidth quota,
+    /// `min_bw_quota_period_us`, at Linux 1590cf03, as Shards' D191 cites it), over [`CPU_PERIOD_US`]. Do write the bound
+    /// of `MIN_CPU_MILLI`, then one a milli-CPU less. Expect the first's quota the kernel's least exactly, at Hex's
+    /// period; the second refused, below it.
+    #[test]
+    fn w14_hexs_least_cpu_bound_is_the_kernels_least_quota_at_its_period() {
+        const KERNEL_LEAST_QUOTA_US: u64 = 1_000;
+        let at = |milli| Bounds {
+            cpu_max_milli: Some(milli),
+            ..Bounds::default()
+        };
+        let got = writes(&at(hex_api::MIN_CPU_MILLI), &[]).unwrap();
+        assert_eq!(
+            got.iter().find(|write| write.file == "cpu.max"),
+            Some(&w(
+                "cpu.max",
+                format!("{KERNEL_LEAST_QUOTA_US} {CPU_PERIOD_US}")
+            ))
+        );
+        assert!(writes(&at(hex_api::MIN_CPU_MILLI - 1), &[]).is_err());
+    }
+
     #[test]
     fn every_bound_becomes_its_kernel_file_in_kernel_units() {
         let b = Bounds {

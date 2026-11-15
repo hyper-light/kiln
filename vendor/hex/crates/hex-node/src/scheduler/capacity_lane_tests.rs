@@ -88,8 +88,29 @@ fn linked(ca: &SimCa, address: SocketAddr, name: &str) -> (Endpoint, Link) {
     (end, link)
 }
 
-/// Says `first` on `link` and each answer to `holder` until neither has more to say: what the holder made of it.
-fn talk(link: &mut Link, holder: &mut Holder, first: Vec<ToKeeper>) -> Vec<Event> {
+/// The capacity lane as the party of a wait on it, from `lines`, its report's: ended once it said it ended
+/// (`hex.capacity event=lane_ended`), its links' end telling a read the rest.
+fn lane_party(lines: &Mutex<Vec<String>>) -> Party {
+    if lines
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.starts_with("hex.capacity event=lane_ended"))
+    {
+        Party::Ended
+    } else {
+        Party::Live
+    }
+}
+
+/// Says `first` on `link` and each answer to `holder` until neither has more to say, by the life of the lane `lines`
+/// reports: what the holder made of it.
+fn talk(
+    link: &mut Link,
+    holder: &mut Holder,
+    first: Vec<ToKeeper>,
+    lines: &Mutex<Vec<String>>,
+) -> Vec<Event> {
     let mut queue = VecDeque::from(first);
     let mut events = Vec::new();
     while let Some(msg) = queue.pop_front() {
@@ -97,7 +118,7 @@ fn talk(link: &mut Link, holder: &mut Holder, first: Vec<ToKeeper>) -> Vec<Event
         let answer = follow::within(
             &HEAR,
             "the lane's next word",
-            || Party::Live,
+            || lane_party(lines),
             |by| match link.hear(by) {
                 Err(Refused::Deadline { .. }) => None,
                 heard => Some(heard),
@@ -153,7 +174,7 @@ fn the_scheduler_serves_its_capacity_view_to_the_holders_it_names_alone() {
     let (_kiln_end, mut link) = linked(&ca, address, KILN);
     let mut kiln = Holder::start(KILN.into(), 1, 4, &[]).unwrap();
     let hello = kiln.connect().unwrap();
-    let joined = talk(&mut link, &mut kiln, vec![hello]);
+    let joined = talk(&mut link, &mut kiln, vec![hello], &lines);
     assert!(
         matches!(joined.as_slice(), [Event::Synced { agree: true, .. }]),
         "{joined:?}"
@@ -168,7 +189,7 @@ fn the_scheduler_serves_its_capacity_view_to_the_holders_it_names_alone() {
     let mut posing = Holder::start(KILN.into(), 2, 4, &[]).unwrap();
     let hello = posing.connect().unwrap();
     assert_eq!(
-        talk(&mut posing_link, &mut posing, vec![hello]),
+        talk(&mut posing_link, &mut posing, vec![hello], &lines),
         vec![Event::Closed(Close::NotAuthorized)]
     );
     assert!(
@@ -183,10 +204,11 @@ fn the_scheduler_serves_its_capacity_view_to_the_holders_it_names_alone() {
     assert_eq!(forget(&service, KILN), Some(dto::Forget::Connected));
     drop(link);
     let mut released = None;
+    // A look: the scheduler tells no event as it hears a link end, its release asked again.
     follow::until(
         &AWAY,
         "kiln-a's link heard ended",
-        || Party::Live,
+        || lane_party(&lines),
         || {
             released = forget(&service, KILN).filter(|f| *f != dto::Forget::Connected);
             released.is_some()
@@ -227,7 +249,7 @@ fn a_peer_the_lane_doesnt_name_holds_none_of_its_connections() {
         credentials,
         holders: vec![CapacityHolder { name: KILN.into() }],
     };
-    let (report, _) = kept();
+    let (report, lines) = kept();
     let service = Service::open(&config(dir.path(), Some(lane)), report).unwrap();
     let address = service.capacity_address().unwrap();
 
@@ -242,7 +264,7 @@ fn a_peer_the_lane_doesnt_name_holds_none_of_its_connections() {
     let mut link = Link::open(&kiln_end, kiln_peer).unwrap();
     let mut kiln = Holder::start(KILN.into(), 1, 4, &[]).unwrap();
     let hello = kiln.connect().unwrap();
-    let joined = talk(&mut link, &mut kiln, vec![hello]);
+    let joined = talk(&mut link, &mut kiln, vec![hello], &lines);
     assert!(
         matches!(joined.as_slice(), [Event::Synced { agree: true, .. }]),
         "{joined:?}"

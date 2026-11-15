@@ -13,6 +13,9 @@ fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
+/// What the tests' waits follow, as a run-out names it.
+const PARTY: &[Piece<'_>] = &[Piece::Kind("the test's party")];
+
 proptest! {
     /// Do: record random answers on a wait with none, then ask whether a new answer would come within it. Expect:
     /// before the first, no bound (it follows its party); after each, the slowest so far, never less than before, and
@@ -48,7 +51,7 @@ proptest! {
 fn original_a_run_out_at_the_bound_never_refuses_by_itself() {
     let p = Patience::measuring("test");
     p.answered(ms(5));
-    p.ran_out(ms(5));
+    p.ran_out(ms(5), ms(5), PARTY);
     assert_eq!(p.slowest(), Some(ms(5)), "a run-out is no sample");
     assert_eq!(p.deadline(), None, "past W*, the wait follows its party");
     p.answered(ms(60_000));
@@ -64,11 +67,11 @@ fn after_a_run_out_the_next_wait_follows_and_learns_its_uncensored_answer() {
     let p = Patience::measuring("test");
     p.answered(ms(5));
     assert_eq!(p.deadline(), Some(ms(5)));
-    p.ran_out(ms(5));
+    p.ran_out(ms(5), ms(5), PARTY);
     assert_eq!((p.deadline(), p.slowest()), (None, Some(ms(5))));
     p.answered(ms(30));
     assert_eq!(p.deadline(), Some(ms(30)));
-    p.ran_out(ms(30));
+    p.ran_out(ms(30), ms(30), PARTY);
     assert_eq!(p.deadline(), None);
 }
 
@@ -83,7 +86,7 @@ fn a_host_slower_than_any_answer_seen_runs_out_once() {
     for _ in 0..100 {
         match p.deadline() {
             Some(bound) if ms(25) > bound => {
-                p.ran_out(bound);
+                p.ran_out(bound, bound, PARTY);
                 ran_out += 1;
             }
             _ => p.answered(ms(25)),
@@ -124,7 +127,7 @@ fn every_answer_and_run_out_reaches_the_census_by_its_waits_name() {
     let p = Patience::measuring("census.test");
     p.answered(ms(7));
     p.answered(ms(9));
-    p.ran_out(ms(20));
+    p.ran_out(ms(20), ms(20), PARTY);
     let told: Vec<Sample> = TOLD
         .lock()
         .unwrap()
@@ -181,4 +184,95 @@ fn refusal_census_preserves_learning_and_marks_only_the_optional_record() {
         census_line("a.wait", Sample::RanOut(Duration::from_nanos(41))),
         "a.wait >41\n"
     );
+}
+
+/// C-1 (decision 9; ROOT's conditions of 2026-11-14): the told line names its party in pieces, each by its kind, the
+/// party a JSON string. Do: form the line for a party of every kind of piece, one a name holding a quote, a backslash,
+/// a newline and a control character. Expect: the fields kiln reads, integers in nanoseconds, the party's pieces in
+/// order, escaped as a JSON string, and the line one line.
+#[test]
+fn a_told_line_names_its_party_in_pieces_as_a_json_string() {
+    let line = told_line(
+        "a.wait",
+        Duration::from_nanos(41),
+        Duration::from_nanos(43),
+        &[
+            Piece::Kind("the init of container "),
+            Piece::Name("a \"b\" \\ c\nd\u{1}"),
+            Piece::Kind(", pid "),
+            Piece::Pid(42),
+            Piece::Kind(", seed "),
+            Piece::Number(7),
+            Piece::Kind(", at "),
+            Piece::Path(std::path::Path::new("/sys/fs/cgroup/x")),
+        ],
+    );
+    assert_eq!(
+        line,
+        "hex.wait event=ran_out wait=a.wait w_star_ns=41 waited_ns=43 party=\"the init of container \
+         a \\\"b\\\" \\\\ c\\nd\\u0001, pid 42, seed 7, at /sys/fs/cgroup/x\"\n"
+    );
+    assert_eq!(line.matches('\n').count(), 1);
+}
+
+/// ROOT's conditions of 2026-11-14: the party is bounded, each piece cut at what the line leaves it, the cut told. Do:
+/// form the line at the widest numbers a wait can name, for a party whose name and path are each ten times the line's
+/// bound, a piece after them. Expect: the line within [`LINE_BOUND`], one line; the pieces before the cut whole; the
+/// party ending with the count of every byte cut, the later piece's among them.
+#[test]
+fn a_party_past_what_the_line_leaves_is_cut_at_its_bound_and_the_cut_told() {
+    let name = "n".repeat(LINE_BOUND * 10);
+    let path = format!("/{}", "p".repeat(LINE_BOUND * 10));
+    let party = [
+        Piece::Kind("the init of container "),
+        Piece::Name(&name),
+        Piece::Kind(" at "),
+        Piece::Path(std::path::Path::new(&path)),
+        Piece::Kind(", by its pidfd"),
+    ];
+    let line = told_line("a.wait", Duration::MAX, Duration::MAX, &party);
+    assert!(line.len() <= LINE_BOUND, "{} bytes", line.len());
+    assert_eq!(line.matches('\n').count(), 1);
+    let head = format!(
+        "hex.wait event=ran_out wait=a.wait w_star_ns={0} waited_ns={0} party=\"the init of container ",
+        Duration::MAX.as_nanos()
+    );
+    let rest = line.strip_prefix(&head).unwrap_or_else(|| panic!("{line}"));
+    let after = rest.trim_start_matches('n');
+    let shown = rest.len() - after.len();
+    assert!(shown > 0, "the name shown up to the cut: {line}");
+    let cut = name.len() - shown + " at ".len() + path.len() + ", by its pidfd".len();
+    assert_eq!(after, format!(" [cut {cut} bytes]\"\n"));
+}
+
+/// The line's bound is POSIX's least PIPE_BUF, `{_POSIX_PIPE_BUF}` (IEEE Std 1003.1-2017, `<limits.h>`), cited where
+/// it is declared: a write of at most that many bytes is never interleaved with another's on a pipe.
+#[test]
+fn the_lines_bound_is_posixs_least_pipe_buf() {
+    assert_eq!(LINE_BOUND, 512);
+}
+
+/// The review's C-10 (decision 9; ROOT, 2026-11-14): a wait that starts with no W* and whose party could hang alive
+/// tells that it follows it, in the run-out's own form and bound. Do: form the following line for a party of a kind and a
+/// name; then a party ten times the line's bound; and ask a cold wait, then one that has its W*, to tell it. Expect: the
+/// fields kiln reads, the party a JSON string, one line; the long one within [`LINE_BOUND`], its cut told; the cold
+/// wait told, the one with a W* not.
+#[test]
+fn c10_a_wait_with_no_w_star_tells_that_it_follows_its_party() {
+    assert_eq!(
+        following_line(
+            "a.wait",
+            &[Piece::Kind("the node VM's run, by its READY and its end")]
+        ),
+        "hex.wait event=following wait=a.wait party=\"the node VM's run, by its READY and its end\"\n"
+    );
+    let name = "n".repeat(LINE_BOUND * 10);
+    let long = following_line("a.wait", &[Piece::Kind("the init of "), Piece::Name(&name)]);
+    assert!(long.len() <= LINE_BOUND, "{} bytes", long.len());
+    assert_eq!(long.matches('\n').count(), 1);
+    assert!(long.ends_with(" bytes]\"\n"), "{long}");
+    let cold = Patience::measuring("c10.cold");
+    assert!(cold.following(&[Piece::Kind("a party")]));
+    cold.answered(Duration::from_nanos(41));
+    assert!(!cold.following(&[Piece::Kind("a party")]));
 }

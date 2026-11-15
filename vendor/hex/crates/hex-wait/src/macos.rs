@@ -244,3 +244,6 @@ fn sleep(waiter: &Kqueue, deadline: Option<Instant>) -> io::Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

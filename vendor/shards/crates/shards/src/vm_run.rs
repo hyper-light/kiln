@@ -17,6 +17,7 @@ use shards_vmm::vm::{
 
 use crate::spec::Options;
 use crate::terminal::RawTerminal;
+use shards_ipc::device::Refusal;
 
 const RUN_USAGE: &str = "usage: shards run vm --kernel PATH [--initrd PATH | --init PATH] [--cmdline STR] [--cpus N] [--memory MIB] [--memory-max MIB] [--disk PATH[:ro]]... [--share DIR[:ro]]... [--pmem PATH]... [--layer PATH] [--vsock PATH] [--nested] [--gpu | --gpu-probe] [--gpu-device ID]...] [--host-managed] [--reporting] [--pci-test | --pci-tests SS.F,...] [--pci-slots N [--pci-slots-iommu]] [--vfio NAME|NODE]... [--vfio-iommu NAME|NODE]... [--no-console [--console-said N]] [--snapshot-dir DIR [--snapshot-then stop|resume]]
        shards run vm --kernel PATH --init SHARDS-INIT --rootfs IMAGE [OPTIONS] [WORKLOAD OPTIONS] -- COMMAND [ARG...]
@@ -198,6 +199,9 @@ struct Common {
     /// `--said-to FD` (Windows: `--said-to NAME`): where it tells its spawner how that
     /// report came out, for the spawner to record.
     said_to: Option<LinkArg>,
+    /// `--final-use FD` (Windows: `--final-use NAME`): where a managed VM tells its keeper what
+    /// its machine used in all once down (D260), for the keeper to record.
+    final_use: Option<LinkArg>,
     snapshot_dir: Option<PathBuf>,
     then: AfterSnapshot,
     vsock: Option<PathBuf>,
@@ -217,6 +221,7 @@ impl Common {
             console: Console::Stdout,
             said: None,
             said_to: None,
+            final_use: None,
             snapshot_dir: None,
             then: AfterSnapshot::Stop,
             vsock: None,
@@ -260,6 +265,7 @@ impl Common {
                 )
             }
             "--said-to" => self.said_to = Some(link_arg("--said-to", text(value("--said-to")?)?)?),
+            "--final-use" => self.final_use = Some(link_arg("--final-use", text(value("--final-use")?)?)?),
             "--snapshot-dir" => self.snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--snapshot-then" => {
                 self.then = match text(value("--snapshot-then")?)?.as_str() {
@@ -402,6 +408,8 @@ struct Run {
     attach: Option<String>,
     /// Where it tells its spawner how its console's report came out ([`Common::said_to`]).
     said_to: Option<LinkArg>,
+    /// Where a managed VM tells its keeper its final use ([`Common::final_use`]).
+    final_use: Option<LinkArg>,
     gpu_report: Option<GpuReportTarget>,
     /// `--host-managed`: a plain boot takes rates from its host's clients (D255).
     managed: bool,
@@ -432,6 +440,38 @@ fn gpu_report_arg(value: String) -> Result<LinkArg, String> {
     Ok(value)
 }
 
+/// The report `--gpu-report` and `--gpu-report-scope` ask for (D232, D233), where they ask
+/// for one: both, of a VM that `may` report, its renderer made of its selection before its guest
+/// runs (a direct boot's, a warm boot's or a warm restore's).
+fn report_target(
+    to: Option<LinkArg>,
+    scope: Option<[u8; 16]>,
+    may: bool,
+) -> Result<Option<GpuReportTarget>, String> {
+    match (to, scope) {
+        (None, None) => Ok(None),
+        (Some(to), Some(scope)) if may => Ok(Some(GpuReportTarget { to, scope })),
+        _ => Err("a GPU report requires one exact selection/scope and a fresh direct boot".into()),
+    }
+}
+
+/// A report's pipe apart from the VM's link (`--warm`): one descriptor or name is never both.
+fn apart(report: Option<&GpuReportTarget>, link: &LinkArg) -> Result<(), String> {
+    match report {
+        Some(report) if report.to == *link => Err("--gpu-report names the VM's link".into()),
+        _ => Ok(()),
+    }
+}
+
+/// `--gpu-report-scope`'s scope: one, nonzero (D232).
+fn report_scope(value: &str, scope: &mut Option<[u8; 16]>) -> Result<(), String> {
+    let given = shards_abi::gpu::uuid_from_hex(value).map_err(|why| why.to_string())?;
+    if given == [0; 16] || scope.replace(given).is_some() {
+        return Err("--gpu-report-scope must name one nonzero native scope".into());
+    }
+    Ok(())
+}
+
 /// `--gpu-device`'s identity, checked alone and added to `selection`, which `parse_run` checks
 /// whole once every flag is read (D232): checked whole after each flag, it was copied and
 /// sorted again for every one, quadratic in the flags given.
@@ -439,8 +479,8 @@ fn gpu_device(selection: &mut Vec<vm::gpu_selection::PhysicalGpu>, value: OsStri
     let device = text(value)?
         .parse::<vm::gpu_selection::PhysicalGpu>()
         .map_err(|error| format!("--gpu-device: {error}"))?;
-    if selection.len() >= vm::gpu_selection::MAX_PHYSICAL_GPUS {
-        return Err("--gpu-device count exceeds the physical device-index space".into());
+    if vm::gpu_selection::selection_fits(selection.len().saturating_add(1)).is_err() {
+        return Err("--gpu-device count exceeds what the renderer's selection carries".into());
     }
     selection
         .try_reserve(1)
@@ -481,13 +521,7 @@ fn parse_run(args: impl Iterator<Item = OsString>) -> Result<Run, String> {
                     return Err("--gpu-report given twice".into());
                 }
             }
-            "--gpu-report-scope" => {
-                let scope = shards_abi::gpu::uuid_from_hex(&text(value("--gpu-report-scope")?)?)
-                    .map_err(|why| why.to_string())?;
-                if scope == [0; 16] || gpu_scope.replace(scope).is_some() {
-                    return Err("--gpu-report-scope must name one nonzero native scope".into());
-                }
-            }
+            "--gpu-report-scope" => report_scope(&text(value("--gpu-report-scope")?)?, &mut gpu_scope)?,
             "--kernel" => kernel = Some(PathBuf::from(value("--kernel")?)),
             "--initrd" => cfg.initrd = Some(PathBuf::from(value("--initrd")?)),
             "--init" => cfg.init = Some(PathBuf::from(value("--init")?)),
@@ -660,9 +694,11 @@ fn parse_run(args: impl Iterator<Item = OsString>) -> Result<Run, String> {
         return Err("--gpu-probe cannot boot a workload, attach devices or write a snapshot".into());
     }
     if let Some(fd) = warm {
-        if gpu_report.is_some() || gpu_scope.is_some() {
-            return Err("a warm guest cannot carry another native scope's GPU report".into());
-        }
+        // A warm boot's report is its spawner's to ask (D233): an orchestrator's run host names
+        // its run's scope before it launches the VM, as a managed launch's client does; the
+        // daemon's warm VMs, started before their requests come, never name one.
+        let gpu_report = report_target(gpu_report, gpu_scope, !cfg.gpu_devices.is_empty())?;
+        apart(gpu_report.as_ref(), &fd)?;
         let rootfs = rootfs.ok_or("--warm needs --rootfs")?;
         if command || common.workload_options || cfg.vsock.is_some() {
             return Err(
@@ -684,7 +720,8 @@ fn parse_run(args: impl Iterator<Item = OsString>) -> Result<Run, String> {
             workload: common.workload,
             attach,
             said_to: None,
-            gpu_report: None,
+            final_use: None,
+            gpu_report,
             managed: false,
         });
     }
@@ -696,13 +733,11 @@ fn parse_run(args: impl Iterator<Item = OsString>) -> Result<Run, String> {
         None if gpu_probe => Mode::GpuProbe,
         None => Mode::Plain,
     };
-    let gpu_report = match (gpu_report, gpu_scope) {
-        (None, None) => None,
-        (Some(to), Some(scope)) if matches!(mode, Mode::Plain) && !cfg.gpu_devices.is_empty() => {
-            Some(GpuReportTarget { to, scope })
-        }
-        _ => return Err("a GPU report requires one exact selection/scope and a fresh direct boot".into()),
-    };
+    let gpu_report = report_target(
+        gpu_report,
+        gpu_scope,
+        matches!(mode, Mode::Plain) && !cfg.gpu_devices.is_empty(),
+    )?;
     // Quoted as it fails where it is supervised to its end (`supervise`), not where it
     // serves a command.
     if matches!(mode, Mode::Plain | Mode::Template(_)) {
@@ -713,6 +748,7 @@ fn parse_run(args: impl Iterator<Item = OsString>) -> Result<Run, String> {
         mode,
         workload: common.workload,
         said_to: common.said_to.take(),
+        final_use: common.final_use.take(),
         attach,
         gpu_report,
         managed: common.host_managed,
@@ -733,6 +769,9 @@ struct Restore {
     resume: bool,
     /// Where it tells its spawner how its console's report came out ([`Common::said_to`]).
     said_to: Option<LinkArg>,
+    /// Where a warm restore writes its GPU report, and its scope (D233): its renderer's as it
+    /// rejoins its snapshot's selection.
+    gpu_report: Option<GpuReportTarget>,
 }
 
 fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String> {
@@ -742,6 +781,7 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
     let mut layer = None;
     let mut layer_cloned = None;
     let mut working_set_to = None;
+    let (mut gpu_report, mut gpu_scope) = (None, None);
     // Each word with the value `spec::next_vm_word` gives it, a value only for a flag
     // `spec::RUN_VALUED` or `spec::RESTORE_VALUED` lists, as the command line is read ahead
     // of this (cli/mod.rs `vm_options`).
@@ -776,6 +816,14 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
                 working_set_to = Some(link_arg("--working-set", text(value("--working-set")?)?)?)
             }
             "--warm" => warm = Some(link_arg("--warm", text(value("--warm")?)?)?),
+            // Its renderer's report as it rejoins its snapshot's selection (D233).
+            "--gpu-report" => {
+                let to = gpu_report_arg(text(value("--gpu-report")?)?)?;
+                if gpu_report.replace(to).is_some() {
+                    return Err("--gpu-report given twice".into());
+                }
+            }
+            "--gpu-report-scope" => report_scope(&text(value("--gpu-report-scope")?)?, &mut gpu_scope)?,
             // A run's snapshot (D176): served as a warm VM's run is, its command running
             // already.
             "--resume" => {
@@ -809,6 +857,12 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
     }
     if warm.is_some() && working_set_to.is_some() {
         return Err("--warm hands its working set to the daemon: no --working-set".into());
+    }
+    // A warm restore's report (D233), as a warm boot's: its run host's, which names the scope
+    // before it launches it; the snapshot's selection is checked as it restores.
+    let gpu_report = report_target(gpu_report, gpu_scope, warm.is_some() && !resume)?;
+    if let Some(link) = &warm {
+        apart(gpu_report.as_ref(), link)?;
     }
     let dir = dir.ok_or("the snapshot directory is required")?;
     if layer_cloned.is_some() && layer.is_none() {
@@ -852,6 +906,7 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
         working_set_to,
         resume,
         said_to: common.said_to.take(),
+        gpu_report,
     })
 }
 
@@ -932,10 +987,13 @@ static PLUGGED_DISKS: std::sync::Mutex<Vec<(u8, shards_vmm::devices::virtio::blo
 
 /// What its daemon asks of this VM's devices (`DEVICE`, D214): `payload` the step and what
 /// it takes, `fds` its file or its share's connection. The answer's text, or why not.
-pub fn device(payload: &[u8], fds: Vec<shards_ipc::fd::OwnedFd>) -> Result<String, String> {
+pub fn device(payload: &[u8], fds: Vec<shards_ipc::fd::OwnedFd>) -> Result<String, Refusal> {
     use shards_ipc::device;
-    let handle = RUNNING.get().ok_or("the microVM has not started")?;
-    let (&step, rest) = payload.split_first().ok_or("a device step of nothing")?;
+    let asked = |why: &str| Refusal::InvalidRequest(why.into());
+    let handle = RUNNING.get().ok_or(Refusal::Inactive)?;
+    let (&step, rest) = payload
+        .split_first()
+        .ok_or_else(|| asked("a device step of nothing"))?;
     let placed = |p: &vm::Plugged| format!("{} {}", p.devfn, p.address);
     let disks = || {
         PLUGGED_DISKS
@@ -944,9 +1002,9 @@ pub fn device(payload: &[u8], fds: Vec<shards_ipc::fd::OwnedFd>) -> Result<Strin
     };
     match step {
         device::DISK => {
-            let (&flags, serial) = rest.split_first().ok_or("a disk of no flags")?;
-            let file = fds.into_iter().next().ok_or("a disk of no file")?;
-            let serial = std::str::from_utf8(serial).map_err(|_| "a serial that is not UTF-8")?;
+            let (&flags, serial) = rest.split_first().ok_or_else(|| asked("a disk of no flags"))?;
+            let file = fds.into_iter().next().ok_or_else(|| asked("a disk of no file"))?;
+            let serial = std::str::from_utf8(serial).map_err(|_| asked("a serial that is not UTF-8"))?;
             let plugged =
                 handle.plug_disk(std::fs::File::from(file), flags & device::READ_ONLY != 0, serial)?;
             if let Some(size) = &plugged.size {
@@ -955,38 +1013,41 @@ pub fn device(payload: &[u8], fds: Vec<shards_ipc::fd::OwnedFd>) -> Result<Strin
             Ok(placed(&plugged))
         }
         device::SHARE => {
-            let tag = std::str::from_utf8(rest).map_err(|_| "a tag that is not UTF-8")?;
-            let conn = fds.into_iter().next().ok_or("a share of no server")?;
+            let tag = std::str::from_utf8(rest).map_err(|_| asked("a tag that is not UTF-8"))?;
+            let conn = fds
+                .into_iter()
+                .next()
+                .ok_or_else(|| asked("a share of no server"))?;
             // On Windows its stream itself, a duplex pipe whose other end its share
             // process holds (D197), as a run's shares are given.
             #[cfg(unix)]
             let stream = std::os::unix::net::UnixStream::from(conn);
             #[cfg(windows)]
             let stream = shards_vmm::platform::PipeStream::from_handle(conn)
-                .map_err(|e| format!("its share's stream: {e}"))?;
+                .map_err(|e| Refusal::Host(format!("its share's stream: {e}")))?;
             let slot: shards_vmm::devices::virtio::fs::Share = std::sync::Arc::default();
-            slot.attach(stream)?;
+            slot.attach(stream).map_err(Refusal::Host)?;
             Ok(placed(&handle.plug_share(tag, slot)?))
         }
         device::UNPLUG => {
-            let &devfn = rest.first().ok_or("an unplug of no place")?;
+            let &devfn = rest.first().ok_or_else(|| asked("an unplug of no place"))?;
             handle.unplug(devfn)?;
             disks().retain(|(d, _)| *d != devfn);
             Ok(String::new())
         }
         device::FUNCTION => function(handle, rest, fds).map(|p| placed(&p)),
         device::GROW => {
-            let &devfn = rest.first().ok_or("a growth of no place")?;
+            let &devfn = rest.first().ok_or_else(|| asked("a growth of no place"))?;
             let size = disks()
                 .iter()
                 .find(|(d, _)| *d == devfn)
                 .map(|(_, s)| s.clone())
-                .ok_or("no disk is plugged there")?;
+                .ok_or(Refusal::NoDevice { devfn })?;
             Ok(size.grow()?.to_string())
         }
-        other => Err(format!(
+        other => Err(asked(&format!(
             "device step {other}, which this VM process does not take"
-        )),
+        ))),
     }
 }
 
@@ -1000,13 +1061,18 @@ fn function(
     handle: &vm::Handle,
     step: &[u8],
     fds: Vec<shards_ipc::fd::OwnedFd>,
-) -> Result<vm::Plugged, String> {
-    let (&flags, names) = step.split_first().ok_or("a function of no flags")?;
-    let names = std::str::from_utf8(names).map_err(|_| "a function's name that is not UTF-8")?;
-    let (name, node) = names.split_once('\0').ok_or("a function of no group")?;
+) -> Result<vm::Plugged, Refusal> {
+    let asked = |why: &str| Refusal::InvalidRequest(why.into());
+    let (&flags, names) = step
+        .split_first()
+        .ok_or_else(|| asked("a function of no flags"))?;
+    let names = std::str::from_utf8(names).map_err(|_| asked("a function's name that is not UTF-8"))?;
+    let (name, node) = names
+        .split_once('\0')
+        .ok_or_else(|| asked("a function of no group"))?;
     let mut fds = fds.into_iter();
     let (Some(first), Some(second), None) = (fds.next(), fds.next(), fds.next()) else {
-        return Err("a function without its two files".into());
+        return Err(asked("a function without its two files"));
     };
     let by_node = flags & shards_ipc::device::BY_NODE != 0;
     let f = vm::Vfio {
@@ -1027,24 +1093,24 @@ fn function(
     _handle: &vm::Handle,
     _step: &[u8],
     _fds: Vec<shards_ipc::fd::OwnedFd>,
-) -> Result<vm::Plugged, String> {
-    Err(vm::passthrough_refused().to_string())
+) -> Result<vm::Plugged, Refusal> {
+    Err(Refusal::Unsupported(vm::passthrough_refused().to_string()))
 }
 
 /// Holds this VM's vCPUs together to `milli` milli-CPU of the host's time, its run's CPU
 /// limits updated (`CPUS`, D191) or its orchestrator's rate (`RATE`, D247): what it holds
-/// them to, none where it lets them be.
-pub fn hold_rate(milli: u64) -> Result<Option<std::num::NonZeroU64>, String> {
+/// them to, none where it lets them be, and the period it holds over (D191).
+pub fn hold_rate(milli: u64) -> Result<shards_vmm::vm::Rated, String> {
     RUNNING
         .get()
         .ok_or("the microVM has not started")?
         .hold_rate(milli)
 }
 
-/// Takes the rates a managed machine's host's clients ask on its vsock socket (D255): the
-/// muxer hands each `RATE` line's connection here ([`VsockHost::rate`]), and a thread of its
-/// own holds the vCPUs to each in turn and answers on its connection ([`serve_rates`]).
-/// Nothing where the machine has no socket, which no client dials.
+/// Takes the asks a managed machine's host's clients make on its vsock socket, its rates
+/// (D255) and its use (D260): the muxer hands each `RATE` or `USE` line's connection here
+/// ([`VsockHost::rate`]), and a thread of its own answers each in turn on its connection
+/// ([`serve_rates`]). Nothing where the machine has no socket, which no client dials.
 fn take_rates(vsock: &mut Option<VsockHost>) -> Result<(), String> {
     let Some(vsock) = vsock.as_mut() else {
         return Ok(());
@@ -1058,41 +1124,92 @@ fn take_rates(vsock: &mut Option<VsockHost>) -> Result<(), String> {
     Ok(())
 }
 
-/// Answers each rate asked of this machine, in turn, until its muxer goes: the hold
-/// [`hold_rate`] makes of it, with its hold's period, or why not (`shards_abi::rate`).
-fn serve_rates(asked: &std::sync::mpsc::Receiver<(shards_vmm::platform::UnixStream, u64)>) {
-    use shards_abi::rate::{Answer, answer};
-    for (mut stream, milli) in asked {
-        let line = match rate_answer(shards_vmm::vm::hold_period(), || hold_rate(milli)) {
-            Ok((milli, period_ns)) => answer(&Answer::Held { milli, period_ns }),
-            Err(why) => answer(&Answer::Refused(&why)),
+/// Answers each ask of this machine, in turn, until its muxer goes (`shards_abi::rate`): a
+/// rate, with the hold [`hold_rate`] makes of it and its hold's period, or why not; its use,
+/// with [`use_answer`].
+fn serve_rates(
+    asked: &std::sync::mpsc::Receiver<(shards_vmm::platform::UnixStream, shards_abi::rate::Asked)>,
+) {
+    use shards_abi::rate::{Answer, Asked, answer};
+    for (mut stream, ask) in asked {
+        let line = match ask {
+            Asked::Rate(milli) => match rate_answer(|| hold_rate(milli)) {
+                Ok((milli, period_ns)) => answer(&Answer::Held { milli, period_ns }),
+                Err(why) => answer(&Answer::Refused(&why)),
+            },
+            Asked::Use => use_answer(guest_times, || {
+                shards_vmm::platform::process_usage(std::process::id())
+            }),
         };
         // Blocking: one line, which its socket takes whole, and its client waits for.
         let answered = stream
             .set_nonblocking(false)
             .and_then(|()| stream.write_all(line.as_bytes()));
         if let Err(e) = answered {
-            shards_vmm::debug!("a rate's answer: {e}");
+            shards_vmm::debug!("a host ask's answer: {e}");
         }
     }
 }
 
-/// What a rate's ask holds: what `hold` held the vCPUs to, none where it lets them be, and
-/// the hold's `period` in nanoseconds; or why not. A period no u64 counts in nanoseconds
-/// holds nothing, as no client could hear it.
-fn rate_answer(
-    period: std::time::Duration,
-    hold: impl FnOnce() -> Result<Option<std::num::NonZeroU64>, String>,
-) -> Result<(Option<std::num::NonZeroU64>, std::num::NonZeroU64), String> {
-    let Some(period_ns) = u64::try_from(period.as_nanos())
-        .ok()
-        .and_then(std::num::NonZeroU64::new)
-    else {
-        return Err(format!(
-            "its hold's period, {period:?}, is no nanoseconds a u64 counts"
-        ));
+/// What this machine's vCPUs have run of its guest, read by `guest`, then what this process
+/// has used of its host, read by `host` (D260): the later read holds the earlier, as an image
+/// run's stats read them (D241), so that the process's CPU time less its vCPUs' is its VMM's
+/// own and never less than none past the clocks' steps.
+fn use_answer(
+    guest: impl FnOnce() -> Result<shards_vmm::vm::GuestTimes, String>,
+    host: impl FnOnce() -> std::io::Result<shards_vmm::platform::Usage>,
+) -> String {
+    let guest = guest();
+    let host = host()
+        .map(|u| shards_abi::guest_time::HostUse {
+            cpu_ns: u.cpu_ns,
+            resident_bytes: u.resident,
+            footprint_bytes: u.footprint,
+        })
+        .map_err(|e| format!("its VM process: {e}"));
+    shards_abi::rate::used(
+        guest.as_ref().map_err(String::as_str),
+        host.as_ref().map_err(String::as_str),
+    )
+}
+
+/// What this machine used in all (D260's final use), as a use's answer says it: its vCPUs'
+/// whole guest time, read by `guest` once they have stopped, then this process's own use.
+fn final_use_of(guest: impl FnOnce() -> Result<shards_vmm::vm::GuestTimes, String>) -> String {
+    use_answer(guest, || shards_vmm::platform::process_usage(std::process::id()))
+}
+
+/// Tells a managed VM's keeper its final use, `used` (final_use.rs, D260): its length, a u32,
+/// big-endian, then it; then waits for the keeper's answer, which it gives once its record is
+/// in place, so that the record is there before this process ends and its client sees its
+/// end. A keeper that ended, or a channel that cannot be read (Windows' pipe, whose reader,
+/// the CLI, keeps it as this process ends), ends the wait.
+fn tell_final_use(mut to: std::fs::File, used: &str) {
+    let Ok(len) = u32::try_from(used.len()) else {
+        return;
     };
-    hold().map(|milli| (milli, period_ns))
+    if let Err(e) = to.write_all(&[&len.to_be_bytes()[..], used.as_bytes()].concat()) {
+        report(format_args!("telling its final use: {e}"));
+        return;
+    }
+    let _ = std::io::Read::read(&mut to, &mut [0u8; 1]);
+}
+
+/// What a rate's ask holds: what `hold` held the vCPUs to, none where it lets them be, and
+/// the period it holds over in nanoseconds, derived as it held them (D191); or why not. A
+/// period no u64 counts in nanoseconds, which no derived one is, is refused, as no client
+/// could hear it.
+pub(crate) fn rate_answer(
+    hold: impl FnOnce() -> Result<shards_vmm::vm::Rated, String>,
+) -> Result<(Option<std::num::NonZeroU64>, std::num::NonZeroU64), String> {
+    let rated = hold()?;
+    let period_ns = rated.period_ns().ok_or_else(|| {
+        format!(
+            "its hold's period, {:?}, is no nanoseconds a u64 counts",
+            rated.period
+        )
+    })?;
+    Ok((rated.milli, period_ns))
 }
 
 /// What each of this VM's vCPUs has run of its guest, by index, read now, and what those it
@@ -1100,6 +1217,15 @@ fn rate_answer(
 /// less theirs.
 pub fn guest_times() -> Result<shards_vmm::vm::GuestTimes, String> {
     Ok(RUNNING.get().ok_or("the microVM has not started")?.guest_times())
+}
+
+/// What each of this VM's vCPUs ran of its guest in all, by index, those gone among them
+/// (`Handle::whole_guest_times`): its whole once its machine is down.
+pub fn whole_guest_times() -> Result<shards_vmm::vm::GuestTimes, String> {
+    Ok(RUNNING
+        .get()
+        .ok_or("the microVM has not started")?
+        .whole_guest_times())
 }
 
 /// This VM paused where it is, every vCPU held out of its guest (`frozen`), or let go on
@@ -1565,6 +1691,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         workload,
         attach,
         said_to,
+        final_use,
         gpu_report,
         managed,
     } = match parsed(parse_run(args.into_iter()), RUN_USAGE) {
@@ -1578,6 +1705,13 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let said_to = match said_to.map(|to| handed("--said-to", to)).transpose() {
+        Ok(to) => to,
+        Err(e) => {
+            report(e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let final_use = match final_use.map(|to| handed("--final-use", to)).transpose() {
         Ok(to) => to,
         Err(e) => {
             report(e);
@@ -1618,17 +1752,17 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             if managed && let Ok((handle, _)) = &started {
                 let _ = RUNNING.set(handle.clone());
             }
-            supervise(started, cfg.console, false, said_to, input)
+            supervise(started, cfg.console, false, said_to, input, final_use)
         }
         Mode::Template(rootfs) => {
             boot_into(&mut cfg, rootfs, true);
             // Restored copies dial the host through this device, served by whatever
             // restores them.
             cfg.vsock.get_or_insert_with(VsockHost::default);
-            supervise(start(&cfg), cfg.console, true, said_to, input)
+            supervise(start(&cfg), cfg.console, true, said_to, input, None)
         }
         Mode::Workload(rootfs) => run_in(cfg, rootfs, &workload),
-        Mode::Warm { rootfs, fd } => warm_boot(cfg, rootfs, fd),
+        Mode::Warm { rootfs, fd } => warm_boot(cfg, rootfs, fd, gpu_report),
     }
 }
 
@@ -1640,12 +1774,23 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
         working_set_to,
         resume,
         said_to,
+        gpu_report,
     } = match parsed(parse_restore(args), RESTORE_USAGE) {
         Ok(restore) => restore,
         Err(code) => return code,
     };
+    let gpu_report = match gpu_report
+        .map(|request| handed("--gpu-report", request.to).map(|writer| (request.scope, writer)))
+        .transpose()
+    {
+        Ok(report) => report,
+        Err(why) => {
+            report(why);
+            return ExitCode::FAILURE;
+        }
+    };
     if let Some(fd) = warm {
-        return warm_restore(cfg, fd, resume);
+        return warm_restore(cfg, fd, resume, gpu_report);
     }
     let to = match working_set_to.map(WorkingSetTo::new).transpose() {
         Ok(to) => to,
@@ -1697,7 +1842,7 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
         (Ok((handle, _)), Some(to)) => to.hand_after(handle, RECORD_FOR),
         _ => None,
     };
-    let code = supervise(started, console, false, said_to, InputOwner::Console);
+    let code = supervise(started, console, false, said_to, InputOwner::Console, None);
     if let Some(h) = handing {
         h.now();
     }
@@ -1830,8 +1975,14 @@ enum Source<'a> {
 /// the device, its path in the workload and its access (D144).
 const RENDER_NODE: &[u8] = b"devices=-\0d\0/dev/dri/renderD128\0/dev/dri/renderD128\0rwm\0";
 
-/// A warm VM's restore: `vm restore DIR --warm FD`, or a run's, `--resume FD` (D176).
-fn warm_restore(mut cfg: RestoreConfig, fd: LinkArg, resume: bool) -> ExitCode {
+/// A warm VM's restore: `vm restore DIR --warm FD`, or a run's, `--resume FD` (D176); a warm
+/// one's GPU report written to `report_to` as its renderer rejoins its selection (D233).
+fn warm_restore(
+    mut cfg: RestoreConfig,
+    fd: LinkArg,
+    resume: bool,
+    report_to: Option<([u8; 16], std::fs::File)>,
+) -> ExitCode {
     let flag = if resume { "--resume" } else { "--warm" };
     let daemon = match daemon_link(flag, fd) {
         Ok(link) => link,
@@ -1843,12 +1994,18 @@ fn warm_restore(mut cfg: RestoreConfig, fd: LinkArg, resume: bool) -> ExitCode {
     cfg.console = Console::Discard;
     serve_workload(None, Source::Warm(daemon, resume), move |vsock| {
         cfg.vsock = Some(vsock);
-        restore_vm(cfg).map_err(vm::StartError::from)
+        restore_reported(cfg, report_to).map_err(vm::StartError::from)
     })
 }
 
-/// A warm VM's boot: `vm run --rootfs IMAGE [--snapshot-dir DIR] --warm FD`.
-fn warm_boot(mut cfg: Config, rootfs: PathBuf, fd: LinkArg) -> ExitCode {
+/// A warm VM's boot: `vm run --rootfs IMAGE [--snapshot-dir DIR] --warm FD`, its GPU report
+/// written to `report_to` as its renderer is made (D233).
+fn warm_boot(
+    mut cfg: Config,
+    rootfs: PathBuf,
+    fd: LinkArg,
+    report_to: Option<([u8; 16], std::fs::File)>,
+) -> ExitCode {
     let daemon = match daemon_link("--warm", fd) {
         Ok(link) => link,
         Err(e) => {
@@ -1862,7 +2019,7 @@ fn warm_boot(mut cfg: Config, rootfs: PathBuf, fd: LinkArg) -> ExitCode {
     crate::warm::HOST_DEVICES.store(!cfg.vfio.is_empty(), std::sync::atomic::Ordering::Relaxed);
     serve_workload(None, Source::Warm(daemon, false), move |vsock| {
         cfg.vsock = Some(vsock);
-        start(&cfg)
+        start_reported(&cfg, report_to)
     })
 }
 
@@ -1933,6 +2090,16 @@ fn serve_workload(
             ));
             engines
         });
+        // So may its members' MCP connections (D254), each its owner's: as its engine's,
+        // its port's connections wait for the run, which takes them or lets the port go.
+        let mcps = matches!(command, Command::Warm(..)).then(|| {
+            let (mcp_port, mcps) = std::sync::mpsc::channel();
+            vsock.every.push((
+                shards_abi::run::MCP_PORT,
+                shards_vmm::vm::ServedPort::Ringed(mcp_port),
+            ));
+            mcps
+        });
         // A warm VM's signals come from its client. The command line's are this process's:
         // blocked before the VM's threads start, so that they inherit the mask.
         // One workload a process (M34): what its threads share lives as long as they do.
@@ -1940,6 +2107,11 @@ fn serve_workload(
         static TIMING: workload::Timing = workload::Timing::new();
         let to_guest = &TO_GUEST;
         let warm = matches!(command, Command::Warm(..));
+        // The run a warm VM took (`warm::receive`, as it says TAKEN): its end goes to its owner
+        // once (`warm::Taken::end`), and what its machine used in all once it is down (D260's
+        // final use) on a handle of the link of its own, from this thread, beside the
+        // workload's end, in no order between them. A VM that took none tells neither.
+        static TAKEN: std::sync::OnceLock<crate::warm::Taken> = std::sync::OnceLock::new();
         if let Command::Given { interactive, .. } = &command {
             // SAFETY: isatty(3) on this process's stdin.
             let reads_terminal = *interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -2022,9 +2194,8 @@ fn serve_workload(
                         )
                     }
                     Command::Warm(link, resumed) => {
-                        let client: std::sync::OnceLock<Option<shards_ipc::Stream>> =
-                            std::sync::OnceLock::new();
                         let engines = std::cell::Cell::new(engines);
+                        let mcps = std::cell::Cell::new(mcps);
                         let started = || {
                             crate::warm::started(&link);
                             end_recording_in(&stopper, RECORD_FOR);
@@ -2033,32 +2204,24 @@ fn serve_workload(
                         };
                         // The daemon and the client hear how the command ended as soon as it
                         // has, before its layer is saved (D37): once, here or after.
-                        let finished = std::sync::atomic::AtomicBool::new(false);
                         let finish = |served: &Result<workload::Ended, String>| {
-                            if finished.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                                return;
-                            }
-                            let Some(connection) = client.get() else {
+                            let Some(taken) = TAKEN.get() else {
                                 return;
                             };
-                            let timing = timing
-                                .asked
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .then(|| timing_json(&stopper, Some(timing)));
-                            // What the run touched goes to the daemon with its end, for the
-                            // template it was restored from, which no VM writes (D30). A
-                            // failure costs later runs their prefetch, and nothing else.
-                            let working_set = stopper.take_working_set().unwrap_or_else(|e| {
-                                shards_vmm::debug!("{e}");
-                                None
+                            taken.end(&link, served, || {
+                                let timing = timing
+                                    .asked
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    .then(|| timing_json(&stopper, Some(timing)));
+                                // What the run touched goes to the daemon with its end, for the
+                                // template it was restored from, which no VM writes (D30). A
+                                // failure costs later runs their prefetch, and nothing else.
+                                let working_set = stopper.take_working_set().unwrap_or_else(|e| {
+                                    shards_vmm::debug!("{e}");
+                                    None
+                                });
+                                (timing, working_set)
                             });
-                            crate::warm::finish(
-                                &link,
-                                connection.as_ref(),
-                                served,
-                                timing.as_deref(),
-                                working_set.as_ref(),
-                            );
                         };
                         let saved = |used| crate::warm::layer_saved(&link, used);
                         // A layer that stays in its file (D190) is the daemon's to read
@@ -2074,13 +2237,14 @@ fn serve_workload(
                         let members = |ended: &[u8]| crate::warm::member_ended(&link, ended);
                         let readiness = |ready: &[u8]| crate::warm::workload_ready(&link, ready);
                         let host_net = |frame: &[u8]| crate::warm::host_net(&link, frame);
-                        let ask = || {
+                        let set_up = || {
                             // A template this VM saved is in place before the daemon hears the
                             // VM is ready, and settles it: its commit runs as the guest does.
                             // Its directory is given up before the run comes.
                             // Its directory is given up before the daemon hears it is ready,
-                            // and out of its reach before it takes the run. What fails is
-                            // said here, in its daemon's log, before its link closes.
+                            // and out of its reach before it takes the run. What fails before
+                            // it takes the run is said here, in its daemon's log, before its
+                            // link closes; what fails after, its end says (`warm::Taken::end`).
                             stopper.wait_for_snapshot();
                             seal().inspect_err(|e| report(e))?;
                             let request = crate::warm::receive(
@@ -2088,30 +2252,56 @@ fn serve_workload(
                                 to_guest,
                                 &|| moved().inspect_err(|e| report(e)),
                                 resumed,
+                                &TAKEN,
                             )
-                            .inspect_err(|e| report(e))?;
+                            .inspect_err(|e| {
+                                if TAKEN.get().is_none() {
+                                    report(e);
+                                }
+                            })?;
                             layer_stays.store(
                                 request.layer_out.is_some() && crate::vm_run::layered(),
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                             // Its own engine (D181), before its guest hears of the run, where
                             // it has one; where not, its port is let go, and refuses. A resumed
-                            // run's token comes after its save's (D176): its guest's relay says
-                            // the one it said before.
-                            let (tokens, engine) = match &request.tokens {
-                                Some(t) => {
-                                    let (run, engine) = t.split_at_checked(2 * shards_abi::run::TOKEN).unwrap_or((t, &[]));
-                                    (Some(run.to_vec()), <[u8; shards_abi::run::TOKEN]>::try_from(engine).ok())
-                                }
-                                None => (None, crate::warm::engine_token(&request.spec)),
+                            // run's tokens come after its save's (D176): its guest's relay says
+                            // the ones it said before.
+                            let brought = request
+                                .tokens
+                                .as_deref()
+                                .map(|t| {
+                                    crate::warm::resumed_tokens(t)
+                                        .ok_or_else(|| "a resumed run's tokens, malformed".to_string())
+                                })
+                                .transpose()
+                                ?;
+                            let (tokens, engine, mcp) = match &brought {
+                                Some((run, kept)) => (
+                                    Some(run.to_vec()),
+                                    crate::warm::engine_token(kept),
+                                    crate::warm::mcp_token(kept),
+                                ),
+                                None => (
+                                    None,
+                                    crate::warm::engine_token(&request.spec),
+                                    crate::warm::mcp_token(&request.spec),
+                                ),
                             };
+                            drop(brought);
                             let engine_served = match (engines.take(), engine) {
                                 (Some(engines), Some(token)) => {
-                                    crate::warm::serve_engine(&link, token, engines).inspect_err(|e| report(e))?;
+                                    crate::warm::serve_engine(&link, token, engines)?;
                                     true
                                 }
                                 _ => false,
                             };
+                            // Its members' MCP connections (D254), where it asks for them,
+                            // before its guest hears of the run; where not, its port is let
+                            // go, and refuses. A resumed run's token is its save's (D176).
+                            if let (Some(mcps), Some(token)) = (mcps.take(), mcp) {
+                                crate::warm::serve_mcp(&link, token, mcps)?;
+                            }
                             // The run's own most memory to plug, before its guest hears of
                             // it (D148), none included: the template's is the host's. A VM
                             // with none to plug has what it booted with.
@@ -2123,14 +2313,14 @@ fn serve_workload(
                             // guest does.
                             stopper
                                 .hold_rate(u64::from(request.cpus).saturating_mul(vm::MILLI_PER_CPU))
-                                .inspect_err(|e| report(e))?;
+                                ?;
                             // Its group's CPU budget too (D183), which every microVM of
                             // the group charges, before its guest hears of the run.
                             if let Some(file) = request.group {
                                 shards_vmm::vm::group::GroupCpu::map(file)
                                     .map_err(|e| format!("its group's CPU budget: {e}"))
                                     .and_then(|group| stopper.hold_group(group))
-                                    .inspect_err(|e| report(e))?;
+                                    ?;
                             }
                             // Its I/O limits, before its guest hears of the run (D178).
                             IO.set(request.io.0, request.io.1);
@@ -2148,7 +2338,7 @@ fn serve_workload(
                                     stopper
                                         .stage_layer(file)
                                         .map_err(|e| format!("its writable layer: {e}"))
-                                        .inspect_err(|e| report(e))?;
+                                        ?;
                                     (None, true)
                                 }
                                 layer_in => (layer_in, false),
@@ -2162,12 +2352,12 @@ fn serve_workload(
                                 Some(file) if resumed => stopper
                                     .restore_swap(file)
                                     .map_err(|e| format!("its swap: {e}"))
-                                    .inspect_err(|e| report(e))?,
+                                    ?,
                                 Some(file) => {
                                     if let Some(len) = stopper
                                         .attach_swap(file)
                                         .map_err(|e| format!("its swap: {e}"))
-                                        .inspect_err(|e| report(e))?
+                                        ?
                                     {
                                         spec.setup.push(format!("swap={len}").into_bytes());
                                     }
@@ -2180,7 +2370,7 @@ fn serve_workload(
                             // such a guest.
                             let conns = match &tokens {
                                 Some(tokens) => {
-                                    let conns = workload::await_resumed(tokens).inspect_err(|e| report(e))?;
+                                    let conns = workload::await_resumed(tokens)?;
                                     let abi = stopper.guest_abi();
                                     if abi != Some(shards_abi::IDENTITY) {
                                         let spoken = abi.map_or_else(|| "none".to_string(), |abi| format!("{abi:016x}"));
@@ -2200,7 +2390,6 @@ fn serve_workload(
                             timing
                                 .asked
                                 .store(request.timing, std::sync::atomic::Ordering::Relaxed);
-                            let _ = client.set(request.client);
                             Ok(workload::Asked {
                                 spec,
                                 capture: request.capture,
@@ -2221,6 +2410,16 @@ fn serve_workload(
                                 resumed: conns,
                             })
                         };
+                        // A run taken whose setup failed leaves its guest waiting for a
+                        // command that never comes: its machine stops, as one with no run
+                        // taken does below, and its end is told after `serve` returns.
+                        let ask = || {
+                            set_up().inspect_err(|_| {
+                                if TAKEN.get().is_some() {
+                                    stopper.stop();
+                                }
+                            })
+                        };
                         let ports = (!resumed).then_some((&listener, signals));
                         let served = workload::serve(
                             ports,
@@ -2229,14 +2428,14 @@ fn serve_workload(
                             timing,
                             &guest_abi,
                         );
-                        // Some once the request came: its client, if it has one. A run that
-                        // failed before its end was told is told now.
-                        let outcome = match client.get() {
+                        // A run taken that failed before its end was told, its setup after
+                        // TAKEN among them, is told now: exactly one end on its link.
+                        let outcome = match TAKEN.get() {
                             Some(_) => {
                                 finish(&served);
                                 (served, true)
                             }
-                            // The daemon went without a request: nobody will ever send one.
+                            // No run taken: its daemon reads the VM's end where TAKEN would be.
                             None => {
                                 stopper.stop();
                                 (served, false)
@@ -2265,7 +2464,14 @@ fn serve_workload(
             handle.stop();
             return failed(format!("workload thread: {e}"));
         }
-        let reason = running.wait_then(crate::warm::tell_kept);
+        // Once every vCPU has stopped, past its guest's last instruction, and before this
+        // process lets go of its memory: what it used in all, read then, is its whole.
+        let reason = running.wait_then(|| {
+            crate::warm::tell_kept();
+            if let Some(link) = TAKEN.get().and_then(crate::warm::Taken::final_link) {
+                crate::warm::final_use(link, &final_use_of(whole_guest_times));
+            }
+        });
         // Its joiners (D119), which the guest ended with its workload, tell the daemon how
         // each ended before this process goes, as the relay has had 5 s to (below).
         crate::warm::await_joiners(std::time::Duration::from_secs(5));
@@ -2526,7 +2732,16 @@ fn snapshots() -> Result<(), String> {
 }
 
 /// [`start`] for a restore: the snapshot's directory, and the files it restores against.
-fn restore_vm(mut cfg: RestoreConfig) -> Result<(Handle, Running), String> {
+fn restore_vm(cfg: RestoreConfig) -> Result<(Handle, Running), String> {
+    restore_reported(cfg, None)
+}
+
+/// [`restore_vm`], its renderer's report written to `report_to` as it rejoins its snapshot's
+/// selection, before any guest vCPU runs (D233), as [`start_reported`]'s boot writes its own.
+fn restore_reported(
+    mut cfg: RestoreConfig,
+    report_to: Option<([u8; 16], std::fs::File)>,
+) -> Result<(Handle, Running), String> {
     for path in std::iter::once(&mut cfg.dir)
         .chain(cfg.snapshot.as_mut().map(|p| &mut p.dir))
         .chain(cfg.vsock.as_mut().and_then(|v| v.path.as_mut()))
@@ -2654,7 +2869,17 @@ fn restore_vm(mut cfg: RestoreConfig) -> Result<(Handle, Running), String> {
     if pinned.snapshot.config.join_share {
         cfg.join_share = Some(give_join_share());
     }
-    vm::restore_from(&cfg, pinned)
+    match report_to {
+        None => vm::restore_from(&cfg, pinned),
+        Some((scope, writer)) => {
+            let mut writer = Some(writer);
+            vm::restore_reported(
+                &cfg,
+                pinned,
+                Some(&mut |selection| write_report(&mut writer, scope, selection)),
+            )
+        }
+    }
 }
 
 /// `path` made whole against the working directory, and normalized as
@@ -2712,9 +2937,10 @@ fn sealing(paths: &crate::confine::Paths, snapshot: Option<&Path>) {
 
 /// Gives up the directory of the snapshot this VM saved, committed by now, before its
 /// spawner hears it is ready, and so before anything of a run's workload runs in its
-/// guest. On Linux, a Landlock layer without it, checked: making a file there must be
-/// refused. Nothing of the snapshot is open by then (vmm snapshot::Staged::commit closes
-/// its files), and Landlock takes back nothing open. On macOS nothing can be given up:
+/// guest. On Linux, a Landlock layer without it, on every thread (its vCPUs' and devices'
+/// among them, `confine::landlock`), checked: making a file there must be refused.
+/// Nothing of the snapshot is open by then (vmm snapshot::Staged::commit closes its
+/// files), and Landlock takes back nothing open. On macOS nothing can be given up:
 /// App Sandbox's grants last the process's life (PM M102); [`moved`] holds instead. A VM
 /// that saved no snapshot has nothing to give up.
 fn seal() -> Result<(), String> {
@@ -2775,10 +3001,8 @@ fn written(paths: &mut crate::confine::Paths, snapshot: Option<&Path>, vsock: Op
     if let Some(dir) = snapshot {
         let _ = std::fs::create_dir_all(dir);
     }
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        paths.vsock = vsock.map(Path::to_path_buf);
-    }
+    paths.vsock = vsock.map(Path::to_path_buf);
+    // Where its socket, which its spawner binds for it, is removed as its device goes.
     #[cfg(not(any(target_os = "macos", windows)))]
     paths
         .sockets_under
@@ -2786,8 +3010,8 @@ fn written(paths: &mut crate::confine::Paths, snapshot: Option<&Path>, vsock: Op
 }
 
 /// The socket this VM asks its spawner for access on (`--grants FD`): one a process, as
-/// its VM is.
-#[cfg(target_os = "macos")]
+/// its VM is. On Linux, for its vsock path and its dials beside it alone.
+#[cfg(unix)]
 static GRANTS: std::sync::OnceLock<std::os::unix::net::UnixStream> = std::sync::OnceLock::new();
 
 /// The pipes this VM asks its spawner for access on (`--grants HANDLE`): taken, and so
@@ -2850,7 +3074,7 @@ fn net_host(spec: &str) -> Result<shards_vmm::devices::virtio::net::NetHost, Str
     let wake_me = adopt("WAKE_ME", me)?;
     let wake_peer = adopt("WAKE_PEER", peer)?;
     let mac = mac
-        .parse::<shards_net::Mac>()
+        .parse::<shards_ipc::Mac>()
         .map_err(|e| format!("--net: {e}"))?
         .0;
     // Asked as the command ends, so that what it sent goes before the run does.
@@ -2915,7 +3139,7 @@ fn net_host(spec: &str) -> Result<shards_vmm::devices::virtio::net::NetHost, Str
         crate::warm::adopt_release(release)?;
     }
     let mac = spec
-        .parse::<shards_net::Mac>()
+        .parse::<shards_ipc::Mac>()
         .map_err(|e| format!("--net: {e}"))?
         .0;
     // Asked as the command ends, so that what it sent goes before the run does.
@@ -2950,14 +3174,11 @@ fn served_shares(cfg: &mut Config, served: &[i32], warm: bool) -> Result<(), Str
         return Ok(());
     }
     served_beside_daemon(cfg, warm, "--slates-fs-fd")?;
-    // The socket `--grants` took, where the VM process asks a broker for access (macOS).
-    #[cfg(target_os = "macos")]
+    // The socket `--grants` took, where the VM process asks a broker for access.
     let grants = {
         use std::os::fd::AsRawFd as _;
         GRANTS.get().map(|link| link.as_raw_fd())
     };
-    #[cfg(not(target_os = "macos"))]
-    let grants: Option<i32> = None;
     for (i, &fd) in served.iter().enumerate() {
         if served.iter().take(i).any(|&other| other == fd) || grants == Some(fd) {
             return Err(format!("--slates-fs-fd {fd}: given twice"));
@@ -3010,8 +3231,8 @@ fn served_shares(cfg: &mut Config, served: &[String], warm: bool) -> Result<(), 
     Ok(())
 }
 
-/// Takes the socket at descriptor `fd` to ask the spawner for access on (macOS).
-#[cfg(target_os = "macos")]
+/// Takes the socket at descriptor `fd` to ask the spawner for access on.
+#[cfg(unix)]
 fn grants(fd: &str) -> Result<(), String> {
     let fd = fd
         .parse::<i32>()
@@ -3057,11 +3278,6 @@ fn grants(pipe: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
-fn grants(_: &str) -> Result<(), String> {
-    Err("--grants: macOS and Windows alone grant a VM its files".into())
-}
-
 /// On macOS, where the VM process is in App Sandbox from its launch, asks its spawner for
 /// `wanted` (grant). It fails closed, as Landlock does: a VM process not signed into App
 /// Sandbox starts no VM.
@@ -3085,6 +3301,22 @@ fn ask(wanted: &[crate::grant::Wanted]) -> Result<(), String> {
 /// anything but `shards`, starts no VM.
 #[cfg(windows)]
 fn ask(wanted: &[crate::grant::Wanted]) -> Result<(), String> {
+    asked(wanted, crate::grant_ask::obtain)
+}
+
+/// [`ask`] for the last grants this VM asks for, its grants sealed after them, before its
+/// guest starts (`grant_ask::obtain_sealed`).
+#[cfg(windows)]
+fn ask_sealed(wanted: &[crate::grant::Wanted]) -> Result<(), String> {
+    asked(wanted, crate::grant_ask::obtain_sealed)
+}
+
+/// `wanted` asked of this VM's spawner by `obtain`, in an AppContainer alone.
+#[cfg(windows)]
+fn asked(
+    wanted: &[crate::grant::Wanted],
+    obtain: fn(&crate::grant::Link, &[crate::grant::Wanted]) -> Result<(), String>,
+) -> Result<(), String> {
     if !shards_ipc::in_app_container() {
         return Err(
             "shards-vm is not in an AppContainer, which confines every VM on Windows: start it with \
@@ -3096,7 +3328,7 @@ fn ask(wanted: &[crate::grant::Wanted]) -> Result<(), String> {
     let link = grants.as_ref().ok_or(
         "nothing was granted to this VM: start it with `shards run vm --kernel`, which grants it its files",
     )?;
-    crate::grant_ask::obtain(link, wanted)
+    obtain(link, wanted)
 }
 
 /// `paths` as the VM asks for them: files it reads read-only, files it writes read-write,
@@ -3122,12 +3354,20 @@ fn granted(paths: &crate::confine::Paths) -> Result<(), String> {
         .chain(paths.write_under.iter().map(|p| (Access::MakeDir, p.clone())))
         .chain(paths.vsock.iter().map(|p| (Access::Listen, p.clone())))
         .collect();
-    ask(&wanted)
+    // The last it asks for: on macOS its link closes after unless it dials (`confine`); on
+    // Windows it stays, for its dials, its files' ranges and its snapshots (D196), and its
+    // grants are sealed.
+    #[cfg(target_os = "macos")]
+    let last = ask;
+    #[cfg(windows)]
+    let last = ask_sealed;
+    last(&wanted)
 }
 
 /// Has the spawner dial, beside `vsock`, every host port the guest connects to: App
-/// Sandbox lets this process dial nothing outside its container (PM M67).
-#[cfg(target_os = "macos")]
+/// Sandbox lets this process dial nothing outside its container (PM M67), and on Linux
+/// its filter refuses it every connect (D30).
+#[cfg(unix)]
 fn dial_through_spawner(vsock: &Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt as _;
     static DIALING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3252,16 +3492,36 @@ fn confine(paths: &crate::confine::Paths) -> Result<(), String> {
             Ok(())
         }
     });
+    // Its sockets narrowed, every connect refused, then Landlock, on every thread; and
+    // its vsock path bound, and its dials beside it made, by its spawner (D30), whose link
+    // closes where it has none to make.
     #[cfg(target_os = "linux")]
-    return crate::confine::landlock(paths);
+    return crate::confine::sockets()
+        .and_then(|()| crate::confine::landlock(paths))
+        .and_then(|()| match &paths.vsock {
+            Some(vsock) => {
+                let link = GRANTS.get().ok_or(
+                    "a VM given a vsock path has its spawner bind it and dial beside it: start it with \
+                     `shards run vm --kernel` or `shards restore vm`, which answer it (--grants)",
+                )?;
+                crate::grant_ask::listen_at(link, vsock)?;
+                dial_through_spawner(vsock)
+            }
+            None => {
+                if let Some(link) = GRANTS.get() {
+                    shards_ipc::end(link);
+                }
+                Ok(())
+            }
+        });
     // As on macOS; and once its partition is set up, before anything of its guest's is
-    // read, this process forbids itself dynamic code (D141, PM M202). Its snapshots its
-    // spawner stages, over the link (D196), which stays open for them.
+    // read, this process forbids itself dynamic code (D141, PM M202). Its grants are sealed
+    // as they are granted (`ask_sealed`), and the link stays for what its spawner does for
+    // it after: its dials, its files' ranges and its snapshots (D196).
     #[cfg(windows)]
     {
         shards_vmm::hv::forbid_dynamic_code_once_set_up();
         granted(paths)?;
-        let stages = !paths.write_under.is_empty();
         // Its spawner stages its snapshots and reads its files' ranges for it, as long as
         // the link stays: it may make no FSCTL (D141), and a restore copies a template's
         // writable layer by its ranges (D196), as any save of it copies its layer and swap
@@ -3271,17 +3531,7 @@ fn confine(paths: &crate::confine::Paths) -> Result<(), String> {
         shards_vmm::platform::set_stager(Box::new(SpawnerStages))?;
         match &paths.vsock {
             Some(vsock) => dial_through_spawner(vsock),
-            None if stages => Ok(()),
-            // Nothing more asked of the spawner but ranges, which it answers on the link it
-            // keeps: no grant after (`SEALED`).
-            None => {
-                let grants = GRANTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                match grants.as_ref() {
-                    Some(link) => shards_ipc::write_message(&link.to, shards_ipc::kind::SEALED, &[])
-                        .map_err(|e| format!("sealing its grants: {e}")),
-                    None => Ok(()),
-                }
-            }
+            None => Ok(()),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -3300,6 +3550,7 @@ fn supervise(
     template: bool,
     said_to: Option<std::fs::File>,
     input: InputOwner,
+    final_use: Option<std::fs::File>,
 ) -> ExitCode {
     let (handle, running) = match started {
         Ok(v) => v,
@@ -3312,7 +3563,12 @@ fn supervise(
     if matches!(input, InputOwner::Console) {
         forward_stdin(handle.clone());
     }
-    let reason = running.wait();
+    // Its final use told once every vCPU has stopped and before its memory goes (D260).
+    let reason = running.wait_then(|| {
+        if let Some(to) = final_use {
+            tell_final_use(to, &final_use_of(whole_guest_times));
+        }
+    });
     drop(terminal);
     report_timing(&handle, None);
     match reason {
@@ -3372,35 +3628,42 @@ fn last_said(said: &[u8], report: shards_abi::bounds::ConsoleReport) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod rate_tests {
-    use super::{rate_answer, serve_rates};
+    use super::{rate_answer, serve_rates, use_answer};
     use shards_abi::rate::{Answer, read_answer};
     use std::io::Read as _;
     use std::num::NonZeroU64;
     use std::time::Duration;
 
-    /// A rate's answer is what its hold held the vCPUs to, a rate or none, with the hold's
-    /// period in nanoseconds, or the hold's words of why not; a period no u64 counts in
-    /// nanoseconds asks for no hold at all (D255).
+    /// A rate's answer is what its hold held the vCPUs to, a rate or none, with the period
+    /// the hold derived for it in nanoseconds (D191), or the hold's words of why not; a
+    /// period no u64 counts in nanoseconds, or none, is refused (D255).
     #[test]
     fn a_rates_answer_is_its_hold_and_its_period() {
-        let period = Duration::from_millis(100);
-        let ns = NonZeroU64::new(100_000_000).unwrap();
+        let rated = |milli, period| {
+            move || {
+                Ok(shards_vmm::vm::Rated {
+                    milli: NonZeroU64::new(milli),
+                    period,
+                })
+            }
+        };
+        let ns = |n| NonZeroU64::new(n).unwrap();
         assert_eq!(
-            rate_answer(period, || Ok(NonZeroU64::new(250))),
-            Ok((NonZeroU64::new(250), ns))
+            rate_answer(rated(250, Duration::from_millis(16))),
+            Ok((NonZeroU64::new(250), ns(16_000_000)))
         );
-        assert_eq!(rate_answer(period, || Ok(None)), Ok((None, ns)));
         assert_eq!(
-            rate_answer(period, || Err("the microVM has not started".into())),
+            rate_answer(rated(0, Duration::from_micros(1_050))),
+            Ok((None, ns(1_050_000)))
+        );
+        assert_eq!(
+            rate_answer(|| Err("the microVM has not started".into())),
             Err("the microVM has not started".into())
         );
-        let mut asked = false;
-        let refused = rate_answer(Duration::MAX, || {
-            asked = true;
-            Ok(None)
-        });
-        assert!(refused.is_err(), "{refused:?}");
-        assert!(!asked, "a period no client could hear holds nothing");
+        for unsaid in [Duration::MAX, Duration::ZERO] {
+            let refused = rate_answer(rated(250, unsaid));
+            assert!(refused.is_err(), "{refused:?}");
+        }
     }
 
     /// Each rate the muxer hands over is answered on its own connection, one line, then
@@ -3410,7 +3673,9 @@ mod rate_tests {
         let (asks, asked) = std::sync::mpsc::channel();
         let (ours, mut theirs) = shards_vmm::platform::UnixStream::pair().unwrap();
         ours.set_nonblocking(true).unwrap();
-        asks.send((ours, 250)).unwrap();
+        asks.send((ours, shards_abi::rate::Asked::Rate(250))).unwrap();
+        let (ours, mut used) = shards_vmm::platform::UnixStream::pair().unwrap();
+        asks.send((ours, shards_abi::rate::Asked::Use)).unwrap();
         drop(asks);
         serve_rates(&asked);
         let mut line = String::new();
@@ -3419,6 +3684,92 @@ mod rate_tests {
             read_answer(line.as_bytes()).unwrap(),
             Answer::Refused("the microVM has not started")
         );
+        // Its use, with no machine running here: its guest's refusal, and this process's own
+        // use, read as the VM process reads its own.
+        let mut answer = String::new();
+        used.read_to_string(&mut answer).unwrap();
+        let read = shards_abi::rate::read_used(answer.as_bytes()).unwrap();
+        assert_eq!(read.guest, Err("the microVM has not started"));
+        assert!(read.host.unwrap().cpu_ns > 0, "{answer}");
+    }
+
+    /// A use's answer reads its guest's times first, then its process's use, which holds them
+    /// (D260): each its reading, or its words of why not, the process's named.
+    #[test]
+    fn a_uses_answer_reads_the_guest_then_its_process() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let times = shards_vmm::vm::GuestTimes {
+            vcpus: vec![shards_vmm::vm::VcpuTime {
+                index: 0,
+                guest_ns: 40,
+                unread: None,
+            }],
+            departed_ns: 2,
+        };
+        let usage = shards_vmm::platform::process_usage(std::process::id()).unwrap();
+        let answer = use_answer(
+            || {
+                order.borrow_mut().push("guest");
+                Ok(times.clone())
+            },
+            || {
+                order.borrow_mut().push("host");
+                Ok(usage)
+            },
+        );
+        assert_eq!(*order.borrow(), ["guest", "host"]);
+        let read = shards_abi::rate::read_used(answer.as_bytes()).unwrap();
+        assert_eq!(read.guest, Ok(times));
+        let host = read.host.unwrap();
+        assert_eq!(
+            (host.cpu_ns, host.resident_bytes, host.footprint_bytes),
+            (usage.cpu_ns, usage.resident, usage.footprint)
+        );
+        let refused = use_answer(
+            || Err("the microVM has not started".into()),
+            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        );
+        let read = shards_abi::rate::read_used(refused.as_bytes()).unwrap();
+        assert_eq!(read.guest, Err("the microVM has not started"));
+        assert!(
+            read.host.unwrap_err().starts_with("its VM process: "),
+            "{refused}"
+        );
+    }
+
+    /// A VM's final use (D260) is its vCPUs' whole guest time, read first, then this
+    /// process's own use, read after it: never less CPU than a reading before the final one.
+    #[test]
+    fn a_final_use_reads_its_whole_guest_then_its_process() {
+        let times = shards_vmm::vm::GuestTimes {
+            vcpus: vec![
+                shards_vmm::vm::VcpuTime {
+                    index: 0,
+                    guest_ns: 7,
+                    unread: None,
+                },
+                shards_vmm::vm::VcpuTime {
+                    index: 3,
+                    guest_ns: 11,
+                    unread: Some(shards_abi::guest_time::Unread::Gone),
+                },
+            ],
+            departed_ns: 0,
+        };
+        let before = shards_vmm::platform::process_usage(std::process::id()).unwrap();
+        let read = std::cell::Cell::new(false);
+        let answer = super::final_use_of(|| {
+            read.set(true);
+            Ok(times.clone())
+        });
+        assert!(read.get());
+        let used = shards_abi::rate::read_used(answer.as_bytes()).unwrap();
+        assert_eq!(used.guest, Ok(times));
+        assert!(used.host.unwrap().cpu_ns >= before.cpu_ns, "{answer}");
+        let unstarted = super::final_use_of(|| Err("the microVM has not started".into()));
+        let used = shards_abi::rate::read_used(unstarted.as_bytes()).unwrap();
+        assert_eq!(used.guest, Err("the microVM has not started"));
+        assert!(used.host.is_ok(), "{unstarted}");
     }
 }
 
@@ -3460,6 +3811,44 @@ mod managed_report_tests {
         ];
         args.extend_from_slice(extra);
         parse_run(args.into_iter().map(OsString::from))
+    }
+
+    /// D233: a warm boot and a warm restore write a GPU report of the scope their spawner (an
+    /// orchestrator's run host) names, as a direct boot does; a warm boot of no selection, a
+    /// resumed run's restore, a restore not warm, and either flag alone are refused.
+    #[test]
+    fn a_warm_boot_and_a_warm_restore_report_their_spawners_scope() {
+        let scope = "03".repeat(16);
+        let target = if cfg!(windows) { "gpu-report" } else { "9" };
+        let link = if cfg!(windows) { "daemon" } else { "3" };
+        let report = ["--gpu-report", target, "--gpu-report-scope", scope.as_str()];
+        let words = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
+        let mut warm = vec!["--rootfs", "/image", "--warm", link];
+        warm.extend(report);
+        let run = parse(&warm).unwrap();
+        assert!(matches!(run.mode, Mode::Warm { .. }));
+        assert_eq!(run.gpu_report.unwrap().scope, [3; 16]);
+        let mut bare = vec!["--kernel", "/k", "--rootfs", "/image", "--warm", link];
+        bare.extend(report);
+        assert!(parse_run(words(&bare).into_iter()).is_err());
+        let restore = |extra: &[&str]| {
+            let mut w = vec!["/t"];
+            w.extend_from_slice(extra);
+            parse_restore(words(&w).into_iter())
+        };
+        let mut warmed = vec!["--warm", link];
+        warmed.extend(report);
+        assert_eq!(restore(&warmed).unwrap().gpu_report.unwrap().scope, [3; 16]);
+        let mut resumed = vec!["--resume", link];
+        resumed.extend(report);
+        assert!(restore(&resumed).is_err());
+        assert!(restore(&report).is_err());
+        assert!(restore(&["--warm", link, "--gpu-report", target]).is_err());
+        assert!(restore(&["--warm", link, "--gpu-report-scope", &scope]).is_err());
+        assert!(restore(&["--warm", link]).unwrap().gpu_report.is_none());
+        let mut aliased = vec!["--warm", target];
+        aliased.extend(report);
+        assert!(restore(&aliased).is_err());
     }
 
     #[test]
@@ -3509,6 +3898,7 @@ mod managed_report_tests {
                 target,
                 "--gpu-report-scope",
                 &scope,
+                // A warm boot reports (D233), but never on its link's own descriptor.
                 "--rootfs",
                 "/image",
                 "--warm",
@@ -3637,7 +4027,7 @@ mod gpu_device_tests {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
-    use vm::gpu_selection::{MAX_PHYSICAL_GPUS, PhysicalGpuError};
+    use vm::gpu_selection::PhysicalGpuError;
 
     /// The system's allocator, counting what the thread that asks allocates while it asks
     /// ([`allocations`]): no other test of this binary asks.
@@ -3736,16 +4126,6 @@ mod gpu_device_tests {
         assert_eq!(
             refusal(repeated),
             format!("--gpu-device: {}", PhysicalGpuError::Duplicate)
-        );
-    }
-
-    /// D232: one identity past the physical device-index space is refused at its flag.
-    #[test]
-    fn a_gpu_device_past_the_index_space_is_refused() {
-        let past = (0..=MAX_PHYSICAL_GPUS).flat_map(|i| flag(&format!("luid:{i:x}")));
-        assert_eq!(
-            refusal(past),
-            "--gpu-device count exceeds the physical device-index space"
         );
     }
 }

@@ -30,10 +30,13 @@ own = ["UPSTREAM.md"]
 # copy (Cargo.toml [patch.crates-io]), as kiln patches the same names. Not hyper-rt or hyper-rt-transport:
 # Hex drives the sans-IO endpoint from a thread of its own (docs/design/hex-quic.md Q2). When hyper-raft
 # publishes these behind an -api crate, Hex depends on that by name and this entry goes.
+# At e0613f52: patch Q35 (hyper-quic's `Connection::handshake_progress`) on hyper-raft's branch
+# p/q35-handshake-progress-v1, main-bound (its main fast-forwards to this commit once its consumers' suites pass),
+# the commit Shards' shards-remote takes hyper-quic at (vendor/shards); kiln takes the same as it vendors this Hex.
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
+commit = "e0613f524b0df198cc61dc1e82b33c22d604cf7b"
 path = "vendor/hyper-raft"
 take = [
     "Cargo.toml",
@@ -113,9 +116,9 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "740fa37268c9200616f6fd543d96625953e23b81"
+commit = "fa953e3cef311caedee3155d0dcbbfe4243bc504"
 path = "vendor/shards"
-take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/dns", "crates/ipc", "crates/remote", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
+take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/dns", "crates/ipc", "crates/remote", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/borrowed-no-clock/focused.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
 own = ["Cargo.toml", "UPSTREAM.md"]
 
 # Firecracker (AWS): the VMM Hex's `firecracker` class launches (crates/hex-runtime/src/firecracker; its

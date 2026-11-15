@@ -31,9 +31,10 @@ fn profile() -> hex_api::RuntimeCost {
         },
     }
 }
+/// A Live shared backing, its guest measured as it went Live at nothing of its own (joint plan step 14, C7, pin 1).
 fn backing() -> BackingOffer {
     BackingOffer {
-        guest: Default::default(),
+        guest: measured(0, 0),
         key: BackingKey {
             pool: [1; 32],
             generation: [2; 16],
@@ -99,6 +100,7 @@ fn node(os: Os) -> NodeSpec {
             offers,
             device_routes: Vec::new(),
             backings: vec![backing],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -212,6 +214,7 @@ fn two_cpu_shared_oci_and_one_gpu_dedicated_oci_pay_two_vm_envelopes() {
             ],
             device_routes: vec![2],
             backings: vec![shared],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -284,6 +287,7 @@ fn shared_backing_checks_below_exact_and_over_aggregate_payload_in_the_actual_in
             }],
             device_routes: Vec::new(),
             backings: vec![backing],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -412,6 +416,7 @@ fn cold_claims_reserve_unobserved_ids_before_boot_without_fabricating_devices() 
                     devices: vec![id],
                 },
             ],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -523,6 +528,7 @@ fn pending_gpu_reservations_keep_original_shape_across_refresh_and_backing_hando
                 phase: BackingPhase::Live,
                 devices: vec![id],
             }],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -610,6 +616,7 @@ fn a_prepared_gpu_backing_does_not_hide_an_eligible_native_oci_route() {
             ],
             device_routes: vec![3],
             backings: vec![observer],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -687,6 +694,7 @@ fn a_prepared_snapshot_cannot_roll_back_a_granted_backing_or_its_claims() {
             }],
             device_routes: vec![1],
             backings: vec![observer],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -757,6 +765,7 @@ fn one_gpu_demand_can_select_an_exact_subset_of_a_two_gpu_observer() {
                 phase: BackingPhase::Live,
                 devices: ids.to_vec(),
             }],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -817,6 +826,7 @@ fn unavailable_route_keeps_committed_recovery_refund_and_backing_charge() {
                 .iter()
                 .map(|backing| backing.try_clone().unwrap())
                 .collect(),
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -853,6 +863,7 @@ fn unavailable_route_keeps_committed_recovery_refund_and_backing_charge() {
             offers: prior.offers.clone(),
             device_routes: prior.device_routes.clone(),
             backings: prepared,
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -919,6 +930,7 @@ fn subset_observer_fixture(native: bool) -> (NodeSpec, Demand, BackingOffer) {
             offers,
             device_routes: vec![if native { 3 } else { 1 }; 2],
             backings: vec![source.try_clone().unwrap()],
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -1417,6 +1429,7 @@ fn committed_pending_recovery_keeps_receipt_charge_and_claim_bounds() {
                 .iter()
                 .map(|backing| backing.try_clone().unwrap())
                 .collect(),
+            node_vm_room: None,
         }
         .share()
         .unwrap(),
@@ -1464,4 +1477,89 @@ fn committed_pending_recovery_keeps_receipt_charge_and_claim_bounds() {
             .is_err()
     );
     assert_eq!(short.key(NodeId(0)).unwrap(), before);
+}
+
+/// `node(Os::Macos)` with its shared backing's guest overhead `guest`, as its runtime measured it (joint plan step 14).
+fn measured_node(guest: hex_api::LearnedOverhead) -> NodeSpec {
+    let mut node = node(Os::Macos);
+    let mut backing = backing();
+    backing.guest = guest;
+    node.routes = Some(
+        RuntimeRoutes {
+            admit: None,
+            offers: vec![RouteOffer {
+                key: RouteKey {
+                    class: hex_api::Class::Oci,
+                    image: image(ImageOs::Linux, true),
+                    execution: Execution::ShardsShared,
+                    gpu: GpuEligibility::None,
+                },
+                cost: None,
+                backing: Some(backing.key),
+            }],
+            device_routes: Vec::new(),
+            backings: vec![backing],
+            node_vm_room: None,
+        }
+        .share()
+        .unwrap(),
+    );
+    node
+}
+
+/// A guest overhead measured in each dimension: `cpu_milli` and `mem_bytes`, no disk.
+fn measured(cpu_milli: u64, mem_bytes: u64) -> hex_api::LearnedOverhead {
+    hex_api::LearnedOverhead {
+        cpu_milli: Some(cpu_milli),
+        mem_bytes: Some(mem_bytes),
+        disk_bytes: Some(0),
+    }
+}
+
+/// Joint plan step 14 (C7; AC-T7.4.1; ROOT, 2026-11-13): a shared guest's own overhead measured after its boxes were
+/// placed stops further boxes, never its node's refresh: the boxes it holds stay held. Do place a box of 0.5 CPU and
+/// 256 MiB on a Live backing of a 1 CPU, 512 MiB envelope whose guest is measured at nothing; then refresh the node
+/// with its guest measured at 300 MiB, past the 256 MiB its box leaves. Expect the refresh taken and a box of 1 MiB
+/// more refused, no room.
+#[test]
+fn w14_a_shared_guests_overhead_measured_past_its_room_keeps_its_boxes_and_admits_no_more() {
+    let mut index = FitIndex::new(&[measured_node(measured(0, 0))]).unwrap();
+    let mut half = demand(Some(Os::Linux), 0);
+    half.need = Resources {
+        cpu_milli: 500,
+        mem_bytes: 256 << 20,
+        disk_bytes: 0,
+        gpus: 0,
+    };
+    assert_eq!(index.verdict(NodeId(0), &half).unwrap(), Verdict::Admits);
+    index
+        .take_allocated(NodeId(0), WorkloadId(1), &half, None)
+        .unwrap();
+    index
+        .refresh_node(&measured_node(measured(0, 300 << 20)))
+        .unwrap();
+    let more = Demand {
+        need: Resources {
+            mem_bytes: 1 << 20,
+            ..Resources::default()
+        },
+        ..half
+    };
+    assert_eq!(index.verdict(NodeId(0), &more).unwrap(), Verdict::NoRoom);
+}
+
+/// Joint plan step 14 (C7; ROOT, 2026-11-13): a Live shared backing ranks the CPU of its envelope its guest's own, as
+/// its runtime measured it, and its boxes leave; one whose guest isn't heard from ranks none, as no box fits it. Do
+/// rank a node's routes with a backing of a 1 CPU envelope whose guest is cold; then measured at 0.25 CPU. Expect none,
+/// then 750 milli-CPU.
+#[test]
+fn w14_a_shared_backing_ranks_the_cpu_its_guest_leaves_and_none_while_cold() {
+    let rank = |guest| {
+        let node = measured_node(guest);
+        Routes::new(node.routes.as_ref().unwrap(), NodeId(0))
+            .unwrap()
+            .rank_cpu()
+    };
+    assert_eq!(rank(hex_api::LearnedOverhead::default()), 0);
+    assert_eq!(rank(measured(250, 0)), 750);
 }

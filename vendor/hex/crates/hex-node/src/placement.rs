@@ -154,6 +154,21 @@ impl Runtimes {
             .ok_or_else(|| invalid("no registered runtime for placement class").into())
     }
 
+    /// Each runtime it holds once, however many classes it is registered for.
+    fn distinct(&self) -> impl Iterator<Item = &Arc<dyn Runtime>> {
+        self.by_class
+            .values()
+            .enumerate()
+            .filter_map(|(at, runtime)| {
+                let earlier = self
+                    .by_class
+                    .values()
+                    .take(at)
+                    .any(|other| Arc::ptr_eq(other, runtime));
+                if earlier { None } else { Some(runtime) }
+            })
+    }
+
     /// Query each configured backend without holding any placement or record lock.
     pub fn capacities(&self) -> Result<Vec<(Class, Option<hex_api::Capacity>)>, Error> {
         let snapshot = self.capacity_snapshot()?;
@@ -569,10 +584,16 @@ fn name(kind: &str, key: Key) -> String {
     format!("{kind}-{}-{}-{}", key.owner, key.epoch, key.seq)
 }
 
+/// What a driver's shell is told, once, as its core stops (the review's E-10): it ends its process, crash-only, and its
+/// next start recovers from the records (capacity-view.md CV11).
+pub type OnStop = Arc<dyn Fn(&Stop) + Send + Sync>;
+
 struct State {
     node: peer::Node,
     rows: Rows,
     stopped: Option<Stop>,
+    /// The shell's ear for the core's stop ([`Driver::on_stop`]).
+    on_stop: Option<OnStop>,
     admission: Option<Refusal>,
     /// The machine's capacity view, once opened (joint plan step 13).
     view: Option<view::View>,
@@ -607,6 +628,9 @@ pub struct Driver {
     runtimes: Runtimes,
     peers: Vec<NodeId>,
     namespace: String,
+    /// What wakes the thread that tells its node what every holder has reserved ([`Driver::on_reserved`]; the review's
+    /// A-10): told each time that changes, so the word reaches the node off the holders' path.
+    reserved_wake: std::sync::OnceLock<hex_wait::mpsc::SyncSender<()>>,
 }
 
 impl Driver {
@@ -689,6 +713,10 @@ impl Driver {
                         return Err(Refusal::Lifecycle {
                             id: physical.try_clone()?,
                             cause: hex_api::LifecycleCause::Uncertain,
+                            why: Some(
+                                "its surviving physical box's allocation or route isn't its placement's"
+                                    .to_owned(),
+                            ),
                         }
                         .into());
                     }
@@ -786,6 +814,7 @@ impl Driver {
                 node,
                 rows,
                 stopped: None,
+                on_stop: None,
                 view: None,
                 facts: None,
                 admitted: None,
@@ -799,6 +828,7 @@ impl Driver {
             runtimes,
             peers: nodes.iter().map(|n| n.id).collect(),
             namespace,
+            reserved_wake: std::sync::OnceLock::new(),
         })
     }
 
@@ -808,6 +838,20 @@ impl Driver {
 
     pub fn physical_id(&self, key: Key) -> Result<BoxId, Refusal> {
         physical_id(&self.namespace, key)
+    }
+
+    /// Tells `tell` as the core stops, once (the review's E-10), its shell's way to end its process crash-only; told at
+    /// once where the core has stopped already.
+    pub fn on_stop(&self, tell: OnStop) -> Result<(), Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Refusal::Broken("placement mutex poisoned".into()))?;
+        if let Some(why) = &state.stopped {
+            tell(why);
+        }
+        state.on_stop = Some(tell);
+        Ok(())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, Error> {
@@ -1054,16 +1098,47 @@ impl Driver {
     // The view's calls and rebook change only state under the core lock, never a runtime's: they don't take the
     // operation's, which refuses a call while another holds it, so a holder's word never waits on a placement.
 
+    /// Books each node VM in `booked` at its receipt, and releases each node VM it booked that `booked` no longer
+    /// names, with what it was said to hold (joint plan step 39; ROOT, 2026-11-13): `booked` is what its node's answers
+    /// say hold room, its Booting and Ready node VMs. A node VM booked again keeps one receipt, the later one. Like
+    /// rebook, it changes only state under the core lock, and the node's ledger is given the room left at once.
+    pub fn book_nodes(&self, booked: &BTreeMap<hex_api::NodeRun, Resources>) -> Result<(), Error> {
+        let mut state = self.lock()?;
+        let count = state.node.booked_nodes().count();
+        let mut gone = Vec::new();
+        gone.try_reserve_exact(count)
+            .map_err(|_| Refusal::Exhausted {
+                what: "node VMs to release",
+                bound: count,
+            })?;
+        gone.extend(
+            state
+                .node
+                .booked_nodes()
+                .filter(|run| !booked.contains_key(run)),
+        );
+        for run in gone {
+            state.node.release_node(run);
+        }
+        for (run, receipt) in booked {
+            state.node.book_node(*run, *receipt);
+        }
+        readmit(&mut state)
+    }
+
     /// What each microVM this node runs holds now, as the learned charge has it (joint plan step 14, C8):
     /// its learned booking, and the memory and disk it holds past it. The machine's capacity view counts
     /// the node's own held so (step 13, CV2), and the node's ledger, which books each box at its receipt,
     /// is given the room those holdings leave, its room the machine's physical room still. Replaces what
     /// was said before; returns how many boxes it holds so.
-    pub fn rebook(&self, holds: &[(Key, hex_api::CapacityResources)]) -> Result<usize, Error> {
+    pub fn rebook(
+        &self,
+        holds: &[(peer::Holder, hex_api::CapacityResources)],
+    ) -> Result<usize, Error> {
         let mut state = self.lock()?;
-        let kept = state.node.rebook(holds.iter().map(|(key, holding)| {
+        let kept = state.node.rebook(holds.iter().map(|(holder, holding)| {
             (
-                *key,
+                *holder,
                 Resources {
                     cpu_milli: holding.cpu_milli,
                     mem_bytes: holding.mem_bytes,
@@ -1094,6 +1169,7 @@ impl Driver {
         let (answer, changed) = finish(&mut state, heard, false)?;
         if changed {
             readmit(&mut state)?;
+            self.wake_reserved();
         }
         Ok(answer)
     }
@@ -1128,8 +1204,67 @@ impl Driver {
         let (forgotten, changed) = finish(&mut state, forgotten, false)?;
         if changed {
             readmit(&mut state)?;
+            self.wake_reserved();
         }
         Ok(forgotten)
+    }
+
+    /// Wakes, where one is waiting, the thread that tells its node what every holder has reserved
+    /// ([`Driver::on_reserved`]): a wake already told is the same word, and one whose thread has ended tells nothing.
+    pub fn wake_reserved(&self) {
+        if let Some(wake) = self.reserved_wake.get() {
+            let _ = wake.try_send(());
+        }
+    }
+
+    /// The wake of the thread that tells its node what every holder has reserved (the review's A-10): told at each change
+    /// of what the holders hold and at each wake its caller makes ([`Driver::wake_reserved`]). Set once.
+    pub fn on_reserved(&self, wake: hex_wait::mpsc::SyncSender<()>) -> Result<(), Error> {
+        self.reserved_wake.set(wake).map_err(|_| {
+            Refusal::Invalid {
+                what: "capacity view",
+                why: "its word's wake is set already".into(),
+            }
+            .into()
+        })
+    }
+
+    /// The machine's capacity view's word to its node (joint plan steps 13 and 14, C7; the review's A-10): what every
+    /// holder has reserved through its keeper, as the keeper of this boot holds it; none where no view is open. It reads
+    /// only state under the core lock, as rebook does.
+    pub fn reserved_word(&self) -> Result<Option<hex_api::Reserved>, Error> {
+        let state = self.lock()?;
+        Ok(state.view.as_ref().map(|view| {
+            let foreign = view.foreign();
+            hex_api::Reserved {
+                keeper: view.epoch(),
+                reserved: hex_api::CapacityResources {
+                    cpu_milli: foreign.cpu_milli,
+                    mem_bytes: foreign.mem_bytes,
+                    disk_bytes: foreign.disk_bytes,
+                },
+            }
+        }))
+    }
+
+    /// Tells each of its runtimes the machine's capacity view's word ([`Driver::reserved_word`]) with its lock let go, as
+    /// its node's charge learner takes it off its fleet's budget (the review's A-10): each runtime's refusal is answered,
+    /// for its caller to tell. Nothing where no view is open.
+    pub fn tell_reserved(&self) -> Result<Vec<Refusal>, Error> {
+        let Some(word) = self.reserved_word()? else {
+            return Ok(Vec::new());
+        };
+        let mut refused = Vec::new();
+        for runtime in self.runtimes.distinct() {
+            if let Err(why) = runtime.reserved(word) {
+                refused.try_reserve(1).map_err(|_| Refusal::Exhausted {
+                    what: "a keeper's word's refusals",
+                    bound: self.runtimes.by_class.len(),
+                })?;
+                refused.push(why);
+            }
+        }
+        Ok(refused)
     }
 
     /// The machine's view as the keeper would answer it now.
@@ -1160,6 +1295,7 @@ impl Driver {
                 return Err(Refusal::Backing {
                     key,
                     cause: hex_api::LifecycleCause::Pending,
+                    why: None,
                 }
                 .into());
             }
@@ -1171,6 +1307,7 @@ impl Driver {
                 self.lock()?.admission = Some(Refusal::Backing {
                     key,
                     cause: hex_api::LifecycleCause::Uncertain,
+                    why: Some(format!("its runtime refused its initialization: {refusal}")),
                 });
                 return Err(refusal.into());
             }
@@ -1181,13 +1318,16 @@ impl Driver {
             && observed.phase == hex_api::BackingPhase::Live;
         let mut state = self.lock()?;
         if !accepted || state.node.observe_backing(&observed).is_err() {
+            let why = "its runtime's initialized offer isn't its grant, or its node's index can't take it";
             state.admission = Some(Refusal::Backing {
                 key,
                 cause: hex_api::LifecycleCause::Uncertain,
+                why: Some(why.to_owned()),
             });
             return Err(Refusal::Backing {
                 key,
                 cause: hex_api::LifecycleCause::Uncertain,
+                why: Some(why.to_owned()),
             }
             .into());
         }
@@ -1205,9 +1345,10 @@ impl Driver {
         expected.allocation()?;
         let _operation = self.operation()?;
         let key = expected.key;
-        let refused = || Refusal::Backing {
+        let refused = |why: &str| Refusal::Backing {
             key,
             cause: hex_api::LifecycleCause::Uncertain,
+            why: Some(why.to_owned()),
         };
         if expected.phase != hex_api::BackingPhase::Draining {
             return Err(invalid_static("native cleanup requires canonical Draining intent").into());
@@ -1215,20 +1356,23 @@ impl Driver {
         self.lock()?
             .node
             .observe_backing(expected)
-            .map_err(|_| refused())?;
+            .map_err(|_| refused("its node's index can't take its draining offer"))?;
         let observed = self.runtimes.get(endpoint)?.release_backing(key)?;
         if observed.key != key
             || observed.cost != expected.cost
             || observed.devices != expected.devices
             || observed.phase != hex_api::BackingPhase::Released
         {
-            self.lock()?.admission = Some(refused());
+            self.lock()?.admission = Some(refused(
+                "its runtime's released offer isn't the one it drained",
+            ));
             return Err(invalid_static("native cleanup changed its exact backing receipt").into());
         }
         let mut state = self.lock()?;
         if state.node.observe_backing(&observed).is_err() {
-            state.admission = Some(refused());
-            return Err(refused().into());
+            let why = "its node's index can't take its released offer";
+            state.admission = Some(refused(why));
+            return Err(refused(why).into());
         }
         Ok(observed)
     }
@@ -1243,18 +1387,22 @@ impl Driver {
         expected.allocation()?;
         let _operation = self.operation()?;
         let key = expected.key;
-        let refused = || Refusal::Backing {
+        let refused = |why: &str| Refusal::Backing {
             key,
             cause: hex_api::LifecycleCause::Uncertain,
+            why: Some(why.to_owned()),
         };
         if expected.phase != hex_api::BackingPhase::Released
             || !self
                 .lock()?
                 .node
                 .backing_released(key)
-                .map_err(|_| refused())?
+                .map_err(|_| refused("its node's index can't say whether it is released"))?
         {
-            return Err(refused().into());
+            return Err(refused(
+                "it isn't released in its node's index as its release is acknowledged",
+            )
+            .into());
         }
         let observed = self.runtimes.get(endpoint)?.release_backing(key)?;
         if observed.key != key
@@ -1262,8 +1410,9 @@ impl Driver {
             || observed.devices != expected.devices
             || observed.phase != expected.phase
         {
-            self.lock()?.admission = Some(refused());
-            return Err(refused().into());
+            let why = "its runtime's acknowledged offer isn't the released one";
+            self.lock()?.admission = Some(refused(why));
+            return Err(refused(why).into());
         }
         Ok(())
     }
@@ -1414,6 +1563,10 @@ impl Driver {
                         refusal: Refusal::Lifecycle {
                             id: id.try_clone()?,
                             cause: hex_api::LifecycleCause::Uncertain,
+                            why: Some(
+                                "the box its placement found has another allocation or route than its launch's"
+                                    .to_owned(),
+                            ),
                         },
                         cleanup: None,
                     });
@@ -1453,6 +1606,10 @@ impl Driver {
                     return Err(Refusal::Lifecycle {
                         id: id.try_clone()?,
                         cause: hex_api::LifecycleCause::Uncertain,
+                        why: Some(
+                            "the box its launch made has another allocation or route than its launch asked"
+                                .to_owned(),
+                        ),
                     });
                 }
                 if info.class != payload.spec.class.class() {
@@ -1528,7 +1685,7 @@ impl Driver {
         let out = finish(&mut state, result, false)?;
         let (mut next, create) = collect(&mut state, out)?;
         if !create.is_empty() {
-            state.stopped = Some(bad("create recursively requested creation"));
+            stop(&mut state, bad("create recursively requested creation"));
             return Err(bad("unexpected nested creation").into());
         }
         if let Some(why) = refusal {
@@ -1797,12 +1954,23 @@ fn validate_backend(payload: &Payload, runtime: &Arc<dyn Runtime>) -> Result<(),
 }
 
 fn finish<T>(state: &mut State, result: Result<T, Stop>, submit: bool) -> Result<T, Error> {
-    result.map_err(|stop| {
-        if !(submit && matches!(stop, Stop::Full { .. })) {
-            state.stopped = Some(stop.clone());
+    result.map_err(|why| {
+        if !(submit && matches!(why, Stop::Full { .. })) {
+            stop(state, why.clone());
         }
-        Error::Core(stop)
+        Error::Core(why)
     })
+}
+
+/// The core stops, `why`: every operation refused from here, and its shell told, once, where it listens ([`OnStop`]).
+fn stop(state: &mut State, why: Stop) {
+    if state.stopped.is_some() {
+        return;
+    }
+    if let Some(tell) = &state.on_stop {
+        tell(&why);
+    }
+    state.stopped = Some(why);
 }
 
 /// The node's capacity view as its lane serves it (`hex_quic::capacity::Server`; joint plan step 13, CV9): this
@@ -1878,8 +2046,9 @@ fn readmit(state: &mut State) -> Result<(), Error> {
 
 /// The spec this node's ledger admits against (joint plan steps 13 and 14): its facts, the machine's
 /// physical room less every holder's reservations (CV3), plus what its boxes' learned holdings leave of the
-/// receipts its ledger books, less what they take past them, so its free room is the physical room less what
-/// everything holds. None before its first facts.
+/// receipts its ledger books, less what they take past them, and less each node VM it runs for itself at its
+/// receipt (joint plan step 39, V2), which no box's admission books, so its free room is the physical room less
+/// what everything holds. None before its first facts.
 fn admission_spec(state: &State) -> Result<Option<NodeSpec>, Stop> {
     let Some(facts) = state.facts.as_ref() else {
         return Ok(None);
@@ -1891,11 +2060,15 @@ fn admission_spec(state: &State) -> Result<Option<NodeSpec>, Stop> {
     let booked = hex_api::capacity::Amounts::from_array(state.node.booked()?);
     let held = hex_api::capacity::Amounts::from_array(state.node.held()?);
     let (credit, debit) = (booked.less(held), held.less(booked));
-    let room = |physical: u64, credit: u64, foreign: u64, debit: u64| {
+    // Its node VMs' receipts are in both what it books and what it holds, so they cancel above: taken here, a host box
+    // gets only the room past them, and their learned holdings move the credit or debit as a box's do.
+    let nodes = hex_api::capacity::Amounts::from_array(state.node.nodes_booked()?);
+    let room = |physical: u64, credit: u64, foreign: u64, debit: u64, nodes: u64| {
         physical
             .saturating_add(credit)
             .saturating_sub(foreign)
             .saturating_sub(debit)
+            .saturating_sub(nodes)
     };
     let mut spec = facts
         .try_clone()
@@ -1906,18 +2079,21 @@ fn admission_spec(state: &State) -> Result<Option<NodeSpec>, Stop> {
             credit.cpu_milli,
             foreign.cpu_milli,
             debit.cpu_milli,
+            nodes.cpu_milli,
         ),
         mem_bytes: room(
             facts.capacity.mem_bytes,
             credit.mem_bytes,
             foreign.mem_bytes,
             debit.mem_bytes,
+            nodes.mem_bytes,
         ),
         disk_bytes: room(
             facts.capacity.disk_bytes,
             credit.disk_bytes,
             foreign.disk_bytes,
             debit.disk_bytes,
+            nodes.disk_bytes,
         ),
         // A holder holds no GPU (CV3) and a holding none past its receipt: the devices still agree.
         gpus: facts.capacity.gpus,

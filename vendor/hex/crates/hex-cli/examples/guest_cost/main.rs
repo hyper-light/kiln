@@ -27,8 +27,9 @@
 //!   its cgroup's memory.peak less its guest's touched pages; macOS: its footprint less them, guest ready);
 //!   and the bytes held in its own folders (one-time host caches left out). guest_overhead = the kernel's and
 //!   relay's use inside it, the envelope less what the guest agent reports free. Each is the maximum over
-//!   SEEDABLE guests (decision 9's census rule, bench/competitive/probes/waits_census.py), each booted, told
-//!   its deadline as the node tells it, within the class's recorded patience, doubled at each run-out. Both are
+//!   SEEDABLE guests (decision 9's census rule, bench/competitive/probes/waits_census.py), each booted with no
+//!   deadline told and followed to its agent's answer, its report and its teardown followed by their parties, no
+//!   record read (the review's C-9). Both are
 //!   evidence alone (joint plan step 14; ROOT, 2026-11-13, by decision 9's rule): the cost carries neither, and a
 //!   node learns a VM's overhead and a guest's own from their windows.
 // A measurement example, not production code (CLAUDE.md): the test crates' opt-outs.
@@ -41,26 +42,31 @@
     clippy::disallowed_macros
 )]
 
-// The shared half reads its host's units through rustix, and the drivers so far are macOS's and Linux's.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// The shared half reads its host's units through its OS (rustix on unix), and the drivers are macOS's, Linux's and
+// Windows'.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+mod guest;
+#[cfg(windows)]
+mod managed;
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod run;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod seam;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod shards;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const USAGE: &str = "usage: guest_cost --class shards --out <dir>";
 #[cfg(target_os = "macos")]
 const USAGE: &str = "usage: guest_cost --class shards --out <dir> --cpu-response <row file> --cpu-response-sha256 <hex>";
 
 /// The run's arguments: which class's driver, where its output goes, and on a Mac its host class's
 /// CPU-response row file and that file's SHA-256. Exactly these, each once.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 struct Args {
     class: String,
     out: PathBuf,
@@ -68,7 +74,7 @@ struct Args {
     cpu_response: (PathBuf, [u8; 32]),
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl Args {
     fn parse(words: &[String]) -> Result<Self, String> {
         let (mut class, mut out) = (None, None);
@@ -122,13 +128,13 @@ fn sha256(digits: &str) -> Result<[u8; 32], String> {
     Ok(bytes)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn main() -> ExitCode {
     eprintln!("guest_cost has no class driver on {}", std::env::consts::OS);
     ExitCode::FAILURE
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn main() -> ExitCode {
     let words: Result<Vec<String>, String> = std::env::args_os()
         .skip(1)
@@ -153,13 +159,16 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn produce(args: &Args) -> Result<run::Made, String> {
     let plan = run::Plan::derived()?;
     match args.class.as_str() {
         "shards" => {
             let (windows, prefix) = windows(args)?;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             let mut driver = shards::Shards::from_env(&args.out)?;
+            #[cfg(windows)]
+            let mut driver = managed::Managed::from_env(&args.out)?;
             run::produce(&mut driver, &plan, &args.out, &windows, &prefix)
         }
         other => Err(format!(
@@ -181,6 +190,14 @@ fn windows(_: &Args) -> Result<(run::Windows, Vec<u8>), String> {
         }),
         Vec::new(),
     ))
+}
+
+/// Windows' window: the period each VM's own governor holds its rate over (Shards' D191, D255), as a guest's VM
+/// process answers it, the CPU control a Windows node holds a managed VM's rate with (`ManagedGuest::rate`), asked of a
+/// guest ([`run::Windows::Governed`]). No section heads the evidence.
+#[cfg(windows)]
+fn windows(_: &Args) -> Result<(run::Windows, Vec<u8>), String> {
+    Ok((run::Windows::Governed, Vec::new()))
 }
 
 /// The Mac's windows: its managed CPU control's cycle for this host class's CPU-response row, at a VM's
@@ -266,7 +283,7 @@ fn smoke_args(out: &std::path::Path) -> Args {
     }
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 mod tests {
     use super::*;
 
@@ -278,7 +295,7 @@ mod tests {
     /// that file's SHA-256): expect a run's parameters, a repeated or unknown argument, refused.
     #[test]
     fn the_producer_takes_its_class_and_folder_alone() {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let needed: Vec<&str> = Vec::new();
         #[cfg(target_os = "macos")]
         let needed = vec![
@@ -308,7 +325,7 @@ mod tests {
             short.extend(["--cpu-response", "/x/row", "--cpu-response-sha256", "ab"]);
             assert!(Args::parse(&words(&short)).is_err());
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         assert!(
             Args::parse(&words(&[
                 "--class",

@@ -136,7 +136,7 @@ impl std::fmt::Display for Cut {
 /// microVM's init while the microVM's process runs ([`Wait::WhileRuns`]): each kind apart, as
 /// each takes its own time (D188; D215's records). None is in source: each is cold until its
 /// kind's first answer.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Answers {
     /// What it holds cold given back (`RECLAIM`).
     pub reclaim: Record,
@@ -144,6 +144,36 @@ pub(super) struct Answers {
     pub room: Record,
     /// Its run's metrics, read (`METRICS`).
     pub metrics: Record,
+    /// A starting VM's READY (`daemon::ready`).
+    pub ready: Record,
+    /// A warm VM's taking of a run: the run's handoff sent, to its TAKEN (`daemon::hand_over`).
+    pub take: Record,
+    /// A visit's VM holding its files, its STARTED after its RUN (`visit::await_holding`).
+    pub held: Record,
+    /// Each request for access a starting VM makes, from the answer before or its spawn
+    /// (`daemon::grant`, macOS).
+    #[cfg(target_os = "macos")]
+    pub grants: Record,
+    /// Each of init's builtins its quiet work asks (`exec_answered`: `STAT`, `TOP`,
+    /// `STATS`, a member's ports, a network's switch, a layer's size, an update), by its
+    /// byte.
+    pub builtins: Box<[Record; 256]>,
+}
+
+impl Default for Answers {
+    fn default() -> Answers {
+        Answers {
+            reclaim: Record::new(),
+            room: Record::new(),
+            metrics: Record::new(),
+            ready: Record::new(),
+            take: Record::new(),
+            held: Record::new(),
+            #[cfg(target_os = "macos")]
+            grants: Record::new(),
+            builtins: Box::new([const { Record::new() }; 256]),
+        }
+    }
 }
 
 /// One probe's result: when it ran, its exit code (-1 if it timed out or could not run),
@@ -313,8 +343,7 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
                         None => c.changed.wait(due).unwrap_or_else(PoisonError::into_inner),
                         Some(Reverse((at, _))) if *at > now => {
                             let wait = at.saturating_duration_since(now);
-                            c.changed
-                                .wait_timeout(due, wait)
+                            super::timed(Some(wait), || c.changed.wait_timeout(due, wait))
                                 .unwrap_or_else(PoisonError::into_inner)
                                 .0
                         }
@@ -455,6 +484,35 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
         timeout: Duration,
     ) -> std::io::Result<Quiet> {
         self.exec_waiting(id, spec, argv, limit, Wait::For(timeout))
+    }
+
+    /// Init's own work in microVM `id`, `spec` (a builtin, no command), as
+    /// [`exec_quietly`](Self::exec_quietly) does it, the first `limit` bytes of its answer
+    /// kept: waited for while its microVM's process runs ([`answered_wait`](Self::answered_wait)).
+    /// It was `TAKE_TIMEOUT`'s 10 s, picked.
+    pub(super) fn exec_answered(
+        &self,
+        id: &str,
+        spec: &shards_abi::run::Spec,
+        limit: usize,
+    ) -> std::io::Result<Quiet> {
+        let vm = match lock(&self.runs).get(id) {
+            Some(RunState::Tracked(t)) => Some(t.vm.id()),
+            _ => None,
+        };
+        self.exec_waiting(id, spec, None, limit, self.answered_wait(vm, spec.builtin))
+    }
+
+    /// How init's answer of `builtin` is waited for in a microVM whose process is `vm`: while
+    /// it runs, judged by that builtin's record (D215's judge, [`Wait::WhileRuns`]): before
+    /// its first answer, its liveness alone; then past the slowest seen, ended where a whole
+    /// one shows it ran no CPU, its host not the reason (R03, ROOT's (3), 2026-11-13). With no
+    /// process to follow, its end alone.
+    pub(super) fn answered_wait(&self, vm: Option<u32>, builtin: u8) -> Wait<'_> {
+        match (vm, self.answers.builtins.get(usize::from(builtin))) {
+            (Some(vm), Some(record)) => Wait::WhileRuns(vm, record),
+            _ => Wait::Ending,
+        }
     }
 
     /// [`exec_quietly`](Self::exec_quietly), waited for as `wait` says.
@@ -654,7 +712,7 @@ fn kill(conn: &shards_ipc::Stream) {
 }
 
 /// How long the daemon waits for the end of an exec of its own.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(super) enum Wait<'a> {
     /// Until it ends.
     Ending,
@@ -667,21 +725,36 @@ pub(super) enum Wait<'a> {
     /// since the look before ([`Cut::Stalled`]), or where it could not be read
     /// ([`Cut::Unread`]). A microVM its host holds at a `memory.high` is slowed there for as
     /// long as it is over it, and the answer of one asked to give back what would bring it
-    /// under comes as its host lets it run (D188; PM M467).
+    /// under comes as its host lets it run (D188; PM M467). An answer there as the wait
+    /// begins teaches nothing: it was waited for not at all (D222).
     WhileRuns(u32, &'a Record),
+    /// A group member's word, judged as WhileRuns, with its refusal told immediately:
+    /// the group must not invent an elapsed-time verdict while this wait still progresses,
+    /// nor wait for a stalled guest to acknowledge its exec's kill before judging the round.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    GroupWord(u32, &'a Record, &'a (dyn Fn(&Cut) + Sync)),
 }
 
 /// Waits on `ours` for an exec's end, ending it (SIGKILL) as `wait` says, and waiting on for
 /// its end then, so that none outlives its asker.
 fn await_exit(ours: &shards_ipc::Stream, wait: Wait<'_>) -> Ended {
     let (mut follow, mut cut) = match wait {
-        Wait::WhileRuns(vm, record) => match following(vm, record) {
+        // Its answer there as its wait begins was waited for not at all: read as it is, it
+        // teaches its kind nothing (D222's wait of nothing), as a slot's rest is learned only
+        // where it was waited for (D185's `Asked::waited`).
+        Wait::WhileRuns(..) | Wait::GroupWord(..) if super::readable_within(ours, Some(Duration::ZERO)) => {
+            (None, None)
+        }
+        Wait::WhileRuns(vm, record) | Wait::GroupWord(vm, record, _) => match following(vm, record) {
             Ok(follow) => (follow, None),
             Err(cut) => (None, Some(cut)),
         },
         Wait::Ending | Wait::For(_) => (None, None),
     };
-    if cut.is_some() {
+    if let Some(cut) = &cut {
+        if let Wait::GroupWord(_, _, refused) = wait {
+            refused(cut);
+        }
         kill(ours);
     }
     let status = loop {
@@ -691,7 +764,7 @@ fn await_exit(ours: &shards_ipc::Stream, wait: Wait<'_>) -> Ended {
             (None, Wait::For(timeout)) => Some(timeout),
             // Until the judge's next look, made first where it is due now: none while the
             // wait follows liveness alone (its kind cold, or its process gone).
-            (None, Wait::WhileRuns(..)) => {
+            (None, Wait::WhileRuns(..) | Wait::GroupWord(..)) => {
                 let left = follow
                     .as_ref()
                     .and_then(Follow::due)
@@ -699,6 +772,9 @@ fn await_exit(ours: &shards_ipc::Stream, wait: Wait<'_>) -> Ended {
                 if left.is_some_and(|left| left.is_zero()) {
                     if let Some(Err(why)) = follow.as_mut().map(Follow::look) {
                         cut = Some(Cut::from(why));
+                        if let (Wait::GroupWord(_, _, refused), Some(cut)) = (wait, &cut) {
+                            refused(cut);
+                        }
                         kill(ours);
                     }
                     continue;
@@ -731,7 +807,7 @@ fn await_exit(ours: &shards_ipc::Stream, wait: Wait<'_>) -> Ended {
                         kill(ours);
                     }
                     // Its look is due: made as the loop goes round.
-                    Wait::WhileRuns(..) => {}
+                    Wait::WhileRuns(..) | Wait::GroupWord(..) => {}
                     // A read with no timeout set times out only on a descriptor that does not
                     // block, which ends the wait as any failed read does.
                     Wait::Ending => break None,
@@ -742,6 +818,84 @@ fn await_exit(ours: &shards_ipc::Stream, wait: Wait<'_>) -> Ended {
     };
     Ended { status, cut }
 }
+
+/// A wait on a socket whose party is process `pid`, judged as D215 judges a wait on a VM
+/// process ([`Wait::WhileRuns`]), by the record of its kind of answer (runs-11 `TAKE_TIMEOUT`):
+/// shards_ipc's judge ([`Judged::judge`]) for its judged sends and receives. Before its kind's
+/// first answer, and once its party has gone (its socket's end then ends the wait), the
+/// socket's readiness alone; then its party looked at once each W* and the wait ended, typed
+/// ([`Stalled`]), where it ran nothing since the look before or could not be read.
+#[cfg(unix)]
+pub(super) struct Judged<'r> {
+    pid: u32,
+    record: &'r Record,
+    follow: Option<Follow<'r>>,
+    begun: bool,
+}
+
+#[cfg(unix)]
+impl<'r> Judged<'r> {
+    pub(super) fn of(pid: u32, record: &'r Record) -> Judged<'r> {
+        Judged {
+            pid,
+            record,
+            follow: None,
+            begun: false,
+        }
+    }
+
+    /// When its wait next asks, or why it ends: asked as each wait begins, and at each time it
+    /// named that passed with the socket not ready.
+    pub(super) fn judge(&mut self) -> std::io::Result<Option<Instant>> {
+        if !std::mem::replace(&mut self.begun, true) {
+            self.follow = following(self.pid, self.record).map_err(Stalled::error)?;
+            return Ok(self.follow.as_ref().and_then(Follow::due));
+        }
+        let Some(follow) = self.follow.as_mut() else {
+            return Ok(None);
+        };
+        follow.look().map_err(|why| Stalled::error(Cut::from(why)))?;
+        Ok(follow.due())
+    }
+
+    /// Its party answered: its kind learns from the answer.
+    pub(super) fn answered(&mut self) {
+        if let Some(follow) = self.follow.as_mut() {
+            follow.answered();
+        }
+    }
+}
+
+/// A judged wait's end ([`Judged`]): its party stalled, or could not be read, as [`Cut`] says.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(super) struct Stalled(pub(super) Cut);
+
+#[cfg(unix)]
+impl Stalled {
+    fn error(cut: Cut) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, Stalled(cut))
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Cut::Stalled(stall) => write!(
+                f,
+                "its process ran no CPU in {:?} past the slowest answer seen ({:?}), {:?} into the wait",
+                stall.over(),
+                stall.slowest(),
+                stall.waited()
+            ),
+            other => write!(f, "{other}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for Stalled {}
 
 /// A wait on VM process `vm` judged by `record`, begun now: none where the process has gone
 /// already, whose end is the exec's; why not, where it cannot be read.
@@ -792,6 +946,28 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn a_group_word_reports_its_refusal_before_the_kill_is_acknowledged() {
+        let idle = sleeper();
+        let record = learned(Duration::from_millis(50));
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        let report = |cut: &Cut| {
+            assert!(matches!(cut, Cut::Stalled(_)));
+            refused.store(true, Ordering::SeqCst);
+        };
+        let ended = waited(Wait::GroupWord(idle.0.id(), &record, &report), |theirs| {
+            let kill = shards_ipc::recv(&theirs).unwrap().unwrap();
+            assert_eq!(kill.kind, shards_ipc::kind::SIGNAL);
+            assert!(
+                refused.load(Ordering::SeqCst),
+                "the group still waits for its own verdict"
+            );
+            shards_ipc::send(&theirs, shards_ipc::kind::EXIT, &[137], &[]).unwrap();
+        });
+        assert!(matches!(ended.cut, Some(Cut::Stalled(_))));
+    }
+
+    #[cfg(unix)]
     fn sleeper() -> Killed {
         Killed(
             std::process::Command::new("/bin/sleep")
@@ -816,7 +992,22 @@ mod tests {
         let shards_api::Seen::Learned { slowest, .. } = record.seen() else {
             panic!("its answer taught nothing");
         };
-        assert!(slowest >= after, "{slowest:?}");
+        // The answer thread starts before await_exit begins its measured wait.
+        assert!(!slowest.is_zero(), "its genuine wait taught no interval");
+    }
+
+    /// An exec's answer there as its wait begins was waited for not at all: it is taken, and
+    /// teaches its kind nothing (D222's wait of nothing), whose W* of next to nothing would
+    /// have its kind's next asks looked at each microsecond. Its microVM's process is this
+    /// one, which lives throughout.
+    #[test]
+    fn an_exit_said_before_its_wait_teaches_nothing() {
+        let record = Record::new();
+        let (ours, theirs) = shards_ipc::Stream::pair().unwrap();
+        shards_ipc::send(&theirs, shards_ipc::kind::EXIT, &[7], &[]).unwrap();
+        let ended = await_exit(&ours, Wait::WhileRuns(std::process::id(), &record));
+        assert_eq!((ended.status, ended.cut), (Some(7), None));
+        assert_eq!(record.seen(), shards_api::Seen::Cold);
     }
 
     /// Set in the child of `a_microvm_that_runs_at_any_rate_is_waited_for`: it runs a CPU a

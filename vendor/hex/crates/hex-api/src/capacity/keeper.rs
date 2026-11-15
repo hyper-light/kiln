@@ -9,7 +9,11 @@
 //! named `epoch` (its own epoch), `holder-<n>` (holder `n`'s epoch and name) and `res-<n>-<epoch>-<seq>`
 //! (a reservation's amounts), `n` a u32: at full width the grammar of the node's own records
 //! (`own-u32-u64-u64`), so the node's record files hold them. A name it didn't write is damage. A
-//! [`Stop`] means the keeper can't go on: its shell boots it again from its records.
+//! [`Stop`] means the keeper can't go on: its shell, `hex schedule serve`, ends its process, crash-only, exiting 1 and
+//! naming the stop, and its next start boots the keeper again from its records (`docs/design/capacity-view.md` CV11;
+//! the review's E-10). Nothing restarts that process yet: Hex's installers set up `hex node` alone, and kiln's fleet
+//! bench and the two-machine tests start the scheduler by hand, so running it under a supervisor that restarts it is its
+//! operator's to do until Hex installs one.
 
 use std::collections::BTreeMap;
 
@@ -117,7 +121,9 @@ pub struct Keeper {
     /// The last session opened in this epoch.
     sessions: u64,
     room: Amounts,
-    slots: Vec<Slot>,
+    /// Each holder's slot by its number in the records (`holder-<n>`). The person's release of a holder frees its
+    /// number, and the next new holder takes the lowest one free (CV6, CV8).
+    slots: BTreeMap<usize, Slot>,
     /// The sum of every holder's reservations.
     foreign: Amounts,
 }
@@ -196,13 +202,6 @@ impl Keeper {
                 bound: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
             });
         }
-        let most = budget
-            .holders
-            .checked_mul(budget.reservations)
-            .ok_or(Stop::Full {
-                what: "capacity reservations",
-                bound: usize::MAX,
-            })?;
         let mut last: Option<u64> = None;
         let mut holders = BTreeMap::<usize, (u64, String)>::new();
         let mut reservations = Vec::new();
@@ -219,7 +218,9 @@ impl Keeper {
                 let (epoch, holder) = value
                     .split_once(' ')
                     .ok_or_else(|| damaged("a holder's record"))?;
-                if !named(holder, budget.name_bytes) || holders.len() >= budget.holders {
+                // More holders than the host's configuration now authorizes is no damage: each one keeps what it
+                // holds until its own word or the person's release (CV6), and only a new one is refused (CV8).
+                if !named(holder, budget.name_bytes) {
                     return Err(damaged("a holder's record"));
                 }
                 let epoch = number(epoch, "a holder's epoch")?;
@@ -227,29 +228,23 @@ impl Keeper {
                     return Err(damaged("a holder recorded twice"));
                 }
             } else if let Some(key) = name.strip_prefix("res-") {
-                if reservations.len() >= most {
-                    return Err(Stop::Full {
-                        what: "capacity reservations",
-                        bound: most,
-                    });
-                }
                 let (n, id) = parse_reservation(key)?;
                 reservations.push((n, id, parse_amounts(&value)?));
             } else {
                 return Err(damaged("a record no keeper writes"));
             }
         }
-        let mut slots = Vec::new();
-        for (expected, (n, (epoch, name))) in holders.into_iter().enumerate() {
-            if n != expected {
-                return Err(damaged("holders not numbered from 0"));
+        let mut slots = BTreeMap::new();
+        for (n, (epoch, name)) in holders {
+            if slots.values().any(|slot: &Slot| slot.name == name) {
+                return Err(damaged("a holder's name recorded twice"));
             }
-            slots.push(Slot::new(name, epoch));
+            slots.insert(n, Slot::new(name, epoch));
         }
         let mut foreign = Amounts::ZERO;
         for (n, id, amount) in reservations {
             let slot = slots
-                .get_mut(n)
+                .get_mut(&n)
                 .ok_or_else(|| damaged("a reservation of no holder"))?;
             if id.epoch > slot.epoch || slot.held.len() >= budget.reservations {
                 return Err(damaged("a reservation past its holder's epoch or bound"));
@@ -333,7 +328,7 @@ impl Keeper {
     /// Whether `session` is some holder's current session: a transport's map from its links to sessions
     /// keeps only those, so it holds at most one entry a holder.
     pub fn current(&self, session: u64) -> bool {
-        self.slots.iter().any(|slot| match slot.link {
+        self.slots.values().any(|slot| match slot.link {
             Link::Joined { session: s } | Link::Synced { session: s } => s == session,
             Link::Away => false,
         })
@@ -342,7 +337,7 @@ impl Keeper {
     /// Holder `name`'s reservations, as the keeper holds them.
     pub fn held_by<'a>(&'a self, name: &'a str) -> impl Iterator<Item = Held> + 'a {
         self.slots
-            .iter()
+            .values()
             .filter(move |slot| slot.name == name)
             .flat_map(|slot| {
                 slot.held.iter().map(|(id, amount)| Held {
@@ -388,7 +383,7 @@ impl Keeper {
 
     /// The session `session` ended (its link dropped): its holder is away, and keeps what it holds (CV5).
     pub fn link_down(&mut self, session: u64) {
-        for slot in &mut self.slots {
+        for slot in self.slots.values_mut() {
             if let Link::Joined { session: s } | Link::Synced { session: s } = slot.link
                 && s == session
             {
@@ -399,14 +394,16 @@ impl Keeper {
 
     /// The person's release of every reservation of holder `name`, which is away and isn't coming back
     /// (CV6: a holder gone for good keeps them otherwise). Refused while the holder has a session: its own
-    /// word says what it holds. Its epoch stays, so a process of it from before is still fenced, and a
-    /// later sync of its own adopts what still runs. What it released is returned for the shell to log.
+    /// word says what it holds. Its record goes after its reservations', so its place among the holders the
+    /// host's configuration authorizes is free for its replacement (CV8); a process of it that comes back is a
+    /// new holder, whose own sync adopts what still runs (CV5). What it released is returned for the shell to
+    /// log.
     pub fn forget(
         &mut self,
         name: &str,
         records: &mut impl Records,
     ) -> Result<Result<Forgotten, NotForgotten>, Stop> {
-        let Some(n) = self.slots.iter().position(|slot| slot.name == name) else {
+        let Some(n) = self.number(name) else {
             return Ok(Err(NotForgotten::Unknown));
         };
         let foreign = self.foreign;
@@ -426,6 +423,10 @@ impl Keeper {
         }
         slot.sum = Amounts::ZERO;
         self.foreign = foreign;
+        // Its reservations' records first: a crash between leaves a holder recorded with none, which the
+        // person forgets again, never a reservation of no holder.
+        records.remove(&holder_record(n))?;
+        self.slots.remove(&n);
         if count > 0 {
             self.owe(Some(n));
         }
@@ -437,7 +438,7 @@ impl Keeper {
         let view = self.view(local);
         let keeper = self.epoch;
         let mut out = Vec::new();
-        for slot in &mut self.slots {
+        for slot in self.slots.values_mut() {
             if let Link::Synced { session } = slot.link
                 && slot.owed
             {
@@ -454,8 +455,8 @@ impl Keeper {
     }
 
     fn owe(&mut self, except: Option<usize>) {
-        for (n, slot) in self.slots.iter_mut().enumerate() {
-            if Some(n) != except && matches!(slot.link, Link::Synced { .. }) {
+        for (n, slot) in &mut self.slots {
+            if Some(*n) != except && matches!(slot.link, Link::Synced { .. }) {
                 slot.owed = true;
             }
         }
@@ -476,10 +477,9 @@ impl Keeper {
         }
         self.slots
             .iter()
-            .enumerate()
             .find_map(|(n, slot)| match slot.link {
-                Link::Joined { session } if session == fence.session => Some((n, false, slot)),
-                Link::Synced { session } if session == fence.session => Some((n, true, slot)),
+                Link::Joined { session } if session == fence.session => Some((*n, false, slot)),
+                Link::Synced { session } if session == fence.session => Some((*n, true, slot)),
                 _ => None,
             })
             .filter(|(_, _, slot)| slot.epoch == fence.holder)
@@ -489,8 +489,16 @@ impl Keeper {
 
     fn slot(&mut self, n: usize) -> Result<&mut Slot, Stop> {
         self.slots
-            .get_mut(n)
+            .get_mut(&n)
             .ok_or_else(|| damaged("a holder's slot"))
+    }
+
+    /// The number of holder `name`'s slot.
+    fn number(&self, name: &str) -> Option<usize> {
+        self.slots
+            .iter()
+            .find(|(_, slot)| slot.name == name)
+            .map(|(n, _)| *n)
     }
 
     fn hello(
@@ -507,7 +515,7 @@ impl Keeper {
         if !named(&holder, self.budget.name_bytes) {
             return Ok(closed(Close::Invalid(Invalid::Name)));
         }
-        let n = match self.slots.iter().position(|slot| slot.name == holder) {
+        let n = match self.number(&holder) {
             Some(n) => n,
             None if self.slots.len() >= self.budget.holders => {
                 return Ok(closed(Close::HoldersFull {
@@ -515,9 +523,12 @@ impl Keeper {
                 }));
             }
             None => {
-                let n = self.slots.len();
+                // The lowest number free: below `budget.holders` (fewer slots than that are held here), so a u32.
+                let n = (0..=self.slots.len())
+                    .find(|n| !self.slots.contains_key(n))
+                    .ok_or_else(|| damaged("a holder's number"))?;
                 records.put(&holder_record(n), &format!("{epoch} {holder}"))?;
-                self.slots.push(Slot::new(holder, epoch));
+                self.slots.insert(n, Slot::new(holder, epoch));
                 n
             }
         };

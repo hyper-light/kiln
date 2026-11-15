@@ -170,6 +170,10 @@ fn spec(
         env,
         control: None,
         gpu_devices: Vec::new(),
+        // No sign-in grant (Shards' D242 step 8, image channel v24): its pass-through is goal 13's.
+        sign_ins: Vec::new(),
+        upstream_roots: Vec::new(),
+        gpu_report: None,
     }
 }
 
@@ -247,7 +251,7 @@ fn once(images: &ImageShards, spec: &ImageSpec, reads: u64, until: Instant) -> R
     let stop = asked.elapsed();
     stopped.map_err(|e| format!("its stop was refused: {e}"))?;
     match end {
-        Ok(Some(RunEnd::Stopped)) => Ok(Run {
+        Ok(Some(ended)) if ended.end == RunEnd::Stopped => Ok(Run {
             boot,
             stats,
             stop,

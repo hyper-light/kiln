@@ -140,6 +140,7 @@ impl Runtime for DeviceRuntime {
             disk_bytes: 0,
         };
         let report = Capacity {
+            own: Default::default(),
             routes: Vec::new(),
             device_routes: Vec::new(),
             backings: Vec::new(),
@@ -150,6 +151,8 @@ impl Runtime for DeviceRuntime {
             devices,
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         };
         report.check()?;
         Ok(Some(report))

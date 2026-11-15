@@ -14,7 +14,8 @@ use std::sync::Weak;
 
 pub(super) struct Backends {
     firecracker: Option<Arc<FirecrackerRuntime>>,
-    shards: Option<Arc<GuestRuntime>>,
+    /// The node's Shards guest runtime, whose managed VMs' processes answer their use (D260) to the charge learner.
+    pub(super) shards: Option<Arc<GuestRuntime>>,
     vm_root: Option<BoxRoot>,
     /// Joint plan step 14: the charge learner of the VMs under `vm_root`, where there are any.
     pub(super) learner: Option<super::charges::Shared>,
@@ -37,12 +38,13 @@ fn project_initialized_routes(
         let present = match pool.execution {
             Execution::Firecracker => firecracker.is_some(),
             Execution::ShardsShared | Execution::ShardsDedicated => shards.is_some(),
-            Execution::Native => false,
+            Execution::Native | Execution::NodeVm => false,
         };
         if !present {
             return Err(Refusal::Backing {
                 key: pool.key,
                 cause: LifecycleCause::Uncertain,
+                why: Some("its node configures no backend for its execution".to_owned()),
             });
         }
     }
@@ -50,7 +52,7 @@ fn project_initialized_routes(
         let present = match execution {
             Execution::Firecracker => firecracker.is_some(),
             Execution::ShardsShared | Execution::ShardsDedicated => shards.is_some(),
-            Execution::Native => false,
+            Execution::Native | Execution::NodeVm => false,
         };
         if !present {
             return Err(projection_refused(
@@ -95,12 +97,12 @@ fn projection_refused(why: &'static str) -> Refusal {
 
 impl Node {
     fn managed_bounds(record: NativeRecord<'_>) -> Result<hex_api::Bounds, Refusal> {
-        let refused = || record.refusal(LifecycleCause::Uncertain);
         match record {
             NativeRecord::Box(record) => {
                 record.spec.check()?;
                 if record.spec.route_execution() == Some(Execution::ShardsShared) {
-                    return Err(refused());
+                    return Err(NativeRecord::Box(record)
+                        .uncertain("a box on a shared backing has no managed bounds of its own"));
                 }
             }
             NativeRecord::Pool(record) => record.check()?,
@@ -108,7 +110,9 @@ impl Node {
         if !matches!(record.class()?, Class::Shards | Class::Firecracker)
             || record.scope().is_none()
         {
-            return Err(refused());
+            return Err(record.uncertain(
+                "its record isn't a VM's with a native scope, which managed bounds are made for",
+            ));
         }
         let allocation = record
             .allocation()
@@ -119,7 +123,9 @@ impl Node {
         // resort and its fleet's budget, and its swap stays off, which its managed create writes itself.
         Ok(hex_api::Bounds {
             cpu_max_milli: Some(
-                u32::try_from(allocation.resources.cpu_milli).map_err(|_| refused())?,
+                u32::try_from(allocation.resources.cpu_milli).map_err(|_| {
+                    record.uncertain("its allocation's CPU is past a managed bound's")
+                })?,
             ),
             ..hex_api::Bounds::default()
         })
@@ -129,7 +135,7 @@ impl Node {
         self.backends
             .get()
             .and_then(|backends| backends.vm_root.as_ref())
-            .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))
+            .ok_or_else(|| record.uncertain("its node holds no VM root to scope it under"))
     }
 
     /// Exact node-owned inputs shared with the configured Shards provider's initialization probe.
@@ -180,16 +186,24 @@ impl Node {
         record: NativeRecord<'_>,
         plan: &ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: Duration,
+        patience: Option<Duration>,
         publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
-        let until = Instant::now()
-            .checked_add(patience)
-            .filter(|_| !patience.is_zero() && patience != Duration::MAX)
-            .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
+        // None: a launch that follows its guest, with no deadline of its caller's (the review's C-9).
+        let until = patience
+            .map(|patience| {
+                Instant::now()
+                    .checked_add(patience)
+                    .filter(|_| !patience.is_zero() && patience != Duration::MAX)
+                    .ok_or_else(|| {
+                        record.uncertain("its managed launch's patience isn't a finite time")
+                    })
+            })
+            .transpose()?;
         let bounds = Self::managed_bounds(record)?;
-        self.backend(plan.class())?
-            .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
+        self.backend(plan.class())?.ok_or_else(|| {
+            record.uncertain("its node configures no backend for its launch's class")
+        })?;
         let shards_api::LaunchIo {
             stdout,
             stderr,
@@ -212,7 +226,11 @@ impl Node {
                 writer,
             }),
             (None, None) => None,
-            _ => return Err(record.refusal(LifecycleCause::Uncertain)),
+            _ => {
+                return Err(
+                    record.uncertain("its managed launch's report descriptor and request disagree")
+                );
+            }
         };
         let owned = match plan {
             ManagedLaunch::Shards(prepared) => Some(self.shards_program(prepared)?),
@@ -221,7 +239,9 @@ impl Node {
         let program = match (plan, owned.as_ref()) {
             (ManagedLaunch::Shards(_), Some(program)) => program,
             (ManagedLaunch::Firecracker { program, .. }, None) => *program,
-            _ => return Err(record.refusal(LifecycleCause::Uncertain)),
+            _ => {
+                return Err(record.uncertain("its managed launch's program isn't its plan's"));
+            }
         };
         program.check()?;
         program.fits(&process::exec_limit())?;
@@ -245,16 +265,25 @@ impl Node {
             stderr: Some(stderr),
             ..Stdio::default()
         };
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(record.refusal(LifecycleCause::Uncertain));
-        }
+        let left = until
+            .map(|until| {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(record.uncertain(
+                        "its managed launch's deadline passed before its controller was bound",
+                    ));
+                }
+                Ok(left)
+            })
+            .transpose()?;
         // A Firecracker VM given a device whole has its VMM's soft RLIMIT_MEMLOCK raised to its hard one, which its
         // create found holds the RAM its VMM pins for DMA.
         let memlock = match plan {
             ManagedLaunch::Firecracker { memlock, .. } => *memlock,
             ManagedLaunch::Shards(_) => None,
         };
+        // The held child's gate is finite where its create has a deadline; a launch that follows its guest gives it
+        // none, its waits then ended by the peer's byte or EOF (the review's C-9; Ada's approval of 2026-11-14).
         self.supervisor.bind_managed(
             &native,
             program,
@@ -378,13 +407,19 @@ impl Node {
         let client = match class {
             Class::Firecracker => match &backends.firecracker {
                 Some(backend) => backend.evented_for(id),
-                None => Err(uncertain(id)),
+                None => Err(uncertain(
+                    id,
+                    "this node has no Firecracker backend for a box its record says is one",
+                )),
             },
             Class::Shards => match &backends.shards {
-                Some(guest) => guest
-                    .evented_for(id)
-                    .and_then(|client| client.ok_or_else(|| uncertain(id))),
-                None => Err(uncertain(id)),
+                Some(guest) => guest.evented_for(id).and_then(|client| {
+                    client.ok_or_else(|| uncertain(id, "its Shards backend holds no guest for it"))
+                }),
+                None => Err(uncertain(
+                    id,
+                    "this node has no Shards backend for a box its record says is one",
+                )),
             },
             Class::Process | Class::Oci => return Forward::Back(Box::new((call, stdio))),
         };
@@ -580,7 +615,9 @@ impl Node {
         let pools = self.store.all_pools()?;
         crate::recorded::preflight_records(&records, &pools, Some(self.attachments.as_ref()))?;
         for (id, record) in &records {
-            let record = record.as_ref().map_err(|_| uncertain(id))?;
+            let record = record
+                .as_ref()
+                .map_err(|why| uncertain(id, &format!("its record can't be read: {why}")))?;
             let handoff = crate::recorded::preflight_handoff_turns(
                 &self.turns,
                 &self.store,
@@ -592,19 +629,29 @@ impl Node {
                     .spec
                     .route
                     .and_then(|route| route.backing)
-                    .ok_or_else(|| uncertain(id))?;
+                    .ok_or_else(|| uncertain(id, "its record routes it on no backing"))?;
                 Some(
                     self.store
                         .read_pool(&key.pool)?
                         .filter(|source| source.key == key)
-                        .ok_or_else(|| uncertain(id))?,
+                        .ok_or_else(|| {
+                            uncertain(
+                                id,
+                                "its record's backing has no record of its own, or another key",
+                            )
+                        })?,
                 )
             } else {
                 None
             };
             match record.spec.backend_class()? {
                 Class::Firecracker => {
-                    let backend = firecracker.ok_or_else(|| uncertain(id))?;
+                    let backend = firecracker.ok_or_else(|| {
+                        uncertain(
+                            id,
+                            "this node has no Firecracker backend for a box its record says is one",
+                        )
+                    })?;
                     preflight_backend(
                         record,
                         source.as_ref(),
@@ -613,7 +660,12 @@ impl Node {
                     )?;
                 }
                 Class::Shards => {
-                    let backend = shards.ok_or_else(|| uncertain(id))?;
+                    let backend = shards.ok_or_else(|| {
+                        uncertain(
+                            id,
+                            "this node has no Shards backend for a box its record says is one",
+                        )
+                    })?;
                     preflight_backend(
                         record,
                         source.as_ref(),
@@ -625,18 +677,27 @@ impl Node {
             }
         }
         for record in &pools {
-            let refused = || Refusal::Backing {
+            let refused = |why: &str| Refusal::Backing {
                 key: record.key,
                 cause: LifecycleCause::Uncertain,
+                why: Some(why.to_owned()),
             };
             match record.execution {
-                Execution::Firecracker => {
-                    firecracker.ok_or_else(refused)?.preflight_backing(record)?
+                Execution::Firecracker => firecracker
+                    .ok_or_else(|| {
+                        refused("its node configures no Firecracker backend to preflight it")
+                    })?
+                    .preflight_backing(record)?,
+                Execution::ShardsShared | Execution::ShardsDedicated => shards
+                    .ok_or_else(|| {
+                        refused("its node configures no Shards backend to preflight it")
+                    })?
+                    .preflight_backing(record)?,
+                Execution::Native | Execution::NodeVm => {
+                    return Err(refused(
+                        "its record's execution is native, which no backend preflights",
+                    ));
                 }
-                Execution::ShardsShared | Execution::ShardsDedicated => {
-                    shards.ok_or_else(refused)?.preflight_backing(record)?
-                }
-                Execution::Native => return Err(refused()),
             }
         }
         let bound = records
@@ -651,7 +712,9 @@ impl Node {
             .try_reserve_exact(bound)
             .map_err(|_| Refusal::Full(MAX_BOXES))?;
         for (id, record) in &records {
-            let record = record.as_ref().map_err(|_| uncertain(id))?;
+            let record = record
+                .as_ref()
+                .map_err(|why| uncertain(id, &format!("its record can't be read: {why}")))?;
             // A retired box's VM is gone with its retirement (joint plan step 14): no native scope to adopt.
             if record.retired {
                 continue;
@@ -698,24 +761,31 @@ impl Node {
         pools: &[hex_core::record::PoolRecord],
     ) -> Result<(), Refusal> {
         for record in pools {
-            let refused = || Refusal::Backing {
+            let refused = |why: &str| Refusal::Backing {
                 key: record.key,
                 cause: LifecycleCause::Uncertain,
+                why: Some(why.to_owned()),
             };
             match record.execution {
                 Execution::Firecracker => self
                     .backends
                     .get()
                     .and_then(|backends| backends.firecracker.as_ref())
-                    .ok_or_else(refused)?
+                    .ok_or_else(|| {
+                        refused("its node configures no Firecracker backend to recover it")
+                    })?
                     .recover_backing()?,
                 Execution::ShardsShared | Execution::ShardsDedicated => self
                     .backends
                     .get()
                     .and_then(|backends| backends.shards.as_ref())
-                    .ok_or_else(refused)?
+                    .ok_or_else(|| refused("its node configures no Shards backend to recover it"))?
                     .recover_backing()?,
-                Execution::Native => return Err(refused()),
+                Execution::Native | Execution::NodeVm => {
+                    return Err(refused(
+                        "its record's execution is native, which no backend recovers",
+                    ));
+                }
             }
         }
         Ok(())
@@ -780,7 +850,11 @@ impl Node {
     /// Dispatch from the retained configuration/generation before entering its method/native turn.
     /// A current offer cannot replace a recovered grant or choose a different VM implementation.
     pub(super) fn pool_backend(&self, key: &BackingKey) -> Result<&dyn Runtime, Refusal> {
-        let refused = |cause| Refusal::Backing { key: *key, cause };
+        let refused = |cause| Refusal::Backing {
+            key: *key,
+            cause,
+            why: None,
+        };
         let record = self
             .store
             .read_pool(&key.pool)?
@@ -818,8 +892,12 @@ impl Node {
         let Some(record) = self.store.read_lifecycle(id)? else {
             return Ok(None);
         };
-        self.backend(record.spec.backend_class()?)
-            .map_err(|_| uncertain(id))
+        self.backend(record.spec.backend_class()?).map_err(|why| {
+            uncertain(
+                id,
+                &format!("this node has no backend for its record's class: {why}"),
+            )
+        })
     }
 
     pub(super) fn initialized_classes(&self) -> Vec<Class> {
@@ -839,9 +917,11 @@ impl Node {
     /// records cannot be treated as native Process/OCI cleanup authority.
     pub(super) fn recover_backends(&self, records: &Records) -> Result<RecoverySummary, Refusal> {
         for (id, record) in records {
-            let record = record.as_ref().map_err(|_| uncertain(id))?;
+            let record = record
+                .as_ref()
+                .map_err(|why| uncertain(id, &format!("its record can't be read: {why}")))?;
             if record.spec.id != *id {
-                return Err(uncertain(id));
+                return Err(uncertain(id, "its record names another box"));
             }
             record.spec.check()?;
             if matches!(
@@ -850,10 +930,14 @@ impl Node {
             ) && record.spec.route_execution() != Some(hex_api::Execution::ShardsShared)
                 && record.spec.allocation.is_none()
             {
-                return Err(uncertain(id));
+                return Err(uncertain(id, "its record holds no allocation for its VM"));
             }
-            self.backend(record.spec.backend_class()?)
-                .map_err(|_| uncertain(id))?;
+            self.backend(record.spec.backend_class()?).map_err(|why| {
+                uncertain(
+                    id,
+                    &format!("this node has no backend for its record's class: {why}"),
+                )
+            })?;
         }
         let mut summary = RecoverySummary::default();
         summary
@@ -869,14 +953,19 @@ impl Node {
             .try_reserve_exact(records.len())
             .map_err(|_| Refusal::Full(MAX_BOXES))?;
         for (id, record) in records {
-            let record = record.as_ref().map_err(|_| uncertain(id))?;
+            let record = record
+                .as_ref()
+                .map_err(|why| uncertain(id, &format!("its record can't be read: {why}")))?;
             // A retired box ran nothing past its retirement and is kept for its owner's delete (joint plan step 14).
             if record.retired {
                 continue;
             }
-            let Some(backend) = self
-                .backend(record.spec.backend_class()?)
-                .map_err(|_| uncertain(id))?
+            let Some(backend) = self.backend(record.spec.backend_class()?).map_err(|why| {
+                uncertain(
+                    id,
+                    &format!("this node has no backend for its record's class: {why}"),
+                )
+            })?
             else {
                 continue;
             };
@@ -899,15 +988,15 @@ impl Node {
                             .backends
                             .get()
                             .and_then(|backends| backends.firecracker.as_ref())
-                            .ok_or_else(|| uncertain(id))?
+                            .ok_or_else(|| uncertain(id, "this node has no Firecracker backend for a box its record says is one"))?
                             .validate_binding(&record.spec),
                         Class::Shards => self
                             .backends
                             .get()
                             .and_then(|backends| backends.shards.as_ref())
-                            .ok_or_else(|| uncertain(id))?
+                            .ok_or_else(|| uncertain(id, "this node has no Shards backend for a box its record says is one"))?
                             .recover_managed(&record.spec),
-                        Class::Process | Class::Oci => return Err(uncertain(id)),
+                        Class::Process | Class::Oci => return Err(uncertain(id, "its record names a class no recovered VM is")),
                     };
                     match recovered {
                         Ok(()) => {}
@@ -926,7 +1015,10 @@ impl Node {
                         || actual.allocation != record.spec.allocation
                         || actual.route != record.spec.route
                     {
-                        return Err(uncertain(id));
+                        return Err(uncertain(
+                            id,
+                            "its recovered VM's class, allocation or route isn't its record's",
+                        ));
                     }
                     summary.adopted.push(id.try_clone()?);
                 }
@@ -958,6 +1050,7 @@ fn preflight_backend(
         Some(source) => Err(Refusal::Backing {
             key: source.key,
             cause: LifecycleCause::Uncertain,
+            why: Some("a box's source backing is prepared or granted, neither live, draining nor released".to_owned()),
         }),
     }
 }
@@ -1004,12 +1097,22 @@ impl Node {
                 (Some(pool), boxed)
             }
         };
-        let _devices = self.hold_attachments(&keys)?;
+        self.held_transaction(owner, &keys, callback)
+    }
+
+    /// `owner`'s transaction once its turn is taken: its devices' attachments held, and this node its native owner.
+    fn held_transaction(
+        &self,
+        owner: BookOwner<'_>,
+        keys: &[DeviceId],
+        callback: &mut dyn FnMut(&dyn Transaction) -> Result<(), Refusal>,
+    ) -> Result<(), Refusal> {
+        let _devices = self.hold_attachments(keys)?;
         let launch =
             |record: NativeRecord<'_>,
              plan: &ManagedLaunch<'_>,
              io: shards_api::LaunchIo,
-             patience: Duration,
+             patience: Option<Duration>,
              publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>| {
                 self.launch_managed(record, plan, io, patience, publish)
             };
@@ -1034,16 +1137,16 @@ impl Node {
         };
         match owner {
             BookOwner::Box(id) => {
-                crate::recorded::transaction(&self.store, id, &keys, &native, callback)
+                crate::recorded::transaction(&self.store, id, keys, &native, callback)
             }
             BookOwner::Pool(key) => {
-                crate::recorded::pool_transaction(&self.store, key, &keys, &native, callback)
+                crate::recorded::pool_transaction(&self.store, key, keys, &native, callback)
             }
             BookOwner::Handoff { id, source } => crate::recorded::handoff_transaction(
                 &self.store,
                 id,
                 source,
-                &keys,
+                keys,
                 &native,
                 callback,
             ),
@@ -1054,6 +1157,9 @@ impl Node {
 impl Books for Node {
     fn records(&self) -> Result<Records, Refusal> {
         self.store.all()
+    }
+    fn record(&self, id: &BoxId) -> Result<Option<Result<BoxRecord, String>>, Refusal> {
+        self.store.get(id)
     }
     fn pool_records(&self) -> Result<PoolRecords, Refusal> {
         self.store.all_pools()
@@ -1110,6 +1216,16 @@ impl Books for Node {
     ) -> Result<(), Refusal> {
         self.book_transaction(BookOwner::Box(id), devices, callback)
     }
+    /// Waits for a turn of the box under way, following its holder (decision 9), as the recorded node's does: it makes
+    /// no native call (`hex_runtime::devices::with_record_transaction` refuses each), so no holder waits on it.
+    fn with_record_transaction(
+        &self,
+        id: &BoxId,
+        callback: &mut dyn FnMut(&dyn Transaction) -> Result<(), Refusal>,
+    ) -> Result<(), Refusal> {
+        let _turn = self.turns.take(id)?;
+        self.held_transaction(BookOwner::Box(id), &[], callback)
+    }
     fn with_pool_transaction(
         &self,
         key: &BackingKey,
@@ -1127,13 +1243,30 @@ impl Books for Node {
     ) -> Result<(), Refusal> {
         self.book_transaction(BookOwner::Handoff { id, source }, full_conflicts, callback)
     }
+    fn node_vm(
+        &self,
+        run: &hex_api::NodeRun,
+    ) -> Result<Option<hex_core::record::NodeVmRecord>, Refusal> {
+        self.store.node_vm(run)
+    }
+    fn put_node_vm(&self, record: &hex_core::record::NodeVmRecord) -> Result<(), Refusal> {
+        self.store.put_node_vm(record)
+    }
+    fn all_node_vms(&self) -> Result<Vec<hex_core::record::NodeVmRecord>, Refusal> {
+        self.store.all_node_vms()
+    }
+    fn mint_node_run(&self) -> Result<hex_api::NodeRun, Refusal> {
+        self.store.mint_node_run()
+    }
 }
 
-pub(super) fn uncertain(id: &BoxId) -> Refusal {
+/// Box `id`'s lifecycle uncertain, in the refusing site's own words (joint plan step 12).
+pub(super) fn uncertain(id: &BoxId, why: &str) -> Refusal {
     match id.try_clone() {
         Ok(id) => Refusal::Lifecycle {
             id,
             cause: LifecycleCause::Uncertain,
+            why: Some(why.to_owned()),
         },
         Err(refusal) => refusal,
     }
@@ -1363,7 +1496,10 @@ mod preflight_dispatch_tests {
                     Some(&source),
                     |_| {
                         ordinary += 1;
-                        Err(uncertain(&record.spec.id))
+                        Err(uncertain(
+                            &record.spec.id,
+                            "the test's ordinary preflight refuses it",
+                        ))
                     },
                     |record, source| {
                         proof += 1;
@@ -1392,7 +1528,10 @@ mod preflight_dispatch_tests {
                 None,
                 |_| {
                     ordinary += 1;
-                    Err(uncertain(&record.spec.id))
+                    Err(uncertain(
+                        &record.spec.id,
+                        "the test's ordinary preflight refuses it",
+                    ))
                 },
                 |_, _| {
                     proof += 1;

@@ -142,11 +142,43 @@ struct Oracle {
     asking: bool,
     counts: Counts,
     handed: Vec<u64>,
-    /// The line's wait and the hang bound, each the slowest answer seen (`crate::patience`, tested on its own): from
-    /// each wait that ends in a seed and each create a seed is done with; no sample from a wait that ran out or a seed
-    /// that died (Karn's point), after a run-out the next wait following its party until an answer comes.
-    wait: Patience,
-    hang: Patience,
+    /// The line's wait and the hang bound, each the slowest answer seen, modelled apart from `crate::patience` (tested
+    /// on its own): from each wait that ends in a seed and each create a seed is done with; no sample from a wait that
+    /// ran out or a seed that died (Karn's point), after a run-out the next wait following its party until an answer
+    /// comes.
+    wait: Learned,
+    hang: Learned,
+}
+
+/// The oracle's model of a learned wait (decision 9): the slowest answer seen, and whether the next wait follows its
+/// party. A model, so it tells no run-out of its own: the pool's waits tell theirs.
+#[derive(Debug, Clone, Copy)]
+struct Learned {
+    slowest: Option<Duration>,
+    following: bool,
+}
+
+impl Learned {
+    /// A wait as it is once it has seen an answer of `seen` ms, or with none.
+    fn starting(seen: Option<u64>) -> Self {
+        Self {
+            slowest: seen.map(ms),
+            following: false,
+        }
+    }
+
+    fn deadline(&self) -> Option<Duration> {
+        if self.following { None } else { self.slowest }
+    }
+
+    fn answered(&mut self, took: Duration) {
+        self.slowest = Some(self.slowest.map_or(took, |slowest| slowest.max(took)));
+        self.following = false;
+    }
+
+    fn ran_out(&mut self) {
+        self.following = true;
+    }
 }
 
 impl Oracle {
@@ -161,15 +193,9 @@ impl Oracle {
             asking: true,
             counts: Counts::default(),
             handed: vec![0; slots],
-            wait: Patience::measuring(WAIT),
-            hang: Patience::measuring(HANG),
+            wait: Learned::starting(setup.wait),
+            hang: Learned::starting(setup.hang),
         }
-        .calibrated(setup)
-    }
-
-    fn calibrated(mut self, setup: Setup) -> Self {
-        calibrate(&mut self.wait, &mut self.hang, setup);
-        self
     }
 
     fn phase(&self, seed: SeedId) -> Option<Phase> {
@@ -235,7 +261,7 @@ impl Oracle {
         if let Wait::Within(until) = wait
             && until < now
         {
-            self.wait.ran_out(until - since);
+            self.wait.ran_out();
             seen.handed_past_bound += 1;
         }
         self.wait.answered(now - since);
@@ -263,8 +289,8 @@ impl Oracle {
                 seen.claim_waits += 1;
                 Claim::Wait { until: Some(until) }
             }
-            Wait::Within(until) => {
-                self.wait.ran_out(until - since);
+            Wait::Within(_) => {
+                self.wait.ran_out();
                 seen.run_out_at_claim += 1;
                 self.line[i] = (ticket, since, Wait::Following);
                 Claim::Wait { until: None }
@@ -646,7 +672,7 @@ fn play(setup: Setup, events: &[Event], paths: &Cell<Paths>) -> Result<(), TestC
                 for &seed in &late {
                     let Some(Phase::Busy {
                         since,
-                        until: Some(until),
+                        until: Some(_),
                         unclaimed,
                     }) = oracle.phase(seed)
                     else {
@@ -654,7 +680,7 @@ fn play(setup: Setup, events: &[Event], paths: &Cell<Paths>) -> Result<(), TestC
                             "{seed} was past its bound serving nothing"
                         )));
                     };
-                    oracle.hang.ran_out(until - since);
+                    oracle.hang.ran_out();
                     let until = None;
                     oracle.set(
                         seed,

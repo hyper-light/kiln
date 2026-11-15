@@ -68,17 +68,13 @@ pub const fn gateway_mac(gateway: [u8; 4]) -> [u8; 6] {
 /// 14.3 through 4 MiB (r433; docs/research/measurements/vsock-window-v1).
 pub const VSOCK_WINDOW: u32 = 4 << 20;
 
-/// The window its host's memory pressure is measured over (D188; `vmm` platform/pressure.rs,
-/// its PSI trigger's and its other hosts' repeat): a guest that grew less than this ago is
-/// taken for one growing, whatever its host says meanwhile (init plug.rs, PM M466).
-pub const PRESSURE_WINDOW_US: u64 = 2_000_000;
-
 pub mod bounds;
 pub mod build;
 pub mod changes;
 pub mod emulate;
 pub mod gpu;
 pub mod guest_time;
+pub mod pace;
 pub mod rate;
 pub mod ring;
 pub mod run;
@@ -147,6 +143,12 @@ pub mod control {
     /// the run under the device in its place, a stopped microVM's own (`run::kind::OVER`).
     /// Read: 1 once one was put there, else 0.
     pub const LAYER_SWAP: u64 = 0x48;
+    /// Read, 64 bits in one access: the VM process's own memory when read, in bytes, as its
+    /// host counts memory per VM and a group shards keeps sums it (D183; PM M30): macOS's
+    /// physical footprint, Windows' private working set, Linux's anonymous resident pages;
+    /// 0 where it cannot say. A group's room is held as of it, read with what the run uses
+    /// (`run::room_now`).
+    pub const FOOTPRINT: u64 = 0x50;
 
     pub const SNAPSHOT_NOW: u32 = 1;
     pub const SHOW_SWAP: u32 = 1;

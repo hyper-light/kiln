@@ -7,8 +7,10 @@ use std::path::Path;
 fn config(root: &Path) -> GuestConfig {
     GuestConfig {
         binary: root.join("bound-cli"),
-        kernel: root.join("bound-kernel"),
-        initrd: root.join("init"),
+        boot: crate::guest::Boot::Kernel {
+            kernel: root.join("bound-kernel"),
+            initrd: root.join("init"),
+        },
         vcpus: 1,
         memory_mib: 256,
         gpu: false,
@@ -110,7 +112,7 @@ fn fixed_native_fixture_uses_real_evidence_and_refuses_legacy_or_wrong_cost() {
     );
     let view = plan.native_startup().unwrap();
     assert_eq!(view.binary(), config.binary);
-    assert_eq!(view.kernel(), config.kernel);
+    assert_eq!(view.kernel(), config.direct().unwrap().0);
     assert_eq!(view.images().evidence(), cost.id);
     assert_eq!(view.paths(), &paths);
     assert_eq!(view.console_kept(), 0);
@@ -152,7 +154,7 @@ fn fallible_fixture_spec_preserves_existing_kernel_and_ordered_share_grammar() {
     let mut config = config(dir.path());
     let spec = config.try_spec().unwrap();
     assert_eq!(spec.cmdline, "console=ttyS0 panic=-1 hex.shares=ro,rw");
-    assert_eq!(spec.kernel, config.kernel);
+    assert_eq!(spec.kernel, config.direct().unwrap().0);
     assert_eq!(
         spec.shares.first().unwrap().dir,
         config.shares.first().unwrap().dir

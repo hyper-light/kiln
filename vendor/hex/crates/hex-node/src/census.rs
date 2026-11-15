@@ -1,8 +1,9 @@
 //! The waits census (`bench/competitive/probes/waits_census.md`; decision 9): with [`ENV_FILE`] naming a file, every
-//! answer every named wait in this process records ([`hex_core::patience`]) is appended as `name nanos`
-//! (completed wire refusals: `name !nanos`),
-//! from the waits' own timing points, so the probe reads each wait's distribution without re-implementing it. With
-//! it unset nothing is installed and a wait's answer costs one atomic load more. A bench's switch: the probe sets it.
+//! answer every named wait in this process records ([`hex_core::patience`]) is appended as `name nanos` (completed
+//! wire refusals: `name !nanos`, run-outs `name >nanos`), from the waits' own timing points, so the probe reads each
+//! wait's distribution without re-implementing it. It disarms no wait: one past its W* tells its run-out, as anywhere,
+//! and follows its party to its answer, which comes in uncensored, so the record keeps each wait's tail. With it unset
+//! nothing is installed and a wait's answer costs one atomic load more. A bench's switch: the probe sets it.
 //!
 //! Bounded (CLAUDE.md §2): at most [`ENV_MAX`] lines, which the probe sets from its N; past it one last line says
 //! the census is full, and no more is written, so the record says it was cut rather than end silently (§3).
@@ -50,8 +51,6 @@ pub fn install_from_env() -> Result<bool, Refusal> {
         .map_err(|e| Refusal::os("opening the waits census", e))?;
     MAX.store(max, Ordering::Relaxed);
     let _ = OUT.set(Mutex::new(out));
-    // The census records every answer, the tail past a wait's bound too: no wait arms while it runs.
-    hex_core::patience::measure_all();
     Ok(hex_core::patience::census(record))
 }
 

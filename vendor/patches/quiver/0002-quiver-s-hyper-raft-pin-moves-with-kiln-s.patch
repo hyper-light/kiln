@@ -1,8 +1,8 @@
 Subject: Quiver's hyper-raft pin moves with kiln's
-Why: kiln takes hyper-raft at 045cf3ff (Shards' control link reads hyper-quic's negotiated idle timeout, patch Q34), and kiln holds one copy, which Quiver builds on
+Why: kiln takes hyper-raft at e0613f52, the revision Shards and Hex pin (hyper-quic's patches Q34, the negotiated idle timeout Shards' control link reads, and Q35, a handshake's progress), and kiln holds one copy, which Quiver builds on
 
 diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
-index adb8583acd907c422b9e32c7c9b4ce4ab19d3166..b7348f286923ba88e78de8e1e046644a00dafaa5 100644
+index adb8583acd907c422b9e32c7c9b4ce4ab19d3166..4d5b8806886c96339907c22eda2fc54f662b82d7 100644
 --- a/vendor/MANIFEST.toml
 +++ b/vendor/MANIFEST.toml
 @@ -32,7 +32,7 @@ own = ["UPSTREAM.md"]
@@ -10,7 +10,7 @@ index adb8583acd907c422b9e32c7c9b4ce4ab19d3166..b7348f286923ba88e78de8e1e046644a
  kind = "git"
  repository = "https://github.com/hyper-light/hyper-raft"
 -commit = "fb74b59533908472ade7e526eb08117601cede0e"
-+commit = "045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
++commit = "e0613f524b0df198cc61dc1e82b33c22d604cf7b"
  path = "vendor/hyper-raft"
  take = [
    "Cargo.toml",

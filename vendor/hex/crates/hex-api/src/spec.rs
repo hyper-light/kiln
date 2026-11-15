@@ -74,7 +74,9 @@ impl BoxSpec {
     pub fn backend_class(&self) -> Result<Class, Refusal> {
         self.check()?;
         Ok(match self.route_execution() {
-            None | Some(crate::runtime::Execution::Native) => self.class.class(),
+            None | Some(crate::runtime::Execution::Native | crate::runtime::Execution::NodeVm) => {
+                self.class.class()
+            }
             Some(
                 crate::runtime::Execution::ShardsShared
                 | crate::runtime::Execution::ShardsDedicated,
@@ -322,6 +324,11 @@ pub struct ShardsImage {
     /// shares (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credentials: Vec<crate::CredentialGrant>,
+    /// Its members' CLIs' sign-ins (Shards' D242, step 8; docs/design/credential-grants.md C8): each a sign-in its
+    /// orchestrator's store names, its tokens taken outside the VM by its run's injector and kept by its orchestrator,
+    /// its CLI given placeholders in their places. None by default. After the credentials (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sign_ins: Vec<crate::SignInGrant>,
 }
 
 /// A member of a Shards image its caller drives ([`ShardsImage::members`]): which one, by the kind and name
@@ -343,16 +350,24 @@ pub struct ImageMember {
     /// After the working directory (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Whether it has an MCP bridge of its own (Shards' D254, `MemberSpec::mcp`): `/run/shards/mcp`, a stdio server its
+    /// harness's MCP config names as a command, each connection to which reaches its run's controller as a lane of the
+    /// run's agent-control endpoint. So it needs that endpoint: a node that asks none of its run refuses a member asking
+    /// one, by this field, as Shards' own check does. None by default. After the run-time arguments (append-only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp: bool,
 }
 
 impl ImageMember {
-    /// `member`, given nothing over its image's, in its image's working directory, its image's command alone.
+    /// `member`, given nothing over its image's, in its image's working directory, its image's command alone, with no
+    /// MCP bridge.
     pub fn new(member: crate::Member) -> Self {
         Self {
             member,
             env: Vec::new(),
             workdir: None,
             args: Vec::new(),
+            mcp: false,
         }
     }
 
@@ -407,6 +422,7 @@ impl ShardsImage {
             members: Vec::new(),
             shares: Vec::new(),
             credentials: Vec::new(),
+            sign_ins: Vec::new(),
         }
     }
 
@@ -419,38 +435,7 @@ impl ShardsImage {
     /// exactly is the runtime's to refuse as it programs the boot. Its credentials, last, as
     /// [`crate::check_credentials`] takes them over its grants (refused naming `credentials`).
     pub fn check(&self) -> Result<(), Refusal> {
-        let (name, digest) = self.image.rsplit_once('@').ok_or_else(|| {
-            invalid_image(format!(
-                "image {:?} isn't pinned by a digest (NAME@sha256:…)",
-                self.image
-            ))
-        })?;
-        if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err(invalid_image(format!(
-                "image {:?} names no image before its digest",
-                self.image
-            )));
-        }
-        let (algorithm, hex) = digest.split_once(':').unwrap_or((digest, ""));
-        // go-digest v1.0.0's algorithms and their encoded lengths (sha256, sha384, sha512), as Shards'
-        // reference parser takes them (crates/image/src/reference.rs at 482c5d78).
-        let length = match algorithm {
-            "sha256" => 64,
-            "sha384" => 96,
-            "sha512" => 128,
-            _ => {
-                return Err(invalid_image(format!(
-                    "image {:?}'s digest algorithm isn't sha256, sha384 or sha512",
-                    self.image
-                )));
-            }
-        };
-        if hex.len() != length || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(invalid_image(format!(
-                "image {:?}'s digest isn't {length} lowercase hex digits",
-                self.image
-            )));
-        }
+        check_pinned("shards image", &self.image)?;
         if let Some(command) = &self.command {
             match command.first() {
                 None => {
@@ -484,7 +469,8 @@ impl ShardsImage {
             }
         }
         // Each share as a mount's paths are checked (its host directory absolute and UTF-8 with no NUL, where the guest
-        // sees it absolute with no `..`), never at the guest's root, which it would hide, and each path seen once.
+        // sees it absolute with no `..`), never at the guest's root, which it would hide, and each place seen once,
+        // however its path is spelled (the review's B-10), so no share's read-only intent is lost to mount order.
         for (at, share) in self.shares.iter().enumerate() {
             let as_image = |e: Refusal| match e {
                 Refusal::Invalid { why, .. } => invalid_image(why),
@@ -503,7 +489,7 @@ impl ShardsImage {
                 .get(..at)
                 .unwrap_or_default()
                 .iter()
-                .any(|s| s.destination == share.destination)
+                .any(|s| same_place(&s.destination, &share.destination))
             {
                 return Err(invalid_image(format!(
                     "{field} {:?} is another share's too",
@@ -513,8 +499,47 @@ impl ShardsImage {
         }
         // Its credentials, each one that could be filled in exactly as it says over the grants just taken (joint plan
         // step 33, docs/design/credential-grants.md C2).
-        crate::check_credentials(&self.credentials, &self.grants)
+        crate::check_credentials(&self.credentials, &self.grants)?;
+        crate::check_sign_ins(&self.sign_ins, &self.credentials, &self.grants)
     }
+}
+
+/// Whether `image` is pinned by a digest go-digest validates, as Shards' reference parser checks one: a name, then `@`,
+/// the algorithm `sha256`, `sha384` or `sha512` and exactly that many lowercase hex digits; refused `Invalid` naming
+/// `what` where it isn't. The rest of the name's grammar is Shards' to refuse as it resolves the image. A box's image
+/// is held to it ([`ShardsImage::check`]), and a node's own guest image (docs/design/node-under-shards-init.md §4; the
+/// review's C-17), so an image boots as it was admitted, whatever a tag names by then.
+pub fn check_pinned(what: &'static str, image: &str) -> Result<(), Refusal> {
+    let refused = |why: String| Refusal::Invalid { what, why };
+    let (name, digest) = image.rsplit_once('@').ok_or_else(|| {
+        refused(format!(
+            "image {image:?} isn't pinned by a digest (NAME@sha256:…)"
+        ))
+    })?;
+    if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(refused(format!(
+            "image {image:?} names no image before its digest"
+        )));
+    }
+    let (algorithm, hex) = digest.split_once(':').unwrap_or((digest, ""));
+    // go-digest v1.0.0's algorithms and their encoded lengths (sha256, sha384, sha512), as Shards'
+    // reference parser takes them (crates/image/src/reference.rs at 482c5d78).
+    let length = match algorithm {
+        "sha256" => 64,
+        "sha384" => 96,
+        "sha512" => 128,
+        _ => {
+            return Err(refused(format!(
+                "image {image:?}'s digest algorithm isn't sha256, sha384 or sha512"
+            )));
+        }
+    };
+    if hex.len() != length || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(refused(format!(
+            "image {image:?}'s digest isn't {length} lowercase hex digits"
+        )));
+    }
+    Ok(())
 }
 
 fn invalid_image(why: String) -> Refusal {
@@ -622,6 +647,24 @@ fn path_parts(path: &str) -> impl Iterator<Item = &str> {
         (path, false)
     };
     rest.split(move |c| c == '/' || (windows && c == '\\'))
+}
+
+/// Whether two paths [`container_path`] took name one place: the same drive where either is drive-absolute (its letter
+/// in either case, as Windows reads it), then the same steps, past the empty components a doubled or trailing
+/// separator leaves and `.`, which names none (`..` is refused before).
+fn same_place(a: &str, b: &str) -> bool {
+    let drive = |path: &str| {
+        path.chars()
+            .next()
+            .filter(|_| drive_absolute(path))
+            .map(|letter| letter.to_ascii_lowercase())
+    };
+    drive(a) == drive(b) && steps(a).eq(steps(b))
+}
+
+/// The components of an absolute path that each name a step ([`path_parts`] past the empty ones and `.`).
+fn steps(path: &str) -> impl Iterator<Item = &str> {
+    path_parts(path).filter(|part| !part.is_empty() && *part != ".")
 }
 
 /// A host path a spec names: absolute on the host that runs the container (POSIX-absolute on Linux and
@@ -1344,6 +1387,7 @@ mod tests {
                 String::new(),
                 "claude-opus-4".to_owned(),
             ],
+            mcp: false,
         };
         let agent = ImageMember::new(crate::Member {
             kind: crate::MemberKind::Agent,
@@ -1412,6 +1456,31 @@ mod tests {
         assert!(refused(bad_name).1.contains("members[0].member.name"));
     }
 
+    /// Joint plan step 12, Shards' D254 (AC-T7.4.1): a member's MCP bridge, asked or not. Do write a member asking none
+    /// and one asking one as JSON, and read each back. Expect the first's JSON to leave `mcp` out, so that a member
+    /// written before the field reads as asking none, and the second's to say it; each read back whole.
+    #[test]
+    fn w12_a_members_mcp_bridge_is_left_out_of_its_json_unless_asked() {
+        let none = ImageMember::new(crate::Member {
+            kind: crate::MemberKind::Harness,
+            name: "claude".to_owned(),
+        });
+        let asked = ImageMember {
+            mcp: true,
+            ..none.clone()
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("mcp").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<ImageMember>(json).unwrap(), none);
+        let json = serde_json::to_value(&asked).unwrap();
+        assert_eq!(
+            json.get("mcp"),
+            Some(&serde_json::Value::Bool(true)),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_value::<ImageMember>(json).unwrap(), asked);
+    }
+
     /// Joint plan step 12 for kiln's step 18 (AC-T7.4.1): the host directories an image VM's guest sees, each a share
     /// as Shards takes one (its host directory, where the guest sees it, read-only or not). Do check a VM sharing a
     /// home volume read-write and a project read-only, and one sharing none; then a share whose host directory is
@@ -1471,6 +1540,57 @@ mod tests {
                 (what, why.contains(field)),
                 ("shards image", true),
                 "{bad:?}: {why}"
+            );
+        }
+    }
+
+    /// The review's B-10 (AC-T7.4.1, joint plan step 12): two shares the guest sees at one place are one share too
+    /// many, however their paths are spelled, or the read-only one's intent is lost to the order they are mounted in.
+    /// Do check a VM sharing a project read-only at `/work/hex` beside another directory, read-write, at the same place
+    /// spelled apart: a trailing slash, a `.` component, doubled slashes, a trailing `.`; and drive-absolute, the same
+    /// drive in the other case and with the other separator. Expect each refused as Invalid naming shares[1]'s
+    /// destination. Then shares at other places: a sibling whose name only begins alike, a folder above it, and the
+    /// same path on another drive. Expect those to pass.
+    #[test]
+    fn b10_two_shares_at_one_guest_place_spelled_apart_are_refused() {
+        let share = |source: &str, destination: &str, read_only: bool| Mount {
+            source: PathBuf::from(source),
+            destination: destination.to_owned(),
+            read_only,
+        };
+        let with = |first: &str, second: &str| ShardsImage {
+            shares: vec![
+                share("/srv/projects/hex", first, true),
+                share("/srv/other", second, false),
+            ],
+            ..ShardsImage::new(crate::sim::SIM_IMAGE)
+        };
+        for (first, second) in [
+            ("/work/hex", "/work/hex/"),
+            ("/work/hex", "/work/./hex"),
+            ("/work/hex", "//work/hex"),
+            ("/work/hex", "/work//hex"),
+            ("/work/hex", "/work/hex/."),
+            ("C:\\work\\hex", "c:/work/hex/"),
+        ] {
+            match with(first, second).check() {
+                Err(Refusal::Invalid { what, why }) => assert_eq!(
+                    (what, why.contains("shares[1].destination")),
+                    ("shards image", true),
+                    "{first:?} and {second:?}: {why}"
+                ),
+                other => panic!("{first:?} and {second:?}, one place: {other:?}"),
+            }
+        }
+        for (first, second) in [
+            ("/work/hex", "/work/hexa"),
+            ("/work/hex", "/work"),
+            ("C:\\work\\hex", "D:\\work\\hex"),
+        ] {
+            assert_eq!(
+                with(first, second).check(),
+                Ok(()),
+                "{first:?} and {second:?} are two places"
             );
         }
     }

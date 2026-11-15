@@ -53,6 +53,8 @@ pub mod sizes;
 #[cfg(target_os = "linux")]
 pub mod supervise;
 
+#[cfg(all(debug_assertions, feature = "test-controls", target_os = "linux"))]
+pub use emptying::EmptyingHold;
 #[cfg(all(target_os = "linux", debug_assertions))]
 pub use node::CrashPoint;
 #[cfg(target_os = "linux")]

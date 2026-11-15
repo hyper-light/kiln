@@ -34,7 +34,8 @@
 //!   client that doesn't read its answers stops being read rather than growing the agent's memory.
 //!   By construction they number at most `in_flight + programs + 1`: an answer for each call in
 //!   flight (a list's parts go one at a time), an end for each program, and the one refusal read
-//!   before reading stopped;
+//!   before reading stopped; and, on a connection that leases its boxes' credentials ([`leases`]), its lease asks
+//!   (at most its in-flight limit), a give-back for each lease its boxes' runs hold, and an end for each run;
 //! - workers (the platform's threads, [`Platform::threads`]): one for every call the connections' in-flight
 //!   bounds admit, where the kernel's thread limit allows; a call past them waits in the queue those
 //!   bounds hold.
@@ -55,11 +56,14 @@ use std::time::{Duration, Instant};
 
 use hex_api::{BoxId, BoxSpec, Exit, Proc, Program, Refusal, Runtime, Stdio};
 use hex_core::netns;
-use hex_core::patience::Patience;
+use hex_core::patience::{Patience, Piece};
 use hex_core::wire::{self, Answer, Call, Header, Hello, Received, Request, Streams};
 
 pub use hex_core::wire::Limits;
+pub use leases::WireLessors;
 
+pub mod fit;
+pub mod leases;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -105,9 +109,11 @@ pub struct Platform {
 ///   admitted has a worker that can exist;
 /// - programs watched: the programs the node can watch at once.
 ///
-/// Each is a ceiling the platform sets, not the room left under it now: what else holds the platform's room, the
-/// kernel refuses past as the node takes it (`EMFILE`, `EAGAIN`), typed, at no cost to an admission (the lead,
-/// 2026-11-09, over reading the room at each admission, which cost every exec a listing of the node's descriptors).
+/// Each is a ceiling the platform sets, which a node's start fits to its descriptors with everything else it holds
+/// ([`fit`], ROOT's one accounting of 2026-11-13; Linux's with its pools, `crate::netns::fit`), not the room left
+/// under it now: what else holds the platform's room, the kernel refuses past as the node takes it (`EMFILE`,
+/// `EAGAIN`), typed, at no cost to an admission (the lead, 2026-11-09, over reading the room at each admission, which
+/// cost every exec a listing of the node's descriptors).
 pub fn limits(platform: &Platform) -> Limits {
     Limits {
         connections: platform.descriptors,
@@ -131,7 +137,11 @@ pub const KEPT: usize = 1;
 fn starts_program(call: &Call) -> bool {
     matches!(
         call,
-        Call::Exec { .. } | Call::ExecStreams { .. } | Call::Run { .. } | Call::Member { .. }
+        Call::Exec { .. }
+            | Call::ExecStreams { .. }
+            | Call::Run { .. }
+            | Call::Member { .. }
+            | Call::Mcp { .. }
     )
 }
 
@@ -280,6 +290,12 @@ pub trait Host: Runtime {
     /// Counts in box `id` a program exec'd in it that the node ended because the connection watching
     /// it closed (the disconnect rule): reported as [`hex_api::BoxInfo::abandoned`].
     fn abandoned(&self, id: &BoxId) -> Result<(), Refusal>;
+    /// The node's lessors over its wire, where its runtime leases its image VMs' credentials through them
+    /// (docs/design/credential-grants.md C7): a connection that says it leases ([`Call::Lessors`]) answers for the
+    /// boxes it creates. None where the runtime leases through no connection, which refuses that call by type.
+    fn lessors(&self) -> Option<Arc<WireLessors>> {
+        None
+    }
 
     /// The node's network namespace counts (decision 4).
     fn netns(&self) -> Result<netns::Counts, Refusal>;
@@ -499,6 +515,23 @@ pub struct Server<O: Os = Native> {
     io: Option<JoinHandle<()>>,
 }
 
+/// Ends a [`Server`] from another thread ([`Server::stopper`]).
+pub struct Stopper<O: Os = Native> {
+    shared: Arc<Shared<O>>,
+}
+
+impl<O: Os> Stopper<O> {
+    /// Ends the server, `why` its fault, the first one kept: its I/O thread stops at its next wake, every connection
+    /// then closing as a failure closes them, and its wait returns `why` ([`Server::wait`]).
+    pub fn stop(&self, why: String) {
+        if let Ok(mut fault) = self.shared.fault.lock() {
+            fault.get_or_insert(why);
+        }
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        let _ = self.shared.os.wake();
+    }
+}
+
 struct Shared<O: Os> {
     os: O,
     host: Arc<dyn Host>,
@@ -535,6 +568,9 @@ struct Shared<O: Os> {
     work: Condvar,
     /// Why the I/O thread stopped, if it failed.
     fault: Mutex<Option<String>>,
+    /// The host's lessors over the wire, asked once ([`Host::lessors`]): each box's route to the connection that
+    /// created it, where that connection leases.
+    lessors: Option<Arc<WireLessors>>,
 }
 
 /// The connections and the programs they watch, by token. Locked before a connection's own state when
@@ -590,6 +626,11 @@ struct PendingOffer {
 struct Out {
     open: bool,
     in_flight: usize,
+    /// Its MCP calls waiting for their harness to connect ([`Call::Mcp`]), apart from its calls in flight: each holds a
+    /// place in the node's in-flight budget, never the call [`KEPT`] for the connection, so a connection waiting on
+    /// bridges can always make one call of another kind (stop, delete, inspect: KEPT's own reason, the lead's of
+    /// 2026-11-06). Its count of calls in flight is its own calls', which the kept call is reckoned by.
+    waits: usize,
     /// The programs it watches, by their exec's id, with their watch's token.
     programs: BTreeMap<u64, u64>,
     /// Places taken by execs under way.
@@ -597,8 +638,9 @@ struct Out {
     /// At most one per reserved program; no stream handle has been exported to another process.
     offered: BTreeMap<u64, PendingOffer>,
     /// Answers waiting for room in the socket, oldest first, each with the descriptors riding with it and, for a given
-    /// answer, its exec's id, whose client is to say it took them.
-    backlog: VecDeque<(Vec<u8>, Vec<hex_api::End>, Option<u64>)>,
+    /// answer, its exec's id, whose client is to say it took them. One that carries a lease's value or a sign-in's
+    /// tokens is wiped as it goes, sent or let go (docs/design/credential-grants.md C7, C8; the review's E-6).
+    backlog: VecDeque<(hex_api::lease::Wiped, Vec<hex_api::End>, Option<u64>)>,
     /// Its given answers whose client hasn't yet said it took their ends ([`Request::Taken`]), by their exec's id, each
     /// with the node's own copies of the ends once the answer has gone: kept from its send until the word, or until
     /// the connection closes, so none is ever in flight alone, as XNU's collector of descriptors in flight flushes a
@@ -610,6 +652,13 @@ struct Out {
     kept: usize,
     /// Whether its requests are read ([`Interest::Read`]) or only its backlog written.
     reading: bool,
+    /// Where it leases ([`Call::Lessors`]): the line its boxes' runs ask their leases on, held while it stands.
+    line: Option<Arc<dyn leases::Line>>,
+    /// Its lease asks waiting for their answers, by their ids: at most its in-flight limit, each filled as its answer
+    /// comes or as it closes.
+    asks: BTreeMap<u64, Arc<leases::Slot>>,
+    /// The id its next lease ask takes.
+    next_ask: u64,
 }
 
 impl Out {
@@ -720,6 +769,8 @@ struct Start {
     box_id: BoxId,
     pid: u32,
     given: Option<hex_api::Given>,
+    /// An MCP call's start: its place among the connection's waits ([`Out::waits`]) given back, never its calls'.
+    wait: bool,
 }
 
 struct Jobs<O: Os> {
@@ -755,6 +806,13 @@ enum Job<O: Os> {
     /// A program here whose watch reported its end before its runtime could tell it: a run's, whose box its node
     /// is removing (decision 7). Its end is waited for on a worker, so the I/O thread waits on no removal.
     Collect(Box<Watched<O>>),
+    /// A remote member's own kill (goal 2's item 2; [`MemberEnd`]): KILL to member `member` of box `id` alone, its
+    /// host's `signal_member`, whose lane's answer it waits for on a worker, as every call does; `done` hears it.
+    MemberKill {
+        id: BoxId,
+        member: hex_api::Member,
+        done: Killed,
+    },
 }
 
 /// What a call that starts a program starts: a program in a box there is (an exec), or a `process` box made for
@@ -774,11 +832,15 @@ impl Launch {
     }
 }
 
-/// A member handed over through the node's wire ([`Shared::member`]), as the node holds it while its caller waits for
-/// its end: told by the thread that waits for it unless its caller let it go first.
+/// A member handed over through the node's wire ([`Shared::member`]), or a member's MCP connection ([`Shared::mcp`]), as
+/// the node holds it while its caller waits for its end: told by the thread that waits for it unless its caller let it go
+/// first.
 struct MemberEnd<O: Os> {
     shared: std::sync::Weak<Shared<O>>,
     token: u64,
+    /// What its own kill reaches.
+    kills: Kills,
+
     /// Its caller let it go: its end goes to no one. Taken for its end's telling and for its release alike, so a
     /// release either comes first, and nothing is told, or after, and clears what was told before its start was
     /// registered ([`Table::early`]).
@@ -800,13 +862,63 @@ impl<O: Os> MemberEnd<O> {
     }
 }
 
+/// What a program the node holds for a remote caller is killed by.
+enum Kills {
+    /// A member: KILL on its own lane (goal 2's item 2), its box and itself named to its host's `signal_member`.
+    Member { id: BoxId, member: hex_api::Member },
+    /// An MCP connection: its runtime's own kill, apart from its `Proc` (`Proc::killer`; goal 2's item 3), taken by the
+    /// first kill, a later one having nothing more to send.
+    Own(Mutex<Option<hex_api::Killer>>),
+    /// An MCP connection whose `Proc` gives no kill apart from it: it ends only by its own end or its stdin's close.
+    Unreachable,
+}
+
+/// Tells a kill's `done` whether it went, where no one has yet.
+fn killed(done: &Mutex<Option<Killed>>, sent: Result<(), Refusal>) {
+    if let Some(done) = done.lock().ok().and_then(|mut done| done.take()) {
+        done(sent);
+    }
+}
+
 impl<O: Os> Remote for MemberEnd<O> {
-    /// A member's own kill awaits Shards' agent-control endpoint (joint plan step 11), as the `Proc`
-    /// `Runtime::member` gives refuses it in process: refused by type, its box's KILL or delete ending it with its VM.
+    /// KILL to the member alone, on its own lane of its run's agent-control endpoint (goal 2's item 2), as the `Proc`
+    /// `Runtime::member` gives kills it in process: its host's `signal_member`, run on a worker as every call is
+    /// ([`Job::MemberKill`]), which tells `done` the lane's answer; or here, refused, where the queue takes no job. An MCP
+    /// connection's is its runtime's own kill, on a thread of its own ("hex-node mcp kill"), as it waits for its lane on
+    /// the run's connection's life and no worker is held by an MCP connection (ROOT, 2026-11-14).
     fn kill(&self, done: Killed) {
-        done(Err(Refusal::Awaits {
-            needs: hex_api::Upstream::MemberSignal,
-        }));
+        let (id, member) = match &self.kills {
+            Kills::Member { id, member } => (id, member),
+            Kills::Own(killer) => return own_kill(killer, done),
+            Kills::Unreachable => {
+                return done(Err(Refusal::Invalid {
+                    what: "kill",
+                    why: "this MCP connection's runtime gives no kill apart from it: it ends by its own end or its \
+                          stdin's close"
+                        .to_owned(),
+                }));
+            }
+        };
+        let Some(shared) = self.shared.upgrade() else {
+            return done(Err(Refusal::Broken(
+                "the node serving the member has ended".to_owned(),
+            )));
+        };
+        let id = match id.try_clone() {
+            Ok(id) => id,
+            Err(why) => return done(Err(why)),
+        };
+        // A queue that refuses the job (its lock poisoned) drops it, and the worker's telling with it.
+        let done = Arc::new(Mutex::new(Some(done)));
+        let telling = Arc::clone(&done);
+        let queued = shared.enqueue(Job::MemberKill {
+            id,
+            member: member.clone(),
+            done: Box::new(move |sent| killed(&telling, sent)),
+        });
+        if let Err(why) = queued {
+            killed(&done, Err(why));
+        }
     }
 
     /// No one waits for its end any longer: it runs on, its end told no one, and an end told before its start was
@@ -821,6 +933,36 @@ impl<O: Os> Remote for MemberEnd<O> {
         {
             table.early.remove(&self.token);
         }
+    }
+}
+
+/// An MCP connection's kill ([`Kills::Own`]), taken once, on a thread of its own, which tells `done`; one taken already
+/// has nothing more to send.
+fn own_kill(killer: &Mutex<Option<hex_api::Killer>>, done: Killed) {
+    let taken = match killer.lock() {
+        Ok(mut killer) => killer.take(),
+        Err(_) => {
+            return done(Err(Refusal::Broken(
+                "an MCP connection's kill's lock was poisoned".to_owned(),
+            )));
+        }
+    };
+    let Some(kill) = taken else {
+        return done(Ok(()));
+    };
+    let done = Arc::new(Mutex::new(Some(done)));
+    let telling = Arc::clone(&done);
+    let spawned = std::thread::Builder::new()
+        .name("hex-node mcp kill".to_owned())
+        .spawn(move || killed(&telling, kill()));
+    if let Err(why) = spawned {
+        killed(
+            &done,
+            Err(Refusal::os(
+                "starting the thread an MCP connection's kill runs on",
+                why,
+            )),
+        );
     }
 }
 
@@ -954,6 +1096,7 @@ impl<O: Os> Server<O> {
         let shared = Arc::new(Shared {
             os,
             classes: host.classes(),
+            lessors: host.lessors(),
             host,
             limits,
             workers,
@@ -997,6 +1140,14 @@ impl<O: Os> Server<O> {
     /// Why its I/O thread stopped, if it failed: it then serves nothing more.
     pub fn fault(&self) -> Option<String> {
         self.shared.fault.lock().ok().and_then(|f| f.clone())
+    }
+
+    /// What ends it from another thread, as a failure ends it ([`Stopper::stop`]): its host's, where the host can't go on
+    /// (the scheduler's placement core stopped: the review's E-10).
+    pub fn stopper(&self) -> Stopper<O> {
+        Stopper {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Serves until the I/O thread stops, which it does only when it fails; returns why.
@@ -1234,6 +1385,7 @@ impl<O: Os> Shared<O> {
                 out: hex_wait::Mutex::new(Out {
                     open: true,
                     in_flight: 0,
+                    waits: 0,
                     programs: BTreeMap::new(),
                     reserved: 0,
                     offered: BTreeMap::new(),
@@ -1241,6 +1393,9 @@ impl<O: Os> Shared<O> {
                     given: BTreeMap::new(),
                     kept: 0,
                     reading: true,
+                    line: None,
+                    asks: BTreeMap::new(),
+                    next_ask: 1,
                 }),
                 drained: hex_wait::Condvar::new(),
             }),
@@ -1322,14 +1477,22 @@ impl<O: Os> Shared<O> {
             if size == 0 && passed.is_empty() && (gone || self.os.hung_up(&conn.sock)) {
                 return Ok(true);
             }
-            let bytes = buf.get(..got.min(size).min(buf.len())).unwrap_or_default();
+            let read = got.min(size).min(buf.len());
+            let bytes = buf.get(..read).unwrap_or_default();
+            // A lease's value crosses in its message alone: its bytes here are wiped once it is read, whatever came of
+            // it (docs/design/credential-grants.md C7).
+            let secret = wire::carries_secret(bytes);
             let received = Received {
                 bytes,
                 size,
                 descriptors: passed.len(),
                 descriptors_cut: cut,
             };
-            if self.request(conn, &received, passed)? {
+            let ended = self.request(conn, &received, passed);
+            if secret && let Some(held) = buf.get_mut(..read) {
+                hex_api::lease::wipe_in_place(held);
+            }
+            if ended? {
                 return Ok(true);
             }
         }
@@ -1380,10 +1543,25 @@ impl<O: Os> Shared<O> {
             Ok((h, Request::Release)) => self.release(conn, h.id),
             Ok((h, Request::Taken)) => self.taken(conn, h.id),
             Ok((h, Request::StreamsReady)) => self.streams_ready(conn, h),
+            Ok((h, Request::Lessor(made))) => {
+                self.lease_reply(conn, h.id, leases::Reply::Lessor(made), None)
+            }
+            Ok((h, Request::Leased { run, answer })) => {
+                self.lease_reply(conn, h.id, leases::Reply::Leased(answer), Some(run))
+            }
+            Ok((h, Request::Captured { run, answer })) => {
+                self.lease_reply(conn, h.id, leases::Reply::Captured(answer), Some(run))
+            }
+            Ok((h, Request::Refreshed { run, answer })) => {
+                self.lease_reply(conn, h.id, leases::Reply::Refreshed(answer), Some(run))
+            }
             Ok((header, Request::Call(call))) => {
+                // An MCP call may wait as long as its harness takes to connect: it is admitted from the budget's shared
+                // part alone, never the connection's kept call ([`Out::waits`]).
+                let waits = matches!(call, Call::Mcp { .. });
                 let admitted = {
                     let mut out = conn.out.lock().map_err(poisoned)?;
-                    let admitted = if out.in_flight < KEPT {
+                    let admitted = if out.in_flight < KEPT && !waits {
                         // Its kept call: always there, since what is kept and in flight never pass the budget.
                         if out.open {
                             self.idle_calls.fetch_sub(1, Ordering::AcqRel);
@@ -1399,7 +1577,9 @@ impl<O: Os> Shared<O> {
                             })
                             .is_ok()
                     };
-                    if admitted {
+                    if admitted && waits {
+                        out.waits = out.waits.saturating_add(1);
+                    } else if admitted {
                         out.in_flight = out.in_flight.saturating_add(1);
                     }
                     admitted
@@ -1419,7 +1599,11 @@ impl<O: Os> Shared<O> {
                     // riding it are held only within a place, which the node counts among its own (the lead,
                     // 2026-11-11): past the budget it is refused here, its streams closed before the answer goes.
                     drop(passed);
-                    self.done(conn)?;
+                    if waits {
+                        self.done_wait(conn)?;
+                    } else {
+                        self.done(conn)?;
+                    }
                     self.answer(
                         conn,
                         header.id,
@@ -1501,6 +1685,10 @@ impl<O: Os> Shared<O> {
         given: Option<u64>,
         after_read: bool,
     ) -> Result<(), Refusal> {
+        // A sign-in's tokens or a lease's value cross in their message alone: its bytes here are wiped as they go,
+        // sent, queued and sent, or let go (docs/design/credential-grants.md C7, C8; the review's E-6).
+        let secret = wire::carries_secret(&bytes);
+        let bytes = hex_api::lease::Wiped::new(bytes, secret);
         let mut out = conn.out.lock().map_err(poisoned)?;
         if after_read {
             out = self.drained(conn, out)?;
@@ -1512,7 +1700,7 @@ impl<O: Os> Shared<O> {
             out.given.insert(exec, Vec::new());
         }
         if out.backlog.is_empty() {
-            match self.os.send(&conn.sock, &bytes, &fds) {
+            match self.os.send(&conn.sock, bytes.bytes(), &fds) {
                 Sent::Sent => {
                     out.sent(fds, given);
                     return Ok(());
@@ -1559,7 +1747,15 @@ impl<O: Os> Shared<O> {
                 && now >= within
             {
                 // Past W*: no sample (Karn's point), the run-out told once, and the wait goes on.
-                self.reads.ran_out(within);
+                self.reads.ran_out(
+                    within,
+                    now,
+                    &[
+                        Piece::Kind("the client of connection "),
+                        Piece::Number(conn.token),
+                        Piece::Kind(", reading its waiting answers"),
+                    ],
+                );
                 bound = None;
             }
             out = match bound {
@@ -1583,7 +1779,7 @@ impl<O: Os> Shared<O> {
     fn flush(&self, conn: &Conn<O>) -> Result<(), Refusal> {
         let mut out = conn.out.lock().map_err(poisoned)?;
         while let Some((front, fds, _)) = out.backlog.front() {
-            match self.os.send(&conn.sock, front, fds) {
+            match self.os.send(&conn.sock, front.bytes(), fds) {
                 Sent::Sent => {
                     if let Some((_, fds, given)) = out.backlog.pop_front() {
                         out.sent(fds, given);
@@ -1623,7 +1819,16 @@ impl<O: Os> Shared<O> {
             if out.places() == 0 {
                 self.idle_programs.fetch_sub(1, Ordering::AcqRel);
             }
+            // What waited to go goes nowhere now: any that carried a sign-in's tokens wiped as it drops.
             out.backlog.clear();
+            // Its lease asks hear its end, and its boxes' runs lease from no one here from now.
+            for slot in std::mem::take(&mut out.asks).into_values() {
+                slot.fill(leases::Reply::Ended);
+            }
+            out.line = None;
+            if let Some(wire) = &self.lessors {
+                wire.closed(conn.token);
+            }
             // Its given ends go with it, and the places those of programs it no longer watches held.
             self.kept.fetch_sub(out.kept, Ordering::AcqRel);
             out.kept = 0;
@@ -2003,6 +2208,10 @@ impl<O: Os> Shared<O> {
                         }) => self.list(&conn, header, &infos),
                         // No worker to wait in: its end isn't known, and is sent so, or counted in its box as
                         // `finish` counts one.
+                        Some(Job::MemberKill { done, .. }) => {
+                            done(Err(Refusal::os("starting a worker for a member's kill", e)));
+                            Ok(())
+                        }
                         Some(Job::Collect(w)) => {
                             let open = w.conn.out.lock().is_ok_and(|out| out.open);
                             if open && !w.killed {
@@ -2067,6 +2276,18 @@ impl<O: Os> Shared<O> {
                 } => {
                     let _ = self.list(&conn, header, &infos);
                 }
+                // A member that no longer runs has nothing to end, as in process (the image class's `MemberProc`):
+                // its end is told as it comes. The worker waits for the member's lane as the image class's
+                // `Steering::signal` does: decision 9's, within its W*, past it the run-out told once and the wait on
+                // by the run's connection's life.
+                Job::MemberKill { id, member, done } => {
+                    done(
+                        match self.host.signal_member(&id, &member, hex_api::Signal::KILL) {
+                            Err(Refusal::NotRunning(..)) => Ok(()),
+                            sent => sent,
+                        },
+                    );
+                }
                 Job::Collect(mut w) => {
                     let exit = match &mut w.run {
                         Run::Local { proc, .. } => {
@@ -2095,14 +2316,20 @@ impl<O: Os> Shared<O> {
         call: Call,
         passed: Vec<O::Passed>,
     ) -> Result<(), Refusal> {
+        let waits = matches!(call, Call::Mcp { .. });
         let reply = |answer: Answer| -> Result<(), Refusal> {
-            self.done(conn)?;
+            if waits {
+                self.done_wait(conn)?;
+            } else {
+                self.done(conn)?;
+            }
             self.answer(conn, header.id, &answer)
         };
         let starts = match &call {
             Call::Exec { id, streams, .. }
             | Call::ExecStreams { id, streams, .. }
-            | Call::Member { id, streams, .. } => Some((id, *streams)),
+            | Call::Member { id, streams, .. }
+            | Call::Mcp { id, streams, .. } => Some((id, *streams)),
             Call::Run { spec, streams, .. } => Some((&spec.id, *streams)),
             _ => None,
         };
@@ -2118,7 +2345,8 @@ impl<O: Os> Shared<O> {
                 };
                 if let Call::ExecStreams { ask, .. }
                 | Call::Run { ask, .. }
-                | Call::Member { ask, .. } = &call
+                | Call::Member { ask, .. }
+                | Call::Mcp { ask, .. } = &call
                 {
                     stdio.ask = hex_api::Ask {
                         stdin: ask.stdin,
@@ -2233,6 +2461,9 @@ impl<O: Os> Shared<O> {
                 ((Call::Member { id, member, .. }, stdio), Some((token, _))) => {
                     return self.member(conn, header, token, id, member, stdio);
                 }
+                ((Call::Mcp { id, member, .. }, stdio), Some((token, _))) => {
+                    return self.mcp(conn, header, token, id, member, stdio);
+                }
                 ((call, _), _) => call,
             },
         };
@@ -2241,7 +2472,8 @@ impl<O: Os> Shared<O> {
             Call::Exec { .. }
             | Call::ExecStreams { .. }
             | Call::Run { .. }
-            | Call::Member { .. } => Err(Refusal::Broken(
+            | Call::Member { .. }
+            | Call::Mcp { .. } => Err(Refusal::Broken(
                 "an exec came back from its host without its place".to_owned(),
             )),
             Call::Kill { exec } => return self.kill(conn, header, exec),
@@ -2262,6 +2494,7 @@ impl<O: Os> Shared<O> {
                 let grant = triomphe::Arc::try_unwrap(grant).map_err(|grant| Refusal::Backing {
                     key: grant.key,
                     cause: hex_api::LifecycleCause::Uncertain,
+                    why: Some("its grant is still shared by another holder".to_owned()),
                 });
                 grant
                     .and_then(|grant| host.initialize_backing(grant))
@@ -2269,12 +2502,29 @@ impl<O: Os> Shared<O> {
             }
             Call::ReleaseBacking(key) => host.release_backing(key).map(Answer::BackingOffer),
             Call::BackingUsage(key) => host.backing_usage(&key).map(Answer::Usage),
-            Call::Create(spec) => host.create(*spec).map(Answer::Info),
+            Call::Create(spec) => self.create(conn, *spec).map(Answer::Info),
             Call::Start(id) => host.start(&id).map(|()| Answer::Done),
             Call::Signal { id, signal } => host.signal(&id, signal).map(|()| Answer::Done),
+            Call::MemberSignal { id, member, signal } => host
+                .signal_member(&id, &member, signal)
+                .map(|()| Answer::Done),
             Call::Inspect(id) => host.inspect(&id).map(Answer::Info),
+            // A start followed to its end on this worker, as decision 9 has a wait follow its party: a boot past its W*
+            // is followed to its answer here, so its remote caller waits on the fact (ROOT, 2026-11-14).
+            Call::Started(id) => host.started(&id).map(Answer::Info),
+            // The machine's capacity view's word, kept for the node's charge learner (the review's A-10).
+            Call::Reserved(word) => host.reserved(word).map(|()| Answer::Done),
             Call::Usage(id) => host.usage(&id).map(Answer::Usage),
-            Call::Delete(id) => host.delete(&id).map(|()| Answer::Done),
+            Call::Delete(id) => {
+                let deleted = host.delete(&id);
+                // Its route goes with it, as does one of a box already gone.
+                if let (Some(wire), Ok(()) | Err(Refusal::NoSuchBox(_))) = (&self.lessors, &deleted)
+                {
+                    wire.deleted(&id);
+                }
+                deleted.map(|()| Answer::Done)
+            }
+            Call::Lessors => self.leasing(conn).map(|()| Answer::Done),
             Call::Netns => host.netns().map(Answer::Netns),
             // The endpoint's links at one moment, in as many parts as they need.
             Call::Links => {
@@ -2351,6 +2601,7 @@ impl<O: Os> Shared<O> {
                     box_id,
                     pid,
                     given,
+                    wait: false,
                 };
                 return self.started(table, conn, header, start, Run::Remote(Arc::from(program)));
             }
@@ -2402,6 +2653,23 @@ impl<O: Os> Shared<O> {
         if out.in_flight == 0 && out.open {
             self.idle_calls.fetch_add(1, Ordering::AcqRel);
         }
+        let _ = self
+            .in_flight
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+
+    /// One of `conn`'s MCP calls is done waiting ([`Out::waits`]): its place in flight given back, its connection's
+    /// kept call untouched, as it never held it.
+    fn done_wait(&self, conn: &Conn<O>) -> Result<(), Refusal> {
+        let mut out = conn.out.lock().map_err(poisoned)?;
+        self.wait_done(&mut out);
+        Ok(())
+    }
+
+    fn wait_done(&self, out: &mut Out) {
+        out.waits = out.waits.saturating_sub(1);
         let _ = self
             .in_flight
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -2566,6 +2834,7 @@ impl<O: Os> Shared<O> {
             box_id: id,
             pid,
             given,
+            wait: false,
         };
         let run = Run::Local {
             proc,
@@ -2608,6 +2877,10 @@ impl<O: Os> Shared<O> {
         let end = Arc::new(MemberEnd {
             shared: Arc::downgrade(self),
             token,
+            kills: Kills::Member {
+                id: id.try_clone()?,
+                member: member.clone(),
+            },
             released: Mutex::new(false),
         });
         let telling = Arc::clone(&end);
@@ -2632,8 +2905,108 @@ impl<O: Os> Shared<O> {
             box_id: id,
             pid: 0,
             given,
+            wait: false,
         };
         self.started(table, conn, header, start, Run::Remote(end))
+    }
+
+    /// Member `member`'s next MCP connection in box `id` ([`Call::Mcp`]; goal 2's item 3), from its runtime's
+    /// `Runtime::mcp`, which waits for its harness to connect, which may be never: so on a thread of its own ("hex-node
+    /// mcp"), never one of the workers, which the node's other calls and its own jobs are served on (a program's collect,
+    /// a member's kill, an abandoned box's count, a list's parts; ROOT, 2026-11-14). The call stays in flight until it is
+    /// answered ([`Out::waits`]), so the node's in-flight bound bounds these threads too. Its cost, one thread for each MCP
+    /// call from its ask to its connection's end, is the price of Shards' lanes that only wait at this pin: once the
+    /// pending wait can be tried without waiting on the event loop's wake (Shards `9f5b1f754`'s `Dialed::wake`,
+    /// `PendingMcp::wait(Duration::ZERO)` after each ring), it holds no thread. One whose connection closes waits on till
+    /// its harness connects or its run ends, its place in flight held, then the disconnect rule ends what it took.
+    fn mcp(
+        self: &Arc<Self>,
+        conn: &Arc<Conn<O>>,
+        header: Header,
+        token: u64,
+        id: BoxId,
+        member: hex_api::Member,
+        stdio: Stdio,
+    ) -> Result<(), Refusal> {
+        let (shared, owner) = (Arc::clone(self), Arc::clone(conn));
+        let waited = std::thread::Builder::new()
+            .name("hex-node mcp".to_owned())
+            .spawn(move || {
+                let _ = shared.mcp_taken(&owner, header, token, &id, &member, stdio);
+            });
+        match waited {
+            Ok(_) => Ok(()),
+            Err(why) => {
+                self.unreserve(conn)?;
+                self.done_wait(conn)?;
+                self.answer(
+                    conn,
+                    header.id,
+                    &Answer::Refused(Refusal::os(
+                        "starting the thread that waits for an MCP connection",
+                        why,
+                    )),
+                )
+            }
+        }
+    }
+
+    /// [`Shared::mcp`]'s thread: the connection its runtime gives, its ends given and joined as a member's are
+    /// ([`joined`]), its start told, then its end waited for here and told as a remote program's; or its runtime's
+    /// refusal, answered.
+    fn mcp_taken(
+        self: &Arc<Self>,
+        conn: &Arc<Conn<O>>,
+        header: Header,
+        token: u64,
+        id: &BoxId,
+        member: &hex_api::Member,
+        stdio: Stdio,
+    ) -> Result<(), Refusal> {
+        let reply = |answer: Answer| -> Result<(), Refusal> {
+            self.done_wait(conn)?;
+            self.answer(conn, header.id, &answer)
+        };
+        let mut proc = match self.host.mcp(id, member) {
+            Ok(proc) => proc,
+            Err(r) => {
+                self.unreserve(conn)?;
+                return reply(Answer::Refused(r));
+            }
+        };
+        // Its ends let go where they can't be given, so its harness's input ends and the connection with it.
+        let given = match proc.streams().and_then(|own| joined(own, stdio)) {
+            Ok(given) => given,
+            Err(r) => {
+                self.unreserve(conn)?;
+                return reply(Answer::Refused(r));
+            }
+        };
+        let kills = match proc.killer() {
+            Some(killer) => Kills::Own(Mutex::new(Some(killer))),
+            None => Kills::Unreachable,
+        };
+        let end = Arc::new(MemberEnd {
+            shared: Arc::downgrade(self),
+            token,
+            kills,
+            released: Mutex::new(false),
+        });
+        let table = self.table()?;
+        let start = Start {
+            token,
+            box_id: id.try_clone()?,
+            pid: 0,
+            given,
+            wait: true,
+        };
+        let remote: Arc<dyn Remote> = Arc::clone(&end) as Arc<dyn Remote>;
+        self.started(table, conn, header, start, Run::Remote(remote))?;
+        let ended = proc.wait_for(Duration::MAX).and_then(|ended| {
+            ended.ok_or_else(|| Refusal::Broken("an MCP connection's end came as none".to_owned()))
+        });
+        end.told(ended);
+        Ok(())
     }
 
     /// A program that had ended and been reaped before it could be watched: a run's, whose node reaps it to remove
@@ -2675,7 +3048,11 @@ impl<O: Os> Shared<O> {
             self.reserving.fetch_sub(1, Ordering::AcqRel);
             let mut out = conn.out.lock().map_err(poisoned)?;
             out.reserved = out.reserved.saturating_sub(1);
-            self.call_done(&mut out);
+            if start.wait {
+                self.wait_done(&mut out);
+            } else {
+                self.call_done(&mut out);
+            }
             if out.open {
                 out.programs.insert(header.id, start.token);
             }
@@ -2739,7 +3116,13 @@ impl<O: Os> Shared<O> {
             if let (Some(window), Some(Duration::ZERO)) = (bound, left) {
                 // Past W*: no sample (Karn's point), the run-out told once, and the drain goes on by the programs'
                 // lives alone.
-                crate::emptying::EMPTYING.ran_out(window);
+                crate::emptying::EMPTYING.ran_out(
+                    window,
+                    killed.elapsed(),
+                    &[Piece::Kind(
+                        "the programs a stopping server's closes ended, by their own events",
+                    )],
+                );
                 past = true;
                 left = None;
             }
@@ -2787,6 +3170,150 @@ impl<O: Os> Shared<O> {
         self.stopping.store(true, Ordering::SeqCst);
         if let Ok(_jobs) = self.jobs.lock() {
             self.work.notify_all();
+        }
+    }
+}
+
+/// A connection's line for its boxes' leases (docs/design/credential-grants.md C7): its asks made and answered on it.
+struct ConnLine<O: Os> {
+    shared: std::sync::Weak<Shared<O>>,
+    conn: std::sync::Weak<Conn<O>>,
+}
+
+impl<O: Os> leases::Line for ConnLine<O> {
+    fn ask(&self) -> Result<(u64, Arc<leases::Slot>), Refusal> {
+        let (Some(shared), Some(conn)) = (self.shared.upgrade(), self.conn.upgrade()) else {
+            return Err(line_ended());
+        };
+        let mut out = conn.out.lock().map_err(poisoned)?;
+        if !out.open {
+            return Err(line_ended());
+        }
+        // Its asks waiting are held to its in-flight limit, as its own calls are: each a message the node sends it and a
+        // slot it keeps until its answer or its close.
+        if out.asks.len() >= shared.limits.in_flight {
+            return Err(Refusal::Exhausted {
+                what: "lease asks waiting on one connection",
+                bound: shared.limits.in_flight,
+            });
+        }
+        let id = out.next_ask;
+        out.next_ask = id.checked_add(1).ok_or_else(|| {
+            Refusal::Broken("a connection's lease asks ran out of ids".to_owned())
+        })?;
+        let slot = leases::Slot::new();
+        out.asks.insert(id, Arc::clone(&slot));
+        Ok((id, slot))
+    }
+
+    fn tell(&self, id: u64, answer: &Answer) -> Result<(), Refusal> {
+        let (Some(shared), Some(conn)) = (self.shared.upgrade(), self.conn.upgrade()) else {
+            return Err(line_ended());
+        };
+        shared.answer(&conn, id, answer)
+    }
+
+    fn forget(&self, id: u64) {
+        if let Some(conn) = self.conn.upgrade()
+            && let Ok(mut out) = conn.out.lock()
+        {
+            out.asks.remove(&id);
+        }
+    }
+}
+
+fn line_ended() -> Refusal {
+    Refusal::Unconfigured {
+        what: "lessors for its image VMs' credentials",
+        why: "the connection that created the box, whose orchestrator leases its credentials, has ended".to_owned(),
+    }
+}
+
+/// Whether `spec` grants a credential or a sign-in: a Shards image VM's, whose runs ask their orchestrator (joint plan
+/// step 33; docs/design/credential-grants.md C7, C8).
+fn grants_credentials(spec: &BoxSpec) -> bool {
+    matches!(&spec.class, hex_api::ClassSpec::ShardsImage(image)
+        if !image.credentials.is_empty() || !image.sign_ins.is_empty())
+}
+
+impl<O: Os> Shared<O> {
+    /// This connection leases the credentials of the boxes it creates from now on ([`Call::Lessors`]), where the node
+    /// leases over its wire; refused by type where it doesn't.
+    fn leasing(self: &Arc<Self>, conn: &Arc<Conn<O>>) -> Result<(), Refusal> {
+        if self.lessors.is_none() {
+            return Err(Refusal::Unconfigured {
+                what: "lessors over the node's wire",
+                why: "this node's runtime leases its image VMs' credentials through no connection's lessors".to_owned(),
+            });
+        }
+        let mut out = conn.out.lock().map_err(poisoned)?;
+        if out.line.is_none() {
+            let line: Arc<dyn leases::Line> = Arc::new(ConnLine {
+                shared: Arc::downgrade(self),
+                conn: Arc::downgrade(conn),
+            });
+            out.line = Some(line);
+        }
+        Ok(())
+    }
+
+    /// A create on `conn` (docs/design/credential-grants.md C7): a box granting a credential is made only for a
+    /// connection that leases, refused before any record otherwise (default deny), and each box's route is its create's,
+    /// kept before the create is answered: to its connection where the box grants a credential and the connection
+    /// leases, else none.
+    fn create(&self, conn: &Conn<O>, spec: BoxSpec) -> Result<hex_api::BoxInfo, Refusal> {
+        let line = conn
+            .out
+            .lock()
+            .map_err(poisoned)?
+            .line
+            .as_ref()
+            .map(Arc::downgrade);
+        let granting = grants_credentials(&spec);
+        if granting && line.is_none() {
+            return Err(Refusal::Unconfigured {
+                what: "lessors for its image VMs' credentials",
+                why: format!(
+                    "box {} grants a credential or a sign-in, and the connection that creates it gave no lessors \
+                     (Lessors): a node \
+                     never leases for a box whose creator gave none",
+                    spec.id
+                ),
+            });
+        }
+        let id = spec.id.try_clone()?;
+        let routed = self.lessors.as_ref().filter(|_| granting);
+        if let Some(wire) = routed {
+            wire.room(&id)?;
+        }
+        let info = self.host.create(spec)?;
+        if let Some(wire) = &self.lessors {
+            wire.route(&id, conn.token, line.filter(|_| granting));
+        }
+        Ok(info)
+    }
+
+    /// A lease ask's answer came on `conn`: its slot filled. One no ask waits for is let go, a lease in it given straight
+    /// back to its run ([`Answer::LeaseGiven`]) so its orchestrator holds it no longer; its value is wiped as it drops.
+    fn lease_reply(
+        &self,
+        conn: &Conn<O>,
+        id: u64,
+        reply: leases::Reply,
+        run: Option<u64>,
+    ) -> Result<(), Refusal> {
+        let slot = conn.out.lock().map_err(poisoned)?.asks.remove(&id);
+        match (slot, reply) {
+            (Some(slot), reply) => {
+                slot.fill(reply);
+                Ok(())
+            }
+            (None, leases::Reply::Leased(Ok(lease))) => self.answer(
+                conn,
+                run.unwrap_or_default(),
+                &Answer::LeaseGiven(lease.lease.clone()),
+            ),
+            (None, _) => Ok(()),
         }
     }
 }

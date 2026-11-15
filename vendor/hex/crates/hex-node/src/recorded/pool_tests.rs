@@ -37,7 +37,7 @@ fn prepared_pool_cannot_reach_native_usage_before_its_exact_grant() {
         |_: NativeRecord<'_>,
          _: &hex_runtime::devices::ManagedLaunch<'_>,
          _: shards_api::LaunchIo,
-         _: std::time::Duration,
+         _: Option<std::time::Duration>,
          _: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>| {
             panic!("the usage control cannot launch a VM")
         };
@@ -113,7 +113,7 @@ fn stale_pool_generation_is_refused_before_any_native_callback() {
         |_: NativeRecord<'_>,
          _: &hex_runtime::devices::ManagedLaunch<'_>,
          _: shards_api::LaunchIo,
-         _: std::time::Duration,
+         _: Option<std::time::Duration>,
          _: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>| {
             panic!("a stale owner cannot launch")
         };

@@ -336,7 +336,7 @@ impl Supervisor {
         identity: Option<&shards_api::Identity>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         if record.scope().is_none() {
-            return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+            return Err(record.uncertain("its record names no native scope to recover"));
         }
         let path = identity.map_or(Path::new(""), |identity| identity.vsock.as_path());
         let native = self.reserve_managed(record, cgroup, path)?;
@@ -350,17 +350,18 @@ impl Supervisor {
                     })
                     || identity.started == 0
                 {
-                    return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+                    return Err(record.uncertain("its recovered controller's pid or start is zero"));
                 }
                 let copied = copy_managed_identity(identity)?;
-                native
-                    .identity
-                    .set(copied)
-                    .map_err(|_| record.refusal(hex_api::LifecycleCause::Uncertain))?;
-                let pid = i32::try_from(identity.pid)
-                    .map_err(|_| record.refusal(hex_api::LifecycleCause::Uncertain))?;
-                let raw = Pid::from_raw(pid)
-                    .ok_or_else(|| record.refusal(hex_api::LifecycleCause::Uncertain))?;
+                native.identity.set(copied).map_err(|_| {
+                    record.uncertain("its recovered controller's identity was set before")
+                })?;
+                let pid = i32::try_from(identity.pid).map_err(|_| {
+                    record.uncertain("its recovered controller's pid is past an i32")
+                })?;
+                let raw = Pid::from_raw(pid).ok_or_else(|| {
+                    record.uncertain("its recovered controller's pid isn't a process id")
+                })?;
                 match rustix::process::pidfd_open(raw, PidfdFlags::empty()) {
                     Err(Errno::SRCH) => ManagedPhase::Exited(Exit::Unknown),
                     Err(error) => {
@@ -372,7 +373,9 @@ impl Supervisor {
                             && !ended(pidfd.as_fd())?
                         {
                             if !native.cgroup.procs()?.contains(&identity.pid) {
-                                return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+                                return Err(record.uncertain(
+                                    "its recovered controller isn't in its scope cgroup",
+                                ));
                             }
                             ManagedPhase::Observed {
                                 pid: i64::from(pid),
@@ -416,7 +419,7 @@ impl Supervisor {
         let owner = record.owner();
         let scope = record
             .scope()
-            .ok_or_else(|| record.refusal(hex_api::LifecycleCause::Uncertain))?;
+            .ok_or_else(|| record.uncertain("its record names no native scope to reserve"))?;
         let commitment = record.commitment()?;
         let mut slot = self.reserve()?;
         let token = self.inits()?.token()?;
@@ -463,7 +466,7 @@ impl Supervisor {
         let token_owner = owner.try_owned()?;
         let mut inits = self.inits()?;
         if inits.get(owner).is_some() {
-            return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+            return Err(record.uncertain("its owner's slot holds an init already"));
         }
         inits.insert(
             row_owner,
@@ -482,7 +485,7 @@ impl Supervisor {
         program: &hex_api::Program,
         stdio: hex_api::Stdio,
         launch: hex_runtime::linux::process::HeldLaunch,
-        gate_budget: Duration,
+        gate_budget: Option<Duration>,
         publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         self.same_managed(native)?;
@@ -492,7 +495,7 @@ impl Supervisor {
         let gate = {
             let mut phase = native.phase.lock().map_err(poisoned)?;
             if !matches!(*phase, ManagedPhase::Reserved) {
-                return Err(native.uncertain());
+                return Err(native.uncertain("its managed VM isn't reserved as it is bound"));
             }
             // The per-VM lock was acquired before creation. Ownership publication below cannot
             // fail through a poisoned lock, conversion, allocation or a second native owner.
@@ -518,7 +521,9 @@ impl Supervisor {
                 )
                 .map_err(|error| Refusal::os("watching the managed controller", error))?;
             } else {
-                return Err(native.uncertain());
+                return Err(
+                    native.uncertain("its managed VM isn't held as its controller is watched")
+                );
             }
         }
         #[cfg(test)]
@@ -546,7 +551,7 @@ impl Supervisor {
     fn same_managed(&self, native: &triomphe::Arc<ManagedVm>) -> Result<(), Refusal> {
         match self.inits()?.get(native.owner.as_ref()) {
             Some(Init::Managed(current)) if triomphe::Arc::ptr_eq(current, native) => Ok(()),
-            _ => Err(native.uncertain()),
+            _ => Err(native.uncertain("its managed VM isn't its owner's current one")),
         }
     }
 
@@ -559,7 +564,9 @@ impl Supervisor {
         let native = match self.inits()?.get(owner) {
             Some(Init::Managed(native)) => triomphe::Arc::clone(native),
             Some(Init::Container(_)) => {
-                return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+                return Err(record.uncertain(
+                    "its owner's slot holds a container, not a managed VM, as it is observed",
+                ));
             }
             None => return Ok(None),
         };
@@ -571,7 +578,7 @@ impl Supervisor {
                 ManagedPhase::Reserved
             )
         {
-            return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+            return Err(record.uncertain("its observed managed VM isn't the one its record names"));
         }
         Ok(Some(shards_api::managed_receipt(native)))
     }
@@ -621,16 +628,20 @@ impl Supervisor {
     ) -> Result<hex_api::Usage, Refusal> {
         let native = match self.inits()?.get(record.owner()) {
             Some(Init::Managed(native)) => triomphe::Arc::clone(native),
-            _ => return Err(record.refusal(hex_api::LifecycleCause::Uncertain)),
+            _ => {
+                return Err(
+                    record.uncertain("its owner's slot holds no managed VM to read usage from")
+                );
+            }
         };
         native.matches_record(record)?;
         if native.cgroup.populated_if_present()?.is_none() {
-            return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+            return Err(record.uncertain("its scope cgroup is gone as its usage is read"));
         }
         native
             .cgroup
             .managed_usage()
-            .map_err(|_| record.refusal(hex_api::LifecycleCause::Uncertain))
+            .map_err(|_| record.uncertain("its scope cgroup's usage couldn't be read"))
     }
 
     pub(crate) fn finalize_managed(
@@ -643,23 +654,27 @@ impl Supervisor {
         let native = match self.inits()?.get(owner) {
             Some(Init::Managed(native)) => triomphe::Arc::clone(native),
             Some(Init::Container(_)) => {
-                return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+                return Err(record.uncertain(
+                    "its owner's slot holds a container, not a managed VM, as it is finalized",
+                ));
             }
-            None => return Err(record.refusal(hex_api::LifecycleCause::Uncertain)),
+            None => return Err(record.uncertain("its owner's slot is empty as it is finalized")),
         };
         native.matches_record(record)?;
         native.matches(identity)?;
         let end = native
             .terminal()
-            .map_err(|_| record.refusal(hex_api::LifecycleCause::Uncertain))?
+            .map_err(|_| {
+                record.uncertain("its managed VM's end couldn't be read as it is finalized")
+            })?
             .filter(|end| end.scope == shards_api::TerminalScope::Released)
-            .ok_or_else(|| record.refusal(hex_api::LifecycleCause::Uncertain))?;
+            .ok_or_else(|| record.uncertain("its managed VM isn't released as it is finalized"))?;
         // The backend has durably recorded Released before calling this function. Its canonical
         // method/device turns exclude reuse until this same Arc and cgroup have been finalized.
         if native.events.is_some() {
             native.cgroup.remove()?;
         } else if native.cgroup.populated_if_present()?.is_some() {
-            return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+            return Err(record.uncertain("its scope cgroup still holds members as it is finalized"));
         }
         self.same_managed(&native)?;
         *native.phase.lock().map_err(poisoned)? = ManagedPhase::Finalized(match end.status {
@@ -865,7 +880,10 @@ impl Supervisor {
     pub fn forget(&self, id: &BoxId) -> Result<Option<Forgotten>, Refusal> {
         let mut inits = self.inits()?;
         if matches!(inits.get(OwnerRef::Box(id)), Some(Init::Managed(_))) {
-            return Err(managed_uncertain(id));
+            return Err(managed_uncertain(
+                id,
+                "its init is a managed VM's, which its delete ends through its own scope",
+            ));
         }
         let Some(Init::Container(init)) = inits.remove(OwnerRef::Box(id)) else {
             return Ok(None);
@@ -1033,7 +1051,9 @@ impl Supervisor {
             }
         };
         if let Some(managed) = managed {
-            return managed.collect().map_err(|_| managed.uncertain());
+            return managed
+                .collect()
+                .map_err(|_| managed.uncertain("its managed VM couldn't be collected"));
         }
         let OwnerRef::Box(id) = owner else {
             return Ok(None);
@@ -1082,7 +1102,7 @@ impl Supervisor {
     }
 
     /// The supervising thread's pass over the inits and runs whose pidfds turned readable.
-    fn ready(&self, tokens: &[u64]) -> Result<(), Refusal> {
+    fn ready(self: &Arc<Self>, tokens: &[u64]) -> Result<(), Refusal> {
         let (owners, runs) = {
             let inits = self.inits()?;
             let mut owners = Vec::new();
@@ -1266,11 +1286,12 @@ fn managed_table_invalid() -> Refusal {
     Refusal::Broken(why)
 }
 
-fn managed_uncertain(id: &BoxId) -> Refusal {
+fn managed_uncertain(id: &BoxId, why: &str) -> Refusal {
     match id.try_clone() {
         Ok(id) => Refusal::Lifecycle {
             id,
             cause: hex_api::LifecycleCause::Uncertain,
+            why: Some(why.to_owned()),
         },
         Err(error) => error,
     }
@@ -1296,7 +1317,9 @@ impl ManagedVm {
     pub(crate) fn prepare_isolation_ack(&self) -> Result<std::io::PipeReader, Refusal> {
         let phase = self.phase.lock().map_err(poisoned)?;
         if !matches!(*phase, ManagedPhase::Reserved) || self.isolation_ack.get().is_some() {
-            return Err(self.uncertain());
+            return Err(self.uncertain(
+                "its managed VM isn't reserved, or its isolation ack was prepared before",
+            ));
         }
         let (reader, writer) = std::io::pipe()
             .map_err(|error| Refusal::os("creating per-launch isolation acknowledgment", error))?;
@@ -1306,7 +1329,7 @@ impl ManagedVm {
             .map_err(|error| Refusal::os("bounding isolation acknowledgment write", error))?;
         self.isolation_ack
             .set(Mutex::new(Some(writer)))
-            .map_err(|_| self.uncertain())?;
+            .map_err(|_| self.uncertain("its isolation ack was set before"))?;
         Ok(reader)
     }
 
@@ -1319,15 +1342,18 @@ impl ManagedVm {
             .map(Option::flatten)
     }
 
-    fn uncertain(&self) -> Refusal {
+    /// Its owner refused Uncertain, and `why` in the refusing site's own words (joint plan steps 14 and 12): a pool's
+    /// backing refusal and a box's Lifecycle refusal carry them alike.
+    fn uncertain(&self, why: &str) -> Refusal {
         match self.owner.as_ref() {
-            OwnerRef::Box(id) => managed_uncertain(id),
+            OwnerRef::Box(id) => managed_uncertain(id, why),
             OwnerRef::Pool(pool) => Refusal::Backing {
                 key: hex_api::BackingKey {
                     pool: *pool,
                     generation: *self.scope.bytes(),
                 },
                 cause: hex_api::LifecycleCause::Uncertain,
+                why: Some(why.to_owned()),
             },
         }
     }
@@ -1337,7 +1363,9 @@ impl ManagedVm {
             || Some(self.scope) != record.scope()
             || self.commitment != record.commitment()?
         {
-            return Err(record.refusal(hex_api::LifecycleCause::Uncertain));
+            return Err(
+                record.uncertain("its managed VM's record isn't the one it was reserved for")
+            );
         }
         Ok(())
     }
@@ -1348,34 +1376,45 @@ impl ManagedVm {
         }
         let pid = match &*self.phase.lock().map_err(poisoned)? {
             ManagedPhase::Held { pid, .. } | ManagedPhase::Running { pid, .. } => *pid,
-            _ => return Err(self.uncertain()),
+            _ => {
+                return Err(self.uncertain(
+                    "its managed VM isn't held or running as its identity is observed",
+                ));
+            }
         };
-        let raw = i32::try_from(pid).map_err(|_| self.uncertain())?;
-        let stat = Stat::of(raw).ok_or_else(|| self.uncertain())?;
+        let raw = i32::try_from(pid)
+            .map_err(|_| self.uncertain("its managed controller's pid is past an i32"))?;
+        let stat = Stat::of(raw)
+            .ok_or_else(|| self.uncertain("its managed controller's stat couldn't be read"))?;
         if stat.ppid != rustix::process::getpid().as_raw_nonzero().get() || stat.start_ticks == 0 {
-            return Err(self.uncertain());
+            return Err(self.uncertain(
+                "its managed controller isn't this node's child, or its start is zero",
+            ));
         }
         let vsock = self
             .pending_path
             .lock()
             .map_err(poisoned)?
             .take()
-            .ok_or_else(|| self.uncertain())?;
+            .ok_or_else(|| self.uncertain("its managed controller's vsock was taken before"))?;
         self.identity
             .set(shards_api::Identity {
-                pid: u32::try_from(pid).map_err(|_| self.uncertain())?,
+                pid: u32::try_from(pid)
+                    .map_err(|_| self.uncertain("its managed controller's pid is past a u32"))?,
                 started: stat.start_ticks,
                 vsock,
             })
-            .map_err(|_| self.uncertain())?;
-        self.identity.get().ok_or_else(|| self.uncertain())
+            .map_err(|_| self.uncertain("its managed controller's identity was set before"))?;
+        self.identity.get().ok_or_else(|| {
+            self.uncertain("its managed controller's identity vanished as it was set")
+        })
     }
 
     fn matches(&self, identity: Option<&shards_api::Identity>) -> Result<(), Refusal> {
         if let Some(expected) = identity
             && self.identity.get() != Some(expected)
         {
-            return Err(self.uncertain());
+            return Err(self.uncertain("its managed controller isn't the one it expected"));
         }
         Ok(())
     }
@@ -2170,7 +2209,7 @@ mod tests {
         record.key.generation = [4; 16];
         assert!(matches!(
             native.matches_record(NativeRecord::Pool(&record)),
-            Err(Refusal::Backing { key, cause: hex_api::LifecycleCause::Uncertain })
+            Err(Refusal::Backing { key, cause: hex_api::LifecycleCause::Uncertain, why: Some(_) })
                 if key == record.key
         ));
         record.key.generation = [2; 16];
@@ -2190,7 +2229,9 @@ mod tests {
                 .unwrap(),
         );
         native.matches_record(NativeRecord::Pool(&record)).unwrap();
-        assert!(matches!(native.uncertain(), Refusal::Backing { key, .. } if key == record.key));
+        assert!(
+            matches!(native.uncertain("a test's uncertain managed VM"), Refusal::Backing { key, .. } if key == record.key)
+        );
     }
 
     /// Decision 3 (HEX-RT-7): a deleted box's programs are reaped by its delete, each exit recorded for

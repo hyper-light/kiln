@@ -5,7 +5,7 @@
 //! directory given, changed one at a time; and each run host's diagnostics a file beside them.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hex_api::lease::Lessors;
@@ -18,13 +18,15 @@ use hex_runtime::devices::{Books, PoolPreparationCheck, PoolRecords, Records, Tr
 use hex_runtime::guest::{ImageClass, ImageWaits, host_images};
 use shards_api::image::Images;
 
-use crate::store::Store;
+use crate::store::{Store, TURNS};
+use crate::turns::Turns;
 
 /// The Shards class on Agentfile images as a runtime of its own: its record authority this runtime's own Store.
 pub struct ImageRuntime {
     store: Store,
-    /// A box's record is read and changed by one transaction at a time.
-    turn: Mutex<()>,
+    /// A box's record is read and changed by one transaction of it at a time; transactions of different boxes never
+    /// wait on each other (the review's B-14), each box's turn its own, at most [`TURNS`] taken at once.
+    turns: Turns,
     class: ImageClass,
 }
 
@@ -62,7 +64,14 @@ impl ImageRuntime {
         records: &Path,
         lessors: Arc<dyn Lessors>,
     ) -> Result<Arc<Self>, Refusal> {
-        Self::built(shards, paths, records, host_images(), Ok(ImageWaits::new()), Some(lessors))
+        Self::built(
+            shards,
+            paths,
+            records,
+            host_images(),
+            Ok(ImageWaits::new()),
+            Some(lessors),
+        )
     }
 
     fn built(
@@ -74,6 +83,7 @@ impl ImageRuntime {
         lessors: Option<Arc<dyn Lessors>>,
     ) -> Result<Arc<Self>, Refusal> {
         let store = Store::open(&records.join("state"), &records.join("run"))?;
+        recover(&store)?;
         let class = ImageClass::new(shards)
             .with_boot(images, waits, records.join("image-diagnostics"))
             .with_paths(Arc::new(paths));
@@ -83,7 +93,15 @@ impl ImageRuntime {
         };
         let runtime = Arc::new(Self {
             store,
-            turn: Mutex::new(()),
+            // A transaction waits for one of the same box under way, made by this process's own thread, bounded by the
+            // slowest hold its transactions taught it and following the holder past it (decision 9), as the store's own
+            // turns do; no record is read for it.
+            turns: Turns::new(
+                "changing an image box's record",
+                "image box record changes under way",
+                TURNS,
+                hex_core::patience::Patience::measuring("images.turns"),
+            ),
             class,
         });
         let books: Arc<dyn Books> = runtime.clone();
@@ -95,6 +113,41 @@ impl ImageRuntime {
             .bind_boot_session(runtime.store.boot().cloned())?;
         Ok(runtime)
     }
+
+    /// The class its VMs boot through, a node VM's among them (joint plan step 39): what a node's guest runtime calls
+    /// to boot, read and stop its node VM, its records this runtime's own Store.
+    pub fn class(&self) -> &ImageClass {
+        &self.class
+    }
+
+    /// Whether box `id`'s turn is free now, held by no transaction: what the tests of the runtime's turns read.
+    #[cfg(test)]
+    fn turn_free(&self, id: &BoxId) -> bool {
+        self.turns.try_take(id).is_ok()
+    }
+}
+
+/// The recovery a node runs over its records (`Recorded::recover`; T-T7.1.2), as an image runtime opens its own (the
+/// review's B-13): the boot session marker taken, so a torn record is told from an earlier boot's; the temporary files a
+/// crash left mid-write removed; a record the state directory can't read refused, naming its file, as the damage it is;
+/// each record torn in the runtime place before this boot of the host removed, that boot's end having ended its run,
+/// and each torn in this boot kept, so its name is never reused and its box stays held, as a node holds one, its list
+/// naming it; and the node VM rows an earlier process left settled. A readable record's run of an earlier process is
+/// the class's to hold or take as it reads the record. The last-resort ends a let-go row kept go with it: an image
+/// runtime has no charge learner to carry them to.
+fn recover(store: &Store) -> Result<(), Refusal> {
+    let last_boot = store.take_boot_marker()?;
+    store.remove_strays()?;
+    let mut records = store.retained_records()?;
+    let torn = store.take_torn(&mut records)?;
+    store.refuse_unreadable(&records)?;
+    if store.before_this_boot(last_boot.as_ref()) {
+        for (id, _) in &torn {
+            store.remove(id)?;
+        }
+    }
+    store.settle_node_vms()?;
+    Ok(())
 }
 
 /// What the class never asks of this runtime's records: a pool, a device, a native launch. Refused as broken, since only
@@ -106,6 +159,9 @@ fn unasked(what: &str) -> Refusal {
 impl Books for ImageRuntime {
     fn records(&self) -> Result<Records, Refusal> {
         self.store.all()
+    }
+    fn record(&self, id: &BoxId) -> Result<Option<Result<BoxRecord, String>>, Refusal> {
+        self.store.get(id)
     }
     fn pool_records(&self) -> Result<PoolRecords, Refusal> {
         Ok(Vec::new())
@@ -127,19 +183,18 @@ impl Books for ImageRuntime {
     fn physical_devices(&self) -> Result<Vec<hex_api::DeviceInfo>, Refusal> {
         Ok(Vec::new())
     }
-    /// One box's record read and changed by `callback` alone, each change through the Store's lifecycle writes.
+    /// One box's record read and changed by `callback` alone, each change through the Store's lifecycle writes, under the
+    /// box's own turn.
     fn with_transaction(
         &self,
-        _: &BoxId,
+        id: &BoxId,
         devices: &[hex_api::DeviceId],
         callback: &mut dyn FnMut(&dyn Transaction) -> Result<(), Refusal>,
     ) -> Result<(), Refusal> {
         if !devices.is_empty() {
             return Err(unasked("device"));
         }
-        let _turn = self.turn.lock().map_err(|_| {
-            Refusal::Broken("an image runtime's record turn is poisoned".to_owned())
-        })?;
+        let _turn = self.turns.take(id)?;
         callback(&Kept(&self.store))
     }
     fn with_pool_transaction(
@@ -158,6 +213,21 @@ impl Books for ImageRuntime {
         _: &mut dyn FnMut(&dyn Transaction) -> Result<(), Refusal>,
     ) -> Result<(), Refusal> {
         Err(unasked("pool"))
+    }
+    fn node_vm(
+        &self,
+        run: &hex_api::NodeRun,
+    ) -> Result<Option<hex_core::record::NodeVmRecord>, Refusal> {
+        self.store.node_vm(run)
+    }
+    fn put_node_vm(&self, record: &hex_core::record::NodeVmRecord) -> Result<(), Refusal> {
+        self.store.put_node_vm(record)
+    }
+    fn all_node_vms(&self) -> Result<Vec<hex_core::record::NodeVmRecord>, Refusal> {
+        self.store.all_node_vms()
+    }
+    fn mint_node_run(&self) -> Result<hex_api::NodeRun, Refusal> {
+        self.store.mint_node_run()
     }
 }
 
@@ -199,7 +269,7 @@ impl Transaction for Kept<'_> {
         &self,
         _: &hex_runtime::devices::ManagedLaunch<'_>,
         _: shards_api::LaunchIo,
-        _: Duration,
+        _: Option<Duration>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         Err(unasked("native launch"))
     }
@@ -252,6 +322,12 @@ impl Runtime for ImageRuntime {
     fn member(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, Refusal> {
         self.class.member(id, member)
     }
+    fn mcp(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, Refusal> {
+        self.class.mcp(id, member)
+    }
+    fn signal_member(&self, id: &BoxId, member: &Member, signal: Signal) -> Result<(), Refusal> {
+        self.class.signal_member(id, member, signal)
+    }
     fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
         self.class.room(id, room)
     }
@@ -268,8 +344,11 @@ impl Runtime for ImageRuntime {
     fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, Refusal> {
         self.class.delete_with_host_use(id)
     }
+    fn started(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        self.class.started(id)
+    }
 }
 
 #[cfg(test)]
 #[path = "images/tests.rs"]
-mod tests;
+pub(crate) mod tests;

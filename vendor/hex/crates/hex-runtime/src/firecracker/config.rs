@@ -26,7 +26,6 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub pool_id: String,
     pub boot_timeout: Duration,
-    pub stop_timeout: Duration,
     pub operation_timeout: Duration,
     /// Exact evidence content is verified against cost.id before capability exposure.
     pub cost_evidence: PathBuf,
@@ -66,7 +65,6 @@ struct FileConfig {
     state_dir: Text,
     pool_id: Text,
     boot_ms: u32,
-    stop_ms: u32,
     operation_ms: u32,
     cost_evidence: Text,
     cost: RuntimeCost,
@@ -246,7 +244,6 @@ impl Config {
             state_dir: path(input.state_dir)?,
             pool_id: input.pool_id.0,
             boot_timeout: Duration::from_millis(u64::from(input.boot_ms)),
-            stop_timeout: Duration::from_millis(u64::from(input.stop_ms)),
             operation_timeout: Duration::from_millis(u64::from(input.operation_ms)),
             cost_evidence: path(input.cost_evidence)?,
             // Its census's overheads are evidence alone (joint plan step 14, `RuntimeCost::census_free`).
@@ -285,7 +282,6 @@ impl Config {
             ));
         }
         self.boot_millis()?;
-        millis(self.stop_timeout)?;
         millis(self.operation_timeout)?;
         self.cost.check()?;
         if self
@@ -631,7 +627,6 @@ mod tests {
             state_dir: "/private/owned".into(),
             pool_id: "one-physical-host".into(),
             boot_timeout: Duration::from_secs(3),
-            stop_timeout: Duration::from_secs(1),
             operation_timeout: Duration::from_secs(1),
             cost_evidence: "/private/cost-evidence".into(),
             cost: cost(),
@@ -833,6 +828,7 @@ mod tests {
             disk_bytes: 0,
         };
         let mut capacity = hex_api::Capacity {
+            own: Default::default(),
             id: "the guest's own node".into(),
             total,
             free: total,
@@ -846,6 +842,8 @@ mod tests {
             backings: Vec::new(),
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         };
         crate::devices::native_routes(
             &mut capacity,
@@ -1026,7 +1024,7 @@ mod tests {
             "binary": "/private/firecracker", "binary_sha256": "02".repeat(32),
             "kernel": "/private/vmlinux", "initrd": "/private/initrd",
             "state_dir": "/private/owned", "pool_id": "one-physical-host",
-            "boot_ms": 3000, "stop_ms": 1000, "operation_ms": 1000,
+            "boot_ms": 3000, "operation_ms": 1000,
             "cost_evidence": "/private/cost-evidence", "cost": cost(),
             "staging": {"entries": 10, "bytes": 1048576, "path": 100}
         })
@@ -1071,7 +1069,7 @@ mod tests {
         unknown = original.clone();
         unknown["staging"]["unrecognized"] = serde_json::json!(1);
         assert!(Config::parse(&serde_json::to_vec(&unknown).unwrap()).is_err());
-        for key in ["boot_ms", "stop_ms", "operation_ms"] {
+        for key in ["boot_ms", "operation_ms"] {
             for value in [0u64, u64::from(u32::MAX) + 1] {
                 let mut invalid = original.clone();
                 invalid[key] = serde_json::json!(value);
@@ -1082,6 +1080,23 @@ mod tests {
         invalid["binary_sha256"] = serde_json::json!("private-invalid-pin");
         let error = Config::parse(&serde_json::to_vec(&invalid).unwrap()).unwrap_err();
         assert!(!error.to_string().contains("private-invalid-pin"));
+    }
+
+    /// A-13 (ROOT, 2026-11-14: no legacy kept; a field nothing reads is a lie in the config): a VM's and an observer's
+    /// stop is its managed scope's own measured wait (`managed.stop`), so `stop_ms` is read by nothing, and a
+    /// configuration naming it is refused as any unknown field is, so whoever still passes it hears of it. Do: parse the
+    /// configuration naming `stop_ms`, then without it. Expect: refused, then parsed.
+    #[test]
+    fn a13_a_configuration_naming_stop_ms_is_refused() {
+        let mut named = json();
+        named["stop_ms"] = serde_json::json!(1000);
+        assert!(
+            Config::parse(&serde_json::to_vec(&named).unwrap()).is_err(),
+            "a configuration naming stop_ms parsed"
+        );
+        // The configuration as it stands names no stop_ms.
+        let parsed = Config::parse(&serde_json::to_vec(&json()).unwrap());
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
     }
 
     /// AC-T7.4.1: configuration bytes are bounded and exact pinned inputs are checked before use.

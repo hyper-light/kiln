@@ -174,6 +174,81 @@ pub fn meminfo(text: &str) -> Option<(u64, u64)> {
     Some((field("MemTotal")?, field("MemAvailable")?))
 }
 
+/// A Linux machine's CPU time since its boot and its uptime, in nanoseconds (joint plan step 14, C7), from `/proc/stat`'s
+/// text `stat`, `/proc/uptime`'s `uptime`, and the kernel's clock ticks a second, `hz`. Its CPU time is every CPU's
+/// user, nice, system, irq and softirq ticks, the aggregate `cpu` line's first, second, third, sixth and seventh fields
+/// (proc(5): guest time is within user and nice; idle, iowait and steal are no work of its own); its uptime the first
+/// field of `uptime`, seconds to at most nanoseconds. Each is none where its text doesn't read.
+pub fn machine_time(stat: &str, uptime: &str, hz: u64) -> hex_api::MachineTime {
+    hex_api::MachineTime {
+        cpu_ns: cpu_time(stat, hz),
+        uptime_ns: uptime.split_whitespace().next().and_then(seconds_ns),
+        boxes_cpu_ns: None,
+    }
+}
+
+fn cpu_time(stat: &str, hz: u64) -> Option<u64> {
+    let line = stat.lines().find_map(|line| line.strip_prefix("cpu "))?;
+    let mut fields = line.split_whitespace().map(str::parse::<u64>);
+    let mut ticks = [0u64; 7];
+    for slot in &mut ticks {
+        *slot = fields.next()?.ok()?;
+    }
+    let [user, nice, system, _idle, _iowait, irq, softirq] = ticks;
+    let work = [user, nice, system, irq, softirq]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)?;
+    if hz == 0 {
+        return None;
+    }
+    u64::try_from(
+        u128::from(work)
+            .checked_mul(1_000_000_000)?
+            .checked_div(u128::from(hz))?,
+    )
+    .ok()
+}
+
+/// Seconds written as `/proc/uptime` writes them, `12345.67`, in nanoseconds: none past nanoseconds or a u64.
+fn seconds_ns(text: &str) -> Option<u64> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let places = u32::try_from(fraction.len())
+        .ok()
+        .filter(|places| *places <= 9)?;
+    let fraction_ns = if fraction.is_empty() {
+        0
+    } else {
+        fraction
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(10u64.checked_pow(9u32.checked_sub(places)?)?)?
+    };
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(fraction_ns)
+}
+
+/// A cgroup v2 `cpu.stat`'s `usage_usec`, the CPU time of everything under the cgroup since it was made (a removed
+/// child's among it: cgroup v2 flushes a child's counts into its parent's as it goes), in nanoseconds; none where the
+/// text doesn't read or the time passes a u64 (the review's A-8).
+pub fn cgroup_usage_ns(cpu_stat: &str) -> Option<u64> {
+    cpu_stat
+        .lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))?
+        .trim()
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1_000)
+}
+
 /// A cgroup v2 `memory.max`: a limit in bytes, or none for `max`.
 pub fn cgroup_max(text: &str) -> Option<u64> {
     text.trim().parse().ok()
@@ -331,6 +406,67 @@ impl Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Joint plan step 14 (C7; ROOT, 2026-11-13), CLAUDE.md §6: a machine's CPU time is every CPU's user, nice, system,
+    /// irq and softirq ticks (proc(5): guest time is within user and nice; idle, iowait and steal are no work of its
+    /// own) at its clock's ticks a second, and its uptime `/proc/uptime`'s first field. Do read a real `cpu` line of
+    /// 100 user, 20 nice, 30 system, 400 idle, 50 iowait, 6 irq, 7 softirq and 8 steal ticks at 100 a second, with an
+    /// uptime of 12345.67 s; then broken texts. Expect 1.63 s of CPU and 12345.67 s up; then none where a text breaks.
+    #[test]
+    fn w14_a_machines_time_is_its_cpus_work_since_boot_and_its_uptime() {
+        let stat = "cpu  100 20 30 400 50 6 7 8 0 0\ncpu0 50 10 15 200 25 3 3 4 0 0\nintr 1 2 3\n";
+        assert_eq!(
+            machine_time(stat, "12345.67 54321.00\n", 100),
+            hex_api::MachineTime {
+                cpu_ns: Some(1_630_000_000),
+                uptime_ns: Some(12_345_670_000_000),
+                boxes_cpu_ns: None,
+            }
+        );
+        assert_eq!(
+            machine_time(stat, "7 1\n", 250).uptime_ns,
+            Some(7_000_000_000)
+        );
+        for (stat, uptime) in [
+            ("", ""),
+            ("cpu0 1 2 3 4 5 6 7 8\n", "1.5x 2"),
+            ("cpu  1 2 3\n", "1.1234567891 2"),
+            ("cpu  lots 2 3 4 5 6 7 8\n", "-1 2"),
+            (
+                "cpu  18446744073709551615 0 0 0 0 0 0 0\n",
+                "18446744073709551615.99 1",
+            ),
+        ] {
+            assert_eq!(
+                machine_time(stat, uptime, 100),
+                hex_api::MachineTime::default(),
+                "{stat:?} {uptime:?}"
+            );
+        }
+        let unclocked = machine_time("cpu  1 2 3 4 5 6 7 8\n", "1.5 2", 0);
+        assert_eq!(
+            (unclocked.cpu_ns, unclocked.uptime_ns),
+            (None, Some(1_500_000_000)),
+            "no clock rate reads no CPU time"
+        );
+    }
+
+    /// The review's A-8 (AC-T7.4.1), CLAUDE.md §6: a cgroup's CPU time is its `cpu.stat`'s `usage_usec`. Do read a real
+    /// `cpu.stat`, then broken ones. Expect 1,922,509 µs in nanoseconds; then none where a text breaks or overflows.
+    #[test]
+    fn a8_a_cgroups_cpu_time_is_its_usage_usec() {
+        let stat = "usage_usec 1922509\nuser_usec 1920000\nsystem_usec 2509\nnr_periods 0\n";
+        assert_eq!(cgroup_usage_ns(stat), Some(1_922_509_000));
+        for broken in [
+            "",
+            "user_usec 1\n",
+            "usage_usec\n",
+            "usage_usec -1\n",
+            "usage_usec 18446744073709551615\n",
+        ] {
+            assert_eq!(cgroup_usage_ns(broken), None, "{broken:?}");
+        }
+    }
 
     /// CLAUDE.md §6, hostile input: do read real and broken `/proc/meminfo` text; expect bytes from the
     /// real, nothing from the broken.

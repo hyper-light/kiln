@@ -482,7 +482,7 @@ fn completion_publication_refusal_never_executes_marker() {
                 &program,
                 Stdio::null(),
                 hex_runtime::linux::process::HeldLaunch::default(),
-                lab.config.gate(),
+                Some(lab.config.gate()),
                 &mut |_| {
                     published = true;
                     Err(Refusal::Broken(
@@ -533,7 +533,7 @@ fn completion_durable_publication_releases_and_reaps() {
                 &program,
                 Stdio::null(),
                 hex_runtime::linux::process::HeldLaunch::default(),
-                lab.config.gate(),
+                Some(lab.config.gate()),
                 &mut |identity| {
                     let result = (|| -> Check<()> {
                         need(
@@ -652,7 +652,7 @@ fn parent_body(config: Config, scope: PathBuf) -> Check<()> {
             let stop = Arc::clone(&stop);
             let ready = ready_tx.clone();
             let guard = lab.config.guard();
-            let gate = lab.config.gate();
+            let gate = Some(lab.config.gate());
             workers.push(text(
                 std::thread::Builder::new()
                     .name(format!("gate-{suffix}"))

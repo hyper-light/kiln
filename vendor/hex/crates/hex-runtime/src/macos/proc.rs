@@ -37,6 +37,11 @@ pub struct BoxProc {
     /// Whether its end is under way: the kernel refused its watch as already exiting (`ESRCH`), or a wait
     /// took its exit event. Its reap then waits for the zombie the same exit path makes.
     exiting: bool,
+    /// Whether its end came to be under way since its last reap: the next reap is the one made on it.
+    on_exit: bool,
+    /// Whether the reap made on its end's coming found nothing, so an end found after it is seen late
+    /// ([`super::process::Status::late_ends`]).
+    missed: bool,
     events: Vec<Event>,
     reaping: Reaping,
 }
@@ -85,6 +90,8 @@ impl Prepared {
             members,
             exit: None,
             exiting,
+            on_exit: exiting,
+            missed: false,
             events: self.events,
             reaping,
         };
@@ -109,6 +116,8 @@ impl BoxProc {
             members,
             exit: None,
             exiting,
+            on_exit: exiting,
+            missed: false,
             events: Vec::with_capacity(1),
             reaping: Reaping::Ordinary,
         })
@@ -130,6 +139,9 @@ impl BoxProc {
         if self.exit.is_some() {
             return Ok(self.exit);
         }
+        // The reap made on its end's coming, if this is it: one that finds nothing leaves the end to a later
+        // wakeup, which sees it late.
+        let on_exit = std::mem::take(&mut self.on_exit);
         let Some(pid) = Pid::from_raw(self.pid) else {
             return Err(Refusal::Invalid {
                 what: "pid",
@@ -146,15 +158,16 @@ impl BoxProc {
         // child read again. Beside its exit a child holds at most one stop and one continue report (XNU
         // keeps one of each a process, `bsd/kern/kern_exit.c`), so a reap reads past at most two.
         for _ in 0..REPORTS {
-            // Peek first (NOWAIT): the zombie's lifetime peak is readable only until the reap, and it tells a
-            // cap kill from another hand's SIGKILL (State::killed_by_cap).
-            let peak =
+            // Peek first (NOWAIT): the zombie's use is readable only until the reap: its lifetime peak, which tells a
+            // cap kill from another hand's SIGKILL (State::killed_by_cap), and its exit's own time.
+            let zombie =
                 match rustix::process::waitid(WaitId::Pid(pid), options | WaitIdOptions::NOWAIT) {
                     Ok(Some(report)) if ended(&report) => {
-                        super::sys::rusage(self.pid).ok().flatten().map(|r| r.peak)
+                        super::sys::rusage(self.pid).ok().flatten()
                     }
                     _ => None,
                 };
+            let peak = zombie.map(|r| r.peak);
             match rustix::process::waitid(WaitId::Pid(pid), options) {
                 Ok(Some(status)) if !ended(&status) => {}
                 Ok(Some(status)) => {
@@ -166,10 +179,20 @@ impl BoxProc {
                     self.exit = Some(exit);
                     if let Some(members) = &self.members {
                         members.ended(self.pid, sigkill, peak)?;
+                        // How long after its exit its end was seen: the time since the exit's own time, on its
+                        // clock, as a life is reckoned.
+                        let after_exit = zombie
+                            .map(|r| r.exited)
+                            .filter(|at| *at != 0)
+                            .and_then(|at| super::process_life(at).ok());
+                        members.seen(after_exit, self.missed)?;
                     }
                     return Ok(self.exit);
                 }
-                Ok(None) => return Ok(None),
+                Ok(None) => {
+                    self.missed = self.missed || on_exit;
+                    return Ok(None);
+                }
                 // No such child: it was reaped elsewhere (a box delete). Its end is no longer knowable here.
                 Err(rustix::io::Errno::CHILD) => {
                     self.exit = Some(Exit::Unknown);
@@ -179,12 +202,13 @@ impl BoxProc {
             }
         }
         // Stopped or continued again past the reports a child holds at once: it still runs.
+        self.missed = self.missed || on_exit;
         Ok(None)
     }
 
     fn observation_refusal(&self) -> Refusal {
         if let Some(members) = &self.members {
-            return members.uncertain();
+            return members.uncertain("its controller's end couldn't be observed");
         }
         let text = "native controller observation has no canonical member owner";
         let mut why = String::new();
@@ -350,6 +374,7 @@ impl Proc for BoxProc {
                 .wait(None, Some(Duration::ZERO), &mut self.events)
                 .map_err(|e| Refusal::os("waiting on a program", e))?;
             self.exiting = ended_in(&self.events, self.pid);
+            self.on_exit = self.exiting;
         }
         self.reap(self.exiting)
     }
@@ -370,7 +395,10 @@ impl Proc for BoxProc {
             self.kq
                 .wait(None, Some(left), &mut self.events)
                 .map_err(|e| Refusal::os("waiting on a program", e))?;
-            self.exiting = self.exiting || ended_in(&self.events, self.pid);
+            if !self.exiting && ended_in(&self.events, self.pid) {
+                self.exiting = true;
+                self.on_exit = true;
+            }
         }
     }
 

@@ -30,7 +30,7 @@ use shards_image::store::{Limits, Ranged, Store};
 use crate::climb::{Climb, Window, cores};
 use crate::links::Learned;
 use crate::pull::Event;
-use crate::registry::{CHUNK, Registry, Trouble, not_fetched, short, stalled};
+use crate::registry::{CHUNK, Registry, Trouble, not_fetched, short};
 use crate::url::Url;
 use crate::{Error, ErrorKind};
 
@@ -499,11 +499,10 @@ impl<'a> Flows<'a> {
                 }
             }
             drop(response);
-            // It brought nothing: asked again while that lasts its path's budget (D222).
-            match trouble.wait(asked, self.registry.budget(url), None) {
-                Some(wait) => self.registry.pause(wait)?,
-                None => return Err(stalled(&layer.digest, trouble.lasted())),
-            }
+            // It brought nothing: asked again while that lasts, its re-asks ending it where
+            // the far end is gone (D222).
+            let wait = self.registry.ride(&mut trouble, url, asked);
+            self.registry.pause(wait)?;
         }
         drop(held);
         if layer.open.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -728,10 +727,7 @@ mod tests {
 
     fn registry(fake: &Fake) -> Registry {
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", fake.registry.port)).unwrap();
-        let client = Client::new(
-            Box::new(|_| crate::tls::client_config(Vec::new(), None)),
-            "shards-test",
-        );
+        let client = crate::testing::client();
         Registry::new(client, &reference, Credentials::Anonymous).unwrap()
     }
 
@@ -916,7 +912,12 @@ mod tests {
             Some(digest(&stuck)),
         );
         let reference = Reference::parse(&format!("127.0.0.1:{}/test/image:v1", fake.registry.port)).unwrap();
-        // An answer's head overdue after 1 s, where the CDN holds the stuck one 5 s.
+        // The CDN's path has shown answers of a second at most: the stuck one's, which the
+        // CDN holds 5 s, is overdue past it (D222).
+        let shown = crate::patience::Shown {
+            slowest_answer_us: Some(1_000_000),
+            ..crate::patience::Shown::default()
+        };
         let client = Client::new(
             Box::new(|_| crate::tls::client_config(Vec::new(), None)),
             "shards-test",
@@ -925,7 +926,8 @@ mod tests {
             connect: Duration::from_secs(30),
             head: Some(Duration::from_secs(1)),
             stall: Some(Duration::from_secs(1)),
-        });
+        })
+        .showing("127.0.0.1", fake.cdn.port, shown);
         let registry = Registry::new(client, &reference, Credentials::Anonymous).unwrap();
         let (store, root) = store("stuck");
         // A path learned at four connections: a new one starts at one (D226), and isolates

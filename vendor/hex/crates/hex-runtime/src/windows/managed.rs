@@ -22,23 +22,29 @@ use super::{Held, WinRuntime, copy_path, copy_text, pending, std_handles};
 pub(super) struct Receipt {
     identity: Identity,
     process: Mutex<BoxProc>,
+    /// The runtime folders its launch gave the VM process, whose cache holds the records of the AppContainer profiles
+    /// it makes ([`release_app_containers`]); none for a controller taken back after its node's end, whose launch
+    /// this runtime never saw.
+    paths: Option<shards_api::RuntimePaths>,
 }
 
-fn uncertain(record: NativeRecord<'_>) -> Refusal {
-    record.refusal(hex_api::LifecycleCause::Uncertain)
-}
-
-fn host_bounds(record: NativeRecord<'_>) -> Result<Bounds, Refusal> {
+pub(super) fn host_bounds(record: NativeRecord<'_>) -> Result<Bounds, Refusal> {
     if record.class()? != Class::Shards {
-        return Err(uncertain(record));
+        return Err(record
+            .uncertain("its record isn't a Shards VM's, which Windows host bounds are made for"));
     }
-    let allocation = record.allocation().ok_or_else(|| uncertain(record))?;
+    let allocation = record.allocation().ok_or_else(|| {
+        record.uncertain("its record holds no allocation to bound its Windows host by")
+    })?;
     allocation.guest()?;
+    // No commit limit (joint plan step 14, ruling B; A-4), as a Linux VM has no memory.max: its VMM's own memory
+    // beside its guest's RAM is never refused at a bound of its guest's size. Its budget's room, the last resort and
+    // its fleet's budget hold it; a job a create before this rule bounded is lifted at its adoption
+    // (JobBox::adopt_vm).
     let bounds = Bounds {
-        cpu_max_milli: Some(
-            u32::try_from(allocation.resources.cpu_milli).map_err(|_| uncertain(record))?,
-        ),
-        memory_max: Some(allocation.resources.mem_bytes),
+        cpu_max_milli: Some(u32::try_from(allocation.resources.cpu_milli).map_err(|_| {
+            record.uncertain("its allocation's CPU is past a Windows host bound's")
+        })?),
         ..Bounds::default()
     };
     bounds.check()?;
@@ -171,7 +177,9 @@ fn quote(line: &mut Vec<u16>, bound: usize, word: &OsStr) -> Result<(), Refusal>
 }
 
 fn job_name(runtime: &WinRuntime, record: NativeRecord<'_>) -> Result<Option<String>, Refusal> {
-    let scope = record.scope().ok_or_else(|| uncertain(record))?;
+    let scope = record
+        .scope()
+        .ok_or_else(|| record.uncertain("its record names no native scope to name its job by"))?;
     let Some(node) = runtime.node.as_ref() else {
         return Ok(None);
     };
@@ -201,24 +209,48 @@ fn job_name(runtime: &WinRuntime, record: NativeRecord<'_>) -> Result<Option<Str
     Ok(Some(name))
 }
 
+/// What a managed VM process is given of the node's own environment beside its configured pair: what Shards' own
+/// spawner gives a child (its crates/ipc windows.rs `KEPT`, PM M208), so the VM process can give it the confined VM
+/// process it starts: `LOCALAPPDATA`, without which Windows makes no child in an AppContainer (ERROR_ENVVAR_NOT_FOUND),
+/// and `SystemRoot`, under which Winsock's providers are found as a socket is made.
+fn kept(name: &'static str, missing: &'static str) -> Result<std::ffi::OsString, Refusal> {
+    match std::env::var_os(name) {
+        Some(value) => Ok(value),
+        None => Err(Refusal::Invalid {
+            what: "a managed VM's environment",
+            why: copy_text(missing)?,
+        }),
+    }
+}
+
 fn runtime_environment(paths: &shards_api::RuntimePaths) -> Result<Vec<u16>, Refusal> {
-    // The exact configured provider pair, in Windows' case-insensitive environment order.
+    let local = kept(
+        "LOCALAPPDATA",
+        "the node's own environment has no LOCALAPPDATA, which Shards' VM process gives the confined VM process it starts (Shards PM M208)",
+    )?;
+    let root = kept(
+        "SystemRoot",
+        "the node's own environment has no SystemRoot, which Shards' VM process gives the confined VM process it starts (Shards PM M208)",
+    )?;
+    // The exact configured provider pair and the node's kept pair, in Windows' case-insensitive environment order.
     let values = [
-        ("SHARDS_CACHE", paths.cache()),
-        ("SHARDS_HOME", paths.home()),
+        ("LOCALAPPDATA", local.as_os_str()),
+        ("SHARDS_CACHE", paths.cache().as_os_str()),
+        ("SHARDS_HOME", paths.home().as_os_str()),
+        ("SystemRoot", root.as_os_str()),
     ];
     let mut size = 1usize;
     for (name, path) in values {
         let entry = name
             .len()
-            .checked_add(path.as_os_str().encode_wide().count())
+            .checked_add(path.encode_wide().count())
             .and_then(|count| count.checked_add(2))
             .ok_or_else(|| super::allocation(usize::MAX))?;
         if entry > hex_core::hcs::ENV_VAR_UNITS {
             return Err(Refusal::Invalid {
                 what: "configured native runtime environment",
                 why: copy_text(
-                    "a configured runtime path exceeds Windows' environment variable bound",
+                    "a configured runtime path or kept variable exceeds Windows' environment variable bound",
                 )?,
             });
         }
@@ -233,9 +265,11 @@ fn runtime_environment(paths: &shards_api::RuntimePaths) -> Result<Vec<u16>, Ref
     for (name, path) in values {
         environment.extend(name.encode_utf16());
         environment.push(u16::from(b'='));
-        for unit in path.as_os_str().encode_wide() {
+        for unit in path.encode_wide() {
             if unit == 0 {
-                return Err(pending("a configured runtime path contains NUL"));
+                return Err(pending(
+                    "a configured runtime path or kept variable contains NUL",
+                ));
             }
             environment.push(unit);
         }
@@ -250,17 +284,32 @@ pub(super) fn launch(
     record: NativeRecord<'_>,
     launch: &crate::devices::ManagedLaunch<'_>,
     io: shards_api::LaunchIo,
-    patience: Duration,
+    patience: Option<Duration>,
     publish: &mut dyn FnMut(&Identity) -> Result<(), Refusal>,
 ) -> Result<ManagedReceipt, Refusal> {
     let crate::devices::ManagedLaunch::Shards(plan) = launch else {
-        return Err(uncertain(record));
+        return Err(record.uncertain("its Windows launch isn't a Shards launch"));
     };
-    let paths = plan.runtime_paths().ok_or_else(|| uncertain(record))?;
-    let deadline = Instant::now()
-        .checked_add(patience)
-        .filter(|_| patience != Duration::MAX && !patience.is_zero())
-        .ok_or_else(|| uncertain(record))?;
+    let paths = plan
+        .runtime_paths()
+        .ok_or_else(|| record.uncertain("its Windows launch plan has no runtime paths"))?;
+    // Kept for its receipt, which releases the VM's AppContainer profiles with its scope ([`release_app_containers`]).
+    let released_paths =
+        shards_api::RuntimePaths::new(copy_path(paths.cache())?, copy_path(paths.home())?)
+            .map_err(|why| {
+                record.uncertain(&format!("its Windows launch's runtime paths: {why}"))
+            })?;
+    // None: a launch that follows its guest, with no deadline of its caller's (the review's C-9).
+    let deadline = patience
+        .map(|patience| {
+            Instant::now()
+                .checked_add(patience)
+                .filter(|_| patience != Duration::MAX && !patience.is_zero())
+                .ok_or_else(|| {
+                    record.uncertain("its Windows launch's patience isn't a finite time")
+                })
+        })
+        .transpose()?;
     let deadline = crate::devices::check_managed_report(
         Some(&runtime.catalog),
         record,
@@ -269,7 +318,9 @@ pub(super) fn launch(
         deadline,
     )?;
     let request = plan.gpu_report_request();
-    record.scope().ok_or_else(|| uncertain(record))?;
+    record.scope().ok_or_else(|| {
+        record.uncertain("its record names no native scope as its Windows launch begins")
+    })?;
     let bounds = host_bounds(record)?;
     let shards_api::LaunchIo {
         stdout,
@@ -285,11 +336,16 @@ pub(super) fn launch(
         .map_err(|error| Refusal::os("preparing the private VM report handle", error))?;
     let report_words = match (request, report.as_ref()) {
         (Some(request), Some(writer)) => Some(
-            shards_api::physical::report_arguments(request.scope(), writer)
-                .map_err(|_| uncertain(record))?,
+            shards_api::physical::report_arguments(request.scope(), writer).map_err(|_| {
+                record.uncertain("its Windows native report's arguments couldn't be made")
+            })?,
         ),
         (None, None) => None,
-        _ => return Err(uncertain(record)),
+        _ => {
+            return Err(
+                record.uncertain("its Windows launch's report descriptor and request disagree")
+            );
+        }
     };
     // Prepare every argument, path and stream before a native controller can exist.
     let vsock = copy_path(plan.vsock())?;
@@ -321,12 +377,16 @@ pub(super) fn launch(
     let held = Held::Process(Arc::clone(&boxed));
     if runtime.holding.made(record.owner(), held.clone())? {
         boxed.not_submitted()?;
-        return Err(uncertain(record));
+        return Err(record.uncertain(
+            "its job's keeper was made before its Windows launch, so it wasn't submitted cleanly",
+        ));
     }
     let result = (|| {
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             boxed.not_submitted()?;
-            return Err(uncertain(record));
+            return Err(
+                record.uncertain("its Windows launch's deadline passed before it was submitted")
+            );
         }
         boxed.bind_vm(name.as_deref())?;
         // The existing passive keeper holds this same job before any VM/helper exists.
@@ -343,7 +403,7 @@ pub(super) fn launch(
         let started = sys::created(&process)
             .map_err(|error| Refusal::os("reading the VM controller's birth", error))?;
         if pid == 0 || started == 0 {
-            return Err(uncertain(record));
+            return Err(record.uncertain("its Windows VM controller's pid or start is zero"));
         }
         let identity = Identity {
             pid,
@@ -353,21 +413,31 @@ pub(super) fn launch(
         let receipt = Receipt {
             identity,
             process: Mutex::new(BoxProc::new(process, pid, boxed.shared())),
+            paths: Some(released_paths),
         };
-        boxed.managed.set(receipt).map_err(|_| uncertain(record))?;
+        boxed
+            .managed
+            .set(receipt)
+            .map_err(|_| record.uncertain("its Windows controller's receipt was set before"))?;
         let identity = &boxed
             .managed
             .get()
-            .ok_or_else(|| uncertain(record))?
+            .ok_or_else(|| {
+                record.uncertain("its Windows controller's receipt vanished as it was published")
+            })?
             .identity;
         publish(identity)?;
-        if Instant::now() >= deadline {
-            return Err(uncertain(record));
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(record.uncertain(
+                "its Windows launch's deadline passed as its controller was published",
+            ));
         }
         sys::resume(&thread)
             .map_err(|error| Refusal::os("resuming the recorded VM controller", error))?;
         if !runtime.holding.ready(record.owner())? {
-            return Err(uncertain(record));
+            return Err(
+                record.uncertain("its Windows VM keeper wasn't ready after its controller resumed")
+            );
         }
         Ok(shards_api::managed_receipt(Arc::clone(&boxed)))
     })();
@@ -385,14 +455,18 @@ pub(super) fn attach(
     record: NativeRecord<'_>,
     identity: Option<&Identity>,
 ) -> Result<ManagedReceipt, Refusal> {
-    record.scope().ok_or_else(|| uncertain(record))?;
+    record.scope().ok_or_else(|| {
+        record.uncertain("its record names no native scope as it is attached on Windows")
+    })?;
     if identity.is_none()
         && !matches!(
             record.stage(),
             NativeStage::Creating | NativeStage::Deleting
         )
     {
-        return Err(uncertain(record));
+        return Err(record.uncertain(
+            "its Windows job box isn't a VM's, or isn't its record's scope, as it is attached",
+        ));
     }
     let boxed = match existing(runtime, record)? {
         Some(boxed) => boxed,
@@ -402,7 +476,11 @@ pub(super) fn attach(
         match boxed.managed.get() {
             Some(receipt) if receipt.identity == *expected => {}
             None if boxed.recovered() && same_init(boxed.original_init(), expected) => {}
-            _ => return Err(uncertain(record)),
+            _ => {
+                return Err(record.uncertain(
+                    "its Windows controller isn't the one it expected as it is attached",
+                ));
+            }
         }
     }
     // A recovered scope without its controller has no usable identity; its API view can only clean
@@ -423,12 +501,14 @@ fn existing(
     let Ok(at) = super::owner_index(&boxes, record.owner()) else {
         return Ok(None);
     };
-    let (_, slot) = boxes.get(at).ok_or_else(|| uncertain(record))?;
+    let (_, slot) = boxes
+        .get(at)
+        .ok_or_else(|| record.uncertain("its Windows slot vanished as it was found"))?;
     match slot.physical() {
         Some(Held::Process(boxed)) if boxed.matches_vm(record, commitment) => {
             Ok(Some(Arc::clone(boxed)))
         }
-        _ => Err(uncertain(record)),
+        _ => Err(record.uncertain("its Windows slot isn't a VM's with its record's scope")),
     }
 }
 
@@ -440,7 +520,7 @@ pub(super) fn set_rate(
     rate: u64,
 ) -> Result<(), Refusal> {
     existing(runtime, record)?
-        .ok_or_else(|| uncertain(record))?
+        .ok_or_else(|| record.uncertain("its node holds no Windows VM slot to set its rate on"))?
         .set_cpu_cap(rate, runtime.processors)
 }
 
@@ -448,9 +528,10 @@ pub(super) fn set_rate(
 /// terminated as the receipt's own stop terminates it; its end is observed as any other. Only a VM this node holds is
 /// ended: one it hasn't taken back is refused, uncertain.
 pub(super) fn stop(runtime: &WinRuntime, record: NativeRecord<'_>) -> Result<(), Refusal> {
-    let boxed = existing(runtime, record)?.ok_or_else(|| uncertain(record))?;
+    let boxed = existing(runtime, record)?
+        .ok_or_else(|| record.uncertain("its node holds no Windows VM slot to stop"))?;
     if !boxed.is_vm() {
-        return Err(uncertain(record));
+        return Err(record.uncertain("its Windows slot isn't a VM's as it is stopped"));
     }
     boxed
         .stop_managed()
@@ -501,6 +582,7 @@ fn controller(
             vsock,
         },
         process: Mutex::new(BoxProc::new(process, expected.pid, boxed.shared())),
+        paths: None,
     })
 }
 
@@ -512,11 +594,13 @@ fn cold(
     if let Some(identity) = identity
         && !same_init(record.init(), identity)
     {
-        return Err(uncertain(record));
+        return Err(record.uncertain("its cold Windows controller isn't its record's"));
     }
-    let name = job_name(runtime, record)?.ok_or_else(|| uncertain(record))?;
+    let name = job_name(runtime, record)?.ok_or_else(|| {
+        record.uncertain("its record names no native scope to name its cold job by")
+    })?;
     let Some(keeping) = runtime.holding.keeper.as_ref() else {
-        return Err(uncertain(record));
+        return Err(record.uncertain("its node runs no Windows VM keeper to take it back"));
     };
     let path = super::keeper::vm::path(&keeping.state, record.owner())?;
     let vsock = identity
@@ -531,9 +615,10 @@ fn cold(
         Some(&name),
         &runtime.holding,
     )?;
-    let held = super::keeper::vm::read(&path)?.ok_or_else(|| uncertain(record))?;
+    let held = super::keeper::vm::read(&path)?
+        .ok_or_else(|| record.uncertain("its Windows VM keeper holds no record of it"))?;
     if !held.commits(boxed.vm_commitment()) {
-        return Err(uncertain(record));
+        return Err(record.uncertain("its Windows VM keeper's record commits another scope"));
     }
     let _keeper = keeping
         .keeper
@@ -541,22 +626,22 @@ fn cold(
         .map_err(|_| pending("native keeper lock is poisoned"))?;
     let process = sys::open_process(held.pid)
         .map_err(|error| Refusal::os("opening the committed VM keeper", error))?
-        .ok_or_else(|| uncertain(record))?;
+        .ok_or_else(|| record.uncertain("its committed Windows VM keeper is gone"))?;
     if sys::created(&process)
         .map_err(|error| Refusal::os("checking the committed VM keeper birth", error))?
         != held.started
         || sys::wait(&process, 0)
             .map_err(|error| Refusal::os("observing the committed VM keeper lifetime", error))?
     {
-        return Err(uncertain(record));
+        return Err(record.uncertain("its committed Windows VM keeper isn't the process it named"));
     }
     let job = sys::Job::open(&name)
         .map_err(|error| Refusal::os("opening the committed native VM scope", error))?
-        .ok_or_else(|| uncertain(record))?;
+        .ok_or_else(|| record.uncertain("its committed Windows job is gone"))?;
     if !sys::same_in(&process, held.value, job.borrowed())
         .map_err(|error| Refusal::os("checking the committed native VM kernel object", error))?
     {
-        return Err(uncertain(record));
+        return Err(record.uncertain("its committed Windows job isn't the kernel object it named"));
     }
     boxed.adopt_vm(job)?;
     runtime.holding.reserve(record.owner(), &[], None, None)?;
@@ -573,15 +658,18 @@ fn cold(
         )?;
         if let (Some(identity), Some(vsock)) = (identity, vsock) {
             match controller(&boxed, identity, vsock) {
-                Ok(receipt) => boxed.managed.set(receipt).map_err(|_| uncertain(record))?,
-                Err(error) => boxed
-                    .observation_failure
-                    .set(error)
-                    .map_err(|_| uncertain(record))?,
+                Ok(receipt) => boxed.managed.set(receipt).map_err(|_| {
+                    record.uncertain("its cold Windows controller's receipt was set before")
+                })?,
+                Err(error) => boxed.observation_failure.set(error).map_err(|_| {
+                    record.uncertain("its cold Windows controller's failure was set before")
+                })?,
             }
         }
         if cancelled || !runtime.holding.ready(record.owner())? {
-            return Err(uncertain(record));
+            return Err(record.uncertain(
+                "its cold Windows take-back was cancelled, or its keeper wasn't ready",
+            ));
         }
         Ok(())
     })();
@@ -597,12 +685,14 @@ pub(super) fn finalize(
     record: NativeRecord<'_>,
     identity: Option<&Identity>,
 ) -> Result<(), Refusal> {
-    record.scope().ok_or_else(|| uncertain(record))?;
+    record.scope().ok_or_else(|| {
+        record.uncertain("its record names no native scope as it is finalized on Windows")
+    })?;
     if !matches!(
         record.stage(),
         NativeStage::Deleting | NativeStage::Released
     ) {
-        return Err(uncertain(record));
+        return Err(record.uncertain("it isn't deleting or released as it is finalized on Windows"));
     }
     let boxed = match existing(runtime, record)? {
         Some(boxed) => boxed,
@@ -614,19 +704,60 @@ pub(super) fn finalize(
         (Some(expected), None)
             if boxed.recovered() && same_init(boxed.original_init(), expected) => {}
         (None, None) => {}
-        _ => return Err(uncertain(record)),
+        _ => {
+            return Err(record
+                .uncertain("its Windows controller isn't the one it expected as it is finalized"));
+        }
     }
     // This query retains keeper/slot ownership. Only the durable Released caller may discharge it.
-    if !matches!(
-        boxed.terminal().map_err(|_| uncertain(record))?,
-        Some(ManagedEnd {
-            scope: TerminalScope::Released,
-            ..
-        })
-    ) {
-        return Err(uncertain(record));
+    let end = match boxed.terminal().map_err(|_| {
+        record.uncertain("its Windows scope's end couldn't be read as it is finalized")
+    })? {
+        Some(
+            end @ ManagedEnd {
+                scope: TerminalScope::Released,
+                ..
+            },
+        ) => end,
+        _ => return Err(record.uncertain("its Windows scope isn't released as it is finalized")),
+    };
+    if let Some(receipt) = boxed.managed.get() {
+        release_app_containers(record, receipt, end)?;
     }
     boxed.release_scope()
+}
+
+/// Deletes the AppContainer profiles, and their records, that the VM process of `receipt` made (Shards' D141), once its
+/// scope has ended `end`, released: a VM ended by its job's end, as Hex ends every managed VM, leaves them, for Shards'
+/// next VM start to sweep (shards_api::release_app_containers). A controller taken back after its node's end has no
+/// runtime folders of this runtime's to name them by: its profiles are left to that sweep. Each refusal is typed, the
+/// finalize refused with it, so its caller tries again: a scope short of released Uncertain; a record a live process
+/// holds (a sweep under way, or a process given the VM's pid since) Busy; a deletion's failure an OS refusal.
+fn release_app_containers(
+    record: NativeRecord<'_>,
+    receipt: &Receipt,
+    end: ManagedEnd,
+) -> Result<usize, Refusal> {
+    let Some(paths) = &receipt.paths else {
+        return Ok(0);
+    };
+    shards_api::release_app_containers(paths, &receipt.identity, end).map_err(|why| match why {
+        shards_api::Refusal::Release(shards_api::ReleaseRefusal::ScopeLive) => record
+            .uncertain("its Windows scope wasn't released as its VM's AppContainer profiles were"),
+        shards_api::Refusal::Release(shards_api::ReleaseRefusal::Held) => {
+            record.refusal(hex_api::LifecycleCause::Busy)
+        }
+        shards_api::Refusal::ManagedIo { kind, code, .. } => Refusal::os(
+            "releasing its VM's AppContainer profiles",
+            code.map_or_else(
+                || std::io::Error::from(kind),
+                std::io::Error::from_raw_os_error,
+            ),
+        ),
+        other => record.uncertain(&format!(
+            "releasing its VM's AppContainer profiles: {other}"
+        )),
+    })
 }
 
 /// The caller already published the exact backend Released receipt. After a crash this path only
@@ -636,9 +767,11 @@ fn finalized_keeper_is_gone(
     record: NativeRecord<'_>,
 ) -> Result<bool, Refusal> {
     let Some(keeping) = runtime.holding.keeper.as_ref() else {
-        return Err(uncertain(record));
+        return Err(record.uncertain("its node runs no Windows VM keeper to prove its end"));
     };
-    let scope = record.scope().ok_or_else(|| uncertain(record))?;
+    let scope = record.scope().ok_or_else(|| {
+        record.uncertain("its record names no native scope as its keeper's end is proven")
+    })?;
     let commitment = record.commitment()?;
     let path = super::keeper::vm::path(&keeping.state, record.owner())?;
     let _keeper = keeping
@@ -650,7 +783,9 @@ fn finalized_keeper_is_gone(
         return Ok(true);
     };
     if !held.commits(Some((scope, commitment))) {
-        return Err(uncertain(record));
+        return Err(record.uncertain(
+            "its Windows VM keeper's record commits another scope as its end is proven",
+        ));
     }
     if let Some(process) = sys::open_process(held.pid)
         .map_err(|error| Refusal::os("observing the finalized VM keeper", error))?
@@ -928,31 +1063,45 @@ mod runtime_environment_tests {
         );
     }
 
-    /// AC-T7.4.1: native and probe receive exactly the same explicitly configured runtime pair.
+    /// AC-T7.4.1 (goal 5's Windows driver, item4-whp's step B): do make a managed VM's environment; expect beside its
+    /// configured pair this process's `LOCALAPPDATA` and `SystemRoot`, which Shards' VM process gives the confined VM
+    /// process it starts (Shards' crates/ipc windows.rs `KEPT`, PM M208: without `LOCALAPPDATA` Windows makes no child
+    /// in an AppContainer, ERROR_ENVVAR_NOT_FOUND), the four in Windows' case-insensitive order.
     #[test]
-    fn runtime_environment_contains_only_the_explicit_provider_paths() {
+    fn a_managed_vms_environment_carries_what_shards_gives_its_confined_vm_process() {
         let paths = shards_api::RuntimePaths::new(
-            std::path::PathBuf::from("C:\\cache\\雪"),
+            std::path::PathBuf::from("C:\\cache"),
             std::path::PathBuf::from("C:\\home"),
         )
         .unwrap();
-        let expected: Vec<u16> = "SHARDS_CACHE=C:\\cache\\雪\0SHARDS_HOME=C:\\home\0\0"
-            .encode_utf16()
-            .collect();
+        let ours = |name: &str| std::env::var_os(name).unwrap().into_string().unwrap();
+        let expected: Vec<u16> = format!(
+            "LOCALAPPDATA={}\0SHARDS_CACHE=C:\\cache\0SHARDS_HOME=C:\\home\0SystemRoot={}\0\0",
+            ours("LOCALAPPDATA"),
+            ours("SystemRoot")
+        )
+        .encode_utf16()
+        .collect();
         assert_eq!(runtime_environment(&paths).unwrap(), expected);
     }
 
     /// AC-T7.4.1: native OS paths remain lossless; no Unicode replacement or display conversion.
     #[test]
     fn runtime_environment_preserves_native_unpaired_utf16() {
-        use std::os::windows::ffi::OsStringExt;
-        let mut wide: Vec<u16> = "C:\\cache\\".encode_utf16().collect();
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut wide: Vec<u16> = "C:\\cache\\雪".encode_utf16().collect();
         wide.push(0xd800);
         let cache = std::ffi::OsString::from_wide(&wide);
         let paths = shards_api::RuntimePaths::new(cache.into(), "C:\\home".into()).unwrap();
-        let mut expected: Vec<u16> = "SHARDS_CACHE=".encode_utf16().collect();
+        let ours =
+            |name: &str| -> Vec<u16> { std::env::var_os(name).unwrap().encode_wide().collect() };
+        let mut expected: Vec<u16> = "LOCALAPPDATA=".encode_utf16().collect();
+        expected.extend(ours("LOCALAPPDATA"));
+        expected.extend("\0SHARDS_CACHE=".encode_utf16());
         expected.extend(wide);
-        expected.extend("\0SHARDS_HOME=C:\\home\0\0".encode_utf16());
+        expected.extend("\0SHARDS_HOME=C:\\home\0SystemRoot=".encode_utf16());
+        expected.extend(ours("SystemRoot"));
+        expected.extend("\0\0".encode_utf16());
         assert_eq!(runtime_environment(&paths).unwrap(), expected);
     }
 }

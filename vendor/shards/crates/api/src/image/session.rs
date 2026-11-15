@@ -15,14 +15,18 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::wire::{self, Channel, LeaseRefusal, MemberInfo, Ready, RunEnd, Stats, StatsScope};
-use super::{ImageGuest, ImageRefusal, ImageSpec, Leased, Lessor, MemberEnd, MemberName, RunLessor};
+use super::wire::{
+    self, Channel, LeaseRefusal, MemberInfo, Ready, RunEnd, RunEnded, Stats, StatsScope, Unused,
+};
+use super::{
+    ChannelEnd, ImageGuest, ImageRefusal, ImageSpec, Leased, Lessor, MemberEnd, MemberName, RunLessor,
+};
 
 /// The most of a member channel's bytes the client lets its host send ahead of what the
 /// caller's pipe has taken: one read of the guest's (`run::CHUNK`), the most one of its
@@ -57,6 +61,16 @@ struct InputFlow {
     room: u64,
     taken: bool,
     ended: Option<(u64, wire::StreamEnd)>,
+    /// The feeder's cancellation handle; no read is allowed to outlive its input.
+    reader: Option<shards_ipc::Stream>,
+}
+
+impl InputFlow {
+    fn close(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            shards_ipc::end(&reader);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -74,7 +88,7 @@ struct State {
     flows: HashMap<(u32, Channel), Flow>,
     /// Each member's stdin its spec asked for, by its index.
     inputs: HashMap<u32, InputFlow>,
-    ends: HashMap<u32, u32>,
+    ends: HashMap<u32, shards_abi::run::members::End>,
     stats: HashMap<u32, Result<Stats, String>>,
     /// Each plug's or unplug's answer, by its ask's id (D235).
     plugs: HashMap<u32, Result<(), (wire::PlugRefusal, String)>>,
@@ -84,24 +98,75 @@ struct State {
     rooms: Awaited<Option<u64>>,
     /// Each rate asked and still awaited, by its ask's id, and its answer once it came
     /// (D247), as rooms.
-    rates: Awaited<Option<NonZeroU64>>,
+    rates: Awaited<wire::Rated>,
+    /// The period its VM's governor holds a rate over, as its last rate's answer said it
+    /// (D191): none until a rate has been answered.
+    rate_period: Option<Duration>,
     /// Each resize asked and still awaited, by its ask's id, and its answer once it came
     /// (D244), held as [`rooms`](Self::rooms) is.
     resizes: HashMap<u32, Option<Result<(), String>>>,
+    /// Each save asked and still awaited, by its ask's id, and its answer once it came (D259),
+    /// held as [`rooms`](Self::rooms) is.
+    saves: HashMap<u32, Option<Saved>>,
     next_ask: u32,
     /// The run's own command's readiness under the nesting grant (D234), as its init last
     /// said it: init owns it, and moves it by D234's table.
     ready: Option<Ready>,
-    end: Option<RunEnd>,
-    /// The host's process has exited and is reaped.
+    end: Option<RunEnded>,
+    /// The host's process has exited, every process of its group has ended (`watch`), and
+    /// it is reaped.
     exited: bool,
-    /// Its answers have all been read: its stdout has ended.
+    /// Where its group could not be followed to its end (`watch`), why: a stop that waited on
+    /// it cannot say it released what the run held.
+    unfollowed: Option<io::ErrorKind>,
+    /// Its answers have all been read: its stdout has ended, or held no more once its host's
+    /// group had ended (`UntilGone`).
     answered: bool,
     said: VecDeque<u8>,
-    /// Its diagnostics have all been read: its stderr has ended, its VM's with it.
+    /// Its diagnostics have all been read, as its answers are: the VM, network and share
+    /// processes' with them.
     said_all: bool,
     /// The leases its host asked (D242).
     leases: Leases,
+    /// The run's GPU report (D233), as its host relays it.
+    report: Report,
+}
+
+/// The run's GPU report as its session holds it (D233, R04): not asked; asked, its host's relay
+/// awaited; relayed, its VM process's frame as that process wrote it; or taken, which every take
+/// after is refused as. Unasked to awaited as the run's request names a scope (`Begun::create`);
+/// awaited to relayed as its host relays it ([`take`], once, before its start or its refusal);
+/// awaited or relayed to taken at the first take ([`Session::take_gpu_report`]).
+#[derive(Debug, Default)]
+enum Report {
+    #[default]
+    Unasked,
+    Awaited,
+    Relayed(Vec<u8>),
+    Taken,
+}
+
+/// What a session reads its run's GPU report against (D233): the scope its request named, the
+/// selection it named, and the boot's deadline, the end of its patience; none where its
+/// patience had none.
+#[derive(Debug)]
+struct ReportAsked {
+    scope: [u8; 16],
+    selected: Vec<crate::PhysicalGpu>,
+    deadline: Option<Instant>,
+}
+
+/// The selection a run's VM was refused by its renderer, where the report its host relayed
+/// before its refusal (D232, D233) says so: what its boot is refused as, typed, in place of
+/// the host's words.
+fn gpu_refused(s: &State, request: &wire::Request) -> Option<ImageRefusal> {
+    let (Report::Relayed(frame), Some(scope)) = (&s.report, request.gpu_report) else {
+        return None;
+    };
+    match crate::physical::report::read(frame, scope, &request.gpu_devices) {
+        Err(why @ crate::GpuProbeError::Refused(_)) => Some(ImageRefusal::GpuProbe(why)),
+        _ => None,
+    }
 }
 
 /// A lease of the run's, as its orchestrator's side holds it (D242, R04): asked of the run's
@@ -110,7 +175,11 @@ struct State {
 #[derive(Debug)]
 enum Holding {
     Asked,
-    Given(String),
+    /// The lessor's name for it, and the credential it is of.
+    Given {
+        lease: String,
+        reference: String,
+    },
 }
 
 /// The run's leases by their asks' ids, whether the run has released them (once it has, a
@@ -127,6 +196,9 @@ struct Leases {
 /// refused it (D241, D247).
 type Awaited<T> = HashMap<u32, Option<Result<T, String>>>;
 
+/// A save's outcome as its host said it (D259): saved, or refused and why.
+type Saved = Result<(), (wire::SaveRefusal, String)>;
+
 /// A numbered ask of the session's, answered by its id (D241, D247): its kind; the ask and
 /// its send, as a refusal names them; where its answer is awaited; what its host's refusal
 /// is.
@@ -139,6 +211,11 @@ struct Asked<T> {
 }
 
 impl State {
+    fn close_inputs(&mut self) {
+        for input in self.inputs.values_mut() {
+            input.close();
+        }
+    }
     /// A session's state before its host has answered, for a request staging `members`:
     /// those whose stdin it asks for named, for their flows to be made with its start.
     fn asking(members: &[wire::MemberStage]) -> State {
@@ -160,21 +237,27 @@ impl State {
     /// The run's end, once it has come: its host's word, or its host gone without one, said
     /// in its last diagnostics; kept as first seen, so that every later look, a stop's among
     /// them, sees the same.
-    fn end_seen(&mut self) -> Option<RunEnd> {
+    fn end_seen(&mut self) -> Option<RunEnded> {
         if self.end.is_none() && self.gone() {
-            self.end = Some(RunEnd::Failed(format!(
-                "the run host exited without its run's end{}",
-                quoted(&self.said)
-            )));
+            self.end = Some(RunEnded::unused(
+                RunEnd::Failed(format!(
+                    "the run host exited without its run's end{}",
+                    quoted(&self.said)
+                )),
+                Unused::Untold,
+            ));
         }
         self.end.clone()
     }
 
     /// The run's end once its stop has been waited for ([`Session::stop`]): the end seen, or
-    /// `Stopped` where none has come.
-    fn stopped(&mut self) -> RunEnd {
-        self.end_seen()
-            .unwrap_or_else(|| self.end.insert(RunEnd::Stopped).clone())
+    /// `Stopped` where none has come, its VM killed with nothing of its use told.
+    fn stopped(&mut self) -> RunEnded {
+        self.end_seen().unwrap_or_else(|| {
+            self.end
+                .insert(RunEnded::unused(RunEnd::Stopped, Unused::Killed))
+                .clone()
+        })
     }
 }
 
@@ -199,20 +282,94 @@ struct Shared {
     lessor: Mutex<Option<RunLessor>>,
     /// The references the run's grants name: no other is leased.
     granted: Mutex<Vec<String>>,
-    /// Where the host's diagnostics are written whole, once its caller has named a file
+    /// The run's sign-in grants (D242, step 8), whose captures and refreshes its host may ask,
+    /// each with what its last capture gave: its access token's reference is leased as a
+    /// grant's is.
+    sign_ins: Mutex<Vec<wire::SignInGrant>>,
+    /// Where the host's diagnostics are written, once its caller has named a file
     /// ([`ImageGuest::keep_diagnostics`]).
-    said_to: Mutex<Option<std::fs::File>>,
+    said_to: Mutex<Option<Diagnostics>>,
+}
+
+/// The file the host's diagnostics are written to, held within its caller's bound
+/// ([`ImageGuest::keep_diagnostics`], Hex audit B-9): `size` counts what it held as it was named
+/// and every byte written to it since, so it is never short of the file's length.
+#[derive(Debug)]
+struct Diagnostics {
+    file: std::fs::File,
+    bound: u64,
+    size: u64,
+}
+
+impl Diagnostics {
+    /// `part`, its two pieces in turn, written after what the file holds, or, where that would pass its bound, the file
+    /// cut back to `tail`, the last of the diagnostics kept to quote (`part` the end of it), and
+    /// written from there on. A part that fails is lost to the file alone; its size is then
+    /// unknown, counted as its bound, so the next part cuts it back.
+    fn write(&mut self, part: [&[u8]; 2], tail: &VecDeque<u8>) -> io::Result<()> {
+        let [front, back] = part;
+        let after = front
+            .len()
+            .checked_add(back.len())
+            .and_then(|n| u64::try_from(n).ok())
+            .and_then(|n| self.size.checked_add(n))
+            .filter(|after| *after <= self.bound);
+        let written = match after {
+            Some(after) => self
+                .file
+                .write_all(front)
+                .and_then(|()| self.file.write_all(back))
+                .map(|()| after),
+            None => self.cut(tail),
+        };
+        self.size = *written.as_ref().unwrap_or(&self.bound);
+        written.map(drop)
+    }
+
+    /// The file holding `tail` alone: emptied, then `tail` written at its start, whether it was
+    /// opened to append or to write in place.
+    fn cut(&mut self, tail: &VecDeque<u8>) -> io::Result<u64> {
+        use std::io::Seek as _;
+        self.file.set_len(0)?;
+        self.file.seek(io::SeekFrom::Start(0))?;
+        let (front, back) = tail.as_slices();
+        self.file.write_all(front)?;
+        self.file.write_all(back)?;
+        u64::try_from(tail.len()).map_err(io::Error::other)
+    }
 }
 
 impl Shared {
-    /// The host's diagnostics written whole to `to` from now on, after what is kept of them
-    /// until now, under the lock their keeper writes each part under ([`keep_said`]): so that
-    /// each part is in what is kept now or written after, and once.
-    fn keep_diagnostics(&self, mut to: std::fs::File) -> io::Result<()> {
+    /// The host's diagnostics written to `to` from now on, held within `bound` bytes, after what
+    /// is kept of them until now, under the lock their keeper writes each part under
+    /// ([`keep_said`]): so that each part is in what is kept now or written after, and once.
+    /// Refused `DiagnosticsBound` for a bound short of the tail kept to quote, which a cut
+    /// leaves; `Os` where `to` cannot be cut (one opened to append alone, on Windows, which
+    /// takes no truncation) or written.
+    fn keep_diagnostics(&self, to: std::fs::File, bound: u64) -> Result<(), ImageRefusal> {
+        let tail = u64::try_from(said_kept()).unwrap_or(u64::MAX);
+        if bound < tail {
+            return Err(ImageRefusal::DiagnosticsBound { bound, tail });
+        }
+        let os = |e: io::Error| ImageRefusal::Os {
+            what: "the run host's diagnostics",
+            kind: e.kind(),
+        };
         let mut said_to = lock(&self.said_to);
-        let kept: Vec<u8> = lock(&self.state).said.iter().copied().collect();
-        to.write_all(&kept)?;
-        *said_to = Some(to);
+        // A truncation to its own length: a file that cannot be cut is refused now, not at
+        // its first cut.
+        let size = to.metadata().map_err(os)?.len();
+        to.set_len(size).map_err(os)?;
+        let mut kept = Diagnostics {
+            file: to,
+            bound,
+            size,
+        };
+        let state = lock(&self.state);
+        let (front, back) = state.said.as_slices();
+        kept.write([front, back], &state.said).map_err(os)?;
+        drop(state);
+        *said_to = Some(kept);
         Ok(())
     }
 
@@ -260,7 +417,7 @@ impl Shared {
     }
 
     /// Tells the run `rate` (D247) and waits at most `patience` for what its VM holds its
-    /// vCPUs to.
+    /// vCPUs to, keeping the period it holds them over (D191).
     fn rate(&self, rate: Option<NonZeroU64>, patience: Duration) -> Result<Option<NonZeroU64>, ImageRefusal> {
         let asked = Asked {
             kind: wire::to_host::RATE,
@@ -269,7 +426,9 @@ impl Shared {
             awaited: |s| &mut s.rates,
             refused: ImageRefusal::Rate,
         };
-        self.ask(asked, |id| wire::RateAsk { id, rate }.encode(), patience)
+        let rated = self.ask(asked, |id| wire::RateAsk { id, rate }.encode(), patience)?;
+        lock(&self.state).rate_period = Some(rated.period);
+        Ok(rated.milli)
     }
 
     /// Sends `asked`'s ask, numbered by the session, and waits at most `patience` for its
@@ -367,6 +526,55 @@ impl Shared {
         answer
     }
 
+    /// Asks the run's microVM saved whole at `to` (D259) and waits at most `patience` for its
+    /// host's answer; its ask awaited from before it is sent until it is answered or given up,
+    /// as [`room`](Self::room)'s is.
+    fn save(&self, to: &str, patience: Duration) -> Result<(), ImageRefusal> {
+        let id = {
+            let mut state = lock(&self.state);
+            if let Some(end) = &state.end {
+                return Err(ImageRefusal::Ended(end.clone()));
+            }
+            state.next_ask = state.next_ask.wrapping_add(1);
+            let id = state.next_ask;
+            state.saves.insert(id, None);
+            id
+        };
+        let answer = wire::SaveAsk { id, to: to.into() }
+            .encode()
+            .map_err(|e| ImageRefusal::Spec {
+                what: "a save",
+                why: e.to_string(),
+            })
+            .and_then(|ask| {
+                self.send(wire::to_host::SAVE, &ask)
+                    .map_err(|e| ImageRefusal::Os {
+                        what: "the run host's save",
+                        kind: e.kind(),
+                    })
+            })
+            .and_then(|()| {
+                self.wait(patience, |s| {
+                    if let Some(answer) = s.saves.get_mut(&id).and_then(Option::take) {
+                        return Some(answer.map_err(|(cause, why)| ImageRefusal::Save(cause, why)));
+                    }
+                    if let Some(end) = &s.end {
+                        return Some(Err(ImageRefusal::Ended(end.clone())));
+                    }
+                    s.gone()
+                        .then(|| Err(ImageRefusal::Host("it exited without answering".into())))
+                })
+                .unwrap_or_else(|| {
+                    Err(ImageRefusal::Unsupported {
+                        what: "a save",
+                        why: format!("no answer within {patience:?}"),
+                    })
+                })
+            });
+        lock(&self.state).saves.remove(&id);
+        answer
+    }
+
     /// Waits for `ready` to give an answer, at most `timeout` past now (`Duration::MAX`:
     /// until it does).
     fn wait<T>(&self, timeout: Duration, mut ready: impl FnMut(&mut State) -> Option<T>) -> Option<T> {
@@ -399,9 +607,19 @@ impl Shared {
 struct Host {
     process: shards_ipc::Child,
     to_host: io::PipeWriter,
-    from_host: io::PipeReader,
-    said: io::PipeReader,
+    from_host: Output,
+    said: Output,
 }
+
+/// The read end of a run host's answers' or diagnostics' pipe, as its reader waits on it
+/// beside its watcher's word (`UntilGone`): on Unix, a pipe polled beside another; on
+/// Windows, a named pipe's overlapped end, whose read an event cancels (std's anonymous
+/// pipes there are synchronous: a read of one waits for bytes or its writers' end alone).
+#[cfg(unix)]
+type Output = io::PipeReader;
+
+#[cfg(windows)]
+type Output = shards_ipc::Pipe;
 
 /// Starts `program` with `args`, its environment this process's with `env` over it, holding
 /// its stdin, stdout and stderr, pipes to this process, and nothing else this process holds
@@ -426,8 +644,12 @@ fn start_host(program: &Path, args: &[&OsStr], env: &[(OsString, OsString)]) -> 
     let boot = |e: io::Error| ImageRefusal::Boot(format!("{}: {e}", program.display()));
     let found = on_path(program).map_err(boot)?;
     let (child_in, to_host) = io::pipe().map_err(os("the run host's pipes"))?;
-    let (from_host, child_out) = io::pipe().map_err(os("the run host's pipes"))?;
-    let (said, child_err) = io::pipe().map_err(os("the run host's pipes"))?;
+    #[cfg(unix)]
+    let output = io::pipe;
+    #[cfg(windows)]
+    let output = shards_ipc::output_pair;
+    let (from_host, child_out) = output().map_err(os("the run host's pipes"))?;
+    let (said, child_err) = output().map_err(os("the run host's pipes"))?;
     #[cfg(unix)]
     let ends = {
         use std::os::fd::AsFd as _;
@@ -446,7 +668,15 @@ fn start_host(program: &Path, args: &[&OsStr], env: &[(OsString, OsString)]) -> 
             (child_err.as_handle(), 2),
         ]
     };
-    let process = shards_ipc::spawn_with(&found, args, &ends, false, &set).map_err(boot)?;
+    // On Unix it leads a session and a process group of its own, which `kill` ends whole; a
+    // terminal's signals to this process's group no longer reach it, and its run ends with
+    // this process all the same, its stdin closing. On Windows it is made in a job of its own,
+    // nested under this process's, which holds every process it starts and which `kill` ends
+    // whole: `detach` would take it out of this process's job, so it is not asked.
+    #[cfg(unix)]
+    let process = shards_ipc::spawn_with(&found, args, &ends, true, &set).map_err(boot)?;
+    #[cfg(windows)]
+    let process = shards_ipc::spawn_grouped(&found, args, &ends, &set).map_err(boot)?;
     // The host holds its ends now; this process's go, so that each pipe ends with it.
     drop((child_in, child_out, child_err));
     Ok(Host {
@@ -483,9 +713,13 @@ fn on_path(program: &Path) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "in no directory of PATH"))
 }
 
-/// Kills the host at once, unless it is reaped (`shards_ipc::Child::kill`).
-fn kill(host: &shards_ipc::Child) {
-    let _ = host.kill(shards_ipc::signal::SIGKILL);
+/// Kills the host at once, and every process it started, unless it is reaped: on Unix its
+/// process group, which it leads (`start_host`), and which its VM, network and share
+/// processes are in (api_run.rs starts each in it); on Windows its group's job, which they
+/// are made in, nested in the host's own (D141, D197), each of them held to be followed to
+/// its end (`shards_ipc::Child::end_group`, D231).
+pub(super) fn kill(host: &shards_ipc::Child) {
+    let _ = host.kill_group(shards_ipc::signal::SIGKILL);
 }
 
 /// One image run, as its client holds it.
@@ -503,11 +737,10 @@ pub(super) struct Session {
     nesting: bool,
     /// Each member whose spec asked for a terminal of its own (D244), by its index.
     terminals: Vec<u32>,
-    /// The period its VM's governor holds a rate over, as its host said it as the run
-    /// started (D247).
-    rate_period: Duration,
     /// How its microVM started, as its host said it (D253).
     started_from: wire::StartedFrom,
+    /// What its GPU report is read against, where its request asked for one (D233).
+    report: Option<ReportAsked>,
 }
 
 /// A run host started, its threads reading its answers, keeping its last diagnostics and
@@ -540,6 +773,7 @@ impl Begun {
             to_host: Mutex::new(Some(to_host)),
             lessor: Mutex::new(None),
             granted: Mutex::new(Vec::new()),
+            sign_ins: Mutex::new(Vec::new()),
             said_to: Mutex::new(None),
         });
         // Shared: the session and its exit watcher, which outlives this call.
@@ -549,11 +783,21 @@ impl Begun {
             host,
             armed: true,
         };
+        let layers = host_layers(env);
         let threads = (|| {
+            #[cfg(unix)]
+            let (told, gone) = io::pipe().map_err(os("the run host's watcher"))?;
+            #[cfg(windows)]
+            let (told, gone) = {
+                let gone = shards_ipc::Event::new().map_err(os("the run host's watcher"))?;
+                (gone.try_clone().map_err(os("the run host's watcher"))?, gone)
+            };
+            let until = |pipe| UntilGone::new(pipe, &told).map_err(os("the run host's watcher"));
+            let (from_host, said, gone) = (until(from_host)?, until(said)?, Gone(gone));
             let (watcher, watched) = (begun.shared.clone(), begun.host.clone());
             std::thread::Builder::new()
                 .name("shards-api-image-exit".into())
-                .spawn(move || watch(&watcher, &watched))
+                .spawn(move || watch(&watcher, &watched, layers.as_deref(), gone))
                 .map_err(os("the run host's watcher"))?;
             let reader = begun.shared.clone();
             std::thread::Builder::new()
@@ -596,20 +840,44 @@ impl Begun {
     ) -> Result<(), ImageRefusal> {
         *lock(&self.shared.lessor) = lessor;
         *lock(&self.shared.granted) = request.credentials.iter().map(|g| g.reference.clone()).collect();
-        lock(&self.shared.state).asked_inputs = State::asking(&request.members).asked_inputs;
+        *lock(&self.shared.sign_ins) = request.sign_ins.clone();
+        {
+            let mut state = lock(&self.shared.state);
+            state.asked_inputs = State::asking(&request.members).asked_inputs;
+            if request.gpu_report.is_some() {
+                state.report = Report::Awaited;
+            }
+        }
         self.send(wire::to_host::CREATE, request)
     }
 
-    /// Sends the host `request`, as a run's (`create`) or a warm host's exemplar (`WARM`).
+    /// Sends the host `request`, as a run's (`create`) or a warm host's exemplar (`WARM`). A
+    /// send that meets the host's end (EPIPE or ECONNRESET: it exited, or closed its stdin,
+    /// before it took the request; or a stop took its channel) is that end, followed as the
+    /// end: the wait after it says why, the host's own words and exit, typed as every other
+    /// host's end is ("it exited before its run started"). Refused here, it was an `Os`
+    /// refusal or a host's word by which of the two came first (Linux, parallel tests:
+    /// `a_run_host_that_ends_before_its_run_starts_leaves_no_layer` and the GPU report's boot
+    /// refused `Os { BrokenPipe }`; D231's note).
     pub(super) fn send(&self, kind: u8, request: &wire::Request) -> Result<(), ImageRefusal> {
         let payload = request.encode().map_err(|e| ImageRefusal::Spec {
             what: "the spec",
             why: e.to_string(),
         })?;
-        self.shared.send(kind, &payload).map_err(|e| ImageRefusal::Os {
-            what: "the run host's request",
-            kind: e.kind(),
-        })
+        match self.shared.send(kind, &payload) {
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Err(ImageRefusal::Os {
+                    what: "the run host's request",
+                    kind: e.kind(),
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Waits for a warm host's microVM to be ready (`WARMED`, D253's pools): how it started;
@@ -639,49 +907,93 @@ impl Begun {
         warmed
     }
 
-    /// Waits at most `patience` for the start of the run `request` it was sent: the run's
+    /// Sends CREATE under `stop`, then waits at most `patience` for the run's start: the run's
     /// session; else why not, the host ended, and whether it refused the run as one of
-    /// another microVM's than its warm one (`Cause::Unfit`, D253's pools).
+    /// another microVM's than its warm one (`Cause::Unfit`, D253's pools). `stop` holds the
+    /// host meanwhile: stopped, it kills the host and all the host started, and the run is
+    /// `Ended(Stopped)` once they are gone.
     pub(super) fn started(
         mut self,
+        lessor: Option<RunLessor>,
         request: &wire::Request,
         patience: Duration,
+        stop: &super::BootStop,
     ) -> Result<Session, (ImageRefusal, bool)> {
+        // The end of the boot's patience, which its GPU report is taken within (D233).
+        let deadline = (patience != Duration::MAX)
+            .then(|| Instant::now().checked_add(patience))
+            .flatten();
         // The host is the session's from here, ended by it, or here where its run does not
         // start.
         self.armed = false;
         let (shared, host) = (self.shared.clone(), self.host.clone());
-        drop(self);
         let end_it = |shared: &Shared| {
             kill(&host);
             lock(&shared.to_host).take();
         };
         let unfit = |shared: &Shared| lock(&shared.state).unfit;
+        if let Err(e) = stop.hold(&host) {
+            end_it(&shared);
+            return Err((e, false));
+        }
+        // Registration precedes CREATE's potentially blocking write. A stop kills
+        // the reader independently of the writer mutex, unblocking this send.
+        let created = self.create(lessor, request);
+        drop(self);
         // Started, refused, or gone: whichever comes first, within the caller's patience. A
         // refusal is the host's last word, told once it has exited and said all it will.
-        let outcome = shared.wait(patience, |s| {
-            if s.refused.is_some() {
-                if !(s.gone() && s.said_all) {
-                    return None;
+        let outcome = match created {
+            Err(e) => Some(Err(e)),
+            Ok(()) => shared.wait(patience, |s| {
+                if s.refused.is_some() {
+                    if !(s.gone() && s.said_all) {
+                        return None;
+                    }
+                    if let Some(refused) = gpu_refused(s, request) {
+                        s.refused = None;
+                        return Some(Err(refused));
+                    }
+                    return s.refused.take().map(|r| Err(with_said(r, &s.said)));
                 }
-                return s.refused.take().map(|r| Err(with_said(r, &s.said)));
+                if let Some(started) = s.started.take() {
+                    return Some(Ok(started));
+                }
+                if let Some(end) = &s.end {
+                    return Some(Err(ImageRefusal::Host(format!(
+                        "the run ended before it started: {end:?}{}",
+                        quoted(&s.said)
+                    ))));
+                }
+                s.gone().then(|| {
+                    Err(ImageRefusal::Host(format!(
+                        "it exited before its run started{}",
+                        quoted(&s.said)
+                    )))
+                })
+            }),
+        };
+        if stop.release() {
+            end_it(&shared);
+            // Followed to its end, never timed (D215, D217): the host exited, every process of
+            // its group ended and followed to its end by its watcher (`watch`), the host
+            // reaped, and its answers and diagnostics read to what they held.
+            let unfollowed = shared.wait(Duration::MAX, |s| {
+                (s.gone() && s.said_all).then_some(s.unfollowed)
+            });
+            if let Some(Some(kind)) = unfollowed {
+                return Err((
+                    ImageRefusal::Os {
+                        what: "the stopped run's processes",
+                        kind,
+                    },
+                    false,
+                ));
             }
-            if let Some(started) = s.started.take() {
-                return Some(Ok(started));
-            }
-            if let Some(end) = &s.end {
-                return Some(Err(ImageRefusal::Host(format!(
-                    "the run ended before it started: {end:?}{}",
-                    quoted(&s.said)
-                ))));
-            }
-            s.gone().then(|| {
-                Err(ImageRefusal::Host(format!(
-                    "it exited before its run started{}",
-                    quoted(&s.said)
-                )))
-            })
-        });
+            return Err((
+                ImageRefusal::Ended(RunEnded::unused(RunEnd::Stopped, Unused::NotStarted)),
+                false,
+            ));
+        }
         let started = match outcome {
             Some(Ok(started)) => started,
             Some(Err(e)) => {
@@ -692,6 +1004,11 @@ impl Begun {
                 end_it(&shared);
                 let mut state = lock(&shared.state);
                 // Refused, by a host that has not yet exited: its refusal still.
+                if state.refused.is_some()
+                    && let Some(refused) = gpu_refused(&state, request)
+                {
+                    return Err((refused, false));
+                }
                 if let Some(r) = state.refused.take() {
                     return Err((with_said(r, &state.said), state.unfit));
                 }
@@ -709,6 +1026,17 @@ impl Begun {
             return Err((
                 ImageRefusal::Host(
                     "the run host's start told an agent-control endpoint other than the run asked".into(),
+                ),
+                false,
+            ));
+        }
+        // Its GPU report relayed before its start where its run asked for one (D233): a host
+        // that starts the run unreported, or relays one unasked, broke the channel's contract.
+        if request.gpu_report.is_some() != matches!(lock(&shared.state).report, Report::Relayed(_)) {
+            end_it(&shared);
+            return Err((
+                ImageRefusal::Host(
+                    "the run host's start came without the GPU report its run asked for".into(),
                 ),
                 false,
             ));
@@ -735,8 +1063,12 @@ impl Begun {
             outputs: Mutex::new(HashMap::new()),
             nesting: request.nesting,
             terminals,
-            rate_period: started.rate_period,
             started_from: started.from,
+            report: request.gpu_report.map(|scope| ReportAsked {
+                scope,
+                selected: request.gpu_devices.clone(),
+                deadline,
+            }),
         };
         session.pump_outputs().map_err(|e| (e, false))?;
         Ok(session)
@@ -782,13 +1114,15 @@ impl super::pool::Hosts for ShardsHosts {
         spec: &ImageSpec,
         request: &wire::Request,
         patience: Duration,
+        stop: &super::BootStop,
     ) -> Result<Box<dyn ImageGuest>, super::pool::Taken> {
         use super::pool::Taken;
-        if let Err(e) = warm.create(spec.lessor.clone(), request) {
-            warm.end();
-            return Err(Taken::Refused(e));
+        // No CREATE has been attempted: this terminal spare cannot have this run.
+        // Check both the watcher and the unreaped process so either ordering is safe.
+        if lock(&warm.shared.state).exited || warm.host.has_ended() {
+            return Err(Taken::Untaken);
         }
-        match warm.started(request, patience) {
+        match warm.started(spec.lessor.clone(), request, patience, stop) {
             Ok(session) => Ok(Box::new(session)),
             Err((_, true)) => Err(Taken::Unfit),
             Err((refused, false)) => Err(Taken::Refused(refused)),
@@ -800,8 +1134,9 @@ impl super::pool::Hosts for ShardsHosts {
         spec: &ImageSpec,
         request: &wire::Request,
         patience: Duration,
+        stop: &super::BootStop,
     ) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
-        Ok(Box::new(Session::start(spec, request, patience)?))
+        Ok(Box::new(Session::start(spec, request, patience, stop)?))
     }
 }
 
@@ -821,40 +1156,18 @@ impl Session {
         spec: &ImageSpec,
         request: &wire::Request,
         patience: Duration,
+        stop: &super::BootStop,
     ) -> Result<Session, ImageRefusal> {
         let begun = Begun::begin(spec.binary.as_deref(), &spec.env)?;
-        begun.create(spec.lessor.clone(), request)?;
-        begun.started(request, patience).map_err(|(refused, _)| refused)
+        begun
+            .started(spec.lessor.clone(), request, patience, stop)
+            .map_err(|(refused, _)| refused)
     }
 
-    /// A pipe for each running member's channels, and the thread that fills it as its
-    /// bytes come, granting the host room for as many more as it took.
+    /// Its running members' outputs ([`pumped`]).
     fn pump_outputs(&self) -> Result<(), ImageRefusal> {
-        let mut outputs = lock(&self.outputs);
-        for m in self.members.iter().filter(|m| m.runs) {
-            for channel in [Channel::Stdout, Channel::Stderr] {
-                let (reader, writer) = io::pipe().map_err(|e| ImageRefusal::Os {
-                    what: "a member's pipe",
-                    kind: e.kind(),
-                })?;
-                outputs.insert((m.index, channel), reader);
-                let shared = self.shared.clone();
-                let member = m.index;
-                std::thread::Builder::new()
-                    .name("shards-api-member".into())
-                    .spawn(move || pump(&shared, member, channel, writer))
-                    .map_err(|e| ImageRefusal::Os {
-                        what: "a member's pump",
-                        kind: e.kind(),
-                    })?;
-                self.shared
-                    .credit(member, channel, AHEAD)
-                    .map_err(|e| ImageRefusal::Os {
-                        what: "the run host's credit",
-                        kind: e.kind(),
-                    })?;
-            }
-        }
+        let pumped = pumped(&self.shared, &self.members)?;
+        lock(&self.outputs).extend(pumped);
         Ok(())
     }
 
@@ -909,19 +1222,60 @@ impl Session {
     }
 }
 
+/// A member's channel, by its index, and the pipe its bytes come out of ([`pumped`]).
+type Pumped = ((u32, Channel), io::PipeReader);
+
+/// A pipe for each of `members`' running members' channels, and the thread that fills it as
+/// its bytes come, the host granted room for its first [`AHEAD`] bytes and for as many more as
+/// each part took ([`pump`]). A credit that cannot go is no refusal: the host's channel is
+/// closed, as the run's end closes it (`read_answers`), or broken, and the run started all the
+/// same, its end its session's to tell (`State::end_seen`), as `pump` takes its own credits'
+/// (WHP at 3a05bc3f1: a template's run of `exit 3`, restored, ended before its first credit
+/// went, and its boot was refused `BrokenPipe`).
+fn pumped(shared: &Arc<Shared>, members: &[MemberInfo]) -> Result<Vec<Pumped>, ImageRefusal> {
+    let mut outputs = Vec::new();
+    for m in members.iter().filter(|m| m.runs) {
+        for channel in [Channel::Stdout, Channel::Stderr] {
+            let (reader, writer) = io::pipe().map_err(|e| ImageRefusal::Os {
+                what: "a member's pipe",
+                kind: e.kind(),
+            })?;
+            outputs.push(((m.index, channel), reader));
+            let pumping = shared.clone();
+            let member = m.index;
+            std::thread::Builder::new()
+                .name("shards-api-member".into())
+                .spawn(move || pump(&pumping, member, channel, writer))
+                .map_err(|e| ImageRefusal::Os {
+                    what: "a member's pump",
+                    kind: e.kind(),
+                })?;
+            let _ = shared.credit(member, channel, AHEAD);
+        }
+    }
+    Ok(outputs)
+}
+
 /// Moves member `member`'s `channel` into `writer` as its bytes come, and grants the host
-/// room for each part once written; ends at the channel's end, closing the pipe. A caller
-/// that let go of its end drops the rest, as a closed pipe drops `docker run`'s output,
-/// still granting room, so that the member is never held by a reader that left.
+/// room for each part once written; ends once every part the session took is written and
+/// no more can come, closing the pipe: at the channel's end, or at the end of its host's
+/// answers. The run's end is neither (control-01): its host may still say output after it,
+/// as its capture's reader sends what its VM's end left beside the end it says. A credit
+/// that cannot go, the host's channel closed by the run's end or by `stop`, or broken,
+/// ends the credits alone: what was taken still goes. A caller that let go of its end drops
+/// the rest, as a closed pipe drops `docker run`'s output, still granting room, so that the
+/// member is never held by a reader that left.
 fn pump(shared: &Shared, member: u32, channel: Channel, mut writer: io::PipeWriter) {
+    // Each a latch, set once: the owner's pipe taking writes, and the host's channel credits.
     let mut open = true;
+    let mut granting = true;
     loop {
         let next = shared.wait(Duration::MAX, |s| {
             let flow = s.flows.entry((member, channel)).or_default();
             if let Some(part) = flow.queued.pop_front() {
                 return Some(Some(part));
             }
-            (flow.ended.is_some() || s.end.is_some() || s.answered).then_some(None)
+            (flow.ended.is_some() || s.answered).then_some(None)
         });
         let Some(Some(part)) = next else {
             return;
@@ -930,17 +1284,29 @@ fn pump(shared: &Shared, member: u32, channel: Channel, mut writer: io::PipeWrit
             open = false;
         }
         let taken = u64::try_from(part.len()).unwrap_or(u64::MAX);
-        if shared.credit(member, channel, taken).is_err() {
-            return;
+        if granting && shared.credit(member, channel, taken).is_err() {
+            granting = false;
         }
+    }
+}
+
+/// How member `member`'s `channel` ended, once known: as its host told it, else with its run
+/// once its host's answers are over, which end its pipe as [`pump`] does.
+fn channel_end(s: &State, member: u32, channel: Channel) -> Option<ChannelEnd> {
+    match s.flows.get(&(member, channel)).and_then(|f| f.ended) {
+        Some(wire::StreamEnd::Closed) => Some(ChannelEnd::Closed),
+        Some(wire::StreamEnd::Aborted(errno)) => Some(ChannelEnd::Aborted(errno)),
+        None => s.answered.then_some(ChannelEnd::WithRun),
     }
 }
 
 /// Moves what the caller writes to member `member`'s stdin to its host, no more at once than
 /// the room the host gave, and its end once the caller closes its pipe; ends with the input,
 /// the run or the host, dropping its pipe's read end so that the caller's writes fail then.
-fn feed(shared: &Shared, member: u32, mut reader: io::PipeReader) {
-    let mut buf = vec![0u8; AHEAD as usize];
+fn feed(shared: &Shared, member: u32, mut reader: impl io::Read) {
+    // What the caller types into the member, a credential as often as not (D242): wiped here
+    // once sent, and the buffer as it goes.
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; AHEAD as usize]);
     loop {
         // Room first: nothing is read of the caller that its host has no room for.
         let room = shared.wait(Duration::MAX, |s| {
@@ -960,6 +1326,17 @@ fn feed(shared: &Shared, member: u32, mut reader: io::PipeReader) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         };
+        // An end may have woken the read, or raced its bytes. Neither sends a new word
+        // after that input's known end.
+        {
+            let state = lock(&shared.state);
+            if state.end.is_some()
+                || state.answered
+                || state.inputs.get(&member).is_none_or(|f| f.ended.is_some())
+            {
+                return;
+            }
+        }
         if n == 0 {
             let end = wire::InputEnd {
                 member,
@@ -971,28 +1348,67 @@ fn feed(shared: &Shared, member: u32, mut reader: io::PipeReader) {
         if let Some(flow) = lock(&shared.state).inputs.get_mut(&member) {
             flow.room = flow.room.saturating_sub(n as u64);
         }
-        let mut payload = Vec::with_capacity(4 + n);
-        payload.extend_from_slice(&wire::Input::head(member));
-        payload.extend_from_slice(buf.get(..n).unwrap_or_default());
-        if shared.send(wire::to_host::INPUT, &payload).is_err() {
+        if send_input(shared, member, buf.get_mut(..n).unwrap_or_default()).is_err() {
             return;
         }
     }
+}
+
+/// The owner's write end, and the reader driven by its member's feeder.
+fn input_pipe(shared: &Shared, member: u32) -> io::Result<(impl io::Read + Send + use<>, io::PipeWriter)> {
+    struct Reader(shards_ipc::Stream);
+    impl io::Read for Reader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            shards_ipc::read(&self.0, out)
+        }
+    }
+    let (reader, writer) = shards_ipc::input_pair(shards_abi::run::CHUNK as u32)?;
+    let cancel = reader.try_clone()?;
+    let mut state = lock(&shared.state);
+    if state.end.is_some() || state.answered {
+        return Err(io::ErrorKind::BrokenPipe.into());
+    }
+    let flow = state.inputs.get_mut(&member).ok_or(io::ErrorKind::InvalidInput)?;
+    if flow.ended.is_some() {
+        return Err(io::ErrorKind::BrokenPipe.into());
+    }
+    flow.reader = Some(cancel);
+    Ok((Reader(reader), writer))
+}
+
+/// Sends `typed`, bytes for member `member`'s stdin, as one `INPUT` frame in its parts, never
+/// copied whole into one (`send_parts`), then wipes them where they were read; the frame's
+/// own copy is wiped as it drops (D242).
+fn send_input(shared: &Shared, member: u32, typed: &mut [u8]) -> io::Result<()> {
+    let mut payload = zeroize::Zeroizing::new(Vec::with_capacity(4 + typed.len()));
+    payload.extend_from_slice(&wire::Input::head(member));
+    payload.extend_from_slice(typed);
+    zeroize::Zeroize::zeroize(typed);
+    shared.send_parts(wire::to_host::INPUT, &payload)
 }
 
 /// Reads the host's answers until it closes its stdout, each into the state; one that
 /// breaks the channel's contract ends the session as a failed run. The run's end closes
 /// the host's stdin: the host then ends. Every lease the run was given is released as its
 /// host says the run released them, or as its answers end where it never says so (D242).
-fn read_answers(shared: &Arc<Shared>, mut from_host: io::PipeReader) {
+fn read_answers(shared: &Arc<Shared>, mut from_host: impl io::Read) {
     let failed = loop {
-        let (kind, payload) = match wire::read_frame(&mut from_host) {
+        let (kind, mut payload) = match wire::read_frame(&mut from_host) {
             Ok(Some(frame)) => frame,
             Ok(None) => break None,
             Err(e) => break Some(format!("its answers: {e}")),
         };
         let taken = match kind {
             wire::to_client::LEASE => lease_asked(shared, &payload).map(|()| false),
+            // A capture's tokens are the lessor's once taken (D242, step 8): the frame's copy is
+            // wiped as it goes.
+            wire::to_client::CAPTURE => {
+                let taken = capture_asked(shared, &payload).map(|()| false);
+                zeroize::Zeroize::zeroize(&mut payload);
+                taken
+            }
+            wire::to_client::REFRESH => refresh_asked(shared, &payload).map(|()| false),
+            wire::to_client::REVOKE => revoke_told(shared, &payload).map(|()| false),
             wire::to_client::RELEASED => wire::released(&payload)
                 .map(|()| {
                     release(shared);
@@ -1015,11 +1431,13 @@ fn read_answers(shared: &Arc<Shared>, mut from_host: io::PipeReader) {
     release(shared);
     let mut state = lock(&shared.state);
     if let Some(why) = failed {
-        state
-            .end
-            .get_or_insert(RunEnd::Failed(format!("the run host broke its channel: {why}")));
+        state.end.get_or_insert(RunEnded::unused(
+            RunEnd::Failed(format!("the run host broke its channel: {why}")),
+            Unused::Untold,
+        ));
     }
     state.answered = true;
+    state.close_inputs();
     shared.changed.notify_all();
 }
 
@@ -1095,7 +1513,7 @@ fn take(shared: &Shared, kind: u8, payload: &[u8]) -> Result<bool, String> {
         }
         k::MEMBER_ENDED => {
             let e = wire::MemberEnded::decode(payload).map_err(bad)?;
-            if state.ends.insert(e.member, e.status).is_some() {
+            if state.ends.insert(e.member, e.end).is_some() {
                 return Err("a member ended twice".into());
             }
         }
@@ -1125,7 +1543,18 @@ fn take(shared: &Shared, kind: u8, payload: &[u8]) -> Result<bool, String> {
                 *awaited = Some(answer.result);
             }
         }
+        k::SAVED => {
+            let answer = wire::SaveAnswer::decode(payload).map_err(bad)?;
+            if let Some(awaited) = state.saves.get_mut(&answer.id) {
+                *awaited = Some(answer.result);
+            }
+        }
         k::READY => state.ready = Some(wire::ready(payload).map_err(bad)?),
+        k::GPU_REPORT => match state.report {
+            Report::Awaited => state.report = Report::Relayed(payload.to_vec()),
+            Report::Unasked => return Err("a GPU report its run asked none of".into()),
+            Report::Relayed(_) | Report::Taken => return Err("a GPU report told twice".into()),
+        },
         k::INPUT_ROOM => {
             let room = wire::InputRoom::decode(payload).map_err(bad)?;
             let flow = state
@@ -1146,12 +1575,14 @@ fn take(shared: &Shared, kind: u8, payload: &[u8]) -> Result<bool, String> {
             if flow.ended.replace((e.written, e.end)).is_some() {
                 return Err("a stdin ended twice".into());
             }
+            flow.close();
         }
         k::ENDED => {
-            let end = wire::RunEnd::decode(payload).map_err(bad)?;
+            let end = wire::RunEnded::decode(payload).map_err(bad)?;
             if state.end.replace(end).is_some() {
                 return Err("the run ended twice".into());
             }
+            state.close_inputs();
             ended = true;
         }
         other => return Err(format!("unknown answer kind {other}")),
@@ -1169,7 +1600,7 @@ fn lease_asked(shared: &Arc<Shared>, payload: &[u8]) -> Result<(), String> {
     let Some(lessor) = lock(&shared.lessor).clone() else {
         return Err("a lease asked of a run with no lessor".into());
     };
-    if !lock(&shared.granted).contains(&ask.reference) {
+    if !granted(shared, &ask.reference) {
         return Err(format!(
             "a lease of {}, which no grant of the run names",
             ask.reference
@@ -1199,7 +1630,7 @@ fn lease_asked(shared: &Arc<Shared>, payload: &[u8]) -> Result<(), String> {
         .name("shards-api-lease".into())
         .spawn(move || {
             let got = lessor.0.lease(&ask.reference, key);
-            let result = settle(&asking, &*lessor.0, ask.id, got, Instant::now());
+            let result = settle(&asking, &*lessor.0, &ask, got, Instant::now());
             answer_lease(&asking, ask.id, result);
         });
     if spawned.is_err() {
@@ -1217,10 +1648,11 @@ fn lease_asked(shared: &Arc<Shared>, payload: &[u8]) -> Result<(), String> {
 fn settle(
     shared: &Shared,
     lessor: &dyn Lessor,
-    id: u32,
+    ask: &wire::LeaseAsk,
     got: Result<Leased, LeaseRefusal>,
     now: Instant,
 ) -> Result<wire::Lease, LeaseRefusal> {
+    let id = ask.id;
     let mut state = lock(&shared.state);
     state.leases.each.remove(&id);
     let leased = got?;
@@ -1233,7 +1665,11 @@ fn settle(
         _ if state.leases.released => LeaseRefusal::Ended,
         None => LeaseRefusal::Lapsed,
         Some(lives) => {
-            state.leases.each.insert(id, Holding::Given(leased.lease.clone()));
+            let given = Holding::Given {
+                lease: leased.lease.clone(),
+                reference: ask.reference.clone(),
+            };
+            state.leases.each.insert(id, given);
             return Ok(wire::Lease {
                 value: leased.value,
                 lives,
@@ -1264,6 +1700,191 @@ fn answer_lease(shared: &Shared, id: u32, result: Result<wire::Lease, LeaseRefus
     }
 }
 
+/// The run's lessor, for an ask of sign-in `sign_in` its host made (D242, step 8): one of a run
+/// with no lessor, or of a sign-in no grant of the run names, breaks the channel's contract.
+fn sign_in_lessor(shared: &Shared, sign_in: &str) -> Result<RunLessor, String> {
+    let Some(lessor) = lock(&shared.lessor).clone() else {
+        return Err("a sign-in asked of a run with no lessor".into());
+    };
+    if !lock(&shared.sign_ins).iter().any(|s| s.sign_in == sign_in) {
+        return Err(format!(
+            "an ask of sign-in {sign_in}, which no grant of the run names"
+        ));
+    }
+    Ok(lessor)
+}
+
+/// Whether credential `reference` is one the run may lease: one its grants name, or the access
+/// token a capture of one of its sign-ins gave (D242, step 8).
+fn granted(shared: &Shared, reference: &str) -> bool {
+    lock(&shared.granted).iter().any(|g| g == reference)
+        || lock(&shared.sign_ins)
+            .iter()
+            .filter_map(|s| s.captured.as_ref())
+            .any(|c| c.access == reference)
+}
+
+/// The ids of the leases given of sign-in `sign_in`'s access token now.
+fn given_of(shared: &Shared, sign_in: &str) -> Vec<u32> {
+    let access = lock(&shared.sign_ins)
+        .iter()
+        .find(|s| s.sign_in == sign_in)
+        .and_then(|s| s.captured.as_ref())
+        .map(|c| c.access.clone());
+    let Some(access) = access else {
+        return Vec::new();
+    };
+    lock(&shared.state)
+        .leases
+        .each
+        .iter()
+        .filter(|(_, held)| matches!(held, Holding::Given { reference, .. } if *reference == access))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Leases `ids`, given before a refresh rotated their value (D242 step 8, Q2), let go of, so
+/// that the next ask of it is leased anew, the placeholders its CLI holds the same: each
+/// released to the run's lessor once, as the run's end would, where the run holds it still.
+fn rotated(shared: &Shared, lessor: &dyn Lessor, ids: &[u32]) {
+    let stale: Vec<String> = {
+        let mut state = lock(&shared.state);
+        ids.iter()
+            .filter_map(|id| match state.leases.each.remove(id) {
+                Some(Holding::Given { lease, .. }) => Some(lease),
+                Some(other) => {
+                    state.leases.each.insert(*id, other);
+                    None
+                }
+                None => None,
+            })
+            .collect()
+    };
+    for lease in stale {
+        lessor.release(&lease);
+    }
+}
+
+/// A sign-in's capture its host asks (D242, step 8), put to the run's lessor on a thread of its
+/// own, so that no answer of the host's waits on it; the access token's reference it gives is
+/// one the run's leases may name from then on. Refused as ended once the run has released its
+/// leases.
+fn capture_asked(shared: &Arc<Shared>, payload: &[u8]) -> Result<(), String> {
+    let ask = wire::CaptureAsk::decode(payload).map_err(|e| e.to_string())?;
+    let lessor = sign_in_lessor(shared, &ask.sign_in)?;
+    let id = ask.id;
+    let asking = Arc::clone(shared);
+    let spawned = std::thread::Builder::new()
+        .name("shards-api-capture".into())
+        .spawn(move || {
+            let wire::CaptureAsk { sign_in, tokens, .. } = ask;
+            let (released, key) = {
+                let state = lock(&asking.state);
+                (state.leases.released, state.leases.key)
+            };
+            let result = if released {
+                Err(wire::SignInRefusal::Ended)
+            } else {
+                lessor.0.capture(&sign_in, tokens, key)
+            };
+            // Its access token is the run's to lease from now, in place of an earlier capture's.
+            if let Ok(c) = &result
+                && let Some(grant) = lock(&asking.sign_ins).iter_mut().find(|s| s.sign_in == sign_in)
+            {
+                grant.captured = Some(c.clone());
+            }
+            answer_capture(&asking, id, result);
+        });
+    if spawned.is_err() {
+        let why = "no thread to ask its lessor on".to_string();
+        answer_capture(shared, id, Err(wire::SignInRefusal::Unavailable(why)));
+    }
+    Ok(())
+}
+
+/// A sign-in's refresh its host asks (D242, step 8), put to the run's lessor on a thread of its
+/// own; refused as ended once the run has released its leases.
+fn refresh_asked(shared: &Arc<Shared>, payload: &[u8]) -> Result<(), String> {
+    let ask = wire::RefreshAsk::decode(payload).map_err(|e| e.to_string())?;
+    let lessor = sign_in_lessor(shared, &ask.sign_in)?;
+    let id = ask.id;
+    let asking = Arc::clone(shared);
+    let spawned = std::thread::Builder::new()
+        .name("shards-api-refresh".into())
+        .spawn(move || {
+            let (released, key) = {
+                let state = lock(&asking.state);
+                (state.leases.released, state.leases.key)
+            };
+            // The leases of its access token given before the refresh, whose value it rotates.
+            let before = given_of(&asking, &ask.sign_in);
+            let result = if released {
+                Err(wire::SignInRefusal::Ended)
+            } else {
+                lessor.0.refresh(&ask.sign_in, key)
+            };
+            // Its access token rotated: those leases let go of before its host hears, so that
+            // the next ask is leased the rotated value (Q2).
+            if result.is_ok() {
+                rotated(&asking, &*lessor.0, &before);
+            }
+            answer_refresh(&asking, id, result);
+        });
+    if spawned.is_err() {
+        let why = "no thread to ask its lessor on".to_string();
+        answer_refresh(shared, id, Err(wire::SignInRefusal::Unavailable(why)));
+    }
+    Ok(())
+}
+
+/// A sign-in its run's VM revoked, told by its host (D242, step 8): told the run's lessor on a
+/// thread of its own; answered nowhere, as its network process answered the VM.
+fn revoke_told(shared: &Arc<Shared>, payload: &[u8]) -> Result<(), String> {
+    let told = wire::Revoked::decode(payload).map_err(|e| e.to_string())?;
+    let lessor = sign_in_lessor(shared, &told.sign_in)?;
+    let key = lock(&shared.state).leases.key;
+    // With no thread to tell it on, the lessor is not told: nothing waits on it.
+    let _ = std::thread::Builder::new()
+        .name("shards-api-revoked".into())
+        .spawn(move || lessor.0.revoked(&told.sign_in, key));
+    Ok(())
+}
+
+/// Tells the run's host capture `id`'s answer (`CAPTURED`); one past the channel's bound is told
+/// unavailable.
+fn answer_capture(shared: &Shared, id: u32, result: Result<wire::Captured, wire::SignInRefusal>) {
+    let payload = wire::CaptureAnswer { id, result }.encode().or_else(|e| {
+        wire::CaptureAnswer {
+            id,
+            result: Err(wire::SignInRefusal::Unavailable(format!("its answer: {e}"))),
+        }
+        .encode()
+    });
+    // A host gone is told nothing: its run has ended.
+    if let Ok(payload) = payload {
+        let _ = shared.send_parts(wire::to_host::CAPTURED, &payload);
+    }
+}
+
+/// Tells the run's host refresh `id`'s answer (`REFRESHED`), every copy of its token response
+/// wiped once sent; one past the channel's bound is told unavailable.
+fn answer_refresh(shared: &Shared, id: u32, result: Result<wire::Secret, wire::SignInRefusal>) {
+    let answer = wire::RefreshAnswer { id, result };
+    let encoded = answer.encode().map(zeroize::Zeroizing::new);
+    drop(answer);
+    let payload = encoded.or_else(|e| {
+        wire::RefreshAnswer {
+            id,
+            result: Err(wire::SignInRefusal::Unavailable(format!("its answer: {e}"))),
+        }
+        .encode()
+        .map(zeroize::Zeroizing::new)
+    });
+    if let Ok(payload) = payload {
+        let _ = shared.send_parts(wire::to_host::REFRESHED, &payload);
+    }
+}
+
 /// Releases every lease the run was given (D242), once; a lease given after is released as
 /// it comes ([`settle`]).
 fn release(shared: &Shared) {
@@ -1279,7 +1900,7 @@ fn release(shared: &Shared) {
             .each
             .drain()
             .filter_map(|(_, held)| match held {
-                Holding::Given(lease) => Some(lease),
+                Holding::Given { lease, .. } => Some(lease),
                 Holding::Asked => None,
             })
             .collect()
@@ -1295,7 +1916,7 @@ fn release(shared: &Shared) {
 /// Keeps the host's last diagnostics until they end, and writes each part whole to the file
 /// its caller named for them, where it has named one ([`Shared::keep_diagnostics`]): kept and
 /// written under that file's lock, which naming a file takes first.
-fn keep_said(shared: &Shared, mut said: io::PipeReader) {
+fn keep_said(shared: &Shared, mut said: impl io::Read) {
     let keep = said_kept();
     let mut buf = [0u8; 4096];
     while let Ok(n) = said.read(&mut buf) {
@@ -1304,33 +1925,206 @@ fn keep_said(shared: &Shared, mut said: io::PipeReader) {
         }
         let part = buf.get(..n).unwrap_or_default();
         let mut said_to = lock(&shared.said_to);
-        {
-            let mut state = lock(&shared.state);
-            state.said.extend(part);
-            let over = state.said.len().saturating_sub(keep);
-            state.said.drain(..over);
-        }
+        let mut state = lock(&shared.state);
+        state.said.extend(part);
+        let over = state.said.len().saturating_sub(keep);
+        state.said.drain(..over);
         // A part its file refuses is lost to it alone: the tail keeps it.
         if let Some(to) = said_to.as_mut() {
-            let _ = to.write_all(part);
+            let _ = to.write([part, &[]], &state.said);
         }
     }
     lock(&shared.state).said_all = true;
     shared.changed.notify_all();
 }
 
-/// Waits for the host to exit, then reaps it under the state's lock as `exited` is set.
-fn watch(shared: &Shared, host: &shards_ipc::Child) {
+/// Waits for the host to exit, ends every process of its group and follows each to its end
+/// (`shards_ipc::Child::end_group`, D231): the VM, network and share processes it started,
+/// which a host that ends as it should has reaped already, and one it leaves is ended with
+/// it. Then reaps it under the state's lock as `exited` is set, and tells its pipes' readers
+/// (`gone`) that no process the run started is left to write to them.
+fn watch(shared: &Shared, host: &shards_ipc::Child, layers: Option<&Path>, gone: Gone) {
     let awaited = host.ended();
+    let followed = awaited
+        .as_ref()
+        .map_err(io::Error::kind)
+        .and_then(|()| host.end_group().map_err(|e| e.kind()));
+    if let (Ok(()), Some(layers)) = (&followed, layers) {
+        clear_layers(layers, host.id());
+    }
     let mut state = lock(&shared.state);
     let _ = host.wait();
     if let Err(e) = awaited {
-        state
-            .end
-            .get_or_insert(RunEnd::Failed(format!("waiting for the run host: {e}")));
+        state.end.get_or_insert(RunEnded::unused(
+            RunEnd::Failed(format!("waiting for the run host: {e}")),
+            Unused::Untold,
+        ));
     }
+    state.unfollowed = followed.err();
     state.exited = true;
     shared.changed.notify_all();
+    drop(state);
+    gone.tell();
+}
+
+/// The word a run host's watcher gives its pipes' readers once the host and every process of
+/// its group have ended: never a pipe's end, which a process holding its write end would hold
+/// back as it would theirs. On Unix a byte written to a pipe they wait on beside their own,
+/// never read, so that it stays readable; on Windows an event set, manual-reset, which stays
+/// so. Either holds for every reader and every read after it.
+#[cfg(unix)]
+struct Gone(io::PipeWriter);
+
+#[cfg(windows)]
+struct Gone(shards_ipc::Event);
+
+impl Gone {
+    #[cfg(unix)]
+    fn tell(self) {
+        let _ = (&self.0).write_all(&[0]);
+    }
+
+    #[cfg(windows)]
+    fn tell(self) {
+        self.0.set();
+    }
+}
+
+/// One of the run host's pipes as its readers read it (D231): to its end, or, once the host
+/// and every process of its group have ended (`gone`, its watcher's word), to what it holds
+/// then, never waiting for its end. No process the run started can write to it after that,
+/// and a write end another process holds holds nothing back: one that a spawn anywhere in
+/// this process inherited as the pipe was made (macOS: std's `pipe` there is pipe(2), then
+/// `FD_CLOEXEC`, Darwin has no pipe2) or as a spawn of shards' held a copy of it inheritable
+/// for its child's handle list (Windows: CreateProcessW with bInheritHandles TRUE and no
+/// list, as std's and an embedder's are, takes every inheritable handle of the process).
+#[cfg(unix)]
+struct UntilGone {
+    pipe: io::PipeReader,
+    gone: io::PipeReader,
+}
+
+#[cfg(unix)]
+impl UntilGone {
+    fn new(pipe: Output, told: &io::PipeReader) -> io::Result<UntilGone> {
+        Ok(UntilGone {
+            pipe,
+            gone: told.try_clone()?,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl io::Read for UntilGone {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsFd as _;
+        loop {
+            let ready = shards_ipc::await_any(&[self.pipe.as_fd(), self.gone.as_fd()])?;
+            match ready.as_slice() {
+                [true, _] => return shards_ipc::read(&self.pipe, buf),
+                [false, true] => return Ok(0),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// [`UntilGone`] on Windows: reading, each read one the watcher's event cancels; once it is
+/// set, draining the bytes the pipe held as the reader first saw it set (PeekNamedPipe), and
+/// no more, then ended: a writer outside the run, which no stop ends, cannot keep it reading.
+#[cfg(windows)]
+struct UntilGone {
+    pipe: shards_ipc::Pipe,
+    gone: shards_ipc::Event,
+    state: Draining,
+}
+
+/// Where a Windows [`UntilGone`] is.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Draining {
+    /// Its watcher has not told it yet: it reads as bytes come.
+    Reading,
+    /// Told: this many bytes of what the pipe held then are left to read; at 0 it has ended.
+    Left(usize),
+}
+
+#[cfg(windows)]
+impl UntilGone {
+    fn new(pipe: Output, told: &shards_ipc::Event) -> io::Result<UntilGone> {
+        Ok(UntilGone {
+            pipe,
+            gone: told.try_clone()?,
+            state: Draining::Reading,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl io::Read for UntilGone {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = match self.state {
+            Draining::Left(left) => left,
+            Draining::Reading => {
+                if !self.gone.is_set()
+                    && let Some(read) = self.pipe.read_unless(buf, &self.gone)?
+                {
+                    return Ok(read);
+                }
+                self.pipe.held()?
+            }
+        };
+        // A read of no bytes would wait for the next to come (await_any's readiness reads).
+        let Some(part) = buf.get_mut(..left.min(buf.len())).filter(|part| !part.is_empty()) else {
+            self.state = Draining::Left(0);
+            return Ok(0);
+        };
+        // Bytes the pipe holds, read at once: it has no other reader.
+        let read = (&self.pipe).read(part)?;
+        self.state = Draining::Left(if read == 0 { 0 } else { left.saturating_sub(read) });
+        Ok(read)
+    }
+}
+
+/// Where the run host started with `env` over this process's environment makes its
+/// microVMs' writable layers' files (D190, shards' layers.rs `fresh`): its home's
+/// [`LAYERS`](shards_ipc::LAYERS), its home found as it finds it ([`shards_ipc::home_in`]),
+/// a variable `env` names twice its last, as the host is given it. None where it finds no
+/// home, as it then makes none.
+fn host_layers(env: &[(OsString, OsString)]) -> Option<PathBuf> {
+    let named = |n: &OsString, name: &str| {
+        // Windows' variables are named without regard to case.
+        n.to_str()
+            .is_some_and(|n| n == name || (cfg!(windows) && n.eq_ignore_ascii_case(name)))
+    };
+    let var = |name: &str| {
+        env.iter()
+            .rev()
+            .find(|(n, _)| named(n, name))
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var_os(name))
+    };
+    shards_ipc::home_in(var)
+        .ok()
+        .map(|home| home.join(shards_ipc::LAYERS))
+}
+
+/// Removes from `layers` every file run host `pid` made ([`shards_ipc::layer_maker`]): the
+/// layers of its microVMs it made and had not let go of as it ended (D253), its microVM not
+/// yet holding one, killed mid-boot or failed. Called once it has ended and before it is
+/// reaped: ended, it makes no more, and only it makes files of its pid's; unreaped (on
+/// Windows, its handle held), its pid is no other process's, so no other run host's file is
+/// taken. A microVM of its still ending that has one open is removed from as one its host
+/// let go of as it started is (layers.rs `LayerFile`'s drop): the name goes, and the file
+/// with the microVM. What cannot be removed stays, as what that drop could not remove does,
+/// for the home's next daemon to clear (layers.rs `clear`).
+fn clear_layers(layers: &Path, pid: u32) {
+    for entry in std::fs::read_dir(layers).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        if name.to_str().and_then(shards_ipc::layer_maker) == Some(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn quoted(said: &VecDeque<u8>) -> String {
@@ -1405,7 +2199,7 @@ impl ImageGuest for Session {
             }
             flow.taken = true;
         }
-        let (reader, writer) = io::pipe().map_err(|e| ImageRefusal::Os {
+        let (reader, writer) = input_pipe(&self.shared, index).map_err(|e| ImageRefusal::Os {
             what: "a member's stdin pipe",
             kind: e.kind(),
         })?;
@@ -1413,9 +2207,15 @@ impl ImageGuest for Session {
         std::thread::Builder::new()
             .name("shards-api-input".into())
             .spawn(move || feed(&shared, index, reader))
-            .map_err(|e| ImageRefusal::Os {
-                what: "a member's stdin feed",
-                kind: e.kind(),
+            .map_err(|e| {
+                if let Some(flow) = lock(&self.shared.state).inputs.get_mut(&index) {
+                    flow.close();
+                    flow.taken = false;
+                }
+                ImageRefusal::Os {
+                    what: "a member's stdin feed",
+                    kind: e.kind(),
+                }
             })?;
         Ok(writer)
     }
@@ -1429,11 +2229,30 @@ impl ImageGuest for Session {
         }
         let index = info.index;
         Ok(self.shared.wait(timeout, |s| {
-            if let Some(status) = s.ends.get(&index) {
-                return Some(MemberEnd::Exited(*status));
+            if let Some(end) = s.ends.get(&index) {
+                return Some(match *end {
+                    shards_abi::run::members::End::Exited(code) => MemberEnd::Exited(code),
+                    shards_abi::run::members::End::Signaled(signal) => MemberEnd::Signaled(signal),
+                });
             }
             (s.end.is_some() || s.gone()).then_some(MemberEnd::WithRun)
         }))
+    }
+
+    fn wait_channel(
+        &self,
+        member: &MemberName,
+        channel: Channel,
+        timeout: Duration,
+    ) -> Result<Option<ChannelEnd>, ImageRefusal> {
+        let info = self.index(member)?;
+        if !info.runs {
+            return Err(ImageRefusal::Image(format!(
+                "{member:?} is files alone, and runs nothing"
+            )));
+        }
+        let index = info.index;
+        Ok(self.shared.wait(timeout, |s| channel_end(s, index, channel)))
     }
 
     fn stats(&self, scope: StatsScope, patience: Duration) -> Result<Stats, ImageRefusal> {
@@ -1479,8 +2298,8 @@ impl ImageGuest for Session {
         self.shared.rate(rate, patience)
     }
 
-    fn rate_period(&self) -> Duration {
-        self.rate_period
+    fn rate_period(&self) -> Option<Duration> {
+        lock(&self.shared.state).rate_period
     }
 
     fn started_from(&self) -> wire::StartedFrom {
@@ -1542,6 +2361,14 @@ impl ImageGuest for Session {
         })
     }
 
+    fn save(&self, to: &Path, patience: Duration) -> Result<(), ImageRefusal> {
+        let to = to.to_str().ok_or_else(|| ImageRefusal::Spec {
+            what: "a save's directory",
+            why: format!("{}: not UTF-8", to.display()),
+        })?;
+        self.shared.save(to, patience)
+    }
+
     fn wait_ready(&self, seen: Option<Ready>, timeout: Duration) -> Result<Option<Ready>, ImageRefusal> {
         self.shared
             .wait(timeout, |s| ready_past(s, self.nesting, seen))
@@ -1557,30 +2384,78 @@ impl ImageGuest for Session {
             kill(&self.host);
         }
         // The run's end comes as its VM goes, which the host kills at once; or the host is
-        // gone. The host's own exit after (its cleanup) is the watcher's to reap.
+        // gone. Its stdin closed then is its cue to reap what it started and exit.
         self.shared.wait(Duration::MAX, |s| s.end_seen().map(|_| ()));
         lock(&self.shared.to_host).take();
         lock(&self.shared.state).stopped();
+        lock(&self.shared.state).close_inputs();
         self.shared.changed.notify_all();
-        Ok(())
+        // Released, as a boot's stop returns (D231): followed to its end, never timed (D215,
+        // D217), the host exited, every process of its group ended and followed to its end by
+        // its watcher (`watch`), the host reaped, and its answers and diagnostics read to
+        // what they held. The run's channels end before that (api-run cuts each as its VM's
+        // capture ends), so no channel's end says it.
+        let unfollowed = self.shared.wait(Duration::MAX, |s| {
+            (s.gone() && s.said_all).then_some(s.unfollowed)
+        });
+        match unfollowed {
+            Some(Some(kind)) => Err(ImageRefusal::Os {
+                what: "the stopped run's processes",
+                kind,
+            }),
+            _ => Ok(()),
+        }
     }
 
-    fn wait_for(&self, timeout: Duration) -> Result<Option<RunEnd>, ImageRefusal> {
+    fn wait_for(&self, timeout: Duration) -> Result<Option<RunEnded>, ImageRefusal> {
         Ok(self.shared.wait(timeout, State::end_seen))
     }
 
-    fn keep_diagnostics(&self, to: std::fs::File) -> Result<(), ImageRefusal> {
-        self.shared.keep_diagnostics(to).map_err(|e| ImageRefusal::Os {
-            what: "the run host's diagnostics",
-            kind: e.kind(),
-        })
+    fn keep_diagnostics(&self, to: std::fs::File, bound: u64) -> Result<(), ImageRefusal> {
+        self.shared.keep_diagnostics(to, bound)
     }
+
+    /// Its VM process's report, relayed before its start (`started` refuses a start without
+    /// it), read as a managed launch's is (`physical::report::read`), within the boot's deadline
+    /// and `patience` from now, as `ManagedGuest::take_gpu_report` takes its own.
+    fn take_gpu_report(&self, patience: Duration) -> Result<crate::physical::GpuReport, ImageRefusal> {
+        take_report(&self.shared, self.report.as_ref(), patience)
+    }
+}
+
+/// [`Session::take_gpu_report`] of the session `shared` is, its report read against `asked`.
+fn take_report(
+    shared: &Shared,
+    asked: Option<&ReportAsked>,
+    patience: Duration,
+) -> Result<crate::physical::GpuReport, ImageRefusal> {
+    use crate::GpuProbeError;
+    let refused = |why| Err(ImageRefusal::GpuProbe(why));
+    let Some(asked) = asked else {
+        return refused(GpuProbeError::Unavailable);
+    };
+    let held = std::mem::replace(&mut lock(&shared.state).report, Report::Taken);
+    let frame = match held {
+        Report::Relayed(frame) => frame,
+        Report::Taken => return refused(GpuProbeError::ReportTaken),
+        Report::Unasked | Report::Awaited => return refused(GpuProbeError::Unreported),
+    };
+    let now = Instant::now();
+    let deadline = match (now.checked_add(patience), asked.deadline) {
+        (Some(caller), Some(boot)) => Some(caller.min(boot)),
+        (caller, boot) => caller.or(boot),
+    };
+    if deadline.is_some_and(|at| now >= at) {
+        return refused(GpuProbeError::Pending);
+    }
+    crate::physical::report::read(&frame, asked.scope, &asked.selected).map_err(ImageRefusal::GpuProbe)
 }
 
 /// Its run ends with it: one still running is stopped; one ended has its host's stdin
 /// closed, its cue to finish and exit, which the watcher then reaps.
 impl Drop for Session {
     fn drop(&mut self) {
+        lock(&self.shared.state).close_inputs();
         let running = {
             let state = lock(&self.shared.state);
             state.end.is_none() && !state.gone()
@@ -1595,9 +2470,93 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     /// A session's shared state with no host behind it: its answers taken as its reader
     /// takes them.
+    /// A member's channel's end is read typed as its host told it (control-01): its writers'
+    /// close or its capture's abort, kept past the run's end; one its host's answers ended
+    /// without telling ends with its run; none before either.
+    #[test]
+    fn a_channels_end_is_read_as_its_host_told_it() {
+        let s = shared();
+        let told = |channel, end| wire::OutputEnd {
+            member: 1,
+            channel,
+            end,
+        };
+        assert_eq!(channel_end(&lock(&s.state), 1, Channel::Stdout), None);
+        let closed = told(Channel::Stdout, wire::StreamEnd::Closed).encode();
+        assert_eq!(take(&s, wire::to_client::OUTPUT_END, &closed), Ok(false));
+        let aborted = told(Channel::Stderr, wire::StreamEnd::Aborted(104)).encode();
+        assert_eq!(take(&s, wire::to_client::OUTPUT_END, &aborted), Ok(false));
+        let ended = untold(RunEnd::Exited(0)).encode().unwrap();
+        assert_eq!(take(&s, wire::to_client::ENDED, &ended), Ok(true));
+        let state = lock(&s.state);
+        assert_eq!(channel_end(&state, 1, Channel::Stdout), Some(ChannelEnd::Closed));
+        assert_eq!(
+            channel_end(&state, 1, Channel::Stderr),
+            Some(ChannelEnd::Aborted(104))
+        );
+        assert_eq!(
+            channel_end(&state, 2, Channel::Stdout),
+            None,
+            "its host still answers"
+        );
+        drop(state);
+        lock(&s.state).answered = true;
+        assert_eq!(
+            channel_end(&lock(&s.state), 2, Channel::Stdout),
+            Some(ChannelEnd::WithRun)
+        );
+        assert_eq!(
+            channel_end(&lock(&s.state), 1, Channel::Stderr),
+            Some(ChannelEnd::Aborted(104))
+        );
+    }
+
+    /// `end`, as a host said it with no final use told.
+    fn untold(end: RunEnd) -> RunEnded {
+        RunEnded::unused(end, Unused::Untold)
+    }
+
+    /// A run's end carries its microVM's final use as its host said it (D260): every look at
+    /// the end sees it, each ask of the run after it is refused with it, and a stop after
+    /// keeps it, never `Stopped` with nothing.
+    #[test]
+    fn a_runs_final_use_comes_with_its_end_and_answers_every_ask_after() {
+        let s = shared();
+        let ended = RunEnded {
+            end: RunEnd::Exited(0),
+            final_use: wire::FinalUse::Read(wire::Microvm {
+                host: Ok(wire::HostUse {
+                    cpu_ns: 900,
+                    resident_bytes: 1 << 20,
+                    footprint_bytes: 2 << 20,
+                }),
+                guest: Ok(wire::GuestTimes {
+                    vcpus: vec![wire::VcpuTime {
+                        index: 0,
+                        guest_ns: 700,
+                        unread: None,
+                    }],
+                    departed_ns: 0,
+                }),
+            }),
+        };
+        assert_eq!(
+            take(&s, wire::to_client::ENDED, &ended.encode().unwrap()),
+            Ok(true)
+        );
+        assert_eq!(lock(&s.state).end_seen(), Some(ended.clone()));
+        assert_eq!(s.room(None, BOUND), Err(ImageRefusal::Ended(ended.clone())));
+        assert_eq!(s.rate(None, BOUND), Err(ImageRefusal::Ended(ended.clone())));
+        assert_eq!(lock(&s.state).stopped(), ended);
+        // An end of version 27, with no final use after it, breaks the channel.
+        let s = shared();
+        assert!(take(&s, wire::to_client::ENDED, &RunEnd::Exited(0).encode().unwrap()).is_err());
+    }
+
     fn shared() -> Shared {
         Shared {
             state: Mutex::new(State::default()),
@@ -1605,8 +2564,35 @@ mod tests {
             to_host: Mutex::new(None),
             lessor: Mutex::new(None),
             granted: Mutex::new(Vec::new()),
+            sign_ins: Mutex::new(Vec::new()),
             said_to: Mutex::new(None),
         }
+    }
+
+    /// A member's typed stdin goes to its host as one `INPUT` frame and is wiped where it was
+    /// read (D242). Do: send typed bytes from a buffer of the test's. Expect: the buffer all
+    /// zeros after; the host reads one `INPUT` frame of the member's bytes, and nothing more.
+    #[test]
+    fn a_members_typed_input_is_wiped_where_it_was_read_once_sent() {
+        let (mut host, to_host) = io::pipe().unwrap();
+        let s = shared();
+        *lock(&s.to_host) = Some(to_host);
+        let mut typed = *b"sk-ant-typed-in-1234";
+        send_input(&s, 4, &mut typed).unwrap();
+        assert!(
+            typed.iter().all(|&b| b == 0),
+            "the typed bytes were left where they were read"
+        );
+        drop(lock(&s.to_host).take());
+        let mut frame = Vec::new();
+        let (kind, len) = wire::read_frame_into(&mut host, &mut frame).unwrap().unwrap();
+        assert_eq!(kind, wire::to_host::INPUT);
+        let input = wire::Input::decode(&frame[..len]).unwrap();
+        assert_eq!(
+            (input.member, input.bytes.0.as_slice()),
+            (4, b"sk-ant-typed-in-1234".as_slice())
+        );
+        assert!(wire::read_frame_into(&mut host, &mut frame).unwrap().is_none());
     }
 
     /// Do have a run host write more diagnostics than are kept to quote, its caller naming a
@@ -1631,7 +2617,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             shared
-                .keep_diagnostics(std::fs::File::create(&path).unwrap())
+                .keep_diagnostics(std::fs::File::create(&path).unwrap(), u64::MAX)
                 .unwrap();
             host.write_all(&after).unwrap();
             drop(host);
@@ -1640,6 +2626,125 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), [&before[..], &after[..]].concat());
         let kept: Vec<u8> = lock(&shared.state).said.iter().copied().collect();
         assert_eq!(kept, after[after.len() - said_kept()..]);
+    }
+
+    /// Do write a run host's diagnostics past their file's bound, what the file held as it was
+    /// named counted, a file opened to write in place and one opened to append. Expect: each
+    /// part written after the last while the file is within its bound; the part that would
+    /// pass it cutting the file back to the tail, exactly its latest bytes; the next parts
+    /// written after that tail, the file growing again.
+    #[test]
+    fn a_bounded_diagnostics_file_is_cut_back_to_the_tail_and_grows_again() {
+        let dir = shards_testdir::TempDir::new("api-bound").unwrap();
+        for append in [false, true] {
+            let path = dir.join(if append { "appended" } else { "in-place" });
+            std::fs::write(&path, b"ab").unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(!append)
+                .append(append)
+                .open(&path)
+                .unwrap();
+            let mut kept = Diagnostics {
+                size: file.metadata().unwrap().len(),
+                file,
+                bound: 10,
+            };
+            if !append {
+                use std::io::Seek as _;
+                kept.file.seek(io::SeekFrom::End(0)).unwrap();
+            }
+            let mut tail = VecDeque::new();
+            let mut said = |kept: &mut Diagnostics, part: &[u8]| {
+                // A tail of six, as `keep_said` keeps `said_kept()`.
+                tail.extend(part);
+                let over = tail.len().saturating_sub(6);
+                tail.drain(..over);
+                kept.write([part, &[]], &tail).unwrap();
+                std::fs::read(&path).unwrap()
+            };
+            assert_eq!(said(&mut kept, b"cdef"), b"abcdef", "within its bound");
+            assert_eq!(said(&mut kept, b"ghij"), b"abcdefghij", "at its bound");
+            assert_eq!(said(&mut kept, b"k"), b"fghijk", "cut back to the tail");
+            assert_eq!(kept.size, 6);
+            assert_eq!(said(&mut kept, b"lm"), b"fghijklm", "grown again after it");
+            assert_eq!(
+                said(&mut kept, b"nopqrstuvwxyz"),
+                b"uvwxyz",
+                "a part past the tail"
+            );
+        }
+    }
+
+    /// Do name a file for a run host's diagnostics with a bound short of the tail kept to
+    /// quote, then one at it, and have the host write past it. Expect: the first refused,
+    /// typed, with the tail's size; the second kept, the file never past its bound, holding
+    /// exactly the latest bytes the host wrote, at least the tail's.
+    #[test]
+    fn a_diagnostics_bound_short_of_the_tail_is_refused_and_one_at_it_holds() {
+        let shared = shared();
+        let dir = shards_testdir::TempDir::new("api-bound").unwrap();
+        let path = dir.join("diagnostics");
+        let tail = u64::try_from(said_kept()).unwrap();
+        assert_eq!(
+            shared.keep_diagnostics(std::fs::File::create(&path).unwrap(), tail - 1),
+            Err(ImageRefusal::DiagnosticsBound {
+                bound: tail - 1,
+                tail
+            })
+        );
+        assert!(lock(&shared.said_to).is_none(), "nothing named");
+        let (said, mut host) = io::pipe().unwrap();
+        let written: Vec<u8> = (0..said_kept() * 3).map(|i| (i % 251) as u8).collect();
+        shared
+            .keep_diagnostics(std::fs::File::create(&path).unwrap(), tail)
+            .unwrap();
+        std::thread::scope(|s| {
+            let keeping = s.spawn(|| keep_said(&shared, said));
+            for part in written.chunks(1000) {
+                host.write_all(part).unwrap();
+                let now = std::fs::metadata(&path).unwrap().len();
+                assert!(now <= tail, "{now} bytes, past its bound of {tail}");
+            }
+            drop(host);
+            keeping.join().unwrap();
+        });
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(
+            file,
+            written[written.len() - said_kept()..],
+            "the latest bytes alone"
+        );
+    }
+
+    /// Do pump the outputs of a run whose end came before them, its host's channel closed by
+    /// it, as a run that ends at once has (WHP at 3a05bc3f1: a template's run of `exit 3`,
+    /// restored, ended before its first credit went), its host's answers over. Expect: a pipe
+    /// for each channel of each running member alone, each ending as its host's answers have,
+    /// and no refusal: the run started, and its end is the session's to tell, never a boot
+    /// refused `BrokenPipe`.
+    #[test]
+    fn a_run_ended_before_its_first_credit_still_has_its_outputs() {
+        let shared = Arc::new(shared());
+        {
+            let mut state = lock(&shared.state);
+            state.end = Some(untold(RunEnd::Exited(3)));
+            state.answered = true;
+        }
+        let member = |index, runs| MemberInfo {
+            index,
+            kind: wire::MemberKind::Harness,
+            name: format!("m{index}"),
+            runs,
+        };
+        let outputs = pumped(&shared, &[member(1, true), member(2, false)]).unwrap();
+        let channels: Vec<(u32, Channel)> = outputs.iter().map(|(key, _)| *key).collect();
+        assert_eq!(channels, [(1, Channel::Stdout), (1, Channel::Stderr)]);
+        for (key, mut reader) in outputs {
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty(), "{key:?}");
+        }
+        assert_eq!(lock(&shared.state).end_seen(), Some(untold(RunEnd::Exited(3))));
     }
 
     /// Do see a run's host gone without its run's end, as `wait_for` sees it, then stop the
@@ -1658,20 +2763,26 @@ mod tests {
                 .collect(),
             ..State::default()
         };
-        let seen = RunEnd::Failed(
+        let seen = untold(RunEnd::Failed(
             "the run host exited without its run's end: shards api-run: its VM's link: reset".into(),
-        );
+        ));
         assert_eq!(state.end_seen(), Some(seen.clone()));
         assert_eq!(state.stopped(), seen);
         assert_eq!(state.end_seen(), Some(seen));
         let mut said = State {
-            end: Some(RunEnd::Exited(3)),
+            end: Some(untold(RunEnd::Exited(3))),
             exited: true,
             answered: true,
             ..State::default()
         };
-        assert_eq!(said.stopped(), RunEnd::Exited(3));
-        assert_eq!(said.end_seen(), Some(RunEnd::Exited(3)));
+        assert_eq!(said.stopped(), untold(RunEnd::Exited(3)));
+        assert_eq!(said.end_seen(), Some(untold(RunEnd::Exited(3))));
+        // A stop that saw no end: its VM killed, its use gone with it.
+        let mut stopped = State::default();
+        assert_eq!(
+            stopped.stopped(),
+            RunEnded::unused(RunEnd::Stopped, Unused::Killed)
+        );
     }
 
     /// A member's stdin has its flow as the run's start is taken, under the lock that answer
@@ -1690,6 +2801,7 @@ mod tests {
             input,
             terminal: false,
             args: Vec::new(),
+            mcp: false,
         };
         let s = Shared {
             state: Mutex::new(State::asking(&[stage("codex", true), stage("other", false)])),
@@ -1697,6 +2809,7 @@ mod tests {
             to_host: Mutex::new(None),
             lessor: Mutex::new(None),
             granted: Mutex::new(Vec::new()),
+            sign_ins: Mutex::new(Vec::new()),
             said_to: Mutex::new(None),
         };
         let info = |index, name: &str| MemberInfo {
@@ -1709,7 +2822,6 @@ mod tests {
             members: vec![info(0, "other"), info(1, "codex")],
             published: Vec::new(),
             control: None,
-            rate_period: Duration::from_millis(100),
             from: wire::StartedFrom::Booted,
         }
         .encode()
@@ -1762,10 +2874,11 @@ mod tests {
             to_host: Mutex::new(Some(to_host)),
             lessor: Mutex::new(None),
             granted: Mutex::new(Vec::new()),
+            sign_ins: Mutex::new(Vec::new()),
             said_to: Mutex::new(None),
         });
         lock(&s.state).inputs.insert(1, InputFlow::default());
-        let (reader, mut writer) = io::pipe().unwrap();
+        let (reader, mut writer) = input_pipe(&s, 1).unwrap();
         let feeding = {
             let s = s.clone();
             std::thread::spawn(move || feed(&s, 1, reader))
@@ -1779,9 +2892,9 @@ mod tests {
         let (kind, first) = wire::read_frame(&mut from_host).unwrap().unwrap();
         assert_eq!(kind, wire::to_host::INPUT);
         let first = wire::Input::decode(&first).unwrap();
-        assert_eq!((first.member, first.bytes.as_slice()), (1, &payload[..7]));
+        assert_eq!((first.member, first.bytes.0.as_slice()), (1, &payload[..7]));
         assert_eq!(take(&s, wire::to_client::INPUT_ROOM, &room(1024)), Ok(false));
-        let mut got = first.bytes;
+        let mut got = first.bytes.0.clone();
         loop {
             let (kind, frame) = wire::read_frame(&mut from_host).unwrap().unwrap();
             if kind == wire::to_host::INPUT_END {
@@ -1795,16 +2908,102 @@ mod tests {
                 break;
             }
             assert_eq!(kind, wire::to_host::INPUT);
-            got.extend(wire::Input::decode(&frame).unwrap().bytes);
+            got.extend_from_slice(&wire::Input::decode(&frame).unwrap().bytes.0);
         }
         assert_eq!(got, payload);
         feeding.join().unwrap();
         lock(&s.to_host).take();
     }
 
-    /// The variable under which the leak check runs, in a test process of its own.
-    #[cfg(any(target_os = "macos", windows))]
+    /// Run in a test process of its own ([`alone`]): the held writer refuses bytes once no
+    /// process holds the input's reader, and a child another test's thread starts meanwhile
+    /// would hold it. On macOS std makes a socketpair and only then marks its ends
+    /// close-on-exec (no SOCK_CLOEXEC there), and its spawn closes nothing it was not told to
+    /// (no POSIX_SPAWN_CLOEXEC_DEFAULT), so a std child started in that moment holds the
+    /// reader for its life; on Linux a child std forks holds it until its exec. Beside the
+    /// crate's other tests on adas-mac-studio-3 (7 spinners beside) the write was taken in 2
+    /// of 50 runs, and lsof, looking just after, found the reader held nowhere: its holder,
+    /// a short-lived child, had gone.
+    #[test]
+    fn an_ended_members_idle_input_releases_its_feeder() {
+        if alone("image::session::tests::an_ended_members_idle_input_releases_its_feeder") {
+            return;
+        }
+        struct Entered<R> {
+            reader: R,
+            entered: std::sync::mpsc::Sender<()>,
+        }
+        impl<R: io::Read> io::Read for Entered<R> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.entered.send(()).unwrap();
+                self.reader.read(out)
+            }
+        }
+        let shared = Arc::new(shared());
+        lock(&shared.state).inputs.insert(
+            1,
+            InputFlow {
+                room: 1,
+                ..InputFlow::default()
+            },
+        );
+        let (reader, mut held_writer) = input_pipe(&shared, 1).unwrap();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let feeding = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                feed(&shared, 1, Entered { reader, entered });
+                done.send(()).unwrap();
+            })
+        };
+        entering.recv_timeout(Duration::from_secs(1)).unwrap();
+        let end = wire::InputEnded {
+            member: 1,
+            written: 0,
+            end: wire::StreamEnd::Aborted(32),
+        }
+        .encode();
+        take(&shared, wire::to_client::INPUT_ENDED, &end).unwrap();
+        let released = finished.recv_timeout(Duration::from_secs(1));
+        // Observe the thread's actual exit before checking that all its descriptors
+        // have closed. A broken old feeder is released first so the red test also joins.
+        if released.is_err() {
+            drop(held_writer);
+            feeding.join().unwrap();
+            assert_eq!(released, Ok(()), "member end retained its idle input feeder");
+            return;
+        }
+        feeding.join().unwrap();
+        assert!(
+            held_writer.write_all(b"x").is_err(),
+            "an ended input still took bytes"
+        );
+    }
+
+    /// The variable under which a test runs in a test process of its own ([`alone`]).
     const ALONE: &str = "SHARDS_API_SPAWN_ALONE";
+
+    /// Whether test `name` ran in a test process of its own, this one its parent, which
+    /// started it and found it passed: false in that process, which runs it. No other test's
+    /// thread starts a child there that holds a descriptor it makes.
+    fn alone(name: &str) -> bool {
+        if std::env::var_os(ALONE).is_some() {
+            return false;
+        }
+        let ran = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1"])
+            .env(ALONE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        true
+    }
 
     /// A program that reads its stdin to its end, saying each line with its argument in it, by
     /// its path: findstr on Windows, grep on macOS.
@@ -1844,7 +3043,6 @@ mod tests {
 
     /// Whether every write end of `read`'s pipe is gone, every process's: a read that would
     /// wait finds its end (Unix), or a look at it finds it broken (Windows), at once.
-    #[cfg(any(target_os = "macos", windows))]
     fn writers_gone(read: &io::PipeReader) -> bool {
         #[cfg(unix)]
         {
@@ -1889,34 +3087,19 @@ mod tests {
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn a_run_host_holds_no_end_it_was_not_given() {
-        if std::env::var_os(ALONE).is_some() {
-            let (read, write) = io::pipe().unwrap();
-            inheritable(&write);
-            let host = start_host(&reader(), &[OsStr::new("api-run")], &[]).unwrap();
-            drop(write);
-            let gone = writers_gone(&read);
-            drop(host.to_host);
-            host.process.wait().unwrap();
-            assert!(
-                gone,
-                "the run host holds the write end of a pipe it was never given"
-            );
+        if alone("image::session::tests::a_run_host_holds_no_end_it_was_not_given") {
             return;
         }
-        let alone = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "image::session::tests::a_run_host_holds_no_end_it_was_not_given",
-                "--test-threads=1",
-            ])
-            .env(ALONE, "1")
-            .output()
-            .unwrap();
+        let (read, write) = io::pipe().unwrap();
+        inheritable(&write);
+        let host = start_host(&reader(), &[OsStr::new("api-run")], &[]).unwrap();
+        drop(write);
+        let gone = writers_gone(&read);
+        drop(host.to_host);
+        host.process.wait().unwrap();
         assert!(
-            alone.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&alone.stdout),
-            String::from_utf8_lossy(&alone.stderr)
+            gone,
+            "the run host holds the write end of a pipe it was never given"
         );
     }
 
@@ -2079,12 +3262,227 @@ mod tests {
             })
         );
         assert!(lock(&s.state).resizes.is_empty());
-        lock(&s.state).end = Some(RunEnd::Stopped);
+        lock(&s.state).end = Some(untold(RunEnd::Stopped));
         assert_eq!(
             s.resize(1, 40, 120, BOUND),
-            Err(ImageRefusal::Ended(RunEnd::Stopped))
+            Err(ImageRefusal::Ended(untold(RunEnd::Stopped)))
         );
         assert!(lock(&s.state).resizes.is_empty());
+    }
+
+    /// A GPU report as its run host relays it (D233): its VM process's frame of one GPU,
+    /// scoped `[3; 16]`, and what its take reads it against.
+    fn reported() -> (Vec<u8>, ReportAsked, crate::physical::GpuReport) {
+        use crate::physical::{GpuProbe, GpuReport, ResolvedGpu};
+        let selected = crate::PhysicalGpu::MetalRegistry(7);
+        let report = GpuReport {
+            scope: [3; 16],
+            probe: GpuProbe {
+                devices: vec![ResolvedGpu {
+                    physical: selected,
+                    uuid: [4; 16],
+                    pci: None,
+                    luid: Some(7u64.to_be_bytes()),
+                    name: None,
+                    device_local_bytes: None,
+                }],
+                host_visible_bytes: 1,
+            },
+        };
+        let asked = ReportAsked {
+            scope: [3; 16],
+            selected: vec![selected],
+            deadline: Instant::now().checked_add(BOUND),
+        };
+        (report.encode().unwrap().into_bytes(), asked, report)
+    }
+
+    /// D233: a run's GPU report is its host's to relay once, for a run that asked for one, as
+    /// its VM process wrote it: one unasked, or told twice, breaks the channel.
+    #[test]
+    fn a_gpu_report_is_relayed_once_and_for_a_run_that_asked() {
+        let (frame, _, _) = reported();
+        let s = shared();
+        assert!(take(&s, wire::to_client::GPU_REPORT, &frame).is_err(), "unasked");
+        lock(&s.state).report = Report::Awaited;
+        assert_eq!(take(&s, wire::to_client::GPU_REPORT, &frame), Ok(false));
+        assert!(matches!(&lock(&s.state).report, Report::Relayed(kept) if *kept == frame));
+        assert!(take(&s, wire::to_client::GPU_REPORT, &frame).is_err(), "twice");
+    }
+
+    /// D233, as `ManagedGuest::take_gpu_report` takes a managed launch's: the report its host
+    /// relayed, read against the run's scope and selection, taken once (`ReportTaken` after,
+    /// whatever the first came to); `Unavailable` for a run that asked none; `Pending` past the
+    /// boot's deadline or the caller's patience, which spends it; a frame of another scope, a
+    /// torn one, one past its bound or none at all refused as a managed launch's are; and a
+    /// refusal its renderer typed is that refusal.
+    #[test]
+    fn a_runs_gpu_report_is_taken_once_within_its_boots_deadline() {
+        use crate::GpuProbeError as E;
+        use crate::physical::{GpuRefusal, JoinError};
+        let relayed = |frame: &[u8]| {
+            let s = shared();
+            lock(&s.state).report = Report::Relayed(frame.to_vec());
+            s
+        };
+        let (frame, asked, report) = reported();
+        let s = relayed(&frame);
+        assert_eq!(take_report(&s, Some(&asked), BOUND), Ok(report));
+        assert_eq!(
+            take_report(&s, Some(&asked), BOUND),
+            Err(ImageRefusal::GpuProbe(E::ReportTaken))
+        );
+        assert_eq!(
+            take_report(&relayed(&frame), None, BOUND),
+            Err(ImageRefusal::GpuProbe(E::Unavailable))
+        );
+        let s = relayed(&frame);
+        assert_eq!(
+            take_report(&s, Some(&asked), Duration::ZERO),
+            Err(ImageRefusal::GpuProbe(E::Pending))
+        );
+        assert_eq!(
+            take_report(&s, Some(&asked), BOUND),
+            Err(ImageRefusal::GpuProbe(E::ReportTaken))
+        );
+        let past = ReportAsked {
+            deadline: Some(Instant::now()),
+            ..reported().1
+        };
+        assert_eq!(
+            take_report(&relayed(&frame), Some(&past), BOUND),
+            Err(ImageRefusal::GpuProbe(E::Pending))
+        );
+        let unbounded = ReportAsked {
+            deadline: None,
+            ..reported().1
+        };
+        assert!(take_report(&relayed(&frame), Some(&unbounded), Duration::MAX).is_ok());
+        let other_scope = ReportAsked {
+            scope: [9; 16],
+            ..reported().1
+        };
+        assert!(take_report(&relayed(&frame), Some(&other_scope), BOUND).is_err());
+        assert!(take_report(&relayed(&frame[..frame.len() - 2]), Some(&asked), BOUND).is_err());
+        let long = vec![b'x'; crate::physical::report_bytes(1).unwrap() + 1];
+        assert_eq!(
+            take_report(&relayed(&long), Some(&asked), BOUND),
+            Err(ImageRefusal::GpuProbe(E::Count))
+        );
+        assert_eq!(
+            take_report(&relayed(&[]), Some(&asked), BOUND),
+            Err(ImageRefusal::GpuProbe(E::Unreported))
+        );
+        let refusal = GpuRefusal::Join(JoinError::Missing);
+        let refused = crate::physical::GpuReport::refusal([3; 16], refusal).unwrap();
+        assert_eq!(
+            take_report(&relayed(refused.as_bytes()), Some(&asked), BOUND),
+            Err(ImageRefusal::GpuProbe(E::Refused(refusal)))
+        );
+    }
+
+    /// D232, D233: a run whose VM its renderer refused its selection is refused as that
+    /// refusal, typed, where its host relayed its report before its refusal; a receipt, or a
+    /// run that asked no report, leaves the host's own refusal.
+    #[test]
+    fn a_boot_refused_its_gpus_is_refused_as_its_renderer_typed_it() {
+        use crate::GpuProbeError as E;
+        use crate::physical::{GpuRefusal, JoinError};
+        let refusal = GpuRefusal::Join(JoinError::Missing);
+        let frame = crate::physical::GpuReport::refusal([3; 16], refusal).unwrap();
+        let request = super::super::request(&ImageSpec {
+            gpu_devices: vec![crate::PhysicalGpu::MetalRegistry(7)],
+            gpu_report: Some([3; 16]),
+            ..stand_in_spec(Path::new("/shards"), Vec::new())
+        })
+        .unwrap();
+        let mut state = State {
+            report: Report::Relayed(frame.into_bytes()),
+            ..State::default()
+        };
+        assert_eq!(
+            gpu_refused(&state, &request),
+            Some(ImageRefusal::GpuProbe(E::Refused(refusal)))
+        );
+        let unasked = wire::Request {
+            gpu_report: None,
+            ..request.clone()
+        };
+        assert_eq!(gpu_refused(&state, &unasked), None);
+        state.report = Report::Relayed(reported().0);
+        assert_eq!(gpu_refused(&state, &request), None);
+        state.report = Report::Awaited;
+        assert_eq!(gpu_refused(&state, &request), None);
+    }
+
+    /// A save's answer is kept for the ask awaiting it alone, as a room's is (D259): one for an
+    /// ask no longer awaited is dropped; one that is no answer breaks the channel. A save no
+    /// host hears is refused, typed, and leaves no ask awaited; a run that has ended is saved
+    /// no more.
+    #[test]
+    fn a_saves_answer_is_kept_for_its_awaited_ask_alone() {
+        let s = shared();
+        lock(&s.state).saves.insert(4, None);
+        let saved = |id, result| wire::SaveAnswer { id, result }.encode().unwrap();
+        assert_eq!(take(&s, wire::to_client::SAVED, &saved(4, Ok(()))), Ok(false));
+        assert_eq!(lock(&s.state).saves.get(&4), Some(&Some(Ok(()))));
+        let refused = Err((wire::SaveRefusal::State, "a save of it is under way".to_string()));
+        assert_eq!(take(&s, wire::to_client::SAVED, &saved(5, refused)), Ok(false));
+        assert!(
+            !lock(&s.state).saves.contains_key(&5),
+            "an answer no ask awaits is dropped"
+        );
+        assert!(take(&s, wire::to_client::SAVED, &[0, 0, 0, 4, 1, 9]).is_err());
+        let s = shared();
+        assert_eq!(
+            s.save("/home/u/.local/share/shards/saves/s1", BOUND),
+            Err(ImageRefusal::Os {
+                what: "the run host's save",
+                kind: io::ErrorKind::BrokenPipe
+            })
+        );
+        assert!(lock(&s.state).saves.is_empty());
+        lock(&s.state).end = Some(untold(RunEnd::Stopped));
+        assert_eq!(
+            s.save("/home/u/.local/share/shards/saves/s1", BOUND),
+            Err(ImageRefusal::Ended(untold(RunEnd::Stopped)))
+        );
+        assert!(lock(&s.state).saves.is_empty());
+    }
+
+    /// A save is asked of the run's host on the run's own channel, its directory whole, and
+    /// its answer is the host's, typed (D259): a refusal comes back as `ImageRefusal::Save` by
+    /// what refused it, a save made as done, each to its own ask, and no ask is left awaited.
+    #[test]
+    fn a_save_rides_the_runs_channel_and_comes_back_typed() {
+        let mut h = hosted(None, &[]);
+        let to = "/home/u/.local/share/shards/saves/s1";
+        for result in [
+            Err((
+                wire::SaveRefusal::Destination,
+                "outside the run's home".to_string(),
+            )),
+            Ok(()),
+        ] {
+            let shared = Arc::clone(&h.shared);
+            let asking = std::thread::spawn(move || shared.save(to, BOUND));
+            let (kind, payload) = wire::read_frame(&mut h.sent).unwrap().unwrap();
+            assert_eq!(kind, wire::to_host::SAVE);
+            let ask = wire::SaveAsk::decode(&payload).unwrap();
+            assert_eq!(ask.to, to);
+            let answer = wire::SaveAnswer {
+                id: ask.id,
+                result: result.clone(),
+            };
+            says(&mut h.host, wire::to_client::SAVED, &answer.encode().unwrap());
+            assert_eq!(
+                asking.join().unwrap(),
+                result.map_err(|(cause, why)| ImageRefusal::Save(cause, why))
+            );
+        }
+        assert!(lock(&h.shared.state).saves.is_empty());
+        drop(h.host);
+        h.reader.join().unwrap();
     }
 
     /// A room no host hears is refused, typed, and leaves no ask awaited; a run that has
@@ -2100,8 +3498,11 @@ mod tests {
             })
         );
         assert!(lock(&s.state).rooms.is_empty());
-        lock(&s.state).end = Some(RunEnd::Stopped);
-        assert_eq!(s.room(None, BOUND), Err(ImageRefusal::Ended(RunEnd::Stopped)));
+        lock(&s.state).end = Some(untold(RunEnd::Stopped));
+        assert_eq!(
+            s.room(None, BOUND),
+            Err(ImageRefusal::Ended(untold(RunEnd::Stopped)))
+        );
         assert!(lock(&s.state).rooms.is_empty());
     }
 
@@ -2112,15 +3513,19 @@ mod tests {
         let s = shared();
         lock(&s.state).rates.insert(4, None);
         let rated = |id, result| wire::RateAnswer { id, result }.encode().unwrap();
+        let held = |milli| wire::Rated {
+            milli: NonZeroU64::new(milli),
+            period: Duration::from_micros(31_250),
+        };
         assert_eq!(
-            take(&s, wire::to_client::RATED, &rated(4, Ok(NonZeroU64::new(1500)))),
+            take(&s, wire::to_client::RATED, &rated(4, Ok(held(1500)))),
             Ok(false)
         );
+        assert_eq!(lock(&s.state).rates.get(&4), Some(&Some(Ok(held(1500)))));
         assert_eq!(
-            lock(&s.state).rates.get(&4),
-            Some(&Some(Ok(NonZeroU64::new(1500))))
+            take(&s, wire::to_client::RATED, &rated(5, Ok(held(0)))),
+            Ok(false)
         );
-        assert_eq!(take(&s, wire::to_client::RATED, &rated(5, Ok(None))), Ok(false));
         assert!(
             !lock(&s.state).rates.contains_key(&5),
             "an answer no ask awaits is dropped"
@@ -2141,8 +3546,11 @@ mod tests {
             })
         );
         assert!(lock(&s.state).rates.is_empty());
-        lock(&s.state).end = Some(RunEnd::Stopped);
-        assert_eq!(s.rate(None, BOUND), Err(ImageRefusal::Ended(RunEnd::Stopped)));
+        lock(&s.state).end = Some(untold(RunEnd::Stopped));
+        assert_eq!(
+            s.rate(None, BOUND),
+            Err(ImageRefusal::Ended(untold(RunEnd::Stopped)))
+        );
         assert!(lock(&s.state).rates.is_empty());
     }
 
@@ -2196,11 +3604,11 @@ mod tests {
             );
         }
         assert_eq!(lock(&s.state).ready, Some(Ready::Late(9)));
-        let ended = RunEnd::Exited(0).encode().unwrap();
+        let ended = untold(RunEnd::Exited(0)).encode().unwrap();
         assert_eq!(take(&s, wire::to_client::ENDED, &ended), Ok(true));
         assert_eq!(
             wait(Some(Ready::Late(9)), BOUND),
-            Err(ImageRefusal::Ended(RunEnd::Exited(0)))
+            Err(ImageRefusal::Ended(untold(RunEnd::Exited(0))))
         );
         assert_eq!(wait(None, Duration::ZERO), Ok(Some(Ready::Late(9))));
         assert!(matches!(
@@ -2302,6 +3710,7 @@ mod tests {
             to_host: Mutex::new(Some(to_host)),
             lessor: Mutex::new(lessor.map(|l| RunLessor(l))),
             granted: Mutex::new(granted.iter().map(|g| (*g).to_string()).collect()),
+            sign_ins: Mutex::new(Vec::new()),
             said_to: Mutex::new(None),
         });
         let reader = {
@@ -2333,6 +3742,100 @@ mod tests {
         let (kind, payload) = wire::read_frame(sent).unwrap().unwrap();
         assert_eq!(kind, wire::to_host::LEASED);
         wire::LeaseAnswer::decode(&payload).unwrap()
+    }
+
+    /// A running member's stdout, as `pumped` gives the run's owner its pipe.
+    fn member_stdout(shared: &Arc<Shared>) -> io::PipeReader {
+        let running = MemberInfo {
+            index: 1,
+            kind: wire::MemberKind::Harness,
+            name: "m1".into(),
+            runs: true,
+        };
+        let mut outputs = pumped(shared, &[running]).unwrap();
+        let at = outputs
+            .iter()
+            .position(|(key, _)| *key == (1, Channel::Stdout))
+            .unwrap();
+        outputs.swap_remove(at).1
+    }
+
+    fn says_output(host: &mut io::PipeWriter, bytes: &[u8]) {
+        let payload = [&wire::Output::head(1, Channel::Stdout)[..], bytes].concat();
+        says(host, wire::to_client::OUTPUT, &payload);
+    }
+
+    /// Waits for the session's reader to take the run's end, which closes the host's stdin.
+    fn until_its_channel_closes(shared: &Shared) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&shared.to_host).is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the run's end never closed its host's channel"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A member's output the session took before the run's end reaches its owner whole
+    /// (control-01, docs/bugs/2026-11-13/control.md): its credits can no longer go, as the
+    /// run's end closed the host's channel, which is no reason to drop what was taken. Do:
+    /// have the host say two records of a member's stdout, its channel's end and the run's
+    /// end, and once the session has taken them all, start the member's pump. Expect: the
+    /// owner reads both records, once each, then its end, while the host's answers are still
+    /// open: the channel's own end ends it. Before, the pump wrote the first record, found
+    /// its credit refused `BrokenPipe` and ended the pipe, the second record left queued.
+    #[test]
+    fn output_taken_before_the_runs_end_reaches_its_owner_whole() {
+        let mut h = hosted(None, &[]);
+        says_output(&mut h.host, b"first record\n");
+        says_output(&mut h.host, b"second record\n");
+        let end = wire::OutputEnd {
+            member: 1,
+            channel: Channel::Stdout,
+            end: wire::StreamEnd::Closed,
+        };
+        says(&mut h.host, wire::to_client::OUTPUT_END, &end.encode());
+        says(
+            &mut h.host,
+            wire::to_client::ENDED,
+            &untold(RunEnd::Exited(0)).encode().unwrap(),
+        );
+        until_its_channel_closes(&h.shared);
+        let mut read = Vec::new();
+        member_stdout(&h.shared).read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"first record\nsecond record\n");
+        assert!(
+            !lock(&h.shared.state).answered,
+            "ended by its host's answers, not its channel's end"
+        );
+        drop(h.host);
+        h.reader.join().unwrap();
+    }
+
+    /// A member's output its host says after the run's end still reaches its owner, as the
+    /// run host says the end as its VM goes while its capture's reader may still be sending
+    /// (api_run.rs `serve`'s `following` beside `records`). Do: have the host say the run's
+    /// end; start the member's pump; then have the host say a record of its stdout and close
+    /// its answers without the channel's end, as a capture cut by its VM's end does. Expect:
+    /// the owner reads the record, then its end, which comes with the host's answers' end.
+    /// Before, the pump took the run's end for its channel's and ended the pipe empty.
+    #[test]
+    fn output_said_after_the_runs_end_reaches_its_owner_before_its_end() {
+        let mut h = hosted(None, &[]);
+        says(
+            &mut h.host,
+            wire::to_client::ENDED,
+            &untold(RunEnd::Exited(0)).encode().unwrap(),
+        );
+        until_its_channel_closes(&h.shared);
+        let mut owner = member_stdout(&h.shared);
+        says_output(&mut h.host, b"the last of it\n");
+        drop(h.host);
+        let mut read = Vec::new();
+        owner.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"the last of it\n");
+        h.reader.join().unwrap();
     }
 
     /// A run with grants, its leases asked by its host on their first use and given by a
@@ -2372,7 +3875,7 @@ mod tests {
                     says(
                         &mut h.host,
                         wire::to_client::ENDED,
-                        &RunEnd::Exited(0).encode().unwrap(),
+                        &untold(RunEnd::Exited(0)).encode().unwrap(),
                     );
                 }
                 "stopped" => {
@@ -2387,7 +3890,7 @@ mod tests {
                     says(
                         &mut h.host,
                         wire::to_client::ENDED,
-                        &RunEnd::Stopped.encode().unwrap(),
+                        &untold(RunEnd::Stopped).encode().unwrap(),
                     );
                 }
                 _ => assert!(lock(&orchestrator.ledger).released.is_empty()),
@@ -2417,8 +3920,9 @@ mod tests {
                 control: key.map(|vm| wire::ControlAt {
                     address: "127.0.0.1:4433".parse().unwrap(),
                     vm,
+                    waker: "127.0.0.1:4434".parse().unwrap(),
+                    wake: "127.0.0.1:4435".parse().unwrap(),
                 }),
-                rate_period: Duration::from_millis(100),
                 from: wire::StartedFrom::Booted,
             };
             says(&mut h.host, wire::to_client::STARTED, &started.encode().unwrap());
@@ -2477,12 +3981,1217 @@ mod tests {
             drop(h.host);
             h.reader.join().unwrap();
             assert!(
-                matches!(lock(&h.shared.state).end, Some(RunEnd::Failed(_))),
+                matches!(
+                    lock(&h.shared.state).end,
+                    Some(RunEnded {
+                        end: RunEnd::Failed(_),
+                        ..
+                    })
+                ),
                 "{lessor} {twice}"
             );
             let l = lock(&orchestrator.ledger);
             assert_eq!(l.given.len(), usize::from(twice));
             assert_eq!(l.released, l.given, "a lease outlived its channel");
         }
+    }
+
+    const SIGN_IN: &str = "claude/acct-1";
+    const SIGNED_ACCESS: &str = "sign-ins/claude/acct-1/access";
+
+    /// What a simulated broker's capture gives (D242, step 8): one reference, and the same
+    /// placeholders every time.
+    fn kept() -> wire::Captured {
+        wire::Captured {
+            access: SIGNED_ACCESS.into(),
+            access_placeholder: "kiln-placeholder-access-0123456789abcdef".into(),
+            refresh_placeholder: Some("kiln-placeholder-refresh-fedcba9876543210".into()),
+        }
+    }
+
+    /// A simulated orchestrator keeping its run's sign-in (D242, step 8): its leases as
+    /// [`Orchestrator`]'s, its value whatever the reference; each capture's tokens kept; each
+    /// refresh answered with the rotated tokens' response, the provider called once for each;
+    /// each revocation told.
+    #[derive(Default)]
+    struct Broker {
+        leases: Orchestrator,
+        kept: Mutex<Vec<wire::SignInTokens>>,
+        refreshed: Mutex<usize>,
+        revoked: Mutex<Vec<String>>,
+    }
+
+    impl Lessor for Broker {
+        fn lease(&self, reference: &str, key: Option<[u8; 32]>) -> Result<Leased, LeaseRefusal> {
+            self.leases.lease(reference, key)
+        }
+
+        fn release(&self, lease: &str) {
+            self.leases.release(lease);
+        }
+
+        fn capture(
+            &self,
+            sign_in: &str,
+            tokens: wire::SignInTokens,
+            _key: Option<[u8; 32]>,
+        ) -> Result<wire::Captured, wire::SignInRefusal> {
+            if sign_in != SIGN_IN {
+                return Err(wire::SignInRefusal::Denied(format!("no sign-in {sign_in}")));
+            }
+            lock(&self.kept).push(tokens);
+            Ok(kept())
+        }
+
+        fn refresh(
+            &self,
+            sign_in: &str,
+            _key: Option<[u8; 32]>,
+        ) -> Result<wire::Secret, wire::SignInRefusal> {
+            if sign_in != SIGN_IN {
+                return Err(wire::SignInRefusal::Denied(format!("no sign-in {sign_in}")));
+            }
+            *lock(&self.refreshed) += 1;
+            Ok(wire::Secret::from(
+                r#"{"access_token":"sk-ant-oat01-rotated","refresh_token":"sk-ant-ort01-rotated","expires_in":28800}"#,
+            ))
+        }
+
+        fn revoked(&self, sign_in: &str, _key: Option<[u8; 32]>) {
+            lock(&self.revoked).push(sign_in.into());
+            self.leases.changed.notify_all();
+        }
+    }
+
+    /// A session of a run that grants sign-in `SIGN_IN` (not yet captured), its lessor `broker`.
+    fn signing(broker: &Arc<Broker>) -> Hosted {
+        let (sent, to_host) = io::pipe().unwrap();
+        let (from_host, host) = io::pipe().unwrap();
+        let lessor: Arc<dyn Lessor> = Arc::clone(broker) as Arc<dyn Lessor>;
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+            to_host: Mutex::new(Some(to_host)),
+            lessor: Mutex::new(Some(RunLessor(lessor))),
+            granted: Mutex::new(Vec::new()),
+            sign_ins: Mutex::new(vec![wire::SignInGrant {
+                sign_in: SIGN_IN.into(),
+                cli: wire::Cli::ClaudeCode,
+                toward: vec!["api.anthropic.com".into()],
+                captured: None,
+            }]),
+            said_to: Mutex::new(None),
+        });
+        let reader = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || read_answers(&shared, from_host))
+        };
+        Hosted {
+            shared,
+            sent,
+            host,
+            reader,
+        }
+    }
+
+    /// A run's sign-in kept by its orchestrator (D242, step 8). Do: have the host ask a capture
+    /// of its tokens; lease the access token the capture gave; refresh the sign-in; lease it
+    /// again; tell a revocation in the VM; say the run released its leases. Expect: the tokens
+    /// kept by the broker, whole, and the capture answered with its placeholders; the access
+    /// token leasable only once captured, by the broker's reference; the refresh answered with
+    /// the broker's response, its provider called once, the lease given before it released and
+    /// the sign-in's placeholders the same; the revocation told the broker, answered nowhere;
+    /// and the lease given after the refresh released at the run's end, each lease once.
+    #[test]
+    fn a_sign_ins_capture_and_refresh_are_kept_by_the_broker_and_its_lease_released_at_the_runs_end() {
+        let broker = Arc::new(Broker::default());
+        let mut h = signing(&broker);
+        assert!(!granted(&h.shared, SIGNED_ACCESS), "leasable before its capture");
+        let capture = wire::CaptureAsk {
+            id: 1,
+            sign_in: SIGN_IN.into(),
+            tokens: wire::SignInTokens {
+                access: wire::Secret::from("sk-ant-oat01-real-access"),
+                refresh: Some(wire::Secret::from("sk-ant-ort01-real-refresh")),
+                expires_in: Some(28800),
+                id_token: None,
+                scope: Some("user:inference".into()),
+            },
+        };
+        says(&mut h.host, wire::to_client::CAPTURE, &capture.encode().unwrap());
+        let (kind, payload) = wire::read_frame(&mut h.sent).unwrap().unwrap();
+        assert_eq!(kind, wire::to_host::CAPTURED);
+        let answer = wire::CaptureAnswer::decode(&payload).unwrap();
+        assert_eq!((answer.id, answer.result), (1, Ok(kept())));
+        assert_eq!(*lock(&broker.kept), std::slice::from_ref(&capture.tokens));
+        assert!(granted(&h.shared, SIGNED_ACCESS));
+        ask(&mut h.host, 7, SIGNED_ACCESS);
+        assert!(answered(&mut h.sent).result.is_ok());
+        let first = lock(&broker.leases.ledger).given.clone();
+        assert_eq!(first, [format!("{SIGNED_ACCESS}#0")]);
+        // The refresh: the broker's alone, its answer relayed; the lease given before let go of.
+        let refresh = wire::RefreshAsk {
+            id: 2,
+            sign_in: SIGN_IN.into(),
+        };
+        says(&mut h.host, wire::to_client::REFRESH, &refresh.encode().unwrap());
+        let (kind, payload) = wire::read_frame(&mut h.sent).unwrap().unwrap();
+        assert_eq!(kind, wire::to_host::REFRESHED);
+        let answer = wire::RefreshAnswer::decode(&payload).unwrap();
+        assert_eq!(answer.id, 2);
+        assert!(answer.result.is_ok());
+        assert_eq!(*lock(&broker.refreshed), 1);
+        assert_eq!(
+            lock(&broker.leases.ledger).released,
+            first,
+            "the rotated token's lease held past its refresh"
+        );
+        assert_eq!(
+            lock(&h.shared.sign_ins)[0].captured,
+            Some(kept()),
+            "a refresh changed the sign-in's placeholders"
+        );
+        ask(&mut h.host, 8, SIGNED_ACCESS);
+        assert!(answered(&mut h.sent).result.is_ok());
+        // The VM's revocation: told the broker, answered nowhere.
+        let revoked = wire::Revoked {
+            sign_in: SIGN_IN.into(),
+        };
+        says(&mut h.host, wire::to_client::REVOKE, &revoked.encode().unwrap());
+        assert!(broker.leases.until(|_| !lock(&broker.revoked).is_empty()));
+        // The run's end: the lease given after the refresh released, each once.
+        says(&mut h.host, wire::to_client::RELEASED, &[]);
+        assert!(
+            broker.leases.until(|l| l.released.len() == 2),
+            "the captured token's lease not released at the run's end"
+        );
+        says(
+            &mut h.host,
+            wire::to_client::ENDED,
+            &untold(RunEnd::Exited(0)).encode().unwrap(),
+        );
+        drop(h.host);
+        h.reader.join().unwrap();
+        let l = lock(&broker.leases.ledger);
+        assert_eq!(l.released, l.given, "each lease released once");
+        assert_eq!(*lock(&broker.revoked), [SIGN_IN]);
+    }
+
+    /// An image spec for run host `binary`, its environment `env`, with nothing to run.
+    fn stand_in_spec(binary: &Path, env: Vec<(OsString, OsString)>) -> ImageSpec {
+        ImageSpec {
+            image: "stand-in:local".into(),
+            vcpus: 1,
+            memory_mib: 256,
+            command: None,
+            members: Vec::new(),
+            publish: Vec::new(),
+            egress: wire::Narrowing::default(),
+            credentials: Vec::new(),
+            lessor: None,
+            sign_ins: Vec::new(),
+            upstream_roots: Vec::new(),
+            gpu_report: None,
+            shares: Vec::new(),
+            nesting: false,
+            ready_by: None,
+            binary: Some(binary.to_path_buf()),
+            env,
+            control: None,
+            gpu_devices: Vec::new(),
+        }
+    }
+
+    /// `script` written to `dir` as an executable stand-in for `shards api-run`, by a process
+    /// of its own (`shards_testdir::program`): one this process wrote itself failed its exec
+    /// ETXTBSY where another test's child held it (Hex's Linux gate, `Text file busy` from
+    /// `a_run_host_that_ends_before_its_run_starts_leaves_no_layer`).
+    #[cfg(unix)]
+    fn stand_in(dir: &Path, script: &str) -> PathBuf {
+        let path = dir.join("host");
+        shards_testdir::program(&path, script).unwrap();
+        path
+    }
+
+    /// A stand-in run host that says `frames` (each a kind and its payload) once its request
+    /// has begun to come (its first byte read), as a run host answers its request; then reads
+    /// its channel to its end, or, `exits`, exits. One that said them as it started told a
+    /// GPU report before the session had asked for one, a broken channel ("a GPU report its
+    /// run asked none of"), in 3 of 40 runs beside the crate's other tests (Linux).
+    #[cfg(unix)]
+    fn saying(dir: &Path, frames: &[(u8, Vec<u8>)], exits: bool) -> PathBuf {
+        let octal: String = frames
+            .iter()
+            .flat_map(|(kind, payload)| wire::frame(*kind, payload).unwrap())
+            .map(|b| format!("\\{b:03o}"))
+            .collect();
+        let after = if exits { "exit 0" } else { "exec cat >/dev/null" };
+        stand_in(
+            dir,
+            &format!("#!/bin/sh\nhead -c 1 >/dev/null\nprintf '{octal}'\n{after}\n"),
+        )
+    }
+
+    /// A run of `host` naming one GPU, its report scoped `[3; 16]` (D233).
+    #[cfg(unix)]
+    fn gpu_spec(host: &Path) -> ImageSpec {
+        ImageSpec {
+            gpu_devices: vec![crate::PhysicalGpu::MetalRegistry(7)],
+            gpu_report: Some([3; 16]),
+            ..stand_in_spec(host, Vec::new())
+        }
+    }
+
+    /// D233 through D231, its host a stand-in: a run whose host relays its VM's report before
+    /// its start boots, and its report is taken whole once, `ReportTaken` after; a host that
+    /// starts the run without it broke the channel's contract, and the boot is refused; a host
+    /// whose VM its renderer refused relays that refusal before its own, and the boot is
+    /// refused as the renderer typed it.
+    #[cfg(unix)]
+    #[test]
+    fn an_image_boot_takes_its_vms_gpu_report_as_a_managed_launch_does() {
+        use crate::GpuProbeError as E;
+        use crate::physical::{GpuRefusal, JoinError};
+        let (frame, _, report) = reported();
+        let started = wire::Started {
+            members: Vec::new(),
+            published: Vec::new(),
+            control: None,
+            from: wire::StartedFrom::Booted,
+        }
+        .encode()
+        .unwrap();
+        let ended = untold(RunEnd::Exited(0)).encode().unwrap();
+        let boot = |host: &Path| {
+            Session::start(
+                &gpu_spec(host),
+                &super::super::request(&gpu_spec(host)).unwrap(),
+                Duration::MAX,
+                &super::super::BootStop::new(),
+            )
+        };
+
+        let dir = shards_testdir::TempDir::new("gpurep").unwrap();
+        let host = saying(
+            dir.path(),
+            &[
+                (wire::to_client::GPU_REPORT, frame.clone()),
+                (wire::to_client::STARTED, started.clone()),
+                (wire::to_client::ENDED, ended.clone()),
+            ],
+            false,
+        );
+        let session = boot(&host).unwrap();
+        assert_eq!(session.take_gpu_report(Duration::MAX), Ok(report));
+        assert_eq!(
+            session.take_gpu_report(Duration::MAX),
+            Err(ImageRefusal::GpuProbe(E::ReportTaken))
+        );
+        drop(session);
+
+        let dir = shards_testdir::TempDir::new("gpuunrep").unwrap();
+        let host = saying(
+            dir.path(),
+            &[
+                (wire::to_client::STARTED, started.clone()),
+                (wire::to_client::ENDED, ended.clone()),
+            ],
+            false,
+        );
+        assert!(matches!(boot(&host), Err(ImageRefusal::Host(_))));
+
+        let dir = shards_testdir::TempDir::new("gpuref").unwrap();
+        let refusal = GpuRefusal::Join(JoinError::Missing);
+        let refused_frame = crate::physical::GpuReport::refusal([3; 16], refusal).unwrap();
+        let host_refused = wire::Refused {
+            cause: wire::Cause::Boot,
+            why: "the VM ended before it was ready".into(),
+        }
+        .encode()
+        .unwrap();
+        let host = saying(
+            dir.path(),
+            &[
+                (wire::to_client::GPU_REPORT, refused_frame.into_bytes()),
+                (wire::to_client::REFUSED, host_refused),
+            ],
+            true,
+        );
+        assert_eq!(
+            boot(&host).err(),
+            Some(ImageRefusal::GpuProbe(E::Refused(refusal)))
+        );
+    }
+
+    /// A FIFO at `path`.
+    #[cfg(unix)]
+    fn fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo(3) of a NUL-terminated path this function holds.
+        let made = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "{}", io::Error::last_os_error());
+    }
+
+    /// A FIFO made at `path`: its read end, opened at once, and a write end of its own, for
+    /// the party a test follows to hold while it runs. No open of it waits on another
+    /// process (a writer's open finds this reader there), and a read of it ends, with what
+    /// was written or with nothing, once that party has let its write end go and every
+    /// process that opened it to write has closed it: never on a writer that will not come.
+    #[cfg(unix)]
+    fn watched(path: &Path) -> (io::PipeReader, std::fs::File) {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fifo(path);
+        let read = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        // SAFETY: fcntl(2) of a descriptor `read` owns: its reads wait again.
+        assert_eq!(unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, 0) }, 0);
+        (io::PipeReader::from(std::os::fd::OwnedFd::from(read)), held)
+    }
+
+    /// The line `read`'s writer says, to its newline: empty where its every writer closed it
+    /// first.
+    #[cfg(unix)]
+    fn line(read: &io::PipeReader) -> String {
+        use std::io::BufRead as _;
+        let mut said = String::new();
+        io::BufReader::new(shards_ipc::Polled(read))
+            .read_line(&mut said)
+            .unwrap();
+        said
+    }
+
+    /// Process `pid`, running, as its ID and start name it: not another that takes its ID
+    /// after it.
+    #[cfg(unix)]
+    fn named(pid: libc::pid_t) -> shards_ipc::Named {
+        let pid = pid.unsigned_abs();
+        shards_ipc::Named {
+            pid,
+            start: shards_ipc::started(pid).unwrap(),
+        }
+    }
+
+    /// SIGKILLs `pid` as it drops, unless let go of: a stand-in VM a failed stop left running,
+    /// never one already seen gone (whose pid may be another's by then).
+    #[cfg(unix)]
+    struct Leftover(Option<libc::pid_t>);
+
+    #[cfg(unix)]
+    impl Drop for Leftover {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                // SAFETY: kill(2) of the stand-in VM, seen still running.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// The stand-in run host of a boot that never starts: it makes a writable layer's file in
+    /// its home's `layers`, named as the real host names one (layers.rs `fresh`), holds
+    /// `$HOST_SEEN` open as long as it runs, starts a stand-in VM that never looks at its host
+    /// (as a VM mid-boot does not), tells the VM's pid, and never answers.
+    #[cfg(unix)]
+    const NEVER_STARTS: &str = "#!/bin/sh\n\
+        : >\"$SHARDS_HOME/layers/$$-0\"\n\
+        exec 3>\"$HOST_SEEN\"\n\
+        tail -f /dev/null 3>&- &\n\
+        echo \"$!\" >&3\n\
+        wait\n";
+
+    /// A valid CREATE can fill the pipe before STARTED waits begin. Its stop must own
+    /// the host during that write, even when the host never reads any of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_cancels_a_create_whose_host_never_reads() {
+        use super::super::pool::Hosts;
+        let dir = shards_testdir::TempDir::new("bwrite").unwrap();
+        let host = stand_in(dir.path(), "#!/bin/sh\nexec tail -f /dev/null\n");
+        let spec = stand_in_spec(&host, Vec::new());
+        let mut request = super::super::request(&spec).unwrap();
+        request.members.push(wire::MemberStage {
+            kind: wire::MemberKind::Agent,
+            name: "writer".into(),
+            env: Vec::new(),
+            files: vec![wire::StagedFile {
+                path: "stage".into(),
+                mode: 0o600,
+                bytes: wire::Secret(vec![b'x'; shards_abi::run::MAX_PAYLOAD as usize / 2]),
+            }],
+            workdir: None,
+            input: false,
+            terminal: false,
+            args: Vec::new(),
+            mcp: false,
+        });
+        request.encode().unwrap();
+        let begun = Begun::begin(Some(&host), &[]).unwrap();
+        let process = begun.process();
+        let shared = begun.shared.clone();
+        let stop = super::super::BootStop::new();
+        let (sent, answered) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let outcome = ShardsHosts.take(begun, &spec, &request, Duration::MAX, &stop);
+                sent.send(outcome.map(drop)).unwrap();
+            });
+            // Once this mutex is held, CREATE is writing. The host reads nothing, so
+            // the protocol-sized staged file keeps it held until its process ends. A take
+            // that ends first ends this wait, its outcome the test's failure.
+            loop {
+                if matches!(
+                    shared.to_host.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ) {
+                    break;
+                }
+                if let Ok(outcome) = answered.try_recv() {
+                    kill(&process);
+                    panic!("the take ended before CREATE began: {outcome:?}");
+                }
+                std::thread::yield_now();
+            }
+            stop.stop();
+            // The take follows its host, which only the stop ends.
+            let outcome = answered.recv();
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(Err(super::super::pool::Taken::Refused(ImageRefusal::Ended(
+                        RunEnded {
+                            end: RunEnd::Stopped,
+                            ..
+                        }
+                    ))))
+                ),
+                "blocked CREATE did not end stopped: {outcome:?}"
+            );
+        });
+        assert!(
+            shared
+                .wait(Duration::MAX, |s| (s.gone() && s.said_all).then_some(()))
+                .is_some()
+        );
+    }
+
+    /// A host can die after WARMED while idle; it never received CREATE for this run.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_warm_host_is_definitely_untaken() {
+        use super::super::pool::{Hosts, Taken};
+        let dir = shards_testdir::TempDir::new("deadwarm").unwrap();
+        let frame = wire::frame(wire::to_client::WARMED, &wire::warmed(wire::StartedFrom::Booted)).unwrap();
+        let octal: String = frame.iter().map(|b| format!("\\{b:03o}")).collect();
+        let host = stand_in(dir.path(), &format!("#!/bin/sh\nprintf '{octal}'\nexit 0\n"));
+        let spec = stand_in_spec(&host, Vec::new());
+        let request = super::super::request(&spec).unwrap();
+        let warm = Begun::begin(Some(&host), &[]).unwrap();
+        assert_eq!(warm.warmed().unwrap(), wire::StartedFrom::Booted);
+        assert!(
+            warm.shared
+                .wait(Duration::MAX, |s| s.gone().then_some(()))
+                .is_some()
+        );
+        let taken = ShardsHosts.take(
+            warm,
+            &spec,
+            &request,
+            Duration::MAX,
+            &super::super::BootStop::new(),
+        );
+        assert!(
+            matches!(taken, Err(Taken::Untaken)),
+            "dead spare was not safely retryable"
+        );
+    }
+
+    /// A home whose `layers` holds a file of a run host other than any these tests start
+    /// (this process's own pid's): the one a sweep of a host's layers leaves.
+    fn layered_home(dir: &Path) -> (PathBuf, PathBuf) {
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join("layers")).unwrap();
+        let others = home.join("layers").join(format!("{}-0", std::process::id()));
+        std::fs::write(&others, b"").unwrap();
+        (home, others)
+    }
+
+    /// The files `home`'s `layers` holds, by name.
+    fn layer_files(home: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(home.join("layers"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Do boot through a run host that makes a writable layer's file, starts a VM of its own
+    /// and never says the run started, and stop the boot once both run. Expect: the boot
+    /// returns `Ended(Stopped)`, the run host gone and the VM it started gone with it, no
+    /// orphan left, and no file of the host's left in its home's `layers`, another host's
+    /// kept. The boot waits on its host alone: only the stop ends it. A boot that ends
+    /// before its host tells the VM's pid ends the test's wait with it, refused with the
+    /// boot's outcome.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_mid_boot_ends_the_boot_its_host_and_all_its_host_started() {
+        let dir = shards_testdir::TempDir::new("bstop").unwrap();
+        let host_seen = dir.path().join("h");
+        let (host_end, host_held) = watched(&host_seen);
+        let (home, others) = layered_home(dir.path());
+        let host = stand_in(dir.path(), NEVER_STARTS);
+        let spec = stand_in_spec(
+            &host,
+            vec![
+                ("HOST_SEEN".into(), host_seen.clone().into()),
+                ("SHARDS_HOME".into(), home.clone().into()),
+            ],
+        );
+        let request = super::super::request(&spec).unwrap();
+        let stop = super::super::BootStop::new();
+        let mut leftover = Leftover(None);
+        std::thread::scope(|s| {
+            let booting = s.spawn(|| {
+                let booted = Session::start(&spec, &request, Duration::MAX, &stop).map(drop);
+                // The boot's end ends the test's wait on its host's word.
+                drop(host_held);
+                booted
+            });
+            // Told once the host holds `h` and has started its VM: both running.
+            let said = line(&host_end);
+            let Ok(vm) = said.trim().parse::<libc::pid_t>() else {
+                panic!("its host told no VM ({said:?}), the boot {:?}", booting.join());
+            };
+            leftover.0 = Some(vm);
+            let vm = named(vm);
+            let stopped_at = Instant::now();
+            stop.stop();
+            let booted = booting.join().unwrap();
+            let took = stopped_at.elapsed();
+            let host_gone = writers_gone(&host_end);
+            let vm_gone = !vm.lives();
+            if vm_gone {
+                leftover.0 = None;
+            }
+            assert_eq!(
+                booted,
+                Err(ImageRefusal::Ended(RunEnded::unused(
+                    RunEnd::Stopped,
+                    Unused::NotStarted
+                ))),
+                "after {took:?}"
+            );
+            assert!(host_gone, "the run host outlived its boot's stop");
+            assert!(vm_gone, "the VM its run host started outlived the boot's stop");
+        });
+        assert!(stop.is_stopped());
+        let others = others.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(layer_files(&home), [others], "its run host's layer outlived it");
+    }
+
+    /// Do boot through a run host that makes a writable layer's file and exits before its run
+    /// starts, as one that fails or is killed does. Expect: the boot refused, its host gone,
+    /// and no file of the host's left in its home's `layers`, another host's kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_host_that_ends_before_its_run_starts_leaves_no_layer() {
+        let dir = shards_testdir::TempDir::new("bgone").unwrap();
+        let (home, others) = layered_home(dir.path());
+        let host = stand_in(
+            dir.path(),
+            "#!/bin/sh\n: >\"$SHARDS_HOME/layers/$$-0\"\n: >\"$SHARDS_HOME/layers/$$-1\"\nexit 3\n",
+        );
+        let spec = stand_in_spec(&host, vec![("SHARDS_HOME".into(), home.clone().into())]);
+        let request = super::super::request(&spec).unwrap();
+        let booted = Session::start(&spec, &request, Duration::MAX, &super::super::BootStop::new()).map(drop);
+        assert!(
+            matches!(&booted, Err(ImageRefusal::Host(why)) if why.contains("exited before its run started")),
+            "{booted:?}"
+        );
+        let others = others.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(layer_files(&home), [others], "its run host's layers outlived it");
+    }
+
+    /// Do boot through a run host that never answers, with a stop never stopped and no
+    /// patience. Expect: the boot refused as one with no stop is, not started within it. Do
+    /// the same with a stop already stopped and patience without end. Expect:
+    /// `Ended(Stopped)`, which only the stop ends it as.
+    #[cfg(unix)]
+    #[test]
+    fn a_boot_not_stopped_answers_as_before_and_one_stopped_first_ends_stopped() {
+        let dir = shards_testdir::TempDir::new("bstop2").unwrap();
+        let host = stand_in(dir.path(), "#!/bin/sh\nexec tail -f /dev/null\n");
+        let spec = stand_in_spec(&host, Vec::new());
+        let request = super::super::request(&spec).unwrap();
+        let stop = super::super::BootStop::new();
+        let refused = Session::start(&spec, &request, Duration::ZERO, &stop).map(drop);
+        assert!(
+            matches!(&refused, Err(ImageRefusal::Boot(why)) if why.contains("did not start within")),
+            "{refused:?}"
+        );
+        assert!(!stop.is_stopped());
+        stop.stop();
+        let asked = Instant::now();
+        let stopped = Session::start(&spec, &request, Duration::MAX, &stop).map(drop);
+        let took = asked.elapsed();
+        assert_eq!(
+            stopped,
+            Err(ImageRefusal::Ended(RunEnded::unused(
+                RunEnd::Stopped,
+                Unused::NotStarted
+            ))),
+            "after {took:?}"
+        );
+    }
+
+    /// A stand-in run host for `request` that runs `beside` first, then starts the run, says
+    /// its end once it is asked to stop, and exits as its stdin closes.
+    #[cfg(unix)]
+    fn ending_host(dir: &Path, request: &wire::Request, beside: &str) {
+        // The host reads its request and the first byte after it: its stop's.
+        let asked = wire::frame(wire::to_host::CREATE, &request.encode().unwrap())
+            .unwrap()
+            .len()
+            + 1;
+        let octal = |kind, payload: &[u8]| -> String {
+            wire::frame(kind, payload)
+                .unwrap()
+                .iter()
+                .map(|b| format!("\\{b:03o}"))
+                .collect()
+        };
+        let started = wire::Started {
+            members: Vec::new(),
+            published: Vec::new(),
+            control: None,
+            from: wire::StartedFrom::Booted,
+        }
+        .encode()
+        .unwrap();
+        let ended = untold(RunEnd::Exited(0)).encode().unwrap();
+        stand_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n{beside}\n\
+                 printf '{}'\n\
+                 head -c {asked} >/dev/null\n\
+                 printf '{}'\n\
+                 exec cat >/dev/null\n",
+                octal(wire::to_client::STARTED, &started),
+                octal(wire::to_client::ENDED, &ended),
+            ),
+        );
+    }
+
+    /// Do run through a stand-in host that starts a VM of its own holding its diagnostics (as
+    /// the VM, network and share processes hold its stderr), starts the run, says the run's
+    /// end once it is asked to stop, and exits as its stdin closes, its VM left running; stop
+    /// the run. Expect: the stop returns `Ok` only once the VM has exited, ended with its
+    /// host's group (D231), the host's descriptors released, and the run's end the host's
+    /// word. Red where the stop returned as the end was told, or as its diagnostics' pipe
+    /// ended: Linux releases an exiting process's files in no set order (kernel/task_work.c:
+    /// "no ordering guarantee", LIFO), its stderr's before another's, while it has not yet
+    /// exited, so a pipe's end is no word that its holders have (7 in 800 on adacachy2, PM
+    /// M583).
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_returns_once_its_host_and_every_process_it_started_are_gone() {
+        let dir = shards_testdir::TempDir::new("rstop").unwrap();
+        let host_seen = dir.path().join("h");
+        let (host_end, _) = watched(&host_seen);
+        let spec = stand_in_spec(
+            &dir.path().join("host"),
+            vec![("HOST_SEEN".into(), host_seen.clone().into())],
+        );
+        let request = super::super::request(&spec).unwrap();
+        ending_host(
+            dir.path(),
+            &request,
+            "exec 3>\"$HOST_SEEN\"\n\
+             tail -f /dev/null 3>&- &\n\
+             echo \"$!\" >&3",
+        );
+        // Its start comes after its host has told its VM's pid.
+        let session = Session::start(&spec, &request, Duration::MAX, &super::super::BootStop::new()).unwrap();
+        let vm: libc::pid_t = line(&host_end).trim().parse().unwrap();
+        let mut leftover = Leftover(Some(vm));
+        let vm = named(vm);
+        let stopped = session.stop();
+        let vm_gone = !vm.lives();
+        if vm_gone {
+            leftover.0 = None;
+        }
+        assert_eq!(stopped, Ok(()));
+        assert!(
+            vm_gone,
+            "the stop returned while the VM its run host started still ran"
+        );
+        assert!(writers_gone(&host_end), "the run host outlived its stop");
+        assert!(lock(&session.shared.state).said_all);
+        assert_eq!(
+            session.wait_for(Duration::ZERO),
+            Ok(Some(untold(RunEnd::Exited(0))))
+        );
+    }
+
+    /// What this test binary is, started with this variable on Unix: a process that leaves its
+    /// starter's group (setsid(2)), tells its pid on descriptor 4, and runs until it is
+    /// killed, holding what it was started with.
+    #[cfg(unix)]
+    const OUTSIDE: &std::ffi::CStr = c"SHARDS_API_OUTSIDE";
+
+    /// Run as this test binary starts, before its harness: each function pointer of
+    /// `.init_array` (ELF gABI) and of `__mod_init_func` (Mach-O, dyld) is called as the
+    /// binary loads, as the `ctor` crate does. Its harness would read no argument a stand-in
+    /// needs: so a stand-in is chosen here, by its variable, and never returns.
+    #[cfg(target_os = "linux")]
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static OUTSIDE_START: extern "C" fn() = outside;
+
+    #[cfg(target_os = "macos")]
+    #[used]
+    #[unsafe(link_section = "__DATA,__mod_init_func")]
+    static OUTSIDE_START: extern "C" fn() = outside;
+
+    #[cfg(unix)]
+    extern "C" fn outside() {
+        // SAFETY: getenv(3) of a NUL-terminated name, as this process loads.
+        if unsafe { libc::getenv(OUTSIDE.as_ptr()) }.is_null() {
+            return;
+        }
+        // SAFETY: setsid(2) of this process, started in its starter's group, which leads none.
+        if unsafe { libc::setsid() } < 0 {
+            std::process::exit(1);
+        }
+        let said = format!("{}\n", std::process::id());
+        // SAFETY: write(2) of `said` and close(2) of descriptor 4, which its starter gave it.
+        unsafe {
+            libc::write(4, said.as_ptr().cast(), said.len());
+            libc::close(4);
+        }
+        loop {
+            // SAFETY: pause(2), until a signal ends this process.
+            unsafe { libc::pause() };
+        }
+    }
+
+    /// Do run through a stand-in host that starts a process outside its group, holding the
+    /// host's answers and diagnostics as a child that a spawn elsewhere in the orchestrator
+    /// let inherit them holds them (macOS makes a pipe close-on-exec only after it has made
+    /// it), and stop the run. Expect: the stop returns `Ok` once its host and its group have
+    /// ended, that process still running, its diagnostics read to their end, and the run's end
+    /// its host's word. Red where a stop waited on its pipes' ends: as long as that process
+    /// runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_returns_though_a_process_outside_its_hosts_group_holds_its_pipes() {
+        let dir = shards_testdir::TempDir::new("rout").unwrap();
+        let seen = dir.path().join("o");
+        let (outside_end, _) = watched(&seen);
+        let spec = stand_in_spec(
+            &dir.path().join("host"),
+            vec![
+                ("OUTSIDE_SEEN".into(), seen.clone().into()),
+                ("OUTSIDE_BIN".into(), std::env::current_exe().unwrap().into()),
+            ],
+        );
+        let request = super::super::request(&spec).unwrap();
+        ending_host(
+            dir.path(),
+            &request,
+            "exec 4>\"$OUTSIDE_SEEN\"\n\
+             SHARDS_API_OUTSIDE=1 \"$OUTSIDE_BIN\" &\n\
+             exec 4>&-",
+        );
+        let session = Session::start(&spec, &request, Duration::MAX, &super::super::BootStop::new()).unwrap();
+        let said = line(&outside_end);
+        let Ok(pid) = said.trim().parse::<libc::pid_t>() else {
+            panic!("the outside process told no pid: {said:?}");
+        };
+        let _outside = Leftover(Some(pid));
+        assert_eq!(session.stop(), Ok(()));
+        // SAFETY: kill(2) with signal 0 of the outside process, which `_outside` kills.
+        let runs = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(runs, "the outside process ended with the run's group");
+        assert!(lock(&session.shared.state).said_all);
+        assert_eq!(
+            session.wait_for(Duration::ZERO),
+            Ok(Some(untold(RunEnd::Exited(0))))
+        );
+    }
+
+    /// What this test binary is, started with this variable: the stand-in run host of a
+    /// boot that never starts (`host`), or the VM that host starts (`vm`).
+    #[cfg(windows)]
+    const STAND_IN: &str = "SHARDS_API_STAND_IN";
+
+    /// The named pipe a stand-in run host tells its own pid and its VM's on.
+    #[cfg(windows)]
+    const STAND_IN_TELLS: &str = "SHARDS_API_STAND_IN_TELLS";
+
+    /// Run by the C runtime as this test binary starts, before its harness: the MSVC CRT
+    /// calls each function pointer of the `.CRT$XCU` section as it initializes ("CRT
+    /// Initialization", Microsoft Learn), as the `ctor` crate does. A run host is started as
+    /// `BINARY api-run`, which the harness would read as a filter matching no test: so a
+    /// stand-in is chosen here, by its variable, and never returns.
+    #[cfg(windows)]
+    #[used]
+    #[unsafe(link_section = ".CRT$XCU")]
+    static STAND_IN_START: extern "C" fn() = stand_in;
+
+    #[cfg(windows)]
+    extern "C" fn stand_in() {
+        match std::env::var_os(STAND_IN).as_deref().and_then(OsStr::to_str) {
+            Some("host") => stand_in_host(),
+            Some("ending") => ending_stand_in(),
+            Some("vm") => stand_by(),
+            _ => {}
+        }
+    }
+
+    /// Waits until this process is ended: on itself, which signals only as it ends.
+    #[cfg(windows)]
+    fn stand_by() -> ! {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE, WaitForSingleObject};
+        loop {
+            // SAFETY: this process's pseudo-handle, which needs no closing.
+            unsafe { WaitForSingleObject(GetCurrentProcess(), INFINITE) };
+        }
+    }
+
+    /// The stand-in run host of a boot that never starts, as `shards api-run` is on Windows
+    /// (api_run.rs `launch`): a writable layer's file in its home's `layers`, named as the
+    /// real host names one (layers.rs `fresh`), a job ending with this process, and a
+    /// stand-in VM made in it holding this process's stderr, as a VM, network and share
+    /// process do; it tells its own pid and its VM's on `STAND_IN_TELLS`, reads its
+    /// orchestrator's asks to their end, and never answers.
+    #[cfg(windows)]
+    fn stand_in_host() -> ! {
+        use std::os::windows::io::AsHandle as _;
+        let home = PathBuf::from(std::env::var_os("SHARDS_HOME").unwrap());
+        std::fs::write(home.join("layers").join(format!("{}-0", std::process::id())), b"").unwrap();
+        let job = shards_ipc::GroupJob::ending_with_this_process().unwrap();
+        let me = std::env::current_exe().unwrap();
+        let stderr = io::stderr();
+        let vm = shards_ipc::spawn_detached(
+            Some(&job),
+            &me,
+            &[],
+            &[(stderr.as_handle(), 2)],
+            &[(STAND_IN, OsStr::new("vm"))],
+        )
+        .unwrap();
+        let tells = std::env::var_os(STAND_IN_TELLS).unwrap();
+        let mut told = std::fs::OpenOptions::new().write(true).open(tells).unwrap();
+        writeln!(told, "{} {}", std::process::id(), vm.id()).unwrap();
+        drop(told);
+        let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+        // Both held for as long as this process runs: its job's last handle, which ends the
+        // VM as this process ends.
+        let _held = (job, vm);
+        stand_by()
+    }
+
+    /// A process's handle, by its pid, that waits on its end; terminated as it drops unless
+    /// seen ended: a stand-in a failed stop left running.
+    #[cfg(windows)]
+    struct Held(std::os::windows::io::OwnedHandle, bool);
+
+    #[cfg(windows)]
+    impl Held {
+        fn open(pid: u32) -> Held {
+            use std::os::windows::io::FromRawHandle as _;
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+            };
+            // SAFETY: a process handle of the rights asked, owned from here on.
+            let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+            assert!(!raw.is_null(), "process {pid}: {}", io::Error::last_os_error());
+            // SAFETY: the handle just opened, which nothing else owns.
+            Held(
+                unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) },
+                false,
+            )
+        }
+
+        /// Whether it has ended, asked once: its handle signalled.
+        fn ended(&mut self) -> bool {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            // SAFETY: a process handle this holds, not waited on past this moment.
+            self.1 = unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+            self.1
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Held {
+        fn drop(&mut self) {
+            use std::os::windows::io::AsRawHandle as _;
+            if !self.1 {
+                // SAFETY: a process handle with PROCESS_TERMINATE, which this holds.
+                unsafe { windows_sys::Win32::System::Threading::TerminateProcess(self.0.as_raw_handle(), 1) };
+            }
+        }
+    }
+
+    /// A named pipe's server end at `name`, inbound, one instance.
+    #[cfg(windows)]
+    fn pipe_server(name: &str) -> std::fs::File {
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+        use windows_sys::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+        };
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: a NUL-terminated name; a pipe of default security, owned below.
+        let raw = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_INBOUND,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                0,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(
+            raw,
+            INVALID_HANDLE_VALUE,
+            "{name}: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: the pipe just made, which nothing else owns.
+        unsafe { std::fs::File::from_raw_handle(raw) }
+    }
+
+    /// What the first client of `server` writes, to its close: none where it writes nothing.
+    #[cfg(windows)]
+    fn pipe_read(server: &mut std::fs::File) -> String {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError};
+        use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+        // SAFETY: a pipe's server end this holds, waited on until a client opens it.
+        let connected = unsafe { ConnectNamedPipe(server.as_raw_handle(), std::ptr::null_mut()) } != 0;
+        // SAFETY: reads this thread's last error, which the call above set.
+        let connected = connected || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+        assert!(connected, "{}", io::Error::last_os_error());
+        let mut said = String::new();
+        server.read_to_string(&mut said).unwrap();
+        said
+    }
+
+    /// The Windows twin of `a_stop_mid_boot_ends_the_boot_its_host_and_all_its_host_started`:
+    /// do boot through a run host that starts a VM in its job and never says the run
+    /// started, and stop the boot once both run. Expect: the boot returns `Ended(Stopped)`,
+    /// which only the stop ends it as, the run host's handle signalled and the VM's with it (its
+    /// job's last handle closed as the host was ended), no orphan left, and no file of the
+    /// host's left in its home's `layers`, another host's kept.
+    #[cfg(windows)]
+    #[test]
+    fn a_stop_mid_boot_ends_the_boot_its_host_and_the_vm_of_its_job() {
+        let dir = shards_testdir::TempDir::new("bstop").unwrap();
+        let (home, others) = layered_home(dir.path());
+        let tells = format!(r"\\.\pipe\shards-api-bstop-{}", std::process::id());
+        let mut server = pipe_server(&tells);
+        let spec = stand_in_spec(
+            &std::env::current_exe().unwrap(),
+            vec![
+                (STAND_IN.into(), "host".into()),
+                (STAND_IN_TELLS.into(), tells.clone().into()),
+                ("SHARDS_HOME".into(), home.clone().into()),
+            ],
+        );
+        let request = super::super::request(&spec).unwrap();
+        let stop = super::super::BootStop::new();
+        std::thread::scope(|s| {
+            let booting = s.spawn(|| {
+                let booted = Session::start(&spec, &request, Duration::MAX, &stop).map(drop);
+                // A boot that ended before its host told anything ends the test's wait:
+                // opened and closed, the pipe says nothing. Refused where its host told.
+                let _ = std::fs::OpenOptions::new().write(true).open(&tells);
+                booted
+            });
+            let said = pipe_read(&mut server);
+            let pids: Vec<u32> = said.split_whitespace().map(|p| p.parse().unwrap()).collect();
+            let [host, vm] = pids[..] else {
+                panic!("its host told no pids: {said:?}; the boot: {:?}", booting.join());
+            };
+            // Each opened while it runs, its host blocked on its asks and its VM on itself.
+            let (mut host, mut vm) = (Held::open(host), Held::open(vm));
+            let stopped_at = Instant::now();
+            stop.stop();
+            let booted = booting.join().unwrap();
+            let took = stopped_at.elapsed();
+            let (host_gone, vm_gone) = (host.ended(), vm.ended());
+            assert_eq!(
+                booted,
+                Err(ImageRefusal::Ended(RunEnded::unused(
+                    RunEnd::Stopped,
+                    Unused::NotStarted
+                ))),
+                "after {took:?}"
+            );
+            assert!(host_gone, "the run host outlived its boot's stop");
+            assert!(vm_gone, "the VM in its run host's job outlived the boot's stop");
+        });
+        assert!(stop.is_stopped());
+        let others = others.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(layer_files(&home), [others], "its run host's layer outlived it");
+    }
+
+    /// The pid of the process outside its job that an `ending` stand-in run host gives its
+    /// answers' and diagnostics' write ends.
+    #[cfg(windows)]
+    const STAND_IN_OUTSIDE: &str = "SHARDS_API_STAND_IN_OUTSIDE";
+
+    /// What an `ending` stand-in run host says on its diagnostics before its run starts.
+    #[cfg(windows)]
+    const LAST_WORDS: &str = "the stand-in's last words";
+
+    /// The stand-in run host of a run that starts and ends as asked (`ending`), as
+    /// `ending_host` is on Unix: it gives copies of its answers' and diagnostics' write ends to
+    /// the process `STAND_IN_OUTSIDE` names, outside its job (DuplicateHandle, the state of a
+    /// process that a spawn elsewhere in its orchestrator let inherit them: a handle of that
+    /// pipe in a process no stop ends), says `LAST_WORDS` on its diagnostics, starts the run,
+    /// says its end once asked to stop, and exits as its stdin closes.
+    #[cfg(windows)]
+    fn ending_stand_in() -> ! {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
+        let outside: u32 = std::env::var(STAND_IN_OUTSIDE).unwrap().parse().unwrap();
+        // SAFETY: a process handle of the right asked; kept open until this process exits.
+        let process = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, outside) };
+        assert!(!process.is_null(), "{}", io::Error::last_os_error());
+        for held in [io::stdout().as_raw_handle(), io::stderr().as_raw_handle()] {
+            let mut copy = std::ptr::null_mut();
+            // SAFETY: a handle of this process's, copied into `process`, the copy's value
+            // written to `copy`, which only that process may use.
+            let copied = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    held,
+                    process,
+                    &raw mut copy,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            assert_ne!(copied, 0, "{}", io::Error::last_os_error());
+        }
+        eprint!("{LAST_WORDS}");
+        let started = wire::Started {
+            members: Vec::new(),
+            published: Vec::new(),
+            control: None,
+            from: wire::StartedFrom::Booted,
+        }
+        .encode()
+        .unwrap();
+        let ended = untold(RunEnd::Exited(0)).encode().unwrap();
+        let mut answers = io::stdout().lock();
+        let mut asks = io::stdin().lock();
+        answers
+            .write_all(&wire::frame(wire::to_client::STARTED, &started).unwrap())
+            .unwrap();
+        answers.flush().unwrap();
+        // Its request, then its stop.
+        wire::read_frame(&mut asks).unwrap().unwrap();
+        wire::read_frame(&mut asks).unwrap().unwrap();
+        answers
+            .write_all(&wire::frame(wire::to_client::ENDED, &ended).unwrap())
+            .unwrap();
+        answers.flush().unwrap();
+        let _ = io::copy(&mut asks, &mut io::sink());
+        std::process::exit(0)
+    }
+
+    /// The Windows twin of `a_stop_returns_though_a_process_outside_its_hosts_group_holds_its_pipes`:
+    /// do run through a stand-in host that gives its answers' and diagnostics' write ends to a
+    /// process outside its job, says its last words, starts the run, and says its end once
+    /// asked to stop; stop the run. Expect: the stop returns `Ok` once its host and its job
+    /// have ended, that process still running and holding both ends, its diagnostics drained
+    /// to its last words, and the run's end its host's word. Red where the readers waited on
+    /// their pipes' ends (base 0004b5a1a: as long as that process runs).
+    #[cfg(windows)]
+    #[test]
+    fn a_stop_returns_though_a_process_outside_its_hosts_job_holds_its_pipes() {
+        let me = std::env::current_exe().unwrap();
+        let mut outside = std::process::Command::new(&me);
+        outside
+            .env(STAND_IN, "vm")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut outside = shards_ipc::spawn_std(&mut outside).unwrap();
+        let mut held = Held::open(outside.id());
+        let spec = stand_in_spec(
+            &me,
+            vec![
+                (STAND_IN.into(), "ending".into()),
+                (STAND_IN_OUTSIDE.into(), outside.id().to_string().into()),
+            ],
+        );
+        let request = super::super::request(&spec).unwrap();
+        let session = Session::start(&spec, &request, Duration::MAX, &super::super::BootStop::new()).unwrap();
+        assert_eq!(session.stop(), Ok(()));
+        assert!(!held.ended(), "the outside process ended with the run's job");
+        let state = lock(&session.shared.state);
+        assert!(state.said_all);
+        let said: Vec<u8> = state.said.iter().copied().collect();
+        assert_eq!(String::from_utf8_lossy(&said), LAST_WORDS);
+        drop(state);
+        assert_eq!(
+            session.wait_for(Duration::ZERO),
+            Ok(Some(untold(RunEnd::Exited(0))))
+        );
+        outside.kill().unwrap();
+        outside.wait().unwrap();
+    }
+
+    /// A Windows reader of a run host's pipe (`UntilGone`) whose writer, another process's,
+    /// never closes it: do write, and read; then write, tell the reader, and read to the end;
+    /// then wait on a read with nothing written, and tell it. Expect: the first read the
+    /// bytes as they come; then the bytes the pipe held as it was told, drained, and its end,
+    /// the writer still held; then the waiting read ended by the word. Red where a reader
+    /// read to its pipe's end (base 0004b5a1a's readers): the read to the end never returns.
+    #[cfg(windows)]
+    #[test]
+    fn a_told_reader_drains_what_its_pipe_holds_and_ends_though_a_writer_holds_it() {
+        let (pipe, mut writer) = shards_ipc::output_pair().unwrap();
+        let told = shards_ipc::Event::new().unwrap();
+        let mut reader = UntilGone::new(pipe, &told).unwrap();
+        writer.write_all(b"first").unwrap();
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"first");
+        writer.write_all(b"last words").unwrap();
+        told.set();
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"last words");
+        assert_eq!(reader.state, Draining::Left(0));
+
+        let (pipe, _writer) = shards_ipc::output_pair().unwrap();
+        let told = shards_ipc::Event::new().unwrap();
+        let mut reader = UntilGone::new(pipe, &told).unwrap();
+        std::thread::scope(|s| {
+            let waiting = s.spawn(move || reader.read(&mut [0u8; 8]));
+            told.set();
+            assert_eq!(waiting.join().unwrap().unwrap(), 0);
+        });
+        drop(writer);
     }
 }

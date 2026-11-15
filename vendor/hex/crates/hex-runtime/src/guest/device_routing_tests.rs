@@ -100,6 +100,7 @@ impl Runtime for NativeReporting {
 #[test]
 fn native_oci_device_capacity_remains_visible_with_a_guest_configured() {
     let native = hex_api::Capacity {
+        own: Default::default(),
         cost: None,
         routes: Vec::new(),
         device_routes: Vec::new(),
@@ -118,6 +119,8 @@ fn native_oci_device_capacity_remains_visible_with_a_guest_configured() {
         }],
         unavailable: Vec::new(),
         learned: None,
+        node_vms: Vec::new(),
+        unlearned: None,
     };
     let guest = Arc::new(NoGuest {
         backend: Ok(shards_api::Backend::Kvm),
@@ -166,7 +169,7 @@ fn every_supported_host_reaches_its_existing_shards_backend() {
 #[test]
 fn conformance_accepts_every_supported_host_backend() {
     let guests = shards_api::sim::SimGuests::new(|_| shards_api::End::PowerOff);
-    let serving = config().spec();
+    let serving = config().spec().unwrap();
     let subject = shards_api::conformance::Subject {
         guests: &guests,
         serving: serving.clone(),

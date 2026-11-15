@@ -3,15 +3,33 @@
 
 use super::*;
 use hex_core::patience::Patience;
-use hex_testkit::waits::until;
+use hex_testkit::waits::follow::{self, Party};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
 
-/// Waits for `fact`, one the refill thread makes on its own: no recorded operation makes it and no census row times
-/// it yet, so the wait is measuring, for the fact alone, its answer recorded under `name` for the census to come, from
-/// the suites run under it (hex_testkit::waits).
+/// Waits for `fact`, one the refill thread makes on its own, measuring, its answer recorded under `name` for the census
+/// to come, by the refill thread's life (the review's C-5): ended once no `hex-ipcuts` task of this process runs. A
+/// look: the pool tells no event as its thread makes a pair or fails one, its counts and namespaces read.
 fn wait_for(name: &'static str, what: &str, fact: impl FnMut() -> bool) {
-    until(&Patience::measuring(name), what, fact).unwrap();
+    follow::until(&Patience::measuring(name), what, refill_thread, fact).unwrap();
+}
+
+/// The pool's refill thread as a party: live while a `hex-ipcuts` task of this process runs, read from procfs.
+fn refill_thread() -> Party {
+    let running = std::fs::read_dir("/proc/self/task").is_ok_and(|tasks| {
+        tasks.flatten().any(|task| {
+            let path = task.path();
+            std::fs::read_to_string(path.join("comm")).is_ok_and(|c| c.trim() == "hex-ipcuts")
+                && std::fs::read_to_string(path.join("stat")).is_ok_and(|stat| {
+                    !matches!(
+                        stat.rsplit_once(')')
+                            .and_then(|(_, fields)| fields.split_whitespace().next()),
+                        Some("Z" | "X" | "x")
+                    )
+                })
+        })
+    });
+    if running { Party::Live } else { Party::Ended }
 }
 
 fn ns_of(fd: &OwnedFd) -> PathBuf {

@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 use triomphe::Arc;
 
 use hex_api::{Bounds, BoxId, Refusal, Signal, Usage};
+use hex_core::helper::managed::response::Estimate;
+use hex_core::patience::Piece;
 use hex_core::record::{NativeRecord, OwnerKey, OwnerRef};
 use hex_core::watch::{self, Life, Limit, Member, Rates, Verdict, Watch};
 
@@ -82,6 +84,24 @@ pub struct Status {
     /// Reads that held any of the box's members stopped across their wait ([`watch::Watch::runs`];
     /// observability: what the hold costs the box).
     pub holds: u64,
+    /// CPU holds whose response went unmeasured (joint plan step 14, 2c): a member that ended, left or couldn't be
+    /// read meanwhile, or a measurement its control refused. Each is no sample, never the scope's refusal; counted here
+    /// so none goes unseen.
+    pub unmeasured_holds: u64,
+    /// Held members a read found running and stopped again (joint plan step 14; ROOT, 2026-11-13): a stop that didn't
+    /// take, or a continue from elsewhere, which would run a member past its charge on its neighbours' CPU. Counted here
+    /// so none goes unseen.
+    pub restops: u64,
+    /// Members' ends their waiters saw late: found only on a later wakeup, after the reap made on the member's own
+    /// exit event found nothing (HEX-RT-3, HEX-DIFF-5; the review's E-5). XNU posts `NOTE_EXIT` before it makes the
+    /// child a zombie and posts it once, so such an end waits for whatever wakes its waiter next (in the native bench,
+    /// its wait's whole budget). 0 while every end is seen on its own exit, which the waiter's reap on that event
+    /// waits for; any other count says ends are being seen late. Counted here so none goes unseen.
+    pub late_ends: u64,
+    /// From the exit of the member its waiter last reaped, the exit's own time on its zombie (`ri_proc_exit_abstime`),
+    /// to that reap: how long after its end its end was seen. `None` before the first, or where its zombie couldn't be
+    /// read.
+    pub last_seen_after_exit: Option<std::time::Duration>,
 }
 
 /// The read that ended a box for a bound, taken apart: the wait armed before it, how long after the read
@@ -113,17 +133,14 @@ pub struct Shared {
     /// The fastest a box is taken to grow, as this node learns it: seeded by the caller (its machine class's
     /// record, hex_core::watch::seed), raised by any faster growth a watcher sees (watch::LearnedRates).
     rates: Arc<Mutex<watch::LearnedRates>>,
-    /// How long a killed group gets to empty, as this node learns it: the record's to start, raised by every
-    /// slower drain any box sees (hex_core::drain::Learned; the learned-waits rule, 2026-11-06).
-    drain: Arc<Mutex<hex_core::drain::Learned>>,
     /// How late the node's watchers act past their armed waits (a wake, its read and its stops), as it learns
     /// it: seeded by the caller (its machine class's record, hex_core::watch::lateness_seed), raised by any
     /// later act a watcher sees (watch::Lateness). What each box's hold reckons a member running across a
     /// wait can run on for.
     lateness: Arc<Mutex<watch::Lateness>>,
-    /// The slowest stop response the managed CPU control has seen in its own holds (joint plan step 14, 2c; ROOT,
-    /// 2026-11-13): none before its first, only rising, every scope's control starting from it.
-    response: Arc<Mutex<Option<Duration>>>,
+    /// The stop responses of the managed CPU control's last holds (joint plan step 14, 2c; the review's A-14, ROOT,
+    /// 2026-11-14), whose estimate every scope's control holds to: none before its first.
+    response: Arc<Mutex<super::cpu::Responses>>,
 }
 
 impl Shared {
@@ -143,12 +160,13 @@ impl Shared {
                 processes: rate_processes,
             })))
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
-            drain: Arc::try_new(Mutex::new(hex_core::drain::Learned::default()))
-                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
             lateness: Arc::try_new(Mutex::new(watch::Lateness::new(lateness)))
                 .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
-            response: Arc::try_new(Mutex::new(None))
-                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
+            response: Arc::try_new(Mutex::new(
+                super::cpu::Responses::new()
+                    .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
+            ))
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?,
         })
     }
 
@@ -161,26 +179,29 @@ impl Shared {
             .worst())
     }
 
-    /// The slowest stop response the helper's managed CPU control has seen in its own holds (joint plan step 14, 2c):
-    /// none before its first.
-    pub fn cpu_response(&self) -> Result<Option<Duration>, Refusal> {
-        Ok(*self
+    /// The stop response the helper's managed CPU control estimates from its own holds (joint plan step 14, 2c; the
+    /// review's A-14): none before its first.
+    pub fn cpu_response(&self) -> Result<Option<Estimate>, Refusal> {
+        Ok(self
             .response
             .lock()
-            .map_err(|_| poisoned("the managed CPU control's response"))?)
+            .map_err(|_| poisoned("the managed CPU control's response"))?
+            .estimate())
     }
 
-    /// A hold's measured response (2c): the slowest seen rises to it.
-    pub(super) fn observe_cpu_response(&self, response: Duration) -> Result<(), Refusal> {
-        let mut slowest = self
-            .response
+    /// A hold's measured response (2c; A-14): the estimate after it, which the hold's scope learns.
+    pub(super) fn observe_cpu_response(&self, response: Duration) -> Result<Estimate, Refusal> {
+        self.response
             .lock()
-            .map_err(|_| poisoned("the managed CPU control's response"))?;
-        *slowest = Some(slowest.map_or(response, |seen| seen.max(response)));
-        Ok(())
+            .map_err(|_| poisoned("the managed CPU control's response"))?
+            .observe(response)
+            .map_err(|_| Refusal::Invalid {
+                what: "a hold's stop response",
+                why: "its control's estimate refused it".to_owned(),
+            })
     }
 
-    /// The response a new scope's control starts from (2c): the slowest seen; before any, a cold helper's probe first
+    /// The response a new scope's control starts from (2c; A-14): the estimate; before any, a cold helper's probe first
     /// ([`probe_response`]), and the cold one where it gave none.
     pub(super) fn cpu_start(&self) -> Result<Duration, Refusal> {
         if self.cpu_response()?.is_none()
@@ -190,7 +211,9 @@ impl Shared {
         }
         Ok(self
             .cpu_response()?
-            .unwrap_or(hex_core::helper::managed::COLD_RESPONSE))
+            .map_or(hex_core::helper::managed::COLD_RESPONSE, |estimate| {
+                estimate.response
+            }))
     }
 
     /// The rates as learned so far.
@@ -245,12 +268,13 @@ struct State {
 }
 
 impl State {
-    fn uncertain(&self) -> Refusal {
+    /// Its owner refused Uncertain, and `why` in the refusing site's own words (joint plan step 14, (B)).
+    fn uncertain(&self, why: &str) -> Refusal {
         if let Some(scope) = &self.vm {
-            return scope.refusal(self.id.as_ref());
+            return scope.uncertain(self.id.as_ref(), why);
         }
         match &self.id {
-            OwnerKey::Box(id) => super::managed::uncertain(id),
+            OwnerKey::Box(id) => super::managed::uncertain(id, why),
             OwnerKey::Pool(_) => super::native_allocation(std::mem::size_of::<State>()),
         }
     }
@@ -371,8 +395,23 @@ impl State {
     /// Holds the box as its watcher's read decided (the graded hold, the lead 2026-11-09): of `order`, its
     /// running members, each in `run` runs across the wait, continued if the watcher held it, and the rest are
     /// held, each stopped in turn. A member the box's own programs stopped is theirs, never held, so never
-    /// continued. Returns how many members it holds.
-    fn apply(&self, order: &[u32], run: &[u32], members: &[Member]) -> Result<usize, Refusal> {
+    /// continued. A held member this read finds running escaped its stop (one that didn't take, or a continue from
+    /// elsewhere: joint plan step 14, ROOT 2026-11-13), and would run past its charge on its neighbours' CPU: it is
+    /// stopped again by its hold's token, once a read, never waited on, and counted (`Status::restops`). Returns how
+    /// many members it holds and how many it stopped again.
+    fn apply(&self, order: &[u32], run: &[u32], members: &[Member]) -> Result<Applied, Refusal> {
+        self.apply_by(order, run, members, sys::run_state)
+    }
+
+    /// [`Self::apply`], each member's run state read through `run_state`, the kernel's (`sys::run_state`): a test reads
+    /// a held member live, as one whose stop didn't take reads.
+    fn apply_by(
+        &self,
+        order: &[u32],
+        run: &[u32],
+        members: &[Member],
+        run_state: impl Fn(i32) -> io::Result<Option<sys::Run>>,
+    ) -> Result<Applied, Refusal> {
         let mut held = self.held()?;
         let additional = order
             .iter()
@@ -382,20 +421,36 @@ impl State {
         held.stopped.reserve(additional)?;
         held.added.clear();
         held.continued.clear();
+        let mut restopped = 0u64;
         let result = (|| {
             for &member in order {
                 let Ok(pid) = i32::try_from(member) else {
                     continue;
+                };
+                let live = || {
+                    run_state(pid)
+                        .map(|state| state == Some(sys::Run::Live))
+                        .map_err(|error| Refusal::os("reading a member's run state", error))
                 };
                 if run.contains(&member) {
                     if let Some(member) = held.stopped.get(&pid) {
                         self.signal_stopped(member, sys::MemberSignal::Continue)?;
                         held.continued.push(pid);
                     }
-                } else if !held.stopped.contains(&pid)
-                    && sys::run_state(pid)
-                        .map_err(|error| Refusal::os("reading a member's run state", error))?
-                        == Some(sys::Run::Live)
+                } else if let Some(stopped) = held.stopped.get(&pid) {
+                    if live()? {
+                        match self.signal_stopped(stopped, sys::MemberSignal::Stop)? {
+                            Some(again) => {
+                                held.stopped.refresh(again)?;
+                                restopped = restopped.saturating_add(1);
+                            }
+                            // Gone since: nothing left to hold.
+                            None => {
+                                held.stopped.remove(&pid);
+                            }
+                        }
+                    }
+                } else if live()?
                     && let Some(member) = self.stopped_member(pid, members)?
                     && let Some(member) = self.signal_stopped(member, sys::MemberSignal::Stop)?
                 {
@@ -413,8 +468,17 @@ impl State {
         } = &mut *held;
         stopped.retain(|pid| continued.binary_search(pid).is_err());
         stopped.append_reserved(added)?;
+        let count = held.stopped.len();
+        drop(held);
+        if restopped > 0 {
+            let mut status = self.status()?;
+            status.restops = status.restops.saturating_add(restopped);
+        }
         result?;
-        Ok(held.stopped.len())
+        Ok(Applied {
+            held: count,
+            restopped,
+        })
     }
 
     /// Continues every member the watcher holds that is still in group `pgid`, and holds none: what a watcher
@@ -423,7 +487,10 @@ impl State {
         let mut held = self.held()?;
         sys::group(pgid, pids).map_err(|e| Refusal::os("listing a box's group", e))?;
         for at in 0..held.stopped.len() {
-            let member = held.stopped.at(at).ok_or_else(|| self.uncertain())?;
+            let member = held
+                .stopped
+                .at(at)
+                .ok_or_else(|| self.uncertain("its hold's entry vanished as it was let go"))?;
             if pids.contains(&member.pid) {
                 self.signal_stopped(member, sys::MemberSignal::Continue)?;
             }
@@ -442,12 +509,12 @@ impl State {
             .iter()
             .find(|member| i32::try_from(member.pid) == Ok(pid))
             .map(|member| member.started)
-            .ok_or_else(|| self.uncertain())?;
+            .ok_or_else(|| self.uncertain("its member isn't in the read that listed it"))?;
         let group = self
             .pgid
             .lock()
-            .map_err(|_| self.uncertain())?
-            .ok_or_else(|| self.uncertain())?;
+            .map_err(|_| self.uncertain("its group is poisoned as a member is held"))?
+            .ok_or_else(|| self.uncertain("it has no group as a member is held"))?;
         if !self.in_scope(scope, pid, birth, group)? {
             return Ok(None);
         }
@@ -514,15 +581,17 @@ impl State {
     ) -> Result<Option<Stopped>, Refusal> {
         if let Some(scope) = &self.vm {
             self.validate_vm_scope()?;
-            let token = member.native.ok_or_else(|| self.uncertain())?;
+            let token = member
+                .native
+                .ok_or_else(|| self.uncertain("its held member has no token to signal it by"))?;
             let group = self
                 .pgid
                 .lock()
-                .map_err(|_| self.uncertain())?
-                .ok_or_else(|| self.uncertain())?;
+                .map_err(|_| self.uncertain("its group is poisoned as a member is signalled"))?
+                .ok_or_else(|| self.uncertain("it has no group as a member is signalled"))?;
             if token.pid() != member.pid {
                 scope.failed(shards_api::ProcessFailure::DifferentScope);
-                return Err(self.uncertain());
+                return Err(self.uncertain("its member's token names another pid"));
             }
             if !self.in_scope(scope, member.pid, token.birth(), group)? {
                 return Ok(None);
@@ -589,7 +658,7 @@ impl State {
             Some(_) if gone(pid, birth)? => Ok(false),
             Some(_) => {
                 scope.failed(shards_api::ProcessFailure::DifferentScope);
-                Err(self.uncertain())
+                Err(self.uncertain("its member left its scope's group alive"))
             }
         }
     }
@@ -647,6 +716,14 @@ struct Hold {
     stopped: Stops,
     added: Stops,
     continued: Vec<i32>,
+}
+
+/// What a hold's [`State::apply`] did: how many members it holds, and how many of them it found running and stopped
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Applied {
+    held: usize,
+    restopped: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -908,8 +985,8 @@ struct ReadRun {
 pub struct Members(Arc<State>);
 
 impl Members {
-    pub(super) fn uncertain(&self) -> Refusal {
-        self.0.uncertain()
+    pub(super) fn uncertain(&self, why: &str) -> Refusal {
+        self.0.uncertain(why)
     }
     /// Tells the box a member ended: when `sigkill` and its `peak` (read from its zombie before the reap)
     /// reached the cap, counts a memory end once ([`State::killed_by_cap`]). A clean exit, another signal,
@@ -920,6 +997,18 @@ impl Members {
         } else {
             Ok(())
         }
+    }
+
+    /// A member's waiter reaped it, `after_exit` after its exit (`None` where its zombie couldn't be read), and `late`
+    /// where it found the end only on a later wakeup, the reap on its exit event having found nothing
+    /// ([`Status::late_ends`]).
+    pub fn seen(&self, after_exit: Option<std::time::Duration>, late: bool) -> Result<(), Refusal> {
+        let mut status = self.0.status()?;
+        if late {
+            status.late_ends = status.late_ends.saturating_add(1);
+        }
+        status.last_seen_after_exit = after_exit;
+        Ok(())
     }
 
     /// Member `pid` is about to be sent KILL by its node (`Proc::kill`): its death is not the kernel's cap,
@@ -938,13 +1027,13 @@ impl Members {
 pub struct ProcessBox {
     state: Arc<State>,
     watcher: Mutex<Option<JoinHandle<()>>>,
-    /// The node's learned drain bound, shared by every box ([`Shared`]).
-    drain: Arc<Mutex<hex_core::drain::Learned>>,
     /// The machine's timebase, for a live read's CPU.
     tb: Timebase,
     pub(super) controller: Mutex<super::managed::Controller>,
     pub(super) identity: OnceLock<shards_api::Identity>,
     pub(super) scope_pids: Mutex<Vec<i32>>,
+    /// A run's box's claim on its removal, carried from its making ([`crate::run::Claim`]); none for any other box.
+    run: OnceLock<std::sync::Arc<crate::run::Claim>>,
 }
 
 impl ProcessBox {
@@ -1016,12 +1105,24 @@ impl ProcessBox {
         Ok(Self {
             state,
             watcher: Mutex::new(None),
-            drain: Arc::clone(&shared.drain),
             tb: shared.tb,
             controller: Mutex::new(super::managed::Controller::Unsubmitted),
             identity: OnceLock::new(),
             scope_pids: Mutex::new(scope_pids),
+            run: OnceLock::new(),
         })
+    }
+
+    /// Makes this box a run's, carrying `claim` from before anything else holds it.
+    pub(super) fn carry(&self, claim: &std::sync::Arc<crate::run::Claim>) -> Result<(), Refusal> {
+        self.run
+            .set(std::sync::Arc::clone(claim))
+            .map_err(|_| self.state.uncertain("it carries a run's claim already"))
+    }
+
+    /// The claim it carries as a run's box; none for any other box.
+    pub(super) fn claim(&self) -> Option<&std::sync::Arc<crate::run::Claim>> {
+        self.run.get()
     }
 
     fn start_watcher(&self, shared: &Shared) -> Result<(), Refusal> {
@@ -1034,7 +1135,7 @@ impl ProcessBox {
             .lock()
             .map_err(|_| poisoned("a box's watcher"))?;
         if held.is_some() {
-            return Err(self.state.uncertain());
+            return Err(self.state.uncertain("its watcher was started before"));
         }
         *held = Some(watcher);
         Ok(())
@@ -1087,7 +1188,9 @@ impl ProcessBox {
             .lock()
             .map_err(|_| poisoned("a box's group"))?;
         if pgid.is_some() {
-            return Err(self.state.uncertain());
+            return Err(self
+                .state
+                .uncertain("its held program's group was introduced before"));
         }
         let mut armed = self
             .state
@@ -1098,7 +1201,10 @@ impl ProcessBox {
             armed.reserve(1)?;
         }
         self.scope()
-            .ok_or_else(|| self.state.uncertain())?
+            .ok_or_else(|| {
+                self.state
+                    .uncertain("it has no native scope for its held program")
+            })?
             .held(self.owner())?;
         let pid = sys::spawn_suspended(spawn, 0, self.state.clamp)
             .map_err(|error| Refusal::os("creating the held native VM controller", error))?;
@@ -1108,7 +1214,9 @@ impl ProcessBox {
             armed.insert(pid)?;
         }
         if pid <= 0 {
-            return Err(self.state.uncertain());
+            return Err(self
+                .state
+                .uncertain("its held program's pid isn't a process's"));
         }
         Ok(pid)
     }
@@ -1121,16 +1229,23 @@ impl ProcessBox {
             .map_err(|_| poisoned("a box's group"))?
             .is_some()
         {
-            return Err(self.state.uncertain());
+            return Err(self
+                .state
+                .uncertain("its group was introduced, so it was submitted"));
         }
         self.scope()
-            .ok_or_else(|| self.state.uncertain())?
+            .ok_or_else(|| {
+                self.state
+                    .uncertain("it has no native scope to refuse its submission")
+            })?
             .not_submitted(self.owner())
     }
 
     pub(super) fn introduce_group(&self, pid: i32, started: u64) -> Result<(), Refusal> {
         if pid <= 0 || started == 0 {
-            return Err(self.state.uncertain());
+            return Err(self
+                .state
+                .uncertain("its controller's pid or start is zero as its group is introduced"));
         }
         {
             let mut group = self
@@ -1139,7 +1254,9 @@ impl ProcessBox {
                 .lock()
                 .map_err(|_| poisoned("a box's group"))?;
             if group.is_some_and(|old| old != pid) {
-                return Err(self.state.uncertain());
+                return Err(self
+                    .state
+                    .uncertain("its group was introduced as another pid"));
             }
             *group = Some(pid);
         }
@@ -1150,7 +1267,9 @@ impl ProcessBox {
                 .lock()
                 .map_err(|_| poisoned("a box's leader"))?;
             if birth.is_some_and(|old| old != started) {
-                return Err(self.state.uncertain());
+                return Err(self
+                    .state
+                    .uncertain("its leader was introduced at another start"));
             }
             *birth = Some(started);
         }
@@ -1169,42 +1288,60 @@ impl ProcessBox {
     /// or continue its members by it.
     pub(super) fn set_managed_rate(&self, rate: u64) -> Result<(), Refusal> {
         self.scope()
-            .ok_or_else(|| self.state.uncertain())?
+            .ok_or_else(|| {
+                self.state
+                    .uncertain("it has no native scope to set a rate on")
+            })?
             .set_cpu_rate(self.owner(), rate)?;
         self.state.wake()
     }
 
     pub(super) fn resume_managed(&self) -> Result<(), Refusal> {
-        let (pid, _) = self.group()?.ok_or_else(|| self.state.uncertain())?;
+        let (pid, _) = self
+            .group()?
+            .ok_or_else(|| self.state.uncertain("it has no group to resume"))?;
         let decision = self
             .scope()
-            .ok_or_else(|| self.state.uncertain())?
+            .ok_or_else(|| {
+                self.state
+                    .uncertain("it has no native scope to start its CPU control")
+            })?
             .start_cpu(self.owner())?;
         self.scope()
-            .ok_or_else(|| self.state.uncertain())?
+            .ok_or_else(|| {
+                self.state
+                    .uncertain("it has no native scope to mark running")
+            })?
             .running(self.owner())?;
         if matches!(decision, super::cpu::Decision::Hold(_)) {
             // The controller is already natively suspended. Earn the same startup debt before
             // any CONT; the existing watcher resumes it from its retained audit-token Hold entry.
             self.scope()
-                .ok_or_else(|| self.state.uncertain())?
+                .ok_or_else(|| {
+                    self.state
+                        .uncertain("it has no native scope to hold at its start")
+                })?
                 .cpu_held(self.owner())?;
             return self.state.wake();
         }
         if decision == super::cpu::Decision::Prepared {
-            return Err(self.state.uncertain());
+            return Err(self
+                .state
+                .uncertain("its CPU control is still prepared as it resumes"));
         }
         let mut held = self.state.held()?;
-        let member = held
-            .stopped
-            .get(&pid)
-            .ok_or_else(|| self.state.uncertain())?;
+        let member = held.stopped.get(&pid).ok_or_else(|| {
+            self.state
+                .uncertain("its controller isn't held as it resumes")
+        })?;
         if self
             .state
             .signal_stopped(member, sys::MemberSignal::Continue)?
             .is_none()
         {
-            return Err(self.state.uncertain());
+            return Err(self
+                .state
+                .uncertain("its controller was gone as it was continued"));
         }
         held.stopped.remove(&pid);
         drop(held);
@@ -1247,7 +1384,10 @@ impl ProcessBox {
 
     pub(super) fn finalize_watcher(&self, end: shards_api::ManagedEnd) -> Result<(), Refusal> {
         self.scope()
-            .ok_or_else(|| self.state.uncertain())?
+            .ok_or_else(|| {
+                self.state
+                    .uncertain("it has no native scope to finalize its watcher")
+            })?
             .finalizing(end, self.owner())?;
         self.state.stop.store(true, Ordering::SeqCst);
         self.state.wake()?;
@@ -1257,7 +1397,9 @@ impl ProcessBox {
             .map_err(|_| poisoned("a box's watcher"))?
             .take()
         {
-            watcher.join().map_err(|_| self.state.uncertain())?;
+            watcher
+                .join()
+                .map_err(|_| self.state.uncertain("its watcher thread ended by a panic"))?;
         }
         Ok(())
     }
@@ -1265,7 +1407,7 @@ impl ProcessBox {
     pub fn id(&self) -> Result<&BoxId, Refusal> {
         match &self.state.id {
             OwnerKey::Box(id) => Ok(id),
-            OwnerKey::Pool(_) => Err(self.state.uncertain()),
+            OwnerKey::Pool(_) => Err(self.state.uncertain("a pool's scope has no box id")),
         }
     }
 
@@ -1432,20 +1574,30 @@ impl ProcessBox {
         };
         let helper = managed_helper_usage()?;
         if let Some(pgid) = pgid {
-            let mut pids = self.scope_pids.lock().map_err(|_| self.state.uncertain())?;
+            let mut pids = self.scope_pids.lock().map_err(|_| {
+                self.state
+                    .uncertain("its scope's members are poisoned as its usage is read")
+            })?;
             if sys::group(pgid, &mut pids)
                 .map_err(|error| Refusal::os("listing strict managed usage", error))?
             {
-                return Err(self.state.uncertain());
+                return Err(self.state.uncertain(
+                    "its scope's members passed the listing's room as its usage was read",
+                ));
             }
             let own = rustix::process::getpid().as_raw_nonzero().get();
             for &pid in pids.iter() {
                 if pid == own {
-                    return Err(self.state.uncertain());
+                    return Err(self
+                        .state
+                        .uncertain("its helper is listed among its scope's members"));
                 }
                 let usage = sys::rusage(pid)
                     .map_err(|error| Refusal::os("reading strict managed usage", error))?
-                    .ok_or_else(|| self.state.uncertain())?;
+                    .ok_or_else(|| {
+                        self.state
+                            .uncertain("a member of its scope vanished as its usage was read")
+                    })?;
                 live.add(usage, !(usage.ended && pid == pgid));
             }
         }
@@ -1495,11 +1647,13 @@ impl ProcessBox {
         }
     }
 
-    /// Ends the box: stops its watcher, kills every member (killpg KILL) and waits for them to die, leaving
-    /// each member's own waiter to reap it. Idempotent.
+    /// Ends the box: stops its watcher, kills every member (killpg KILL) and waits for the group to empty as decision 9
+    /// waits ([`end_followed`]), leaving each member's own waiter to reap it. Idempotent.
     pub fn delete(&self) -> Result<(), Refusal> {
         if self.is_managed() {
-            return Err(self.state.uncertain());
+            return Err(self
+                .state
+                .uncertain("a managed scope is deleted through its helper, never directly"));
         }
         self.state.stop.store(true, Ordering::SeqCst);
         self.state.wake()?;
@@ -1518,37 +1672,14 @@ impl ProcessBox {
             .lock()
             .map_err(|_| poisoned("a box's group"))?
         {
-            let mut pids = sys::listing().map_err(|e| Refusal::os("listing a box's group", e))?;
-            // The group's size sets how long it gets to empty: the measured kill-to-empty envelope, doubled,
-            // as this node has learned it (hex_core::drain). Past it the kill didn't take, a fault named
-            // (CLAUDE.md §4); a delete has no other box to try, so the caller gets it.
-            let members = alive_in(pgid, &mut pids)?;
-            let patience = self
-                .drain
-                .lock()
-                .map_err(|_| poisoned("the node's drain bound"))?
-                .bound(members);
-            let killed = Instant::now();
-            let _ = killpg(
+            end_followed(
                 pgid,
-                hex_core::darwin::signal_to_macos(Signal::KILL.number()).unwrap_or(9),
-            );
-            let deadline = killed.checked_add(patience);
-            loop {
-                if alive_in(pgid, &mut pids)? == 0 {
-                    if let Ok(mut learned) = self.drain.lock() {
-                        learned.observe(members, killed.elapsed());
-                    }
-                    return Ok(());
-                }
-                if deadline.is_none_or(|d| Instant::now() >= d) {
-                    return Err(Refusal::os(
-                        "emptying a box",
-                        io::Error::other(format!("box {} still holds a live member", self.id()?)),
-                    ));
-                }
-                std::thread::yield_now();
-            }
+                &[
+                    Piece::Kind("the killed group of box "),
+                    Piece::Name(self.id()?.as_str()),
+                    Piece::Kind(", by its members' ends"),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -1726,33 +1857,260 @@ pub fn owned(pgid: i32, started: u64) -> Result<bool, Refusal> {
     )
 }
 
-/// Ends what runs of box group `pgid` (its leader started at `started`), for a box its node's recovery
-/// removes: killpg KILL where the group is still the box's ([`owned`]), and its members waited out within
-/// the measured kill-to-empty envelope for the group's size (`hex_core::drain::bound`; a recovering node
-/// has learned none of its own yet). Past it the kill didn't take, a fault named (CLAUDE.md §4).
+/// Ends what runs of box group `pgid` (its leader started at `started`), for a box its node's recovery removes: killpg
+/// KILL where the group is still the box's ([`owned`]), and the group followed to its emptying as decision 9 waits
+/// ([`end_followed`]).
 pub fn end_group(pgid: i32, started: u64) -> Result<(), Refusal> {
     if !owned(pgid, started)? {
         return Ok(());
     }
-    let mut pids = sys::listing().map_err(|e| Refusal::os("listing a box's group", e))?;
-    let members = alive_in(pgid, &mut pids)?;
-    let _ = killpg(
+    end_followed(
         pgid,
-        hex_core::darwin::signal_to_macos(Signal::KILL.number()).unwrap_or(9),
-    );
-    let deadline = Instant::now().checked_add(hex_core::drain::bound(members));
-    loop {
-        if alive_in(pgid, &mut pids)? == 0 {
-            return Ok(());
-        }
-        if deadline.is_none_or(|d| Instant::now() >= d) {
-            return Err(Refusal::os(
-                "ending a box's group",
-                io::Error::other(format!("group {pgid} still holds a live member")),
-            ));
-        }
-        std::thread::yield_now();
+        &[
+            Piece::Kind("the killed process group "),
+            Piece::Pid(i64::from(pgid)),
+            Piece::Kind(" of a box recovery removes, by its members' ends"),
+        ],
+    )
+}
+
+/// Kills group `pgid` ([`kill_group`]), its running members watched first, and waits for it to empty as decision 9 waits
+/// on [`crate::emptying::EMPTYING`] (the review's E-12): within W*, the slowest emptying seen, its emptying; past it, its
+/// run-out told once, naming `party`, and the group followed by its members' own ends ([`Emptying`]) however late, never
+/// refused at a time.
+fn end_followed(pgid: i32, party: &[Piece<'_>]) -> Result<(), Refusal> {
+    let mut emptying = Emptying::watching(Whose::Group(pgid))?;
+    let killed = Instant::now();
+    emptying.kill()?;
+    crate::emptying::followed(&crate::emptying::EMPTYING, killed, party, |slice| {
+        emptying.within(slice)
+    })
+}
+
+/// Whether box user `uid`, its processes killed, holds none running within `slice` (`Duration::MAX`: until it holds
+/// none): the box-user mode's emptying, the box helper's ([`super::helper_daemon::Privileged::empties_within`]),
+/// followed as a killed group's is ([`Emptying`]). Its running processes are watched, then killed again, so none a kill
+/// before may have missed (one forked as the user was killed) runs on unkilled.
+pub(super) fn user_empties_within(uid: u32, slice: Duration) -> Result<bool, Refusal> {
+    let mut emptying = Emptying::watching(Whose::User(uid))?;
+    emptying.kill()?;
+    emptying.within(slice)
+}
+
+/// Sends group `pgid` KILL as far as this node may (killpg). XNU's `killpg1` (`bsd/kern/kern_sig.c`) passes a group's
+/// members but its zombies, counts those the caller may signal, and answers `EPERM` where it counted none: a group whose
+/// members have all ended and wait for their reap, as a group its watcher killed has by its delete, or one whose members
+/// are none of them this node's to signal (a member running a set-user-ID program). Either way the wait on its emptying
+/// follows what still runs by its own end, as it follows a group already gone (`ESRCH`); any other refusal is the
+/// caller's.
+fn kill_group(pgid: i32) -> Result<(), Refusal> {
+    let group = rustix::process::Pid::from_raw(pgid).ok_or(Refusal::Invalid {
+        what: "pgid",
+        why: format!("{pgid} isn't a process group"),
+    })?;
+    match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::PERM | rustix::io::Errno::SRCH) => Ok(()),
+        Err(e) => Err(Refusal::os("killpg", e)),
     }
+}
+
+/// Whose processes a killed box's emptying follows: its process group (the rootless mode), or its pool user, every
+/// process running as that user (the box-user mode, the helper's: a member that left the group by `setsid` is still its
+/// user's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Whose {
+    Group(i32),
+    User(u32),
+}
+
+/// A killed box as its emptying's wait follows it (decision 9; the review's E-12): each of its processes running,
+/// watched for its end and its forks on a kqueue of the wait's own (`EVFILT_PROC` with `NOTE_EXIT | NOTE_FORK`, which XNU
+/// attaches to any process the caller sees), and the box listed again only once no watched process is left or one has
+/// forked: the wait rests on the members' own ends, never on a spin listing the box again and again.
+struct Emptying {
+    whose: Whose,
+    kq: Kqueue,
+    /// The members watched and not yet seen to end, in order.
+    watched: Vec<i32>,
+    /// A watched member forked since the box was last listed: its child is one more to end.
+    forked: bool,
+    /// The last listing found no member running: one more that finds none says the box is empty.
+    quiet: bool,
+    /// The box's listing, with room for every process the kernel holds.
+    pids: Vec<i32>,
+    events: Vec<Event>,
+}
+
+/// What one listing of a killed box found: how many members it read running, and whether any of them wasn't watched
+/// before.
+struct Listed {
+    running: usize,
+    new: bool,
+}
+
+impl Emptying {
+    /// Box `whose`, each member running now watched, before its kill, so none ends unseen.
+    fn watching(whose: Whose) -> Result<Self, Refusal> {
+        let mut emptying = Self {
+            whose,
+            kq: Kqueue::new().map_err(|e| Refusal::os("making a box's emptying kqueue", e))?,
+            watched: Vec::new(),
+            forked: false,
+            quiet: false,
+            pids: sys::listing().map_err(|e| Refusal::os("listing a box's members", e))?,
+            events: Vec::new(),
+        };
+        emptying.watch_running()?;
+        Ok(emptying)
+    }
+
+    /// Kills what of the box runs: its group (killpg, [`kill_group`]), or its user's processes
+    /// ([`super::helper_daemon::kill_user`], as root).
+    fn kill(&self) -> Result<(), Refusal> {
+        match self.whose {
+            Whose::Group(pgid) => kill_group(pgid),
+            Whose::User(uid) => super::helper_daemon::kill_user(uid, Signal::KILL.number())
+                .map(|_| ())
+                .map_err(|e| Refusal::os("killing a box user's processes", e)),
+        }
+    }
+
+    /// Lists the box and watches each member running that isn't watched yet. A member is watched once a read after its
+    /// watch's attach still finds it running in the box: XNU drains a process's references (`proc_refdrain`), which the
+    /// attach and the read take, before it posts `NOTE_EXIT` (`proc_exit`, `bsd/kern/kern_exit.c`), so a member read
+    /// running after its attach posts its end to the watch; one read ended, gone or out of the box by then (another
+    /// group, or another user: a set-user-ID program it ran) may have posted it before, or is no longer the box's to
+    /// wait for, and is left out.
+    fn watch_running(&mut self) -> Result<Listed, Refusal> {
+        match self.whose {
+            Whose::Group(pgid) => sys::group(pgid, &mut self.pids),
+            Whose::User(uid) => sys::user_pids(uid, &mut self.pids),
+        }
+        .map_err(|e| Refusal::os("listing a box's members", e))?;
+        self.watched
+            .try_reserve(self.pids.len())
+            .map_err(|_| super::native_allocation(self.pids.len()))?;
+        let known = self.watched.len();
+        let mut listed = Listed {
+            running: 0,
+            new: false,
+        };
+        for &pid in &self.pids {
+            if !running(pid)? {
+                continue;
+            }
+            listed.running = listed.running.saturating_add(1);
+            if self
+                .watched
+                .get(..known)
+                .is_some_and(|watched| watched.binary_search(&pid).is_ok())
+            {
+                continue;
+            }
+            listed.new = true;
+            let gone = self
+                .kq
+                .watch_one(pid, 0, false)
+                .map_err(|e| Refusal::os("watching a killed box's member", e))?;
+            if gone {
+                continue;
+            }
+            if running(pid)? && self.holds(pid)? {
+                self.watched.push(pid);
+            } else {
+                self.kq
+                    .unwatch(pid)
+                    .map_err(|e| Refusal::os("unwatching a killed box's member", e))?;
+            }
+        }
+        self.watched.sort_unstable();
+        Ok(listed)
+    }
+
+    /// Whether process `pid` is still the box's: in its group, or running as its user.
+    fn holds(&self, pid: i32) -> Result<bool, Refusal> {
+        Ok(match self.whose {
+            Whose::Group(pgid) => {
+                sys::group_of(pid).map_err(|e| Refusal::os("reading a member's group", e))?
+                    == Some(pgid)
+            }
+            Whose::User(uid) => {
+                sys::uid_of(pid).map_err(|e| Refusal::os("reading a member's user", e))?
+                    == Some(uid)
+            }
+        })
+    }
+
+    /// Whether the box empties within `slice` (`Duration::MAX`: until it does): each watched member's end taken as the
+    /// kernel posts it, the box listed again once none is left watched or one forked, a member running that wasn't
+    /// watched before (forked as the box was killed, so no kill may have reached it) killed with the box again, and the
+    /// box empty once two listings in a row find no member running (a child forked as the first was read is in the
+    /// second).
+    fn within(&mut self, slice: Duration) -> Result<bool, Refusal> {
+        #[cfg(test)]
+        if let Whose::Group(pgid) = self.whose
+            && !crate::emptying::hold::lets_empty(&pgid.to_string(), slice)
+        {
+            return Ok(false);
+        }
+        let by = Instant::now().checked_add(slice);
+        loop {
+            if self.watched.is_empty() || self.forked {
+                self.forked = false;
+                let listed = self.watch_running()?;
+                if listed.running == 0 {
+                    if self.quiet {
+                        return Ok(true);
+                    }
+                    self.quiet = true;
+                    continue;
+                }
+                self.quiet = false;
+                if listed.new {
+                    self.kill()?;
+                }
+                if self.watched.is_empty() {
+                    continue;
+                }
+            }
+            let left = match by {
+                Some(by) => match by.checked_duration_since(Instant::now()) {
+                    Some(left) if !left.is_zero() => Some(left),
+                    _ => return Ok(false),
+                },
+                None => None,
+            };
+            self.kq
+                .wait(None, left, &mut self.events)
+                .map_err(|e| Refusal::os("waiting on a killed box's members' ends", e))?;
+            for event in &self.events {
+                match *event {
+                    Event::Exit { pid, .. } => forget(&mut self.watched, pid),
+                    Event::Fork { pid, exited, .. } => {
+                        self.forked = true;
+                        if exited {
+                            forget(&mut self.watched, pid);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Takes member `pid` out of `watched`, its end posted.
+fn forget(watched: &mut Vec<i32>, pid: i32) {
+    if let Ok(at) = watched.binary_search(&pid) {
+        watched.remove(at);
+    }
+}
+
+/// Whether process `pid` runs: it is there and hasn't ended (a zombie waiting to be reaped has).
+fn running(pid: i32) -> Result<bool, Refusal> {
+    Ok(sys::rusage(pid)
+        .map_err(|e| Refusal::os("reading a member's rusage", e))?
+        .is_some_and(|r| !r.ended))
 }
 
 /// How many of process group `pgid`'s members are alive (not a zombie), by reading each one's rusage.
@@ -2006,12 +2364,18 @@ impl Watcher {
                 native
                     .vm
                     .as_ref()
-                    .ok_or_else(|| native.uncertain())?
+                    .ok_or_else(|| {
+                        native.uncertain("its watcher has no native scope to permit a run")
+                    })?
                     .cpu_permit(native.id.as_ref())?;
                 true
             }
             Some(super::cpu::Decision::Hold(_)) => false,
-            Some(super::cpu::Decision::Prepared) => return Err(native.uncertain()),
+            Some(super::cpu::Decision::Prepared) => {
+                return Err(
+                    native.uncertain("its CPU control is still prepared as its watcher reads")
+                );
+            }
         };
         let mut reading = Reading {
             members: storage(self.maximum)?,
@@ -2205,10 +2569,11 @@ impl Watcher {
         if !cpu_run {
             self.run.clear();
         }
-        let mut held = self.state.apply(&self.order, &self.run, &self.last)?;
+        let applied = self.state.apply(&self.order, &self.run, &self.last)?;
+        let mut held = applied.held;
         self.ran_from = Some(Instant::now());
         let next = floor.or(next);
-        let next = self.cpu_pace(native.vm.as_ref(), next, &mut held)?;
+        let next = self.cpu_pace(native.vm.as_ref(), next, &mut held, applied.restopped)?;
         // How late the watcher acted past its wait: its wake, its read and its stops, through all of which a
         // member running across the wait runs on (the lead, 2026-11-09: from the reads' own observed delays).
         if let Some((at, wait)) = armed {
@@ -2232,35 +2597,55 @@ impl Watcher {
         Ok(next)
     }
 
+    /// The scope's CPU control's turn after the read's hold, which stopped `restopped` held members again: a hold, its
+    /// response measured unless a member had escaped a stop in this read, or the run it permits.
     fn cpu_pace(
         &mut self,
         scope: Option<&super::managed::Scope>,
         next: Option<Duration>,
         held: &mut usize,
+        restopped: u64,
     ) -> Result<Option<Duration>, Refusal> {
         let Some(scope) = scope else { return Ok(next) };
         let owner = self.state.id.as_ref();
         let decision = scope.cpu_decision(owner)?;
         let wait = match decision {
             None => return Ok(next),
-            Some(super::cpu::Decision::Prepared) => return Err(self.state.uncertain()),
+            Some(super::cpu::Decision::Prepared) => {
+                return Err(self
+                    .state
+                    .uncertain("its CPU control is still prepared as its watcher paces it"));
+            }
             Some(super::cpu::Decision::Run(wait)) => wait,
             Some(super::cpu::Decision::Hold(_)) => {
                 // Its response runs from when its credit ran out, read off the observation that held it (2c).
-                let ran_out = scope.cpu_ran_out(owner)?;
-                *held = self.state.apply(&self.order, &[], &self.last)?;
+                let ran_out = scope.cpu_ran_out(owner).ok().flatten();
+                let applied = self.state.apply(&self.order, &[], &self.last)?;
+                *held = applied.held;
                 scope.cpu_held(owner)?;
                 // The hold's response (joint plan step 14, 2c; ROOT, 2026-11-13): from its credit's running out until
-                // every member it holds reads stopped, followed with no timer while they live. A member that ended or
-                // left meanwhile, or a response of no time, is no sample (Karn's point).
-                if let Some(from) = ran_out
-                    && let Some(stopped) = stopped_after(&self.order, sys::run_state)?
-                    && let Some(response) = stopped
-                        .checked_duration_since(from)
-                        .filter(|response| !response.is_zero())
-                {
-                    scope.cpu_learn(owner, response)?;
-                    self.shared.observe_cpu_response(response)?;
+                // every member it holds reads stopped, each read once after its stop ([`stopped_after`]). A member that
+                // didn't take its stop (one this read had to stop again among them), ended, left or couldn't be read, a
+                // response of no time, or one its control or the helper refuses, is no sample (Karn's point): counted,
+                // never the scope's refusal. The helper's estimate takes it first, then the scope's control learns it
+                // against the estimate after it (the review's A-14).
+                let escaped = restopped.saturating_add(applied.restopped);
+                let learned = ran_out
+                    .filter(|_| escaped == 0)
+                    .zip(stopped_after(&self.order, sys::run_state))
+                    .and_then(|(from, stopped)| stopped.checked_duration_since(from))
+                    .filter(|response| !response.is_zero())
+                    .is_some_and(|response| {
+                        self.shared
+                            .observe_cpu_response(response)
+                            .and_then(|estimate| {
+                                scope.cpu_learn(owner, response, estimate.response)
+                            })
+                            .is_ok()
+                    });
+                if !learned {
+                    let mut status = self.state.status()?;
+                    status.unmeasured_holds = status.unmeasured_holds.saturating_add(1);
                 }
                 match scope.cpu_decision(owner)? {
                     Some(super::cpu::Decision::Hold(wait)) => Some(wait),
@@ -2270,7 +2655,11 @@ impl Watcher {
                         self.state.wake()?;
                         None
                     }
-                    _ => return Err(self.state.uncertain()),
+                    _ => {
+                        return Err(self.state.uncertain(
+                            "its CPU control decided neither a hold nor a run after its hold",
+                        ));
+                    }
                 }
             }
         };
@@ -2387,7 +2776,8 @@ impl Watcher {
             {
                 continue;
             }
-            let pid = i32::try_from(member.pid).map_err(|_| self.state.uncertain())?;
+            let pid = i32::try_from(member.pid)
+                .map_err(|_| self.state.uncertain("its member's pid is past an i32"))?;
             match sys::rusage(pid)
                 .map_err(|error| Refusal::os("reading a gone member's rusage", error))?
             {
@@ -2465,7 +2855,10 @@ impl Watcher {
             )
         }) && let Some(scope) = &self.state.vm
         {
-            scope.notify().map_err(|_| self.state.uncertain())?;
+            scope.notify().map_err(|_| {
+                self.state
+                    .uncertain("its scope's notification failed as an exit was counted")
+            })?;
         }
         Ok(())
     }
@@ -2545,23 +2938,29 @@ impl Watcher {
 
     fn end_managed_scope(&mut self) -> Result<(), Refusal> {
         self.state.validate_vm_scope()?;
-        let scope = self
-            .state
-            .vm
-            .as_ref()
-            .ok_or_else(|| self.state.uncertain())?;
-        let group = *self.state.pgid.lock().map_err(|_| self.state.uncertain())?;
+        let scope = self.state.vm.as_ref().ok_or_else(|| {
+            self.state
+                .uncertain("its watcher has no native scope to end")
+        })?;
+        let group = *self.state.pgid.lock().map_err(|_| {
+            self.state
+                .uncertain("its group is poisoned as its scope is ended")
+        })?;
         let Some(pgid) = group else {
             return if scope.no_submission(self.state.id.as_ref())? {
                 Ok(())
             } else {
-                Err(self.state.uncertain())
+                Err(self
+                    .state
+                    .uncertain("it has no group, though it was submitted, as its scope is ended"))
             };
         };
         if sys::group(pgid, &mut self.pids)
             .map_err(|error| Refusal::os("listing owned scope to stop", error))?
         {
-            return Err(self.state.uncertain());
+            return Err(self
+                .state
+                .uncertain("its group passed the listing's room as its scope was ended"));
         }
         for &pid in &self.pids {
             // A member gone since the listing (ended or reaped: one the scope's own end let finish, as a
@@ -2688,9 +3087,9 @@ fn killpg(pgid: i32, signal: i32) -> Result<bool, Refusal> {
 /// its own (`/usr/bin/yes`, one busy thread, as `macos_cpu_response`'s member) runs under a control at Hex's least CPU
 /// bound, `hex_api::MIN_CPU_MILLI` (the kernel's least quota, 1 ms a 100 ms period: the least the learner caps any VM
 /// at, so the charge window's cycle is the one at it; this control's quantum is a milli-CPU, so it holds it), from the
-/// cold response. Once its credit runs out it is held, followed by liveness with no timer, and its response is a
-/// hold's: from its credit's running out to its read stop. None where the spinner ended first, or the stop took no
-/// time.
+/// cold response. Once its credit runs out it is held, and its response is a hold's: from its credit's running out to
+/// its stop, read once ([`stopped_after`]). None where the spinner ended first, didn't take its stop, or the stop took
+/// no time.
 fn probe_response() -> Result<Option<Duration>, Refusal> {
     let mut spinner = super::command::Command::new("/usr/bin/yes")
         .stdin(super::command::Stdio::null())
@@ -2758,35 +3157,30 @@ fn probe_hold(pid: u32) -> Result<Option<Duration>, Refusal> {
         .ok_or_else(|| Refusal::os("the CPU response probe's spinner", "its pid"))?;
     rustix::process::kill_process(target, rustix::process::Signal::STOP)
         .map_err(|error| Refusal::os("holding the CPU response probe", io::Error::from(error)))?;
-    let stopped = stopped_after(&[pid], sys::run_state)?;
+    let stopped = stopped_after(&[pid], sys::run_state);
     Ok(ran_out
         .zip(stopped)
         .and_then(|(from, at)| at.checked_duration_since(from))
         .filter(|response| !response.is_zero()))
 }
 
-/// When every member of `order` read stopped (joint plan step 14, 2c): each read until it is, followed with no timer
-/// while it lives, as `macos_cpu_response` reads a stop; none where one ended or left meanwhile, so its hold is no
-/// sample.
+/// When every member of `order` read stopped (joint plan step 14, 2c), each read once after its stop was sent and never
+/// followed: XNU marks a process stopped (SSTOP) inside the kill that stops it with the default action (`psignal_internal`,
+/// bsd/kern/kern_sig.c), so a member that reads anything else there didn't take its stop, and a wait for it to read
+/// stopped could last as long as it lives (Studio r214: one read live for the 5 s after its stop, and its watcher, spinning
+/// on it, missed the release's stop). None where one reads live, ended, left or couldn't be read (ROOT, 2026-11-13: a
+/// measurement that fails or can't be trusted is no sample, never the scope's refusal), so its hold is no sample.
 fn stopped_after(
     order: &[u32],
     run_state: impl Fn(i32) -> std::io::Result<Option<sys::Run>>,
-) -> Result<Option<Instant>, Refusal> {
+) -> Option<Instant> {
     for &member in order {
-        let Ok(pid) = i32::try_from(member) else {
-            return Ok(None);
-        };
-        loop {
-            match run_state(pid)
-                .map_err(|error| Refusal::os("reading a held member's run state", error))?
-            {
-                Some(sys::Run::Stopped) => break,
-                Some(sys::Run::Live) => std::thread::yield_now(),
-                Some(sys::Run::Ended) | None => return Ok(None),
-            }
+        let pid = i32::try_from(member).ok()?;
+        if run_state(pid).ok()? != Some(sys::Run::Stopped) {
+            return None;
         }
     }
-    Ok(Some(Instant::now()))
+    Some(Instant::now())
 }
 
 #[cfg(test)]
@@ -2795,28 +3189,50 @@ mod hold_response_tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
-    /// Joint plan step 14 (2c): a hold's stop is followed until every member it holds reads stopped, and a member that
-    /// ended or left meanwhile makes the hold no sample. Do read members 11 and 12, the second live for two reads before
-    /// it stops; then 11 and 13, the second gone. Expect an instant after both stopped, 12 read three times; then none.
+    /// Joint plan step 14 (2c; ROOT, 2026-11-13): a hold's stop is read once a member, after the stop is sent, and never
+    /// followed: XNU marks a process stopped (SSTOP) inside the kill that stops it, so a member that reads anything else
+    /// there didn't take its stop, and a wait for it to read stopped can last as long as the member does. On the Studio
+    /// (r214) a member read live 76 µs after its stop was sent and for the 5 s after, while the watcher spun on it and
+    /// never acted on the release's stop (macos_pool_restart, refused Uncertain). Do read members 11 and 12 after their
+    /// stops, 12 live at its first read and stopped at any later one; then 11 and 13, 13 gone; then 11 and 14, both
+    /// stopped. Expect no sample with 12 read once; none; then an instant after both read stopped, each read once.
     #[test]
-    fn w14_a_holds_stop_is_followed_until_every_member_reads_stopped() {
+    fn w14_a_holds_stop_is_read_once_and_a_member_it_didnt_stop_is_no_sample() {
         let reads = RefCell::new(BTreeMap::<i32, u32>::new());
         let read = |pid: i32| {
             let mut reads = reads.borrow_mut();
             let n = reads.entry(pid).or_insert(0);
             *n += 1;
             Ok(match (pid, *n) {
-                (11, _) => Some(sys::Run::Stopped),
-                (12, 1 | 2) => Some(sys::Run::Live),
+                (11 | 14, _) => Some(sys::Run::Stopped),
+                (12, 1) => Some(sys::Run::Live),
                 (12, _) => Some(sys::Run::Stopped),
                 _ => None,
             })
         };
+        assert_eq!(stopped_after(&[11, 12], read), None);
+        assert_eq!(
+            reads.borrow().get(&12),
+            Some(&1),
+            "read once, never followed"
+        );
+        assert_eq!(stopped_after(&[11, 13], read), None);
         let before = Instant::now();
-        let stopped = stopped_after(&[11, 12], read).unwrap().unwrap();
+        let stopped = stopped_after(&[11, 14], read).unwrap();
         assert!(stopped >= before);
-        assert_eq!(reads.borrow().get(&12), Some(&3));
-        assert_eq!(stopped_after(&[11, 13], read).unwrap(), None);
+        assert_eq!(reads.borrow().get(&14), Some(&1));
+    }
+
+    /// Joint plan step 14 (2c; ROOT, 2026-11-13: a hold's measurement that fails is no sample, never the scope's
+    /// refusal): a member's run state that can't be read, as after a node's restart when the node is no longer its
+    /// members' parent, leaves the hold unmeasured. Do read a member whose run state read fails. Expect no sample, not
+    /// an error.
+    #[test]
+    fn w14_a_holds_stop_that_cant_be_read_is_no_sample() {
+        let read = |_: i32| -> std::io::Result<Option<sys::Run>> {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        };
+        assert_eq!(stopped_after(&[11], read), None);
     }
 }
 
@@ -2969,6 +3385,33 @@ mod storage_tests {
         assert_eq!(hold.stopped.at(1).unwrap().pid, 17);
         assert!(hold.stopped.reserve(1).is_err());
         assert!(hold.stopped.contains(&11) && hold.stopped.contains(&17));
+    }
+}
+
+#[cfg(test)]
+mod emptying_tests {
+    use super::*;
+
+    /// The review's E-12 (decision 9), AC-T7.4.1: a killed group's emptying is followed by its members' own ends as the
+    /// kernel posts them (`NOTE_EXIT`), the wait ending at the last one, never at a time. Do: start `/bin/cat` in a
+    /// process group of its own, running until its stdin closes; watch the group; ask whether it empties within no time;
+    /// close cat's stdin and wait for the group with no bound. Expect: not within no time, cat still running; then
+    /// empty, once cat has ended, which exited 0.
+    #[test]
+    fn e12_a_groups_emptying_is_followed_by_its_members_ends() {
+        use std::os::unix::process::CommandExt;
+        let mut cat = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("start cat in a group of its own");
+        let pgid = i32::try_from(cat.id()).unwrap();
+        let mut emptying = Emptying::watching(Whose::Group(pgid)).expect("watch the group");
+        assert_eq!(emptying.within(Duration::ZERO), Ok(false));
+        drop(cat.stdin.take());
+        assert_eq!(emptying.within(Duration::MAX), Ok(true));
+        assert!(cat.wait().expect("cat's end").success());
     }
 }
 

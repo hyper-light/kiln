@@ -43,6 +43,24 @@ pub struct RecoverySummary {
     /// Why the host's boot session couldn't be read, when it couldn't: no record was known for an earlier
     /// boot's, and each keeps recovery's other rules (T-T7.1.2).
     pub boot_unknown: Option<String>,
+    /// The node VM rows an earlier node process left, each by its run with what this start did with it (joint plan
+    /// step 39).
+    pub node_vms: Vec<(hex_api::NodeRun, crate::store::NodeVmSettled)>,
+    /// The last-resort ends those rows kept, carried into the charge learner's ends; none on record told as such.
+    pub node_vm_ends: crate::store::NodeVmEnds,
+}
+
+/// Why a native owner that runs no node VM refuses `call` about node VM `run` (joint plan step 39).
+fn no_node_vm(run: hex_api::NodeRun, call: &str) -> Refusal {
+    let name: String = run
+        .bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Refusal::Invalid {
+        what: "node VM",
+        why: format!("run {name}: this native owner runs no node VM, so it has no {call} of one"),
+    }
 }
 
 /// Why recovery keeps a Shards image box's record and claim: its run is an earlier node process's, which
@@ -157,13 +175,19 @@ pub trait Recover: Runtime {
     /// never scope termination, permission to adopt a Guest, or release from absence alone.
     fn handoff_unsubmitted(&self, record: &BoxRecord, pool: &PoolRecord) -> Result<(), Refusal> {
         let _ = pool;
-        Err(uncertain(&record.spec.id))
+        Err(uncertain(
+            &record.spec.id,
+            "this runtime holds no native backing to hand it to",
+        ))
     }
 
     /// Native half of the same pending no-Intent check. Concrete owners must prove that no
     /// conflicting submission receipt is retained; missing cold proof remains typed uncertainty.
     fn preflight_unsubmitted(&self, record: &BoxRecord) -> Result<(), Refusal> {
-        Err(uncertain(&record.spec.id))
+        Err(uncertain(
+            &record.spec.id,
+            "this runtime holds no native backing to prove it unsubmitted",
+        ))
     }
 
     /// Read-only initialized configuration and retained metadata validation, before ANY owner is
@@ -171,19 +195,23 @@ pub trait Recover: Runtime {
     fn preflight_record(&self, record: &BoxRecord) -> Result<(), Refusal> {
         record.spec.check()?;
         if !self.classes().contains(&record.spec.backend_class()?) {
-            return Err(uncertain(&record.spec.id));
+            return Err(uncertain(
+                &record.spec.id,
+                "this node serves no runtime of its record's class",
+            ));
         }
         Ok(())
     }
 
     /// An unknown backing configuration retains its grant; absence of an adapter is not cleanup.
     fn preflight_pool(&self, record: &PoolRecord) -> Result<(), Refusal> {
-        Err(NativeRecord::Pool(record).refusal(hex_api::LifecycleCause::Uncertain))
+        Err(NativeRecord::Pool(record)
+            .uncertain("its node has no native owner to preflight its pool"))
     }
 
     /// The SAME native owner's scope/receipt metadata, without attaching or adopting that scope.
     fn preflight_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
-        Err(record.refusal(hex_api::LifecycleCause::Uncertain))
+        Err(record.uncertain("its node has no native owner to preflight its managed scope"))
     }
 
     /// Read-only cross-check of native metadata names against the complete retained cohort. Every
@@ -212,11 +240,11 @@ pub trait Recover: Runtime {
         record: NativeRecord<'_>,
         plan: &hex_runtime::devices::ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: std::time::Duration,
+        patience: Option<std::time::Duration>,
         publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         let _ = (plan, io, patience, publish);
-        Err(record.refusal(hex_api::LifecycleCause::Uncertain))
+        Err(record.uncertain("its node has no native owner to launch it"))
     }
 
     fn attach_managed(
@@ -225,7 +253,7 @@ pub trait Recover: Runtime {
         identity: Option<&shards_api::Identity>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         let _ = identity;
-        Err(record.refusal(hex_api::LifecycleCause::Uncertain))
+        Err(record.uncertain("its node has no native owner to attach it"))
     }
 
     /// Called only after the selected VM receipt durably records positive whole-scope release.
@@ -235,27 +263,27 @@ pub trait Recover: Runtime {
         identity: Option<&shards_api::Identity>,
     ) -> Result<(), Refusal> {
         let _ = identity;
-        Err(record.refusal(hex_api::LifecycleCause::Uncertain))
+        Err(record.uncertain("its node has no native owner to finalize it"))
     }
 
     fn managed_usage(&self, record: NativeRecord<'_>) -> Result<Usage, Refusal> {
-        Err(record.refusal(hex_api::LifecycleCause::Uncertain))
+        Err(record.uncertain("its node has no native owner to read its usage"))
     }
 
-    /// Joint plan step 14 (C1): the window the charge learner reads and caps this owner's managed VMs over, derived from
-    /// how the platform holds a VM's CPU rate; refused, typed, naming what is missing where nothing derives it.
-    fn charge_window(&self) -> Result<std::time::Duration, Refusal> {
+    /// Joint plan step 14 (C1; ROOT, 2026-11-13; 2c-4b): the cycle this owner's cap holds a managed VM at `rate` over,
+    /// derived from how the platform holds a VM's CPU rate, which the charge learner's window takes for each VM that cap
+    /// holds: never at a rate it never holds a VM below, and cold, told, until what derives it has been measured.
+    /// Refused, typed, naming what is missing where nothing derives it.
+    fn cap_cycle(&self, rate: u64) -> Result<hex_runtime::guest::CapCycle, Refusal> {
+        let _ = rate;
         Err(Refusal::Platform {
-            what: "the charge learner's window",
+            what: "a managed VM's cap's cycle",
             platform: std::env::consts::OS,
-            why: "this native owner holds no managed VM's CPU rate to learn and cap over a window"
+            why: "this native owner holds no managed VM's CPU rate over a cycle it derives"
                 .to_owned(),
         })
     }
 
-    /// Joint plan step 14 (C1): the period a Shards image VM's rate holds over (Shards' D247, its hold D191's governor),
-    /// the window the charge learner caps image VMs through their rates over. Refused, typed, while Shards' API says
-    /// none (`Awaits(RatePeriod)`): the learner then books image VMs whole.
     /// Joint plan step 14 (ROOT, 2026-11-13): retires what its node recorded under a profile's census cost (each
     /// backing and VM box, its boxes kept retired), run once at its node's start after native initialization, before
     /// any preparation or recovery uses them; none where it keeps no such record.
@@ -263,10 +291,121 @@ pub trait Recover: Runtime {
         Ok(())
     }
 
-    fn image_rate_period(&self) -> Result<std::time::Duration, Refusal> {
-        Err(Refusal::Awaits {
-            needs: hex_api::Upstream::RatePeriod,
+    /// Joint plan step 14 (C1): the period Shards image VM `record`'s rate holds over (Shards' D247, its hold D191's
+    /// governor), its run's own as its VM said it with its last rate's answer, none before its first (Shards' image
+    /// channel v31): the window the charge learner caps it through its rate over, read each window, never a number of
+    /// Hex's. Refused, typed, by a native owner that runs no image VM.
+    fn image_rate_period(
+        &self,
+        record: &BoxRecord,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        Err(Refusal::Invalid {
+            what: "rate_period",
+            why: format!(
+                "box {} isn't a Shards image VM this native owner runs: only a guest's image VM holds a rate over its \
+                 run's period",
+                record.spec.id
+            ),
         })
+    }
+
+    /// Joint plan step 39 (place 3): what node VM `run` costs its host, its run's microVM part (D241), read as an image
+    /// VM's is. Refused, typed, by a native owner that runs no node VM.
+    fn node_vm_host_use(&self, run: hex_api::NodeRun) -> Result<hex_api::HostUse, Refusal> {
+        Err(no_node_vm(run, "host_use"))
+    }
+
+    /// Joint plan step 39 (place 3): the period node VM `run`'s governor holds its rate over (D191, D247), its run's own
+    /// as its VM said it with its last rate's answer, none before its first (Shards' image channel v31). Refused, typed,
+    /// by a native owner that runs no node VM.
+    fn node_vm_rate_period(
+        &self,
+        run: hex_api::NodeRun,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        Err(no_node_vm(run, "rate_period"))
+    }
+
+    /// Joint plan step 39 (place 3): holds node VM `run`'s vCPUs together to `rate` milli-CPU through its run's rate
+    /// (D247), as an image VM's are held. Refused, typed, by a native owner that runs no node VM.
+    fn node_vm_rate(
+        &self,
+        run: hex_api::NodeRun,
+        rate: Option<std::num::NonZeroU64>,
+    ) -> Result<Option<std::num::NonZeroU64>, Refusal> {
+        let _ = rate;
+        Err(no_node_vm(run, "rate"))
+    }
+
+    /// Joint plan step 39 (place 3): stops node VM `run`'s run, the charge learner's last resort (C5), its end kept in
+    /// its row. Refused, typed, by a native owner that runs no node VM.
+    fn stop_node_vm(&self, run: hex_api::NodeRun) -> Result<(), Refusal> {
+        Err(no_node_vm(run, "stop"))
+    }
+
+    /// Joint plan step 39: tells node VM `run`'s guest its room, `room` bytes past what it holds (D188), as an image VM's
+    /// guest is told it. Refused, typed, by a native owner that runs no node VM.
+    fn node_vm_room(&self, run: hex_api::NodeRun, room: i64) -> Result<(), Refusal> {
+        let _ = room;
+        Err(no_node_vm(run, "room"))
+    }
+
+    /// Joint plan step 14 (D255): asks the governor of managed VM `record` to hold its vCPUs to `rate` milli-CPU, through
+    /// the guest this owner boots it in (`GuestRuntime::managed_rate`). An owner that boots no managed guest has no
+    /// governor to ask: its platform's cap is to hold the VM, told why.
+    fn managed_rate(
+        &self,
+        record: &BoxRecord,
+        rate: u64,
+    ) -> Result<hex_runtime::guest::ManagedRate, Refusal> {
+        let _ = (record, rate);
+        Ok(hex_runtime::guest::ManagedRate::Platform(
+            Refusal::Platform {
+                what: "a managed VM's governor",
+                platform: std::env::consts::OS,
+                why: "this native owner boots no managed guest whose governor it asks".to_owned(),
+            },
+        ))
+    }
+
+    /// Joint plan step 14 (D255): the period managed VM `record`'s governor holds its rate over, as its VM process last
+    /// answered: none before its first answer, and none from an owner that boots no managed guest.
+    fn managed_rate_period(
+        &self,
+        record: &BoxRecord,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        let _ = record;
+        Ok(None)
+    }
+
+    /// Joint plan step 14 (D260): managed VM `record`'s vCPUs' guest time, as its VM process answers its use, through
+    /// the guest this owner boots it in (`GuestRuntime::managed_guest_time`). An owner that boots no managed guest reads
+    /// none apart, told why.
+    fn managed_guest_time(
+        &self,
+        record: &BoxRecord,
+    ) -> Result<hex_runtime::guest::ManagedGuestTime, Refusal> {
+        let _ = record;
+        Ok(hex_runtime::guest::ManagedGuestTime::Unheld(
+            "this native owner boots no managed guest whose use it asks".to_owned(),
+        ))
+    }
+
+    /// Joint plan step 14 (D260): how long managed VM `record`'s VM process has run, from its start as its record names
+    /// it (`init`, on its OS's own clock) to now. Refused, typed, by an owner that holds no managed VM.
+    fn managed_life(&self, record: &BoxRecord) -> Result<std::time::Duration, Refusal> {
+        let _ = record;
+        Err(Refusal::Platform {
+            what: "a managed VM's life",
+            platform: std::env::consts::OS,
+            why: "this native owner holds no managed VM".to_owned(),
+        })
+    }
+
+    /// Joint plan step 14 (C4; ROOT, 2026-11-13): the least share this owner holds a managed VM at, its actuator's least
+    /// unit: macOS's CPU control's, Windows' job's; an owner with no cap of its own holds none below its VM's governor's
+    /// ([`charges::GOVERNOR_LEAST`]).
+    fn managed_least(&self) -> u64 {
+        charges::GOVERNOR_LEAST.get()
     }
 
     /// Joint plan step 14 (C4): caps the managed VM's CPU at `rate` milli-CPU, its share as the charge learner
@@ -345,7 +484,10 @@ pub trait Recover: Runtime {
     /// Deletes orphan `id` ([`Recover::orphans`]) through its guest. A runtime with no guest has none to
     /// delete, so it refuses.
     fn delete_orphan(&self, id: &BoxId) -> Result<(), Refusal> {
-        Err(uncertain(id))
+        Err(uncertain(
+            id,
+            "its delete found no record, and only a record's cleanup is proved",
+        ))
     }
     /// The core's loop, for connections of its own ([`Host::attach`]). By default it has none.
     fn attach(&self, lp: Arc<dyn Loop>) -> Result<(), Refusal> {
@@ -374,6 +516,8 @@ pub trait Recover: Runtime {
 pub struct Recorded<R> {
     runtime: R,
     books: Arc<Books>,
+    /// Its lessors over its wire, where its image VMs lease through them ([`Recorded::lease_over_wire`]).
+    wire_lessors: std::sync::OnceLock<Arc<crate::serve::WireLessors>>,
 }
 
 /// The node's records of its boxes, shared with the completions of calls its guest answers.
@@ -389,12 +533,21 @@ struct Books {
     /// The boot session the store's records were written in before this node opened it, as its marker said
     /// ([`Store::take_boot_marker`]): what tells a torn record from an earlier boot (T-T7.1.2).
     last_boot: Option<hex_core::record::BootSession>,
-    /// Joint plan step 14: the charge learner of the managed VMs, where the node's platform caps them, and the end its
-    /// window's thread waits on beside the window: dropped with the node.
+    /// Joint plan step 14: the charge learner of the node's VMs, where its platform caps them, and the sender its
+    /// thread waits on beside its window: told each box's beginning (`Recorded::begun`), and dropped with the node.
     charges: std::sync::OnceLock<(
         Mutex<charges::Learner>,
         Mutex<hex_wait::mpsc::SyncSender<()>>,
     )>,
+    /// Joint plan step 39, place 1: the last-resort ends a recovery read back from the node VM rows it let go, kept for
+    /// the charge learner, which starts after it ([`Recorded::start_charges`]); at most the rows a store scans.
+    node_vm_ends: Mutex<Vec<hex_api::LearnedEnd>>,
+    /// Whether the machine's capacity view serves this node's machine, as its configuration says (`--capacity-view`; the
+    /// review's A-10): its keeper's word is then awaited before its charge learner learns ([`Recorded::set_capacity_view`]).
+    capacity_view: std::sync::atomic::AtomicBool,
+    /// The machine's capacity view's latest word, what every holder has reserved through its keeper (the review's A-10),
+    /// kept for the charge learner: none until its keeper speaks ([`Runtime::reserved`]).
+    reserved: Mutex<Option<hex_api::Reserved>>,
 }
 
 /// Concrete shared transaction; its caller keeps the same method/device Turn on stack.
@@ -420,7 +573,7 @@ type NativeLaunch<'a> = dyn Fn(
         NativeRecord<'_>,
         &hex_runtime::devices::ManagedLaunch<'_>,
         shards_api::LaunchIo,
-        std::time::Duration,
+        Option<std::time::Duration>,
         &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<ManagedReceipt, Refusal>
     + 'a;
@@ -442,14 +595,29 @@ pub(crate) struct Native<'a> {
     pub unsubmitted_pool: &'a NativeUnsubmittedPool<'a>,
 }
 
-fn uncertain(id: &BoxId) -> Refusal {
+/// Box `id`'s lifecycle uncertain, in the refusing site's own words (joint plan step 12).
+fn uncertain(id: &BoxId, why: &str) -> Refusal {
     match id.try_clone() {
         Ok(id) => Refusal::Lifecycle {
             id,
             cause: hex_api::LifecycleCause::Uncertain,
+            why: Some(why.to_owned()),
         },
         Err(error) => error,
     }
+}
+
+/// Joint plan step 14 (D260): the start of managed VM `record`'s VM process, as its record names it (`init`, on its OS's
+/// own clock, Shards' `Identity::started`): refused, typed, for a record that names none.
+#[cfg(any(target_os = "macos", windows))]
+fn started(record: &BoxRecord) -> Result<u64, Refusal> {
+    record
+        .init
+        .map(|init| init.start_ticks)
+        .ok_or_else(|| Refusal::Invalid {
+            what: "a managed VM's life",
+            why: format!("box {}'s record names no VM process", record.spec.id),
+        })
 }
 
 fn broken(message: &'static str) -> Refusal {
@@ -472,7 +640,8 @@ fn check_native_projection(
     introduced: Option<(hex_api::Execution, &[DeviceId])>,
 ) -> Result<(), Refusal> {
     if let Some(pool) = pools.first() {
-        return Err(NativeRecord::Pool(pool).refusal(hex_api::LifecycleCause::Uncertain));
+        return Err(NativeRecord::Pool(pool)
+            .uncertain("a native-only runtime holds a VM backing it can't project"));
     }
     if introduced.is_some() {
         return Err(broken("native runtime cannot project a VM backing"));
@@ -487,13 +656,18 @@ pub(crate) fn check_backing_reference(
     record: &BoxRecord,
     pool: &PoolRecord,
 ) -> Result<(), Refusal> {
-    let bad = || uncertain(&record.spec.id);
-    let route = record.spec.route.ok_or_else(bad)?;
+    let bad = |why: &str| uncertain(&record.spec.id, why);
+    let route = record
+        .spec
+        .route
+        .ok_or_else(|| bad("its record routes it on no backing"))?;
     if route.backing != Some(pool.key)
         || route.key.backend_class() != NativeRecord::Pool(pool).class()?
         || pool.phase == hex_api::BackingPhase::Prepared
     {
-        return Err(bad());
+        return Err(bad(
+            "its route names another backing, another class, or one still only prepared",
+        ));
     }
     route.check_backing_parts(
         record.spec.allocation.map(|allocation| allocation.cost),
@@ -517,7 +691,9 @@ pub(crate) fn check_backing_reference(
         hex_api::BackingPhase::Released if pool.allocation.is_some() && pool.exit.is_some() => {
             Ok(())
         }
-        _ => Err(bad()),
+        _ => Err(bad(
+            "its record's phase, init, run or end disagrees with its backing's phase",
+        )),
     }
 }
 
@@ -532,9 +708,14 @@ pub(crate) fn check_single_consumer(
         return Err(Refusal::Full(crate::store::TURNS));
     }
     for (other, row) in records {
-        let row = row.as_ref().map_err(|_| uncertain(other))?;
+        let row = row
+            .as_ref()
+            .map_err(|why| uncertain(other, &format!("a record beside it can't be read: {why}")))?;
         if row.version != hex_core::record::RECORD_VERSION || row.spec.id != *other {
-            return Err(uncertain(other));
+            return Err(uncertain(
+                other,
+                "a record beside it is of another version or names another box",
+            ));
         }
         row.spec.check()?;
         if other != id
@@ -546,6 +727,7 @@ pub(crate) fn check_single_consumer(
             return Err(Refusal::Backing {
                 key: source,
                 cause: hex_api::LifecycleCause::Busy,
+                why: None,
             });
         }
     }
@@ -572,7 +754,7 @@ pub(crate) fn preflight_handoff_turns<'a>(
     }
     let pool = store
         .read_pool(&source.pool)?
-        .ok_or_else(|| uncertain(&record.spec.id))?;
+        .ok_or_else(|| uncertain(&record.spec.id, "its backing has no record"))?;
     check_backing_reference(record, &pool)?;
     if !matches!(
         pool.phase,
@@ -581,13 +763,16 @@ pub(crate) fn preflight_handoff_turns<'a>(
         return Ok(None);
     }
     let keys = catalog
-        .ok_or_else(|| uncertain(&record.spec.id))?
+        .ok_or_else(|| uncertain(&record.spec.id, "no device catalog holds its devices"))?
         .conflict_ids(&pool.devices)?;
     let held = turns.try_take_handoff(&record.spec.id, &source, &keys)?;
     if store.read_pool(&source.pool)?.as_ref() != Some(&pool)
         || store.read_lifecycle(&record.spec.id)?.as_ref() != Some(record)
     {
-        return Err(uncertain(&record.spec.id));
+        return Err(uncertain(
+            &record.spec.id,
+            "its record or its backing changed while its handoff's turns were taken",
+        ));
     }
     Ok(Some(held))
 }
@@ -665,7 +850,8 @@ pub(crate) fn preflight_records(
                 .iter()
                 .any(|id| !catalog.entries().iter().any(|entry| entry.info.id == *id))
             {
-                return Err(NativeRecord::Pool(pool).refusal(hex_api::LifecycleCause::Uncertain));
+                return Err(NativeRecord::Pool(pool)
+                    .uncertain("its pool selects a device its node's catalog doesn't hold"));
             }
         }
         scopes.push(*pool.scope().bytes());
@@ -677,9 +863,14 @@ pub(crate) fn preflight_records(
         }
     }
     for (id, result) in records {
-        let record = result.as_ref().map_err(|_| uncertain(id))?;
+        let record = result
+            .as_ref()
+            .map_err(|why| uncertain(id, &format!("its record can't be read: {why}")))?;
         if record.version != hex_core::record::RECORD_VERSION || record.spec.id != *id {
-            return Err(uncertain(id));
+            return Err(uncertain(
+                id,
+                "its record is of another version or names another box",
+            ));
         }
         record.spec.check()?;
         if [record.init, record.run]
@@ -687,7 +878,7 @@ pub(crate) fn preflight_records(
             .flatten()
             .any(|process| process.pid == 0)
         {
-            return Err(uncertain(id));
+            return Err(uncertain(id, "its record names a process with no pid"));
         }
         // A retired box (joint plan step 14) runs nothing, holds no device and names no backing any more: its record is
         // kept for its owner's delete alone.
@@ -706,7 +897,7 @@ pub(crate) fn preflight_records(
                 || record.init.is_some_and(|init| init.start_ticks == 0)
                 || (record.phase == Phase::Ready && record.init.is_none()))
         {
-            return Err(uncertain(id));
+            return Err(uncertain(id, "its record's phase and its init disagree"));
         }
         if let Some(scope) = record.native_scope {
             scopes.push(*scope.bytes());
@@ -725,7 +916,10 @@ pub(crate) fn preflight_records(
                 }
             } else {
                 // Every immutable route reference retains its source row through Box removal.
-                return Err(uncertain(id));
+                return Err(uncertain(
+                    id,
+                    "its route names a backing with no record, which its removal would leave",
+                ));
             }
         }
         add_claims(&record.spec.devices)?;
@@ -738,6 +932,7 @@ pub(crate) fn preflight_records(
         return Err(Refusal::Backing {
             key: duplicate,
             cause: hex_api::LifecycleCause::Uncertain,
+            why: Some("two retained boxes name it as their source".to_owned()),
         });
     }
     scopes.sort_unstable();
@@ -766,21 +961,31 @@ pub(crate) fn preflight_records(
 }
 
 impl Transaction<'_> {
-    fn refused(&self, cause: hex_api::LifecycleCause) -> Refusal {
+    /// Its owner refused Uncertain, and `why` in the refusing site's own words (joint plan steps 14 and 12): a pool's
+    /// backing refusal and a box's Lifecycle refusal carry them alike.
+    fn uncertain(&self, why: &str) -> Refusal {
         match self.owner {
             TransactionOwner::Box(id) | TransactionOwner::Handoff { id, .. } => {
                 match id.try_clone() {
-                    Ok(id) => Refusal::Lifecycle { id, cause },
+                    Ok(id) => Refusal::Lifecycle {
+                        id,
+                        cause: hex_api::LifecycleCause::Uncertain,
+                        why: Some(why.to_owned()),
+                    },
                     Err(error) => error,
                 }
             }
-            TransactionOwner::Pool(key) => Refusal::Backing { key: *key, cause },
+            TransactionOwner::Pool(key) => Refusal::Backing {
+                key: *key,
+                cause: hex_api::LifecycleCause::Uncertain,
+                why: Some(why.to_owned()),
+            },
         }
     }
     fn box_id(&self) -> Result<&BoxId, Refusal> {
         match self.owner {
             TransactionOwner::Box(id) | TransactionOwner::Handoff { id, .. } => Ok(id),
-            TransactionOwner::Pool(_) => Err(self.refused(hex_api::LifecycleCause::Uncertain)),
+            TransactionOwner::Pool(_) => Err(self.uncertain("a pool's transaction has no box id")),
         }
     }
     fn owns(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
@@ -802,7 +1007,7 @@ impl Transaction<'_> {
                 .iter()
                 .any(|device| !self.devices.contains(device))
         {
-            return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+            return Err(self.uncertain("its record isn't its transaction's owner, or selects devices its transaction doesn't hold"));
         }
         Ok(())
     }
@@ -812,10 +1017,9 @@ impl Transaction<'_> {
     ) -> Result<T, Refusal> {
         match self.owner {
             TransactionOwner::Box(id) | TransactionOwner::Handoff { id, .. } => {
-                let record = self
-                    .store
-                    .read_lifecycle(id)?
-                    .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+                let record = self.store.read_lifecycle(id)?.ok_or_else(|| {
+                    self.uncertain("its box record is gone as its transaction reads it")
+                })?;
                 let native = NativeRecord::Box(&record);
                 self.owns(native)?;
                 record.spec.check()?;
@@ -832,15 +1036,15 @@ impl Transaction<'_> {
                     return Err(Refusal::Backing {
                         key,
                         cause: hex_api::LifecycleCause::Pending,
+                        why: None,
                     });
                 }
                 operation(native)
             }
             TransactionOwner::Pool(key) => {
-                let record = self
-                    .store
-                    .read_pool(&key.pool)?
-                    .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+                let record = self.store.read_pool(&key.pool)?.ok_or_else(|| {
+                    self.uncertain("its pool record is gone as its transaction reads it")
+                })?;
                 let native = NativeRecord::Pool(&record);
                 self.owns(native)?;
                 record.check()?;
@@ -857,33 +1061,37 @@ impl Transaction<'_> {
                 if record.spec.devices.is_empty() {
                     return Ok(());
                 }
-                let catalog = self
-                    .native
-                    .catalog
-                    .ok_or_else(|| uncertain(&record.spec.id))?;
+                let catalog = self.native.catalog.ok_or_else(|| {
+                    uncertain(&record.spec.id, "no device catalog holds its devices")
+                })?;
                 let boxes = self.store.all()?;
                 let pools = self.store.all_pools()?;
                 for id in &record.spec.devices {
                     match catalog.holder(*id, &boxes, &pools)? {
                         Some(hex_api::DeviceHolder::Box(id)) if id == record.spec.id => {}
-                        _ => return Err(uncertain(&record.spec.id)),
+                        _ => {
+                            return Err(uncertain(
+                                &record.spec.id,
+                                "a device it claims is held by another box, or by none",
+                            ));
+                        }
                     }
                 }
                 if let Some(route) = record.spec.route
                     && let Some(key) = route.backing
                 {
-                    let pool =
-                        pools
-                            .iter()
-                            .find(|pool| pool.key == key)
-                            .ok_or(Refusal::Backing {
-                                key,
-                                cause: hex_api::LifecycleCause::Uncertain,
-                            })?;
+                    let pool = pools.iter().find(|pool| pool.key == key).ok_or_else(|| {
+                        Refusal::Backing {
+                            key,
+                            cause: hex_api::LifecycleCause::Uncertain,
+                            why: Some("a launching box's source backing has no record".to_owned()),
+                        }
+                    })?;
                     if pool.phase != hex_api::BackingPhase::Released || pool.exit.is_none() {
                         return Err(Refusal::Backing {
                             key,
                             cause: hex_api::LifecycleCause::Pending,
+                            why: None,
                         });
                     }
                     route.check_backing_parts(
@@ -910,14 +1118,14 @@ impl Transaction<'_> {
                 || current.stage() != NativeStage::Creating
                 || current.init().is_some()
             {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(self.uncertain("its launch was published, or its controller set, before its transaction published it"));
             }
             match current {
                 NativeRecord::Box(record) => {
                     let mut current = self
                         .store
                         .read_lifecycle(&record.spec.id)?
-                        .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+                        .ok_or_else(|| self.uncertain("its box record is gone as its transaction publishes it"))?;
                     current.init = Some(init);
                     self.store.put_lifecycle(&current)
                 }
@@ -925,7 +1133,7 @@ impl Transaction<'_> {
                     let mut current = self
                         .store
                         .read_pool(&record.key.pool)?
-                        .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+                        .ok_or_else(|| self.uncertain("its pool record is gone as its transaction publishes it"))?;
                     current.init = Some(init);
                     self.store.put_pool(&current)
                 }
@@ -937,18 +1145,18 @@ impl Transaction<'_> {
 impl hex_runtime::devices::Transaction for Transaction<'_> {
     fn check_unsubmitted_pool(&self) -> Result<(), Refusal> {
         if !matches!(self.owner, TransactionOwner::Pool(_)) {
-            return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+            return Err(self.uncertain("a box's transaction can't prove a pool unsubmitted"));
         }
         self.with_native(|record| {
             let NativeRecord::Pool(pool) = record else {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(self.uncertain("its transaction's record isn't a pool's as it is proven unsubmitted"));
             };
             if pool.phase != hex_api::BackingPhase::Prepared
                 || pool.allocation.is_some()
                 || pool.init.is_some()
                 || pool.exit.is_some()
             {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(self.uncertain("its pool is past its preparation, or holds an allocation, a controller or an end"));
             }
             // The caller's SAME Pool/configuration turn excludes grant/native submission.
             // This is only the native metadata half of cancellation, never a Released witness.
@@ -961,7 +1169,9 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
                 || record.allocation().is_none()
                 || !matches!(record.class()?, Class::Shards | Class::Firecracker)
             {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(
+                    self.uncertain("its record isn't an allocated VM's as its usage is read")
+                );
             }
             (self.native.usage)(record)
         })
@@ -970,19 +1180,26 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
         &self,
         plan: &hex_runtime::devices::ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: std::time::Duration,
+        patience: Option<std::time::Duration>,
     ) -> Result<ManagedReceipt, Refusal> {
-        let deadline = std::time::Instant::now()
-            .checked_add(patience)
-            .filter(|_| patience != std::time::Duration::MAX && !patience.is_zero())
-            .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+        // None: a create that follows its guest, with no deadline of its caller's (the review's C-9).
+        let deadline = patience
+            .map(|patience| {
+                std::time::Instant::now()
+                    .checked_add(patience)
+                    .filter(|_| patience != std::time::Duration::MAX && !patience.is_zero())
+                    .ok_or_else(|| {
+                        self.uncertain("its transaction's launch patience isn't a finite time")
+                    })
+            })
+            .transpose()?;
         self.with_native(|record| {
             if record.class()? != plan.class()
                 || record.allocation().is_none()
                 || record.stage() != NativeStage::Creating
                 || record.init().is_some()
             {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(self.uncertain("its record isn't a fresh VM creation as its transaction launches it"));
             }
             self.launch_claims(record)?;
             let deadline = hex_runtime::devices::check_managed_report(
@@ -994,7 +1211,7 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
             )?;
             let scope = record
                 .scope()
-                .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+                .ok_or_else(|| self.uncertain("its record names no native scope to launch"))?;
             let commitment = record.commitment()?;
             let mut introduced = false;
             let mut publish = |identity: &shards_api::Identity| {
@@ -1003,7 +1220,7 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
                     || identity.started == 0
                     || identity.vsock != plan.vsock()
                 {
-                    return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                    return Err(self.uncertain("its launched controller's identity or vsock isn't its plan's"));
                 }
                 self.publish(
                     scope,
@@ -1016,13 +1233,18 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
                 introduced = true;
                 Ok(())
             };
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
-            }
+            let remaining = deadline
+                .map(|deadline| {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(self.uncertain("its transaction's launch deadline passed before its controller was handed over"));
+                    }
+                    Ok(remaining)
+                })
+                .transpose()?;
             let receipt = (self.native.launch)(record, plan, io, remaining, &mut publish)?;
             if !introduced {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(self.uncertain("its launch's controller wasn't introduced to its record"));
             }
             Ok(receipt)
         })
@@ -1036,7 +1258,9 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
                 || record.scope().is_none()
                 || !matches!(record.class()?, Class::Shards | Class::Firecracker)
             {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(self.uncertain(
+                    "its record isn't an allocated VM's as its transaction attaches it",
+                ));
             }
             match identity {
                 Some(identity)
@@ -1048,7 +1272,11 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
                     record.stage(),
                     NativeStage::Creating | NativeStage::Deleting
                 ) => {}
-                _ => return Err(self.refused(hex_api::LifecycleCause::Uncertain)),
+                _ => {
+                    return Err(self.uncertain(
+                        "its attached controller isn't its record's, or it isn't fresh",
+                    ));
+                }
             }
             (self.native.attach)(record, identity)
         })
@@ -1063,14 +1291,14 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
                     NativeStage::Deleting | NativeStage::Released
                 )
             {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(self.uncertain("its record isn't an allocated VM's that is deleting or released as it is finalized"));
             }
             match (record.init(), identity) {
                 (Some(expected), Some(actual))
                     if expected.pid == actual.pid && expected.start_ticks == actual.started => {}
                 (None, Some(actual)) if actual.pid != 0 && actual.started != 0 => {}
                 (None, None) => {}
-                _ => return Err(self.refused(hex_api::LifecycleCause::Uncertain)),
+                _ => return Err(self.uncertain("its finalized controller isn't its record's")),
             }
             (self.native.finalize)(record, identity)
         })
@@ -1080,7 +1308,7 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
     }
     fn read(&self, id: &BoxId) -> Result<Option<BoxRecord>, Refusal> {
         if id != self.box_id()? {
-            return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+            return Err(self.uncertain("its transaction reads another box than its owner"));
         }
         self.store.read_lifecycle(id)
     }
@@ -1091,7 +1319,7 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
                 route.backing.is_some() && route.key.execution != hex_api::Execution::ShardsShared
             }) && !matches!(self.owner, TransactionOwner::Handoff { .. })
             {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(self.uncertain("a new box record names a backing outside a handoff"));
             }
             check_box_claims(self.store, self.native.catalog, &record.spec)?;
         }
@@ -1099,7 +1327,7 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
     }
     fn remove(&self, id: &BoxId) -> Result<(), Refusal> {
         if id != self.box_id()? {
-            return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+            return Err(self.uncertain("its transaction removes another box than its owner"));
         }
         if let Some(record) = self.store.read_lifecycle(id)? {
             self.owns(NativeRecord::Box(&record))?;
@@ -1114,21 +1342,26 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
             TransactionOwner::Pool(expected) if expected == key => {}
             TransactionOwner::Handoff { source, .. } if source == key => {}
             TransactionOwner::Box(id) => {
-                let current = self
-                    .store
-                    .read_lifecycle(id)?
-                    .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+                let current = self.store.read_lifecycle(id)?.ok_or_else(|| {
+                    self.uncertain("its handoff's box record is gone as its source is read")
+                })?;
                 if current.spec.route.and_then(|route| route.backing) != Some(*key) {
-                    return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                    return Err(self.uncertain("its handoff's box names another source"));
                 }
             }
-            _ => return Err(self.refused(hex_api::LifecycleCause::Uncertain)),
+            _ => {
+                return Err(self.uncertain(
+                    "its transaction reads a pool that isn't its owner or handoff source",
+                ));
+            }
         }
         let record = self.store.read_pool(&key.pool)?;
         if let Some(record) = &record {
             record.check()?;
             if record.key != *key {
-                return Err(self.refused(hex_api::LifecycleCause::Uncertain));
+                return Err(
+                    self.uncertain("its transaction's pool record names another generation")
+                );
             }
             if matches!(self.owner, TransactionOwner::Pool(_)) {
                 self.owns(NativeRecord::Pool(record))?;
@@ -1137,9 +1370,9 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
         Ok(record)
     }
     fn grant_pool(&self, grant: &hex_api::BackingGrant) -> Result<PoolRecord, Refusal> {
-        let record = self
-            .read_pool(&grant.key)?
-            .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+        let record = self.read_pool(&grant.key)?.ok_or_else(|| {
+            self.uncertain("its pool record is gone before its transaction's grant")
+        })?;
         self.owns(NativeRecord::Pool(&record))?;
         check_pool_claims(self.store, self.native.catalog, &record)?;
         self.store.grant_pool(grant)
@@ -1151,9 +1384,9 @@ impl hex_runtime::devices::Transaction for Transaction<'_> {
         self.store.put_pool(record)
     }
     fn remove_pool(&self, key: &hex_api::BackingKey) -> Result<(), Refusal> {
-        let record = self
-            .read_pool(key)?
-            .ok_or_else(|| self.refused(hex_api::LifecycleCause::Uncertain))?;
+        let record = self.read_pool(key)?.ok_or_else(|| {
+            self.uncertain("its pool record is gone before its transaction removed it")
+        })?;
         self.owns(NativeRecord::Pool(&record))?;
         if record.phase == hex_api::BackingPhase::Released
             && record.allocation.is_none()
@@ -1195,11 +1428,14 @@ pub(crate) fn handoff_transaction(
     native: &Native<'_>,
     callback: &mut dyn FnMut(&dyn hex_runtime::devices::Transaction) -> Result<(), Refusal>,
 ) -> Result<(), Refusal> {
-    let refused = || Refusal::Backing {
+    let refused = |why: &str| Refusal::Backing {
         key: *source,
         cause: hex_api::LifecycleCause::Uncertain,
+        why: Some(why.to_owned()),
     };
-    let pool = store.read_pool(&source.pool)?.ok_or_else(refused)?;
+    let pool = store
+        .read_pool(&source.pool)?
+        .ok_or_else(|| refused("its handoff's source has no pool record"))?;
     pool.check()?;
     if pool.key != *source
         || pool.allocation.is_none()
@@ -1214,17 +1450,28 @@ pub(crate) fn handoff_transaction(
                 | hex_api::BackingPhase::Released
         )
     {
-        return Err(refused());
+        return Err(refused(
+            "its handoff's source isn't an allocated dedicated or Firecracker backing that is live, draining or released",
+        ));
     }
     hex_api::BackingOffer::check_selection_parts(&pool.devices, &pool.devices)?;
-    let catalog = native.catalog.ok_or_else(refused)?;
+    let catalog = native
+        .catalog
+        .ok_or_else(|| refused("its node holds no device catalog for its handoff"))?;
     if catalog.conflict_ids(&pool.devices)?.as_slice() != full_conflicts {
-        return Err(refused());
+        return Err(refused(
+            "its handoff source's device conflicts aren't the ones asked",
+        ));
     }
     let records = store.retained_records()?;
     check_single_consumer(&records, *source, id)?;
     if let Some(current) = records.get(id) {
-        check_backing_reference(current.as_ref().map_err(|_| uncertain(id))?, &pool)?;
+        check_backing_reference(
+            current
+                .as_ref()
+                .map_err(|why| uncertain(id, &format!("its record can't be read: {why}")))?,
+            &pool,
+        )?;
     }
     callback(&Transaction {
         store,
@@ -1272,7 +1519,8 @@ fn check_box_claims(
     if spec.devices.is_empty() {
         return Ok(());
     }
-    let catalog = catalog.ok_or_else(|| uncertain(&spec.id))?;
+    let catalog =
+        catalog.ok_or_else(|| uncertain(&spec.id, "no device catalog holds its devices"))?;
     catalog.prepare(spec, &store.all()?, &store.all_pools()?)?;
     Ok(())
 }
@@ -1288,6 +1536,7 @@ fn check_pool_claims(
     let refused = || Refusal::Backing {
         key: record.key,
         cause: hex_api::LifecycleCause::Busy,
+        why: None,
     };
     let catalog = catalog.ok_or_else(refused)?;
     let boxes = store.all()?;
@@ -1346,6 +1595,18 @@ fn native_metadata(
 }
 
 impl<R: Recover> Recorded<R> {
+    /// Its image VMs' credentials leased over its wire (joint plan step 33; docs/design/credential-grants.md C7):
+    /// `lessors`, which its guest runtime's image class was built with, each box's route kept by its socket as the box is
+    /// created. Given once.
+    pub fn lease_over_wire(&self, lessors: Arc<crate::serve::WireLessors>) -> Result<(), Refusal> {
+        self.wire_lessors
+            .set(lessors)
+            .map_err(|_| Refusal::Invalid {
+                what: "lessors over the node's wire",
+                why: "the node was given them already".to_owned(),
+            })
+    }
+
     /// The retained records past the whole-owner barrier, and apart from them the torn ones
     /// ([`Store::take_torn`]), which no barrier can check: [`Recorded::recover`] proves their boxes gone or
     /// holds them. A record in the state directory that can't be read is refused, naming its file.
@@ -1361,7 +1622,9 @@ impl<R: Recover> Recorded<R> {
         // Configuration validation is a complete second read-only pass. Native observations and
         // cleanup are deliberately deferred until every sibling and backing passes both passes.
         for (id, record) in &records {
-            let record = record.as_ref().map_err(|_| uncertain(id))?;
+            let record = record
+                .as_ref()
+                .map_err(|why| uncertain(id, &format!("its record can't be read: {why}")))?;
             let handoff = preflight_handoff_turns(
                 &self.books.lifecycle,
                 &self.books.store,
@@ -1373,12 +1636,12 @@ impl<R: Recover> Recorded<R> {
                     .spec
                     .route
                     .and_then(|route| route.backing)
-                    .ok_or_else(|| uncertain(id))?;
+                    .ok_or_else(|| uncertain(id, "its record routes it on no backing"))?;
                 let pool = pools
                     .binary_search_by_key(&source, |pool| pool.key)
                     .ok()
                     .and_then(|at| pools.get(at))
-                    .ok_or_else(|| uncertain(id))?;
+                    .ok_or_else(|| uncertain(id, "its backing has no record"))?;
                 self.runtime.handoff_unsubmitted(record, pool)?;
             } else {
                 self.runtime.preflight_record(record)?;
@@ -1421,7 +1684,7 @@ impl<R: Recover> Recorded<R> {
             |record: NativeRecord<'_>,
              plan: &hex_runtime::devices::ManagedLaunch<'_>,
              io: shards_api::LaunchIo,
-             patience: std::time::Duration,
+             patience: Option<std::time::Duration>,
              publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>| {
                 self.runtime
                     .launch_managed(record, plan, io, patience, publish)
@@ -1461,6 +1724,9 @@ impl<R: Recover> hex_runtime::devices::Books for Recorded<R> {
     fn records(&self) -> Result<hex_runtime::devices::Records, Refusal> {
         self.books.store.all()
     }
+    fn record(&self, id: &BoxId) -> Result<Option<Result<BoxRecord, String>>, Refusal> {
+        self.books.store.get(id)
+    }
     fn physical_devices(&self) -> Result<Vec<hex_api::DeviceInfo>, Refusal> {
         let prober = self
             .books
@@ -1489,12 +1755,16 @@ impl<R: Recover> hex_runtime::devices::Books for Recorded<R> {
         // performs its renderer/native join later, exactly once; it must not be called recursively
         // from the authority it queries. The same Prober provides all native metadata here.
         capacity.devices = hex_runtime::devices::Books::physical_devices(self)?;
-        recorded_holders(
-            &mut capacity,
-            &self.books.store.all()?,
-            &self.books.store.all_pools()?,
-            self.runtime.device_catalog()?.as_deref(),
-        )?;
+        if capacity.devices.is_empty() {
+            capacity.check()?;
+        } else {
+            recorded_holders(
+                &mut capacity,
+                &self.books.store.all()?,
+                &self.books.store.all_pools()?,
+                self.runtime.device_catalog()?.as_deref(),
+            )?;
+        }
         Ok(capacity)
     }
     fn with_transaction(
@@ -1505,6 +1775,17 @@ impl<R: Recover> hex_runtime::devices::Books for Recorded<R> {
     ) -> Result<(), Refusal> {
         let _method = self.books.lifecycle.try_take_devices(id, devices)?;
         self.native_transaction(TransactionOwner::Box(id), devices, callback)
+    }
+    /// Waits for a turn of the box under way, following its holder (decision 9), where a method's or a native
+    /// transaction's is refused the overlap: it makes no native call (`hex_runtime::devices::with_record_transaction`
+    /// refuses each), so no holder waits on it.
+    fn with_record_transaction(
+        &self,
+        id: &BoxId,
+        callback: &mut dyn FnMut(&dyn hex_runtime::devices::Transaction) -> Result<(), Refusal>,
+    ) -> Result<(), Refusal> {
+        let _turn = self.books.lifecycle.take(id)?;
+        self.native_transaction(TransactionOwner::Box(id), &[], callback)
     }
     fn pool_records(&self) -> Result<Vec<PoolRecord>, Refusal> {
         self.books.store.all_pools()
@@ -1573,6 +1854,27 @@ impl<R: Recover> hex_runtime::devices::Books for Recorded<R> {
         let _method = self.books.lifecycle.try_take_pool(key, devices)?;
         self.native_transaction(TransactionOwner::Pool(key), devices, callback)
     }
+    fn node_vm(
+        &self,
+        run: &hex_api::NodeRun,
+    ) -> Result<Option<hex_core::record::NodeVmRecord>, Refusal> {
+        self.books.store.node_vm(run)
+    }
+    fn put_node_vm(&self, record: &hex_core::record::NodeVmRecord) -> Result<(), Refusal> {
+        self.books.store.put_node_vm(record)?;
+        // A node VM Ready is a VM to learn: a learner holding no cap reads it now, not at the next box's beginning
+        // (A-9).
+        if record.phase == hex_api::NodeVmPhase::Ready {
+            self.begun();
+        }
+        Ok(())
+    }
+    fn all_node_vms(&self) -> Result<Vec<hex_core::record::NodeVmRecord>, Refusal> {
+        self.books.store.all_node_vms()
+    }
+    fn mint_node_run(&self) -> Result<hex_api::NodeRun, Refusal> {
+        self.books.store.mint_node_run()
+    }
 }
 
 type Projection = (
@@ -1602,7 +1904,10 @@ fn project_info(info: &mut BoxInfo, expected: &Projection) -> Result<(), Refusal
         || (info.allocation != *allocation && !(inner && info.allocation.is_none()))
         || (info.route.is_some() && info.route != *route)
     {
-        return Err(uncertain(id));
+        return Err(uncertain(
+            id,
+            "its runtime's view of it isn't its record's: another id, class, allocation or route",
+        ));
     }
     info.class = *class;
     info.allocation = *allocation;
@@ -1653,6 +1958,8 @@ mod projection_tests {
             route: None,
             last_resort: None,
             ended: None,
+            control: None,
+            control_wake: None,
             credentials: Vec::new(),
         }
     }
@@ -1701,6 +2008,28 @@ impl Drop for ForwardTurn {
 }
 
 impl<R: Recover> Recorded<R> {
+    /// Whether the machine's capacity view serves this node's machine, as its configuration says (`--capacity-view`; the
+    /// review's A-10, CV10's configured form): where one does, the charge learner learns nothing until its keeper has
+    /// spoken since the node started, its VMs booked whole meanwhile, told; where none does, no holder reserves room
+    /// there. Set before the learner starts.
+    pub fn set_capacity_view(&self, served: bool) {
+        self.books
+            .capacity_view
+            .store(served, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Tells the charge learner a box has begun, or a node VM has booted (joint plan step 14, C1; A-9): one holding no
+    /// cap runs a window at once; one waiting out its window reads it at the window's end. Nothing where no learner
+    /// runs.
+    fn begun(&self) {
+        if let Some((_, begun)) = self.books.charges.get()
+            && let Ok(begun) = begun.lock()
+        {
+            // Full: a beginning is told already. Gone: the learner has stopped, its failure kept.
+            let _ = begun.try_send(());
+        }
+    }
+
     /// Native methods use this same owner. A backend registered with Books enters it itself;
     /// route changes between the initial read and acquisition are refused before native I/O.
     fn method_turn(&self, id: &BoxId) -> Result<Option<Turn<'_>>, Refusal> {
@@ -1716,7 +2045,7 @@ impl<R: Recover> Recorded<R> {
         let turn = self.books.lifecycle.try_take_devices(id, devices)?;
         let after = self.books.store.read_lifecycle(id)?;
         if before.as_ref().map(|r| &r.spec) != after.as_ref().map(|r| &r.spec) {
-            return Err(uncertain(id));
+            return Err(uncertain(id, "its record's spec changed during its call"));
         }
         Ok(Some(turn))
     }
@@ -1754,6 +2083,7 @@ impl<R: Recover> Recorded<R> {
         let last_boot = store.take_boot_marker()?;
         Ok(Self {
             runtime,
+            wire_lessors: std::sync::OnceLock::new(),
             books: Arc::new(Books {
                 store,
                 prober,
@@ -1761,14 +2091,18 @@ impl<R: Recover> Recorded<R> {
                     "changing a recorded box's lifecycle",
                     "recorded lifecycle methods",
                     crate::store::TURNS,
-                    // try_take never waits: an overlap is refused at once, no timeout guessed; the existing
-                    // Turns owner records the method's actual hold.
+                    // A method's turn never waits (try_take): an overlap is refused at once, no timeout guessed. A
+                    // record transaction's waits for its holder (take), bounded by the slowest hold seen and following
+                    // the holder past it (decision 9); the existing Turns owner records each hold.
                     hex_core::patience::Patience::measuring("recorded.lifecycle"),
                 ),
                 abandoned: Abandoned::default(),
                 adopted: Mutex::new(BTreeSet::new()),
                 last_boot,
                 charges: std::sync::OnceLock::new(),
+                node_vm_ends: Mutex::new(Vec::new()),
+                capacity_view: std::sync::atomic::AtomicBool::new(false),
+                reserved: Mutex::new(None),
             }),
         })
     }
@@ -1793,19 +2127,40 @@ impl<R: Recover> Recorded<R> {
         self.runtime.initialize_native()?;
         // What a crash at a record write left: a temp file never renamed into place.
         self.books.store.remove_strays()?;
+        let settled = self.books.store.settle_node_vms()?;
+        // Each oci box a node VM's last-resort end ended, retired with it before recovery plans it (A-6): kept with
+        // why, never removed as a box nothing runs, its node VM's run ended with an earlier node or before it.
+        let retired = charges::retire_with_node_vms(
+            &self.books.store,
+            &records,
+            &self.books.store.all_node_vms()?,
+        )?;
         let mut summary = RecoverySummary {
             boot_unknown: self.books.store.boot_unread().map(str::to_owned),
+            node_vms: settled.rows,
+            node_vm_ends: crate::store::NodeVmEnds::of(&settled.ends)?,
             ..RecoverySummary::default()
         };
+        self.books
+            .node_vm_ends
+            .lock()
+            .map_err(|_| broken("the node VM ends' lock was poisoned"))?
+            .extend(settled.ends);
         let torn = self.remove_torn_before_this_boot(torn, &mut summary)?;
         self.recover_orphans(&records, torn, &mut summary)?;
         let mut seen: BTreeMap<BoxId, Seen> = BTreeMap::new();
         for (id, record) in &records {
             // Without a readable class/identity this owner cannot choose a cleanup backend.
             // Retain the row and its claims rather than run native host cleanup by guesswork.
-            let r = record.as_ref().map_err(|_| uncertain(id))?;
-            // A retired box ran nothing past its retirement and is kept for its owner's delete (joint plan step 14).
-            if r.retired {
+            let r = record.as_ref().map_err(|_| {
+                uncertain(
+                    id,
+                    "its record can't be read, so no cleanup backend can be chosen",
+                )
+            })?;
+            // A retired box ran nothing past its retirement and is kept for its owner's delete (joint plan step 14),
+            // one retired with its node VM just now too (A-6).
+            if r.retired || retired.contains(id) {
                 continue;
             }
             // T-T7.1.2: a box this node keeps the record of, written in an earlier boot of the host, ran
@@ -1872,7 +2227,9 @@ impl<R: Recover> Recorded<R> {
                 }
                 Decision::Remove(why) => {
                     if managed {
-                        let r = record.ok_or_else(|| uncertain(&id))?;
+                        let r = record.ok_or_else(|| {
+                            uncertain(&id, "its recovery has no record to delete it by")
+                        })?;
                         match self.runtime.runtime_for(&r.spec)?.delete(&id) {
                             Ok(()) => {}
                             Err(Refusal::Awaits {
@@ -1892,7 +2249,7 @@ impl<R: Recover> Recorded<R> {
                         self.runtime.discard(&r.spec)?;
                         self.books.store.remove(&id)?;
                     } else {
-                        return Err(uncertain(&id));
+                        return Err(uncertain(&id, "its recovery has no record to remove it by"));
                     }
                     summary.removed.push((id, why_text(&why)));
                 }
@@ -2010,34 +2367,162 @@ impl<R: Recover> Recorded<R> {
 /// The charge learner's reads and writes of the node's managed VMs, through their native owner, and of their records.
 struct Managed<'a, R> {
     runtime: &'a R,
-    store: &'a Store,
+    books: &'a Books,
 }
 
 impl<R: Recover> charges::Managed for Managed<'_, R> {
-    fn usage(&self, record: &BoxRecord) -> Result<Usage, Refusal> {
-        self.runtime.managed_usage(NativeRecord::Box(record))
+    fn usage(&self, holder: charges::Holder<'_>) -> Result<Usage, Refusal> {
+        match holder {
+            charges::Holder::Box(record) => self.runtime.managed_usage(NativeRecord::Box(record)),
+            // A node VM is read by its run's host use alone, as an image VM is (`charges::Read::of`).
+            charges::Holder::Node { .. } => Err(Refusal::Invalid {
+                what: "a node VM's use",
+                why: "a node VM is read by its run's host use, as an image VM is".to_owned(),
+            }),
+        }
     }
 
-    fn host_use(&self, record: &BoxRecord) -> Result<hex_api::HostUse, Refusal> {
-        self.runtime.host_use(&record.spec.id)
+    fn guest_time(
+        &self,
+        holder: charges::Holder<'_>,
+    ) -> Result<hex_runtime::guest::ManagedGuestTime, Refusal> {
+        match holder {
+            charges::Holder::Box(record) => self.runtime.managed_guest_time(record),
+            // A node VM's vCPUs' guest time comes with its run's host use, as an image VM's does (D241).
+            charges::Holder::Node { .. } => Err(Refusal::Invalid {
+                what: "a node VM's guest time",
+                why: "a node VM's guest time comes with its run's host use".to_owned(),
+            }),
+        }
     }
 
-    fn set_rate(&self, record: &BoxRecord, rate: u64) -> Result<(), Refusal> {
+    fn life(&self, holder: charges::Holder<'_>) -> Result<std::time::Duration, Refusal> {
+        match holder {
+            charges::Holder::Box(record) => self.runtime.managed_life(record),
+            // A node VM's life comes with its run's host use, its window, as an image VM's does.
+            charges::Holder::Node { .. } => Err(Refusal::Invalid {
+                what: "a node VM's life",
+                why: "a node VM's life comes with its run's host use".to_owned(),
+            }),
+        }
+    }
+
+    fn cap_cycle(&self, rate: u64) -> Result<hex_runtime::guest::CapCycle, Refusal> {
+        self.runtime.cap_cycle(rate)
+    }
+
+    /// An image VM's governor's least, a node VM's as an image VM's (its run's governor); a managed VM's its platform's
+    /// cap's, which holds its share.
+    fn least(&self, holder: charges::Holder<'_>) -> u64 {
+        match holder {
+            charges::Holder::Box(record) if !charges::running_image(record) => {
+                self.runtime.managed_least()
+            }
+            charges::Holder::Box(_) | charges::Holder::Node { .. } => charges::GOVERNOR_LEAST.get(),
+        }
+    }
+
+    fn host_use(&self, holder: charges::Holder<'_>) -> Result<hex_api::HostUse, Refusal> {
+        match holder {
+            charges::Holder::Box(record) => self.runtime.host_use(&record.spec.id),
+            charges::Holder::Node { row, .. } => self.runtime.node_vm_host_use(row.run),
+        }
+    }
+
+    fn taken(&self, holder: charges::Holder<'_>) -> Result<u64, Refusal> {
+        match holder {
+            charges::Holder::Box(record) if charges::running(record) => self
+                .runtime
+                .managed_usage(NativeRecord::Box(record))
+                .map(|usage| usage.memory_bytes),
+            charges::Holder::Box(record) => self
+                .runtime
+                .usage(&record.spec.id)
+                .map(|usage| usage.memory_bytes),
+            charges::Holder::Node { row, .. } => self
+                .runtime
+                .node_vm_host_use(row.run)
+                .map(|host| host.footprint_bytes),
+        }
+    }
+
+    fn free(&self) -> Result<hex_api::CapacityResources, Refusal> {
+        Ok(crate::facts::capacity(self.books.store.directory(), self.books.authority_id()?)?.free)
+    }
+
+    fn rate_period(
+        &self,
+        holder: charges::Holder<'_>,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        let record = match holder {
+            charges::Holder::Box(record) => record,
+            charges::Holder::Node { row, .. } => {
+                return self.runtime.node_vm_rate_period(row.run);
+            }
+        };
+        if charges::running_image(record) {
+            return self.runtime.image_rate_period(record);
+        }
+        self.runtime.managed_rate_period(record)
+    }
+
+    /// D255, D260: the VM's governor holds its vCPUs to its share less its VMM's own (`Cap::governor`): an image VM's
+    /// through its rate (D247), a managed VM's through the guest its node boots it in. On Windows a managed VM's job's
+    /// CPU rate is set at the share beside, the hard ceiling over its VMM's own and its vCPUs' together, which binds
+    /// only while its VMM's own isn't read apart; on macOS the CPU control stays at the VM's ceiling, a backstop. Where
+    /// its VM process takes no rate, its platform's cap holds it at the share, told why.
+    fn set_rate(
+        &self,
+        holder: charges::Holder<'_>,
+        cap: charges::Cap<'_>,
+    ) -> Result<hex_api::RateHeld, Refusal> {
+        let record = match holder {
+            charges::Holder::Box(record) => record,
+            // A node VM is a D231 image run, held through its run's rate as an image VM is (place 3).
+            charges::Holder::Node { row, .. } => {
+                return self
+                    .runtime
+                    .node_vm_rate(row.run, Some(cap.governor()))
+                    .map(|_| cap.held(false));
+            }
+        };
         if charges::running_image(record) {
             return self
                 .runtime
-                .rate(&record.spec.id, std::num::NonZeroU64::new(rate))
-                .map(|_| ());
+                .rate(&record.spec.id, Some(cap.governor()))
+                .map(|_| cap.held(false));
         }
-        self.runtime
-            .set_managed_rate(NativeRecord::Box(record), rate)
+        match self.runtime.managed_rate(record, cap.governor().get())? {
+            hex_runtime::guest::ManagedRate::Governor { .. } => {
+                if cfg!(windows) {
+                    self.runtime
+                        .set_managed_rate(NativeRecord::Box(record), cap.share)?;
+                }
+                Ok(cap.held(cfg!(windows)))
+            }
+            hex_runtime::guest::ManagedRate::Platform(why) => {
+                self.runtime
+                    .set_managed_rate(NativeRecord::Box(record), cap.share)?;
+                Ok(hex_api::RateHeld::Platform(why.to_string()))
+            }
+        }
     }
 
-    fn set_room(&self, record: &BoxRecord, room: i64) -> Result<(), Refusal> {
-        self.runtime.room(&record.spec.id, Some(room)).map(|_| ())
+    fn set_room(&self, holder: charges::Holder<'_>, room: i64) -> Result<(), Refusal> {
+        match holder {
+            charges::Holder::Box(record) => {
+                self.runtime.room(&record.spec.id, Some(room)).map(|_| ())
+            }
+            // Its guest told its room through its run, as an image VM's is (D188).
+            charges::Holder::Node { row, .. } => self.runtime.node_vm_room(row.run, room),
+        }
     }
 
-    fn stop(&self, record: &BoxRecord) -> Result<(), Refusal> {
+    fn stop(&self, holder: charges::Holder<'_>) -> Result<(), Refusal> {
+        let record = match holder {
+            charges::Holder::Box(record) => record,
+            charges::Holder::Node { row, .. } => return self.runtime.stop_node_vm(row.run),
+        };
         if charges::running_image(record) {
             return self.runtime.signal(&record.spec.id, Signal::KILL);
         }
@@ -2046,84 +2531,89 @@ impl<R: Recover> charges::Managed for Managed<'_, R> {
 
     fn intend(
         &self,
-        id: &BoxId,
+        id: &hex_api::LearnedHolder,
         scope: charges::Scope,
         end: &hex_api::LearnedEnd,
     ) -> Result<bool, Refusal> {
-        charges::record_last_resort(self.store, id, scope, Some(end))
+        charges::record_last_resort(&self.books.store, id, scope, Some(end))
     }
 }
 
+/// A node's charge learner as it is set ([`Recorded::start_charges`]): the receiver its thread waits on, its window, and
+/// what of the rule it can't hold.
+type Charges = (
+    hex_wait::mpsc::Receiver<()>,
+    Option<std::time::Duration>,
+    Vec<Refusal>,
+);
+
 impl<R: Recover + Send + Sync + 'static> Recorded<R> {
     /// Joint plan step 14 (C1, C4, C5): starts the charge learner of the node's VMs, a thread that runs a window each
-    /// time its window passes, until the node is gone, and says its window and what of the rule it can't hold, typed:
-    /// a managed VM's memory budget, and each kind of VM it books whole for want of its cap's period. Its window is the
-    /// longest of the periods its caps hold over: the platform's for managed VMs (`Recover::charge_window`), their rate's
-    /// for Shards image VMs (`Recover::image_rate_period`); a kind whose period is refused it doesn't learn. Refused,
-    /// typed, where it can take neither: the node runs on, its VMs booked whole, as before.
-    pub fn start_charges(self: &Arc<Self>) -> Result<(std::time::Duration, Vec<Refusal>), Refusal> {
-        let managed = self.runtime.charge_window();
-        let images = self.runtime.image_rate_period();
-        let window = match (&managed, &images) {
-            (Ok(managed), Ok(images)) => (*managed).max(*images),
-            (Ok(managed), Err(_)) => *managed,
-            (Err(_), Ok(images)) => *images,
-            (Err(why), Err(_)) => return Err(why.clone()),
-        };
-        let learns = charges::Learns {
-            managed: managed.is_ok(),
-            images: images.is_ok(),
-        };
-        let learner = charges::Learner::new(window, self.machine()?, learns)?;
-        let mut unheld = Vec::new();
-        unheld
-            .try_reserve_exact(3)
-            .map_err(|_| Refusal::Exhausted {
-                what: "the charge learner's refusals",
-                bound: 3,
-            })?;
-        if learns.managed {
-            unheld.push(learner.unheld().clone());
-        }
-        unheld.extend(managed.err());
-        unheld.extend(images.err());
-        // Nothing is sent on it: the end is its sender's drop, with the node.
-        let (end, ended) = hex_wait::mpsc::sync_channel(1)
-            .map_err(|why| Refusal::os("making the charge learner's end", why))?;
-        self.books
-            .charges
-            .set((Mutex::new(learner), Mutex::new(end)))
-            .map_err(|_| broken("the charge learner is started already"))?;
+    /// time its window passes, until the node is gone, and says its window and what of the rule it can't hold, typed: a
+    /// managed VM's memory budget, or, where the platform's cap derives no cycle (`Recover::cap_cycle`), why its managed
+    /// VMs are learned over their governors' periods alone. Its window is the longest period of the caps it holds,
+    /// re-read each window: each image VM's its run's own (`Recover::image_rate_period`), each governed managed VM's its
+    /// governor's, and each VM its platform's cap holds that cap's cycle at its share. Its first window runs as it
+    /// starts, so what its node holds then (the VMs its recovery took back, its node VM) is read, capped and told at
+    /// once (A-9); holding no cap, it then waits for a box to begin or a node VM to boot (`charges::learn`).
+    pub fn start_charges(
+        self: &Arc<Self>,
+    ) -> Result<(Option<std::time::Duration>, Vec<Refusal>), Refusal> {
+        let (waits, window, unheld) = self.set_charges()?;
         let node = Arc::downgrade(self);
         std::thread::Builder::new()
             .name("hex-charges".to_owned())
             .spawn(move || {
-                loop {
-                    match ended.recv_timeout(window) {
-                        Err(hex_wait::mpsc::RecvTimeoutError::Timeout) => {}
-                        Ok(()) | Err(hex_wait::mpsc::RecvTimeoutError::Disconnected) => return,
-                        Err(hex_wait::mpsc::RecvTimeoutError::Failed(why)) => {
-                            // It can't wait out a window: it says so where its failures are kept, and stops.
-                            if let Some(node) = node.upgrade()
-                                && let Some((learner, _)) = node.books.charges.get()
-                                && let Ok(mut learner) = learner.lock()
-                            {
-                                learner.failed(Refusal::os(
-                                    "waiting out the charge learner's window",
-                                    why,
-                                ));
-                            }
-                            return;
-                        }
-                    }
-                    let Some(node) = node.upgrade() else {
-                        return;
-                    };
-                    node.learn_window();
+                let learned =
+                    charges::learn(&waits, || node.upgrade().map(|node| node.learn_window()));
+                // It can't wait for a window: it says so where its failures are kept, and stops.
+                if let Err(why) = learned
+                    && let Some(node) = node.upgrade()
+                    && let Some((learner, _)) = node.books.charges.get()
+                    && let Ok(mut learner) = learner.lock()
+                {
+                    learner.failed(why);
                 }
             })
             .map_err(|e| Refusal::os("starting the charge learner", e))?;
         Ok((window, unheld))
+    }
+
+    /// The charge learner of the node's VMs, kept where its capacity answers read it ([`Recorded::start_charges`]),
+    /// with the receiver its thread waits on, told each box's beginning ([`Recorded::begun`]), its window and what of the
+    /// rule it can't hold.
+    fn set_charges(&self) -> Result<Charges, Refusal> {
+        // Whether its platform's cap derives a cycle at all, asked at its least.
+        let managed = self.runtime.cap_cycle(self.runtime.managed_least());
+        let mut learner = charges::Learner::new(managed.is_ok(), self.machine()?)?;
+        // What its node's recovery read back from the node VM rows it let go (joint plan step 39, place 1).
+        learner.carry_ended(std::mem::take(
+            &mut *self
+                .books
+                .node_vm_ends
+                .lock()
+                .map_err(|_| broken("the node VM ends' lock was poisoned"))?,
+        ))?;
+        let window = learner.next_window();
+        let mut unheld = Vec::new();
+        unheld
+            .try_reserve_exact(1)
+            .map_err(|_| Refusal::Exhausted {
+                what: "the charge learner's refusals",
+                bound: 1,
+            })?;
+        unheld.push(match managed {
+            Ok(_) => learner.unheld().clone(),
+            Err(why) => why,
+        });
+        // Each box's beginning is told on it ([`Recorded::begun`]); its end is its sender's drop, with the node.
+        let (begun, waits) = hex_wait::mpsc::sync_channel(1)
+            .map_err(|why| Refusal::os("making the charge learner's wake", why))?;
+        self.books
+            .charges
+            .set((Mutex::new(learner), Mutex::new(begun)))
+            .map_err(|_| broken("the charge learner is started already"))?;
+        Ok((waits, window, unheld))
     }
 
     /// The machine's resources, as its facts say them.
@@ -2131,50 +2621,124 @@ impl<R: Recover + Send + Sync + 'static> Recorded<R> {
         Ok(crate::facts::capacity(self.books.store.directory(), self.books.authority_id()?)?.total)
     }
 
-    /// One window of the charge learner (joint plan step 14): the running managed VMs in the node's records, within the
-    /// machine less what its native boxes are capped at (C4: their bookings off the fleet's budget). Its failure is
-    /// kept for the capacity answers.
-    fn learn_window(&self) {
-        let Some((shared, _)) = self.books.charges.get() else {
-            return;
+    /// One window of the charge learner (joint plan step 14): the running managed VMs in the node's records, and its node
+    /// VMs (step 39, place 3), within the machine less what its native boxes are capped at (C4: their bookings off the
+    /// fleet's budget). Its failure is kept for the capacity answers. Answers the window it reads over next.
+    fn learn_window(&self) -> Option<std::time::Duration> {
+        let (shared, _) = self.books.charges.get()?;
+        // Its learner is taken for each pure step and let go while the node's records and VMs are read and its VMs acted
+        // on (A-2), so a capacity answer, which takes it, never waits on a record or a VM.
+        let fail = |why: Refusal| {
+            let mut learner = shared.lock().ok()?;
+            learner.failed(why);
+            learner.next_window()
         };
-        let read = self
-            .books
-            .store
-            .all()
-            .and_then(|records| Ok((records, self.machine()?)));
-        let Ok(mut learner) = shared.lock() else {
-            return;
+        // What the capacity view's holders have reserved, as the node's configuration and its keeper's word say (A-10):
+        // until the keeper of a view that serves its machine has spoken since the node started, its VMs are booked whole,
+        // none learned, told so, and its keeper's word wakes it.
+        let reservations = match self.books.reservations() {
+            Ok(reservations) => reservations,
+            Err(why) => return fail(why),
         };
-        let (records, machine) = match read {
+        let reserved = {
+            let Ok(mut learner) = shared.lock() else {
+                return None;
+            };
+            learner.told_reservations(reservations);
+            match reservations {
+                hex_api::LearnedReservations::Unheard => return learner.next_window(),
+                hex_api::LearnedReservations::Heard { reserved, .. } => reserved,
+                hex_api::LearnedReservations::Unserved => hex_api::CapacityResources::default(),
+            }
+        };
+        // The node's records and node VM rows as its store holds them: pointers, no file read (the review's per-window
+        // reads).
+        let read = self.books.store.snapshot().and_then(|records| {
+            let rows = self.books.store.all_node_vms()?;
+            // Each oci box a node VM's last-resort end ended, retired with it once its run has ended (A-6), off the
+            // learner's lock as every write into a box's record is.
+            charges::retire_with_node_vms(&self.books.store, charges::entries(&records), &rows)?;
+            Ok((records, rows, self.machine()?))
+        });
+        let (records, rows, machine) = match read {
             Ok(read) => read,
-            Err(why) => return learner.failed(why),
+            Err(why) => return fail(why),
         };
-        // The VMs it learns; the rest of the node's boxes off the fleet's budget, native boxes at their caps and VMs of
-        // a kind it doesn't learn whole (C4).
-        let sorted = match charges::sort(records.into_values().flatten(), learner.learns()) {
-            Ok(sorted) => sorted,
-            Err(why) => return learner.failed(why),
+        // What ending its node VM ends: its node's oci boxes, an unreadable record among them (place 3).
+        let band = charges::node_band(charges::entries(&records));
+        // Each record it can't read is counted at its machine and told, never dropped (the review's dropped records).
+        let (records, unreadable) = match charges::readable(&records) {
+            Ok(split) => split,
+            Err(why) => return fail(why),
         };
-        let booked = |dim: fn(&hex_api::CapacityResources) -> u64| {
-            dim(&sorted.native).saturating_add(dim(&sorted.whole))
-        };
-        let budget = hex_api::CapacityResources {
-            cpu_milli: machine.cpu_milli.saturating_sub(booked(|c| c.cpu_milli)),
-            mem_bytes: machine.mem_bytes.saturating_sub(booked(|c| c.mem_bytes)),
-            disk_bytes: machine.disk_bytes,
-        };
-        let running = sorted.learned;
-        // Its outcome is kept as the learner's fault, which the capacity answers read.
         let io = Managed {
             runtime: &self.runtime,
-            store: &self.books.store,
+            books: &self.books,
         };
-        let _ = learner.window(&io, &running, budget, std::time::Instant::now());
+        // Each managed VM it hasn't seen is asked its governor's period first, where the platform has no window (D255).
+        if let Err(why) =
+            charges::boxes(&records).and_then(|holders| charges::govern(shared, &io, &holders))
+        {
+            return fail(why);
+        }
+        // The VMs it learns; the rest of the node's boxes off the fleet's budget, native boxes at their caps and VMs of
+        // a kind it doesn't learn whole (C4).
+        let sorted = {
+            let Ok(learner) = shared.lock() else {
+                return None;
+            };
+            charges::sort(&records, &rows, |holder| learner.learns(holder))
+        };
+        let mut sorted = match sorted {
+            Ok(sorted) => sorted,
+            Err(why) => return fail(why),
+        };
+        // Each node VM that boots, its booking off the fleet's budget until it is Ready and learned (step 39).
+        if let Err(why) = charges::booting(&rows, &band).and_then(|booting| {
+            sorted
+                .booked
+                .try_reserve(booting.len())
+                .map_err(|_| Refusal::Exhausted {
+                    what: "a window's holders",
+                    bound: booting.len(),
+                })?;
+            sorted.booked.extend(booting);
+            Ok(())
+        }) {
+            return fail(why);
+        }
+        // Each node VM that runs, learned as an image VM is, over its run's period (joint plan step 39, place 3).
+        let nodes = charges::nodes(&rows, &band).and_then(|nodes| {
+            sorted
+                .learned
+                .try_reserve(nodes.len())
+                .map_err(|_| Refusal::Exhausted {
+                    what: "a window's VMs",
+                    bound: nodes.len(),
+                })?;
+            Ok(nodes)
+        });
+        match nodes {
+            Ok(nodes) => sorted.learned.extend(nodes),
+            Err(why) => return fail(why),
+        }
+        // Its outcome is kept as the learner's fault, which the capacity answers read.
+        let _ = charges::window(
+            shared,
+            &io,
+            &sorted.learned,
+            unreadable,
+            |held| charges::measured(&io, machine, &sorted.booked, held, reserved),
+            std::time::Instant::now,
+        );
         // Each end the last resort made goes into its box's record (C5), off the learner's lock; a write that fails
         // is kept for the next window and fails this one.
-        let ends = learner.unrecorded();
-        drop(learner);
+        let (next, ends) = {
+            let Ok(mut learner) = shared.lock() else {
+                return None;
+            };
+            (learner.next_window(), learner.unrecorded())
+        };
         let (left, failed) = charges::write_ends(&self.books.store, ends);
         if let Some(why) = failed
             && let Ok(mut learner) = shared.lock()
@@ -2182,6 +2746,7 @@ impl<R: Recover + Send + Sync + 'static> Recorded<R> {
             learner.keep_unrecorded(left);
             learner.failed(why);
         }
+        next
     }
 }
 
@@ -2200,6 +2765,18 @@ impl<P: Recover + 'static> Recorded<hex_runtime::guest::WithGuest<P>> {
             .bind_boot_session(self.books.store.boot().cloned())
     }
 
+    /// The lanes its guest under shards-init admits at once, as this node fitted them with that guest's among its
+    /// descriptors (joint plan step 39): set once, before that guest boots.
+    pub fn set_guest_lanes(&self, lanes: u32) -> Result<(), Refusal> {
+        self.runtime.guest().set_lanes(lanes)
+    }
+
+    /// Boots its guest now, so no create pays a boot: a guest under shards-init, which no shared backing's grant
+    /// boots (joint plan step 39).
+    pub fn boot_guest(&self) -> Result<(), Refusal> {
+        self.runtime.guest().boot()
+    }
+
     /// Publish only the configured shared backing after the complete retained-owner preflight.
     /// This does not boot a VM or sample GPU capacity; Index still owns its later actual grant.
     pub fn prepare_guest_backing(&self) -> Result<hex_api::BackingOffer, Refusal> {
@@ -2216,13 +2793,26 @@ impl<P: Recover + 'static> Recorded<hex_runtime::guest::WithGuest<P>> {
 }
 
 impl Books {
+    /// What the charge learner takes off its fleet's budget for the capacity view's holders now (the review's A-10), as
+    /// the node's configuration and its keeper's latest word say ([`charges::reservations`]).
+    fn reservations(&self) -> Result<hex_api::LearnedReservations, Refusal> {
+        let word = *self
+            .reserved
+            .lock()
+            .map_err(|_| broken("the keeper's word's lock was poisoned"))?;
+        Ok(charges::reservations(
+            self.capacity_view.load(std::sync::atomic::Ordering::SeqCst),
+            word,
+        ))
+    }
+
     /// What a VM class's capacity answer carries of the charge learner (joint plan step 14, C8), fitted to one message:
     /// nothing where no learner runs.
     fn attach_learned(
         &self,
         class: Class,
         capacity: &mut hex_api::Capacity,
-        records: &std::collections::BTreeMap<BoxId, Result<BoxRecord, String>>,
+        records: &crate::store::Snapshot,
     ) -> Result<(), Refusal> {
         let class = match class {
             Class::Shards => hex_sim::model::Class::Shards,
@@ -2232,10 +2822,24 @@ impl Books {
         let Some((learner, _)) = self.charges.get() else {
             return Ok(());
         };
+        // Its node VMs' holdings too, each by its run (joint plan step 39, place 3).
+        let rows = self.store.all_node_vms()?;
+        let band = charges::node_band(charges::entries(records));
+        let nodes = charges::nodes(&rows, &band)?;
+        // Its holders are the records it reads: a box whose record it can't read is told from its last window, counted
+        // at its machine (the review's dropped records).
         learner
             .lock()
             .map_err(|_| broken("the charge learner's lock was poisoned"))?
-            .answer(class, capacity, records.values().flatten())
+            .answer(
+                class,
+                capacity,
+                records
+                    .values()
+                    .filter_map(|record| record.as_ref().as_ref().ok())
+                    .map(charges::Holder::Box)
+                    .chain(nodes),
+            )
     }
 
     /// The same Store identity backs both initialized backend capacities and the native report.
@@ -2296,7 +2900,12 @@ impl Books {
                 project_info(&mut info, &projection(record.spec)?)?;
                 abandoned
             }
-            Some(Err(_)) => return Err(uncertain(&info.id)),
+            Some(Err(why)) => {
+                return Err(uncertain(
+                    &info.id,
+                    &format!("its record can't be read: {why}"),
+                ));
+            }
             None => 0,
         };
         info.abandoned = recorded.saturating_add(self.abandoned.unrecorded(&info.id)?);
@@ -2335,9 +2944,10 @@ impl<R: Recover> Runtime for Recorded<R> {
             .store
             .read_pool(&key.pool)?
             .filter(|record| record.key == *key)
-            .ok_or(Refusal::Backing {
+            .ok_or_else(|| Refusal::Backing {
                 key: *key,
                 cause: hex_api::LifecycleCause::Uncertain,
+                why: Some("its node holds no pool record of it to read usage from".to_owned()),
             })?;
         let mut result = None;
         hex_runtime::devices::Books::with_pool_transaction(
@@ -2383,14 +2993,20 @@ impl<R: Recover> Runtime for Recorded<R> {
                 hex_runtime::devices::Books::physical_devices(self)?,
             )?;
         }
-        let records = self.books.store.all()?;
-        recorded_holders(
-            &mut report,
-            &records,
-            &self.books.store.all_pools()?,
-            self.runtime.device_catalog()?.as_deref(),
-        )?;
-        self.books.attach_learned(class, &mut report, &records)?;
+        // Its devices' holders from a copy of every record, where it offers a device; its learned holders from the
+        // records as the store holds them, no copy.
+        if report.devices.is_empty() {
+            report.check()?;
+        } else {
+            recorded_holders(
+                &mut report,
+                &self.books.store.all()?,
+                &self.books.store.all_pools()?,
+                self.runtime.device_catalog()?.as_deref(),
+            )?;
+        }
+        self.books
+            .attach_learned(class, &mut report, &self.books.store.snapshot()?)?;
         Ok(Some(report))
     }
 
@@ -2403,7 +3019,9 @@ impl<R: Recover> Runtime for Recorded<R> {
     fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
         spec.check()?;
         if self.runtime.owns_records(&spec)? {
-            return self.counted(self.runtime.create(spec)?);
+            let info = self.runtime.create(spec)?;
+            self.begun();
+            return self.counted(info);
         }
         let _lifecycle = self
             .books
@@ -2441,17 +3059,20 @@ impl<R: Recover> Runtime for Recorded<R> {
         // cleanup; keep Creating and its exact claims even when the backend could not publish.
         let info = self.runtime.create(spec)?;
         self.books.store.made(&record)?;
+        self.begun();
         self.counted(info)
     }
 
     fn start(&self, id: &BoxId) -> Result<(), Refusal> {
         let _lifecycle = self.method_turn(id)?;
-        self.runtime_at(id)?.start(id)
+        self.runtime_at(id)?.start(id)?;
+        self.begun();
+        Ok(())
     }
 
-    /// Its runtime's to refuse: none this wraps makes a box for one program's life (macOS's and Windows' refuse a
-    /// run, naming their platform, and an `oci` spec's is refused everywhere; decision 7), so there is no run's box
-    /// to record.
+    /// Its runtime's: macOS's and Windows' `process` classes run the program in a box of its own life, which a thread
+    /// of the run's removes once the program ends (`hex_runtime::run`, decision 7), and an `oci` spec's run is refused
+    /// everywhere. No record is written for the box: it is held in its runtime's memory alone.
     fn run(&self, spec: BoxSpec, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, Refusal> {
         spec.check_no_devices(std::env::consts::OS)?;
         self.runtime.run(spec, program, stdio)
@@ -2483,12 +3104,31 @@ impl<R: Recover> Runtime for Recorded<R> {
         self.counted(self.runtime_at(id)?.inspect(id)?)
     }
 
+    /// The box's runtime answers it, counted as its inspect is (the review's B-6): an image VM's start followed to its
+    /// end, never the trait's inspect at once.
+    fn started(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        self.counted(self.runtime_at(id)?.started(id)?)
+    }
+
     fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
         self.runtime_at(id)?.usage(id)
     }
 
     fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
         self.runtime_at(id)?.member(id, member)
+    }
+
+    fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        self.runtime_at(id)?.mcp(id, member)
+    }
+
+    fn signal_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        signal: Signal,
+    ) -> Result<(), Refusal> {
+        self.runtime_at(id)?.signal_member(id, member, signal)
     }
 
     fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
@@ -2518,15 +3158,50 @@ impl<R: Recover> Runtime for Recorded<R> {
     /// Records the box as being deleted, deletes it, then removes its record: a crash between leaves a
     /// record recovery finishes.
     fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.delete_by(id, |runtime| runtime.delete(id), ())
+    }
+
+    /// Deletes the box as [`Runtime::delete`] does here, its runtime answering its VM's final use (the review's B-6),
+    /// never the trait's plain delete answering none, read as a run that never started; none where its runtime held no
+    /// such box while its record named devices, as the delete finds it gone then.
+    fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<hex_api::HostUse>, Refusal> {
+        self.delete_by(id, |runtime| runtime.delete_with_host_use(id), None)
+    }
+
+    /// The machine's capacity view's word, kept for the charge learner (the review's A-10): the latest keeper's, an older
+    /// keeper's refused, typed; the learner then told, so one waiting for its keeper's first word runs a window now.
+    fn reserved(&self, word: hex_api::Reserved) -> Result<(), Refusal> {
+        charges::keep_word(
+            &mut *self
+                .books
+                .reserved
+                .lock()
+                .map_err(|_| broken("the keeper's word's lock was poisoned"))?,
+            word,
+        )?;
+        self.begun();
+        Ok(())
+    }
+}
+
+impl<R: Recover> Recorded<R> {
+    /// [`Runtime::delete`]'s course, the box's runtime deleting it through `delete`, its answer this call's: `gone`
+    /// where that runtime held no such box while its record named devices.
+    fn delete_by<T>(
+        &self,
+        id: &BoxId,
+        delete: impl FnOnce(&dyn Runtime) -> Result<T, Refusal>,
+        gone: T,
+    ) -> Result<T, Refusal> {
         if let Some(record) = self.books.store.read_lifecycle(id)?
             && self.runtime.owns_records(&record.spec)?
         {
-            self.runtime.runtime_for(&record.spec)?.delete(id)?;
+            let answer = delete(self.runtime.runtime_for(&record.spec)?)?;
             self.books.abandoned.forget(id);
             if let Ok(mut adopted) = self.books.adopted.lock() {
                 adopted.remove(id);
             }
-            return Ok(());
+            return Ok(answer);
         }
         let _lifecycle = self.method_turn(id)?;
         let mut devices = false;
@@ -2535,23 +3210,27 @@ impl<R: Recover> Runtime for Recorded<R> {
             record.phase = Phase::Deleting;
             self.books.store.put(&record)?;
         }
-        match self.runtime_at(id)?.delete(id) {
-            Ok(()) => {}
-            Err(Refusal::NoSuchBox(_)) if devices => {}
+        let answer = match delete(self.runtime_at(id)?) {
+            Ok(answer) => answer,
+            Err(Refusal::NoSuchBox(_)) if devices => gone,
             Err(why) => return Err(why),
-        }
+        };
         self.books.store.remove(id)?;
         self.books.abandoned.forget(id);
         if let Ok(mut adopted) = self.books.adopted.lock() {
             adopted.remove(id);
         }
-        Ok(())
+        Ok(answer)
     }
 }
 
 impl<R: Recover> Host for Recorded<R> {
     fn attach(&self, lp: Arc<dyn Loop>) -> Result<(), Refusal> {
         self.runtime.attach(lp)
+    }
+
+    fn lessors(&self) -> Option<Arc<crate::serve::WireLessors>> {
+        self.wire_lessors.get().cloned()
     }
 
     /// The calls its runtime answers later go there: an inspect's answer counted as any inspect's is
@@ -2674,12 +3353,20 @@ impl Recover for hex_runtime::macos::MacRuntime {
         hex_runtime::macos::MacRuntime::set_managed_rate(self, record, rate)
     }
 
+    fn managed_life(&self, record: &BoxRecord) -> Result<std::time::Duration, Refusal> {
+        hex_runtime::macos::MacRuntime::managed_life(self, started(record)?)
+    }
+
+    fn managed_least(&self) -> u64 {
+        hex_runtime::macos::MacRuntime::managed_least(self)
+    }
+
     fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
         hex_runtime::macos::MacRuntime::stop_managed(self, record)
     }
 
-    fn charge_window(&self) -> Result<std::time::Duration, Refusal> {
-        hex_runtime::macos::MacRuntime::charge_window(self)
+    fn cap_cycle(&self, rate: u64) -> Result<hex_runtime::guest::CapCycle, Refusal> {
+        hex_runtime::macos::MacRuntime::cap_cycle(self, rate)
     }
 
     fn launch_managed(
@@ -2687,7 +3374,7 @@ impl Recover for hex_runtime::macos::MacRuntime {
         record: NativeRecord<'_>,
         plan: &hex_runtime::devices::ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: std::time::Duration,
+        patience: Option<std::time::Duration>,
         publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         hex_runtime::macos::MacRuntime::launch_managed(self, record, plan, io, patience, publish)
@@ -2784,19 +3471,27 @@ impl Recover for hex_runtime::windows::WinRuntime {
         hex_runtime::windows::WinRuntime::set_managed_rate(self, record, rate)
     }
 
+    fn managed_life(&self, record: &BoxRecord) -> Result<std::time::Duration, Refusal> {
+        hex_runtime::windows::WinRuntime::managed_life(self, started(record)?)
+    }
+
+    fn managed_least(&self) -> u64 {
+        hex_runtime::windows::WinRuntime::managed_least(self)
+    }
+
     fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
         hex_runtime::windows::WinRuntime::stop_managed(self, record)
     }
 
-    /// A job's hard cap holds per scheduling interval, whose length Windows doesn't document
-    /// (`JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`), so no window derives from it until it is measured.
-    fn charge_window(&self) -> Result<std::time::Duration, Refusal> {
+    /// A managed VM here is held by its governor over its governor's period (D255; every managed VM is booted
+    /// `--host-managed`), the job's hard cap only its ceiling, so no job's cycle is a window: a VM whose process takes no
+    /// rate is booked whole, told (ROOT, 2026-11-13).
+    fn cap_cycle(&self, rate: u64) -> Result<hex_runtime::guest::CapCycle, Refusal> {
+        let _ = rate;
         Err(Refusal::Platform {
-            what: "the charge learner's window",
+            what: "a managed VM's cap's cycle",
             platform: "windows",
-            why: "a job's CPU hard cap holds per scheduling interval, whose length Windows doesn't document \
-                  (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION): the window waits on its measurement on the host"
-                .to_owned(),
+            why: "a managed VM is held by its governor's period; a VM with no governor is booked whole".to_owned(),
         })
     }
 
@@ -2805,7 +3500,7 @@ impl Recover for hex_runtime::windows::WinRuntime {
         record: NativeRecord<'_>,
         plan: &hex_runtime::devices::ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: std::time::Duration,
+        patience: Option<std::time::Duration>,
         publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         hex_runtime::windows::WinRuntime::launch_managed(self, record, plan, io, patience, publish)
@@ -2885,7 +3580,9 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
                 pool.execution,
                 hex_api::Execution::ShardsShared | hex_api::Execution::ShardsDedicated
             ) {
-                return Err(NativeRecord::Pool(pool).refusal(hex_api::LifecycleCause::Uncertain));
+                return Err(NativeRecord::Pool(pool).uncertain(
+                    "its pool's execution isn't a Shards backing's, which its routes project",
+                ));
             }
         }
         if introduced.is_some_and(|(execution, _)| {
@@ -2944,9 +3641,9 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
             let record = records
                 .get(&id)
                 .and_then(|record| record.as_ref().ok())
-                .ok_or_else(|| uncertain(&id))?;
+                .ok_or_else(|| uncertain(&id, "its record can't be read"))?;
             if self.route_for(&record.spec)? != hex_runtime::guest::Side::Guest {
-                return Err(uncertain(&id));
+                return Err(uncertain(&id, "its record routes it outside the guest"));
             }
         }
         Ok(())
@@ -2973,6 +3670,38 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
         self.host().managed_usage(record)
     }
 
+    /// D255: the box's managed VM is booted in its guest runtime, whose governor ask it is.
+    fn managed_rate(
+        &self,
+        record: &BoxRecord,
+        rate: u64,
+    ) -> Result<hex_runtime::guest::ManagedRate, Refusal> {
+        self.guest().managed_rate(record, rate)
+    }
+
+    fn managed_rate_period(
+        &self,
+        record: &BoxRecord,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        self.guest().managed_rate_period(record)
+    }
+
+    /// D260: the box's managed VM is booted in its guest runtime, whose use ask it is.
+    fn managed_guest_time(
+        &self,
+        record: &BoxRecord,
+    ) -> Result<hex_runtime::guest::ManagedGuestTime, Refusal> {
+        self.guest().managed_guest_time(record)
+    }
+
+    fn managed_life(&self, record: &BoxRecord) -> Result<std::time::Duration, Refusal> {
+        self.host().managed_life(record)
+    }
+
+    fn managed_least(&self) -> u64 {
+        self.host().managed_least()
+    }
+
     fn set_managed_rate(&self, record: NativeRecord<'_>, rate: u64) -> Result<(), Refusal> {
         self.host().set_managed_rate(record, rate)
     }
@@ -2981,8 +3710,49 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
         self.host().stop_managed(record)
     }
 
-    fn charge_window(&self) -> Result<std::time::Duration, Refusal> {
-        self.host().charge_window()
+    fn cap_cycle(&self, rate: u64) -> Result<hex_runtime::guest::CapCycle, Refusal> {
+        self.host().cap_cycle(rate)
+    }
+
+    /// Joint plan step 14 (C1): an image VM's rate period is its run's, which its guest runtime reads (D247): its last
+    /// rate's answer's, none before its first (Shards' image channel v31).
+    fn image_rate_period(
+        &self,
+        record: &BoxRecord,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        self.guest().rate_period(&record.spec.id)
+    }
+
+    /// Joint plan step 39 (place 3): its node VM's host use, through its guest runtime's image class (D241).
+    fn node_vm_host_use(&self, run: hex_api::NodeRun) -> Result<hex_api::HostUse, Refusal> {
+        self.guest().node_vm_host_use(run)
+    }
+
+    /// Joint plan step 39 (place 3): its node VM's run's rate period (D247), none before its first rate's answer.
+    fn node_vm_rate_period(
+        &self,
+        run: hex_api::NodeRun,
+    ) -> Result<Option<std::time::Duration>, Refusal> {
+        self.guest().node_vm_rate_period(run)
+    }
+
+    /// Joint plan step 39 (place 3): its node VM held through its run's rate (D247).
+    fn node_vm_rate(
+        &self,
+        run: hex_api::NodeRun,
+        rate: Option<std::num::NonZeroU64>,
+    ) -> Result<Option<std::num::NonZeroU64>, Refusal> {
+        self.guest().node_vm_rate(run, rate)
+    }
+
+    /// Joint plan step 39 (place 3): its node VM's run stopped, its end kept in its row.
+    fn stop_node_vm(&self, run: hex_api::NodeRun) -> Result<(), Refusal> {
+        self.guest().stop_node_vm(run)
+    }
+
+    /// Joint plan step 39: its node VM's guest told its room through its run (D188).
+    fn node_vm_room(&self, run: hex_api::NodeRun, room: i64) -> Result<(), Refusal> {
+        self.guest().node_vm_room(run, room)
     }
 
     fn launch_managed(
@@ -2990,7 +3760,7 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
         record: NativeRecord<'_>,
         plan: &hex_runtime::devices::ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: std::time::Duration,
+        patience: Option<std::time::Duration>,
         publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         self.host()
@@ -3189,6 +3959,9 @@ fn forward_guest(
         Call::Signal { id, .. } | Call::Exec { id, .. } | Call::ExecStreams { id, .. } => id,
         _ => return Forward::Back(Box::new((call, stdio))),
     };
+    // HEX-RT-17: a Windows node hands its caller handles alone, never sockets, so it offers an exec's streams to the
+    // caller to open itself, where its guest's link lends the VM's identity; a node VM's lanes lend none, and their
+    // exec's streams are made here on pipes whose ends it hands on (the review's D-10).
     let offer = cfg!(windows)
         && matches!(&call, Call::Exec { .. } | Call::ExecStreams { .. })
         && (stdio.ask.stdin
@@ -3197,19 +3970,14 @@ fn forward_guest(
             || stdio.stdin.is_some()
             || stdio.stdout.is_some()
             || stdio.stderr.is_some());
-    let connected = if offer {
-        guest.program_client_for(id)
-    } else {
-        guest.evented_for(id)
-    };
-    let client = match connected {
-        Ok(Some(client)) => client,
+    let client = match guest.exec_client_for(id, offer) {
+        Ok(Some(hex_runtime::guest::ExecClient::Offered(client))) => client,
+        Ok(Some(hex_runtime::guest::ExecClient::Evented(client))) => {
+            return forward_evented(client, call, stdio, reply, ended);
+        }
         Ok(None) => return Forward::Refused(Refusal::NoSuchBox(id.clone())),
         Err(why) => return Forward::Refused(why),
     };
-    if !offer {
-        return forward_evented(client, call, stdio, reply, ended);
-    }
     let (call, stdio) = match guest_call(call, stdio) {
         Ok(prepared) => prepared,
         Err(why) => return Forward::Refused(why),
@@ -3404,6 +4172,12 @@ mod route_projection_tests;
 #[cfg(test)]
 mod shared_outer_original_tests;
 
+#[cfg(test)]
+mod answers_tests;
+
+#[cfg(test)]
+mod image_turn_tests;
+
 #[cfg(all(test, target_os = "macos"))]
 mod macos_unsubmitted_tests {
     use super::*;
@@ -3436,7 +4210,6 @@ mod macos_unsubmitted_tests {
                 dir.join("hex"),
                 dir.join("helper.sock"),
                 dir.join("helper.receipt"),
-                std::time::Duration::from_secs(1),
             )
             .unwrap(),
         )
@@ -3538,7 +4311,7 @@ mod macos_unsubmitted_tests {
             .unwrap();
         assert!(matches!(
             Recover::preflight_unsubmitted(&native, &record),
-            Err(Refusal::Lifecycle { id, cause: LifecycleCause::Uncertain }) if id == record.spec.id
+            Err(Refusal::Lifecycle { id, cause: LifecycleCause::Uncertain, .. }) if id == record.spec.id
         ));
         assert_eq!(native.list().unwrap().len(), 1, "the check removed nothing");
         native.delete(&record.spec.id).unwrap();

@@ -177,11 +177,15 @@ impl Journal {
     /// The history the home's settings give, a log's where they do not read (said where
     /// a run's start reads them: D186).
     fn retention_now(&self) -> crate::spec::LogRetention {
+        let unit = self
+            .home
+            .as_ref()
+            .and_then(|h| shards_vmm::platform::allocation_unit(h).ok());
         self.home
             .as_ref()
             .and_then(|h| crate::disk::read(h).ok())
             .unwrap_or_default()
-            .events_retention()
+            .events_retention(unit)
     }
 
     /// Where it ends now.
@@ -734,9 +738,8 @@ impl<D: crate::containers::Disk> Daemon<D> {
                     let heard = match until {
                         Some(u) => {
                             let left = u.saturating_sub(crate::spec::now() as i128).max(0);
-                            match from
-                                .recv_timeout(Duration::from_nanos(u64::try_from(left).unwrap_or(u64::MAX)))
-                            {
+                            let left = Duration::from_nanos(u64::try_from(left).unwrap_or(u64::MAX));
+                            match super::timed(Some(left), || from.recv_timeout(left)) {
                                 Ok(h) => h,
                                 Err(_) => break,
                             }

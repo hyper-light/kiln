@@ -14,7 +14,7 @@ use hex_api::{BoxId, BoxInfo, BoxSpec, Proc, Program, Refusal, Runtime, Signal, 
 use hex_core::patience::Patience;
 use hex_sim::index::Pick;
 use hex_sim::model::{Class, NodeId, NodeSpec};
-use hex_sim::peer::{Budget, Msg};
+use hex_sim::peer::{self, Budget, Msg};
 use hex_testkit::waits::follow::{self, Party};
 
 use super::tests::{cpu, demand_of, four_cpus, holding, quiesce, started, talk};
@@ -24,7 +24,6 @@ use crate::placement::{Driver, Envelope, Notice, Runtimes, Step};
 // alone (decision 9), so past the slowest answer seen the wait goes on, and ends with the fact or that thread's end.
 static PARKED: Patience = Patience::measuring("test.hex_node.capacity_race.parked");
 static LET_ON: Patience = Patience::measuring("test.hex_node.capacity_race.let_on");
-static ENDED: Patience = Patience::measuring("test.hex_node.capacity_race.ended");
 
 /// The seam: once armed, the next `classes` call says it is there and waits for the test's word.
 #[derive(Default)]
@@ -45,11 +44,19 @@ impl Runtime for Gated {
     fn classes(&self) -> Vec<hex_api::Class> {
         if self.gate.armed.swap(false, Ordering::SeqCst) {
             self.gate.parked.store(true, Ordering::SeqCst);
-            // The test's thread gives the word once its own word on the view is said.
+            // The test's thread gives the word once its own word on the view is said: by the life of the test's hold on
+            // the gate, its end letting the gate's other count go. A look: the gate is the test's own word, with no
+            // event of its own.
             follow::until(
                 &LET_ON,
                 "the test's word to go on",
-                || Party::Live,
+                || {
+                    if Arc::strong_count(&self.gate) > 1 {
+                        Party::Live
+                    } else {
+                        Party::Ended
+                    }
+                },
                 || self.gate.open.load(Ordering::SeqCst),
             )
             .unwrap();
@@ -154,10 +161,7 @@ fn raced(driver: &Arc<Driver>, gate: &Gate, start: Envelope, word: impl FnOnce()
     .unwrap();
     word();
     gate.open.store(true, Ordering::SeqCst);
-    follow::until(&ENDED, "the admission's end", admitting, || {
-        admission.is_finished()
-    })
-    .unwrap();
+    // Its end, waited for on the thread's own end.
     let step = admission.join().unwrap().unwrap();
     quiesce(driver, step)
 }
@@ -245,7 +249,12 @@ fn a_rebook_past_the_room_inside_an_admission_leaves_it_refused() {
     let (d, p) = demand_of(1500);
     let (_, step) = driver.submit(d, p).unwrap();
     let notices = raced(&driver, &gate, start_of(step), || {
-        assert_eq!(driver.rebook(&[(vm, holding(5000))]).unwrap(), 1);
+        assert_eq!(
+            driver
+                .rebook(&[(peer::Holder::Box(vm), holding(5000))])
+                .unwrap(),
+            1
+        );
     });
     assert!(
         !started(&notices),

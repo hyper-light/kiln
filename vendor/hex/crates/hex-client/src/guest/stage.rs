@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use hex_api::{BoxId, Refusal};
 use hex_core::bundle::MAX_LAYERS;
-use hex_core::patience::Patience;
+use hex_core::patience::{Patience, Piece};
 use hex_core::stream::Deframer;
 use hex_core::stream::files::{self, Entry, Limits, Meta, Mtime, Op, What, Xattr};
 use hex_core::wire::{self, Answer, Received};
@@ -81,7 +81,13 @@ impl Staging<'_> {
         if began.elapsed() < window {
             return Ok(());
         }
-        self.wait.ran_out(window);
+        self.wait.ran_out(
+            window,
+            began.elapsed(),
+            &[Piece::Kind(
+                "the guest's relay, staging files on its connection",
+            )],
+        );
         self.window = None;
         self.armed = false;
         self.arm()

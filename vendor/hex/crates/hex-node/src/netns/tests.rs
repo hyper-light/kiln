@@ -289,6 +289,30 @@ fn a_node_at_its_fitted_bounds_counts_every_program_place_within_its_hard_limit(
     }
 }
 
+/// ROOT's one accounting of 2026-11-13 (joint plan step 39): a node whose guest runtime holds a node VM under
+/// shards-init counts that VM's lanes among its own, each the descriptors `hex_client::guest::lanes` counts for it (its
+/// socket pair's two ends), with its controller's two, fitted to its hard limit with every other bound. Do: fit a root node's pools on fedora's figures, 40 held
+/// beside, to a guest's 4,096 and to 65,536, hosting one VM and two. Expect: its own counts the hosted term at its
+/// fitted places (`serve::fit::hosted_descriptors`), within the limit; two VMs fit no more places than one.
+#[test]
+fn a_node_hosting_vms_counts_their_lanes_within_its_hard_limit() {
+    let beside = 40;
+    for hard in [4_096, 65_536] {
+        let one = fit(root_pools().hosting(1), hard, beside).unwrap();
+        let places = crate::serve::limits(&one.sizes.platform()).programs;
+        let none = Pools { hosted: 0, ..one };
+        assert_eq!(
+            descriptors_of_the_node(one, beside) - descriptors_of_the_node(none, beside),
+            crate::serve::fit::hosted_descriptors(1, places),
+            "at {hard}"
+        );
+        assert!(descriptors_of_the_node(one, beside) <= hard, "at {hard}");
+        let two = fit(root_pools().hosting(2), hard, beside).unwrap();
+        assert!(descriptors_of_the_node(two, beside) <= hard, "at {hard}");
+        assert!(two.sizes.inits <= one.sizes.inits, "at {hard}");
+    }
+}
+
 /// A root node's pools on the bench host.
 fn root_pools() -> Pools {
     Pools::root(bench(), files_ahead())
@@ -631,6 +655,7 @@ fn the_files_bound_counts_the_namespaces_both_pools_make_ahead() {
                 sizes: bench(),
                 files_ahead: files_ahead(),
                 vms: false,
+                hosted: 0,
             },
             beside,
         )
@@ -687,6 +712,7 @@ fn the_files_bound_counts_the_namespaces_both_pools_make_ahead() {
             sizes: bench(),
             files_ahead: files_ahead(),
             vms: false,
+            hosted: 0,
         }),
         10,
         "what the limit leaves past the pools, four a namespace"

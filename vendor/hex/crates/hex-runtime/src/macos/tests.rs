@@ -19,6 +19,7 @@ use hex_api::{
     Stdio,
 };
 use hex_core::helper::START_FDS;
+use hex_core::helper::managed::response::Estimate;
 
 use super::MacRuntime;
 use super::helper_daemon::{self, Daemon, Member, Privileged};
@@ -90,6 +91,11 @@ impl Privileged for Sim {
 
     fn list(&self, _uid: u32) -> io::Result<Vec<Member>> {
         Ok(self.inner.lock().expect("sim lock").members.clone())
+    }
+
+    /// The stand-in's user is empty once its KILL has cleared its members.
+    fn empties_within(&self, _uid: u32, _slice: Duration) -> Result<bool, Refusal> {
+        Ok(self.inner.lock().expect("sim lock").members.is_empty())
     }
 
     fn kill(&self, _uid: u32, signal: i32) -> io::Result<usize> {
@@ -197,7 +203,10 @@ fn box_user_mode_routes_through_the_helper() {
 
 /// A backend whose programs are real but children of a shell of their own, never of this process: as a
 /// box-user program is the root helper's child, not the node's. Each spawn starts
-/// `sh -c '"$@" & echo $!; wait $!; echo $?'`, reads the program's pid, and a thread reads its status.
+/// `sh -c 'exec 3<&0; "$@" <&3 3<&- & exec 3<&-; echo $!; wait $!; echo $?'`, reads the program's pid, and a thread
+/// reads its status. The program's stdin is the one the node passed, redirected by name: a shell gives a program it
+/// starts in the background with no stdin of its own the null device (POSIX's asynchronous lists, without job
+/// control).
 #[derive(Default)]
 struct Shells {
     ends: Mutex<BTreeMap<i32, mpsc::Receiver<Exit>>>,
@@ -274,7 +283,7 @@ impl Privileged for Shells {
         let mut shell: Child = Command::new("/bin/sh")
             .args([
                 "-c",
-                "\"$@\" >/dev/null 2>&1 & echo $!; wait $!; echo $?",
+                "exec 3<&0; \"$@\" <&3 3<&- >/dev/null 2>&1 & exec 3<&-; echo $!; wait $!; echo $?",
                 "sh",
             ])
             .args(&program.args)
@@ -352,6 +361,11 @@ impl Privileged for Shells {
 
     fn kill(&self, _uid: u32, _signal: i32) -> io::Result<usize> {
         Ok(0)
+    }
+
+    /// The stand-in's programs aren't its user's (they run as this test's), so its user holds none: as its listing.
+    fn empties_within(&self, _uid: u32, _slice: Duration) -> Result<bool, Refusal> {
+        Ok(true)
     }
 }
 
@@ -990,4 +1004,495 @@ fn a_process_box_bounded_where_macos_holds_no_bound_is_refused_typed() {
     }
     drop((rootless, helped));
     drop(server);
+}
+
+/// Joint plan step 14 (D260; AC-T7.4.1): a process's life runs from its start, as `proc_pid_rusage` reads it, to now on
+/// the same clock. Do take this test process's start; note the time since this test began; read its life, then again;
+/// then read the life of a start past every now. Expect its life at least the time the test had run (the process began
+/// before it), no more than the machine has been up, never less on its second read; and the start past now refused,
+/// typed.
+#[test]
+fn w14_d260_a_process_life_runs_from_its_start_to_now_on_one_clock() {
+    let began = std::time::Instant::now();
+    let pid = i32::try_from(std::process::id()).unwrap();
+    let started = super::sys::rusage(pid).unwrap().unwrap().started;
+    let ran = began.elapsed();
+    let life = super::process_life(started).unwrap();
+    assert!(life >= ran, "{life:?} against {ran:?}");
+    assert!(life <= super::sys::uptime_raw().unwrap(), "{life:?}");
+    assert!(super::process_life(started).unwrap() >= life);
+    assert!(matches!(
+        super::process_life(u64::MAX),
+        Err(Refusal::Invalid {
+            what: "a process's start",
+            ..
+        })
+    ));
+}
+
+/// Joint plan step 14 (C1; ROOT, 2026-11-13; AC-T7.4.1): the managed control's cycle at a rate is its run and its hold at
+/// that rate at the stop response its helper learned, the longer the lower the rate. Do take the cycle of a control whose
+/// helper learned a 1 ms response at a thousandth of a CPU and at a CPU. Expect each its control's own run and hold at
+/// that rate, the first the longer.
+#[test]
+fn w14_the_controls_cycle_at_a_rate_is_its_run_and_hold_there() {
+    let ceiling = super::cpu_ceiling().unwrap();
+    let response = Duration::from_millis(1);
+    let estimate = Some(Estimate {
+        response,
+        cold: false,
+    });
+    let at = |rate| {
+        let (run, hold) = super::cpu::cycle(rate, ceiling, response).unwrap();
+        run + hold
+    };
+    assert_eq!(
+        super::cycle_of(1, ceiling, estimate).unwrap(),
+        crate::guest::CapCycle::Of(at(1))
+    );
+    assert_eq!(
+        super::cycle_of(1_000, ceiling, estimate).unwrap(),
+        crate::guest::CapCycle::Of(at(1_000))
+    );
+    assert!(at(1) > at(1_000));
+}
+
+/// The review's A-14 (ROOT, 2026-11-14; AC-T7.4.1): a cycle at a cold estimate of the control's stop response, the
+/// slowest of too few holds to have seen their p99.9 (or an older helper's slowest seen), is used, and told cold. Do take
+/// the cycle at a thousandth of a CPU at a cold 1 ms estimate and at a settled one. Expect both the control's run and
+/// hold at 1 ms, the cold one saying why, the settled one plain.
+#[test]
+fn a14_a_cycle_at_a_cold_estimate_is_used_and_told_cold() {
+    let ceiling = super::cpu_ceiling().unwrap();
+    let response = Duration::from_millis(1);
+    let (run, hold) = super::cpu::cycle(1, ceiling, response).unwrap();
+    let cold = super::cycle_of(
+        1,
+        ceiling,
+        Some(Estimate {
+            response,
+            cold: true,
+        }),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            &cold,
+            crate::guest::CapCycle::ColdOf { cycle, why }
+                if *cycle == run + hold && why.contains("slowest stop")
+        ),
+        "{cold:?}"
+    );
+    assert_eq!(
+        super::cycle_of(
+            1,
+            ceiling,
+            Some(Estimate {
+                response,
+                cold: false,
+            }),
+        )
+        .unwrap(),
+        crate::guest::CapCycle::Of(run + hold)
+    );
+}
+
+/// The review's A-14 (2c-4b; ROOT, 2026-11-13: no record seeds, a cold start told): the node's control takes its cycle
+/// from its helper's learned stop response, never a number its node configured, so before its helper has measured a
+/// stop, or with no helper running, its cycle is cold, told. Do make a runtime whose control its node configured cold, as
+/// it sends it, with no managed helper, and take its cycle at a thousandth of a CPU and at its ceiling. Expect the first
+/// cold, naming its helper's measurement, and the second never.
+#[test]
+fn w14_2c4b_a_control_whose_helper_measured_no_stop_has_a_cold_cycle() {
+    let model = super::machine_model().unwrap();
+    let rates = hex_core::watch::seed(&model);
+    let runtime = MacRuntime::new(
+        rates.bytes,
+        rates.processes,
+        hex_core::watch::lateness_seed(&model),
+    )
+    .unwrap()
+    .with_cpu_control(super::CpuControl::cold([7; 32]))
+    .unwrap();
+    let (_, ceiling) = runtime.cpu_control.unwrap();
+    assert!(
+        matches!(
+            runtime.cap_cycle(1).unwrap(),
+            crate::guest::CapCycle::Cold(why) if why.contains("managed helper")
+        ),
+        "a cycle cold until its helper measures a stop"
+    );
+    assert_eq!(
+        runtime.cap_cycle(ceiling).unwrap(),
+        crate::guest::CapCycle::Never
+    );
+}
+
+/// The run's thread's stop at the hold on its box (the review's E-11): a fact no recorded operation makes, waited for
+/// measuring, following the run's thread (`hex_testkit::waits::follow`).
+static RUN_STOPPED: hex_core::patience::Patience =
+    hex_core::patience::Patience::measuring("test.hex_runtime.run_stopped_at_hold");
+/// A delete's wait on the word of the run's thread removing the box, or its answer beside it, following the delete.
+static RUN_BESIDE: hex_core::patience::Patience =
+    hex_core::patience::Patience::measuring("test.hex_runtime.delete_beside_run_removal");
+
+/// A process box of the default bounds.
+fn run_spec(id: &BoxId) -> BoxSpec {
+    BoxSpec {
+        route: None,
+        allocation: None,
+        devices: Vec::new(),
+        id: id.clone(),
+        bounds: Bounds::default(),
+        class: ClassSpec::Process,
+        owner: None,
+        band: 0,
+    }
+}
+
+/// A program that runs until it is ended or its stdin closes (the test's end among them): a fact, never a delay.
+fn until_ended() -> Program {
+    Program::of(&["/bin/cat"])
+}
+
+/// Its stdin a pipe the runtime makes, whose end the caller holds ([`Proc::streams`]).
+fn fed() -> Stdio {
+    Stdio {
+        ask: hex_api::Ask {
+            stdin: true,
+            ..hex_api::Ask::default()
+        },
+        ..Stdio::null()
+    }
+}
+
+/// A rootless runtime at this Mac's model's pacing.
+fn rootless() -> MacRuntime {
+    let model = super::machine_model().expect("this Mac's model");
+    let rates = hex_core::watch::seed(&model);
+    MacRuntime::new(
+        rates.bytes,
+        rates.processes,
+        hex_core::watch::lateness_seed(&model),
+    )
+    .expect("a rootless runtime")
+}
+
+/// A box-user runtime whose helper's backend is [`Shells`] on a socket in `dir`, with two pool users.
+fn helped(dir: &std::path::Path) -> MacRuntime {
+    let sock = dir.join("helper.sock");
+    let listener = helper_daemon::bind(&sock).expect("bind the helper socket");
+    thread::spawn(move || {
+        let daemon = Daemon::new(Shells::default(), vec![7000, 7001], 64);
+        let _ = daemon.serve_listener(listener.as_fd());
+    });
+    MacRuntime::detect(
+        NonZeroU64::new(1 << 40).unwrap(),
+        NonZeroU64::new(1_000_000).unwrap(),
+        hex_core::watch::lateness_seed(&super::machine_model().expect("this Mac's model")),
+        &sock,
+    )
+    .expect("a box-user runtime")
+}
+
+/// Ends a box-user run's program as its helper would: [`Shells`]' own kill is a stand-in's no-op.
+fn kill_by_pid(run: &mut dyn Proc) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(run.pid()).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+}
+
+/// Ends a rootless run's program through its box's KILL.
+fn kill_by_run(run: &mut dyn Proc) {
+    run.kill().unwrap();
+}
+
+/// The review's E-11 (runtime goal 7, decision 7), AC-T7.4.1: a run's late removal never takes a later box of its id.
+/// Do: hold run box `name`'s thread once its program has ended; run a program in it until it is ended, and end it
+/// (`end`); once the run's thread has stopped at the hold, delete the box, make it again and start a program in it;
+/// let the run's thread go and take its end. Expect: the run ends Signal(9); the later box stands and its program
+/// runs on.
+fn a_runs_late_removal_leaves_a_later_box(rt: &MacRuntime, name: &str, end: fn(&mut dyn Proc)) {
+    let id = BoxId::new(name).unwrap();
+    let held = crate::run::hold::hold(&id, crate::run::hold::At::End);
+    let mut run = rt
+        .run(run_spec(&id), until_ended(), fed())
+        .expect("run a program until it is ended");
+    let _feeding = run.streams().unwrap().stdin;
+    end(&mut *run);
+    hex_testkit::waits::follow::until(
+        &RUN_STOPPED,
+        "the run's thread at the hold, its program ended",
+        || held.thread(),
+        || held.stopped(),
+    )
+    .unwrap();
+    rt.delete(&id).expect("delete the run's box");
+    rt.create(run_spec(&id)).expect("make the box again");
+    let mut later = rt
+        .exec(&id, until_ended(), fed())
+        .expect("start a program in the later box");
+    let _feeding_later = later.streams().unwrap().stdin;
+    drop(held);
+    assert_eq!(
+        hex_api::conformance::end_of(&mut *run),
+        Ok(Exit::Signal(9)),
+        "the run's end"
+    );
+    assert!(
+        rt.inspect(&id).is_ok(),
+        "the run's late removal took the later box of its id: {:?}",
+        rt.inspect(&id)
+    );
+    assert_eq!(
+        later.try_wait(),
+        Ok(None),
+        "the run's late removal ended the later box's program"
+    );
+    end(&mut *later);
+    rt.delete(&id).expect("delete the later box");
+}
+
+/// The review's E-11 (runtime goal 7), AC-T7.4.1: a delete of a run's box that its program's end is removing answers as
+/// that removal does, never beside it. Do: hold run box `name`'s thread once it has claimed the box's removal; run a
+/// program in it until it is ended, and end it (`end`); once the run's thread has stopped at the hold, delete the box
+/// from another thread; once that delete waits on the removal or answers, let the removal go. Expect: the delete waits
+/// rather than answer while the removal is under way, then answers Ok; the run ends Signal(9); and the box is gone.
+fn a_delete_beside_a_runs_removal_waits_for_its_word(
+    rt: &MacRuntime,
+    name: &str,
+    end: fn(&mut dyn Proc),
+) {
+    let id = BoxId::new(name).unwrap();
+    let held = crate::run::hold::hold(&id, crate::run::hold::At::Removal);
+    let mut run = rt
+        .run(run_spec(&id), until_ended(), fed())
+        .expect("run a program until it is ended");
+    let _feeding = run.streams().unwrap().stdin;
+    end(&mut *run);
+    hex_testkit::waits::follow::until(
+        &RUN_STOPPED,
+        "the run's thread at the hold, its removal claimed",
+        || held.thread(),
+        || held.stopped(),
+    )
+    .unwrap();
+    thread::scope(|s| {
+        let deleting = s.spawn(|| rt.delete(&id));
+        hex_testkit::waits::follow::until(
+            &RUN_BESIDE,
+            "the delete's wait on the run's removal, or its answer",
+            || {
+                if deleting.is_finished() {
+                    hex_core::patience::Party::Ended
+                } else {
+                    hex_core::patience::Party::Live
+                }
+            },
+            || held.waiting() == 1 || deleting.is_finished(),
+        )
+        .unwrap();
+        assert!(
+            !deleting.is_finished(),
+            "the delete answered beside the run's removal under way"
+        );
+        drop(held);
+        assert_eq!(
+            deleting.join().unwrap(),
+            Ok(()),
+            "the delete once the removal went"
+        );
+    });
+    assert_eq!(hex_api::conformance::end_of(&mut *run), Ok(Exit::Signal(9)));
+    assert!(matches!(rt.inspect(&id), Err(Refusal::NoSuchBox(_))));
+}
+
+/// A thread's handle as a party: live until it has finished.
+fn party<T>(thread: &thread::ScopedJoinHandle<'_, T>) -> hex_core::patience::Party {
+    if thread.is_finished() {
+        hex_core::patience::Party::Ended
+    } else {
+        hex_core::patience::Party::Live
+    }
+}
+
+/// The review's E-11 (runtime goal 7), AC-T7.4.1: a delete of a run's box while the run is making it waits for the box
+/// to be made whole and its program watched, then takes it, as a delete on Linux waits on the run's create turn. Do:
+/// hold run box `name`'s setup once its box is made and its program started, before the program's watch starts; run a
+/// program in it until it is ended, from another thread; once the setup has stopped at the hold, delete the box from
+/// another thread; once that delete waits on the setup or answers, let the setup go; then end the run's program
+/// (`end`). Expect: the delete waits rather than answer while the box is being made, then answers Ok; the run ends as
+/// its mode tells a program whose box a delete took (`ends`); and the box is gone.
+fn a_delete_of_a_run_being_made_waits_for_its_making(
+    rt: &MacRuntime,
+    name: &str,
+    end: fn(&mut dyn Proc),
+    ends: Exit,
+) {
+    let id = BoxId::new(name).unwrap();
+    let held = crate::run::hold::hold(&id, crate::run::hold::At::Making);
+    thread::scope(|s| {
+        let running = s.spawn(|| rt.run(run_spec(&id), until_ended(), fed()));
+        hex_testkit::waits::follow::until(
+            &RUN_STOPPED,
+            "the run's setup at the hold, its box made",
+            || party(&running),
+            || held.stopped(),
+        )
+        .unwrap();
+        let deleting = s.spawn(|| rt.delete(&id));
+        hex_testkit::waits::follow::until(
+            &RUN_BESIDE,
+            "the delete's wait on the run's making, or its answer",
+            || party(&deleting),
+            || held.waiting() == 1 || deleting.is_finished(),
+        )
+        .unwrap();
+        assert!(
+            !deleting.is_finished(),
+            "the delete answered beside the run's making"
+        );
+        drop(held);
+        let mut run = running.join().unwrap().expect("the run, once made");
+        let _feeding = run.streams().unwrap().stdin;
+        assert_eq!(
+            deleting.join().unwrap(),
+            Ok(()),
+            "the delete once the run was made"
+        );
+        end(&mut *run);
+        assert_eq!(hex_api::conformance::end_of(&mut *run), Ok(ends));
+    });
+    assert!(matches!(rt.inspect(&id), Err(Refusal::NoSuchBox(_))));
+}
+
+/// E-11 in the rootless process-group mode (step 1).
+#[test]
+fn e11_a_rootless_runs_late_removal_leaves_a_later_box_of_its_id() {
+    a_runs_late_removal_leaves_a_later_box(&rootless(), "e11-late-rootless", kill_by_run);
+}
+
+/// E-11 in the box-user mode (step 2), through a daemon on a real socket.
+#[test]
+fn e11_a_box_user_runs_late_removal_leaves_a_later_box_of_its_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    a_runs_late_removal_leaves_a_later_box(&helped(dir.path()), "e11-late-helped", kill_by_pid);
+}
+
+/// E-11 in the rootless process-group mode (step 1).
+#[test]
+fn e11_a_rootless_delete_beside_a_runs_removal_waits_for_its_word() {
+    a_delete_beside_a_runs_removal_waits_for_its_word(
+        &rootless(),
+        "e11-beside-rootless",
+        kill_by_run,
+    );
+}
+
+/// E-11 in the box-user mode (step 2), through a daemon on a real socket.
+#[test]
+fn e11_a_box_user_delete_beside_a_runs_removal_waits_for_its_word() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    a_delete_beside_a_runs_removal_waits_for_its_word(
+        &helped(dir.path()),
+        "e11-beside-helped",
+        kill_by_pid,
+    );
+}
+
+/// E-11 in the rootless process-group mode (step 1): the delete's KILL ends the run's program, Signal(9).
+#[test]
+fn e11_a_rootless_delete_of_a_run_being_made_waits_for_its_making() {
+    a_delete_of_a_run_being_made_waits_for_its_making(
+        &rootless(),
+        "e11-making-rootless",
+        kill_by_run,
+        Exit::Signal(9),
+    );
+}
+
+/// E-11 in the box-user mode (step 2), through a daemon on a real socket: the helper keeps a dropped box's programs
+/// until their own ends come, never an end made up at a time (the review's E-12), so the run's end, read after the
+/// delete, is its KILL's, Signal(9), as in the rootless mode.
+#[test]
+fn e11_a_box_user_delete_of_a_run_being_made_waits_for_its_making() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    a_delete_of_a_run_being_made_waits_for_its_making(
+        &helped(dir.path()),
+        "e11-making-helped",
+        kill_by_pid,
+        Exit::Signal(9),
+    );
+}
+
+/// A delete's or a recovery's end's wait on a killed box's group past W*, stopped at the hold on its emptying, or its
+/// answer: a fact no recorded operation makes, waited for measuring, following the ending thread.
+static EMPTYING_FOLLOWED: hex_core::patience::Patience =
+    hex_core::patience::Patience::measuring("test.hex_runtime.emptying_followed");
+
+/// How a test ends a box's killed group: the box's delete, or a recovery's end of its group `(pgid, leader's start)`.
+type EndGroup = fn(&MacRuntime, &BoxId, (i32, u64)) -> Result<(), Refusal>;
+
+/// The review's E-12 (decision 9), AC-T7.4.1: a killed box's group that empties late is followed to its emptying, never
+/// refused at a bound. Do: make rootless box `name` and start a program in it until it is ended; hold its group's
+/// emptying, as a group whose last member's teardown runs long reads; end the group from another thread (`end`); once
+/// that end follows the group past W* (stopped at the hold) or answers, let the hold go. Expect: the end hadn't answered
+/// while the group read as not yet empty, then answers Ok; the program ends Signal(9).
+fn a_late_emptying_is_followed_to_its_end(name: &str, end: EndGroup) {
+    let rt = rootless();
+    let id = BoxId::new(name).unwrap();
+    rt.create(run_spec(&id)).expect("make the box");
+    let mut program = rt
+        .exec(&id, until_ended(), fed())
+        .expect("start a program until it is ended");
+    let _feeding = program.streams().unwrap().stdin;
+    let group = rt
+        .group(&id)
+        .unwrap()
+        .expect("the box's group, its program started");
+    let held = crate::emptying::hold::hold(&group.0.to_string());
+    thread::scope(|s| {
+        let ending = s.spawn(|| end(&rt, &id, group));
+        hex_testkit::waits::follow::until(
+            &EMPTYING_FOLLOWED,
+            "the end's wait following the group past W*, or its answer",
+            || party(&ending),
+            || held.following() || ending.is_finished(),
+        )
+        .unwrap();
+        if ending.is_finished() {
+            panic!(
+                "the end answered while the group read as not yet empty: {:?}",
+                ending.join()
+            );
+        }
+        drop(held);
+        assert_eq!(
+            ending.join().unwrap(),
+            Ok(()),
+            "the end once the group emptied"
+        );
+    });
+    assert_eq!(
+        hex_api::conformance::end_of(&mut *program),
+        Ok(Exit::Signal(9))
+    );
+    let cleanup = rt.delete(&id);
+    assert!(
+        matches!(cleanup, Ok(()) | Err(Refusal::NoSuchBox(_))),
+        "{cleanup:?}"
+    );
+}
+
+/// E-12 at a box's delete (`ProcessBox::delete`).
+#[test]
+fn e12_a_delete_follows_a_late_emptying_to_its_end() {
+    a_late_emptying_is_followed_to_its_end("e12-delete", |rt, id, _| rt.delete(id));
+}
+
+/// E-12 at a recovery's end of a box's group (`MacRuntime::end`, `process::end_group`).
+#[test]
+fn e12_a_recoverys_end_follows_a_late_emptying_to_its_end() {
+    a_late_emptying_is_followed_to_its_end("e12-recovery", |_, _, group| {
+        MacRuntime::end(Some(group))
+    });
 }

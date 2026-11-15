@@ -1,7 +1,7 @@
 //! Read-only retained native metadata, before the keeper or any recovery cleanup is entered.
 use std::path::Path;
 
-use hex_api::{BoxId, Class, ClassSpec, LifecycleCause, Refusal};
+use hex_api::{BoxId, Class, ClassSpec, Refusal};
 use hex_core::hcs;
 use hex_core::record::{BoxRecord, NativeRecord, NativeStage, OwnerRef, PoolRecord};
 
@@ -17,7 +17,8 @@ impl WinRuntime {
         let native = super::oci::read_marker_if_present(&marker)?;
         if matches!(spec.class, ClassSpec::Process) {
             if native.is_some() || record.native_scope.is_some() {
-                return Err(NativeRecord::Box(record).refusal(LifecycleCause::Uncertain));
+                return Err(NativeRecord::Box(record)
+                    .uncertain("a host process's record holds a native marker or scope"));
             }
             return self.preflight_legacy_keeper(&spec.id);
         }
@@ -38,12 +39,14 @@ impl WinRuntime {
             | ClassSpec::Firecracker(_)
             | ClassSpec::Shards(_)
             | ClassSpec::ShardsImage(_) => {
-                return Err(NativeRecord::Box(record).refusal(LifecycleCause::Uncertain));
+                return Err(NativeRecord::Box(record)
+                    .uncertain("its record's class has no retained HCS mapping"));
             }
         };
         // Missing metadata is not evidence that an asynchronous HCS create was never submitted.
-        let native =
-            native.ok_or_else(|| NativeRecord::Box(record).refusal(LifecycleCause::Uncertain))?;
+        let native = native.ok_or_else(|| {
+            NativeRecord::Box(record).uncertain("its retained HCS mapping has no native marker")
+        })?;
         check_marker(
             &native,
             &spec.id,
@@ -59,7 +62,7 @@ impl WinRuntime {
     /// No native job is opened/adopted/stopped. Missing metadata is not a Released scope fact.
     pub fn preflight_unsubmitted(&self, record: &BoxRecord) -> Result<(), Refusal> {
         record.spec.check()?;
-        let bad = || NativeRecord::Box(record).refusal(LifecycleCause::Uncertain);
+        let bad = |why: &str| NativeRecord::Box(record).uncertain(why);
         if record.spec.backend_class()? != Class::Shards
             || record.native_scope.is_none()
             || !matches!(
@@ -70,20 +73,28 @@ impl WinRuntime {
             || record.run.is_some()
             || record.exit.is_some()
         {
-            return Err(bad());
+            return Err(bad(
+                "its handoff box isn't a pending Shards VM with a native scope and nothing run",
+            ));
         }
-        let cost = record.spec.allocation.ok_or_else(bad)?.cost;
+        let cost = record
+            .spec
+            .allocation
+            .ok_or_else(|| bad("its handoff box holds no allocation"))?
+            .cost;
         self.check_vm_cost(&cost)?;
         {
             let boxes = self.boxes()?;
             if owner_index(&boxes, OwnerRef::Box(&record.spec.id)).is_ok() {
-                return Err(bad());
+                return Err(bad("its Windows table holds a slot of its handoff box"));
             }
         }
         if let Some(keeping) = &self.holding.keeper {
             let path = keeper::vm::path(&keeping.state, OwnerRef::Box(&record.spec.id))?;
             if keeper::vm::read(&path)?.is_some() {
-                return Err(bad());
+                return Err(bad(
+                    "its Windows VM keeper holds a record of its handoff box",
+                ));
             }
         }
         Ok(())
@@ -91,10 +102,14 @@ impl WinRuntime {
 
     /// Read the SAME keeper commitment without opening/adopting a job or starting the keeper.
     pub fn preflight_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
-        let bad = || record.refusal(LifecycleCause::Uncertain);
-        let scope = record.scope().ok_or_else(bad)?;
+        let bad = |why: &str| record.uncertain(why);
+        let scope = record
+            .scope()
+            .ok_or_else(|| bad("its record names no native scope to preflight on Windows"))?;
         if record.class()? != Class::Shards {
-            return Err(bad());
+            return Err(bad(
+                "its record isn't a Shards VM's to preflight on Windows",
+            ));
         }
         let commitment = record
             .allocation()
@@ -115,21 +130,34 @@ impl WinRuntime {
                     {
                         true
                     }
-                    _ => return Err(bad()),
+                    _ => {
+                        return Err(bad(
+                            "its Windows slot isn't a VM's with its record's commitment",
+                        ));
+                    }
                 },
             }
         };
         let Some(keeping) = self.holding.keeper.as_ref() else {
-            return if present || record.stage() == NativeStage::Prepared {
+            // With no keeper there is no keeper record: the answer below for a keeper that holds none, and macOS's
+            // without its helper. Prepared can have had no native effects, Released is checked later against its
+            // backend's exact terminal receipt, and preflight grants no authority: no native absence witness.
+            return if present
+                || matches!(
+                    record.stage(),
+                    NativeStage::Prepared | NativeStage::Released
+                ) {
                 Ok(())
             } else {
-                Err(bad())
+                Err(bad(
+                    "its node runs no Windows VM keeper, though it is past its preparation",
+                ))
             };
         };
         let path = keeper::vm::path(&keeping.state, record.owner())?;
         match keeper::vm::read(&path)? {
             Some(held) if held.commits(commitment.map(|commitment| (scope, commitment))) => Ok(()),
-            Some(_) => Err(bad()),
+            Some(_) => Err(bad("its Windows VM keeper's record commits another scope")),
             None if present
                 || matches!(
                     record.stage(),
@@ -140,7 +168,9 @@ impl WinRuntime {
                 // the exact backend terminal receipt. This is not a new native absence witness.
                 Ok(())
             }
-            None => Err(bad()),
+            None => Err(bad(
+                "its Windows VM keeper holds no record of it, though it is past its preparation",
+            )),
         }
     }
 
@@ -556,7 +586,7 @@ mod tests {
             .reserve(OwnerRef::Box(&record.spec.id), &[], None, None)
             .unwrap();
         assert!(
-            matches!(native.preflight_unsubmitted(&record), Err(Refusal::Lifecycle { id, cause: LifecycleCause::Uncertain }) if id == record.spec.id)
+            matches!(native.preflight_unsubmitted(&record), Err(Refusal::Lifecycle { id, cause: hex_api::LifecycleCause::Uncertain, .. }) if id == record.spec.id)
         );
         assert_eq!(native.boxes().unwrap().len(), 1);
 

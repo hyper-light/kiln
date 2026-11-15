@@ -168,18 +168,15 @@ impl Files {
         Ok(out)
     }
 
-    /// The folder's own entry flushed, so a rename or removal in it survives the host.
-    #[cfg(unix)]
+    /// The folder's own entry flushed, so a rename or removal in it survives the host. Windows flushes a directory
+    /// only through a handle opened as FlushFileBuffers asks (`hex_runtime::windows::sys::flush_directory`), as the
+    /// node's store does (the review's D-1: without it a power loss could roll the keeper's epoch back).
     fn sync_dir(&self) -> Result<(), Stop> {
-        File::open(&self.dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io("flushing the records' folder"))
-    }
-
-    /// NTFS journals the rename itself; Windows offers no directory flush through std.
-    #[cfg(not(unix))]
-    fn sync_dir(&self) -> Result<(), Stop> {
-        Ok(())
+        #[cfg(windows)]
+        let flushed = hex_runtime::windows::sys::flush_directory(&self.dir);
+        #[cfg(not(windows))]
+        let flushed = File::open(&self.dir).and_then(|d| d.sync_all());
+        flushed.map_err(io("flushing the records' folder"))
     }
 }
 
@@ -199,6 +196,9 @@ impl Records for Files {
                 .map_err(io("writing a temp record"))?;
             f.sync_all().map_err(io("flushing a temp record"))?;
         }
+        // std's rename, on Windows a POSIX-semantics rename that replaces a record a reader holds open (MoveFileExW's
+        // write-through move refuses it "Access is denied": ROOT's Windows host, records_are_written_whole_and_replaced_
+        // by_rename_on_every_os); its folder's flush, below, makes it outlive the host (D-1).
         fs::rename(&temp, &record).map_err(io("renaming a record into place"))?;
         self.sync_dir()
     }

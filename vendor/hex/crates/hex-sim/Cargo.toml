@@ -10,6 +10,9 @@ publish.workspace = true
 
 [dependencies]
 hex-api.workspace = true
+# The capacity view's sync bound (hex_core::capacity::most_held), the protocol's own, which a runner's reservation bound
+# in the capacity nemesis may not pass (CV8).
+hex-core.workspace = true
 serde.workspace = true
 hex-health.workspace = true
 hyper-swim.workspace = true
@@ -19,6 +22,9 @@ triomphe.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# The capacity nemesis's tests read kiln's committed export (bench/sched/kiln-ci-20261022-20261105.export.json.gz), the
+# record its generator's parameters rest on.
+flate2.workspace = true
 # AC-T7.11.4's counting allocator (tests/memory.rs): a safe count of live heap bytes over System.
 cap = "0.1.2"
 proptest = "1.12.0"

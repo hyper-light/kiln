@@ -63,7 +63,20 @@ pub struct PoolRecord {
 }
 
 fn refused(key: BackingKey, cause: LifecycleCause) -> Refusal {
-    Refusal::Backing { key, cause }
+    Refusal::Backing {
+        key,
+        cause,
+        why: None,
+    }
+}
+
+/// Backing `key` refused Uncertain, and `why` in the refusing site's own words (joint plan step 14).
+fn uncertain(key: BackingKey, why: &str) -> Refusal {
+    Refusal::Backing {
+        key,
+        cause: LifecycleCause::Uncertain,
+        why: Some(why.to_owned()),
+    }
 }
 
 impl PoolRecord {
@@ -72,14 +85,27 @@ impl PoolRecord {
     }
 
     pub fn check(&self) -> Result<(), Refusal> {
-        let bad = || refused(self.key, LifecycleCause::Uncertain);
-        if self.version != RECORD_VERSION
-            || self.execution == Execution::Native
-            || (self.execution == Execution::ShardsShared && !self.devices.is_empty())
-            || self.cost.floor != self.cost.ceiling
-            || self.devices.len() > hex_api::MAX_DEVICES
-        {
-            return Err(bad());
+        let bad = |why: &str| uncertain(self.key, why);
+        if self.version != RECORD_VERSION {
+            return Err(bad("its record's version isn't this node's"));
+        }
+        if self.execution == Execution::Native {
+            return Err(bad(
+                "its record's execution is native, which no backing runs",
+            ));
+        }
+        if self.execution == Execution::ShardsShared && !self.devices.is_empty() {
+            return Err(bad(
+                "its record is a shared backing's, which names no physical device",
+            ));
+        }
+        if self.cost.floor != self.cost.ceiling {
+            return Err(bad("its cost's floor isn't its ceiling"));
+        }
+        if self.devices.len() > hex_api::MAX_DEVICES {
+            return Err(bad(
+                "its record names more physical devices than a node holds",
+            ));
         }
         self.cost.check()?;
         for device in &self.devices {
@@ -90,42 +116,55 @@ impl PoolRecord {
             .windows(2)
             .any(|pair| matches!(pair, [left, right] if left >= right))
         {
-            return Err(bad());
+            return Err(bad("its physical devices aren't sorted and unique"));
         }
         if let Some(allocation) = self.allocation {
             allocation.check(hex_api::CapacityResources::default())?;
             if allocation != self.cost.allocate(hex_api::CapacityResources::default())? {
-                return Err(bad());
+                return Err(bad("its allocation isn't its cost's"));
             }
         }
         match self.phase {
             BackingPhase::Prepared
                 if self.allocation.is_some() || self.init.is_some() || self.exit.is_some() =>
             {
-                return Err(bad());
+                return Err(bad(
+                    "it is prepared, yet its record holds an allocation, a controller or an end",
+                ));
             }
             BackingPhase::Granted | BackingPhase::Live | BackingPhase::Draining
                 if self.allocation.is_none() =>
             {
-                return Err(bad());
+                return Err(bad("it is granted, yet its record holds no allocation"));
             }
-            BackingPhase::Live if self.init.is_none() || self.exit.is_some() => return Err(bad()),
+            BackingPhase::Live if self.init.is_none() => {
+                return Err(bad("it is live, yet its record names no controller"));
+            }
+            BackingPhase::Live if self.exit.is_some() => {
+                return Err(bad("it is live, yet its record holds an end"));
+            }
             BackingPhase::Released if self.allocation.is_some() && self.exit.is_none() => {
-                return Err(bad());
+                return Err(bad(
+                    "it is released, yet its record holds its allocation with no end",
+                ));
             }
             _ => {}
         }
         if self
             .init
             .is_some_and(|init| init.pid == 0 || init.start_ticks == 0)
-            || (self.allocation.is_none() && (self.init.is_some() || self.exit.is_some()))
         {
-            return Err(bad());
+            return Err(bad("its controller's pid or start is zero"));
+        }
+        if self.allocation.is_none() && (self.init.is_some() || self.exit.is_some()) {
+            return Err(bad(
+                "its record names a controller or an end with no allocation",
+            ));
         }
         if self.exit.is_some()
             && !matches!(self.phase, BackingPhase::Draining | BackingPhase::Released)
         {
-            return Err(bad());
+            return Err(bad("its record holds an end before it drained"));
         }
         Ok(())
     }
@@ -153,11 +192,20 @@ impl PoolRecord {
     pub fn accept_grant(&mut self, grant: &BackingGrant) -> Result<(), Refusal> {
         self.check()?;
         grant.check()?;
-        if self.key != grant.key
-            || self.devices != grant.devices
-            || grant.allocation != self.cost.allocate(hex_api::CapacityResources::default())?
-        {
-            return Err(refused(self.key, LifecycleCause::Uncertain));
+        if self.key != grant.key {
+            return Err(uncertain(self.key, "the grant names another backing"));
+        }
+        if self.devices != grant.devices {
+            return Err(uncertain(
+                self.key,
+                "the grant names other physical devices",
+            ));
+        }
+        if grant.allocation != self.cost.allocate(hex_api::CapacityResources::default())? {
+            return Err(uncertain(
+                self.key,
+                "the grant's allocation isn't its cost's",
+            ));
         }
         match (self.phase, self.allocation) {
             (BackingPhase::Prepared, None) => {
@@ -170,7 +218,10 @@ impl PoolRecord {
             {
                 Ok(())
             }
-            _ => Err(refused(self.key, LifecycleCause::Uncertain)),
+            _ => Err(uncertain(
+                self.key,
+                "it is past its grant, or was granted another allocation",
+            )),
         }
     }
 
@@ -179,14 +230,21 @@ impl PoolRecord {
     pub fn accepts(&self, next: &Self) -> Result<(), Refusal> {
         self.check()?;
         next.check()?;
-        let bad = || refused(self.key, LifecycleCause::Uncertain);
-        if self.key != next.key
-            || self.execution != next.execution
-            || self.cost != next.cost
-            || self.devices != next.devices
-            || self.version != next.version
-        {
-            return Err(bad());
+        let bad = |why: &str| uncertain(self.key, why);
+        if self.key != next.key {
+            return Err(bad("its next record names another backing"));
+        }
+        if self.execution != next.execution {
+            return Err(bad("its next record changes its execution"));
+        }
+        if self.cost != next.cost {
+            return Err(bad("its next record changes its cost"));
+        }
+        if self.devices != next.devices {
+            return Err(bad("its next record changes its physical devices"));
+        }
+        if self.version != next.version {
+            return Err(bad("its next record changes its version"));
         }
         let phase = matches!(
             (self.phase, next.phase),
@@ -205,27 +263,35 @@ impl PoolRecord {
             ) | (BackingPhase::Released, BackingPhase::Released)
         );
         if !phase {
-            return Err(bad());
+            return Err(bad("its next record's phase doesn't follow from its phase"));
         }
         match (self.allocation, next.allocation) {
             (None, Some(_))
                 if self.phase == BackingPhase::Prepared && next.phase == BackingPhase::Granted => {}
             (known, proposed) if known == proposed => {}
-            _ => return Err(bad()),
+            _ => {
+                return Err(bad(
+                    "its next record changes its allocation outside its grant",
+                ));
+            }
         }
         match (self.init, next.init) {
             (None, Some(_))
                 if self.phase == BackingPhase::Granted && next.phase == BackingPhase::Granted => {}
             (known, proposed) if known == proposed => {}
-            _ => return Err(bad()),
+            _ => {
+                return Err(bad(
+                    "its next record changes its controller outside its launch",
+                ));
+            }
         }
         if self.exit.is_some() && self.exit != next.exit {
-            return Err(bad());
+            return Err(bad("its next record changes its recorded end"));
         }
         if next.exit.is_some()
             && !matches!(next.phase, BackingPhase::Draining | BackingPhase::Released)
         {
-            return Err(bad());
+            return Err(bad("its next record holds an end before it drained"));
         }
         Ok(())
     }
@@ -263,7 +329,7 @@ impl PoolRecord {
         }
         let mut length = Length(0);
         serde_json::to_writer(&mut length, self)
-            .map_err(|_| refused(self.key, LifecycleCause::Uncertain))?;
+            .map_err(|_| uncertain(self.key, "its record couldn't be measured as JSON"))?;
         let count = length
             .0
             .checked_add(1)
@@ -280,7 +346,7 @@ impl PoolRecord {
                 bound: count,
             })?;
         serde_json::to_writer(&mut bytes, self)
-            .map_err(|_| refused(self.key, LifecycleCause::Uncertain))?;
+            .map_err(|_| uncertain(self.key, "its record couldn't be written as JSON"))?;
         bytes.push(b'\n');
         Ok(bytes)
     }
@@ -348,8 +414,11 @@ impl<'a> NativeRecord<'a> {
                 Ok(match record.execution {
                     Execution::ShardsShared | Execution::ShardsDedicated => Class::Shards,
                     Execution::Firecracker => Class::Firecracker,
-                    Execution::Native => {
-                        return Err(refused(record.key, LifecycleCause::Uncertain));
+                    Execution::Native | Execution::NodeVm => {
+                        return Err(uncertain(
+                            record.key,
+                            "its record's execution is native, which has no VM class",
+                        ));
                     }
                 })
             }
@@ -386,10 +455,30 @@ impl<'a> NativeRecord<'a> {
     pub fn refusal(self, cause: LifecycleCause) -> Refusal {
         match self {
             Self::Box(record) => match record.spec.id.try_clone() {
-                Ok(id) => Refusal::Lifecycle { id, cause },
+                Ok(id) => Refusal::Lifecycle {
+                    id,
+                    cause,
+                    why: None,
+                },
                 Err(error) => error,
             },
             Self::Pool(record) => refused(record.key, cause),
+        }
+    }
+
+    /// Its owner refused Uncertain, and `why` in the refusing site's own words (joint plan steps 14 and 12): a backing's
+    /// refusal and a box's carry them alike.
+    pub fn uncertain(self, why: &str) -> Refusal {
+        match self {
+            Self::Box(record) => match record.spec.id.try_clone() {
+                Ok(id) => Refusal::Lifecycle {
+                    id,
+                    cause: LifecycleCause::Uncertain,
+                    why: Some(why.to_owned()),
+                },
+                Err(error) => error,
+            },
+            Self::Pool(record) => uncertain(record.key, why),
         }
     }
 }

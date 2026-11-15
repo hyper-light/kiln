@@ -223,6 +223,10 @@ mod local {
     struct InProcess(PathBuf);
 
     impl Link for InProcess {
+        fn lends_identity(&self) -> bool {
+            false
+        }
+
         fn dial(&self, _port: u32) -> Result<hex_client::guest::DuplexOwner, Refusal> {
             let (near, far) = std::os::unix::net::UnixStream::pair()
                 .map_err(|e| Refusal::os("pairing a staging socket", e))?;
@@ -407,8 +411,10 @@ fn boot_guest(kernel: &Path, initrd: &Path, binary: &Path, memory_mib: u64) -> G
     use shards_api::Guests;
     let config = hex_runtime::guest::GuestConfig {
         binary: binary.to_path_buf(),
-        kernel: kernel.to_path_buf(),
-        initrd: initrd.to_path_buf(),
+        boot: hex_runtime::guest::Boot::Kernel {
+            kernel: kernel.to_path_buf(),
+            initrd: initrd.to_path_buf(),
+        },
         vcpus: 1,
         gpu: false,
         memory_mib,
@@ -416,13 +422,14 @@ fn boot_guest(kernel: &Path, initrd: &Path, binary: &Path, memory_mib: u64) -> G
         staged: hex_client::guest::stage::STAGED.to_owned(),
     };
     let guest: std::sync::Arc<dyn shards_api::Guest> = shards_api::Shards::new()
-        .boot(&config.spec())
+        .boot(&config.spec().unwrap())
         .unwrap()
         .into();
     let link = hex_client::guest::own_link(hex_client::guest::shards::ShardsLink::new(
         guest.clone(),
-        // The first dial's bound as the node gives it before any boot (`first_dial_bound`, decision 9).
-        hex_runtime::guest::recorded_dial_bound().expect("this host class's boot-to-ready record"),
+        // A first dial as the node makes one before any boot: within no record's bound, following the guest (decision
+        // 9; the review's C-9).
+        None,
     ))
     .unwrap();
     let client = hex_client::guest::Client::connect(link.clone()).unwrap();

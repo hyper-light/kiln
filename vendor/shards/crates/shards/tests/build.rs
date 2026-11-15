@@ -9,9 +9,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TempDir, bridge, cannot_run_vms, guest_init, kernel, run_shards_env, served};
-
-const TIMEOUT: Duration = Duration::from_secs(120);
+use common::{Patience, TempDir, bridge, cannot_run_vms, guest_init, kernel, run_shards_env, served};
 
 /// A build context holding `dockerfile` as its Dockerfile.
 fn context(name: &str, dockerfile: &str) -> TempDir {
@@ -87,7 +85,6 @@ fn the_agentignore_is_read_before_the_dockerignore() {
                 ctx.to_str().unwrap(),
             ],
             &env,
-            TIMEOUT,
         );
         let mut kept: Vec<String> = std::fs::read_dir(&out)
             .map(|d| {
@@ -270,12 +267,7 @@ fn an_image_built_of_settings_runs_as_built() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let built = run_shards_env(
-        &["build"],
-        &["-t", "built:1", ctx.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let built = run_shards_env(&["build"], &["-t", "built:1", ctx.to_str().unwrap()], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
     assert!(
@@ -295,14 +287,9 @@ fn an_image_built_of_settings_runs_as_built() {
     let id = |r: &common::Run| r.stdout.trim().to_string();
     let mut plain = env.to_vec();
     plain.push(("BUILDX_NO_DEFAULT_ATTESTATIONS", std::ffi::OsStr::new("1")));
-    let q1 = run_shards_env(&["build"], &["-q", ctx.to_str().unwrap()], &plain, TIMEOUT);
-    let q2 = run_shards_env(
-        &["image", "build"],
-        &["-q", ctx.to_str().unwrap()],
-        &plain,
-        TIMEOUT,
-    );
-    let attested = run_shards_env(&["build"], &["-q", ctx.to_str().unwrap()], &env, TIMEOUT);
+    let q1 = run_shards_env(&["build"], &["-q", ctx.to_str().unwrap()], &plain);
+    let q2 = run_shards_env(&["image", "build"], &["-q", ctx.to_str().unwrap()], &plain);
+    let attested = run_shards_env(&["build"], &["-q", ctx.to_str().unwrap()], &env);
     assert_eq!(attested.status, Some(0), "{}", attested.stderr);
     assert_ne!(id(&attested), id(&q1));
     assert_eq!(q1.status, Some(0), "{}", q1.stderr);
@@ -320,7 +307,7 @@ fn an_image_built_of_settings_runs_as_built() {
     );
     // The manifest an unattested build writes is the ID its -q prints (Docker's types,
     // D83); an attested build's manifest is OCI's, and another.
-    let shown_plain = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &plain, TIMEOUT);
+    let shown_plain = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &plain);
     assert!(
         shown_plain
             .stderr
@@ -333,7 +320,7 @@ fn an_image_built_of_settings_runs_as_built() {
         eprintln!("SKIP: this host cannot run VMs");
         return;
     }
-    let ran = run_shards_env(&["run"], &["--pull", "never", "--rm", "built:1"], &env, TIMEOUT);
+    let ran = run_shards_env(&["run"], &["--pull", "never", "--rm", "built:1"], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{shown}");
     for line in [
@@ -397,9 +384,11 @@ fn limits_said(out: &str) -> std::collections::BTreeMap<String, Vec<u64>> {
 }
 
 /// A builder's steps see the memory it may have, as a build on a host sees the host's,
-/// where its kernel reports what it may still plug (D149): `MemTotal` is all of it, not the
-/// 512 MiB it boots with, and one allocation of three times that is made, which the
-/// kernel's overcommit heuristic refused while it counted only memory plugged.
+/// where its kernel reports what it may still plug (D149): in a home that has learned what
+/// its guest needs to boot (D133, memory-15), its first build having ended, a builder boots
+/// with that and has the rest to plug, and its steps' `MemTotal` is all of it, not what it
+/// booted with; and one allocation of more than it booted with is made, which the kernel's
+/// overcommit heuristic refused while it counted only memory plugged.
 #[test]
 fn a_builders_steps_see_the_memory_it_may_have() {
     if cannot_run_vms() {
@@ -419,20 +408,32 @@ fn a_builders_steps_see_the_memory_it_may_have() {
             &["build"],
             &["--progress=plain", "--no-cache", ctx.to_str().unwrap()],
             &env,
-            TIMEOUT,
         );
         let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
         (built, shown)
     };
-    let (seen, shown) = build(
-        "build-report-ctx",
-        r#"["/bin/testguest", "stat", "/proc/sys/vm/pluggable_kbytes", "/proc/meminfo"]"#,
-    );
-    if seen.stderr.contains("/proc/sys/vm/pluggable_kbytes missing") {
+    let stat = r#"["/bin/testguest", "stat", "/proc/sys/vm/pluggable_kbytes", "/proc/meminfo"]"#;
+    // The home's first builder boots cold, with all it may have, and teaches the home what
+    // its guest needs to boot.
+    let (cold, shown) = build("build-report-cold-ctx", stat);
+    if cold.stderr.contains("/proc/sys/vm/pluggable_kbytes missing") {
         println!("SKIP: this guest kernel reports none of the memory it may plug (D149)");
         return;
     }
+    assert_eq!(cold.status, Some(0), "{shown}");
+    let boot = common::learned_boot(&home).unwrap_or_else(|| panic!("no boot learned: {shown}"));
+    assert!(
+        boot < 1536 << 20,
+        "its guest learned to boot with {boot} bytes: {shown}"
+    );
+    let (seen, shown) = build("build-report-ctx", stat);
     assert_eq!(seen.status, Some(0), "{shown}");
+    assert!(
+        common::pluggable_said(&seen.stderr)
+            .first()
+            .is_some_and(|&kib| kib > 0),
+        "a builder booted with {boot} bytes of 2560 MiB has nothing to plug: {shown}"
+    );
     let total_kib: u64 = seen
         .stderr
         .split_once("MemTotal:")
@@ -501,7 +502,9 @@ fn host_available() -> u64 {
 /// steps see `MemTotal` no more than the host had available as it started, and its build's
 /// need is recorded in the home as it ends; a build ended short of memory is recorded so,
 /// and the next builder may have all its host's memory, as a run with no limit may (D148):
-/// `MemTotal` of the host's less no more than what a builder boots with.
+/// `MemTotal` of the host's less no more than what the home learned its builders' guest
+/// needs to boot (memory-15), which holds what its kernel keeps past `MemTotal`, and a block
+/// of what whole blocks round off.
 #[test]
 fn a_builders_ceiling_comes_from_its_host_and_its_homes_builds() {
     if cannot_run_vms() {
@@ -529,7 +532,6 @@ fn a_builders_ceiling_comes_from_its_host_and_its_homes_builds() {
             &["build"],
             &["--progress=plain", "--no-cache", ctx.to_str().unwrap()],
             &env,
-            TIMEOUT,
         );
         let shown = format!("--- stdout\n{}\n--- stderr\n{}", seen.stdout, seen.stderr);
         (seen, shown)
@@ -595,17 +597,22 @@ fn a_builders_ceiling_comes_from_its_host_and_its_homes_builds() {
     let (seen, shown) = build(&meminfo, None);
     assert_eq!(seen.status, Some(0), "{shown}");
     let all = total_kib(&seen.stderr, &shown);
+    let boot_kib = common::learned_boot(&home).unwrap_or_else(|| panic!("no boot learned: {shown}")) >> 10;
     assert!(
-        all <= host_kib && all + (512 << 10) > host_kib,
-        "MemTotal {all} kB of a builder after a build ended short, on a host of {host_kib} kB: {shown}"
+        all <= host_kib && all + boot_kib + block_kib > host_kib,
+        "MemTotal {all} kB of a builder after a build ended short, its guest learned to boot with {boot_kib} kB, on a host of {host_kib} kB: {shown}"
     );
 }
 
-/// A builder boots with little memory and is given more as its build needs it (D133): a
-/// step that touches three times what it booted with succeeds, and so does a layer twice
-/// as large; its steps' limits, those the kernel sizes by its memory, are at least a guest's
-/// booted with all of it, and within a tenth of them; and a step that takes more than all of
-/// it fails, as one past the memory of a builder booted with all of it does.
+/// A builder boots with what its home learned its guest needs and is given more as its
+/// build needs it (D133, memory-15): in a home whose first build has ended, a builder that
+/// may have 2,560 MiB boots with less than 1,536 and has the rest to plug, its kernel says;
+/// a step that touches 1,536 MiB succeeds, and so does a 1 GiB layer, the kernel then
+/// having less to plug; its steps' limits, those the kernel sizes by its memory, are at
+/// least a guest's booted with all of it, and within a tenth of them; and a step that takes
+/// more than all of it fails, as one past the memory of a builder booted with all of it
+/// does. A home's first builder boots with all it may have and plugs nothing
+/// (`a_builders_memory_in_a_new_home_is_all_it_may_have`).
 #[test]
 fn a_builders_memory_is_plugged_as_its_build_needs_it() {
     if cannot_run_vms() {
@@ -619,39 +626,62 @@ fn a_builders_memory_is_plugged_as_its_build_needs_it() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "2560".as_ref()),
     ];
+    let pluggable = "RUN [\"/bin/testguest\", \"stat\", \"/proc/sys/vm/pluggable_kbytes\"]";
+    // The home's first build, whose builder boots cold and teaches the home its guest's boot.
+    let first = context("build-plug-first", &format!("FROM {image}\n{pluggable}\n"));
+    let warmed = run_shards_env(&["build"], &["--progress=plain", first.to_str().unwrap()], &env);
+    if warmed.stderr.contains("/proc/sys/vm/pluggable_kbytes missing") {
+        println!("SKIP: this guest kernel reports none of the memory it may plug (D149)");
+        return;
+    }
+    assert_eq!(warmed.status, Some(0), "{warmed}");
+    let boot = common::learned_boot(&home).unwrap_or_else(|| panic!("no boot learned: {warmed}"));
+    assert!(
+        boot < 1536 << 20,
+        "its guest learned to boot with {boot} bytes: {warmed}"
+    );
     let ctx = context(
         "build-plug-ctx",
         &format!(
             "FROM {image}\n\
              USER root\n\
+             {pluggable}\n\
              RUN [\"/bin/testguest\", \"alloc\", \"1536\"]\n\
              RUN [\"/bin/testguest\", \"big\", \"/big\", \"1024\"]\n\
-             RUN [\"/bin/testguest\", \"limits\"]\n"
+             RUN [\"/bin/testguest\", \"limits\"]\n\
+             RUN [\"/bin/testguest\", \"stat\", \"/proc/sys/vm/pluggable_kbytes\", \"/proc/meminfo\"]\n"
         ),
     );
     let built = run_shards_env(
         &["build"],
-        &["--progress=plain", "-t", "plugged:1", ctx.to_str().unwrap()],
+        &[
+            "--progress=plain",
+            "--no-cache",
+            "-t",
+            "plugged:1",
+            ctx.to_str().unwrap(),
+        ],
         &env,
-        TIMEOUT,
     );
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
     assert!(built.stderr.contains("allocated 1536"), "{shown}");
-
-    let full = common::vm_run(
-        &[
-            "--kernel",
-            kernel().to_str().unwrap(),
-            "--init",
-            common::test_guest().to_str().unwrap(),
-            "--memory",
-            "2560",
-            "--cmdline",
-            "console=ttyS0 panic=-1 shards_test=limits",
-        ],
-        TIMEOUT,
+    let said = common::pluggable_said(&built.stderr);
+    assert!(
+        matches!(said[..], [before, after] if before > 0 && after < before),
+        "what it could still plug, before its steps and after: {said:?} KiB, booted with {boot} bytes: {shown}"
     );
+
+    let full = common::vm_run(&[
+        "--kernel",
+        kernel().to_str().unwrap(),
+        "--init",
+        common::test_guest().to_str().unwrap(),
+        "--memory",
+        "2560",
+        "--cmdline",
+        "console=ttyS0 panic=-1 shards_test=limits",
+    ]);
     assert_eq!(full.status, Some(0), "{full}");
     let (stepped, booted) = (limits_said(&built.stderr), limits_said(&full.stdout));
     let mut wrong = Vec::new();
@@ -673,18 +703,19 @@ fn a_builders_memory_is_plugged_as_its_build_needs_it() {
             ));
         }
     }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    eprintln!("limits of a step of a builder booted with {boot} bytes of 2560 MiB: {stepped:?}");
+    eprintln!("limits of a guest booted with all 2560 MiB: {booted:?}");
+    assert!(
+        wrong.is_empty(),
+        "{}\n{shown}\n--- booted with all of it\n{full}",
+        wrong.join("\n")
+    );
 
     let ctx = context(
         "build-plug-over-ctx",
         &format!("FROM {image}\nRUN [\"/bin/testguest\", \"alloc\", \"3072\"]\n"),
     );
-    let over = run_shards_env(
-        &["build"],
-        &["--progress=plain", ctx.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let over = run_shards_env(&["build"], &["--progress=plain", ctx.to_str().unwrap()], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", over.stdout, over.stderr);
     assert_eq!(over.status, Some(1), "{shown}");
     assert!(
@@ -704,7 +735,10 @@ fn a_builders_memory_is_plugged_as_its_build_needs_it() {
 /// gigabyte of its layers, has it plugged in time (D133): what its CPUs keep on their own
 /// lists of the pages their ended jobs freed is kept out of the hold that wakes its grower.
 /// Without, its guest ran out of memory short of that hold, as a build of 8 compilers on 32
-/// vCPUs over its 1 GiB of packages did, and its grower never plugged more (PM M392).
+/// vCPUs over its 1 GiB of packages did, and its grower never plugged more (PM M392). In a
+/// home whose first build has ended, whose builder boots with what its guest was learned
+/// to need, less than the build's 4 GiB (memory-15): a home's first builder boots with all
+/// it may have, and plugs nothing.
 #[test]
 fn a_builders_memory_is_plugged_as_fast_as_its_jobs_take_it() {
     if cannot_run_vms() {
@@ -718,6 +752,17 @@ fn a_builders_memory_is_plugged_as_fast_as_its_jobs_take_it() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "8192".as_ref()),
     ];
+    let first = context(
+        "build-fast-first",
+        &format!("FROM {image}\nRUN [\"/bin/testguest\", \"report\"]\n"),
+    );
+    let warmed = run_shards_env(&["build"], &["--progress=plain", first.to_str().unwrap()], &env);
+    assert_eq!(warmed.status, Some(0), "{warmed}");
+    let boot = common::learned_boot(&home).unwrap_or_else(|| panic!("no boot learned: {warmed}"));
+    assert!(
+        boot < 4096 << 20,
+        "its guest learned to boot with {boot} bytes: {warmed}"
+    );
     // A builder has a vCPU for each of its host's CPUs (build::builder_cpus): a job on a
     // quarter of them, as 8 compilers on 32, the rest idle, where what ended jobs freed stays
     // on their CPUs' own lists. A gigabyte its step writes to a tmpfs first stays in its
@@ -731,12 +776,7 @@ fn a_builders_memory_is_plugged_as_fast_as_its_jobs_take_it() {
              RUN --mount=type=tmpfs,target=/held,size=2g [\"/bin/testguest\", \"alloc-par\", \"{jobs}\", \"3072\", \"/held/big\", \"1024\"]\n"
         ),
     );
-    let built = run_shards_env(
-        &["build"],
-        &["--progress=plain", ctx.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let built = run_shards_env(&["build"], &["--progress=plain", ctx.to_str().unwrap()], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     eprintln!(
         "{jobs} jobs: {}",
@@ -751,8 +791,9 @@ fn a_builders_memory_is_plugged_as_fast_as_its_jobs_take_it() {
 }
 
 /// A builder gives back what it holds cold at its build's word (D188 for D133's builders):
-/// a step reads a 256 MiB file of a cache mount, which an earlier build wrote, into its
-/// builder's page cache, then waits; the build is told once that its host is short of
+/// a step reads a 256 MiB file of a cache mount, which an earlier build wrote, the home's
+/// first, whose builder booted cold and taught the home its guest's boot (memory-15), into
+/// its builder's page cache, then waits; the build is told once that its host is short of
 /// memory (SHARDS_BUILD_PRESSURE's FIFO, as no unprivileged process may raise macOS's
 /// system pressure), and its builder gives back most of the file, its VM process then
 /// holding that much less on its host, the step going on to its end; and the build's
@@ -782,12 +823,7 @@ fn a_builder_gives_back_what_it_holds_cold_at_its_builds_word() {
             "FROM {image}\nUSER root\nRUN --mount=type=cache,target=/c [\"/bin/testguest\", \"big\", \"/c/big\", \"{MIB}\"]\n"
         ),
     );
-    let filled = run_shards_env(
-        &["build"],
-        &["--progress=plain", fill.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let filled = run_shards_env(&["build"], &["--progress=plain", fill.to_str().unwrap()], &env);
     assert_eq!(filled.status, Some(0), "{filled}");
     let ctx = context(
         "build-give-ctx",
@@ -889,10 +925,238 @@ fn a_builder_gives_back_what_it_holds_cold_at_its_builds_word() {
     assert_eq!(layers(&told_out), layers(&untold_out), "{shown}");
 }
 
+/// A home's first builder boots with all it may have (D133, memory-15): with nothing
+/// learned of what its guest needs to boot, the cold start, its VM process is given its
+/// ceiling to boot with and nothing past it to plug, and its kernel says it has nothing to
+/// plug; it gives back what it holds cold at its build's word all the same, its files'
+/// pages (D188), its VM process then holding that much less, as
+/// `a_builder_gives_back_what_it_holds_cold_at_its_builds_word`'s warm builder does; and as
+/// it ends its home learns what its guest needs to boot, less than its ceiling, which the
+/// home's next builder boots with, having the rest to plug.
+#[cfg(unix)]
+#[test]
+fn a_builders_memory_in_a_new_home_is_all_it_may_have() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if cannot_run_vms() {
+        return;
+    }
+    let (image, _) = served();
+    let home = TempDir::new("build-cold-home");
+    const CEILING: u64 = 2560;
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+        ("SHARDS_BUILD_MEMORY", "2560".as_ref()),
+    ];
+    assert_eq!(common::learned_boot(&home), None);
+    const MIB: u64 = 256;
+    let ctx = context(
+        "build-cold-ctx",
+        &format!(
+            "FROM {image}\n\
+             USER root\n\
+             RUN [\"/bin/testguest\", \"stat\", \"/proc/sys/vm/pluggable_kbytes\"]\n\
+             RUN --mount=type=cache,target=/c [\"/bin/testguest\", \"big\", \"/c/big\", \"{MIB}\"]\n\
+             RUN --mount=type=cache,target=/c [\"/bin/testguest\", \"read-dropped\", \"/c/big\", \"20\", \"/sum\"]\n"
+        ),
+    );
+    let fifo = home.join("pressure");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: mkfifo(3) of a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let mut cmd = common::command();
+    cmd.args(["build", "--progress=plain"])
+        .arg(ctx.as_os_str())
+        .envs(env)
+        .env("SHARDS_BUILD_PRESSURE", &fifo)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut built = cmd.spawn().unwrap();
+    // What the VM process was given to boot with and to plug to, in MiB, as its spawner
+    // started it (`--memory`, `--memory-max`).
+    let given = |vm: u32| {
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "args=", "-p", &vm.to_string()])
+            .output()
+            .unwrap();
+        let args = String::from_utf8_lossy(&ps.stdout).into_owned();
+        let after = |flag: &str| {
+            let words: Vec<&str> = args.split_whitespace().collect();
+            words
+                .iter()
+                .position(|w| *w == flag)
+                .and_then(|i| words.get(i + 1))
+                .and_then(|v| v.parse::<u64>().ok())
+        };
+        (after("--memory"), after("--memory-max"), args)
+    };
+    let held_kib = |vm: u32| {
+        shards_vmm::platform::process_usage(vm)
+            .ok()
+            .map(|u| u.footprint >> 10)
+    };
+    let stderr = std::io::BufReader::new(built.stderr.take().unwrap());
+    let (mut lines, mut booted, mut before, mut gave, mut after) = (Vec::new(), None, None, None, None);
+    for line in stderr.lines() {
+        let line = line.unwrap();
+        if before.is_none() && line.contains(&format!("read /c/big {}", MIB << 20)) {
+            let vm = builder_vm(built.id()).unwrap_or_else(|| panic!("no builder VM under {}", built.id()));
+            booted = Some(given(vm));
+            before = Some((vm, held_kib(vm)));
+            let mut word = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap();
+            word.write_all(b"\n").unwrap();
+        }
+        if let Some((_, rest)) = line.split_once("the build's builders gave back ") {
+            gave = rest
+                .split_whitespace()
+                .next()
+                .and_then(|mib| mib.parse::<u64>().ok());
+            after = before.map(|(vm, _)| held_kib(vm));
+        }
+        lines.push(line);
+    }
+    let status = built.wait().unwrap();
+    let shown = lines.join("\n");
+    if shown.contains("/proc/sys/vm/pluggable_kbytes missing") {
+        println!("SKIP: this guest kernel reports none of the memory it may plug (D149)");
+        return;
+    }
+    assert!(status.success(), "{shown}");
+    let (memory, memory_max, args) =
+        booted.unwrap_or_else(|| panic!("its step never read the file:\n{shown}"));
+    assert_eq!(
+        (memory, memory_max),
+        (Some(CEILING), Some(CEILING)),
+        "a home's first builder, which may have {CEILING} MiB, given: {args}"
+    );
+    assert_eq!(
+        common::pluggable_said(&shown),
+        [0],
+        "a builder booted with all it may have has memory to plug:\n{shown}"
+    );
+    let gave = gave.unwrap_or_else(|| panic!("nothing given back said:\n{shown}"));
+    assert!(
+        gave >= MIB / 2,
+        "gave back {gave} MiB of the {MIB} MiB file:\n{shown}"
+    );
+    assert!(
+        shown.contains("dropped "),
+        "its step's page cache kept the file:\n{shown}"
+    );
+    let (Some((_, Some(before))), Some(Some(after))) = (before, after) else {
+        panic!("its builder's VM process's memory not read:\n{shown}");
+    };
+    eprintln!(
+        "a cold builder of {CEILING} MiB gave back {gave} MiB of the {MIB} MiB file; its VM process held {before} KiB, then {after} KiB"
+    );
+    assert!(
+        before.saturating_sub(after) >= (gave << 10) / 2,
+        "its builder's VM process held {before} KiB, then {after} KiB, having given back {gave} MiB:\n{shown}"
+    );
+    // Learned as it ended: what its guest needs to boot, which the next builder boots with.
+    let boot = common::learned_boot(&home).unwrap_or_else(|| panic!("no boot learned:\n{shown}"));
+    assert!(
+        boot > 0 && boot < CEILING << 20,
+        "its guest learned to boot with {boot} bytes"
+    );
+    let next = context(
+        "build-cold-next",
+        &format!("FROM {image}\nRUN [\"/bin/testguest\", \"stat\", \"/proc/sys/vm/pluggable_kbytes\"]\n"),
+    );
+    let warm = run_shards_env(&["build"], &["--progress=plain", next.to_str().unwrap()], &env);
+    assert_eq!(warm.status, Some(0), "{warm}");
+    assert!(
+        common::pluggable_said(&warm.stderr)
+            .first()
+            .is_some_and(|&kib| kib > 0),
+        "the home's next builder, its guest learned to boot with {boot} bytes, has nothing to plug: {warm}"
+    );
+}
+
+/// A home's first build that runs out of memory is recorded short (D133, D148, memory-15):
+/// its builder, booted cold with all it may have and nothing to plug, counts what its build
+/// held in the build's cgroup as a warm one does, and the processes its kernel ended; the
+/// home records the build's need and that it ended short, and its next builder may have all
+/// its host's memory, as a run with no limit may: `MemTotal` of the host's less no more than
+/// what the home learned its guest needs to boot, and a block.
+#[test]
+fn a_new_homes_build_that_runs_out_is_recorded_short() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (image, _) = served();
+    let home = TempDir::new("build-cold-short-home");
+    let env = |most: Option<&'static str>| {
+        let mut env = vec![
+            ("SHARDS_HOME", home.as_os_str()),
+            ("SHARDS_KERNEL", kernel().as_os_str()),
+            ("SHARDS_INIT", guest_init().as_os_str()),
+        ];
+        if let Some(m) = most {
+            env.push(("SHARDS_BUILD_MEMORY", m.as_ref()));
+        }
+        env
+    };
+    assert_eq!(common::learned_boot(&home), None);
+    let over = context(
+        "build-cold-short-ctx",
+        &format!("FROM {image}\nRUN [\"/bin/testguest\", \"alloc\", \"3072\"]\n"),
+    );
+    let ended = run_shards_env(
+        &["build"],
+        &["--progress=plain", over.to_str().unwrap()],
+        &env(Some("2560")),
+    );
+    assert!(
+        ended
+            .stderr
+            .contains("did not complete successfully: exit code: 137"),
+        "{ended}"
+    );
+    let said =
+        std::fs::read_to_string(home.join("builder-memory")).unwrap_or_else(|e| panic!("{e}: {ended}"));
+    let needed: u64 = said
+        .lines()
+        .find_map(|l| l.strip_prefix("needed "))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no need recorded: {said}"));
+    assert!(needed > 0 && said.contains("short yes"), "{said}\n{ended}");
+    let meminfo = context(
+        "build-cold-short-next",
+        &format!("FROM {image}\nRUN [\"/bin/testguest\", \"stat\", \"/proc/meminfo\"]\n"),
+    );
+    let seen = run_shards_env(
+        &["build"],
+        &["--progress=plain", meminfo.to_str().unwrap()],
+        &env(None),
+    );
+    assert_eq!(seen.status, Some(0), "{seen}");
+    let all: u64 = seen
+        .stderr
+        .split_once("MemTotal:")
+        .and_then(|(_, after)| after.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no MemTotal: {seen}"));
+    let host_kib = common::host_memory() >> 10;
+    let boot_kib = common::learned_boot(&home).unwrap_or_else(|| panic!("no boot learned: {seen}")) >> 10;
+    let block_kib = 128 << 10;
+    assert!(
+        all <= host_kib && all + boot_kib + block_kib > host_kib,
+        "MemTotal {all} kB of a builder after a new home's build ended short, its guest learned to boot with {boot_kib} kB, on a host of {host_kib} kB: {seen}"
+    );
+}
+
 /// A build held short of memory has its builder give back what it holds cold at its host's
 /// word (D188 for D133's builders): `shards build` in a scope of the user's manager, which
-/// can swap nothing (`MemorySwapMax=0`), reads a 512 MiB file of a cache mount into its
-/// builder's page cache, the scope's `MemoryHigh` set as the read begins to what it holds
+/// can swap nothing (`MemorySwapMax=0`), reads a 512 MiB file of a cache mount, which the
+/// home's first build wrote, its builder booted cold (memory-15), into its builder's page
+/// cache, the scope's `MemoryHigh` set as the read begins to what it holds
 /// then and half the file; past that its memory stalls (PSI) as its host reclaims what it
 /// cannot swap, and the build's watcher, which watches its own cgroup's pressure, asks its
 /// builder to give back and tells it the room the budget leaves (`ROOM`). Its log says what it gave back and asked to unplug, and
@@ -934,12 +1198,7 @@ fn a_build_held_short_of_memory_has_its_builder_give_back() {
             "FROM {image}\nUSER root\nRUN --mount=type=cache,target=/c [\"/bin/testguest\", \"big\", \"/c/big\", \"{MIB}\"]\n"
         ),
     );
-    let filled = run_shards_env(
-        &["build"],
-        &["--progress=plain", fill.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let filled = run_shards_env(&["build"], &["--progress=plain", fill.to_str().unwrap()], &env);
     assert_eq!(filled.status, Some(0), "{filled}");
     let ctx = context(
         "build-psi-ctx",
@@ -1231,16 +1490,29 @@ fn a_killed_build_takes_its_builder_with_it() {
         .spawn()
         .unwrap();
     let stderr = build.stderr.take().unwrap();
-    let (ready, said) = std::sync::mpsc::channel();
+    // Each line it says, whether its step is ready: a judged wait on the build (D209), each
+    // line its progress.
+    let (line, said) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
-            if line.ends_with(" ready") {
-                let _ = ready.send(());
-            }
+        for l in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = line.send(l.ends_with(" ready"));
         }
     });
-    said.recv_timeout(TIMEOUT)
-        .expect("the step never said it was ready");
+    let kind = common::WaitKind::at(std::panic::Location::caller());
+    let mut wait = common::Wait::begin(kind, build.id(), None, "its step's word that it is ready");
+    loop {
+        let progress = match said.recv_timeout(wait.next_look()) {
+            Ok(true) => break wait.answered(),
+            Ok(false) => true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the step never said it was ready: the build's stderr ended")
+            }
+        };
+        if let Err(stall) = wait.look(progress) {
+            panic!("the step never said it was ready: {}", wait.refused(&stall));
+        }
+    }
     // Its builder: the processes whose command lines name its directory, its VM's
     // (`--vsock`), as each host lists them (`common::commands_with`).
     let builders = || {
@@ -1250,13 +1522,27 @@ fn a_killed_build_takes_its_builder_with_it() {
             .collect::<Vec<_>>()
     };
     assert!(!builders().is_empty(), "no builder runs");
+    let builder = common::commands_with(tmp.to_str().unwrap())
+        .first()
+        .map(|(pid, _)| *pid)
+        .expect("its builder's process");
     build.kill().unwrap();
     build.wait().unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !builders().is_empty() && std::time::Instant::now() < deadline {
+    // Its builder's end, waited on as it goes on (D209): its party the builder's process and
+    // what descends from it.
+    let kind = common::WaitKind::at(std::panic::Location::caller());
+    let mut wait = common::Wait::begin(kind, builder, None, "its builder's end after its build's");
+    while !builders().is_empty() {
+        if let Err(stall) = wait.look(false) {
+            panic!(
+                "the builder outlived its build: {:?}\n{}",
+                builders(),
+                wait.refused(&stall)
+            );
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(builders(), Vec::<String>::new(), "the builder outlived its build");
+    wait.answered();
     let left: Vec<std::path::PathBuf> = std::fs::read_dir(&*tmp)
         .unwrap()
         .flatten()
@@ -1268,12 +1554,7 @@ fn a_killed_build_takes_its_builder_with_it() {
         "kill-next-ctx",
         &format!("FROM {image}\nRUN [\"/bin/testguest\", \"report\"]\n"),
     );
-    let built = run_shards_env(
-        &["build"],
-        &["--progress=plain", next.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let built = run_shards_env(&["build"], &["--progress=plain", next.to_str().unwrap()], &env);
     assert_eq!(built.status, Some(0), "{}", built.stderr);
     assert!(!left[0].exists(), "the killed build's directory is left");
 }
@@ -1316,7 +1597,6 @@ fn run_steps_run_in_a_builder_microvm() {
         &["build"],
         &["--progress=plain", "-t", "ran:1", ctx.to_str().unwrap()],
         &env,
-        TIMEOUT,
     );
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
@@ -1363,7 +1643,7 @@ fn run_steps_run_in_a_builder_microvm() {
     assert_eq!(exported_from(&built.stderr), "snapshot", "{shown}");
     assert_rootfs_is_its_layers(&home, "ran:1");
 
-    let ran = run_shards_env(&["run"], &["--rm", "ran:1"], &env, TIMEOUT);
+    let ran = run_shards_env(&["run"], &["--rm", "ran:1"], &env);
     // stat's status says a path was missing: /etc/group, removed.
     assert_eq!(ran.status, Some(1), "{}", ran.stderr);
     assert_eq!(
@@ -1383,7 +1663,7 @@ fn run_steps_run_in_a_builder_microvm() {
         "build-run-fail-ctx",
         &format!("FROM {image}\nRUN [\"/bin/testguest\", \"exit\", \"3\"]\n"),
     );
-    let failed = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env, TIMEOUT);
+    let failed = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env);
     assert_eq!(failed.status, Some(1), "{}", failed.stderr);
     assert!(
         failed.stderr.ends_with(
@@ -1399,7 +1679,7 @@ fn run_steps_run_in_a_builder_microvm() {
         "build-run-empty-path-ctx",
         &format!("FROM {image}\nENV PATH=\nWORKDIR /bin\nRUN [\"testguest\", \"exit\", \"0\"]\n"),
     );
-    let failed = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env, TIMEOUT);
+    let failed = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env);
     assert_eq!(failed.status, Some(1), "{}", failed.stderr);
     assert!(
         failed
@@ -1462,7 +1742,7 @@ fn run_steps_take_the_builds_secrets_ulimits_and_entitlements() {
         "given:1",
         ctx.to_str().unwrap(),
     ];
-    let built = run_shards_env(&["build"], &args, &env, TIMEOUT);
+    let built = run_shards_env(&["build"], &args, &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
     for line in [
@@ -1499,7 +1779,7 @@ fn run_steps_take_the_builds_secrets_ulimits_and_entitlements() {
     assert_eq!(seccomp(&reports[3]), "0", "an insecure step's none\n{shown}");
 
     // Nothing of the secrets in the image.
-    let ran = run_shards_env(&["run"], &["--rm", "given:1"], &env, TIMEOUT);
+    let ran = run_shards_env(&["run"], &["--rm", "given:1"], &env);
     assert_eq!(ran.status, Some(1), "{}", ran.stderr);
     assert!(ran.stdout.contains("/run/secrets/tok missing"), "{}", ran.stdout);
     assert!(ran.stdout.contains("/s missing"), "{}", ran.stdout);
@@ -1509,7 +1789,7 @@ fn run_steps_take_the_builds_secrets_ulimits_and_entitlements() {
         "build-given-insecure-ctx",
         &format!("FROM {image}\nRUN --security=insecure [\"/bin/testguest\", \"exit\", \"0\"]\n"),
     );
-    let failed = run_shards_env(&["build"], &[insecure.to_str().unwrap()], &env, TIMEOUT);
+    let failed = run_shards_env(&["build"], &[insecure.to_str().unwrap()], &env);
     assert_eq!(failed.status, Some(1), "{}", failed.stderr);
     assert!(
         failed.stderr.contains("security.insecure is not allowed"),
@@ -1522,7 +1802,7 @@ fn run_steps_take_the_builds_secrets_ulimits_and_entitlements() {
             "FROM {image}\nRUN --mount=type=secret,id=tok,required=true [\"/bin/testguest\", \"exit\", \"0\"]\n"
         ),
     );
-    let failed = run_shards_env(&["build"], &[required.to_str().unwrap()], &env, TIMEOUT);
+    let failed = run_shards_env(&["build"], &[required.to_str().unwrap()], &env);
     assert_eq!(failed.status, Some(1), "{}", failed.stderr);
     assert!(
         failed.stderr.contains("secret tok: not found"),
@@ -1556,7 +1836,6 @@ fn run_steps_start_with_high_file_and_process_limits() {
         &["build"],
         &["--progress=plain", "--no-cache", ctx.to_str().unwrap()],
         &env,
-        TIMEOUT,
     );
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
@@ -1589,14 +1868,14 @@ fn run_steps_reach_the_network_unless_it_is_none() {
         return;
     };
     let server = listening_anywhere();
-    let port = server.local_addr().unwrap().port();
-    // Serves one connection if one comes before the build is done; a build that never
-    // connects leaves it to give up, so that the test fails rather than hangs.
+    let port = crate::common::minted_port(server.local_addr().unwrap().port());
+    // Serves one connection if one comes before the build is done: the build's end (its
+    // word, or its sender dropped as the test fails) ends it, no bound of its own, so that a
+    // build that never connects fails the test rather than hangs it.
     server.set_nonblocking(true).unwrap();
     let (built_tx, built_rx) = std::sync::mpsc::channel::<()>();
     let serving = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + TIMEOUT;
-        while std::time::Instant::now() < deadline && built_rx.try_recv().is_err() {
+        while matches!(built_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
             match server.accept() {
                 Ok((mut c, _)) => {
                     c.set_nonblocking(false).unwrap();
@@ -1622,12 +1901,7 @@ fn run_steps_reach_the_network_unless_it_is_none() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "1024".as_ref()),
     ];
-    let built = run_shards_env(
-        &["build"],
-        &["--progress=plain", ctx.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let built = run_shards_env(&["build"], &["--progress=plain", ctx.to_str().unwrap()], &env);
     let _ = built_tx.send(());
     serving.join().unwrap();
     assert!(
@@ -1649,14 +1923,15 @@ fn proxied_server(
 ) -> (u16, std::sync::mpsc::Receiver<String>) {
     use std::io::{BufRead as _, Write as _};
     let listener = listening_anywhere();
-    let port = listener.local_addr().unwrap().port();
+    let port = crate::common::minted_port(listener.local_addr().unwrap().port());
     let (said, asked) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(conn) = conn else { return };
             let (tls, said) = (tls.clone(), said.clone());
+            // Each connection read until its client closes it: a client the build ends closes
+            // it as it goes; no bound of the server's own.
             std::thread::spawn(move || {
-                let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
                 let stream: Box<dyn ProxiedIo> = match tls {
                     Some(c) => Box::new(rustls::StreamOwned::new(
                         rustls::ServerConnection::new(c).unwrap(),
@@ -1802,7 +2077,6 @@ fn steps_under_the_proxy_cap_reach_the_network_through_it_alone() {
                 ctx.to_str().unwrap(),
             ],
             &env,
-            TIMEOUT,
         )
     };
     let built = build();
@@ -2057,7 +2331,6 @@ fn proxy_request_costs_in_microvms() {
             &["build"],
             &["--progress=plain", "--no-cache", ctx.to_str().unwrap()],
             &env,
-            TIMEOUT,
         );
         assert_eq!(built.status, Some(0), "{}", built.stderr);
         let line = built
@@ -2095,7 +2368,7 @@ fn a_build_given_no_name_is_kept_dangling() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("build-unnamed-ctx", &format!("FROM {image}\nLABEL unnamed=1\n"));
     let untagged = |out: &str| out.lines().filter(|row| row.starts_with("<untagged>")).count();
     let built = shards(&["build", "-q", ctx.to_str().unwrap()]);
@@ -2124,7 +2397,7 @@ fn a_build_file_error_shows_its_lines() {
     let home = TempDir::new("build-error-home");
     let ctx = context("build-error-ctx", "FROM scratch\nFOO bar\n");
     let env = [("SHARDS_HOME", home.as_os_str())];
-    let r = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env, TIMEOUT);
+    let r = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env);
     assert_eq!(r.status, Some(1), "{}", r.stderr);
     let want = "Dockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> FOO bar\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: dockerfile parse error on line 2: unknown instruction: FOO (did you mean FROM?)\n";
     assert!(r.stderr.ends_with(want), "{}", r.stderr);
@@ -2159,12 +2432,7 @@ fn steps_bind_one_layer_trees() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "1024".as_ref()),
     ];
-    let built = run_shards_env(
-        &["build"],
-        &["--progress=plain", ctx.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let built = run_shards_env(&["build"], &["--progress=plain", ctx.to_str().unwrap()], &env);
     assert_eq!(built.status, Some(1), "{}", built.stderr);
     assert!(
         built
@@ -2226,10 +2494,9 @@ fn steps_resolve_their_paths_in_their_root() {
         &["build"],
         &["--progress=plain", "-t", "inroot:1", ctx.to_str().unwrap()],
         &env,
-        TIMEOUT,
     );
     assert_eq!(built.status, Some(0), "{}", built.stderr);
-    let ran = run_shards_env(&["run"], &["--rm", "inroot:1"], &env, TIMEOUT);
+    let ran = run_shards_env(&["run"], &["--rm", "inroot:1"], &env);
     assert_eq!(
         ran.stdout,
         "/inside/x missing No such file or directory (os error 2)\n\
@@ -2246,7 +2513,7 @@ fn steps_resolve_their_paths_in_their_root() {
             tg("\"rmdir:/w\", \"write:/w=x\"")
         ),
     );
-    let failed = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env, TIMEOUT);
+    let failed = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env);
     assert_eq!(failed.status, Some(1), "{}", failed.stderr);
     assert!(
         failed.stderr.ends_with(
@@ -2292,12 +2559,7 @@ fn files_a_build_copies_are_in_the_vm_as_built() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let built = run_shards_env(
-        &["build"],
-        &["-t", "files:1", ctx.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let built = run_shards_env(&["build"], &["-t", "files:1", ctx.to_str().unwrap()], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
     for step in [
@@ -2319,7 +2581,7 @@ fn files_a_build_copies_are_in_the_vm_as_built() {
         eprintln!("SKIP: this host cannot run VMs");
         return;
     }
-    let ran = run_shards_env(&["run"], &["--pull", "never", "--rm", "files:1"], &env, TIMEOUT);
+    let ran = run_shards_env(&["run"], &["--pull", "never", "--rm", "files:1"], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", ran.stdout, ran.stderr);
     assert_eq!(
         ran.status,
@@ -2381,19 +2643,13 @@ fn a_staged_build_copies_from_its_stages_and_images() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let built = run_shards_env(
-        &["build"],
-        &["-t", "stages:1", ctx.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let built = run_shards_env(&["build"], &["-t", "stages:1", ctx.to_str().unwrap()], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
     let target = run_shards_env(
         &["build"],
         &["--target", "base", "-t", "stages:base", ctx.to_str().unwrap()],
         &env,
-        TIMEOUT,
     );
     let shown_target = format!("--- stdout\n{}\n--- stderr\n{}", target.stdout, target.stderr);
     assert_eq!(target.status, Some(0), "{shown_target}");
@@ -2407,7 +2663,6 @@ fn a_staged_build_copies_from_its_stages_and_images() {
         &["build"],
         &["--target", "files", "-t", "stages:files", ctx.to_str().unwrap()],
         &env,
-        TIMEOUT,
     );
     let shown_files = format!("--- stdout\n{}\n--- stderr\n{}", files.stdout, files.stderr);
     assert_eq!(files.status, Some(0), "{shown_files}");
@@ -2422,7 +2677,7 @@ fn a_staged_build_copies_from_its_stages_and_images() {
         eprintln!("SKIP: this host cannot run VMs");
         return;
     }
-    let ran = run_shards_env(&["run"], &["--pull", "never", "--rm", "stages:1"], &env, TIMEOUT);
+    let ran = run_shards_env(&["run"], &["--pull", "never", "--rm", "stages:1"], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(1), "/src is the base stage's alone\n{shown}");
     let group = "root:x:0:\\napp:x:1000:\\nstaff:x:50:app\\n";
@@ -2456,7 +2711,6 @@ fn a_staged_build_copies_from_its_stages_and_images() {
             "/out",
         ],
         &env,
-        TIMEOUT,
     );
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", base.stdout, base.stderr);
     assert!(
@@ -2524,7 +2778,7 @@ fn add_unpacks_archives_of_every_compression_in_the_vm() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let built = run_shards_env(&["build"], &["-t", "add:1", ctx.to_str().unwrap()], &env, TIMEOUT);
+    let built = run_shards_env(&["build"], &["-t", "add:1", ctx.to_str().unwrap()], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
     assert_eq!(exported_from(&built.stderr), "snapshot", "{shown}");
@@ -2534,7 +2788,7 @@ fn add_unpacks_archives_of_every_compression_in_the_vm() {
         eprintln!("SKIP: this host cannot run VMs");
         return;
     }
-    let ran = run_shards_env(&["run"], &["--pull", "never", "--rm", "add:1"], &env, TIMEOUT);
+    let ran = run_shards_env(&["run"], &["--pull", "never", "--rm", "add:1"], &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{shown}");
     // a/x is the file a/h links to: the link's header, the archive's later word, set it.
@@ -2585,7 +2839,7 @@ fn add_stops_at_the_image_limits_and_leaves_nothing() {
         std::fs::write(ctx.join(archive_name), archive(archive_name)).unwrap();
         let limit = std::ffi::OsString::from(limit);
         let env = [("SHARDS_HOME", home.as_os_str()), (setting, limit.as_os_str())];
-        let r = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env, TIMEOUT);
+        let r = run_shards_env(&["build"], &[ctx.to_str().unwrap()], &env);
         let shown = format!("--- stdout\n{}\n--- stderr\n{}", r.stdout, r.stderr);
         assert_eq!(r.status, Some(1), "{shown}");
         // ADD's own limit, before the archive is written out whole: not the export's.
@@ -2618,23 +2872,13 @@ fn an_images_stop_signal_is_what_stop_sends() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let built = run_shards_env(
-        &["build"],
-        &["-t", "usr1:1", ctx.to_str().unwrap()],
-        &env,
-        TIMEOUT,
-    );
+    let built = run_shards_env(&["build"], &["-t", "usr1:1", ctx.to_str().unwrap()], &env);
     assert_eq!(built.status, Some(0), "{}", built.stderr);
-    let ran = run_shards_env(
-        &["run"],
-        &["-d", "--init", "--name", "usr1", "usr1:1"],
-        &env,
-        TIMEOUT,
-    );
+    let ran = run_shards_env(&["run"], &["-d", "--init", "--name", "usr1", "usr1:1"], &env);
     assert_eq!(ran.status, Some(0), "{}", ran.stderr);
-    let stopped = run_shards_env(&["stop"], &["usr1"], &env, TIMEOUT);
+    let stopped = run_shards_env(&["stop"], &["usr1"], &env);
     assert_eq!(stopped.status, Some(0), "{}", stopped.stderr);
-    let waited = run_shards_env(&["wait"], &["usr1"], &env, TIMEOUT);
+    let waited = run_shards_env(&["wait"], &["usr1"], &env);
     assert_eq!(waited.stdout, "138\n", "{}", waited.stderr);
 }
 
@@ -2663,7 +2907,6 @@ fn an_images_healthcheck_probes_its_microvm() {
             &["build"],
             &["-t", &format!("{tag}:1"), ctx.to_str().unwrap()],
             &env,
-            TIMEOUT,
         );
         assert_eq!(built.status, Some(0), "{}", built.stderr);
     };
@@ -2689,11 +2932,11 @@ fn an_images_healthcheck_probes_its_microvm() {
         let mut args = vec!["-d", "--name", name];
         args.extend_from_slice(options);
         args.push(image);
-        let ran = run_shards_env(&["run"], &args, &env, TIMEOUT);
+        let ran = run_shards_env(&["run"], &args, &env);
         assert_eq!(ran.status, Some(0), "{}", ran.stderr);
     }
     let status = |name: &str| {
-        let ps = run_shards_env(&["ps"], &["--no-trunc"], &env, TIMEOUT);
+        let ps = run_shards_env(&["ps"], &["--no-trunc"], &env);
         ps.stdout
             .lines()
             .find(|l| l.ends_with(&format!(" {name}")))
@@ -2703,7 +2946,7 @@ fn an_images_healthcheck_probes_its_microvm() {
             })
             .unwrap_or_default()
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut patience = Patience::of(&home);
     let wanted = [
         ("good", "(healthy)"),
         ("bad", "(unhealthy)"),
@@ -2719,30 +2962,21 @@ fn an_images_healthcheck_probes_its_microvm() {
         {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "{now:?}");
-        std::thread::sleep(Duration::from_millis(100));
+        assert!(patience.holds(), "{now:?}");
+        std::thread::sleep(patience.next_look());
     }
-    // Five more probes, each failing: two would have done for the image's retries.
-    std::thread::sleep(Duration::from_secs(1));
-    assert!(
-        status("patient").contains("(health: starting)"),
-        "{}",
-        status("patient")
-    );
+    patience.done();
+    // The run's retries over the image's: `patient` is still starting once its failing
+    // streak is past five (below), where the image's two would have made it unhealthy. An
+    // order, its probes counted, where a second's sleep claimed nothing came within it.
     // `inspect` shows each record as dockerd keeps it (moby daemon/health.go): its status,
     // its failing streak, and its last five probes, each with its times, exit code and
     // output, a probe past its timeout -1 and dockerd's words (D26).
     let health = |name: &str| -> serde_json::Value {
-        let shown = run_shards_env(
-            &["inspect"],
-            &["-f", "{{json .State.Health}}", name],
-            &env,
-            TIMEOUT,
-        );
+        let shown = run_shards_env(&["inspect"], &["-f", "{{json .State.Health}}", name], &env);
         assert_eq!(shown.status, Some(0), "{}", shown.stderr);
         serde_json::from_str(&shown.stdout).unwrap()
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     // The good one last: once each failing one has failed six times, it has been probed
     // more than five times too.
     for (name, status, code, output) in [
@@ -2758,15 +2992,17 @@ fn an_images_healthcheck_probes_its_microvm() {
         ("good", "healthy", 0, ""),
     ] {
         // More than five probes run (a failing streak counts them); five are kept.
+        let mut patience = Patience::of(&home);
         let h = loop {
             let h = health(name);
             let probed = h["Log"].as_array().is_some_and(|l| l.len() >= 5)
                 && (code == 0 || h["FailingStreak"].as_u64().is_some_and(|n| n > 5));
             if probed {
+                patience.done();
                 break h;
             }
-            assert!(std::time::Instant::now() < deadline, "{name}: {h}");
-            std::thread::sleep(Duration::from_millis(100));
+            assert!(patience.holds(), "{name}: {h}");
+            std::thread::sleep(patience.next_look());
         };
         assert_eq!(h["Status"], status, "{name}: {h}");
         let log = h["Log"].as_array().unwrap();
@@ -2795,7 +3031,7 @@ fn an_images_healthcheck_probes_its_microvm() {
         }
     }
     for name in ["good", "bad", "slow", "patient"] {
-        let _ = run_shards_env(&["rm"], &["-f", name], &env, TIMEOUT);
+        let _ = run_shards_env(&["rm"], &["-f", name], &env);
     }
 }
 
@@ -2818,7 +3054,7 @@ fn an_images_exposed_ports_publish_with_publish_all() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let built = shards(&["build", "-t", "exposes:1", ctx.to_str().unwrap()]);
     assert_eq!(built.status, Some(0), "{}", built.stderr);
     let ran = shards(&["run", "-d", "--name", "plain", "exposes:1", "sleep"]);
@@ -2839,18 +3075,19 @@ fn an_images_exposed_ports_publish_with_publish_all() {
         )
     );
     // The guest listens once it runs: connected to, it says whom it serves.
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut patience = Patience::of(&home);
     let greeting = loop {
         let mut got = String::new();
-        let read = std::net::TcpStream::connect(("127.0.0.1", n)).and_then(|mut c| {
+        let read = std::net::TcpStream::connect(("127.0.0.1", n)).and_then(|c| {
             c.shutdown(std::net::Shutdown::Write)?;
-            c.read_to_string(&mut got)
+            common::Following::of_home(&c, &home).read_to_string(&mut got)
         });
         if read.is_ok() && !got.is_empty() {
+            patience.done();
             break got;
         }
-        assert!(std::time::Instant::now() < deadline, "{read:?}");
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(patience.holds(), "{read:?}");
+        std::thread::sleep(patience.next_look());
     };
     assert_eq!(greeting, format!("from {}\n", bridge().gateway()));
     let waited = shards(&["wait", "all"]);
@@ -2877,7 +3114,7 @@ fn an_images_volumes_are_anonymous_volumes_at_run() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let built = shards(&["build", "-t", "volumed:1", ctx.to_str().unwrap()]);
     assert_eq!(built.status, Some(0), "{}", built.stderr);
     let ran = shards(&[
@@ -2936,7 +3173,7 @@ fn call_answers_the_frontends_subrequests() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let outline = shards(&[
         "build",
         "--call=outline",
@@ -3003,7 +3240,7 @@ fn sboms_are_scanned() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     // The scanner: the test guest's, as an image of its own.
     let scanner_ctx = context(
         "build-sbom-scanner",
@@ -3170,7 +3407,7 @@ fn provenance_max_records_a_builds_steps_and_layers() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let meta = home.join("meta.json");
     let built = shards(&[
         "build",
@@ -3318,7 +3555,7 @@ fn builds_attest_their_provenance() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let meta = home.join("meta.json");
     let built = shards(&[
         "build",
@@ -3598,7 +3835,7 @@ fn builds_attest_their_provenance() {
     // the image output asks for them.
     let mut plain = env.to_vec();
     plain.push(("BUILDX_NO_DEFAULT_ATTESTATIONS", std::ffi::OsStr::new("1")));
-    let quiet = run_shards_env(&[], &["build", "-q", ctx.to_str().unwrap()], &plain, TIMEOUT);
+    let quiet = run_shards_env(&[], &["build", "-q", ctx.to_str().unwrap()], &plain);
     assert_eq!(quiet.status, Some(0), "{}", quiet.stderr);
     assert_eq!(
         blob(quiet.stdout.trim())["mediaType"],
@@ -3614,7 +3851,6 @@ fn builds_attest_their_provenance() {
             ctx.to_str().unwrap(),
         ],
         &plain,
-        TIMEOUT,
     );
     assert_eq!(asked.status, Some(0), "{}", asked.stderr);
     assert_eq!(
@@ -3631,7 +3867,6 @@ fn builds_attest_their_provenance() {
             ctx.to_str().unwrap(),
         ],
         &plain,
-        TIMEOUT,
     );
     assert_ne!(refused.status, Some(0));
     assert!(
@@ -3653,7 +3888,7 @@ fn url_server(log: Asked, release: std::sync::mpsc::Receiver<()>) -> u16 {
     use std::io::{BufRead as _, Write as _};
     use std::sync::{Arc, Condvar, Mutex};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let port = crate::common::minted_port(listener.local_addr().unwrap().port());
     let asked_b = Arc::new((Mutex::new(false), Condvar::new()));
     let release = Arc::new(Mutex::new(release));
     std::thread::spawn(move || {
@@ -3693,16 +3928,13 @@ fn url_server(log: Asked, release: std::sync::mpsc::Receiver<()>) -> u16 {
                     "/final" => ("200 OK", b"final\n"),
                     "/gz" => ("200 OK\r\nContent-Encoding: GZIP", gz),
                     "/three" => ("300 Multiple Choices", b"choices\n"),
+                    // Answered only once /b is asked: an order, no bound of its own. A build
+                    // that fetched them one after the other waits here, and its own judged
+                    // wait fails it.
                     "/a" => {
                         let (asked, cv) = &*asked_b;
-                        let asked = cv
-                            .wait_timeout_while(asked.lock().unwrap(), Duration::from_secs(60), |a| !*a)
-                            .unwrap();
-                        if *asked.0 {
-                            ("200 OK", b"a\n")
-                        } else {
-                            ("500 Not Concurrent", b"")
-                        }
+                        drop(cv.wait_while(asked.lock().unwrap(), |a| !*a).unwrap());
+                        ("200 OK", b"a\n")
                     }
                     "/b" => {
                         *asked_b.0.lock().unwrap() = true;
@@ -3742,7 +3974,7 @@ fn url_server(log: Asked, release: std::sync::mpsc::Receiver<()>) -> u16 {
 fn epoch_server() -> u16 {
     use std::io::{BufRead as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let port = crate::common::minted_port(listener.local_addr().unwrap().port());
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { return };
@@ -3831,7 +4063,7 @@ fn source_date_epoch_is_taken_from_a_source_stage() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let sum: String = sha2::Sha256::digest(crafted("links.tar"))
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -3945,7 +4177,7 @@ fn source_date_epoch_is_taken_from_a_named_or_remote_context() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let built = |n: usize, extra: &[&str], epoch: &str, context: &str| {
         let tag = format!("epoch2:{n}");
         let arg = format!("SOURCE_DATE_EPOCH={epoch}");
@@ -4062,7 +4294,7 @@ fn files_the_frontend_reads_are_read_whole() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     // Lines of 64 bytes: the FROM, then comments.
     let mut exact = format!("FROM scratch{}\n", " ".repeat(51)).into_bytes();
     let comment = format!("#{}\n", "x".repeat(62));
@@ -4118,7 +4350,6 @@ fn a_steps_output_is_clipped() {
             &[],
             &["build", "--no-cache", "--progress=plain", ctx.to_str().unwrap()],
             &env,
-            TIMEOUT,
         );
         assert_eq!(built.status, Some(0), "{}", built.stderr);
         built.stderr
@@ -4166,7 +4397,7 @@ fn add_checks_a_checksum_by_its_own_algorithm() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let sha384 = format!("sha384:{}", hex(&sha2::Sha384::digest(b"x")));
     let sha512 = format!("sha512:{}", hex(&sha2::Sha512::digest(b"x")));
@@ -4220,7 +4451,7 @@ fn add_fetches_urls() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let url = format!("http://127.0.0.1:{port}");
     let ctx = context(
         "build-add-url-ctx",
@@ -4316,7 +4547,9 @@ fn add_fetches_urls() {
         "{missing}"
     );
     // The hang is still held when the build ends, which cancels it rather than wait
-    // for it to time out.
+    // for it to time out. Recorded, not asserted (D209): either way its connection is closed
+    // before the build ends, so a build that waited for the hang's head shows only in how
+    // long it took, a claim of speed, which a loaded host's slowness would fail.
     let started = std::time::Instant::now();
     let hung = fails(
         "build-add-url-hung",
@@ -4326,10 +4559,10 @@ fn add_fetches_urls() {
         hung.contains("failed to load cache key: invalid response status 404"),
         "{hung}"
     );
-    assert!(
-        started.elapsed() < shards_registry::http::HEAD,
-        "{:?}",
-        started.elapsed()
+    let took = started.elapsed();
+    eprintln!(
+        "build-add-url-hung: its end with the hang held, n=1: p50=p90=p99=max={took:?} (a wait for the hang's head: {:?})",
+        shards_registry::http::HEAD
     );
     let _ = release.send(());
     // Downloads count against what ADD may write, as unpacked archives do: one past it
@@ -4346,7 +4579,7 @@ fn add_fetches_urls() {
         let limit_value = std::ffi::OsString::from(limit);
         let mut limited = env.to_vec();
         limited.push(("SHARDS_MAX_IMAGE_BYTES", limit_value.as_os_str()));
-        let over = run_shards_env(&[], &["build", ctx.to_str().unwrap()], &limited, TIMEOUT);
+        let over = run_shards_env(&[], &["build", ctx.to_str().unwrap()], &limited);
         assert!(
             over.stderr.contains(&format!(
                 "what ADD fetches and unpacks comes to more than {limit} bytes (SHARDS_MAX_IMAGE_BYTES)"
@@ -4385,7 +4618,7 @@ fn bases_whose_names_share_a_start_are_each_their_own() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let base = format!("127.0.0.1:{port}/test/base");
     let ctx = context(
         "build-two-bases",
@@ -4418,7 +4651,7 @@ fn an_agentfile_is_found_first_and_built() {
     )
     .unwrap();
     let env = [("SHARDS_HOME", home.as_os_str())];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let built = shards(&[
         "build",
         "--progress=plain",
@@ -4551,7 +4784,7 @@ fn git_at(dir: &std::path::Path, date: &str, args: &[&str]) -> String {
 fn git_http_server(root: std::path::PathBuf, accepted: Vec<String>) -> u16 {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let port = crate::common::minted_port(listener.local_addr().unwrap().port());
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
             let root = root.clone();
@@ -4678,7 +4911,7 @@ fn a_layerless_image_inspects_whole() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let built = shards(&["build", "-q", "-t", "layerless:1", ctx.to_str().unwrap()]);
     assert_eq!(built.status, Some(0), "{built}");
     let shown = shards(&[
@@ -4722,7 +4955,6 @@ fn frontend_build_args_are_read() {
                 ctx.to_str().unwrap(),
             ],
             &env,
-            TIMEOUT,
         )
     };
     let refused = build("BUILDKIT_DISABLE_FILEOP=1");
@@ -4783,7 +5015,7 @@ fn run_steps_take_cdi_devices() {
         let mut args = vec!["build", "--progress=plain", "--no-cache"];
         args.extend_from_slice(extra);
         args.push(ctx.to_str().unwrap());
-        let r = run_shards_env(&[], &args, &env, TIMEOUT);
+        let r = run_shards_env(&[], &args, &env);
         (r.status, r.stderr)
     };
     let run = format!(
@@ -4881,7 +5113,7 @@ fn run_steps_reach_the_devices_buildkit_gives_them_alone() {
         let mut args = vec!["build", "--progress=plain", "--no-cache"];
         args.extend_from_slice(extra);
         args.push(ctx.to_str().unwrap());
-        let r = run_shards_env(&[], &args, &env, TIMEOUT);
+        let r = run_shards_env(&[], &args, &env);
         (r.status, r.stderr)
     };
     let (code, log) = build(
@@ -4979,7 +5211,7 @@ fn builds_take_remote_contexts() {
     ];
     let fetched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let wport = listener.local_addr().unwrap().port();
+    let wport = crate::common::minted_port(listener.local_addr().unwrap().port());
     {
         let fetched = fetched.clone();
         std::thread::spawn(move || {
@@ -5279,13 +5511,14 @@ fn add_fetches_git_repositories() {
             .unwrap(),
     );
     let hport = git_http_server(repos.to_path_buf(), Vec::new());
-    // The daemon listens a moment after it starts.
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", dport)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    // The daemon listens a moment after it starts: waited for as what this test started
+    // goes on (D209).
+    let mut patience = Patience::started();
+    while std::net::TcpStream::connect(("127.0.0.1", dport)).is_err() {
+        assert!(patience.holds(), "git daemon never listened on {dport}");
+        std::thread::sleep(patience.next_look());
     }
+    patience.done();
 
     let (image, _) = served();
     let home = TempDir::new("build-add-git-home");
@@ -5294,7 +5527,7 @@ fn add_fetches_git_repositories() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let g = format!("git://127.0.0.1:{dport}/repo.git");
     let h = format!("http://127.0.0.1:{hport}/repo.git");
     let ctx = context(
@@ -5634,12 +5867,12 @@ fn add_fetches_git_over_ssh() {
         ports.push(port);
     }
     for port in &ports {
-        for _ in 0..100 {
-            if std::net::TcpStream::connect(("127.0.0.1", *port)).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        let mut patience = Patience::started();
+        while std::net::TcpStream::connect(("127.0.0.1", *port)).is_err() {
+            assert!(patience.holds(), "sshd never listened on {port}");
+            std::thread::sleep(patience.next_look());
         }
+        patience.done();
     }
     // The client's known_hosts, in a home of the test's own.
     let user_home = dir.join("home");
@@ -5679,7 +5912,7 @@ fn add_fetches_git_over_ssh() {
         let mut args = vec!["build", "--no-cache", "-t", "sshed:1"];
         args.extend_from_slice(ssh);
         args.push(ctx.to_str().unwrap());
-        run_shards_env(&[], &args, &env, TIMEOUT)
+        run_shards_env(&[], &args, &env)
     };
     let with_key = format!("default={}", client.display());
     let built = build(&user_home, &["--ssh", &with_key]);
@@ -5703,7 +5936,7 @@ fn add_fetches_git_over_ssh() {
     }
     let mut args = vec!["run", "--rm", "-u", "root", "sshed:1", "stat"];
     args.extend(paths.iter().map(String::as_str));
-    let stat = run_shards_env(&[], &args, &env, TIMEOUT);
+    let stat = run_shards_env(&[], &args, &env);
     let mut want = String::new();
     for i in 0..urls.len() {
         want.push_str(&format!(
@@ -5711,12 +5944,7 @@ fn add_fetches_git_over_ssh() {
         ));
     }
     assert_eq!(stat.stdout, want, "{}", stat.stderr);
-    let noise_size = run_shards_env(
-        &[],
-        &["run", "--rm", "sshed:1", "stat", "/s1/noise.bin"],
-        &env,
-        TIMEOUT,
-    );
+    let noise_size = run_shards_env(&[], &["run", "--rm", "sshed:1", "stat", "/s1/noise.bin"], &env);
     assert!(
         noise_size
             .stdout
@@ -5765,7 +5993,6 @@ fn add_fetches_git_over_ssh() {
         &[],
         &["build", "--ssh", &with_key, missing_ctx.to_str().unwrap()],
         &env_home,
-        TIMEOUT,
     );
     assert_ne!(missing.status, Some(0));
     assert!(
@@ -5779,12 +6006,16 @@ fn add_fetches_git_over_ssh() {
     // Ready once it takes connections: its socket's file is there from its bind(2), before
     // its listen(2), and a connection between the two is refused, as one was on a loaded
     // host ("Error connecting to agent: Connection refused").
-    for _ in 0..500 {
-        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    let mut patience = Patience::started();
+    while std::os::unix::net::UnixStream::connect(&sock).is_err() {
+        assert!(
+            patience.holds(),
+            "ssh-agent never took connections at {}",
+            sock.display()
+        );
+        std::thread::sleep(patience.next_look());
     }
+    patience.done();
     let added = std::process::Command::new("ssh-add")
         .arg(&client)
         .env("SSH_AUTH_SOCK", &sock)
@@ -5855,7 +6086,7 @@ fn add_fetches_a_commit_a_server_will_not_send_alone() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "build-add-git-strict-ctx",
         &format!("FROM {image}\nADD --keep-git-dir=true {url}#{first} /r\n"),
@@ -5936,7 +6167,7 @@ fn add_fetches_git_with_the_builds_secrets() {
         ("TOK", std::ffi::OsStr::new("s3cr3t")),
         ("HDR", std::ffi::OsStr::new("Bearer h3ad3r")),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "build-add-git-auth-ctx",
         &format!("FROM {image}\nADD http://127.0.0.1:{hport}/private/repo.git /p\n"),
@@ -5986,7 +6217,7 @@ fn builds_reuse_the_steps_they_have_run() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "build-cache-ctx",
         &format!(
@@ -6101,7 +6332,7 @@ fn steps_are_kept_by_what_they_read() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "1024".as_ref()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "read-keys-ctx",
         &format!(
@@ -6185,7 +6416,7 @@ fn run_caches_are_kept_across_builds() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "1024".as_ref()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     // Each build its own context, and steps no other build has, which the build cache
     // answers none of.
     let n = std::cell::Cell::new(0);
@@ -6348,7 +6579,7 @@ fn a_caches_changes_are_layered_as_a_directory_shows_them() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "1024".as_ref()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let n = std::cell::Cell::new(0);
     // A build of `ops` on the cache `id`, then a step that lists it.
     let build = |id: &str, ops: &[&str]| {
@@ -6591,12 +6822,7 @@ fn a_caches_changes_are_layered_as_a_directory_shows_them() {
             "FROM {image}\nUSER root\nRUN --mount=type=cache,target=/c,id=room [\"/bin/testguest\", \"big\", \"/c/f\", \"32\"]\n"
         ),
     );
-    let over = run_shards_env(
-        &[],
-        &["build", "--progress=plain", ctx.to_str().unwrap()],
-        &tight,
-        TIMEOUT,
-    );
+    let over = run_shards_env(&[], &["build", "--progress=plain", ctx.to_str().unwrap()], &tight);
     assert_ne!(over.status, Some(0), "{}", over.stderr);
     assert!(
         over.stderr
@@ -6625,7 +6851,7 @@ fn run_caches_are_shared_among_concurrent_builds() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "1024".as_ref()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     for sharing in ["shared", "private", "locked"] {
         let build = |name: &str, ops: &str| {
             let ctx = context(
@@ -6666,14 +6892,12 @@ fn run_caches_are_shared_among_concurrent_builds() {
                     &format!("\"fs\", \"write:/c/a-{sharing}=written-by-a\", \"sleep:30000\""),
                 )
             });
-            let deadline = std::time::Instant::now() + TIMEOUT;
+            let mut patience = Patience::of(&home);
             while records() != [true] {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "no build took the {sharing} cache"
-                );
-                std::thread::sleep(Duration::from_millis(200));
+                assert!(patience.holds(), "no build took the {sharing} cache");
+                std::thread::sleep(patience.next_look());
             }
+            patience.done();
             let b = build(
                 "b",
                 &format!(
@@ -6735,7 +6959,7 @@ fn build_cache_usage_lists_every_record() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_BUILD_MEMORY", "1024".as_ref()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ok = |args: &[&str]| {
         let r = shards(args);
         assert_eq!(r.status, Some(0), "{args:?}\n{}", r.stderr);
@@ -6821,16 +7045,17 @@ fn build_cache_usage_lists_every_record() {
     // A cache a running step holds: in use, its size 0B.
     std::thread::scope(|s| {
         let held = s.spawn(|| build("hold", "\"write:/c/g=2\", \"sleep:20000\""));
-        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut patience = Patience::of(&home);
         let in_use = loop {
             if let Some(r) = records(&["--filter", "type=exec.cachemount"])
                 .into_iter()
                 .find(|r| r["Reclaimable"] == false)
             {
+                patience.done();
                 break r;
             }
-            assert!(std::time::Instant::now() < deadline, "no step held the cache");
-            std::thread::sleep(Duration::from_millis(200));
+            assert!(patience.holds(), "no step held the cache");
+            std::thread::sleep(patience.next_look());
         };
         assert_eq!(in_use["Size"], "0B", "{in_use}");
         assert_eq!(in_use["ID"], mounts[0]["ID"]);
@@ -6867,7 +7092,7 @@ fn builds_take_steps_from_caches_written_elsewhere() {
             ("SHARDS_KERNEL", kernel().as_os_str()),
             ("SHARDS_INIT", guest_init().as_os_str()),
         ];
-        run_shards_env(&[], args, &env, TIMEOUT)
+        run_shards_env(&[], args, &env)
     };
     let ctx = context(
         "remote-cache-ctx",
@@ -7042,7 +7267,7 @@ fn builds_take_steps_from_an_s3_cache() {
             ("AWS_CONFIG_FILE", nowhere.as_os_str()),
         ];
         env.extend_from_slice(extra);
-        run_shards_env(&[], args, &env, TIMEOUT)
+        run_shards_env(&[], args, &env)
     };
     let ctx = context(
         "s3-cache-ctx",
@@ -7234,7 +7459,7 @@ fn builds_take_steps_from_an_azure_blob_cache() {
             ("SHARDS_KERNEL", kernel().as_os_str()),
             ("SHARDS_INIT", guest_init().as_os_str()),
         ];
-        run_shards_env(&[], args, &env, TIMEOUT)
+        run_shards_env(&[], args, &env)
     };
     let ctx = context(
         "azblob-cache-ctx",
@@ -7368,7 +7593,7 @@ fn builds_take_steps_from_a_github_actions_cache() {
             ("ACTIONS_CACHE_SERVICE_V2", std::ffi::OsStr::new("")),
         ];
         env.extend_from_slice(extra);
-        run_shards_env(&[], args, &env, TIMEOUT)
+        run_shards_env(&[], args, &env)
     };
     let ctx = context(
         "gha-cache-ctx",
@@ -7603,7 +7828,7 @@ fn run_steps_take_the_builds_hosts_shm_and_limits() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "build-limits-ctx",
         &format!(
@@ -7721,7 +7946,7 @@ fn squash_makes_a_builds_layers_one() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let blob = |d: &str| -> Vec<u8> {
         std::fs::read(
             home.join("images/blobs/sha256")
@@ -7916,7 +8141,7 @@ fn builder_prune_removes_the_build_cache() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "builder-prune-ctx",
         &format!("FROM {image}\nUSER root\nRUN [\"/bin/testguest\", \"fs\", \"write:/one=1\"]\n"),
@@ -7985,7 +8210,7 @@ fn a_builds_cache_is_kept_as_its_user_set() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "disk-cache-ctx",
         &format!("FROM {image}\nUSER root\nRUN [\"/bin/testguest\", \"fs\", \"write:/one=1\"]\n"),
@@ -8031,7 +8256,7 @@ fn annotations_land_on_the_manifest_or_descriptor_named() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("annotate-ctx", &format!("FROM {image}\nLABEL a=b\n"));
     let out = TempDir::new("annotate-out");
     let meta = out.join("meta.json");
@@ -8121,7 +8346,7 @@ fn check_says_the_builds_warnings() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("check-ctx", &format!("FROM {image} as Build\nLABEL a=b\n"));
     let checked = shards(&["build", "--check", ctx.to_str().unwrap()]);
     assert_eq!(checked.status, Some(1), "{}", checked.stderr);
@@ -8286,12 +8511,12 @@ fn run_steps_reach_the_clients_ssh_agent() {
             }
         }
         let agent = Ended(common::ssh_agent(&sock));
-        for _ in 0..100 {
-            if sock.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        let mut patience = Patience::started();
+        while !sock.exists() {
+            assert!(patience.holds(), "ssh-agent made no {}", sock.display());
+            std::thread::sleep(patience.next_look());
         }
+        patience.done();
         let made = std::process::Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "shards-test-key", "-f"])
             .arg(&key)
@@ -8326,7 +8551,7 @@ fn run_steps_reach_the_clients_ssh_agent() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SSH_AUTH_SOCK", sock.as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "build-ssh-ctx",
         &format!(
@@ -8465,7 +8690,7 @@ fn builds_push_what_they_build() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("build-push-ctx", &format!("FROM {image}\nLABEL pushed=yes\n"));
     let refused = shards(&["build", "--push", ctx.to_str().unwrap()]);
     assert_ne!(refused.status, Some(0));
@@ -8559,7 +8784,7 @@ fn builds_write_each_output() {
     );
     std::fs::write(ctx.join("a.txt"), "owned\n").unwrap();
     let out = TempDir::new("build-out-dest");
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let path = |p: &str| out.join(p).to_str().unwrap().to_string();
 
     // Refused before the build: no step reported.
@@ -8835,7 +9060,7 @@ fn named_contexts_stand_in_for_what_they_name() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "build-named-ctx",
         "FROM scratch AS deps\nCOPY never /d\n\
@@ -8922,7 +9147,7 @@ fn oci_layout_contexts_are_the_images_they_hold() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let out = TempDir::new("build-layout-out");
     let layout = out.join("layout");
     let first = context("build-layout-first", &format!("FROM {image}\nCOPY made /made\n"));
@@ -9033,7 +9258,6 @@ fn supplied_agents_and_harness_archives_start_their_declared_entrypoints() {
         &["build", "image"],
         &["-t", "supplied-startup:1", ctx.to_str().unwrap()],
         &env,
-        TIMEOUT,
     );
     assert_eq!(built.status, Some(0), "{}", built.stderr);
     // The existing handshake observes each domain process from init, then releases the
@@ -9053,11 +9277,15 @@ fn supplied_agents_and_harness_archives_start_their_declared_entrypoints() {
         ],
         "supplied-startup",
         ("confined-ready", 2),
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
 }
 
+/// A run's supplied members' output never rewrites its command's own (G01): its stdout stays
+/// exactly the command's JSON-RPC, and its stderr bytes whole, while the daemon drains its
+/// members' output into their logs and shows the attached client each of their lines on its
+/// stderr after its label, to the members' ends (their tails cut short as the run ends them
+/// included), before the client's own end says its timing (D59 "Its stdio", PM M543).
 #[test]
 fn supplied_member_output_does_not_rewrite_the_main_protocol() {
     if cannot_run_vms() {
@@ -9099,7 +9327,6 @@ fn supplied_member_output_does_not_rewrite_the_main_protocol() {
         &["build", "image"],
         &["-t", "capture-protocol:1", ctx.to_str().unwrap()],
         &env,
-        TIMEOUT,
     );
     assert_eq!(built.status, Some(0), "{built}");
     let ran = common::run_awaiting(
@@ -9115,16 +9342,46 @@ fn supplied_member_output_does_not_rewrite_the_main_protocol() {
         ],
         "capture-protocol",
         ("capture-ready", 2),
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{ran}");
     assert_eq!(ran.stdout, r#"{"jsonrpc":"2.0","id":1,"result":"main"}"#, "{ran}");
-    let timing = ran
+    // Its stderr: main's own bytes, whole, and its members' lines, which the daemon drains
+    // and shows the client attached, each after its label (D59 "Its stdio", PM M543), the
+    // host's timing last. Main's are one write of its command's, so they lie whole between
+    // two of the members' lines, or within one, each of which is one write too.
+    let (said, timing) = ran
         .stderr
-        .strip_prefix("main-stderrshards-timing ")
-        .and_then(|s| s.strip_suffix('\n'))
-        .expect("only main stderr and one final host timing diagnostic");
+        .rsplit_once("shards-timing ")
+        .expect("a final host timing diagnostic");
+    let timing = timing
+        .strip_suffix('\n')
+        .expect("the timing line ends the stderr");
     assert!(!timing.contains('\n'), "{ran}");
+    let members = said.replacen("main-stderr", "", 1);
+    assert_eq!(
+        said.len() - members.len(),
+        "main-stderr".len(),
+        "main's stderr whole: {ran}"
+    );
+    assert!(members.is_empty() || members.ends_with('\n'), "{ran}");
+    let mut shown: Vec<&str> = members.lines().collect();
+    shown.sort_unstable();
+    // What each member writes (testguest `managed_capture_bytes`), its lines as shown: a line
+    // cut short at its stream's end ended.
+    let mut expected: Vec<String> = [("agent helper", "agent"), ("harness driver", "harness")]
+        .iter()
+        .flat_map(|(label, member)| {
+            [
+                format!("{member}\0stdout").into_bytes(),
+                b"\xff\x1b[2Jout-tail".to_vec(),
+                format!("{member}\0stderr").into_bytes(),
+                b"\x80\xfeerr-tail".to_vec(),
+            ]
+            .map(|line| format!("[{label}] {}", String::from_utf8_lossy(&line)))
+        })
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(shown, expected, "{ran}");
     let value: serde_json::Value = serde_json::from_str(timing).expect("host timing JSON");
     let timing = value.as_object().expect("host timing object");
     let numbers = [
@@ -9176,7 +9433,7 @@ fn agentfile_directives_lay_out_what_they_bring() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("build-domains-ctx", &format!("FROM {image}\n"));
     let write = |rel: &str, text: &str| {
         let p = ctx.join(rel);
@@ -9282,7 +9539,7 @@ fn agents_are_osi_artifacts_made_pushed_and_taken() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("build-osi-agent");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     std::fs::write(dir.join("bin/run"), "#!/bin/sh\necho agent\n").unwrap();
@@ -9391,7 +9648,7 @@ fn agents_come_from_the_oci_layouts_build_contexts_give() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("build-osi-layout-agent");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     std::fs::write(dir.join("bin/run"), "#!/bin/sh\necho agent\n").unwrap();
@@ -9526,7 +9783,7 @@ fn osi_artifacts_of_several_platforms_are_an_index() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let guest = if cfg!(target_arch = "aarch64") {
         "arm64"
     } else {
@@ -9638,7 +9895,7 @@ fn domains_are_checked_before_an_image_leaves_the_build() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("build-isolation-ctx", &format!("FROM {image}\n"));
     std::fs::create_dir_all(ctx.join("agent")).unwrap();
     std::fs::write(ctx.join("agent/run"), "run\n").unwrap();
@@ -9710,7 +9967,7 @@ fn an_internal_agent_reaches_the_world_through_nothing() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("reach-ctx", &format!("FROM {image}\n"));
     for d in ["a", "b", "h"] {
         std::fs::create_dir_all(ctx.join(d)).unwrap();
@@ -9805,7 +10062,7 @@ fn only_a_domains_own_directives_write_in_it() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("build-writes-ctx", &format!("FROM {image}\n"));
     std::fs::create_dir_all(ctx.join("agent")).unwrap();
     std::fs::write(ctx.join("agent/run"), "run\n").unwrap();
@@ -9857,7 +10114,7 @@ fn agents_expand_their_words_and_are_copied_from() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("build-q19-ctx", &format!("FROM {image}\n"));
     std::fs::create_dir_all(ctx.join("agent/bin")).unwrap();
     std::fs::write(ctx.join("agent/bin/run"), "run\n").unwrap();
@@ -9920,7 +10177,7 @@ fn an_agentfiles_manifest_says_what_it_holds() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("build-annot-ctx", &format!("FROM {image}\nLABEL plain=yes\n"));
     std::fs::create_dir_all(ctx.join("a")).unwrap();
     std::fs::write(ctx.join("a/run"), "run\n").unwrap();
@@ -9979,7 +10236,7 @@ fn agents_run_in_their_domains() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("domains-agent");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     std::fs::copy(common::test_guest(), dir.join("bin/testguest")).unwrap();
@@ -10049,7 +10306,6 @@ fn agents_run_in_their_domains() {
         ],
         "aw-confined",
         ("confined-ready", 2),
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.stdout, "", "the workload's stdout is its own");
@@ -10170,7 +10426,7 @@ fn agents_reach_by_ipv6_only_what_connect_grants() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let agent = |name: &str, args: &[&str]| -> String {
         let dir = TempDir::new(&format!("links6-agent-{name}"));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -10231,7 +10487,6 @@ fn agents_reach_by_ipv6_only_what_connect_grants() {
         ],
         "aw-links6",
         ("confined-ready", 3),
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
     let said = |who: &str| -> Vec<String> {
@@ -10315,7 +10570,7 @@ fn agents_reach_past_the_microvm_by_ipv6_what_their_networks_grant() {
     };
     let serve = || {
         let server = std::net::TcpListener::bind("[::]:0").unwrap();
-        let port = server.local_addr().unwrap().port();
+        let port = crate::common::minted_port(server.local_addr().unwrap().port());
         std::thread::spawn(move || for _ in server.incoming() {});
         port
     };
@@ -10325,7 +10580,11 @@ fn agents_reach_past_the_microvm_by_ipv6_what_their_networks_grant() {
     // Bound to the address it is asked at, so its answers come from it on a host of several
     // addresses, as a resolver's must (RFC 5452 §9.1).
     let resolver = std::net::UdpSocket::bind((*host4.ip(), 0)).unwrap();
-    let resolver_at = format!("{}:{}", host4.ip(), resolver.local_addr().unwrap().port());
+    let resolver_at = format!(
+        "{}:{}",
+        host4.ip(),
+        crate::common::minted_port(resolver.local_addr().unwrap().port())
+    );
     std::thread::spawn(move || {
         let mut buf = [0u8; 512];
         while let Ok((n, from)) = common::recv_from(&resolver, &mut buf) {
@@ -10358,7 +10617,7 @@ fn agents_reach_past_the_microvm_by_ipv6_what_their_networks_grant() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_DNS", std::ffi::OsStr::new(&resolver_at)),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let to = |p: u16| format!("[{host}]:{p}");
     let dir = TempDir::new("egress6-agent-a");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -10429,7 +10688,6 @@ fn agents_reach_past_the_microvm_by_ipv6_what_their_networks_grant() {
             ],
             &name,
             ("confined-ready", 1),
-            TIMEOUT,
         );
         assert_eq!(ran.status, Some(0), "{network}: {}{}", ran.stdout, ran.stderr);
         for want in [
@@ -10489,7 +10747,7 @@ fn agents_reach_only_what_connect_grants() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let agent = |name: &str, args: &[&str]| -> String {
         let dir = TempDir::new(&format!("links-agent-{name}"));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -10558,7 +10816,6 @@ fn agents_reach_only_what_connect_grants() {
         ],
         "aw-links",
         ("confined-ready", 4),
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
     let said = |who: &str| -> Vec<String> {
@@ -10658,7 +10915,7 @@ fn an_engines_member_reaches_no_farther_than_the_command_beside_agents() {
     };
     let host = host.ip();
     let server = listening_anywhere();
-    let granted = server.local_addr().unwrap().port();
+    let granted = crate::common::minted_port(server.local_addr().unwrap().port());
     std::thread::spawn(move || {
         for mut c in server.incoming().flatten() {
             let _ = std::io::Write::write_all(&mut c, b"served\n");
@@ -10667,7 +10924,7 @@ fn an_engines_member_reaches_no_farther_than_the_command_beside_agents() {
     // The host's word to the agent, said once its engine's member serves: what the agent
     // tries of the member waits for it.
     let word_server = listening_anywhere();
-    let word = word_server.local_addr().unwrap().port();
+    let word = crate::common::minted_port(word_server.local_addr().unwrap().port());
     let (say, word_said) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         if let Ok((mut c, _)) = word_server.accept() {
@@ -10683,7 +10940,7 @@ fn an_engines_member_reaches_no_farther_than_the_command_beside_agents() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let to = format!("{host}:{granted}");
     let heard = format!("{host}:{word}");
     // The member of the network its engine makes, at an address of that network's subnet.
@@ -10731,11 +10988,12 @@ fn an_engines_member_reaches_no_farther_than_the_command_beside_agents() {
         all.extend_from_slice(args);
         shards(&all)
     };
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut patience = Patience::of(&home);
     while in_beside(&["api", "GET", "/_ping", ""]).stdout != "api HTTP/1.1 200 OK\nOK" {
-        assert!(std::time::Instant::now() < deadline, "its engine never answered");
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(patience.holds(), "its engine never answered");
+        std::thread::sleep(patience.next_look());
     }
+    patience.done();
     // The plain image, pulled through its engine: no joiner runs an Agentfile's.
     let (repo, tag) = image.rsplit_once(':').unwrap();
     let pulled = in_beside(&[
@@ -10772,28 +11030,27 @@ fn an_engines_member_reaches_no_farther_than_the_command_beside_agents() {
     assert!(made.stdout.starts_with("api HTTP/1.1 201"), "{made}");
     let started = in_beside(&["api", "POST", "/containers/far/start", ""]);
     assert!(started.stdout.starts_with("api HTTP/1.1 204"), "{started}");
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut patience = Patience::of(&home);
     while !in_beside(&["api", "GET", "/containers/far/logs?stdout=1", ""])
         .stdout
         .contains("ready")
     {
-        assert!(std::time::Instant::now() < deadline, "far never served");
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(patience.holds(), "far never served");
+        std::thread::sleep(patience.next_look());
     }
+    patience.done();
     let _ = say.send(());
     // The agent's lines, its last once it has tried the member.
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut patience = Patience::of(&home);
     let logged = loop {
         let logged = shards(&["logs", "beside"]);
         let logged = format!("{}{}", logged.stdout, logged.stderr);
         if logged.contains("[agent a] confined net=") {
+            patience.done();
             break logged;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the agent never said:\n{logged}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(patience.holds(), "the agent never said:\n{logged}");
+        std::thread::sleep(patience.next_look());
     };
     for want in [
         format!("[agent a] confined reach {to}: ok"),
@@ -10852,7 +11109,7 @@ fn agents_reach_past_the_microvm_what_their_networks_grant() {
     // until the test ends.
     let serve = || {
         let server = listening_anywhere();
-        let port = server.local_addr().unwrap().port();
+        let port = crate::common::minted_port(server.local_addr().unwrap().port());
         std::thread::spawn(move || for _ in server.incoming() {});
         port
     };
@@ -10861,7 +11118,7 @@ fn agents_reach_past_the_microvm_what_their_networks_grant() {
     // At the address the guest sends to, so that its answers come back from it on a host of
     // several addresses, the flow's own reverse.
     let echo = std::net::UdpSocket::bind((host, 0)).unwrap();
-    let echoed = echo.local_addr().unwrap().port();
+    let echoed = crate::common::minted_port(echo.local_addr().unwrap().port());
     std::thread::spawn(move || {
         let mut buf = [0u8; 64];
         while let Ok((n, from)) = common::recv_from(&echo, &mut buf) {
@@ -10873,7 +11130,10 @@ fn agents_reach_past_the_microvm_what_their_networks_grant() {
     // Bound to the address it is asked at, as a resolver's answers must come from it (RFC
     // 5452 §9.1), on a host of several addresses too.
     let resolver = std::net::UdpSocket::bind((host, 0)).unwrap();
-    let resolver_at = format!("{host}:{}", resolver.local_addr().unwrap().port());
+    let resolver_at = format!(
+        "{host}:{}",
+        crate::common::minted_port(resolver.local_addr().unwrap().port())
+    );
     let address = match host {
         std::net::IpAddr::V4(a) => a.octets(),
         std::net::IpAddr::V6(_) => panic!("an IPv4 host address"),
@@ -10912,7 +11172,7 @@ fn agents_reach_past_the_microvm_what_their_networks_grant() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_DNS", std::ffi::OsStr::new(&resolver_at)),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let agent = |name: &str, args: &[String]| -> String {
         let dir = TempDir::new(&format!("egress-agent-{name}"));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -10996,7 +11256,6 @@ fn agents_reach_past_the_microvm_what_their_networks_grant() {
         ],
         "aw-egress",
         ("confined-ready", 4),
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
     let said = |who: &str| -> Vec<String> {
@@ -11086,7 +11345,7 @@ fn agents_answer_what_their_networks_let_in() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("ingress-agent");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     std::fs::copy(common::test_guest(), dir.join("bin/testguest")).unwrap();
@@ -11159,28 +11418,33 @@ fn agents_answer_what_their_networks_let_in() {
             .unwrap_or_else(|| panic!("no {container} in {}", listed.stdout))
     };
     let (granted, other) = (host_port("7100"), host_port("7200"));
-    // What a connection to the host's published port reads, in 3 s at most.
+    // What a connection to the host's published port reads to its end, read as a stream
+    // its home's daemon carries (a judged wait, D209).
     let read = |p: u16| -> String {
-        let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", p)) else {
+        let Ok(c) = std::net::TcpStream::connect(("127.0.0.1", p)) else {
             return String::new();
         };
-        let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(3)));
         let mut got = String::new();
-        let _ = c.read_to_string(&mut got);
+        let _ = common::Following::of_home(&c, &home).read_to_string(&mut got);
         got
     };
     // Once the agent listens: until then a connection finds no one.
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    let mut said = String::new();
-    while std::time::Instant::now() < deadline {
-        said = read(granted);
+    let mut patience = Patience::of(&home);
+    let said = loop {
+        let said = read(granted);
         if !said.is_empty() {
-            break;
+            patience.done();
+            break said;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+        if !patience.holds() {
+            break said;
+        }
+        std::thread::sleep(patience.next_look());
+    };
     assert_eq!(said, "hello from agent-a\n", "the published ingress port");
-    // No grant lets 7200 in: the agent listens on it, and is not reached.
+    // No grant lets 7200 in: the agent listens on it, and is not reached. An order, after
+    // 7100 answered: 7200's flow ends with none of the agent's words (its old 3 s read
+    // claimed none came within them).
     assert!(!read(other).contains("agent-a"), "port 7200 reached the agent");
     let _ = shards(&["remove", "vm", "-f", "front"]);
 }
@@ -11203,7 +11467,7 @@ fn each_agent_answers_the_port_its_expose_names() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for name in ["web", "api"] {
         let dir = TempDir::new(&format!("members-{name}"));
@@ -11271,20 +11535,24 @@ fn each_agent_answers_the_port_its_expose_names() {
             .and_then(|p| p.parse().ok())
             .unwrap_or_else(|| panic!("no {container} in {}", listed.stdout))
     };
-    // What a connection to the host's published port reads, in 3 s at most; once its agent
-    // listens, as until then a connection finds no one.
+    // What a connection to the host's published port reads to its end, read as a stream its
+    // home's daemon carries; once its agent listens, as until then a connection finds no one.
+    // Both waits judged (D209).
     let read = |p: u16| -> String {
-        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut patience = Patience::of(&home);
         loop {
             let mut got = String::new();
-            if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", p)) {
-                let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(3)));
-                let _ = c.read_to_string(&mut got);
+            if let Ok(c) = std::net::TcpStream::connect(("127.0.0.1", p)) {
+                let _ = common::Following::of_home(&c, &home).read_to_string(&mut got);
             }
-            if !got.is_empty() || std::time::Instant::now() >= deadline {
+            if !got.is_empty() {
+                patience.done();
                 return got;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !patience.holds() {
+                return got;
+            }
+            std::thread::sleep(patience.next_look());
         }
     };
     assert_eq!(read(host_port("7100")), "hello from agent-web\n");
@@ -11327,7 +11595,7 @@ fn a_port_comes_in_to_the_member_listening_on_it() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for (name, listens) in [("web", 7100), ("api", 7200), ("ops", 7300), ("idle", 7400)] {
         let dir = TempDir::new(&format!("listening-{name}"));
@@ -11383,24 +11651,28 @@ fn a_port_comes_in_to_the_member_listening_on_it() {
             .and_then(|p| p.parse().ok())
             .unwrap_or_else(|| panic!("no {container} in {}", listed.stdout))
     };
-    // What one connection reads, in 3 s at most.
+    // What one connection reads to its end, read as a stream its home's daemon carries (a
+    // judged wait, D209).
     let once = |p: u16| -> String {
         let mut got = String::new();
-        if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", p)) {
-            let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(3)));
-            let _ = c.read_to_string(&mut got);
+        if let Ok(c) = std::net::TcpStream::connect(("127.0.0.1", p)) {
+            let _ = common::Following::of_home(&c, &home).read_to_string(&mut got);
         }
         got
     };
     // Once its agent listens: until then a connection finds no one.
     let read = |p: u16| -> String {
-        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut patience = Patience::of(&home);
         loop {
             let got = once(p);
-            if !got.is_empty() || std::time::Instant::now() >= deadline {
+            if !got.is_empty() {
+                patience.done();
                 return got;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !patience.holds() {
+                return got;
+            }
+            std::thread::sleep(patience.next_look());
         }
     };
     // What the run and its agents said, where a port reached no one.
@@ -11458,7 +11730,7 @@ fn chooser_round_trip_costs() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     let ops = [
         ("cand", format!(r#""listencost","{n}:7600","{n}:7700""#)),
@@ -11496,17 +11768,20 @@ fn chooser_round_trip_costs() {
     assert_eq!(built.status, Some(0), "{}", built.stderr);
     let ran = shards(&["run", "vm", "-d", "--name", "chooser", "chooser:1", "sleep"]);
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    let mut said = String::new();
-    while std::time::Instant::now() < deadline {
+    let mut patience = Patience::of(&home);
+    let said = loop {
         // Agents say theirs on the run's stderr, each line `[agent NAME] `.
         let logs = shards(&["read", "logs", "chooser"]);
-        said = logs.stdout + &logs.stderr;
+        let said = logs.stdout + &logs.stderr;
         if said.matches("confined listencost").count() == 3 {
-            break;
+            patience.done();
+            break said;
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+        if !patience.holds() {
+            break said;
+        }
+        std::thread::sleep(patience.next_look());
+    };
     let _ = shards(&["remove", "vm", "-f", "chooser"]);
     for line in said.lines().filter(|l| l.contains("listencost")) {
         println!("{line}");
@@ -11531,7 +11806,7 @@ fn a_udp_flow_goes_to_its_ports_next_holder() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for (name, spec) in [("web", "7500:0:20000"), ("api", "7500:25000:0")] {
         let dir = TempDir::new(&format!("udpholder-{name}"));
@@ -11584,17 +11859,17 @@ fn a_udp_flow_goes_to_its_ports_next_holder() {
         .and_then(|at| at.rsplit(':').next())
         .and_then(|p| p.trim().parse().ok())
         .unwrap_or_else(|| panic!("no 7500/udp in {}", listed.stdout));
-    // One socket, one flow: a datagram every 200 ms, each answer kept as it changes.
+    // One socket, one flow: a datagram every 200 ms (the flow's pace, which a lost datagram
+    // or answer costs no more than), each answer kept as it changes, for as long as its
+    // home's daemon and microVM go on (D209).
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     sock.connect(("127.0.0.1", host_port)).unwrap();
     sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
         .unwrap();
     let mut heard: Vec<String> = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut patience = Patience::of(&home);
     let mut buf = [0u8; 512];
-    while std::time::Instant::now() < deadline
-        && heard.last().map(String::as_str) != Some("hello from agent-api\n")
-    {
+    while heard.last().map(String::as_str) != Some("hello from agent-api\n") && patience.holds() {
         let _ = sock.send(b"who");
         if let Ok(n) = sock.recv(&mut buf) {
             let said = String::from_utf8_lossy(&buf[..n]).into_owned();
@@ -11602,6 +11877,9 @@ fn a_udp_flow_goes_to_its_ports_next_holder() {
                 heard.push(said);
             }
         }
+    }
+    if heard.last().map(String::as_str) == Some("hello from agent-api\n") {
+        patience.done();
     }
     let logs = shards(&["read", "logs", "udpholder"]);
     // The flows init tracks, where they went.
@@ -11665,7 +11943,7 @@ fn a_remote_mcp_server_is_a_grant_of_that_server_alone() {
     };
     let serve = || {
         let server = listening_anywhere();
-        let port = server.local_addr().unwrap().port();
+        let port = crate::common::minted_port(server.local_addr().unwrap().port());
         std::thread::spawn(move || for _ in server.incoming() {});
         port
     };
@@ -11690,7 +11968,7 @@ fn a_remote_mcp_server_is_a_grant_of_that_server_alone() {
             .find_map(|n| {
                 if n % 2 == 0 {
                     let tcp = std::net::TcpListener::bind((address, 0)).unwrap();
-                    let port = tcp.local_addr().unwrap().port();
+                    let port = crate::common::minted_port(tcp.local_addr().unwrap().port());
                     match std::net::UdpSocket::bind((address, port)) {
                         Ok(udp) => Some((udp, tcp)),
                         Err(e) => {
@@ -11701,7 +11979,7 @@ fn a_remote_mcp_server_is_a_grant_of_that_server_alone() {
                     }
                 } else {
                     let udp = std::net::UdpSocket::bind((address, 0)).unwrap();
-                    let port = udp.local_addr().unwrap().port();
+                    let port = crate::common::minted_port(udp.local_addr().unwrap().port());
                     match std::net::TcpListener::bind((address, port)) {
                         Ok(tcp) => Some((udp, tcp)),
                         Err(e) => {
@@ -11714,7 +11992,7 @@ fn a_remote_mcp_server_is_a_grant_of_that_server_alone() {
             })
             .unwrap_or_else(|| panic!("no port free in both TCP and UDP: {refused:?}"))
     };
-    let resolver_port = resolver.local_addr().unwrap().port();
+    let resolver_port = crate::common::minted_port(resolver.local_addr().unwrap().port());
     let resolver_at = format!("{host}:{resolver_port}");
     let answer = move |q: &[u8]| -> Vec<u8> {
         let mut at = 12;
@@ -11783,7 +12061,7 @@ fn a_remote_mcp_server_is_a_grant_of_that_server_alone() {
         ("SHARDS_INIT", guest_init().as_os_str()),
         ("SHARDS_DNS", std::ffi::OsStr::new(&resolver_at)),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let agent = |name: &str, args: &[String]| -> String {
         let dir = TempDir::new(&format!("mcp-agent-{name}"));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -11876,7 +12154,6 @@ fn a_remote_mcp_server_is_a_grant_of_that_server_alone() {
         ],
         "aw-mcp",
         ("confined-ready", 3),
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
     let said = |who: &str| -> Vec<String> {
@@ -11978,7 +12255,7 @@ fn a_skill_an_agent_lists_is_taken_from_it() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("skill-from-agent");
     std::fs::create_dir_all(dir.join("skills/pdf")).unwrap();
     std::fs::write(
@@ -12059,7 +12336,7 @@ fn a_domains_user_owns_nothing_past_its_domain() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context("owners-ctx", &format!("FROM {image}\n"));
     std::fs::create_dir_all(ctx.join("agent")).unwrap();
     std::fs::write(ctx.join("agent/run"), "run\n").unwrap();
@@ -12102,7 +12379,7 @@ fn an_agent_reaches_no_socket_of_the_runs_own() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("unix-agent");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     std::fs::copy(common::test_guest(), dir.join("bin/testguest")).unwrap();
@@ -12142,7 +12419,6 @@ fn an_agent_reaches_no_socket_of_the_runs_own() {
         ],
         "unix",
         ("confined-ready", 1),
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
     let said: Vec<&str> = ran
@@ -12196,7 +12472,6 @@ fn an_awaiting_command_is_signalled_once_it_waits() {
         "aw-late",
         "comm",
         &mut |_| true,
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}{}", ran.stdout, ran.stderr);
 }
@@ -12220,7 +12495,7 @@ fn agents_out_of_memory_end_whole_and_spare_the_run() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let agent = |name: &str, verbs: &[&str], asks: &str| {
         let dir = TempDir::new(&format!("oom-agent-{name}"));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -12323,7 +12598,6 @@ fn agents_out_of_memory_end_whole_and_spare_the_run() {
             name,
             "time,comm",
             &mut ready,
-            TIMEOUT,
         );
         let all = format!("{}{}", ran.stdout, ran.stderr);
         assert!(
@@ -12418,7 +12692,7 @@ fn agents_reach_only_the_unix_sockets_granted() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let tools = "/run/networks/n/tools/sock";
     let secret = "/run/networks/n/secret/sock";
     let mut agents = String::new();
@@ -12474,7 +12748,6 @@ fn agents_reach_only_the_unix_sockets_granted() {
         ],
         "aw-sock",
         ("confined-ready", 4),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -12509,7 +12782,7 @@ fn an_agents_flood_of_flows_takes_no_others() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let flood = std::env::var("SHARDS_FLOOD_SECS").unwrap_or_else(|_| "10".to_string());
     let mut agents = String::new();
     for (name, verbs) in [
@@ -12561,7 +12834,6 @@ fn an_agents_flood_of_flows_takes_no_others() {
         ],
         "aw-flood",
         ("confined-ready", 3),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -12601,7 +12873,7 @@ fn an_agents_assured_flows_take_no_others() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let flood: u64 = std::env::var("SHARDS_FLOOD_SECS").map_or(10, |s| s.parse().unwrap());
     let mut agents = String::new();
     for (name, verbs) in [
@@ -12653,7 +12925,6 @@ fn an_agents_assured_flows_take_no_others() {
         ],
         "aw-assured",
         ("confined-ready", 4),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -12713,7 +12984,7 @@ fn an_agents_own_flows_take_no_port_it_accepts() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for (name, verbs) in [
         ("x", "\"listen\",\"7002\""),
@@ -12762,7 +13033,6 @@ fn an_agents_own_flows_take_no_port_it_accepts() {
         ],
         "aw-ports",
         ("confined-ready", 3),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -12791,7 +13061,7 @@ fn an_agent_reaches_nothing_past_its_grants() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     // Where the microVM is, from a run of its own: its address and gateway.
     let probe = shards(&["run", "--rm", &image, "sweep-target", "7100", "none", "0"]);
     let where_ = |all: &str| -> (String, String) {
@@ -12864,7 +13134,6 @@ fn an_agent_reaches_nothing_past_its_grants() {
         ],
         "aw-sweep",
         ("confined-ready", 3),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -12921,7 +13190,7 @@ fn an_agents_daemon_ends_with_it() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("daemon-agent");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     std::fs::copy(common::test_guest(), dir.join("bin/testguest")).unwrap();
@@ -12972,7 +13241,6 @@ fn an_agents_daemon_ends_with_it() {
         "aw-daemon",
         "comm",
         &mut watch,
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert!(
@@ -13000,7 +13268,7 @@ fn no_kernel_channel_joins_two_agents() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for (name, verbs) in [
         ("a", "\"ipc-make\",\"ipc-try\""),
@@ -13040,7 +13308,6 @@ fn no_kernel_channel_joins_two_agents() {
         ],
         "aw-chan",
         ("confined-ready", 2),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -13072,7 +13339,7 @@ fn the_in_vm_server_knows_each_agent() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for name in ["x", "y"] {
         let dir = TempDir::new(&format!("server-agent-{name}"));
@@ -13127,7 +13394,6 @@ fn the_in_vm_server_knows_each_agent() {
         "aw-server",
         fields,
         &mut ready,
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -13188,7 +13454,7 @@ fn agents_message_one_another_as_granted() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for (name, verbs) in [
         ("a", r#""srv-peers","srv-send","agent b|hi","srv-receive","30""#),
@@ -13235,7 +13501,6 @@ fn agents_message_one_another_as_granted() {
         ],
         "aw-msg",
         ("confined-ready", 3),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -13266,14 +13531,12 @@ fn code_mode_runs_a_program_with_the_callers_grants() {
     }
     #[path = "common/managed_capture.rs"]
     mod capture;
-    use capture::{Ask, Event, Metadata, Observer};
+    use capture::{Ask, Event, Metadata, Observer, Until};
     use shards_abi::run::managed::{Channel, Event as CaptureEvent, Record, StreamState};
     use shards_remote::identity::Identity;
     use shards_remote::net::Command;
     use std::collections::BTreeMap;
-    use std::time::Instant;
 
-    let until = Instant::now().checked_add(TIMEOUT).unwrap();
     let records = std::env::var_os("SHARDS_CODE_MODE_CAPTURE_RECORDS").map(std::path::PathBuf::from);
     if let Some(path) = &records {
         assert!(path.is_absolute(), "absolute new evidence directory");
@@ -13287,6 +13550,8 @@ fn code_mode_runs_a_program_with_the_callers_grants() {
     let (image, _) = served();
     let (port, _repos) = common::writable_registry();
     let home = TempDir::new("code-home");
+    // Its observers' reads judged on its home's daemon and microVMs (D209).
+    let until = Until::Judged(&home);
     let owner = Identity::load_or_create(&home.join("identity")).unwrap();
     let mut observers = Vec::<Observer>::new();
     let env = [
@@ -13294,11 +13559,7 @@ fn code_mode_runs_a_program_with_the_callers_grants() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| {
-        let left = until.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "original code-mode deadline");
-        run_shards_env(&[], args, &env, left)
-    };
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let a_program = r#"const me = await shards.whoami();
 const peers = await shards.peers();
@@ -13451,7 +13712,7 @@ return { me, peers, sent, refused };"#;
         // that leave nothing to wait on: each agent names itself confined-ready after writing
         // it (testguest workload.rs), and the server ends an abandoned session's program
         // worker as it finds the client gone. So the process table is read again, each
-        // snapshot kept, until it shows both or the original deadline passes.
+        // snapshot kept, until it shows both or its wait is refused (a `Patience`, D209).
         fn table(stdout: &str) -> Vec<Vec<&str>> {
             stdout
                 .lines()
@@ -13480,6 +13741,7 @@ return { me, peers, sent, refused };"#;
                 && main_awaits(rows)
         }
         let mut snapshot = 0;
+        let mut patience = Patience::of(&home);
         let top = loop {
             let top = shards(&["top", "aw-code", "-o", "pid,caught,comm"]);
             save(
@@ -13487,9 +13749,14 @@ return { me, peers, sent, refused };"#;
                 top.to_string().as_bytes(),
             );
             assert_eq!(top.status, Some(0), "{top}");
-            if settled(&table(&top.stdout)) || Instant::now() >= until {
+            if settled(&table(&top.stdout)) {
+                patience.done();
                 break top;
             }
+            if !patience.holds() {
+                break top;
+            }
+            std::thread::sleep(patience.next_look());
             snapshot += 1;
         };
         let rows = table(&top.stdout);
@@ -13547,22 +13814,13 @@ return { me, peers, sent, refused };"#;
         assert_eq!(removed.status, Some(0), "{removed}");
         assert!(!record.exists(), "private run metadata removed");
     }));
-    // The explicit cleanup phase has 15s of its own, capped by the original case+15s.
-    let cleanup = Duration::from_secs(15);
-    let cleanup_until = Instant::now()
-        .checked_add(cleanup)
-        .unwrap()
-        .min(until.checked_add(cleanup).unwrap());
+    // The cleanup: each observer asked to stop, and its driver's end, which that request owes,
+    // joined with no bound of its own (an order).
     for observer in &observers {
         observer.sender.request_stop();
     }
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_shards_env(
-            &[],
-            &["stop", "daemon"],
-            &env,
-            cleanup_until.saturating_duration_since(Instant::now()),
-        )
+        run_shards_env(&[], &["stop", "daemon"], &env)
     }));
     let mut errors = Vec::new();
     match stopped {
@@ -13575,7 +13833,7 @@ return { me, peers, sent, refused };"#;
         Err(_) => errors.push("owner-stop helper panicked; cleanup unknown".to_string()),
     }
     for observer in &mut observers {
-        if let Err(error) = observer.join(cleanup_until) {
+        if let Err(error) = observer.join(Until::Ordered) {
             errors.push(error);
         }
     }
@@ -13607,7 +13865,7 @@ fn a_harness_is_handed_files_and_no_link_fifo_or_giant() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut domains = String::new();
     for (kind, name, verbs) in [
         (
@@ -13671,7 +13929,6 @@ fn a_harness_is_handed_files_and_no_link_fifo_or_giant() {
         ],
         "aw-hand",
         ("confined-ready", 2),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -13721,7 +13978,7 @@ fn the_in_vm_server_speaks_each_revision() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("revisions-agent");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     std::fs::copy(common::test_guest(), dir.join("bin/testguest")).unwrap();
@@ -13757,7 +14014,6 @@ fn the_in_vm_server_speaks_each_revision() {
         ],
         "aw-revisions",
         ("confined-ready", 1),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -13842,7 +14098,7 @@ fn code_mode_costs_in_microvms() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let dir = TempDir::new("code-cost-agent");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     std::fs::copy(common::test_guest(), dir.join("bin/testguest")).unwrap();
@@ -13876,7 +14132,6 @@ fn code_mode_costs_in_microvms() {
         ],
         "aw-code-cost",
         ("confined-ready", 1),
-        Duration::from_secs(600),
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -13907,7 +14162,7 @@ fn mcp_servers_are_offered_to_those_in_scope() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for name in ["a", "b"] {
         let dir = TempDir::new(&format!("offer-agent-{name}"));
@@ -13951,7 +14206,6 @@ fn mcp_servers_are_offered_to_those_in_scope() {
         ],
         "aw-offer",
         ("confined-ready", 2),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -13994,7 +14248,7 @@ fn a_builds_platform_defaults_to_the_default_platforms() {
             ("SHARDS_INIT", guest_init().as_os_str()),
         ];
         env.extend(defaults.iter().map(|(k, v)| (*k, std::ffi::OsStr::new(*v))));
-        let ran = run_shards_env(&[], args, &env, TIMEOUT);
+        let ran = run_shards_env(&[], args, &env);
         assert_eq!(ran.status, Some(0), "{defaults:?} {args:?}: {}", ran.stderr);
         ran.stdout.trim().to_string()
     };
@@ -14039,7 +14293,7 @@ fn builds_for_another_platform_run_only_the_build_platforms_steps() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let (arch, other) = if cfg!(target_arch = "aarch64") {
         ("arm64", "amd64")
     } else {
@@ -14158,13 +14412,18 @@ fn a_step_for_another_cpu_runs_under_its_emulator() {
     if cannot_run_vms() {
         return;
     }
+    if common::cannot_reach_docker_hub(
+        "alpine:3.22 for other CPUs, and the build's emulator image (EMULATOR_IMAGE)",
+    ) {
+        return;
+    }
     let home = TempDir::new("emulated-home");
     let env = [
         ("SHARDS_HOME", home.as_os_str()),
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let (ours, theirs) = if cfg!(target_arch = "aarch64") {
         (("arm64", "aarch64"), ("amd64", "x86_64"))
     } else {
@@ -14326,7 +14585,7 @@ fn layers_are_compressed() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "compress-ctx",
         &format!(
@@ -14579,7 +14838,7 @@ fn rewrite_timestamp_rewrites_the_builds_layers() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "rewrite-ctx",
         &format!("FROM {image}\nRUN [\"/bin/testguest\", \"fs\", \"write:/work/made=made now\"]\n"),
@@ -14683,7 +14942,7 @@ fn several_platforms_make_one_image_of_their_manifests() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let (arch, other) = if cfg!(target_arch = "aarch64") {
         ("arm64", "amd64")
     } else {
@@ -14875,7 +15134,6 @@ fn several_platforms_make_one_image_of_their_manifests() {
             ctx.to_str().unwrap(),
         ],
         &fresh_env,
-        TIMEOUT,
     );
     assert_eq!(again.status, Some(0), "{}", again.stderr);
     for p in [other, arch] {
@@ -14928,7 +15186,7 @@ fn an_agentfile_made_from_an_image_builds_its_config() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let ctx = context(
         "from-image-ctx",
         &format!(
@@ -14998,7 +15256,7 @@ fn builds_are_reproducible_byte_for_byte() {
         serde_json::from_slice(&std::fs::read(dir.join("docker.json")).unwrap()).unwrap();
     let home = TempDir::new("repro-home");
     let env = [("SHARDS_HOME", home.as_os_str())];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut failures = Vec::new();
     for (case, want) in spec["cases"]
         .as_array()
@@ -15186,7 +15444,7 @@ fn policies_hold_over_remote_contexts() {
         args.extend_from_slice(extra);
         let ctx = format!("{repo}#{branch}");
         args.push(&ctx);
-        common::run_shards_env_in(&cwd, &[], &args, &env, TIMEOUT)
+        common::run_shards_env_in(&cwd, &[], &args, &env)
     };
     let tail = |s: &str| s.lines().last().unwrap_or_default().to_string();
     let source = |branch: &str| format!("git://127.0.0.1:{port}/repo.git#{branch}");
@@ -15323,7 +15581,7 @@ fn a_policys_own_error_ends_the_build() {
         let mut args = vec!["build", "--progress=plain"];
         args.extend_from_slice(extra);
         args.push(".");
-        common::run_shards_env_in(ctx, &[], &args, &env, TIMEOUT)
+        common::run_shards_env_in(ctx, &[], &args, &env)
     };
     let tail = |s: &str| s.lines().last().unwrap_or_default().to_string();
     let conflict = |on: &str| {
@@ -15427,7 +15685,7 @@ fn builds_heed_their_policies() {
         let mut args = vec!["build", "--progress=plain"];
         args.extend_from_slice(extra);
         args.push(ctx);
-        common::run_shards_env_in(cwd, &[], &args, &env, TIMEOUT)
+        common::run_shards_env_in(cwd, &[], &args, &env)
     };
     // Built from inside its context, as `.`, as measured.
     let build = |ctx: &std::path::Path, extra: &[&str]| build_in(ctx, ".", extra);
@@ -15764,7 +16022,7 @@ fn policies_read_git_and_http_sources() {
         "package docker\n\ndefault allow := false\n\nallow if input.local\n\nallow if {\n  input.git.commit.tree != \"\"\n  print(\"git\", input.git)\n}\n\nallow if {\n  input.http.checksum != \"\"\n  print(\"http\", input.http)\n}\n\ndecision := {\"allow\": allow}\n",
     )
     .unwrap();
-    let built = common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "."], &env, TIMEOUT);
+    let built = common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "."], &env);
     assert_eq!(built.status, Some(0), "{}", built.stderr);
     let log = policy_log(&built.stderr);
     let git_src = format!("git://127.0.0.1:{git_port}/repo.git#v1");
@@ -15896,13 +16154,7 @@ fn policies_verify_git_and_http_signatures() {
     let build = |signer: &str, key: &str| {
         std::fs::write(ctx.join("signer.pub"), signer).unwrap();
         std::fs::write(ctx.join("key.asc"), key).unwrap();
-        common::run_shards_env_in(
-            &ctx,
-            &[],
-            &["build", "--progress=plain", "--no-cache", "."],
-            &env,
-            TIMEOUT,
-        )
+        common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "--no-cache", "."], &env)
     };
     let decisions = |stderr: &str, src: &str| -> Vec<String> {
         policy_log(stderr)
@@ -15979,13 +16231,7 @@ fn policies_verify_artifact_attestations() {
             include_bytes!("../src/build/testdata/gh-2.102.0-linux-arm64.sigstore.json"),
         )
         .unwrap();
-        common::run_shards_env_in(
-            &ctx,
-            &[],
-            &["build", "--progress=plain", "--no-cache", "."],
-            &env,
-            TIMEOUT,
-        )
+        common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "--no-cache", "."], &env)
     };
     let limited = |log: &[String], dgst: &str| {
         log.iter().any(|l| {
@@ -16080,6 +16326,9 @@ fn policies_read_image_provenance_and_signatures() {
     if cannot_run_vms() {
         return;
     }
+    if common::cannot_reach_docker_hub("moby/buildkit:v0.28.1's attestation chain") {
+        return;
+    }
     let home = TempDir::new("policy-image-sig-home");
     let env = [
         ("SHARDS_HOME", home.as_os_str()),
@@ -16096,7 +16345,6 @@ fn policies_read_image_provenance_and_signatures() {
         &[],
         &["build", "--progress=plain", "--platform", "linux/arm64", "."],
         &env,
-        TIMEOUT,
     );
     assert_eq!(built.status, Some(0), "{}", built.stderr);
     let got: Vec<String> = policy_log(&built.stderr)
@@ -16131,7 +16379,7 @@ fn a_policy_asking_a_single_manifests_chain_is_answered() {
         "package docker\n\ndefault allow := false\n\nallow if input.local\n\nallow if {\n\tinput.image\n\tprint(\"PROV\", input.image.hasProvenance)\n\tprint(\"SIG\", count(object.get(input.image, \"signatures\", [])))\n}\n\ndecision := {\"allow\": allow}\n",
     )
     .unwrap();
-    let built = common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "."], &env, TIMEOUT);
+    let built = common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "."], &env);
     assert_eq!(built.status, Some(0), "{}", built.stderr);
     let host = match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -16180,6 +16428,9 @@ fn policies_check_the_frontend_and_the_default_policy() {
     if cannot_run_vms() {
         return;
     }
+    if common::cannot_reach_docker_hub("docker/dockerfile:1, alpine:3.20 and moby/buildkit's signatures") {
+        return;
+    }
     let host = match std::env::consts::ARCH {
         "aarch64" => "arm64",
         "x86_64" => "amd64",
@@ -16215,7 +16466,6 @@ fn policies_check_the_frontend_and_the_default_policy() {
             &[],
             &["build", "--progress=plain", "--platform", platform, "."],
             &env,
-            TIMEOUT,
         );
         let checks: Vec<String> = policy_log(&out.stderr)
             .into_iter()
@@ -16335,6 +16585,9 @@ fn policies_check_the_frontend_and_the_default_policy() {
 /// refuses.
 #[test]
 fn policy_eval_answers() {
+    if common::cannot_reach_docker_hub("alpine:3.20's metadata") {
+        return;
+    }
     let home = TempDir::new("policy-eval-home");
     let dir = TempDir::new("policy-eval");
     let write = |sub: &str, rego: &str| {
@@ -16357,7 +16610,7 @@ fn policy_eval_answers() {
     let eval = |sub: &str, args: &[&str]| {
         let mut argv = vec!["buildx", "policy", "eval"];
         argv.extend_from_slice(args);
-        let out = common::run_shards_env_in(&dir.join(sub), &[], &argv, &env, TIMEOUT);
+        let out = common::run_shards_env_in(&dir.join(sub), &[], &argv, &env);
         (out.status, out.stdout, out.stderr)
     };
     let alpine = |extra: &str| {
@@ -16470,6 +16723,9 @@ fn policy_eval_answers() {
 /// platform), `--run`, a test file named alone, and the paths and policies buildx refuses.
 #[test]
 fn policy_test_runs() {
+    if common::cannot_reach_docker_hub("alpine's metadata") {
+        return;
+    }
     let home = TempDir::new("policy-test-home");
     let dir = TempDir::new("policy-test");
     for sub in ["basic", "notests"] {
@@ -16494,7 +16750,7 @@ fn policy_test_runs() {
     let test = |sub: &str, args: &[&str]| {
         let mut argv = vec!["buildx", "policy", "test"];
         argv.extend_from_slice(args);
-        let out = common::run_shards_env_in(&dir.join(sub), &[], &argv, &env, TIMEOUT);
+        let out = common::run_shards_env_in(&dir.join(sub), &[], &argv, &env);
         (out.status, out.stdout, out.stderr)
     };
     let refused = |e: &str| (Some(1), String::new(), format!("ERROR: {e}\n"));
@@ -16550,16 +16806,21 @@ fn a_failing_step_cites_its_build_file_lines() {
     if cannot_run_vms() {
         return;
     }
+    // A home of its own, and alpine:3.22 as Docker 29.3.1 ran it for D115 (Docker Hub,
+    // 2026-10-15) from the tests' own registry.
+    let home = TempDir::new("excerpt-home");
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+    ];
+    let alpine =
+        common::hub("alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8");
     let ctx = context(
         "excerpt-ctx",
-        "FROM alpine:3.22 as base\nRUN echo one\nRUN echo hi && \\\n  exit 3\n",
+        &format!("FROM {alpine} as base\nRUN echo one\nRUN echo hi && \\\n  exit 3\n"),
     );
-    let out = common::run_shards_in(
-        &ctx,
-        &[],
-        &["build", "--progress=plain", "--no-cache", "."],
-        TIMEOUT,
-    );
+    let out = common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "--no-cache", "."], &env);
     assert_eq!(out.status, Some(1), "{}", out.stderr);
     let tail = out
         .stderr
@@ -16599,13 +16860,11 @@ fn a_failing_step_cites_its_build_file_lines() {
     // A source the context lacks: the step's error is the checksum's, the build's the
     // cache key's that failed to load (BuildKit names its internal reference where shards
     // names the context).
-    let ctx = context("excerpt-copy-ctx", "FROM alpine:3.22\nCOPY missing.txt /m\n");
-    let out = common::run_shards_in(
-        &ctx,
-        &[],
-        &["build", "--progress=plain", "--no-cache", "."],
-        TIMEOUT,
+    let ctx = context(
+        "excerpt-copy-ctx",
+        &format!("FROM {alpine}\nCOPY missing.txt /m\n"),
     );
+    let out = common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "--no-cache", "."], &env);
     assert_eq!(out.status, Some(1), "{}", out.stderr);
     assert!(
         out.stderr
@@ -16614,9 +16873,9 @@ fn a_failing_step_cites_its_build_file_lines() {
         out.stderr
     );
     assert!(
-        out.stderr.ends_with(
-            "------\n > [2/2] COPY missing.txt /m:\n------\nDockerfile:2\n--------------------\n   1 |     FROM alpine:3.22\n   2 | >>> COPY missing.txt /m\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: failed to compute cache key: failed to calculate checksum of ref context: \"/missing.txt\": not found\n"
-        ),
+        out.stderr.ends_with(&format!(
+            "------\n > [2/2] COPY missing.txt /m:\n------\nDockerfile:2\n--------------------\n   1 |     FROM {alpine}\n   2 | >>> COPY missing.txt /m\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: failed to compute cache key: failed to calculate checksum of ref context: \"/missing.txt\": not found\n"
+        )),
         "{}",
         out.stderr
     );
@@ -16716,13 +16975,7 @@ fn policies_verify_git_signatures_by_ssh_certificates() {
     let src = format!("git://127.0.0.1:{port}/repo.git#main");
     let build = |key: &str| {
         std::fs::write(ctx.join("signer.pub"), key).unwrap();
-        common::run_shards_env_in(
-            &ctx,
-            &[],
-            &["build", "--progress=plain", "--no-cache", "."],
-            &env,
-            TIMEOUT,
-        )
+        common::run_shards_env_in(&ctx, &[], &["build", "--progress=plain", "--no-cache", "."], &env)
     };
     let last = |stderr: &str| {
         policy_log(stderr)
@@ -16763,7 +17016,7 @@ fn harnesses_message_their_attached_agents() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut domains = String::new();
     for (kind, name, verbs) in [
         (
@@ -16815,7 +17068,6 @@ fn harnesses_message_their_attached_agents() {
         ],
         "aw-attach",
         ("confined-ready", 3),
-        TIMEOUT,
     );
     let all = format!("{}{}", ran.stdout, ran.stderr);
     assert_eq!(ran.status, Some(0), "{all}");
@@ -16854,7 +17106,7 @@ fn agentfile_volumes_reach_whom_they_are_for() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     let mut agents = String::new();
     for (name, verbs) in [
         (
@@ -16913,7 +17165,7 @@ fn agentfile_volumes_reach_whom_they_are_for() {
         let mut args = vec!["run", "--rm", "--name", "aw-agvol"];
         args.extend_from_slice(extra);
         args.extend_from_slice(&["agvol:1", "await", "confined-ready", "2"]);
-        let ran = common::run_awaiting(&env, &args, "aw-agvol", ("confined-ready", 2), TIMEOUT);
+        let ran = common::run_awaiting(&env, &args, "aw-agvol", ("confined-ready", 2));
         let all = format!("{}{}", ran.stdout, ran.stderr);
         assert_eq!(ran.status, Some(0), "{all}");
         all
@@ -17118,7 +17370,6 @@ fn agentfile_volumes_reach_whom_they_are_for() {
         &["start", "-a", "agvol-cp"],
         "agvol-cp",
         ("confined-ready", 2),
-        TIMEOUT,
     );
     let all = format!("{}{}", started.stdout, started.stderr);
     assert_eq!(started.status, Some(0), "{all}");
@@ -17151,7 +17402,7 @@ fn a_run_reaches_none_of_its_images_agents() {
         ("SHARDS_KERNEL", kernel().as_os_str()),
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
-    let shards = |args: &[&str]| run_shards_env(&[], args, &env, TIMEOUT);
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
     // One agent that reaches past the microVM (egress), so its flows cross the command's
     // network namespace: it holds until the run ends.
     let dir = TempDir::new("beside-agent");
@@ -17200,7 +17451,7 @@ fn a_run_reaches_none_of_its_images_agents() {
         let mut args = vec!["run", "--rm", "--name", name];
         args.extend(init);
         args.extend(["beside:1", "beside", "confined-ready", "1"]);
-        let ran = common::run_awaiting(&env, &args, name, ("confined-ready", 1), TIMEOUT);
+        let ran = common::run_awaiting(&env, &args, name, ("confined-ready", 1));
         let all = format!("{}{}", ran.stdout, ran.stderr);
         assert_eq!(ran.status, Some(0), "{all}");
         let rows: Vec<Vec<&str>> = all
@@ -17390,7 +17641,7 @@ fn a_steps_directories_keep_their_numbers() {
         "security.insecure",
         ctx.to_str().unwrap(),
     ];
-    let built = run_shards_env(&["build"], &args, &env, TIMEOUT);
+    let built = run_shards_env(&["build"], &args, &env);
     let shown = format!("--- stdout\n{}\n--- stderr\n{}", built.stdout, built.stderr);
     assert_eq!(built.status, Some(0), "{shown}");
     // The step's lines, `#N T.TTT PATH DEV:INO`.

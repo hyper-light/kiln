@@ -4,8 +4,6 @@
 use std::fmt;
 use std::io;
 
-#[cfg(target_os = "macos")]
-mod apple;
 pub mod auth;
 pub mod certs;
 mod climb;
@@ -15,9 +13,6 @@ mod fetch;
 pub mod http;
 pub mod links;
 mod patience;
-/// D222's restart cutoff, for other waits whose cut is asked again: the daemon's for a
-/// client's request (D185).
-pub use patience::{Cutoff, Sketch};
 pub mod proxy;
 pub mod pull;
 pub mod push;
@@ -45,9 +40,27 @@ pub struct Error {
     /// registry named insecure without a port is then asked in plain HTTP on HTTP's
     /// (registry.rs, D194).
     refused: bool,
-    /// Whether it is an answer its path's wait cut (crate::patience `Cutoff`): asked
-    /// again at once, the trouble's pause spent waiting for it.
-    overdue: bool,
+    /// Whether the far end ended the connection before any answer: reset, aborted or
+    /// closed under a request. Past a trouble's run-out, a re-ask so ended is the far end's
+    /// end ([`ErrorKind::Gone`], D222).
+    cut: bool,
+    /// Which of its path's waits cut it, where one did, past the slowest of its kind the
+    /// path has shown (crate::patience): asked again at once.
+    overdue: Option<Overdue>,
+    /// Whether a wait's own time ended it: its deadline, or a socket's timeout set to what
+    /// was left of it, whatever time `Instant` says passed (a connect's or a handshake's,
+    /// which its path then counts as timed out, crate::patience).
+    timed_out: bool,
+}
+
+/// Which of a path's waits ran out on a request's answer, which is then asked again at once
+/// (crate::patience).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Overdue {
+    /// The wait for its first byte.
+    Answer,
+    /// A silence, once its bytes had begun.
+    Silence,
 }
 
 /// What dockerd says of a registry's refusal in place of containerd's words
@@ -80,6 +93,10 @@ pub enum ErrorKind {
     /// A token server refused the credentials (401 or 403): what a login is refused by.
     /// Every other caller takes it as [`Other`](ErrorKind::Other).
     Refused,
+    /// The far end is gone or refuses: nothing listens where it is (a connection refused),
+    /// or a re-ask made while its trouble follows liveness (past its run-out, or on a path
+    /// that bounds none) ended before any answer (D222).
+    Gone,
     Other,
 }
 
@@ -95,7 +112,9 @@ impl Error {
             said: None,
             not_tls: false,
             refused: false,
-            overdue: false,
+            cut: false,
+            overdue: None,
+            timed_out: false,
         }
     }
 
@@ -123,16 +142,51 @@ impl Error {
         self.refused
     }
 
-    /// The same error, of an answer its path's wait cut.
-    pub(crate) fn overdue(self) -> Error {
+    /// The same error, of a connection its far end ended before any answer.
+    pub(crate) fn cut(self) -> Error {
+        Error { cut: true, ..self }
+    }
+
+    pub(crate) fn is_cut(&self) -> bool {
+        self.cut
+    }
+
+    /// The same error, as the far end's end: refused or cut on a re-ask past a trouble's
+    /// run-out (D222).
+    pub(crate) fn gone(self) -> Error {
         Error {
-            overdue: true,
+            kind: ErrorKind::Gone,
+            ..self
+        }
+    }
+
+    /// The same error, of an answer its path's wait `which` cut.
+    pub(crate) fn overdue(self, which: Overdue) -> Error {
+        Error {
+            overdue: Some(which),
             ..self
         }
     }
 
     pub(crate) fn is_overdue(&self) -> bool {
+        self.overdue.is_some()
+    }
+
+    /// Which of its path's waits cut it, where one did.
+    pub(crate) fn overdue_by(&self) -> Option<Overdue> {
         self.overdue
+    }
+
+    /// The same error, of a wait its own time ended.
+    pub(crate) fn timed_out(self) -> Error {
+        Error {
+            timed_out: true,
+            ..self
+        }
+    }
+
+    pub(crate) fn is_timed_out(&self) -> bool {
+        self.timed_out
     }
 
     /// The same error, with what dockerd says of it.
@@ -166,7 +220,9 @@ impl Error {
             said: self.said,
             not_tls: self.not_tls,
             refused: self.refused,
+            cut: self.cut,
             overdue: self.overdue,
+            timed_out: self.timed_out,
         }
     }
 }
@@ -207,7 +263,14 @@ impl From<io::Error> for Error {
             | io::ErrorKind::BrokenPipe => ErrorKind::Transient,
             _ => ErrorKind::Other,
         };
-        Error::of(kind, e.to_string())
+        let cut = matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe
+        );
+        Error {
+            cut,
+            ..Error::of(kind, e.to_string())
+        }
     }
 }
 

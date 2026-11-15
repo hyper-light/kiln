@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use hex_core::lanes::DATA_BOUND;
 use hex_core::patience::Patience;
 use hex_core::stream::STDIO_PORT;
-use hex_testkit::waits::{answered, until, within};
+use hex_testkit::waits::answered;
 use rustix::event::{PollFd, PollFlags, Timespec};
 
 use super::{Local, socket};
 use crate::enroll::{self, sim::SimCa};
+use crate::tests::{accept, conn_party, dial, end_half, on_change, read};
 use crate::{Config, Conn, Endpoint, Shape};
 
 // Each wait is for its own fact, named for it: no census records any of them yet, so each measures, for the fact
@@ -88,7 +89,7 @@ fn read_to_end(conn: &Conn) -> usize {
     let mut buf = vec![0u8; DATA_BOUND];
     let mut got = 0;
     loop {
-        match within(&READ, |by| conn.read(&mut buf, by)).unwrap() {
+        match read(&READ, conn, &mut buf).unwrap() {
             0 => return got,
             n => got += n,
         }
@@ -107,13 +108,19 @@ fn step_with(client: &Endpoint, node: &Endpoint, peer: crate::PeerId, room: &Pat
     let ours = client.open(peer, STDIO_PORT).unwrap();
     let mut slowest = Duration::ZERO;
     for _ in 0..SPREAD {
-        until(room, "room for the next byte", || ours.writable()).unwrap();
+        on_change(
+            room,
+            "room for the next byte",
+            &ours,
+            || conn_party(&ours),
+            || ours.writable(),
+        );
         let began = Instant::now();
         ours.write_all(&[0], None).unwrap();
         slowest = slowest.max(began.elapsed());
     }
-    within(room, |by| ours.end(by)).unwrap();
-    let (_, there) = within(&ACCEPT, |by| node.accept(STDIO_PORT, by)).unwrap();
+    end_half(room, &ours).unwrap();
+    let (_, there) = accept(&ACCEPT, node, STDIO_PORT).unwrap();
     assert_eq!(read_to_end(&there), usize::try_from(SPREAD).unwrap());
     slowest
 }
@@ -129,10 +136,7 @@ fn original_a_wait_for_room_past_its_learned_w_star_waits_for_the_room() {
     let ca = SimCa::new().unwrap();
     let node = endpoint(&ca, "node-room.test", true);
     let client = endpoint(&ca, "client-room.test", false);
-    let peer = within(&DIAL, |by| {
-        client.dial("node-room.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = dial(&DIAL, &client, "node-room.test", node.local_addr()).unwrap();
     step_with(&client, &node, peer, &PAST);
 }
 
@@ -150,10 +154,7 @@ fn ac_t7_4_1_an_owners_half_close_reaches_the_peer_through_its_bridge() {
     let ca = SimCa::new().unwrap();
     let node = endpoint(&ca, "node-bridge.test", true);
     let client = endpoint(&ca, "client-bridge.test", false);
-    let peer = within(&DIAL, |by| {
-        client.dial("node-bridge.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = dial(&DIAL, &client, "node-bridge.test", node.local_addr()).unwrap();
     let spread = step(&client, &node, peer) * 2;
     for round in 0..ROUNDS {
         let mut owner = socket(client.open(peer, STDIO_PORT).unwrap()).unwrap();
@@ -169,7 +170,7 @@ fn ac_t7_4_1_an_owners_half_close_reaches_the_peer_through_its_bridge() {
             std::hint::spin_loop();
         }
         owner.shutdown(Shutdown::Write).unwrap();
-        let (_, there) = within(&ACCEPT, |by| node.accept(STDIO_PORT, by)).unwrap();
+        let (_, there) = accept(&ACCEPT, &node, STDIO_PORT).unwrap();
         assert_eq!(read_to_end(&there), sent, "round {round}");
     }
 }

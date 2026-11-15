@@ -1,6 +1,7 @@
 //! The channel, on every platform (AC-T7.4.1). Each wait here is for its fact alone (a thread's end, joined), but
-//! where a deadline is the claim under test, which says so; how late a receive returns past its deadline is held by
-//! the client's mailbox test against the platform's recorded overshoot (`hex_testkit::waits::OVERSHOOT`).
+//! where a deadline is the claim under test, which says so. How late a receive returns past its deadline is the
+//! host's, which the client's mailbox test tells the census and holds to no bound; its receive waits on the
+//! condition variable, whose deadline wait on macOS the kernel's read-back holds (`macos::tests`).
 
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};

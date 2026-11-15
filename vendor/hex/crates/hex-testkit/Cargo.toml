@@ -10,10 +10,11 @@ publish.workspace = true
 
 [dependencies]
 hex-core = { workspace = true, features = ["test-seeds"] }
+# The rest between an until's looks, to a deadline on every OS (hex_wait::rest_until; docs/design/deadline-waits.md).
+hex-wait.workspace = true
 
-# A thread as a party (waits::follow::Thread): macOS reads another thread through proc_pidinfo. A delegated cgroup's
-# preparation (cgroup::delegated): Linux's ESRCH, a process that ended before it was moved.
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# A delegated cgroup's preparation (cgroup::delegated): Linux's ESRCH, a process that ended before it was moved.
+[target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]

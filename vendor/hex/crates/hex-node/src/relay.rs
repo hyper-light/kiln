@@ -439,7 +439,8 @@ impl Relay {
                 Request::Call(
                     Call::Exec { streams, .. }
                     | Call::Run { streams, .. }
-                    | Call::Member { streams, .. },
+                    | Call::Member { streams, .. }
+                    | Call::Mcp { streams, .. },
                 ),
             )) => Some((header, streams)),
             _ => None,
@@ -574,11 +575,20 @@ fn refuse_exec(parked: &Parked, why: Refusal) -> Result<(), Gone> {
 }
 
 /// A stdio connection refused before it named itself, on `hex.guest` (the guest's console), as the
-/// event `stdio_unnamed`.
+/// event `stdio_unnamed` ([`unnamed_line`]).
 fn log_unnamed(why: &Refusal) {
     let _ = io::stderr()
         .lock()
-        .write_all(format!("hex.guest event=stdio_unnamed why=\"{why}\"\n").as_bytes());
+        .write_all(format!("{}\n", unnamed_line(why)).as_bytes());
+}
+
+/// `hex.guest event=stdio_unnamed why=<a JSON string>`.
+fn unnamed_line(why: &Refusal) -> String {
+    hex_api::event::line(
+        "hex.guest",
+        "stdio_unnamed",
+        &[("why", hex_api::event::Value::Text(&why.to_string()))],
+    )
 }
 
 /// For each stream, in stdin-stdout-stderr order, the pipe end the node takes, with the stream's

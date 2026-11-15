@@ -181,6 +181,14 @@ mod hosted {
         fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
             self.0.member(id, member)
         }
+        fn signal_member(
+            &self,
+            id: &BoxId,
+            member: &hex_api::Member,
+            signal: Signal,
+        ) -> Result<(), Refusal> {
+            self.0.signal_member(id, member, signal)
+        }
     }
 
     impl<R: Runtime> Host for Hosted<R> {
@@ -406,16 +414,22 @@ fn hex_quic_27_a_client_holds_itself_to_the_lanes_its_node_grants() {
     drop(server);
 }
 
-/// Joint plan steps 12 and 17's remote callers, AC-T7.4.1 (docs/design/shards-image-class.md §2): a member of a Shards
-/// image VM that its caller drives is handed over through QUIC as through the node's socket. A QUIC client makes the
-/// streams it asks for itself (lanes), so it carries the member's stdin, stdout and stderr, and the node joins each to
-/// the member's own. Do: through a simulator node served over QUIC in this process, create and start a VM whose spec
-/// names a member its caller drives, take that member, write its stdin and close it, read its stdout to its end, and
-/// wait for its end as it comes. Expect: its stdout the bytes written, and its end Code(0).
-#[test]
-fn a_member_is_handed_over_through_quic() {
+/// A simulator node served over QUIC in this process, a client of its own reaching it, and, made and started through
+/// that client, a Shards image VM whose spec names `claude`, a harness its caller drives (joint plan steps 12 and 17):
+/// what the member tests over QUIC share. Its fields drop in order: the client before the node it reaches.
+struct MemberVm {
+    client: hex_quic::link::Client,
+    id: BoxId,
+    claude: hex_api::Member,
+    _server: Server<Quic<Native>>,
+    _client_end: Arc<Endpoint>,
+    _node: Arc<Endpoint>,
+    _dir: tempfile::TempDir,
+}
+
+/// [`MemberVm`]: its node named `name`, its box `id`.
+fn member_vm(name: &str, id: &str) -> MemberVm {
     use hex_api::Runtime as _;
-    use std::io::{Read as _, Write as _};
     let ca = SimCa::new().unwrap();
     let enrolled = |name: &str| {
         ca.admit(name, name.as_bytes());
@@ -424,7 +438,7 @@ fn a_member_is_handed_over_through_quic() {
     let limits = limits();
     let node = Arc::new(
         Endpoint::start(Config {
-            credentials: enrolled("node.member.test"),
+            credentials: enrolled(name),
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             listen: true,
             serves: hex_node::quic::ports(false),
@@ -445,7 +459,7 @@ fn a_member_is_handed_over_through_quic() {
     let server = Server::with_os(quic, host, limits, limits.in_flight, &socket).unwrap();
     let client_end = Arc::new(
         Endpoint::start(Config {
-            credentials: enrolled("client.member.test"),
+            credentials: enrolled(&format!("client.{name}")),
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             listen: false,
             serves: Vec::new(),
@@ -458,7 +472,7 @@ fn a_member_is_handed_over_through_quic() {
     );
     let (client, _peer) = hex_quic::link::connect(
         Arc::clone(&client_end),
-        "node.member.test",
+        name,
         node.local_addr(),
         false,
         None,
@@ -470,7 +484,7 @@ fn a_member_is_handed_over_through_quic() {
     };
     let id = client
         .create(BoxSpec {
-            id: BoxId::new("member-over-quic").unwrap(),
+            id: BoxId::new(id).unwrap(),
             bounds: Bounds::default(),
             class: ClassSpec::ShardsImage(Box::new(hex_api::ShardsImage {
                 members: vec![hex_api::ImageMember::new(claude.clone())],
@@ -485,7 +499,29 @@ fn a_member_is_handed_over_through_quic() {
         .unwrap()
         .id;
     client.start(&id).unwrap();
-    let mut member = client.member(&id, &claude).unwrap();
+    MemberVm {
+        client,
+        id,
+        claude,
+        _server: server,
+        _client_end: client_end,
+        _node: node,
+        _dir: dir,
+    }
+}
+
+/// Joint plan steps 12 and 17's remote callers, AC-T7.4.1 (docs/design/shards-image-class.md §2): a member of a Shards
+/// image VM that its caller drives is handed over through QUIC as through the node's socket. A QUIC client makes the
+/// streams it asks for itself (lanes), so it carries the member's stdin, stdout and stderr, and the node joins each to
+/// the member's own. Do: through a simulator node served over QUIC in this process, create and start a VM whose spec
+/// names a member its caller drives, take that member, write its stdin and close it, read its stdout to its end, and
+/// wait for its end as it comes. Expect: its stdout the bytes written, and its end Code(0).
+#[test]
+fn a_member_is_handed_over_through_quic() {
+    use hex_api::Runtime as _;
+    use std::io::{Read as _, Write as _};
+    let vm = member_vm("node.member.test", "member-over-quic");
+    let mut member = vm.client.member(&vm.id, &vm.claude).unwrap();
     let given = member.streams().unwrap();
     let mut stdin = hex_api::OwnedStream::from(given.stdin.unwrap());
     let mut stdout = hex_api::OwnedStream::from(given.stdout.unwrap());
@@ -499,9 +535,102 @@ fn a_member_is_handed_over_through_quic() {
         Some(hex_api::Exit::Code(0))
     );
     drop(member);
-    client.delete(&id).unwrap();
-    drop(client);
-    drop(server);
+    vm.client.delete(&vm.id).unwrap();
+}
+
+/// Goal 2's item 2 (ROOT, 2026-11-14: the node's wire carries a member's signal): a member handed over through QUIC is
+/// killed as in process, KILL on its own lane, the member's alone: the node's host signals it, no longer refused
+/// `Awaits(MemberSignal)`. Do: take a member of a running image VM through a simulator node served over QUIC, its
+/// streams held open, and kill it. Expect: the kill done; its end Signal(9); its VM running on.
+#[test]
+fn w2_a_member_handed_over_through_quic_is_killed_alone() {
+    use hex_api::Runtime as _;
+    let vm = member_vm("node.member-kill.test", "member-killed-over-quic");
+    let mut member = vm.client.member(&vm.id, &vm.claude).unwrap();
+    let given = member.streams().unwrap();
+    assert_eq!(member.kill(), Ok(()));
+    assert_eq!(
+        member.wait_for(std::time::Duration::MAX).unwrap(),
+        Some(hex_api::Exit::Signal(9))
+    );
+    assert_eq!(
+        vm.client.inspect(&vm.id).unwrap().state,
+        hex_api::BoxState::Running
+    );
+    drop((member, given));
+    vm.client.delete(&vm.id).unwrap();
+}
+
+/// Goal 2's item 2 (ROOT, 2026-11-14): the node's wire carries a member's own signal (`Call::MemberSignal`, appended),
+/// so a caller through QUIC signals a member as one in process does, and its refusals come typed as they are made. Do:
+/// take a member of a running image VM through a simulator node served over QUIC, its streams held open; send it TERM;
+/// send it TERM again once it has ended; send TERM to a member its run declares not. Expect: the first done, the
+/// member's end Signal(15), as its echo keeps no handler, and its VM running on; the second refused NotRunning, "signal
+/// a member: it has ended"; the third refused Invalid, of the member.
+#[test]
+fn w2_a_members_signal_goes_through_quic() {
+    use hex_api::Runtime as _;
+    let vm = member_vm("node.member-signal.test", "member-signalled-over-quic");
+    let mut member = vm.client.member(&vm.id, &vm.claude).unwrap();
+    let given = member.streams().unwrap();
+    assert_eq!(
+        vm.client
+            .signal_member(&vm.id, &vm.claude, hex_api::Signal::TERM),
+        Ok(())
+    );
+    assert_eq!(
+        member.wait_for(std::time::Duration::MAX).unwrap(),
+        Some(hex_api::Exit::Signal(15))
+    );
+    assert_eq!(
+        vm.client.inspect(&vm.id).unwrap().state,
+        hex_api::BoxState::Running
+    );
+    assert_eq!(
+        vm.client
+            .signal_member(&vm.id, &vm.claude, hex_api::Signal::TERM),
+        Err(hex_api::Refusal::NotRunning(
+            vm.id.clone(),
+            "signal a member: it has ended"
+        ))
+    );
+    let helper = hex_api::Member {
+        kind: hex_api::MemberKind::Agent,
+        name: "helper".to_owned(),
+    };
+    let undeclared = vm
+        .client
+        .signal_member(&vm.id, &helper, hex_api::Signal::TERM);
+    assert!(
+        matches!(
+            &undeclared,
+            Err(hex_api::Refusal::Invalid { what: "member", .. })
+        ),
+        "{undeclared:?}"
+    );
+    drop((member, given));
+    vm.client.delete(&vm.id).unwrap();
+}
+
+/// Goal 2 (ROOT, 2026-11-14: the node's wire carries `started`): a remote caller follows a VM's start through `started`
+/// as a caller in the node's own process does, waiting on the fact, never looking. Do: through a simulator node served
+/// over QUIC in this process, ask `started` of a VM it started, and of an id it holds no box of. Expect: the VM's info,
+/// Running; and NoSuchBox for the other.
+#[test]
+fn w2_a_vms_start_is_followed_through_started_over_quic() {
+    use hex_api::Runtime as _;
+    let vm = member_vm("node.started.test", "started-over-quic");
+    let started = vm.client.started(&vm.id).unwrap();
+    assert_eq!(
+        (started.id, started.state),
+        (vm.id.clone(), hex_api::BoxState::Running)
+    );
+    let none = BoxId::new("started-over-quic-none").unwrap();
+    assert_eq!(
+        vm.client.started(&none),
+        Err(hex_api::Refusal::NoSuchBox(none.clone()))
+    );
+    vm.client.delete(&vm.id).unwrap();
 }
 
 /// The calls in flight the node named `name` at `address` runs at once, as its hello says (its budget): how a client that

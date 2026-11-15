@@ -7,7 +7,7 @@ use hex_api::{
 use hex_core::record::{NativeRecord, OwnerRef, PoolRecord};
 
 use super::dedicated::{Guest, Operation};
-use super::pool::{self, Receipt, refused};
+use super::pool::{self, Receipt, refused, uncertain};
 use super::selected::Phase;
 use super::shared::{Binding, GpuBacking};
 use super::{Booted, GuestRuntime, managed, observer, refusal};
@@ -16,18 +16,23 @@ use crate::devices::{self, Transaction};
 impl GuestRuntime {
     pub(super) fn handoff_source_released(&self, record: &PoolRecord) -> Result<(), Refusal> {
         self.preflight_backing(record)?;
-        let bad = || refused(record.key, LifecycleCause::Uncertain);
+        let bad = |why: &str| uncertain(record.key, why);
         if record.phase != BackingPhase::Released || record.exit.is_none() {
-            return Err(bad());
+            return Err(bad(
+                "its handed-off source isn't released with its end recorded",
+            ));
         }
         let definition = self.gpu_definition_for_record(record)?;
-        let receipt = pool::read(&definition.path)?.ok_or_else(bad)?;
+        let receipt = pool::read(&definition.path)?
+            .ok_or_else(|| bad("its handed-off source has no receipt"))?;
         receipt.matches(record)?;
         let Phase::Released { status, .. } = receipt.phase else {
-            return Err(bad());
+            return Err(bad("its handed-off source's receipt isn't released"));
         };
         if record.exit != Some(super::shared::exit_of(status)) {
-            return Err(bad());
+            return Err(bad(
+                "its handed-off source's recorded end isn't its receipt's",
+            ));
         }
         Ok(())
     }
@@ -36,24 +41,32 @@ impl GuestRuntime {
     /// Released generation. No retained Box may reference it during rearm.
     pub(super) fn acknowledge_gpu_release(&self, key: BackingKey) -> Result<BackingOffer, Refusal> {
         let definition = self.gpu_definition_for(key)?;
-        let books = self
-            .books
-            .get()
-            .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+        let books = self.books.get().ok_or_else(|| {
+            uncertain(
+                key,
+                "its guest has no record authority to acknowledge its release",
+            )
+        })?;
         let keys = self.turn_keys(&definition.devices)?;
         let mut reservation = self.reserve_owner(OwnerRef::Pool(&key.pool), Operation::Stopping)?;
         let offer = devices::with_pool_transaction(books, &key, &keys, |transaction| {
-            let record = transaction
-                .read_pool(&key)?
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+            let record = transaction.read_pool(&key)?.ok_or_else(|| {
+                uncertain(
+                    key,
+                    "its pool record is gone before its release was acknowledged",
+                )
+            })?;
             self.preflight_backing(&record)?;
             if record.phase != BackingPhase::Released {
                 return Err(refused(key, LifecycleCause::Pending));
             }
             for boxed in transaction.records()?.values() {
-                let boxed = boxed
-                    .as_ref()
-                    .map_err(|_| refused(key, LifecycleCause::Uncertain))?;
+                let boxed = boxed.as_ref().map_err(|_| {
+                    uncertain(
+                        key,
+                        "a box record couldn't be read as its release was acknowledged",
+                    )
+                })?;
                 if boxed
                     .spec
                     .route
@@ -66,7 +79,10 @@ impl GuestRuntime {
             if let Some(receipt) = pool::read(&definition.path)? {
                 receipt.matches(&record)?;
                 if !matches!(receipt.phase, Phase::Released { .. }) {
-                    return Err(refused(key, LifecycleCause::Uncertain));
+                    return Err(uncertain(
+                        key,
+                        "its receipt isn't released as its release is acknowledged",
+                    ));
                 }
                 transaction.finalize_managed(receipt.released_identity()?)?;
                 super::held::remove(&definition.path)?;
@@ -91,31 +107,36 @@ impl GuestRuntime {
             return self.acknowledge_gpu_release(key);
         }
         let definition = self.gpu_definition_for_record(&snapshot)?;
-        let budget = managed::Budget::new(self.first_dial_bound()?)?;
         let keys = self.turn_keys(&definition.devices)?;
         let books = self
             .books
             .get()
-            .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+            .ok_or_else(|| uncertain(key, "its guest has no record authority to release it"))?;
         let mut reservation = self.reserve_owner(OwnerRef::Pool(&key.pool), Operation::Stopping)?;
         let offer = devices::with_pool_transaction(books, &key, &keys, |transaction| {
             let mut record = transaction
                 .read_pool(&key)?
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                .ok_or_else(|| uncertain(key, "its pool record is gone before its release"))?;
             self.preflight_backing(&record)?;
             if snapshot.phase == BackingPhase::Prepared {
                 if record != snapshot {
-                    return Err(refused(key, LifecycleCause::Uncertain));
+                    return Err(uncertain(
+                        key,
+                        "its prepared record changed before its release",
+                    ));
                 }
             } else if record.native_commitment()? != snapshot.native_commitment()?
                 || record.init != snapshot.init
             {
-                return Err(refused(key, LifecycleCause::Uncertain));
+                return Err(uncertain(
+                    key,
+                    "its record's commitment or controller changed before its release",
+                ));
             }
             for boxed in transaction.records()?.values() {
-                let boxed = boxed
-                    .as_ref()
-                    .map_err(|_| refused(key, LifecycleCause::Uncertain))?;
+                let boxed = boxed.as_ref().map_err(|_| {
+                    uncertain(key, "a box record couldn't be read as it was released")
+                })?;
                 if boxed.spec.route.and_then(|route| route.backing) == Some(key) {
                     return Err(refused(key, LifecycleCause::Busy));
                 }
@@ -129,7 +150,10 @@ impl GuestRuntime {
                     || record.init.is_some()
                     || record.exit.is_some()
                 {
-                    return Err(refused(key, LifecycleCause::Uncertain));
+                    return Err(uncertain(
+                        key,
+                        "it is prepared, yet holds an earlier owner, a receipt, an allocation, a controller or an end",
+                    ));
                 }
                 transaction.check_unsubmitted_pool()?;
                 record.phase = BackingPhase::Released;
@@ -140,9 +164,12 @@ impl GuestRuntime {
                 record.phase,
                 BackingPhase::Granted | BackingPhase::Live | BackingPhase::Draining
             ) {
-                return Err(refused(key, LifecycleCause::Uncertain));
+                return Err(uncertain(
+                    key,
+                    "it isn't granted, live or draining as it is released",
+                ));
             }
-            self.stop_gpu_scope(transaction, &mut record, &definition, &budget)?;
+            self.stop_gpu_scope(transaction, &mut record, &definition)?;
             record.offer()
         })?;
         reservation.previous.take();
@@ -151,14 +178,13 @@ impl GuestRuntime {
     }
 
     /// Stops and releases dedicated GPU backing `record`'s scope through its receipt at `definition`'s path, in
-    /// `transaction` (its pool turn), within `budget`: drained, its scope stopped where its receipt names one, its
-    /// controller finalized, and its exit recorded, Released.
+    /// `transaction` (its pool turn): drained, its scope stopped where its receipt names one (its stop's own wait,
+    /// [`managed::stop_scope`]), its controller finalized, and its exit recorded, Released.
     fn stop_gpu_scope(
         &self,
         transaction: &dyn Transaction,
         record: &mut PoolRecord,
         definition: &GpuBacking,
-        budget: &managed::Budget,
     ) -> Result<(), Refusal> {
         let key = record.key;
         let mut receipt = match pool::read(&definition.path)? {
@@ -169,7 +195,12 @@ impl GuestRuntime {
                 original.exit = None;
                 Receipt::retained(original, self.catalog_physical(&record.devices)?)?
             }
-            None => return Err(refused(key, LifecycleCause::Uncertain)),
+            None => {
+                return Err(uncertain(
+                    key,
+                    "its receipt is gone though its record names a controller",
+                ));
+            }
         };
         receipt.matches(record)?;
         let identity = match &receipt.phase {
@@ -193,8 +224,10 @@ impl GuestRuntime {
         let terminal = managed::stop_scope(
             transaction,
             identity.as_ref(),
-            budget.remaining()?,
-            refused(key, LifecycleCause::Uncertain),
+            uncertain(
+                key,
+                "its dedicated GPU backing's end wasn't seen after its stop",
+            ),
         )?;
         receipt.phase = Phase::Released {
             identity,
@@ -243,14 +276,16 @@ impl GuestRuntime {
                 continue;
             };
             let key = record.key;
-            let budget = managed::Budget::new(self.first_dial_bound()?)?;
             let keys = self.turn_keys(&definition.devices)?;
             let mut reservation =
                 self.reserve_owner(OwnerRef::Pool(&key.pool), Operation::Stopping)?;
             devices::with_pool_transaction(books, &key, &keys, |transaction| {
-                let mut record = transaction
-                    .read_pool(&key)?
-                    .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                let mut record = transaction.read_pool(&key)?.ok_or_else(|| {
+                    uncertain(
+                        key,
+                        "its GPU pool record is gone before its census retirement",
+                    )
+                })?;
                 match record.phase {
                     BackingPhase::Released => {
                         if let Some(receipt) = pool::read(&definition.path)? {
@@ -265,14 +300,17 @@ impl GuestRuntime {
                             || record.init.is_some()
                             || record.exit.is_some()
                         {
-                            return Err(refused(key, LifecycleCause::Uncertain));
+                            return Err(uncertain(
+                                key,
+                                "it is prepared, yet holds an earlier owner, a receipt, an allocation, a controller or an end at its census retirement",
+                            ));
                         }
                         transaction.check_unsubmitted_pool()?;
                         record.phase = BackingPhase::Released;
                         transaction.put_pool(&record)?;
                     }
                     BackingPhase::Granted | BackingPhase::Live | BackingPhase::Draining => {
-                        self.stop_gpu_scope(transaction, &mut record, &definition, &budget)?;
+                        self.stop_gpu_scope(transaction, &mut record, &definition)?;
                     }
                 }
                 if pool::read(&definition.path)?.is_some() {
@@ -290,7 +328,6 @@ impl GuestRuntime {
         &self,
         key: BackingKey,
         boxed: &hex_core::record::BoxRecord,
-        budget: managed::Budget,
     ) -> Result<BackingOffer, Refusal> {
         let definition = self.gpu_definition_for(key)?;
         if boxed.spec.route.and_then(|route| route.backing) != Some(key)
@@ -300,12 +337,18 @@ impl GuestRuntime {
             || boxed.exit.is_some()
             || boxed.native_scope.is_none()
         {
-            return Err(refused(key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                key,
+                "the box handed off to it is past its creation or has no native scope",
+            ));
         }
         boxed
             .spec
             .route
-            .ok_or(super::books::uncertain(&boxed.spec.id)?)?
+            .ok_or(super::books::uncertain(
+                &boxed.spec.id,
+                "its record routes it on no backing",
+            )?)?
             .check_backing_parts(
                 boxed.spec.allocation.map(|allocation| allocation.cost),
                 key,
@@ -317,16 +360,16 @@ impl GuestRuntime {
         let books = self
             .books
             .get()
-            .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+            .ok_or_else(|| uncertain(key, "its guest has no record authority for its handoff"))?;
         let mut reservation = self.reserve_owner(OwnerRef::Pool(&key.pool), Operation::Stopping)?;
         let offer = devices::with_pool_transaction(books, &key, &keys, |transaction| {
             let mut record = transaction
                 .read_pool(&key)?
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                .ok_or_else(|| uncertain(key, "its pool record is gone before its handoff"))?;
             self.preflight_backing(&record)?;
             let current = transaction
                 .read(&boxed.spec.id)?
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                .ok_or_else(|| uncertain(key, "the box handed off to it is gone"))?;
             if current.spec != boxed.spec
                 || current.native_scope != boxed.native_scope
                 || current.phase != hex_core::record::Phase::Creating
@@ -334,17 +377,20 @@ impl GuestRuntime {
                 || current.run.is_some()
                 || current.exit.is_some()
             {
-                return Err(refused(key, LifecycleCause::Uncertain));
+                return Err(uncertain(
+                    key,
+                    "the box handed off to it changed before its handoff",
+                ));
             }
             let mut receipt = pool::read(&definition.path)?
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                .ok_or_else(|| uncertain(key, "its receipt is gone before its handoff"))?;
             receipt.matches(&record)?;
             if record.phase == BackingPhase::Released {
                 self.handoff_source_released(&record)?;
                 return record.offer();
             }
             if record.phase != BackingPhase::Live && record.phase != BackingPhase::Draining {
-                return Err(refused(key, LifecycleCause::Uncertain));
+                return Err(uncertain(key, "it isn't live or draining at its handoff"));
             }
             let identity = super::shared::copy_identity(receipt.identity()?)?;
             managed::same_native(NativeRecord::Pool(&record), &identity)?;
@@ -355,8 +401,10 @@ impl GuestRuntime {
             let terminal = managed::stop_scope(
                 transaction,
                 Some(&identity),
-                budget.remaining()?,
-                refused(key, LifecycleCause::Uncertain),
+                uncertain(
+                    key,
+                    "its handed-off GPU backing's end wasn't seen after its stop",
+                ),
             )?;
             receipt.phase = Phase::Released {
                 identity: Some(identity),
@@ -376,26 +424,27 @@ impl GuestRuntime {
 
     pub(super) fn initialize_gpu_pool(&self, grant: BackingGrant) -> Result<BackingOffer, Refusal> {
         grant.check()?;
-        // This one finite absolute budget is captured before grant persistence,
-        // native effects, report observation, guest workload or publication.
-        let budget = managed::Budget::new(self.first_dial_bound()?)?;
         let definition = self.gpu_definition_for(grant.key)?;
         if grant.devices != definition.devices
             || grant.allocation != self.configured_allocation()?
         {
-            return Err(refused(grant.key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                grant.key,
+                "the grant names other devices or another allocation than its definition",
+            ));
         }
         let observer = self
             .gpu_observer
             .as_ref()
             .ok_or_else(|| refused(grant.key, LifecycleCause::Pending))?;
         observer.verify(&self.config)?;
-        budget.remaining()?;
         let keys = self.turn_keys(&definition.devices)?;
-        let books = self
-            .books
-            .get()
-            .ok_or_else(|| refused(grant.key, LifecycleCause::Uncertain))?;
+        let books = self.books.get().ok_or_else(|| {
+            uncertain(
+                grant.key,
+                "its guest has no record authority to initialize it",
+            )
+        })?;
         let mut reservation =
             self.reserve_owner(OwnerRef::Pool(&grant.key.pool), Operation::Creating)?;
         devices::with_pool_transaction(books, &grant.key, &keys, |transaction| {
@@ -404,37 +453,42 @@ impl GuestRuntime {
             let booted = match reservation.previous.as_ref() {
                 Some(known) => {
                     self.matches_pool(&known.booted, &record)?;
-                    let identity = known.booted.guest.identity().map_err(|why| {
-                        refusal("checking the same GPU backing publication", &why)
-                    })?;
+                    let identity = known
+                        .booted
+                        .guest
+                        .shards_for("checking the same GPU backing publication")?
+                        .identity()
+                        .map_err(|why| {
+                            refusal("checking the same GPU backing publication", &why)
+                        })?;
                     managed::same_native(NativeRecord::Pool(&record), &identity)?;
                     self.pool_alive(&known.booted, record.key)?;
-                    let receipt = pool::read(&definition.path)?
-                        .ok_or_else(|| refused(record.key, LifecycleCause::Uncertain))?;
+                    let receipt = pool::read(&definition.path)?.ok_or_else(|| {
+                        uncertain(record.key, "its receipt is gone though its pool is alive")
+                    })?;
                     receipt.matches(&record)?;
                     receipt.checked_report()?;
                     self.check_pool_native_report(&receipt)?;
                     receipt.checked_work_ready()?;
                     triomphe::Arc::clone(&known.booted)
                 }
-                None => self.boot_gpu_pool(transaction, &definition, record, budget)?,
+                None => self.boot_gpu_pool(transaction, &definition, record)?,
             };
             record = transaction
                 .read_pool(&grant.key)?
-                .ok_or_else(|| refused(grant.key, LifecycleCause::Uncertain))?;
+                .ok_or_else(|| uncertain(grant.key, "its pool record is gone after its boot"))?;
             self.matches_pool(&booted, &record)?;
             let receipt = pool::read(&definition.path)?
-                .ok_or_else(|| refused(grant.key, LifecycleCause::Uncertain))?;
+                .ok_or_else(|| uncertain(grant.key, "its receipt is gone after its boot"))?;
             receipt.matches(&record)?;
             receipt.checked_work_ready()?;
             self.pool_alive(&booted, grant.key)?;
-            budget.remaining()?;
             if record.phase == BackingPhase::Granted {
                 record.phase = BackingPhase::Live;
                 transaction.put_pool(&record)?;
             }
             if record.phase != BackingPhase::Live {
-                return Err(refused(grant.key, LifecycleCause::Uncertain));
+                return Err(uncertain(grant.key, "it isn't live after its boot"));
             }
             let offer = record.offer()?;
             reservation.previous = Some(Guest { booted });
@@ -458,12 +512,20 @@ impl GuestRuntime {
         record.check()?;
         let definition = self
             .gpu_backing_definition_for(Some(&record.devices))?
-            .ok_or_else(|| refused(record.key, LifecycleCause::Uncertain))?;
+            .ok_or_else(|| {
+                uncertain(
+                    record.key,
+                    "its node defines no GPU backing for its devices",
+                )
+            })?;
         if record.execution != hex_api::Execution::ShardsDedicated
             || record.key.pool != definition.pool
             || record.cost != definition.cost
         {
-            return Err(refused(record.key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                record.key,
+                "its record's execution, pool or cost isn't its definition's",
+            ));
         }
         Ok(definition)
     }
@@ -473,7 +535,6 @@ impl GuestRuntime {
         transaction: &dyn Transaction,
         definition: &GpuBacking,
         record: PoolRecord,
-        budget: managed::Budget,
     ) -> Result<triomphe::Arc<Booted>, Refusal> {
         let key = record.key;
         let retained = pool::read(&definition.path)?;
@@ -490,7 +551,12 @@ impl GuestRuntime {
                     &self.config,
                 )?
             }
-            None => return Err(refused(key, LifecycleCause::Uncertain)),
+            None => {
+                return Err(uncertain(
+                    key,
+                    "its receipt is gone though it is past its grant or names a controller",
+                ));
+            }
         };
         let binding = Binding {
             key,
@@ -503,51 +569,67 @@ impl GuestRuntime {
             .map_err(|_| Refusal::Full(hex_api::MAX_DEVICES))?;
         spec.gpu_devices.extend_from_slice(&receipt.physical);
         let socket = self.pool_socket(key)?;
-        let plan = self.managed_plan(&spec, &socket, budget)?;
+        let plan = self.managed_plan(&spec, &socket)?;
         let guest = match &receipt.phase {
             Phase::Intent if fresh => {
                 self.check_current_luids(
                     &receipt.original.devices,
                     &receipt.physical,
-                    refused(key, LifecycleCause::Uncertain),
+                    uncertain(key, "its selected GPUs aren't the ones its node reads now"),
                 )?;
                 let plan = plan
-                    .with_gpu_report(*receipt.original.scope().bytes(), budget.deadline())
+                    .with_gpu_report(
+                        *receipt.original.scope().bytes(),
+                        shards_api::Until::Released,
+                    )
                     .map_err(|why| refusal("preparing charged GPU observer report", &why))?;
                 pool::write(&definition.path, &receipt)?;
-                managed::boot(transaction, plan, budget)?
+                managed::boot(transaction, plan)?
             }
             Phase::Running(identity) => {
                 receipt.checked_report()?;
                 self.check_pool_native_report(&receipt)?;
                 receipt.checked_work_ready()?;
-                let canonical = transaction
-                    .read_pool(&key)?
-                    .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                let canonical = transaction.read_pool(&key)?.ok_or_else(|| {
+                    uncertain(
+                        key,
+                        "its pool record is gone as its boot's report was checked",
+                    )
+                })?;
                 managed::same_native(NativeRecord::Pool(&canonical), identity)?;
                 if identity.vsock != socket {
-                    return Err(refused(key, LifecycleCause::Uncertain));
+                    return Err(uncertain(key, "its controller's vsock isn't its socket"));
                 }
-                managed::attach(transaction, plan, identity, budget)?
+                managed::attach(transaction, plan, identity)?
             }
             // An interrupted Intent/report/workload is uncertainty, never a
             // second VM/program launch or an automatic grant refund.
-            _ => return Err(refused(key, LifecycleCause::Uncertain)),
+            _ => {
+                return Err(uncertain(
+                    key,
+                    "an interrupted boot of it left an intent, a report or a workload",
+                ));
+            }
         };
         let identity = shards_api::Guest::identity(&guest)
             .map_err(|why| refusal("reading charged GPU observer identity", &why))?;
-        let canonical = transaction
-            .read_pool(&key)?
-            .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+        let canonical = transaction.read_pool(&key)?.ok_or_else(|| {
+            uncertain(key, "its pool record is gone after its controller started")
+        })?;
         receipt.matches(&canonical)?;
         managed::same_native(NativeRecord::Pool(&canonical), &identity)?;
         if identity.vsock != socket {
-            return Err(refused(key, LifecycleCause::Uncertain));
+            return Err(uncertain(
+                key,
+                "its started controller's vsock isn't its socket",
+            ));
         }
         if fresh {
             receipt.report = Some(
                 guest
-                    .take_gpu_report(budget.remaining()?)
+                    // Its report comes or its VM process ends: Shards waits with no clock (`Until::Released`; the
+                    // review's C-9).
+                    .take_gpu_report(std::time::Duration::MAX)
                     .map_err(|why| refusal("observing same-scope full renderer ACK", &why))?,
             );
             receipt.checked_report()?;
@@ -555,24 +637,26 @@ impl GuestRuntime {
         }
         receipt.phase = Phase::Running(identity);
         pool::write(&definition.path, &receipt)?;
-        let booted = self.connect_managed(guest, None, Some(binding), budget)?;
+        let booted = self.connect_managed(guest, None, Some(binding))?;
         if fresh {
             let observer = self
                 .gpu_observer
                 .as_ref()
                 .ok_or_else(|| refused(key, LifecycleCause::Pending))?;
-            observer::observe(observer, &booted, &mut receipt, &definition.path, budget)?;
+            observer::observe(observer, &booted, &mut receipt, &definition.path)?;
         }
         receipt.checked_work_ready()?;
         self.check_pool_native_report(&receipt)?;
-        budget.remaining()?;
         Ok(booted)
     }
 
     fn check_pool_native_report(&self, receipt: &Receipt) -> Result<(), Refusal> {
-        let report = receipt
-            .checked_report()?
-            .ok_or_else(|| refused(receipt.original.key, LifecycleCause::Uncertain))?;
+        let report = receipt.checked_report()?.ok_or_else(|| {
+            uncertain(
+                receipt.original.key,
+                "its receipt holds no native report to check",
+            )
+        })?;
         self.check_native_report(
             &receipt.original.devices,
             &receipt.physical,
@@ -611,16 +695,24 @@ impl GuestRuntime {
             match record.phase {
                 BackingPhase::Prepared | BackingPhase::Released => {}
                 BackingPhase::Live => {
-                    let allocation = record
-                        .allocation
-                        .ok_or_else(|| refused(record.key, LifecycleCause::Uncertain))?;
+                    let allocation = record.allocation.ok_or_else(|| {
+                        uncertain(
+                            record.key,
+                            "it is live, yet holds no allocation, at its recovery",
+                        )
+                    })?;
                     self.initialize_gpu_pool(BackingGrant {
                         key: record.key,
                         allocation,
                         devices: self.gpu_ids(&record.devices)?,
                     })?;
                 }
-                _ => return Err(refused(record.key, LifecycleCause::Uncertain)),
+                _ => {
+                    return Err(uncertain(
+                        record.key,
+                        "it is granted or draining, and its end wasn't recovered",
+                    ));
+                }
             }
         }
         Ok(())
@@ -632,21 +724,22 @@ impl GuestRuntime {
         snapshot: &PoolRecord,
     ) -> Result<bool, Refusal> {
         let key = snapshot.key;
-        let budget = managed::Budget::new(self.first_dial_bound()?)?;
         let keys = self.turn_keys(&definition.devices)?;
-        let books = self
-            .books
-            .get()
-            .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+        let books = self.books.get().ok_or_else(|| {
+            uncertain(key, "its guest has no record authority to recover its end")
+        })?;
         let mut reservation = self.reserve_owner(OwnerRef::Pool(&key.pool), Operation::Loading)?;
         let released = devices::with_pool_transaction(books, &key, &keys, |transaction| {
-            let mut record = transaction
-                .read_pool(&key)?
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+            let mut record = transaction.read_pool(&key)?.ok_or_else(|| {
+                uncertain(key, "its pool record is gone before its end was recovered")
+            })?;
             if record.native_commitment()? != snapshot.native_commitment()?
                 || record.init != snapshot.init
             {
-                return Err(refused(key, LifecycleCause::Uncertain));
+                return Err(uncertain(
+                    key,
+                    "its record's commitment or controller changed before its end was recovered",
+                ));
             }
             let mut receipt = match pool::read(&definition.path)? {
                 Some(receipt) => {
@@ -659,7 +752,12 @@ impl GuestRuntime {
                         self.catalog_physical(&record.devices)?,
                     )?
                 }
-                None => return Err(refused(key, LifecycleCause::Uncertain)),
+                None => {
+                    return Err(uncertain(
+                        key,
+                        "its receipt is gone though its record names a controller, at its recovery",
+                    ));
+                }
             };
             let identity = match &receipt.phase {
                 Phase::Running(identity)
@@ -696,8 +794,10 @@ impl GuestRuntime {
                 _ => managed::stop_scope(
                     transaction,
                     identity.as_ref(),
-                    budget.remaining()?,
-                    refused(key, LifecycleCause::Uncertain),
+                    uncertain(
+                        key,
+                        "its recovered GPU backing's end wasn't seen after its stop",
+                    ),
                 )?,
             };
             receipt.phase = Phase::Released {
@@ -733,12 +833,12 @@ impl GuestRuntime {
         let books = self
             .books
             .get()
-            .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+            .ok_or_else(|| uncertain(key, "its guest has no record authority to read its usage"))?;
         let keys = self.turn_keys(&definition.devices)?;
         devices::with_pool_transaction(books, &key, &keys, |transaction| {
-            let record = transaction
-                .read_pool(&key)?
-                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+            let record = transaction.read_pool(&key)?.ok_or_else(|| {
+                uncertain(key, "its pool record is gone before its usage was read")
+            })?;
             self.preflight_backing(&record)?;
             if !matches!(
                 record.phase,
@@ -1287,7 +1387,7 @@ mod tests {
         *owner.row.lock().unwrap() = Some(row);
         let observed = runtime.physical_observations();
         assert!(
-            matches!(observed, Err(Refusal::Backing { key, cause: LifecycleCause::Uncertain }) if key == prepared.key)
+            matches!(observed, Err(Refusal::Backing { key, cause: LifecycleCause::Uncertain, why: None }) if key == prepared.key)
         );
         assert_eq!(native.attaches.load(Ordering::SeqCst), 1);
 
@@ -1431,6 +1531,7 @@ mod tests {
             row: Mutex::new(None),
             shared: Mutex::new(None),
             native_report: Some(Capacity {
+                own: Default::default(),
                 id: "same-books-native-owner".into(),
                 total: room,
                 free: room,
@@ -1441,6 +1542,8 @@ mod tests {
                 cost: None,
                 unavailable: Vec::new(),
                 learned: None,
+                node_vms: Vec::new(),
+                unlearned: None,
             }),
             physical: Some(vec![factual]),
             effects: AtomicUsize::new(0),
@@ -1540,6 +1643,7 @@ mod tests {
             arch: super::super::route::host_platform().unwrap().arch,
         };
         let prefix = Capacity {
+            own: Default::default(),
             id: "original-native-oci-pool".into(),
             total: room,
             free: CapacityResources {
@@ -1580,6 +1684,8 @@ mod tests {
             cost: None,
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         };
         prefix.check().unwrap();
         assert_ne!(
@@ -2163,6 +2269,7 @@ mod tests {
                 disk_bytes: 1 << 30,
             };
             Ok(hex_api::Capacity {
+                own: Default::default(),
                 id: "cold-model".into(),
                 total: room,
                 free: room,
@@ -2173,6 +2280,8 @@ mod tests {
                 cost: None,
                 unavailable: Vec::new(),
                 learned: None,
+                node_vms: Vec::new(),
+                unlearned: None,
             })
         }
         fn physical_devices(&self) -> Result<Vec<hex_api::DeviceInfo>, Refusal> {
@@ -2314,7 +2423,7 @@ mod tests {
             &self,
             _: &devices::ManagedLaunch<'_>,
             _: shards_api::LaunchIo,
-            _: std::time::Duration,
+            _: Option<std::time::Duration>,
         ) -> Result<shards_api::ManagedReceipt, Refusal> {
             self.launches.fetch_add(1, Ordering::SeqCst);
             Err(refused_model())
@@ -2638,9 +2747,13 @@ mod tests {
                 // The model launcher refuses after the join: no VM or readiness.
                 assert_eq!(result, Err(refused_model()));
             } else {
+                // Refused Uncertain, in its site's words (joint plan step 14, (B)).
                 assert_eq!(
                     result,
-                    Err(refused(prepared.key, LifecycleCause::Uncertain))
+                    Err(uncertain(
+                        prepared.key,
+                        "its selected GPUs aren't the ones its node reads now"
+                    ))
                 );
                 assert!(
                     pool::read(&runtime.gpu_backing_definition().unwrap().unwrap().path)

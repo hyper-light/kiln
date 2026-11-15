@@ -252,7 +252,7 @@ fn native_only_component_refuses_vm_owners_and_new_vm_lifetimes() {
     };
     pool.check().unwrap();
     assert!(
-        matches!(check_native_projection(std::slice::from_ref(&pool), None), Err(Refusal::Backing { key, cause: hex_api::LifecycleCause::Uncertain }) if key == pool.key)
+        matches!(check_native_projection(std::slice::from_ref(&pool), None), Err(Refusal::Backing { key, cause: hex_api::LifecycleCause::Uncertain, why: Some(_) }) if key == pool.key)
     );
     for execution in [
         Execution::ShardsShared,

@@ -333,11 +333,11 @@ fn arguments(
     args.push(copy(input.cost_file.as_os_str())?);
     args.push(hex(&input.cost_sha256)?);
     args.push(copy(input.evidence.as_os_str())?);
-    for p in [
-        &input.config.binary,
-        &input.config.kernel,
-        &input.config.initrd,
-    ] {
+    let (kernel, initrd) = input
+        .config
+        .direct()
+        .map_err(|_| invalid("an image's boot has no kernel or initramfs"))?;
+    for p in [input.config.binary.as_path(), kernel, initrd] {
         args.push(copy(p.as_os_str())?);
     }
     args.push(decimal(u64::from(input.config.vcpus))?);
@@ -461,8 +461,7 @@ fn parse(args: Vec<OsString>) -> Result<EntryInput, Fault> {
     Ok(EntryInput {
         config: GuestConfig {
             binary,
-            kernel,
-            initrd,
+            boot: crate::guest::Boot::Kernel { kernel, initrd },
             vcpus,
             memory_mib,
             gpu,

@@ -243,7 +243,10 @@ impl FirecrackerRuntime {
                 || record.native_scope != before.native_scope
                 || !matches!(record.spec.class, ClassSpec::Firecracker(_))
             {
-                return Err(lifecycle(id, LifecycleCause::Uncertain)?);
+                return Err(uncertain(
+                    id,
+                    "its record's native scope or class changed during its call",
+                ));
             }
             // A box whose backing was retired has no VM to ask (joint plan step 14).
             if record.retired {
@@ -291,7 +294,12 @@ impl FirecrackerRuntime {
         let native = self.native(record, transaction)?;
         if native
             .terminal()
-            .map_err(|_| uncertain(&record.spec.id))?
+            .map_err(|why| {
+                uncertain(
+                    &record.spec.id,
+                    &format!("its managed VM's end can't be read: {why}"),
+                )
+            })?
             .is_some()
         {
             return Err(Refusal::NotRunning(
@@ -399,7 +407,10 @@ impl FirecrackerRuntime {
                     .as_ref()
                     .is_some_and(|holder| holder.box_id() != Some(&spec.id))
                 {
-                    return Err(lifecycle(&spec.id, LifecycleCause::Uncertain)?);
+                    return Err(uncertain(
+                        &spec.id,
+                        "a device its spec claims is held by another box",
+                    ));
                 }
                 translated.push(guest_id);
                 assignments.push(observations::Assignment {
@@ -462,18 +473,25 @@ impl FirecrackerRuntime {
         let id = spec.id.try_clone()?;
         // The optional handoff already persisted this SAME scope before stopping its observer.
         if let Some(scope) = expected_scope {
-            let current = transaction.read(&id)?.ok_or_else(|| uncertain(&id))?;
+            let current = transaction
+                .read(&id)?
+                .ok_or_else(|| uncertain(&id, "its record is gone"))?;
             if current.spec != spec
                 || current.native_scope != Some(scope)
                 || current.phase != Phase::Creating
                 || current.init.is_some()
             {
-                return Err(uncertain(&id));
+                return Err(uncertain(
+                    &id,
+                    "its record names another native scope, isn't Creating, or names an init",
+                ));
             }
         } else {
             transaction.put(&BoxRecord::new(spec, Phase::Creating, Vec::new()))?;
         }
-        let mut record = transaction.read(&id)?.ok_or_else(|| uncertain(&id))?;
+        let mut record = transaction
+            .read(&id)?
+            .ok_or_else(|| uncertain(&id, "its record is gone"))?;
         let plan = vfio::plan(&self.host, &self.catalog, &record.spec.devices, &[])?;
         // A function no reset clears goes to one VM per host boot: refused where any node's VM had it on this one, or
         // where this node can't tell (unavailable_once).
@@ -529,7 +547,7 @@ impl FirecrackerRuntime {
                 memlock,
             },
             io,
-            remaining(until)?,
+            Some(remaining(until)?),
         )?;
         // Publication happened while the child was held. Read the SAME immutable scope/spec back.
         let current = transaction
@@ -539,7 +557,10 @@ impl FirecrackerRuntime {
             || current.native_scope != record.native_scope
             || current.init.is_none()
         {
-            return Err(lifecycle(&id, LifecycleCause::Uncertain)?);
+            return Err(uncertain(
+                &id,
+                "its record's native scope changed, or names no init",
+            ));
         }
         record = current;
         transport::ready(&listener, native.as_ref(), &mut output, until)?;
@@ -579,12 +600,18 @@ impl FirecrackerRuntime {
         let paths = self.paths(record)?;
         let identity = self.native_identity(record)?;
         let native = transaction.attach_managed(identity.as_ref())?;
-        native.stop().map_err(|_| uncertain(&id))?;
-        let end = native
-            .wait_for(self.config.stop_timeout)
-            .map_err(|_| uncertain(&id))?
-            .filter(|end| end.scope == shards_api::TerminalScope::Released)
-            .ok_or(lifecycle(&id, LifecycleCause::Uncertain)?)?;
+        let began = Instant::now();
+        native
+            .stop()
+            .map_err(|why| uncertain(&id, &format!("its managed VM's stop was refused: {why}")))?;
+        // Its stop's own wait (managed.stop; decision 9): past the slowest stop seen, its scope followed by its life to
+        // its end, never refused at a configured time (A-13: census retirement at a node's start stops VMs this way).
+        let end = crate::guest::wait_stopped(&*native, began)
+            .map_err(|why| uncertain(&id, &format!("its managed VM's end can't be read: {why}")))?
+            .ok_or(uncertain(
+                &id,
+                "its managed VM's scope hasn't been released",
+            ))?;
         record.exit = Some(exit(end.status));
         transaction.put(record)?;
         // Persisted exit is not itself absence proof. Finalize checks the same native receipt and
@@ -715,13 +742,21 @@ impl FirecrackerRuntime {
                 || record.phase != Phase::Ready
                 || !matches!(record.spec.class, ClassSpec::Firecracker(_))
             {
-                return Err(lifecycle(&expected.id, LifecycleCause::Uncertain)?);
+                return Err(uncertain(
+                    &expected.id,
+                    "its record isn't Ready, or isn't a Firecracker box's",
+                ));
             }
             expected.check()?;
             let native = self.native(&record, transaction)?;
             if native
                 .terminal()
-                .map_err(|_| uncertain(&expected.id))?
+                .map_err(|why| {
+                    uncertain(
+                        &expected.id,
+                        &format!("its managed VM's end can't be read: {why}"),
+                    )
+                })?
                 .is_some()
             {
                 return Ok(());
@@ -733,7 +768,10 @@ impl FirecrackerRuntime {
                 || actual.bounds != expected.bounds
                 || actual.allocation.is_some()
             {
-                return Err(lifecycle(&expected.id, LifecycleCause::Uncertain)?);
+                return Err(uncertain(
+                    &expected.id,
+                    "its managed VM's bounds aren't its record's, or it holds an allocation",
+                ));
             }
             Ok(())
         })
@@ -752,17 +790,29 @@ impl FirecrackerRuntime {
             || !matches!(record.spec.class, ClassSpec::Firecracker(_))
             || record.native_scope.is_none()
         {
-            return Err(uncertain(&record.spec.id));
+            return Err(uncertain(
+                &record.spec.id,
+                "its record isn't a Firecracker box's with a native scope",
+            ));
         }
-        self.config
-            .guest(&record.spec)
-            .map_err(|_| uncertain(&record.spec.id))?;
-        self.config
-            .machine_memory(&record.spec)
-            .map_err(|_| uncertain(&record.spec.id))?;
+        self.config.guest(&record.spec).map_err(|why| {
+            uncertain(
+                &record.spec.id,
+                &format!("its record's Firecracker guest can't be built: {why}"),
+            )
+        })?;
+        self.config.machine_memory(&record.spec).map_err(|why| {
+            uncertain(
+                &record.spec.id,
+                &format!("its record's machine memory can't be read: {why}"),
+            )
+        })?;
         let paths = self.paths(record)?;
         if record.dirs.iter().any(|owned| owned != &paths.dir) {
-            return Err(uncertain(&record.spec.id));
+            return Err(uncertain(
+                &record.spec.id,
+                "its record owns a directory that isn't its VM's",
+            ));
         }
         Ok(())
     }
@@ -777,7 +827,10 @@ impl FirecrackerRuntime {
         self.preflight_record(record)?;
         self.preflight_backing(source)?;
         let id = &record.spec.id;
-        let route = record.spec.route.ok_or_else(|| uncertain(id))?;
+        let route = record
+            .spec
+            .route
+            .ok_or_else(|| uncertain(id, "its record routes it on no backing"))?;
         if !matches!(record.phase, Phase::Creating | Phase::Deleting)
             || record.init.is_some()
             || record.run.is_some()
@@ -790,7 +843,7 @@ impl FirecrackerRuntime {
                 hex_api::BackingPhase::Live | hex_api::BackingPhase::Draining
             )
         {
-            return Err(uncertain(id));
+            return Err(uncertain(id, "its backing isn't live or draining"));
         }
         route.check_backing_parts(
             record.spec.allocation.map(|allocation| allocation.cost),
@@ -809,7 +862,10 @@ impl FirecrackerRuntime {
                 "checking unsubmitted Firecracker incarnation",
                 error,
             )),
-            Ok(_) => Err(uncertain(id)),
+            Ok(_) => Err(uncertain(
+                id,
+                "an unsubmitted Firecracker incarnation of it is there",
+            )),
         }
     }
 
@@ -824,9 +880,10 @@ impl FirecrackerRuntime {
             .pool_records()?
             .into_iter()
             .find(|pool| pool.key == key)
-            .ok_or(Refusal::Backing {
+            .ok_or_else(|| Refusal::Backing {
                 key,
                 cause: LifecycleCause::Uncertain,
+                why: Some("its Firecracker handoff's source backing has no record".to_owned()),
             })?;
         self.preflight_backing(&source)?;
         // This is an exact isolation/identity check, not another picker. Refuse an inseparable
@@ -860,12 +917,15 @@ impl FirecrackerRuntime {
             &key,
             &keys,
             |transaction| {
-                let source = transaction.read_pool(&key)?.ok_or_else(|| uncertain(&id))?;
+                let source = transaction
+                    .read_pool(&key)?
+                    .ok_or_else(|| uncertain(&id, "its backing has no record"))?;
                 self.preflight_backing(&source)?;
                 if source.phase != hex_api::BackingPhase::Live {
                     return Err(Refusal::Backing {
                         key,
                         cause: LifecycleCause::Pending,
+                        why: None,
                     });
                 }
                 if transaction.read(&id)?.is_some() {
@@ -879,7 +939,9 @@ impl FirecrackerRuntime {
                 self.catalog.prepare(&spec, &records, &pools)?;
                 let commitment = source.native_commitment()?;
                 transaction.put(&BoxRecord::new(spec, Phase::Creating, Vec::new()))?;
-                let pending = transaction.read(&id)?.ok_or_else(|| uncertain(&id))?;
+                let pending = transaction
+                    .read(&id)?
+                    .ok_or_else(|| uncertain(&id, "its record is gone right after its put"))?;
                 self.handoff_unsubmitted(&pending, &source)?;
                 Ok((pending, commitment, source.init))
             },
@@ -889,7 +951,9 @@ impl FirecrackerRuntime {
         let released = self.release_observer_before(&key, Some(until))?;
         remaining(until)?;
         crate::devices::with_handoff_transaction(&self.books, &id, &key, &keys, |transaction| {
-            let source = transaction.read_pool(&key)?.ok_or_else(|| uncertain(&id))?;
+            let source = transaction
+                .read_pool(&key)?
+                .ok_or_else(|| uncertain(&id, "its backing has no record"))?;
             self.preflight_backing(&source)?;
             if source.phase != hex_api::BackingPhase::Released
                 || source.exit.is_none()
@@ -900,12 +964,17 @@ impl FirecrackerRuntime {
                 || released.cost != source.cost
                 || released.devices != source.devices
             {
-                return Err(uncertain(&id));
+                return Err(uncertain(
+                    &id,
+                    "its backing's release isn't the one its handoff began with",
+                ));
             }
             if transaction.read(&id)?.as_ref() != Some(&pending) {
-                return Err(uncertain(&id));
+                return Err(uncertain(&id, "its record changed during its handoff"));
             }
-            let scope = pending.native_scope.ok_or_else(|| uncertain(&id))?;
+            let scope = pending
+                .native_scope
+                .ok_or_else(|| uncertain(&id, "its pending record names no native scope"))?;
             self.create_or_cleanup(&id, pending.spec, Some(scope), transaction, until)
         })
     }
@@ -1171,7 +1240,8 @@ impl FirecrackerRuntime {
 
     pub fn recover(&self) -> Result<(), Refusal> {
         for (id, record) in self.authority()?.records()? {
-            let record = record.map_err(|_| uncertain(&id))?;
+            let record = record
+                .map_err(|why| uncertain(&id, &format!("its record can't be read: {why}")))?;
             if !matches!(record.spec.class, ClassSpec::Firecracker(_)) {
                 continue;
             }
@@ -1234,11 +1304,13 @@ fn missing(id: &BoxId) -> Refusal {
     }
 }
 
-fn uncertain(id: &BoxId) -> Refusal {
+/// Box `id`'s lifecycle uncertain, in the refusing site's own words (joint plan step 12).
+fn uncertain(id: &BoxId, why: &str) -> Refusal {
     match id.try_clone() {
         Ok(id) => Refusal::Lifecycle {
             id,
             cause: LifecycleCause::Uncertain,
+            why: Some(why.to_owned()),
         },
         Err(error) => error,
     }
@@ -1248,6 +1320,7 @@ fn lifecycle(id: &BoxId, cause: LifecycleCause) -> Result<Refusal, Refusal> {
     Ok(Refusal::Lifecycle {
         id: id.try_clone()?,
         cause,
+        why: None,
     })
 }
 
@@ -1356,7 +1429,9 @@ impl Runtime for FirecrackerRuntime {
                 && let Some(end) = self
                     .native(record, transaction)?
                     .terminal()
-                    .map_err(|_| uncertain(id))?
+                    .map_err(|why| {
+                        uncertain(id, &format!("its managed VM's end can't be read: {why}"))
+                    })?
             {
                 return Ok(BoxInfo {
                     published: Vec::new(),
@@ -1373,6 +1448,8 @@ impl Runtime for FirecrackerRuntime {
                     abandoned: record.abandoned,
                     last_resort: None,
                     ended: None,
+                    control: None,
+                    control_wake: None,
                     credentials: Vec::new(),
                 });
             }
@@ -1426,7 +1503,7 @@ impl Runtime for FirecrackerRuntime {
                 .pool_records()?
                 .into_iter()
                 .find(|pool| pool.key == key)
-                .ok_or_else(|| uncertain(id))?;
+                .ok_or_else(|| uncertain(id, "its route's backing has no record"))?;
             if matches!(
                 source.phase,
                 hex_api::BackingPhase::Live | hex_api::BackingPhase::Draining
@@ -1438,7 +1515,9 @@ impl Runtime for FirecrackerRuntime {
                     &key,
                     &keys,
                     |transaction| {
-                        let source = transaction.read_pool(&key)?.ok_or_else(|| uncertain(id))?;
+                        let source = transaction
+                            .read_pool(&key)?
+                            .ok_or_else(|| uncertain(id, "its backing has no record"))?;
                         let mut current = transaction.read(id)?.ok_or_else(|| missing(id))?;
                         self.handoff_unsubmitted(&current, &source)?;
                         current.phase = Phase::Deleting;
@@ -1680,17 +1759,17 @@ mod io_tests {
             gate.write_all(b"\n").unwrap();
             drop(gate);
             let pid = self.pid();
-            hex_testkit::waits::until(&STAND_IN_ENDS, "the stand-in VMM's end", || {
-                rustix::process::waitid(
-                    rustix::process::WaitId::Pid(pid),
-                    rustix::process::WaitIdOptions::EXITED
-                        | rustix::process::WaitIdOptions::NOWAIT
-                        | rustix::process::WaitIdOptions::NOHANG,
-                )
-                .unwrap()
-                .is_some()
-            })
-            .unwrap();
+            // Its end, waited for on the child's own end (the review's C-5): waitid blocks until it, and NOWAIT leaves
+            // it a zombie.
+            let ended =
+                hex_testkit::waits::follow::whole(&STAND_IN_ENDS, "the stand-in VMM's end", || {
+                    rustix::process::waitid(
+                        rustix::process::WaitId::Pid(pid),
+                        rustix::process::WaitIdOptions::EXITED
+                            | rustix::process::WaitIdOptions::NOWAIT,
+                    )
+                });
+            assert!(ended.unwrap().is_some(), "the stand-in VMM's end");
         }
 
         /// Has its receipt collect its end, as the node's supervisor collects an ended VMM's at once
@@ -1892,7 +1971,7 @@ mod io_tests {
             &self,
             _: &ManagedLaunch<'_>,
             io: shards_api::LaunchIo,
-            _: std::time::Duration,
+            _: Option<std::time::Duration>,
         ) -> Result<shards_api::ManagedReceipt, Refusal> {
             let (vmm, gate) = StandIn::held(
                 &format!("echo '{MEMLOCK}' >&2; exit 1"),
@@ -2372,7 +2451,7 @@ mod cleanup_tests {
             &self,
             _: &ManagedLaunch<'_>,
             _: shards_api::LaunchIo,
-            _: std::time::Duration,
+            _: Option<std::time::Duration>,
         ) -> Result<shards_api::ManagedReceipt, Refusal> {
             panic!("this create is refused before its VMM")
         }
@@ -2563,7 +2642,7 @@ mod memlock_tests {
             &self,
             _: &ManagedLaunch<'_>,
             _: shards_api::LaunchIo,
-            _: std::time::Duration,
+            _: Option<std::time::Duration>,
         ) -> Result<shards_api::ManagedReceipt, Refusal> {
             Err(Refusal::Broken(
                 "the VMM was launched past its memlock".to_owned(),
@@ -2825,7 +2904,7 @@ mod single_use_tests {
             &self,
             _: &ManagedLaunch<'_>,
             _: shards_api::LaunchIo,
-            _: std::time::Duration,
+            _: Option<std::time::Duration>,
         ) -> Result<shards_api::ManagedReceipt, Refusal> {
             self.launched.set(self.launched.get() + 1);
             Err(Refusal::Broken(
@@ -3150,6 +3229,7 @@ mod single_use_tests {
                 disk_bytes: 1 << 40,
             };
             Ok(hex_api::Capacity {
+                own: Default::default(),
                 id: "node:stand-in".into(),
                 total: room,
                 free: room,
@@ -3160,6 +3240,8 @@ mod single_use_tests {
                 backings: Vec::new(),
                 unavailable: Vec::new(),
                 learned: None,
+                node_vms: Vec::new(),
+                unlearned: None,
             })
         }
         fn physical_devices(&self) -> Result<Vec<hex_api::DeviceInfo>, Refusal> {

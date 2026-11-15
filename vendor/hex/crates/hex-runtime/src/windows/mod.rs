@@ -87,6 +87,14 @@ struct Slot {
     route: Option<hex_api::RouteReceipt>,
     keeper: KeeperHold,
     state: SlotState,
+    /// A run's box's claim on its removal, carried from its making ([`crate::run::Claim`]); none for any other box.
+    run: Option<Arc<crate::run::Claim>>,
+}
+
+impl Slot {
+    fn carries(&self, claim: &Arc<crate::run::Claim>) -> bool {
+        self.run.as_ref().is_some_and(|run| Arc::ptr_eq(run, claim))
+    }
 }
 
 impl Slot {
@@ -500,6 +508,18 @@ impl Holding {
         marker: Option<PathBuf>,
         route: Option<hex_api::RouteReceipt>,
     ) -> Result<(), Refusal> {
+        self.reserve_with(id, devices, marker, route, None)
+    }
+
+    /// [`Holding::reserve`] of a box that carries `run`, its removal's claim as a run's box, from its making.
+    fn reserve_with(
+        &self,
+        id: OwnerRef<'_>,
+        devices: &[DeviceId],
+        marker: Option<PathBuf>,
+        route: Option<hex_api::RouteReceipt>,
+        run: Option<Arc<crate::run::Claim>>,
+    ) -> Result<(), Refusal> {
         let key = id.try_owned()?;
         let owned = copy_devices(devices)?;
         let mut selected = copy_devices(devices)?;
@@ -544,6 +564,7 @@ impl Holding {
                     route,
                     keeper: KeeperHold::Unheld,
                     state: SlotState::Creating,
+                    run,
                 },
             ),
         );
@@ -1019,17 +1040,35 @@ impl Holding {
     /// Keep the slot through every external cleanup operation; only an actual successful removal
     /// releases claims. Concurrent cancellation requests never remove a creator's slot underneath it.
     fn remove(&self, id: &BoxId) -> Result<(), Refusal> {
-        self.remove_using(id, oci::end)
+        self.remove_using(id, oci::end, None)
+    }
+
+    /// Removes run box `id` where it still carries `claim`, its removal's claimer's (the run's end or a delete), as
+    /// [`Holding::remove`] removes any box: its slot kept, so a delete beside it waits for the claimer's word and no box
+    /// takes its id meanwhile. A box under the id that carries no such claim is another, which this touches not: the
+    /// claimer's box is gone.
+    fn remove_run(&self, id: &BoxId, claim: &Arc<crate::run::Claim>) -> Result<(), Refusal> {
+        self.remove_using(id, oci::end, Some(claim))
     }
 
     fn remove_using(
         &self,
         id: &BoxId,
         end: impl FnOnce(&Path) -> Result<(), Refusal>,
+        carrying: Option<&Arc<crate::run::Claim>>,
     ) -> Result<(), Refusal> {
         let (removal, marker) = {
             let mut boxes = self.boxes()?;
-            let at = slot_index(&boxes, id).map_err(|_| Refusal::NoSuchBox(id.clone()))?;
+            let at = match (slot_index(&boxes, id), carrying) {
+                (Ok(at), Some(claim))
+                    if !boxes.get(at).is_some_and(|(_, slot)| slot.carries(claim)) =>
+                {
+                    return Ok(());
+                }
+                (Ok(at), _) => at,
+                (Err(_), Some(_)) => return Ok(()),
+                (Err(_), None) => return Err(Refusal::NoSuchBox(id.clone())),
+            };
             let (_, slot) = boxes.get_mut(at).ok_or_else(inconsistent_slots)?;
             let removal = match &slot.state {
                 SlotState::Creating => {
@@ -1440,7 +1479,7 @@ impl WinRuntime {
         record: NativeRecord<'_>,
         plan: &crate::devices::ManagedLaunch<'_>,
         io: shards_api::LaunchIo,
-        patience: std::time::Duration,
+        patience: Option<std::time::Duration>,
         publish: &mut dyn FnMut(&shards_api::Identity) -> Result<(), Refusal>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
         managed::launch(self, record, plan, io, patience, publish)
@@ -1472,6 +1511,18 @@ impl WinRuntime {
     /// node holds.
     pub fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
         managed::stop(self, record)
+    }
+
+    /// Joint plan step 14 (C4 on Windows; ROOT, 2026-11-13): the least share a managed VM's job holds it at, its hard
+    /// cap's least unit on this machine (`hex_core::job::least_milli`).
+    pub fn managed_least(&self) -> u64 {
+        hex_core::job::least_milli(self.processors)
+    }
+
+    /// Joint plan step 14 (D260): how long the process created at `started` has run, a managed VM's VM process by its
+    /// record's `init` ([`process_life`]).
+    pub fn managed_life(&self, started: u64) -> Result<std::time::Duration, Refusal> {
+        process_life(started)
     }
     pub fn managed_usage(&self, record: NativeRecord<'_>) -> Result<Usage, Refusal> {
         managed::usage(self, record)
@@ -1697,6 +1748,80 @@ impl WinRuntime {
         self.holding.drop_from_keeper(id)
     }
 
+    /// Makes box `spec`, a run's carrying `run`, its removal's claim, from its making ([`crate::run::Claim`]).
+    fn create_with(
+        &self,
+        spec: BoxSpec,
+        run: Option<&Arc<crate::run::Claim>>,
+    ) -> Result<BoxInfo, Refusal> {
+        self.check_native_spec(&spec)?;
+        // This ordinary native route advertises legacy identity cost (None). Managed VM launches
+        // enter the canonical Books transaction and configure their explicit allocation instead.
+        if spec.allocation.is_some() {
+            return Err(Refusal::Invalid {
+                what: "native runtime allocation",
+                why: copy_text("this ordinary native route advertises identity cost")?,
+            });
+        }
+        if matches!(spec.class, ClassSpec::Process) {
+            spec.check_no_devices("windows process")?;
+        }
+        // Refuse invalid/missing/native-incompatible bindings before taking a slot or creating jobs.
+        self.bindings(&spec)?;
+        let container = if matches!(spec.class, ClassSpec::Process) {
+            None
+        } else {
+            Some(self.container(&spec)?)
+        };
+        let marker = if matches!(spec.class, ClassSpec::Process) {
+            None
+        } else {
+            Some(self.marker(&spec.id)?)
+        };
+        if marker.as_ref().is_some_and(|path| path.exists()) {
+            return Err(Refusal::Exists(spec.id));
+        }
+        let physical_id = spec.id.try_clone()?;
+        self.holding.reserve_with(
+            OwnerRef::Box(&spec.id),
+            &spec.devices,
+            marker,
+            spec.route,
+            run.map(Arc::clone),
+        )?;
+        let held = match &spec.class {
+            ClassSpec::Process => match self.job_name(&spec.id) {
+                Some(name) => {
+                    JobBox::create_named(physical_id, &spec.bounds, self.processors, &name)
+                }
+                None => JobBox::create(physical_id, &spec.bounds, self.processors),
+            }
+            .and_then(native_held),
+            _ => match container.as_ref() {
+                Some(container) => self
+                    .create_oci(&spec, container)
+                    .map(|boxed| Held::Oci(Arc::new(boxed))),
+                None => Err(inconsistent_slots()),
+            },
+        };
+        if held.is_err() && matches!(spec.class, ClassSpec::Process) {
+            self.holding.unmade(&spec.id)?;
+            return held.and_then(|boxed| self.info(&boxed));
+        }
+        if let Err(error) = held.as_ref()
+            && !spec.devices.is_empty()
+        {
+            self.holding.preparation_failed(&spec.id)?;
+            return match self.holding.remove(&spec.id) {
+                Ok(()) => held.and_then(|boxed| self.info(&boxed)),
+                Err(cleanup) => Err(Refusal::Broken(format!(
+                    "native preparation failed ({error}); owned scratch cleanup remains pending ({cleanup})"
+                ))),
+            };
+        }
+        self.finish_make(&spec.id, held)
+    }
+
     fn get(&self, id: &BoxId) -> Result<Held, Refusal> {
         let boxes = self.boxes()?;
         let at = slot_index(&boxes, id).map_err(|_| Refusal::NoSuchBox(id.clone()))?;
@@ -1732,6 +1857,8 @@ impl WinRuntime {
                 allocation: None,
                 last_resort: None,
                 ended: None,
+                control: None,
+                control_wake: None,
                 credentials: Vec::new(),
             }),
             Held::Oci(b) => oci::info(b),
@@ -1993,6 +2120,7 @@ impl Runtime for WinRuntime {
             .map_err(|_| allocation(identity.len()))?;
         id.push_str(identity);
         let mut report = Capacity {
+            own: Default::default(),
             routes: Vec::new(),
             device_routes: Vec::new(),
             backings: Vec::new(),
@@ -2015,6 +2143,8 @@ impl Runtime for WinRuntime {
             },
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         };
         native_route_offer(&mut report, class, initialized)?;
         report.check()?;
@@ -2030,67 +2160,7 @@ impl Runtime for WinRuntime {
     }
 
     fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
-        self.check_native_spec(&spec)?;
-        // This ordinary native route advertises legacy identity cost (None). Managed VM launches
-        // enter the canonical Books transaction and configure their explicit allocation instead.
-        if spec.allocation.is_some() {
-            return Err(Refusal::Invalid {
-                what: "native runtime allocation",
-                why: copy_text("this ordinary native route advertises identity cost")?,
-            });
-        }
-        if matches!(spec.class, ClassSpec::Process) {
-            spec.check_no_devices("windows process")?;
-        }
-        // Refuse invalid/missing/native-incompatible bindings before taking a slot or creating jobs.
-        self.bindings(&spec)?;
-        let container = if matches!(spec.class, ClassSpec::Process) {
-            None
-        } else {
-            Some(self.container(&spec)?)
-        };
-        let marker = if matches!(spec.class, ClassSpec::Process) {
-            None
-        } else {
-            Some(self.marker(&spec.id)?)
-        };
-        if marker.as_ref().is_some_and(|path| path.exists()) {
-            return Err(Refusal::Exists(spec.id));
-        }
-        let physical_id = spec.id.try_clone()?;
-        self.holding
-            .reserve(OwnerRef::Box(&spec.id), &spec.devices, marker, spec.route)?;
-        let held = match &spec.class {
-            ClassSpec::Process => match self.job_name(&spec.id) {
-                Some(name) => {
-                    JobBox::create_named(physical_id, &spec.bounds, self.processors, &name)
-                }
-                None => JobBox::create(physical_id, &spec.bounds, self.processors),
-            }
-            .and_then(native_held),
-            _ => match container.as_ref() {
-                Some(container) => self
-                    .create_oci(&spec, container)
-                    .map(|boxed| Held::Oci(Arc::new(boxed))),
-                None => Err(inconsistent_slots()),
-            },
-        };
-        if held.is_err() && matches!(spec.class, ClassSpec::Process) {
-            self.holding.unmade(&spec.id)?;
-            return held.and_then(|boxed| self.info(&boxed));
-        }
-        if let Err(error) = held.as_ref()
-            && !spec.devices.is_empty()
-        {
-            self.holding.preparation_failed(&spec.id)?;
-            return match self.holding.remove(&spec.id) {
-                Ok(()) => held.and_then(|boxed| self.info(&boxed)),
-                Err(cleanup) => Err(Refusal::Broken(format!(
-                    "native preparation failed ({error}); owned scratch cleanup remains pending ({cleanup})"
-                ))),
-            };
-        }
-        self.finish_make(&spec.id, held)
+        self.create_with(spec, None)
     }
 
     fn start(&self, id: &BoxId) -> Result<(), Refusal> {
@@ -2136,14 +2206,17 @@ impl Runtime for WinRuntime {
     }
 
     /// A run's box goes once its program ends (decision 7): a thread of the run's own waits on the program's
-    /// process handle and removes the box through the delete's own path ([`Holding::remove`], its job and the
+    /// process handle and removes the box through the delete's own path ([`Holding::remove_run`], its job and the
     /// keeper's handle with it), whether or not its caller still holds the run, and only then gives the caller
-    /// the end. Its kill is the box's KILL, the box's job holding that program alone.
+    /// the end. Its kill is the box's KILL, the box's job holding that program alone. The box carries its removal's
+    /// claim from its making, held here until it is whole and its program watched, so no delete moves it meanwhile,
+    /// and it is removed once, by the run's end or a delete, never after another box has taken its id (runtime goal 7).
     fn run(&self, spec: BoxSpec, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, Refusal> {
         spec.check_no_devices("windows")?;
         spec.check_run()?;
         let id = spec.id.clone();
-        self.create(spec)?;
+        let (claim, making) = crate::run::Claim::making();
+        self.create_with(spec, Some(&claim))?;
         let begun = self.exec(&id, program, stdio).and_then(|proc| {
             let b = match self.get(&id)? {
                 Held::Process(b) => b,
@@ -2154,17 +2227,24 @@ impl Runtime for WinRuntime {
                     });
                 }
             };
-            let (holding, gone) = (Arc::clone(&self.holding), id.clone());
+            let (holding, gone, carried) =
+                (Arc::clone(&self.holding), id.clone(), Arc::clone(&claim));
             crate::run::Run::start(
                 proc,
                 &id,
+                &claim,
                 Box::new(move || b.signal(Signal::KILL)),
-                Box::new(move || holding.remove(&gone)),
+                Box::new(move || holding.remove_run(&gone, &carried)),
             )
         });
+        making.made();
         match begun {
             Ok(run) => Ok(Box::new(run)),
-            Err(why) => Err(crate::run::undone(why, self.delete(&id), &id)),
+            Err(why) => Err(crate::run::undone(
+                why,
+                crate::run::delete(&claim, &id, || self.holding.remove_run(&id, &claim)),
+                &id,
+            )),
         }
     }
 
@@ -2209,18 +2289,25 @@ impl Runtime for WinRuntime {
         held.iter().map(|boxed| self.info(boxed)).collect()
     }
 
+    /// A run's box is its removal's claimer's ([`crate::run::delete`]); any other is removed here.
     fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
-        {
+        let claim = {
             let boxes = self.boxes()?;
-            if let Ok(at) = slot_index(&boxes, id)
-                && let Some((_, slot)) = boxes.get(at)
-                && let Some(Held::Process(boxed)) = slot.physical()
+            let slot = slot_index(&boxes, id)
+                .ok()
+                .and_then(|at| boxes.get(at))
+                .map(|(_, slot)| slot);
+            if let Some(Held::Process(boxed)) = slot.and_then(Slot::physical)
                 && boxed.is_vm()
             {
                 return Err(Refusal::NoSuchBox(id.try_clone()?));
             }
+            slot.and_then(|slot| slot.run.clone())
+        };
+        match claim {
+            Some(claim) => crate::run::delete(&claim, id, || self.holding.remove_run(id, &claim)),
+            None => self.holding.remove(id),
         }
-        self.holding.remove(id)
     }
 }
 
@@ -2312,9 +2399,75 @@ fn handle(given: Option<OwnedHandle>) -> Result<OwnedHandle, Refusal> {
     }
 }
 
+/// FILETIME's epoch, 1601-01-01 UTC, to the system time's, 1970-01-01: 369 years of 365 days and 89 leap days (every
+/// fourth year, less 1700, 1800 and 1900), 86,400 s a day. Microsoft converts a `time_t` to a FILETIME by the same
+/// offset, 116,444,736,000,000,000 intervals.
+const UNIX_EPOCH_SINCE_1601: std::time::Duration =
+    std::time::Duration::from_secs((369 * 365 + 89) * 86_400);
+/// A FILETIME's interval, in nanoseconds: 100 ns.
+const FILETIME_INTERVAL_NS: u64 = 100;
+/// A FILETIME's intervals a second.
+const FILETIME_PER_SECOND: u64 = 1_000_000_000 / FILETIME_INTERVAL_NS;
+
+/// Joint plan step 14 (D260): how long the process created at `started` has run: from its creation, as `GetProcessTimes`
+/// reads it (a FILETIME, 100 ns intervals since 1601-01-01 UTC: a managed VM's `init`, Shards' `Identity::started`), to
+/// now on the same clock, the system time, which Windows reads as a FILETIME too (`SystemTime::now`). Refused where the
+/// creation is past now.
+pub fn process_life(started: u64) -> Result<std::time::Duration, Refusal> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Refusal::Invalid {
+            what: "the system time",
+            why: "it is before 1970".to_owned(),
+        })?;
+    life_since(started, now)
+}
+
+/// The life of a process created at FILETIME `started`, the system time being `now` past the Unix epoch.
+fn life_since(started: u64, now: std::time::Duration) -> Result<std::time::Duration, Refusal> {
+    let past = || Refusal::Invalid {
+        what: "a process's start",
+        why: format!("FILETIME {started} is past now on the system time"),
+    };
+    let seconds = started.checked_div(FILETIME_PER_SECOND).ok_or_else(past)?;
+    let nanos = started
+        .checked_rem(FILETIME_PER_SECOND)
+        .and_then(|intervals| intervals.checked_mul(FILETIME_INTERVAL_NS))
+        .ok_or_else(past)?;
+    let start = std::time::Duration::from_secs(seconds)
+        .checked_add(std::time::Duration::from_nanos(nanos))
+        .ok_or_else(past)?;
+    now.checked_add(UNIX_EPOCH_SINCE_1601)
+        .and_then(|now| now.checked_sub(start))
+        .ok_or_else(past)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Joint plan step 14 (D260; AC-T7.4.1): a process's life runs from its creation FILETIME to now on the system time.
+    /// Do reckon the life of a process created at the Unix epoch, as Microsoft's FILETIME of it says it
+    /// (116,444,736,000,000,000), a day and 7 intervals past the epoch; of one created a second past now; and of one
+    /// created at the epoch, now. Expect a day less 700 ns; the second past now refused, typed; and the system time since
+    /// 1970, more than none.
+    #[test]
+    fn w14_d260_a_process_life_runs_from_its_creation_to_now() {
+        let epoch = 116_444_736_000_000_000u64;
+        let day = std::time::Duration::from_secs(86_400);
+        assert_eq!(
+            life_since(epoch + 7, day).unwrap(),
+            day - std::time::Duration::from_nanos(700)
+        );
+        assert!(matches!(
+            life_since(epoch + 10_000_000, std::time::Duration::ZERO),
+            Err(Refusal::Invalid {
+                what: "a process's start",
+                ..
+            })
+        ));
+        assert!(process_life(epoch).unwrap() > std::time::Duration::ZERO);
+    }
     use std::sync::atomic::Ordering;
 
     fn device_runtime(scratch: &Path) -> WinRuntime {
@@ -2339,6 +2492,7 @@ mod tests {
     #[test]
     fn native_windows_route_does_not_require_a_configured_gpu() {
         let mut report = Capacity {
+            own: Default::default(),
             id: "native-control".into(),
             total: CapacityResources::default(),
             free: CapacityResources::default(),
@@ -2349,6 +2503,8 @@ mod tests {
             backings: Vec::new(),
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         };
         native_route_offer(&mut report, Class::Oci, true).unwrap();
         let route = report
@@ -2372,6 +2528,7 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let rt = device_runtime(scratch.path());
         let mut report = Capacity {
+            own: Default::default(),
             id: "containers-node".into(),
             total: CapacityResources::default(),
             free: CapacityResources::default(),
@@ -2382,6 +2539,8 @@ mod tests {
             backings: Vec::new(),
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         };
         native_route_offer(&mut report, Class::Oci, true).unwrap();
         report.check().unwrap();
@@ -2431,6 +2590,7 @@ mod tests {
         native_encoding_upper_bound(Some(true), Some(&enabled), &mut projection).unwrap();
         assert_eq!(projection.count().unwrap(), 2); // Possible Process + OCI, not current service facts.
         let mut unavailable = Capacity {
+            own: Default::default(),
             id: "service-unavailable-control".into(),
             total: CapacityResources::default(),
             free: CapacityResources::default(),
@@ -2441,6 +2601,8 @@ mod tests {
             backings: Vec::new(),
             unavailable: Vec::new(),
             learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
         };
         native_route_offer(&mut unavailable, Class::Oci, false).unwrap();
         let (process, _) =
@@ -2836,10 +2998,14 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let error = rt
             .holding
-            .remove_using(&spec.id, |_| {
-                calls.set(calls.get() + 1);
-                Ok(())
-            })
+            .remove_using(
+                &spec.id,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                None,
+            )
             .unwrap_err();
         assert!(matches!(
             error,
@@ -3062,8 +3228,8 @@ mod tests {
                 stderr,
                 gpu_report: None,
             },
-            // A finite launch bound this test never spends: publication refuses first.
-            std::time::Duration::from_secs(3_600),
+            // No deadline (the review's C-9): publication refuses first.
+            None,
             &mut publish,
         ) else {
             panic!("a launch whose publication was refused succeeded");
@@ -3536,6 +3702,47 @@ mod tests {
         record
     }
 
+    /// AC-T7.4.1, joint plan step 14 (ROOT, 2026-11-13, ruling B; A-4): do take a VM's host bounds from its record,
+    /// as its launch and its adoption prepare its job. Expect its CPU at its allocation's and no commit limit, so
+    /// its VMM's own memory beside its guest's RAM is never refused at a bound of its guest's size.
+    #[test]
+    fn w14_a4_a_vms_job_holds_its_cpu_and_no_commit_limit() {
+        let record = vm_record("ruling-b");
+        let native = hex_core::record::NativeRecord::Box(&record);
+        let cpu = record.spec.allocation.unwrap().resources.cpu_milli;
+        let bounds = super::managed::host_bounds(native).unwrap();
+        assert_eq!(bounds.cpu_max_milli, Some(u32::try_from(cpu).unwrap()));
+        assert_eq!(bounds.memory_max, None);
+    }
+
+    /// AC-T7.4.1, joint plan step 14 (ROOT, 2026-11-13, ruling B; A-4): do adopt a VM's job that a create before
+    /// ruling B made, with a commit limit at its guest's RAM. Expect the adoption to lift it, as Linux lifts a VM's
+    /// `memory.max` at its first window.
+    #[test]
+    fn w14_a4_an_adopted_vms_job_has_its_old_commit_limit_lifted() {
+        let scratch = tempfile::tempdir().unwrap();
+        let rt = device_runtime(scratch.path());
+        let record = vm_record("adopted");
+        let native = hex_core::record::NativeRecord::Box(&record);
+        let guest = record.spec.allocation.unwrap().resources.mem_bytes;
+        let name = format!("Local\\hex-test-{}-a4", std::process::id());
+        let old = super::sys::Job::create_named(&name).unwrap();
+        let before = super::sys::Limits {
+            memory: Some(guest),
+            processes: None,
+            cpu: None,
+        };
+        old.configure(&before).unwrap();
+        assert_eq!(old.memory_limit().unwrap(), Some(guest));
+        let bounds = super::managed::host_bounds(native).unwrap();
+        let boxed =
+            JobBox::prepare_vm(native, bounds, rt.processors, Some(&name), &rt.holding).unwrap();
+        boxed
+            .adopt_vm(super::sys::Job::open(&name).unwrap().unwrap())
+            .unwrap();
+        assert_eq!(old.memory_limit().unwrap(), None);
+    }
+
     /// AC-T7.4.1: a creator marks only the slot holding its own job receipt. A stale creator whose
     /// slot was released and relaunched never marks the newer creator's slot; its own goes to
     /// cleanup, and one already in cleanup needs no mark.
@@ -3545,7 +3752,8 @@ mod tests {
         let rt = device_runtime(scratch.path());
         let record = vm_record("relaunched");
         let native = hex_core::record::NativeRecord::Box(&record);
-        let bounds = hex_api::Bounds::default();
+        // A VM's job is prepared with the bounds managed::host_bounds gives it.
+        let bounds = super::managed::host_bounds(native).unwrap();
         let stale =
             JobBox::prepare_vm(native, bounds.clone(), rt.processors, None, &rt.holding).unwrap();
         let newer = JobBox::prepare_vm(native, bounds, rt.processors, None, &rt.holding).unwrap();
@@ -3571,5 +3779,293 @@ mod tests {
         assert!(
             matches!(&slot.state, SlotState::CleanupPending(Held::Process(current)) if NativeArc::ptr_eq(current, &newer))
         );
+    }
+
+    /// The run's thread's stop at the hold on its box (the review's E-11): a fact no recorded operation makes, waited
+    /// for measuring, following the run's thread (`hex_testkit::waits::follow`).
+    static RUN_STOPPED: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("test.hex_runtime.run_stopped_at_hold");
+    /// A delete's wait on the word of the run's thread removing the box, or its answer beside it, following the delete.
+    static RUN_BESIDE: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("test.hex_runtime.delete_beside_run_removal");
+
+    /// A program that runs until it is ended or its stdin closes (the test's end among them): sort, which reads its
+    /// input to its end before it writes any. A fact, never a delay.
+    fn until_ended() -> Program {
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        let sort = format!("{system}\\System32\\sort.exe");
+        Program::of(&[sort.as_str()])
+    }
+
+    /// Its stdin a pipe the runtime makes, whose end the caller holds ([`Proc::streams`]).
+    fn fed() -> Stdio {
+        Stdio {
+            ask: hex_api::Ask {
+                stdin: true,
+                ..hex_api::Ask::default()
+            },
+            ..Stdio::null()
+        }
+    }
+
+    /// The review's E-11 (runtime goal 7, decision 7), AC-T7.4.1: a run's late removal never takes a later box of its
+    /// id. Do: hold run box `e11-late-win`'s thread once its program has ended; run a program in it until it is ended,
+    /// and end it through the run; once the run's thread has stopped at the hold, delete the box, make it again and
+    /// start a program in it; let the run's thread go and take its end. Expect: the run ends Signal(9); the later box
+    /// stands and its program runs on.
+    #[test]
+    fn e11_a_runs_late_removal_leaves_a_later_box_of_its_id() {
+        let rt = WinRuntime::new();
+        let spec = process_box("e11-late-win");
+        let id = spec.id.clone();
+        let held = crate::run::hold::hold(&id, crate::run::hold::At::End);
+        let mut run = rt.run(spec.clone(), until_ended(), fed()).unwrap();
+        let _feeding = run.streams().unwrap().stdin;
+        run.kill().unwrap();
+        hex_testkit::waits::follow::until(
+            &RUN_STOPPED,
+            "the run's thread at the hold, its program ended",
+            || held.thread(),
+            || held.stopped(),
+        )
+        .unwrap();
+        rt.delete(&id).unwrap();
+        rt.create(spec).unwrap();
+        let mut later = rt.exec(&id, until_ended(), fed()).unwrap();
+        let _feeding_later = later.streams().unwrap().stdin;
+        drop(held);
+        assert_eq!(
+            hex_api::conformance::end_of(&mut *run),
+            Ok(hex_api::Exit::Signal(9)),
+            "the run's end"
+        );
+        assert!(
+            rt.inspect(&id).is_ok(),
+            "the run's late removal took the later box of its id: {:?}",
+            rt.inspect(&id)
+        );
+        assert_eq!(
+            later.try_wait(),
+            Ok(None),
+            "the run's late removal ended the later box's program"
+        );
+        later.kill().unwrap();
+        hex_api::conformance::end_of(&mut *later).unwrap();
+        rt.delete(&id).unwrap();
+    }
+
+    /// The review's E-11 (runtime goal 7), AC-T7.4.1: a delete of a run's box that its program's end is removing
+    /// answers as that removal does, never beside it. Do: hold run box `e11-beside-win`'s thread once it has claimed the
+    /// box's removal; run a program in it until it is ended, and end it through the run; once the run's thread has
+    /// stopped at the hold, delete the box from another thread; once that delete waits on the removal or answers, let
+    /// the removal go. Expect: the delete waits rather than answer while the removal is under way, then answers Ok; the
+    /// run ends Signal(9); and the box is gone.
+    #[test]
+    fn e11_a_delete_beside_a_runs_removal_waits_for_its_word() {
+        let rt = WinRuntime::new();
+        let spec = process_box("e11-beside-win");
+        let id = spec.id.clone();
+        let held = crate::run::hold::hold(&id, crate::run::hold::At::Removal);
+        let mut run = rt.run(spec, until_ended(), fed()).unwrap();
+        let _feeding = run.streams().unwrap().stdin;
+        run.kill().unwrap();
+        hex_testkit::waits::follow::until(
+            &RUN_STOPPED,
+            "the run's thread at the hold, its removal claimed",
+            || held.thread(),
+            || held.stopped(),
+        )
+        .unwrap();
+        std::thread::scope(|s| {
+            let deleting = s.spawn(|| rt.delete(&id));
+            hex_testkit::waits::follow::until(
+                &RUN_BESIDE,
+                "the delete's wait on the run's removal, or its answer",
+                || {
+                    if deleting.is_finished() {
+                        hex_core::patience::Party::Ended
+                    } else {
+                        hex_core::patience::Party::Live
+                    }
+                },
+                || held.waiting() == 1 || deleting.is_finished(),
+            )
+            .unwrap();
+            assert!(
+                !deleting.is_finished(),
+                "the delete answered beside the run's removal under way"
+            );
+            drop(held);
+            assert_eq!(
+                deleting.join().unwrap(),
+                Ok(()),
+                "the delete once the removal went"
+            );
+        });
+        assert_eq!(
+            hex_api::conformance::end_of(&mut *run),
+            Ok(hex_api::Exit::Signal(9))
+        );
+        assert!(matches!(rt.inspect(&id), Err(Refusal::NoSuchBox(_))));
+    }
+
+    /// A thread's handle as a party: live until it has finished.
+    fn party<T>(thread: &std::thread::ScopedJoinHandle<'_, T>) -> hex_core::patience::Party {
+        if thread.is_finished() {
+            hex_core::patience::Party::Ended
+        } else {
+            hex_core::patience::Party::Live
+        }
+    }
+
+    /// The box's emptying once its program is ended, a fact no recorded operation makes, waited for measuring.
+    static RUN_EMPTIED: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("test.hex_runtime.run_box_emptied");
+
+    /// The review's E-11 (runtime goal 7), AC-T7.4.1: a delete of a run's box while the run is making it waits for the
+    /// box to be made whole and its program watched, then takes it, as a delete on Linux waits on the run's create turn.
+    /// Do: hold run box `e11-making-win`'s setup once its box is made and its program started, before the program's
+    /// watch starts; run a program in it until it is ended, from another thread; once the setup has stopped at the
+    /// hold, end the box's program by its KILL and, once the box holds no process, delete the box from another thread;
+    /// once that delete waits on the setup or answers, let the setup go. Expect: the delete waits rather than answer
+    /// while the box is being made, then answers Ok; the run ends Signal(9); and the box is gone.
+    #[test]
+    fn e11_a_delete_of_a_run_being_made_waits_for_its_making() {
+        let rt = WinRuntime::new();
+        let spec = process_box("e11-making-win");
+        let id = spec.id.clone();
+        let held = crate::run::hold::hold(&id, crate::run::hold::At::Making);
+        std::thread::scope(|s| {
+            let running = s.spawn(|| rt.run(spec, until_ended(), fed()));
+            hex_testkit::waits::follow::until(
+                &RUN_STOPPED,
+                "the run's setup at the hold, its box made",
+                || party(&running),
+                || held.stopped(),
+            )
+            .unwrap();
+            rt.signal(&id, Signal::KILL).unwrap();
+            hex_testkit::waits::follow::until(
+                &RUN_EMPTIED,
+                "the run's box holding no process, its program killed",
+                || party(&running),
+                || rt.usage(&id).is_ok_and(|usage| usage.pids == 0),
+            )
+            .unwrap();
+            let deleting = s.spawn(|| rt.delete(&id));
+            hex_testkit::waits::follow::until(
+                &RUN_BESIDE,
+                "the delete's wait on the run's making, or its answer",
+                || party(&deleting),
+                || held.waiting() == 1 || deleting.is_finished(),
+            )
+            .unwrap();
+            assert!(
+                !deleting.is_finished(),
+                "the delete answered beside the run's making"
+            );
+            drop(held);
+            let mut run = running.join().unwrap().expect("the run, once made");
+            let _feeding = run.streams().unwrap().stdin;
+            assert_eq!(
+                deleting.join().unwrap(),
+                Ok(()),
+                "the delete once the run was made"
+            );
+            assert_eq!(
+                hex_api::conformance::end_of(&mut *run),
+                Ok(hex_api::Exit::Signal(9))
+            );
+        });
+        assert!(matches!(rt.inspect(&id), Err(Refusal::NoSuchBox(_))));
+    }
+
+    /// A delete's or a recovery's end's wait on a killed box's job past W*, stopped at the hold on its emptying, or its
+    /// answer: a fact no recorded operation makes, waited for measuring, following the ending thread.
+    static EMPTYING_FOLLOWED: hex_core::patience::Patience =
+        hex_core::patience::Patience::measuring("test.hex_runtime.emptying_followed");
+
+    /// The review's E-12 (decision 9), AC-T7.4.1: a killed box's job that empties late is followed to its emptying,
+    /// never refused, nor said done, before it is. Do: make a box and start a program in it until it is ended; hold the
+    /// box's emptying under `key`, as a job whose last member's teardown runs long reads; end the box from another
+    /// thread (`end`); once that end follows the job past W* (stopped at the hold) or answers, let the hold go. Expect:
+    /// the end hadn't answered while the job read as not yet empty, then answers Ok; the program ends as `ends`.
+    fn a_late_emptying_is_followed_to_its_end(
+        rt: &WinRuntime,
+        spec: BoxSpec,
+        key: &str,
+        end: impl FnOnce() -> Result<(), Refusal> + Send,
+        ends: hex_api::Exit,
+    ) {
+        let id = spec.id.clone();
+        rt.create(spec).unwrap();
+        let mut program = rt.exec(&id, until_ended(), fed()).unwrap();
+        let _feeding = program.streams().unwrap().stdin;
+        let held = crate::emptying::hold::hold(key);
+        std::thread::scope(|s| {
+            let ending = s.spawn(end);
+            hex_testkit::waits::follow::until(
+                &EMPTYING_FOLLOWED,
+                "the end's wait following the job past W*, or its answer",
+                || party(&ending),
+                || held.following() || ending.is_finished(),
+            )
+            .unwrap();
+            if ending.is_finished() {
+                panic!(
+                    "the end answered while the job read as not yet empty: {:?}",
+                    ending.join()
+                );
+            }
+            drop(held);
+            assert_eq!(
+                ending.join().unwrap(),
+                Ok(()),
+                "the end once the job emptied"
+            );
+        });
+        assert_eq!(hex_api::conformance::end_of(&mut *program), Ok(ends));
+    }
+
+    /// E-12 at a box's delete (`JobBox::delete`): it refused at once while its killed job still listed a member, as
+    /// TerminateJobObject only begins its members' ends. The box is gone after.
+    #[test]
+    fn e12_a_delete_follows_a_late_emptying_to_its_end() {
+        let rt = WinRuntime::new();
+        let spec = process_box("e12-delete-win");
+        let id = spec.id.clone();
+        a_late_emptying_is_followed_to_its_end(
+            &rt,
+            spec,
+            id.as_str(),
+            || rt.delete(&id),
+            hex_api::Exit::Signal(9),
+        );
+        assert!(matches!(rt.inspect(&id), Err(Refusal::NoSuchBox(_))));
+    }
+
+    /// E-12 at a recovery's end of a box no node takes back (`WinRuntime::end`, `JobBox::end_named`): it said the box
+    /// ended once TerminateJobObject returned, its members still ending. The box is made by one runtime of a node and
+    /// ended by name from another of the same node, as a recovery ends it; the program, ended by a runtime that isn't
+    /// its box's, ends with the terminated job's code.
+    #[test]
+    fn e12_a_recoverys_end_follows_a_late_emptying_to_its_end() {
+        let name = node("e12end");
+        let mut made = WinRuntime::new();
+        made.node = Some(name.clone());
+        let mut recovering = WinRuntime::new();
+        recovering.node = Some(name);
+        let spec = process_box("e12-recovery-win");
+        let id = spec.id.clone();
+        let job = made.job_name(&id).unwrap();
+        let terminated = hex_core::job::terminated_code(Signal::KILL);
+        a_late_emptying_is_followed_to_its_end(
+            &made,
+            spec,
+            &job,
+            || recovering.end(&id),
+            hex_api::Exit::Code(i32::from_ne_bytes(terminated.to_ne_bytes())),
+        );
+        made.delete(&id).unwrap();
     }
 }

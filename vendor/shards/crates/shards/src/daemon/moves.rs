@@ -13,7 +13,7 @@
 //!   snapshot made to restore against that machine's files, and the microVM made there,
 //!   stopped, as saved; `restore vm` resumes it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -28,10 +28,10 @@ use super::snapshots::SNAPSHOTS;
 use super::{Daemon, lock};
 use crate::containers::{Container, Disk};
 
-/// The stream's first bytes, then its version: 2, each entry as its guest sees it
+/// Version 3 preserves regular-file hardlinks; version 2 introduced guest metadata
 /// ([`guest::Meta`]), where 1's held the host's own modes and attributes.
 const MAGIC: &[u8; 8] = b"SHRDMOVE";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 /// Kinds of the stream's entries.
 const END: u8 = 0;
 const DIR: u8 = 1;
@@ -40,13 +40,20 @@ const LINK: u8 = 3;
 const PLAN: u8 = 4;
 /// A FIFO or a device node.
 const NODE: u8 = 5;
+/// Another name of a regular file already sent, both in volume data.
+const HARDLINK: u8 = 6;
 /// The most a name in the stream may hold: a path of the guest's, Linux's `PATH_MAX`
 /// (include/uapi/linux/limits.h l. 13, Linux 6.18).
 const MAX_PATH: usize = 4096;
-/// The most a plan's JSON may hold: the plan the other machine was given as a word of its
-/// `ready` step's request (cli/moves.rs), a frame of a context's connection at most
-/// ([`shards_remote::frame::MAX_FRAME`]); the stream's is that one.
-const MAX_PLAN: usize = shards_remote::frame::MAX_FRAME;
+/// The most a plan's JSON may hold (remote-08, D180 *Frame bounds*): what this host can hold
+/// now (`shards_ipc::holdable_known`), as the `ready` step's request frame that carried it to
+/// the other machine is held to (shards_remote's `server`), and as a snapshot's state is read;
+/// a host that says nothing of its memory reads no plan.
+fn plan_most() -> io::Result<usize> {
+    shards_ipc::holdable_known()
+        .and_then(|most| usize::try_from(most).ok())
+        .ok_or_else(|| io::Error::other("its plan: this host says nothing of its memory"))
+}
 /// The most of a file's extended attributes, as a Linux guest's file system holds them:
 /// an attribute's name, its value, and the list of its names (`XATTR_NAME_MAX`,
 /// `XATTR_SIZE_MAX` and `XATTR_LIST_MAX`, include/uapi/linux/limits.h l. 15-17).
@@ -155,29 +162,8 @@ fn read_baseline(at: &Path) -> shards_vmm::arch::cpu::Id {
         .unwrap_or_default()
 }
 
-/// The register of each feature macOS names (`hw.optional.arm.FEAT_*`, [`host_cpu`]) that
-/// its field is in (Arm ARM DDI 0487, the ID_AA64* registers' fields): a baseline that
-/// names the register masks the feature where it is lower, and a feature whose register
-/// the baseline does not name (ISAR2's, which Hypervisor.framework neither says nor lets a
-/// VMM set, PM M460) is the guest's whatever the baseline says, and checked by name.
 #[cfg(target_arch = "aarch64")]
-fn feature_register(feature: &str) -> Option<u16> {
-    Some(match feature {
-        "FEAT_CSV2" | "FEAT_CSV3" | "FEAT_DIT" | "FEAT_FP16" => 0xc020,
-        "FEAT_SSBS" | "FEAT_BTI" => 0xc021,
-        "FEAT_CRC32" | "FEAT_FlagM" | "FEAT_FlagM2" | "FEAT_FHM" | "FEAT_DotProd" | "FEAT_SHA3"
-        | "FEAT_RDM" | "FEAT_LSE" | "FEAT_SHA256" | "FEAT_SHA512" | "FEAT_SHA1" | "FEAT_AES"
-        | "FEAT_PMULL" => 0xc030,
-        "FEAT_SPECRES" | "FEAT_SPECRES2" | "FEAT_SB" | "FEAT_FRINTTS" | "FEAT_PACIMP" | "FEAT_LRCPC"
-        | "FEAT_LRCPC2" | "FEAT_FCMA" | "FEAT_JSCVT" | "FEAT_PAuth" | "FEAT_PAuth2" | "FEAT_FPAC"
-        | "FEAT_FPACCOMBINE" | "FEAT_DPB" | "FEAT_DPB2" | "FEAT_BF16" | "FEAT_EBF16" | "FEAT_I8MM" => 0xc031,
-        "FEAT_WFxT" | "FEAT_RPRES" | "FEAT_CSSC" | "FEAT_HBC" => 0xc032,
-        "FEAT_ECV" => 0xc038,
-        "FEAT_AFP" => 0xc039,
-        "FEAT_LSE2" => 0xc03a,
-        _ => return None,
-    })
-}
+use shards_vmm::arch::aarch64::cpu::feature_register;
 
 /// The features of `ran_on` a guest told `baseline` may still have used: those whose
 /// register the baseline does not name, and every one where it is none.
@@ -419,6 +405,72 @@ pub(crate) enum Refused {
         asked: String,
         current: Option<String>,
     },
+    /// A name its move gives, which the machine moved to makes a path of its home of, is
+    /// not one name of its kind ([`Named`], migrate-11): its ID, its snapshot's, or a
+    /// volume's (its plan's, or one its record mounts).
+    NotAName {
+        name: String,
+        field: Named,
+        value: String,
+    },
+}
+
+/// What a move names that a home's paths are made of (migrate-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Named {
+    /// Its ID: `containers/ID`.
+    Id,
+    /// Its snapshot's name: `containers/ID/snapshots/SNAPSHOT`.
+    Snapshot,
+    /// A volume's name: `volumes/NAME`, and the host directory its record shares into its
+    /// guest, `volumes/NAME/_data`.
+    Volume,
+}
+
+impl Named {
+    /// Whether `value` is one name of this kind, and so one component of a path: an ID as
+    /// [`crate::containers::new_id`] makes one, its random bytes in lowercase hex; a snapshot's
+    /// one file's name on any host ([`crate::synced::name_alone`], Windows' rules being the
+    /// stricter, so that a name one host takes every host takes); a volume's, the local
+    /// driver's ([`crate::volumes::Store::valid`]) and one file's name too, as the driver's
+    /// rule takes `..`'s dots. Each refuses a separator, `.`, `..`, a root and, by Windows'
+    /// rules, a drive's colon: none can name a path of more than one component.
+    fn takes(self, value: &str) -> bool {
+        match self {
+            Named::Id => {
+                value.len() == 2 * crate::containers::ID_BYTES
+                    && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            }
+            Named::Snapshot => crate::synced::name_alone(value, true).is_ok(),
+            Named::Volume => {
+                crate::volumes::Store::valid(value).is_ok() && crate::synced::name_alone(value, true).is_ok()
+            }
+        }
+    }
+}
+
+/// `value`, which the move of microVM `name` gives as its `field`, as the one component of a
+/// path it is to be joined as: every join a move makes of a name it was given goes through
+/// this.
+fn one_name<'v>(name: &str, field: Named, value: &'v str) -> Result<&'v str, Refused> {
+    match field.takes(value) {
+        true => Ok(value),
+        false => Err(Refused::NotAName {
+            name: name.to_string(),
+            field,
+            value: value.to_string(),
+        }),
+    }
+}
+
+/// The first of `plan`'s names that is not one name of its kind: checked as the plan
+/// arrives, before anything is asked of this machine's home or put in it.
+fn names_refused(plan: &Plan) -> Option<Refused> {
+    [(Named::Id, &plan.id), (Named::Snapshot, &plan.snapshot)]
+        .into_iter()
+        .chain(plan.volumes.iter().map(|v| (Named::Volume, v)))
+        .find_map(|(field, value)| one_name(&plan.name, field, value).err())
 }
 
 /// A field of the CPU a guest was told that this machine's hypervisor shows less of.
@@ -637,6 +689,21 @@ impl std::fmt::Display for Refused {
                     "{asked} is the key {name} had before it moved, which no lease is served under: it has no key here yet"
                 ),
             },
+            Refused::NotAName { name, field, value } => match field {
+                Named::Id => write!(
+                    f,
+                    "{name}'s move gives its ID as {value:?}, which is no microVM's: {} lowercase hex digits",
+                    2 * crate::containers::ID_BYTES
+                ),
+                Named::Snapshot => write!(
+                    f,
+                    "{name}'s move gives its snapshot's name as {value:?}, which is not one file's name"
+                ),
+                Named::Volume => write!(
+                    f,
+                    "{name}'s move gives a volume's name as {value:?}, which is not one volume's name"
+                ),
+            },
             Refused::PortTaken {
                 name,
                 port,
@@ -702,6 +769,12 @@ enum Unready {
 impl From<String> for Unready {
     fn from(e: String) -> Unready {
         Unready::Failed(e)
+    }
+}
+
+impl From<&str> for Unready {
+    fn from(e: &str) -> Unready {
+        Unready::Failed(e.to_string())
     }
 }
 
@@ -813,6 +886,8 @@ fn rel_of(home: &Path, path: &Path) -> Option<String> {
 /// its runs is read.
 pub(crate) struct Writer<W: Write> {
     out: W,
+    /// Only multiply-linked volume files, keyed by the opened source's identity.
+    hardlinks: HashMap<(u64, u64), String>,
 }
 
 impl<W: Write> Writer<W> {
@@ -823,13 +898,24 @@ impl<W: Write> Writer<W> {
         out.write_all(&[PLAN])?;
         out.write_all(&(json.len() as u64).to_le_bytes())?;
         out.write_all(&json)?;
-        Ok(Writer { out })
+        Ok(Writer {
+            out,
+            hardlinks: HashMap::new(),
+        })
     }
 
-    fn name(&mut self, kind: u8, rel: &str) -> io::Result<()> {
-        self.out.write_all(&[kind])?;
-        self.out.write_all(&(rel.len() as u32).to_le_bytes())?;
-        self.out.write_all(rel.as_bytes())
+    fn name(out: &mut W, kind: u8, rel: &str) -> io::Result<()> {
+        out.write_all(&[kind])?;
+        Self::text(out, rel)
+    }
+
+    fn text(out: &mut W, text: &str) -> io::Result<()> {
+        let len = u32::try_from(text.len())
+            .ok()
+            .filter(|_| text.len() <= MAX_PATH)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        out.write_all(&len.to_le_bytes())?;
+        out.write_all(text.as_bytes())
     }
 
     /// A file as its guest sees it: its mode (kind and permissions), its device number,
@@ -862,13 +948,13 @@ impl<W: Write> Writer<W> {
             guest::S_IFLNK => {
                 let target = String::from_utf8(guest::read_link(path)?)
                     .map_err(|_| io::Error::other(format!("{}: a link that is not UTF-8", path.display())))?;
-                self.name(LINK, rel)?;
+                Self::name(&mut self.out, LINK, rel)?;
                 self.out.write_all(&(target.len() as u32).to_le_bytes())?;
                 self.out.write_all(target.as_bytes())?;
                 self.meta(&meta)
             }
             guest::S_IFDIR => {
-                self.name(DIR, rel)?;
+                Self::name(&mut self.out, DIR, rel)?;
                 self.meta(&meta)?;
                 let mut entries: Vec<(String, PathBuf)> = std::fs::read_dir(path)?
                     .map(|e| {
@@ -890,7 +976,7 @@ impl<W: Write> Writer<W> {
             }
             guest::S_IFREG => self.file(path, rel),
             guest::S_IFIFO | guest::S_IFCHR | guest::S_IFBLK => {
-                self.name(NODE, rel)?;
+                Self::name(&mut self.out, NODE, rel)?;
                 self.meta(&meta)
             }
             // A socket is its listener's, which a saved microVM has none of (as tar leaves
@@ -904,9 +990,23 @@ impl<W: Write> Writer<W> {
     pub(crate) fn file(&mut self, path: &Path, rel: &str) -> io::Result<()> {
         let meta = guest::read(path)?;
         let file = File::open(path)?;
+        if volume_file(rel)
+            && meta.mode & guest::S_IFMT == guest::S_IFREG
+            && let Some(id) = guest::hardlink_identity(&file)?
+        {
+            if let Some(target) = self.hardlinks.get(&id) {
+                Self::name(&mut self.out, HARDLINK, rel)?;
+                return Self::text(&mut self.out, target);
+            }
+            self.hardlinks.try_reserve(1).map_err(io::Error::other)?;
+            let mut name = String::new();
+            name.try_reserve_exact(rel.len()).map_err(io::Error::other)?;
+            name.push_str(rel);
+            self.hardlinks.insert(id, name);
+        }
         let len = file.metadata()?.len();
         let runs = shards_vmm::platform::data_ranges(&file, len)?;
-        self.name(FILE, rel)?;
+        Self::name(&mut self.out, FILE, rel)?;
         self.meta(&meta)?;
         self.out.write_all(&len.to_le_bytes())?;
         self.out.write_all(&(runs.len() as u64).to_le_bytes())?;
@@ -956,6 +1056,10 @@ pub(crate) enum Entry<'a> {
         rel: String,
         target: String,
         meta: guest::Meta,
+    },
+    Hardlink {
+        rel: String,
+        target: String,
     },
     /// A FIFO or a device node.
     Node {
@@ -1039,6 +1143,7 @@ pub(crate) fn read_plan(r: &mut dyn Read) -> Result<Plan, String> {
         return Err("the move's stream is not one".into());
     }
     let version = u32_of(r).map_err(io)?;
+    // Both ends of a move are this build's (D36): a stream of any other version is refused.
     if version != VERSION {
         return Err(format!(
             "the move's stream is of version {version}; this shards reads {VERSION}"
@@ -1050,7 +1155,7 @@ pub(crate) fn read_plan(r: &mut dyn Read) -> Result<Plan, String> {
         return Err("the move's stream has no plan".into());
     }
     let n = u64_of(r).map_err(io)?;
-    serde_json::from_slice(&bytes_of(r, n, MAX_PLAN, "its plan").map_err(io)?)
+    serde_json::from_slice(&bytes_of(r, n, plan_most().map_err(io)?, "its plan").map_err(io)?)
         .map_err(|e| format!("the move's plan: {e}"))
 }
 
@@ -1077,6 +1182,11 @@ pub(crate) fn read_entries(
                 let target = text_of(r, MAX_PATH, "a link").map_err(io)?;
                 let meta = meta_of(r).map_err(io)?;
                 take(Entry::Link { rel, target, meta })?;
+            }
+            HARDLINK => {
+                let rel = text_of(r, MAX_PATH, "a name").map_err(io)?;
+                let target = text_of(r, MAX_PATH, "a hardlink's source").map_err(io)?;
+                take(Entry::Hardlink { rel, target })?;
             }
             NODE => {
                 let rel = text_of(r, MAX_PATH, "a name").map_err(io)?;
@@ -1131,69 +1241,93 @@ pub(crate) fn read_entries(
 /// to be one [`relative`] takes, and to be one the plan allows (`allowed`), made new, never
 /// over anything there; each made and given what its guest saw ([`guest::set`]) as the
 /// share server makes and keeps a guest's, so that this host's server shows it the same.
+/// Each is reached from `root` held open, a component at a time, through no symlink
+/// ([`guest::Beneath`]): a stream's link is data, and what it names below one is refused,
+/// never made where the link leads. A link is taken only where a guest makes one, in a
+/// volume's files (`links`): shards makes none in a microVM's own directory or the files
+/// its snapshot restores against, which a move's later steps reach by their paths.
 /// A directory is given its own once all it holds is in it ([`Placer::finish`]), so that a
 /// mode that keeps its owner out (a guest's `0555`, kept as such where no owner of it is
 /// recorded) is no bar to what goes in it.
 struct Placer<'a> {
-    root: &'a Path,
+    root: guest::Beneath,
+    shown: &'a Path,
     allowed: &'a dyn Fn(&str) -> bool,
+    links: &'a dyn Fn(&str) -> bool,
     dirs: Vec<(PathBuf, guest::Meta)>,
 }
 
 impl<'a> Placer<'a> {
-    fn new(root: &'a Path, allowed: &'a dyn Fn(&str) -> bool) -> Placer<'a> {
-        Placer {
-            root,
+    fn new(
+        root: &'a Path,
+        allowed: &'a dyn Fn(&str) -> bool,
+        links: &'a dyn Fn(&str) -> bool,
+    ) -> Result<Placer<'a>, String> {
+        Ok(Placer {
+            root: guest::Beneath::open(root).map_err(|e| format!("{}: {e}", root.display()))?,
+            shown: root,
             allowed,
+            links,
             dirs: Vec::new(),
-        }
+        })
     }
 
+    /// `rel` as this host's components beneath the root, where the plan allows it.
     fn path(&self, rel: &str) -> Result<PathBuf, String> {
         if !(self.allowed)(rel) {
             return Err(format!(
                 "the move's stream holds {rel}, which its plan does not name"
             ));
         }
-        Ok(self.root.join(relative(rel)?))
+        relative(rel)
     }
 
     fn take(&mut self, entry: Entry<'_>) -> Result<(), String> {
-        let at = |p: &Path, e: &dyn std::fmt::Display| format!("{}: {e}", p.display());
+        let shown = self.shown;
+        let at = |p: &Path, e: &dyn std::fmt::Display| format!("{}: {e}", shown.join(p).display());
         match entry {
             Entry::Dir { rel, meta } => {
                 let path = self.path(&rel)?;
-                make_parent(&path)?;
-                guest::make_dir(&path).map_err(|e| at(&path, &e))?;
+                self.root.make_dir(&parts(&path)).map_err(|e| at(&path, &e))?;
                 self.dirs.push((path, meta));
                 Ok(())
             }
             Entry::Link { rel, target, meta } => {
                 let path = self.path(&rel)?;
-                make_parent(&path)?;
-                guest::make_link(&path, target.as_bytes()).map_err(|e| at(&path, &e))?;
-                guest::set(&path, &meta).map_err(|e| at(&path, &e))
+                if !(self.links)(&rel) {
+                    return Err(format!(
+                        "the move's stream holds a symlink at {rel}, where only a volume's files hold one"
+                    ));
+                }
+                let parts = parts(&path);
+                self.root
+                    .make_link(&parts, target.as_bytes())
+                    .map_err(|e| at(&path, &e))?;
+                self.root.set(&parts, &meta).map_err(|e| at(&path, &e))
+            }
+            Entry::Hardlink { rel, target } => {
+                let path = self.path(&rel)?;
+                let source = self.path(&target)?;
+                if !(self.links)(&rel) || !(self.links)(&target) {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied).to_string());
+                }
+                self.root
+                    .make_hardlink(&parts(&path), &parts(&source))
+                    .map_err(|e| at(&path, &e))
             }
             Entry::Node { rel, meta } => {
                 let path = self.path(&rel)?;
-                make_parent(&path)?;
-                guest::make_node(&path, &meta).map_err(|e| at(&path, &e))?;
-                guest::set(&path, &meta).map_err(|e| at(&path, &e))
+                let parts = parts(&path);
+                self.root.make_node(&parts, &meta).map_err(|e| at(&path, &e))?;
+                self.root.set(&parts, &meta).map_err(|e| at(&path, &e))
             }
             Entry::File { rel, meta, len, runs } => {
                 if meta.mode & guest::S_IFMT != guest::S_IFREG {
                     return Err(format!("{rel}: a file of mode {:o}", meta.mode));
                 }
                 let path = self.path(&rel)?;
-                make_parent(&path)?;
-                let file = crate::os::owner_only(
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true),
-                )
-                .open(&path)
-                .map_err(|e| at(&path, &e))?;
+                let parts = parts(&path);
+                let file = self.root.make_file(&parts).map_err(|e| at(&path, &e))?;
                 shards_vmm::platform::make_sparse(&file).map_err(|e| at(&path, &e))?;
                 file.set_len(len).map_err(|e| at(&path, &e))?;
                 runs(&mut |offset, bytes| {
@@ -1206,7 +1340,7 @@ impl<'a> Placer<'a> {
                 })
                 .map_err(|e| at(&path, &e))?;
                 drop(file);
-                guest::set(&path, &meta).map_err(|e| at(&path, &e))
+                self.root.set(&parts, &meta).map_err(|e| at(&path, &e))
             }
         }
     }
@@ -1215,17 +1349,17 @@ impl<'a> Placer<'a> {
     /// entries are all in place.
     fn finish(self) -> Result<(), String> {
         for (path, meta) in self.dirs.iter().rev() {
-            guest::set(path, meta).map_err(|e| format!("{}: {e}", path.display()))?;
+            self.root
+                .set(&parts(path), meta)
+                .map_err(|e| format!("{}: {e}", self.shown.join(path).display()))?;
         }
         Ok(())
     }
 }
 
-fn make_parent(path: &Path) -> Result<(), String> {
-    match path.parent() {
-        Some(parent) => std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display())),
-        None => Ok(()),
-    }
+/// `rel`'s components, as [`guest::Beneath`] takes them.
+fn parts(rel: &Path) -> Vec<&std::ffi::OsStr> {
+    rel.iter().collect()
 }
 
 /// Where in a home a move's stream may put what it holds: the microVM's own directory, its
@@ -1235,6 +1369,24 @@ fn allowed(plan: &Plan, needed: &BTreeSet<String>, rel: &str) -> bool {
     under(&format!("containers/{}", plan.id))
         || plan.volumes.iter().any(|v| under(&format!("volumes/{v}")))
         || needed.contains(rel)
+}
+
+/// Where a move's stream may put a symlink: in a volume's files, where its guest made it.
+/// Nowhere else holds one shards made, and a move's later steps reach a microVM's own
+/// directory and the files its snapshot restores against by their paths.
+fn holds_links(plan: &Plan, rel: &str) -> bool {
+    plan.volumes
+        .iter()
+        .any(|v| rel.starts_with(&format!("volumes/{v}/_data/")))
+}
+
+/// The writer deduplicates only volume contents, never metadata or backing files.
+fn volume_file(rel: &str) -> bool {
+    let mut parts = rel.splitn(4, '/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("volumes"), Some(v), Some("_data"), Some(name)) if !v.is_empty() && !name.is_empty()
+    )
 }
 
 impl<D: Disk> Daemon<D> {
@@ -1257,7 +1409,7 @@ impl<D: Disk> Daemon<D> {
             Some("save") => typed(self.move_save(args.get(1).map_or("", String::as_str))),
             Some("plan") => typed(self.move_plan(args.get(1).map_or("", String::as_str))),
             Some("live") => self.move_live(args.get(1..).unwrap_or_default(), asker, reply),
-            Some("done") => self.move_done(args.get(1..).unwrap_or_default()),
+            Some("done") => typed(self.move_done(args.get(1..).unwrap_or_default())),
             Some("ready") => typed(self.move_ready(args.get(1).map_or("", String::as_str), asker, reply)),
             Some("key") => typed(self.move_key(args.get(1..).unwrap_or_default())),
             Some("cpu") if restores_on_its_own_cpu_alone() => {
@@ -1265,7 +1417,7 @@ impl<D: Disk> Daemon<D> {
             }
             Some("cpu") => self.host_cpu_id().map(|id| shards_vmm::arch::cpu::encode(&id)),
             Some("export") => self.move_export(args.get(1..).unwrap_or_default(), asker),
-            Some("import") => self.move_import(args.get(1..).unwrap_or_default(), asker),
+            Some("import") => typed(self.move_import(args.get(1..).unwrap_or_default(), asker)),
             _ => Err(format!("no step of a move in {args:?}")),
         };
         match done {
@@ -1328,7 +1480,7 @@ impl<D: Disk> Daemon<D> {
         let home = std::fs::canonicalize(&self.home).map_err(|e| format!("{}: {e}", self.home.display()))?;
         let mut files = Vec::new();
         let cancel = shards_registry::http::Cancel::new();
-        let image = c.image_id.clone().unwrap_or_else(|| c.image.clone());
+        let image = c.image_id.clone();
         if let Ok((found, _lease)) = crate::run::find_image(
             &image,
             shards_ipc::Pull::Never,
@@ -1375,7 +1527,7 @@ impl<D: Disk> Daemon<D> {
             id: c.id.clone(),
             name: c.name.clone(),
             image: c.image.clone(),
-            image_id: c.image_id.clone().unwrap_or_default(),
+            image_id: c.image_id.clone(),
             arch: std::env::consts::ARCH.into(),
             format: shards_vmm::snapshot::FORMAT,
             hypervisor: shards_vmm::hv::BACKEND.map(str::to_string),
@@ -1538,19 +1690,20 @@ impl<D: Disk> Daemon<D> {
     /// its last save holds stops as saved; back, the other machine did not take it, and it
     /// goes on here, the snapshot of what its guest wrote since the move's last round, which
     /// nothing restores, removed.
-    fn move_done(&self, args: &[String]) -> Result<String, String> {
+    fn move_done(&self, args: &[String]) -> Result<String, Unready> {
         let (Some(reference), Some(snapshot), Some(how)) = (args.first(), args.get(1), args.get(2)) else {
             return Err("done: a microVM, its snapshot, and moved or back".into());
         };
+        let snapshot = one_name(reference, Named::Snapshot, snapshot)?;
         let id = self.resolve(reference)?;
         let moved = match how.as_str() {
             "moved" => true,
             "back" => false,
-            other => return Err(format!("done: {other:?}")),
+            other => return Err(format!("done: {other:?}").into()),
         };
         let socket = match lock(&self.runs).get(&id) {
             Some(super::RunState::Tracked(t)) => t.socket.clone(),
-            _ => return Err(format!("{reference} is not running")),
+            _ => return Err(format!("{reference} is not running").into()),
         };
         socket
             .send(shards_ipc::kind::MOVED, &[u8::from(moved)], &[])
@@ -1572,6 +1725,9 @@ impl<D: Disk> Daemon<D> {
             .ok_or_else(|| format!("no container {id}"))?;
         let home = std::fs::canonicalize(&self.home).map_err(|e| format!("{}: {e}", self.home.display()))?;
         let dir = lock(&self.containers).dir(id).join(SNAPSHOTS).join(snapshot);
+        // A snapshot no build resumes is not moved: one whose init is another build's
+        // (D176).
+        shards_vmm::snapshot::resumable(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let pinned = shards_vmm::snapshot::read(&dir)?;
         let mut files = Vec::new();
         for (path, _) in shards_vmm::snapshot::backing_of(&pinned) {
@@ -1610,7 +1766,7 @@ impl<D: Disk> Daemon<D> {
             id: c.id.clone(),
             name: c.name.clone(),
             image: c.image.clone(),
-            image_id: c.image_id.clone().unwrap_or_default(),
+            image_id: c.image_id.clone(),
             arch: std::env::consts::ARCH.into(),
             format: shards_vmm::snapshot::FORMAT,
             hypervisor: shards_vmm::hv::BACKEND.map(str::to_string),
@@ -1791,6 +1947,9 @@ impl<D: Disk> Daemon<D> {
     fn move_ready(&self, plan: &str, asker: &Asker, reply: &Reply<'_>) -> Result<String, Unready> {
         let plan: Plan = serde_json::from_str(plan).map_err(|e| format!("the move's plan: {e}"))?;
         let name = || plan.name.clone();
+        if let Some(refused) = names_refused(&plan) {
+            return Err(refused.into());
+        }
         if let Some(refused) = platform_refused(
             &plan,
             std::env::consts::ARCH,
@@ -1979,11 +2138,11 @@ impl<D: Disk> Daemon<D> {
     /// where it was packed (`crate::packing`), its files put in place, its snapshot made to
     /// restore against this machine's files, and the microVM made here, stopped as saved. Its
     /// name, once it is.
-    fn move_import(&self, args: &[String], asker: &Asker) -> Result<String, String> {
+    fn move_import(&self, args: &[String], asker: &Asker) -> Result<String, Unready> {
         let packed = match args {
             [] => false,
             [flag, codec] if flag == "--packed" && codec == crate::packing::CODEC => true,
-            other => return Err(format!("import: {other:?}")),
+            other => return Err(format!("import: {other:?}").into()),
         };
         let input = asker
             .files
@@ -2015,9 +2174,15 @@ impl<D: Disk> Daemon<D> {
             None => Box::new(rest),
         };
         let plan = read_plan(&mut rest)?;
+        // Its names, before anything of the stream is put anywhere: each becomes a path
+        // of this home's (migrate-11).
+        if let Some(refused) = names_refused(&plan) {
+            return Err(refused.into());
+        }
         let needed: BTreeSet<String> = plan.files.iter().map(|f| f.rel.clone()).collect();
         let allows = |rel: &str| allowed(&plan, &needed, rel);
-        let mut placer = Placer::new(staging.path(), &allows);
+        let links = |rel: &str| holds_links(&plan, rel);
+        let mut placer = Placer::new(staging.path(), &allows, &links)?;
         read_entries(&mut rest, &mut |entry| placer.take(entry))?;
         placer.finish()?;
         self.adopt(&plan, staging.path(), precopied.as_ref())
@@ -2043,13 +2208,15 @@ impl<D: Disk> Daemon<D> {
     /// Makes the microVM a move's stream put in `staged` this machine's: its volumes and
     /// the files its snapshot restores against put in place, its snapshot made to restore
     /// against them, its record its own here, and it seen, stopped as saved.
-    fn adopt(&self, plan: &Plan, staged: &Path, precopied: Option<&Precopy>) -> Result<String, String> {
+    fn adopt(&self, plan: &Plan, staged: &Path, precopied: Option<&Precopy>) -> Result<String, Unready> {
         let at = |p: &Path, e: &dyn std::fmt::Display| format!("{}: {e}", p.display());
-        let staged_dir = staged.join("containers").join(&plan.id);
+        let id = one_name(&plan.name, Named::Id, &plan.id)?;
+        let snapshot = one_name(&plan.name, Named::Snapshot, &plan.snapshot)?;
+        let staged_dir = staged.join("containers").join(id);
         // A live move's last save holds what its guest wrote since its last round alone:
         // what the rounds sent goes under it (D176 part 7).
         if let Some(precopied) = precopied {
-            precopied.lay_under(&staged_dir.join(SNAPSHOTS).join(&plan.snapshot))?;
+            precopied.lay_under(&staged_dir.join(SNAPSHOTS).join(snapshot))?;
         }
         // The files this machine lacked, kept in its own directory, each by its place in the
         // plan.
@@ -2063,7 +2230,7 @@ impl<D: Disk> Daemon<D> {
             std::fs::create_dir_all(&backing_dir).map_err(|e| at(&backing_dir, &e))?;
             let (sha256, size) = digest_of(&sent).map_err(|e| at(&sent, &e))?;
             if sha256 != file.sha256 || size != file.size {
-                return Err(format!("{}: its bytes changed on the way", file.rel));
+                return Err(format!("{}: its bytes changed on the way", file.rel).into());
             }
             let kept = backing_dir.join(i.to_string());
             std::fs::rename(&sent, &kept).map_err(|e| at(&sent, &e))?;
@@ -2076,10 +2243,13 @@ impl<D: Disk> Daemon<D> {
         if c.id != plan.id {
             return Err("its record is another microVM's".into());
         }
+        // Each volume it mounts by name, shared into its guest from that volume's
+        // directory here: a name of its record's, which came with the stream.
         let store = crate::volumes::Store::new(&self.home);
         for m in &mut c.mounts {
             if m.kind == "volume" && !m.name.is_empty() {
-                m.source = store.data(&m.name).to_string_lossy().into_owned();
+                let volume = one_name(&plan.name, Named::Volume, &m.name)?;
+                m.source = store.data(volume).to_string_lossy().into_owned();
             }
         }
         c.saved = Some(plan.snapshot.clone());
@@ -2096,7 +2266,7 @@ impl<D: Disk> Daemon<D> {
                 if let Err(e) = std::fs::remove_file(&kept)
                     && e.kind() != io::ErrorKind::NotFound
                 {
-                    return Err(at(&kept, &e));
+                    return Err(at(&kept, &e).into());
                 }
             }
         }
@@ -2112,7 +2282,7 @@ impl<D: Disk> Daemon<D> {
             std::fs::write(&request, run.encode()).map_err(|e| at(&request, &e))?;
         }
         let home = std::fs::canonicalize(&self.home).map_err(|e| at(&self.home, &e))?;
-        let dir = lock(&self.containers).dir(&plan.id);
+        let dir = lock(&self.containers).dir(id);
         // Each file its snapshot names, by the name the plan gave it there.
         let to = |path: &Path| -> Option<PathBuf> {
             let file = plan.files.iter().find(|f| Path::new(&f.path) == path)?;
@@ -2136,43 +2306,50 @@ impl<D: Disk> Daemon<D> {
         {
             let _volumes = crate::volumes::lock();
             for v in &plan.volumes {
+                let v = match one_name(&plan.name, Named::Volume, v) {
+                    Ok(v) => v,
+                    Err(refused) => {
+                        undo(&placed);
+                        return Err(refused.into());
+                    }
+                };
                 let target = volumes_root.join(v);
                 if store.get(v).is_some() || target.exists() {
                     undo(&placed);
-                    return Err(format!("a volume named {v} is here already"));
+                    return Err(format!("a volume named {v} is here already").into());
                 }
                 let sent = staged.join("volumes").join(v);
                 if let Err(e) = std::fs::rename(&sent, &target) {
                     undo(&placed);
-                    return Err(at(&sent, &e));
+                    return Err(at(&sent, &e).into());
                 }
                 placed.push(target);
             }
         }
         {
             let mut registry = lock(&self.containers);
-            if registry.get(&plan.id).is_some() || registry.name_taken(&plan.name).is_some() || dir.exists() {
+            if registry.get(id).is_some() || registry.name_taken(&plan.name).is_some() || dir.exists() {
                 drop(registry);
                 undo(&placed);
-                return Err(format!("a microVM named {} is here already", plan.name));
+                return Err(format!("a microVM named {} is here already", plan.name).into());
             }
             if let Err(e) = std::fs::rename(&staged_dir, &dir) {
                 drop(registry);
                 undo(&placed);
-                return Err(at(&staged_dir, &e));
+                return Err(at(&staged_dir, &e).into());
             }
             // Its snapshot, against this machine's files where they are now.
-            if let Err(e) = shards_vmm::snapshot::relocate(&dir.join(SNAPSHOTS).join(&plan.snapshot), &to) {
+            if let Err(e) = shards_vmm::snapshot::relocate(&dir.join(SNAPSHOTS).join(snapshot), &to) {
                 let _ = std::fs::remove_dir_all(&dir);
                 drop(registry);
                 undo(&placed);
-                return Err(e);
+                return Err(e.into());
             }
             if let Err(e) = registry.adopt(c) {
                 let _ = std::fs::remove_dir_all(&dir);
                 drop(registry);
                 undo(&placed);
-                return Err(e);
+                return Err(e.into());
             }
         }
         self.container_event(&plan.id, "create", &[]);
@@ -2643,6 +2820,30 @@ mod tests {
                 },
                 "/srv, which web binds, is not on this machine: a move takes a bind's host path shared at the same place",
             ),
+            (
+                Refused::NotAName {
+                    name: "web".into(),
+                    field: Named::Id,
+                    value: "../x".into(),
+                },
+                "web's move gives its ID as \"../x\", which is no microVM's: 64 lowercase hex digits",
+            ),
+            (
+                Refused::NotAName {
+                    name: "web".into(),
+                    field: Named::Snapshot,
+                    value: "/s".into(),
+                },
+                "web's move gives its snapshot's name as \"/s\", which is not one file's name",
+            ),
+            (
+                Refused::NotAName {
+                    name: "web".into(),
+                    field: Named::Volume,
+                    value: "..".into(),
+                },
+                "web's move gives a volume's name as \"..\", which is not one volume's name",
+            ),
         ];
         for (refused, said) in all {
             let json = serde_json::to_string(&refused).unwrap();
@@ -2651,6 +2852,77 @@ mod tests {
         }
         let json = serde_json::to_string(&Refused::NameTaken { name: "web".into() }).unwrap();
         assert_eq!(json, r#"{"refused":"name-taken","name":"web"}"#);
+        let json = serde_json::to_string(&Refused::NotAName {
+            name: "web".into(),
+            field: Named::Volume,
+            value: "..".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"refused":"not-a-name","name":"web","field":"volume","value":".."}"#
+        );
+    }
+
+    /// Each name a move gives that a home's paths are made of is one name of its kind, and
+    /// so one component of a path (migrate-11): an ID only as `new_id` makes one, a
+    /// snapshot's and a volume's no path, no dots alone, no root and no drive on any host,
+    /// and a volume's the local driver's too. A plan is refused by the first that is not.
+    #[test]
+    fn a_moves_names_are_each_one_name_of_their_kind() {
+        let id = crate::containers::new_id().unwrap();
+        assert!(Named::Id.takes(&id));
+        for bad in [
+            "",
+            "../x",
+            "a".repeat(63).as_str(),
+            "a".repeat(65).as_str(),
+            "A".repeat(64).as_str(),
+            format!("{}/", "a".repeat(63)).as_str(),
+            format!("/{}", "a".repeat(63)).as_str(),
+            format!("{}.", "a".repeat(63)).as_str(),
+            format!("{}g", "a".repeat(63)).as_str(),
+        ] {
+            assert!(!Named::Id.takes(bad), "ID {bad:?}");
+        }
+        for good in ["s1", "2026-11-13T10-00-00Z", "a.b", "a:b-on-unix"] {
+            let windows_too = !good.contains(':');
+            assert_eq!(Named::Snapshot.takes(good), windows_too, "snapshot {good:?}");
+        }
+        for bad in [
+            "", ".", "..", "../x", "a/b", "a\\b", "/s", "C:s", "C:", "s.", "NUL", "a\0b",
+        ] {
+            assert!(!Named::Snapshot.takes(bad), "snapshot {bad:?}");
+        }
+        for good in ["data", "my-vol_1.2", "0a"] {
+            assert!(Named::Volume.takes(good), "volume {good:?}");
+        }
+        for bad in [
+            "", "a", ".", "..", "../x", "a/b", "/etc", "a\\b", "C:v", "-v", ".v", "v.", "CON",
+        ] {
+            assert!(!Named::Volume.takes(bad), "volume {bad:?}");
+        }
+
+        let ok = plan();
+        assert_eq!(names_refused(&ok), None);
+        let mut id = ok.clone();
+        id.id = "../x".into();
+        let mut snapshot = ok.clone();
+        snapshot.snapshot = "../../x".into();
+        let mut volume = ok.clone();
+        volume.volumes.push("../../x".into());
+        for (field, p) in [
+            (Named::Id, id),
+            (Named::Snapshot, snapshot),
+            (Named::Volume, volume),
+        ] {
+            match names_refused(&p) {
+                Some(Refused::NotAName { name, field: f, .. }) => {
+                    assert_eq!((name.as_str(), f), ("web", field))
+                }
+                other => panic!("{field:?}: {other:?}"),
+            }
+        }
     }
 
     /// A baseline masks the features of the registers it names, which the move checks by
@@ -2789,7 +3061,7 @@ mod tests {
     }
 
     /// A tree written as a move's stream reads back whole, a sparse file as sparse, its
-    /// modes and links with it; and its names are only those its plan allows.
+    /// modes with it; and its names are only those its plan allows.
     #[test]
     fn a_tree_moves_whole_and_as_sparse() {
         let from = shards_testdir::TempDir::new("mv-from").unwrap();
@@ -2807,7 +3079,6 @@ mod tests {
         shards_vmm::platform::write_all_at(&sparse, b"head", 0).unwrap();
         shards_vmm::platform::write_all_at(&sparse, b"tail", (64 << 20) - 4).unwrap();
         drop(sparse);
-        guest::make_link(&own.join("link"), b"config.json").unwrap();
         let mut bytes = Vec::new();
         {
             let mut w = Writer::new(&mut bytes, &p).unwrap();
@@ -2826,7 +3097,8 @@ mod tests {
         let to = shards_testdir::TempDir::new("mv-to").unwrap();
         let needed: BTreeSet<String> = p.files.iter().map(|f| f.rel.clone()).collect();
         let allows = |rel: &str| allowed(&p, &needed, rel);
-        let mut placer = Placer::new(&to, &allows);
+        let links = |rel: &str| holds_links(&p, rel);
+        let mut placer = Placer::new(&to, &allows, &links).unwrap();
         let mut input = bytes.as_slice();
         assert_eq!(read_plan(&mut input).unwrap(), p);
         read_entries(&mut input, &mut |e| placer.take(e)).unwrap();
@@ -2838,14 +3110,101 @@ mod tests {
         assert_eq!(memory.len(), 64 << 20);
         assert_eq!(&memory[..4], b"head");
         assert_eq!(&memory[(64 << 20) - 4..], b"tail");
-        assert_eq!(guest::read_link(&there.join("link")).unwrap(), b"config.json");
         // Cut short, it is refused.
         let mut cut = &bytes[..bytes.len() - 1];
         let elsewhere = shards_testdir::TempDir::new("mv-cut").unwrap();
         let anything = |_: &str| true;
-        let mut placer = Placer::new(&elsewhere, &anything);
+        let mut placer = Placer::new(&elsewhere, &anything, &anything).unwrap();
         read_plan(&mut cut).unwrap();
         assert!(read_entries(&mut cut, &mut |e| placer.take(e)).is_err());
+    }
+
+    #[test]
+    fn a_volumes_hardlinks_keep_shared_contents_after_move() {
+        let from = shards_testdir::TempDir::new("mv-hfrom").unwrap();
+        std::fs::write(from.join("a"), b"before").unwrap();
+        std::fs::hard_link(from.join("a"), from.join("b")).unwrap();
+        let p = plan();
+        let mut bytes = Vec::new();
+        let mut writer = Writer::new(&mut bytes, &p).unwrap();
+        writer.tree(&from, "volumes/data/_data", &|_| false).unwrap();
+        writer.finish().unwrap();
+        let to = shards_testdir::TempDir::new("mv-hto").unwrap();
+        let allows = |_: &str| true;
+        let mut placer = Placer::new(&to, &allows, &allows).unwrap();
+        let mut input = bytes.as_slice();
+        read_plan(&mut input).unwrap();
+        read_entries(&mut input, &mut |entry| placer.take(entry)).unwrap();
+        placer.finish().unwrap();
+        let root = to.join("volumes/data/_data");
+        std::fs::write(root.join("a"), b"after").unwrap();
+        assert_eq!(std::fs::read(root.join("b")).unwrap(), b"after");
+    }
+
+    #[test]
+    fn hardlinks_require_existing_volume_files_at_both_ends() {
+        let p = plan();
+        let needed: BTreeSet<_> = p.files.iter().map(|f| f.rel.clone()).collect();
+        let allows = |rel: &str| allowed(&p, &needed, rel);
+        let links = |rel: &str| holds_links(&p, rel);
+        let to = shards_testdir::TempDir::new("mv-hardlink-guard").unwrap();
+        let data = "volumes/data/_data";
+        std::fs::create_dir_all(to.join(data)).unwrap();
+        std::fs::write(to.join(data).join("source"), b"kept").unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(to.join("images/x.erofs"), b"backing").unwrap();
+        let mut placer = Placer::new(&to, &allows, &links).unwrap();
+        let hardlink = |rel: &str, target: &str| Entry::Hardlink {
+            rel: rel.into(),
+            target: target.into(),
+        };
+        let source = format!("{data}/source");
+        for (rel, target) in [
+            (format!("{data}/early"), format!("{data}/later")),
+            (format!("{data}/dir"), data.into()),
+            (format!("{data}/backing"), "images/x.erofs".into()),
+            (format!("containers/{}/alias", p.id), source.clone()),
+            (format!("{data}/escape"), "../outside".into()),
+            ("volumes/other/_data/alias".into(), source.clone()),
+        ] {
+            assert!(placer.take(hardlink(&rel, &target)).is_err(), "{rel} <- {target}");
+            assert!(std::fs::symlink_metadata(to.join(rel)).is_err());
+        }
+        placer
+            .take(Entry::Link {
+                rel: format!("{data}/sym"),
+                target: "source".into(),
+                meta: guest::Meta {
+                    mode: guest::S_IFLNK | 0o777,
+                    ..guest::Meta::default()
+                },
+            })
+            .unwrap();
+        assert!(
+            placer
+                .take(hardlink(&format!("{data}/bad"), &format!("{data}/sym")))
+                .is_err()
+        );
+        assert!(!to.join(data).join("bad").exists());
+        assert_eq!(std::fs::read(to.join(source)).unwrap(), b"kept");
+        assert_eq!(std::fs::read(to.join("images/x.erofs")).unwrap(), b"backing");
+    }
+
+    #[test]
+    fn hardlink_names_use_the_streams_path_bound() {
+        let mut bytes = vec![HARDLINK];
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(b"a");
+        bytes.extend_from_slice(&((MAX_PATH + 1) as u32).to_le_bytes());
+        let mut taken = false;
+        assert!(
+            read_entries(&mut bytes.as_slice(), &mut |_| {
+                taken = true;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!taken);
     }
 
     /// A volume's files move as its guest saw them (D176 part 6), whatever this host keeps
@@ -2915,7 +3274,8 @@ mod tests {
         let to = shards_testdir::TempDir::new("mv-vto").unwrap();
         let needed = BTreeSet::new();
         let allows = |rel: &str| allowed(&p, &needed, rel);
-        let mut placer = Placer::new(&to, &allows);
+        let links = |rel: &str| holds_links(&p, rel);
+        let mut placer = Placer::new(&to, &allows, &links).unwrap();
         let mut input = bytes.as_slice();
         read_plan(&mut input).unwrap();
         read_entries(&mut input, &mut |e| placer.take(e)).unwrap();
@@ -2925,10 +3285,12 @@ mod tests {
         assert_eq!(guest::read_link(&there.join("l")).unwrap(), b"f");
         let ab = there.join(guest::host_name(b"a:b").unwrap());
         assert_eq!(std::fs::read(ab).unwrap(), b"a:b");
-        // A stream of another version is refused.
-        let mut old = bytes.clone();
-        old[8..12].copy_from_slice(&1u32.to_le_bytes());
-        assert!(read_plan(&mut old.as_slice()).is_err());
+        // A stream of another version is refused: version 2's, which held no hardlinks, too.
+        for version in [1u32, 2, VERSION + 1] {
+            let mut old = bytes.clone();
+            old[8..12].copy_from_slice(&version.to_le_bytes());
+            assert!(read_plan(&mut old.as_slice()).is_err(), "version {version}");
+        }
         // Put back to the host's own access, for the test's directories to go.
         guest::set(&there, &meta(guest::S_IFDIR | 0o755, None)).unwrap();
         guest::set(&root, &meta(guest::S_IFDIR | 0o755, None)).unwrap();
@@ -2956,5 +3318,106 @@ mod tests {
         );
         assert_eq!(rel_of(Path::new("/h"), Path::new("/other/x")), None);
         assert_eq!(rel_of(Path::new("/h"), Path::new("/h")), None);
+    }
+
+    /// A stream's symlink is data, never a way out of the move's directory (migrate-01): no
+    /// entry below one, by an absolute or a relative target, is made where the link leads
+    /// (a file, a directory, a node, or a link), and the volume's link itself stays, as
+    /// its guest made it. And a link is taken only in a volume's files: one in the
+    /// microVM's own directory, which a move's later steps write by path, or at a file
+    /// its snapshot restores against, is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_streams_symlinks_never_lead_out_of_its_directory() {
+        let p = plan();
+        let needed: BTreeSet<String> = p.files.iter().map(|f| f.rel.clone()).collect();
+        let allows = |rel: &str| allowed(&p, &needed, rel);
+        let links = |rel: &str| holds_links(&p, rel);
+        let top = shards_testdir::TempDir::new("mv-esc").unwrap();
+        let to = top.join("move");
+        let outside = top.join("outside");
+        std::fs::create_dir(&to).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let meta = |mode: u32| guest::Meta {
+            mode,
+            ..guest::Meta::default()
+        };
+        let link = |rel: &str, target: &str| Entry::Link {
+            rel: rel.into(),
+            target: target.into(),
+            meta: meta(guest::S_IFLNK | 0o777),
+        };
+        let mut placer = Placer::new(&to, &allows, &links).unwrap();
+        let data = "volumes/data/_data";
+        placer
+            .take(link(&format!("{data}/abs"), outside.to_str().unwrap()))
+            .unwrap();
+        // From the volume's files up to the test's own directory: move/volumes/data/_data/.
+        placer
+            .take(link(&format!("{data}/rel"), "../../../../outside"))
+            .unwrap();
+        for via in ["abs", "rel"] {
+            let bytes = b"from the other machine";
+            let mut runs = |put: &mut dyn FnMut(u64, &[u8]) -> io::Result<()>| put(0, bytes);
+            let file = Entry::File {
+                rel: format!("{data}/{via}/new-file"),
+                meta: meta(guest::S_IFREG | 0o755),
+                len: bytes.len() as u64,
+                runs: &mut runs,
+            };
+            let placed = placer.take(file);
+            assert!(
+                !outside.join("new-file").exists(),
+                "made outside the move's directory through {via}"
+            );
+            let refused = placed.unwrap_err();
+            assert!(refused.contains("no directory of its own"), "{refused}");
+            for entry in [
+                Entry::Dir {
+                    rel: format!("{data}/{via}/dir"),
+                    meta: meta(guest::S_IFDIR | 0o755),
+                },
+                Entry::Node {
+                    rel: format!("{data}/{via}/fifo"),
+                    meta: meta(guest::S_IFIFO | 0o644),
+                },
+                link(&format!("{data}/{via}/link"), "/"),
+                Entry::Dir {
+                    rel: format!("{data}/{via}/deeper/dir"),
+                    meta: meta(guest::S_IFDIR | 0o755),
+                },
+            ] {
+                assert!(placer.take(entry).is_err(), "{via}");
+            }
+        }
+        placer.finish().unwrap();
+        let left: Vec<_> = std::fs::read_dir(&outside).unwrap().collect();
+        assert!(left.is_empty(), "made outside the move's directory: {left:?}");
+        let there = to.join(data);
+        assert_eq!(
+            guest::read_link(&there.join("abs")).unwrap(),
+            outside.as_os_str().as_encoded_bytes()
+        );
+        assert_eq!(
+            guest::read_link(&there.join("rel")).unwrap(),
+            b"../../../../outside"
+        );
+
+        // Nowhere but a volume's files: not the microVM's own directory, nor a file its
+        // snapshot restores against, nor a volume's own directory beside its files.
+        let mut placer = Placer::new(&to, &allows, &links).unwrap();
+        let victim = outside.join("victim");
+        for rel in [
+            format!("containers/{}/{KEY_REPLACED}", p.id),
+            format!("containers/{}", p.id),
+            "images/x.erofs".to_string(),
+            "volumes/data/_data".to_string(),
+            "volumes/data/opts".to_string(),
+        ] {
+            let refused = placer.take(link(&rel, victim.to_str().unwrap())).unwrap_err();
+            assert!(refused.contains("only a volume's files"), "{rel}: {refused}");
+            let kept = std::fs::symlink_metadata(to.join(&rel));
+            assert!(kept.is_err() || kept.unwrap().is_dir(), "{rel}");
+        }
     }
 }

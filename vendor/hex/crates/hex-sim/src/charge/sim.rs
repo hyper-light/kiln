@@ -238,7 +238,7 @@ impl Live {
 pub fn run(s: &Scenario) -> Result<Report, ChargeError> {
     let mut rng = Rng::new(s.seed);
     let mut node: Node<u32> = Node::new(
-        s.window,
+        Some(s.window),
         s.capacity,
         Bounds {
             vms: s.vms.max(1),

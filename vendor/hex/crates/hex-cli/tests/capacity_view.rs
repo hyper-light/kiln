@@ -26,7 +26,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 
-use hex_api::capacity::Why;
+use hex_api::capacity::Amounts;
 use hex_quic::Refused;
 use hex_quic::enroll::sim::SimCa;
 use hex_quic::enroll::{Ca, Request, store};
@@ -36,7 +36,7 @@ mod machine;
 #[path = "capacity_view/stand_in.rs"]
 mod stand_in;
 
-use stand_in::{Asked, Rng, StandIn, run_of, workload};
+use stand_in::{StandIn, drain, fill, kiln_runs};
 
 /// The scheduler's name: the DNS name its certificate carries, which the holder checks it for.
 const KEEPER: &str = "scheduler.capacity-view.test";
@@ -85,21 +85,20 @@ fn a_stranger_is_turned_away(dir: &Path, address: SocketAddr) {
     );
 }
 
-/// The boxes of Hex's own HEX-CV-L1 places on the machine in `dir`, each a quarter of its CPUs: two where its scheduler
-/// places a `process` box under its `oci` placement class ([`machine::places_process_boxes`]), as on Linux and
-/// Windows; none where it doesn't, as on a Mac, which places Shards microVMs alone, which this test boots none of:
-/// there the stand-in meets the machine's room alone.
-pub fn hex_boxes(dir: &Path) -> u64 {
+/// The boxes of Hex's own the tests place on the machine in `dir`, where its scheduler places a `process` box under its
+/// `oci` placement class ([`machine::places_process_boxes`]), as on Linux and Windows; none where it doesn't, as on a
+/// Mac, which places Shards microVMs alone, which these tests boot none of: there the holder meets the machine's room
+/// alone. One box, the first recorded `oci` leg (hex-sim's `oci_needs`; ROOT's rulings 2 and 7, 2026-11-14): the fewest
+/// that puts Hex's own admission in the view and has it hinted to the holder (CV7). The recorded fleet ran fewer at once
+/// on an `oci` host, on average: its 8,432 `oci` boxes over 15 hosts and 86,400 s, 6.94 s each, are 0.045 at once
+/// (Little's law).
+pub fn hex_boxes(dir: &Path) -> Vec<Amounts> {
     if machine::places_process_boxes(dir) {
-        2
+        hex_sim::capacity::oci_needs().take(1).collect()
     } else {
-        0
+        Vec::new()
     }
 }
-
-/// What a kiln-shaped workload's run of HEX-CV-L1 takes: steps enough to fill the room and empty it again several times
-/// over, with the runs' shares of 2 to 8 of the machine (`stand_in::workload`). A test generator's parameter.
-const L1_STEPS: u64 = 64;
 
 /// HEX-CV-L1's body: the machine in `dir`'s `a`, its boxes under `box_root` on Linux; the stand-in in `b`, a stranger in
 /// `c`.
@@ -133,33 +132,21 @@ fn light(dir: &Path, box_root: Option<&Path>) {
     let mut kiln = StandIn::start(&holder_dir, HOLDER, KEEPER, address);
     assert!(kiln.join().unwrap(), "the first sync's counts disagree");
     let room = kiln.view().unwrap().room;
-    // Hex's own: two boxes of a quarter of the machine's CPUs each, placed through the scheduler, where it places them.
+    // Hex's own boxes, placed through the scheduler where it places them.
     let boxes = hex_boxes(&machine_dir);
-    eprintln!("HEX-CV-L1: Hex's boxes {boxes}");
-    for n in 0..boxes {
-        let placed = machine::place(&machine_dir, &format!("cv-box-{n}"), room.cpu_milli / 4);
+    eprintln!("HEX-CV-L1: Hex's boxes {boxes:?}");
+    for (n, need) in boxes.iter().enumerate() {
+        let placed = machine::place(&machine_dir, &format!("cv-box-{n}"), *need);
         assert!(
             placed.created && placed.refusals.is_empty(),
             "Hex's box {n}: {placed:?}\n{}",
             scheduler.said()
         );
     }
-    // Runs of an eighth of the machine until the room refuses one: what Hex's boxes leave, and no more.
-    let left = 8 - 2 * boxes;
-    let mut granted = 0u64;
-    loop {
-        match kiln.reserve(run_of(room, 8)).unwrap() {
-            Asked::Granted => granted += 1,
-            Asked::Refused(why) => {
-                assert_eq!(why, Why::Room);
-                break;
-            }
-        }
-        assert!(
-            granted <= left,
-            "granted past the {left} eighths Hex's boxes leave"
-        );
-    }
+    // kiln's recorded runs, one after another, until the room refuses one (ROOT's ruling 7): what Hex's boxes leave, and
+    // no more.
+    let mut runs = kiln_runs();
+    let granted = fill(&mut kiln, &mut runs).unwrap();
     assert!(granted >= 1, "nothing granted beside Hex's boxes");
     let boxed: u64 = machine::boxes(&machine_dir)
         .iter()
@@ -178,7 +165,7 @@ fn light(dir: &Path, box_root: Option<&Path>) {
     drop(scheduler);
     let (mut scheduler, address) = machine::scheduler(&machine_dir);
     kiln.moved(address);
-    let lost = kiln.reserve(run_of(room, 8));
+    let lost = kiln.reserve(runs.next().expect("the recorded runs go on"));
     assert!(lost.is_err(), "a word to the killed scheduler: {lost:?}");
     assert!(
         kiln.join().unwrap(),
@@ -192,21 +179,23 @@ fn light(dir: &Path, box_root: Option<&Path>) {
     );
     assert!(kiln.is_up());
 
-    let seed = kiln.epoch();
-    workload(&mut kiln, &mut Rng::new(seed), L1_STEPS).unwrap();
+    // The rest of ruling 7's order: every run ended, then the next asked until the room refuses one again, that set held
+    // for the books' check below.
+    drain(&mut kiln).unwrap();
+    fill(&mut kiln, &mut runs).unwrap();
     let tally = kiln.tally;
     eprintln!("HEX-CV-L1: {tally:?}");
-    // Non-vacuity: the work met the room's edge and came back from it, Hex's boxes were hinted where it placed them,
-    // the reserve said to the killed scheduler was abandoned, and every join synced.
+    // Non-vacuity: the work met the room's edge twice, every run it held then ended between, the room given again after,
+    // Hex's box hinted where it placed one, the reserve said to the killed scheduler abandoned, and every join synced.
     assert!(
         tally.granted > granted
-            && tally.released > 0
-            && tally.refused_room > 0
+            && tally.released == granted
+            && tally.refused_room == 2
             && tally.refused_other == 0
             && tally.unanswered > 0
             && tally.synced == 3
             && tally.links_lost == 2
-            && (boxes == 0 || tally.hints > 0)
+            && (boxes.is_empty() || tally.hints > 0)
             && tally.views > tally.granted,
         "{tally:?}"
     );
@@ -221,12 +210,13 @@ fn light(dir: &Path, box_root: Option<&Path>) {
 
 /// HEX-CV-L1 (joint plan step 13; AC-T7.4.1; CV1-CV11 over CV9's lane): do run `hex node` and `hex schedule serve` with
 /// a capacity lane on loopback, its enrollment begun by `hex node enroll` and answered by the simulator CA; have a peer
-/// the lane doesn't name dial it; have the stand-in join, Hex place two boxes of a quarter of the CPUs (where it places
-/// a `process` box: `hex_boxes`), and the stand-in reserve eighths until refused; kill the scheduler and start it
-/// again; drop the stand-in's link; then run 64 steps of kiln-shaped work. Expect the stranger refused at its handshake
-/// (Identity); every view's CPU held within the machine's and every grant within its room; the runs refused for room
-/// past what the boxes leave, the boxes and the runs within the machine's CPUs; the sync agreeing after the restart and
-/// after the dropped link; and the keeper's books, read from its records once it has ended, the stand-in's own.
+/// the lane doesn't name dial it; have the stand-in join, Hex place its box (a recorded `oci` leg, where it places a
+/// `process` box: `hex_boxes`), and the stand-in ask kiln's recorded runs in recorded order until one is refused; kill
+/// the scheduler and start it again; drop the stand-in's link; then end every run and ask the next until one is refused
+/// again (ROOT's ruling 7). Expect the stranger refused at its handshake (Identity); every view's CPU held within the
+/// machine's and every grant within its room; the runs refused for room past what the box leaves, the box and the runs
+/// within the machine's CPUs; the sync agreeing after the restart and after the dropped link; and the keeper's books,
+/// read from its records once it has ended, the stand-in's own.
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn hex_cv_l1() {
@@ -299,7 +289,7 @@ mod two_hosts {
     use hex_quic::enroll::{Ca, Issued, Request};
     use hex_testkit::waits::follow::{self, Party};
 
-    use super::stand_in::{Rng, StandIn, workload};
+    use super::stand_in::{StandIn, kiln_runs, workload};
     use super::{a_stranger_is_turned_away, enroll_holder, machine};
 
     /// The grants the simulator CA admits each name with, each taken once (HEX-ENROLL-5).
@@ -310,14 +300,6 @@ mod two_hosts {
     /// The operator's word that the keeper is back: what B3 waits for once its link has gone, following the operator by
     /// their life alone (decision 9), however long the heal takes them.
     static HEALED: Patience = Patience::measuring("test.hex_cli.capacity_view.healed");
-
-    /// The steps of kiln-shaped work a phase runs (`HEX_CV_STEPS`, else HEX-CV-L1's), a test generator's parameter.
-    fn steps() -> u64 {
-        std::env::var("HEX_CV_STEPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(super::L1_STEPS)
-    }
 
     /// The run's variable `name`, which the phase needs.
     fn var(name: &str) -> String {
@@ -454,14 +436,11 @@ mod two_hosts {
         let (mut scheduler, address) = machine::scheduler(&dir);
         say("HEX_CV_SCHEDULER_PID", scheduler.child.id());
         say("HEX_CV_CAPACITY", address);
-        // Hex's own: two boxes of a quarter of the machine's CPUs each (the node's CPUs are its hardware threads, as
-        // the standard library counts them within the cgroup's quota), kept through every restart; none where its
-        // scheduler places no `process` box (`hex_boxes`).
-        let threads = u64::try_from(std::thread::available_parallelism().unwrap().get()).unwrap();
+        // Hex's own boxes (`hex_boxes`), kept through every restart.
         let boxes = super::hex_boxes(&dir);
-        say("HEX_CV_HEX_BOXES", boxes);
-        for n in 0..boxes {
-            let placed = machine::place(&dir, &format!("cv-2h-box-{n}"), threads * 1000 / 4);
+        say("HEX_CV_HEX_BOXES", boxes.len());
+        for (n, need) in boxes.iter().enumerate() {
+            let placed = machine::place(&dir, &format!("cv-2h-box-{n}"), *need);
             assert!(
                 placed.created && placed.refusals.is_empty(),
                 "Hex's box {n}: {placed:?}"
@@ -490,8 +469,8 @@ mod two_hosts {
     }
 
     /// HEX-CV-2H A3, on the keeper's host, in the background. Do: run `hex node` and `hex schedule serve` with its lane
-    /// at `HEX_CV_BIND` serving `HEX_CV_HOLDER` alone, and place two boxes of Hex's own of a quarter of the machine's
-    /// CPUs each where its scheduler places a `process` box (`HEX_CV_HEX_BOXES` says how many); each time the
+    /// at `HEX_CV_BIND` serving `HEX_CV_HOLDER` alone, and place Hex's own box (`hex_boxes`: a recorded `oci` leg) where
+    /// its scheduler places a `process` box (`HEX_CV_HEX_BOXES` says how many); each time the
     /// scheduler ends, start it again over the same state and address, until it ends with `$HEX_CV_DIR/stop` there.
     /// Expect: each start said (`HEX_CV_SCHEDULER_PID`, `HEX_CV_CAPACITY`), Hex's boxes placed, and once stopped the
     /// keeper's books of the holder said from its records (`HEX_CV_BOOKS`) and the boxes deleted (`HEX_CV_LEFT=none`).
@@ -509,9 +488,9 @@ mod two_hosts {
     }
 
     /// HEX-CV-2H B2, on the holder's host. Do: have the stranger dial the keeper at `HEX_CV_ADDR`; start the stand-in
-    /// and join; run `HEX_CV_STEPS` steps (else 64) of kiln-shaped work. Expect: the stranger refused at its handshake
-    /// (Identity), the sync agreeing, every view's CPU held within the machine's and every grant within its room.
-    /// Says `HEX_CV_TALLY` and `HEX_CV_HELD`.
+    /// and join; run kiln-shaped work (`stand_in::workload`: kiln's recorded runs until refused, all ended, again until
+    /// refused). Expect: the stranger refused at its handshake (Identity), the sync agreeing, every view's CPU held
+    /// within the machine's and every grant within its room. Says `HEX_CV_TALLY` and `HEX_CV_HELD`.
     #[test]
     #[ignore = "HEX-CV-2H's phase B2, on the holder's host: the lead's two-host run"]
     fn hex_cv_2h_b2_the_holder_reserves_across_the_hosts() {
@@ -523,8 +502,7 @@ mod two_hosts {
             addr(),
         );
         assert!(kiln.join().unwrap(), "the first sync's counts disagree");
-        let seed = kiln.epoch();
-        workload(&mut kiln, &mut Rng::new(seed), steps()).unwrap();
+        workload(&mut kiln, &mut kiln_runs()).unwrap();
         say("HEX_CV_TALLY", format!("{:?}", kiln.tally));
         say("HEX_CV_HELD", books_hex(&kiln.held()));
     }
@@ -552,8 +530,8 @@ mod two_hosts {
             addr(),
         );
         assert!(kiln.join().unwrap(), "the sync before the loss disagrees");
-        let seed = kiln.epoch();
-        workload(&mut kiln, &mut Rng::new(seed), steps()).unwrap();
+        let mut runs = kiln_runs();
+        workload(&mut kiln, &mut runs).unwrap();
         say(
             "HEX_CV_READY",
             if loss == "kill" {
@@ -564,6 +542,8 @@ mod two_hosts {
         );
         let lost = kiln.until_lost();
         say("HEX_CV_LOST", lost.0);
+        // A look at the operator's word, a file a person touches: its party is the person running this run, who ends
+        // it by ending the run (the review's C-5), and a file's appearing tells this test no event on every OS.
         follow::until(
             &HEALED,
             "the operator's word that the keeper is back",
@@ -573,7 +553,7 @@ mod two_hosts {
         .unwrap();
         assert!(kiln.join().unwrap(), "the sync after the loss disagrees");
         say("HEX_CV_HEALED", "agree");
-        workload(&mut kiln, &mut Rng::new(seed + 1), steps()).unwrap();
+        workload(&mut kiln, &mut runs).unwrap();
         say("HEX_CV_TALLY", format!("{:?}", kiln.tally));
         say("HEX_CV_HELD", books_hex(&kiln.held()));
     }

@@ -58,7 +58,7 @@ use hex_node::{Node, OCI_BOXES, records_dir};
 use hex_runtime::linux::cgroup::BoxRoot;
 use hex_runtime::linux::disks;
 use hex_runtime::linux::oci::run::ClassicReason;
-use hex_testkit::waits::{CREATE, EMPTYING, EXEC, NETNS_MAKE, NODE_TURN, PROGRAM, until};
+use hex_testkit::waits::{CREATE, PROGRAM};
 
 const TEST: &str = "oci_boxes_report_their_inits_exit_through_the_seam";
 /// Runs just the prepared-device oracle through the existing root/delegation fixture, in a fresh
@@ -110,20 +110,19 @@ static RERUN: Patience = Patience::measuring("test.oci_box.rerun");
 // where no recorded operation makes its fact, its answers recorded for the census to come.
 /// A program's run, to its end or to what it does on its way (an init exec'ing its program, a program it runs writing
 /// its mark, a program reaped once ended): the program-run record.
-static PROGRAM_RUN: Patience = Patience::seeded("test.oci_box.program", PROGRAM);
+static PROGRAM_RUN: Patience = Patience::measuring("test.oci_box.program");
 /// A killed process's end, and its reaping: `node.emptying`.
-static KILLED: Patience = Patience::seeded("test.oci_box.killed", EMPTYING);
+static KILLED: Patience = Patience::measuring("test.oci_box.killed");
 /// What a create makes within itself, while the test holds it or as it answers (a create blocked reading its config or
 /// writing its record, handed a seed, an init's stack mapped): the create's record. Each such test then asserts the
 /// create still held, the fact made within it.
-static CREATING: Patience = Patience::seeded("test.oci_box.create", CREATE);
+static CREATING: Patience = Patience::measuring("test.oci_box.create");
 /// An exec'd program running: made within the exec, before it answers.
-static EXECUTING: Patience = Patience::seeded("test.oci_box.exec", EXEC);
+static EXECUTING: Patience = Patience::measuring("test.oci_box.exec");
 /// A create's or delete's wait for the same box's call under way: `node.turns`.
-static TURN: Patience = Patience::seeded("test.oci_box.turn", NODE_TURN);
+static TURN: Patience = Patience::measuring("test.oci_box.turn");
 /// Two namespaces made by the pool's refill thread, one after the other: two of `netns.make`'s.
-static TWO_NAMESPACES: Patience =
-    Patience::seeded("test.oci_box.two_namespaces", NETNS_MAKE.saturating_mul(2));
+static TWO_NAMESPACES: Patience = Patience::measuring("test.oci_box.two_namespaces");
 /// What the node's own threads make on their own, no recorded operation making it: the /dev pool filled, procs and
 /// inits made ahead, procs dropped by the dropper, a dead seed's slot started again, an exec'd program's loader closing
 /// its descriptors. Measuring, for the fact alone.
@@ -4277,9 +4276,19 @@ fn programs_hold_their_stdio_alone(lab: &Lab, own: &Path) {
                 .filter(|fd| !["0", "1", "2"].contains(&fd.as_str()))
                 .collect()
         };
-        until(
+        // A look: procfs tells no event as a loader lets a descriptor go. Its party, the program, ends with its pid.
+        hex_testkit::waits::follow::until(
             &LOADER,
             &format!("program {pid} to become its program and hold its stdio alone"),
+            || {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+                match stat.as_deref().ok().and_then(|stat| stat.rsplit_once(')')) {
+                    Some((_, rest)) if !rest.trim_start().starts_with(['Z', 'X', 'x']) => {
+                        hex_testkit::waits::follow::Party::Live
+                    }
+                    _ => hex_testkit::waits::follow::Party::Ended,
+                }
+            },
             || cmdline_has(pid, "/usr/bin/sleep") && held().is_empty(),
         )
         .unwrap();
@@ -5683,9 +5692,12 @@ fn wait_exit(rt: &dyn Runtime, id: &BoxId) -> BoxInfo {
     last.unwrap()
 }
 
-/// Waits for `cond` on `wait`, its own fact's record or measuring (hex_testkit::waits): says how many looks it took.
+/// Waits for `cond` on `wait`, measuring, by the life of the in-process node this test holds (the review's C-5), whose
+/// own threads make the fact: it lives while held. A look: the node tells no event of these facts, its state read.
+/// Says how many looks it took.
 fn wait_for(wait: &Patience, cond: impl FnMut() -> bool, what: &str) -> u64 {
-    until(wait, what, cond).unwrap()
+    hex_testkit::waits::follow::until(wait, what, || hex_testkit::waits::follow::Party::Live, cond)
+        .unwrap()
 }
 
 /// The init's pid, from the state (`"pid":<n>`) in its container's state dir.

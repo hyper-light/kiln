@@ -10,11 +10,7 @@
 
 mod common;
 
-use std::time::Duration;
-
 use common::{TempDir, Vm, cannot_run_vms, guest_init, kernel, run_shards_env, served};
-
-const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A detached run's microVM given a disk, made empty ext4 of 64 MiB, written through,
 /// grown to 128 MiB with its file system as it runs, unplugged, and plugged again with what
@@ -28,7 +24,7 @@ fn devices_are_plugged_into_a_run_and_its_disk_grows() {
     let home = TempDir::new("plug");
     let env = [("SHARDS_HOME", home.as_os_str())];
     let shards = |command: &[&str], args: &[&str]| {
-        let r = run_shards_env(command, args, &env, TIMEOUT);
+        let r = run_shards_env(command, args, &env);
         assert_eq!(
             r.status,
             Some(0),
@@ -45,7 +41,7 @@ fn devices_are_plugged_into_a_run_and_its_disk_grows() {
         "--init".as_ref(),
         guest_init().as_os_str(),
     ];
-    let used = run_shards_env(&["guest"], &args, &env, TIMEOUT);
+    let used = run_shards_env(&["guest"], &args, &env);
     assert_eq!(used.status, Some(0), "{}", used.stderr);
     // Its template saved by a first run where templates are kept; the run plugged into
     // restores it.
@@ -76,7 +72,7 @@ fn devices_are_plugged_into_a_run_and_its_disk_grows() {
     assert!(size(&after) > size(&before) + (48 << 20), "{before} then {after}");
     assert_eq!(std::fs::metadata(&disk).unwrap().len(), 128 << 20);
     // A disk only grows.
-    let shrunk = run_shards_env(&["grow"], &["disk", "plugged", "/data", "32m"], &env, TIMEOUT);
+    let shrunk = run_shards_env(&["grow"], &["disk", "plugged", "/data", "32m"], &env);
     assert_ne!(shrunk.status, Some(0), "{}", shrunk.stdout);
     shards(&["unplug"], &["disk", "plugged", "/data"]);
     assert!(inside(&["slurp", "/data/hello"]).contains("errno 2"));
@@ -113,12 +109,33 @@ fn devices_are_plugged_into_a_run_and_its_disk_grows() {
     assert_eq!(std::fs::read_to_string(dir.join("from-guest")).unwrap(), "guest");
     shards(&["unplug"], &["volume", "plugged", "/shared"]);
     assert!(inside(&["slurp", "/shared/from-host"]).contains("errno 2"));
-    let none = run_shards_env(&["unplug"], &["volume", "plugged", "/shared"], &env, TIMEOUT);
+    let none = run_shards_env(&["unplug"], &["volume", "plugged", "/shared"], &env);
     assert!(
         none.stderr.contains("no volume is plugged in at /shared"),
         "{}",
         none.stderr
     );
+
+    // Concurrent same-destination requests have one owner and leave no hidden mount.
+    let contested = format!("{}:/contended", dir.display());
+    let barrier = std::sync::Barrier::new(2);
+    let attempt = || {
+        barrier.wait();
+        run_shards_env(&["plug"], &["volume", "plugged", &contested], &env)
+    };
+    let results = std::thread::scope(|scope| {
+        let a = scope.spawn(attempt);
+        let b = scope.spawn(attempt);
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    assert_eq!(
+        results.iter().filter(|r| r.status == Some(0)).count(),
+        1,
+        "statuses/errors: {:?}",
+        results.iter().map(|r| (r.status, &r.stderr)).collect::<Vec<_>>()
+    );
+    shards(&["unplug"], &["volume", "plugged", "/contended"]);
+    assert!(inside(&["slurp", "/contended/from-host"]).contains("errno 2"));
 
     // Off Linux no host's function is plugged in: refused by name, with its host's own
     // limit, as a run's start refuses one (D154; PM M401, M402, M403).
@@ -126,7 +143,7 @@ fn devices_are_plugged_into_a_run_and_its_disk_grows() {
     {
         let limit = shards_vmm::vm::passthrough_refused();
         for function in ["0000:01:00.0", "/dev/vfio/devices/vfio0"] {
-            let r = run_shards_env(&["plug"], &["function", "plugged", function], &env, TIMEOUT);
+            let r = run_shards_env(&["plug"], &["function", "plugged", function], &env);
             assert_ne!(r.status, Some(0), "{function}: {}", r.stdout);
             let said = format!("shards: cannot plug into plugged: {function}: {limit}");
             assert!(r.stderr.contains(&said), "{function}: {}", r.stderr);
@@ -156,7 +173,7 @@ fn a_project_is_plugged_into_a_running_agent_at_its_host_path() {
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
     let shards = |args: &[&str]| {
-        let r = run_shards_env(&[], args, &env, TIMEOUT);
+        let r = run_shards_env(&[], args, &env);
         assert_eq!(r.status, Some(0), "shards {args:?}: {}\n{}", r.stderr, r.stdout);
         r.stdout
     };
@@ -202,12 +219,7 @@ fn a_project_is_plugged_into_a_running_agent_at_its_host_path() {
 
     // Outside every root: refused, the roots named.
     let outside = format!("{}:/outside/proj", proj.display());
-    let refused = run_shards_env(
-        &["plug"],
-        &["volume", "--for", "a", "plugm", &outside],
-        &env,
-        TIMEOUT,
-    );
+    let refused = run_shards_env(&["plug"], &["volume", "--for", "a", "plugm", &outside], &env);
     assert_ne!(refused.status, Some(0), "{}", refused.stdout);
     assert!(
         refused.stderr.contains("not beneath a plug root") && refused.stderr.contains(roots[0].as_str()),
@@ -219,18 +231,15 @@ fn a_project_is_plugged_into_a_running_agent_at_its_host_path() {
     let said = shards(&["plug", "volume", "--for", "a", "plugm", &spec]);
     assert!(said.starts_with(&format!("{dest} ")), "{said}");
     let seen_at = proj.join("seen");
-    let started = std::time::Instant::now();
+    let mut patience = common::Patience::of(&home);
     let seen = loop {
         if let Ok(seen) = std::fs::read_to_string(&seen_at) {
             break seen;
         }
-        assert!(
-            started.elapsed() < TIMEOUT,
-            "the agent wrote no {}",
-            seen_at.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(patience.holds(), "the agent wrote no {}", seen_at.display());
+        std::thread::sleep(patience.next_look());
     };
+    patience.done();
     for root in &roots {
         let line = format!("root {root} mkdir errno 30 create errno 30");
         assert!(seen.lines().any(|l| l == line), "no {line:?} in\n{seen}");
@@ -259,8 +268,6 @@ fn a_host_edit_wakes_a_watch_in_the_guest() {
     if cannot_run_vms() {
         return;
     }
-    /// Test patience, a loaded host's: never a runtime policy.
-    const PATIENCE: Duration = Duration::from_secs(60);
     let (image, _) = served();
     let home = TempDir::new("notice");
     let env = [
@@ -269,7 +276,7 @@ fn a_host_edit_wakes_a_watch_in_the_guest() {
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
     let shards = |command: &[&str], args: &[&str]| {
-        let r = run_shards_env(command, args, &env, TIMEOUT);
+        let r = run_shards_env(command, args, &env);
         assert_eq!(
             r.status,
             Some(0),
@@ -295,12 +302,12 @@ fn a_host_edit_wakes_a_watch_in_the_guest() {
     let vm_env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.to_str().unwrap())).collect();
     for (dir, at) in dirs.iter().zip(["/rw", "/ro", "/plugged"]) {
         let mut watch = Vm::spawn_env(&["exec", "noticed", "/bin/testguest", "inotify", at], &vm_env);
-        watch.wait_for("inotify ready", PATIENCE);
+        watch.wait_for("inotify ready");
         std::fs::write(dir.join("f"), "host").unwrap();
-        watch.wait_for("inotify IN_MODIFY f", PATIENCE);
+        watch.wait_for("inotify IN_MODIFY f");
         assert_eq!(std::fs::read_to_string(dir.join("f")).unwrap(), "host", "{at}");
         std::fs::remove_file(dir.join("f")).unwrap();
-        watch.wait_for("inotify IN_MODIFY|IN_ISDIR ", PATIENCE);
+        watch.wait_for("inotify IN_MODIFY|IN_ISDIR ");
         watch.kill();
         let left: Vec<_> = std::fs::read_dir(dir).unwrap().collect();
         assert!(left.is_empty(), "{at}: {left:?}");
@@ -320,7 +327,6 @@ fn notices_latency() {
     if cannot_run_vms() {
         return;
     }
-    const PATIENCE: Duration = Duration::from_secs(60);
     let samples: usize = std::env::var("SHARDS_NOTICE_SAMPLES")
         .ok()
         .and_then(|n| n.parse().ok())
@@ -338,24 +344,23 @@ fn notices_latency() {
         &["run"],
         &["-d", "--name", "lat", "-v", &bind, &image, "sleep"],
         &env,
-        TIMEOUT,
     );
     assert_eq!(r.status, Some(0), "{}", r.stderr);
     let vm_env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.to_str().unwrap())).collect();
     let mut watch = Vm::spawn_env(&["exec", "lat", "/bin/testguest", "inotify", "/w"], &vm_env);
-    watch.wait_for("inotify ready", PATIENCE);
+    watch.wait_for("inotify ready");
     let mut took = Vec::with_capacity(samples);
     for i in 0..samples + 10 {
         let name = format!("f{i}");
         let start = std::time::Instant::now();
         std::fs::write(files.join(&name), "x").unwrap();
-        watch.wait_for(&format!("inotify IN_MODIFY {name}"), PATIENCE);
+        watch.wait_for(&format!("inotify IN_MODIFY {name}"));
         if i >= 10 {
             took.push(start.elapsed().as_secs_f64() * 1e3);
         }
     }
     watch.kill();
-    let _ = run_shards_env(&["rm"], &["-f", "lat"], &env, TIMEOUT);
+    let _ = run_shards_env(&["rm"], &["-f", "lat"], &env);
     let mut sorted = took.clone();
     sorted.sort_by(f64::total_cmp);
     let at = |q: f64| sorted[((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1];
@@ -410,7 +415,6 @@ fn a_shares_names_are_its_hosts_case_and_all() {
         &["run"],
         &["--rm", "-u", "0", "-v", &bind, &image, "case", "/case"],
         &env,
-        TIMEOUT,
     );
     assert_eq!(ran.status, Some(0), "{}\n{}", ran.stderr, ran.stdout);
     let guest: Vec<&str> = ran.stdout.lines().filter(|l| l.starts_with("case ")).collect();
@@ -489,7 +493,7 @@ fn a_hosts_function_is_plugged_into_a_run_for_its_workload() {
         ("SHARDS_INIT", guest_init().as_os_str()),
     ];
     let shards = |command: &[&str], args: &[&str]| {
-        let r = run_shards_env(command, args, &env, TIMEOUT);
+        let r = run_shards_env(command, args, &env);
         assert_eq!(
             r.status,
             Some(0),
@@ -500,7 +504,7 @@ fn a_hosts_function_is_plugged_into_a_run_for_its_workload() {
         r.stdout
     };
     let refused = |command: &[&str], args: &[&str]| {
-        let r = run_shards_env(command, args, &env, TIMEOUT);
+        let r = run_shards_env(command, args, &env);
         assert_ne!(r.status, Some(0), "shards {command:?} {args:?}: {}", r.stdout);
         r.stderr
     };
@@ -538,12 +542,7 @@ fn a_hosts_function_is_plugged_into_a_run_for_its_workload() {
         shards(&["unplug"], &["function", "taker", &name]);
         let gone = shards(&["exec"], &["taker", "/bin/testguest", "slurp", node]);
         assert!(gone.contains("errno 2"), "round {round}: its node, gone: {gone}");
-        let after = run_shards_env(
-            &["exec"],
-            &["taker", "/bin/testguest", "vfio-dma", address],
-            &env,
-            TIMEOUT,
-        );
+        let after = run_shards_env(&["exec"], &["taker", "/bin/testguest", "vfio-dma", address], &env);
         assert_ne!(
             after.status,
             Some(0),
@@ -594,7 +593,7 @@ fn a_hosts_function_is_plugged_into_a_run_for_its_workload() {
                     "{run}: {dma}"
                 );
                 shards(&["unplug"], &["function", run, &cdev]);
-                let after = run_shards_env(&["exec"], &stat, &env, TIMEOUT).stdout;
+                let after = run_shards_env(&["exec"], &stat, &env).stdout;
                 assert!(after.contains(&format!("{node} missing")), "{run}: {after}");
                 let iommu = if made {
                     "/dev/iommu missing"

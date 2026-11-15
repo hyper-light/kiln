@@ -45,6 +45,10 @@ hyper-timing = "0.1.0"
 # on serde_json's preserve_order for every crate here (vendor/hyper-raft/UPSTREAM.md, change 1).
 hyper-quic = { version = "=0.1.0", default-features = false }
 hyper-transport = "=0.1.0"
+# The seal of a message that carries a secret over QUIC, AES-256-GCM (crates/hex-quic seal.rs; docs/design/hex-quic.md
+# Q13): the AWS-LC hyper-quic's TLS runs on, its version and features hyper-transport's, so no second copy, as kiln
+# links it (kiln crates/kiln/Cargo.toml).
+aws-lc-rs = { version = "1.18.2", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # A peer's key and its signing request, and the simulator CA that issues from one (crates/hex-quic enroll; Q6):
 # kiln's own version and features (kiln crates/kiln/Cargo.toml), so kiln vendoring Hex adds no second copy.
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
@@ -95,6 +99,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",

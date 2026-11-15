@@ -53,6 +53,10 @@ static ANSWERS: [Patience; KINDS] = [
     Patience::measuring("client.answer.schedule.forget"),
     // MEASURING until a waits census records the node's links (docs/design/hex-quic.md Q12).
     Patience::measuring("client.answer.links"),
+    // MEASURING until a waits census records a connection's lessors (docs/design/credential-grants.md C7).
+    Patience::measuring("client.answer.lessors"),
+    // MEASURING until a waits census records a keeper's word to its node (the review's A-10).
+    Patience::measuring("client.answer.reserved"),
 ];
 
 /// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`,
@@ -168,30 +172,54 @@ impl Transport for Socket {
         let Reading {
             buf, deframer, fds, ..
         } = reading;
-        let mut input = buf.get(..msg.bytes).unwrap_or_default();
-        while !input.is_empty() {
-            let (took, whole) = deframer.take(input).map_err(|fault| {
-                Refusal::Broken(format!("the node agent's stream can't be read: {fault}"))
-            })?;
-            input = input.get(took..).unwrap_or_default();
-            let Some(message) = whole else { continue };
-            let these = std::mem::take(fds);
-            let received = Received {
-                bytes: &message,
-                size: message.len(),
-                descriptors: these.len(),
-                descriptors_cut: false,
-            };
-            take(&received, these)?;
+        let framed: Result<(), Refusal> = 'framed: {
+            let mut input = buf.get(..msg.bytes).unwrap_or_default();
+            while !input.is_empty() {
+                let (took, whole) = match deframer.take(input) {
+                    Ok(taken) => taken,
+                    Err(fault) => {
+                        break 'framed Err(Refusal::Broken(format!(
+                            "the node agent's stream can't be read: {fault}"
+                        )));
+                    }
+                };
+                input = input.get(took..).unwrap_or_default();
+                let Some(mut message) = whole else { continue };
+                let these = std::mem::take(fds);
+                let received = Received {
+                    bytes: &message,
+                    size: message.len(),
+                    descriptors: these.len(),
+                    descriptors_cut: false,
+                };
+                let taken = take(&received, these);
+                // A sign-in's tokens cross in the message the core reads alone (docs/design/credential-grants.md C8).
+                if wire::carries_secret(&message) {
+                    hex_api::lease::wipe(&mut message);
+                }
+                if let Err(why) = taken {
+                    break 'framed Err(why);
+                }
+            }
+            Ok(())
+        };
+        // Framed into the messages handed on, or refused: what was read here wiped either way (the review's E-6).
+        if let Some(held) = buf.get_mut(..msg.bytes) {
+            hex_api::lease::wipe_in_place(held);
         }
-        Ok(true)
+        framed.map(|()| true)
     }
 
-    fn frame(message: Vec<u8>) -> Result<Vec<u8>, Refusal> {
-        stream::frame(&message, wire::MAX_MESSAGE).map_err(|fault| Refusal::Invalid {
+    fn frame(mut message: Vec<u8>) -> Result<Vec<u8>, Refusal> {
+        let framed = stream::frame(&message, wire::MAX_MESSAGE).map_err(|fault| Refusal::Invalid {
             what: "message",
             why: fault.to_string(),
-        })
+        });
+        // A lease's value crosses in its framed copy alone (docs/design/credential-grants.md C7).
+        if wire::carries_secret(&message) {
+            hex_api::lease::wipe(&mut message);
+        }
+        framed
     }
 
     /// What the socket takes of the frame now: its first write with the descriptors lent, at its first byte.

@@ -218,10 +218,12 @@ impl Spawn {
 }
 
 /// The single parent-side execution gate. Its byte is sent only after the existing native owner
-/// holds the child and the canonical identity is durable. Closing it cancels before execve.
+/// holds the child and the canonical identity is durable. Closing it cancels before execve. Its
+/// deadline is its create's, none where the create follows its guest (the review's C-9): its waits
+/// then end at the peer's byte or EOF, each end's process closing its socket as it ends.
 pub struct HeldGate {
     socket: OwnedFd,
-    deadline: libc::timespec,
+    deadline: Option<libc::timespec>,
 }
 
 impl HeldGate {
@@ -262,7 +264,7 @@ struct HeldStart<'a> {
     envp: &'a [*const c_char],
     reader: RawFd,
     report: Option<RawFd>,
-    deadline: libc::timespec,
+    deadline: Option<libc::timespec>,
 }
 
 impl HeldChild {
@@ -284,12 +286,12 @@ pub fn spawn_held(
     procs: BorrowedFd<'_>,
     spawn: Spawn,
     report: Option<OwnedFd>,
-    gate_budget: Duration,
+    gate_budget: Option<Duration>,
 ) -> std::io::Result<HeldChild> {
     if report.as_ref().is_some_and(|fd| fd.as_raw_fd() < 3) {
         return Err(rustix::io::Errno::BADF.into());
     }
-    let deadline = held_deadline(gate_budget)?;
+    let deadline = gate_budget.map(held_deadline).transpose()?;
     let argv = held_pointers(&spawn.argv)?;
     let envp = held_pointers(&spawn.envp)?;
     let (reader, writer) = rustix::net::socketpair(
@@ -505,25 +507,33 @@ fn held_ready(reader: RawFd) -> rustix::io::Result<()> {
     }
 }
 
-fn held_wait(reader: RawFd, deadline: libc::timespec, expected: u8) -> rustix::io::Result<()> {
+fn held_wait(
+    reader: RawFd,
+    deadline: Option<libc::timespec>,
+    expected: u8,
+) -> rustix::io::Result<()> {
     held_receive(reader, deadline, expected, false)
 }
 
 fn held_receive(
     reader: RawFd,
-    deadline: libc::timespec,
+    deadline: Option<libc::timespec>,
     expected: u8,
     peek: bool,
 ) -> rustix::io::Result<()> {
-    let remaining = held_remaining(deadline)?;
+    let remaining = deadline.map(held_remaining).transpose()?;
     let mut fd = libc::pollfd {
         fd: reader,
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: one live pollfd and a valid finite relative timespec; no signal-mask change. Every
-    // signal was blocked before clone, so an interrupted wait is cancellation rather than a retry.
-    let ready = unsafe { libc::ppoll(&mut fd, 1, &remaining, std::ptr::null()) };
+    let timeout = remaining
+        .as_ref()
+        .map_or(std::ptr::null(), std::ptr::from_ref);
+    // SAFETY: one live pollfd and a valid finite relative timespec, or none (null) for a gate with no
+    // deadline, whose wait then ends at the peer's byte or EOF; no signal-mask change. Every signal was
+    // blocked before clone, so an interrupted wait is cancellation rather than a retry.
+    let ready = unsafe { libc::ppoll(&mut fd, 1, timeout, std::ptr::null()) };
     if ready != 1 {
         return Err(if ready == 0 {
             rustix::io::Errno::TIMEDOUT
@@ -531,7 +541,9 @@ fn held_receive(
             held_errno()
         });
     }
-    held_remaining(deadline)?;
+    if let Some(deadline) = deadline {
+        held_remaining(deadline)?;
+    }
     let mut byte = 0u8;
     // SAFETY: a single stack byte is writable; this is the retained gate reader. DONTWAIT bounds
     // the read even on an unexpected readiness transition; EOF or any other byte cancels.
@@ -835,7 +847,7 @@ mod tests {
         .unwrap();
         let gate = HeldGate {
             socket: parent,
-            deadline: held_deadline(Duration::from_secs(1)).unwrap(),
+            deadline: Some(held_deadline(Duration::from_secs(1)).unwrap()),
         };
         assert_eq!(
             rustix::net::send(&child, &[2], rustix::net::SendFlags::DONTWAIT).unwrap(),
@@ -870,14 +882,14 @@ mod tests {
             .unwrap();
             let gate = HeldGate {
                 socket: parent,
-                deadline: if mode == 2 {
+                deadline: Some(if mode == 2 {
                     libc::timespec {
                         tv_sec: 0,
                         tv_nsec: 0,
                     }
                 } else {
                     held_deadline(Duration::from_secs(1)).unwrap()
-                },
+                }),
             };
             if mode == 0 {
                 rustix::net::send(&child, &[3], rustix::net::SendFlags::DONTWAIT).unwrap();
@@ -907,7 +919,60 @@ mod tests {
         }
     }
 
-    /// AC-T7.4.1: the launch gate is finite, uses the caller's budget and never wraps a timespec.
+    /// The review's C-9 (decision 9; Ada's approval of 2026-11-14): a launch whose create follows its guest has a gate
+    /// with no deadline, its waits ended by the peer's byte or its end, EOF from either end cancelling it at once. Do:
+    /// release a gate with none after its child's isolation byte; release one whose child's end closed before its byte;
+    /// and wait, as the child does, for the authorization of a gate whose parent's end closed. Expect the first
+    /// released, the authorization byte sent; the second and third cancelled at once, nothing sent.
+    #[test]
+    fn c9_a_gate_with_no_deadline_waits_for_its_peers_byte_or_its_end() {
+        let pair = || {
+            rustix::net::socketpair(
+                rustix::net::AddressFamily::UNIX,
+                rustix::net::SocketType::STREAM,
+                rustix::net::SocketFlags::CLOEXEC,
+                None,
+            )
+            .unwrap()
+        };
+        let (parent, child) = pair();
+        let gate = HeldGate {
+            socket: parent,
+            deadline: None,
+        };
+        assert_eq!(
+            rustix::net::send(&child, &[2], rustix::net::SendFlags::DONTWAIT).unwrap(),
+            1
+        );
+        gate.release().unwrap();
+        let mut byte = [0u8];
+        assert_eq!(
+            rustix::net::recv(&child, &mut byte, rustix::net::RecvFlags::DONTWAIT).unwrap(),
+            (1, 1)
+        );
+        assert_eq!(byte, [1]);
+        let (parent, child) = pair();
+        let gate = HeldGate {
+            socket: parent,
+            deadline: None,
+        };
+        drop(child);
+        let ended = gate.release().unwrap_err();
+        assert_eq!(
+            ended.raw_os_error(),
+            Some(rustix::io::Errno::CANCELED.raw_os_error())
+        );
+        // The child's side: its wait for byte 1 on its reader, the parent's end closed first.
+        let (parent, child) = pair();
+        drop(parent);
+        assert_eq!(
+            held_wait(child.as_raw_fd(), None, 1),
+            Err(rustix::io::Errno::CANCELED)
+        );
+    }
+
+    /// AC-T7.4.1: the launch gate's deadline, where its create has one, uses the caller's budget and never wraps a
+    /// timespec.
     #[test]
     fn a_held_launch_carries_one_finite_deadline_across_the_handshake() {
         let now = rustix::time::Timespec {

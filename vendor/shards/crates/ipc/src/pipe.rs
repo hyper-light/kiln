@@ -33,12 +33,12 @@ use windows_sys::Win32::Foundation::{
     DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING,
     ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
     ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-    LocalFree, STATUS_PENDING, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    LocalFree, STATUS_PENDING, SetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows_sys::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+use windows_sys::Win32::Security::Cryptography::ProcessPrng;
 use windows_sys::Win32::Security::{
     GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
@@ -48,29 +48,24 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeInfo, NMPWAIT_WAIT_FOREVER,
-    PIPE_READMODE_BYTE, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE,
-    PIPE_WAIT, PeekNamedPipe, SetNamedPipeHandleState, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, CreatePipe, DisconnectNamedPipe, GetNamedPipeInfo,
+    NMPWAIT_WAIT_FOREVER, PIPE_READMODE_BYTE, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE, PIPE_WAIT, PeekNamedPipe, SetNamedPipeHandleState, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, INFINITE, OpenProcessToken, ResetEvent, SetEvent,
     WaitForMultipleObjects, WaitForSingleObject,
 };
 
-use crate::{MAX_FDS, MAX_PAYLOAD};
+use crate::{MAX_FDS, MAX_PAYLOAD, Window};
 
 mod poll;
 pub use poll::{ExitWatch, Poller};
 
-/// What each direction of a pipe of shards' holds before a writer waits: M340's larger
-/// buffer, at which its throughput was the more even (64 KiB moved 3.3 to 13.4 GB/s, 1 MiB
-/// 4.1 to 15.1). The pipe takes these as quotas, not allocations (CreateNamedPipeW).
-pub(crate) const BUFFER: u32 = 1 << 20;
-
-/// What each direction of a slot's line holds (D185): a FIFO's capacity on Linux (pipe(7):
-/// 16 pages, 65,536 bytes), so that an answer its client does not take holds its daemon as
-/// it does there (PM M261). M340's 64 KiB moved 3.3 GB/s at least, past any answer's need.
-pub(crate) const LINE_BUFFER: u32 = 64 << 10;
+/// The longest message a [`Stream`] carries ([`send`]): its header, the most payload a
+/// message may carry, and a value for each of the most handles one gives. Its pairs' window
+/// ([`Window`], platform-11).
+const MESSAGE_FRAME: usize = HEADER + MAX_PAYLOAD + MAX_FDS * std::mem::size_of::<u64>();
 
 /// `code`, a Win32 error, as an `io::Error`.
 pub(crate) fn error(code: u32) -> io::Error {
@@ -282,6 +277,98 @@ pub(crate) fn write_from(
     })
 }
 
+/// Writes from `buf` to `handle` with [`call`], waiting on nothing but the write: `pended`
+/// is told, as the write begins to wait, where it could not finish at once (ERROR_IO_PENDING).
+/// A named pipe's write finishes at once where its pipe holds it whole, or hands it to a read
+/// its reader has pending; one it cannot pends until its reader has taken enough of what the
+/// pipe holds for it to (npfs: a write is charged what its quota has free, and completes once
+/// all of it is, `NpAddDataQueueEntry`, `NpCompleteStalledWrites`). So its pend is its reader's
+/// to end: what a slot's answer is waited on its client for (D185's takes, `slots::named`).
+pub(crate) fn write_telling(handle: HANDLE, buf: &[u8], pended: impl FnOnce()) -> Called {
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    let at = buf.as_ptr();
+    let mut pended = Some(pended);
+    call(handle, &[], None, |ov| {
+        // SAFETY: as `read_into`'s.
+        let started = unsafe { WriteFile(handle, at, len, std::ptr::null_mut(), ov) };
+        if started == 0 {
+            // SAFETY: no arguments.
+            let code = unsafe { GetLastError() };
+            if code == ERROR_IO_PENDING
+                && let Some(pended) = pended.take()
+            {
+                pended();
+            }
+            // What `call` reads of its start is the start's own error, whatever `pended` did.
+            // SAFETY: no arguments but the code.
+            unsafe { SetLastError(code) };
+        }
+        started
+    })
+}
+
+/// Whether the pipe whose end is `handle` is connected still: its local information's
+/// `NamedPipeState` (NtQueryInformationFile's `FilePipeLocalInformation`), which turns from
+/// `FILE_PIPE_CONNECTED_STATE` as its other end closes (npfs keeps one state for both ends:
+/// ReactOS's `NpSetClosingPipeState`). A write that pended on its reader and then finished
+/// may have finished as that reader went: Windows completes it so, its data dropped, and fails
+/// the next with ERROR_NO_DATA (Windows 11 build 26200, PM M553), so its finish is a take only
+/// where this says connected after it.
+pub(crate) fn connected_now(handle: HANDLE) -> io::Result<bool> {
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_PIPE_CONNECTED_STATE, FILE_PIPE_LOCAL_INFORMATION, FilePipeLocalInformation,
+        NtQueryInformationFile,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    let mut info = FILE_PIPE_LOCAL_INFORMATION::default();
+    // SAFETY: an IO_STATUS_BLOCK is plain data (a status or pointer, and a count), which the
+    // call fills; zero is a valid one.
+    let mut status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(size_of::<FILE_PIPE_LOCAL_INFORMATION>())
+        .map_err(|_| io::Error::other("a pipe's local information past a u32"))?;
+    // SAFETY: a pipe's end this process holds, and a FILE_PIPE_LOCAL_INFORMATION and an
+    // IO_STATUS_BLOCK of ours for the call to fill, of their own sizes.
+    let got = unsafe {
+        NtQueryInformationFile(
+            handle,
+            &raw mut status,
+            (&raw mut info).cast(),
+            size,
+            FilePipeLocalInformation,
+        )
+    };
+    if got < 0 {
+        // SAFETY: no pointers; an NTSTATUS as Win32 says it.
+        let e = error(unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(got) });
+        // A pipe its other end has left may say so by failing the query too.
+        return if ended(&e) { Ok(false) } else { Err(e) };
+    }
+    Ok(info.NamedPipeState == FILE_PIPE_CONNECTED_STATE)
+}
+
+/// What the pipe whose end is `handle` holds of that end's writes before one waits on its
+/// reader: its outbound quota, the buffer its instance was made with (GetNamedPipeInfo's out
+/// buffer size: the system's default for a slot's line, `Window::System`); none where it says
+/// none.
+pub(crate) fn outbound_quota(handle: HANDLE) -> io::Result<u32> {
+    let mut quota = 0u32;
+    // SAFETY: a pipe's end this process holds, and one size for the call to fill; its flags,
+    // its in buffer and its instances are not asked for.
+    if unsafe {
+        GetNamedPipeInfo(
+            handle,
+            std::ptr::null_mut(),
+            &raw mut quota,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(quota)
+}
+
 /// Waits for a client to open the instance `server`, or for `cancel`: `Ok(true)` once one
 /// has, a client gone again since among them; `Ok(false)` for the cancel.
 pub(crate) fn connected(server: HANDLE, cancels: &[&Event]) -> io::Result<bool> {
@@ -373,10 +460,14 @@ pub(crate) fn attributes() -> io::Result<SECURITY_ATTRIBUTES> {
 
 /// [`crate::create_private`] on Windows: a new file at `path` made with the DACL
 /// [`attributes`] gives, this process's user's alone, protected from what its directory
-/// would give it; shared with no other open while this one is (share mode 0).
+/// would give it. While this open holds it, another of its user's may read it, as a reader
+/// opens a file on Unix that its writer holds (a run's managed-output record, held for the
+/// run's life, is how its owner finds the run: share mode 0 refused that read,
+/// ERROR_SHARING_VIOLATION); none may write, rename or delete it (no FILE_SHARE_WRITE or
+/// FILE_SHARE_DELETE).
 pub(crate) fn create_private(path: &std::path::Path) -> io::Result<std::fs::File> {
     use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ};
     let attributes = attributes()?;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     // SAFETY: a NUL-terminated path, and attributes whose descriptor lives as long as the
@@ -385,7 +476,7 @@ pub(crate) fn create_private(path: &std::path::Path) -> io::Result<std::fs::File
         CreateFileW(
             wide.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
-            0,
+            FILE_SHARE_READ,
             &raw const attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL,
@@ -448,22 +539,46 @@ fn user_sid() -> io::Result<String> {
     Ok(sid)
 }
 
-/// `n` random bytes from the system's generator, as hex.
+/// ProcessPrng said FALSE, which Microsoft documents it never does: no bytes are taken as
+/// random.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RandomFailed;
+
+impl std::fmt::Display for RandomFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProcessPrng failed")
+    }
+}
+
+impl std::error::Error for RandomFailed {}
+
+impl From<RandomFailed> for io::Error {
+    fn from(e: RandomFailed) -> Self {
+        io::Error::other(e)
+    }
+}
+
+/// `buf` filled from the system's generator, for every random byte shards' Windows code
+/// takes (D195): ProcessPrng, bcryptprimitives.dll's per-process generator, which Microsoft
+/// documents as always returning TRUE
+/// (https://learn.microsoft.com/en-us/windows/win32/seccng/processprng) and from which Rust's
+/// std fills its own (rust-lang/rust 1.98.1, library/std/src/sys/random/windows.rs, bound in
+/// sys/pal/windows/c.rs as raw-dylib of bcryptprimitives). Not BCryptGenRandom: that is
+/// bcrypt.dll's, which Windows Nano Server does not carry.
+pub fn fill_random(buf: &mut [u8]) -> Result<(), RandomFailed> {
+    // SAFETY: ProcessPrng writes `buf.len()` bytes into `buf`, a buffer of ours of that length.
+    let filled = unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) };
+    if filled == 0 {
+        return Err(RandomFailed);
+    }
+    Ok(())
+}
+
+/// `n` random bytes from the system's generator ([`fill_random`]), as hex: a name nobody can
+/// guess and take first.
 pub(crate) fn random_hex(n: usize) -> io::Result<String> {
     let mut bytes = vec![0u8; n];
-    let len = u32::try_from(n).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: `len` bytes for the call to fill, with the system's preferred generator.
-    let status = unsafe {
-        BCryptGenRandom(
-            std::ptr::null_mut(),
-            bytes.as_mut_ptr(),
-            len,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::other(format!("BCryptGenRandom: {status:#x}")));
-    }
+    fill_random(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -474,7 +589,7 @@ pub(crate) fn wide(name: &str) -> Vec<u16> {
 
 /// A new instance of the pipe `name`, duplex and overlapped, refusing remote clients, of
 /// this user's alone ([`attributes`]); its name's first instance where `first`, its only
-/// where `only`; `buffer` bytes each way. In bytes; or with `messages` written in messages,
+/// where `only`; its quota each way its caller's `window` ([`Window`]). In bytes; or with `messages` written in messages,
 /// where a message of no bytes reaches its reader, which a writer says the end of its
 /// writes with: Docker's engine makes its pipe so, "so that CloseWrite() is supported"
 /// (moby `daemon/listeners/listeners_windows.go`), and go-winio, its clients', says a
@@ -486,9 +601,13 @@ pub(crate) fn instance(
     name: &[u16],
     first: bool,
     only: bool,
-    buffer: u32,
+    window: Window,
     messages: bool,
 ) -> io::Result<OwnedHandle> {
+    let quota = match window.frame_bytes() {
+        Some(bytes) => bytes,
+        None => system_quota()?,
+    };
     let attributes = attributes()?;
     let first = if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
     let mode = if messages {
@@ -507,8 +626,8 @@ pub(crate) fn instance(
             } else {
                 windows_sys::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES
             },
-            buffer,
-            buffer,
+            quota,
+            quota,
             0,
             &raw const attributes,
         )
@@ -518,6 +637,31 @@ pub(crate) fn instance(
     }
     // SAFETY: the instance just made, which nothing else owns.
     Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+/// The quota the system gives a pipe asked for none ([`Window::System`]): what an anonymous
+/// pipe made with CreatePipe's `nSize` of zero says its write end holds (GetNamedPipeInfo),
+/// read once a process. Failing, what failed, each time it is asked.
+pub(crate) fn system_quota() -> io::Result<u32> {
+    static QUOTA: OnceLock<Result<u32, String>> = OnceLock::new();
+    QUOTA
+        .get_or_init(|| {
+            let (mut read, mut write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+            // SAFETY: two handles for the call to fill, the default security, the system's size.
+            if unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 0) } == 0 {
+                return Err(format!("CreatePipe: {}", io::Error::last_os_error()));
+            }
+            // SAFETY: the two handles just made, which nothing else owns.
+            let (_read, write) = unsafe {
+                (
+                    OwnedHandle::from_raw_handle(read),
+                    OwnedHandle::from_raw_handle(write),
+                )
+            };
+            outbound_quota(write.as_raw_handle()).map_err(|e| format!("GetNamedPipeInfo: {e}"))
+        })
+        .clone()
+        .map_err(|why| io::Error::other(format!("the system's pipe quota: {why}")))
 }
 
 /// Opens the pipe `name` as its client, read and write, `overlapped` or not: its server
@@ -593,8 +737,16 @@ fn more_data(e: &io::Error) -> bool {
 
 /// A connected pair of ends, each overlapped: a fresh name's only instance, and the client
 /// end opened at once, which no other process can then open (M340); written in `messages`
-/// where each end says the end of its writes ([`instance`]).
-pub(crate) fn pair(buffer: u32, messages: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+/// where each end says the end of its writes ([`instance`]); its quota its caller's `window`.
+pub(crate) fn pair(window: Window, messages: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    pair_with_client(window, messages, true)
+}
+
+fn pair_with_client(
+    window: Window,
+    messages: bool,
+    overlapped: bool,
+) -> io::Result<(OwnedHandle, OwnedHandle)> {
     static MADE: AtomicU64 = AtomicU64::new(0);
     let name = wide(&format!(
         r"\\.\pipe\shards-{}-{}-{}",
@@ -602,8 +754,8 @@ pub(crate) fn pair(buffer: u32, messages: bool) -> io::Result<(OwnedHandle, Owne
         MADE.fetch_add(1, Ordering::Relaxed),
         random_hex(8)?
     ));
-    let server = instance(&name, true, true, buffer, messages)?;
-    let client = open(&name, true)?;
+    let server = instance(&name, true, true, window, messages)?;
+    let client = open(&name, overlapped)?;
     if messages {
         read_in_messages(&client)?;
     }
@@ -613,12 +765,33 @@ pub(crate) fn pair(buffer: u32, messages: bool) -> io::Result<(OwnedHandle, Owne
     Ok((server, client))
 }
 
+/// The reader uses the stream's overlapped cancellation; the PipeWriter's client handle
+/// is synchronous, as std's Write implementation requires. Bytes have no message framing.
+pub fn input_pair(room: u32) -> io::Result<(Stream, io::PipeWriter)> {
+    let window = Window::frame(usize::try_from(room).unwrap_or(usize::MAX))?;
+    let (server, client) = pair_with_client(window, false, false)?;
+    Ok((
+        Stream::of(server, Way::Plain, false)?,
+        io::PipeWriter::from(client),
+    ))
+}
+
+/// A child's output: a pipe of bytes, its read end overlapped, this process's, for a read
+/// that a wake ends ([`Pipe::read_unless`]); its write end not, as a child's standard output
+/// is written (std's Write, synchronous). Made as a [`Stream`]'s are (this user's alone, no
+/// remote client's, its name random), neither end inheritable; its quota the system's, as an
+/// anonymous pipe's (CreatePipe) is. A run host's answers and diagnostics (D231).
+pub fn output_pair() -> io::Result<(Pipe, io::PipeWriter)> {
+    let (server, client) = pair_with_client(Window::System, false, false)?;
+    Ok((Pipe(server), io::PipeWriter::from(client)))
+}
+
 /// A connected pair of a pipe's ends, of bytes alone and overlapped, made as a [`Stream`]'s
 /// are (this user's alone, no remote client's, its name random): a share's stream on
 /// Windows (D197), its server end its share process's and its other its VM's, each a
-/// `platform::PipeStream` there.
-pub fn byte_pair() -> io::Result<(OwnedHandle, OwnedHandle)> {
-    pair(BUFFER, false)
+/// `platform::PipeStream` there; its quota its caller's `window`, a share's longest frame.
+pub fn byte_pair(window: Window) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    pair(window, false)
 }
 
 /// One end of an overlapped pipe, read and written by several threads at once, each call
@@ -651,6 +824,21 @@ impl Pipe {
             Called::Done(Err(e)) if ended(&e) => Called::Done(Ok(0)),
             called => called,
         }
+    }
+
+    /// A read into `buf` that `wake` ends: what it read, `Some(0)` at the end of its
+    /// writers; `None` where `wake` was set first and it read nothing.
+    pub fn read_unless(&self, buf: &mut [u8], wake: &Event) -> io::Result<Option<usize>> {
+        match self.read_within(buf, &[wake], None) {
+            Called::Done(done) => done.map(Some),
+            Called::Cancelled | Called::Late => Ok(None),
+        }
+    }
+
+    /// The bytes it holds to read now, without taking them (PeekNamedPipe): 0 once its
+    /// writers have gone and it holds none.
+    pub fn held(&self) -> io::Result<usize> {
+        Ok(available(self.raw(), None)?.map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)))
     }
 
     /// All of `buf` written, or the error that cut it short; waiting no longer than `cancels`
@@ -801,7 +989,8 @@ impl Stream {
 
     /// A connected pair, both ends this process's ([`pair`]).
     pub fn pair() -> io::Result<(Stream, Stream)> {
-        let (server, client) = pair(BUFFER, false)?;
+        let window = Window::frame(MESSAGE_FRAME)?;
+        let (server, client) = pair(window, false)?;
         let queues = Arc::new(Queues::default());
         Ok((
             Stream::of(
@@ -835,7 +1024,8 @@ impl Stream {
     /// socket's half-close does: one end for this process, the other's handle
     /// ([`Stream::share`]) to give a child, which takes it as [`Stream::given`].
     pub fn plain_pair() -> io::Result<(Stream, Stream)> {
-        let (server, client) = pair(BUFFER, true)?;
+        // Bytes as its programs write them: no frame of its own.
+        let (server, client) = pair(Window::System, true)?;
         Ok((
             Stream::of(server, Way::Plain, true)?,
             Stream::of(client, Way::Plain, true)?,
@@ -1246,7 +1436,8 @@ impl std::fmt::Debug for Waiting {
 
 impl Waiting {
     fn begin(name: &[u16], first: bool, event: &Event) -> io::Result<Waiting> {
-        let instance = instance(name, first, false, BUFFER, true)?;
+        // A Docker client's HTTP: bytes with no frame of shards'.
+        let instance = instance(name, first, false, Window::System, true)?;
         let mut overlapped = Box::new(OVERLAPPED::default());
         let connected = Waiting::connect(&instance, &mut overlapped, event)?;
         Ok(Waiting {
@@ -1827,6 +2018,18 @@ pub fn end(sock: &Stream) {
     let _ = sock.shutdown(Shutdown::Both);
 }
 
+/// Whether `sock` has hung up, asked at once: its peer gone, the pipe's other end closed
+/// (PeekNamedPipe's ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED or ERROR_NO_DATA), or this
+/// end ended both ways ([`end`]). A peer that ended only its writes, a message of no bytes,
+/// has not hung it up, the pipe connected still: so what a read's end was (D251).
+pub fn hung_up(sock: &Stream) -> io::Result<bool> {
+    let guard = sock.0.pipe.read().unwrap_or_else(PoisonError::into_inner);
+    match &*guard {
+        Some(handle) => Ok(available(handle.as_raw_handle(), None)?.is_none()),
+        None => Ok(true),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -2022,15 +2225,44 @@ mod tests {
         format!(r"\\.\pipe{}", String::from_utf16_lossy(name))
     }
 
+    /// A pipe's quota is its caller's window as made (platform-11): a [`Stream`] pair's holds
+    /// its longest message whole, a 16-byte frame's no such thing, and one of bytes alone is
+    /// the system's, none of shards'.
+    #[test]
+    fn a_pipes_quota_is_its_callers_window_as_made() {
+        let (stream, _peer) = Stream::pair().unwrap();
+        let held = stream
+            .0
+            .pipe
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|h| outbound_quota(h.as_raw_handle()));
+        let held = held.unwrap().unwrap() as usize;
+        assert!(held >= MESSAGE_FRAME, "{held} of a {MESSAGE_FRAME}-byte message");
+        let (small, _peer) = pair(Window::frame(16).unwrap(), false).unwrap();
+        let small = outbound_quota(small.as_raw_handle()).unwrap() as usize;
+        assert!((16..MESSAGE_FRAME).contains(&small), "{small}");
+        let (system, _peer) = pair(Window::System, false).unwrap();
+        assert_eq!(
+            outbound_quota(system.as_raw_handle()).unwrap(),
+            system_quota().unwrap()
+        );
+        assert!(
+            system_quota().unwrap() > 0,
+            "an anonymous pipe of the system's holds nothing"
+        );
+    }
+
     /// A pair's name is its one instance's: no other can be made under it, as a process that
     /// learned it might, to be opened in its place (M340).
     #[test]
     fn a_pairs_name_takes_no_second_instance() {
-        let (server, _client) = pair(BUFFER, false).unwrap();
+        let (server, _client) = pair(Window::System, false).unwrap();
         let name = pipe_name(&server);
         assert!(name.contains(r"\shards-"), "{name}");
         assert!(
-            instance(&wide(&name), false, false, BUFFER, false).is_err(),
+            instance(&wide(&name), false, false, Window::System, false).is_err(),
             "a second instance made of {name}"
         );
     }
@@ -2048,7 +2280,7 @@ mod tests {
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, PSECURITY_DESCRIPTOR, PSID,
         };
-        let (server, _client) = pair(BUFFER, false).unwrap();
+        let (server, _client) = pair(Window::System, false).unwrap();
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: a handle `server` holds, which may read its DACL, and pointers for the call
@@ -2311,7 +2543,7 @@ mod tests {
     #[test]
     fn an_instance_peeks_as_listening_until_opened() {
         let name = fresh("peek");
-        let server = instance(&name, true, false, BUFFER, false).unwrap();
+        let server = instance(&name, true, false, Window::System, false).unwrap();
         let e = available(server.as_raw_handle(), None).unwrap_err();
         assert_eq!(code(&e), ERROR_BAD_PIPE);
         let client = open(&name, true).unwrap();
@@ -2330,7 +2562,7 @@ mod tests {
         let waited = |ms| unsafe { WaitNamedPipeW(name.as_ptr(), ms) };
         assert_eq!(waited(1000), 0);
         assert_eq!(code(&io::Error::last_os_error()), ERROR_FILE_NOT_FOUND);
-        let first = instance(&name, true, false, BUFFER, false).unwrap();
+        let first = instance(&name, true, false, Window::System, false).unwrap();
         let _taken = open(&name, true).unwrap();
         let t0 = Instant::now();
         assert_eq!(waited(50), 0);
@@ -2342,7 +2574,7 @@ mod tests {
                 (waited(10_000), t0.elapsed())
             });
             std::thread::sleep(Duration::from_millis(100));
-            let _second = instance(&name, false, false, BUFFER, false).unwrap();
+            let _second = instance(&name, false, false, Window::System, false).unwrap();
             let (got, took) = waiting.join().unwrap();
             assert_ne!(got, 0);
             assert!(
@@ -2358,7 +2590,7 @@ mod tests {
     #[test]
     fn a_wait_ends_as_the_last_instance_closes() {
         let name = fresh("gone");
-        let server = instance(&name, true, false, BUFFER, false).unwrap();
+        let server = instance(&name, true, false, Window::System, false).unwrap();
         let _taken = open(&name, true).unwrap();
         std::thread::scope(|s| {
             let waiting = s.spawn(|| {
@@ -2441,5 +2673,28 @@ mod tests {
         });
         event.reset();
         assert!(!event.is_set());
+    }
+
+    /// Names from ProcessPrng are lowercase hex of twice their bytes, and none repeats: a
+    /// squatter cannot take one first by guessing it.
+    #[test]
+    fn random_names_are_distinct_hex_of_their_length() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4096 {
+            let name = random_hex(16).unwrap();
+            assert_eq!(name.len(), 32, "{name}");
+            assert!(
+                name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{name}"
+            );
+            assert!(seen.insert(name));
+        }
+        assert_eq!(random_hex(0).unwrap(), "");
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        fill_random(&mut a).unwrap();
+        fill_random(&mut b).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, [0u8; 64]);
     }
 }

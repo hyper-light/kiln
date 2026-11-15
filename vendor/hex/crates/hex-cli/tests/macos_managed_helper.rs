@@ -78,8 +78,9 @@ struct Lab {
 }
 
 impl Lab {
-    /// `rpc` bounds each helper request (the node's configured control patience).
-    fn new(rpc: Duration) -> Self {
+    /// A node and its managed helper, whose requests carry their caller's deadline where it has one and otherwise follow
+    /// the helper (the review's C-9: no control patience).
+    fn new() -> Self {
         let dir = tempfile::Builder::new().prefix("mh-").tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         for name in ["helper", "cache", "home", "state"] {
@@ -113,7 +114,6 @@ impl Lab {
                 PathBuf::from(env!("CARGO_BIN_EXE_hex")),
                 helper.join("helper.sock"),
                 helper.join("helper.receipt"),
-                rpc,
             )
             .unwrap(),
         )
@@ -195,7 +195,7 @@ impl Lab {
                     stderr,
                     gpu_report: None,
                 },
-                PATIENCE,
+                Some(PATIENCE),
             )
         })
     }
@@ -285,7 +285,7 @@ fn wait_for(what: &str, mut fact: impl FnMut() -> bool) {
 /// controller, its descendant and the helper are gone, and the helper's endpoint with them.
 #[test]
 fn a_completed_scope_leaves_no_descendant_and_closes_its_helper() {
-    let lab = Lab::new(PATIENCE);
+    let lab = Lab::new();
     let id = BoxId::new("completed").unwrap();
     let receipt = lab.launch(&id).expect("managed launch through the helper");
     let identity = receipt.identity().unwrap().clone();
@@ -315,7 +315,7 @@ fn a_completed_scope_leaves_no_descendant_and_closes_its_helper() {
 /// closed: ended, reaped and its endpoint gone.
 #[test]
 fn a_refused_start_is_cleaned_up_and_closes_its_helper() {
-    let lab = Lab::new(PATIENCE);
+    let lab = Lab::new();
     let id = BoxId::new("refused").unwrap();
     std::fs::set_permissions(
         lab.path("controller"),
@@ -350,24 +350,29 @@ fn a_refused_start_is_cleaned_up_and_closes_its_helper() {
     assert!(!lab.path("helper/helper.sock").exists());
 }
 
-/// AC-T7.4.1 (timeout): with the helper stopped, a control request spends its whole bounded patience
-/// and is refused, typed; it neither claims an end nor loses the scope. Once the helper runs again,
-/// the canonical deletion ends the controller and its descendant and closes the helper.
+/// AC-T7.4.1 (timeout; the review's C-9): with the helper stopped, a control request with its caller's deadline
+/// returns at it with no end; it neither claims one nor loses the scope (one with none follows the helper, ended only by
+/// its answer or its connection's end). The caller's deadline is one answered request's time, measured here. Once the
+/// helper runs again, the canonical deletion ends the controller and its descendant and closes the helper.
 #[test]
 fn a_timed_out_request_keeps_the_scope_for_its_cleanup() {
-    // The node's configured control patience for this lab: long enough for a launch on this host,
-    // short enough that the timed-out request below ends the test well within PATIENCE.
-    let lab = Lab::new(Duration::from_secs(5));
+    let lab = Lab::new();
     let id = BoxId::new("timed-out").unwrap();
     let receipt = lab.launch(&id).expect("managed launch through the helper");
     let controller = i32::try_from(receipt.identity().unwrap().pid).unwrap();
     let descendant = lab.descendant(receipt.identity().unwrap().pid);
     let helper = lab.helper_pid();
     let born = birth(helper);
+    let asked = Instant::now();
+    receipt.terminal().expect("a running helper answers");
+    let deadline = asked.elapsed();
     signal(helper, born, rustix::process::Signal::STOP);
-    let refused = receipt.terminal();
+    let timed_out = receipt.wait_for(deadline);
     signal(helper, born, rustix::process::Signal::CONT);
-    assert!(refused.is_err(), "a stopped helper answered: {refused:?}");
+    assert!(
+        matches!(timed_out, Ok(None)),
+        "a stopped helper's request ended otherwise than at its caller's deadline: {timed_out:?}"
+    );
     assert!(
         alive(controller) && alive(descendant),
         "the timeout ended the scope"
@@ -386,7 +391,7 @@ fn a_timed_out_request_keeps_the_scope_for_its_cleanup() {
 /// scope's own UID (the privileged box-user helper's), the step this test names and doesn't take.
 #[test]
 fn a_killed_helper_ends_its_controllers_and_never_releases_their_scope() {
-    let lab = Lab::new(PATIENCE);
+    let lab = Lab::new();
     let id = BoxId::new("orphaned").unwrap();
     let receipt = lab.launch(&id).expect("managed launch through the helper");
     let identity = receipt.identity().unwrap().clone();

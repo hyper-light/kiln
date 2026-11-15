@@ -3,6 +3,85 @@
 //! No period, sampler, admission row or device ownership is introduced here.
 use std::time::{Duration, Instant};
 
+use hex_core::helper::managed::response::Estimate;
+
+/// The least rate, in thousandths of a CPU, the managed CPU control holds a scope at (joint plan step 14, C4; ROOT,
+/// 2026-11-13): its rate's unit, every rate of one up taken ([`Budget::new`] refuses none but none).
+pub(super) const LEAST_RATE: u64 = 1;
+
+/// How many of its last holds' stop responses the control's estimate reads (the review's A-14; ROOT, 2026-11-14): the
+/// fewest whose nearest-rank p99.9, the bar's tail (`hex-sim-constants.md`), is one of them rather than their slowest,
+/// decision 9's census rule (`SEEDABLE` in `bench/competitive/probes/waits_census.py`, held to it by a doc-truth test, as
+/// hex-sim's charge is). Fewer are cold, their slowest the estimate.
+pub(super) const SEEDABLE: usize = 1_000;
+
+/// A helper's last [`SEEDABLE`] holds' stop responses, every scope's control's estimate (the review's A-14; ROOT,
+/// 2026-11-14): their nearest-rank p99.9, cold while they are fewer. Once there are enough, one slow stop among them is
+/// never the estimate, and every stop leaves it [`SEEDABLE`] holds later: the slowest seen held one for good.
+#[derive(Debug)]
+pub(super) struct Responses {
+    /// In nanoseconds, in the order they came; once full, the next overwrites the oldest, at `next`.
+    ring: Vec<u64>,
+    next: usize,
+    /// The same, in order of size: the estimate is read off it by its rank.
+    sorted: Vec<u64>,
+}
+
+impl Responses {
+    /// None yet: room for [`SEEDABLE`] made now, so no hold allocates.
+    pub(super) fn new() -> Result<Self, std::collections::TryReserveError> {
+        let mut ring = Vec::new();
+        ring.try_reserve_exact(SEEDABLE)?;
+        let mut sorted = Vec::new();
+        sorted.try_reserve_exact(SEEDABLE)?;
+        Ok(Self {
+            ring,
+            next: 0,
+            sorted,
+        })
+    }
+
+    /// A hold's measured `response`, the oldest leaving once [`SEEDABLE`] are kept: the estimate after it. Refused for a
+    /// response of no time, as [`Budget::new`] refuses one.
+    pub(super) fn observe(&mut self, response: Duration) -> Result<Estimate, Failure> {
+        let nanos = u64::try_from(response.as_nanos()).map_err(|_| Failure::Arithmetic)?;
+        if nanos == 0 {
+            return Err(Failure::Envelope);
+        }
+        if self.ring.len() < SEEDABLE {
+            self.ring.push(nanos);
+        } else {
+            let oldest = self.ring.get_mut(self.next).ok_or(Failure::Transition)?;
+            // The order holds every response the ring does, the oldest among them.
+            let at = self
+                .sorted
+                .binary_search(oldest)
+                .map_err(|_| Failure::Transition)?;
+            self.sorted.remove(at);
+            *oldest = nanos;
+            self.next = self
+                .next
+                .checked_add(1)
+                .filter(|next| *next < SEEDABLE)
+                .unwrap_or(0);
+        }
+        let at = self.sorted.binary_search(&nanos).unwrap_or_else(|at| at);
+        self.sorted.insert(at, nanos);
+        self.estimate().ok_or(Failure::Transition)
+    }
+
+    /// Their nearest-rank p99.9, the ⌈0.999 n⌉-th fastest of n: the `n / SEEDABLE + 1`-th slowest, their slowest below
+    /// [`SEEDABLE`], cold, and their second slowest at it. None before the first.
+    pub(super) fn estimate(&self) -> Option<Estimate> {
+        let n = self.sorted.len();
+        let at = n.checked_sub(1)?.checked_sub(n.checked_div(SEEDABLE)?)?;
+        Some(Estimate {
+            response: Duration::from_nanos(*self.sorted.get(at)?),
+            cold: n < SEEDABLE,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Failure {
     Envelope,
@@ -14,7 +93,11 @@ pub(super) enum Failure {
 enum Mode {
     Prepared,
     Running,
-    Held,
+    /// `paid`: what its hold has paid for its scope's run past its stop, in milli-CPU nanoseconds, the burst as it was
+    /// held and any overshoot charged since ([`Budget::learn`]).
+    Held {
+        paid: i128,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,9 +177,10 @@ impl Control {
         self.budget.burst
     }
 
-    /// A hold's measured response (joint plan step 14, 2c): [`Budget::learn`].
-    pub(super) fn learn(&mut self, response: Duration) -> Result<(), Failure> {
-        self.budget.learn(response)
+    /// A hold's measured response and the estimate after it (joint plan step 14, 2c; the review's A-14):
+    /// [`Budget::learn`].
+    pub(super) fn learn(&mut self, response: Duration, estimate: Duration) -> Result<(), Failure> {
+        self.budget.learn(response, estimate)
     }
 
     /// When the scope's credit ran out (joint plan step 14, 2c; ROOT, 2026-11-13), off its last observation: its
@@ -110,7 +194,7 @@ impl Control {
     pub(super) fn permit(&mut self) -> Result<(), Failure> {
         match self.budget.mode {
             Mode::Prepared => Err(Failure::Transition),
-            Mode::Held => self.budget.resume(),
+            Mode::Held { .. } => self.budget.resume(),
             Mode::Running => Ok(()),
         }
     }
@@ -190,21 +274,23 @@ impl Budget {
         })
     }
 
-    /// A hold's measured response (joint plan step 14, 2c; ROOT, 2026-11-13): the control's is the slowest seen, only
-    /// rising, and its burst, the most a scope runs past its stop, the maximum over it. A hold under way paid the burst
-    /// before it, so what its scope ran past its stop beyond that is owed too: its credit tops up by the difference.
-    /// Refused for a response of no time, as [`Budget::new`] refuses one.
-    pub(super) fn learn(&mut self, response: Duration) -> Result<(), Failure> {
-        if response.is_zero() {
+    /// A hold's measured `response`, and the control's `estimate` after it (joint plan step 14, 2c; the review's A-14,
+    /// ROOT, 2026-11-14). What its scope ran past its stop, the maximum over the response, beyond what its hold paid is
+    /// its overshoot, which its credit is charged, so no stop's run is free whatever the estimate; and its burst, which
+    /// its next hold pays, becomes the maximum over the estimate, falling as it does. Refused for a response or an
+    /// estimate of no time, as [`Budget::new`] refuses one.
+    pub(super) fn learn(&mut self, response: Duration, estimate: Duration) -> Result<(), Failure> {
+        if response.is_zero() || estimate.is_zero() {
             return Err(Failure::Envelope);
         }
-        let burst = product(self.maximum, response)?;
-        if burst <= self.burst {
-            return Ok(());
-        }
-        if self.mode == Mode::Held {
-            let owed = burst.checked_sub(self.burst).ok_or(Failure::Arithmetic)?;
+        let ran = product(self.maximum, response)?;
+        let burst = product(self.maximum, estimate)?;
+        if let Mode::Held { paid } = self.mode
+            && ran > paid
+        {
+            let owed = ran.checked_sub(paid).ok_or(Failure::Arithmetic)?;
             self.credit = self.credit.checked_sub(owed).ok_or(Failure::Arithmetic)?;
+            self.mode = Mode::Held { paid: ran };
         }
         self.burst = burst;
         Ok(())
@@ -279,20 +365,20 @@ impl Budget {
     pub(super) fn held(&mut self) -> Result<(), Failure> {
         match self.mode {
             Mode::Prepared => return Err(Failure::Transition),
-            Mode::Held => return Ok(()),
+            Mode::Held { .. } => return Ok(()),
             Mode::Running => {}
         }
         self.credit = self
             .credit
             .checked_sub(self.burst)
             .ok_or(Failure::Arithmetic)?;
-        self.mode = Mode::Held;
+        self.mode = Mode::Held { paid: self.burst };
         Ok(())
     }
 
     /// Only full earned credit permits another pulse. Called before CONT/probing a held member.
     pub(super) fn resume(&mut self) -> Result<(), Failure> {
-        if self.mode != Mode::Held || self.credit < self.burst {
+        if !matches!(self.mode, Mode::Held { .. }) || self.credit < self.burst {
             return Err(Failure::Transition);
         }
         self.mode = Mode::Running;
@@ -302,13 +388,13 @@ impl Budget {
     pub(super) fn decision(&self) -> Result<Decision, Failure> {
         match self.mode {
             Mode::Prepared => Ok(Decision::Prepared),
-            Mode::Held if self.credit < self.burst => Ok(Decision::Hold(until(
+            Mode::Held { .. } if self.credit < self.burst => Ok(Decision::Hold(until(
                 self.burst
                     .checked_sub(self.credit)
                     .ok_or(Failure::Arithmetic)?,
                 self.rate,
             )?)),
-            Mode::Held | Mode::Running if self.credit > 0 => {
+            Mode::Held { .. } | Mode::Running if self.credit > 0 => {
                 let depletion = self
                     .maximum
                     .checked_sub(self.rate)
@@ -326,7 +412,7 @@ impl Budget {
                     .ok_or(Failure::Arithmetic)?,
                 self.rate,
             )?)),
-            Mode::Held => Err(Failure::Transition),
+            Mode::Held { .. } => Err(Failure::Transition),
         }
     }
 }
@@ -334,6 +420,18 @@ impl Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Joint plan step 14 (C4; ROOT, 2026-11-13; AC-T7.4.1): the control's least rate is its unit, a thousandth of a CPU.
+    /// Do make a control's budget at its least rate and at none. Expect the least taken and none refused.
+    #[test]
+    fn w14_the_controls_least_rate_is_its_unit() {
+        let response = Duration::from_millis(1);
+        assert!(Budget::new(LEAST_RATE, 4_000, response).is_ok());
+        assert_eq!(
+            Budget::new(LEAST_RATE - 1, 4_000, response).err(),
+            Some(Failure::Envelope)
+        );
+    }
 
     /// AC-T7.4.1: actual helper startup cannot run free before the first VMM pulse. A sibling uses
     /// its measured pre-prepare baseline rather than charging an unrelated historical lifetime.
@@ -458,40 +556,151 @@ mod tests {
         assert!(cycle(4000, 4000, Duration::from_nanos(10)).is_err());
     }
 
-    /// Joint plan step 14 (2c; ROOT, 2026-11-13): the control's response is learned from its holds, the slowest seen,
-    /// only rising (decision 9: no census row seeds it), and its burst, the most a scope runs past its stop, with it. Do
-    /// make a scope's budget at 1 CPU of 4 with a 10 ns response, then learn a hold's 20 ns response, then a 5 ns one,
-    /// then one of no time. Expect the burst 4 CPUs over 20 ns once the slower is learned, unchanged by the faster, and
-    /// the response of no time refused, the burst as it was.
+    /// The review's A-14 (ROOT, 2026-11-14; AC-T7.4.1): the control's estimate reads SEEDABLE holds, decision 9's
+    /// census rule: the fewest whose nearest-rank p99.9, the ⌈999 n / 1000⌉-th fastest of n, is one below their slowest.
+    /// Do read waits_census.py's SEEDABLE, and rank each count of holds up to it by that definition. Expect this
+    /// control's SEEDABLE, every count below it ranked its slowest, and SEEDABLE ranked one below.
     #[test]
-    fn the_control_learns_its_response_from_its_holds_the_slowest_seen() {
-        let mut budget = Budget::new(1000, 4000, Duration::from_nanos(10)).unwrap();
-        assert_eq!(budget.burst, 4000 * 10);
-        budget.learn(Duration::from_nanos(20)).unwrap();
-        assert_eq!(budget.burst, 4000 * 20);
-        budget.learn(Duration::from_nanos(5)).unwrap();
-        assert_eq!(budget.burst, 4000 * 20, "only rising");
-        assert_eq!(budget.learn(Duration::ZERO), Err(Failure::Envelope));
-        assert_eq!(budget.burst, 4000 * 20);
+    fn a14_the_estimates_holds_are_the_census_rules_seedable() {
+        let census = include_str!("../../../../bench/competitive/probes/waits_census.py");
+        let seedable: usize = census
+            .lines()
+            .find_map(|line| line.strip_prefix("SEEDABLE = "))
+            .map(|n| n.trim().replace('_', "").parse().unwrap())
+            .unwrap();
+        assert_eq!(seedable, SEEDABLE);
+        let rank = |n: usize| (999 * n).div_ceil(1000);
+        assert!((1..SEEDABLE).all(|n| rank(n) == n), "fewer: their slowest");
+        assert_eq!(rank(SEEDABLE), SEEDABLE - 1);
     }
 
-    /// Joint plan step 14 (2c; ROOT, 2026-11-13): a hold's response, measured once the hold is issued, tops up that
-    /// hold's own allowance where it is slower than the one it paid, so what a scope ran past its stop is charged; a
-    /// faster one changes nothing. Do run a scope at 1 CPU of 4 with a 10 ns response until it is held, then learn that
-    /// its stop took 30 ns, then 20 ns. Expect its debt 4 CPUs over 20 ns more than the hold paid, and no more.
+    /// The review's A-14 (ROOT, 2026-11-14; AC-T7.4.1): one slow stop leaves the control's estimate: never its p99.9
+    /// once SEEDABLE holds are kept, and gone from them as newer ones come, where the slowest seen held it for good. Do
+    /// observe a 40 ms stop, then 1 ms ones until two SEEDABLE holds are in, then a 30 ms stop. Expect the estimate
+    /// 1 ms from the SEEDABLE-th hold on, and still after the 30 ms stop: the 40 ms one has aged out, as beside it the
+    /// 30 ms one would be the p99.9.
     #[test]
-    fn a_held_scopes_slower_stop_tops_up_its_hold() {
-        let mut budget = Budget::new(1000, 4000, Duration::from_nanos(10)).unwrap();
-        budget.start().unwrap();
-        budget
-            .observe(Duration::from_nanos(14), Duration::ZERO)
-            .unwrap();
-        budget.held().unwrap();
+    fn a14_one_slow_stop_ages_out_of_the_controls_estimate() {
+        let ms = Duration::from_millis;
+        let mut responses = Responses::new().unwrap();
+        responses.observe(ms(40)).unwrap();
+        for hold in 2..=2 * SEEDABLE {
+            let estimate = responses.observe(ms(1)).unwrap();
+            if hold >= SEEDABLE {
+                assert_eq!(estimate.response, ms(1), "hold {hold}");
+            }
+        }
+        assert_eq!(
+            responses.observe(ms(30)).unwrap().response,
+            ms(1),
+            "the 40 ms stop aged out"
+        );
+    }
+
+    /// The review's A-14 (ROOT, 2026-11-14; AC-T7.4.1): with fewer holds than SEEDABLE, too few to have seen their
+    /// p99.9, the control's estimate is their slowest and says it is cold; with SEEDABLE, their p99.9, not cold. Do
+    /// observe stops of 1 us, 2 us and on, each a microsecond slower, SEEDABLE of them. Expect none before the first;
+    /// after each before the SEEDABLE-th its own length, cold; after that one, the one before it, not cold.
+    #[test]
+    fn a14_too_few_holds_estimate_their_slowest_told_cold() {
+        let mut responses = Responses::new().unwrap();
+        assert_eq!(responses.estimate(), None);
+        let us = |n: usize| Duration::from_micros(u64::try_from(n).unwrap());
+        for hold in 1..SEEDABLE {
+            assert_eq!(
+                responses.observe(us(hold)).unwrap(),
+                Estimate {
+                    response: us(hold),
+                    cold: true,
+                },
+                "hold {hold}"
+            );
+        }
+        assert_eq!(
+            responses.observe(us(SEEDABLE)).unwrap(),
+            Estimate {
+                response: us(SEEDABLE - 1),
+                cold: false,
+            }
+        );
+        assert_eq!(responses.observe(Duration::ZERO), Err(Failure::Envelope));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+
+        /// The review's A-14 (ROOT, 2026-11-14; AC-T7.4.1): the control's estimate is the nearest-rank p99.9 of its last
+        /// SEEDABLE holds' responses, cold while it has fewer. Do observe any responses, of few lengths so equal ones
+        /// come in runs, past two SEEDABLE of them. Expect after each the ⌈999 n / 1000⌉-th fastest of the last n, n at
+        /// most SEEDABLE, and cold exactly while n is under SEEDABLE.
+        #[test]
+        fn a14_the_estimate_is_the_nearest_rank_p999_of_the_last_seedable_holds(
+            responses in proptest::collection::vec(1u64..40, 1..2_600)
+        ) {
+            let mut estimate = Responses::new().unwrap();
+            for (at, nanos) in responses.iter().enumerate() {
+                let got = estimate.observe(Duration::from_nanos(*nanos)).unwrap();
+                let last = &responses[(at + 1).saturating_sub(SEEDABLE)..=at];
+                let rank = (999 * last.len()).div_ceil(1000);
+                let mut order = last.to_vec();
+                let (_, nearest, _) = order.select_nth_unstable(rank - 1);
+                proptest::prop_assert_eq!(
+                    got,
+                    Estimate {
+                        response: Duration::from_nanos(*nearest),
+                        cold: last.len() < SEEDABLE,
+                    }
+                );
+            }
+        }
+    }
+
+    /// The review's A-14 (ROOT, 2026-11-14; AC-T7.4.1): the control's burst is its estimate's, falling as it falls,
+    /// and what a held scope ran past its stop beyond what its hold paid, its overshoot, is charged once; a stop within
+    /// what it paid is charged nothing more, and refunds nothing. Do run a scope at 1 CPU of 4 with a 20 ns response
+    /// until it is held; learn that its stop took 30 ns, the estimate after it 10 ns, and learn it again; then hold a
+    /// second such scope and learn a 15 ns stop. Expect the first charged 4 CPUs over 10 ns past its hold's payment,
+    /// once, its burst 4 CPUs over 10 ns and its hold refilling to that; the second's credit as its hold left it.
+    #[test]
+    fn a14_the_burst_follows_the_estimate_and_a_holds_overshoot_is_charged() {
+        let held = || {
+            let mut budget = Budget::new(1000, 4000, Duration::from_nanos(20)).unwrap();
+            budget.start().unwrap();
+            budget
+                .observe(Duration::from_nanos(27), Duration::ZERO)
+                .unwrap();
+            budget.held().unwrap();
+            budget
+        };
+        let mut budget = held();
         let paid = budget.credit;
-        budget.learn(Duration::from_nanos(30)).unwrap();
-        assert_eq!(budget.credit, paid - 4000 * 20);
-        budget.learn(Duration::from_nanos(20)).unwrap();
-        assert_eq!(budget.credit, paid - 4000 * 20);
+        budget
+            .learn(Duration::from_nanos(30), Duration::from_nanos(10))
+            .unwrap();
+        assert_eq!(budget.credit, paid - 4000 * 10, "its overshoot charged");
+        assert_eq!(budget.burst, 4000 * 10, "its burst at the estimate");
+        budget
+            .learn(Duration::from_nanos(30), Duration::from_nanos(10))
+            .unwrap();
+        assert_eq!(budget.credit, paid - 4000 * 10, "charged once");
+        assert_eq!(
+            budget.decision().unwrap(),
+            Decision::Hold(until(4000 * 10 - budget.credit, 1000).unwrap())
+        );
+        let mut within = held();
+        let left = within.credit;
+        within
+            .learn(Duration::from_nanos(15), Duration::from_nanos(15))
+            .unwrap();
+        assert_eq!(within.credit, left);
+        assert_eq!(
+            within.learn(Duration::ZERO, Duration::from_nanos(1)),
+            Err(Failure::Envelope)
+        );
+        assert_eq!(
+            within.learn(Duration::from_nanos(1), Duration::ZERO),
+            Err(Failure::Envelope)
+        );
     }
 
     /// Joint plan step 14 (2c): a hold's response is from when its scope's credit ran out, which the control reads off

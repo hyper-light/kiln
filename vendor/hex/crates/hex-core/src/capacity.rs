@@ -62,9 +62,11 @@ pub fn most_held() -> Result<usize, Fault> {
     .map_err(json)?
     .len();
     let one = serde_json::to_vec(&widest).map_err(json)?.len();
-    // n entries take n of `one` and the n - 1 commas between them, and the frame's prefix its own bytes.
+    // n entries take n of `one` and the n - 1 commas between them: n * (one + 1) - 1 bytes beside the sync's own, which
+    // fit the bound's room past those while n * (one + 1) <= room + 1. The frame's prefix is outside the bound.
     MESSAGE_BOUND
         .checked_sub(empty)
+        .and_then(|room| room.checked_add(1))
         .zip(one.checked_add(1))
         .and_then(|(room, each)| room.checked_div(each))
         .ok_or_else(|| Fault::value("a capacity sync", "its own fields pass the message bound"))
@@ -138,8 +140,8 @@ mod tests {
         }
     }
 
-    /// AC-T7.4.1, CV8: list the most reservations a sync may, each at its widest; expect the sync to fit one
-    /// message, and one more past its bound not to.
+    /// AC-T7.4.1, CV8 (R03: the bound pinned at its edge): list the most reservations a sync may, each at its widest;
+    /// expect the sync to fit one message, and one more not to.
     #[test]
     fn the_most_held_fit_one_message() {
         let most = most_held().unwrap();
@@ -162,7 +164,7 @@ mod tests {
         };
         assert!(encode(&sync(most)).is_ok());
         assert!(matches!(
-            encode(&sync(2 * most + 1)),
+            encode(&sync(most + 1)),
             Err(Fault::Oversized { .. })
         ));
     }

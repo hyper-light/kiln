@@ -2,7 +2,7 @@
 //! named sockets and RemoteProc. It starts no VM/GPU/host workload or reaper.
 
 use super::*;
-use crate::guest::{Booted, GuestHandle, managed, pool, selected};
+use crate::guest::{Booted, GuestHandle, pool, selected};
 use hex_api::{
     BackingKey, BackingPhase, Class, ClassSpec, DeviceId, DeviceKind, Exit, LifecycleCause,
 };
@@ -22,6 +22,10 @@ struct LocalLink {
 }
 
 impl Link for LocalLink {
+    fn lends_identity(&self) -> bool {
+        false
+    }
+
     fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
         let stream = match port {
             stream::CONTROL_PORT => self.control.lock().unwrap().take(),
@@ -83,15 +87,8 @@ impl shards_api::Guest for NoNative {
     }
 }
 
-fn read_exact(
-    stream: &mut UnixStream,
-    mut bytes: &mut [u8],
-    budget: managed::Budget,
-) -> Result<(), String> {
+fn read_exact(stream: &mut UnixStream, mut bytes: &mut [u8]) -> Result<(), String> {
     while !bytes.is_empty() {
-        stream
-            .set_read_timeout(Some(budget.remaining().map_err(|why| why.to_string())?))
-            .map_err(|why| why.to_string())?;
         match stream.read(bytes) {
             Ok(0) => return Err("model peer read EOF".into()),
             Ok(n) => bytes = bytes.get_mut(n..).ok_or("model read exceeded its buffer")?,
@@ -99,19 +96,11 @@ fn read_exact(
             Err(why) => return Err(why.to_string()),
         }
     }
-    budget.remaining().map_err(|why| why.to_string())?;
     Ok(())
 }
 
-fn write_all(
-    stream: &mut UnixStream,
-    mut bytes: &[u8],
-    budget: managed::Budget,
-) -> Result<(), String> {
+fn write_all(stream: &mut UnixStream, mut bytes: &[u8]) -> Result<(), String> {
     while !bytes.is_empty() {
-        stream
-            .set_write_timeout(Some(budget.remaining().map_err(|why| why.to_string())?))
-            .map_err(|why| why.to_string())?;
         match stream.write(bytes) {
             Ok(0) => return Err("model peer wrote zero bytes".into()),
             Ok(n) => bytes = bytes.get(n..).ok_or("model write exceeded its buffer")?,
@@ -119,34 +108,25 @@ fn write_all(
             Err(why) => return Err(why.to_string()),
         }
     }
-    budget.remaining().map_err(|why| why.to_string())?;
     Ok(())
 }
 
-fn request(
-    stream: &mut UnixStream,
-    budget: managed::Budget,
-) -> Result<(wire::Header, wire::Request), String> {
+fn request(stream: &mut UnixStream) -> Result<(wire::Header, wire::Request), String> {
     let mut prefix = [0u8; size_of::<u32>()];
-    read_exact(stream, &mut prefix, budget)?;
+    read_exact(stream, &mut prefix)?;
     let length = usize::try_from(u32::from_be_bytes(prefix)).map_err(|why| why.to_string())?;
     if length > wire::MAX_MESSAGE {
         return Err("model frame exceeded the actual wire bound".into());
     }
     let mut bytes = vec![0u8; length];
-    read_exact(stream, &mut bytes, budget)?;
+    read_exact(stream, &mut bytes)?;
     wire::read_request_apart(&bytes, wire::MAX_MESSAGE).map_err(|why| format!("{why:?}"))
 }
 
-fn answer(
-    stream: &mut UnixStream,
-    id: u64,
-    value: &wire::Answer,
-    budget: managed::Budget,
-) -> Result<(), String> {
+fn answer(stream: &mut UnixStream, id: u64, value: &wire::Answer) -> Result<(), String> {
     let bytes = wire::answer(id, value, wire::MAX_MESSAGE).map_err(|why| format!("{why:?}"))?;
     let bytes = stream::frame(&bytes, wire::MAX_MESSAGE).map_err(|why| format!("{why:?}"))?;
-    write_all(stream, &bytes, budget)
+    write_all(stream, &bytes)
 }
 
 #[derive(Debug)]
@@ -166,11 +146,10 @@ fn failed_workload(
     mut control: UnixStream,
     mut stdout: UnixStream,
     mut stderr: UnixStream,
-    budget: managed::Budget,
     deleted: bool,
 ) -> Result<Seen, String> {
-    write_all(&mut control, &7u64.to_le_bytes(), budget)?;
-    let (hello, request_hello) = request(&mut control, budget)?;
+    write_all(&mut control, &7u64.to_le_bytes())?;
+    let (hello, request_hello) = request(&mut control)?;
     if !matches!(request_hello, wire::Request::Hello { .. }) {
         return Err("model expected actual Client Hello".into());
     }
@@ -191,9 +170,8 @@ fn failed_workload(
                 programs: 1,
             },
         }),
-        budget,
     )?;
-    let (run, run_request) = request(&mut control, budget)?;
+    let (run, run_request) = request(&mut control)?;
     let wire::Request::Call(wire::Call::Run { spec, .. }) = run_request else {
         return Err("model expected actual Client Run".into());
     };
@@ -207,8 +185,8 @@ fn failed_workload(
     let id = spec.id.try_clone().map_err(|why| why.to_string())?;
     let mut out_name = [0u8; stream::NAME_BYTES];
     let mut err_name = [0u8; stream::NAME_BYTES];
-    read_exact(&mut stdout, &mut out_name, budget)?;
-    read_exact(&mut stderr, &mut err_name, budget)?;
+    read_exact(&mut stdout, &mut out_name)?;
+    read_exact(&mut stderr, &mut err_name)?;
     let out_name = stream::read_name(&out_name).map_err(|why| format!("{why:?}"))?;
     let err_name = stream::read_name(&err_name).map_err(|why| format!("{why:?}"))?;
     if out_name.exec.id != run.id
@@ -218,13 +196,8 @@ fn failed_workload(
     {
         return Err("model stdio did not name the SAME actual Run".into());
     }
-    answer(
-        &mut control,
-        run.id,
-        &wire::Answer::Started { pid: 7 },
-        budget,
-    )?;
-    write_all(&mut stderr, b"vkCreateDevice refused\n", budget)?;
+    answer(&mut control, run.id, &wire::Answer::Started { pid: 7 })?;
+    write_all(&mut stderr, b"vkCreateDevice refused\n")?;
     stdout
         .shutdown(Shutdown::Write)
         .map_err(|why| why.to_string())?;
@@ -232,16 +205,11 @@ fn failed_workload(
         .shutdown(Shutdown::Write)
         .map_err(|why| why.to_string())?;
     drop((stdout, stderr));
-    answer(
-        &mut control,
-        run.id,
-        &wire::Answer::Exited(Exit::Code(7)),
-        budget,
-    )?;
+    answer(&mut control, run.id, &wire::Answer::Exited(Exit::Code(7)))?;
     // At most the one in-flight and one program acknowledgements may precede
     // the one Delete in this declared 1/1 fixture. No unbounded reader loop.
     for _ in 0..3 {
-        let (header, next) = request(&mut control, budget)?;
+        let (header, next) = request(&mut control)?;
         match next {
             wire::Request::Taken | wire::Request::StreamsReady => {}
             wire::Request::Call(wire::Call::Delete(gone)) if gone == id => {
@@ -251,9 +219,10 @@ fn failed_workload(
                     wire::Answer::Refused(Refusal::Lifecycle {
                         id: id.try_clone().map_err(|why| why.to_string())?,
                         cause: LifecycleCause::Uncertain,
+                        why: Some("the test's guest can't prove its delete".to_owned()),
                     })
                 };
-                answer(&mut control, header.id, &done, budget)?;
+                answer(&mut control, header.id, &done)?;
                 return Ok(Seen {
                     run: id,
                     deletes: 1,
@@ -281,7 +250,6 @@ fn hex(bytes: &[u8]) -> String {
 /// read back and as written, what the model saw, the run's scope and allocation, and native calls.
 struct Observed {
     result: Result<(), Refusal>,
-    remaining: Result<Duration, Refusal>,
     retained: Result<Option<pool::Receipt>, Refusal>,
     durable: std::io::Result<String>,
     seen: Seen,
@@ -342,13 +310,12 @@ fn observed(dir: &std::path::Path, deleted: bool) -> Observed {
     })
     .unwrap();
     let native_calls = Arc::new(AtomicUsize::new(0));
-    // One observer attempt's budget, as the node gives one before any boot (`first_dial_bound`).
-    let budget = managed::Budget::new(crate::guest::recorded_dial_bound().unwrap()).unwrap();
     let worker = std::thread::Builder::new()
         .name("observer-known-facts".into())
-        .spawn(move || failed_workload(peer, stdout, stderr, budget, deleted))
+        .spawn(move || failed_workload(peer, stdout, stderr, deleted))
         .unwrap();
-    let connected = Client::connect_before(triomphe::Arc::clone(&link), budget.deadline());
+    // A GPU create follows its guest (the review's C-9): its connection is made with no deadline.
+    let connected = Client::connect(triomphe::Arc::clone(&link));
     let setup_ok = connected.is_ok();
     let result = match connected {
         Ok(client) => {
@@ -360,11 +327,10 @@ fn observed(dir: &std::path::Path, deleted: bool) -> Observed {
                 owner: None,
                 backing: None,
             };
-            observe(&configured, &booted, &mut receipt, &path, budget)
+            observe(&configured, &booted, &mut receipt, &path)
         }
         Err(why) => Err(why),
     };
-    let remaining = budget.remaining();
     let retained = pool::read(&path);
     let durable = std::fs::read_to_string(&path);
     // Cleanup precedes every oracle assertion, including an original setup or
@@ -382,7 +348,6 @@ fn observed(dir: &std::path::Path, deleted: bool) -> Observed {
     );
     Observed {
         result,
-        remaining,
         retained,
         durable,
         seen: joined.unwrap().unwrap(),
@@ -399,7 +364,6 @@ fn known_guest_exit_and_typed_cleanup_failure_survive_the_same_vm_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let Observed {
         result,
-        remaining,
         retained,
         durable,
         seen,
@@ -413,10 +377,6 @@ fn known_guest_exit_and_typed_cleanup_failure_survive_the_same_vm_receipt() {
     assert_eq!(
         seen.run.as_str(),
         format!("hex-gpu-observer-{}", hex(scope.bytes()))
-    );
-    assert!(
-        remaining.is_ok(),
-        "expiry must not masquerade as known exit failure"
     );
     assert_eq!(native_calls, 0);
     assert!(matches!(
@@ -443,6 +403,7 @@ fn known_guest_exit_and_typed_cleanup_failure_survive_the_same_vm_receipt() {
         &wire::Answer::Refused(Refusal::Lifecycle {
             id: seen.run,
             cause: LifecycleCause::Uncertain,
+            why: Some("the test's guest can't prove its delete".to_owned()),
         }),
         wire::MAX_MESSAGE,
     )
@@ -477,7 +438,6 @@ fn an_unsuccessful_observer_is_refused_with_its_programs_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let observed = observed(dir.path(), true);
     assert_eq!(observed.seen.deletes, 1);
-    assert!(observed.remaining.is_ok());
     let Err(refusal) = observed.result else {
         panic!("an exit 7 was taken as ready");
     };

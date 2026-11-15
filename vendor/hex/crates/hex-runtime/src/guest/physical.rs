@@ -206,7 +206,7 @@ impl GuestRuntime {
         let definition = self.gpu_definition_for_record(record)?;
         self.preflight_backing(record)?;
         let receipt = super::pool::read(&definition.path)?
-            .ok_or_else(|| super::pool::refused(record.key, hex_api::LifecycleCause::Uncertain))?;
+            .ok_or_else(|| super::pool::uncertain(record.key, "its live backing has no receipt"))?;
         receipt.matches(record)?;
         if !matches!(receipt.phase, selected::Phase::Running(_)) {
             return Err(super::pool::refused(
@@ -226,15 +226,14 @@ impl GuestRuntime {
         receipt.checked_work_ready()?;
         let identity = receipt.identity()?;
         managed::same_native(hex_core::record::NativeRecord::Pool(record), identity)?;
-        let books = self
-            .books
-            .get()
-            .ok_or_else(|| super::pool::refused(record.key, hex_api::LifecycleCause::Uncertain))?;
+        let books = self.books.get().ok_or_else(|| {
+            super::pool::uncertain(record.key, "its guest has no record authority")
+        })?;
         let keys = self.turn_keys(&record.devices)?;
         crate::devices::with_pool_transaction(books, &record.key, &keys, |transaction| {
-            let current = transaction.read_pool(&record.key)?.ok_or_else(|| {
-                super::pool::refused(record.key, hex_api::LifecycleCause::Uncertain)
-            })?;
+            let current = transaction
+                .read_pool(&record.key)?
+                .ok_or_else(|| super::pool::uncertain(record.key, "its pool record is gone"))?;
             if current.phase != hex_api::BackingPhase::Live
                 || current.native_commitment()? != record.native_commitment()?
                 || current.init != record.init
@@ -416,7 +415,10 @@ impl GuestRuntime {
         }
         let actual = self.checked_physical(&definition.devices, &definition.physical)?;
         if actual.len() != definition.devices.len() {
-            return Err(super::pool::refused(record.key, LifecycleCause::Uncertain));
+            return Err(super::pool::uncertain(
+                record.key,
+                "its checked physical devices aren't its definition's",
+            ));
         }
         let mut observations = Vec::new();
         observations

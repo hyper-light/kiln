@@ -14,9 +14,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", windows))]
 use std::sync::{Condvar, Mutex, PoisonError};
+#[cfg(any(target_os = "macos", windows))]
+use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", windows))]
-use super::{Daemon, Threads, lock, log};
+use super::reclaim::Gave;
+#[cfg(any(target_os = "macos", windows))]
+use super::{Daemon, RunState, Threads, lock, log};
 #[cfg(any(target_os = "macos", windows))]
 use crate::containers::Disk;
 
@@ -41,7 +45,25 @@ pub(super) struct Budget {
     /// is stopped, as a cgroup's OOM killer kills within it.
     pub max: Option<u64>,
     /// `cpu.max`: µs of CPU time its microVMs may use together each period of µs.
-    pub cpu: Option<(u64, u64)>,
+    pub cpu: CpuMax,
+}
+
+/// A group's `cpu.max` as the kernel reads it: `quota` µs of CPU time each `period` µs, no
+/// quota for `max`, whose period is still the group's own, as `cpu.max` reads `max 100000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CpuMax {
+    pub quota: Option<u64>,
+    pub period: u64,
+}
+
+/// A `cpu.max` not written: `max`, over the kernel's default period.
+impl Default for CpuMax {
+    fn default() -> CpuMax {
+        CpuMax {
+            quota: None,
+            period: CPU_PERIOD,
+        }
+    }
 }
 
 impl Budget {
@@ -131,7 +153,7 @@ pub(super) fn budget(dir: &Path) -> Result<Budget, String> {
     };
     let cpu = match read("cpu.max")? {
         Some(text) => cpu_max(&text).map_err(|e| format!("{}: {e}", dir.join("cpu.max").display()))?,
-        None => None,
+        None => CpuMax::default(),
     };
     Ok(Budget {
         high: memory("memory.high")?,
@@ -144,7 +166,7 @@ pub(super) fn budget(dir: &Path) -> Result<Budget, String> {
 /// `cpu_period_quota_parse` and `tg_set_cfs_bandwidth`): `$MAX $PERIOD`, µs of CPU time
 /// each period of µs, `$MAX` `max` for none and `$PERIOD` [`CPU_PERIOD`] where it is left
 /// out; the period 1 ms to 1 s, a quota 1 ms or more and less than 2^44 µs.
-fn cpu_max(text: &str) -> Result<Option<(u64, u64)>, String> {
+fn cpu_max(text: &str) -> Result<CpuMax, String> {
     let bad = || format!("{:?}: not a quota and its period, or max", text.trim());
     let mut words = text.split_whitespace();
     let quota = words.next().ok_or_else(bad)?;
@@ -157,7 +179,7 @@ fn cpu_max(text: &str) -> Result<Option<(u64, u64)>, String> {
         return Err(format!("a period of {period} µs, where it is 1000 to 1000000"));
     }
     if quota == "max" {
-        return Ok(None);
+        return Ok(CpuMax { quota: None, period });
     }
     if !quota.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
@@ -168,7 +190,10 @@ fn cpu_max(text: &str) -> Result<Option<(u64, u64)>, String> {
             "a quota of {quota} µs, where it is 1000 or more and less than 2^44"
         ));
     }
-    Ok(Some((quota, period)))
+    Ok(CpuMax {
+        quota: Some(quota),
+        period,
+    })
 }
 
 /// A memory budget as the kernel reads one written to `memory.max` (mm/page_counter.c,
@@ -198,47 +223,278 @@ fn bytes(text: &str) -> Result<Option<u64>, String> {
         .ok_or_else(|| format!("{text:?}: more bytes than a budget holds"))
 }
 
+/// A run of a group: its microVM's VM process, by its identity, its pid and when it started
+/// (`shards_ipc::started`, none where that could not be read), which a joiner shares with its
+/// provider (D119); and the run its words go through.
 #[cfg(any(target_os = "macos", windows))]
 #[derive(Debug, Clone)]
 struct Member {
     pid: u32,
+    start: Option<u64>,
     id: String,
 }
 
-/// What the groups' thread hears of runs (D183, slice 3): those begun, by VM process and
-/// microVM, and those ended, by VM process.
+#[cfg(any(target_os = "macos", windows))]
+impl Member {
+    /// Whether `other`'s VM process is its own: one microVM's, its provider's and joiners'.
+    fn shares(&self, other: &Member) -> bool {
+        self.pid == other.pid && self.start == other.start
+    }
+}
+
+/// What the groups' thread hears (D183, slice 3): runs begun, by VM process and microVM,
+/// and ended, by VM process; each give-back of a round that ended; that a member's word
+/// moved on, which may make a round due; and its test's end, where a test ends it (a
+/// daemon exits from within, its threads unwaited for).
 #[cfg(any(target_os = "macos", windows))]
 #[derive(Debug, Default)]
 struct Woke {
     ran: Vec<Member>,
     left: Vec<u32>,
+    gave: Vec<Answered>,
+    spoke: bool,
+    ended: bool,
 }
 
-/// The groups' thread's word from the daemon, and what wakes it; each group's CPU budget,
-/// by its name, its file and the daemon's mapping of it; on Windows each group's job too,
-/// with the `memory.max` it is held to.
+#[cfg(any(target_os = "macos", windows))]
+impl Woke {
+    /// Whether it holds nothing to hear.
+    fn quiet(&self) -> bool {
+        self.ran.is_empty() && self.left.is_empty() && self.gave.is_empty() && !self.spoke && !self.ended
+    }
+}
+
+/// A member's give-back of a round, ended: its VM process, the round, and what it gave; none
+/// where it gave nothing back, its answer refused or cut, or its run gone.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Clone, Copy)]
+struct Answered {
+    pid: u32,
+    round: u64,
+    gave: Option<Gave>,
+}
+
+/// What a member is asked at a pass (R04): the room its group's budget leaves it, none for
+/// no budget (init's `ROOM`); and, where its group is short, to give back for a round.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ask {
+    room: Option<Room>,
+    give: Option<u64>,
+}
+
+/// A member's room (D183): the bytes its group's budget leaves it, read with what its VM
+/// process held then, `at`, which its init holds it as of (`run::room_now`), so that what it
+/// grew by before the word comes counts once; none where that could not be read.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Room {
+    bytes: i64,
+    at: Option<u64>,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl Ask {
+    /// This ask, made while `pending` waits behind a word under way: its room the newest,
+    /// and a give-back of either kept, the newest round's first.
+    fn over(self, pending: Option<Ask>) -> Ask {
+        Ask {
+            room: self.room,
+            give: self.give.or(pending.and_then(|p| p.give)),
+        }
+    }
+}
+
+/// A member's word under way (R04): its exec's own judge's state, and the next ask. Only
+/// that judge can refuse it, and its refusal stands for that exec alone: each exec of the
+/// word begins `Waiting` (its room told, then a give-back). The groups thread consumes it.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug)]
+struct Word {
+    state: WordState,
+    next: Option<Ask>,
+}
+
+/// The authoritative exec judge's outcome for a word still under way.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug)]
+enum WordState {
+    Waiting,
+    Refused(super::health::Cut),
+}
+
+/// The pace of the groups' passes (D188, R03; it was a pressure window): D215's
+/// `sqrt(2 c w)` (`shards_abi::pace`) after the last, `c` that pass's own time and `w` how
+/// long its groups had gone unchanged as it was made, a change what a pass looks for: a
+/// member come or gone, a group's budget written, or a group fallen short of it or within
+/// it again, which no notification says on macOS or Windows. A pass that finds one restarts
+/// `w`, so passes come close together while groups change and spread out while they stay
+/// as they are. The first pass is made at once.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Clone, Copy, Default)]
+struct Paced {
+    /// What the last pass took, and since when its groups had been unchanged then.
+    took: Duration,
+    unchanged_since: Option<Instant>,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl Paced {
+    /// A pass begun `at` has ended, `changed` whether it found a change.
+    fn passed(&mut self, at: Instant, changed: bool) {
+        self.took = at.elapsed();
+        if changed || self.unchanged_since.is_none() {
+            self.unchanged_since = Some(at);
+        }
+    }
+
+    /// When the pass after one made `at` is due.
+    fn next(&self, at: Instant) -> Instant {
+        let unchanged = self
+            .unchanged_since
+            .map_or(Duration::ZERO, |since| at.saturating_duration_since(since));
+        at.checked_add(shards_abi::pace::pause(self.took, unchanged, Duration::MAX))
+            .unwrap_or(at)
+    }
+}
+
+/// What the groups' thread keeps of a group between its passes (R04): whether it was said
+/// short of its budget, its round of give-backs under way, and the members told a room, who
+/// are told it has none once its budget has none.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Default)]
+struct Hold {
+    short: bool,
+    round: Option<Round>,
+    told: HashSet<u32>,
+    /// Its budget as its last pass read it: one written since is a change its passes
+    /// look for ([`Daemon::next_look`]).
+    budget: Option<Budget>,
+}
+
+/// A group's round of give-backs (R04): opened at a pass that finds it short of its budget,
+/// each of its members then asked once, by VM process; done once each has answered, ended,
+/// or its own exec judge refused it, and judged then.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug)]
+struct Round {
+    id: u64,
+    of: HashMap<u32, Given>,
+}
+
+/// What a round knows of a member's give-back.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Clone, Copy)]
+enum Given {
+    /// Asked, its answer to come.
+    Asked,
+    /// Answered: what it gave back.
+    Gave(Gave),
+    /// Nothing: its answer refused or cut, or its run ended.
+    Nothing,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl Round {
+    /// What its members gave back, in all.
+    fn gave(&self) -> Gave {
+        self.of.values().fold(Gave::default(), |all, g| match g {
+            Given::Gave(gave) => all.and(*gave),
+            Given::Asked | Given::Nothing => all,
+        })
+    }
+
+    /// Whether every member it asked is done.
+    fn done(&self) -> bool {
+        !self.of.values().any(|g| matches!(g, Given::Asked))
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl Hold {
+    /// Member `pid`'s run ended: its group's round waits for nothing more of it, and it is
+    /// told nothing more.
+    fn left(&mut self, pid: u32) {
+        self.told.remove(&pid);
+        if let Some(given) = self.round.as_mut().and_then(|r| r.of.get_mut(&pid))
+            && matches!(given, Given::Asked)
+        {
+            *given = Given::Nothing;
+        }
+    }
+
+    /// A member's give-back ended: what it gave, where it was its round's.
+    fn answered(&mut self, answered: Answered) {
+        if let Some(given) = self
+            .round
+            .as_mut()
+            .filter(|r| r.id == answered.round)
+            .and_then(|r| r.of.get_mut(&answered.pid))
+        {
+            *given = answered.gave.map_or(Given::Nothing, Given::Gave);
+        }
+    }
+}
+
+/// What a group's microVMs hold in all: `held`'s footprints summed.
+#[cfg(any(target_os = "macos", windows))]
+fn sum(held: &[(usize, u64)]) -> u64 {
+    held.iter().fold(0u64, |s, (_, b)| s.saturating_add(*b))
+}
+
+/// The groups' thread's word from the daemon, and what wakes it; each member's word under
+/// way; each group's CPU budget, by its name, its file and the daemon's mapping of it; on
+/// Windows each group's job too, with the `memory.max` it is held to.
 #[cfg(any(target_os = "macos", windows))]
 #[derive(Debug, Default)]
 pub(super) struct Groups {
     woke: Mutex<Woke>,
     wake: Condvar,
+    /// Each member's word under way, by its VM process: one at a time, so that none is told
+    /// over itself, and none waits on another's.
+    words: Mutex<HashMap<u32, Word>>,
     cpus: Mutex<HashMap<String, (std::fs::File, shards_vmm::vm::group::GroupCpu)>>,
     #[cfg(windows)]
     jobs: Mutex<HashMap<String, (shards_ipc::GroupJob, Option<u64>)>>,
+    /// The footprints a test plays for its microVMs' VM processes, by process, in place of
+    /// what their kernels count.
+    #[cfg(test)]
+    played: Mutex<HashMap<u32, u64>>,
+}
+
+#[cfg(all(test, any(target_os = "macos", windows)))]
+impl Groups {
+    /// VM process `pid` holds `footprint` bytes from now, as its group sums it.
+    pub(super) fn play(&self, pid: u32, footprint: u64) {
+        lock(&self.played).insert(pid, footprint);
+    }
+
+    /// Its test has ended: the groups' thread returns.
+    pub(super) fn end(&self) {
+        lock(&self.woke).ended = true;
+        self.wake.notify_all();
+    }
 }
 
 /// What a group's microVMs hold themselves to of its `cpu.max` (`GroupCpu::set_budget`):
-/// none where it lets them use every CPU of the host's, which they cannot pass, and none
+/// no quota where it lets them use every CPU of the host's, which they cannot pass, and none
 /// where a quota is past what the count's word holds, which takes a host of more than
-/// 4,295 CPUs.
+/// 4,295 CPUs; its period the group's own whatever the quota, which its governors look again
+/// each of where there is none. Refused where the period is none, or past the word's: no
+/// `cpu.max` the kernel takes (`cpu_max`) has one.
 #[cfg(any(target_os = "macos", windows))]
-fn held_cpu(cpu: Option<(u64, u64)>) -> Option<(u32, u32)> {
-    let (quota, period) = cpu?;
+fn held_cpu(cpu: CpuMax) -> Result<shards_vmm::vm::group::Budget, String> {
+    let period = u32::try_from(cpu.period)
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| format!("a CPU period of {} µs", cpu.period))?;
     let host = u64::try_from(crate::resources::host_cpus()).unwrap_or(u64::MAX);
-    if quota >= period.saturating_mul(host) {
-        return None;
-    }
-    Some((u32::try_from(quota).ok()?, u32::try_from(period).ok()?))
+    let quota = cpu
+        .quota
+        .filter(|&quota| quota < cpu.period.saturating_mul(host))
+        .and_then(|quota| u32::try_from(quota).ok())
+        .and_then(std::num::NonZeroU32::new);
+    Ok(shards_vmm::vm::group::Budget { quota, period })
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -265,16 +521,19 @@ impl<D: Disk> Daemon<D> {
             .map_err(|e| at(&e))?;
         let mapped = shards_vmm::vm::group::GroupCpu::map(file.try_clone().map_err(|e| at(&e))?)
             .map_err(|e| at(&e))?;
-        mapped.set_budget(held_cpu(budget(&dir)?.cpu));
+        mapped.set_budget(held_cpu(budget(&dir)?.cpu).map_err(|e| at(&e))?);
         let given = file.try_clone().map_err(|e| at(&e))?;
         cpus.insert(name.to_string(), (file, mapped));
         Ok(given)
     }
 
     /// Group `name`'s CPU budget written as its `cpu.max` says now, where its count is kept.
-    fn budget_group_cpu(&self, name: &str, cpu: Option<(u64, u64)>) {
+    fn budget_group_cpu(&self, name: &str, cpu: CpuMax) {
         if let Some((_, mapped)) = lock(&self.groups.cpus).get(name) {
-            mapped.set_budget(held_cpu(cpu));
+            match held_cpu(cpu) {
+                Ok(budget) => mapped.set_budget(budget),
+                Err(e) => log(format!("group {name}'s CPU budget, kept as it was: {e}")),
+            }
         }
     }
 }
@@ -323,7 +582,7 @@ impl<D: Disk> Daemon<D> {
     pub(super) fn start_groups<'s, 'e>(&'s self, threads: &'s Threads<'s, 'e>) {
         if let Err(e) = std::thread::Builder::new()
             .name("groups".into())
-            .spawn_scoped(threads, move || self.hold_groups())
+            .spawn_scoped(threads, move || self.hold_groups(threads))
         {
             log(format!(
                 "the groups' thread: {e}; no group's budget holds its microVMs"
@@ -333,8 +592,10 @@ impl<D: Disk> Daemon<D> {
 
     /// Run `id`, of VM process `pid`, began: held to its group's budget, where it has one.
     pub(super) fn group_ran(&self, pid: u32, id: &str) {
+        let start = shards_ipc::started(pid).ok();
         lock(&self.groups.woke).ran.push(Member {
             pid,
+            start,
             id: id.to_string(),
         });
         self.groups.wake.notify_one();
@@ -348,30 +609,40 @@ impl<D: Disk> Daemon<D> {
 
     /// The groups' thread: each group's microVMs held to its budget as runs begin and end,
     /// and every pressure window while a group has any, its files read again then, so that
-    /// a budget written is heard within one.
-    fn hold_groups(&self) {
+    /// a budget written is heard within one. It asks its members and hears their answers,
+    /// and waits on none of them, each member's words its own ([`speak`](Self::speak)):
+    /// between its passes it wakes as one answers or its own exec judge refuses it.
+    fn hold_groups<'s, 'e>(&'s self, threads: &'s Threads<'s, 'e>) {
         let mut members: HashMap<String, Vec<Member>> = HashMap::new();
-        // The groups short of their budgets, which are said again once they are within it.
-        let mut short: HashSet<String> = HashSet::new();
+        let mut holds: HashMap<String, Hold> = HashMap::new();
+        let mut rounds = 0u64;
+        let mut passed: Option<Instant> = None;
+        let mut paced = Paced::default();
         loop {
+            let look = self.next_look(&members, passed, paced);
             let woke = {
                 let mut woke = lock(&self.groups.woke);
-                if woke.ran.is_empty() && woke.left.is_empty() {
-                    woke = if members.is_empty() {
-                        self.groups
+                if woke.quiet() {
+                    woke = match look {
+                        None => self
+                            .groups
                             .wake
                             .wait(woke)
-                            .unwrap_or_else(PoisonError::into_inner)
-                    } else {
-                        self.groups
-                            .wake
-                            .wait_timeout(woke, shards_vmm::platform::PRESSURE_WINDOW)
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .0
+                            .unwrap_or_else(PoisonError::into_inner),
+                        Some(at) => {
+                            let left = at.saturating_duration_since(Instant::now());
+                            super::timed(Some(left), || self.groups.wake.wait_timeout(woke, left))
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .0
+                        }
                     };
                 }
                 std::mem::take(&mut *woke)
             };
+            if woke.ended {
+                return;
+            }
+            let moved = !woke.ran.is_empty() || !woke.left.is_empty();
             for m in woke.ran {
                 if let Some(group) = self.parent_of(&m.id).filter(|p| !p.is_empty()) {
                     members.entry(group).or_default().push(m);
@@ -381,21 +652,68 @@ impl<D: Disk> Daemon<D> {
                 for list in members.values_mut() {
                     list.retain(|m| m.pid != pid);
                 }
+                for hold in holds.values_mut() {
+                    hold.left(pid);
+                }
+            }
+            for answered in woke.gave {
+                for hold in holds.values_mut() {
+                    hold.answered(answered);
+                }
             }
             members.retain(|_, list| !list.is_empty());
-            short.retain(|name| members.contains_key(name));
+            holds.retain(|name, _| members.contains_key(name));
+            let now = Instant::now();
+            let pass = moved || passed.is_none_or(|p| now >= paced.next(p));
+            if pass {
+                passed = Some(now);
+            }
+            let mut changed = moved;
             for (name, list) in &members {
-                self.hold_group(name, list, &mut short);
+                let hold = holds.entry(name.clone()).or_default();
+                if pass {
+                    let was = (hold.short, hold.budget);
+                    self.hold_group(threads, name, list, hold, &mut rounds);
+                    changed |= (hold.short, hold.budget) != was;
+                }
+                self.judge_round(name, list, hold);
+            }
+            if pass {
+                paced.passed(now, changed);
             }
         }
     }
 
-    /// Holds group `name`'s microVMs `members` to its budget: each told the room it leaves
-    /// them (init's `ROOM`, D188), and where it is short each asked to give back what it
-    /// holds cold; past `memory.max` with nothing given back, the one that holds the most
-    /// stopped, as a cgroup's OOM killer kills within it. What they hold is their VM
-    /// processes' footprints (proc_pid_rusage), written to the group's `memory.current`.
-    fn hold_group(&self, name: &str, members: &[Member], short: &mut HashSet<String>) {
+    /// The next resource-accounting pass, on its pace ([`Paced`]). Word outcomes wake the
+    /// thread independently; no second timer judges a member behind its authoritative exec
+    /// judge.
+    fn next_look(
+        &self,
+        members: &HashMap<String, Vec<Member>>,
+        passed: Option<Instant>,
+        paced: Paced,
+    ) -> Option<Instant> {
+        if members.is_empty() {
+            return None;
+        }
+        Some(passed.map_or_else(Instant::now, |p| paced.next(p)))
+    }
+
+    /// A pass over group `name` and its microVMs `members` (D183, slice 3): its files read
+    /// again, what its microVMs hold, their VM processes' footprints, written to its
+    /// `memory.current` and its processes to its `cgroup.procs`; each microVM asked, on a
+    /// thread of its own, its room under its budget told (init's `ROOM`, D188), or that it
+    /// has none once its budget has none; and where it is short with no round of give-backs
+    /// under way, one begun, each asked to give back what it holds cold. Said once as it
+    /// falls short of its budget, and once as it is within it again.
+    fn hold_group<'s, 'e>(
+        &'s self,
+        threads: &'s Threads<'s, 'e>,
+        name: &str,
+        members: &[Member],
+        hold: &mut Hold,
+        rounds: &mut u64,
+    ) {
         let dir = self.home.join(DIR).join(name);
         let budget = match budget(&dir) {
             Ok(b) => b,
@@ -404,24 +722,13 @@ impl<D: Disk> Daemon<D> {
                 return;
             }
         };
+        hold.budget = Some(budget);
         // Its microVMs' CPU budget its `cpu.max`, as the file now says it, and on Windows its
         // job's memory limit its `memory.max`.
         self.budget_group_cpu(name, budget.cpu);
         #[cfg(windows)]
         self.limit_group_job(name, budget.max);
-        let footprints = || -> Vec<(usize, u64)> {
-            members
-                .iter()
-                .enumerate()
-                .filter_map(|(i, m)| {
-                    shards_vmm::platform::process_usage(m.pid)
-                        .ok()
-                        .map(|u| (i, u.footprint))
-                })
-                .collect()
-        };
-        let mut held = footprints();
-        let sum = |held: &[(usize, u64)]| held.iter().fold(0u64, |s, (_, b)| s.saturating_add(*b));
+        let held = self.footprints(members);
         let current = sum(&held);
         let _ = std::fs::write(dir.join("memory.current"), format!("{current}\n"));
         // Its processes, a line each, as a cgroup's `cgroup.procs` lists its own: on Windows
@@ -437,30 +744,61 @@ impl<D: Disk> Daemon<D> {
                 None
             });
         #[cfg(target_os = "macos")]
-        let procs = Some(members.iter().map(|m| m.pid).collect::<Vec<_>>());
+        let procs = Some(
+            held.iter()
+                .filter_map(|&(i, _)| members.get(i).map(|m| m.pid))
+                .collect::<Vec<_>>(),
+        );
         if let Some(procs) = procs {
             let listed: String = procs.iter().map(|p| format!("{p}\n")).collect();
             let _ = std::fs::write(dir.join("cgroup.procs"), listed);
         }
         let Some(limit) = budget.room_of() else {
+            // Its budget gone: each told a room is told it has none, its hold let go of.
+            for m in members {
+                if hold.told.remove(&m.pid) {
+                    self.ask(
+                        threads,
+                        m,
+                        Ask {
+                            room: None,
+                            give: None,
+                        },
+                    );
+                }
+            }
             return;
         };
         let signed = |b: u64| i64::try_from(b).unwrap_or(i64::MAX);
         let room = signed(limit).saturating_sub(signed(current));
+        let mut give = None;
+        if room < 0 && hold.round.is_none() {
+            *rounds = rounds.saturating_add(1);
+            give = Some(*rounds);
+            hold.round = Some(Round {
+                id: *rounds,
+                of: members.iter().map(|m| (m.pid, Given::Asked)).collect(),
+            });
+        }
+        // Each told its room with what its VM process held as the room was read: one read.
         for m in members {
-            self.tell_group_room(&m.id, m.pid, room);
+            hold.told.insert(m.pid);
+            let at = held
+                .iter()
+                .find(|&&(j, _)| members.get(j).is_some_and(|first| first.shares(m)))
+                .map(|&(_, footprint)| footprint);
+            let room = Some(Room { bytes: room, at });
+            self.ask(threads, m, Ask { room, give });
         }
         if room >= 0 {
-            if short.remove(name) {
+            if std::mem::take(&mut hold.short) {
                 log(format!(
                     "group {name}: its microVMs hold {} MiB, within its budget of {} MiB again",
                     current >> 20,
                     limit >> 20
                 ));
             }
-            return;
-        }
-        if short.insert(name.to_string()) {
+        } else if !std::mem::replace(&mut hold.short, true) {
             log(format!(
                 "group {name}: its microVMs hold {} MiB, {} MiB past its budget of {} MiB: each told so, and asked to give back what it holds cold",
                 current >> 20,
@@ -468,32 +806,43 @@ impl<D: Disk> Daemon<D> {
                 limit >> 20
             ));
         }
-        let (mut freed, mut unplugging) = (0u64, 0u64);
-        for m in members {
-            // Waited on while its VM process runs, as a budget's slice is (D209, PM M467):
-            // a host short of CPU slows a member as much here as Linux's throttle does there.
-            if let Some(gave) = self.give_back_of(&m.id, m.pid) {
-                freed = freed.saturating_add(gave.freed);
-                unplugging = unplugging.saturating_add(gave.unplugging);
-            }
-        }
-        if freed > 0 || unplugging > 0 {
-            log(format!(
-                "group {name}: its microVMs gave back {} MiB they held cold of their files, and asked to unplug {} MiB",
-                freed >> 20,
-                unplugging >> 20
-            ));
-        }
-        let Some(max) = budget.max else {
+    }
+
+    /// Judges group `name`'s round of give-backs once it is done (D183, slice 3): a member
+    /// whose own word judge refused it gave nothing;
+    /// and past its `memory.max`, with nothing given back, the one of its microVMs that
+    /// holds the most is stopped, its record marked OOM-killed, as a cgroup's OOM killer
+    /// takes its largest (mm/oom_kill.c, `oom_badness`).
+    fn judge_round(&self, name: &str, members: &[Member], hold: &mut Hold) {
+        let Some(round) = hold.round.as_mut() else {
             return;
         };
-        held = footprints();
-        let after = sum(&held);
-        if after <= max || freed > 0 || unplugging > 0 {
+        for (pid, given) in &mut round.of {
+            if matches!(given, Given::Asked) && self.word_refusal(*pid).is_some() {
+                *given = Given::Nothing;
+            }
+        }
+        if !round.done() {
             return;
         }
-        // Past its hard budget with nothing given back: the one that holds the most goes,
-        // as a cgroup's OOM killer takes its largest (mm/oom_kill.c, `oom_badness`).
+        let gave = round.gave();
+        hold.round = None;
+        if gave.freed > 0 || gave.unplugging > 0 {
+            log(format!(
+                "group {name}: its microVMs gave back {} MiB they held cold of their files, and asked to unplug {} MiB",
+                gave.freed >> 20,
+                gave.unplugging >> 20
+            ));
+            return;
+        }
+        let Some(max) = budget(&self.home.join(DIR).join(name)).ok().and_then(|b| b.max) else {
+            return;
+        };
+        let held = self.footprints(members);
+        let after = sum(&held);
+        if after <= max {
+            return;
+        }
         let Some(&(largest, bytes)) = held.iter().max_by_key(|(_, b)| *b) else {
             return;
         };
@@ -513,22 +862,196 @@ impl<D: Disk> Daemon<D> {
         }
     }
 
+    /// Asks member `m` `ask` (R04): now, on a thread of its own, where it has no word under
+    /// way; else once that has ended, the newest room told and a give-back of either kept.
+    fn ask<'s, 'e>(&'s self, threads: &'s Threads<'s, 'e>, m: &Member, ask: Ask) {
+        {
+            let mut words = lock(&self.groups.words);
+            if let Some(word) = words.get_mut(&m.pid) {
+                word.next = Some(ask.over(word.next));
+                return;
+            }
+            words.insert(
+                m.pid,
+                Word {
+                    state: WordState::Waiting,
+                    next: None,
+                },
+            );
+        }
+        let member = m.clone();
+        let spawned = std::thread::Builder::new()
+            .name("group-word".into())
+            .spawn_scoped(threads, move || self.speak(&member, ask));
+        if let Err(e) = spawned {
+            lock(&self.groups.words).remove(&m.pid);
+            if let Some(round) = ask.give {
+                self.heard(Answered {
+                    pid: m.pid,
+                    round,
+                    gave: None,
+                });
+            }
+            log(format!("container {}: its group's word: its thread: {e}", m.id));
+        }
+    }
+
+    /// Member `m`'s words, from `ask` on, until none is due (D183, slice 3): its room told,
+    /// then, for a round, what it holds cold asked back, once a give-back of its host's
+    /// pressure under way has ended, as a budget's waits it out (reclaim.rs `give_after`);
+    /// each waited for while its VM process runs, as D215's judge judges a wait
+    /// (`Wait::WhileRuns`). Its own: nothing else waits on it.
+    fn speak(&self, m: &Member, mut ask: Ask) {
+        loop {
+            self.tell_group_room(&m.id, m.pid, ask.room);
+            if let Some(round) = ask.give {
+                // Its room's exec has ended: a refusal of it is no verdict on the give-back
+                // that follows, which its own judge judges, nor on a round opened after it.
+                self.word_begins(m.pid);
+                let vm = self.own_run(&m.id);
+                self.give_after(&vm);
+                let refused = |cut: &super::health::Cut| self.refuse_word(m.pid, cut);
+                let wait = super::health::Wait::GroupWord(m.pid, &self.answers.reclaim, &refused);
+                let gave = self.give_back_waiting(&m.id, wait);
+                self.given_back(&vm);
+                self.heard(Answered {
+                    pid: m.pid,
+                    round,
+                    gave,
+                });
+            }
+            let next = {
+                let mut words = lock(&self.groups.words);
+                let next = words.get_mut(&m.pid).and_then(|word| {
+                    let next = word.next.take()?;
+                    word.state = WordState::Waiting;
+                    Some(next)
+                });
+                if next.is_none() {
+                    words.remove(&m.pid);
+                }
+                next
+            };
+            self.spoke();
+            match next {
+                Some(next) => ask = next,
+                None => return,
+            }
+        }
+    }
+
+    /// Member `pid`'s word begins an exec of its own: no refusal stands for it yet.
+    fn word_begins(&self, pid: u32) {
+        if let Some(word) = lock(&self.groups.words).get_mut(&pid) {
+            word.state = WordState::Waiting;
+        }
+    }
+
+    /// The active word's exec judge refused it. Publish under the group's wake mutex
+    /// through spoke(), so a refusal between its check and wait cannot lose its wake.
+    fn refuse_word(&self, pid: u32, cut: &super::health::Cut) {
+        if let Some(word) = lock(&self.groups.words).get_mut(&pid) {
+            word.state = WordState::Refused(cut.clone());
+        }
+        self.spoke();
+    }
+
+    /// A member's word moved on: the groups' thread looks again.
+    fn spoke(&self) {
+        lock(&self.groups.woke).spoke = true;
+        self.groups.wake.notify_one();
+    }
+
+    /// A member's give-back of a round ended: the groups' thread hears what it gave.
+    fn heard(&self, answered: Answered) {
+        lock(&self.groups.woke).gave.push(answered);
+        self.groups.wake.notify_one();
+    }
+
+    fn word_refusal(&self, pid: u32) -> Option<super::health::Cut> {
+        match &lock(&self.groups.words).get(&pid)?.state {
+            WordState::Waiting => None,
+            WordState::Refused(cut) => Some(cut.clone()),
+        }
+    }
+
+    /// The microVM run `id` is of, by its own run's ID: its own, or the provider's of a
+    /// joiner (D119), as a give-back of its host's pressure names it (reclaim.rs `giving`).
+    fn own_run(&self, id: &str) -> String {
+        match lock(&self.runs).get(id) {
+            Some(RunState::Tracked(t)) => t.joined.clone().unwrap_or_else(|| id.to_string()),
+            _ => id.to_string(),
+        }
+    }
+
+    /// What each of `members` holds, by its index, as its group sums it: none of one whose
+    /// VM process cannot be read.
+    fn footprints(&self, members: &[Member]) -> Vec<(usize, u64)> {
+        let mut read: Vec<&Member> = Vec::new();
+        let mut held = Vec::new();
+        for (i, m) in members.iter().enumerate() {
+            // Each VM process once, by its first run: a joiner's is its provider's (D119).
+            if read.iter().any(|first| first.shares(m)) {
+                continue;
+            }
+            read.push(m);
+            if let Some(footprint) = self.footprint_of(m) {
+                held.push((i, footprint));
+            }
+        }
+        held
+    }
+
+    /// What member `m`'s VM process holds, as its group sums it: its footprint (proc_pid_rusage's
+    /// `ri_phys_footprint`, Windows' private working set); none where it cannot be read, or
+    /// where its pid now names a process that started at another time, not its own.
+    fn footprint_of(&self, m: &Member) -> Option<u64> {
+        if m.start.is_some() && shards_ipc::started(m.pid).ok() != m.start {
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(&played) = lock(&self.groups.played).get(&m.pid) {
+            return Some(played);
+        }
+        shards_vmm::platform::process_usage(m.pid)
+            .ok()
+            .map(|u| u.footprint)
+    }
+
     /// Tells run `id`'s guest the room its group's budget leaves it (init's `ROOM`, D188):
-    /// past what its run uses, the least room a run goes on in, as a slice's is told.
-    fn tell_group_room(&self, id: &str, pid: u32, room: i64) {
+    /// past what its run uses, the least room a run goes on in, as a slice's is told, as of
+    /// what its VM process held as the room was read where that was read (D183); or, with
+    /// none, that it has no budget, its hold let go of. A guest whose VMM could not say what
+    /// its VM process holds now held it as told, and said so.
+    fn tell_group_room(&self, id: &str, pid: u32, room: Option<Room>) {
+        let argv = match room {
+            None => Vec::new(),
+            Some(Room { bytes, at: None }) => vec![bytes.to_string().into_bytes()],
+            Some(Room { bytes, at: Some(at) }) => {
+                vec![bytes.to_string().into_bytes(), at.to_string().into_bytes()]
+            }
+        };
         let spec = shards_abi::run::Spec {
             builtin: shards_abi::run::builtin::ROOM,
-            argv: vec![room.to_string().into_bytes()],
+            argv,
             ..Default::default()
         };
+        let refused = |cut: &super::health::Cut| self.refuse_word(pid, cut);
         match self.exec_waiting(
             id,
             &spec,
             None,
             1 << 12,
-            super::health::Wait::WhileRuns(pid, &self.answers.room),
+            super::health::Wait::GroupWord(pid, &self.answers.room, &refused),
         ) {
-            Ok(q) if q.status == Some(0) && q.cut.is_none() => {}
+            Ok(q) if q.status == Some(0) && q.cut.is_none() => {
+                let said = String::from_utf8_lossy(&q.output);
+                if said.split_whitespace().nth(1) == Some(shards_abi::run::builtin::ROOM_UNREAD) {
+                    log(format!(
+                        "container {id}: its microVM's VMM could not say what its VM process holds: its group's room held as told, not as of what it held then"
+                    ));
+                }
+            }
             Ok(q) => log(format!(
                 "container {id}: telling its microVM its group's room: {}",
                 super::reclaim::said_of(&q)
@@ -544,6 +1067,81 @@ impl<D: Disk> Daemon<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The groups' passes come on D215's pace: the first at once; one that found nothing
+    /// changed for 10 s, taking 5 ms, next due 316 ms on (a pressure window would have been 2
+    /// s whatever a pass cost); one that found a change, due again at once.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn the_groups_passes_follow_their_cost_against_how_long_groups_stayed_as_they_are() {
+        let t0 = Instant::now();
+        let mut paced = Paced::default();
+        assert_eq!(paced.next(t0), t0, "no pass yet: at once");
+        paced.passed(t0, true);
+        let at = t0 + Duration::from_secs(10);
+        paced = Paced {
+            took: Duration::from_millis(5),
+            ..paced
+        };
+        assert_eq!(paced.next(at), at + Duration::from_nanos(316_227_766));
+        paced.unchanged_since = Some(at);
+        assert_eq!(paced.next(at), at, "a change found: the next at once");
+    }
+
+    /// A pending word's own exec wait owns its progress and host holds. Elapsed wall time
+    /// alone cannot finish its group's round, including while it waits behind host reclaim.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_pending_member_word_is_not_a_failed_give_back() {
+        let t = super::super::tests::Test::new("group-pending");
+        let slowest = std::time::Duration::from_millis(1);
+        t.daemon.answers.room.teach(slowest, slowest);
+        let pid = std::process::id();
+        lock(&t.daemon.groups.words).insert(
+            pid,
+            Word {
+                state: WordState::Waiting,
+                next: None,
+            },
+        );
+        let mut hold = Hold {
+            round: Some(Round {
+                id: 1,
+                of: [(pid, Given::Asked)].into(),
+            }),
+            ..Hold::default()
+        };
+        std::thread::sleep(slowest * 2);
+        t.daemon.judge_round("pending", &[], &mut hold);
+        assert!(
+            hold.round.is_some(),
+            "a pending word was treated as a completed failed pass"
+        );
+        hold.answered(Answered {
+            pid,
+            round: 1,
+            gave: Some(Gave {
+                freed: 1,
+                unplugging: 0,
+            }),
+        });
+        t.daemon.judge_round("pending", &[], &mut hold);
+        assert!(hold.round.is_none(), "a completed give-back was not judged");
+        hold.round = Some(Round {
+            id: 2,
+            of: [(pid, Given::Asked)].into(),
+        });
+        let now = Instant::now();
+        let cut = super::super::health::Cut::Stalled(
+            t.daemon.answers.room.stalled(now - slowest * 2, now).unwrap(),
+        );
+        t.daemon.refuse_word(pid, &cut);
+        t.daemon.judge_round("pending", &[], &mut hold);
+        assert!(
+            hold.round.is_none(),
+            "an authoritative refusal did not finish the round"
+        );
+    }
 
     #[test]
     fn a_group_is_named_as_a_file_of_the_home_alone() {
@@ -573,12 +1171,14 @@ mod tests {
     /// the period the kernel's default where it is left out; each within the kernel's bounds.
     #[test]
     fn cpu_budgets_read_as_the_kernel_reads_them() {
-        assert_eq!(cpu_max("max 100000\n"), Ok(None));
-        assert_eq!(cpu_max("max"), Ok(None));
-        assert_eq!(cpu_max("50000 100000"), Ok(Some((50_000, 100_000))));
-        assert_eq!(cpu_max("250000\n"), Ok(Some((250_000, 100_000))));
-        assert_eq!(cpu_max("1000 1000"), Ok(Some((1_000, 1_000))));
-        assert_eq!(cpu_max("200000 1000000 more"), Ok(Some((200_000, 1_000_000))));
+        let cpu = |quota, period| Ok(CpuMax { quota, period });
+        assert_eq!(cpu_max("max 100000\n"), cpu(None, 100_000));
+        assert_eq!(cpu_max("max"), cpu(None, 100_000));
+        assert_eq!(cpu_max("max 20000"), cpu(None, 20_000), "max keeps its period");
+        assert_eq!(cpu_max("50000 100000"), cpu(Some(50_000), 100_000));
+        assert_eq!(cpu_max("250000\n"), cpu(Some(250_000), 100_000));
+        assert_eq!(cpu_max("1000 1000"), cpu(Some(1_000), 1_000));
+        assert_eq!(cpu_max("200000 1000000 more"), cpu(Some(200_000), 1_000_000));
         for bad in [
             "",
             "lots",
@@ -599,10 +1199,72 @@ mod tests {
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn a_cpu_budget_of_every_cpu_holds_nothing() {
+        use std::num::NonZeroU32;
         let host = u64::try_from(crate::resources::host_cpus()).unwrap();
-        assert_eq!(held_cpu(None), None);
-        assert_eq!(held_cpu(Some((50_000, 100_000))), Some((50_000, 100_000)));
-        assert_eq!(held_cpu(Some((host * 100_000, 100_000))), None);
+        let cpu = |quota, period| CpuMax { quota, period };
+        let held = |quota, period| {
+            Ok(shards_vmm::vm::group::Budget {
+                quota: NonZeroU32::new(quota),
+                period: NonZeroU32::new(period).unwrap(),
+            })
+        };
+        assert_eq!(held_cpu(CpuMax::default()), held(0, 100_000));
+        assert_eq!(
+            held_cpu(cpu(None, 20_000)),
+            held(0, 20_000),
+            "max keeps its period"
+        );
+        assert_eq!(held_cpu(cpu(Some(50_000), 100_000)), held(50_000, 100_000));
+        assert_eq!(held_cpu(cpu(Some(host * 100_000), 100_000)), held(0, 100_000));
+        assert!(held_cpu(cpu(None, 0)).is_err());
+        assert!(held_cpu(cpu(None, 1 << 32)).is_err());
+    }
+
+    /// An ask made while a member's word is under way waits behind it, the newest room told
+    /// and a give-back of either kept; a round is done once each member it asked has given
+    /// back, gone, or given nothing, and what it gave is theirs summed (D183, R04).
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn an_ask_behind_a_word_keeps_its_newest_room_and_any_give_back() {
+        let ask = |room: Option<i64>, give| Ask {
+            room: room.map(|bytes| Room { bytes, at: Some(7) }),
+            give,
+        };
+        assert_eq!(ask(Some(5), None).over(None), ask(Some(5), None));
+        assert_eq!(
+            ask(Some(-3), None).over(Some(ask(Some(5), Some(1)))),
+            ask(Some(-3), Some(1))
+        );
+        assert_eq!(
+            ask(None, Some(2)).over(Some(ask(Some(5), Some(1)))),
+            ask(None, Some(2))
+        );
+        let gave = |freed| Given::Gave(Gave { freed, unplugging: 0 });
+        let mut round = Round {
+            id: 1,
+            of: [(1, gave(4)), (2, Given::Asked), (3, Given::Nothing)].into(),
+        };
+        assert!(!round.done());
+        let mut hold = Hold {
+            round: Some(round),
+            ..Hold::default()
+        };
+        hold.answered(Answered {
+            pid: 2,
+            round: 0,
+            gave: Some(Gave {
+                freed: 8,
+                unplugging: 0,
+            }),
+        });
+        assert!(
+            !hold.round.as_ref().unwrap().done(),
+            "another round's answer taken"
+        );
+        hold.left(2);
+        round = hold.round.take().unwrap();
+        assert!(round.done());
+        assert_eq!(round.gave().freed, 4);
     }
 
     #[test]
@@ -615,7 +1277,13 @@ mod tests {
             "max 100000\n"
         );
         std::fs::write(dir.join("cpu.max"), "50000\n").unwrap();
-        assert_eq!(budget(&dir).unwrap().cpu, Some((50_000, 100_000)));
+        assert_eq!(
+            budget(&dir).unwrap().cpu,
+            CpuMax {
+                quota: Some(50_000),
+                period: 100_000
+            }
+        );
         std::fs::write(dir.join("cpu.max"), "max 100000\n").unwrap();
         std::fs::write(dir.join("memory.high"), "1G\n").unwrap();
         assert_eq!(made(&home, "agents").unwrap(), dir);
