@@ -93,7 +93,61 @@ pub enum Runs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         reach: Option<Box<crate::sandbox::narrow::Reach>>,
+        /// What its launch gave its run as it started ([`Granted`]): the base its live overrides change. None from
+        /// a runner before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        granted: Option<Box<Granted>>,
     },
+}
+
+/// What a microVM session's launch gave its harness as it started (kiln plan 01a1dd2e…, P5.2's page: its base
+/// beside its live overrides, `sessions.grants`), as the runner launched it: its working folder, the machine's folders
+/// it sees, each where it sees it and whether it may write it, and its credentials by reference, each with the hosts
+/// it is filled in toward at the microVM's egress (Shards' D242; never a value or a placeholder).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentGranted"))]
+pub struct Granted {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub volumes: Vec<GrantedVolume>,
+    #[serde(default)]
+    pub secrets: Vec<GrantedSecret>,
+}
+
+/// A folder of the machine's a microVM session's harness sees ([`Granted`]): its path on the machine, where the
+/// harness sees it, and whether it may write it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentGrantedVolume"))]
+pub struct GrantedVolume {
+    pub host: String,
+    pub at: String,
+    pub writable: bool,
+}
+
+/// A credential a microVM session's harness was granted by reference ([`Granted`]): its reference and the hosts it is
+/// filled in toward.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentGrantedSecret"))]
+pub struct GrantedSecret {
+    pub name: String,
+    pub toward: Vec<String>,
+}
+
+impl Granted {
+    /// What a run's launch gave it, as its held run keeps it (`sandbox::held::Declared`).
+    pub fn of(d: &crate::sandbox::held::Declared) -> Self {
+        Granted {
+            folder: d.folder.clone(),
+            volumes: d.shares.iter().map(|s| GrantedVolume { host: s.host.clone(), at: s.at.clone(), writable: s.writable }).collect(),
+            secrets: d.credentials.iter().map(|(name, toward)| GrantedSecret { name: name.clone(), toward: toward.clone() }).collect(),
+        }
+    }
 }
 
 /// The link a session's harness's stdio rides into its microVM, as each end says its TLS 1.3
@@ -1608,7 +1662,7 @@ impl Session {
     /// upgrade), or one whose end went unseen, which ends now.
     fn began(&self, p: &crate::proc::Duplex) {
         let runs = match (p.boundary(), p.host_pid()) {
-            (Some(held), host_pid) => Runs::Microvm { vm: held.id(), image: held.image().to_owned(), host_pid, control: None, reach: Some(Box::new(held.reach().clone())) },
+            (Some(held), host_pid) => Runs::Microvm { vm: held.id(), image: held.image().to_owned(), host_pid, control: None, reach: Some(Box::new(held.reach().clone())), granted: Some(Box::new(Granted::of(held.declared()))) },
             (None, Some(pid)) => Runs::Host { pid },
             // A `Duplex` is a process of the machine's or a boundary's run: there's no third.
             (None, None) => return,
@@ -5979,7 +6033,7 @@ mod tests {
     fn s17_a_microvm_run_keeps_the_agentfile_and_image_its_conversation_ran_in() -> anyhow::Result<()> {
         use super::{Isolation, Runs, Spec, ran_in_of};
         use crate::harness::isolated::home::RanIn;
-        let run = Runs::Microvm { vm: None, image: "agentfile-0123@sha256:00".into(), host_pid: None, control: None, reach: None };
+        let run = Runs::Microvm { vm: None, image: "agentfile-0123@sha256:00".into(), host_pid: None, control: None, reach: None, granted: None };
         let isolated = |image: Option<&str>, person: Option<&str>| Isolation { image: image.map(str::to_owned), person: person.map(str::to_owned), ..Isolation::microvm() };
         let own = Spec { kind: "claude".into(), isolation: Some(isolated(Some("agentfile:0123"), Some("user:u1"))), agentfile: Some("FROM x\n".into()), ..Spec::default() };
         let ran = |agentfile: &str, digest: String| RanIn { conversation: "c-1".into(), agentfile: agentfile.into(), digest, image: "agentfile-0123@sha256:00".into(), kept_in: None };
@@ -6004,7 +6058,7 @@ mod tests {
     #[test]
     fn s17_a_run_kept_whole_by_a_fallback_says_so() {
         use crate::sandbox::narrow::{Reach, Whole};
-        let run = |reach| super::Runs::Microvm { vm: None, image: "i@sha256:00".into(), host_pid: None, control: None, reach: Some(Box::new(reach)) };
+        let run = |reach| super::Runs::Microvm { vm: None, image: "i@sha256:00".into(), host_pid: None, control: None, reach: Some(Box::new(reach)), granted: None };
         let said = super::whole_notice(&run(Reach::Whole { why: Whole::NoHome })).unwrap_or_default();
         assert!(said.contains("isn't narrowed") && said.contains("keeps no home"), "{said}");
         let unread = super::whole_notice(&run(Reach::Whole { why: Whole::Unread { file: "/home/h/x.json".into(), error: "denied".into() } })).unwrap_or_default();

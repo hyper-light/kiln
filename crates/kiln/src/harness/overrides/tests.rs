@@ -381,6 +381,62 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
     })
 }
 
+/// P5.2's page (the base beside the live overrides): `sessions.grants` says what each session's launch gave it as it
+/// started. A host session: its working folder, the folder its harness is allowed, nothing narrowing its egress, no
+/// microVM's plug roots or ceiling. A microVM session: its folder and the machine's folders it sees as its runner
+/// launched them (each where it sees it, and whether it may write it), the folders its harness is allowed, its plug
+/// roots and egress ceiling as its launch declared them, what it reaches past its microVM, and no port or network,
+/// none being given at a launch; a port published live shows among its live overrides, its base unchanged. A session
+/// kiln doesn't run is 404. Dropping the runner's record of its launch (`granted`) leaves its base unsaid
+/// (`reported` false), which the microVM half fails on.
+#[cfg(unix)]
+#[test]
+fn p5_2_a_sessions_grants_are_what_its_launch_gave_beside_its_live_overrides() -> anyhow::Result<()> {
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, _log) = stand_in(&dir.path().join("h"))?;
+        let ask = |name: &'static str, input: Value| {
+            let cx = owner(&hub);
+            async move { call(cx, name, input).await.map_err(|(s, m)| anyhow::anyhow!("{name}: {s} {m}")) }
+        };
+        let cwd = dir.path().to_string_lossy().into_owned();
+
+        opened(&hub, "host-base", dir.path(), &program, None).await?;
+        // Its folder as kiln holds it (resolved as its session resolved it).
+        let cwd = hub.harness.info("host-base").map(|i| i.cwd).unwrap_or(cwd);
+        let g = ask("sessions.grants", json!({"agent": "host-base"})).await?;
+        anyhow::ensure!(g.get("engine") == Some(&json!("host")) && g.pointer("/base/folder") == Some(&json!(cwd)) && g.pointer("/base/allowed_dirs") == Some(&json!([cwd])), "{g}");
+        anyhow::ensure!(g.pointer("/base/egress") == Some(&json!({"as": "host"})) && g.pointer("/base/plug_roots") == Some(&json!([])) && g.pointer("/base/egress_ceiling") == Some(&json!([])), "{g}");
+
+        let vms = microvms(&hub, dir.path(), &program)?;
+        opened(&hub, "vm-base", dir.path(), &program, Some(Isolation::microvm())).await?;
+        shows(&hub, "vm-base", "what its launch declared", |v| v.pointer("/state/overrides/roots").is_some() && v.pointer("/info/runs/granted").is_some()).await?;
+        let launched = vms.launched();
+        let launch = launched.first().ok_or_else(|| anyhow::anyhow!("nothing was launched"))?;
+        let g = ask("sessions.grants", json!({"agent": "vm-base"})).await?;
+        anyhow::ensure!(g.get("engine") == Some(&json!("microvm")) && g.pointer("/base/reported") == Some(&json!(true)), "its runner said its base: {g}");
+        anyhow::ensure!(g.pointer("/base/folder") == Some(&json!(launch.folder)), "its folder as launched: {g}");
+        let volumes: Vec<Value> = launch.shares.iter().map(|s| json!({"host": s.host, "at": s.at, "writable": s.writable})).collect();
+        anyhow::ensure!(g.pointer("/base/volumes") == Some(&json!(volumes)) && !volumes.is_empty(), "the folders it sees, as launched: {g}");
+        let allowed = g.pointer("/base/allowed_dirs").and_then(Value::as_array).cloned().unwrap_or_default();
+        anyhow::ensure!(launch.folder.iter().chain(launch.shares.iter().map(|s| &s.at)).all(|d| allowed.contains(&json!(d))), "its harness allowed each: {g}");
+        anyhow::ensure!(g.pointer("/base/plug_roots") == Some(&json!(launch.plug_roots)) && g.pointer("/base/egress_ceiling") == Some(&json!([CEILING])), "{g}");
+        anyhow::ensure!(g.pointer("/base/egress").is_some_and(|e| !e.is_null()) && g.pointer("/base/ports") == Some(&json!([])) && g.pointer("/base/networks") == Some(&json!([])), "{g}");
+        ask("sessions.ports.publish", json!({"agent": "vm-base", "bind": "127.0.0.1", "host_port": 8081, "guest_port": 3000, "protocol": "tcp"})).await?;
+        shows(&hub, "vm-base", "its port, held", |v| v.pointer("/state/overrides/ports/0").is_some()).await?;
+        let g = ask("sessions.grants", json!({"agent": "vm-base"})).await?;
+        anyhow::ensure!(g.pointer("/live/ports/0").is_some() && g.pointer("/base/ports") == Some(&json!([])) && g.pointer("/live/roots").is_none(), "live beside an unchanged base: {g}");
+
+        let gone = call(owner(&hub), "sessions.grants", json!({"agent": "nobody"})).await.err().ok_or_else(|| anyhow::anyhow!("a session kiln doesn't run answered"))?;
+        anyhow::ensure!(gone.0 == http::StatusCode::NOT_FOUND, "{gone:?}");
+        for id in ["host-base", "vm-base"] {
+            anyhow::ensure!(hub.harness.close(&hub, id).await, "{id} closed");
+        }
+        Ok(())
+    })
+}
+
 /// P6b.4 AC3: a folder given read-only is the session's scope for reading, and refused for changing, by kiln at each
 /// call it holds (`hold::verdict`); a folder given read-write is inside the session's folder for its file calls.
 #[test]

@@ -203,7 +203,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     if lanes.is_some() {
         offer_mcp(kind, &source, person, homes, &mut launch.args).await;
     }
-    let declared = crate::sandbox::held::Declared { plug_roots: launch.plug_roots.clone(), egress_ceiling: launch.egress_ceiling.clone() };
+    let declared = crate::sandbox::held::Declared::of(&launch);
     let asked = std::time::Instant::now();
     let (run, swapped) = match swap_from {
         // A switch: its member swapped for this one in the microVM it runs in.
