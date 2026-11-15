@@ -1,7 +1,7 @@
 //! Every operation, once (docs/ci.md W20-R01): deployments' ([`crate::cd::ops`]), releases by
 //! API ([`crate::deploy::ops`]), CI's ([`crate::ci::ops`]) and kiln's own: agents'
 //! ([`crate::harness::ops`]), plans' ([`crate::plans::ops`]), Agentfiles'
-//! ([`crate::agentfiles::ops`]) and goal stacks' ([`crate::goals::ops`]). Each has its name, summary, input schema and whether it changes
+//! ([`crate::agentfiles::ops`]), agent definitions' ([`crate::agentdefs::ops`]) and goal stacks' ([`crate::goals::ops`]). Each has its name, summary, input schema and whether it changes
 //! anything. The MCP tools and code mode's `kiln.*` are this list. Each operation is checked
 //! against the route table as its HTTP route is, so a caller may do through them exactly what it
 //! may do over HTTP.
@@ -311,6 +311,7 @@ pub fn own() -> &'static [Op] {
             .into_iter()
             .chain(crate::plans::ops::list_ops())
             .chain(crate::agentfiles::ops::list_ops())
+            .chain(crate::agentdefs::ops::list_ops())
             .chain(crate::goals::ops::list_ops())
             .chain(crate::programs::ops::list_ops())
             .chain(crate::research::ops::list_ops())

@@ -183,6 +183,51 @@ interface AgentfileListing { agentfiles: AgentfileBrief[]; reaches_all: boolean 
   project?: { repo; sha: string|null; agentfiles: { name; path; text: string|null }[] } }
 ```
 
+## Agent definitions
+
+An agent definition is an agent as data (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P5.1): one of
+kiln's ten harnesses (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor, pi) and
+its model, its instructions and playbook, its tools and MCP servers, its skills, its limits (time,
+cost, tokens), and the Agentfile its microVM is made from (one of its owner's, `agentfile:<id>`, or
+kiln's for its harness, `harness-<harness>`; none: its harness's own). People keep their own in kiln
+(`crate::agentdefs`), each with every version of its settings: a change of settings is a new version,
+and so is a restore; a rename alone is none. The routes need `agents.run`; each keeps a person to
+their own, and answers 404 for another's. The server's owner, and whoever has `agentdefs.manage` (an
+admin), reach everyone's; an agent reaches those of the person it acts for. Each route is an
+operation too (`agentdefs.*`: `POST /api/ops/<name>`, kiln's MCP tools `agentdefs_*`, code mode's
+`kiln.agentdefs.*`), and each change is audited. (`agents.*` and `/api/agents` are the agents kiln
+runs and its runners: a definition's run is one of those agents.)
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/agentdefs?all=` | `{ agents: AgentDefBrief[], reaches_all }`, newest change first |
+| POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile? }` → `AgentDef` (version 1); 422 `kiln can't run this agent: <why>`, 409 a name taken |
+| POST | `/api/agentdefs/check` | the settings → `{ ok, problems: string[] }`, keeping nothing |
+| GET | `/api/agentdefs/{id}` | `AgentDef` |
+| PATCH | `/api/agentdefs/{id}` | what's given changes (null `model` or `agentfile`: back to its harness's) → `AgentDef` |
+| GET | `/api/agentdefs/{id}/versions` | `{ versions: { version, at, by, ...settings }[] }`, newest first |
+| POST | `/api/agentdefs/{id}/restore` | `{ version }` → `AgentDef`, that version's settings as a new version |
+| DELETE | `/api/agentdefs/{id}` | `{ deleted: true }` |
+| POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }` |
+
+Kept and restored settings are checked first, and refused, every reason said, where: the harness
+isn't one of kiln's ten; the Agentfile isn't one its owner reaches (another person's is as none) or is
+kiln's for another harness; the model isn't one kiln's machines list for that harness (what its
+sessions said they offer; a harness no machine lists models for takes any); an MCP server has no name
+of its own, or not exactly one of `url` and `command`; a tool or skill has no name; a limit is 0.
+A run starts an agent through `agents.start`, as its route starts one (the caller's right to start
+agents there checked and audited as such): the definition's harness and model, `isolation`
+`microvm`, `image` its Agentfile (left out: the start's own for its harness), and as its first
+message its instructions, then the run's `prompt`.
+
+```ts
+interface Mcp { name; url?; command?: string[] }
+interface Limits { seconds?; cents?; tokens? }
+interface AgentDef { id; owner /* "owner" | "user:<id>" */; name; version; created_at; updated_at;
+  harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
+type AgentDefBrief = Pick<AgentDef, "id"|"owner"|"name"|"harness"|"model"|"agentfile"|"version"|"created_at"|"updated_at">;
+```
+
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/api/agentfiles?repo=&all=` | `AgentfileListing`: yours, newest change first, without their texts; beside them, read only, those kiln ships per harness (`builtin`), and with `repo` (`owner/name`, a repository whose runs you read, else 404) its `.kiln/images/<name>/Agentfile` files at its default branch (`text` null past 2 MiB). `all=true`: everyone's (403 without `agentfiles.manage`) |
