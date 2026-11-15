@@ -217,7 +217,8 @@ one, or one whose target changed since (409, and the next such call asks anew) d
 confirmation lasts until the person's next message to that agent, which drops what was asked before it;
 a click after the agent's turn ended still confirms. kiln keeps the confirmation and never hands it to
 the agent, so there's nothing for an agent or a page it reads to copy, guess or replay. An op an agent
-makes in a person's turn says so on its audit row (kiln's own operations).
+makes in a person's turn says so on its audit row, whichever operation it is. The Agents page's Remove is
+`agents.remove` (`DELETE /api/harness/agents/{agent}`), held to this gate as every operation is.
 
 ## Agent definitions
 

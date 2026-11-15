@@ -190,12 +190,12 @@ fn a_person_reaches_the_agents_they_opened() -> anyhow::Result<()> {
     assert!(st == 200 && list.contains(&mine) && list.contains(&theirs), "mia's list: {st} {list}");
     let (st, said) = mia.call(&s, "GET", &format!("/api/harness/sessions/{theirs}"), None)?;
     assert_eq!(st, 200, "mia reads dev2's: {said}");
-    let (st, said) = mia.call(&s, "DELETE", &format!("/api/harness/sessions/{theirs}"), None)?;
+    let (st, said) = mia.call(&s, "DELETE", &format!("/api/harness/agents/{theirs}"), None)?;
     assert!((200..300).contains(&st), "mia closes dev2's: {st} {said}");
 
     // dev1 closes their own; the rows of their command and close name them, as does the
     // command on their socket.
-    let (st, said) = dev1.call(&s, "DELETE", &format!("/api/harness/sessions/{mine}"), None)?;
+    let (st, said) = dev1.call(&s, "DELETE", &format!("/api/harness/agents/{mine}"), None)?;
     assert!((200..300).contains(&st), "dev1 closes their own: {st} {said}");
     let deadline = Instant::now() + Duration::from_secs(10);
     let rows = loop {

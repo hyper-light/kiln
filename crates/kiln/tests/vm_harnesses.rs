@@ -1345,7 +1345,7 @@ mod engine {
         anyhow::ensure!(code >= 400 && said.contains("its engine is host"), "a microVM refused on it: {code} {said}");
         anyhow::ensure!(vm_e2e::status(&vm_e2e::info(&f, &vm)?) != "exited", "the microVM one goes on: {}", vm_e2e::info(&f, &vm)?);
         for id in [&next, &vm] {
-            let _ = crate::common::http(f.port, "DELETE", &format!("/api/harness/sessions/{id}"), &f.admin, None);
+            let _ = crate::common::http(f.port, "DELETE", &format!("/api/harness/agents/{id}"), &f.admin, None);
         }
         let (code, _) = crate::common::http(f.port, "PUT", &format!("/api/runners/{}/engine", f.machine), &f.admin, Some(&json!({"engine": null})))?;
         anyhow::ensure!(code == 200 && vm_e2e::engine_of(&f, &f.machine)?.get("engine") == Some(&json!("microvm")));
@@ -1376,7 +1376,7 @@ mod engine {
             let id = a.get("id").and_then(Value::as_str).unwrap_or_default();
             let info = vm_e2e::info(&f, id)?;
             anyhow::ensure!(info.get("target") == Some(&json!(format!("agent:{}", f.machine))), "on the microvm runner: {info}");
-            let _ = crate::common::http(f.port, "DELETE", &format!("/api/harness/sessions/{id}"), &f.admin, None);
+            let _ = crate::common::http(f.port, "DELETE", &format!("/api/harness/agents/{id}"), &f.admin, None);
         }
         Ok(())
     }

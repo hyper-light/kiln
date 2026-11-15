@@ -775,6 +775,26 @@ async fn stop(cx: Cx, v: Value) -> Out {
     Ok(json!({"ended": ended}))
 }
 
+/// Agent `agent` ended for good and taken off kiln's lists (the Agents page's Remove: kiln plan
+/// 01a1dd2e8618733a87f2793aab1322a8 P5.6, S1): its goals forgotten and its copy let go, audited as whoever
+/// asked. One whose machine keeps it (its archive or restore under way) is refused until that's done.
+async fn remove(cx: Cx, v: Value) -> Out {
+    let id = known(&cx, &agent_of(&v)?)?.id;
+    may_steer(&cx, &id).await?;
+    super::about::ended(&id);
+    if cx.hub.harness.close(&cx.hub, &id).await {
+        let _ = crate::goals::forget(&cx.hub, &id).await;
+        cx.hub.copies.forget_agent(&cx.hub, &id).await;
+        cx.hub.store.audit(cx.caller.name.clone(), "agent.close".into(), id.clone()).await;
+        Ok(json!({"removed": id}))
+    } else if cx.hub.harness.info(&id).is_some() {
+        // Its machine kept it: its archive or restore is under way (attention plan 01a199e1b177752e84dad5dc990e6a15).
+        Err((StatusCode::CONFLICT, "its archive or restore is under way: end it once that's done".to_owned()))
+    } else {
+        Err((StatusCode::NOT_FOUND, "no such agent session".to_owned()))
+    }
+}
+
 async fn children(cx: Cx, v: Value) -> Out {
     let id = seen(&cx, &agent_of(&v)?).await?.id;
     Ok(json!({"children": lineage::children_brief(&cx.hub, &id)}))
@@ -986,6 +1006,15 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentsStop>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "stop"]))),
             run: |cx, v| Box::pin(stop(cx, v)),
+        },
+        Op {
+            name: "agents.remove",
+            summary: "Remove an agent: end it for good and take it off kiln's lists (its goals forgotten, its copy let go; its changes stay on disk). Refused while its machine archives or restores it.",
+            read_only: false,
+            destructive: true,
+            input: Input::of::<input::AgentsRemove>(),
+            route: |v| Ok((Method::DELETE, path(&["api", "harness", "agents", &agent_of(v)?]))),
+            run: |cx, v| Box::pin(remove(cx, v)),
         },
         Op {
             name: "agents.credential",
@@ -1309,6 +1338,13 @@ pub mod input {
         pub agent: String,
         /// End the agents it started (and theirs) too.
         pub children: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRemove {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
