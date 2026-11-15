@@ -1745,6 +1745,10 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub perms: Option<Perms>,
+    /// What a person changed of it while it runs, in place (`Command::Override`, `super::overrides`): its ports,
+    /// egress, networks and volumes, each with how each place took it, given again at its harness's every start.
+    #[serde(default, skip_serializing_if = "super::overrides::Overrides::is_empty")]
+    pub overrides: super::overrides::Overrides,
 }
 
 /// One of kiln's own messages its harness was handed (`State::given`).
@@ -2496,6 +2500,10 @@ pub enum Command {
         ids: Vec<String>,
         response_digest: String,
     },
+    /// A person changes a live override of it, in place (kiln plan 01a1dd2e…, P6b.4; `super::overrides`): a port, an
+    /// egress grant, a network or a volume. Its session takes it as its own record, then its microVM and its harness,
+    /// each as it can, and keeps it for its harness's every start.
+    Override { change: super::overrides::Change },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

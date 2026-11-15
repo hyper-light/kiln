@@ -121,7 +121,10 @@ async fn get(cx: Cx, v: Value) -> Out {
             o.remove(*k);
         }
     }
-    Ok(json!({"agent": wait::brief(&info), "info": info, "state": state}))
+    // Its live overrides, and the operations that change them on its engine (kiln plan 01a1dd2e…, P6b.4): the network's
+    // offered only on a microVM session.
+    let live = super::overrides::view(&info, &state);
+    Ok(json!({"agent": wait::brief(&info), "info": info, "state": state, "live": live}))
 }
 
 async fn start(cx: Cx, v: Value) -> Out {

@@ -88,6 +88,9 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
     anyhow::ensure!(std::path::Path::new(&cwd).is_dir(), "{cwd} is not a directory on this machine");
     let run = kind.elsewhere(spec)?;
     let project = project_share(&cwd).map_err(anyhow::Error::msg)?;
+    // Its project's top-level directory, where a folder is plugged in live ([`launch`] adds its person's volumes' and its
+    // session's root).
+    let roots = plug_root_of(&project.at).into_iter().collect();
     Ok(Launch {
         program: run.member.to_owned(),
         args: run.args,
@@ -100,6 +103,9 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
         // No credential granted by reference yet (D242): its harness signs in natively until its sign-in is captured
         // outside the microVM (plan step 33's steps 6 and 8), so nothing is filled in at its egress.
         credentials: Vec::new(),
+        plug_roots: roots,
+        // The most egress it may be granted live: its person's or org's policy, as kiln's server set it at its start.
+        egress_ceiling: spec.egress_ceiling.clone(),
     })
 }
 
@@ -155,6 +161,16 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         _ => (Vec::new(), None),
     };
     launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true }));
+    // Where a folder a person gives it while it runs is plugged in live (Shards' `ImageSpec::plug_roots`, D271): the
+    // top-level directories of its project and its person's volumes, and its session's own root, where kiln puts such a
+    // folder by default (`harness::overrides`), each once.
+    let mut roots: Vec<String> = Vec::new();
+    for root in launch.shares.iter().filter(|s| s.writable).filter_map(|s| plug_root_of(&s.at)).chain([VOLUMES.to_owned()]) {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    launch.plug_roots = roots;
     for dir in plugin_folders(kind, session) {
         let at = guest_path(&dir, PLUGINS).map_err(anyhow::Error::msg)?;
         launch.args.extend(["--plugin-dir".to_owned(), at.clone()]);
@@ -175,6 +191,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
         _ => None,
     };
+    let declared = crate::sandbox::held::Declared { plug_roots: launch.plug_roots.clone(), egress_ceiling: launch.egress_ceiling.clone() };
     let run = vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
     if let Some(lanes) = lanes {
         let here = crate::reach::node::global().map(|h| crate::reach::local::Here { handle: h.clone(), me: h.name().to_owned(), host, session: session.to_owned() });
@@ -187,7 +204,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     if let (Some(claim), Some(reach), Some(group)) = (&spec.claim, crate::reach::node::global(), super::group_of(vms, run.as_ref())) {
         reach.session_grouped(claim.clone(), group).await;
     }
-    Ok(crate::proc::duplex_of_run(run, image, reach, kept_in))
+    Ok(crate::proc::duplex_of_run(run, image, reach, kept_in, declared))
 }
 
 /// Serves kiln's MCP to run `vm`'s harness in this runner's own process (Shards D254; #75 step 3): each connection
@@ -230,6 +247,28 @@ pub const PROJECTS: &str = "/work";
 
 /// Where a microVM sees a Windows machine's plugin folders: beneath this, each by its own name.
 pub const PLUGINS: &str = "/plugins";
+
+/// Where a microVM sees the folders a person gives its running session (`harness::overrides`), by default: beneath
+/// this, each by its own name, one of the plug roots its launch declares ([`launch`]), so each is taken live.
+pub const VOLUMES: &str = "/volumes";
+
+/// The plug root path `at` of a microVM lies beneath (Shards' `shards_abi::run::plug::root_name`, D271): its top-level
+/// directory, unless that is one its init keeps its own ([`INITS_OWN`]), which no plug root names.
+pub fn plug_root_of(at: &str) -> Option<String> {
+    let first = at.strip_prefix('/')?.split('/').next().filter(|f| !f.is_empty() && *f != "." && *f != ".." && !f.contains('\0'))?;
+    (!INITS_OWN.contains(&first)).then(|| format!("/{first}"))
+}
+
+/// The top-level directories a microVM's init keeps its own, which no plug root names (Shards' `plug::REFUSED`, D271).
+pub const INITS_OWN: &[&str] = &["proc", "sys", "dev", "tmp", "etc", "run"];
+
+/// Where a microVM sees folder `host` of the machine, given its running session (`harness::overrides`) where none was
+/// asked: beneath [`VOLUMES`] by its own name, its last part. Why not, for one with no name to go by.
+pub fn volume_at(host: &str) -> Result<String, String> {
+    let name = host.rsplit(['\\', '/']).find(|c| !c.is_empty()).filter(|c| *c != "." && *c != ".." && !c.ends_with(':') && *c != "?");
+    let name = name.ok_or_else(|| format!("{host:?} has no folder's name to plug it in by"))?;
+    Ok(format!("{VOLUMES}/{name}"))
+}
 
 /// Where a microVM sees folder `host` of the machine, as Shards plugs one in (D235): a Unix path at its
 /// own path, so what the harness says of its files names them as the machine does; a Windows one

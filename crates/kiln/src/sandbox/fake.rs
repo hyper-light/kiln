@@ -6,8 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
-use kiln_seams::sandbox::{Boundary, Egress, Holds, Launch, Limits, Link, Output, Refusal, Run, Sandbox, Signal};
+use kiln_seams::sandbox::{Boundary, Change, Egress, Holds, Launch, Limits, Link, Output, Refusal, Run, Sandbox, Signal};
 use parking_lot::Mutex;
 
 use super::host::HostSandbox;
@@ -18,12 +20,14 @@ pub struct FakeVms {
     launched: Mutex<Vec<Launch>>,
     /// The link each run's stdio is said to ride, once it's started.
     link: Option<Link>,
+    /// Each change a run took while it ran (`Run::change`), by its microVM's name, in order.
+    changed: Arc<Mutex<Vec<(String, Change)>>>,
 }
 
 impl FakeVms {
     /// One image, `image`, whose member `member` runs `program`.
     pub fn with(image: &str, member: &str, program: &Path) -> Self {
-        Self { images: vec![(image.to_owned(), member.to_owned(), program.to_path_buf())], launched: Mutex::new(Vec::new()), link: None }
+        Self { images: vec![(image.to_owned(), member.to_owned(), program.to_path_buf())], launched: Mutex::new(Vec::new()), link: None, changed: Arc::default() }
     }
 
     /// Its runs' stdio said to ride `link`.
@@ -34,6 +38,12 @@ impl FakeVms {
     /// Every launch asked of it, in order.
     pub fn launched(&self) -> Vec<Launch> {
         self.launched.lock().clone()
+    }
+
+    /// Each change its runs took while they ran, by its microVM's name, in order: what the stand-in runtime records of a
+    /// session's live overrides.
+    pub fn changed(&self) -> Vec<(String, Change)> {
+        self.changed.lock().clone()
     }
 }
 
@@ -108,7 +118,7 @@ impl Sandbox for FakeVms {
             let Boundary::MicroVm { image } = &launch.boundary else { return Err(Refusal::Unsupported("a run outside a microVM".into())) };
             let program = self.images.iter().find(|(i, m, _)| i == image && *m == launch.program).map(|(_, _, p)| p.to_string_lossy().into_owned()).ok_or_else(|| Refusal::NoSuchProgram(format!("{image}'s {}", launch.program)))?;
             let run = HostSandbox.launch(Launch { program, shares: Vec::new(), limits: Limits::NONE, egress: Egress::Any, boundary: Boundary::Host, ..launch }).await?;
-            Ok(Box::new(FakeRun { run, id: format!("fake-vm-{n}"), link: self.link.clone() }) as Box<dyn Run>)
+            Ok(Box::new(FakeRun { run, id: format!("fake-vm-{n}"), link: self.link.clone(), changed: Arc::clone(&self.changed) }) as Box<dyn Run>)
         })
     }
 
@@ -117,7 +127,7 @@ impl Sandbox for FakeVms {
     }
 
     fn holds(&self) -> Holds {
-        super::host::HOLDS
+        Holds { live: true, ..super::host::HOLDS }
     }
 }
 
@@ -126,6 +136,7 @@ struct FakeRun {
     run: Box<dyn Run>,
     id: String,
     link: Option<Link>,
+    changed: Arc<Mutex<Vec<(String, Change)>>>,
 }
 
 impl Run for FakeRun {
@@ -156,5 +167,12 @@ impl Run for FakeRun {
     fn link(&self) -> BoxFuture<'_, Option<Link>> {
         let link = self.link.clone();
         Box::pin(async move { link })
+    }
+
+    /// Taken and recorded, as Hex's wire calls will take one (P6b.3); a held run that ended refuses one before it comes
+    /// here (`Held::change`).
+    fn change(&self, change: Change) -> BoxFuture<'_, Result<(), Refusal>> {
+        self.changed.lock().push((self.id.clone(), change));
+        Box::pin(async { Ok(()) })
     }
 }

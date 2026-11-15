@@ -32,7 +32,7 @@ pub fn command_kind(command: &Command) -> Option<&'static str> {
         | Command::Pause { .. } | Command::Perms { .. } | Command::Branch { .. } | Command::PauseAt { .. }
         | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::AutoResume { .. }
         | Command::McpEnable { .. } | Command::McpReconnect { .. } | Command::McpAuth { .. } | Command::McpAdd { .. }
-        | Command::McpRemove { .. } | Command::RemoveTask { .. } | Command::OwnEdits { .. } => Some("command"),
+        | Command::McpRemove { .. } | Command::RemoveTask { .. } | Command::OwnEdits { .. } | Command::Override { .. } => Some("command"),
         // Reads and refreshes.
         Command::Snapshot | Command::McpRefresh | Command::Suggest { .. } | Command::SkillView { .. } | Command::SkillsReload => None,
         // kiln's own: a move's progress, a hand-over's word, another session's usage limit.
