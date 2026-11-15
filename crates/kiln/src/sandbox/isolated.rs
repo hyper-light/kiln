@@ -43,8 +43,16 @@ use crate::harness::session::{Isolation, Spec};
 /// Why an isolated agent doesn't move to another machine.
 pub const NO_MOVE: &str = "an isolated agent doesn't move to another machine yet: its microVM and what its harness keeps there are its machine's; end it, or start it anew there";
 
-/// Why an isolated agent doesn't switch to another harness.
-pub const NO_SWITCH: &str = "An isolated agent doesn't switch to another harness yet: its microVM runs its own harness's image. End it, and start the other harness isolated.";
+/// Why an isolated agent doesn't switch to another harness where its machine's microVMs swap none in place.
+pub const NO_SWITCH: &str = "An isolated agent switches harness only where its machine's microVMs swap one in place, and these don't yet (Hex's wire calls, kiln plan 01a1dd2e…, P6c.2). End it, and start the other harness isolated.";
+
+/// Whether `kind`'s harness can be swapped into a microVM session of `spec` (kiln plan 01a1dd2e…, P6c.5): its image
+/// (the Agentfile `spec` names for it, kiln's own where none) pinned in the machine's store, built there once where it
+/// isn't, before the session's harness is handed on, so a switch that can't go leaves it as it was. Why not, in words.
+pub async fn ready_to_swap(kind: &Kind, spec: &Spec, vms: &Microvms, secrets: &[crate::secrets::mine::BuildSecret]) -> Result<(), String> {
+    let source = source_of(kind, spec)?;
+    vms.images.pinned(source, secrets).await.map(|_| ()).map_err(|r| format!("{}'s image, {}: {r}", kind.name, source.name()))
+}
 
 /// How a start names one of a person's own Agentfiles as an isolated agent's image (the console's
 /// `views/agentfiles/choose.ts`, `keptImage`).
@@ -123,8 +131,11 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
 /// `host_tools`); its harness gets kiln's variables as a microVM's member does
 /// (`isolated::env::member_env`) and kiln's MCP through its link's lane ([`offer_mcp`]), served by this runner for
 /// `session` ([`bridge`], its asks `host`'s), where its microVMs carry the lane. A build of its image is
-/// given `secrets` (`Spec::build_secrets`, P4.7).
-pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret]) -> anyhow::Result<crate::proc::Duplex> {
+/// given `secrets` (`Spec::build_secrets`, P4.7). With `swap_from`, the harness a session switches from in a microVM of
+/// its own (kiln plan 01a1dd2e…, P6c.5), its member is swapped for this one there (`Run::swap`): the same microVM, none
+/// started; refused, why, and that harness's run is let go of.
+#[allow(clippy::too_many_arguments, reason = "a launch's own, and the run a switch swaps it into")]
+pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret], swap_from: Option<crate::proc::Duplex>) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     let mut launch = launch_of(kind, spec, source.name())?;
@@ -187,12 +198,23 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     if lanes.is_some() {
         offer_mcp(kind, &source, person, homes, &mut launch.args).await;
     }
-    let name = match (&spec.claim, crate::reach::node::global()) {
-        (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
-        _ => None,
-    };
     let declared = crate::sandbox::held::Declared { plug_roots: launch.plug_roots.clone(), egress_ceiling: launch.egress_ceiling.clone() };
-    let run = vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
+    let run = match swap_from {
+        // A switch: its member swapped for this one in the microVM it runs in.
+        Some(from) => {
+            let held = from.boundary().ok_or_else(|| anyhow::anyhow!("{} has no microVM to be swapped into", kind.name))?;
+            let swapped = held.swap(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't be swapped into its microVM ({image}): {r}", kind.name));
+            drop(from);
+            swapped?
+        }
+        None => {
+            let name = match (&spec.claim, crate::reach::node::global()) {
+                (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
+                _ => None,
+            };
+            vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?
+        }
+    };
     if let Some(lanes) = lanes {
         let here = crate::reach::node::global().map(|h| crate::reach::local::Here { handle: h.clone(), me: h.name().to_owned(), host, session: session.to_owned() });
         let served = run.id().ok_or_else(|| std::io::Error::other("its run names no microVM")).and_then(|vm| bridge(lanes, vm, here, crate::harness::session::resolve_cwd(spec.cwd.as_deref())));

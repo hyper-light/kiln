@@ -3450,16 +3450,18 @@ fn switch_now(core: &Core) -> bool {
 
 /// A person chose a model of harness `to`: the session goes on in it once nothing is under way
 /// (kiln's queue waits for it meanwhile). None: it can't (said in the timeline).
-fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<Switch> {
+fn wanted(s: &Session, from: &'static Kind, to: &str, model: String, swaps: bool) -> Option<Switch> {
     let target = Kind::get(to).filter(|k| k.switchable() && from.switchable());
-    let installed = target.is_some_and(Kind::available);
     // Its spec before its core: never the one lock inside the other.
     let (allow_bypass, isolated) = {
         let spec = s.spec.lock();
         (spec.allow_bypass, spec.isolation.is_some())
     };
+    // In a microVM, its harness is its image's, swapped there for the other's (kiln plan 01a1dd2e…, P6c.5): where its
+    // microVMs swap one in place, never in a new microVM; none installed on the machine is asked for.
+    let installed = isolated || target.is_some_and(Kind::available);
     let mut core = s.core.lock();
-    if isolated {
+    if isolated && !swaps {
         core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: crate::sandbox::isolated::NO_SWITCH.to_owned() });
         return None;
     }
@@ -3481,6 +3483,22 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
         core.upsert("switch-pending", None, super::model::Body::Notice { level: Level::Info, text });
     }
     Some(Switch { to: target, model })
+}
+
+/// `spec` as its session goes on in harness `to` in its microVM (kiln plan 01a1dd2e…, P6c.5): `to`'s own image, kiln's
+/// Agentfile for it, the one it started from being its first harness's.
+fn switched_spec(spec: &Spec, to: &Kind) -> Spec {
+    let mut target = spec.clone();
+    to.id.clone_into(&mut target.kind);
+    if let Some(i) = target.isolation.as_mut() {
+        i.image = None;
+    }
+    target
+}
+
+/// Whether this machine's microVMs swap a harness for another in place (`Holds::swaps`: kiln plan 01a1dd2e…, P6c.5).
+fn swaps_here(files: &Files) -> bool {
+    files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()).is_some_and(|v| v.sandbox.holds().swaps)
 }
 
 /// A model's name as its harness lists it, else its id.
@@ -3533,10 +3551,19 @@ struct Carried {
 /// default). Err: `from`'s record couldn't be read.
 #[allow(clippy::too_many_arguments)]
 async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)], session: Option<String>, timeline: Option<super::handoff::Conversation>, cwd: &str, old_model: &str, mode: &str, effort: &str, allow_bypass: bool, model: &str, more: Option<&str>) -> Result<Carried, String> {
+    carried_in(from, to, env, session, timeline, cwd, old_model, mode, effort, allow_bypass, model, more, false).await
+}
+
+/// [`carried`], for a session in a microVM where `isolated`: its harness's own record is its microVM's, so kiln carries
+/// its own timeline, into a harness's own record where it takes one over its protocol (Codex's thread items), else in
+/// words with the next message (Claude Code's transcript is written nowhere on the machine for it; kiln plan
+/// 01a1dd2e…, P6c.5).
+#[allow(clippy::too_many_arguments, reason = "carried's own, and whether its session is in a microVM")]
+async fn carried_in(from: &'static Kind, to: &'static Kind, env: &[(String, String)], session: Option<String>, timeline: Option<super::handoff::Conversation>, cwd: &str, old_model: &str, mode: &str, effort: &str, allow_bypass: bool, model: &str, more: Option<&str>, isolated: bool) -> Result<Carried, String> {
     use super::handoff;
     // What the model saw: from the harness's own record (no session yet: nothing to carry), or
-    // for one whose record kiln doesn't read, kiln's timeline.
-    let read = match (from.own_record(), session) {
+    // for one whose record kiln doesn't read, kiln's timeline (a microVM's harness's too).
+    let read = match (from.own_record() && !isolated, session) {
         (false, _) => Some(timeline.unwrap_or_default()),
         (true, None) => Some(handoff::Conversation::default()),
         (true, Some(id)) => {
@@ -3552,8 +3579,8 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
         }
     };
     let Some(mut conv) = read else { return Err(format!("kiln could not read {}'s record of this conversation", from.name)) };
-    // In words it all goes with one message: less of it.
-    let words = !to.own_record();
+    // In words it all goes with one message: less of it. A microVM's Claude Code takes it so.
+    let words = !to.own_record() || (isolated && to.protocol == Protocol::ClaudeStreamJson);
     let dropped = handoff::fit(&mut conv, if words { handoff::WORDS_BUDGET } else { CARRY_MAX });
     let empty = conv.entries.is_empty() && conv.summary.is_none();
     let (mode, effort) = carried_settings(from, to, mode, effort, allow_bypass, model);
@@ -3564,6 +3591,7 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
     }
     let record = match to.protocol {
         _ if empty => Record::Nothing,
+        Protocol::ClaudeStreamJson if isolated => Record::Words(handoff::as_words(conv, &note, usize::MAX)),
         Protocol::ClaudeStreamJson => {
             let id = uuid::Uuid::now_v7().to_string();
             let records = handoff::to_claude(&conv, Some(&format!("<system-reminder>\n{note}\n</system-reminder>")), &id, cwd, if old_model.is_empty() { "unknown" } else { old_model });
@@ -3583,9 +3611,14 @@ fn timeline_of<'a>(from: &Kind, events: impl IntoIterator<Item = &'a super::mode
     if from.own_record() {
         return None;
     }
+    Some(timeline(events, todos, queue))
+}
+
+/// The conversation as kiln's timeline keeps it, with the plan as it stands, whatever its harness.
+fn timeline<'a>(events: impl IntoIterator<Item = &'a super::model::Event>, todos: &[super::model::Todo], queue: &[super::model::QueueItem]) -> super::handoff::Conversation {
     let mut c = super::handoff::from_events(handed_events(events, queue));
     c.todos = todos.to_vec();
-    Some(c)
+    c
 }
 
 /// CP-T3.2: shown queued input still travels in the durable queue, and must not also become
@@ -3679,14 +3712,16 @@ fn picks_up_there(st: &mut super::model::State) -> bool {
 async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usize, sink: &Sink) -> Option<(&'static Kind, Option<Vec<serde_json::Value>>)> {
     use super::handoff;
     let to = sw.to;
-    let (env, allow_bypass) = {
+    let (env, allow_bypass, isolated) = {
         let sp = s.spec.lock();
-        (sp.env.clone(), sp.allow_bypass)
+        (sp.env.clone(), sp.allow_bypass, sp.isolation.is_some())
     };
+    // In a microVM, its harness's own record is its microVM's: kiln carries its own timeline (kiln plan 01a1dd2e…, P6c.5).
     let (cwd, session, old_model, mode, effort, timeline) = {
         let core = s.core.lock();
         let st = &core.state;
-        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone(), timeline_of(from, core.events(), &st.todos, &st.queue))
+        let timeline = if isolated { Some(timeline(core.events(), &st.todos, &st.queue)) } else { timeline_of(from, core.events(), &st.todos, &st.queue) };
+        (st.cwd.clone(), if isolated { None } else { st.harness_session.clone() }, st.model.clone(), st.mode.clone(), st.effort.clone(), timeline)
     };
     let fail = |s: &Arc<Session>, text: String| {
         let mut core = s.core.lock();
@@ -3698,7 +3733,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
             e.body = super::model::Body::Notice { level: Level::Info, text: "Switch cancelled".to_owned() };
         }
     };
-    let c = match carried(from, to, &env, session, timeline, &cwd, &old_model, &mode, &effort, allow_bypass, &sw.model, None).await {
+    let c = match carried_in(from, to, &env, session, timeline, &cwd, &old_model, &mode, &effort, allow_bypass, &sw.model, None, isolated).await {
         Ok(c) => c,
         Err(e) => {
             fail(s, format!("{e}, so it goes on in {}.", from.name));
@@ -3725,6 +3760,10 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
     {
         let mut sp = s.spec.lock();
         sp.kind = to.id.to_owned();
+        // In a microVM, its image is the new harness's own from now on (kiln plan 01a1dd2e…, P6c.5).
+        if let Some(i) = sp.isolation.as_mut() {
+            i.image = None;
+        }
         // None chosen: the harness's own default.
         sp.model = Some(sw.model.clone()).filter(|m| !m.is_empty());
         sp.mode.clone_from(&mode);
@@ -4694,6 +4733,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
     // A switch to another harness, waiting for the turn under way to end; and the conversation
     // carried over, for a harness that takes it once started (Codex), until it has.
     let mut switching: Option<Switch> = None;
+    // A microVM session's harness, handed on whole as it switches harness: swapped for the next in its microVM there
+    // (kiln plan 01a1dd2e…, P6c.5), never stopped here.
+    let mut swap_from: Option<crate::proc::Duplex> = None;
     // A session that moved here with a new thread's history starts with it.
     let mut seed: Option<Vec<serde_json::Value>> = carried;
     // A move to another runner, waiting for the turn under way to end.
@@ -4824,7 +4866,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     None if isolated => {
                         let host = files.host.as_ref().and_then(std::sync::Weak::upgrade);
                         match host.as_ref().and_then(|h| h.microvm()) {
-                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets).await,
+                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets, swap_from.take()).await,
                             None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                         }
                     }
@@ -5058,7 +5100,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 on_change();
                             }
                             Command::SetModel { model, kind: Some(to) } if to != kind.id => {
-                                if let Some(sw) = wanted(&s, kind, &to, model) {
+                                if let Some(sw) = wanted(&s, kind, &to, model, swaps_here(&files)) {
                                     switching = Some(sw);
                                 }
                             }
@@ -5421,6 +5463,37 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     };
                     if go {
                         left = s.core.lock().state.tasks.iter().filter(|t| t.left_running()).count();
+                        // A switch in a microVM: its member is swapped for the next harness's there, as it starts, once
+                        // the next one's image is in the machine's store (built there now where it isn't).
+                        if let Some(to) = switching.as_ref().map(|sw| sw.to).filter(|_| s.spec.lock().isolation.is_some() && p.boundary().is_some()) {
+                            let vms = files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm());
+                            let ready = match vms {
+                                Some(vms) => {
+                                    let target = switched_spec(&s.spec.lock(), to);
+                                    crate::sandbox::isolated::ready_to_swap(to, &target, vms.as_ref(), &build_secrets).await
+                                }
+                                None => Err("its machine holds no microVMs now".to_owned()),
+                            };
+                            match ready {
+                                Ok(()) => {
+                                    swap_from = Some(p);
+                                    ending = true;
+                                    break;
+                                }
+                                Err(why) => {
+                                    switching = None;
+                                    let mut core = s.core.lock();
+                                    core.hold = false;
+                                    core.state.switching = None;
+                                    core.touch_state();
+                                    let text = format!("It can't switch to {} in its microVM: {why}. It goes on in {}.", to.name, kind.name);
+                                    core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text });
+                                    drop(core);
+                                    on_change();
+                                    continue;
+                                }
+                            }
+                        }
                         p.stdin.close();
                         if crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await.is_err() {
                             p.terminate(Duration::from_secs(2));
@@ -5639,7 +5712,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     // Another harness's model: the session goes on in it, now.
                     Command::SetModel { model, kind: Some(to) } if to != kind.id => {
-                        if let Some(sw) = wanted(&s, kind, &to, model) {
+                        if let Some(sw) = wanted(&s, kind, &to, model, swaps_here(&files)) {
                             switching = Some(sw);
                             break;
                         }
