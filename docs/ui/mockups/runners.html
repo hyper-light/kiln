@@ -3,268 +3,212 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Runners · engine · kiln mockup</title>
+<title>Runners · kiln mockup</title>
 <link rel="stylesheet" href="assets/fonts.css" />
 <link rel="stylesheet" href="assets/kiln.css" />
 <link rel="stylesheet" href="assets/mockup.css" />
 </head>
 <body>
-<div class="container-console mk-page">
-  <div class="mk-banner">
-    <span><b>Mockup</b> · kiln UI design · sample data · P2.3, P3.2</span>
-    <nav aria-label="Mockups"><a href="runners.html" aria-current="page">Runners</a><a href="agents.html">Agents</a><a href="agentfile.html">Agentfile</a><a href="experiments.html">Experiments</a></nav>
-  </div>
-
-  <header class="page-intro">
-    <div class="min-w-0">
-      <div class="eyebrow"><span class="spectrum-rule"></span>04 / Runners</div>
-      <h1>Fleet</h1>
-      <p class="lead" id="lead"></p>
-    </div>
-    <div class="row">
-      <a class="btn btn-secondary btn-default" href="#">Offers</a>
-      <a class="btn btn-primary btn-default" href="#">+ Add machines</a>
-    </div>
-  </header>
-
-  <div class="filter-bar runners-tools">
-    <div class="filter-bar-row">
-      <div class="field search-field grow"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input aria-label="Filter runners" placeholder="Filter by name, state, label, platform, engine…" id="q" /></div>
-      <div class="select-field"><label class="sr-only" for="layout">Layout</label><div class="select"><select id="layout"><option>Table</option><option>Cards</option></select><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></div></div>
-    </div>
-  </div>
-  <p class="mk-note">The filter's facets gain <span class="mono">Engine</span> (host, microvm) beside State, Labels and Platform. Try typing <span class="mono">host</span>.</p>
-
-  <div class="table-wrap mt-3">
-    <table class="data-table">
-      <thead><tr>
-        <th class="w-6" aria-label="State"></th>
-        <th>Runner</th>
-        <th class="hidden md:table-cell">Labels</th>
-        <th class="hidden sm:table-cell">Engine <span class="mk-new">new</span></th>
-        <th class="hidden lg:table-cell">Executors</th>
-        <th>Slots</th>
-        <th class="num hidden sm:table-cell">CPU</th>
-        <th class="num hidden lg:table-cell">Mem</th>
-        <th class="num hidden xl:table-cell">Disk</th>
-        <th class="hidden md:table-cell">Drain</th>
-      </tr></thead>
-      <tbody id="rows"></tbody>
-    </table>
-  </div>
-  <p class="mk-note"><label class="inline-flex items-center gap-2"><input type="checkbox" class="check" id="viewer"> Mockup: see it as someone without <span class="mono">runners.manage</span></label></p>
-  <p class="mk-note">Press a runner to open it in place. Try <b>adas-mac-studio.local</b> (switch it to host: its microVM session drains first), <b>adas-mac-studio-2.local</b> (can't run microVMs: Shards says why) and <b>adas-mac-studio-3.local</b> (warm pools).</p>
-</div>
-
+<div class="container-console v3 page3" id="page"></div>
 <script src="assets/mockup.js"></script>
 <script>
-
-const HVF = "Hypervisor.framework";
+/* ------------------------------------------------------------ sample data */
+const W = (b, s, seed) => walk(60, b, s, seed);
 const R = [
-  { id: "e301", name: "adas-macbook-pro-2.local", host: "Adas-MacBook-Pro-2.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 4, busy: 0, cpu: 27, mem: 25, disk: 58,
-    can: true, hv: HVF, engine: "microvm", origin: "default", cores: 18, memG: 128, room: "88.0 GiB · 14 vCPUs", sessions: [], images: ["rust-dev", "harness-claude", "harness-codex", "harness-devin"], pools: [] },
-  { id: "cec3", name: "adas-mac-studio.local", host: "Adas-Mac-Studio-3.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 3, busy: 1, cpu: 12, mem: 12, disk: 61,
-    can: true, hv: HVF, engine: "microvm", origin: "default", cores: 14, memG: 36, room: "21.4 GiB · 9 vCPUs", images: ["rust-dev", "harness-claude", "harness-codex"],
-    sessions: [{ who: "reviewer", kind: "Claude Code", state: "on a turn", since: "6 min" }], pools: [{ agent: "reviewer", yours: true, image: "rust-dev v8", size: "2 vCPU · 4 GiB", warm: 1, hits: [7, 9] }] },
-  { id: "b24c", name: "adas-mac-studio-2.local", host: "Adas-Mac-Studio-2.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 3, busy: 0, cpu: 13, mem: 21, disk: 74,
-    can: false, hv: null, engine: "host", origin: "cannot", cores: 14, memG: 36,
-    why: "Hypervisor.framework refused the VM process (HV_DENIED): kiln's shards-vm on this machine isn't signed with com.apple.security.hypervisor.",
-    sessions: [], images: [], pools: [] },
-  { id: "2768", name: "adas-mac-studio-3.local", host: "Adas-Mac-Studio-4.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 3, busy: 2, cpu: 29, mem: 26, disk: 66,
-    can: true, hv: HVF, engine: "microvm", origin: "default", cores: 14, memG: 36, room: "14.9 GiB · 6 vCPUs", images: ["rust-dev", "harness-claude", "harness-codex"],
-    sessions: [{ who: "ci-diagnose", kind: "Claude Code", state: "idle", since: "2 min" }, { who: "reviewer", kind: "Claude Code", state: "on a turn", since: "40 s" }],
-    pools: [{ agent: "reviewer", yours: true, image: "rust-dev v8", size: "2 vCPU · 4 GiB", warm: 2, hits: [41, 47] }, { agent: "ci-diagnose", yours: false, image: "harness-claude", size: "2 vCPU · 2 GiB", warm: 1, hits: [9, 12] }, { agent: "pr-triage", yours: true, image: "rust-dev v8", size: "1 vCPU · 2 GiB", warm: 0, hits: [0, 1], idle: true }] },
-  { id: "d132", name: "adas-mac-studio.local-2", host: "Adas-Mac-Studio.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 8, busy: 0, cpu: 10, mem: 34, disk: 22,
-    can: true, hv: HVF, engine: "microvm", origin: "default", cores: 32, memG: 96, room: "58.2 GiB · 28 vCPUs", sessions: [], images: ["harness-claude", "harness-codex"], pools: [] },
-  { id: "4513", name: "adacachy", host: "adacachy", plat: "linux/x86_64", ver: "0.9.41", labels: ["baremetal", "bench", "local"], slots: 8, busy: 1, cpu: 15, mem: 27, disk: 93,
-    can: true, hv: "KVM", engine: "host", origin: "owner", originWhen: "3 days ago", cores: 32, memG: 123, room: "—", sessions: [], images: [], pools: [] },
-  { id: "00aa", name: "adacachy2", host: "adacachy2", plat: "linux/x86_64", ver: "0.9.41", labels: ["baremetal", "linux", "x86_64"], slots: 8, busy: 2, cpu: 5, mem: 37, disk: 81,
-    can: true, hv: "KVM", engine: "microvm", origin: "default", cores: 32, memG: 123, room: "71.6 GiB · 24 vCPUs", images: ["rust-dev", "harness-claude", "harness-codex"],
-    sessions: [{ who: "opus-kiln-12", kind: "Codex", state: "on a turn", since: "14 min" }, { who: "reviewer", kind: "Claude Code", state: "waiting on you", since: "3 min" }], pools: [{ agent: "reviewer", yours: true, image: "rust-dev v8", size: "2 vCPU · 4 GiB", warm: 1, hits: [12, 15] }] },
+  { id: "e301", name: "adas-macbook-pro-2.local", host: "Adas-MacBook-Pro-2.local", plat: "macos/aarch64", engine: "microvm", can: true, hv: "HVF", cores: 18, memG: 128, cpu: W(26, 8, 3), mem: 25, disk: 58, net: 0.4, starts: [9, 2, 1], vcpu: [2, 18],
+    vms: [{ id: "v1", agent: "release-notes", proj: "hyper-light/hex", image: "docs-site v3", start: ["template", 431], up: "41m", state: "idle", cpu: W(4, 3, 11), mem: [1.1, 4], disk: [0.4, 8] }], pools: [], images: [["rust-dev", "rust-dev v8", 1.42, "4m", "ok"], ["harness-claude", "kiln's", 0.61, "2d", "ok"]] },
+  { id: "cec3", name: "adas-mac-studio.local", host: "Adas-Mac-Studio-3.local", plat: "macos/aarch64", engine: "microvm", can: true, hv: "HVF", cores: 14, memG: 36, cpu: W(12, 6, 5), mem: 41, disk: 61, net: 1.2, starts: [31, 9, 4], vcpu: [5, 14], override: ["hyper-light/kiln", "host"],
+    vms: [{ id: "v2", agent: "reviewer", proj: "hyper-light/kiln", image: "rust-dev v8", start: ["warm", 212], up: "6m", state: "run", cpu: W(38, 18, 7), mem: [2.3, 4], disk: [1.1, 8] }],
+    pools: [{ agent: "reviewer", size: "2 vCPU · 4 GiB", warm: 1, of: 2, hits: [7, 9], idle: "1m" }], images: [["rust-dev", "rust-dev v8", 1.42, "4m", "ok"], ["harness-claude", "kiln's", 0.61, "2d", "ok"], ["harness-codex", "kiln's", 0.59, "2d", "ok"]] },
+  { id: "b24c", name: "adas-mac-studio-2.local", host: "Adas-Mac-Studio-2.local", plat: "macos/aarch64", engine: "host", can: false, hv: null, why: "HVF denied", whyFull: "Hypervisor.framework refused the VM process (HV_DENIED): shards-vm isn't signed with com.apple.security.hypervisor", cores: 14, memG: 36, cpu: W(13, 5, 9), mem: 21, disk: 74, net: 0.1, starts: [0, 0, 0], vcpu: [0, 14], vms: [], pools: [], images: [] },
+  { id: "2768", name: "adas-mac-studio-3.local", host: "Adas-Mac-Studio-4.local", plat: "macos/aarch64", engine: "microvm", can: true, hv: "HVF", cores: 14, memG: 36, cpu: W(29, 10, 13), mem: 74, disk: 66, net: 3.4, starts: [64, 12, 6], vcpu: [9, 14],
+    vms: [
+      { id: "v3", agent: "reviewer", proj: "hyper-light/kiln", image: "rust-dev v8", start: ["warm", 221], up: "40s", state: "run", cpu: W(62, 20, 17), mem: [3.1, 4], disk: [1.4, 8] },
+      { id: "v4", agent: "ci-diagnose", proj: "hyper-light/shards", image: "harness-claude", start: ["warm", 198], up: "2m", state: "idle", cpu: W(6, 4, 19), mem: [1.4, 2], disk: [0.3, 8] },
+      { id: "v5", agent: "pr-triage", proj: "hyper-light/kiln", image: "rust-dev v8", start: ["template", 455], up: "18m", state: "paused", cpu: W(1, 1, 23), mem: [1.9, 2], disk: [0.6, 8] },
+    ],
+    pools: [{ agent: "reviewer", size: "2 vCPU · 4 GiB", warm: 2, of: 3, hits: [41, 47], idle: "40s" }, { agent: "ci-diagnose", size: "2 vCPU · 2 GiB", warm: 1, of: 1, hits: [9, 12], idle: "2m" }, { agent: "pr-triage", size: "1 vCPU · 2 GiB", warm: 0, of: 1, hits: [0, 1], idle: "31m", leaving: true }],
+    images: [["rust-dev", "rust-dev v8", 1.42, "4m", "ok"], ["rust-dev", "rust-dev v9", 1.44, "now", "start"], ["harness-claude", "kiln's", 0.61, "2d", "ok"], ["harness-codex", "kiln's", 0.59, "2d", "ok"]] },
+  { id: "d132", name: "adas-mac-studio.local-2", host: "Adas-Mac-Studio.local", plat: "macos/aarch64", engine: "microvm", can: true, hv: "HVF", cores: 32, memG: 96, cpu: W(10, 4, 29), mem: 34, disk: 22, net: 0.2, starts: [3, 1, 2], vcpu: [0, 32], vms: [], pools: [], images: [["harness-claude", "kiln's", 0.61, "2d", "ok"]] },
+  { id: "4513", name: "adacachy", host: "adacachy", plat: "linux/x86_64", engine: "host", can: true, hv: "KVM", owner: true, cores: 32, memG: 123, cpu: W(15, 8, 31), mem: 27, disk: 93, net: 6.1, starts: [0, 0, 0], vcpu: [0, 32], vms: [], pools: [], images: [] },
+  { id: "00aa", name: "adacachy2", host: "adacachy2", plat: "linux/x86_64", engine: "microvm", can: true, hv: "KVM", cores: 32, memG: 123, cpu: W(5, 4, 37), mem: 37, disk: 81, net: 2.2, starts: [22, 6, 3], vcpu: [6, 32],
+    vms: [
+      { id: "v6", agent: "opus-kiln-12", proj: "hyper-light/kiln", image: "harness-codex", start: ["cold", 1912], up: "14m", state: "run", cpu: W(44, 16, 41), mem: [2.8, 4], disk: [2.2, 8] },
+      { id: "v7", agent: "pr-triage", proj: "hyper-light/hex", image: "rust-dev v8", start: ["warm", 205], up: "3m", state: "failed", cpu: W(2, 2, 43), mem: [2.0, 2], disk: [0.5, 8] },
+    ],
+    pools: [{ agent: "reviewer", size: "2 vCPU · 4 GiB", warm: 1, of: 2, hits: [12, 15], idle: "5m" }], images: [["rust-dev", "rust-dev v8", 1.42, "6m", "ok"], ["rust-dev", "rust-dev v9", 0, "now", "failed"], ["harness-codex", "kiln's", 0.59, "2d", "ok"]] },
 ];
-const IMAGES = {
-  "rust-dev": { by: "yours · v8", for: "claude, codex", digest: "sha256:7c1e0b9a44d2", size: "1.42 GiB", got: "prebuilt 4 min ago", used: "12 min ago" },
-  "harness-claude": { by: "kiln's", for: "claude", digest: "sha256:3a90d1c2fe07", size: "611 MiB", got: "prebuilt 2 days ago", used: "1 hour ago" },
-  "harness-codex": { by: "kiln's", for: "codex", digest: "sha256:91fe72b04c3d", size: "588 MiB", got: "prebuilt 2 days ago", used: "yesterday" },
-  "harness-devin": { by: "kiln's", for: "devin", digest: "sha256:c40a8e19b2d6", size: "702 MiB", got: "prebuilt 2 days ago", used: "3 days ago" },
-};
-let open = null;
-let manage = true; // the viewer holds runners.manage (decision 8: only they switch)
-const WORKSPACE = "microvm"; // Settings → Runners: the workspace's default engine
-const OVERRIDES = { cec3: [["hyper-light/kiln", "host"]] }; // projects that ask another engine here
-let asking = null; // runner id whose switch is being confirmed
-let ending = null; // runner id whose "End them now" is being confirmed
-const ui = {}; // per-runner transient: {moving:{to, left:[...]}}
+const S = { open: OPEN.get() || "2768", owner: true, asking: null, ending: null, moving: {}, vmCharts: new Set(), nodeCharts: false, building: false };
+const vmState = (v, r) => (S.moving[r.id] && r.engine === "microvm" && v.state !== "stopped" ? "drain" : v.state);
+const last = (a) => a[a.length - 1];
 
-function stateDot(r) { return r.busy > 0 ? "running" : "succeeded"; }
+/* ------------------------------------------------------------ the fleet */
+const FLEET = () => [{ h: "Runner", name: true, w: "24%" }, { h: narrow() ? "" : "Engine", w: narrow() ? 36 : 104 }, { h: "VMs", w: 88, c: "h640" }, { h: "CPU", w: narrow() ? 76 : 100 }, { h: "Memory", w: 96, c: "h900" }, { h: "Disk", w: 96, c: "h1100" }, { h: "Warm", w: 80, c: "h900" }, { spacer: true }, { h: "", w: narrow() ? 64 : 96 }];
 function engineCell(r) {
-  const t = ui[r.id]?.moving;
-  if (t) return `<span class="eng-cell" data-moving>${r.engine} → ${t.to}</span><span class="cell-sub">draining ${t.left.length}</span>`;
-  const sub = r.engine === "microvm" ? r.hv : r.origin === "owner" ? "your choice" : "can't run microVMs";
-  return `<span class="eng-cell" data-engine="${r.engine}">${r.engine}</span><span class="cell-sub">${sub}</span>`;
+  const m = S.moving[r.id];
+  if (m) return `<span class="cr">${st("drain", "Switching: draining")}${icon(m.to, ENGINE_TIP[m.to])}<span class="ell h640">${m.to}</span></span>`;
+  return `<span class="cr">${icon(r.engine, ENGINE_TIP[r.engine])}<span class="ell h640">${r.engine}</span>${!r.can ? st("off", r.why) : ""}</span>`;
 }
-function lead() {
-  const mv = R.filter((r) => r.engine === "microvm").length;
-  $("#lead").textContent = `7 of 8 runners connected · 6/37 slots busy · ${mv} run sessions in microVMs, ${R.length - mv} on the host. Runners are long-lived machines that take CI jobs; Kubernetes job pods show up under their jobs.`;
-}
-function render() {
-  lead();
-  const q = $("#q").value.trim().toLowerCase();
-  const list = R.filter((r) => !q || `${r.name} ${r.host} ${r.labels.join(" ")} ${r.plat} ${r.engine}`.toLowerCase().includes(q));
-  $("#rows").innerHTML = list.map((r) => `
-    <tr data-href tabindex="0" aria-expanded="${open === r.id}" data-id="${r.id}">
-      <td><i class="dot" data-status="${stateDot(r)}" role="img" aria-label="${r.busy ? "busy" : "idle"}"></i></td>
-      <td class="max-w-[260px] max-sm:w-full max-sm:max-w-0">
-        <div class="truncate text-[#e4e5e7]">${esc(r.name)}</div>
-        <div class="truncate font-mono text-[10px] text-[#7b7e88]">${esc(r.host)} · ${r.plat} · v${r.ver}<span class="sm:hidden"> · ${r.engine}</span></div>
-      </td>
-      <td class="hidden md:table-cell"><span class="inline-flex flex-wrap gap-1">${r.labels.map((l) => `<span class="chip" ${l === "baremetal" || l === "bench" ? `data-tone="${l}"` : ""}>${l}</span>`).join("")}</span></td>
-      <td class="hidden sm:table-cell">${engineCell(r)}</td>
-      <td class="cell-mono hidden lg:table-cell">host${r.engine === "microvm" ? ", shards" : ""}</td>
-      <td class="min-w-[90px]"><div class="font-mono text-[11px] text-[#c8cad0] tabular-nums">${r.busy}/${r.slots}</div><div class="mt-1 w-20"><div class="meter"><span style="width:${(r.busy / r.slots) * 100}%"></span></div></div></td>
-      <td class="num cell-mono hidden sm:table-cell">${r.cpu}%</td>
-      <td class="num cell-mono hidden lg:table-cell">${r.mem}%</td>
-      <td class="num cell-mono hidden xl:table-cell">${r.disk}%</td>
-      <td class="hidden md:table-cell"><label class="inline-flex min-h-8 items-center gap-2"><input type="checkbox" class="check" aria-label="Drain ${esc(r.name)}"><span class="font-mono text-[10px] text-[#7b7e88]">off</span></label></td>
-    </tr>
-    ${open === r.id ? `<tr class="runner-detail-row"><td colspan="10">${details(r)}</td></tr>` : ""}`).join("");
+/** One glyph per VM, in its state: the count at a glance. */
+function vmMix(r) { return `<span class="gl">${r.vms.map((v) => st(vmState(v, r), `${v.agent} · ${STATES[vmState(v, r)][1]}`)).join("")}</span>`; }
+function fleetRow(r) {
+  const open = S.open === r.id;
+  const memPct = r.mem, warm = r.pools.reduce((a, p) => a + p.warm, 0), of = r.pools.reduce((a, p) => a + p.of, 0);
+  return `<tr class="pick" tabindex="0" data-r="${r.id}" aria-expanded="${open}" aria-selected="${open}">${td3(FLEET(), [
+    named(r.draining ? "drain" : "ok", r.name, "", r.draining ? "Draining" : `Connected · ${r.host} · ${r.plat} · kiln 0.9.41`),
+    engineCell(r),
+    r.vms.length ? vmMix(r) : `<span class="dim">0</span>`,
+    spark(r.cpu, `${Math.round(last(r.cpu))}%`, "#3987e5", narrow() ? 24 : 40, 16, `rc:${r.id}`),
+    ubar(memPct, `${memPct}%`, 36),
+    ubar(r.disk, `${r.disk}%`, 36),
+    of ? wdots(warm, of) : `<span class="dim">0</span>`,
+    "",
+    `<span class="acts ctl">${ib(r.draining ? "play" : "pause", r.draining ? "Resume" : "Drain", `data-do="${r.draining ? "resume" : "drain"}" data-r="${r.id}"`)}${narrow() ? "" : ib("terminal", "Terminal")}${ib("more", "More", `data-do="rmore" data-r="${r.id}"`)}</span>`,
+  ])}</tr>${open ? `<tr><td class="detail" colspan="${shown(FLEET())}">${detail(r)}</td></tr>` : ""}`;
 }
 
-function details(r) {
-  const moving = ui[r.id]?.moving;
-  return `<section class="runner-details" aria-label="${esc(r.name)} in depth">
-    <div class="runner-details-head">
-      <div class="min-w-0">
-        <div class="runner-details-eyebrow">Runner · ${r.busy ? "busy" : "idle"}</div>
-        <h3>${esc(r.name)}</h3>
-        <p>${esc(r.host)} · ${r.plat} · kiln v${r.ver}</p>
-      </div>
-      <button class="btn btn-ghost btn-xs" data-act="close">✕ Close</button>
-    </div>
-    <div class="row"><span class="inline-flex flex-wrap gap-1">${r.labels.map((l) => `<span class="chip">${l}</span>`).join("")}</span></div>
-    <div class="row mt-4">
-      <button class="btn btn-secondary btn-xs">Terminal</button><button class="btn btn-secondary btn-xs">Insights</button><button class="btn btn-secondary btn-xs">Drain</button><button class="btn btn-secondary btn-xs" style="color:#d1aaad">Forget</button>
-    </div>
-    ${engineBlock(r, moving)}
-    <div class="mt-6"><dl class="facts">
-      <div><dt>Slots</dt><dd>${r.busy} / ${r.slots} busy</dd></div>
-      <div data-tone="pass"><dt>Connected</dt><dd>yes</dd></div>
-      <div><dt>CPU</dt><dd>${r.cpu}.0% · ${r.cores} cores</dd></div>
-      <div><dt>Memory</dt><dd>${Math.round((r.memG * r.mem) / 100)} GB / ${r.memG} GB</dd></div>
-    </dl></div>
-    <p class="mk-note">Name, the rest of the facts, agent sessions, running jobs and the last hour sit here unchanged.</p>
-    ${microvmBlock(r)}
-  </section>`;
-}
-
-function engineBlock(r, moving) {
-  const want = moving ? moving.to : r.engine;
+/* ------------------------------------------------------------ one runner, in place */
+const VMCOLS = [{ h: "Agent", name: true, w: "20%" }, { h: "Project", w: 150, c: "h900" }, { h: "Image", w: 116, c: "h1100" }, { h: "Start", w: 84, c: "h640" }, { h: "Up", w: 52, c: "h640" }, { h: "CPU", w: 92 }, { h: "Memory", w: 104, c: "h640" }, { h: "Disk", w: 88, c: "h1100" }, { spacer: true }, { h: "", w: 150 }];
+const POOLCOLS = [{ h: "Agent", name: true, w: "20%" }, { h: "Size", w: 120, c: "h900" }, { h: "Warm", w: 76 }, { h: "Hits", w: 104 }, { h: "Idle", w: 56, c: "h640" }, { spacer: true }, { h: "", w: 44 }];
+const IMGCOLS = [{ h: "Image", name: true, w: "20%" }, { h: "From", w: 120, c: "h900" }, { h: "Size", w: 112, c: "h640" }, { h: "Age", w: 56 }, { spacer: true }, { h: "", w: 70 }];
+function detail(r) {
+  const m = S.moving[r.id];
+  const want = m ? m.to : r.engine;
   const other = r.engine === "microvm" ? "host" : "microvm";
-  let line;
-  if (moving) line = `Switching to <b>${moving.to}</b>. New sessions here start on the ${moving.to === "host" ? "host" : "microVM engine"} already; ${moving.left.length ? `the ${moving.left.length} ${r.engine} session${moving.left.length === 1 ? "" : "s"} below finish${moving.left.length === 1 ? "es" : ""} first, then the switch is done.` : "nothing is left to drain."}`;
-  else if (r.engine === "microvm") line = `Sessions here run in microVMs of their own (Shards, through Hex) on ${r.hv}. The default for a runner that can: you can opt out.`;
-  else if (r.origin === "owner") line = `Sessions here run on the host, as processes of the machine: set by you ${r.originWhen}. It can run microVMs (${r.hv}).`;
-  else line = `Sessions here run on the host: this runner can't run microVMs.`;
-  const why = !r.can ? `<p class="eng-why">${esc(r.why)}</p><p class="mk-note" style="margin:0">Shards' host check, 4 min ago, without booting a VM. <button class="text-link" data-act="recheck">Check again</button></p>` : "";
-  const confirm = asking === r.id ? `
-    <div class="confirm" role="group" aria-label="Confirm switching the engine">
-      <p>Switch <b>${esc(r.name)}</b> to <b>${other}</b>? New sessions start on the ${other === "host" ? "host, with no microVM," : "microVM engine"} at once. ${r.sessions.length ? `Its ${r.sessions.length} ${r.engine} session${r.sessions.length === 1 ? " drains" : "s drain"} first: ${r.sessions.length === 1 ? "it goes" : "they go"} on until ${r.sessions.length === 1 ? "it ends" : "they end"}, and none is stopped unless you end ${r.sessions.length === 1 ? "it" : "them"} yourself.` : `Nothing runs on ${r.engine} here, so it switches at once.`}</p>
-      ${r.sessions.length ? `<ul class="eng-drain">${r.sessions.map((s) => `<li><i class="dot" data-status="${s.state === "idle" ? "succeeded" : "running"}"></i><span class="mono">${s.who}</span><span class="dim">${s.kind} · ${s.state} · ${s.since}</span></li>`).join("")}</ul>` : ""}
-      <div class="confirm-actions"><button class="btn btn-primary btn-xs" data-act="switch" data-to="${other}">${r.sessions.length ? "Switch and drain" : "Switch"}</button><button class="btn btn-ghost btn-xs" data-act="keep">Keep ${r.engine}</button></div>
-    </div>` : "";
-  const drain = moving && moving.left.length ? `
-    <ul class="eng-drain">${moving.left.map((s) => `<li><i class="dot" data-status="running"></i><span class="mono">${s.who}</span><span class="dim">${s.kind} · ${s.state} · ${s.since}</span><span class="right dim mono" style="font-size:10.5px">${r.engine} until it ends</span></li>`).join("")}</ul>
-    ${ending === r.id ? `<div class="confirm" data-tone="danger" role="group" aria-label="Confirm ending them"><p>End ${moving.left.length === 1 ? "it" : `all ${moving.left.length}`} now? ${moving.left.length === 1 ? "Its turn stops and the session ends" : "Their turns stop and the sessions end"}; ${moving.left.length === 1 ? "its conversation is kept" : "their conversations are kept"}, to go on later on the ${moving.to === "host" ? "host" : "microVM engine"}.</p><div class="confirm-actions"><button class="btn btn-danger btn-xs" data-act="endnow">${moving.left.length === 1 ? "End it now" : "End them now"}</button><button class="btn btn-ghost btn-xs" data-act="noend">${moving.left.length === 1 ? "Let it finish" : "Let them finish"}</button></div></div>` : ""}
-    <div class="row"><button class="btn btn-ghost btn-xs" data-act="cancel">Cancel the switch</button>${ending === r.id ? "" : `<button class="btn btn-ghost-danger btn-xs" data-act="askend">End them now</button>`}</div>` : "";
-  return `<div class="eng-block" aria-label="Engine">
-    <div class="label-row"><div class="label">Engine <span class="mk-new">new</span></div><span class="dim mono" style="font-size:10.5px">workspace → runner → project → session</span></div>
-    <div class="seg" role="group" aria-label="Engine of ${esc(r.name)}" data-runner="${r.id}">
-      <button type="button" data-v="host" aria-pressed="${want === "host"}" ${moving || !manage ? "disabled" : ""} ${!manage ? 'title="Only those who manage runners switch its engine"' : ""}>host</button>
-      <button type="button" data-v="microvm" aria-pressed="${want === "microvm"}" ${!r.can || moving || !manage ? "disabled" : ""} ${!r.can ? `title="${esc(r.why)}"` : !manage ? 'title="Only those who manage runners switch its engine"' : ""}>microvm</button>
+  const checks = r.can
+    ? [["microVM", "ok", "virt.microvm: true"], ["Isolation", "ok", `isolation.available: true · ${r.hv}`], ["Host check", "ok", `Shards host_check: usable · ${r.hv} · 2m ago`], ["Image class", r.engine === "microvm" ? "ok" : "idle", "Hex node: shards-image"]]
+    : [["microVM", "failed", "virt.microvm: false"], ["Isolation", "failed", `isolation.why_not: ${r.whyFull}`], ["Host check", "failed", "Shards host_check: not usable · HV_DENIED · 4m ago"], ["Image class", "off", "Hex node: no shards-image"]];
+  let fr = "";
+  if (S.forget === r.id) fr = `<div class="fr">${st("warn")}<span class="lbl hi">Forget ${esc(r.name)}?</span><span class="acts">${ib("check", "Forget", `data-do="forget" data-r="${r.id}"`)}${ib("x", "Keep", 'data-do="noforget"')}</span></div>`;
+  else if (S.asking === r.id) fr = `<div class="fr">${st("warn")}<span class="lbl hi">Switch to ${other}?</span><span class="val dim">${r.vms.length ? `${r.vms.length} VM${r.vms.length > 1 ? "s" : ""} drain` : "nothing running"}</span><span class="acts"><button class="b3 p" data-do="switch" data-r="${r.id}">Switch</button><button class="b3 g" data-do="noswitch">Cancel</button></span></div>`;
+  else if (m && S.ending === r.id) fr = `<div class="fr">${st("warn")}<span class="lbl hi">End ${m.left.length} session${m.left.length > 1 ? "s" : ""}?</span><span class="val dim">conversations kept</span><span class="acts"><button class="b3 d" data-do="endnow" data-r="${r.id}">End</button><button class="b3 g" data-do="noend">Back</button></span></div>`;
+  else if (m) fr = `<div class="fr">${st("drain")}<span class="lbl hi">Draining</span><span class="val dim">${m.left.length} left</span><span class="acts"><button class="b3 d" data-do="askend" data-r="${r.id}">End now</button><button class="b3 g" data-do="cancel" data-r="${r.id}">Cancel</button></span></div>`;
+  const used = r.vms.filter((v) => v.state !== "stopped").reduce((a, v) => a + v.mem[1], 0) + r.pools.reduce((a, p) => a + p.warm * parseInt(p.size.split("·")[1]), 0);
+  const room = r.engine === "microvm" ? Math.round((used / r.memG) * 100) : 0;
+  const tot = r.starts.reduce((a, b) => a + b, 0);
+  const warm = r.pools.reduce((a, p) => a + p.warm, 0), of = r.pools.reduce((a, p) => a + p.of, 0);
+  return `<div class="ch">
+      <span class="seg-w">${S.owner ? "" : icon("lock", "Needs runners.manage")}<span class="sg3" role="group" aria-label="Engine">${["microvm", "host"].map((e) => `<button data-do="engine" data-e="${e}" data-r="${r.id}" aria-pressed="${want === e}" ${!S.owner || m || (e === "microvm" && !r.can) ? "disabled" : ""} title="${e === "microvm" && !r.can ? esc(r.why) : ENGINE_TIP[e]}">${icon(e)}${e}</button>`).join("")}</span></span>
+      <span class="checks3">${checks.map(([l, s, tip]) => `<span title="${esc(tip)}">${st(s, tip)}<span class="lbl h900">${l}</span></span>`).join("")}</span>
+      <span class="acts"><span class="kv3 h640" title="Workspace default · Settings → Runners"><span class="lbl">Default</span><span class="val">microvm</span></span>${r.override ? `<span class="kv3 h1100" title="${esc(`${r.override[0]} asks for ${r.override[1]}`)}">${st("warn", "Project override")}<span class="val">kiln → ${r.override[1]}</span></span>` : ""}</span>
+    </div>${fr}
+    <div class="sum3 body3">
+      <div><span class="lbl">Memory</span><span class="v">${ubar(room, `${used.toFixed(1)}/${r.memG}G`, 56)}</span></div>
+      <div><span class="lbl">vCPUs</span><span class="v">${ubar((r.vcpu[0] / r.vcpu[1]) * 100, `${r.vcpu[0]}/${r.vcpu[1]}`, 56)}</span></div>
+      <div><span class="lbl">Disk</span><span class="v">${ubar(r.disk, `${r.disk}%`, 56)}</span></div>
+      <div><span class="lbl">Network</span><span class="v">${spark(W(r.net, r.net / 2 + 0.2, 51), `${r.net} MB/s`, "#3987e5", 56)}</span></div>
+      <div><span class="lbl">Starts</span><span class="v">${tot ? stack([{ v: r.starts[0], color: START_COLORS.warm, tip: "Warm" }, { v: r.starts[1], color: START_COLORS.template, tip: "Template" }, { v: r.starts[2], color: START_COLORS.cold, tip: "Cold" }], 56, String(tot)) : `<span class="dim">0</span>`}</span></div>
+      <div><span class="lbl">Warm</span><span class="v">${of ? wdots(warm, of) : `<span class="dim">0</span>`}</span></div>
     </div>
-    ${!manage ? `<p class="eng-why" style="color:var(--color-meta)">Only those who manage runners (<span class="mono">runners.manage</span>) switch its engine: ask the runner's owner.</p>` : ""}
-    <p class="eng-line">${line}</p>${why}${confirm}${drain}
-    <p class="mk-note" style="margin:0">Workspace default: <span class="mono">${WORKSPACE}</span>, in <a class="text-link" href="#">Settings → Runners</a>. ${(OVERRIDES[r.id] || []).length ? OVERRIDES[r.id].map(([p, e]) => `<span class="warn">${p} asks for <span class="mono">${e}</span>: its sessions here run on the ${e === "host" ? "host" : "microVM engine"}.</span>`).join(" ") : "No project overrides it here."}</p>
-  </div>`;
+    <div class="sh"><button class="lbl hi kv3" data-do="nodecharts" aria-expanded="${S.nodeCharts}">${icon("chart")}Telemetry${icon("chev")}</button></div>
+    ${S.nodeCharts ? `<div class="charts3">${chart("CPU", [{ name: "CPU", color: "#3987e5", values: r.cpu }], "%")}${chart("Memory", [{ name: "Used", color: "#3987e5", values: W(used, 1.2, 61) }], "G")}${chart("Network", [{ name: "In", color: "#3987e5", values: W(r.net, 0.8, 63) }, { name: "Out", color: "#d95926", values: W(r.net / 2, 0.5, 67) }], "MB/s")}${chart("Start", [{ name: "Warm", color: START_COLORS.warm, values: W(215, 14, 71) }, { name: "Template", color: START_COLORS.template, values: W(440, 30, 73) }], "ms")}</div>` : ""}
+    <div class="sh"><span class="lbl hi">MicroVMs</span><span class="val dim">${r.vms.length}</span></div>
+    ${r.vms.length ? `<table class="t3">${th3(VMCOLS)}<tbody>${r.vms.map((v) => vmRow(v, r)).join("")}</tbody></table>` : ""}
+    <div class="sh"><span class="lbl hi">Pools</span><span class="val dim">${r.pools.length}</span></div>
+    ${r.pools.length ? `<table class="t3">${th3(POOLCOLS)}<tbody>${r.pools.map((p, i) => `<tr>${td3(POOLCOLS, [named(p.leaving ? "warn" : "ok", p.agent, `data-peek="agent:${esc(p.agent)}"`, p.leaving ? "Releasing soon" : "Kept"), `<span class="ell">${esc(p.size)}</span>`, wdots(p.warm, p.of), ubar((p.hits[0] / p.hits[1]) * 100, `${Math.round((p.hits[0] / p.hits[1]) * 100)}%`, 44, "#3987e5"), `<span class="${p.leaving ? "" : "dim"}">${p.idle}</span>`, "", `<span class="acts ctl">${ib("x", "Release", `data-do="release" data-r="${r.id}" data-i="${i}" data-tone="danger" data-confirm="Release?"`)}</span>`])}</tr>`).join("")}</tbody></table>` : ""}
+    <div class="sh"><span class="lbl hi">Images</span><span class="val dim">${r.images.length}</span><span class="acts">${r.can ? `<button class="b3" data-do="build" aria-expanded="${S.building}">${icon("build")}Build image</button>` : ""}</span></div>
+    ${S.building && r.can ? `<div class="fr">${sel([["rust-dev", "rust-dev v9"], ["docs-site", "docs-site v3"], ["harness-claude", "harness-claude"]], "rust-dev", 'id="bfrom" aria-label="Agentfile"')}<span class="val dim">${r.plat.startsWith("linux/x86") ? "linux/amd64" : "linux/arm64"}</span><span class="acts"><button class="b3 p" data-do="dobuild" data-r="${r.id}">Build</button><button class="b3 g" data-do="build">Cancel</button></span></div>` : ""}
+    ${r.images.length ? `<table class="t3">${th3(IMGCOLS)}<tbody>${r.images.map(([n, from, size, age, s], i) => `<tr>${td3(IMGCOLS, [named(s === "start" ? "start" : s, n, "", s === "start" ? "Building" : s === "failed" ? "Failed: checksum mismatch, line 13" : "Built"), `<span class="ell">${esc(from)}</span>`, size ? ubar((size / 1.5) * 100, `${size.toFixed(2)}G`, 44, "#3987e5") : `<span class="dim">—</span>`, `<span class="dim">${age}</span>`, "", `<span class="acts ctl">${ib("restart", "Build again", `data-do="rebuild" data-r="${r.id}" data-i="${i}"`)}${ib("trash", "Remove", `data-do="rmimg" data-r="${r.id}" data-i="${i}" data-tone="danger" data-confirm="Remove?"`)}</span>`])}</tr>`).join("")}</tbody></table>` : ""}`;
+}
+function vmRow(v, r) {
+  const s = vmState(v, r);
+  const charts = S.vmCharts.has(v.id);
+  return `<tr tabindex="0" data-vm="${v.id}" data-r="${r.id}">${td3(VMCOLS, [
+    named(s, v.agent, `data-peek="vm:${v.id}"`),
+    `<span class="ell">${esc(v.proj)}</span>`,
+    `<span class="ell">${esc(v.image)}</span>`,
+    `<span class="cr">${startIcon(v.start[0])}<span>${v.start[1] >= 1000 ? (v.start[1] / 1000).toFixed(1) + "s" : v.start[1] + "ms"}</span></span>`,
+    `<span class="dim">${v.up}</span>`,
+    spark(v.cpu, s === "paused" || s === "stopped" ? "0%" : `${Math.round(last(v.cpu))}%`, "#3987e5", 36, 16, `vc:${v.id}`),
+    ubar((v.mem[0] / v.mem[1]) * 100, `${v.mem[0]}/${v.mem[1]}G`, 36),
+    ubar((v.disk[0] / v.disk[1]) * 100, `${v.disk[0]}G`, 36),
+    "",
+    `<span class="acts ctl">${ib("play", "Resume (P)", `data-do="vm-play" data-vm="${v.id}" ${["paused", "stopped", "failed"].includes(v.state) ? "" : "disabled"}`)}${ib("pause", "Pause (P)", `data-do="vm-pause" data-vm="${v.id}" ${["run", "idle"].includes(v.state) ? "" : "disabled"}`)}${ib("restart", "Restart (R)", `data-do="vm-restart" data-vm="${v.id}"`)}${ib("stop", "Stop (S)", `data-do="vm-stop" data-vm="${v.id}" data-tone="danger" data-confirm="Stop?" ${v.state === "stopped" ? "disabled" : ""}`)}${ib("chart", "Telemetry (T)", `data-do="vm-charts" data-vm="${v.id}" aria-expanded="${charts}"`)}</span>`,
+  ])}</tr>${charts ? `<tr><td class="detail" colspan="${shown(VMCOLS)}"><div class="charts3">${chart("CPU", [{ name: "CPU", color: "#3987e5", values: v.cpu }], "%")}${chart("Memory", [{ name: "Used", color: "#3987e5", values: W(v.mem[0], 0.3, 81) }], "G")}${chart("Network", [{ name: "In", color: "#3987e5", values: W(0.6, 0.4, 83) }, { name: "Out", color: "#d95926", values: W(0.3, 0.3, 87) }], "MB/s")}</div></td></tr>` : ""}`;
 }
 
-function microvmBlock(r) {
-  const facts = r.can
-    ? [["microVMs", "yes", "pass", "virt.microvm"], ["Isolation", "available", "pass", "isolation.available"], ["Hypervisor", r.hv, null, "isolation.hypervisor"], ["Why not", "—", null, "isolation.why_not"],
-       ["Host check", `usable · ${r.hv === "KVM" ? "kvm" : "hvf"} · 2 min ago`, "pass", "Shards host_check"], ["Hex node", r.engine === "microvm" ? "lists shards-image" : "lists shards-image (unused: host)", null, "class"], ["Room", r.engine === "microvm" ? r.room + " free" : "—", null, "Hex keeper"]]
-    : [["microVMs", "no", "fail", "virt.microvm"], ["Isolation", "not available", "fail", "isolation.available"], ["Hypervisor", "—", null, "isolation.hypervisor"], ["Why not", r.why, "error", "isolation.why_not"], ["Host check", "not usable · hvf · 4 min ago", "fail", "Shards host_check"], ["Hex node", "lists no shards-image", null, "class"]];
-  const imgs = r.images.map((n) => ({ n, ...IMAGES[n] }));
-  const imagesHtml = !r.can ? "" : `
-    <div class="eng-sub"><div class="label-row"><div class="label">Images here <span class="mk-new">new</span></div><span class="dim mono" style="font-size:10.5px">${imgs.length} · built on this runner</span></div>
-    ${imgs.length === 0 ? `<p class="empty-line">None yet: an Agentfile saved by you builds here once this runner runs microVMs.</p>` : `
-    <div class="table-wrap"><table class="data-table" aria-label="Images on ${esc(r.name)}"><thead><tr><th>Image</th><th class="hidden sm:table-cell">Harnesses</th><th class="hidden md:table-cell">Digest</th><th class="num">Size</th><th class="hidden sm:table-cell">Got</th><th class="num hidden md:table-cell">Last used</th></tr></thead><tbody>
-      ${imgs.map((i) => `<tr><td><span class="font-mono text-[12.5px]">${i.n}</span><span class="cell-sub">${i.by}</span></td><td class="cell-mono hidden sm:table-cell">${i.for}</td><td class="cell-mono hidden md:table-cell">${i.digest}…</td><td class="num cell-mono">${i.size}</td><td class="cell-mono hidden sm:table-cell">${i.got}</td><td class="num cell-mono hidden md:table-cell">${i.used}</td></tr>`).join("")}
-    </tbody></table></div>`}</div>`;
-  const poolsHtml = !r.can ? "" : `
-    <div class="eng-sub"><div class="label-row"><div class="label">Warm pools <span class="mk-new">new</span></div><span class="dim mono" style="font-size:10.5px">named by kiln · sized by Shards</span></div>
-    ${r.pools.length === 0 ? `<p class="empty-line">${r.engine === "microvm" ? "None: no agent starts here often enough for kiln to keep one warm." : "None: sessions here run on the host."}</p>` : `
-    <div class="table-wrap"><table class="data-table" aria-label="Warm pools on ${esc(r.name)}"><thead><tr><th>Agent</th><th class="hidden sm:table-cell">Image · size</th><th class="num">Warm</th><th class="num">Hits, 24 h</th><th class="hidden md:table-cell">Kept</th><th class="w-0"><span class="sr-only">Release</span></th></tr></thead><tbody>
-      ${r.pools.map((p, i) => `<tr><td><a class="text-link font-mono text-[12.5px]" href="agents.html">${p.agent}</a><span class="cell-sub">${p.yours ? "yours" : "kiln's"}</span></td>
-        <td class="cell-mono hidden sm:table-cell">${p.image} · ${p.size}</td>
-        <td class="num cell-mono">${p.warm}</td>
-        <td class="num cell-mono">${p.hits[0]} of ${p.hits[1]}<span class="cell-sub">starts warm</span></td>
-        <td class="cell-mono hidden md:table-cell">${p.idle ? `<span class="warn">no starts for 31 min · goes at 38</span>` : "while its starts come"}</td>
-        <td class="text-right"><button class="btn btn-ghost btn-xs" data-act="release" data-i="${i}">Release</button></td></tr>`).join("")}
-    </tbody></table></div>
-    <p class="mk-note" style="margin:0">kiln keeps a pool for an agent whose starts are placed here. Its size is Shards' rule: the largest burst of starts within a refill window, inside this node's room, which pays for its memory. One with no starts for its keep window is released.</p>`}</div>`;
-  return `<div class="eng-block"><div class="label">MicroVMs here <span class="mk-new">new</span></div>
-    <dl class="facts eng-facts">${facts.map(([k, v, t, src]) => `<div ${t ? `data-tone="${t}"` : ""}><dt>${k}<span class="src">${src}</span></dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
-    ${imagesHtml}${poolsHtml}</div>`;
+/* ------------------------------------------------------------ render, act */
+function render() {
+  const mv = R.filter((r) => r.engine === "microvm").length, vms = R.reduce((a, r) => a + r.vms.length, 0);
+  $("#page").innerHTML = `${mockBar("runners")}
+    <div class="head3"><div class="crumb">04 / Runners</div><h1>Fleet</h1><div class="sub">Machines, engines and their microVMs</div></div>
+    <div class="bar-row"><span class="sg3" role="group" aria-label="View as">${[["owner", "Owner"], ["viewer", "Viewer"]].map(([v, l]) => `<button data-do="as" data-v="${v}" aria-pressed="${S.owner === (v === "owner")}">${l}</button>`).join("")}</span></div>
+    <div class="card3"><div class="ch"><span class="lbl hi">Runners</span><span class="val dim">${R.length}</span><span class="acts">${stack([{ v: mv, color: "#3987e5", tip: "microVM" }, { v: R.length - mv, color: "#898781", tip: "Host" }], 64, `${mv} microVM`)}<span class="kv3 h640" style="margin-left:16px"><span class="lbl">VMs</span><span class="val">${vms}</span></span></span></div>
+      <table class="t3">${th3(FLEET())}<tbody>${R.map(fleetRow).join("")}</tbody></table></div>`;
+  liveScan();
 }
-
-$("#rows").addEventListener("click", (e) => {
-  const act = e.target.closest("[data-act]");
-  const tr = e.target.closest("tr[data-id]");
-  const detail = e.target.closest(".runner-detail-row");
-  const id = detail ? detail.previousElementSibling.dataset.id : tr?.dataset.id;
-  const r = R.find((x) => x.id === id);
-  const seg = e.target.closest(".seg button");
-  if (seg && r) {
-    if (seg.disabled || seg.dataset.v === r.engine) { asking = null; render(); return; }
-    asking = r.id; render(); return;
-  }
-  if (act && r) {
-    const a = act.dataset.act;
-    if (a === "close") { open = null; asking = null; render(); return; }
-    if (a === "keep") { asking = null; render(); return; }
-    if (a === "recheck") { press(act, 900, () => render()); return; }
-    if (a === "release") { press(act, 600, () => { r.pools.splice(Number(act.dataset.i), 1); render(); }); return; }
-    if (a === "cancel") { delete ui[r.id]; ending = null; render(); return; }
-    if (a === "askend") { ending = r.id; render(); return; }
-    if (a === "noend") { ending = null; render(); return; }
-    if (a === "endnow") { press(act, 700, () => { const m = ui[r.id]?.moving; if (!m) return; r.busy = Math.max(0, r.busy - m.left.length); m.left = []; r.sessions = []; delete ui[r.id]; ending = null; r.engine = m.to; r.origin = m.to === "host" ? "owner" : "default"; r.originWhen = "just now"; if (m.to === "host") r.pools = []; render(); }); return; }
-    if (a === "switch") {
-      const to = act.dataset.to;
-      press(act, 500, () => {
-        asking = null;
-        if (r.sessions.length === 0) { r.engine = to; r.origin = to === "host" ? "owner" : "default"; r.originWhen = "just now"; render(); return; }
-        ui[r.id] = { moving: { to, left: [...r.sessions] } };
-        render();
-        // The sessions end one by one (here: on a timer), then the switch is done.
-        const tick = () => {
-          const m = ui[r.id]?.moving; if (!m) return;
-          m.left.shift(); r.sessions = [...m.left]; r.busy = Math.max(0, r.busy - 1);
-          if (m.left.length === 0) { delete ui[r.id]; r.engine = to; r.origin = to === "host" ? "owner" : "default"; r.originWhen = "just now"; if (to === "host") r.pools = []; render(); }
-          else { render(); setTimeout(tick, 8000); }
-        };
-        setTimeout(tick, 8000);
-      });
-      return;
-    }
-    return;
-  }
-  if (detail) return;
-  if (tr && !e.target.closest("button,a,input,label")) { open = open === id ? null : id; asking = null; render(); }
+liveStream(2000, () => { R.forEach((r) => { r.cpu.push(Math.max(1, Math.min(99, last(r.cpu) + (Math.random() - 0.5) * 8))); r.cpu.shift(); r.vms.forEach((v) => { if (v.state === "run" || v.state === "idle") { v.cpu.push(Math.max(0, Math.min(99, last(v.cpu) + (Math.random() - 0.5) * 10))); v.cpu.shift(); } }); }); },
+  (k) => { const [kind, id] = k.split(":"); if (kind === "rc") { const r = R.find((x) => x.id === id); return r && spark(r.cpu, `${Math.round(last(r.cpu))}%`, "#3987e5", narrow() ? 24 : 40, 16, k); } const [v] = VM(id); return v && spark(v.cpu, ["paused", "stopped"].includes(v.state) ? "0%" : `${Math.round(last(v.cpu))}%`, "#3987e5", 36, 16, k); });
+onBand(() => render());
+onOpenChange((id) => { S.open = id; render(); });
+const VM = (id) => { for (const r of R) { const v = r.vms.find((x) => x.id === id); if (v) return [v, r]; } return [null, null]; };
+function vmDo(id, what, el) {
+  const [v, r] = VM(id); if (!v) return;
+  const next = { "vm-play": "run", "vm-pause": "paused", "vm-restart": "start", "vm-stop": "stopped", play: "run", pause: "paused", restart: "start", stop: "stopped" }[what];
+  if (!next) return;
+  const was = v.state;
+  press(el, 450, () => { v.state = next; if (next === "paused") toast(`Paused ${v.agent}`, () => { v.state = was; render(); }); if (next === "start") setTimeout(() => { v.state = "run"; v.up = "0s"; render(); }, 1100); render(); const at = $(`[data-peek="vm:${id}"]`); if ($("#peek3") && at) peekAt(at); else $("#peek3")?.remove(); });
+}
+function switchTo(r, to) {
+  if (!r.vms.filter((v) => v.state !== "stopped").length) { r.engine = to; if (to === "host") r.pools = []; render(); return; }
+  S.moving[r.id] = { to, left: r.vms.filter((v) => v.state !== "stopped").map((v) => v.id) }; render();
+  const tick = () => { const m = S.moving[r.id]; if (!m) return; const id = m.left.shift(); const v = r.vms.find((x) => x.id === id); if (v) v.state = "stopped"; if (!m.left.length) { delete S.moving[r.id]; r.engine = to; if (to === "host") r.pools = []; r.vms = r.vms.filter((x) => x.state !== "stopped"); } render(); if (S.moving[r.id]) setTimeout(tick, 9000); };
+  setTimeout(tick, 9000);
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-do]");
+  const row = e.target.closest("tr.pick");
+  if (!b && row && !e.target.closest("button,a,input,select,[data-peek]")) { S.asking = null; S.open = S.open === row.dataset.r ? null : row.dataset.r; setOpen(S.open, render); return; }
+  if (!b || b.closest("#peek3")) return;
+  const d = b.dataset.do, r = R.find((x) => x.id === b.dataset.r);
+  if (d === "as") { S.owner = b.dataset.v === "owner"; S.asking = null; render(); return; }
+  if (d === "engine") { if (b.dataset.e !== r.engine) { S.asking = r.id; render(); } return; }
+  if (d === "noswitch") { S.asking = null; render(); return; }
+  if (d === "switch") { press(b, 500, () => { S.asking = null; switchTo(r, r.engine === "microvm" ? "host" : "microvm"); }); return; }
+  if (d === "askend") { S.ending = r.id; render(); return; }
+  if (d === "noend") { S.ending = null; render(); return; }
+  if (d === "cancel") { delete S.moving[r.id]; r.vms.forEach((v) => { if (v.state === "drain") v.state = "run"; }); render(); return; }
+  if (d === "endnow") { press(b, 600, () => { const m = S.moving[r.id]; delete S.moving[r.id]; S.ending = null; r.engine = m.to; r.vms = []; if (m.to === "host") r.pools = []; render(); }); return; }
+  if (d === "drain" || d === "resume") { press(b, 400, () => { r.draining = d === "drain"; if (r.draining) toast(`Draining ${r.name}`, () => { r.draining = false; render(); }); render(); }); return; }
+  if (d === "rmore") { menu(b, [{ icon: "terminal", label: "Terminal", run: () => {} }, { icon: "chart", label: "Insights", run: () => {} }, { icon: "trash", label: "Forget", danger: true, run: () => { S.forget = r.id; S.open = r.id; render(); } }]); return; }
+  if (d === "forget") { press(b, 500, () => { R.splice(R.indexOf(r), 1); S.forget = null; S.open = null; setOpen(null, render); }); return; }
+  if (d === "noforget") { S.forget = null; render(); return; }
+  if (d === "nodecharts") { S.nodeCharts = !S.nodeCharts; render(); return; }
+  if (d === "release") { press(b, 400, () => { r.pools.splice(Number(b.dataset.i), 1); render(); }); return; }
+  if (d === "build") { S.building = !S.building; render(); return; }
+  if (d === "dobuild") { press(b, 500, () => { S.building = false; r.images.unshift(["rust-dev", $("#bfrom").selectedOptions[0].textContent, 0, "now", "start"]); render(); setTimeout(() => { r.images[0][4] = "ok"; r.images[0][2] = 1.44; r.images[0][3] = "1m"; render(); }, 2600); }); return; }
+  if (d === "rebuild") { press(b, 400, () => { const im = r.images[Number(b.dataset.i)]; im[4] = "start"; render(); setTimeout(() => { im[4] = "ok"; im[2] = im[2] || 1.44; im[3] = "now"; render(); }, 2200); }); return; }
+  if (d === "rmimg") { press(b, 400, () => { r.images.splice(Number(b.dataset.i), 1); render(); }); return; }
+  if (d === "vm-charts") { const id = b.dataset.vm; S.vmCharts.has(id) ? S.vmCharts.delete(id) : S.vmCharts.add(id); render(); return; }
+  if (d.startsWith("vm-")) { vmDo(b.dataset.vm, d, b); return; }
 });
-$("#rows").addEventListener("keydown", (e) => { const tr = e.target.closest("tr[data-id]"); if (e.key === "Enter" && tr && e.target === tr) { open = open === tr.dataset.id ? null : tr.dataset.id; render(); } });
-$("#q").addEventListener("input", render);
-$("#viewer").addEventListener("change", (e) => { manage = !e.target.checked; asking = null; render(); });
-open = "cec3";
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && S.open && !$("#pal")?.open) { const id = S.open; S.open = null; setOpen(null, render); $(`tr.pick[data-r="${id}"]`)?.focus(); return; }
+  const row = e.target.closest?.("tr[data-vm], tr.pick"); if (!row || e.metaKey || e.ctrlKey) return;
+  if (row.matches("tr.pick") && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); S.open = S.open === row.dataset.r ? null : row.dataset.r; setOpen(S.open, render); $(`tr.pick[data-r="${row.dataset.r}"]`)?.focus(); return; }
+  if (!row.dataset.vm) return; const [v] = VM(row.dataset.vm); const k = e.key.toLowerCase();
+  const map = { p: v.state === "paused" ? "vm-play" : "vm-pause", r: "vm-restart", s: "vm-stop", t: "vm-charts" };
+  if (!map[k]) return; e.preventDefault();
+  const btn = $(`[data-do="${map[k]}"][data-vm="${v.id}"]`, row); btn?.click();
+});
+/* Peek: an agent named on a VM or pool row, its status and controls, acting in place. */
+peekHtml = (id) => {
+  const [kind, x] = id.split(":");
+  if (kind === "vm") { const [v, r] = VM(x); if (!v) return ""; const s = vmState(v, r); return `<div class="ch">${st(s)}<span class="name">${esc(v.agent)}</span><span class="val dim ell">${esc(v.proj)}</span></div><div class="sum3"><div><span class="lbl">CPU</span><span class="v">${spark(v.cpu, `${Math.round(last(v.cpu))}%`, "#3987e5", 40)}</span></div><div><span class="lbl">Memory</span><span class="v">${ubar((v.mem[0] / v.mem[1]) * 100, `${v.mem[0]}/${v.mem[1]}G`, 36)}</span></div><div><span class="lbl">Start</span><span class="v">${startIcon(v.start[0])}<span class="val">${v.start[1]}ms</span></span></div><div><span class="lbl">Up</span><span class="v val">${v.up}</span></div></div><div class="sh">${peekCtl(s === "drain" ? "run" : s, x)}<span class="acts">${ib("open", "Open chat")}</span></div>`; }
+  if (kind === "agent") return `<div class="ch">${st("ok")}<span class="name">${esc(x)}</span><span class="val dim">claude · Opus 5.5</span></div><div class="sum3"><div><span class="lbl">Sessions</span><span class="v">${stack([{ v: 3, color: "#0ca30c", tip: "Running" }, { v: 1, color: "#a6b2c6", tip: "Paused" }], 40, "4")}</span></div><div><span class="lbl">Starts</span><span class="v">${spark(W(5, 3, 91), "47", "#3987e5", 40)}</span></div></div><div class="sh">${ib("play", "Run", 'data-do="run"')}<span class="acts">${ib("open", "Open in Agents")}</span></div>`;
+  return "";
+};
+peekAct = (id, what, el) => { const [kind, x] = id.split(":"); if (kind === "vm" && (what === "play" || what === "pause")) vmDo(x, what, el); };
+/* ⌘K: the page's own actions first, then everywhere's. */
+paletteItems = () => fromOps([
+  ["sessions.pause", "reviewer · adas-mac-studio-3.local", () => { const [v] = VM("v3"); v.state = "paused"; render(); }, "MicroVMs"],
+  ["sessions.restart", "pr-triage · adacachy2", () => { const [v] = VM("v7"); v.state = "run"; render(); }, "MicroVMs"],
+  ["runners.engine", "adas-mac-studio.local → host", () => { S.open = "cec3"; S.asking = "cec3"; setOpen("cec3", render); }, "Runners"],
+  ["runners.drain", "adacachy2", () => { R.find((r) => r.id === "00aa").draining = true; render(); }, "Runners"],
+  ["images.build", "rust-dev v9 · adacachy2", () => { S.building = true; S.open = "00aa"; setOpen("00aa", render); }, "Images"],
+  ["agentdefs.run", "reviewer", () => { location.href = "agents.html?open=reviewer"; }, "Agents"],
+  ["experiments.start", "pr-triage", () => { location.href = "agents.html?open=pr-triage"; }, "Agents"],
+]);
 render();
 </script>
 </body>
