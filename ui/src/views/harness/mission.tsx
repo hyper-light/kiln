@@ -58,6 +58,7 @@ import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
+import { Definitions } from "./definitions";
 import { KindGlyph } from "./kind-glyph";
 import { NODE_WORD, subagentTree, treePaths, type SubagentNode, type SubagentRow } from "./subagent-tree";
 import { PauseButton } from "./subagent-pause";
@@ -1366,6 +1367,10 @@ function Agents() {
           </React.Suspense>
         </>
       )}
+
+      <React.Suspense fallback={null}>
+        <Definitions list={list} />
+      </React.Suspense>
 
       {everyRow.length === 0 ? (
         <div className="ms-empty">

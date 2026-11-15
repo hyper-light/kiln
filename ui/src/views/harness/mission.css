@@ -2035,3 +2035,69 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
     --companion-w: min(184px, 50%);
   }
 }
+
+/* Definitions (definitions.tsx): agents as you define them, in the list's own rows; their sessions and
+   experiment open under them as a row's subagents do. */
+.ms-defs {
+  margin-bottom: 22px;
+}
+.ms-defs-title {
+  color: #ededee;
+}
+.ms-defs .ms-listhead {
+  justify-content: space-between;
+}
+/* A split's share of new sessions: one bar, each variant's part in the prism's own stops. */
+.ms-split {
+  display: inline-flex;
+  gap: 2px;
+  width: 64px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.ms-split > i {
+  display: block;
+  height: 100%;
+}
+.ms-split > i[data-i="0"],
+.ms-vkey[data-i="0"] {
+  background: #a6c4ed;
+}
+.ms-split > i[data-i="1"],
+.ms-vkey[data-i="1"] {
+  background: #d6a2aa;
+}
+.ms-split > i[data-i="2"],
+.ms-vkey[data-i="2"] {
+  background: #b8d9d2;
+}
+.ms-split > i[data-i="3"],
+.ms-vkey[data-i="3"] {
+  background: #d8cbb0;
+}
+.ms-vkey {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  margin: 10px 0 0 22px;
+  border-radius: 5px;
+  color: #0b0c0e;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.ms-vkey[data-current] {
+  box-shadow: 0 0 0 2px #0a0b0d, 0 0 0 3px #ededee;
+}
+.ms-weight {
+  width: 64px;
+}
+.ms-measure + .ms-measure::before {
+  content: " · ";
+  color: #5c6470;
+}
+.ms-measure[data-win] {
+  color: #bfdccf;
+}
