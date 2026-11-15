@@ -60,7 +60,7 @@ import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
 import { DefGroupRows, GroupHead, OpenHead, ownDefOf, SandboxLine, watchUnseen } from "./definitions";
 import { agentdefsRes } from "@/api/agentdefs";
-import { enginesRes, sandboxesRes } from "@/api/microvms";
+import { sandboxesRes } from "@/api/microvms";
 import { KindGlyph } from "./kind-glyph";
 import { NODE_WORD, subagentTree, treePaths, type SubagentNode, type SubagentRow } from "./subagent-tree";
 import { PauseButton } from "./subagent-pause";
@@ -753,7 +753,6 @@ export default function Mission() {
   ask(agentsRes);
   ask(agentdefsRes);
   ask(sandboxesRes);
-  ask(enginesRes);
   ask(pushStateRes);
   ask(thisDeviceRes);
   ask(pushDevicesRes);

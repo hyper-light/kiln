@@ -20,12 +20,12 @@ import { harnessApi } from "@/api/harness";
 import { errorMessage } from "@/lib/hooks";
 import { agentdefsRes, type AgentDef, type Experiment, type Variant } from "@/api/agentdefs";
 import { rebalance, variantName, variantTone } from "./variants";
-import { enginesRes, sandboxesRes, type SandboxBrief } from "@/api/microvms";
+import { engineOf, sandboxesRes, type SandboxBrief } from "@/api/microvms";
 import type { AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { labelOf, useRes } from "@/lib/data";
+import { agentsRes, labelOf, useRes } from "@/lib/data";
 import { useNavigate } from "@/lib/router";
 import { EngineGlyph, START, StartMark, WarmDots, msText } from "@/views/sandbox-marks";
 import { chatStand, type ChatStand } from "./chat-state";
@@ -105,8 +105,8 @@ export function SandboxLine({ id, target }: { id: string; target: string }) {
 function SandboxLineRead({ id, target }: { id: string; target: string }) {
   const b: SandboxBrief | undefined = useRes(sandboxesRes).data[id];
   const machine = target.replace(/^agent:/, "");
-  // A session the sandboxes don't list yet (just started): where it runs, from its machine's engine.
-  const engine = useRes(enginesRes).data[machine]?.engine;
+  // A session the sandboxes don't list yet (just started): where it runs, from its machine's facts.
+  const engine = engineOf(useRes(agentsRes).data.find((r) => r.name === machine)?.facts)?.engine;
   if (!b)
     return (
       <span className="df-sandbox">

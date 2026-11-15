@@ -51,7 +51,7 @@ import { refusedLately, refusedLine } from "./refused";
 import { useClock } from "./harness/dom";
 import { ImagesPanel, PoolsPanel, poolsRes, imagesRes } from "./runners-pools";
 import { EngineBlock, EngineCell, MicrovmsSection, RunnerNow } from "./runners-microvms";
-import { enginesRes, runnerVmsRes } from "@/api/microvms";
+import { runnerEngineRes, runnerVmsRes } from "@/api/microvms";
 import { useAuth } from "@/lib/auth";
 
 /** The facets runners are filtered by, with each runner's values. */
@@ -132,8 +132,7 @@ function RunnersBody() {
   const selected = params.get("agent");
   // All of it asked for at once, the open runner's microVMs and the CI panels below too: each read
   // would otherwise wait for the one before it, and the page move as each came.
-  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, enginesRes, poolsRes, imagesRes, ...(selected ? [runnerVmsRes(selected)] : []));
-  const engines = useRes(enginesRes).data;
+  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, poolsRes, imagesRes, ...(selected ? [runnerVmsRes(selected), runnerEngineRes(selected)] : []));
   const agents = useAgentsLive();
   const history = useMetricsHistory().data;
   const joinRequests = useRes(joinRequestsRes).data;
@@ -143,7 +142,7 @@ function RunnersBody() {
   const [chosen, setChosen] = React.useState<Chosen>({});
 
   const openAgent = (name: string | null) => {
-    if (name) warm(runnerVmsRes(name));
+    if (name) warm(runnerVmsRes(name), runnerEngineRes(name));
     const n = new URLSearchParams(params);
     if (name) n.set("agent", name);
     else n.delete("agent");
@@ -330,10 +329,10 @@ function RunnersBody() {
                         </span>
                       </td>
                       <td>
-                        <EngineCell e={engines[a.name]} />
+                        <EngineCell facts={a.facts} />
                       </td>
                       {/* What it can run legs in, as it last probed (W21-R08). */}
-                      <td className="cell-mono hidden lg:table-cell">{a.facts ? Object.keys(a.facts.executors).join(", ") || "—" : "—"}</td>
+                      <td className="cell-mono hidden whitespace-nowrap lg:table-cell">{a.facts ? Object.keys(a.facts.executors).join(", ") || "—" : "—"}</td>
                       <td className="min-w-[90px]">
                         {a.outpost ? (
                           // Kiln run there without installing it: its terminals and agents, no jobs.

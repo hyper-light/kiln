@@ -36,10 +36,11 @@ import { handleOffers } from "./offers.ts";
 import { handleReap } from "./reap.ts";
 import { handleExperiments } from "./experiments.ts";
 import { handleAgentdefs } from "./agentdefs.ts";
-import { handleMicrovms } from "./microvms.ts";
+import { handleMicrovms, sessionsOn } from "./microvms.ts";
 import { handlePeersOpen, handleRunnersCi } from "./runners-ci.ts";
 import { handleAgentPage } from "./agent-page.ts";
 import { handleOps } from "./ops.ts";
+import { handleEngine } from "./engine.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleLongTimeline, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { handleMockHistory } from "./history.ts";
@@ -285,6 +286,39 @@ const reservedName = (n: string) => n.replace(/\.+$/, "").toLowerCase() === "kil
 const shownAs = (a: Agent) => (a.label ? `${a.label} (${a.name})` : a.name);
 
 /**
+ * What a Linux runner says of itself (`RunnerFacts`): KVM where it has `/dev/kvm`, and so whether its
+ * agents can be held in microVMs (`isolation`; engine.ts writes its engine over it, as the server does).
+ */
+function linuxFacts(cores: number, memGiB: number, diskGiB: number, at: number, arch: string, kvm: boolean, whyNot: string | null): NonNullable<Agent["facts"]> {
+  return {
+    os: "linux",
+    os_version: "6.17",
+    os_distro: "fedora",
+    kernel: "6.17.7",
+    arch,
+    arch_variant: null,
+    cpu: { model: arch === "aarch64" ? "Cortex-A76" : "AMD Ryzen 9 7950X", cores, threads: cores * (arch === "aarch64" ? 1 : 2), flags: [] },
+    mem: { total: memGiB * 1024 ** 3, free: (memGiB * 1024 ** 3) / 2 },
+    disk: { total: diskGiB * 1024 ** 3, free: (diskGiB * 1024 ** 3) / 2 },
+    gpus: [],
+    virt: { kvm, hvf: false, nested: false, microvm: false },
+    isolation: { available: kvm, hypervisor: kvm ? "KVM" : null, why_not: kvm ? null : whyNot },
+    executors: { host: { version: null, details: {} }, docker: { version: "28.3.2", details: { rootless: "true" } } },
+    binfmt: [],
+    tools: { git: "2.51.0" },
+    net: { egress: true, proxy: null },
+    custom: {},
+    probed_at: at,
+    kiln: null,
+    workspaces: null,
+    work: null,
+    machine_id: null,
+    storage: null,
+    runs: [],
+  };
+}
+
+/**
  * What a Mac with Hypervisor.framework says of itself (`RunnerFacts`), its microVMs as
  * `MICROVM_RUNNERS` has them (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
  */
@@ -301,6 +335,8 @@ function macFacts(name: string, cores: number, memGiB: number, diskGiB: number, 
     disk: { total: diskGiB * 1024 ** 3, free: (diskGiB * 1024 ** 3) / 2 },
     gpus: [],
     virt: { kvm: false, hvf: true, nested: false, microvm: MICROVM_RUNNERS.has(name) },
+    // Agents here can be held in microVMs (engine.ts writes its engine over it, as the server does).
+    isolation: { available: true, hypervisor: "Hypervisor.framework", why_not: null },
     executors: { host: { version: null, details: {} } },
     binfmt: [],
     tools: { git: "2.43.0" },
@@ -330,6 +366,7 @@ addAgent(
     connected: true,
     last_seen: t,
     enrolled_at: t - 86400 * 40,
+    facts: linuxFacts(16, 64, 2000, t, "x86_64", true, null),
   },
   newHost(16, 64, 2000),
 );
@@ -346,6 +383,7 @@ addAgent(
     connected: true,
     last_seen: t,
     enrolled_at: t - 86400 * 38,
+    facts: linuxFacts(24, 128, 4000, t, "x86_64", true, null),
   },
   newHost(24, 128, 4000),
 );
@@ -362,6 +400,7 @@ addAgent(
     connected: true,
     last_seen: t,
     enrolled_at: t - 86400 * 12,
+    facts: linuxFacts(64, 512, 8000, t, "x86_64", true, null),
   },
   newHost(64, 512, 8000),
 );
@@ -398,6 +437,7 @@ addAgent(
     last_seen: t,
     enrolled_at: t - 86400 * 60,
     draining: true,
+    facts: linuxFacts(4, 8, 120, t, "aarch64", false, "KVM unavailable: this board's kernel has no /dev/kvm (CONFIG_KVM is off)"),
   },
   newHost(4, 8, 120),
 );
@@ -1819,6 +1859,7 @@ const server = http.createServer(async (req, res) => {
     // ---- experiments from an agent's question (docs/ci.md W20-R11) ----
     if (await handleExperiments(req, res, url, { json, body })) return;
     if (await handleAgentdefs(req, res, url, { json, body })) return;
+    if (await handleEngine(req, res, url, { json, body, runner: (n) => agents.get(n), runners: () => [...agents.values()], sessionsOn })) return;
     if (await handleMicrovms(req, res, url, { json, body })) return;
     if (await handleRunnersCi(req, res, url, { json, body })) return;
     if (handlePeersOpen(req, res, url, { json })) return;

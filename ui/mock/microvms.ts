@@ -3,9 +3,8 @@
  * P2.3, P3.2), every harness session of the mock's own given one, so each row and each agent page has
  * its sandbox:
  *
- *   GET  /api/microvm/engines                     each runner's engine, why it can't, its host check, its Hex node's room
- *   GET  /api/microvm/runners/:name               its microVMs, its warm pools, the images built there
- *   PUT  /api/microvm/runners/:name/engine        {engine | end | cancel}: a switch drains the other engine's microVMs first
+ *   GET  /api/microvm/runners/:name               its microVMs, its warm pools, the images built there, its Hex node's room
+ *                                                 (a proposal: a runner's engine is the server's GET /api/runners/:name/engine, engine.ts)
  *   GET  /api/microvm/sessions                    every session's sandbox, in short: engine, runner, start, state, CPU and memory now
  *   GET  /api/microvm/sessions/:id                one session's sandbox: its Hex box, its Shards microVM, grants, volumes, secret names, pool, telemetry
  *   POST /api/microvm/sessions/:id/:act           pause | resume | restart | stop its microVM
@@ -25,131 +24,17 @@ interface Ctx {
   body: <T>(req: http.IncomingMessage) => Promise<T>;
 }
 
-type Engine = "host" | "microvm";
-interface EngineView {
-  engine: Engine;
-  /** Why it runs this engine: the default for one that can, its owner's choice, or it can't. */
-  origin: "default" | "owner" | "cannot";
-  can: boolean;
-  hypervisor: string | null;
-  why: string | null;
-  checked_at: number;
-  hex_class: string[];
-  room: { memory_free: number; memory_total: number; vcpus_free: number; vcpus_total: number } | null;
-  switching: { to: Engine; draining: string[]; since: number } | null;
-  /** The workspace's default engine (Settings → Runners), and the projects that ask for another here. */
-  default: Engine;
-  overrides: { project: string; engine: Engine }[];
-}
-
 const G = 2 ** 30;
-const now = () => Math.floor(Date.now() / 1000);
-const ENGINES: Record<string, EngineView> = {
-  [MAC_MINI]: {
-    engine: "microvm",
-    origin: "default",
-    can: true,
-    hypervisor: "Hypervisor.framework",
-    why: null,
-    checked_at: now() - 120,
-    hex_class: ["shards-image"],
-    room: { memory_free: 21 * G, memory_total: 32 * G, vcpus_free: 7, vcpus_total: 10 },
-    switching: null,
-    default: "microvm",
-    overrides: [],
-  },
-  "metal-ryzen-01": {
-    engine: "microvm",
-    origin: "default",
-    can: true,
-    hypervisor: "KVM",
-    why: null,
-    checked_at: now() - 300,
-    hex_class: ["shards-image"],
-    room: { memory_free: 41 * G, memory_total: 64 * G, vcpus_free: 7, vcpus_total: 16 },
-    switching: null,
-    default: "microvm",
-    overrides: [{ project: "hyper-light/kiln", engine: "host" }],
-  },
-  "metal-ryzen-02": {
-    engine: "host",
-    origin: "owner",
-    can: true,
-    hypervisor: "KVM",
-    why: null,
-    checked_at: now() - 240,
-    hex_class: ["shards-image"],
-    room: null,
-    switching: null,
-    default: "microvm",
-    overrides: [],
-  },
-  "metal-epyc-01": {
-    engine: "microvm",
-    origin: "default",
-    can: true,
-    hypervisor: "KVM",
-    why: null,
-    checked_at: now() - 60,
-    hex_class: ["shards-image"],
-    room: { memory_free: 388 * G, memory_total: 512 * G, vcpus_free: 52, vcpus_total: 64 },
-    switching: null,
-    default: "microvm",
-    overrides: [],
-  },
-  "metal-pi-04": {
-    engine: "host",
-    origin: "cannot",
-    can: false,
-    hypervisor: null,
-    why: "KVM unavailable: this board's kernel has no /dev/kvm (CONFIG_KVM is off)",
-    checked_at: now() - 900,
-    hex_class: [],
-    room: null,
-    switching: null,
-    default: "microvm",
-    overrides: [],
-  },
-  "metal-nuc-old": {
-    engine: "host",
-    origin: "cannot",
-    can: false,
-    hypervisor: null,
-    why: "kiln on this runner is from before microVMs: upgrade it to say",
-    checked_at: now() - 86400,
-    hex_class: [],
-    room: null,
-    switching: null,
-    default: "microvm",
-    overrides: [],
-  },
-  // kiln's own machine (sessions at `local`) and a person's laptop: not in the runners' table, but sessions run there.
-  local: {
-    engine: "microvm",
-    origin: "default",
-    can: true,
-    hypervisor: "KVM",
-    why: null,
-    checked_at: now() - 180,
-    hex_class: ["shards-image"],
-    room: { memory_free: 30 * G, memory_total: 64 * G, vcpus_free: 9, vcpus_total: 24 },
-    switching: null,
-    default: "microvm",
-    overrides: [],
-  },
-  "adas-macbook-pro-2.local": {
-    engine: "host",
-    origin: "owner",
-    can: true,
-    hypervisor: "Hypervisor.framework",
-    why: null,
-    checked_at: now() - 3600,
-    hex_class: [],
-    room: null,
-    switching: null,
-    default: "microvm",
-    overrides: [],
-  },
+/**
+ * The Hex node's room on each runner whose agents run in microVMs: what its keeper says is free of its
+ * memory and vCPUs. Not a route of the server's yet (a proposal, as `GET /api/microvm/runners/:name`
+ * carries it): a runner's engine is `GET /api/runners/:name/engine` (engine.ts).
+ */
+const ROOMS: Record<string, { memory_free: number; memory_total: number; vcpus_free: number; vcpus_total: number }> = {
+  [MAC_MINI]: { memory_free: 21 * G, memory_total: 32 * G, vcpus_free: 7, vcpus_total: 10 },
+  "metal-ryzen-01": { memory_free: 41 * G, memory_total: 64 * G, vcpus_free: 7, vcpus_total: 16 },
+  "metal-epyc-01": { memory_free: 388 * G, memory_total: 512 * G, vcpus_free: 52, vcpus_total: 64 },
+  local: { memory_free: 30 * G, memory_total: 64 * G, vcpus_free: 9, vcpus_total: 24 },
 };
 
 type Kind = "warm" | "template" | "cold";
@@ -489,13 +374,12 @@ function detail(session: string) {
   }
   const h = ON_HOST.find((x) => x[0] === session);
   if (h) {
-    const [, runner, harness, cpu, used, project] = h;
-    const e = ENGINES[runner];
+    const [, , harness, cpu, used, project] = h;
     const seed = 97 + session.length * 7;
     const reach = reachOf(session, harness, sessionDef(session)?.agent ?? harness, sessionDef(session)?.agentfile ?? `harness-${harness}`, true);
     return {
       ...b,
-      why: project ? `${project} asks for the host here` : e?.origin === "cannot" ? e.why : "its owner's choice",
+      why: project ? `${project} asks for the host here` : "its owner's choice",
       up_s: 3000,
       process: { harness, pid: 40000 + (parseInt(hex6(session), 16) % 20000), user: "kiln" },
       hex: null,
@@ -579,27 +463,19 @@ function reachOf(session: string, harness: string, agent: string, agentfile: str
   return reach;
 }
 
+/** The sessions on runner `name`, each in a microVM or not, running or not: its engine's view counts them (engine.ts). */
+export function sessionsOn(name: string): { microvm: boolean; running: boolean }[] {
+  const all = [...AT.map((a) => a[0]), ...ON_HOST.map((h) => h[0])];
+  return all.flatMap((id) => {
+    const b = brief(id);
+    return b && b.runner === name ? [{ microvm: b.engine === "microvm", running: b.state !== "ended" }] : [];
+  });
+}
+
 /** Handles the routes above; false when it doesn't know the route. */
 export async function handleMicrovms(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";
-  if (p === "/api/microvm/engines" && m === "GET") {
-    // A switch drains: its microVMs end one by one, then it's done.
-    for (const [name, e] of Object.entries(ENGINES)) {
-      if (!e.switching) continue;
-      const r = RUNNERS[name];
-      const gone = Math.floor((Date.now() / 1000 - e.switching.since) / 20);
-      e.switching.draining = e.switching.draining.slice(Math.min(gone, e.switching.draining.length));
-      if (r) r.vms = r.vms.filter((v) => v.state !== "draining" || e.switching!.draining.includes(v.id));
-      if (e.switching.draining.length === 0) {
-        e.engine = e.switching.to;
-        e.origin = e.switching.to === "host" ? "owner" : "default";
-        e.switching = null;
-        if (r && e.engine === "host") r.pools = [];
-      }
-    }
-    return (ctx.json(res, 200, ENGINES), true);
-  }
   if (p === "/api/microvm/sessions" && m === "GET") {
     const all = [...AT.map((a) => a[0]), ...ON_HOST.map((h) => h[0]), ...Object.keys(ENDED)];
     return (ctx.json(res, 200, Object.fromEntries(all.flatMap((id) => (brief(id) ? [[id, brief(id)]] : [])))), true);
@@ -723,45 +599,9 @@ export async function handleMicrovms(req: http.IncomingMessage, res: http.Server
   }
   const one = p.match(/^\/api\/microvm\/runners\/([^/]+)$/);
   if (one && m === "GET") {
-    const r = RUNNERS[decodeURIComponent(one[1]!)] ?? { vms: [], pools: [], images: [], starts: { warm: 0, template: 0, cold: 0 }, net: [] };
-    return (ctx.json(res, 200, { ...r, vms: r.vms.map(({ footprint: _f, box: _b, ...v }) => v) }), true);
-  }
-  const sw = p.match(/^\/api\/microvm\/runners\/([^/]+)\/engine$/);
-  if (sw && m === "PUT") {
-    const name = decodeURIComponent(sw[1]!);
-    const e = ENGINES[name];
-    const b = await ctx.body<{ engine?: Engine; end?: boolean; cancel?: boolean }>(req);
-    if (!e) return (ctx.json(res, 404, { error: "no such runner" }), true);
-    if (b.cancel && e.switching) {
-      const r = RUNNERS[name];
-      r?.vms.forEach((v) => {
-        if (v.state === "draining") v.state = "running";
-      });
-      e.switching = null;
-      return (ctx.json(res, 200, e), true);
-    }
-    if (b.end && e.switching) {
-      const r = RUNNERS[name];
-      if (r) r.vms = r.vms.filter((v) => !e.switching!.draining.includes(v.id));
-      e.engine = e.switching.to;
-      e.origin = e.engine === "host" ? "owner" : "default";
-      e.switching = null;
-      if (r && e.engine === "host") r.pools = [];
-      return (ctx.json(res, 200, e), true);
-    }
-    if (b.engine !== "host" && b.engine !== "microvm") return (ctx.json(res, 400, { error: "engine is host or microvm" }), true);
-    if (b.engine === "microvm" && !e.can) return (ctx.json(res, 409, { error: e.why ?? "this runner can't run microVMs" }), true);
-    if (b.engine === e.engine) return (ctx.json(res, 200, e), true);
-    const r = RUNNERS[name];
-    const live = (r?.vms ?? []).filter((v) => v.state !== "failed");
-    if (live.length === 0) {
-      e.engine = b.engine;
-      e.origin = b.engine === "host" ? "owner" : "default";
-      return (ctx.json(res, 200, e), true);
-    }
-    live.forEach((v) => (v.state = "draining"));
-    e.switching = { to: b.engine, draining: live.map((v) => v.id), since: Date.now() / 1000 };
-    return (ctx.json(res, 200, e), true);
+    const name = decodeURIComponent(one[1]!);
+    const r = RUNNERS[name] ?? { vms: [], pools: [], images: [], starts: { warm: 0, template: 0, cold: 0 }, net: [] };
+    return (ctx.json(res, 200, { ...r, room: ROOMS[name] ?? null, vms: r.vms.map(({ footprint: _f, box: _b, ...v }) => v) }), true);
   }
   return false;
 }

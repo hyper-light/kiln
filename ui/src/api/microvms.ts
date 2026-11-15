@@ -1,31 +1,31 @@
 /** Runners' engines and their microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2.3, P3.2). */
 import type { Res } from "@/lib/data";
 import { request } from "./client";
+import type { IsolationFacts } from "./wire";
 
 const enc = encodeURIComponent;
 
 export type Engine = "host" | "microvm";
 
-export interface EngineView {
-  engine: Engine;
-  /** Why it runs this engine: the default for a runner that can, its owner's choice, or it can't. */
-  origin: "default" | "owner" | "cannot";
-  can: boolean;
-  /** `KVM`, `Hypervisor.framework`, `WHP`, where known. */
-  hypervisor: string | null;
-  /** Shards' own words for why it can't (host_check), none when it can. */
+/**
+ * A runner's engine as the server says it (`GET|PUT /api/runners/:name/engine`, crates/kiln/src/harness/engine.rs):
+ * the engine it holds (none for a runner that hasn't said what it can do), where that comes from (its owner set it
+ * on the server, or what it can do decides) and why it's host where it can't be microvm; what its owner set and how
+ * many times; whether it can hold microVMs now and why not; its isolation facts; its sessions on that engine, and
+ * those of the other, which finish there (`draining`).
+ */
+export interface RunnerEngineView {
+  runner: string;
+  engine: Engine | null;
+  from: "server" | "default" | null;
   why: string | null;
-  /** When Shards' host check last ran, unix seconds. */
-  checked_at: number;
-  /** The Hex node's classes: `shards-image` when it can boot images. */
-  hex_class: string[];
-  /** The Hex node's room, from its keeper. */
-  room: { memory_free: number; memory_total: number; vcpus_free: number; vcpus_total: number } | null;
-  /** A switch under way: the other engine's microVMs drain first. */
-  switching: { to: Engine; draining: string[]; since: number } | null;
-  /** The workspace's default engine (Settings → Runners), and the projects that ask for another here. */
-  default: Engine;
-  overrides: { project: string; engine: Engine }[];
+  asked: Engine | null;
+  version: number;
+  microvm: { usable: boolean; why: string | null } | null;
+  isolation: IsolationFacts | null;
+  virt: { microvm: boolean; kvm: boolean; hvf: boolean } | null;
+  sessions: number;
+  draining: number;
 }
 
 export interface MicroVm {
@@ -73,6 +73,8 @@ export interface RunnerImage {
 }
 
 export interface RunnerMicrovms {
+  /** The Hex node's room, from its keeper (a proposal: not one of the server's routes yet). */
+  room: { memory_free: number; memory_total: number; vcpus_free: number; vcpus_total: number } | null;
   vms: MicroVm[];
   pools: WarmPool[];
   images: RunnerImage[];
@@ -82,13 +84,23 @@ export interface RunnerMicrovms {
 }
 
 export const microvmsApi = {
-  engines: (signal?: AbortSignal) => request<Record<string, EngineView>>("GET", "/api/microvm/engines", undefined, { signal }),
   runner: (name: string, signal?: AbortSignal) => request<RunnerMicrovms>("GET", `/api/microvm/runners/${enc(name)}`, undefined, { signal }),
-  setEngine: (name: string, body: { engine?: Engine; end?: boolean; cancel?: boolean }) => request<EngineView>("PUT", `/api/microvm/runners/${enc(name)}/engine`, body),
 };
 
-/** Every runner's engine, kept current while shown (a drain moves on its own). */
-export const enginesRes: Res<Record<string, EngineView>> = { key: "microvm/engines", fetch: (s) => microvmsApi.engines(s), opts: { pollMs: 5000 } };
+/** A runner's engine (the server's routes): read, and set (`null`: what it can do decides). */
+export const engineApi = {
+  get: (name: string, signal?: AbortSignal) => request<RunnerEngineView>("GET", `/api/runners/${enc(name)}/engine`, undefined, { signal }),
+  set: (name: string, engine: Engine | null) => request<RunnerEngineView>("PUT", `/api/runners/${enc(name)}/engine`, { engine }),
+};
+/** One runner's engine, kept current while shown (its sessions finish on the engine they started on). */
+export const runnerEngineRes = (name: string): Res<RunnerEngineView> => ({ key: `runner-engine/${name}`, fetch: (s) => engineApi.get(name, s), opts: { pollMs: 5000 } });
+
+/** Where a runner's facts say its agents run now (`isolation.engine`), whether it can hold microVMs, and why not; none from a runner before engines. */
+export function engineOf(facts: { isolation?: IsolationFacts } | null | undefined): { engine: Engine; can: boolean; why: string | null } | null {
+  const i = facts?.isolation;
+  if (!i) return null;
+  return { engine: i.engine ?? (i.available ? "microvm" : "host"), can: i.available, why: i.why_not };
+}
 export const runnerVmsRes = (name: string): Res<RunnerMicrovms> => ({ key: `microvm/runner/${name}`, fetch: (s) => microvmsApi.runner(name, s), opts: { pollMs: 5000 } });
 
 /* ------------------------------------------------ a session's sandbox (the agent's Sandbox or Host tab, its rows) */

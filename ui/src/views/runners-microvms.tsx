@@ -1,13 +1,13 @@
 /**
  * A runner's engine and its microVMs on the Runners page (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
- * P2.3, P3.2): the table's Engine cell; in a runner's details, its engine (switched by its owner, the
- * other engine's microVMs drained first, ended now only when asked), what Shards' host check and its
- * Hex node say, and then the microVMs it runs, each with its controls, its warm pools and the images
- * built there.
+ * P2.3, P3.2): the table's "Agents in" cell, from its facts; in a runner's details, its engine as the
+ * server says it (`GET|PUT /api/runners/:name/engine`: switched by those who manage runners, what runs
+ * on the other engine finishing there), and then the microVMs it runs, each with its controls, its
+ * warm pools and the images built there.
  */
 import * as React from "react";
 import { Ban, ChartLine, Hammer, Pause, Play, RotateCcw, Square, Trash2, X, Check } from "lucide-react";
-import { microvmsApi, runnerVmsRes, enginesRes, sandboxApi, type Engine, type EngineView, type MicroVm, type RunnerImage, type WarmPool } from "@/api/microvms";
+import { engineApi, engineOf, runnerEngineRes, runnerVmsRes, sandboxApi, type Engine, type MicroVm, type RunnerImage, type WarmPool } from "@/api/microvms";
 import type { HostSample } from "@/api/wire";
 import { Button } from "@/components/ui/button";
 import { Confirm, Meter, Sparkline } from "@/components/ui/misc";
@@ -17,7 +17,6 @@ import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
 import { Link } from "@/lib/router";
 import { LimitMeter } from "./harness/limits";
 import { ENGINE_ICON, START, StartMark, WarmDots } from "./sandbox-marks";
@@ -29,22 +28,20 @@ const ago = (s: number) => (s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}
 const G = 2 ** 30;
 const gib = (n: number) => Math.round((n / G) * 100) / 100;
 
-/** The table's cell: its engine as an icon and a word; one that can't run microVMs carries ⊘, its reason in the tooltip. */
-export function EngineCell({ e }: { e: EngineView | undefined }) {
-  if (!e) return <span className="cell-dim">—</span>;
-  const Icon = ENGINE_ICON[e.switching ? e.switching.to : e.engine];
+/** The table's cell, from its facts: its engine as an icon and a word; one that can't run microVMs carries ⊘, its reason in the tooltip; a runner from before engines, none. */
+export function EngineCell({ facts }: { facts: Parameters<typeof engineOf>[0] }) {
+  const e = engineOf(facts);
+  if (!e)
+    return (
+      <span className="cell-dim" title="Its runner says nothing of microVMs: its kiln is from before them">
+        —
+      </span>
+    );
+  const Icon = ENGINE_ICON[e.engine];
   return (
-    <span
-      className="rv-engine"
-      data-switching={e.switching ? "" : undefined}
-      title={
-        e.switching
-          ? `Switching to ${e.switching.to}: ${e.switching.draining.length} draining`
-          : (e.why ?? (e.engine === "microvm" ? `microVMs on ${e.hypervisor}` : e.origin === "owner" ? "Host, its owner's choice" : "Host"))
-      }
-    >
+    <span className="rv-engine" title={e.why ?? (e.engine === "microvm" ? `In microVMs (${facts?.isolation?.hypervisor ?? "its hypervisor"})` : "On the host")}>
       <Icon size={13} aria-hidden="true" />
-      <span className="rv-engine-word">{e.switching ? `→ ${e.switching.to}` : e.engine}</span>
+      <span className="rv-engine-word">{e.engine}</span>
       {!e.can && <Ban size={12} className="rv-ban" role="img" aria-label={e.why ?? "Can't run microVMs"} />}
     </span>
   );
@@ -62,7 +59,7 @@ function size(used: number, total: number): { used: number; limit: number; unit:
  * holds for them, of its room.
  */
 export function RunnerNow({ name, sample }: { name: string; sample: HostSample | null }) {
-  const room = useRes(enginesRes).data[name]?.room ?? null;
+  const room = useRes(runnerVmsRes(name)).data.room;
   if (!sample && !room) return null;
   const held = room ? room.vcpus_total - room.vcpus_free : 0;
   return (
@@ -79,42 +76,40 @@ export function RunnerNow({ name, sample }: { name: string; sample: HostSample |
   );
 }
 
-/** A runner's engine, in its details: the switch, Shards' and Hex's checks, the workspace default and any project that asks for another. */
+/**
+ * A runner's engine, in its details, as the server says it: the switch (those who manage runners;
+ * microvm only where it can hold them), its checks (its facts' microVM, its isolation, whether it can
+ * hold microVMs now), where its engine comes from, and its sessions still on the other engine, which
+ * finish there. Ending those, and taking a switch back, wait on the server (their routes are coming).
+ */
 export function EngineBlock({ name, manage }: { name: string; manage: boolean }) {
-  const engines = useRes(enginesRes);
-  const e = engines.data[name];
-  const vms = useRes(runnerVmsRes(name)).data;
+  const res = useRes(runnerEngineRes(name));
+  const e = res.data;
   const [asking, setAsking] = React.useState<Engine | null>(null);
-  const [ending, setEnding] = React.useState(false);
   const [sending, setSending] = React.useState(false);
-  if (!e) return null;
-  const draining = e.switching ? vms.vms.filter((v) => e.switching!.draining.includes(v.id)) : [];
-  const live = vms.vms.filter((v) => v.state !== "failed");
-  const send = (body: { engine?: Engine; end?: boolean; cancel?: boolean }, after: () => void) => {
+  if (!e.engine) return null;
+  const can = e.microvm?.usable ?? false;
+  const send = (engine: Engine | null) => {
     setSending(true);
-    microvmsApi
-      .setEngine(name, body)
+    engineApi
+      .set(name, engine)
       .then((next) => {
-        engines.setData((all) => ({ ...all, [name]: next }));
-        invalidate(`microvm/runner/${name}`);
-        after();
+        res.setData(() => next);
+        setAsking(null);
+        toast({ title: engine ? `Its new sessions run in ${engine === "microvm" ? "microVMs" : "its host"}` : "Its engine is what it can do", tone: "info" });
       })
-      .catch((err: unknown) => toast.error("Couldn't switch the engine", errorMessage(err)))
+      .catch((err: unknown) => toast.error("Couldn't set its engine", errorMessage(err)))
       .finally(() => setSending(false));
   };
-  const checks: [string, string, string][] = e.can
-    ? [
-        ["microVM", "succeeded", "virt.microvm: yes"],
-        ["Isolation", "succeeded", `isolation.available: yes · ${e.hypervisor ?? ""}`],
-        ["Host check", "succeeded", `Shards host_check: usable · ${ago(Math.max(0, Math.floor(Date.now() / 1000) - e.checked_at))} ago`],
-        ["Image class", e.hex_class.includes("shards-image") ? "succeeded" : "skipped", `Hex node: ${e.hex_class.join(", ") || "none"}`],
-      ]
-    : [
-        ["microVM", "failed", "virt.microvm: no"],
-        ["Isolation", "failed", `isolation.why_not: ${e.why ?? ""}`],
-        ["Host check", "failed", `Shards host_check: not usable · ${e.why ?? ""}`],
-        ["Image class", "skipped", "Hex node: no shards-image"],
-      ];
+  const checks: [string, string, string][] = [
+    ["microVM", e.virt?.microvm ? "succeeded" : "skipped", e.virt?.microvm ? "virt.microvm: yes" : "virt.microvm: no (its engine is host)"],
+    [
+      "Isolation",
+      e.isolation?.available ? "succeeded" : "failed",
+      e.isolation?.available ? `isolation.available: yes · ${e.isolation.hypervisor ?? ""}` : `isolation.why_not: ${e.isolation?.why_not ?? "not said"}`,
+    ],
+    ["Can hold", can ? "succeeded" : "failed", can ? "It can hold agents in microVMs now" : (e.microvm?.why ?? "It can't hold agents in microVMs")],
+  ];
   return (
     <section className="rv-block" aria-label="Engine">
       <div className="rv-head">
@@ -124,16 +119,16 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
         <Segmented
           size="xs"
           label={`Engine of ${name}`}
-          value={e.switching ? e.switching.to : e.engine}
+          value={e.engine}
           pending={sending ? (asking ?? null) : null}
           onChange={(v) => v !== e.engine && setAsking(v)}
           options={(["microvm", "host"] as Engine[]).map((x) => {
             const Icon = ENGINE_ICON[x];
-            const disabled = !manage || Boolean(e.switching) || (x === "microvm" && !e.can);
+            const disabled = !manage || (x === "microvm" && !can);
             return {
               value: x,
               disabled,
-              title: !manage ? "Only those who manage runners switch its engine" : x === "microvm" && !e.can ? (e.why ?? undefined) : undefined,
+              title: !manage ? "Only those who manage runners set its engine" : x === "microvm" && !can ? (e.microvm?.why ?? undefined) : undefined,
               label: (
                 <>
                   <Icon size={13} aria-hidden="true" />
@@ -151,22 +146,28 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
             </span>
           ))}
         </span>
-        <span className="rv-default" title="The workspace's default, in Settings → Runners">
-          default <b>{e.default}</b>
-          {e.overrides.map((o) => (
-            <span key={o.project} className="rv-override" title={`${o.project} asks for ${o.engine}: its sessions here run on ${o.engine === "host" ? "the host" : "microVMs"}`}>
-              {o.project.split("/").pop()} → {o.engine}
+        <span className="rv-default" title={e.from === "server" ? "Its owner set it on the server" : "What it can do decides: microvm where it can hold them, else host"}>
+          {e.from === "server" ? "set" : "default"}
+          {e.draining > 0 && (
+            <span className="rv-override" title={`${e.draining} of its sessions run on the other engine, and finish there`}>
+              {e.draining} draining
             </span>
-          ))}
+          )}
+          {e.asked && manage && (
+            <button type="button" className="ms-link" disabled={sending} onClick={() => send(null)} title="Take what was set away: what it can do decides">
+              use default
+            </button>
+          )}
         </span>
       </div>
-      {asking && !e.switching && (
+      {e.why && <p className="rv-why">{e.why}</p>}
+      {asking && (
         <Confirm
-          label={`Switch to ${asking}`}
+          label={`Run its new sessions in ${asking === "microvm" ? "microVMs" : "its host"}`}
           actions={
             <>
-              <Button size="xs" pending={sending} onClick={() => send({ engine: asking }, () => setAsking(null))}>
-                {live.length ? "Switch and drain" : "Switch"}
+              <Button size="xs" pending={sending} onClick={() => send(asking)}>
+                {e.sessions > 0 ? "Switch, they finish" : "Switch"}
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setAsking(null)}>
                 Cancel
@@ -174,36 +175,7 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
             </>
           }
         >
-          <p>{live.length ? `Switch to ${asking}? ${live.length} microVM${live.length === 1 ? "" : "s"} drain first.` : `Switch to ${asking}?`}</p>
-        </Confirm>
-      )}
-      {e.switching && (
-        <Confirm
-          label="Draining"
-          tone={ending ? "danger" : undefined}
-          actions={
-            ending ? (
-              <>
-                <Button size="xs" variant="danger" pending={sending} onClick={() => send({ end: true }, () => setEnding(false))}>
-                  End {draining.length === 1 ? "it" : "them"} now
-                </Button>
-                <Button size="xs" variant="ghost" onClick={() => setEnding(false)}>
-                  Let {draining.length === 1 ? "it" : "them"} finish
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button size="xs" variant="ghost-danger" onClick={() => setEnding(true)}>
-                  End now
-                </Button>
-                <Button size="xs" variant="ghost" pending={sending} onClick={() => send({ cancel: true }, () => undefined)}>
-                  Cancel the switch
-                </Button>
-              </>
-            )
-          }
-        >
-          <p>{ending ? `End ${draining.length === 1 ? "it" : `all ${draining.length}`}? Conversations are kept.` : `Draining to ${e.switching.to}: ${draining.length} left.`}</p>
+          <p>{e.sessions > 0 ? `Its ${e.sessions} running finish on ${e.engine}.` : `New sessions on ${asking}.`}</p>
         </Confirm>
       )}
     </section>
@@ -212,13 +184,14 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
 
 /** What a runner's microVMs hold: its room, then each microVM, its warm pools and the images built there. */
 export function MicrovmsSection({ name, manage }: { name: string; manage: boolean }) {
-  const e = useRes(enginesRes).data[name];
+  const e = useRes(runnerEngineRes(name)).data;
   const res = useRes(runnerVmsRes(name));
   const r = res.data;
   // One microVM's telemetry open at a time (kiln's principle 1).
   const [chart, setChart] = React.useState<string | null>(null);
   const [building, setBuilding] = React.useState(false);
-  if (!e || (!e.can && r.vms.length === 0 && r.images.length === 0)) return null;
+  const can = e.microvm?.usable ?? false;
+  if (!can && r.vms.length === 0 && r.images.length === 0) return null;
   const warm = r.pools.reduce((a, p) => a + p.warm, 0);
   const bound = r.pools.reduce((a, p) => a + p.bound, 0);
   const total = r.starts.warm + r.starts.template + r.starts.cold;
@@ -278,7 +251,7 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
         </>
       )}
 
-      {e.can && (
+      {can && (
         <>
           <div className="rv-labelrow">
             <span className="label rv-label">Images{r.images.length ? ` · ${r.images.length}` : ""}</span>
