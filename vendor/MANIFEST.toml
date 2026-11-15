@@ -267,7 +267,7 @@ own = ["UPSTREAM.md"]
 [projects.hex]
 kind = "git"
 repository = "https://github.com/hyper-light/hex"
-commit = "f386be7afaf83f10dc725736d35b1f87a91f7ed8"
+commit = "6cff7829178d8f82f25e5669a70932be67d33f24"
 path = "vendor/hex"
 take = [
   "Cargo.toml",
