@@ -148,6 +148,18 @@ its own through Hex (`sandbox::hexvm`).
 - **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view), and
   new sessions take the new one.
 
+## Live overrides
+
+kiln plan 01a1dd2e…, P6b.4 (`harness::overrides`; docs/agents.md, "Live overrides"). A person publishes a
+port into a running session's microVM, grants it egress, connects its members to networks and plugs in a
+folder, each in place: the session's `Command::Override`, which its session takes into its record
+(`State::overrides`), gives its microVM live through the seam's `Run::change` (`kiln_seams::sandbox::Change`:
+`Publish`, `Unpublish`, `Grant`, `Revoke`, `Connect`, `Disconnect`, `Plug`, `Unplug`) and a folder to its
+harness among its allowed ones. Each start of its harness gives them again: the new run is given each change once
+it runs, and its harness its folders as it starts (`Spec::dirs`). A microVM that takes no change live refuses it
+in its own words, kept on the override (`took: refused`): Hex's microVMs do until its wire calls land (P6b.3,
+`sandbox::hexvm::NO_LIVE`). A session on its machine's host refuses ports, egress and networks, naming its engine.
+
 ## Facts
 
 A runner says whether it holds isolated agents (`RunnerFacts.isolation`: `available`, `hypervisor`,

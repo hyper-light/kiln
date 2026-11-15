@@ -1405,7 +1405,46 @@ What this page describes, once an isolated agent's start goes through:
 | `kiln spawn` and `kiln agents` from a kiln shell | Can't: they use the machine's own sockets, which a microVM doesn't have; kiln's MCP does their work. |
 | Taking over a found session | Can't: a microVM's harness is never found on the machine. |
 | Moving it to another machine | Not yet: your volume stays on the machine it ran on. |
+| Live overrides: ports, egress, networks, volumes (above) | Taken by its microVM live where its runtime takes them (`Holds::live`): through Hex once its wire calls land (P6b.3); until then refused, each saying why in `state.overrides`, its harness's folders and kiln's scope taken all the same. |
 | The machine's own tools (Xcode, MSVC) | Can't: refused, saying which and why (above). |
+
+## Live overrides: ports, egress, networks and volumes
+
+kiln plan 01a1dd2e…, P6b.4 (`harness::overrides`). A person changes a running session in place: no
+Agentfile edit, no image build, no new microVM and no session restart. Each change is kept on the session
+(`state.overrides`, with how each place took it) and given again each time its harness starts (a restart,
+a resume, a restore), for the session's life.
+
+| Operation | What it takes | Engines |
+|---|---|---|
+| `sessions.ports.publish` / `unpublish` | `agent`, `bind` (the host address: who may reach it), `host_port`, `guest_port`, `protocol` (`tcp`, `udp`), `member` | microVM |
+| `sessions.egress.grant` / `revoke` | `agent`, `host` (a DNS name or an address), `port`, `member` | microVM |
+| `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member` | microVM |
+| `sessions.volumes.add` / `remove` | `agent`, `path` (a folder of its machine), `access` (`ro`, `rw`), `at` (where a microVM sees it), `members` | every engine |
+
+A `member` is `harness` (the default), `agent:<name>` or `mcp:<name>`. Every grant names who, to whom, which
+ports and which way: nothing is implied. Each is on REST (`POST /api/ops/<name>`, and
+`POST /api/harness/sessions/:id/{ports,egress,networks,volumes}`, a removal at `…/unpublish`, `…/revoke`,
+`…/disconnect` or `…/remove`), MCP (`sessions_ports_publish`, …) and code mode (`kiln.sessions.ports.publish`).
+None is read-only; the removals are destructive. `agents_get` says the session's engine and the operations it
+takes (`live`): a session on its machine's host is offered its volumes' alone, and refuses the network ones,
+naming its engine (409).
+
+A volume joins its harness's own allowed folders, each harness's way, and kiln's scope for the session: its
+file calls there are inside its folder (Permissions' `folder`), and a read-only one's changes are refused at each
+call kiln holds. In a microVM it's also plugged in, read-only or writable as asked.
+
+| Harness | Its own allowed folders | A change while it runs |
+|---|---|---|
+| Claude Code | `--add-dir` as it starts | live: its flag settings' `permissions.additionalDirectories` |
+| Codex | the folders it may write ride each turn (`turn/start`'s `sandboxPolicy.writableRoots`) | from its next turn; a read-only folder needs nothing, as its sandbox reads everywhere |
+| Gemini CLI | `--include-directories` as it starts | it starts again with it once nothing is under way, its conversation going on |
+| Antigravity | `--add-dir` as it starts | it starts again with it once nothing is under way, as for its other settings |
+| Devin, opencode, Goose, Amp, Cursor | ACP's `additionalDirectories` as its session opens, where it says it takes them (`sessionCapabilities.additionalDirectories`) | it opens its session again with them; one that doesn't say so holds its tools to no folder kiln sets, and kiln's scope holds the calls it asks about |
+| Pi | none: it holds its tools to no folder | kiln's scope alone |
+
+In a microVM, a harness that takes its folders only as it starts takes a change as it next starts: kiln
+starts no new microVM for it.
 
 ## The Changes tab
 
