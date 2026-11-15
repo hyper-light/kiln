@@ -27,7 +27,9 @@ import { toast } from "@/components/ui/toast";
 import { useActions } from "@/lib/action";
 import { agentsRes, labelOf, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
-import { formOf, pinWords, problemOf, type SourceForm } from "./sources";
+import { mySecretsRes } from "@/api/secrets";
+import { Link } from "@/lib/router";
+import { chosenIn, formOf, lineOf, pinWords, problemOf, slotsOf, type SecretChoice, type SecretSlot, type SourceForm } from "./sources";
 
 const ago = (s: number) => (s < 60 ? `${Math.max(0, Math.round(s))}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`);
 const gib = (n: number) => `${(n / 2 ** 30).toFixed(n >= 10 * 2 ** 30 ? 0 : 1)}G`;
@@ -212,7 +214,17 @@ const KIND: Record<AgentfileSourceKind, { icon: typeof GitBranch; word: string; 
  * Each install source as a row, opened at its line in the editor (`onJump`), and changed there
  * through the source picker (`onWrite`: the line written again, in the editor, for Save).
  */
-export function Sources({ id, text, onJump, onWrite }: { id: string; text: () => string; onJump: (s: AgentfileSource) => void; onWrite: (s: AgentfileSource, f: SourceForm) => boolean }) {
+export function Sources({
+  id,
+  text,
+  onJump,
+  onWrite,
+}: {
+  id: string;
+  text: () => string;
+  onJump: (s: AgentfileSource) => void;
+  onWrite: (s: AgentfileSource, f: SourceForm, chosen: SecretChoice) => boolean;
+}) {
   const b = useRes(agentfileBuildsRes(id)).data;
   const [editing, setEditing] = React.useState<string | null>(null);
   const loose = b.sources.filter((s) => !s.pin).length;
@@ -238,8 +250,8 @@ export function Sources({ id, text, onJump, onWrite }: { id: string; text: () =>
                 onJump={() => onJump(s)}
                 onEdit={() => setEditing(editing === key ? null : key)}
                 text={text}
-                onWrite={(f) => {
-                  if (onWrite(s, f)) setEditing(null);
+                onWrite={(f, chosen) => {
+                  if (onWrite(s, f, chosen)) setEditing(null);
                 }}
               />
             );
@@ -263,7 +275,7 @@ function SourceRow({
   onJump: () => void;
   onEdit: () => void;
   text: () => string;
-  onWrite: (f: SourceForm) => void;
+  onWrite: (f: SourceForm, chosen: SecretChoice) => void;
 }) {
   const K = KIND[s.kind];
   const pin = pinWords(s.pin);
@@ -282,16 +294,14 @@ function SourceRow({
           {s.pin?.by === "ref" ? <GitBranch size={12} aria-hidden="true" /> : <Check size={12} aria-hidden="true" />}
           <span>{pin}</span>
         </span>
-        <span className="afs-cred" title={s.credential ? `${s.credential.name} · ${s.credential.scope} secret, by name` : "No credential"}>
-          {s.credential ? (
+        <span className="afs-cred" title={secretsTitle(s)}>
+          {s.secrets.length > 0 ? (
             <>
               <KeyRound size={12} aria-hidden="true" />
-              <span>
-                {s.credential.name} <i>{s.credential.scope}</i>
-              </span>
+              <span>{s.secrets.map((x) => x.name).join(" + ")}</span>
             </>
           ) : (
-            <span className="afb-dim">no key</span>
+            <span className="afb-dim">{s.kind === "git-ssh" ? "ssh agent" : "no key"}</span>
           )}
         </span>
         <span className="afs-grant" title={s.grant ? `Its fetch alone may reach ${s.grant}` : undefined}>
@@ -310,10 +320,15 @@ function SourceRow({
           <Pencil size={13} />
         </button>
       )}
-      {editing && <SourcePicker s={s} line={text().split("\n")[s.line - 1] ?? ""} onWrite={onWrite} onCancel={onEdit} />}
+      {editing && <SourcePicker s={s} text={text()} onWrite={onWrite} onCancel={onEdit} />}
     </li>
   );
 }
+
+/** Git over ssh signs in with an SSH agent, and kiln gives a build secrets alone (`--secret`, sandbox/image.rs). */
+const SSH = "Git over ssh signs in with an SSH agent, and kiln gives builds secrets alone: its https URL takes a token";
+/** Each secret its fetch is given, as its label names it. */
+const secretsTitle = (s: AgentfileSource) => (s.secrets.length ? s.secrets.map((x) => `${x.id} = user:${x.name}`).join(", ") : s.kind === "git-ssh" ? SSH : "Its fetch is given no secret");
 
 const KINDS = [
   { value: "git", label: "Git" },
@@ -328,10 +343,14 @@ const PIN: Record<SourceForm["kind"], { label: string; hint: string }> = {
   path: { label: "", hint: "" },
 };
 
-/** The source picker, in place under its row: kind, source and pin, written into the editor's line in Shards' syntax. */
-function SourcePicker({ s, line, onWrite, onCancel }: { s: AgentfileSource; line: string; onWrite: (f: SourceForm) => void; onCancel: () => void }) {
-  const [f, setF] = React.useState<SourceForm>(() => formOf(s, line));
-  const problem = problemOf(f);
+/** The source picker, in place under its row: kind, source and pin, and the secrets its fetch is given (yours, by name), written into the editor in Shards' syntax. */
+function SourcePicker({ s, text, onWrite, onCancel }: { s: AgentfileSource; text: string; onWrite: (f: SourceForm, chosen: SecretChoice) => void; onCancel: () => void }) {
+  const [f, setF] = React.useState<SourceForm>(() => formOf(s, text.split("\n")[lineOf(text, s) - 1] ?? ""));
+  const [chosen, setChosen] = React.useState<SecretChoice>(() => chosenIn(text, slotsOf(f)));
+  const slots = slotsOf(f);
+  // Shards refuses half an S3 key (build/s3.rs): both halves, or neither.
+  const half = f.kind === "s3" && slots.length === 2 && Boolean(chosen.key_id) !== Boolean(chosen.secret_key);
+  const problem = problemOf(f) ?? (half ? "both halves of the key" : null);
   const set = (p: Partial<SourceForm>) => setF((x) => ({ ...x, ...p }));
   return (
     <form
@@ -339,7 +358,7 @@ function SourcePicker({ s, line, onWrite, onCancel }: { s: AgentfileSource; line
       aria-label={`${s.name}'s source`}
       onSubmit={(e) => {
         e.preventDefault();
-        if (!problem) onWrite(f);
+        if (!problem) onWrite(f, chosen);
       }}
     >
       <Segmented size="xs" label="Kind" value={f.kind} onChange={(kind) => set({ kind })} options={KINDS.map((k) => ({ value: k.value, label: k.label }))} />
@@ -348,7 +367,7 @@ function SourcePicker({ s, line, onWrite, onCancel }: { s: AgentfileSource; line
         <input
           value={f.source}
           spellCheck={false}
-          placeholder={f.kind === "git" ? "git@host:org/repo.git" : f.kind === "s3" ? "s3://bucket/key" : f.kind === "https" ? "https://…/x.tar.gz" : "./dir"}
+          placeholder={f.kind === "git" ? "https://host/org/repo.git" : f.kind === "s3" ? "s3://bucket/key" : f.kind === "https" ? "https://…/x.tar.gz" : "./dir"}
           onChange={(e) => set({ source: e.target.value })}
         />
       </label>
@@ -364,17 +383,18 @@ function SourcePicker({ s, line, onWrite, onCancel }: { s: AgentfileSource; line
           <input value={f.region} spellCheck={false} placeholder="us-east-1" onChange={(e) => set({ region: e.target.value })} />
         </label>
       )}
-      <span className="afs-cred afs-key" title="Handed to its fetch alone, by name: never in the text">
-        <KeyRound size={12} aria-hidden="true" />
-        {s.credential ? (
-          <>
-            {s.credential.name}
-            <i>{s.credential.scope}</i>
-          </>
-        ) : (
-          "no key"
-        )}
-      </span>
+      {slots.length > 0 ? (
+        <React.Suspense fallback={slots.map((x) => <SecretPickHold key={x.role} slot={x} />)}>
+          <SecretPicks slots={slots} chosen={chosen} onChoose={(role, name) => setChosen((c) => ({ ...c, [role]: name }))} />
+        </React.Suspense>
+      ) : (
+        f.kind === "git" &&
+        /^(git@|ssh:\/\/)/.test(f.source.trim()) && (
+          <span className="afs-cred afs-key afb-dim" title={SSH}>
+            ssh agent
+          </span>
+        )
+      )}
       <span className="afs-acts">
         {problem && <span className="afs-problem">{problem}</span>}
         <Button size="xs" type="submit" disabled={Boolean(problem)}>
@@ -385,6 +405,51 @@ function SourcePicker({ s, line, onWrite, onCancel }: { s: AgentfileSource; line
         </Button>
       </span>
     </form>
+  );
+}
+
+/**
+ * Its fetch's secrets, each one of yours by name (`/api/me/secrets`): a name written that isn't yours
+ * says so, as kiln refuses its session's build until you set one.
+ */
+function SecretPicks({ slots, chosen, onChoose }: { slots: SecretSlot[]; chosen: SecretChoice; onChoose: (role: SecretSlot["role"], name: string | null) => void }) {
+  const mine = useRes(mySecretsRes).data;
+  return (
+    <>
+      {slots.map((x) => {
+        const name = chosen[x.role] ?? "";
+        const yours = !name || mine.some((m) => m.name === name);
+        return (
+          <label key={x.role} className="field afs-field afs-secret" data-missing={!yours || undefined} title={`${x.id}: one of your secrets, by name, given to this fetch alone`}>
+            <KeyRound size={12} aria-hidden="true" />
+            <span className="afs-k">{x.label}</span>
+            <select value={name} onChange={(e) => onChoose(x.role, e.target.value || null)}>
+              <option value="">none</option>
+              {mine.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.name}
+                </option>
+              ))}
+              {!yours && <option value={name}>{name} · not yours</option>}
+            </select>
+          </label>
+        );
+      })}
+      {mine.length === 0 && (
+        <Link to="/settings#secrets.mine" className="afs-set">
+          Set one of yours
+        </Link>
+      )}
+    </>
+  );
+}
+
+function SecretPickHold({ slot }: { slot: SecretSlot }) {
+  return (
+    <span className="field afs-field afs-secret" aria-hidden="true">
+      <KeyRound size={12} />
+      <span className="afs-k">{slot.label}</span>
+    </span>
   );
 }
 

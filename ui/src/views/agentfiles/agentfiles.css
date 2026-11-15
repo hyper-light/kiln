@@ -497,6 +497,30 @@ a.af-name:hover {
   letter-spacing: 0.04em;
   white-space: nowrap;
 }
+/* A secret its fetch is given: one of yours, by name; one not yours, the warning's colour. */
+.afs-secret {
+  flex: 0 1 230px;
+  gap: 7px;
+  padding-left: 10px;
+}
+.afs-secret > svg {
+  flex: none;
+  color: #8c8f98;
+}
+.afs-secret select {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.afs-secret[data-missing] select,
+.afs-secret[data-missing] > svg {
+  color: var(--color-warn);
+}
+.afs-set {
+  color: var(--color-meta);
+  font-size: 11.5px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 .afs-acts {
   display: inline-flex;
   align-items: center;

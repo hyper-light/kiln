@@ -54,7 +54,7 @@ export const agentfileVersionsRes = (id: string): Res<AgentfileVersion[]> => ({
 /** An install source's kind, as Shards tells a `HARNESS` or `AGENT` source apart (crates/agentfile `source_of`). */
 export type AgentfileSourceKind = "path" | "git-https" | "git-ssh" | "s3" | "https" | "oci";
 
-/** An install source, as Shards reads a `HARNESS` or `AGENT` line: what pins it, and the credential its fetch uses, by name. */
+/** An install source, as Shards reads a `HARNESS` or `AGENT` line: what pins it, and the secrets its fetch is given, by name. */
 export interface AgentfileSource {
   line: number;
   directive: "HARNESS" | "AGENT";
@@ -64,8 +64,12 @@ export interface AgentfileSource {
   source: string;
   /** A SHA-256, an S3 object's version, a Git ref (and the commit it named at the last build), or kiln's own pin for a path. */
   pin: { by: "sha256" | "version-id" | "ref" | "kiln"; value: string; resolved: string | null } | null;
-  /** The secret its fetch is handed, by name and scope: never a value. */
-  credential: { name: string; scope: string } | null;
+  /**
+   * The build secrets its fetch is given, each one of the person's own by name (never a value): those
+   * its text's `LABEL kiln.secret.<ID>=user:<NAME>` labels name for it, in Shards' order (a proposal:
+   * the server reads the labels, `secrets::mine::references`, and lists no sources yet).
+   */
+  secrets: { id: string; name: string }[];
   /** The origin its fetch alone is granted (default deny). */
   grant: string | null;
 }

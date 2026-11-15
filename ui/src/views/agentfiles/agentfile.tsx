@@ -9,13 +9,14 @@
 import * as React from "react";
 import type { EditorView } from "@codemirror/view";
 import { agentfileBuildsRes, agentfileRes, agentfilesApi, agentfileVersionsRes, type AgentfileImage, type AgentfileSource } from "@/api/agentfiles";
+import { mySecretsRes } from "@/api/secrets";
 import type { Agentfile, AgentfileSaved } from "@/api/wire";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, Crumbs, EmptyState, TextField } from "@/components/ui/misc";
 import { useAction, useActions } from "@/lib/action";
-import { useRes } from "@/lib/data";
+import { useRes, warm } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -23,7 +24,7 @@ import { Link, useNavigate, useParams } from "@/lib/router";
 import { Builds, ImageCells, Sources, useImages } from "./builds";
 import { keptWords, restoredWords } from "./lint";
 import { named } from "./names";
-import { lineOf, writeSource, type SourceForm } from "./sources";
+import { lineOf, oneChange, slotsOf, spanOf, writeSecrets, writeSource, type SecretChoice, type SourceForm } from "./sources";
 import { AgentfileRead, AgentfileText } from "./text";
 import "./agentfiles.css";
 
@@ -91,6 +92,8 @@ const NO_IMAGES: ReadonlyMap<number, AgentfileImage> = new Map();
 
 function AgentfileEditor({ id }: { id: string }) {
   const res = useRes(agentfileRes(id));
+  // Your secrets' names, for its sources' picker.
+  warm(mySecretsRes);
   // Its builds and sources come with it, under the page's one loader: nothing below them moves as they land.
   useRes(agentfileBuildsRes(id));
   const images = useImages(id);
@@ -118,13 +121,19 @@ function AgentfileEditor({ id }: { id: string }) {
     v.dispatch({ selection: { anchor: line.from, head: line.to }, scrollIntoView: true });
     v.focus();
   };
-  const write = (s: AgentfileSource, f: SourceForm): boolean => {
+  // Its line, and the labels naming the secrets its fetch is given: one change, the line and its labels selected.
+  const write = (s: AgentfileSource, f: SourceForm, chosen: SecretChoice): boolean => {
     const v = view.current;
     if (!v) return false;
-    const line = v.state.doc.line(Math.min(v.state.doc.lines, Math.max(1, lineOf(v.state.doc.toString(), s))));
-    const next = writeSource(line.text, f);
+    const doc = v.state.doc.toString();
+    const lines = doc.split("\n");
+    const at = Math.min(lines.length, Math.max(1, lineOf(doc, s)));
+    const next = writeSource(lines[at - 1] ?? "", f);
     if (next === null) return false;
-    v.dispatch({ changes: { from: line.from, to: line.to, insert: next }, selection: { anchor: line.from, head: line.from + next.length }, scrollIntoView: true });
+    lines[at - 1] = next;
+    const written = writeSecrets(lines.join("\n"), at, slotsOf(f), chosen);
+    const span = spanOf(written, s);
+    v.dispatch({ changes: oneChange(doc, written), selection: { anchor: span.from, head: span.to }, scrollIntoView: true });
     v.focus();
     return true;
   };

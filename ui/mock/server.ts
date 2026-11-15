@@ -38,6 +38,7 @@ import { handleExperiments } from "./experiments.ts";
 import { handleAgentdefs } from "./agentdefs.ts";
 import { handleMicrovms, sessionOf, sessionsOn } from "./microvms.ts";
 import { handleOverrides } from "./overrides.ts";
+import { handleMySecrets } from "./secrets-mine.ts";
 import { handlePeersOpen, handleRunnersCi } from "./runners-ci.ts";
 import { handleAgentPage } from "./agent-page.ts";
 import { handleOps } from "./ops.ts";
@@ -1865,6 +1866,7 @@ const server = http.createServer(async (req, res) => {
     if (await handleEngine(req, res, url, { json, body, runner: (n) => agents.get(n), runners: () => [...agents.values()], sessionsOn })) return;
     if (await handleMicrovms(req, res, url, { json, body })) return;
     if (await handleRunnersCi(req, res, url, { json, body })) return;
+    if (await handleMySecrets(req, res, url, { json, body })) return;
     if (handlePeersOpen(req, res, url, { json })) return;
     if (handleAgentPage(req, res, url, { json })) return;
     if (handleOps(req, res, url, { json })) return;

@@ -30,6 +30,8 @@ import { MyPasswordGroup, MyPasswordHold, PasskeysGroup, PasskeysHold, myPasswor
 import { PeopleGroup, PeopleHold, RolesGroup, RolesHold, peopleRes, rolesRes } from "@/views/settings-people";
 import { TokensGroup, TokensHold, tokensRes } from "@/views/settings-tokens";
 import { CiSecretsGroups, CiSecretsHold } from "@/views/settings-ci";
+import { MySecretsGroup, MySecretsHold } from "@/views/settings-secrets";
+import { mySecretsRes } from "@/api/secrets";
 import { GithubGroup, GithubHold } from "@/views/settings-github";
 import { RoutingGroups, RoutingHold } from "@/views/settings-routing";
 import { OidcGroups, OidcHold } from "@/views/settings-oidc";
@@ -59,7 +61,7 @@ export default function Settings() {
     myNotificationsRes,
     attentionSettingsRes,
     passkeysRes,
-    ...(signedIn ? [tokensRes, rolesRes] : []),
+    ...(signedIn ? [tokensRes, rolesRes, mySecretsRes] : []),
     ...(manages ? [peopleRes] : []),
     ...(person ? [myPasswordRes, chatLinksRes] : []),
     ...(pushes ? [pushStateRes, pushDevicesRes] : []),
@@ -141,6 +143,13 @@ export default function Settings() {
           <SettingsSection id="tokens" index={next()} title="Tokens" about="Personal access tokens, for the CLI, scripts and tools" words="tokens pat api cli">
             <Loadable label="your tokens" fallback={<TokensHold />}>
               <TokensGroup />
+            </Loadable>
+          </SettingsSection>
+        )}
+        {signedIn && (
+          <SettingsSection id="secrets" index={next()} title="Your secrets" about="Yours alone, for your Agentfiles' sources to fetch with" words="secrets mine user agentfile credentials">
+            <Loadable label="your secrets" fallback={<MySecretsHold />}>
+              <MySecretsGroup />
             </Loadable>
           </SettingsSection>
         )}
