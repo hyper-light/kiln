@@ -798,7 +798,11 @@ offers **Move to…** beside **Start a new one**.
    the harness keeps, starts the session under the same id with its timeline as it was, and says so
    (what came, what went beside, what stayed); the server follows the session
    there and viewers stay on it. Only then does the first runner let go of it. A runner that can't take
-   it over says why, and the session goes on where it was. The agent starts only once its folder there
+   it over says why, and the session goes on where it was. It spools what comes on its own disk first,
+   leaving the room the operator set (`[ci.scheduler.admission] disk_free`, or none): the server says
+   that room to each runner as it connects (`ServerMsg::AdoptPolicy`, docs/wire.md), a runner forgets
+   it as its server drops, and one that doesn't know it refuses the hand-over ("transfer storage
+   policy or volume authority is unavailable"). The agent starts only once its folder there
    has taken the sync log as far as it stood on the other machine ("Waiting for its folder's last
    changes"; messages sent meanwhile wait, and a restart waits again), so it never starts on files
    older than the ones it left. Then its repository is put as it was, touching no file of the working

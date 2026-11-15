@@ -3692,6 +3692,9 @@ impl Hub {
                 self.instances.update(|i| i.set_features(peer, names.clone()));
                 // One that takes its engine is told what its owner set (`crate::harness::engine`).
                 crate::harness::engine::on_features(self, &agent, peer, &names).await;
+                // One that takes it is told the room a hand-over's spool leaves there: a session
+                // moved to it from another machine is taken over (CP-T3.2).
+                crate::harness::mail_transfer::on_features(self, &agent, peer, &names).await;
                 self.harness.mail_delivery.changed();
                 // One that installs skills is told what it lays out (docs/agents.md, "Skills kiln installs").
                 if skills {

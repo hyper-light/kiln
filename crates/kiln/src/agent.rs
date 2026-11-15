@@ -4452,6 +4452,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         continue;
                     }
+                    // The room a hand-over's spool leaves here, as the server says it each time this
+                    // runner names the feature (CP-T3.2): its reach node takes sessions over from
+                    // other machines under it, and forgets it as the server drops.
+                    Carried::Read(FromServer::AdoptPolicy(told)) => {
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::AdoptPolicy(crate::harness::moving::stream::StoragePolicy::offered(told.disk_floor))).await;
+                        }
+                        continue;
+                    }
                     // Its engine as its owner set it on the server (kiln plan 01a1dd2e…, P2.3): kept for its
                     // restarts, written into its facts from now on, and said at once, so its own
                     // admission and the server's placement hold it alike.
@@ -5611,7 +5620,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     | ServerMsg::Cluster { .. }
                     | ServerMsg::AgentLimit { .. }
                     | ServerMsg::HarnessHistoryFor { .. }
-                    | ServerMsg::RunnerEngine { .. } => {}
+                    | ServerMsg::RunnerEngine { .. }
+                    | ServerMsg::AdoptPolicy { .. } => {}
                 }
             }
             Ev::Headroom => {
