@@ -1227,10 +1227,12 @@ impl Hub {
         self.live.event(e);
         let text: Arc<str> = Arc::from(e.text());
         self.feed.push(Arc::clone(&text));
-        // What the viewers hear of mostly follows a change whose event its trigger recorded; and
-        // what outgoing webhooks take of it besides is recorded (crate::events).
-        self.relay.heard(&text);
-        self.relay.kick();
+        // What outgoing webhooks take of it and nothing else records is kept for the relay to
+        // record, which is told so. A change's own event its trigger recorded, and the relay hears
+        // of that row from the store (crate::events): not of every event the viewers hear.
+        if self.relay.heard(&text) {
+            self.relay.kick();
+        }
         match e {
             ServerEvent::Harness { info } => self.emit_session(&info.id, text),
             ServerEvent::HarnessClosed { id } => self.emit_session(id, text),

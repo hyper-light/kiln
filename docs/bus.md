@@ -111,6 +111,9 @@ and delivered from it in that order, at least once, so a kill -9 of the server l
   of the topic's log carries them, one message after another; then it records how far it got and
   lets the rows go. A restart goes on from the first row not recorded: of rows published before a
   kill and not recorded, the last goes again (its events with the numbers they had), the rest not.
+  It looks at the outbox as a write records a row there (the store names the table as that write
+  commits), as the hub hands it an event to record, and once a second besides; not at each thing
+  the hub tells its viewers, which is every change of every agent session.
 - **Delivered from the topic.** Each kind of delivery reads `kiln.events` from a position of its
   own, kept in kiln.db: for each event it logs the deliveries the event makes (each subscription
   that takes it; each channel a rule sends it to), each with its body and a delivery id that is the
