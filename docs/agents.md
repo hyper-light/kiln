@@ -1376,9 +1376,15 @@ to `s28-pi-agentfile`).
   tool. What's still to come is the launch handing each connection to it.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
-- **Move to another machine, or switch to another harness.** Not yet: it stays where it started, in
-  the harness it started with, and says so when asked. To go on elsewhere or in another harness, end
-  it and start a new one there.
+- **Move to another machine.** Not yet: it stays where it started, and says so when asked. To go on
+  elsewhere, end it and start a new one there.
+- **Switch to another harness**, as on its machine: one click (kiln plan 01a1dd2e…, P6c.5). Once its
+  turn is over and the other harness's image is in its machine's store (built there once where it
+  isn't), its harness is swapped for the other in the same microVM, no microVM started, its
+  conversation carried from kiln's own timeline (its harness's own record is its microVM's): into
+  Codex's thread as its items, else in words with the next message. Where its machine's microVMs swap
+  no harness in place (Hex's, until its wire calls land, P6c.2) it's refused, saying so, and it goes
+  on as it was.
 - **Not yet**, as well as the start itself: a terminal into the microVM, its sign-in and exec
   there; git signing and a git host's credentials by the microVM's own key; kiln's MCP, over that
   lane; and the commands it asks kiln to run on other machines,

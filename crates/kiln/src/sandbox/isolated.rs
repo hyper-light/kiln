@@ -25,8 +25,9 @@
 //!   harness's config names its microVM's bridge, and this runner serves each connection to it in its own process
 //!   ([`bridge`]), where its microVMs carry the lane (`super::Microvms::mcp`); where they don't, its harness starts
 //!   without it, said.
-//! - **What it can't do yet**, refused rather than done another way: move to another machine, or
-//!   switch to another harness ([`NO_MOVE`], [`NO_SWITCH`]).
+//! - **What it can't do yet**, refused rather than done another way: move to another machine
+//!   ([`NO_MOVE`]), or switch to another harness where its microVMs swap none in place ([`NO_SWITCH`]);
+//!   where they do, a switch swaps its member there ([`ready_to_swap`], [`launch`]'s `swap_from`).
 
 use std::path::Path;
 
