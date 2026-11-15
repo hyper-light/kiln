@@ -1359,6 +1359,32 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, "agentfiles.restore", body)).await
         }
+        // Agent definitions (`crate::agentdefs`): each operation is its route, each keeping its caller to their own.
+        (&Method::GET, ["api", "agentdefs"]) => boxed(|| own_op(&hub, &caller, "agentdefs.list", query_value(&q))).await,
+        (&Method::POST, ["api", "agentdefs"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.create", body)).await
+        }
+        (&Method::POST, ["api", "agentdefs", "check"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.check", body)).await
+        }
+        (&Method::GET, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.get", json!({ "id": id }))).await,
+        (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
+        (&Method::PATCH, ["api", "agentdefs", id]) | (&Method::POST, ["api", "agentdefs", id, "restore" | "run"]) => {
+            let name = match s.get(3).copied() {
+                Some("restore") => "agentdefs.restore",
+                Some(_) => "agentdefs.run",
+                None => "agentdefs.update",
+            };
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
+        }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
