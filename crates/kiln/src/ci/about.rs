@@ -22,6 +22,12 @@ use crate::store::Repo;
 const KIND: &str = "claude";
 const MODE: &str = "auto";
 
+/// A helper's mode in harness `kind`: Claude Code's classifier (`MODE`) where it's Claude Code, else
+/// the harness's own.
+fn mode_for(kind: &str) -> Option<String> {
+    (kind == KIND).then(|| MODE.to_owned())
+}
+
 /// Whether `s` reads as a commit's id: 7 to 64 hex digits.
 fn is_commit(s: &str) -> bool {
     (7..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -64,6 +70,9 @@ pub async fn start(hub: &Arc<Hub>, repo: &str, caller: &Caller, body: &Value) ->
     let by = Starter { parent: None, opener: caller.opener(), actor: caller.name.clone(), plan_run: None, asker: Some(caller.clone()) };
     let name = format!("About {}", selection.unwrap_or(path).chars().take(48).collect::<String>());
     let ask = Ask { kind: KIND.into(), prompt: Some(prompt), mode: Some(MODE.into()), name: Some(name), count: Some(1), helper: Some(crate::harness::about::ABOUT.to_owned()), ..Ask::default() };
+    // The asker's own copy of kiln's card, where one stands in for it (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.1b).
+    let person = lineage::person_of(caller);
+    let ask = crate::agentdefs::uses::ask_for(hub, person.as_deref(), crate::agentdefs::builtin::ABOUT_CODE, ask, mode_for).await.map_err(crate::agentdefs::ops::fail)?;
     let infos = lineage::start(hub, &by, ask).await?;
     // It's the card's: ended once no card reads it.
     for i in &infos {

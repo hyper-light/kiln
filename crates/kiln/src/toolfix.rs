@@ -305,13 +305,32 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     let repo = run.as_ref().map(|r| r.repo_name.clone()).unwrap_or_default();
     let number = run.as_ref().map(|r| r.number).unwrap_or_default();
     let shown = hub.shown(&runner);
-    let prompt = brief(&shown, &job.display, &repo, number, &tools, m.why.as_deref(), m.runners.iter().find(|u| u.runner == runner));
-    let kind = ask.kind.clone().unwrap_or_else(|| "claude".to_owned());
-    let mut input = json!({ "kind": kind, "on": runner, "cwd": "~", "prompt": prompt, "name": format!("Install {} on {shown}", tools.join(", ")) });
-    if let Some(mode) = &ask.mode
-        && let Some(o) = input.as_object_mut()
-    {
-        o.insert("mode".into(), json!(mode));
+    let prompt = brief(&shown, &job.display, &repo, &number.to_string(), &tools, m.why.as_deref(), m.runners.iter().find(|u| u.runner == runner));
+    let mut input = json!({ "on": runner, "cwd": "~", "name": format!("Install {} on {shown}", tools.join(", ")) });
+    if let Some(o) = input.as_object_mut() {
+        // The most specific agent wins (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.1b): the harness
+        // asked for here; else the asker's own copy of kiln's tool fixer (`agentdefs.use`), its harness,
+        // model, Agentfile and instructions before the brief; else kiln's own.
+        match ask.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+            Some(kind) => {
+                o.insert("kind".into(), json!(kind));
+                o.insert("prompt".into(), json!(prompt));
+                if let Some(mode) = &ask.mode {
+                    o.insert("mode".into(), json!(mode));
+                }
+            }
+            None => {
+                let person = crate::harness::lineage::person_of(&caller);
+                let s = crate::agentdefs::uses::or_kilns(&hub, person.as_deref(), crate::agentdefs::builtin::TOOLFIX).await.map_err(crate::agentdefs::ops::fail)?;
+                o.insert("prompt".into(), json!(crate::agentdefs::first_message(&s, Some(&prompt))));
+                for (k, v) in [("model", s.model.clone()), ("image", s.agentfile.clone())] {
+                    if let Some(v) = v {
+                        o.insert(k.into(), json!(v));
+                    }
+                }
+                o.insert("kind".into(), json!(s.harness));
+            }
+        }
     }
     // The job is this ask's while its agent starts: one asked for meanwhile is told so.
     let f = Fix { agent: String::new(), runner: runner.clone(), tools: tools.clone(), state: "working".into(), note: None, by: caller.name.clone(), started_at: crate::util::now_unix() };
@@ -356,8 +375,9 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     Ok(json!({ "fix": f }))
 }
 
-/// The agent's first message, on runner `runner` (the name people see), what it lacks there `unmet`.
-fn brief(runner: &str, job: &str, repo: &str, number: i64, tools: &[String], why: Option<&str>, unmet: Option<&Unmet>) -> String {
+/// The agent's first message, on runner `runner` (the name people see), for run `number` of `repo`,
+/// what it lacks there `unmet`; kiln's own agent definition shows it too (`crate::agentdefs::builtin`).
+pub(crate) fn brief(runner: &str, job: &str, repo: &str, number: &str, tools: &[String], why: Option<&str>, unmet: Option<&Unmet>) -> String {
     let what = tools.iter().map(|t| if t == XCODE_TOOLS { "Xcode's command-line tools".to_owned() } else { format!("`{t}`") }).collect::<Vec<_>>().join(", ");
     let reason = match why {
         Some(w) => format!("failed on this machine because a command wasn't there: `{w}`"),

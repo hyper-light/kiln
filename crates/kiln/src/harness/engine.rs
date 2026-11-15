@@ -40,6 +40,24 @@ use crate::proto::ServerMsg;
 pub struct Asked {
     #[serde(default)]
     pub engine: Option<Engine>,
+    /// How many times it was set: the one before's plus one, at every set (none set yet: 0). A start
+    /// carries the version its boundary was decided under (`Spec::engine_version`), and its runner
+    /// refuses one decided under another ([`stale`]): placed just before a switch, it never starts on
+    /// the engine the runner had.
+    #[serde(default)]
+    pub version: u64,
+}
+
+/// Why a runner holding `here` refuses a start whose boundary was decided under its engine setting's
+/// version `placed`: decided under another, it may be on the engine the runner had (kiln plan
+/// 01a1dd2e…, P2.3). None: it starts. A start that names none (from a server before versions, or one
+/// the server itself starts) isn't held to it.
+pub fn stale(placed: Option<u64>, here: Asked) -> Option<String> {
+    let placed = placed?;
+    (placed != here.version).then(|| {
+        let now = here.engine.map_or_else(|| "what it can do".to_owned(), |e| e.to_string());
+        format!("this runner's engine was set again (to {now}, setting {}) after this start was placed under setting {placed}: start it again, and it's placed on the engine it has now", here.version)
+    })
 }
 
 /// Where a runner's engine comes from.
@@ -148,21 +166,15 @@ pub fn kept(state_dir: &Path) -> Asked {
     std::fs::read(kept_path(state_dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-/// `asked` kept for this machine's restarts (none: what was kept goes). Blocking.
+/// `asked` kept for this machine's restarts, its version with it (none set is kept too: its version
+/// says which setting it is). Blocking.
 pub fn keep(state_dir: &Path, asked: Asked) -> std::io::Result<()> {
-    let path = kept_path(state_dir);
-    if asked.engine.is_none() {
-        return match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
-    }
-    crate::util::write_secret(&path, &serde_json::to_vec(&asked)?, 0o644)
+    crate::util::write_secret(&kept_path(state_dir), &serde_json::to_vec(&asked)?, 0o644)
 }
 
 /// What this process's runner was set on the server, which its facts are written with ([`overlay`],
 /// `runner::probe::Probing::read`). One runner a process.
-static HERE: Mutex<Asked> = Mutex::new(Asked { engine: None });
+static HERE: Mutex<Asked> = Mutex::new(Asked { engine: None, version: 0 });
 
 /// This process's runner holds `asked` from now on (as its next facts say).
 pub fn hold(asked: Asked) {
@@ -212,6 +224,11 @@ impl Engines {
         self.inner.load().get(runner).copied().unwrap_or_default()
     }
 
+    /// Every runner's setting now, for a start to carry the versions it was decided under.
+    pub fn now(&self) -> std::sync::Arc<HashMap<String, Asked>> {
+        self.inner.get()
+    }
+
     /// A runner known by another name from now on (docs/machines.md): what's set for it goes with it
     /// (its row moves with the store's, `Store::move_runner`).
     pub fn moved(&self, from: &str, to: &str) {
@@ -229,6 +246,12 @@ impl Engines {
             tracing::warn!(runner, error = %format!("{e:#}"), "runner engine: what was set wasn't deleted");
         }
     }
+}
+
+/// The version of `target`'s runner's engine setting now, for a start whose boundary is decided now to
+/// carry (`Spec::engine_version`): none for the server itself (`local`).
+pub fn version_at(hub: &Hub, target: &str) -> Option<u64> {
+    target.strip_prefix("agent:").map(|m| hub.engines.asked(m).version)
 }
 
 /// The runner processes of `runner` that take its engine.
@@ -303,6 +326,7 @@ pub async fn view(hub: &Hub, name: &str) -> Value {
         "from": held.as_ref().map(|h| h.from),
         "why": held.as_ref().and_then(|h| h.why.clone()),
         "asked": asked.engine,
+        "version": asked.version,
         "microvm": can.as_ref().map(|c| json!({"usable": c.usable, "why": c.why})),
         "isolation": facts.as_ref().and_then(|f| f.isolation.clone()),
         "virt": facts.as_ref().map(|f| json!({"microvm": f.virt.microvm, "kvm": f.virt.kvm, "hvf": f.virt.hvf})),
@@ -334,8 +358,8 @@ pub fn asked_of(body: &Value) -> Result<Asked, String> {
     match o.get("engine").ok_or(SHAPE)? {
         Value::Null => Ok(Asked::default()),
         Value::String(s) => match s.trim() {
-            "host" => Ok(Asked { engine: Some(Engine::Host) }),
-            "microvm" => Ok(Asked { engine: Some(Engine::Microvm) }),
+            "host" => Ok(Asked { engine: Some(Engine::Host), version: 0 }),
+            "microvm" => Ok(Asked { engine: Some(Engine::Microvm), version: 0 }),
             other => Err(format!("a runner's engine is \"host\" or \"microvm\", not {other:?}")),
         },
         v => Err(format!("a runner's engine is \"host\" or \"microvm\", not {v}")),
@@ -365,22 +389,13 @@ pub async fn set(hub: &Hub, name: &str, body: &Value, by: &str) -> Result<Value,
             None => return Err(fail(StatusCode::CONFLICT, format!("{} hasn't said yet whether it can run microVMs: set its engine once it has", hub.shown(name)))),
         }
     }
-    let key = format!("{KEY_PREFIX}{name}");
-    let stored = match asked.engine {
-        Some(_) => match serde_json::to_string(&asked) {
-            Ok(json) => hub.store.kv_set(key, json).await,
-            Err(e) => Err(e.into()),
-        },
-        None => hub.store.kv_delete(key).await,
-    };
-    stored.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    hub.engines.inner.update(|g| match asked.engine {
-        Some(_) => {
-            g.insert(name.to_owned(), asked);
-        }
-        None => {
-            g.remove(name);
-        }
+    // The one before's plus one: a start decided under the setting before is refused by the runner.
+    let version = hub.engines.asked(name).version.checked_add(1).ok_or_else(|| fail(StatusCode::CONFLICT, format!("{name}'s engine was set as many times as a setting's version counts")))?;
+    let asked = Asked { version, ..asked };
+    let json = serde_json::to_string(&asked).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    hub.store.kv_set(format!("{KEY_PREFIX}{name}"), json).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.engines.inner.update(|g| {
+        g.insert(name.to_owned(), asked);
     });
     let said = asked.engine.map_or_else(|| "nothing set here: what it can do".to_owned(), |e| e.to_string());
     hub.store.audit(by.to_owned(), "runner_engine.update".into(), format!("{name}: {said}")).await;
@@ -410,7 +425,7 @@ mod tests {
     /// where it can't any more is held as `host`, saying why.
     #[test]
     fn p2_3_ac2_a_capable_runner_defaults_to_microvm_and_one_that_isnt_says_why() {
-        let set = |e| Asked { engine: Some(e) };
+        let set = |e| Asked { engine: Some(e), version: 1 };
         let yes = capable(&facts(Some(able())));
         let no = capable(&facts(Some(unable("no hypervisor"))));
         assert_eq!(held(Asked::default(), &yes), Held { engine: Engine::Microvm, from: Source::Default, why: None });
@@ -431,25 +446,37 @@ mod tests {
         let mut f = facts(Some(able()));
         overlay(&mut f, Asked::default());
         assert_eq!((f.virt.microvm, of(&f)), (true, Some(Engine::Microvm)));
-        overlay(&mut f, Asked { engine: Some(Engine::Host) });
+        overlay(&mut f, Asked { engine: Some(Engine::Host), version: 0 });
         assert_eq!((f.virt.microvm, of(&f)), (false, Some(Engine::Host)));
-        overlay(&mut f, Asked { engine: Some(Engine::Host) });
+        overlay(&mut f, Asked { engine: Some(Engine::Host), version: 0 });
         assert_eq!((f.virt.microvm, of(&f)), (false, Some(Engine::Host)), "said again, the same");
         overlay(&mut f, Asked::default());
         assert!(f.virt.microvm, "set back to what it can do");
         let mut g = facts(Some(unable("no hypervisor")));
         g.virt.microvm = true;
-        overlay(&mut g, Asked { engine: Some(Engine::Microvm) });
+        overlay(&mut g, Asked { engine: Some(Engine::Microvm), version: 0 });
         assert_eq!((g.virt.microvm, of(&g)), (false, Some(Engine::Host)));
         assert_eq!(of(&facts(None)), Some(Engine::Host), "a runner from before microVMs runs its sessions on its host");
         assert_eq!(node_images(&f), NodeImages::Unknown, "no shards-image class in the Hex kiln vendors");
     }
 
+    /// A start placed under one setting of its runner's engine is refused by the runner once another
+    /// is set, saying what it is now; one under the setting it holds, or one that names none, starts.
+    #[test]
+    fn a_start_placed_before_a_switch_is_refused_by_the_runner() {
+        let now = Asked { engine: Some(Engine::Host), version: 3 };
+        let why = stale(Some(2), now).unwrap_or_default();
+        assert!(why.contains("set again (to host, setting 3)") && why.contains("placed under setting 2"), "{why}");
+        assert_eq!(stale(Some(3), now), None);
+        assert_eq!(stale(None, now), None, "a start that names none");
+        assert!(stale(Some(0), Asked { engine: None, version: 1 }).is_some_and(|w| w.contains("what it can do")));
+    }
+
     /// A `PUT` sets `host`, `microvm` or `null`, and nothing else.
     #[test]
     fn a_put_sets_host_microvm_or_null_and_nothing_else() {
-        assert_eq!(asked_of(&json!({"engine": "host"})), Ok(Asked { engine: Some(Engine::Host) }));
-        assert_eq!(asked_of(&json!({"engine": "microvm"})), Ok(Asked { engine: Some(Engine::Microvm) }));
+        assert_eq!(asked_of(&json!({"engine": "host"})), Ok(Asked { engine: Some(Engine::Host), version: 0 }));
+        assert_eq!(asked_of(&json!({"engine": "microvm"})), Ok(Asked { engine: Some(Engine::Microvm), version: 0 }));
         assert_eq!(asked_of(&json!({"engine": null})), Ok(Asked::default()));
         for bad in [json!({}), json!({"engin": "host"}), json!({"engine": "docker"}), json!({"engine": 1}), json!({"engine": "host", "x": 1}), json!(["host"])] {
             assert!(asked_of(&bad).is_err(), "{bad} was taken");
@@ -461,10 +488,10 @@ mod tests {
     fn a_runner_keeps_its_engine_for_its_restarts() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         assert_eq!(kept(dir.path()), Asked::default());
-        keep(dir.path(), Asked { engine: Some(Engine::Host) })?;
-        assert_eq!(kept(dir.path()), Asked { engine: Some(Engine::Host) });
-        keep(dir.path(), Asked::default())?;
-        assert_eq!(kept(dir.path()), Asked::default());
+        keep(dir.path(), Asked { engine: Some(Engine::Host), version: 1 })?;
+        assert_eq!(kept(dir.path()), Asked { engine: Some(Engine::Host), version: 1 });
+        keep(dir.path(), Asked { engine: None, version: 2 })?;
+        assert_eq!(kept(dir.path()), Asked { engine: None, version: 2 }, "nothing set, its version kept");
         std::fs::write(kept_path(dir.path()), "not json")?;
         assert_eq!(kept(dir.path()), Asked::default());
         Ok(())

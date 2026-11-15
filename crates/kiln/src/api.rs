@@ -1380,12 +1380,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let body = boxed(|| body_value(req)).await?;
             boxed(|| own_op(&hub, &caller, "agentdefs.check", body)).await
         }
+        (&Method::POST, ["api", "agentdefs", "use"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.use", body)).await
+        }
         (&Method::GET, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.get", json!({ "id": id }))).await,
         (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
-        (&Method::PATCH, ["api", "agentdefs", id]) | (&Method::POST, ["api", "agentdefs", id, "restore" | "run"]) => {
+        (&Method::PATCH, ["api", "agentdefs", id]) | (&Method::POST, ["api", "agentdefs", id, "restore" | "run" | "copy"]) => {
             let name = match s.get(3).copied() {
                 Some("restore") => "agentdefs.restore",
+                Some("copy") => "agentdefs.copy",
                 Some(_) => "agentdefs.run",
                 None => "agentdefs.update",
             };
@@ -6505,6 +6510,8 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     // and so are the secrets its build is given (P4.7).
     spec.agentfile = None;
     spec.build_secrets = Vec::new();
+    // The engine setting its boundary is decided under is kiln's (kiln plan 01a1dd2e…, P2.3).
+    spec.engine_version = None;
     // An isolated agent's person, whose volume its harness's configuration is on, is whoever asks
     // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked.
     if let Some(i) = spec.isolation.as_mut() {

@@ -110,19 +110,19 @@ fn p2_3_a_runner_without_microvms_runs_host_says_why_and_cant_be_set_to_microvm(
     assert!(failed && said.contains("can't run its sessions in microVMs") && said.contains(&why), "MCP: {said}");
     let (failed, said) = mcp(&s, "code_run", json!({"program": "return await kiln.runners.engine.set({ runner: input.runner, engine: 'microvm' })", "input": {"runner": machine("box")}}))?;
     assert!(failed && said.contains("can't run its sessions in microVMs"), "code mode: {said}");
-    assert_eq!(engine(&s, "box")?.get("asked"), Some(&Value::Null), "a refusal sets nothing");
+    assert_eq!((engine(&s, "box")?.get("asked"), engine(&s, "box")?.get("version")), (Some(&Value::Null), Some(&json!(0))), "a refusal sets nothing");
 
     // Its owner sets `host`: held, from the server, and kept on the runner for its restarts.
     let (st, v) = put(&s, "box", json!({"engine": "host"}))?;
-    assert_eq!((st, v.get("engine"), v.get("from"), v.get("asked")), (200, Some(&json!("host")), Some(&json!("server")), Some(&json!("host"))), "{v}");
-    until("kept host on the runner", &log, || Ok(std::fs::read_to_string(&kept).unwrap_or_default()), |t| t.contains("host"))?;
+    assert_eq!((st, v.get("engine"), v.get("from"), v.get("asked"), v.get("version")), (200, Some(&json!("host")), Some(&json!("server")), Some(&json!("host")), Some(&json!(1))), "{v}");
+    until("kept host on the runner", &log, || Ok(std::fs::read_to_string(&kept).unwrap_or_default()), |t| t.contains("host") && t.contains("\"version\":1"))?;
     let (failed, said) = mcp(&s, "code_run", json!({"program": "return (await kiln.runners.engine({ runner: input.runner })).from", "input": {"runner": machine("box")}}))?;
     assert!(!failed && said.contains("server"), "code mode reads it: {said}");
     // Taken away through MCP: what it can do decides again, and the runner keeps nothing.
     let (failed, said) = mcp(&s, "runners_engine_set", json!({"runner": machine("box"), "engine": null}))?;
     assert!(!failed, "{said}");
-    assert_eq!((engine(&s, "box")?.get("from"), engine(&s, "box")?.get("asked")), (Some(&json!("default")), Some(&Value::Null)));
-    until("let go of what it kept", &log, || Ok(kept.exists()), |k| !k)?;
+    assert_eq!((engine(&s, "box")?.get("from"), engine(&s, "box")?.get("asked"), engine(&s, "box")?.get("version")), (Some(&json!("default")), Some(&Value::Null), Some(&json!(2))));
+    until("kept nothing set, at setting 2", &log, || Ok(std::fs::read_to_string(&kept).unwrap_or_default()), |t| t.contains("\"engine\":null") && t.contains("\"version\":2"))?;
 
     // What isn't an engine; a runner the server doesn't know.
     for bad in [json!({}), json!({"engine": "docker"}), json!({"engin": "host"}), json!({"engine": 1}), json!(["host"])] {
@@ -137,3 +137,55 @@ fn p2_3_a_runner_without_microvms_runs_host_says_why_and_cant_be_set_to_microvm(
     Ok(())
 }
 
+
+/// Waits until session `id`, as the server has it, is as `holds` says.
+fn session_until(s: &Server, id: &str, what: &str, log: &Path, holds: impl Fn(&Value) -> bool) -> anyhow::Result<Value> {
+    until(what, log, || Ok(call(s, "GET", &format!("/api/harness/sessions/{id}"), None)?.1), holds)
+}
+
+/// P2.3's second test on a `host` runner, and P2.4's second: a new session that asks nothing starts on
+/// the runner's host with no microVM, by the console's route and by `agents.start` alike, and counts
+/// among those on its engine; one that needs a microVM is refused with words naming the engine, by
+/// `agents.start` (placed by need, every runner here `host`) and by a start naming the runner; one
+/// asked as a process (`isolation` "none") starts there.
+#[test]
+fn p2_3_a_new_session_takes_its_runners_engine_and_p2_4_a_microvm_one_is_refused_on_host_runners() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = common::start(dir.path(), &Options::default())?;
+    let (runner, log) = agents::runner_with(dir.path(), s.port, "box", None, TALK, &[])?;
+    agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
+    agents::headroom_off(s.port, &s.admin, "box", Duration::from_secs(60))?;
+    until("said its engine", &log, || engine(&s, "box"), |v| v.get("engine") == Some(&json!("host")))?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    let cwd = work.display().to_string();
+
+    // Asking nothing: on its host, no microVM; on its engine, none draining.
+    let id = agents::open_session(s.port, &s.admin, "box", &work, Duration::from_secs(90))?;
+    let info = session_until(&s, &id, "said where it runs", &log, |v| v.pointer("/runs/in").is_some())?;
+    assert!(info.pointer("/runs/in") == Some(&json!("host")) && info.get("isolation").is_none_or(Value::is_null), "on its host, no microVM: {info}");
+    let v = until("counted it", &log, || engine(&s, "box"), |v| v.get("sessions").and_then(Value::as_u64) >= Some(1))?;
+    assert_eq!(v.get("draining"), Some(&json!(0)), "{v}");
+
+    // Needing a microVM: refused, the engine named, by need and by naming the runner; nothing starts.
+    let before = call(&s, "GET", "/api/harness/sessions", None)?.1.as_array().map_or(0, Vec::len);
+    let (failed, said) = mcp(&s, "agents_start", json!({"kind": "claude", "cwd": cwd, "isolation": "microvm"}))?;
+    assert!(failed && said.contains("needs a microVM starts only on a runner whose engine is microvm") && said.contains("its engine is host"), "agents.start by need: {said}");
+    let (failed, said) = mcp(&s, "agents_start", json!({"kind": "claude", "cwd": cwd, "isolation": "microvm", "on": machine("box")}))?;
+    assert!(failed && said.contains("whose engine is microvm") && said.contains("its engine is host"), "agents.start on the runner: {said}");
+    let open = json!({"target": format!("agent:{}", machine("box")), "spec": {"kind": "claude", "cwd": cwd, "isolation": {"kind": "microvm"}}});
+    let (st, said) = common::http_within(s.port, "POST", "/api/harness/sessions", &s.admin, Some(&open), Duration::from_secs(75))?;
+    assert!(st >= 400 && said.contains("its engine is host"), "the console's route: {st} {said}");
+    assert_eq!(call(&s, "GET", "/api/harness/sessions", None)?.1.as_array().map_or(0, Vec::len), before, "nothing started");
+
+    // Asked as a process: it starts there, on its host.
+    let (failed, said) = mcp(&s, "agents_start", json!({"kind": "claude", "cwd": cwd, "isolation": "none", "on": machine("box"), "prompt": "stream"}))?;
+    assert!(!failed, "{said}");
+    let started: Value = serde_json::from_str(&said).unwrap_or_default();
+    let id = started.pointer("/agents/0/id").or_else(|| started.pointer("/0/id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+    anyhow::ensure!(!id.is_empty(), "no id in {said}");
+    let info = session_until(&s, &id, "said where it runs", &log, |v| v.pointer("/runs/in").is_some())?;
+    assert_eq!(info.pointer("/runs/in"), Some(&json!("host")), "{info}");
+    drop(runner);
+    Ok(())
+}

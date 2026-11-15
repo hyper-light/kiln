@@ -10,13 +10,14 @@ use serde_json::{Value, json};
 use super::{Error, Limits, Mcp, Patch, Settings, Who};
 use crate::ops::{Cx, Fail, Input, Op, Out, path};
 
-fn fail(e: Error) -> Fail {
+pub(crate) fn fail(e: Error) -> Fail {
     match e {
         Error::Bad(m) => (StatusCode::BAD_REQUEST, m),
         Error::Missing => (StatusCode::NOT_FOUND, "no such agent definition".into()),
         Error::Conflict(m) => (StatusCode::CONFLICT, m),
         Error::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, format!("kiln can't run this agent: {}", why.join("; "))),
         Error::Forbidden(m) => (StatusCode::FORBIDDEN, m),
+        e @ Error::ReadOnly(_) => (StatusCode::FORBIDDEN, e.to_string()),
         Error::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
         Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
@@ -61,11 +62,33 @@ fn flag(v: &Value, k: &str) -> bool {
 async fn list(cx: Cx, v: Value) -> Out {
     let w = who(&cx)?;
     let defs = super::list(&cx.hub, &w, flag(&v, "all")).await.map_err(fail)?;
-    Ok(json!({"agents": json_of(&defs)?, "reaches_all": w.all}))
+    let uses = super::uses::of(&cx.hub, &w.person).await.map_err(fail)?;
+    Ok(json!({"agents": json_of(&defs)?, "reaches_all": w.all, "builtin": json_of(&super::builtin::all())?, "uses": uses}))
 }
 
 async fn get(cx: Cx, v: Value) -> Out {
-    json_of(&super::get(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)?)
+    let (w, id) = (who(&cx)?, id_of(&v)?);
+    match super::builtin::get(&id) {
+        Some(b) => json_of(&b),
+        None => json_of(&super::get(&cx.hub, &w, &id).await.map_err(fail)?),
+    }
+}
+
+/// One of the caller's own standing in for one of kiln's UI agents for them, or kiln's own again.
+async fn use_(cx: Cx, v: Value) -> Out {
+    let kiln_agent = crate::ops::text(&v, "builtin")?;
+    let id = field::<Option<String>>(&v, "id")?.flatten();
+    let uses = super::uses::set(&cx.hub, &who(&cx)?, &kiln_agent, id.as_deref()).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "agentdef.use".into(), format!("{kiln_agent} as {}", id.as_deref().unwrap_or("kiln's own"))).await;
+    Ok(json!({"uses": uses}))
+}
+
+/// One of the caller's, or kiln's own, made one of theirs.
+async fn copy(cx: Cx, v: Value) -> Out {
+    let name = v.get("name").and_then(Value::as_str);
+    let made = super::copy(&cx.hub, &who(&cx)?, &id_of(&v)?, name, &cx.caller.name).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "agentdef.copy".into(), audit_line(&made)).await;
+    json_of(&made)
 }
 
 fn audit_line(d: &super::AgentDef) -> String {
@@ -129,11 +152,12 @@ async fn check(cx: Cx, v: Value) -> Out {
 /// right to start agents, and on that machine, checked and audited there), with the definition's
 /// harness, model and Agentfile, in a microVM of its own, first told its instructions and the task.
 async fn run(cx: Cx, v: Value) -> Out {
-    let d = super::get(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)?;
+    let id = id_of(&v)?;
+    let (name, version, d) = super::settings_of(&cx.hub, &who(&cx)?, &id).await.map_err(fail)?;
     let task = v.get("prompt").and_then(Value::as_str);
-    let mut ask = json!({"kind": d.settings.harness, "isolation": "microvm", "name": v.get("name").and_then(Value::as_str).unwrap_or(&d.name)});
+    let mut ask = json!({"kind": d.harness, "isolation": "microvm", "name": v.get("name").and_then(Value::as_str).unwrap_or(&name)});
     if let Some(o) = ask.as_object_mut() {
-        let given = [("model", d.settings.model.clone()), ("image", d.settings.agentfile.clone()), ("prompt", super::first_message(&d.settings, task))]
+        let given = [("model", d.model.clone()), ("image", d.agentfile.clone()), ("prompt", super::first_message(&d, task))]
             .into_iter()
             .chain(["on", "cwd"].into_iter().map(|k| (k, v.get(k).and_then(Value::as_str).map(str::to_owned))));
         for (k, val) in given {
@@ -144,7 +168,7 @@ async fn run(cx: Cx, v: Value) -> Out {
     }
     let mut started = crate::ops::call(cx, "agents.start", ask).await?;
     if let Some(o) = started.as_object_mut() {
-        o.insert("agentdef".into(), json!({"id": d.id, "version": d.version}));
+        o.insert("agentdef".into(), json!({"id": id, "version": version}));
     }
     Ok(started)
 }
@@ -154,7 +178,7 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "agentdefs.list",
-            summary: "Agent definitions (an agent as data: one of kiln's ten harnesses, its model, instructions, tools and MCP servers, skills, limits and Agentfile): yours, newest change first. `all`: everyone's, for the server's owner and those with agentdefs.manage.",
+            summary: "Agent definitions (an agent as data: one of kiln's ten harnesses, its model, instructions, tools and MCP servers, skills, limits and Agentfile): yours, newest change first, and beside them, read only, kiln's own (`builtin`: one per CI skill, one per harness, and the agents kiln starts from its UI, such as the about card; agentdefs.copy makes one yours). `all`: everyone's, for the server's owner and those with agentdefs.manage.",
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentdefsList>(),
@@ -214,6 +238,24 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentdefsDelete>(),
             route: |v| Ok((Method::DELETE, path(&["api", "agentdefs", &id_of(v)?]))),
             run: |cx, v| Box::pin(delete(cx, v)),
+        },
+        Op {
+            name: "agentdefs.copy",
+            summary: "Make one of kiln's own agent definitions (`kiln:<name>`, as agentdefs.list's `builtin` names them: one per CI skill, one per harness, and kiln's own agents such as the about card), or one of yours, one of yours: version 1, named `name` (by default as it is), checked as agentdefs.create checks it. Kiln's own are read only: copy one to change it.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentdefsCopy>(),
+            route: |v| Ok((Method::POST, path(&["api", "agentdefs", &id_of(v)?, "copy"]))),
+            run: |cx, v| Box::pin(copy(cx, v)),
+        },
+        Op {
+            name: "agentdefs.use",
+            summary: "Have one of your own agent definitions (`id`) stand in for one of kiln's UI agents (`builtin`: one agentdefs.list marks `replaceable`, such as kiln:kiln-about, the card that answers \"ask about this code\") where kiln starts it for you: its harness, model and Agentfile, first told its instructions and then kiln's brief. Only your own use changes. Null `id`: kiln's own again. Answers what stands in for what (`uses`), as agentdefs.list does.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentdefsUse>(),
+            route: |_| Ok((Method::POST, path(&["api", "agentdefs", "use"]))),
+            run: |cx, v| Box::pin(use_(cx, v)),
         },
         Op {
             name: "agentdefs.check",
@@ -323,6 +365,24 @@ pub mod input {
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
+    pub struct AgentdefsUse {
+        /// One of kiln's UI agents (`kiln:<name>`) agentdefs.list marks `replaceable`.
+        pub builtin: String,
+        /// One of your own agent definitions; null: kiln's own again.
+        pub id: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentdefsCopy {
+        /// One of kiln's own (`kiln:<name>`) or one of yours.
+        pub id: String,
+        /// The copy's name; by default the one it has.
+        pub name: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct AgentdefsCheck {
         pub harness: String,
         pub model: Option<String>,
@@ -337,7 +397,7 @@ pub mod input {
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct AgentdefsRun {
-        /// The agent definition's id.
+        /// The agent definition's id: one of yours, or one of kiln's own (`kiln:<name>`).
         pub id: String,
         /// The task: told after its instructions.
         pub prompt: Option<String>,

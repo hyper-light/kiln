@@ -114,7 +114,7 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
 | GET | `/api/runners/:name/agent-limit` | `{ runner, own, connected, runs_agents, supported, max_sessions, held: { max_sessions, from: "server" \| "config" \| "default", config? } \| null, working, waiting, sessions, default, max }`: the most agent sessions the runner has at work at once, what's set here (`max_sessions`, null for none), what it holds and why as it last said, how many of its sessions are at work now (`working`, what the limit counts) and wait for room to go to work (`waiting`; both null while it's offline), and how many it has in all (`sessions`, finished, paused and ended ones too) ([agents.md](agents.md#how-many-agents-a-machine-runs)); 404 for an unknown runner |
 | PUT | `/api/runners/:name/agent-limit` | `{ max_sessions: n }` (1 to 4096), or `{ max_sessions: null }` to take it away (its config's, or kiln's default of 64, holds again) → the same view. Wins over the runner's config; stored and pushed to the runner (held when it next connects if it's offline). 400 for anything else, saying why; audited `agent_limit.update` |
-| GET | `/api/runners/:name/engine` | `{ runner, engine: "host" \| "microvm" \| null, from: "server" \| "default" \| null, why, asked, microvm: { usable, why } \| null, isolation, virt, sessions, draining }`: how the runner runs new agent sessions (its engine), where that comes from (its owner set it, or what it can do: `microvm` where it can hold microVMs, else `host`) and why, what's set here (`asked`, null for none), whether it can hold microVMs now and why not, its isolation facts, and how many of its running sessions are on its engine (`sessions`) and on the other (`draining`, which finish there); null fields until its facts come ([isolation.md](isolation.md#a-runners-engine)); 404 for an unknown runner |
+| GET | `/api/runners/:name/engine` | `{ runner, engine: "host" \| "microvm" \| null, from: "server" \| "default" \| null, why, asked, version, microvm: { usable, why } \| null, isolation, virt, sessions, draining }`: how the runner runs new agent sessions (its engine), where that comes from (its owner set it, or what it can do: `microvm` where it can hold microVMs, else `host`) and why, what's set here (`asked`, null for none) and how many times it was set (`version`, which a start placed under an older one is refused by), whether it can hold microVMs now and why not, its isolation facts, and how many of its running sessions are on its engine (`sessions`) and on the other (`draining`, which finish there); null fields until its facts come ([isolation.md](isolation.md#a-runners-engine)); 404 for an unknown runner |
 | PUT | `/api/runners/:name/engine` | `{ engine: "host" \| "microvm" }`, or `{ engine: null }` for what the runner can do → the same view. `microvm` is refused (409), saying why, where the runner can't hold microVMs now. Stored, held in the server's facts of it at once (`isolation.engine`, `virt.microvm` only on `microvm`) and pushed to the runner; nothing running stops. 400 for anything else, saying why; audited `runner_engine.update` |
 | GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
 | GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |
@@ -202,7 +202,7 @@ runs and its runners: a definition's run is one of those agents.)
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/agentdefs?all=` | `{ agents: AgentDefBrief[], reaches_all }`, newest change first |
+| GET | `/api/agentdefs?all=` | `{ agents: AgentDefBrief[], reaches_all, builtin: KilnAgentDef[], uses: { [kiln_id]: id } }`, newest change first |
 | POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile? }` → `AgentDef` (version 1); 422 `kiln can't run this agent: <why>`, 409 a name taken |
 | POST | `/api/agentdefs/check` | the settings → `{ ok, problems: string[] }`, keeping nothing |
 | GET | `/api/agentdefs/{id}` | `AgentDef` |
@@ -210,13 +210,32 @@ runs and its runners: a definition's run is one of those agents.)
 | GET | `/api/agentdefs/{id}/versions` | `{ versions: { version, at, by, ...settings }[] }`, newest first |
 | POST | `/api/agentdefs/{id}/restore` | `{ version }` → `AgentDef`, that version's settings as a new version |
 | DELETE | `/api/agentdefs/{id}` | `{ deleted: true }` |
-| POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }` |
+| POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }`; `id` one of yours or kiln's |
+| POST | `/api/agentdefs/{id}/copy` | `{ name? }` → `AgentDef`: one of kiln's (`kiln:<name>`) or yours, made yours, version 1 |
+| POST | `/api/agentdefs/use` | `{ builtin, id }` → `{ uses }`: your own `id` stands in for kiln's UI agent `builtin` for you (null `id`: kiln's own again) |
 
 Kept and restored settings are checked first, and refused, every reason said, where: the harness
 isn't one of kiln's ten; the Agentfile isn't one its owner reaches (another person's is as none) or is
 kiln's for another harness; the model isn't one kiln's machines list for that harness (what its
 sessions said they offer; a harness no machine lists models for takes any); an MCP server has no name
 of its own, or not exactly one of `url` and `command`; a tool or skill has no name; a limit is 0.
+kiln ships its own, read only, listed as `builtin` (kiln plan 01a1dd2e8618733a87f2793aab1322a8
+P5.1b), each made from what kiln itself has so that none drifts from it: one per CI skill
+(`kiln-ci-*`: the skill its own, its description its instructions), one per harness (`harness-<id>`,
+in kiln's Agentfile for it), and the agents kiln starts from its UI, their briefs shown with what kiln
+fills in at each start `<like this>`: `kiln-about` (the card that answers "ask about this code" in an
+agent's conversation), `kiln-about-code` (the same in a change no agent made), `kiln-attach` (an
+attachment's agent, woken by an incident), `kiln-review` (a review agent) and `kiln-toolfix` (the
+agent that installs a tool a job lacks on a runner). Changing, restoring or deleting one of kiln's is
+refused, 403: `copy` makes it yours. Each UI agent is `replaceable`: its `brief` is what kiln tells
+it at each start, after the instructions of whichever definition starts (kiln's own have none). A
+person's own definition may stand in for one, for them alone (`use`): where kiln starts that agent
+for them, it starts theirs, its harness, model and Agentfile, first told its instructions and then
+kiln's brief. The most specific wins: a harness set where it's started (an attachment's `harness.kind`
+its person set, a tool fix's `kind`; left unset, it's stored unset), then the person's own, then
+kiln's. An attachment's agent and a review agent are their attachment person's (`by`). Deleting the
+definition makes it kiln's own again.
+
 A run starts an agent through `agents.start`, as its route starts one (the caller's right to start
 agents there checked and audited as such): the definition's harness and model, `isolation`
 `microvm`, `image` its Agentfile (left out: the start's own for its harness), and as its first
@@ -228,6 +247,8 @@ interface Limits { seconds?; cents?; tokens? }
 interface AgentDef { id; owner /* "owner" | "user:<id>" */; name; version; created_at; updated_at;
   harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
 type AgentDefBrief = Pick<AgentDef, "id"|"owner"|"name"|"harness"|"model"|"agentfile"|"version"|"created_at"|"updated_at">;
+interface KilnAgentDef { id /* "kiln:<name>" */; name; about; replaceable: boolean; brief?: string;
+  harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
 ```
 
 | Method | Path | Notes |

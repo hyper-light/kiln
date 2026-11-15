@@ -7,11 +7,14 @@
 //! rename alone none. A person reaches only their own; the server's owner, and whoever has
 //! `agentdefs.manage` (an admin), reach everyone's, and another's is as none to the rest. Its settings
 //! are checked before they're kept ([`check`]). Running one starts an agent session with its
-//! settings, in its Agentfile's microVM, through the one start path (`agents.start`). The same
+//! settings, in its Agentfile's microVM, through the one start path (`agents.start`). Beside a
+//! person's own, read only, are kiln's ([`builtin`]), which `copy` makes theirs. The same
 //! operations serve the console (`/api/agentdefs`), agents (kiln's MCP server: `agentdefs_*`) and code
 //! mode (`kiln.agentdefs.*`): [`ops`]. kiln.db keeps them: a definition is small, its settings JSON.
 
+pub mod builtin;
 pub mod ops;
+pub mod uses;
 
 use rusqlite::{OptionalExtension as _, params};
 use schemars::JsonSchema;
@@ -134,6 +137,9 @@ pub enum Error {
     Refused(Vec<String>),
     #[error("{0}")]
     Forbidden(String),
+    /// Kiln's own ([`builtin`]): read only.
+    #[error("{0} is kiln's own agent definition: copy it as yours (agentdefs.copy) to change it")]
+    ReadOnly(String),
     /// What it names couldn't be read just now (an Agentfile's record).
     #[error("{0}")]
     Unavailable(String),
@@ -322,8 +328,12 @@ pub async fn list(hub: &Hub, who: &Who, everyone: bool) -> R<Vec<Brief>> {
         .collect()
 }
 
-/// The record of one the caller reaches; another's is as none.
+/// The record of one the caller reaches; another's is as none, and kiln's own ([`builtin`]) are
+/// read only.
 async fn record(hub: &Hub, who: &Who, id: &str) -> R<Record> {
+    if id.starts_with(builtin::PREFIX) {
+        return Err(Error::ReadOnly(id.to_owned()));
+    }
     let id = id.to_owned();
     let r = hub.store.read(move |c| Ok(get_in(c, &id)?)).await?;
     r.filter(|r| who.reaches(&r.owner)).ok_or(Error::Missing)
@@ -332,6 +342,22 @@ async fn record(hub: &Hub, who: &Who, id: &str) -> R<Record> {
 /// One the caller reaches; another's is as none.
 pub async fn get(hub: &Hub, who: &Who, id: &str) -> R<AgentDef> {
     record(hub, who, id).await?.def()
+}
+
+/// The settings and name of one the caller may run or copy: one of theirs, or kiln's own.
+pub async fn settings_of(hub: &Hub, who: &Who, id: &str) -> R<(String, i64, Settings)> {
+    if let Some(b) = builtin::get(id) {
+        return Ok((b.name, 0, b.settings));
+    }
+    let d = get(hub, who, id).await?;
+    Ok((d.name, d.version, d.settings))
+}
+
+/// One the caller may run or copy (theirs, or kiln's own: [`settings_of`]) made one of theirs, named
+/// `name` (by default as it is): version 1, checked as [`create`] checks it.
+pub async fn copy(hub: &Hub, who: &Who, id: &str, name: Option<&str>, by: &str) -> R<AgentDef> {
+    let (was, _, settings) = settings_of(hub, who, id).await?;
+    create(hub, who, name.unwrap_or(&was), settings, by).await
 }
 
 /// Its versions, newest first.
@@ -513,6 +539,8 @@ pub async fn delete(hub: &Hub, who: &Who, id: &str) -> R<AgentDef> {
             let tx = crate::store::tx(c)?;
             let n = tx.execute("DELETE FROM agent_defs WHERE id = ?1", params![i])?;
             tx.execute("DELETE FROM agent_def_versions WHERE agent_def_id = ?1", params![i])?;
+            // Where it stood in for one of kiln's agents (`uses`), kiln's own again.
+            tx.execute("DELETE FROM agent_def_uses WHERE agent_def_id = ?1", params![i])?;
             tx.commit()?;
             Ok(n)
         })
@@ -528,3 +556,6 @@ pub fn first_message(d: &Settings, task: Option<&str>) -> Option<String> {
     let parts: Vec<&str> = [Some(d.instructions.as_str()), task].into_iter().flatten().map(str::trim).filter(|p| !p.is_empty()).collect();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
+
+#[cfg(test)]
+mod tests;

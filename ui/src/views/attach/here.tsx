@@ -9,6 +9,7 @@
 import * as React from "react";
 import { Plus } from "lucide-react";
 import { attachApi, attachmentsRes, onWords, WAKES_CODE, WAKES_RUNNERS, type AttachmentRow } from "@/api/attach";
+import { defaultsFor, KILNS } from "@/views/attach/defaults";
 import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
 import { SelectField, TextField } from "@/components/ui/misc";
@@ -37,6 +38,7 @@ const WAKE_WORDS: Record<string, string> = {
 };
 
 const HARNESSES = [
+  { value: KILNS, label: "Kiln's (or your copy)" },
   { value: "claude", label: "Claude Code" },
   { value: "codex", label: "Codex" },
   { value: "gemini", label: "Gemini CLI" },
@@ -67,7 +69,8 @@ function wakesOf(on: string): readonly string[] {
 
 /** What wakes it, in words; its agent. */
 const wakeWords = (wake: string[]) => wake.map((w) => WAKE_WORDS[w] ?? w).join(", ");
-const agentWords = (r: AttachmentRow) => (r.attachment.session ? "a live agent" : (HARNESSES.find((h) => h.value === r.attachment.harness?.kind)?.label ?? r.attachment.harness?.kind ?? "no agent"));
+const agentWords = (r: AttachmentRow) =>
+  r.attachment.session ? "a live agent" : (HARNESSES.find((h) => h.value === (r.attachment.harness?.kind ?? KILNS))?.label ?? r.attachment.harness?.kind ?? "no agent");
 
 /**
  * "Watched by", where what they watch is: its own row, then each attached agent's chip (what of it
@@ -249,7 +252,7 @@ function QuickAttach({ on, onDone }: { on: string; onDone: () => void }) {
   const runners = forRunners(on);
   const wakes = wakesOf(on);
   const [name, setName] = React.useState(runners ? "runner-doctor" : "ci-doctor");
-  const [harness, setHarness] = React.useState("claude");
+  const [harness, setHarness] = React.useState(KILNS);
   const [wake, setWake] = React.useState<string[]>(runners ? ["offline", "upgrade"] : ["failure"]);
   const [error, setError] = React.useState<string | null>(null);
   // Waits for the answer, its button saying so (W21-R15), so a refusal is said here with what was
@@ -295,19 +298,4 @@ function QuickAttach({ on, onDone }: { on: string; onDone: () => void }) {
       </div>
     </form>
   );
-}
-
-/** An attachment as kiln keeps it, from what's asked of a person: the rest, kiln's defaults. */
-function defaultsFor({ name, on, harness, wake, playbook, machine, cwd }: { name: string; on: string; harness: string; wake: string[]; playbook: string; machine?: string; cwd?: string }) {
-  return {
-    name: name.trim(),
-    on,
-    branches: [],
-    harness: { kind: harness, ...(machine && { on: machine }), ...(cwd && { cwd }) },
-    wake,
-    can: ["read"],
-    limits: { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15, slow_percent: 25, tokens_per_day: 5_000_000, runner_minutes_per_day: 300 },
-    playbook,
-    reviewers: [],
-  };
 }
