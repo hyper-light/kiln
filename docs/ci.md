@@ -1945,6 +1945,15 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
     later attempt, waits a whole lease and the lock-delay first (W05-R34): the store doesn't keep
     when its retry was due, and that wait runs past the end of any lease from before the restart
     (docs/sim.md's bug 13).
+  - A run comes back as it stood. One under way (a leg of its attempt made, or a report in its
+    plan's log) holds its place in its workflow-level group again (W05-R06): the runs behind it
+    still wait for it, and a newer one still cancels it where the group says so. One that never
+    started (held behind its group, none of its legs made) comes back holding its plan's first
+    actions and arrives in its group again once every run under way holds its place, in the order
+    such runs arrived before (when each was made, approved, or run again, whichever is last): it
+    starts in its turn, at once when nothing holds its group. One cancelled with none of its legs
+    made ends cancelled as it's rebuilt. Runs are rebuilt, and their demands given (W28-R46), in
+    the order they were made, as before.
 - **W05-R26 Speed.** The targets of §1.5: ready → `Assign` p99 < 50 ms with capacity, ≥ 2,000
   assignments per second, 10,000 queued legs, 1,000 runners.
 - **W05-R27 Pools.** The scheduler asks W13's pool manager to scale up when the legs waiting for a

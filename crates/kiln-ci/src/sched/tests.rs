@@ -116,6 +116,20 @@ fn w05_s03_run_groups() {
     assert_eq!(starts(&s.handle(Input::RunFinished { run: "r1".into() }, 3)), vec!["r3"]);
 }
 
+/// W05-R25 through the scheduler: a run that had started as the dispatcher stopped holds its
+/// workflow-level group again. The run behind it waits for it, and starts when it has finished.
+#[test]
+fn w05_r25_a_run_resumed_holds_its_group() {
+    let mut s = Scheduler::new(Config::default());
+    let key = "acme/x\0deploy-prod";
+    let g = || Some((key.to_owned(), "deploy-prod".to_owned(), GroupConfig::default()));
+    let starts = |c: &[Command]| c.iter().filter_map(|x| if let Command::StartRun { run } = x { Some(run.clone()) } else { None }).collect::<Vec<_>>();
+    assert!(s.handle(Input::RunResumed { run: "r1".into(), key: key.to_owned(), cfg: GroupConfig::default() }, 0).is_empty(), "it runs already: nothing starts it");
+    assert!(s.handle(Input::RunQueued { run: "r2".into(), group: g(), supersede: None }, 1).is_empty(), "r2 waits behind r1");
+    assert_eq!(starts(&s.handle(Input::RunFinished { run: "r1".into() }, 2)), vec!["r2"]);
+    assert!(s.handle(Input::RunFinished { run: "r2".into() }, 3).is_empty());
+}
+
 /// W05-AC02: supersede on a branch cancels the older runs; without it all run.
 #[test]
 fn w05_ac02_supersede() {

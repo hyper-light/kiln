@@ -96,6 +96,18 @@ impl Groups {
         out
     }
 
+    /// A member that was in progress as the dispatcher stopped takes its place again (W05-R25).
+    /// It runs already, so it holds a place whatever the limit, and nothing is decided of anyone
+    /// else here: the members arriving after it wait for it, or cancel it, as they would have.
+    pub fn resume(&mut self, key: &str, member: &str, cfg: &GroupConfig) {
+        let g = self.groups.entry(key.to_owned()).or_default();
+        g.limit = cfg.limit.max(1);
+        g.pending.retain(|m| m != member);
+        if !g.running.iter().any(|m| m == member) {
+            g.running.push(member.to_owned());
+        }
+    }
+
     /// Who holds the group now (for the wait reason `concurrency`).
     pub fn holders(&self, key: &str) -> Vec<String> {
         self.groups.get(key).map(|g| g.running.clone()).unwrap_or_default()
@@ -167,5 +179,33 @@ mod tests {
         assert!(g.arrive("s", "staging", "d", &c).is_empty());
         assert!(g.leave("s", "d").is_empty());
         assert!(!g.is_pending("s", "d"));
+    }
+
+    /// W05-R25: a member in progress across a restart holds its place again. The next one waits
+    /// for it, or cancels it, as it would have had the dispatcher never stopped.
+    #[test]
+    fn w05_r25_a_member_in_progress_takes_its_place_again() {
+        let (mut g, c) = (Groups::default(), GroupConfig::default());
+        g.resume("k", "r1", &c);
+        assert_eq!(g.holders("k"), vec!["r1"]);
+        assert!(g.arrive("k", "ci", "r2", &c).is_empty() && g.is_pending("k", "r2"), "r2 waits behind r1");
+        assert_eq!(starts(&g.leave("k", "r1")), vec!["r2"]);
+        // `cancel-in-progress` cancels it as it would any member in progress.
+        let mut g = Groups::default();
+        let c = GroupConfig { cancel_in_progress: true, ..GroupConfig::default() };
+        g.resume("k", "r1", &c);
+        let a = g.arrive("k", "ci", "r2", &c);
+        assert_eq!(cancels(&a), vec![("r1", true)]);
+        assert!(starts(&a).is_empty(), "r2 waits until r1 has stopped");
+        // Two already in progress in a group of one both keep their places (they run, whatever
+        // the limit says), once each; the next waits for both.
+        let (mut g, c) = (Groups::default(), GroupConfig::default());
+        g.resume("k", "r1", &c);
+        g.resume("k", "r2", &c);
+        g.resume("k", "r1", &c);
+        assert_eq!(g.holders("k"), vec!["r1", "r2"]);
+        assert!(g.arrive("k", "ci", "r3", &c).is_empty());
+        assert!(g.leave("k", "r1").is_empty(), "r2 still runs");
+        assert_eq!(starts(&g.leave("k", "r2")), vec!["r3"]);
     }
 }
