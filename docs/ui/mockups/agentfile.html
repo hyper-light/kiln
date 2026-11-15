@@ -137,9 +137,9 @@ function parse(text) {
 function originOf(h) {
   const s = h.source;
   try {
-    if (s.kind === "https") return new URL(s.url.replace("${TARGETARCH}", "arm64")).host + ":443";
+    if (s.kind === "https") return parseAddress(s.url.replace("${TARGETARCH}", "arm64")).host + ":443";
     if (s.kind === "git") return (s.scheme === "ssh" ? s.repo.replace(/^git@/, "").split("/")[0] + ":22" : s.repo.split("/")[0] + ":443");
-    if (s.kind === "s3") return s.endpoint ? new URL(s.endpoint).host + ":443" : "";
+    if (s.kind === "s3") return s.endpoint ? parseAddress(s.endpoint).host + ":443" : "";
   } catch { return ""; }
   return "";
 }
@@ -207,7 +207,7 @@ function agentRow(a) {
 function grantsTable(m) {
   const rows = [];
   for (const h of m.harnesses) if (h.egress.length) rows.push([h.id, h.egress.map((e) => e.split(":")[0]).join(", "), "443/tcp", "out", "NETWORK " + h.id + "-out"]);
-  for (const a of m.agents) for (const [n, src] of a.mcp) { try { rows.push([a.name, new URL(src).host, "443/tcp", "out", "MCP " + n]); } catch {} }
+  for (const a of m.agents) for (const [n, src] of a.mcp) { try { rows.push([a.name, parseAddress(src).host, "443/tcp", "out", "MCP " + n]); } catch {} }
   for (const h of m.harnesses) if (originOf(h)) rows.push([`${h.id}'s build`, originOf(h).split(":")[0], originOf(h).split(":")[1] + "/tcp", "out, fetch only", "HARNESS FROM"]);
   return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Who</th><th>To</th><th class="hidden sm:table-cell">Ports</th><th>Way</th><th class="hidden md:table-cell">From</th></tr></thead><tbody>
     ${rows.map((r) => `<tr><td class="cell-mono">${esc(r[0])}</td><td class="cell-mono" style="white-space:normal">${esc(r[1])}</td><td class="cell-mono hidden sm:table-cell">${r[2]}</td><td class="cell-mono">${r[3]}</td><td class="cell-mono hidden md:table-cell">${esc(r[4])}</td></tr>`).join("")}

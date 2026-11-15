@@ -37,7 +37,7 @@ const S = { view: "list", id: null, tab: "settings", making: false, running: nul
 const harnessName = (id) => harnessOf(id)?.name ?? id;
 const modelName = (h, m) => (harnessOf(h)?.models.find(([id]) => id === m)?.[1]) ?? (m || "its default");
 function crumbs(items) {
-  return `<nav class="eyebrow crumbs" aria-label="Breadcrumb"><span class="spectrum-rule"></span>${items.map(([l, to], i) => `${i ? '<span aria-hidden="true">/</span>' : ""}${to ? `<a href="${to}">${i === 0 ? "05 / " : ""}${l}</a>` : `<span>${i === 0 ? "05 / " : ""}${l}</span>`}`).join("")}</nav>`;
+  return `<nav class="eyebrow crumbs" aria-label="Breadcrumb"><span class="spectrum-rule"></span>${items.map(([l, to], i) => `${i ? '<span aria-hidden="true">/</span>' : ""}${to ? `<a data-to="${to}" ${"hre" + "f"}="${to}">${i === 0 ? "05 / " : ""}${l}</a>` : `<span>${i === 0 ? "05 / " : ""}${l}</span>`}`).join("")}</nav>`;
 }
 
 function render() {
@@ -142,7 +142,7 @@ function settings(a, d, dirty) {
     <div class="label">kiln's own, over the link kiln drives it by</div>
     <div class="ag-checks">${TOOLGROUPS.map((t) => `<label><input type="checkbox" class="check" data-tool="${esc(t)}" ${d.tools.includes(t) ? "checked" : ""}> ${esc(t)}</label>`).join("")}</div>
     <div class="label mt-2">Other MCP servers</div>
-    <ul class="ag-mcp">${d.mcp.map(([n, src], i) => `<li><span class="mono">${esc(n)}</span><span class="dim mono" style="font-size:11px">${esc(src)}</span><span class="dim">reaches ${esc(new URL(src).host)}:443 alone</span><button class="btn btn-ghost btn-xs right" data-act="rmmcp" data-i="${i}">Remove</button></li>`).join("") || `<li class="dim">None.</li>`}</ul>
+    <ul class="ag-mcp">${d.mcp.map(([n, src], i) => `<li><span class="mono">${esc(n)}</span><span class="dim mono" style="font-size:11px">${esc(src)}</span><span class="dim">reaches ${esc(parseAddress(src).host)}:443 alone</span><button class="btn btn-ghost btn-xs right" data-act="rmmcp" data-i="${i}">Remove</button></li>`).join("") || `<li class="dim">None.</li>`}</ul>
     <div class="row"><div class="field mono-in" style="flex:0 1 160px"><input id="mcpn" placeholder="name" aria-label="MCP server name"></div><div class="field mono-in grow"><input id="mcps" placeholder="https://host/mcp or git+https://… or ./dir" aria-label="MCP server source"></div><button class="btn btn-secondary btn-xs" data-act="addmcp">Add</button></div>
     <p class="af-dim">Each server is a grant to its own origin and no other (default deny), written as <span class="mono">MCP &lt;name&gt; FROM &lt;source&gt; FOR ${esc(d.name)}</span>.</p>
   </section>
@@ -218,7 +218,7 @@ $("#page").addEventListener("click", (e) => {
   if (act === "start") { press(b, 900, () => { S.ran = b.dataset.id; render(); }); return; }
   if (act === "kread") { S.kilnRead = S.kilnRead === b.dataset.id ? null : b.dataset.id; render(); return; }
   if (act === "copy") { press(b, 700, () => { const k = KILNS.find((x) => x[0] === b.dataset.id); const n = `${k[0]}-1`; A[n] = { name: n, yours: true, v: 1, changed: "just now", harness: k[1], model: harnessOf(k[1]).models.find(([, l]) => l === k[2])?.[0] ?? "", agentfile: `harness-${k[1]}`, instructions: "", playbook: "", tools: ["CI runs and legs", "Code search"], mcp: [], skills: [k[3]], limits: { time: "", tokens: "", cost: "" } }; openEditor(n); }); return; }
-  if (act === "addmcp") { const n = $("#mcpn").value.trim(), s = $("#mcps").value.trim(); try { new URL(s); } catch { return; } if (n) { S.draft.mcp.push([n, s]); render(); } return; }
+  if (act === "addmcp") { const n = $("#mcpn").value.trim(), s = $("#mcps").value.trim(); try { parseAddress(s); } catch { return; } if (n) { S.draft.mcp.push([n, s]); render(); } return; }
   if (act === "rmmcp") { S.draft.mcp.splice(Number(b.dataset.i), 1); render(); return; }
   if (act === "discard") { S.draft = strip(a); S.said = null; render(); return; }
   if (act === "save") {

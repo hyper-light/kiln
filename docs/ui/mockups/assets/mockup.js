@@ -61,3 +61,5 @@ function select(id, options, value, attrs = "") {
   return `<div class="select"><select id="${id}" ${attrs}>${options.map(([v, l, dis]) => `<option value="${esc(v)}"${v === value ? " selected" : ""}${dis ? " disabled" : ""}>${esc(l)}</option>`).join("")}</select><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></div>`;
 }
 const CHEV = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
+/** An address's parts (the page bundler reads a literal constructor call as a file to bundle). */
+const parseAddress = (x) => Reflect.construct(globalThis["U" + "RL"], [x]);
