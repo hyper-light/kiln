@@ -61,7 +61,7 @@ use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, R
 /// (`Runtime::signal_member`, Shards' agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or
 /// refused fork of an image VM's guest: its `usage_of`), or weights. Credentials it holds where its runtime leases
 /// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
 pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (kiln's credential store is its server's, which this runner doesn't hold), and a run granted one is never run without it (Shards' D242)";
@@ -640,7 +640,17 @@ impl Run for HexRun {
         let over = self.over();
         Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_LIVE.to_owned())) } })
     }
+
+    // None yet (`HOLDS.swaps`): Hex's wire calls for a component swapped into a running box (P6c.2, over Shards' P6c.1).
+    fn swap(&self, launch: Launch) -> BoxFuture<'_, Result<Box<dyn Run>, Refusal>> {
+        drop(launch);
+        let over = self.over();
+        Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_SWAP.to_owned())) } })
+    }
 }
+
+/// Why a box's harness isn't swapped for another in place yet.
+pub const NO_SWAP: &str = "a harness swapped for another in its running microVM: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6c.2)";
 
 /// Why a box's network and folders don't change while it runs yet.
 pub const NO_LIVE: &str = "a change to a running microVM's network or folders: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6b.3)";

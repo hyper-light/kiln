@@ -147,6 +147,15 @@ impl Held {
         self.run.id()
     }
 
+    /// Its member swapped for `launch`'s in its boundary (`Run::swap`, kiln plan 01a1dd2e…, P6c.5: a harness switched
+    /// in its microVM): the new member's run, its boundary the same; refused, this one goes on.
+    pub async fn swap(&self, launch: kiln_seams::sandbox::Launch) -> Result<Box<dyn Run>, Refusal> {
+        if self.ended.load(Ordering::Acquire) {
+            return Err(Refusal::Ended);
+        }
+        self.run.swap(launch).await
+    }
+
     /// Its network or its folders changed while it runs (a session's live overrides, `harness::overrides`): taken,
     /// else its boundary's refusal (`Ended` once it has ended, `Unsupported` where it takes no change live).
     pub async fn change(&self, change: kiln_seams::sandbox::Change) -> Result<(), Refusal> {

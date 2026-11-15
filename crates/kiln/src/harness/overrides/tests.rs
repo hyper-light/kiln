@@ -82,6 +82,7 @@ for line in sys.stdin:
         out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
     elif m.get("type") == "user":
         uid = m.get("uuid")
+        note("user", m.get("message"))
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
         out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "fixture", "permissionMode": "default", "claude_code_version": "2.1.296"})
         out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
@@ -91,6 +92,12 @@ for line in sys.stdin:
     std::fs::write(&program, format!("#!/bin/sh\nexec python3 {} {} \"$@\"\n", script.display(), said.display()))?;
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
     Ok((program, said))
+}
+
+/// Whether session `s`'s harness is up and at rest.
+fn at_rest(s: &crate::harness::session::Session) -> bool {
+    let core = s.core.lock();
+    !core.meta.features.is_empty() && core.state.status == crate::harness::model::Status::Idle
 }
 
 /// What the stand-in wrote down, of `kind`: each line's pid and value.
@@ -460,4 +467,79 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
     assert_eq!(Member::read(Some("agent:helper"), "claude"), Ok(Member::Agent("helper".into())));
     assert!(Member::read(Some("worker"), "claude").is_err());
     Ok(())
+}
+
+/// P6c.5 (the person: "right now on bare metal I can swap between claude code, codex, cursor, devin, antigravity,
+/// opencode, pi, etc. with just a click. We need to keep that!"): the same one-click switch (`Command::SetModel` naming
+/// another harness, as the composer's control sends it) in a microVM session: Claude Code to Codex and back, each harness
+/// swapped into the same microVM (the stand-in runtime records each swap, none launched again), and the conversation
+/// carried each time, so the person's first words reach the last harness. Codex's member is kiln's stand-in for every
+/// harness's interface (`tests/fixtures/vm-stub`), in Codex's dialect.
+#[cfg(unix)]
+#[test]
+fn p6c_5_a_one_click_harness_switch_in_a_microvm_keeps_its_microvm_and_its_conversation() -> anyhow::Result<()> {
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (claude, log) = stand_in(&dir.path().join("h"))?;
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let codex = bin.join("codex");
+        std::os::unix::fs::symlink(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vm-stub/harness/stub"), &codex)?;
+        let builtin = |h: &str| crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == h).ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for {h}"));
+        let (_, claude_image) = crate::sandbox::image::tests::holding(dir.path(), crate::sandbox::image::Source::Builtin(builtin("claude")?))?;
+        let (images, codex_image) = crate::sandbox::image::tests::holding(dir.path(), crate::sandbox::image::Source::Builtin(builtin("codex")?))?;
+        let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&claude_image, "claude", &claude).and(&codex_image, "codex", &codex).swapping());
+        hub.harness.local.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images));
+        opened(&hub, "vm-switch", dir.path(), &claude, Some(Isolation::microvm())).await?;
+        let session = hub.harness.local.get("vm-switch").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        let say = |text: &'static str| {
+            let cx = owner(&hub);
+            async move { call(cx, "agents.send", json!({"agent": "vm-switch", "text": text})).await.map_err(|(s, m)| anyhow::anyhow!("agents.send: {s} {m}")) }
+        };
+        let heard = |words: &str| said(&log, "user").iter().filter(|(_, m)| m.to_string().contains(words)).count();
+        let answers = || session.core.lock().events().filter(|e| matches!(e.body, crate::harness::model::Body::Assistant { .. })).count();
+        let same_box = |vms: &crate::sandbox::fake::FakeVms| vms.launched().len() == 1 && vms.swapped().iter().all(|(vm, _)| vm == "fake-vm-1");
+        say("Remember the word kumquat.").await?;
+        until("Claude Code heard it", || heard("kumquat") == 1).await?;
+        until("Claude Code at rest", || at_rest(&session)).await?;
+        // One click: Codex, swapped into the same microVM.
+        let _ = hub.harness.command(&hub, "vm-switch", Command::SetModel { model: String::new(), kind: Some("codex".into()) }).await;
+        until("Codex, at rest", || session.info().kind == "codex" && at_rest(&session)).await?;
+        anyhow::ensure!(same_box(&vms) && vms.swapped().len() == 1, "one microVM, its member swapped: {:?} {:?}", vms.launched().len(), vms.swapped());
+        anyhow::ensure!(vms.swapped().first().is_some_and(|(_, l)| l.program == "codex" && l.boundary == kiln_seams::sandbox::Boundary::MicroVm { image: codex_image.clone() }), "Codex's member, of its own image: {:?}", vms.swapped());
+        let before = answers();
+        say("What comes next?").await?;
+        until("Codex answered", || answers() > before && at_rest(&session)).await?;
+        // And back to Claude Code, in the same microVM still: the conversation carried to it.
+        let _ = hub.harness.command(&hub, "vm-switch", Command::SetModel { model: String::new(), kind: Some("claude".into()) }).await;
+        until("Claude Code again, at rest", || session.info().kind == "claude" && at_rest(&session)).await?;
+        anyhow::ensure!(same_box(&vms) && vms.swapped().len() == 2, "one microVM, swapped twice: {:?}", vms.swapped());
+        say("What was the word?").await?;
+        until("the first words, carried to the last harness", || said(&log, "user").iter().any(|(_, m)| m.to_string().contains("What was the word?") && m.to_string().contains("kumquat"))).await?;
+        anyhow::ensure!(said(&log, "start").len() == 2, "Claude Code started twice, each in the one microVM: {:?}", said(&log, "start"));
+        anyhow::ensure!(matches!(hub.harness.info("vm-switch").and_then(|i| i.runs), Some(crate::harness::session::Runs::Microvm { vm: Some(ref vm), .. }) if vm == "fake-vm-1"), "the same box");
+        anyhow::ensure!(hub.harness.close(&hub, "vm-switch").await, "it closed");
+        Ok(())
+    })
+}
+
+/// P6c.5: where the machine's microVMs swap no harness in place (Hex's until its wire calls land), the switch is refused
+/// as before, saying why, and the session goes on in its harness, in its microVM.
+#[cfg(unix)]
+#[test]
+fn p6c_5_a_switch_where_microvms_swap_none_is_refused_and_the_session_goes_on() -> anyhow::Result<()> {
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, _log) = stand_in(&dir.path().join("h"))?;
+        let vms = microvms(&hub, dir.path(), &program)?;
+        opened(&hub, "vm-noswap", dir.path(), &program, Some(Isolation::microvm())).await?;
+        let session = hub.harness.local.get("vm-noswap").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        let _ = hub.harness.command(&hub, "vm-noswap", Command::SetModel { model: String::new(), kind: Some("codex".into()) }).await;
+        until("its switch refused", || session.core.lock().events().any(|e| matches!(&e.body, crate::harness::model::Body::Notice { text, .. } if text == crate::sandbox::isolated::NO_SWITCH))).await?;
+        anyhow::ensure!(session.info().kind == "claude" && vms.launched().len() == 1 && vms.swapped().is_empty(), "it goes on as it was");
+        anyhow::ensure!(hub.harness.close(&hub, "vm-noswap").await, "it closed");
+        Ok(())
+    })
 }

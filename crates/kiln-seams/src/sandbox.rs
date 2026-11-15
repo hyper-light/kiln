@@ -212,11 +212,13 @@ pub struct Holds {
     pub credentials: bool,
     /// Changes to a run's network and folders while it runs ([`Run::change`]: kiln plan 01a1dd2e…, P6b.4).
     pub live: bool,
+    /// A run's member swapped for another in its boundary ([`Run::swap`]: kiln plan 01a1dd2e…, P6c.5).
+    pub swaps: bool,
 }
 
 impl Holds {
     /// Everything (the simulator's).
-    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true };
+    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true, swaps: true };
 
     /// `Ok` when `launch`'s weights are on their scale, its credential grants could each be filled
     /// in, and it asks only for what these hold; else its refusal, `Invalid` or `Unsupported`,
@@ -459,6 +461,17 @@ pub trait Run: Send + Sync {
         drop(change);
         Box::pin(async { Err(Refusal::Unsupported("a change to a run while it runs".into())) })
     }
+    /// Its member swapped for `launch`'s in the same boundary (kiln plan 01a1dd2e…, P6c.5; Shards'
+    /// P6c.1 component attached through Hex's P6c.2): its member ended as its input ends, then
+    /// `launch`'s member started in its place, given what `launch` gives it. The run returned is the
+    /// new member's, its boundary the same (the same [`id`](Self::id)); this one says its end, and its
+    /// end and its kill end nothing more of its boundary. Refused `Unsupported` where its boundary
+    /// swaps none (`Holds::swaps`, and a run's own unless it says otherwise), `Ended` once it has
+    /// ended, and in its runtime's words where that refuses it: refused, this run goes on.
+    fn swap(&self, launch: Launch) -> BoxFuture<'_, Result<Box<dyn Run>, Refusal>> {
+        drop(launch);
+        Box::pin(async { Err(Refusal::Unsupported("a member swapped for another in its boundary".into())) })
+    }
 }
 
 /// Harnesses launched in boundaries.
@@ -523,6 +536,8 @@ struct SimRun {
     runs: Arc<Mutex<usize>>,
     signals: bool,
     live: bool,
+    /// Its sandbox, which starts a member it's swapped for ([`Run::swap`]).
+    sandbox: SimSandbox,
 }
 
 #[derive(Default)]
@@ -650,6 +665,22 @@ impl Run for SimRun {
         };
         Box::pin(async move { out })
     }
+
+    fn swap(&self, launch: Launch) -> BoxFuture<'_, Result<Box<dyn Run>, Refusal>> {
+        Box::pin(async move {
+            if self.state.lock().ended {
+                return Err(Refusal::Ended);
+            }
+            if !self.sandbox.holds.swaps {
+                return Err(Refusal::Unsupported("a member swapped for another in its boundary".into()));
+            }
+            let new = self.sandbox.launch(launch).await?;
+            // Its member ended as the new one started: its end said, once.
+            self.state.lock().say(Output::Exited(Exit::Code(0)));
+            self.said.notify(usize::MAX);
+            Ok(new)
+        })
+    }
 }
 
 impl Sandbox for SimSandbox {
@@ -722,7 +753,7 @@ impl Sandbox for SimSandbox {
                 return Err(Refusal::Full { limit: SIM_RUNS });
             }
             *n = n.saturating_add(1);
-            let run: Box<dyn Run> = Box::new(SimRun { state: Arc::new(Mutex::new(st)), said: Arc::new(event_listener::Event::new()), runs: Arc::clone(&self.runs), signals: self.holds.signals, live: self.holds.live });
+            let run: Box<dyn Run> = Box::new(SimRun { state: Arc::new(Mutex::new(st)), said: Arc::new(event_listener::Event::new()), runs: Arc::clone(&self.runs), signals: self.holds.signals, live: self.holds.live, sandbox: self.clone() });
             Ok(run)
         })();
         Box::pin(async move { out })
@@ -1078,6 +1109,33 @@ fn c14<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c15<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let run = fine("launch", f.sandbox().launch(f.wait()).await)?;
+        let id = run.id();
+        if !f.sandbox().holds().swaps {
+            let swapped = run.swap(f.echo()).await;
+            let on = run.stdin(b"still here\n".to_vec()).await;
+            run.kill();
+            return match swapped {
+                Err(Refusal::Unsupported(_)) => fine("its run, after the swap it refused", on),
+                Err(e) => Err(format!("a member swapped in its boundary: refused as {e:?}, not Unsupported")),
+                Ok(_) => Err("a member swapped in its boundary: taken, though the sandbox says it doesn't hold it".into()),
+            };
+        }
+        let new = fine("a member swapped in its boundary", run.swap(f.echo()).await)?;
+        let outs = drain(run.as_ref()).await;
+        same("the member swapped out: its ends", outs.iter().filter(|o| matches!(o, Output::Exited(_))).count(), 1)?;
+        same("the new member's boundary", new.id(), id)?;
+        fine("stdin to the new member", new.stdin(b"swapped\n".to_vec()).await)?;
+        new.close_stdin();
+        let outs = drain(new.as_ref()).await;
+        same("what the new member said", String::from_utf8_lossy(&stdout(&outs)).into_owned(), "swapped\n".to_owned())?;
+        same("its end", end(&outs), Some(Exit::Code(0)))?;
+        ensure(run.swap(f.echo()).await.is_err(), || "a run swapped out was swapped again".into())
+    })
+}
+
 /// The `Sandbox` contract, clause by clause (docs/seams.md, "Sandbox").
 pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
     vec![
@@ -1126,6 +1184,11 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
             id: "SANDBOX-14",
             says: "a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on",
             check: c14::<F>,
+        },
+        Case {
+            id: "SANDBOX-15",
+            says: "a run's member swapped for another in its boundary ends, its end said once, and the run it gives runs the other in the same boundary; one swapped out swaps no more; a sandbox that swaps none refuses one Unsupported, and its run goes on",
+            check: c15::<F>,
         },
     ]
 }
@@ -1221,7 +1284,7 @@ mod tests {
         let make = || async { Holding { sim: SimSandboxFixture::default(), lies: Some(Liar(SimSandbox::new())) } };
         let report = futures::executor::block_on(run("Sandbox", &cases::<Holding>(), make));
         let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
-        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14"], "{:?}", report.failed);
+        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15"], "{:?}", report.failed);
         assert!(report.failed.iter().all(|(_, why)| why.contains("doesn't hold it")), "{:?}", report.failed);
     }
 
