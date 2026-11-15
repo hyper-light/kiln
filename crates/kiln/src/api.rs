@@ -6490,6 +6490,8 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     // and so are the secrets its build is given (P4.7).
     spec.agentfile = None;
     spec.build_secrets = Vec::new();
+    // The engine setting its boundary is decided under is kiln's (kiln plan 01a1dd2e…, P2.3).
+    spec.engine_version = None;
     // An isolated agent's person, whose volume its harness's configuration is on, is whoever asks
     // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked.
     if let Some(i) = spec.isolation.as_mut() {

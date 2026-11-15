@@ -332,6 +332,12 @@ pub struct Spec {
     /// the same ledger as CI legs and commands. Set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<crate::reach::place::Claim>,
+    /// The version of its runner's engine setting its boundary was decided under
+    /// (`crate::harness::engine::Asked::version`; kiln plan 01a1dd2e…, P2.3): its runner refuses it
+    /// where its own is another, so a start placed before a switch never starts on the engine it
+    /// had. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<u64>,
     /// Whom it acts for, the person whose words its opening prompt (`prompt`) is
     /// (`lineage::person_of`'s form: `owner`, `user:<id>`; kiln plan
     /// 01a1cd8e862e7169a074db3d5fa33f3d step 35): its input admits that prompt as theirs, held to
@@ -359,6 +365,7 @@ impl Default for Spec {
     fn default() -> Self {
         Self {
             claim: None,
+            engine_version: None,
             kind: String::new(),
             cwd: None,
             model: None,
