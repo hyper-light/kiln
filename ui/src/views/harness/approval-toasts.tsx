@@ -25,7 +25,7 @@ import { useLabels } from "@/lib/data";
 import { pauseLine } from "./pause";
 import { getNoneWaiting, getWaiting, subscribeWaiting } from "./waiting";
 import { answer, dealWith, resumeHeld, tried, tryKey, useAnswered } from "./answered";
-import { isMarked, markNotices, useMarks } from "./notices";
+import { isMarked, markNotices, useMarks, useMarksKnown } from "./notices";
 import { swipeAway } from "./swipe-away";
 
 /** Cards at once (one on a phone); past these, one line says how many more agents wait. */
@@ -222,12 +222,14 @@ function CardOf({ card }: { card: Card }) {
 export default function RequestToasts() {
   const waiting = React.useSyncExternalStore(subscribeWaiting, getWaiting, getNoneWaiting);
   const marks = useMarks();
+  // Until your marks are in, a card you put away can't be told from one waiting: show none rather than one that goes again.
+  const known = useMarksKnown();
   const gone = React.useMemo(() => ({ has: (key: string) => isMarked(marks, key) }), [marks]);
   const done = useAnswered();
   const path = useLocation().pathname;
   const max = useMediaQuery(PHONE) ? 1 : MAX;
   const cards = cardsOf(waiting, path, gone, done);
-  if (cards.length === 0) return null;
+  if (!known || cards.length === 0) return null;
   const rest = cards.slice(max);
   const limits = rest.filter((c) => c.kind === "limit").length;
   const needs = rest.length - limits;

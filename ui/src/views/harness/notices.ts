@@ -17,6 +17,12 @@ const SEEN_EVERY_MS = 30_000;
 const OLD_SEEN = "kiln.agents.seen";
 
 let marks: ReadonlyMap<string, NoticeMark> = new Map(oldSeen());
+/**
+ * The server's marks have come (or there are none to come: not signed in as one with notices, or an
+ * older server). Until then a notice can't be told put away, so what shows them waits for this rather
+ * than showing one and taking it back (a card that came and went moved the page under it).
+ */
+let known = false;
 let you: string | null = null;
 const listeners = new Set<() => void>();
 let stop: (() => void) | null = null;
@@ -56,8 +62,18 @@ function mine(): boolean {
   return !can || can["agents.run"] === "server";
 }
 
+function knownNow() {
+  if (known) return;
+  known = true;
+  emit();
+}
+
 async function load() {
-  if (!mine()) return;
+  if (!mine()) {
+    // Signed in without notices, or not signed in: there are none to wait for. Still signing in: wait.
+    if (useAuth.getState().kind !== "loading") knownNow();
+    return;
+  }
   try {
     const r = await pushApi.notices();
     you = r.you;
@@ -65,6 +81,7 @@ async function load() {
   } catch {
     /* an older server: marks stay this page's */
   }
+  knownNow();
 }
 
 /** The notifications of agents `tags` on this device, closed. */
@@ -94,6 +111,7 @@ function start() {
   });
   const offAuth = useAuth.subscribe((now, before) => {
     if (now.kind === "authed" && before.kind !== "authed") void load();
+    else if (now.kind === "anon") knownNow();
   });
   return () => {
     offEvents();
@@ -115,10 +133,16 @@ function subscribe(l: () => void) {
 }
 
 const get = () => marks;
+const getKnown = () => known;
 
 /** Your marks (re-renders as they change). */
 export function useMarks(): ReadonlyMap<string, NoticeMark> {
   return useSyncExternalStore(subscribe, get, get);
+}
+
+/** Whether your marks from the server are in (`known` above): notices show once they are. */
+export function useMarksKnown(): boolean {
+  return useSyncExternalStore(subscribe, getKnown, getKnown);
 }
 
 /** Whether notice `key` was put away or acted on (seen is for agents, not notices). */

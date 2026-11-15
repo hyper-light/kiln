@@ -8,6 +8,7 @@
 import * as React from "react";
 import { Ban, ChartLine, Hammer, Pause, Play, RotateCcw, Square, Trash2, X, Check } from "lucide-react";
 import { microvmsApi, runnerVmsRes, enginesRes, sandboxApi, type Engine, type EngineView, type MicroVm, type RunnerImage, type WarmPool } from "@/api/microvms";
+import type { HostSample } from "@/api/wire";
 import { Button } from "@/components/ui/button";
 import { Confirm, Meter, Sparkline } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
@@ -46,6 +47,35 @@ export function EngineCell({ e }: { e: EngineView | undefined }) {
       <span className="rv-engine-word">{e.switching ? `→ ${e.switching.to}` : e.engine}</span>
       {!e.can && <Ban size={12} className="rv-ban" role="img" aria-label={e.why ?? "Can't run microVMs"} />}
     </span>
+  );
+}
+
+/** Bytes in a bar's words: GiB, or TiB from a TiB up, to two places. */
+function size(used: number, total: number): { used: number; limit: number; unit: string } {
+  const unit = total >= 2 ** 40 ? 2 ** 40 : G;
+  return { used: Math.round((used / unit) * 100) / 100, limit: Math.round((total / unit) * 100) / 100, unit: unit === G ? "GiB" : "TiB" };
+}
+
+/**
+ * Where a runner is now, first in its details (under its name): its CPU, memory and disk as live
+ * bars, from its own samples, and on a runner whose agents run in microVMs, the vCPUs its Hex node
+ * holds for them, of its room.
+ */
+export function RunnerNow({ name, sample }: { name: string; sample: HostSample | null }) {
+  const room = useRes(enginesRes).data[name]?.room ?? null;
+  if (!sample && !room) return null;
+  const held = room ? room.vcpus_total - room.vcpus_free : 0;
+  return (
+    <div className="rv-now" role="group" aria-label="Now">
+      {sample && (
+        <>
+          <LimitMeter live limit={{ id: "cpu", label: "CPU", used_percent: sample.cpu_pct, used: Math.round((sample.cpu_pct / 100) * sample.cpus * 100) / 100, limit: sample.cpus, unit: "cores" }} />
+          <LimitMeter live limit={{ id: "memory", label: "Memory", used_percent: (sample.mem_used / sample.mem_total) * 100, ...size(sample.mem_used, sample.mem_total) }} />
+          <LimitMeter live limit={{ id: "disk", label: "Disk", used_percent: (sample.disk_used / sample.disk_total) * 100, ...size(sample.disk_used, sample.disk_total) }} />
+        </>
+      )}
+      {room && <LimitMeter live limit={{ id: "vcpus", label: "vCPUs held", used_percent: (held / room.vcpus_total) * 100, used: held, limit: room.vcpus_total, unit: "vCPU" }} />}
+    </div>
   );
 }
 
@@ -188,19 +218,14 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
   const [charts, setCharts] = React.useState<Set<string>>(new Set());
   const [building, setBuilding] = React.useState(false);
   if (!e || (!e.can && r.vms.length === 0 && r.images.length === 0)) return null;
-  const room = e.room;
-  const usedMem = room ? room.memory_total - room.memory_free : 0;
-  const usedCpu = room ? room.vcpus_total - room.vcpus_free : 0;
   const warm = r.pools.reduce((a, p) => a + p.warm, 0);
   const bound = r.pools.reduce((a, p) => a + p.bound, 0);
   const total = r.starts.warm + r.starts.template + r.starts.cold;
   return (
     <section className="rv-block" aria-label="MicroVMs">
-      {/* Where we are now, first: the node's room as live bars, then how its microVMs start and its warm hosts. */}
-      {room && (
+      {/* How its microVMs start, and its warm hosts (where it is now, its bars, leads its details). */}
+      {(total > 0 || bound > 0) && (
         <div className="rv-room">
-          <LimitMeter live limit={{ id: "memory", label: "Memory", used_percent: (usedMem / room.memory_total) * 100, used: gib(usedMem), limit: gib(room.memory_total), unit: "GiB" }} />
-          <LimitMeter live limit={{ id: "vcpus", label: "vCPUs", used_percent: (usedCpu / room.vcpus_total) * 100, used: usedCpu, limit: room.vcpus_total, unit: "held" }} />
           {total > 0 && (
             <span className="rv-cell">
               <span className="label" title="Flame: warm · layers: from its template · snowflake: cold">

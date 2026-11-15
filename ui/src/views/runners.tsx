@@ -50,7 +50,7 @@ import { limitLine, parseLimit, settable, standing, withEvent } from "./agent-li
 import { refusedLately, refusedLine } from "./refused";
 import { useClock } from "./harness/dom";
 import { ImagesPanel, PoolsPanel, poolsRes, imagesRes } from "./runners-pools";
-import { EngineBlock, EngineCell, MicrovmsSection } from "./runners-microvms";
+import { EngineBlock, EngineCell, MicrovmsSection, RunnerNow } from "./runners-microvms";
 import { enginesRes, runnerVmsRes } from "@/api/microvms";
 import { useAuth } from "@/lib/auth";
 
@@ -324,7 +324,10 @@ function RunnersBody() {
                         <UpgradeNote agent={a} />
                       </td>
                       <td className="hidden md:table-cell">
-                        <Chips labels={a.labels} max={4} />
+                        {/* One line, its rest faded out (all of them in its title and its details): a row's height is its name's, whatever the font that comes. */}
+                        <span className="rt-labels" title={a.labels.join(", ")}>
+                          <Chips labels={a.labels} max={4} />
+                        </span>
                       </td>
                       <td>
                         <EngineCell e={engines[a.name]} />
@@ -453,12 +456,15 @@ function RunnersHead() {
 /** The fleet while it loads: its intro, its tools, the table's head and its rows' space. */
 function RunnersHold() {
   const [view] = usePref<"table" | "cards">("kiln.agents.view", "table");
+  const [params] = useSearchParams();
   const noop = () => undefined;
   return (
     <>
       <Intro lead={LEAD} />
       <RunnersTools q="" onQ={noop} facets={[]} chosen={{}} onChosen={noop} view={view} onView={noop} />
       {view === "cards" ? <Hold height={196} label="Loading the runners" /> : <TableHold head={<RunnersHead />} rows={6} rowHeight={57} label="Loading the runners" />}
+      {/* A runner open (?agent=): its details' place too, so what loads below starts below the fold and nothing seen moves when they come. */}
+      {params.get("agent") && <Hold height={560} className="runner-details" label="Loading its details" />}
     </>
   );
 }
@@ -583,6 +589,8 @@ function AgentDetails({
           <X /> Close
         </Button>
       </div>
+      {/* Where it is now, first: CPU, memory and disk, and what its Hex node holds for microVMs. */}
+      <RunnerNow name={agent.name} sample={s} />
       <div className="flex flex-wrap items-center gap-2">
         <Chips labels={agent.labels} max={12} />
       </div>
@@ -641,14 +649,12 @@ function AgentDetails({
 
       <div className="mt-6">
         <Facts
+          className="runner-facts"
           items={[
             { label: "Slots", value: `${agent.busy} / ${agent.slots} busy` },
             { label: "Connected", value: agent.connected ? "yes" : "no", tone: agent.connected ? "pass" : "fail" },
             { label: "Last seen", value: <RelTime ts={agent.last_seen} /> },
             { label: "Enrolled", value: absoluteTime(agent.enrolled_at) },
-            { label: "CPU", value: s ? `${formatPct(s.cpu_pct, 1)} · ${s.cpus} cores` : "—" },
-            { label: "Memory", value: s ? `${formatBytes(s.mem_used)} / ${formatBytes(s.mem_total)}` : "—" },
-            { label: "Disk", value: s ? `${formatBytes(s.disk_used)} / ${formatBytes(s.disk_total)}` : "—" },
             { label: "Lost below the channel", value: lostLine(agent) },
             { label: "Refused messages", value: <RefusedWords refused={agent.refused} />, tone: refusedLately(agent.refused, now) ? "fail" : undefined },
           ]}
