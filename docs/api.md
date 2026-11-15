@@ -200,7 +200,7 @@ runs and its runners: a definition's run is one of those agents.)
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/agentdefs?all=` | `{ agents: AgentDefBrief[], reaches_all }`, newest change first |
+| GET | `/api/agentdefs?all=` | `{ agents: AgentDefBrief[], reaches_all, builtin: KilnAgentDef[], uses: { [kiln_id]: id } }`, newest change first |
 | POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile? }` → `AgentDef` (version 1); 422 `kiln can't run this agent: <why>`, 409 a name taken |
 | POST | `/api/agentdefs/check` | the settings → `{ ok, problems: string[] }`, keeping nothing |
 | GET | `/api/agentdefs/{id}` | `AgentDef` |
@@ -208,13 +208,29 @@ runs and its runners: a definition's run is one of those agents.)
 | GET | `/api/agentdefs/{id}/versions` | `{ versions: { version, at, by, ...settings }[] }`, newest first |
 | POST | `/api/agentdefs/{id}/restore` | `{ version }` → `AgentDef`, that version's settings as a new version |
 | DELETE | `/api/agentdefs/{id}` | `{ deleted: true }` |
-| POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }` |
+| POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }`; `id` one of yours or kiln's |
+| POST | `/api/agentdefs/{id}/copy` | `{ name? }` → `AgentDef`: one of kiln's (`kiln:<name>`) or yours, made yours, version 1 |
+| POST | `/api/agentdefs/use` | `{ builtin, id }` → `{ uses }`: your own `id` stands in for kiln's UI agent `builtin` for you (null `id`: kiln's own again) |
 
 Kept and restored settings are checked first, and refused, every reason said, where: the harness
 isn't one of kiln's ten; the Agentfile isn't one its owner reaches (another person's is as none) or is
 kiln's for another harness; the model isn't one kiln's machines list for that harness (what its
 sessions said they offer; a harness no machine lists models for takes any); an MCP server has no name
 of its own, or not exactly one of `url` and `command`; a tool or skill has no name; a limit is 0.
+kiln ships its own, read only, listed as `builtin` (kiln plan 01a1dd2e8618733a87f2793aab1322a8
+P5.1b), each made from what kiln itself has so that none drifts from it: one per CI skill
+(`kiln-ci-*`: the skill its own, its description its instructions), one per harness (`harness-<id>`,
+in kiln's Agentfile for it), and the agents kiln starts from its UI, their briefs shown with what kiln
+fills in at each start `<like this>`: `kiln-about` (the card that answers "ask about this code" in an
+agent's conversation), `kiln-about-code` (the same in a change no agent made), `kiln-attach` (an
+attachment's agent, woken by an incident), `kiln-review` (a review agent) and `kiln-toolfix` (the
+agent that installs a tool a job lacks on a runner). Changing, restoring or deleting one of kiln's is
+refused, 403: `copy` makes it yours. A UI agent kiln starts for a person that's `replaceable`
+(`kiln-about`, `kiln-about-code`) may have their own definition stand in for it, for them alone
+(`use`): where kiln starts that card for them, it starts theirs, its harness, model and Agentfile,
+first told its instructions and then kiln's brief, which carries what was asked. Deleting the
+definition makes it kiln's own again.
+
 A run starts an agent through `agents.start`, as its route starts one (the caller's right to start
 agents there checked and audited as such): the definition's harness and model, `isolation`
 `microvm`, `image` its Agentfile (left out: the start's own for its harness), and as its first
@@ -226,6 +242,8 @@ interface Limits { seconds?; cents?; tokens? }
 interface AgentDef { id; owner /* "owner" | "user:<id>" */; name; version; created_at; updated_at;
   harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
 type AgentDefBrief = Pick<AgentDef, "id"|"owner"|"name"|"harness"|"model"|"agentfile"|"version"|"created_at"|"updated_at">;
+interface KilnAgentDef { id /* "kiln:<name>" */; name; about; replaceable: boolean;
+  harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
 ```
 
 | Method | Path | Notes |

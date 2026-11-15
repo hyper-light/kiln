@@ -1363,12 +1363,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let body = boxed(|| body_value(req)).await?;
             boxed(|| own_op(&hub, &caller, "agentdefs.check", body)).await
         }
+        (&Method::POST, ["api", "agentdefs", "use"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.use", body)).await
+        }
         (&Method::GET, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.get", json!({ "id": id }))).await,
         (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
-        (&Method::PATCH, ["api", "agentdefs", id]) | (&Method::POST, ["api", "agentdefs", id, "restore" | "run"]) => {
+        (&Method::PATCH, ["api", "agentdefs", id]) | (&Method::POST, ["api", "agentdefs", id, "restore" | "run" | "copy"]) => {
             let name = match s.get(3).copied() {
                 Some("restore") => "agentdefs.restore",
+                Some("copy") => "agentdefs.copy",
                 Some(_) => "agentdefs.run",
                 None => "agentdefs.update",
             };

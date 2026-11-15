@@ -305,7 +305,7 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     let repo = run.as_ref().map(|r| r.repo_name.clone()).unwrap_or_default();
     let number = run.as_ref().map(|r| r.number).unwrap_or_default();
     let shown = hub.shown(&runner);
-    let prompt = brief(&shown, &job.display, &repo, number, &tools, m.why.as_deref(), m.runners.iter().find(|u| u.runner == runner));
+    let prompt = brief(&shown, &job.display, &repo, &number.to_string(), &tools, m.why.as_deref(), m.runners.iter().find(|u| u.runner == runner));
     let kind = ask.kind.clone().unwrap_or_else(|| "claude".to_owned());
     let mut input = json!({ "kind": kind, "on": runner, "cwd": "~", "prompt": prompt, "name": format!("Install {} on {shown}", tools.join(", ")) });
     if let Some(mode) = &ask.mode
@@ -356,8 +356,9 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     Ok(json!({ "fix": f }))
 }
 
-/// The agent's first message, on runner `runner` (the name people see), what it lacks there `unmet`.
-fn brief(runner: &str, job: &str, repo: &str, number: i64, tools: &[String], why: Option<&str>, unmet: Option<&Unmet>) -> String {
+/// The agent's first message, on runner `runner` (the name people see), for run `number` of `repo`,
+/// what it lacks there `unmet`; kiln's own agent definition shows it too (`crate::agentdefs::builtin`).
+pub(crate) fn brief(runner: &str, job: &str, repo: &str, number: &str, tools: &[String], why: Option<&str>, unmet: Option<&Unmet>) -> String {
     let what = tools.iter().map(|t| if t == XCODE_TOOLS { "Xcode's command-line tools".to_owned() } else { format!("`{t}`") }).collect::<Vec<_>>().join(", ");
     let reason = match why {
         Some(w) => format!("failed on this machine because a command wasn't there: `{w}`"),

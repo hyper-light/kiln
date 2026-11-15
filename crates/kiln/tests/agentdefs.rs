@@ -185,3 +185,88 @@ fn p5_1_an_agent_naming_an_unknown_harness_is_refused() -> anyhow::Result<()> {
     anyhow::ensure!(s(&now, "/harness") == "goose" && now.get("version") == Some(&json!(1)), "as it was: {now}");
     Ok(())
 }
+
+/// P5.1, kiln's own (the person, 2026-11-14: "One per ci skill and one for each harness we support.
+/// Also don't forget the ask/about popup agents"): agentdefs.list shows them beside a person's own,
+/// read only: one per CI skill kiln ships, one per harness in kiln's Agentfile for it, and the agents
+/// kiln starts from its UI (the about card, the same for code no agent made, an attachment's agent, a
+/// review agent, the tool fixer), each of them settings kiln runs (agentdefs.check passes it). One is
+/// copied as yours and edited, on REST and MCP; kiln's own can't be changed, restored or deleted.
+/// Only a replaceable one of kiln's takes a stand-in, and only one of your own (P5.1b; the stand-in
+/// at work is `agentdefs::tests`'). Taking the read-only rule out of `agentdefs::record` answers 404,
+/// not 403.
+#[test]
+fn p5_1_kilns_own_agent_definitions_are_listed_copied_and_read_only() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let srv = start_env(dir.path(), &Options::default(), false, &[])?;
+    let ada = person(&srv, "ada", &["developer"])?;
+    let harnesses = ["claude", "codex", "devin", "gemini", "opencode", "goose", "amp", "antigravity", "cursor", "pi"];
+    let mut want: Vec<String> = ["author", "diagnose", "runners", "review", "migrate", "secrets", "performance"].iter().map(|s| format!("kiln-ci-{s}")).collect();
+    want.extend(harnesses.iter().map(|h| format!("harness-{h}")));
+    want.extend(["kiln-about", "kiln-about-code", "kiln-attach", "kiln-review", "kiln-toolfix"].map(str::to_owned));
+
+    let (st, listed) = call(&srv, &ada, "GET", "/api/agentdefs", None)?;
+    let builtin: Vec<Value> = listed.get("builtin").and_then(Value::as_array).cloned().unwrap_or_default();
+    let names: Vec<String> = builtin.iter().map(|b| s(b, "/name")).collect();
+    anyhow::ensure!(st == 200 && names == want && listed.get("agents") == Some(&json!([])), "{st} {names:?}\n{listed}");
+    for b in &builtin {
+        anyhow::ensure!(s(b, "/id") == format!("kiln:{}", s(b, "/name")), "{b}");
+        let mut settings = json!({});
+        for k in ["harness", "model", "instructions", "tools", "mcp", "skills", "limits", "agentfile"] {
+            if let (Some(o), Some(v)) = (settings.as_object_mut(), b.get(k)) {
+                o.insert(k.into(), v.clone());
+            }
+        }
+        let (st, checked) = call(&srv, &ada, "POST", "/api/agentdefs/check", Some(settings))?;
+        anyhow::ensure!(st == 200 && checked.get("ok") == Some(&json!(true)), "{}: {st} {checked}", s(b, "/name"));
+    }
+    let ci = builtin.iter().find(|b| s(b, "/name") == "kiln-ci-author").cloned().unwrap_or_default();
+    anyhow::ensure!(ci.get("skills") == Some(&json!(["kiln-ci-author"])) && s(&ci, "/instructions").contains("skill://kiln-ci-author/SKILL.md"), "{ci}");
+    for h in harnesses {
+        let b = builtin.iter().find(|b| s(b, "/name") == format!("harness-{h}")).cloned().unwrap_or_default();
+        anyhow::ensure!(s(&b, "/harness") == h && s(&b, "/agentfile") == format!("harness-{h}"), "{b}");
+    }
+    let replaceable: Vec<String> = builtin.iter().filter(|b| b.get("replaceable") == Some(&json!(true))).map(|b| s(b, "/name")).collect();
+    anyhow::ensure!(replaceable == ["kiln-about", "kiln-about-code"] && listed.get("uses") == Some(&json!({})), "{replaceable:?} {listed}");
+    let review = builtin.iter().find(|b| s(b, "/name") == "kiln-review").cloned().unwrap_or_default();
+    anyhow::ensure!(s(&review, "/instructions").contains("ci.diffs.review gives your verdict") && s(&review, "/instructions").contains("incidents.report"), "{review}");
+    let (failed, said) = mcp(&srv, &ada, "agentdefs_get", json!({ "id": "kiln:kiln-about" }))?;
+    anyhow::ensure!(!failed && said.contains("## What it is") && said.contains("<selection>"), "the about card's brief: {said}");
+
+    // Kiln's own are read only.
+    for (method, path, body) in [
+        ("PATCH", "/api/agentdefs/kiln:kiln-about", Some(json!({ "instructions": "mine" }))),
+        ("POST", "/api/agentdefs/kiln:kiln-about/restore", Some(json!({ "version": 1 }))),
+        ("DELETE", "/api/agentdefs/kiln:kiln-about", None),
+    ] {
+        let (st, said) = call(&srv, &ada, method, path, body)?;
+        anyhow::ensure!(st == 403 && said.to_string().contains("kiln:kiln-about is kiln's own agent definition: copy it as yours"), "{method} {path}: {st} {said}");
+    }
+
+    // Copied as hers: her own, version 1, its settings kiln's; then hers to change.
+    let (st, copied) = call(&srv, &ada, "POST", "/api/agentdefs/kiln:kiln-ci-author/copy", Some(json!({})))?;
+    anyhow::ensure!(st == 200 && s(&copied, "/owner").starts_with("user:") && s(&copied, "/name") == "kiln-ci-author" && copied.get("version") == Some(&json!(1)), "{st} {copied}");
+    anyhow::ensure!(copied.get("instructions") == ci.get("instructions") && copied.get("skills") == ci.get("skills"), "{copied}");
+    let id = s(&copied, "/id");
+    let (st, edited) = call(&srv, &ada, "PATCH", &format!("/api/agentdefs/{id}"), Some(json!({ "instructions": "Author it my way." })))?;
+    anyhow::ensure!(st == 200 && edited.get("version") == Some(&json!(2)) && s(&edited, "/instructions") == "Author it my way.", "{st} {edited}");
+    let (failed, said) = mcp(&srv, &ada, "agentdefs_copy", json!({ "id": "kiln:harness-codex", "name": "my-codex" }))?;
+    anyhow::ensure!(!failed && said.contains("\"name\":\"my-codex\"") && said.contains("\"agentfile\":\"harness-codex\""), "her tool: {said}");
+    // Her copy may stand in for kiln's about card for her; not for one of kiln's that isn't a UI agent
+    // it starts for her, and not another person's copy.
+    let bo = person(&srv, "bo", &["developer"])?;
+    let (_, his) = call(&srv, &bo, "POST", "/api/agentdefs/kiln:kiln-about/copy", Some(json!({})))?;
+    let (st, said) = call(&srv, &ada, "POST", "/api/agentdefs/use", Some(json!({ "builtin": "kiln:kiln-about", "id": s(&his, "/id") })))?;
+    anyhow::ensure!(st == 404, "his copy: {st} {said}");
+    let (st, said) = call(&srv, &ada, "POST", "/api/agentdefs/use", Some(json!({ "builtin": "kiln:kiln-ci-author", "id": id })))?;
+    anyhow::ensure!(st == 400 && said.to_string().contains("kiln:kiln-about, kiln:kiln-about-code"), "{st} {said}");
+    let (st, used) = call(&srv, &ada, "POST", "/api/agentdefs/use", Some(json!({ "builtin": "kiln:kiln-about", "id": id })))?;
+    anyhow::ensure!(st == 200 && used == json!({ "uses": { "kiln:kiln-about": id } }), "{st} {used}");
+    let (_, his_list) = call(&srv, &bo, "GET", "/api/agentdefs", None)?;
+    anyhow::ensure!(his_list.get("uses") == Some(&json!({})), "only her use changes: {his_list}");
+    let (_, after) = call(&srv, &ada, "GET", "/api/agentdefs", None)?;
+    anyhow::ensure!(after.get("uses") == Some(&json!({ "kiln:kiln-about": id })), "{after}");
+    let theirs: Vec<String> = after.get("builtin").and_then(Value::as_array).into_iter().flatten().map(|b| s(b, "/name")).collect();
+    anyhow::ensure!(theirs == want && after.get("agents").and_then(Value::as_array).map(Vec::len) == Some(2), "kiln's own as they were: {after}");
+    Ok(())
+}

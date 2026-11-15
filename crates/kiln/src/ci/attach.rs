@@ -1085,10 +1085,17 @@ async fn review_detail(hub: &Hub, diff: &str, by: &str, url: &str) -> String {
             b.push_str(&format!("\n- {t} on {at}, by {who}: {}", said.lines().next().unwrap_or_default()));
         }
     }
-    b.push_str(&format!(
-        "\n\nReview it as a reviewer would: ci.diffs.files and ci.diffs.interdiff read it; ci.diffs.comment {{\"diff\": \"{diff}\", \"file\": …, \"start_line\": …, \"body\": …, \"publish\": true}} comments on its lines; ci.diffs.reply answers a thread; ci.diffs.resolve resolves one that's fixed; ci.diffs.review gives your verdict. What you say is signed as you, for whoever attached you. You can't push or land it."
-    ));
+    b.push_str("\n\n");
+    b.push_str(&review_how(diff));
     b
+}
+
+/// How a review agent reviews change `diff`, and what it can't do (W26-R18): the end of what it's
+/// given ([`review_detail`]), and of kiln's own agent definition for it (`crate::agentdefs::builtin`).
+pub(crate) fn review_how(diff: &str) -> String {
+    format!(
+        "Review it as a reviewer would: ci.diffs.files and ci.diffs.interdiff read it; ci.diffs.comment {{\"diff\": \"{diff}\", \"file\": …, \"start_line\": …, \"body\": …, \"publish\": true}} comments on its lines; ci.diffs.reply answers a thread; ci.diffs.resolve resolves one that's fixed; ci.diffs.review gives your verdict. What you say is signed as you, for whoever attached you. You can't push or land it."
+    )
 }
 
 /// Change `diff`'s reviewer asked as `who` (`agent:review`) is review agent session `agent`, as review
@@ -1259,8 +1266,8 @@ async fn over_budget(hub: &Arc<Hub>, a: &Attachment, all: &[Incident]) -> Option
 }
 
 /// What an incident's agent is given: who it is, what happened, what it may do, its playbook, and
-/// how it reports.
-fn bundle(a: &Attachment, i: &Incident, t: &Trigger, earlier: &[&Incident]) -> String {
+/// how it reports; kiln's own agent definitions show it too (`crate::agentdefs::builtin`).
+pub(crate) fn bundle(a: &Attachment, i: &Incident, t: &Trigger, earlier: &[&Incident]) -> String {
     let mut b = format!("You are {}, attached to {} in kiln, and this woke you ({}): {}\n\n{}", a.name, a.on, t.wake, t.title, t.detail);
     if !earlier.is_empty() {
         b.push_str("\n\nThe same thing before:");

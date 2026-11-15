@@ -163,6 +163,16 @@ async fn start(cx: Cx, v: Value) -> Out {
     }
 }
 
+/// An about card's mode: read-only, in the harnesses that have such a mode; the others start within
+/// what the agent has.
+fn read_only_mode(kind: &str) -> Option<String> {
+    match kind {
+        "claude" => Some("plan".to_owned()),
+        "codex" => Some("read-only".to_owned()),
+        _ => None,
+    }
+}
+
 /// The four parts an answer about a piece of code comes in (the UI reads them by these headings).
 pub const ABOUT_PARTS: [&str; 4] = ["What it is", "What it does here", "Used elsewhere", "Worth knowing"];
 
@@ -225,14 +235,12 @@ async fn about(cx: Cx, v: Value) -> Out {
         return Ok(json!({"agents": [], "itself": true, "sent": sent}));
     }
     let by = Starter { parent: Some(info.clone()), opener: cx.caller.opener(), actor: cx.caller.name.clone(), plan_run: None, asker: Some(cx.caller.clone()) };
-    // Read-only, in the harnesses that have such a mode; the others start within what the agent has.
-    let mode = match info.kind.as_str() {
-        "claude" => Some("plan".to_owned()),
-        "codex" => Some("read-only".to_owned()),
-        _ => None,
-    };
+    let mode = read_only_mode(&info.kind);
     let name = format!("About {}", selection.unwrap_or(&path).chars().take(48).collect::<String>());
     let ask = Ask { kind: info.kind.clone(), prompt: Some(prompt), mode, name: Some(name), helper: Some(super::about::ABOUT.to_owned()), ..Ask::default() };
+    // The asker's own copy of kiln's about card, where one stands in for it (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.1b).
+    let person = lineage::person_of(&cx.caller);
+    let ask = crate::agentdefs::uses::ask_for(&cx.hub, person.as_deref(), crate::agentdefs::builtin::ABOUT, ask, read_only_mode).await.map_err(crate::agentdefs::ops::fail)?;
     let infos = lineage::start(&cx.hub, &by, ask).await?;
     // It's the card's: ended once no card reads it (`super::about`).
     for i in &infos {
