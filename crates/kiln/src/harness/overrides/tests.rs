@@ -5,6 +5,9 @@
 //! which records each change its run takes. What's checked is what a person and a client see: `agents.get`, what the
 //! harness was told, and what the microVM took.
 
+// Most of these start a stand-in harness, which they do on Unix alone: elsewhere what only they use is unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;

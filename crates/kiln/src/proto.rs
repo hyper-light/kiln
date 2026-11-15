@@ -802,7 +802,12 @@ pub mod feature {
     /// admission holds it as an owner probes it. A runner that didn't name it is held to it by the
     /// server alone.
     pub const RUNNER_ENGINE: &str = "runner.engine";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE];
+    /// This runner takes the room its hand-overs' spools leave as the server says it
+    /// ([`super::ServerMsg::AdoptPolicy`]; CP-T3.2), each time it names this: a session moved to it
+    /// from another machine is taken over under it. A runner that didn't name it hears it only with
+    /// a transfer's offer, as before, and refuses a move until then.
+    pub const ADOPT_POLICY: &str = "reach.adopt-policy";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1203,6 +1208,14 @@ pub enum ServerMsg {
     /// decides. Only to runners that named [`feature::RUNNER_ENGINE`], as they name it and whenever it
     /// changes. Appended last, after `HarnessHistoryFor`: postcard encodes variants by index.
     RunnerEngine { json: String },
+    /// The room a hand-over's spool leaves on this runner's volume (JSON
+    /// [`crate::harness::moving::stream::Told`]: the operator's floor, or none set; CP-T3.2). A
+    /// runner takes no session over until it knows it, forgets it as its server drops, and heard
+    /// it only with a transfer's offer (`HarnessMailTransfer`), which a move between machines
+    /// doesn't make: every such move was refused. Only to runners that named
+    /// [`feature::ADOPT_POLICY`], as they name it. Appended last, after `RunnerEngine`: postcard
+    /// encodes variants by index.
+    AdoptPolicy { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2054,8 +2067,9 @@ mod tests {
         // owners 74; an owner's word on a session's start 69, and the ask for it 75; the keeper's rules and ask 76.
         // W20-R01 appended Skills and SkillFile in each direction (70/71 and 77/78), and W20's retained mail its
         // transfer, HarnessMailTransfer, in each (72 and 79); plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5 a history
-        // asked for a person, HarnessHistoryFor (80); kiln plan 01a1dd2e… P2.3 a runner's engine, RunnerEngine (81).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (73, 82), "each table has every variant once");
+        // asked for a person, HarnessHistoryFor (80); kiln plan 01a1dd2e… P2.3 a runner's engine, RunnerEngine (81);
+        // CP-T3.2 the room a hand-over's spool leaves, AdoptPolicy (82).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (73, 83), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -2282,6 +2296,7 @@ mod tests {
             ("HarnessMailTransfer", ServerMsg::HarnessMailTransfer { json: "{}".into() }),
             ("HarnessHistoryFor", ServerMsg::HarnessHistoryFor { req: 1, json: "{}".into() }),
             ("RunnerEngine", ServerMsg::RunnerEngine { json: "{}".into() }),
+            ("AdoptPolicy", ServerMsg::AdoptPolicy { json: "{}".into() }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

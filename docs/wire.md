@@ -692,6 +692,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   (`ServerMsg::RunnerEngine`; kiln plan 01a1dd2e…, P2.3), keeps it for its restarts and writes it into
   its facts, so its own admission holds it; a runner that didn't name it is held to it by the server
   alone.
+  `reach.adopt-policy`: the runner takes the room its hand-overs' spools leave on its volume as the
+  server says it (`ServerMsg::AdoptPolicy`; CP-T3.2), each time it names this, and takes sessions
+  over from other machines under it; a runner that didn't name it hears it only with a transfer's
+  offer (`HarnessMailTransfer`), and refuses a move until then.
 
 ## Registry
 
@@ -754,6 +758,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 79 | `HarnessMailTransfer` | | this line: durable journal transfer phase, to a runner that named `mail-transfer` |
 | `ServerMsg` | 80 | `HarnessHistoryFor` | | main (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5): a machine's past sessions for a person, JSON, to a runner that named `harness.history-volumes` |
 | `ServerMsg` | 81 | `RunnerEngine` | | main (kiln plan 01a1dd2e…, P2.3): a runner's engine as its owner set it, JSON, to a runner that named `runner.engine` |
+| `ServerMsg` | 82 | `AdoptPolicy` | | main (CP-T3.2): the room a hand-over's spool leaves on a runner's volume, JSON, to a runner that named `reach.adopt-policy` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -1012,6 +1017,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessMailTransfer` | command, refused while away | Apply the authoritative durable transfer phase for one exact manifest. | Persisted destination readiness precedes source permission to send; Committed precedes activation. |
 | `HarnessHistoryFor` | ask | `HarnessHistory` for a person (`aisessions::Asked`, JSON: `{kind, limit, person}`, the person whoever asked the server): the machine's past sessions with those kept in that person's microVM volumes there, each saying it ran in one (`isolation`). Answered by `HarnessHistory`. | New: to runners that named `harness.history-volumes`; a runner that didn't is asked `HarnessHistory`, and lists its own alone. |
 | `RunnerEngine` | state | What the runner's owner set on the server for its engine (`harness::engine::Asked`, JSON: `{engine, version}`, `engine` `host`, `microvm` or null for what it can do, `version` how many times it was set): kept in its state folder for its restarts and written into its facts (`isolation.engine`, `virt.microvm` only on `microvm`), which it says again at once; a `HarnessOpen` whose spec was decided under another `version` (`engine_version`) is refused. A barrier against session commands. The newest wins. | New: to runners that named `runner.engine`, as they name it and whenever it changes. |
+| `AdoptPolicy` | state | The room a hand-over's spool leaves on this runner's volume (`harness::moving::stream::Told`, JSON: `{disk_floor}`, the operator's `[ci.scheduler.admission] disk_free` in bytes, or null for none set): its reach node takes sessions over from other machines under it (docs/reach.md §8), and forgets it as its server drops. Until it knows it, it refuses every hand-over. The newest wins. | New: to runners that named `reach.adopt-policy`, as they name it (each time they connect). |
 
 ## Commands to a session: `Command`
 
@@ -1068,6 +1074,7 @@ travels in `HarnessCmd`.
 | `Perms` | command, refused while away | What a person lets a session (and its harness's subagents) or one of those subagents do; they set it again if it didn't apply. The server narrows a session's to its parent's, and the subagents kiln started under it to it. | New. A runner from before it can't read it, and says so. |
 | `Branch` | command, refused while away | A person's branch of a session, or of one of its harness's subagents: a new session on its machine from the conversation so far, beside it or of its own. They branch again if it didn't go. | New. A runner from before it can't read it, and says so. |
 | `RemoveTask` | command, refused while away | A person's Remove of one of a session's harness subagents that ended: it leaves the session's tasks for good. They remove it again if it didn't go. | New: a session whose features have `remove_task` takes it. |
+| `Override` | command, refused while away | A person's change of a live override of a session, in place: a port, an egress grant, a network or a volume (kiln plan 01a1dd2e…, P6b.4). Its session takes it as its own record, then its microVM and its harness, each as it can, and keeps it for its harness's every start. They make it again if it didn't apply. | New. A runner from before it can't read it, and says so. |
 
 ## Updates of a session: `Update`
 
