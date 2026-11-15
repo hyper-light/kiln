@@ -69,7 +69,8 @@ function wakesOf(on: string): readonly string[] {
 
 /** What wakes it, in words; its agent. */
 const wakeWords = (wake: string[]) => wake.map((w) => WAKE_WORDS[w] ?? w).join(", ");
-const agentWords = (r: AttachmentRow) => (r.attachment.session ? "a live agent" : (HARNESSES.find((h) => h.value === (r.attachment.harness?.kind ?? KILNS))?.label ?? r.attachment.harness?.kind ?? "no agent"));
+const agentWords = (r: AttachmentRow) =>
+  r.attachment.session ? "a live agent" : (HARNESSES.find((h) => h.value === (r.attachment.harness?.kind ?? KILNS))?.label ?? r.attachment.harness?.kind ?? "no agent");
 
 /**
  * "Watched by", where what they watch is: its own row, then each attached agent's chip (what of it
