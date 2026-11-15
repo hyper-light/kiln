@@ -201,7 +201,14 @@ impl Running {
 }
 
 /// Spawn `cmd` in a new process group with piped output.
-pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
+pub fn spawn_group(cmd: Command) -> anyhow::Result<Running> {
+    spawn_group_at(cmd, None)
+}
+
+/// [`spawn_group`], its pipes read and its exit awaited on shard `home` where one's named (the shard
+/// of the task that takes its output, when it's spawned from the blocking pool:
+/// `crate::runner::cpus::spawn_step`), else where `crate::rt::spawn` puts them.
+pub fn spawn_group_at(mut cmd: Command, home: Option<usize>) -> anyhow::Result<Running> {
     use std::os::unix::process::CommandExt as _;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
@@ -217,7 +224,7 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
             continue;
         }
         let tx = tx.clone();
-        crate::rt::spawn(async move {
+        spawn_at(home, async move {
             let mut buf = vec![0u8; CHUNK];
             while let Ok(Some(n)) = read_chunk(&fd, &mut buf).await {
                 if tx.send(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).await.is_err() {
@@ -228,7 +235,7 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
     }
     drop(tx);
     let (exit_tx, exit_rx) = oneshot::channel();
-    crate::rt::spawn(async move {
+    spawn_at(home, async move {
         let code = wait_child(&mut child).await.ok().and_then(|s| s.code());
         let _ = exit_tx.send(code);
     });

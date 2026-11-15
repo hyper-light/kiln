@@ -4995,7 +4995,7 @@ impl Registry {
         // at its latest version, for its machine to build its microVM from again, as at its start (kiln
         // plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5; `lineage::kept_agentfile`).
         let person = pkg.spec.isolation.as_ref().and_then(|i| i.person.clone());
-        pkg.spec.agentfile = super::lineage::kept_agentfile(hub, pkg.spec.isolation.as_ref(), person.as_deref()).await?;
+        super::lineage::kept_agentfile(hub, pkg.spec.isolation.as_ref(), person.as_deref()).await?.into_spec(&mut pkg.spec);
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();

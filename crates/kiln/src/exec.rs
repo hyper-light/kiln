@@ -457,7 +457,8 @@ impl Exec {
         // a kiln it starts holds its agents there, never in the runner's (the 2026-10-29 outage).
         crate::runner::freeze::enter(&self.assign.job_id, &mut cmd);
         // On the CPUs its job may use: its own share, or what no share holds (W05-R03).
-        let mut running = crate::runner::cpus::spawn_on(&self.assign.job_id, move || crate::proc::spawn_group(cmd))?;
+        // Off the shard: joining a frozen job's cgroup holds the spawn until it's let go on.
+        let mut running = crate::runner::cpus::spawn_step(&self.assign.job_id, cmd, self.cancel.cancelled()).await?;
         let pgid = running.pgid;
         if let Some(f) = crate::runner::freeze::of(&self.assign.job_id) {
             f.step(&running);

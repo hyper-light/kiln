@@ -4,7 +4,7 @@
 //! hyper-rt readiness fires and exits arrive through a pidfd (Linux) or a short poll (macOS); on
 //! Windows pipes are drained by threads and process trees are job objects.
 
-pub use crate::os::proc::{Detached, Duplex, Running, adopt_duplex, interrupt_group, kill_orphan_group, output, spawn_duplex, spawn_duplex_in, spawn_group, stdout_stream, terminate_group, terminate_tree, wait_pid_exit};
+pub use crate::os::proc::{Detached, Duplex, Running, adopt_duplex, interrupt_group, kill_orphan_group, output, spawn_duplex, spawn_duplex_in, spawn_group, spawn_group_at, stdout_stream, terminate_group, terminate_tree, wait_pid_exit};
 
 /// How long kiln waits for a program asked its version: a runner's tools (`runner::runtime::memo`)
 /// and an upgrade's new kiln (`agent`'s `binary_runs`).

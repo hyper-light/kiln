@@ -252,6 +252,37 @@ kiln's balancer places it, asking that size, and refuses it where it can't (step
 keeps them at `/agents/agentfiles` and chooses one as an agent starts (docs/agents.md, "From an
 Agentfile, in a microVM of its own").
 
+## Your secrets
+
+A person's own secrets (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, decision 6): the `user` scope of
+CI's secrets (docs/ci.md W09), sealed as every scope's are (`crate::secrets::mine`). Each person sets,
+lists and deletes their own; no one else sees them, by name or value: not an admin, not
+`secrets.manage` (`/api/ci/secrets` refuses `scope=user:…` for everyone, 400), not the server's
+owner, whose admin token reaches the owner's own alone. No answer carries a value. An agent lists its
+person's names, to name them in an Agentfile, and sets none (403). Each route is an operation too
+(`secrets.mine.*`: `POST /api/ops/<name>`, kiln's MCP tools `secrets_mine_*`, code mode's
+`kiln.secrets.mine.*`), and each change is audited, by name.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/me/secrets` | `{ secrets: { name, size, created_at, updated_at, last_used_at }[] }`: yours |
+| PUT | `/api/me/secrets/<name>` | `{ value }` → `{ set: true, name }`. `name`: letters, digits and `_`, not starting with a digit (kept upper-case); `value`: 64 KiB at the most (422) |
+| DELETE | `/api/me/secrets/<name>` | `{ deleted: true }`; 404 for a name you hold none of |
+
+One of your own Agentfiles names each secret a build of it is given, by reference:
+`LABEL kiln.secret.<ID>=user:<NAME>`, `<ID>` the build secret Shards reads (`GIT_AUTH_TOKEN`,
+`GIT_AUTH_TOKEN.<host>`, `HTTP_AUTH_HEADER_<host>`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for
+an `AGENT` or `HARNESS` source; any `RUN --mount=type=secret,id=<ID>`), `<NAME>` one of yours. A label
+under `kiln.secret.` that isn't such a reference isn't kept (422, rule `SecretReference`), its words
+never repeating what it held. As an agent of yours starts from that Agentfile, kiln reads each named
+secret from yours; one you hold none of refuses the start before anything is placed (400,
+`… kiln.secret.<ID> names user:<NAME>, which isn't one of your secrets`), whoever's Agentfile has the
+same text. Its runner gives them to that build alone (`shards build --secret id=<ID>,env=…`, the value in
+the build's environment, never on its command line, in a layer or in the session it starts). The build
+is given the Agentfile without its `kiln.secret.` labels (each line kept, so Shards' words name your
+lines), so neither a reference nor a secret's name reaches the image: its config's labels, its build's
+definition and source map, its provenance.
+
 ## WebSockets
 
 * `GET /api/events` — server → client JSON messages:

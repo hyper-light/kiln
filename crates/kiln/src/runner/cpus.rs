@@ -438,6 +438,31 @@ pub fn spawn_on<T>(job: &str, spawn: impl FnOnce() -> T) -> T {
     spawn()
 }
 
+/// Starts step `cmd` of job `job` ([`spawn_on`] its CPUs, in its own process group) on the blocking
+/// pool, never on a shard: the step joins its job's cgroup between fork and exec
+/// (`crate::runner::freeze::enter`), and a job's cgroup can be frozen (headroom paces it for part of
+/// each period; W26-R22 pauses it), and so is a process that joins it, while `spawn` waits for that
+/// exec. On a shard the wait stopped everything else the shard served: the runner's link to the
+/// server, and the headroom controller that would have let the group run again (adacachy2,
+/// 2026-11-15: a frozen leg's step held the runner offline for half an hour). Agents' harnesses
+/// start this way already (`crate::proc::spawn_duplex_in_pool`).
+///
+/// Its pipes are read on the caller's shard. Should `ending` come first (the leg cancelled while the
+/// step waits on its frozen job to start), the job is let go on so the step starts and can be ended,
+/// as a cancel thaws a running step's job.
+pub async fn spawn_step(job: &str, cmd: std::process::Command, ending: impl std::future::Future<Output = ()>) -> anyhow::Result<crate::proc::Running> {
+    let home = crate::rt::shard_index();
+    let owned = job.to_owned();
+    let spawning = Box::pin(crate::rt::blocking(move || spawn_on(&owned, move || crate::proc::spawn_group_at(cmd, home))));
+    match futures::future::select(spawning, Box::pin(ending)).await {
+        futures::future::Either::Left((started, _)) => started?,
+        futures::future::Either::Right(((), spawning)) => {
+            super::freeze::thaw(job).await;
+            spawning.await?
+        }
+    }
+}
+
 /// A step's process group, counted while it runs, so a share taken or let go meanwhile moves it.
 pub struct Step {
     job: String,
