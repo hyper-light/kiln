@@ -99,7 +99,21 @@ pub enum Charge {
     LastRead,
 }
 
-/// A run's charge as [`USE`] keeps it: Hex's [`HostUse`], its window in nanoseconds, and which use it is.
+/// What a VM process's counters say it cost its host in all, its vCPUs' guest time among it (Shards' D265, Hex's
+/// `HostUse::charged`): its CPU time where its OS charges its vCPUs' guest time to it (`ToThread`: Linux's KVM,
+/// macOS' Hypervisor.framework, Windows' root scheduler), that and its vCPUs' guest time beside it where it doesn't
+/// (`Apart`: Windows' classic scheduler), and where its run host can't say (`Unknown`), no less than its vCPUs ran.
+pub fn host_cpu_ns(used: &HostUse) -> u64 {
+    let guest = used.guest_ns.iter().fold(0u64, |all, n| all.saturating_add(*n));
+    match used.charged {
+        hex_api::Charged::ToThread => used.cpu_ns,
+        hex_api::Charged::Apart => used.cpu_ns.saturating_add(guest),
+        hex_api::Charged::Unknown => used.cpu_ns.max(guest),
+    }
+}
+
+/// A run's charge as [`USE`] keeps it: Hex's [`HostUse`] (its CPU time all it cost its host, its vCPUs' guest time
+/// among it: [`host_cpu_ns`]), its window in nanoseconds, and which use it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Charged {
     pub of: Charge,
@@ -113,7 +127,7 @@ pub struct Charged {
 impl Charged {
     pub fn of(used: &HostUse, of: Charge) -> Self {
         let window_ns = u64::try_from(used.window.as_nanos()).unwrap_or(u64::MAX);
-        Charged { of, cpu_ns: used.cpu_ns, footprint_bytes: used.footprint_bytes, resident_bytes: used.resident_bytes, guest_ns: used.guest_ns.clone(), window_ns }
+        Charged { of, cpu_ns: host_cpu_ns(used), footprint_bytes: used.footprint_bytes, resident_bytes: used.resident_bytes, guest_ns: used.guest_ns.clone(), window_ns }
     }
 }
 
@@ -156,11 +170,11 @@ impl Meter {
         let now = self.0.runtime.host_use(&self.0.id)?;
         let mut last = self.0.last.lock();
         let (cpu0, window0) = match &*last {
-            Some((u, Charge::LastRead)) if u.window <= now.window => (u.cpu_ns, u.window),
+            Some((u, Charge::LastRead)) if u.window <= now.window => (host_cpu_ns(u), u.window),
             _ => (0, Duration::ZERO),
         };
         let span = now.window.saturating_sub(window0).as_nanos();
-        let milli = u128::from(now.cpu_ns.saturating_sub(cpu0)).saturating_mul(1000) / span.max(1);
+        let milli = u128::from(host_cpu_ns(&now).saturating_sub(cpu0)).saturating_mul(1000) / span.max(1);
         let used = Used { cpu_milli: u64::try_from(milli).unwrap_or(u64::MAX), footprint_bytes: now.footprint_bytes };
         // Once its delete has answered a final use, that use is what the run is charged: no read replaces it.
         if !matches!(*last, Some((_, Charge::Final))) {
@@ -1094,12 +1108,26 @@ pub(crate) mod tests {
     /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
     /// growth since the read before, not its whole run's.
     fn use_at(n: u64) -> HostUse {
-        HostUse { cpu_ns: n * n * 1_000_000, footprint_bytes: (64 << 20) + n, resident_bytes: (80 << 20) + n, guest_ns: vec![n * 500_000], window: Duration::from_millis(n * 4) }
+        HostUse { cpu_ns: n * n * 1_000_000, footprint_bytes: (64 << 20) + n, resident_bytes: (80 << 20) + n, guest_ns: vec![n * 500_000], window: Duration::from_millis(n * 4), charged: hex_api::Charged::ToThread }
     }
 
     /// A VM's final use, as its delete reads it with its end.
     fn final_use() -> HostUse {
-        HostUse { cpu_ns: 90_000_000, footprint_bytes: 96 << 20, resident_bytes: 112 << 20, guest_ns: vec![70_000_000], window: Duration::from_secs(1) }
+        HostUse { cpu_ns: 90_000_000, footprint_bytes: 96 << 20, resident_bytes: 112 << 20, guest_ns: vec![70_000_000], window: Duration::from_secs(1), charged: hex_api::Charged::ToThread }
+    }
+
+    /// D265: a VM's host CPU is its process's CPU time where its OS charges its vCPUs' guest time to it, that and its
+    /// vCPUs' beside it where it doesn't, and, where its run host can't say, no less than its vCPUs ran.
+    #[test]
+    fn a_vms_host_cpu_counts_its_guest_time_once_however_its_os_charges_it() {
+        let at = |charged| HostUse { cpu_ns: 30, guest_ns: vec![50, 20], charged, ..HostUse::default() };
+        assert_eq!(host_cpu_ns(&at(hex_api::Charged::ToThread)), 30);
+        assert_eq!(host_cpu_ns(&at(hex_api::Charged::Apart)), 100);
+        assert_eq!(host_cpu_ns(&at(hex_api::Charged::Unknown)), 70);
+        let held = HostUse { cpu_ns: 90, guest_ns: vec![50, 20], ..HostUse::default() };
+        assert_eq!(host_cpu_ns(&held), 90, "unknown, its CPU time past its guest time's is all of it");
+        let huge = HostUse { cpu_ns: u64::MAX, guest_ns: vec![u64::MAX, 1], charged: hex_api::Charged::Apart, ..HostUse::default() };
+        assert_eq!(host_cpu_ns(&huge), u64::MAX, "saturates, never wraps");
     }
 
     impl Runtime for Metered {
