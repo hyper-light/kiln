@@ -1751,8 +1751,8 @@ impl Pace {
     /// its feed goes with it.
     pub fn stop(&mut self, f: &Fixture, id: &str) -> anyhow::Result<()> {
         // Longer than the server waits for its runner's answer (`hub::COMMAND_WITHIN`).
-        let (code, body) = common::http_within(f.port, "DELETE", &format!("/api/harness/sessions/{id}"), &f.admin, None, Duration::from_secs(75))?;
-        anyhow::ensure!(code == 204, "ending {id}: {code} {body}");
+        let (code, body) = common::http_within(f.port, "DELETE", &format!("/api/harness/agents/{id}"), &f.admin, None, Duration::from_secs(75))?;
+        anyhow::ensure!(code == 200, "ending {id}: {code} {body}");
         self.feeds.remove(id);
         self.unlisted(f, id, &format!("ending {id}"))
     }

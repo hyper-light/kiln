@@ -31,7 +31,12 @@ async fn session(hub: &Hub, id: &str, parent: Option<&str>, person: &str, last_t
 /// A hub with runner `box` and the owner's agents on it: `chat` (a person talks to it), `kid` (which
 /// `chat` started), `other` (another of the owner's, which it didn't); and `bos`, user `bo`'s.
 async fn hub() -> anyhow::Result<Arc<Hub>> {
-    let hub = crate::hub::tests::scratch_hub().await?;
+    hub_with(false).await
+}
+
+/// [`hub`], with deployments on (`cd`) or not.
+async fn hub_with(cd: bool) -> anyhow::Result<Arc<Hub>> {
+    let hub = crate::hub::tests::scratch_hub_with(|c| c.cd.enabled = cd).await?;
     hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
     session(&hub, "chat", None, "owner", None).await?;
     session(&hub, "kid", Some("chat"), "owner", None).await?;
@@ -182,6 +187,48 @@ fn p5_6_a_destructive_op_waits_for_the_click_held_to_its_target_until_the_person
         says(&hub, "chat").await;
         let late = call(owner, "confirms.answer", json!({"id": id, "yes": true})).await;
         anyhow::ensure!(code(&late) == 409 && late.as_ref().err().is_some_and(|(_, m)| m.contains("dropped")), "{late:?}");
+        Ok(())
+    })
+}
+
+/// P5.6's slice S1: the Agents page's Remove is an operation (`agents.remove`, its route `DELETE
+/// /api/harness/agents/{agent}`; the bare `DELETE /api/harness/sessions/{id}` is gone), held to the same
+/// gate as every other: in the owner's chat turn its own child goes at once, another of theirs waits on
+/// their click; and the click confirms it, run as theirs and audited as them, the turn's person on the
+/// row of what the agent did at once. With deployments on, their destructive operations wait as kiln's
+/// own do, and an agent on its own is refused them: the gate is before every dispatch.
+#[test]
+fn p5_6_s1_remove_is_an_operation_held_to_the_gate_as_deployments_are() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub_with(true).await?;
+        let alone = agent(&hub, "chat").await?;
+        let cd = call(alone, "cd.apps.delete", json!({"app": "web"})).await;
+        anyhow::ensure!(code(&cd) == 403 && cd.as_ref().err().is_some_and(|(_, m)| m.contains("isn't serving a person's chat turn")), "deployments' ops on its own: {cd:?}");
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let cd = call(chat.clone(), "cd.apps.delete", json!({"app": "web"})).await;
+        anyhow::ensure!(code(&cd) == 428, "deployments' ops in a person's turn wait: {cd:?}");
+
+        let kid = call(chat.clone(), "agents.remove", json!({"agent": "kid"})).await;
+        anyhow::ensure!(code(&kid) == 200 && kid.as_ref().ok().and_then(|v| v.get("removed")) == Some(&json!("kid")), "its own child, at once: {kid:?}");
+        let other = call(chat.clone(), "agents.remove", json!({"agent": "other"})).await;
+        anyhow::ensure!(code(&other) == 428, "{other:?}");
+        let id = asked(&hub).await?.iter().find(|a| a.get("op") == Some(&json!("agents.remove"))).and_then(|a| a.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+        call(person(&hub), "confirms.answer", json!({"id": id, "yes": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+        let removed = call(chat, "agents.remove", json!({"agent": "other"})).await;
+        anyhow::ensure!(code(&removed) == 200, "confirmed: {removed:?}");
+        let rows: Vec<(String, String, String)> = hub
+            .store
+            .call(|c| {
+                let mut st = c.prepare("SELECT principal, target, detail FROM audit2 WHERE action LIKE 'DELETE %' AND target LIKE '/api/harness/agents/%' ORDER BY id")?;
+                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await?;
+        // The one that waited ran nothing, and wrote no row: the two that ran did.
+        anyhow::ensure!(rows.len() == 2, "{rows:?}");
+        anyhow::ensure!(rows.iter().any(|(p, _, d)| p.starts_with("agent:chat") && d.contains("in owner's chat turn")), "what it did at once says whose turn: {rows:?}");
+        anyhow::ensure!(rows.iter().any(|(p, _, d)| p == "admin" && d.contains("confirmed by owner's click")), "the confirmed one is the owner's: {rows:?}");
         Ok(())
     })
 }

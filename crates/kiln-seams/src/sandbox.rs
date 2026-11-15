@@ -295,6 +295,14 @@ pub struct Launch {
     /// its boundary, toward the hosts its grant names alone; none by default, when nothing is
     /// filled in toward any host. A value is never here.
     pub credentials: Vec<CredentialGrant>,
+    /// Where a folder may be plugged into it while it runs (kiln plan 01a1dd2e…, P6b.4; Shards'
+    /// `ImageSpec::plug_roots`, D271): top-level directories of its boundary (`/volumes`), none of
+    /// its init's own (`/proc`, `/sys`, `/dev`, `/tmp`, `/etc`, `/run`), each once; beside them,
+    /// each share's top-level directory. A plug ([`Change::Plug`]) goes strictly beneath one.
+    pub plug_roots: Vec<String>,
+    /// The most egress it may ever be granted while it runs (Shards' `ImageSpec::egress_ceiling`),
+    /// each `host:port`: a grant past it is refused. None: none is granted live.
+    pub egress_ceiling: Vec<String>,
 }
 
 impl Launch {
@@ -310,6 +318,8 @@ impl Launch {
             egress: Egress::default(),
             boundary: Boundary::Host,
             credentials: Vec::new(),
+            plug_roots: Vec::new(),
+            egress_ceiling: Vec::new(),
         }
     }
 }
@@ -379,10 +389,13 @@ pub struct Member(pub String);
 /// ports and which way, as a launch's are (default deny).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    /// The host's `bind` address and `host_port` (UDP, else TCP) reach `member`'s `guest_port`.
-    Publish { member: Member, bind: String, host_port: u16, guest_port: u16, udp: bool },
-    /// What the host's `bind` and `host_port` reached, unpublished.
-    Unpublish { bind: String, host_port: u16, udp: bool },
+    /// Its `guest_port` (UDP, else TCP) published on the host at `host` (an address; none, every
+    /// one) and `host_port` (0: one the host picks), reaching the members its image gives that port
+    /// coming in, as Shards' `ImageGuest::publish` takes one (D269).
+    Publish { guest_port: u16, udp: bool, host: Option<String>, host_port: u16 },
+    /// The port it publishes at `host` (`address:port`, as bound) let go of, as Shards'
+    /// `ImageGuest::unpublish` takes one (D269).
+    Unpublish { udp: bool, host: String },
     /// `member` may reach `host` (a DNS name or an address) on `port`.
     Grant { member: Member, host: String, port: u16 },
     /// That grant taken back: its next connection there is refused.
@@ -390,10 +403,29 @@ pub enum Change {
     /// `member` joins the named `network`, shared with the runs connected to it.
     Connect { member: Member, network: String },
     Disconnect { member: Member, network: String },
-    /// The machine's folder plugged in for `members`, at its share's path, writable as it says.
-    Plug { share: Share, members: Vec<Member> },
+    /// `source` plugged into the members `to` at `at` (absolute, strictly beneath one of its plug
+    /// roots: its launch's [`Launch::plug_roots`] and each share's top-level directory), read-only
+    /// where it says, as Shards' `ImageGuest::plug` takes one (D271).
+    Plug { source: PlugSource, to: PlugFor, at: String, read_only: bool },
     /// The folder plugged in at `at`, unplugged.
     Unplug { at: String },
+}
+
+/// What a [`Change::Plug`] gives the members it plugs into, as Shards takes one (D271).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlugSource {
+    /// A folder of the machine's, absolute.
+    Host(String),
+    /// A volume of its boundary's own store, by its name, made where it isn't there.
+    Volume(String),
+}
+
+/// Whom a [`Change::Plug`] plugs into, as Shards takes one (D271): every member that runs, or those
+/// named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlugFor {
+    Every,
+    Members(Vec<Member>),
 }
 
 /// A run under way: what it's given on stdin, what it says (its output, then its end, once), the

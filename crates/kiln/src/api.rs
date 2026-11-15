@@ -1506,20 +1506,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             Some(info) => Ok(pre_encoded(info)),
             None => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
         },
-        (&Method::DELETE, ["api", "harness", "sessions", id]) => {
-            let id = (*id).to_owned();
-            if boxed(|| hub.harness.close(&hub, &id)).await {
-                let _ = boxed(|| crate::goals::forget(&hub, &id)).await;
-                boxed(|| hub.copies.forget_agent(&hub, &id)).await;
-                boxed(|| hub.store.audit("admin".into(), "agent.close".into(), id)).await;
-                Ok(srv::status(StatusCode::NO_CONTENT))
-            } else if hub.harness.info(&id).is_some() {
-                // Its machine kept it: its archive or restore is under way (attention plan 01a199e1b177752e84dad5dc990e6a15).
-                Err(err(StatusCode::CONFLICT, "its archive or restore is under way: end it once that's done"))
-            } else {
-                Err(err(StatusCode::NOT_FOUND, "no such agent session"))
-            }
-        }
+        // Remove an agent: `agents.remove` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S1).
+        (&Method::DELETE, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.remove", json!({ "agent": id }))).await,
         (&Method::POST, ["api", "harness", "broadcast"]) => boxed(|| harness_broadcast(&hub, req)).await,
         (&Method::POST, ["api", "harness", "broadcast", "preview"]) => boxed(|| harness_broadcast_preview(&hub, req)).await,
         (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => boxed(|| harness_recover(&hub, machine, req)).await,

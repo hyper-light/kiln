@@ -350,6 +350,12 @@ pub struct Spec {
     /// harness. Never what was asked, and never kept: its state is their record.
     #[serde(skip)]
     pub dirs: Vec<super::overrides::Dir>,
+    /// The most egress its microVM may be granted while it runs, each `host:port` (kiln plan 01a1dd2e…, P6b.4; Shards'
+    /// `ImageSpec::egress_ceiling`): its person's or org's policy (`[agents] egress_ceiling`), as kiln's server set it
+    /// as it opened, declared at each launch of its microVM. Set by kiln, never from what was asked
+    /// (`Registry::open_as` sets it over what came).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_ceiling: Vec<String>,
 }
 
 /// The id of session `session`'s opening prompt (`Spec::prompt`), its own (CP-T3.2): made once,
@@ -401,6 +407,7 @@ impl Default for Spec {
             variant_of: None,
             opener: None,
             dirs: Vec::new(),
+            egress_ceiling: Vec::new(),
         }
     }
 }
@@ -1280,7 +1287,9 @@ async fn take_override(s: &Session, change: super::overrides::Change, run: Optio
     let said = |core: &mut Core, level: Level, text: String| core.upsert(&format!("override:{}", Core::now()), None, Body::Notice { level, text });
     let taken = {
         let mut core = s.core.lock();
-        match o::check(&change, microvm, kind.id).and_then(|()| o::take(&mut core.state.overrides, &change)) {
+        // In a microVM, within what its launch declared too (its plug roots, its egress ceiling).
+        let fitted = o::check(&change, microvm, kind.id).and_then(|()| if microvm { o::fits(&change, &core.state.overrides) } else { Ok(()) });
+        match fitted.and_then(|()| o::take(&mut core.state.overrides, &change)) {
             Ok(taken) => {
                 core.touch_state();
                 taken
@@ -1344,7 +1353,16 @@ async fn reapply_overrides(s: &Session, run: Option<Arc<crate::sandbox::held::He
     use super::overrides as o;
     let changes = {
         let mut core = s.core.lock();
-        if core.state.overrides.is_empty() {
+        // What its microVM's launch declared of the changes it takes live, for each change asked of it from now on.
+        if let Some(held) = &run {
+            let declared = held.declared();
+            if core.state.overrides.roots != declared.plug_roots || core.state.overrides.ceiling != declared.egress_ceiling {
+                core.state.overrides.roots.clone_from(&declared.plug_roots);
+                core.state.overrides.ceiling.clone_from(&declared.egress_ceiling);
+                core.touch_state();
+            }
+        }
+        if core.state.overrides.ports.is_empty() && core.state.overrides.egress.is_empty() && core.state.overrides.networks.is_empty() && core.state.overrides.volumes.is_empty() {
             return;
         }
         for h in &mut core.state.overrides.volumes {

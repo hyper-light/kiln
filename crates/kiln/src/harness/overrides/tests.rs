@@ -145,11 +145,16 @@ async fn shows(hub: &Arc<Hub>, id: &str, what: &str, check: impl Fn(&Value) -> b
 async fn opened(hub: &Arc<Hub>, id: &str, dir: &Path, program: &Path, isolation: Option<Isolation>) -> anyhow::Result<()> {
     // An isolated one under the claim kiln's balancer would have placed it with (step 32).
     let claim = isolation.as_ref().map(|_| crate::reach::place::Claim { owner: "mac".into(), epoch: 1, run: format!("session-{id}"), fence: kiln_ci::sched::Fence::default() });
-    let spec = Spec { kind: "claude".into(), cwd: Some(dir.to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), isolation, claim, ..Spec::default() };
+    // The most egress it may be granted live, as kiln's server sets it from the org's policy (`[agents] egress_ceiling`).
+    let egress_ceiling = if isolation.is_some() { vec![CEILING.to_owned()] } else { Vec::new() };
+    let spec = Spec { kind: "claude".into(), cwd: Some(dir.to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), isolation, claim, egress_ceiling, ..Spec::default() };
     let s = hub.harness.local.open(Some(id.to_owned()), spec)?;
     until("its harness at rest", || !s.core.lock().meta.features.is_empty() && s.core.lock().state.status == crate::harness::model::Status::Idle).await?;
     until("the server's copy of it", || hub.harness.info(id).is_some()).await
 }
+
+/// The org's policy the tests' microVM sessions start under: the most egress each may be granted live.
+const CEILING: &str = "api.example.com:443";
 
 /// The first held override of `list` (`ports`, `egress`, `networks`, `volumes`) in an `agents.get`, and how `place` took it.
 fn took<'a>(v: &'a Value, list: &str, place: &str) -> Option<&'a str> {
@@ -292,7 +297,7 @@ fn microvms(hub: &Hub, dir: &Path, program: &Path) -> anyhow::Result<Arc<crate::
 #[cfg(unix)]
 #[test]
 fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> anyhow::Result<()> {
-    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, Share};
+    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, PlugFor, PlugSource};
     run(async {
         let hub = hub().await?;
         let dir = tempfile::tempdir()?;
@@ -302,8 +307,15 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         std::fs::create_dir_all(&data)?;
         let data = data.to_string_lossy().into_owned();
         opened(&hub, "vm-live", dir.path(), &program, Some(Isolation::microvm())).await?;
-        let v = get(&hub, "vm-live").await?;
+        // What its launch declared (Shards' ImageSpec::plug_roots and egress_ceiling, D271): its project's top-level
+        // directory and its session's volume root, and the org's ceiling.
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let roots: Vec<String> = crate::sandbox::isolated::plug_root_of(&cwd).into_iter().chain([crate::sandbox::isolated::VOLUMES.to_owned()]).collect();
+        let v = shows(&hub, "vm-live", "what its launch declared", |v| v.pointer("/state/overrides/roots").is_some()).await?;
         anyhow::ensure!(v.pointer("/live/engine") == Some(&json!("microvm")) && v.pointer("/live/ops").and_then(Value::as_array).is_some_and(|o| o.len() == 8), "every operation offered: {v}");
+        anyhow::ensure!(v.pointer("/state/overrides/roots") == Some(&json!(roots)) && v.pointer("/state/overrides/ceiling") == Some(&json!([CEILING])), "{v}");
+        let launched = vms.launched();
+        anyhow::ensure!(launched.first().is_some_and(|l| l.plug_roots == roots && l.egress_ceiling == [CEILING]), "declared at its launch: {launched:?}");
         let member = || SeamMember("claude".into());
         let ask = |name: &'static str, input: Value| {
             let cx = owner(&hub);
@@ -313,9 +325,16 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         ask("sessions.egress.grant", json!({"agent": "vm-live", "host": "API.example.com", "port": 443})).await?;
         ask("sessions.networks.connect", json!({"agent": "vm-live", "network": "team"})).await?;
         ask("sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "ro"})).await?;
-        let plug = Seam::Plug { share: Share { host: data.clone(), at: data.clone(), writable: false }, members: vec![member()] };
+        // Past what its launch declared: egress past its ceiling, a folder outside its plug roots with nothing restarted.
+        let past = call(owner(&hub), "sessions.egress.grant", json!({"agent": "vm-live", "host": "elsewhere.example.com", "port": 443})).await.err().ok_or_else(|| anyhow::anyhow!("egress past its ceiling was taken"))?;
+        anyhow::ensure!(past.0 == http::StatusCode::CONFLICT && past.1.contains("past the most egress"), "{past:?}");
+        let outside = call(owner(&hub), "sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "ro", "at": "/opt/data"})).await.err().ok_or_else(|| anyhow::anyhow!("a folder outside its plug roots was taken"))?;
+        anyhow::ensure!(outside.0 == http::StatusCode::CONFLICT && outside.1.contains("outside every folder") && outside.1.contains(crate::sandbox::isolated::VOLUMES), "{outside:?}");
+        // Beneath its session's volume root by default, plugged as Shards' ImageGuest::plug takes one.
+        let at = format!("{}/data", crate::sandbox::isolated::VOLUMES);
+        let plug = Seam::Plug { source: PlugSource::Host(data.clone()), to: PlugFor::Members(vec![member()]), at: at.clone(), read_only: true };
         let all = vec![
-            Seam::Publish { member: member(), bind: "127.0.0.1".into(), host_port: 8080, guest_port: 3000, udp: false },
+            Seam::Publish { guest_port: 3000, udp: false, host: Some("127.0.0.1".into()), host_port: 8080 },
             Seam::Grant { member: member(), host: "api.example.com".into(), port: 443 },
             Seam::Connect { member: member(), network: "team".into() },
             plug.clone(),
@@ -325,8 +344,9 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         let v = shows(&hub, "vm-live", "each override, taken by its microVM", |v| ["ports", "egress", "networks", "volumes"].iter().all(|l| took(v, l, "microvm") == Some("now"))).await?;
         anyhow::ensure!(took(&v, "volumes", "harness") == Some("now") && took(&v, "volumes", "scope") == Some("now"), "{v}");
         anyhow::ensure!(v.pointer("/state/overrides/volumes/0/volume/access") == Some(&json!("ro")), "{v}");
-        // In place: the same microVM, none launched again, and its harness the same process, told the folder.
-        until("its harness told the folder", || told_dirs(&log) == Some(json!([data.clone()]))).await?;
+        anyhow::ensure!(v.pointer("/state/overrides/volumes/0/volume/at") == Some(&json!(at)), "{v}");
+        // In place: the same microVM, none launched again, and its harness the same process, told the folder where it sees it.
+        until("its harness told the folder", || told_dirs(&log) == Some(json!([at.clone()]))).await?;
         anyhow::ensure!(vms.launched().len() == 1 && said(&log, "start").len() == 1, "one microVM, one harness: {:?}", said(&log, "start"));
         anyhow::ensure!(matches!(hub.harness.info("vm-live").and_then(|i| i.runs), Some(crate::harness::session::Runs::Microvm { vm: Some(ref vm), .. }) if vm == "fake-vm-1"), "the same box");
         // Started again (by force): its next run takes all four again, its harness the folder as it starts.
@@ -334,7 +354,7 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         until("its second run took all four", || on("fake-vm-2") == all).await?;
         let resumed = vms.launched();
         let args = resumed.get(1).map(|l| l.args.clone()).unwrap_or_default();
-        anyhow::ensure!(args.windows(2).any(|w| w == ["--add-dir", data.as_str()]), "{args:?}");
+        anyhow::ensure!(args.windows(2).any(|w| w == ["--add-dir", at.as_str()]), "{args:?}");
         shows(&hub, "vm-live", "each override, held again", |v| ["ports", "egress", "networks", "volumes"].iter().all(|l| took(v, l, "microvm") == Some("now"))).await?;
         // Each taken back: its microVM lets go of each.
         ask("sessions.ports.unpublish", json!({"agent": "vm-live", "bind": "127.0.0.1", "host_port": 8080, "protocol": "tcp"})).await?;
@@ -342,10 +362,10 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         ask("sessions.networks.disconnect", json!({"agent": "vm-live", "network": "team"})).await?;
         ask("sessions.volumes.remove", json!({"agent": "vm-live", "path": data})).await?;
         let gone = vec![
-            Seam::Unpublish { bind: "127.0.0.1".into(), host_port: 8080, udp: false },
+            Seam::Unpublish { udp: false, host: "127.0.0.1:8080".into() },
             Seam::Revoke { member: member(), host: "api.example.com".into(), port: 443 },
             Seam::Disconnect { member: member(), network: "team".into() },
-            Seam::Unplug { at: data.clone() },
+            Seam::Unplug { at: at.clone() },
         ];
         until("its microVM let go of each", || on("fake-vm-2").get(4..) == Some(gone.as_slice())).await?;
         shows(&hub, "vm-live", "none held", |v| v.pointer("/state/overrides/ports").is_none() && v.pointer("/state/overrides/volumes").is_none()).await?;
@@ -389,7 +409,7 @@ fn p6b_4_ac3_a_volume_is_the_sessions_scope_as_its_access_says() {
 fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow::Result<()> {
     use super::*;
     let harness = || Member::Harness("claude".into());
-    let port = Port { member: harness(), bind: "127.0.0.1".into(), host_port: 8080, guest_port: 3000, protocol: Protocol::Tcp };
+    let port = Port { bind: "127.0.0.1".into(), host_port: 8080, guest_port: 3000, protocol: Protocol::Tcp };
     let mut o = Overrides::default();
     assert_eq!(take(&mut o, &Change::Publish(port.clone())).map_err(anyhow::Error::msg)?, Taken::Added);
     assert_eq!(take(&mut o, &Change::Publish(port.clone())).map_err(anyhow::Error::msg)?, Taken::Same);
@@ -407,7 +427,7 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
     for bad in [
         Change::Grant(Egress { member: harness(), host: "-bad-.example".into(), port: 443 }),
         Change::Grant(Egress { member: harness(), host: "example.com".into(), port: 0 }),
-        Change::Publish(Port { member: harness(), bind: "localhost".into(), host_port: 1, guest_port: 1, protocol: Protocol::Udp }),
+        Change::Publish(Port { bind: "localhost".into(), host_port: 1, guest_port: 1, protocol: Protocol::Udp }),
         Change::Connect(Network { member: Member::Harness("codex".into()), name: "team".into() }),
         Change::Add(Volume { path: "relative/dir".into(), at: "relative/dir".into(), access: Access::Rw, members: vec![harness()] }),
     ] {
@@ -417,6 +437,25 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
     assert!(check(&Change::Add(host_volume.clone()), false, "claude").is_ok());
     assert!(check(&Change::Add(Volume { at: "/elsewhere".into(), ..host_volume.clone() }), false, "claude").is_err());
     assert!(check(&Change::Add(Volume { members: vec![Member::Mcp("db".into())], ..host_volume }), false, "claude").is_err_and(|e| e.contains("one member, its harness")));
+    // What its microVM declared: a folder strictly beneath a plug root fits, as Shards plugs one (D271); egress within its
+    // ceiling alone.
+    let declared = Overrides { roots: vec!["/work".into(), "/volumes".into()], ceiling: vec!["api.example.com:443".into(), "[::1]:8080".into()], ..Overrides::default() };
+    let vol = |at: &str| Change::Add(Volume { path: "/data".into(), at: at.into(), access: Access::Rw, members: vec![harness()] });
+    assert!(fits(&vol("/volumes/data"), &declared).is_ok());
+    assert!(fits(&vol("/work/proj/sub"), &declared).is_ok());
+    assert!(fits(&vol("/volumes"), &declared).is_err(), "a root itself is no plug's place: strictly beneath one");
+    assert!(fits(&vol("/volumes-other/data"), &declared).is_err(), "a sibling of a root isn't beneath it");
+    assert!(fits(&vol("/opt/data"), &declared).is_err_and(|e| e.contains("outside every folder")));
+    assert_eq!(crate::sandbox::isolated::plug_root_of("/Users/ada/proj").as_deref(), Some("/Users"));
+    for refused in ["/tmp/x", "/proc/1", "/etc/kiln", "/run/x", "/dev/null", "/sys/x", "relative", "/"] {
+        assert_eq!(crate::sandbox::isolated::plug_root_of(refused), None, "{refused}");
+    }
+    let grant = |host: &str, port| Change::Grant(Egress { member: harness(), host: host.into(), port });
+    assert!(fits(&grant("API.example.com", 443), &declared).is_ok());
+    assert!(fits(&grant("::1", 8080), &declared).is_ok());
+    assert!(fits(&grant("api.example.com", 80), &declared).is_err_and(|e| e.contains("past the most egress")));
+    assert!(fits(&grant("api.example.com", 443), &Overrides::default()).is_err_and(|e| e.contains("none")), "no ceiling declared: none live");
+    assert!(fits(&Change::Remove("/data".into()), &Overrides::default()).is_ok(), "a removal always fits");
     assert_eq!(Member::read(None, "claude"), Ok(harness()));
     assert_eq!(Member::read(Some("agent:helper"), "claude"), Ok(Member::Agent("helper".into())));
     assert!(Member::read(Some("worker"), "claude").is_err());
