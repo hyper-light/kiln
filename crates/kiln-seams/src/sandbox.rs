@@ -150,12 +150,16 @@ pub struct Share {
     pub host: String,
     pub at: String,
     pub writable: bool,
+    /// In a microVM, the members it's given to at their start, at `at` (Shards' share member scope, as
+    /// a plug's `PlugFor::Members`): none, its microVM's own root alone, which no member sees. A run on
+    /// the host has no members, and every share is its process's.
+    pub members: Vec<Member>,
 }
 
 impl Share {
-    /// `path`, writable, at its own path.
+    /// `path`, writable, at its own path, given to no member.
     pub fn at_its_path(path: &str) -> Self {
-        Self { host: path.to_owned(), at: path.to_owned(), writable: true }
+        Self { host: path.to_owned(), at: path.to_owned(), writable: true, members: Vec::new() }
     }
 }
 

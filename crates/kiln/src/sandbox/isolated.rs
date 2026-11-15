@@ -176,7 +176,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         (Some(root), Some(person)) => home_of(root, person, kind, source, &vms.images, &image).await?,
         _ => (Vec::new(), None),
     };
-    launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true }));
+    launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true, members: Vec::new() }));
     // Where a folder a person gives it while it runs is plugged in live (Shards' `ImageSpec::plug_roots`, D271): the
     // top-level directories of its project and its person's volumes, and its session's own root, where kiln puts such a
     // folder by default (`harness::overrides`), each once.
@@ -190,7 +190,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     for dir in plugin_folders(kind, session) {
         let at = guest_path(&dir, PLUGINS).map_err(anyhow::Error::msg)?;
         launch.args.extend(["--plugin-dir".to_owned(), at.clone()]);
-        launch.shares.push(Share { host: dir, at, writable: false });
+        launch.shares.push(Share { host: dir, at, writable: false, members: Vec::new() });
     }
     // kiln's MCP once its person's volume is made (agy's config is kept there), where its lane is carried.
     let lanes = match vms.mcp() {
@@ -202,6 +202,13 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     };
     if lanes.is_some() {
         offer_mcp(kind, &source, person, homes, &mut launch.args).await;
+    }
+    // Every folder it starts with is its harness's own: given to that member at its start, where it sees it
+    // (Shards' share member scope). A start share given to no member reaches its microVM's root alone, which
+    // its harness never sees: its project, its working directory, wasn't there (kiln plan P1.4 on HVF).
+    let member = kiln_seams::sandbox::Member(launch.program.clone());
+    for share in &mut launch.shares {
+        share.members = vec![member.clone()];
     }
     let declared = crate::sandbox::held::Declared::of(&launch);
     let asked = std::time::Instant::now();
@@ -382,7 +389,7 @@ pub fn harness_cwd(spec: &Spec) -> String {
 /// The project folder `cwd` as a launch shares it: writable, where [`guest_path`] puts it in the
 /// microVM, which is its member's working folder too.
 pub fn project_share(cwd: &str) -> Result<Share, String> {
-    Ok(Share { host: cwd.to_owned(), at: guest_path(cwd, PROJECTS)?, writable: true })
+    Ok(Share { host: cwd.to_owned(), at: guest_path(cwd, PROJECTS)?, writable: true, members: Vec::new() })
 }
 
 /// The folders of plugins `kind`'s harness loads for `session`, as the machine's launch gives them
@@ -809,12 +816,12 @@ mod tests {
         // person's volume.
         let name = dir.path().file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("{cwd} has no name"))?;
         let at = if cfg!(windows) { format!("{PROJECTS}/{name}") } else { cwd.clone() };
-        assert_eq!(codex.shares, [Share { host: cwd.clone(), at: at.clone(), writable: true }], "its project, where its microVM sees it");
+        assert_eq!(codex.shares, [Share { host: cwd.clone(), at: at.clone(), writable: true, members: Vec::new() }], "its project, where its microVM sees it");
         assert_eq!(codex.folder.as_deref(), Some(at.as_str()), "its working folder, its project's place in its microVM");
         // A Windows machine's project: shared from where it is, at a Linux path of its own name, which is
         // its working folder too; Unix's at its own path.
         let windows = project_share(r"C:\Users\ada\proj").map_err(anyhow::Error::msg)?;
-        assert_eq!(windows, Share { host: r"C:\Users\ada\proj".into(), at: "/work/proj".into(), writable: true });
+        assert_eq!(windows, Share { host: r"C:\Users\ada\proj".into(), at: "/work/proj".into(), writable: true, members: Vec::new() });
         for (host, at) in [(r"\\?\C:\Users\ada\proj\", "/work/proj"), ("D:/src/kiln", "/work/kiln"), (r"\\server\share\repo", "/work/repo"), ("/Users/ada/proj", "/Users/ada/proj")] {
             assert_eq!(guest_path(host, PROJECTS), Ok(at.to_owned()), "{host}");
         }

@@ -5411,11 +5411,13 @@ while True:
             // folders Claude Code loads on the machine (kiln's skills, its session's), read-only at their
             // own paths and named to it as there.
             let volume = dir.path().join("homes").join("owner").join("claude").join("home").join("claude");
-            let home = kiln_seams::sandbox::Share { host: volume.to_string_lossy().into_owned(), at: "/home/claude".into(), writable: true };
+            // Each its harness's own, given to its member at its start.
+            let claude = vec![kiln_seams::sandbox::Member("claude".into())];
+            let home = kiln_seams::sandbox::Share { host: volume.to_string_lossy().into_owned(), at: "/home/claude".into(), writable: true, members: claude.clone() };
             let plugins = crate::sandbox::isolated::plugin_folders(crate::harness::kinds::Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?, "isolated");
             anyhow::ensure!(plugins.len() == 2, "kiln's skills and its session's: {plugins:?}");
-            let read_only = plugins.iter().map(|p| kiln_seams::sandbox::Share { host: p.clone(), at: p.clone(), writable: false });
-            let shares: Vec<_> = [kiln_seams::sandbox::Share::at_its_path(&cwd), home].into_iter().chain(read_only).collect();
+            let read_only = plugins.iter().map(|p| kiln_seams::sandbox::Share { host: p.clone(), at: p.clone(), writable: false, members: claude.clone() });
+            let shares: Vec<_> = [kiln_seams::sandbox::Share { members: claude.clone(), ..kiln_seams::sandbox::Share::at_its_path(&cwd) }, home].into_iter().chain(read_only).collect();
             assert_eq!(launch.shares, shares);
             assert!(volume.is_dir(), "its volume, made before it started");
             assert!(plugins.iter().all(|p| launch.args.windows(2).any(|w| w == ["--plugin-dir", p.as_str()])), "named to it: {:?}", launch.args);
