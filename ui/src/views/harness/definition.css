@@ -376,3 +376,49 @@
 .at {
   --open-top: 0px;
 }
+/* Saved by someone else since it was read (definitions.tsx Clash; kiln's principle 5): each value that
+   differs, theirs now (changed: marked) and yours, then keep theirs or save yours over it. */
+.df-clash {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 2px solid #d8bb95;
+  border-radius: 0 6px 6px 0;
+  background: rgb(216 187 149 / 6%);
+}
+.df-clash-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.df-clash-head > .ms-edit-k {
+  margin-right: auto;
+  color: #e2cfae;
+}
+.df-clash-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12.5px;
+}
+.df-clash-v {
+  min-width: 0;
+  overflow: hidden;
+  color: #97999f;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.df-clash-v[data-changed] {
+  color: #e2cfae;
+}
+.df-clash-v[data-mine] {
+  color: #ededee;
+}
+.df-clip {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

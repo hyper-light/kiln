@@ -8,7 +8,8 @@ import { agentdefsRes } from "@/api/agentdefs";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
-import { DefFields, RunsMarks, sessionVariant, Swatch } from "./definitions";
+import { AgentfileName, DefValues, RunsMarks, sessionVariant, Swatch } from "./definitions";
+import { Loadable } from "@/components/ui/loading";
 import { Fold } from "./fold";
 import "./definition.css";
 
@@ -25,7 +26,7 @@ export function DefinitionPanel({ agentId }: { agentId: string }) {
         <span className="df-line">
           <b>{d.name}</b>
           <span>{d.harness}</span>
-          <span>{d.agentfile}</span>
+          <AgentfileName ref_={d.agentfile} harness={d.harness} />
           <RunsMarks d={d} />
         </span>
         <span className="df-line">
@@ -52,7 +53,9 @@ export function DefinitionPanel({ agentId }: { agentId: string }) {
             <span>{weight}%</span>
           </span>
         )}
-        <DefFields d={d} />
+        <Loadable label={`Loading ${d.name}'s values`} fallback={<span className="ms-fields" aria-busy="true" />}>
+          <DefValues d={d} />
+        </Loadable>
       </div>
     </Fold>
   );

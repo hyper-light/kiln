@@ -50,9 +50,12 @@ import type {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** The refusal's own JSON, where it says more than its words (a 409 with the current state, say). */
+  body?: unknown;
+  constructor(status: number, message: string, body?: unknown) {
     super(message);
     this.status = status;
+    this.body = body;
     this.name = "ApiError";
   }
 }
@@ -135,11 +138,13 @@ export async function request<T>(
   }
   if (!res.ok) {
     let msg = res.statusText || `HTTP ${res.status}`;
+    let said: unknown;
     try {
       const text = await res.text();
       if (text) {
         try {
           const j = JSON.parse(text) as { error?: string; message?: string };
+          said = j;
           msg = j.error ?? j.message ?? text;
         } catch {
           msg = text.slice(0, 300);
@@ -148,7 +153,7 @@ export async function request<T>(
     } catch {
       /* ignore */
     }
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, said);
   }
   if (opts.raw) return (await res.text()) as T;
   if (res.status === 204) return undefined as T;

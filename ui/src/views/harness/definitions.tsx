@@ -18,7 +18,12 @@ import { useAgentList } from "./use-agents";
 import "./mission.css";
 import { harnessApi } from "@/api/harness";
 import { errorMessage } from "@/lib/hooks";
-import { agentdefsRes, type AgentDef, type Experiment, type Variant } from "@/api/agentdefs";
+import { agentdefRes, agentdefsApi, agentdefsRes, agentdefVersionsRes, limitSeconds, limitWords, type AgentDef, type AgentDefFull, type Builtin, type Experiment, type Variant } from "@/api/agentdefs";
+import { Ago } from "./parts";
+import { agentfilesRes } from "@/api/agentfiles";
+import { ApiError } from "@/api/client";
+import { Loadable } from "@/components/ui/loading";
+import { invalidate } from "@/lib/resource";
 import { rebalance, variantName, variantTone } from "./variants";
 import { engineOf, sandboxesRes, type SandboxBrief } from "@/api/microvms";
 import type { AgentInfo } from "@/api/harness";
@@ -249,6 +254,7 @@ export function GroupHead({
 }
 
 function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; open: boolean; onOpen: () => void; onSetup: () => void; inRow?: boolean }) {
+  const [asking, setAsking] = React.useState<DefAskKind | null>(null);
   return (
     <>
       <GroupHead
@@ -259,7 +265,6 @@ function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; ope
           <>
             <span className="df-strong">{d.name}</span>
             <span>v{d.version}</span>
-            {d.conflict && <span className="ms-flag" data-flag="stale" title={`${d.conflict.field}: ${d.conflict.here} here, ${d.conflict.there} in ${d.conflict.from}`} />}
             {!inRow && <RunsMarks d={d} />}
             {inRow && d.model && <span>{modelLabel(d.model)}</span>}
           </>
@@ -268,14 +273,13 @@ function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; ope
         actions={
           inRow ? undefined : (
             <>
-              <Button size="xs" variant="secondary" onClick={() => toast({ title: `Starting ${d.name}`, tone: "running" })}>
-                Run
-              </Button>
-              <DefMenu d={d} onSetup={onSetup} />
+              <RunButton d={d} />
+              <DefMenu d={d} onSetup={onSetup} onAsk={setAsking} />
             </>
           )
         }
       />
+      {asking && <DefAsk d={d} asking={asking} onDone={() => setAsking(null)} />}
       {open && (
         <li className="ms-node ms-defnode" data-stand="done" data-depth={2}>
           <span className="ms-node-path" />
@@ -283,15 +287,17 @@ function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; ope
             <span className="df-runs-full">
               <RunsMarks d={d} />
             </span>
-            <DefFields d={d} />
+            <Loadable label={`Loading ${d.name}'s values`} fallback={<span className="ms-fields" aria-busy="true" />}>
+              <DefValues d={d} />
+            </Loadable>
           </span>
           <span className="ms-node-meta">
             <span>
-              {d.agentfile} · {d.harness}
+              <AgentfileName ref_={d.agentfile} harness={d.harness} /> · {d.harness}
             </span>
-            <span>
-              {d.tools} kiln · {d.mcp} MCP · {d.skills} skills
-            </span>
+            <Loadable label="Loading what it holds" fallback={null}>
+              <Holds id={d.id} />
+            </Loadable>
           </span>
           <span className="ms-node-actions" />
         </li>
@@ -634,8 +640,8 @@ type Draft = { agentfile: string; engine: "microvm" | "host"; cpus: number; memo
 function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; onStart: (e: Experiment) => void }) {
   const G = 2 ** 30;
   const [vs, setVs] = React.useState<Draft[]>([
-    { agentfile: d.agentfile, engine: "microvm", cpus: 2, memory: 4 * G, weight: 80 },
-    { agentfile: d.agentfile, engine: "microvm", cpus: 4, memory: 8 * G, weight: 20 },
+    { agentfile: setupAgentfile(d), engine: "microvm", cpus: 2, memory: 4 * G, weight: 80 },
+    { agentfile: setupAgentfile(d), engine: "microvm", cpus: 4, memory: 8 * G, weight: 20 },
   ]);
   const set = (i: number, patch: Partial<Draft>) => setVs(vs.map((v, j) => (j === i ? { ...v, ...patch } : v)));
   const start = () => {
@@ -765,16 +771,76 @@ function Measure({ label, iv, f, win }: { label: string; iv: [number, number, nu
   );
 }
 
-/** A definition's rarer acts, behind one ⋯, as a Mission row's are (actions.tsx): its history, an experiment, a copy, delete. */
-function DefMenu({ d, onSetup }: { d: AgentDef; onSetup: () => void }) {
+type DefAskKind = "delete" | "versions";
+
+/** Run one: the server starts an agent from it (a microVM, its Agentfile's latest), and its page opens; one that waits says so. */
+function RunButton({ d }: { d: AgentDef }) {
+  const navigate = useNavigate();
+  const [busy, setBusy] = React.useState(false);
+  return (
+    <Button
+      size="xs"
+      variant="secondary"
+      pending={busy}
+      onClick={() => {
+        setBusy(true);
+        agentdefsApi
+          .run(d.id)
+          .then((r) => {
+            const started = r.agents[0];
+            if (started) navigate(`/agents/${started.id}`);
+            else toast({ title: `${d.name} v${r.agentdef.version}`, description: r.queued, tone: "info" });
+          })
+          .catch((e: unknown) => toast.error(`Couldn't run ${d.name}`, errorMessage(e)))
+          .finally(() => setBusy(false));
+      }}
+    >
+      Run
+    </Button>
+  );
+}
+
+/** A definition's rarer acts, behind one ⋯, as a Mission row's are (actions.tsx): its versions, an experiment, a copy, delete; kiln's own copied as yours. */
+function DefMenu({ d, onSetup, onAsk }: { d: AgentDef; onSetup: () => void; onAsk: (what: DefAskKind) => void }) {
+  const copy = () =>
+    agentdefsApi.copy(d.id).then(
+      (mine) => {
+        invalidate("agentdefs/list");
+        toast({ title: `${mine.name} is yours now, v1`, tone: "info" });
+      },
+      (e: unknown) => toast.error(`Couldn't copy ${d.name}`, errorMessage(e)),
+    );
+  const duplicate = () =>
+    agentdefsApi
+      .get(d.id)
+      .then((full) =>
+        agentdefsApi.create({
+          name: `${d.name}-copy`,
+          harness: full.harness,
+          model: full.model,
+          instructions: full.instructions,
+          tools: full.tools,
+          mcp: full.mcp,
+          skills: full.skills,
+          limits: full.limits,
+          agentfile: full.agentfile,
+        }),
+      )
+      .then(
+        (mine) => {
+          invalidate("agentdefs/list");
+          toast({ title: `${mine.name}, v1`, tone: "info" });
+        },
+        (e: unknown) => toast.error(`Couldn't duplicate ${d.name}`, errorMessage(e)),
+      );
   const items: { label: string; onSelect: () => void; danger?: boolean }[] = d.own
     ? [
-        { label: `History (v${d.version})`, onSelect: () => toast({ title: `${d.name}: v1 to v${d.version}`, tone: "info" }) },
+        { label: `Versions (v${d.version})`, onSelect: () => onAsk("versions") },
         ...(d.experiment ? [] : [{ label: "New experiment", onSelect: onSetup }]),
-        { label: "Duplicate", onSelect: () => toast({ title: `Copied ${d.name}`, tone: "info" }) },
-        { label: "Delete…", onSelect: () => toast({ title: `Delete ${d.name}? Confirm on its row`, tone: "info" }), danger: true },
+        { label: "Duplicate", onSelect: () => void duplicate() },
+        { label: "Delete…", onSelect: () => onAsk("delete"), danger: true },
       ]
-    : [{ label: "Copy as yours", onSelect: () => toast({ title: `${d.name} copied as yours`, tone: "info" }) }];
+    : [{ label: "Copy as yours", onSelect: () => void copy() }];
   return (
     <DropdownMenu.Root modal={false}>
       <DropdownMenu.Trigger asChild>
@@ -792,6 +858,113 @@ function DefMenu({ d, onSetup }: { d: AgentDef; onSetup: () => void }) {
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
+  );
+}
+
+/** What its ⋯ asked, under its head (no popup): delete it, confirmed in place; or its versions, each restorable as a new one. */
+function DefAsk({ d, asking, onDone }: { d: AgentDef; asking: DefAskKind; onDone: () => void }) {
+  const [busy, setBusy] = React.useState(false);
+  if (asking === "delete")
+    return (
+      <li className="ms-node df-ask" data-stand="failed" data-depth={2}>
+        <span className="ms-node-path" />
+        <span className="ms-node-main">
+          <span className="ms-confirm" role="group" aria-label={`Delete ${d.name}?`}>
+            <span>Delete {d.name} and its versions?</span>
+            <button
+              type="button"
+              className="ms-go"
+              disabled={busy}
+              aria-label={`Delete ${d.name}`}
+              onClick={() => {
+                setBusy(true);
+                agentdefsApi
+                  .remove(d.id)
+                  .then(() => {
+                    invalidate("agentdefs/list");
+                    toast({ title: `Deleted ${d.name}`, tone: "info" });
+                  })
+                  .catch((e: unknown) => toast.error(`Couldn't delete ${d.name}`, errorMessage(e)))
+                  .finally(onDone);
+              }}
+            >
+              <Check size={15} />
+            </button>
+            <button type="button" className="ms-go" aria-label="Keep it" onClick={onDone}>
+              <X size={15} />
+            </button>
+          </span>
+        </span>
+        <span className="ms-node-meta" />
+        <span className="ms-node-actions" />
+      </li>
+    );
+  return (
+    <Loadable label={`Loading ${d.name}'s versions`} fallback={null}>
+      <DefVersions d={d} onDone={onDone} />
+    </Loadable>
+  );
+}
+
+/** Its versions, newest first: when, by whom; any but the current made current again, as a new version. */
+function DefVersions({ d, onDone }: { d: AgentDef; onDone: () => void }) {
+  const res = useRes(agentdefVersionsRes(d.id));
+  const [busy, setBusy] = React.useState<number | null>(null);
+  const current = res.data[0]?.version;
+  return (
+    <>
+      {res.data.map((v) => (
+        <li key={v.version} className="ms-node df-ask" data-stand="done" data-depth={2}>
+          <span className="ms-node-path" />
+          <span className="ms-node-main">
+            <span className="df-group-line">
+              <span className="ms-sep-h df-group-k">v{v.version}</span>
+              <span className="df-group-sum">
+                <span>{v.model ? modelLabel(v.model) : "default"}</span>
+                {limitWords(v.limits) && <span>{limitWords(v.limits)}</span>}
+                <span className="df-clip">{v.instructions || "no instructions"}</span>
+              </span>
+            </span>
+          </span>
+          <span className="ms-node-meta">
+            <span>
+              <Ago ts={v.at} /> · {v.by}
+            </span>
+          </span>
+          <span className="ms-node-actions">
+            <span className="ms-tail">
+              {v.version === current ? (
+                <span className="ms-edit-k">current</span>
+              ) : (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  pending={busy === v.version}
+                  onClick={() => {
+                    setBusy(v.version);
+                    agentdefsApi
+                      .restore(d.id, v.version)
+                      .then((next) => {
+                        invalidate("agentdefs/");
+                        toast({ title: `v${v.version} is current again, as v${next.version}`, tone: "info" });
+                      })
+                      .catch((e: unknown) => toast.error(`Couldn't restore v${v.version}`, errorMessage(e)))
+                      .finally(() => setBusy(null));
+                  }}
+                >
+                  Restore
+                </Button>
+              )}
+              {v.version === current && (
+                <button type="button" className="ms-go" aria-label="Close its versions" onClick={onDone}>
+                  <X size={15} />
+                </button>
+              )}
+            </span>
+          </span>
+        </li>
+      ))}
+    </>
   );
 }
 
@@ -848,54 +1021,164 @@ function SessionControls({ a, stand }: { a: AgentInfo; stand: string }) {
   );
 }
 
-/** A definition's values: each a value until pressed, then its control, in place; a save is a new version, running sessions keep theirs. */
-export function DefFields({ d }: { d: AgentDef }) {
-  const [editing, setEditing] = React.useState<string | null>(null);
-  const [vals, setVals] = React.useState({ model: d.model, limit: d.limit, instructions: d.instructions });
-  const [version, setVersion] = React.useState(d.version);
-  const save = (k: keyof typeof vals, v: string) => {
-    setVals({ ...vals, [k]: v });
-    setEditing(null);
-    setVersion((n) => n + 1);
-    toast({ title: `Saved v${version + 1}`, tone: "info" });
+/** The Agentfiles of yours by id, for a definition's `agentfile:<id>`. */
+function useAgentfileNames(): Map<string, string> {
+  const list = useRes(agentfilesRes()).data;
+  return React.useMemo(() => new Map(list.agentfiles.map((a) => [`agentfile:${a.id}`, a.name])), [list]);
+}
+/** A definition's Agentfile by its name: one of yours, kiln's for its harness, or its harness's own (none). */
+export function AgentfileName({ ref_, harness }: { ref_: string | null; harness: string }) {
+  return (
+    <React.Suspense fallback={<span>{ref_?.startsWith("agentfile:") ? "an Agentfile" : (ref_ ?? `harness-${harness}`)}</span>}>
+      <AgentfileNameRead ref_={ref_} harness={harness} />
+    </React.Suspense>
+  );
+}
+function AgentfileNameRead({ ref_, harness }: { ref_: string | null; harness: string }) {
+  const names = useAgentfileNames();
+  return <span>{ref_ ? (names.get(ref_) ?? ref_) : `harness-${harness}`}</span>;
+}
+/** The Agentfile an experiment's setup starts from: the definition's, by name where it's one of yours. */
+const setupAgentfile = (d: AgentDef) => (d.agentfile?.startsWith("agentfile:") ? (d.name === "release-notes" ? "docs-site" : "rust-dev") : (d.agentfile ?? `harness-${d.harness}`));
+
+/** What a definition holds besides its values: its tools, MCP servers and skills, counted. */
+function Holds({ id }: { id: string }) {
+  const full = useRes(agentdefRes(id)).data;
+  return (
+    <span title={[...full.tools, ...full.mcp.map((m) => `mcp:${m.name}`), ...full.skills.map((k) => `skill:${k}`)].join(", ") || "nothing"}>
+      {full.tools.length} tools · {full.mcp.length} MCP · {full.skills.length} skills
+    </span>
+  );
+}
+
+type Values = { model: string | null; limit: string; instructions: string };
+const valuesOf = (f: AgentDefFull | Builtin): Values => ({ model: f.model, limit: limitWords(f.limits), instructions: f.instructions });
+const VALUE_WORDS: Record<keyof Values, string> = { model: "model", limit: "limit", instructions: "instructions" };
+
+/**
+ * A definition's values (kiln's principle 5): each a value until pressed, then its control, in place.
+ * A save is a new version (running sessions keep theirs; new ones get it), and carries the version it
+ * was based on: one saved by someone else since is shown here as a diff, theirs and yours, never
+ * overwritten unasked. kiln's own are read only (copy one to change it).
+ */
+export function DefValues({ d }: { d: AgentDef }) {
+  const res = useRes(agentdefRes(d.id));
+  const base = res.data;
+  const own = d.own && "version" in base;
+  const [editing, setEditing] = React.useState<keyof Values | null>(null);
+  const [saving, setSaving] = React.useState(false);
+  // Another's save between this one's read and its own: what each said, and the version now current.
+  const [clash, setClash] = React.useState<{ mine: Partial<Values>; theirs: AgentDefFull } | null>(null);
+  const shown = valuesOf(base);
+  const save = (k: keyof Values, v: string, on: AgentDefFull = base as AgentDefFull) => {
+    const change = k === "limit" ? { limits: { ...on.limits, seconds: limitSeconds(v) ?? undefined } } : k === "model" ? { model: v.trim() || null } : { instructions: v };
+    setSaving(true);
+    agentdefsApi
+      .update(d.id, { ...change, version: on.version })
+      .then((next) => {
+        res.setData(() => next);
+        setEditing(null);
+        setClash(null);
+        invalidate("agentdefs/list");
+        toast({ title: next.version > on.version ? `Saved v${next.version}` : "Nothing changed", tone: "info" });
+      })
+      .catch((e: unknown) => {
+        const current = e instanceof ApiError && e.status === 409 ? (e.body as { current?: AgentDefFull } | undefined)?.current : undefined;
+        if (current) setClash({ mine: { [k]: v }, theirs: current });
+        else toast.error(`Couldn't save its ${VALUE_WORDS[k]}`, errorMessage(e));
+      })
+      .finally(() => setSaving(false));
   };
-  const field = (k: keyof typeof vals, label: string, shown: string) =>
+  const field = (k: keyof Values, words: string) =>
     editing === k ? (
       <span className="ms-edit">
-        <span className="ms-edit-k">{label}</span>
+        <span className="ms-edit-k">{VALUE_WORDS[k]}</span>
         <input
           className="ms-edit-in"
           autoFocus
-          defaultValue={vals[k]}
-          aria-label={label}
+          defaultValue={k === "model" ? (shown.model ?? "") : shown[k]}
+          placeholder={k === "model" ? "its harness's default" : k === "limit" ? "45m" : ""}
+          aria-label={VALUE_WORDS[k]}
+          disabled={saving}
           onKeyDown={(e) => {
             if (e.key === "Enter") save(k, e.currentTarget.value);
             if (e.key === "Escape") setEditing(null);
           }}
         />
-        <button type="button" className="ms-go" aria-label={`Save ${label}`} onClick={(e) => save(k, (e.currentTarget.previousElementSibling as HTMLInputElement).value)}>
+        <button type="button" className="ms-go" disabled={saving} aria-label={`Save ${VALUE_WORDS[k]}`} onClick={(e) => save(k, (e.currentTarget.previousElementSibling as HTMLInputElement).value)}>
           <Check size={15} />
         </button>
       </span>
     ) : (
-      <button type="button" className="ms-field" title={d.own ? `Change ${label}` : "kiln's: copy it to change it"} disabled={!d.own} onClick={() => setEditing(k)}>
-        <span className="ms-edit-k">{label}</span>
-        <span className="ms-field-v">{shown || "none"}</span>
+      <button type="button" className="ms-field" title={own ? `Change its ${VALUE_WORDS[k]}` : "kiln's: copy it to change it"} disabled={!own || saving} onClick={() => setEditing(k)}>
+        <span className="ms-edit-k">{VALUE_WORDS[k]}</span>
+        <span className="ms-field-v">{words || "none"}</span>
         <Pencil size={12} aria-hidden="true" />
       </button>
     );
   return (
     <>
       <span className="ms-fields">
-        {field("model", "model", vals.model ? modelLabel(vals.model) : "default")}
-        {field("limit", "limit", vals.limit)}
+        {field("model", shown.model ? modelLabel(shown.model) : "default")}
+        {field("limit", shown.limit)}
         <span className="ms-field">
           <span className="ms-edit-k">version</span>
-          <span className="ms-field-v">v{version}</span>
+          <span className="ms-field-v">{own ? `v${(base as AgentDefFull).version}` : "kiln's"}</span>
         </span>
       </span>
-      <span className="ms-fields">{field("instructions", "instructions", vals.instructions)}</span>
+      <span className="ms-fields">{field("instructions", shown.instructions)}</span>
+      {clash && (
+        <Clash
+          mine={clash.mine}
+          was={shown}
+          theirs={clash.theirs}
+          saving={saving}
+          onTheirs={() => {
+            res.setData(() => clash.theirs);
+            setClash(null);
+            setEditing(null);
+            invalidate("agentdefs/list");
+          }}
+          onMine={() => {
+            const [k, v] = Object.entries(clash.mine)[0] as [keyof Values, string];
+            save(k, v, clash.theirs);
+          }}
+        />
+      )}
     </>
+  );
+}
+
+/** Saved by someone else since it was read: each value that differs, as it was, theirs now and yours, the change marked; theirs kept, or yours saved over it. */
+function Clash({ mine, was, theirs, saving, onTheirs, onMine }: { mine: Partial<Values>; was: Values; theirs: AgentDefFull; saving: boolean; onTheirs: () => void; onMine: () => void }) {
+  const now = valuesOf(theirs);
+  const keys = (Object.keys(VALUE_WORDS) as (keyof Values)[]).filter((k) => k in mine || now[k] !== was[k]);
+  const word = (v: string | null) => v || "none";
+  return (
+    <span className="df-clash" role="group" aria-label={`Saved as v${theirs.version} since you read it`}>
+      <span className="df-clash-head">
+        <span className="ms-edit-k">v{theirs.version} since</span>
+        <Button size="xs" variant="ghost" disabled={saving} onClick={onTheirs}>
+          Keep theirs
+        </Button>
+        <Button size="xs" variant="secondary" pending={saving} onClick={onMine}>
+          Save mine on v{theirs.version}
+        </Button>
+      </span>
+      {keys.map((k) => (
+        <span key={k} className="df-clash-row">
+          <span className="ms-edit-k">{VALUE_WORDS[k]}</span>
+          <span className="df-clash-v" data-changed={now[k] !== was[k] || undefined} title="Theirs now">
+            {word(now[k])}
+          </span>
+          {k in mine && (
+            <span className="df-clash-v" data-mine="" title="Yours">
+              {word(mine[k] ?? null)}
+            </span>
+          )}
+        </span>
+      ))}
+    </span>
   );
 }
 
@@ -907,6 +1190,7 @@ export function DefFields({ d }: { d: AgentDef }) {
  * its rarer acts. Its chevron opens its groups under it.
  */
 export function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly AgentInfo[]; open: boolean; onOpen: () => void }) {
+  const [asking, setAsking] = React.useState<DefAskKind | null>(null);
   const sessions = d.sessions.map((s) => list.find((x) => x.id === s.id)).filter((a): a is AgentInfo => a !== undefined);
   const stands = sessions.map((a) => NODE[chatStand(a)]);
   const ORDER = ["needs", "failed", "working", "paused", "done", "offline", "stopped"];
@@ -942,18 +1226,18 @@ export function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly 
         </span>
         <span className="ms-node-actions">
           <span className="ms-tail">
-            <Button size="xs" variant="secondary" onClick={() => toast({ title: `Starting ${d.name}`, tone: "running" })}>
-              Run
-            </Button>
+            <RunButton d={d} />
             <DefMenu
               d={d}
               onSetup={() => {
                 if (!open) onOpen();
               }}
+              onAsk={setAsking}
             />
           </span>
         </span>
       </li>
+      {asking && <DefAsk d={d} asking={asking} onDone={() => setAsking(null)} />}
       {open && <DefGroups d={d} list={list} first="definition" inRow onClose={onOpen} />}
     </>
   );
