@@ -1420,7 +1420,7 @@ a resume, a restore), for the session's life.
 | `sessions.ports.publish` / `unpublish` | `agent`, `bind` (the host address: who may reach it), `host_port`, `guest_port`, `protocol` (`tcp`, `udp`); a port reaches the members its image gives it coming in, as Shards publishes one | microVM |
 | `sessions.egress.grant` / `revoke` | `agent`, `host` (a DNS name or an address), `port`, `member` | microVM |
 | `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member` | microVM |
-| `sessions.volumes.add` / `remove` | `agent`, `path` (a folder of its machine), `access` (`ro`, `rw`), `at` (where a microVM sees it), `members`, `restart` | every engine |
+| `sessions.volumes.add` / `remove` | `agent`, `path` (a folder of its machine), `access` (`ro`, `rw`), `at` (where a microVM sees it), `members` | every engine |
 
 A `member` is `harness` (the default), `agent:<name>` or `mcp:<name>`. Every grant names who, to whom, which
 ports and which way: nothing is implied. Each is on REST (`POST /api/ops/<name>`, and
@@ -1433,9 +1433,10 @@ naming its engine (409).
 A volume joins its harness's own allowed folders, each harness's way, and kiln's scope for the session: its
 file calls there are inside its folder (Permissions' `folder`), and a read-only one's changes are refused at each
 call kiln holds. In a microVM it's also plugged in, read-only or writable as asked: by default at
-`/volumes/<its name>`, beneath the session's own volume root. A microVM takes a folder live beneath the roots its
-launch declared (its project, its person's volumes, `/volumes`: `state.overrides.roots`); one elsewhere only with
-`restart`, its members restarted to take it. Egress is granted live up to the most its launch declared
+`/volumes/<its name>`, beneath the session's own volume root. A microVM takes a folder live strictly beneath the
+plug roots its launch declared (the top-level directories of its project and its person's volumes, and `/volumes`:
+`state.overrides.roots`), as Shards plugs one in (D271); one elsewhere is refused, saying them, until a member
+restarted can take it (Shards' D270). Egress is granted live up to the most its launch declared
 (`state.overrides.ceiling`): the org's policy, `[agents] egress_ceiling` (`host:port` each; none by default, so
 none is granted live), declared as each session starts. Past either, it's refused (409), saying what it declared.
 

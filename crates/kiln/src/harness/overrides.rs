@@ -150,10 +150,6 @@ pub struct Volume {
     pub access: Access,
     /// Who sees it: a host session's harness alone.
     pub members: Vec<Member>,
-    /// Its members restarted to take it: asked of one outside every plug root its microVM declared as it started
-    /// ([`Overrides::roots`]), which none takes live.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub restart: bool,
 }
 
 /// One change to a session's overrides, as `Command::Override` carries it to its machine.
@@ -244,8 +240,9 @@ pub struct Overrides {
     pub networks: Vec<HeldNetwork>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<HeldVolume>,
-    /// Where its microVM takes a folder live, as its launch declared them (Shards' `ImageSpec::plug_roots`): its
-    /// project, its person's volumes and its session's volume root ([`crate::sandbox::isolated::VOLUMES`]).
+    /// Where its microVM takes a folder live, as its launch declared them (Shards' `ImageSpec::plug_roots`, D271): the
+    /// top-level directories of its project and its person's volumes, and its session's volume root
+    /// ([`crate::sandbox::isolated::VOLUMES`]), a folder going strictly beneath one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots: Vec<String>,
     /// The most egress its microVM may be granted live, as its launch declared it (Shards' `ImageSpec::egress_ceiling`;
@@ -265,12 +262,13 @@ impl Overrides {
 }
 
 /// Whether `change` fits what its microVM declared as it started (`o`'s [`Overrides::roots`] and
-/// [`Overrides::ceiling`]): a folder beneath one of its plug roots, or one asked with its members restarted; egress
-/// within its ceiling. Why not, in words. A removal always fits.
+/// [`Overrides::ceiling`]): a folder strictly beneath one of its plug roots, as Shards plugs one in (D271; one elsewhere
+/// is refused, `Outside`, until a member restarted can take it, D270); egress within its ceiling. Why not, in words. A
+/// removal always fits.
 pub fn fits(change: &Change, o: &Overrides) -> Result<(), String> {
     match change {
-        Change::Add(v) if !v.restart && !o.roots.iter().any(|r| beneath(&v.at, r)) => Err(format!(
-            "{} is outside every folder its microVM takes a plug in live ({}): give it beneath one (the default puts it beneath {}), or ask for its members restarted to take it (`restart`)",
+        Change::Add(v) if !o.roots.iter().any(|r| beneath(&v.at, r)) => Err(format!(
+            "{} is outside every folder its microVM takes a plug in live ({}): give it beneath one; by default it goes beneath {}",
             v.at,
             if o.roots.is_empty() { "none declared".to_owned() } else { o.roots.join(", ") },
             crate::sandbox::isolated::VOLUMES
@@ -285,10 +283,10 @@ pub fn fits(change: &Change, o: &Overrides) -> Result<(), String> {
     }
 }
 
-/// Whether path `at` is `root` or beneath it.
+/// Whether path `at` is strictly beneath `root`, as Shards takes a plug (D271).
 fn beneath(at: &str, root: &str) -> bool {
     let root = root.trim_end_matches('/');
-    at == root || at.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
+    at.strip_prefix(root).is_some_and(|rest| rest.len() > 1 && rest.starts_with('/'))
 }
 
 /// Whether ceiling entry `entry` (`host:port`) names `host` on `port`, its host as DNS compares names (RFC 4343).
@@ -613,13 +611,8 @@ fn seam_network(n: &Network, connect: bool) -> kiln_seams::sandbox::Change {
 }
 
 fn seam_plug(v: &Volume) -> kiln_seams::sandbox::Change {
-    kiln_seams::sandbox::Change::Plug { share: kiln_seams::sandbox::Share { host: v.path.clone(), at: v.at.clone(), writable: v.access == Access::Rw }, members: v.volume_members(), restart: v.restart }
-}
-
-impl Volume {
-    fn volume_members(&self) -> Vec<kiln_seams::sandbox::Member> {
-        self.members.iter().map(member_of).collect()
-    }
+    use kiln_seams::sandbox::{PlugFor, PlugSource};
+    kiln_seams::sandbox::Change::Plug { source: PlugSource::Host(v.path.clone()), to: PlugFor::Members(v.members.iter().map(member_of).collect()), at: v.at.clone(), read_only: v.access == Access::Ro }
 }
 
 /// How its microVM took a change it was asked (`Run::change`): now, or refused in its words (one that takes none live,
@@ -760,11 +753,7 @@ async fn add(cx: Cx, v: Value) -> Out {
         None => vec![Member::Harness(info.kind.clone())],
         Some(said) => said.iter().map(|m| Member::read(Some(m), &info.kind)).collect::<Result<Vec<_>, _>>().map_err(|e| (StatusCode::BAD_REQUEST, e))?,
     };
-    let restart = i.restart.unwrap_or(false);
-    if restart && !microvm {
-        return Err((StatusCode::BAD_REQUEST, "a session on its machine's host takes a folder with nothing restarted: `restart` is a microVM's".to_owned()));
-    }
-    send(&cx, &info, Change::Add(Volume { path, at, access: i.access, members, restart })).await
+    send(&cx, &info, Change::Add(Volume { path, at, access: i.access, members })).await
 }
 
 async fn remove(cx: Cx, v: Value) -> Out {
@@ -840,7 +829,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "sessions.volumes.add",
-            summary: "Give a running session a folder of its machine (`path`), `access` ro or rw, in place: it joins its harness's own allowed folders (each harness's way) and the session's scope (kiln holds its file calls there to `access`), and in a microVM session it's plugged into the microVM too, for `members` (else its harness), at `at`: by default beneath its session's volume root (/volumes/<name>), which it takes live; a path outside every plug root it declared (state.overrides.roots) only with `restart`, its members restarted to take it. Every engine. Kept on the session and given again whenever its harness starts again; agents_get shows how each took it (state.overrides).",
+            summary: "Give a running session a folder of its machine (`path`), `access` ro or rw, in place: it joins its harness's own allowed folders (each harness's way) and the session's scope (kiln holds its file calls there to `access`), and in a microVM session it's plugged into the microVM too, for `members` (else its harness), at `at`: by default beneath its session's volume root (/volumes/<name>); strictly beneath one of the plug roots it declared as it started (state.overrides.roots), else refused. Every engine. Kept on the session and given again whenever its harness starts again; agents_get shows how each took it (state.overrides).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::Add>(),
@@ -925,8 +914,6 @@ pub mod input {
         pub at: Option<String>,
         /// Who sees it: `harness` (the default), `agent:<name>`, `mcp:<name>`.
         pub members: Option<Vec<String>>,
-        /// A microVM session's: its members restarted to take it, for an `at` outside every plug root it declared.
-        pub restart: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

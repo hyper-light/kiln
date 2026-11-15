@@ -297,7 +297,7 @@ fn microvms(hub: &Hub, dir: &Path, program: &Path) -> anyhow::Result<Arc<crate::
 #[cfg(unix)]
 #[test]
 fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> anyhow::Result<()> {
-    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, Share};
+    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, PlugFor, PlugSource};
     run(async {
         let hub = hub().await?;
         let dir = tempfile::tempdir()?;
@@ -307,14 +307,15 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         std::fs::create_dir_all(&data)?;
         let data = data.to_string_lossy().into_owned();
         opened(&hub, "vm-live", dir.path(), &program, Some(Isolation::microvm())).await?;
-        // What its launch declared (Shards' ImageSpec::plug_roots and egress_ceiling): its project and its session's
-        // volume root, and the org's ceiling.
+        // What its launch declared (Shards' ImageSpec::plug_roots and egress_ceiling, D271): its project's top-level
+        // directory and its session's volume root, and the org's ceiling.
         let cwd = dir.path().to_string_lossy().into_owned();
+        let roots: Vec<String> = crate::sandbox::isolated::plug_root_of(&cwd).into_iter().chain([crate::sandbox::isolated::VOLUMES.to_owned()]).collect();
         let v = shows(&hub, "vm-live", "what its launch declared", |v| v.pointer("/state/overrides/roots").is_some()).await?;
         anyhow::ensure!(v.pointer("/live/engine") == Some(&json!("microvm")) && v.pointer("/live/ops").and_then(Value::as_array).is_some_and(|o| o.len() == 8), "every operation offered: {v}");
-        anyhow::ensure!(v.pointer("/state/overrides/roots") == Some(&json!([cwd, crate::sandbox::isolated::VOLUMES])) && v.pointer("/state/overrides/ceiling") == Some(&json!([CEILING])), "{v}");
+        anyhow::ensure!(v.pointer("/state/overrides/roots") == Some(&json!(roots)) && v.pointer("/state/overrides/ceiling") == Some(&json!([CEILING])), "{v}");
         let launched = vms.launched();
-        anyhow::ensure!(launched.first().is_some_and(|l| l.plug_roots == [cwd.clone(), crate::sandbox::isolated::VOLUMES.to_owned()] && l.egress_ceiling == [CEILING]), "declared at its launch: {launched:?}");
+        anyhow::ensure!(launched.first().is_some_and(|l| l.plug_roots == roots && l.egress_ceiling == [CEILING]), "declared at its launch: {launched:?}");
         let member = || SeamMember("claude".into());
         let ask = |name: &'static str, input: Value| {
             let cx = owner(&hub);
@@ -328,10 +329,10 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         let past = call(owner(&hub), "sessions.egress.grant", json!({"agent": "vm-live", "host": "elsewhere.example.com", "port": 443})).await.err().ok_or_else(|| anyhow::anyhow!("egress past its ceiling was taken"))?;
         anyhow::ensure!(past.0 == http::StatusCode::CONFLICT && past.1.contains("past the most egress"), "{past:?}");
         let outside = call(owner(&hub), "sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "ro", "at": "/opt/data"})).await.err().ok_or_else(|| anyhow::anyhow!("a folder outside its plug roots was taken"))?;
-        anyhow::ensure!(outside.0 == http::StatusCode::CONFLICT && outside.1.contains("outside every folder") && outside.1.contains("restart"), "{outside:?}");
-        // Beneath its session's volume root by default.
+        anyhow::ensure!(outside.0 == http::StatusCode::CONFLICT && outside.1.contains("outside every folder") && outside.1.contains(crate::sandbox::isolated::VOLUMES), "{outside:?}");
+        // Beneath its session's volume root by default, plugged as Shards' ImageGuest::plug takes one.
         let at = format!("{}/data", crate::sandbox::isolated::VOLUMES);
-        let plug = Seam::Plug { share: Share { host: data.clone(), at: at.clone(), writable: false }, members: vec![member()], restart: false };
+        let plug = Seam::Plug { source: PlugSource::Host(data.clone()), to: PlugFor::Members(vec![member()]), at: at.clone(), read_only: true };
         let all = vec![
             Seam::Publish { guest_port: 3000, udp: false, host: Some("127.0.0.1".into()), host_port: 8080 },
             Seam::Grant { member: member(), host: "api.example.com".into(), port: 443 },
@@ -368,10 +369,6 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         ];
         until("its microVM let go of each", || on("fake-vm-2").get(4..) == Some(gone.as_slice())).await?;
         shows(&hub, "vm-live", "none held", |v| v.pointer("/state/overrides/ports").is_none() && v.pointer("/state/overrides/volumes").is_none()).await?;
-        // A folder outside its plug roots, asked with its member restarted to take it: plugged so.
-        ask("sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "rw", "at": "/opt/data", "restart": true})).await?;
-        let restarted = Seam::Plug { share: Share { host: data.clone(), at: "/opt/data".into(), writable: true }, members: vec![member()], restart: true };
-        until("its microVM plugged it, its member restarted", || on("fake-vm-2").last() == Some(&restarted)).await?;
         anyhow::ensure!(hub.harness.close(&hub, "vm-live").await, "it closed");
         Ok(())
     })
@@ -385,7 +382,7 @@ fn p6b_4_ac3_a_volume_is_the_sessions_scope_as_its_access_says() {
     let mut core = crate::harness::core::Core::new();
     core.state.cwd = "/work/proj".into();
     let volume = |path: &str, access| super::HeldVolume {
-        volume: super::Volume { path: path.into(), at: path.into(), access, members: vec![super::Member::Harness("claude".into())], restart: false },
+        volume: super::Volume { path: path.into(), at: path.into(), access, members: vec![super::Member::Harness("claude".into())] },
         harness: super::Took::Now { how: String::new() },
         scope: super::Took::Now { how: String::new() },
         microvm: None,
@@ -432,23 +429,27 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
         Change::Grant(Egress { member: harness(), host: "example.com".into(), port: 0 }),
         Change::Publish(Port { bind: "localhost".into(), host_port: 1, guest_port: 1, protocol: Protocol::Udp }),
         Change::Connect(Network { member: Member::Harness("codex".into()), name: "team".into() }),
-        Change::Add(Volume { path: "relative/dir".into(), at: "relative/dir".into(), access: Access::Rw, members: vec![harness()], restart: false }),
+        Change::Add(Volume { path: "relative/dir".into(), at: "relative/dir".into(), access: Access::Rw, members: vec![harness()] }),
     ] {
         assert!(check(&bad, true, "claude").is_err(), "{bad:?}");
     }
-    let host_volume = Volume { path: "/data".into(), at: "/data".into(), access: Access::Ro, members: vec![harness()], restart: false };
+    let host_volume = Volume { path: "/data".into(), at: "/data".into(), access: Access::Ro, members: vec![harness()] };
     assert!(check(&Change::Add(host_volume.clone()), false, "claude").is_ok());
     assert!(check(&Change::Add(Volume { at: "/elsewhere".into(), ..host_volume.clone() }), false, "claude").is_err());
     assert!(check(&Change::Add(Volume { members: vec![Member::Mcp("db".into())], ..host_volume }), false, "claude").is_err_and(|e| e.contains("one member, its harness")));
-    // What its microVM declared: a folder beneath a plug root fits, one elsewhere only with its members restarted;
-    // egress within its ceiling alone.
-    let declared = Overrides { roots: vec!["/work/proj".into(), "/volumes".into()], ceiling: vec!["api.example.com:443".into(), "[::1]:8080".into()], ..Overrides::default() };
-    let vol = |at: &str, restart| Change::Add(Volume { path: "/data".into(), at: at.into(), access: Access::Rw, members: vec![harness()], restart });
-    assert!(fits(&vol("/volumes/data", false), &declared).is_ok());
-    assert!(fits(&vol("/work/proj/sub", false), &declared).is_ok());
-    assert!(fits(&vol("/volumes-other/data", false), &declared).is_err(), "a sibling of a root isn't beneath it");
-    assert!(fits(&vol("/opt/data", false), &declared).is_err_and(|e| e.contains("restart")));
-    assert!(fits(&vol("/opt/data", true), &declared).is_ok());
+    // What its microVM declared: a folder strictly beneath a plug root fits, as Shards plugs one (D271); egress within its
+    // ceiling alone.
+    let declared = Overrides { roots: vec!["/work".into(), "/volumes".into()], ceiling: vec!["api.example.com:443".into(), "[::1]:8080".into()], ..Overrides::default() };
+    let vol = |at: &str| Change::Add(Volume { path: "/data".into(), at: at.into(), access: Access::Rw, members: vec![harness()] });
+    assert!(fits(&vol("/volumes/data"), &declared).is_ok());
+    assert!(fits(&vol("/work/proj/sub"), &declared).is_ok());
+    assert!(fits(&vol("/volumes"), &declared).is_err(), "a root itself is no plug's place: strictly beneath one");
+    assert!(fits(&vol("/volumes-other/data"), &declared).is_err(), "a sibling of a root isn't beneath it");
+    assert!(fits(&vol("/opt/data"), &declared).is_err_and(|e| e.contains("outside every folder")));
+    assert_eq!(crate::sandbox::isolated::plug_root_of("/Users/ada/proj").as_deref(), Some("/Users"));
+    for refused in ["/tmp/x", "/proc/1", "/etc/kiln", "/run/x", "/dev/null", "/sys/x", "relative", "/"] {
+        assert_eq!(crate::sandbox::isolated::plug_root_of(refused), None, "{refused}");
+    }
     let grant = |host: &str, port| Change::Grant(Egress { member: harness(), host: host.into(), port });
     assert!(fits(&grant("API.example.com", 443), &declared).is_ok());
     assert!(fits(&grant("::1", 8080), &declared).is_ok());
