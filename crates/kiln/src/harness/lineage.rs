@@ -1763,7 +1763,7 @@ mod tests {
                 facts: Some(Box::new(kiln_ci::facts::RunnerFacts { isolation, ..Default::default() })),
                 ..crate::hub::tests::live_runner(name, "linux", "x86_64")
             };
-            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()) })));
+            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()), engine: None })));
             hub.put_agent(said("older", None));
             let refused = isolation_on(&hub, "agent:no-hypervisor").err().unwrap_or_default();
             anyhow::ensure!(refused.ends_with(why), "the runner's own reason: {refused}");

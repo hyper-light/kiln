@@ -156,6 +156,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // it connects, and the server's own agents held to theirs from the start.
     hub.agent_limits.load(&hub.store).await?;
     crate::harness::limit::hold_local(&hub);
+    // Each runner's engine as its owner set it: sent to each runner as it names the feature.
+    hub.engines.load(&hub.store).await?;
     hub.headrooms.load(&hub.store).await?;
     // Peered clusters (docs/peers.md): forwarded to, and their ports open, from the start.
     crate::peers::start(&hub).await;
