@@ -688,7 +688,7 @@ pub(crate) mod tests {
     use kiln_seams::records::{Consistency, SimRecords};
     use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Output, Refusal, Run, Sandbox as _, Signal};
 
-    use super::{Charge, Charged, HexVms, USE, Used};
+    use super::{Charge, Charged, HexVms, USE, Used, host_cpu_ns};
 
     /// The sandbox over Hex's simulator, its boxes numbered as a runner process of epoch 7 numbers those of its runs
     /// that reserve nothing.
