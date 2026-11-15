@@ -1082,6 +1082,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let name = (*name).to_owned();
             boxed(|| crate::harness::engine::put(&hub, &name, req, &caller.name)).await.map_err(|(c, m)| err(c, m))
         }
+        // While a switch of it drains (decision 8): "End them now", and the switch cancelled.
+        (&Method::POST, ["api", "runners", name, "engine", "end"]) => boxed(|| own_op(&hub, &caller, "runners.engine.end_draining", json!({ "runner": name }))).await,
+        (&Method::POST, ["api", "runners", name, "engine", "cancel"]) => boxed(|| own_op(&hub, &caller, "runners.engine.cancel", json!({ "runner": name }))).await,
         (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(boxed(|| crate::frontdoor::control::renew(&hub, name)).await),
         (&Method::GET, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::get(&hub)).await),
         (&Method::PUT, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::put(&hub, req)).await),
