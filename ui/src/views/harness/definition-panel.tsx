@@ -61,3 +61,31 @@ export function DefinitionPanel({ agentId }: { agentId: string }) {
     </Fold>
   );
 }
+
+/**
+ * In the agent's head, beside its harness and machine: the definition it was started from, the version
+ * and its variant; pressed, the Tools tab, where they are. A session started from no definition shows
+ * nothing here.
+ */
+export function DefCrumb({ agentId, onOpen }: { agentId: string; onOpen: () => void }) {
+  const defs = useRes(agentdefsRes).data;
+  const d = defs.find((x) => x.sessions.some((s) => s.id === agentId));
+  if (!d) return null;
+  const mine = d.sessions.find((s) => s.id === agentId)!;
+  const variant = d.experiment?.variants.find((v) => v.key === mine.variant);
+  const vi = d.experiment && variant ? d.experiment.variants.indexOf(variant) : -1;
+  return (
+    <>
+      <span aria-hidden="true">·</span>
+      <button type="button" className="df-crumb" onClick={onOpen} title={mine.version === d.version ? `${d.name} v${d.version}` : `Started on v${mine.version}; v${d.version} is current`}>
+        {d.name} v{mine.version}
+        {mine.version !== d.version && <span className="df-old">→v{d.version}</span>}
+        {variant && d.experiment && (
+          <span className="df-key" style={{ background: variantTone(vi, d.experiment.variants.length) }} title={`Variant ${variant.key} of ${d.experiment.id}`}>
+            {variant.key}
+          </span>
+        )}
+      </button>
+    </>
+  );
+}

@@ -4,7 +4,7 @@
  *
  *   /agents/rev-cicd   "CI/CD Integration" (Devin): its goal stack waits on its goal 6's plan, as
  *                      kiln keeps it (5 steps, research of 7 findings, one graded C)
- *   /agents/rev-big    "Planner audit" (Claude Code): its goal stack waits on a plan with heavy
+ *   /agents/rev-big    "Review the planner audit" (Claude Code): its goal stack waits on a plan with heavy
  *                      research (46 findings from 31 sources: weak, contested and unquoted ones among
  *                      them, a step resting on 12, one on none)
  *   /agents/rev-mode   "Slates" (Claude Code): it proposes a plan in plan mode, its harness asking
@@ -481,7 +481,7 @@ const seedPlans = () => {
         text: CICD_GOAL,
       }),
     ],
-    ["pl_big", planOf("pl_big", "The planner, researched and audited", `Goal: ${BIG_QUESTION}`, BIG_V1, "rev-big", "Planner audit", "rs_big", { id: "b1", text: BIG_QUESTION })],
+    ["pl_big", planOf("pl_big", "The planner, researched and audited", `Goal: ${BIG_QUESTION}`, BIG_V1, "rev-big", "Review the planner audit", "rs_big", { id: "b1", text: BIG_QUESTION })],
     ["pl_slates", planOf("pl_slates", "Fix: a mount taken over by a restarted daemon dropped a store", PROPOSED, [], "rev-mode", "Slates", null, undefined, true)],
   ]);
   kept.get("pl_slates")?.plan.steps.push(...planSteps(PROPOSED));
@@ -621,7 +621,7 @@ function seedMembers(): Map<string, Member> {
   {
     const at = now() - 3 * 60_000;
     const m: Member = {
-      info: { ...base("rev-big", "Planner audit", "claude", "agent:metal-epyc-01"), held: { why: heldWhy("The planner, researched and audited"), plan: "pl_big", since: at } },
+      info: { ...base("rev-big", "Review the planner audit", "claude", "agent:metal-epyc-01"), held: { why: heldWhy("The planner, researched and audited"), plan: "pl_big", since: at } },
       events: [
         { id: "rb-u1", seq: 1, at: at - 1_800_000, kind: "user", text: "Audit the planner against DuckDB, DataFusion and Umbra, and plan what's worth taking. Let me see the plan first." },
         tool("rb-t1", at - 900_000, "research_add", "Recorded 46 findings from 31 sources", { id: "rs_big" }, '{"id": "rs_big", "findings": 46}'),

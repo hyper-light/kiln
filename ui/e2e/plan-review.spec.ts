@@ -1,7 +1,7 @@
 /**
  * A plan waiting on you, reviewed in its agent's Plan tab (views/plans/review.tsx, docs/plans.md
  * "Reviewing a plan"), in the mock's three (mock/plan-review.ts): a plan a goal stack waits on with
- * light research ("CI/CD Integration"), one with heavy research ("Planner audit": 46 findings), and
+ * light research ("CI/CD Integration"), one with heavy research ("Review the planner audit": 46 findings), and
  * one proposed in plan mode ("Slates"). Read step by step, research a few lines however much there
  * is, answered Approve, Reject or Other…; Other… brings it back changed, saying what changed; every
  * Review lands there; on its own page it's approved where it would be run; picking an answer moves

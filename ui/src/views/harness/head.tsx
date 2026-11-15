@@ -10,6 +10,7 @@ import { Link, useNavigate } from "@/lib/router";
 import { ArrowLeft, Flag, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import { FORCE_STOP_AFTER_MS, harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
 import type { RefusedMessages } from "@/api/types";
+import { DefCrumb } from "./definition-panel";
 import { sendingProps } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { newestFirst, refusedCounts, refusedFlag, refusedWhen, whatWhy } from "@/views/refused";
@@ -98,7 +99,10 @@ export function AgentHeader({
   onStop,
   onForceStop,
   lastTurnFrom,
+  onDefinition,
 }: {
+  /** Open what it was started from (the Tools tab's Definition). */
+  onDefinition?: () => void;
   /** When the last turn began (`lastTurnFrom`), for the stopped clock between turns. */
   lastTurnFrom?: number | null;
   /** Find in the conversation. */
@@ -254,6 +258,11 @@ export function AgentHeader({
           </>
         )}
         {info && <span title={cwd}>{machineShown(info.target)}</span>}
+        {info && (
+          <React.Suspense fallback={null}>
+            <DefCrumb agentId={info.id} onOpen={() => onDefinition?.()} />
+          </React.Suspense>
+        )}
       </p>
       {/* The name and the buttons on one row, centred on each other. */}
       <div className="ag-top">

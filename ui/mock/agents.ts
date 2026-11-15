@@ -288,6 +288,27 @@ for (const m of [
     ended: t0 + 56_000,
   } as unknown as HEvent);
 }
+// It looks at the agent it's splitting (agentdefs.get, kiln's MCP): chat shows the definition's rows, its sessions and experiment, with their controls.
+{
+  const m = family.get("fam-orch");
+  m?.events.push({
+    id: "fam-orch-agentdef",
+    seq: 5,
+    at: t0 + 58_000,
+    kind: "tool",
+    tool_id: "ta1",
+    name: "mcp__kiln__agentdefs_get",
+    tool: "mcp",
+    server: "kiln",
+    tool_short: "agentdefs_get",
+    title: "agentdefs_get",
+    input: { id: "reviewer" },
+    output: '{"id": "reviewer", "version": 4, "experiment": "reviewer-size"}',
+    status: "done",
+    started: t0 + 58_000,
+    ended: t0 + 58_400,
+  } as unknown as HEvent);
+}
 // Asked to plan three of its goals now (goals.ts, Make a plan), each by a subagent of its own: kiln's
 // steer for each (`kiln-plan-…`, the plan's id in it), a subagent at "The planner" (its calls so far,
 // the last still going), none yet for "Store and transfer", and one that stopped before "Optimize"

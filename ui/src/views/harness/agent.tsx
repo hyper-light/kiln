@@ -554,6 +554,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
         actions={actions}
         send={send}
         onBackground={onUsage}
+        onDefinition={onUsage}
         onSettings={onSettings}
         onFind={onFind}
         stopAt={stopAt}

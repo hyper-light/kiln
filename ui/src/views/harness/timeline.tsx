@@ -70,6 +70,8 @@ import { liveOf } from "./live-of";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { researchCall } from "@/api/research";
 import { ResearchCard } from "@/views/research/research";
+import { DefinitionCard, defCall } from "./definitions";
+import { Loadable } from "@/components/ui/loading";
 import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Condense, formatThought, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
 import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type ThoughtItem } from "./thinking";
@@ -372,6 +374,10 @@ function ToolBody({ calls, lastResearch }: { calls: ToolEvent[]; lastResearch?: 
             </div>
             {r?.id ? (
               (lastResearch ? lastResearch.has(c.id) : lastOf.get(r.id) === i) && <ResearchCard id={r.id} />
+            ) : defCall(c) ? (
+              <Loadable label="Loading the agent" fallback={null}>
+                <DefinitionCard id={defCall(c)!} at={c.ended ?? c.started} />
+              </Loadable>
             ) : (
               <>
                 {input && (c.server || c.tool === "other" || c.tool === "mcp") && (

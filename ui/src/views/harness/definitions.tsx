@@ -7,7 +7,9 @@
  */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { Check, ChevronDown, ChevronUp, ArrowUpRight, Lock, MoreHorizontal, Pause, Pencil, Play, Repeat2, Square, X } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, ArrowUpRight, Lock, MoreHorizontal, Pause, Pencil, Play, Repeat2, RotateCw, Square, X } from "lucide-react";
+import { useAgentList } from "./use-agents";
+import "./mission.css";
 import { harnessApi } from "@/api/harness";
 import { errorMessage } from "@/lib/hooks";
 import { agentdefsRes, type AgentDef, type Experiment, type Variant } from "@/api/agentdefs";
@@ -567,5 +569,48 @@ function DefNode({ d }: { d: AgentDef }) {
       </span>
       <span className="ms-node-actions" />
     </li>
+  );
+}
+
+/** A kiln MCP call about an agent definition (agentdefs_get, _update, _run …): the definition's id it names, so chat shows its rows. */
+export function defCall(c: { server?: string; tool_short?: string; input?: unknown; status?: string }): string | null {
+  if (c.server !== "kiln" || !c.tool_short?.startsWith("agentdefs_") || c.status === "error") return null;
+  const id = (c.input as { id?: unknown } | null)?.id;
+  return typeof id === "string" ? id : null;
+}
+
+/**
+ * An agent definition in chat: the same rows, with the same controls, as in Mission control. Live
+ * while it's on screen; further back, as it stood when the agent asked ("as of"), with ↻ to go live.
+ */
+export function DefinitionCard({ id, at }: { id: string; at?: number }) {
+  const defs = useRes(agentdefsRes).data;
+  const list = useAgentList();
+  const [live, setLive] = React.useState(false);
+  const [open, setOpen] = React.useState(true);
+  const d = defs.find((x) => x.id === id);
+  if (!d) return null;
+  const old = at !== undefined && Date.now() - at > 60_000 && !live;
+  return (
+    <div className="ms-card" data-asof={old || undefined}>
+      <div className="ms-card-head">
+        <span className="ms-edit-k">agent</span>
+        {old ? (
+          <>
+            <span className="ms-card-asof">as of {new Date(at!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+            <button type="button" className="ms-go" title="Go live" aria-label="Show it as it is now" onClick={() => setLive(true)}>
+              <RotateCw size={14} />
+            </button>
+          </>
+        ) : (
+          <span className="ms-card-asof" data-live>
+            live
+          </span>
+        )}
+      </div>
+      <ul className="ms-list" data-list="defs-chat" inert={old || undefined}>
+        <DefRow d={d} list={list} open={open} onOpen={() => setOpen(!open)} />
+      </ul>
+    </div>
   );
 }

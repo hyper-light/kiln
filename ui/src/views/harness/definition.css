@@ -115,3 +115,52 @@
 .df-panel .meter {
   width: 64px;
 }
+/* A definition in chat (definitions.tsx DefinitionCard): Mission's rows in a frame, live while on screen. */
+.ms-card {
+  container-type: inline-size;
+  border: 1px solid #25272c;
+  border-radius: 9px;
+  overflow: hidden;
+}
+.ms-card .ms-list {
+  margin: 0;
+}
+.ms-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 8px 0 14px;
+  border-bottom: 1px solid #25272c;
+}
+.ms-card-asof {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ms-card-asof[data-live] {
+  color: #bfdccf;
+}
+.ms-card[data-asof] .ms-list {
+  opacity: 0.72;
+}
+.df-crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+}
+.df-crumb:hover {
+  color: #ededee;
+}
+.df-crumb .df-key {
+  width: 15px;
+  height: 15px;
+  font-size: 9.5px;
+  letter-spacing: 0;
+}
