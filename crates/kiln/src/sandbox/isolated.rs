@@ -118,6 +118,10 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
     })
 }
 
+/// How a start that swapped its member into the microVM its session ran in started (the one-click harness switch,
+/// P6c.5), in a start's record beside Hex's `started_from` words (`booted`, `saved`, `restored`, `replaced`, `warm`).
+pub const SWAPPED: &str = "swapped";
+
 /// Starts `kind`'s harness for isolated `spec` in the machine's microVMs `vms`: what its microVM
 /// reaches of its image's destinations ([`reach_of`], read from its person's home under `homes`, the
 /// machine's), its image pinned by its digest (`image::Images::pinned`, built where their store holds
@@ -200,22 +204,37 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         offer_mcp(kind, &source, person, homes, &mut launch.args).await;
     }
     let declared = crate::sandbox::held::Declared { plug_roots: launch.plug_roots.clone(), egress_ceiling: launch.egress_ceiling.clone() };
-    let run = match swap_from {
+    let asked = std::time::Instant::now();
+    let (run, swapped) = match swap_from {
         // A switch: its member swapped for this one in the microVM it runs in.
         Some(from) => {
             let held = from.boundary().ok_or_else(|| anyhow::anyhow!("{} has no microVM to be swapped into", kind.name))?;
             let swapped = held.swap(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't be swapped into its microVM ({image}): {r}", kind.name));
             drop(from);
-            swapped?
+            (swapped?, true)
         }
         None => {
             let name = match (&spec.claim, crate::reach::node::global()) {
                 (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
                 _ => None,
             };
-            vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?
+            // Its microVM's size as its isolation gives it (plan step 32; a deployment experiment's variant, P7.1):
+            // whole vCPUs and MiB, rounded up.
+            let size = spec.isolation.as_ref().filter(|i| i.cpus.is_some() || i.memory.is_some()).map(|i| {
+                let cpus = i.cpus.map_or(0, kiln_ci::sched::state::Cpus::ceil);
+                (u32::try_from(cpus).unwrap_or(u32::MAX), i.memory.map_or(0, |b| b.div_ceil(1 << 20)))
+            });
+            (vms.launch(name, launch, size).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?, false)
         }
     };
+    let us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let (from, meter) = match (&vms.hex, run.id()) {
+        // A swap started no microVM: its start is its member's in the one it ran in (`swapped`), never that
+        // microVM's own start, which a split's strata would otherwise count it as (P7.1, P6c.5).
+        (Some(hex), Some(vm)) => (if swapped { Some(SWAPPED) } else { hex.started_from(&vm).await.map(super::hexvm::said) }, hex.meter(&vm)),
+        _ => (swapped.then_some(SWAPPED), None),
+    };
+    let started = super::held::Started { us, from, meter };
     if let Some(lanes) = lanes {
         let here = crate::reach::node::global().map(|h| crate::reach::local::Here { handle: h.clone(), me: h.name().to_owned(), host, session: session.to_owned() });
         let served = run.id().ok_or_else(|| std::io::Error::other("its run names no microVM")).and_then(|vm| bridge(lanes, vm, here, crate::harness::session::resolve_cwd(spec.cwd.as_deref())));
@@ -227,7 +246,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     if let (Some(claim), Some(reach), Some(group)) = (&spec.claim, crate::reach::node::global(), super::group_of(vms, run.as_ref())) {
         reach.session_grouped(claim.clone(), group).await;
     }
-    Ok(crate::proc::duplex_of_run(run, image, reach, kept_in, declared))
+    Ok(crate::proc::duplex_of_run(run, image, reach, kept_in, declared, Some(started)))
 }
 
 /// Serves kiln's MCP to run `vm`'s harness in this runner's own process (Shards D254; #75 step 3): each connection

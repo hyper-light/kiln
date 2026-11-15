@@ -157,7 +157,11 @@ async fn run(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let (name, version, d) = super::settings_of(&cx.hub, &who(&cx)?, &id).await.map_err(fail)?;
     let task = v.get("prompt").and_then(Value::as_str);
-    let mut ask = json!({"kind": d.harness, "isolation": "microvm", "name": v.get("name").and_then(Value::as_str).unwrap_or(&name)});
+    // Its definition and its task apart, for a split of it to match and retell (P7.1).
+    let mut ask = json!({"kind": d.harness, "isolation": "microvm", "name": v.get("name").and_then(Value::as_str).unwrap_or(&name), "agentdef": id});
+    if let (Some(o), Some(t)) = (ask.as_object_mut(), task) {
+        o.insert("task".into(), json!(t));
+    }
     if let Some(o) = ask.as_object_mut() {
         let given = [("model", d.model.clone()), ("image", d.agentfile.clone()), ("prompt", super::first_message(&d, task))]
             .into_iter()

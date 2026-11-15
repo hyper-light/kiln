@@ -6,6 +6,8 @@
 //! the threshold; otherwise there is "no clear difference". Randomness comes from a seed the
 //! caller passes, so a verdict is reproducible.
 
+pub mod sequence;
+
 /// A 95 % interval of `current / baseline` (the medians' ratio), and its point estimate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Interval {

@@ -134,6 +134,54 @@ pub struct Start {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub ended: Option<Ended>,
+    /// What its microVM measured (P7.1): how long it took to start and how it started, and, once it ended, what it
+    /// lived on. None for a run of the machine's, or one its boundary measures nothing of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub measured: Option<Measured>,
+}
+
+/// The variant of a deployment experiment a session runs as (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1): drawn
+/// by its variants' weights as it started, or its experiment's promoted variant once one was decided.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentExperiment"))]
+pub struct Assigned {
+    pub experiment: String,
+    pub arm: String,
+    /// Its experiment's decision promoted it: the split had ended, so no draw.
+    #[serde(default)]
+    pub promoted: bool,
+}
+
+/// What a start of a session's harness in a microVM measured (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1, a
+/// deployment experiment's measures), each from Hex where Hex says it: its start, from its launch asked to its member
+/// running, and how its microVM started (Hex's `Usage::started_from`: `booted`, `saved`, `restored`, `replaced`,
+/// `warm`; `swapped` where its member was swapped into the microVM its session ran in, P6c.5); once it ended, its
+/// VM's CPU time over its run and its footprint, steady (its last) and peak (the most).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentMeasured"))]
+pub struct Measured {
+    /// Its start, from its launch asked to its member running, in microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub start_us: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub started_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub cpu_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub window_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub footprint_steady_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub footprint_peak_bytes: Option<u64>,
 }
 
 /// How a start of a session's harness ended.
@@ -289,6 +337,10 @@ pub struct Spec {
     /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
+    /// The deployment experiment's variant it was assigned as it started (P7.1, `ci::experiments::assign`): kept
+    /// for its life. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment: Option<Assigned>,
     /// What it helps with when it's a card's helper (`harness::about`: `about`, answering what a
     /// person tapped in its parent's conversation): no row of Mission Control, its parent not told
     /// of it, ended once no card reads it. Set by kiln, never from what was asked.
@@ -398,6 +450,7 @@ impl Default for Spec {
             reach: None,
             parent: None,
             plan_run: None,
+            experiment: None,
             helper: None,
             subagent: false,
             workspace: None,
@@ -716,6 +769,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub plan_run: Option<String>,
+    /// The deployment experiment's variant it runs as (as `Spec::experiment`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub experiment: Option<Assigned>,
     /// What it helps with when it's a card's helper (as `Spec::helper`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -890,7 +947,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace, isolation, runs, starts } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, workspace, isolation, runs, starts } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -948,6 +1005,7 @@ impl Info {
             && *max_subagents == o.max_subagents
             && *parent == o.parent
             && *plan_run == o.plan_run
+            && *experiment == o.experiment
             && *helper == o.helper
             && *subagent == o.subagent
             && *variant_of == o.variant_of
@@ -1564,7 +1622,7 @@ impl Session {
             if open && let Some(l) = starts.last_mut() {
                 l.ended = Some(Ended { at: now, code: None });
             }
-            starts.push(Start { at: now, runs: runs.clone(), ended: None });
+            starts.push(Start { at: now, runs: runs.clone(), ended: None, measured: p.boundary().and_then(|h| h.measured()) });
         }
         // Its image's destinations kept whole for want of knowing what its session uses: said, never
         // a silent widening (ROOT, 2026-11-13), once for each start.
@@ -1585,12 +1643,16 @@ impl Session {
     }
 
     /// Its harness ended, `code` its exit code where it was seen: nothing runs, and kiln's record of
-    /// its start says how it ended.
-    fn ended_run(&self, code: Option<i32>) {
+    /// its start says how it ended and what its boundary `held` measured of it (P7.1).
+    fn ended_run(&self, code: Option<i32>, held: Option<std::sync::Arc<crate::sandbox::held::Held>>) {
         let now = Core::now();
+        let measured = held.and_then(|h| h.measured());
         let mut core = self.core.lock();
         if let Some(l) = core.state.starts.last_mut().filter(|l| l.ended.is_none()) {
             l.ended = Some(Ended { at: now, code });
+            if measured.is_some() {
+                l.measured = measured;
+            }
         }
         core.state.runs = None;
         core.touch_state();
@@ -2292,6 +2354,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         max_subagents: core.state.max_subagents,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        experiment: spec.experiment.clone(),
         helper: spec.helper.clone(),
         subagent: spec.subagent,
         variant_of: spec.variant_of.clone(),
@@ -4972,6 +5035,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 let roots = std::sync::Arc::new(super::whose::Roots::of(&spec));
                 // The link its stdio rides into its microVM, said once it's made.
                 let mut linking = link_made(p.boundary());
+                // Its run's boundary as its end records it (P7.1's measures): kept apart from `p`, which a switch in
+                // its microVM hands on to the next harness's launch (P6c.5), and read again as a resume replaces `p`.
+                let mut boundary = p.boundary();
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -5285,7 +5351,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
                                 keep_ran_in(&s, &files, kept_in.as_deref()).await;
-                                s.ended_run(None);
+                                s.ended_run(None, p.boundary());
                                 // What its adapter held goes with its record, in its queue.
                                 adapter.let_go(&mut s.core.lock());
                                 let _ = reply.send(Ok(None));
@@ -5306,7 +5372,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             if unresolved {
                                 let _ = reply.send(Err("trailing native input effects could not commit; the current owner is retained".into()));
                                 match crate::proc::adopt_duplex(process) {
-                                    Ok(resumed) => { p = resumed; out_open = true; err_open = true; continue; }
+                                    Ok(resumed) => { p = resumed; boundary = p.boundary(); out_open = true; err_open = true; continue; }
                                     Err(error) => {
                                         crate::proc::terminate_tree(i32::try_from(process.pid).unwrap_or(0), Duration::from_secs(2)).await;
                                         let mut core = s.core.lock();
@@ -5360,7 +5426,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
                             keep_ran_in(&s, &files, kept_in.as_deref()).await;
-                            s.ended_run(None);
+                            s.ended_run(None, p.boundary());
                             if let Some(g) = group {
                                 end_group(g, Duration::from_millis(3500));
                             }
@@ -5540,7 +5606,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 }
                 *s.pid.lock() = None;
                 keep_ran_in(&s, &files, kept_in.as_deref()).await;
-                s.ended_run(code);
+                s.ended_run(code, boundary);
                 // A conversation carried in that it took is in its own session now, which it
                 // starts again on (Antigravity starts again for a new mode, model or effort); one
                 // it hasn't taken yet is given to it again.
@@ -7953,7 +8019,7 @@ sys.exit(1)
             pause_at: None,
             max_subagents: None,
             parent: None,
-            plan_run: None,
+            plan_run: None, experiment: None,
             helper: None,
             subagent: false,
             no_bypass: false,

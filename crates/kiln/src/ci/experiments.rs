@@ -17,6 +17,15 @@
 //!   against the baseline's with intervals, each option's main effect and each pair's
 //!   interaction, and a recommendation. Then decided: brought back (the default), or the clear
 //!   winner taken (`decide: auto`), and the agent that asked told either way.
+//! - **A split** (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1, the person's decision 7): an experiment may deploy
+//!   2 or more variants of a target instead of options. The target is one of the opener's agent definitions, or a
+//!   harness and its Agentfile. Each variant (`arms`) is a deployment (an Agentfile, an agent or harness, an engine,
+//!   a VM size) with a weight in percent. While it runs, each new session of the target that its opener starts is one
+//!   of them, drawn by weight as it starts ([`assign`], from `harness::lineage::start`), recorded on the session
+//!   (`Spec::experiment`) and kept for its life. Its measures come from those sessions as they run and end, each with
+//!   its anytime-valid confidence sequence (`kiln_ci::split`), so reading them live inflates no false winner.
+//!   Pausing stops the draws; deciding promotes one variant (a person's press), which every later session of the
+//!   target gets, and ends the split; cancelling ends both.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,6 +42,7 @@ use crate::authz::{Caller, Scope};
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 use crate::store::Repo;
+use kiln_ci::split;
 
 /// An option: its name, what was given for it, and the commits it adds (`from..to`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +143,12 @@ pub struct Experiment {
     /// Whom its agents act for (`owner` or `user:<id>`).
     pub opener: String,
     pub options: Vec<OptionDef>,
+    /// What a split splits (P7.1): none for an experiment of options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<Target>,
+    /// A split's variants, each a deployment with its weight.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub arms: Vec<Arm>,
     pub strategy: Option<Strategy>,
     pub baseline: bool,
     pub criteria: Vec<Criterion>,
@@ -188,6 +204,16 @@ fn decision_key(id: &str) -> String {
     format!("ci/experiment-decision/{id}")
 }
 
+/// Who paused a split: its draws stop while this is kept.
+fn paused_key(id: &str) -> String {
+    format!("ci/experiment-paused/{id}")
+}
+
+/// A split's draws, each its own: the `n`-th session's variant, and what came of it.
+fn drawn_key(id: &str, n: u64) -> String {
+    format!("ci/experiment-drawn/{id}/{n:012}")
+}
+
 fn bad(m: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, m.into())
 }
@@ -214,14 +240,23 @@ fn planned(e: &Experiment) -> usize {
 
 /// `e` with its cancellation and decision laid over it.
 async fn overlay(hub: &Hub, mut e: Experiment) -> Experiment {
+    if let Some(d) = hub.store.kv_get(decision_key(&e.id)).await.ok().flatten().and_then(|t| serde_json::from_str::<Decision>(&t).ok()) {
+        e.decision = Some(d);
+    }
+    // A split runs until it's decided (its variant promoted), paused or cancelled; a cancel ends a promotion too.
+    if e.target.is_some() {
+        if e.decision.is_some() {
+            e.state = "done".into();
+        } else if let Some(by) = hub.store.kv_get(paused_key(&e.id)).await.ok().flatten() {
+            e.state = "paused".into();
+            e.why = Some(format!("paused by {by}"));
+        }
+    }
     if let Some(by) = hub.store.kv_get(cancel_key(&e.id)).await.ok().flatten()
-        && !matches!(e.state.as_str(), "done" | "failed")
+        && (e.target.is_some() || !matches!(e.state.as_str(), "done" | "failed"))
     {
         e.state = "cancelled".into();
         e.why = Some(format!("cancelled by {by}"));
-    }
-    if let Some(d) = hub.store.kv_get(decision_key(&e.id)).await.ok().flatten().and_then(|t| serde_json::from_str::<Decision>(&t).ok()) {
-        e.decision = Some(d);
     }
     e
 }
@@ -319,6 +354,12 @@ struct AskOption {
 /// `POST /api/experiments`: an experiment started by `caller`, its variants built and measured from
 /// now on.
 pub async fn start(hub: &Arc<Hub>, caller: &Caller, body: Value) -> Result<Response, Fail> {
+    if body.get("target").is_some_and(|t| !t.is_null()) {
+        return start_split(hub, caller, body).await;
+    }
+    if body.get("arms").is_some_and(|a| !a.is_null()) {
+        return Err(bad("`arms` are a split's: say what it splits (`target`)"));
+    }
     let mut ask: Ask = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
     // Left out: the repository the asking agent's folder is a checkout of.
     if ask.repo.trim().is_empty()
@@ -1231,9 +1272,9 @@ pub async fn list(hub: &Hub, caller: &Caller, q: &std::collections::HashMap<Stri
     let shown: Vec<Value> = all(hub)
         .await
         .into_iter()
-        .filter(|e| repo.is_none_or(|r| *r == e.repo) && caller.can("runs.read", &Scope::Repo { repo: e.repo.clone() }))
+        .filter(|e| repo.is_none_or(|r| *r == e.repo) && may_read(caller, e))
         .map(|e| {
-            json!({ "id": e.id, "repo": e.repo, "question": e.question, "state": e.state, "variants": e.variants.len(), "measured": e.runs.iter().filter(|r| r.conclusion.is_some()).count(), "runs": planned(&e),
+            json!({ "id": e.id, "repo": e.repo, "question": e.question, "state": e.state, "variants": e.variants.len(), "target": e.target, "arms": e.arms.len(), "measured": e.runs.iter().filter(|r| r.conclusion.is_some()).count(), "runs": planned(&e),
                     "recommendation": e.results.as_ref().and_then(|r| r.get("recommendation")), "decision": e.decision, "by": e.by, "created_at": e.created_at })
         })
         .collect();
@@ -1243,6 +1284,13 @@ pub async fn list(hub: &Hub, caller: &Caller, q: &std::collections::HashMap<Stri
 /// The experiment `id`, for `caller` with `cap` on its repository.
 async fn mine(hub: &Hub, caller: &Caller, id: &str, cap: &str) -> Result<Experiment, Fail> {
     let e = get(hub, id).await.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no experiment `{id}`")))?;
+    if e.target.is_some() {
+        // A split is its opener's: it splits their sessions alone.
+        if !caller.is_owner() && crate::harness::lineage::person_of(caller).as_deref() != Some(e.opener.as_str()) {
+            return Err((StatusCode::NOT_FOUND, format!("no experiment `{id}`")));
+        }
+        return Ok(e);
+    }
     if !caller.can(cap, &Scope::Repo { repo: e.repo.clone() }) {
         return Err((StatusCode::FORBIDDEN, format!("{} may not do that to {id}: it needs {cap} on {}", caller.name, e.repo)));
     }
@@ -1251,7 +1299,10 @@ async fn mine(hub: &Hub, caller: &Caller, id: &str, cap: &str) -> Result<Experim
 
 /// `GET /api/experiments/:id`.
 pub async fn show(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fail> {
-    let e = mine(hub, caller, id, "runs.read").await?;
+    let mut e = mine(hub, caller, id, "runs.read").await?;
+    if e.target.is_some() {
+        read_split(hub, &mut e).await;
+    }
     Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })))
 }
 
@@ -1259,6 +1310,19 @@ pub async fn show(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fail
 pub async fn decide(hub: &Arc<Hub>, caller: &Caller, id: &str, body: &Value) -> Result<Response, Fail> {
     let mut e = mine(hub, caller, id, "experiments.run").await?;
     let name = body.get("variant").and_then(Value::as_str).ok_or_else(|| bad("say which variant (`variant`)"))?;
+    if e.target.is_some() {
+        if e.state == "cancelled" {
+            return Err((StatusCode::CONFLICT, format!("{id} was cancelled: it promotes nothing")));
+        }
+        if !e.arms.iter().any(|a| a.name == name) {
+            return Err(bad(format!("{id} has no variant `{name}`")));
+        }
+        // Promoted: every later session of its target is this variant, and the split is over.
+        record_decision(hub, &mut e, Decision { variant: name.to_owned(), commit: String::new(), by: caller.name.clone(), at: crate::util::now_unix() }).await;
+        hub.store.audit(caller.name.clone(), "experiments.decide".into(), format!("{id}: {name} promoted")).await;
+        let e = overlay(hub, e).await;
+        return Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })));
+    }
     let v = e.variants.iter().find(|v| v.name == name).cloned().ok_or_else(|| bad(format!("{id} has no variant `{name}`")))?;
     let commit = v.commit.clone().ok_or_else(|| (StatusCode::CONFLICT, format!("{name} wasn't built: {}", v.why.clone().unwrap_or_default())))?;
     record_decision(hub, &mut e, Decision { variant: name.to_owned(), commit, by: caller.name.clone(), at: crate::util::now_unix() }).await;
@@ -1272,7 +1336,7 @@ pub async fn decide(hub: &Arc<Hub>, caller: &Caller, id: &str, body: &Value) -> 
 /// `POST /api/experiments/:id/cancel`: no more runs; those running are cancelled.
 pub async fn cancel(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fail> {
     let mut e = mine(hub, caller, id, "experiments.run").await?;
-    if matches!(e.state.as_str(), "done" | "cancelled" | "failed") {
+    if e.state == "cancelled" || (e.target.is_none() && matches!(e.state.as_str(), "done" | "failed")) {
         return Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })));
     }
     hub.store.kv_set(cancel_key(id), caller.name.clone()).await.map_err(internal)?;
@@ -1406,7 +1470,394 @@ pub async fn where_for(hub: &Hub, caller: &Caller, q: &std::collections::HashMap
     ))
 }
 
-/// `/api/experiments[/:id[/decide|/cancel]]`, `/where` and `/suggest`.
+/// What a split splits (P7.1): one of its opener's agent definitions (`agent`), or a harness (`harness`) and, where
+/// given, the Agentfile its sessions are made from (`agentfile`; left out, every session of the harness).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Target {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agentfile: Option<String>,
+}
+
+/// A start as a split's target matches it: the agent definition it runs, its harness and the Agentfile it's made
+/// from (kiln's own for its harness where it's isolated and names none), and whom it's for.
+pub struct Starting<'a> {
+    pub agentdef: Option<&'a str>,
+    pub harness: &'a str,
+    pub agentfile: Option<&'a str>,
+    pub person: &'a str,
+}
+
+impl Target {
+    fn holds(&self, s: &Starting<'_>) -> bool {
+        match (&self.agent, &self.harness) {
+            (Some(agent), _) => s.agentdef == Some(agent.as_str()),
+            (None, Some(harness)) => s.harness == harness && self.agentfile.as_deref().is_none_or(|f| s.agentfile == Some(f)),
+            (None, None) => false,
+        }
+    }
+}
+
+/// A microVM's size, as a variant asks it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Size {
+    pub cpus: u32,
+    pub memory_mib: u64,
+}
+
+/// A split's variant (P7.1): a deployment, and its weight in percent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Arm {
+    pub name: String,
+    pub weight: f64,
+    /// The harness its sessions run: its own, or its agent's.
+    pub harness: String,
+    /// The agent definition it runs, and its version as the split started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The Agentfile its microVM is made from; none: kiln's own for its harness, or none on the host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agentfile: Option<String>,
+    /// `microvm` or `host`.
+    pub engine: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<Size>,
+    /// Its agent's settings as the split started: what its sessions are told.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<crate::agentdefs::Settings>,
+}
+
+/// A split's draw: the variant its session got, and what came of it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+struct Drawn {
+    arm: String,
+    at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    /// Its start was refused, why: its variant's failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refused: Option<String>,
+    /// Its session as last seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seen: Option<Seen>,
+}
+
+/// A split's session as last seen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+struct Seen {
+    ended: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed: Option<bool>,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_ms: Option<f64>,
+    measures: BTreeMap<String, f64>,
+}
+
+/// What a split's start asks.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SplitAsk {
+    target: Target,
+    arms: Vec<ArmAsk>,
+    question: Option<String>,
+    agent: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ArmAsk {
+    name: String,
+    weight: f64,
+    agentfile: Option<String>,
+    harness: Option<String>,
+    agent: Option<String>,
+    engine: Option<String>,
+    size: Option<Size>,
+}
+
+fn some(s: &Option<String>) -> Option<&str> {
+    s.as_deref().map(str::trim).filter(|x| !x.is_empty())
+}
+
+/// `POST /api/experiments` with `target` (P7.1): a split of the caller's sessions of `target` across `arms`, by their
+/// weights, from now on.
+async fn start_split(hub: &Arc<Hub>, caller: &Caller, body: Value) -> Result<Response, Fail> {
+    let ask: SplitAsk = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
+    let person = crate::harness::lineage::person_of(caller).ok_or_else(|| (StatusCode::FORBIDDEN, format!("{} acts for no person, and a split splits a person's sessions", caller.name)))?;
+    let files = crate::agentfiles::Who { person: person.clone(), all: false };
+    let defs = crate::agentdefs::Who { person: person.clone(), all: false };
+    let target = match (some(&ask.target.agent), some(&ask.target.harness)) {
+        (Some(agent), None) => {
+            if ask.target.agentfile.is_some() {
+                return Err(bad("an agent's target is its definition alone: its Agentfile is its definition's"));
+            }
+            crate::agentdefs::get(hub, &defs, agent).await.map_err(|e| bad(format!("`target`: {e}")))?;
+            Target { agent: Some(agent.to_owned()), ..Target::default() }
+        }
+        (None, Some(harness)) => {
+            let kind = crate::harness::kinds::Kind::get(harness).ok_or_else(|| bad(format!("`target`: `{harness}` is none of kiln's harnesses")))?;
+            let agentfile = match some(&ask.target.agentfile) {
+                Some(f) => Some(crate::harness::lineage::image_for(hub, &files, kind, f).await.map_err(|(st, why)| (st, format!("`target`: {why}")))?),
+                None => None,
+            };
+            Target { harness: Some(harness.to_owned()), agentfile, ..Target::default() }
+        }
+        _ => return Err(bad("a split's `target` is one of your agents (`agent`), or a harness (`harness`) and, where you like, its Agentfile (`agentfile`)")),
+    };
+    if ask.arms.len() < 2 || ask.arms.len() > ex::MOST_VARIANTS {
+        return Err(bad(format!("a split deploys from 2 to {} variants (`arms`)", ex::MOST_VARIANTS)));
+    }
+    let mut arms: Vec<Arm> = Vec::new();
+    for a in &ask.arms {
+        let name = a.name.trim().to_owned();
+        if name.is_empty() || arms.iter().any(|x| x.name == name) {
+            return Err(bad("each variant has a name of its own"));
+        }
+        let named = |what: String| bad(format!("variant `{name}`: {what}"));
+        if !(a.weight.is_finite() && a.weight > 0.0) {
+            return Err(named("its `weight` is a percentage above 0".into()));
+        }
+        let engine = match a.engine.as_deref().map(str::trim) {
+            None | Some("" | "microvm") => "microvm",
+            Some("host") => "host",
+            Some(other) => return Err(named(format!("`{other}` is no engine: microvm or host"))),
+        };
+        let mut arm = Arm { name: name.clone(), weight: a.weight, engine: engine.into(), size: a.size.filter(|s| s.cpus > 0 || s.memory_mib > 0), ..Arm::default() };
+        let mut agentfile = some(&a.agentfile).map(str::to_owned);
+        match (some(&a.harness), some(&a.agent)) {
+            (Some(h), None) => arm.harness = h.to_owned(),
+            (None, Some(agent)) => {
+                let d = crate::agentdefs::get(hub, &defs, agent).await.map_err(|e| named(format!("{e}")))?;
+                arm.harness.clone_from(&d.settings.harness);
+                arm.model.clone_from(&d.settings.model);
+                arm.agent = Some(d.id.clone());
+                arm.agent_version = Some(d.version);
+                agentfile = agentfile.or_else(|| d.settings.agentfile.clone());
+                arm.settings = Some(d.settings);
+            }
+            _ => return Err(named("its member is a `harness` or one of your `agent`s, one of them".into())),
+        }
+        let kind = crate::harness::kinds::Kind::get(&arm.harness).ok_or_else(|| named(format!("`{}` is none of kiln's harnesses", arm.harness)))?;
+        match engine {
+            "host" => {
+                if agentfile.is_some() || arm.size.is_some() {
+                    return Err(named("an Agentfile and a size are a microVM's: the host engine runs its harness as a process of its machine".into()));
+                }
+            }
+            _ => {
+                arm.agentfile = match agentfile {
+                    Some(f) => Some(crate::harness::lineage::image_for(hub, &files, kind, &f).await.map_err(|(st, why)| (st, format!("variant `{name}`: {why}")))?),
+                    None if crate::agentfiles::builtin::ALL.iter().any(|b| b.harness == kind.id) => None,
+                    None => return Err(named(format!("kiln ships no Agentfile for {}: name yours (`agentfile`)", kind.name))),
+                };
+            }
+        }
+        arms.push(arm);
+    }
+    let total: f64 = arms.iter().map(|a| a.weight).sum();
+    if (total - 100.0).abs() > 1e-9 * 100.0 {
+        return Err(bad(format!("a split's weights are percentages that add up to 100, not {total}")));
+    }
+    if let Some(other) = all(hub).await.into_iter().find(|o| o.opener == person && o.target.as_ref() == Some(&target) && o.state != "cancelled") {
+        return Err((StatusCode::CONFLICT, format!("{} splits that target already ({}): cancel it first", other.id, other.state)));
+    }
+    let id = next_id(hub).await.map_err(internal)?;
+    let mut e = Experiment {
+        id: id.clone(),
+        question: ask.question.clone(),
+        agent: ask.agent.clone().or_else(|| caller.agent.clone()),
+        opener: person,
+        target: Some(target),
+        arms,
+        decide: "ask".into(),
+        state: "running".into(),
+        trusted: caller.is_owner(),
+        by: caller.name.clone(),
+        created_at: crate::util::now_unix(),
+        ..Experiment::default()
+    };
+    save(hub, &mut e).await;
+    hub.store.audit(caller.name.clone(), "experiments.start".into(), format!("{id}: a split of {} variants, {}", e.arms.len(), e.arms.iter().map(|a| format!("{} {}%", a.name, a.weight)).collect::<Vec<_>>().join(", "))).await;
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "experiment": e })))
+}
+
+/// A session's variant, as [`assign`] gave it: the split's `n`-th draw (none for a promoted variant).
+pub struct Draw {
+    pub assigned: crate::harness::session::Assigned,
+    pub arm: Arm,
+    n: Option<u64>,
+}
+
+/// The next of split `id`'s draws: `0`, `1`, ….
+async fn next_draw(hub: &Hub, id: &str) -> anyhow::Result<u64> {
+    let key = format!("ci/experiment-draws/{id}");
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let n: u64 = tx.query_row("SELECT v FROM kv WHERE k = ?1", [&key], |r| r.get::<_, String>(0)).optional()?.and_then(|v| v.parse().ok()).unwrap_or(0);
+            tx.execute("INSERT INTO kv (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", [key.clone(), (n + 1).to_string()])?;
+            tx.commit()?;
+            Ok(n)
+        })
+        .await
+}
+
+/// The variant a new session starting as `s` is (P7.1): while a split of its opener's holds its target, its draw by
+/// the variants' weights, kept as the split's next; once the split promoted one, that one, with no draw; none while
+/// none holds it, it's paused, or it was cancelled.
+pub async fn assign(hub: &Hub, s: &Starting<'_>) -> Option<Draw> {
+    let e = all(hub).await.into_iter().find(|e| e.opener == s.person && e.target.as_ref().is_some_and(|t| t.holds(s)) && matches!(e.state.as_str(), "running" | "done"))?;
+    if let Some(d) = &e.decision {
+        let arm = e.arms.iter().find(|a| a.name == d.variant)?.clone();
+        return Some(Draw { assigned: crate::harness::session::Assigned { experiment: e.id.clone(), arm: arm.name.clone(), promoted: true }, arm, n: None });
+    }
+    let weights: Vec<f64> = e.arms.iter().map(|a| a.weight).collect();
+    let n = match next_draw(hub, &e.id).await {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::warn!(experiment = %e.id, error = %format!("{err:#}"), "a split's draw wasn't kept: the session starts as asked");
+            return None;
+        }
+    };
+    let arm = e.arms.get(split::draw(&weights, seed_of(&e.id), n)?)?.clone();
+    let drawn = Drawn { arm: arm.name.clone(), at: crate::util::now_ms(), ..Drawn::default() };
+    let text = serde_json::to_string(&drawn).ok()?;
+    hub.store.kv_set(drawn_key(&e.id, n), text).await.ok()?;
+    Some(Draw { assigned: crate::harness::session::Assigned { experiment: e.id.clone(), arm: arm.name.clone(), promoted: false }, arm, n: Some(n) })
+}
+
+/// What draw `d`'s start came to: its session, or why it was refused (its variant's failure).
+pub async fn started(hub: &Hub, d: &Draw, came: Result<String, String>) {
+    let Some(n) = d.n else { return };
+    let key = drawn_key(&d.assigned.experiment, n);
+    let mut drawn: Drawn = hub.store.kv_get(key.clone()).await.ok().flatten().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| Drawn { arm: d.arm.name.clone(), ..Drawn::default() });
+    match came {
+        Ok(session) => drawn.session = Some(session),
+        Err(why) => drawn.refused = Some(why),
+    }
+    if let Ok(text) = serde_json::to_string(&drawn) {
+        let _ = hub.store.kv_set(key, text).await;
+    }
+}
+
+/// A split's session as its info says it (`Info::starts`' measures, P7.1).
+fn seen_of(i: &crate::harness::session::Info) -> Seen {
+    let ended = i.status == crate::harness::model::Status::Exited;
+    let errored = i.exit.as_ref().is_some_and(|x| x.error.is_some());
+    let ran = !i.starts.is_empty();
+    let outcome = match (ended, errored || !ran) {
+        (false, _) => "running",
+        (true, true) => "failed",
+        (true, false) => "ended",
+    };
+    let failed = if ended { Some(errored || !ran) } else if ran { Some(false) } else { None };
+    let first = i.starts.iter().find_map(|s| s.measured.as_ref());
+    let mut measures = BTreeMap::new();
+    if let Some(peak) = i.starts.iter().filter_map(|s| s.measured.as_ref()?.footprint_peak_bytes).max() {
+        measures.insert("footprint_peak_bytes".to_owned(), peak as f64);
+    }
+    if let Some(steady) = i.starts.iter().rev().find_map(|s| s.measured.as_ref()?.footprint_steady_bytes) {
+        measures.insert("footprint_steady_bytes".to_owned(), steady as f64);
+    }
+    let cpu: Vec<u64> = i.starts.iter().filter_map(|s| s.measured.as_ref()?.cpu_ns).collect();
+    if !cpu.is_empty() {
+        measures.insert("cpu_ms".to_owned(), cpu.iter().map(|n| *n as f64).sum::<f64>() / 1e6);
+    }
+    Seen {
+        ended,
+        failed,
+        outcome: outcome.into(),
+        start_kind: first.and_then(|m| m.started_from.as_deref()).and_then(split::kind_of).map(str::to_owned),
+        start_ms: first.and_then(|m| m.start_us).map(|us| us as f64 / 1000.0),
+        measures,
+    }
+}
+
+/// `e`'s results, a split's: each draw's session read as it stands now (one that ended kept as it ended), then what
+/// they say (`kiln_ci::split::analyze`).
+async fn read_split(hub: &Hub, e: &mut Experiment) {
+    let mut sessions = Vec::new();
+    for (key, text) in hub.store.kv_prefix(format!("ci/experiment-drawn/{}/", e.id)).await.unwrap_or_default() {
+        let Ok(mut drawn) = serde_json::from_str::<Drawn>(&text) else { continue };
+        let seen = match (&drawn.refused, &drawn.session) {
+            (Some(_), _) => Some(Seen { ended: true, failed: Some(true), outcome: "refused".into(), ..Seen::default() }),
+            (None, Some(session)) => match (&drawn.seen, hub.harness.info(session)) {
+                (Some(last), _) if last.ended => Some(last.clone()),
+                (_, Some(info)) => {
+                    let now = seen_of(&info);
+                    if drawn.seen.as_ref() != Some(&now) {
+                        drawn.seen = Some(now.clone());
+                        if let Ok(t) = serde_json::to_string(&drawn) {
+                            let _ = hub.store.kv_set(key.clone(), t).await;
+                        }
+                    }
+                    Some(now)
+                }
+                (last, None) => last.clone().or(Some(Seen { outcome: "gone".into(), ..Seen::default() })),
+            },
+            (None, None) => Some(Seen { outcome: "starting".into(), ..Seen::default() }),
+        };
+        let seen = seen.unwrap_or_default();
+        sessions.push(split::Session {
+            arm: drawn.arm.clone(),
+            failed: seen.failed,
+            outcome: seen.outcome.clone(),
+            start: match (split::KINDS.iter().copied().find(|k| seen.start_kind.as_deref() == Some(*k)), seen.start_ms) {
+                (Some(k), Some(ms)) => Some((k, ms)),
+                _ => None,
+            },
+            measures: seen.measures.clone(),
+        });
+    }
+    let names: Vec<String> = e.arms.iter().map(|a| a.name.clone()).collect();
+    e.results = serde_json::to_value(split::analyze(&names, &sessions)).ok();
+}
+
+/// `POST /api/experiments/:id/pause` (`on`) and `/resume`: a split's draws stop, and start again.
+pub async fn pause(hub: &Hub, caller: &Caller, id: &str, on: bool) -> Result<Response, Fail> {
+    let e = mine(hub, caller, id, "experiments.run").await?;
+    if e.target.is_none() {
+        return Err(bad(format!("{id} measures options: only a split pauses")));
+    }
+    if matches!(e.state.as_str(), "done" | "cancelled") {
+        return Err((StatusCode::CONFLICT, format!("{id} is {}: it draws no more", e.state)));
+    }
+    if on {
+        hub.store.kv_set(paused_key(id), caller.name.clone()).await.map_err(internal)?;
+    } else {
+        hub.store.kv_delete(paused_key(id)).await.map_err(internal)?;
+    }
+    hub.store.audit(caller.name.clone(), if on { "experiments.pause" } else { "experiments.resume" }.into(), id.to_owned()).await;
+    let e = overlay(hub, e).await;
+    hub.emit(&crate::wire::events::ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(crate::wire::events::ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), measured: None, runs: None, decision: None }) });
+    Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })))
+}
+
+/// Whether `caller` may read `e`: a split its opener (and the server's owner); one of options whoever reads its
+/// repository's runs.
+fn may_read(caller: &Caller, e: &Experiment) -> bool {
+    if e.target.is_some() {
+        return caller.is_owner() || crate::harness::lineage::person_of(caller).as_deref() == Some(e.opener.as_str());
+    }
+    caller.can("runs.read", &Scope::Repo { repo: e.repo.clone() })
+}
+
+/// `/api/experiments[/:id[/decide|/cancel|/pause|/resume]]`, `/where` and `/suggest`.
 pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: Value) -> Result<Response, Fail> {
     use http::Method;
     match (method, rest) {
@@ -1417,6 +1868,8 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &http::Method, rest:
         (&Method::GET, [id]) => show(hub, caller, id).await,
         (&Method::POST, [id, "decide"]) => decide(hub, caller, id, &body).await,
         (&Method::POST, [id, "cancel"]) => cancel(hub, caller, id).await,
+        (&Method::POST, [id, "pause"]) => pause(hub, caller, id, true).await,
+        (&Method::POST, [id, "resume"]) => pause(hub, caller, id, false).await,
         _ => Err((StatusCode::NOT_FOUND, "no such route".into())),
     }
 }

@@ -25,8 +25,18 @@ pub struct Held {
     reach: crate::sandbox::narrow::Reach,
     kept_in: Option<String>,
     declared: Declared,
+    started: Option<Started>,
     ended: AtomicBool,
     changed: crate::rt::Changed,
+}
+
+/// How a boundary's run started, and the meter what it lives on is read from (P7.1): its launch's time, from asked to
+/// its member running, and how Hex says its microVM started.
+pub struct Started {
+    /// From its launch asked to its member running, in microseconds.
+    pub us: u64,
+    pub from: Option<&'static str>,
+    pub meter: Option<super::hexvm::Meter>,
 }
 
 /// What a run's launch declared of the changes it takes while it runs (kiln plan 01a1dd2e…, P6b.4; Shards'
@@ -51,8 +61,8 @@ pub struct Parts {
 /// destinations, its harness keeping its conversations in `kept_in` (as its microVM has the folder,
 /// `harness::isolated::home::Layout::kept_in`): one task writes what's sent to its stdin, in order, and
 /// closes its stdin once nothing more can be sent; another hands on what it says and its end.
-pub fn pump(run: Box<dyn Run>, image: String, reach: crate::sandbox::narrow::Reach, kept_in: Option<String>, declared: Declared) -> Parts {
-    let held = Arc::new(Held { run: Arc::from(run), image, reach, kept_in, declared, ended: AtomicBool::new(false), changed: crate::rt::Changed::new() });
+pub fn pump(run: Box<dyn Run>, image: String, reach: crate::sandbox::narrow::Reach, kept_in: Option<String>, declared: Declared, started: Option<Started>) -> Parts {
+    let held = Arc::new(Held { run: Arc::from(run), image, reach, kept_in, declared, started, ended: AtomicBool::new(false), changed: crate::rt::Changed::new() });
     let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     // A process's pipes' bounds, so its session's loop reads it as it reads a process.
     let (out_tx, stdout) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDOUT_CHUNKS);
@@ -116,6 +126,21 @@ fn code(how: Exit) -> Option<i32> {
 }
 
 impl Held {
+    /// What its run measured so far (P7.1): its start, and what it lived on as its meter last knew it; none where it
+    /// measured nothing.
+    pub fn measured(&self) -> Option<crate::harness::session::Measured> {
+        let started = self.started.as_ref()?;
+        let lived = started.meter.as_ref().and_then(super::hexvm::Meter::lived);
+        Some(crate::harness::session::Measured {
+            start_us: Some(started.us),
+            started_from: started.from.map(str::to_owned),
+            cpu_ns: lived.map(|l| l.cpu_ns),
+            window_ns: lived.map(|l| l.window_ns),
+            footprint_steady_bytes: lived.map(|l| l.footprint_steady_bytes),
+            footprint_peak_bytes: lived.map(|l| l.footprint_peak_bytes),
+        })
+    }
+
     /// Ends it in its own time, then by force: a signal to end where its boundary delivers one, else
     /// the end of its input; its kill once `grace` passes without its end.
     pub fn terminate(self: &Arc<Self>, grace: Duration) {
@@ -205,7 +230,7 @@ mod tests {
 
     async fn launched(s: &SimSandbox, program: &str) -> anyhow::Result<Parts> {
         let run = s.launch(Launch::of(program, &[])).await.map_err(anyhow::Error::msg)?;
-        Ok(pump(run, "sim".to_owned(), sim_reach(), None, Declared::default()))
+        Ok(pump(run, "sim".to_owned(), sim_reach(), None, Declared::default(), None))
     }
 
     /// Step 17: what a session writes reaches the run in order and comes back on its stdout; the
@@ -257,7 +282,7 @@ mod tests {
     fn s17_a_held_duplex_is_no_process_hands_nothing_over_and_stops_through_its_boundary() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let run = SimSandbox::new().launch(Launch::of("wait", &[])).await.map_err(anyhow::Error::msg)?;
-            let mut p = crate::proc::duplex_of_run(run, "sim".to_owned(), sim_reach(), None, Declared::default());
+            let mut p = crate::proc::duplex_of_run(run, "sim".to_owned(), sim_reach(), None, Declared::default(), None);
             assert_eq!(p.host_pid(), None);
             assert!(p.detach().await.is_none(), "nothing of it is this process's to hand over");
             p.terminate(Duration::from_secs(30));
@@ -273,7 +298,7 @@ mod tests {
         crate::rt::block_on(async {
             let s = SimSandbox::new();
             let run = s.launch(Launch::of("echo", &[])).await.map_err(anyhow::Error::msg)?;
-            let p = pump(run, "sim".to_owned(), sim_reach(), None, Declared::default());
+            let p = pump(run, "sim".to_owned(), sim_reach(), None, Declared::default(), None);
             let held = Arc::clone(&p.held);
             let Parts { stdin, stdout, .. } = p;
             drop(stdout);

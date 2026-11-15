@@ -84,6 +84,7 @@ pub mod sched;
 pub mod secrets;
 pub mod sharing;
 pub mod sizes;
+pub mod split;
 pub mod stats;
 pub mod store;
 pub mod topo;
