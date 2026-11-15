@@ -7,6 +7,8 @@
  *                                   facts, and its sessions on each engine (`draining`: the other's)
  *   PUT /api/runners/:name/engine   {engine: "host" | "microvm" | null}: set it, or take what was set
  *                                   away (null: what it can do); microvm refused (409) where it can't
+ *   POST /api/runners/:name/engine/end     its draining sessions ended now (`ended`, their ids)
+ *   POST /api/runners/:name/engine/cancel  the setting before its switch put back while any drains
  *
  * Its engine is what its owner set, else `microvm` where it can hold microVMs, else `host`; one set to
  * microvm where it can't any more is held as host, saying why. Each runner's facts carry it
@@ -22,8 +24,8 @@ interface Ctx {
   body: <T>(req: http.IncomingMessage) => Promise<T>;
   runner: (name: string) => Agent | undefined;
   runners: () => Agent[];
-  /** Its sessions' engines now (each session on it, in a microVM or not, running or not). */
-  sessionsOn: (name: string) => { microvm: boolean; running: boolean }[];
+  /** Its sessions now (each on it, in a microVM or not, running or not). */
+  sessionsOn: (name: string) => { id: string; kind: string; microvm: boolean; running: boolean }[];
 }
 
 const NO_MICROVM = "this machine can't hold agents in microVMs";
@@ -32,6 +34,10 @@ const NOT_SAID = "its runner doesn't say whether it starts microVMs: its kiln is
 /** What each runner's owner set, and how many times (metal-ryzen-02's owner runs its agents on its host). */
 const asked = new Map<string, { engine: Engine | null; version: number }>([["metal-ryzen-02", { engine: "host", version: 1 }]]);
 const askedOf = (name: string) => asked.get(name) ?? { engine: null, version: 0 };
+/** Each runner's last switch, for its drain's cancel (metal-ryzen-01's owner took its host setting away 42 minutes ago: one session it started on its host drains). */
+const switched = new Map<string, { from: Engine | null; to: Engine | null; at: number }>([["metal-ryzen-01", { from: "host", to: null, at: Date.now() - 42 * 60_000 }]]);
+/** The sessions an end of a drain ended, which the engine's view leaves out. */
+const ended = new Set<string>();
 
 function capable(a: Agent | undefined): { usable: boolean; why: string | null } | null {
   const facts = a?.facts;
@@ -61,8 +67,10 @@ function view(name: string, ctx: Ctx) {
   const a = ctx.runner(name);
   const can = capable(a);
   const h = can ? held(name, can) : null;
-  const sessions = ctx.sessionsOn(name).filter((s) => s.running);
+  const sessions = ctx.sessionsOn(name).filter((s) => s.running && !ended.has(s.id));
   const on = h ? sessions.filter((s) => s.microvm === (h.engine === "microvm")).length : 0;
+  const draining = h ? sessions.filter((s) => s.microvm !== (h.engine === "microvm")) : [];
+  const sw = switched.get(name);
   const facts = a?.facts;
   return {
     runner: name,
@@ -75,7 +83,9 @@ function view(name: string, ctx: Ctx) {
     isolation: facts?.isolation ?? null,
     virt: facts ? { microvm: facts.virt.microvm, kvm: facts.virt.kvm, hvf: facts.virt.hvf } : null,
     sessions: on,
-    draining: h ? sessions.length - on : 0,
+    draining: draining.length,
+    draining_sessions: draining.map((s) => ({ id: s.id, name: s.id, kind: s.kind, state: "working", engine: s.microvm ? "microvm" : "host", created_at: 0 })),
+    switch: draining.length > 0 && sw && sw.to === askedOf(name).engine ? sw : null,
   };
 }
 
@@ -86,6 +96,25 @@ export async function handleEngine(req: http.IncomingMessage, res: http.ServerRe
   if (!overlaid) {
     overlaid = true;
     for (const a of ctx.runners()) overlay(a);
+  }
+  const act = url.pathname.match(/^\/api\/runners\/([^/]+)\/engine\/(end|cancel)$/);
+  if (act && req.method === "POST") {
+    const name = decodeURIComponent(act[1]!);
+    if (!ctx.runner(name)) return (ctx.json(res, 404, { error: `no runner named ${name}` }), true);
+    const v = view(name, ctx);
+    if (act[2] === "end") {
+      const ids = v.draining_sessions.map((d) => d.id);
+      ids.forEach((id) => ended.add(id));
+      return (ctx.json(res, 200, { ...view(name, ctx), ended: ids }), true);
+    }
+    const sw = switched.get(name);
+    if (!sw || sw.to !== askedOf(name).engine) return (ctx.json(res, 409, { error: `${name}'s engine wasn't switched: set it instead` }), true);
+    if (v.draining === 0) return (ctx.json(res, 409, { error: `nothing of ${name} drains: its switch is done, so set its engine instead` }), true);
+    asked.set(name, { engine: sw.from, version: askedOf(name).version + 1 });
+    switched.set(name, { from: sw.to, to: sw.from, at: Date.now() });
+    const a = ctx.runner(name);
+    if (a) overlay(a);
+    return (ctx.json(res, 200, view(name, ctx)), true);
   }
   const m = url.pathname.match(/^\/api\/runners\/([^/]+)\/engine$/);
   if (!m) return false;
@@ -107,6 +136,7 @@ export async function handleEngine(req: http.IncomingMessage, res: http.ServerRe
     if (!can) return (ctx.json(res, 409, { error: `${a.label ?? name} hasn't said yet whether it can run microVMs: set its engine once it has` }), true);
     if (!can.usable) return (ctx.json(res, 409, { error: `${a.label ?? name} can't run its sessions in microVMs: ${can.why ?? NO_MICROVM}` }), true);
   }
+  if (e !== askedOf(name).engine) switched.set(name, { from: askedOf(name).engine, to: e, at: Date.now() });
   asked.set(name, { engine: e, version: askedOf(name).version + 1 });
   overlay(a);
   return (ctx.json(res, 200, view(name, ctx)), true);

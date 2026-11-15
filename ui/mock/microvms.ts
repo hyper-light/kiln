@@ -470,11 +470,12 @@ export function sessionOf(id: string): { engine: "microvm" | "host"; harness: st
 }
 
 /** The sessions on runner `name`, each in a microVM or not, running or not: its engine's view counts them (engine.ts). */
-export function sessionsOn(name: string): { microvm: boolean; running: boolean }[] {
+export function sessionsOn(name: string): { id: string; kind: string; microvm: boolean; running: boolean }[] {
   const all = [...AT.map((a) => a[0]), ...ON_HOST.map((h) => h[0])];
   return all.flatMap((id) => {
     const b = brief(id);
-    return b && b.runner === name ? [{ microvm: b.engine === "microvm", running: b.state !== "ended" }] : [];
+    const kind = AT.find((a) => a[0] === id)?.[2] ?? ON_HOST.find((h) => h[0] === id)?.[2] ?? "claude";
+    return b && b.runner === name ? [{ id, kind, microvm: b.engine === "microvm", running: b.state !== "ended" }] : [];
   });
 }
 

@@ -80,14 +80,30 @@ export function RunnerNow({ name, sample }: { name: string; sample: HostSample |
  * A runner's engine, in its details, as the server says it: the switch (those who manage runners;
  * microvm only where it can hold them), its checks (its facts' microVM, its isolation, whether it can
  * hold microVMs now), where its engine comes from, and its sessions still on the other engine, which
- * finish there. Ending those, and taking a switch back, wait on the server (their routes are coming).
+ * finish there: listed in place, ended now (destructive, confirmed inline), or kept by taking the switch
+ * back (`runners.engine.end_draining`, `runners.engine.cancel`).
  */
 export function EngineBlock({ name, manage }: { name: string; manage: boolean }) {
   const res = useRes(runnerEngineRes(name));
   const e = res.data;
   const [asking, setAsking] = React.useState<Engine | null>(null);
   const [sending, setSending] = React.useState(false);
+  const [drains, setDrains] = React.useState(false);
+  const [ending, setEnding] = React.useState(false);
   if (!e.engine) return null;
+  const drained = (call: Promise<typeof e>, said: (v: typeof e) => string, failed: string) => {
+    setSending(true);
+    call
+      .then((next) => {
+        res.setData(() => next);
+        setEnding(false);
+        toast({ title: said(next), tone: "info" });
+      })
+      .catch((err: unknown) => toast.error(failed, errorMessage(err)))
+      .finally(() => setSending(false));
+  };
+  const endNow = () => drained(engineApi.endDraining(name), (v) => `Ended ${(v as typeof v & { ended?: string[] }).ended?.length ?? 0}`, "Couldn't end them");
+  const undo = () => drained(engineApi.cancel(name), (v) => `Back on ${v.engine === "microvm" ? "microVMs" : "its host"}`, "Couldn't take the switch back");
   const can = e.microvm?.usable ?? false;
   const send = (engine: Engine | null) => {
     setSending(true);
@@ -149,9 +165,15 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
         <span className="rv-default" title={e.from === "server" ? "Its owner set it on the server" : "What it can do decides: microvm where it can hold them, else host"}>
           {e.from === "server" ? "set" : "default"}
           {e.draining > 0 && (
-            <span className="rv-override" title={`${e.draining} of its sessions run on the other engine, and finish there`}>
+            <button
+              type="button"
+              className="rv-override rv-drain-toggle"
+              aria-expanded={drains}
+              onClick={() => setDrains((o) => !o)}
+              title={`${e.draining} of its sessions run on the other engine, and finish there`}
+            >
               {e.draining} draining
-            </span>
+            </button>
           )}
           {e.asked && manage && (
             <button type="button" className="ms-link" disabled={sending} onClick={() => send(null)} title="Take what was set away: what it can do decides">
@@ -161,6 +183,54 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
         </span>
       </div>
       {e.why && <p className="rv-why">{e.why}</p>}
+      {drains && e.draining_sessions.length > 0 && (
+        <div className="rv-drains">
+          <ul aria-label="Draining">
+            {e.draining_sessions.map((d) => {
+              const Icon = ENGINE_ICON[d.engine];
+              return (
+                <li key={d.id}>
+                  <StatusDot status={d.state === "working" ? "running" : "queued"} title={d.state} />
+                  <Link to={`/agents/${encodeURIComponent(d.id)}`}>{d.name}</Link>
+                  <span className="rv-drain-kind">{d.kind}</span>
+                  <Icon size={12} aria-label={d.engine} />
+                </li>
+              );
+            })}
+          </ul>
+          {manage && (
+            <span className="rv-drain-acts">
+              <Button size="xs" variant="ghost" disabled={sending} onClick={() => setEnding(true)} title="End each now, rather than letting it finish where it runs">
+                <Square size={12} aria-hidden="true" />
+                End now
+              </Button>
+              {e.switch && (
+                <Button size="xs" variant="ghost" disabled={sending} onClick={undo} title="Put back the engine it had: these run on it again">
+                  <RotateCcw size={12} aria-hidden="true" />
+                  Undo switch
+                </Button>
+              )}
+            </span>
+          )}
+        </div>
+      )}
+      {ending && (
+        <Confirm
+          label={`End ${e.draining_sessions.length} now`}
+          actions={
+            <>
+              <Button size="xs" pending={sending} onClick={endNow}>
+                End them
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setEnding(false)}>
+                Keep
+              </Button>
+            </>
+          }
+        >
+          <p>Each ends for good; its changes stay on disk.</p>
+        </Confirm>
+      )}
       {asking && (
         <Confirm
           label={`Run its new sessions in ${asking === "microvm" ? "microVMs" : "its host"}`}

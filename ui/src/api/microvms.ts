@@ -26,6 +26,22 @@ export interface RunnerEngineView {
   virt: { microvm: boolean; kvm: boolean; hvf: boolean } | null;
   sessions: number;
   draining: number;
+  /** Each session that drains: it runs on the engine the runner no longer holds, and finishes there (an agent's children first). */
+  draining_sessions: DrainingSession[];
+  /** The switch they drain for, while any drains: what was set before (null: what it can do), to what, and when. */
+  switch: { from: Engine | null; to: Engine | null; at: number } | null;
+}
+
+/** A session still on the engine its runner switched away from (`runners.engine`'s `draining_sessions`). */
+export interface DrainingSession {
+  id: string;
+  name: string;
+  /** Its harness. */
+  kind: string;
+  /** How it stands, as agents.list's `stand` says. */
+  state: string;
+  engine: Engine;
+  created_at: number;
 }
 
 export interface MicroVm {
@@ -91,6 +107,10 @@ export const microvmsApi = {
 export const engineApi = {
   get: (name: string, signal?: AbortSignal) => request<RunnerEngineView>("GET", `/api/runners/${enc(name)}/engine`, undefined, { signal }),
   set: (name: string, engine: Engine | null) => request<RunnerEngineView>("PUT", `/api/runners/${enc(name)}/engine`, { engine }),
+  /** Ends its draining sessions now (`runners.engine.end_draining`; destructive): the view after, and those ended. */
+  endDraining: (name: string) => request<RunnerEngineView & { ended: string[] }>("POST", `/api/runners/${enc(name)}/engine/end`),
+  /** Puts back the setting it had before its switch while its sessions drain (`runners.engine.cancel`). */
+  cancel: (name: string) => request<RunnerEngineView>("POST", `/api/runners/${enc(name)}/engine/cancel`),
 };
 /** One runner's engine, kept current while shown (its sessions finish on the engine they started on). */
 export const runnerEngineRes = (name: string): Res<RunnerEngineView> => ({ key: `runner-engine/${name}`, fetch: (s) => engineApi.get(name, s), opts: { pollMs: 5000 } });
