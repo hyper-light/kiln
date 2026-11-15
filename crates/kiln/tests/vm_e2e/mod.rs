@@ -2160,17 +2160,69 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
 /// stand-in under each harness's name and no real harness: a real one is never started here.
 #[cfg(unix)]
 pub fn host_fixture(dir: &Path) -> anyhow::Result<Fixture> {
+    let (path, shell) = stub_host_env(dir)?;
+    let f = up(dir, "box", &[("PATH", &path), ("SHELL", &shell)])?;
+    // Its sessions as processes on this host: a runner of a kiln carrying Shards runs them in microVMs
+    // unless its engine is set to host (kiln plan 01a1dd2e…, P2.3), as here. ROOT's runner
+    // (`VM_E2E_SERVER`) is left as ROOT set it.
+    if f._server.is_some() {
+        let machine = f.machine.clone();
+        set_engine(&f, &machine, "host")?;
+    }
+    Ok(f)
+}
+
+/// A runner's `PATH` and login shell with the stand-in under each harness's name and no real harness,
+/// under `dir`: [`host_fixture`]'s, and a second runner's beside it.
+#[cfg(unix)]
+pub fn stub_host_env(dir: &Path) -> anyhow::Result<(String, String)> {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin)?;
-    for k in kiln::harness::kinds::Kind::all() {
-        std::os::unix::fs::symlink(stub_path(), bin.join(k.program))?;
+    if !bin.exists() {
+        std::fs::create_dir_all(&bin)?;
+        for k in kiln::harness::kinds::Kind::all() {
+            std::os::unix::fs::symlink(stub_path(), bin.join(k.program))?;
+        }
     }
     let path = format!("{}:{}", bin.display(), common::agents::path_without_harnesses(dir)?);
     let shell = dir.join("login-shell");
     std::fs::write(&shell, format!("#!/bin/sh\nPATH='{path}'\nexport PATH\nwhile [ $# -gt 1 ]; do shift; done\nexec /bin/sh -c \"$1\"\n"))?;
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))?;
-    up(dir, "box", &[("PATH", &path), ("SHELL", &shell.to_string_lossy())])
+    Ok((path, shell.to_string_lossy().into_owned()))
+}
+
+/// Runner `machine`'s engine as kiln says it (`GET /api/runners/:name/engine`; kiln plan 01a1dd2e…, P2.3).
+pub fn engine_of(f: &Fixture, machine: &str) -> anyhow::Result<Value> {
+    f.get(&format!("/api/runners/{machine}/engine"))
+}
+
+/// Sets runner `machine`'s engine (`host`, `microvm`) and waits until the facts kiln has of it say so:
+/// its view then.
+pub fn set_engine(f: &Fixture, machine: &str, engine: &str) -> anyhow::Result<Value> {
+    let path = format!("/api/runners/{machine}/engine");
+    setup_on(f, &format!("{machine}'s engine set to {engine}"), || {
+        let (code, body) = common::http(f.port, "PUT", &path, &f.admin, Some(&json!({"engine": engine})))?;
+        Ok(if code == 200 { Setup::Ready(()) } else { server_said(code, &body) })
+    })?;
+    setup_on(f, &format!("{machine} holding engine {engine}"), || {
+        let v = engine_of(f, machine)?;
+        Ok(if v.pointer("/isolation/engine").and_then(Value::as_str) == Some(engine) { Setup::Ready(v) } else { Setup::Wait })
+    })
+}
+
+/// A second runner `name` of the fixture's own server, connected: held while it's kept.
+pub fn another_runner(f: &Fixture, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Runner> {
+    let (r, _log) = runner(&f.dir, f.port, name, env)?;
+    let machine = common::machine(name);
+    setup_on(f, &format!("runner {name} connecting"), || {
+        let (code, body) = common::http(f.port, "GET", "/api/agents", &f.admin, None)?;
+        if code != 200 {
+            return Ok(server_said(code, &body));
+        }
+        Ok(if connected(&serde_json::from_str(&body)?, &machine) { Setup::Ready(()) } else { Setup::Wait })
+    })?;
+    headroom_off(f, name)?;
+    Ok(r)
 }
 
 /// Drives `kind` as a process on this host, the stand-in behind its name, through kiln, with the

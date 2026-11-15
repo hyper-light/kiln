@@ -4166,6 +4166,12 @@ impl Registry {
         if spec.isolation.is_none() {
             spec.isolation = spec.parent.as_deref().and_then(|p| self.info(p)).and_then(|i| i.isolation);
         }
+        // A new conversation that asks for no microVM takes its runner's engine (kiln plan 01a1dd2e…,
+        // P2.3): on a `microvm` runner, a microVM of its own. One taken up (`resume`: a found session
+        // taken over or branched, a conversation continued) stays where its harness keeps it.
+        if spec.isolation.is_none() && spec.resume.is_none() && crate::harness::lineage::engine_at(hub, target) == Ok(crate::harness::engine::Engine::Microvm) {
+            spec.isolation = Some(super::session::Isolation { person: spec.opener.clone(), ..super::session::Isolation::microvm() });
+        }
         if spec.isolation.is_some() {
             crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
         }

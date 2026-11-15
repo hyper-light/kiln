@@ -307,13 +307,22 @@ fn w05_r03_place_agents_holds_a_child_agents_claim_from_start_to_end() -> anyhow
     })
 }
 
+/// A linux runner's facts: whether it can hold microVMs, and its engine as its owner set it (`asked`),
+/// written in as its runner and the server write them (`harness::engine::overlay`; kiln plan 01a1dd2e…,
+/// P2.3).
+fn vm_facts(can: bool, asked: crate::harness::engine::Asked) -> kiln_ci::facts::RunnerFacts {
+    let mut f = kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), isolation: Some(kiln_ci::facts::Isolation { available: can, ..Default::default() }), ..Default::default() };
+    crate::harness::engine::overlay(&mut f, asked);
+    f
+}
+
 /// Runners `mac` (process 1) and `linux` (process 2) joined to `hub`, each placing sessions and
 /// having Claude Code, `linux` alone saying it starts microVMs (its facts' `virt.microvm`), each idle
 /// as the server last heard (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
 fn join_vm_runners(hub: &crate::hub::Hub) {
     for (peer, name, microvm) in [(1, "mac", false), (2, "linux", true)] {
         crate::hub::tests::join_runner(hub, peer, name, crate::proto::CAP_WIRE);
-        let facts = kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), virt: kiln_ci::facts::Virt { microvm, ..Default::default() }, ..Default::default() };
+        let facts = vm_facts(microvm, crate::harness::engine::Asked::default());
         hub.put_agent(crate::hub::AgentLive { sample: Some(reading(0.0)), facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") });
         hub.instances.update(|i| i.set_features(peer, vec![crate::proto::feature::SESSIONS.to_owned()]));
         let kinds = crate::harness::kinds::offered()
@@ -344,7 +353,7 @@ fn step32_an_agent_a_microvm_agent_starts_is_isolated_and_placed_with_its_microv
         let lab = lab_placing().await?;
         // Whether linux starts microVMs, as its own facts say it (what its admission and its owner
         // read of itself) and as the directory does (what other owners read of it); mac doesn't.
-        let microvm = |on: bool| In::LocalFacts(Box::new(kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), virt: kiln_ci::facts::Virt { microvm: on, ..Default::default() }, ..Default::default() }));
+        let microvm = |on: bool| In::LocalFacts(Box::new(vm_facts(on, crate::harness::engine::Asked::default())));
         lab.linux.feed(microvm(true)).await;
         lab.ctl.send(super::Ctl::Microvm("linux", true)).await?;
         lab.ctl.send(super::Ctl::Microvm("mac", false)).await?;
@@ -381,6 +390,18 @@ fn step32_an_agent_a_microvm_agent_starts_is_isolated_and_placed_with_its_microv
         anyhow::ensure!(lab.linux.session_started(claim.clone(), Some(crate::reach::place::vm_group("vm-child-2", homes.path()))).await?);
         anyhow::ensure!(held_and_cap(&lab.linux).await?.0 == [1_000, 2 * GIB, 0, 0], "{:?}", held_and_cap(&lab.linux).await?);
         lab.linux.session_ended(claim.clone()).await;
+
+        // Kiln plan 01a1dd2e…, P2.4: its owner set linux's engine to host, which its runner holds as the
+        // server pushed it (its own facts, `engine::here`), while the server's view of it is from
+        // before. Its parent's runner, linux, places the agent itself, and its own admission refuses a
+        // microVM's ask: never in a microVM on a host runner, whoever places it.
+        let host = crate::harness::engine::Asked { engine: Some(crate::harness::engine::Engine::Host) };
+        lab.linux.feed(In::LocalFacts(Box::new(vm_facts(true, host)))).await;
+        lab.linux.directory().await?;
+        let never = crate::rt::timeout(HANG, place_start(&hub, Some(&parent), &Ask { kind: "claude".into(), ..Ask::default() })).await?;
+        let why = never.as_ref().err().map(|(_, w)| w.clone()).unwrap_or_default();
+        anyhow::ensure!(why.contains("never") && why.contains("microvm"), "a host runner placing for itself refuses a microVM: {never:?}");
+        anyhow::ensure!(held_and_cap(&lab.linux).await?.0 == [0; 4] && waiting(&lab.linux, "interactive").await? == 0, "nothing held or waiting on the host runner");
 
         lab.linux.feed(microvm(false)).await;
         lab.ctl.send(super::Ctl::Microvm("linux", false)).await?;

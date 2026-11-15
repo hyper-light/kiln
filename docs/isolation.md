@@ -145,6 +145,12 @@ its own through Hex (`sandbox::hexvm`).
   and the runners API read. It sends it to the runner (`ServerMsg::RunnerEngine`, feature `runner.engine`),
   which keeps it for its restarts and writes it into its own facts, so its admission refuses a microVM ask
   while it runs sessions on its host, whoever owns the placement.
+- **Each new session's boundary.** A start that asks nothing takes the engine of the runner it's placed on
+  (a conversation taken up, `resume`, stays where its harness keeps it). One
+  that asks `microvm`, names an Agentfile or has an isolated parent needs a `microvm` runner; one that asks
+  `none` needs a `host` runner. Each is refused where nothing fits, the engine named. The server itself
+  (`local`) runs sessions on its host. Once kiln vendors Hex's `shards-image` class (P2.2), a `microvm` runner
+  must also list it (`engine::node_images`).
 - **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view), and
   new sessions take the new one.
 
