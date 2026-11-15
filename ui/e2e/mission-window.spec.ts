@@ -1,5 +1,5 @@
 /**
- * Mission control's lists are windowed (docs/ci.md W21-R02, src/lib/virtual.ts): only the rows near
+ * Mission control's lists are windowed (docs/ci.md W21-R02, src/lib/list-window.ts): only the rows near
  * the viewport are in the page, gaps keeping the room of the rest, so the page is as tall and every
  * row where it would be with all of them in it. In the production build against the mock, at a
  * desktop's and a phone's own heights: what's mounted and what the gaps keep; rows mounted and let
@@ -25,7 +25,7 @@ const boxes = (page: Page) =>
       return { id: r.getAttribute("data-agent") ?? "", top: b.top + scrollY, height: b.height };
     }),
   );
-/** The middle of some heights, as the window takes a row it hasn't measured to be (src/lib/virtual.ts `typicalHeight`). */
+/** The middle of some heights, as the window takes a row it hasn't measured to be (src/lib/list-window.ts `typicalHeight`). */
 function middle(heights: number[]): number {
   const sorted = [...heights].sort((a, b) => a - b);
   const mid = sorted.length >> 1;

@@ -1,7 +1,7 @@
-/** W21-R02: the arithmetic of a windowed list of rows of differing heights (src/lib/virtual.ts), and its window off the page. */
+/** W21-R02: the arithmetic of a windowed list of rows of differing heights (src/lib/list-window.ts), and its window off the page. */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ListWindow, mountedRuns, nearRows, rowAt, rowTops, shiftAbove, typicalHeight, windowParts, type Part } from "../src/lib/virtual.ts";
+import { ListWindow, mountedRuns, nearRows, rowAt, rowTops, shiftAbove, typicalHeight, windowParts, type Part } from "../src/lib/list-window.ts";
 
 const keys = (n: number) => Array.from({ length: n }, (_, i) => `row:${i}`);
 /** Rows of 84 px, every seventh 141 px, every fiftieth with 600 px open under it: a list like Mission control's. */

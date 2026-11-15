@@ -1,5 +1,5 @@
 /**
- * Mission control's lists are windowed (docs/ci.md W21-R02, src/lib/virtual.ts): only the rows near
+ * Mission control's lists are windowed (docs/ci.md W21-R02, src/lib/list-window.ts): only the rows near
  * the viewport are in the page, gaps keeping the room of the rest. A spec that reads rows wherever
  * they are in a list (one by its id, all of them in order, one gone or back) makes the browser's
  * window as tall as the page first, so the whole list shows and every row is in the page, at its
