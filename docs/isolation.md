@@ -196,7 +196,7 @@ A held run is never stopped by a process id: its `Duplex` has none (`host_pid`, 
 at `os/proc_unix.rs:384`), so the handover paths that stop a harness by its pid (`harness/host.rs`
 `stop_process`, `agent.rs:3161,3273`) never take it, and the session terminates it through its boundary
 instead (`harness/session.rs:4953`). Hex delivers a member's own signal (`Runtime::signal_member`,
-`Call::MemberSignal`, over Shards' agent-control endpoint) since its `e19198bd`, which kiln vendors.
+`Call::MemberSignal`, over Shards' agent-control endpoint) since its `414aa30d`, which kiln vendors.
 
 ## Tests
 

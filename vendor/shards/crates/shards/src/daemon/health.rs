@@ -118,12 +118,17 @@ impl std::fmt::Display for Cut {
             Cut::Stalled(stall) => write!(
                 f,
                 "its microVM ran no CPU in {:?} past the slowest answer seen ({:?}), {:?} into the \
-                 wait (the least a microVM ran and still answered: {:?} in {:?})",
+                 wait ({})",
                 stall.over(),
                 stall.slowest(),
                 stall.waited(),
-                stall.least().cpu,
-                stall.least().over
+                stall.least().map_or_else(
+                    || "no answer of its kind had its CPU read".to_string(),
+                    |least| format!(
+                        "the least a microVM ran and still answered: {:?} in {:?}",
+                        least.cpu, least.over
+                    )
+                )
             ),
             Cut::Unread { pid, failure } => {
                 write!(f, "its microVM's process {pid} could not be read: {failure}")
@@ -148,9 +153,25 @@ pub(super) struct Answers {
     pub ready: Record,
     /// A warm VM's taking of a run: the run's handoff sent, to its TAKEN (`daemon::hand_over`).
     pub take: Record,
+    /// A microVM's join share's taking of a joiner's link: its door's `JOIN_LINK` sent
+    /// (`daemon::give_join_volumes`).
+    pub door: Record,
+    /// A join share's taking of a joiner's volume: its `JOIN_VOLUME` sent, to its `TAKEN`
+    /// (`daemon::give_join_volume`).
+    pub link: Record,
     /// A visit's VM holding its files, its STARTED after its RUN (`visit::await_holding`).
     pub held: Record,
-    /// Each request for access a starting VM makes, from the answer before or its spawn
+    /// Room in a run's socket for what the daemon sends its VM (`daemon::RunSocket`, Unix):
+    /// one record for every run's, as a run's own would be cold each run.
+    pub run_send: Record,
+    /// A VM's guest times, its `GUEST_TIMED` after its `GUEST_TIME` (`commands::guest_times_of`).
+    pub guest_time: Record,
+    /// A starting VM's launch, its spawn to its first request for access (`daemon::launch`,
+    /// macOS): the host's to admit (PM M166), followed by its liveness alone, said once past
+    /// its slowest.
+    #[cfg(target_os = "macos")]
+    pub launches: Record,
+    /// Each request for access a starting VM makes after its first, from the answer before
     /// (`daemon::grant`, macOS).
     #[cfg(target_os = "macos")]
     pub grants: Record,
@@ -168,7 +189,13 @@ impl Default for Answers {
             metrics: Record::new(),
             ready: Record::new(),
             take: Record::new(),
+            door: Record::new(),
+            link: Record::new(),
             held: Record::new(),
+            run_send: Record::new(),
+            guest_time: Record::new(),
+            #[cfg(target_os = "macos")]
+            launches: Record::new(),
             #[cfg(target_os = "macos")]
             grants: Record::new(),
             builtins: Box::new([const { Record::new() }; 256]),
@@ -626,7 +653,10 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
         inbox.execs_in_flight.push((number, held));
         let log = std::io::stderr();
         let fds = [handed.as_fd(), pipe.as_fd(), log.as_fd(), log.as_fd()];
-        if let Err(e) = inbox.socket.send(shards_ipc::kind::EXEC_RUN, &payload, &fds) {
+        if let Err(e) = inbox
+            .socket
+            .send(&self.answers.run_send, shards_ipc::kind::EXEC_RUN, &payload, &fds)
+        {
             inbox.execs_in_flight.retain(|(n, _)| *n != number);
             return Err(e);
         }
@@ -696,7 +726,7 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
         }
         let [stdin, stdout, stderr] = stdio;
         let fds = [handed.as_fd(), stdin, stdout, stderr];
-        if let Err(e) = socket.send(shards_ipc::kind::EXEC_RUN, &payload, &fds) {
+        if let Err(e) = socket.send(&self.answers.run_send, shards_ipc::kind::EXEC_RUN, &payload, &fds) {
             let mut held = lock(&inbox);
             held.execs_in_flight.retain(|(n, _)| *n != number);
             held.exec_ids.retain(|(n, _)| *n != number);
@@ -825,7 +855,6 @@ fn await_exit(ours: &shards_ipc::Stream, wait: Wait<'_>) -> Ended {
 /// first answer, and once its party has gone (its socket's end then ends the wait), the
 /// socket's readiness alone; then its party looked at once each W* and the wait ended, typed
 /// ([`Stalled`]), where it ran nothing since the look before or could not be read.
-#[cfg(unix)]
 pub(super) struct Judged<'r> {
     pid: u32,
     record: &'r Record,
@@ -833,7 +862,6 @@ pub(super) struct Judged<'r> {
     begun: bool,
 }
 
-#[cfg(unix)]
 impl<'r> Judged<'r> {
     pub(super) fn of(pid: u32, record: &'r Record) -> Judged<'r> {
         Judged {
@@ -867,18 +895,15 @@ impl<'r> Judged<'r> {
 }
 
 /// A judged wait's end ([`Judged`]): its party stalled, or could not be read, as [`Cut`] says.
-#[cfg(unix)]
 #[derive(Debug)]
 pub(super) struct Stalled(pub(super) Cut);
 
-#[cfg(unix)]
 impl Stalled {
     fn error(cut: Cut) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::TimedOut, Stalled(cut))
     }
 }
 
-#[cfg(unix)]
 impl std::fmt::Display for Stalled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
@@ -894,14 +919,13 @@ impl std::fmt::Display for Stalled {
     }
 }
 
-#[cfg(unix)]
 impl std::error::Error for Stalled {}
 
 /// A wait on VM process `vm` judged by `record`, begun now: none where the process has gone
 /// already, whose end is the exec's; why not, where it cannot be read.
 fn following(vm: u32, record: &Record) -> Result<Option<Follow<'_>>, Cut> {
     match Followed::of_pid(vm).map_err(|failure| Cut::Unread { pid: vm, failure })? {
-        Some(followed) => Follow::begin(record, followed).map_err(Cut::from),
+        Some(followed) => Follow::begin(record, followed, shards_api::Bound::Rate).map_err(Cut::from),
         None => Ok(None),
     }
 }
@@ -920,16 +944,23 @@ mod tests {
     }
 
     /// Waits for `wait` in an exec whose VM side `theirs` is answered by `answer`, on a
-    /// thread of its own.
+    /// thread of its own that begins only as the wait is about to: an answer timed from its
+    /// thread's start, begun first, came early of the wait on a busy host.
     fn waited(wait: Wait<'_>, answer: impl FnOnce(shards_ipc::Stream) + Send) -> Ended {
         let (ours, theirs) = shards_ipc::Stream::pair().unwrap();
+        let (go, gone) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
-            s.spawn(|| answer(theirs));
+            s.spawn(move || {
+                if gone.recv().is_ok() {
+                    answer(theirs);
+                }
+            });
+            go.send(()).unwrap();
             await_exit(&ours, wait)
         })
     }
 
-    /// The exec's answer, `status`, said `after` its wait began.
+    /// The exec's answer, `status`, said `after` its wait was about to begin.
     fn answers(status: u8, after: Duration) -> impl FnOnce(shards_ipc::Stream) + Send {
         move |theirs| {
             std::thread::sleep(after);
@@ -1046,15 +1077,24 @@ mod tests {
         );
         let slowest = Duration::from_secs(1);
         let record = learned(slowest);
+        let began = Instant::now();
         let ended = waited(
             Wait::WhileRuns(trickler.0.id(), &record),
             answers(7, slowest * 7 / 2),
         );
+        let wall = began.elapsed();
         assert_eq!((ended.status, ended.cut), (Some(7), None));
         let shards_api::Seen::Learned { slowest: now, .. } = record.seen() else {
             panic!("its record was lost");
         };
-        assert!(now >= slowest * 7 / 2, "its answer, slower, raised W*: {now:?}");
+        // What the wait learned is its own answer's time, from its begin, which follows its
+        // first reads of the trickler (`following`): past the slowest before, within the
+        // wait's whole; never the answer's 3.5 s exactly, which a busy host's delay between
+        // the go and that begin takes from.
+        assert!(
+            now > slowest && now <= wall,
+            "its answer, slower, raised W*: {now:?} of {wall:?}"
+        );
     }
 
     /// Past its kind's slowest answer, an exec whose microVM's process runs is waited for, and
@@ -1090,12 +1130,80 @@ mod tests {
         assert_eq!(stall.slowest(), slowest);
         assert!(stall.over() >= slowest, "{stall:?}");
         assert!(stall.waited() >= stall.over(), "{stall:?}");
-        assert_eq!(stall.least().over, slowest);
+        assert_eq!(stall.least().map(|least| least.over), Some(slowest));
         assert_eq!(
             record.seen(),
             learned(slowest).seen(),
             "an end it made taught nothing"
         );
+    }
+
+    /// b26 (ROOT's HVF batch at 1f71dea19, moved.rs:645, containers.rs:2257): a kind whose W*
+    /// was microseconds refused a live VM process 16.6 µs past its first look, a window in
+    /// which its reading (macOS: a clock tick's steps) shows nothing of a run. A wait is
+    /// judged over no window shorter than its VM process's reading shows, its kernel's tick
+    /// (`Watch::resolution`), whatever W* says: a process that runs nothing is refused only
+    /// once a whole tick has shown it still. Red with the reading's unit alone (42 ns on
+    /// macOS, 1 ns on Linux) as its resolution: refused microseconds in.
+    #[cfg(unix)]
+    #[test]
+    fn a_wait_is_never_refused_within_what_its_reading_resolves() {
+        let idle = sleeper();
+        let tick = tick();
+        let slowest = Duration::from_micros(10);
+        let record = learned(slowest);
+        let ended = waited(Wait::WhileRuns(idle.0.id(), &record), killed);
+        let Some(Cut::Stalled(stall)) = &ended.cut else {
+            panic!("{:?}", ended.cut);
+        };
+        assert!(
+            stall.over() >= tick,
+            "{stall:?} within its kernel's tick {tick:?}"
+        );
+        assert_eq!(stall.slowest(), slowest);
+        let resolution = shards_api::Followed::of_pid(idle.0.id())
+            .unwrap()
+            .and_then(|followed| shards_api::Watch::of(followed).unwrap())
+            .unwrap()
+            .resolution();
+        assert!(
+            resolution >= tick,
+            "{resolution:?} below its kernel's tick {tick:?}"
+        );
+    }
+
+    /// The kernel's tick, read here apart from shards-api: macOS's `kern.clockrate` `tick`.
+    #[cfg(target_os = "macos")]
+    fn tick() -> Duration {
+        let mut info = [0 as libc::c_int; 5];
+        let mut len = size_of_val(&info);
+        // SAFETY: sysctlbyname(3) into a local struct clockinfo's five ints.
+        let code = unsafe {
+            libc::sysctlbyname(
+                c"kern.clockrate".as_ptr(),
+                info.as_mut_ptr().cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!((code, len), (0, size_of_val(&info)));
+        Duration::from_micros(u64::try_from(info[1]).unwrap())
+    }
+
+    /// The kernel's tick, read here apart from shards-api: Linux's CLOCK_MONOTONIC_COARSE
+    /// resolution, one jiffy.
+    #[cfg(target_os = "linux")]
+    fn tick() -> Duration {
+        // SAFETY: a timespec, plain data, for clock_getres(2) to fill.
+        let mut at: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: clock_getres(2) into a local timespec.
+        let code = unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC_COARSE, &raw mut at) };
+        assert_eq!(code, 0);
+        Duration::new(
+            u64::try_from(at.tv_sec).unwrap(),
+            u32::try_from(at.tv_nsec).unwrap(),
+        )
     }
 
     /// A microVM process that cannot be read is never taken for one that ran nothing: its

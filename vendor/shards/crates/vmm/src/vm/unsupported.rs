@@ -26,8 +26,11 @@ pub fn restore_from(
     Err(no_backend())
 }
 
-pub fn check_host() -> Result<(), String> {
-    Err(no_backend())
+pub fn check_host() -> Result<(), shards_abi::host::Unusable> {
+    Err(shards_abi::host::Unusable::Unsupported {
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+    })
 }
 
 pub fn restores_here() -> bool {
@@ -165,7 +168,11 @@ impl Handle {
         match self.0 {}
     }
 
-    pub fn console_said(&self) -> crate::devices::serial::Said {
+    pub fn console_said(&self) -> crate::devices::said::Said {
+        match self.0 {}
+    }
+
+    pub fn panicked(&self) -> bool {
         match self.0 {}
     }
 

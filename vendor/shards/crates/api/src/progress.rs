@@ -263,6 +263,42 @@ pub struct Watch {
     hold: Hold,
     /// The least time a change of its CPU counter stands for ([`Span::resolution`]).
     resolution: Duration,
+    /// Its threads as [`starved`](Watch::starved) last read them, none before its first.
+    threads: Option<Threads>,
+}
+
+/// A process's threads as one read saw them, each by its OS's ID for it: its own CPU time,
+/// in nanoseconds, and whether it was runnable on no CPU or running ([`Watch::starved`]).
+pub(crate) type Threads = std::collections::BTreeMap<u64, (u64, bool)>;
+
+/// How many of process `pid`'s threads are runnable (running, or waiting for a CPU), of how
+/// many, as [`Watch::starved`] reads them: for a waiter's account of its party, so that a
+/// refusal names what its members were doing. None where they cannot be read (Windows reads
+/// none outside the system's whole listing).
+pub fn runnable_threads(pid: u32) -> Option<(usize, usize)> {
+    #[cfg(target_os = "linux")]
+    let threads = os::threads(pid)?;
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let threads = os::threads_cpu(pid)?;
+    #[cfg(windows)]
+    let threads: Threads = {
+        let _ = pid;
+        return None;
+    };
+    Some((
+        threads.values().filter(|(_, runnable)| *runnable).count(),
+        threads.len(),
+    ))
+}
+
+/// Whether a thread runnable in `now` had no CPU at all since `before`: its host kept it
+/// from a CPU through the whole time between the two reads (or it ran less than its OS's
+/// counter shows). A thread that ran any CPU, or that `before` did not see, shows nothing:
+/// a process that wakes for a moment's housekeeping each window is never starved by it
+/// (the gitssh lane's wedged run, ~750 µs a window, which must stay refusable).
+pub(crate) fn starved(before: &Threads, now: &Threads) -> bool {
+    now.iter()
+        .any(|(id, &(cpu, runnable))| runnable && before.get(id).is_some_and(|&(was, _)| was == cpu))
 }
 
 impl Watch {
@@ -280,7 +316,30 @@ impl Watch {
             last,
             hold,
             resolution,
+            threads: None,
         }))
+    }
+
+    /// Whether its host held a thread of it from any CPU since the call before ([`starved`]):
+    /// for a waiter whose party's CPU is its liveness alone, whose looks find it ran (some of
+    /// its threads did) while the one its answer waits on sat runnable on no CPU, as a guest of
+    /// more vCPUs than its host has CPUs, the host busy besides (ROOT's batch 26, HVF: a
+    /// 64-vCPU storm's stream refused 170 ms into its quiet). Its threads are read only here,
+    /// so a waiter that never asks pays nothing; false at its first call, and where they
+    /// cannot be read (Windows reads none: its threads' states are in the system's whole
+    /// listing alone).
+    pub fn starved(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        let now = os::threads(self.followed.pid());
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let now = os::threads_cpu(self.followed.pid());
+        #[cfg(windows)]
+        let now: Option<Threads> = None;
+        let was = std::mem::replace(&mut self.threads, now);
+        match (&was, &self.threads) {
+            (Some(before), Some(now)) => starved(before, now),
+            _ => false,
+        }
     }
 
     /// The least time a change of its CPU counter stands for, as its OS says it
@@ -335,6 +394,14 @@ impl Watch {
         self.hold.stopped
     }
 
+    /// Whether a look of it that found `found`, its threads read `starved` meanwhile
+    /// ([`starved`](Self::starved)), vouches for its window as its own running or rest, its
+    /// host not the reason (D215's rate, [`Span::work`]): it ran or rested, and was neither
+    /// starved of a CPU, stopped, nor ending. One rule for every judge that rates a party.
+    pub fn vouched_by(&self, found: Found, starved: bool) -> bool {
+        matches!(found, Found::Progressed | Found::Still) && !starved && !self.stopped() && !self.ended()
+    }
+
     /// The CPU time its process's threads have had by now, the look before kept; none where
     /// it has gone or could not be read.
     fn cpu_now(&mut self) -> Option<Duration> {
@@ -342,11 +409,27 @@ impl Watch {
     }
 }
 
+/// What a wait on a VM process holds it to (D215), which every wait names, as what it waits
+/// for says: there is no default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// A reply of bounded work, a protocol's (a VM's READY, its next request for access, a
+    /// builtin the daemon asked, a held visit, the network process's start): refused where it
+    /// is still a whole W*, and where it ticks on past W* below R* having done more than C*
+    /// (b24's shape: a guest asleep on an event that never comes).
+    Rate,
+    /// An end that comes when its work does (a user's command, a build, a guest's first
+    /// listener after its own start): refused only where it is still a whole W*. A guest
+    /// asleep by design (`sleep 3600`) ticks on, its caller's to end.
+    Stillness,
+}
+
 /// A wait that follows a VM process, judged by the record of its kind of answer ([`Judge`])
-/// on what each look at the process finds ([`Watch`]).
+/// on what each look at the process finds ([`Watch`]), to its [`Bound`].
 #[derive(Debug)]
 pub struct Follow<'a> {
     judge: Judge<'a>,
+    bound: Bound,
     watch: Watch,
     /// Its VM process, for a refusal to name.
     pid: u32,
@@ -356,9 +439,13 @@ pub struct Follow<'a> {
 }
 
 impl<'a> Follow<'a> {
-    /// A wait beginning now that follows `followed`, learning into and judged by `record`:
-    /// none where its process has gone already, whose end is the wait's.
-    pub fn begin(record: &'a Record, followed: Followed) -> Result<Option<Follow<'a>>, Unfollowed> {
+    /// A wait beginning now that follows `followed`, learning into and judged by `record` to
+    /// `bound`: none where its process has gone already, whose end is the wait's.
+    pub fn begin(
+        record: &'a Record,
+        followed: Followed,
+        bound: Bound,
+    ) -> Result<Option<Follow<'a>>, Unfollowed> {
         let mut judge = Judge::begin(record);
         let (pid, started) = (followed.pid(), followed.started());
         let began = Instant::now();
@@ -377,12 +464,14 @@ impl<'a> Follow<'a> {
             ended: Instant::now(),
             resolution: watch.resolution(),
             own: Duration::ZERO,
+            work: None,
         };
         judge
             .found_over(Found::Based, span)
             .map_err(Unfollowed::Stalled)?;
         Ok(Some(Follow {
             judge,
+            bound,
             from: watch.cpu(),
             watch,
             pid,
@@ -413,19 +502,30 @@ impl<'a> Follow<'a> {
             expected_started,
             failure,
         })?;
+        // Its work since it began, for its rate, where its bound is one and this look vouches
+        // for its window; its threads read only then.
+        let work = (self.bound == Bound::Rate && {
+            let starved = self.watch.starved();
+            self.watch.vouched_by(found, starved)
+        })
+        .then(|| self.watch.cpu().saturating_sub(self.from));
         let span = Span {
             began,
             ended: Instant::now(),
             resolution: self.watch.resolution(),
             own: Duration::ZERO,
+            work,
         };
         self.judge.found_over(found, span).map_err(Unfollowed::Stalled)
     }
 
-    /// Its party answered: its kind learns from the answer, its VM process read now.
+    /// Its party answered: its kind learns from the answer, its VM process read now; its
+    /// slowest alone where it could not be read (D215: only work read through an answer
+    /// teaches R* and C*).
     pub fn answered(&mut self) {
-        if let Some(cpu) = self.watch.cpu_now() {
-            self.judge.answered(cpu.saturating_sub(self.from));
+        match self.watch.cpu_now() {
+            Some(cpu) => self.judge.answered(cpu.saturating_sub(self.from)),
+            None => self.judge.answered_unrated(),
         }
     }
 
@@ -439,8 +539,9 @@ impl<'a> Follow<'a> {
         // On Windows the tree's handles read its processes after they have ended.
         #[cfg(windows)]
         let cpu = self.watch.cpu_now().or(cpu);
-        if let Some(cpu) = cpu {
-            self.judge.answered(cpu.saturating_sub(self.from));
+        match cpu {
+            Some(cpu) => self.judge.answered(cpu.saturating_sub(self.from)),
+            None => self.judge.answered_unrated(),
         }
     }
 }
@@ -584,6 +685,37 @@ mod os {
         hold
     }
 
+    /// Process `pid`'s threads ([`Threads`]): each task's run time, its `schedstat`'s first
+    /// field (`sum_exec_runtime`, nanoseconds; a thread's own CPU clock is its own thread
+    /// group's alone, posix-cpu-timers.c `pid_for_clock`), and whether its state is `R`
+    /// (`/proc/<pid>/task/<tid>/stat` field 3). A task whose schedstat reads as zeros (no
+    /// accounting) is left out: its run would not show. None where its tasks cannot be listed.
+    pub(super) fn threads(pid: u32) -> Option<super::Threads> {
+        let mut threads = super::Threads::new();
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()?.flatten() {
+            let Some(tid) = task.file_name().to_str().and_then(|tid| tid.parse::<u64>().ok()) else {
+                continue;
+            };
+            let dir = task.path();
+            let Some(ran) = std::fs::read_to_string(dir.join("schedstat"))
+                .ok()
+                .and_then(|text| {
+                    let mut fields = text.split_whitespace().map(str::parse::<u64>);
+                    let (ran, waited, slices) =
+                        (fields.next()?.ok()?, fields.next()?.ok()?, fields.next()?.ok()?);
+                    (ran != 0 || waited != 0 || slices != 0).then_some(ran)
+                })
+            else {
+                continue;
+            };
+            let Some(state) = std::fs::read(dir.join("stat")).ok().and_then(|stat| state(&stat)) else {
+                continue;
+            };
+            threads.insert(tid, (ran, state == b'R'));
+        }
+        Some(threads)
+    }
+
     /// A task's run-queue wait in nanoseconds, its `schedstat`'s second field; none where it
     /// could not be read, or reads as zeros (no accounting, [`Queued::Unread`]).
     fn run_delay(task: &Path) -> Option<u64> {
@@ -652,13 +784,36 @@ mod os {
         read_clock(pid, libc::clock_gettime)
     }
 
-    /// The resolution of process `pid`'s CPU clock (clock_getres(2)), the least time a
-    /// change of it stands for: one nanosecond for the scheduler's clock that
-    /// clock_getcpuclockid(3) names (kernel/time/posix-cpu-timers.c,
-    /// `posix_cpu_clock_getres`), a clock tick for one that counts ticks. None where it has
-    /// gone.
+    /// The least time a change of process `pid`'s CPU clock shows: its resolution
+    /// (clock_getres(2); one nanosecond for the scheduler's clock that clock_getcpuclockid(3)
+    /// names, kernel/time/posix-cpu-timers.c `posix_cpu_clock_getres`), or the kernel's tick
+    /// where that is longer. Read from another process, that clock brings only the reader's
+    /// own thread up to date: a thread of `pid` running on another CPU is in it as of that
+    /// CPU's last tick or scheduler event (kernel/sched/cputime.c `thread_group_cputime`,
+    /// `read_sum_exec_runtime`), so between ticks it shows none of that thread's run (CI's
+    /// aarch64 run 43575280954: a thread spinning throughout, its process's clock unchanged
+    /// for 2.6 ms). The tick is the kernel's own, the resolution of its coarse clock
+    /// (clock_getres(2) of CLOCK_MONOTONIC_COARSE: `LOW_RES_NSEC`, one jiffy,
+    /// kernel/time/posix-timers.c `posix_get_coarse_res`). None where it has gone.
     pub(super) fn resolution(pid: u32) -> Result<Option<Duration>, ProcessFailure> {
-        read_clock(pid, libc::clock_getres)
+        let Some(clock) = read_clock(pid, libc::clock_getres)? else {
+            return Ok(None);
+        };
+        Ok(Some(clock.max(tick()?)))
+    }
+
+    /// The kernel's tick: the resolution of CLOCK_MONOTONIC_COARSE (clock_getres(2)).
+    fn tick() -> Result<Duration, ProcessFailure> {
+        // SAFETY: a timespec, plain data, for the call to fill.
+        let mut at: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: clock_getres(2) of a clock every Linux since 2.6.32 has, into a local.
+        if unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC_COARSE, &raw mut at) } != 0 {
+            return Err(crate::taken::io_failure(
+                ProcessOperation::CpuClock,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        timespec(&at)
     }
 
     /// `read` (clock_gettime(2) or clock_getres(2)) of process `pid`'s CPU clock; none where
@@ -694,13 +849,17 @@ mod os {
             }
             return Err(crate::taken::io_failure(ProcessOperation::CpuClock, e));
         }
-        // A timespec's nanoseconds are below a second's (POSIX <time.h>).
+        timespec(&at).map(Some)
+    }
+
+    /// A timespec as a duration; its nanoseconds are below a second's (POSIX <time.h>).
+    fn timespec(at: &libc::timespec) -> Result<Duration, ProcessFailure> {
         let secs = u64::try_from(at.tv_sec).map_err(|_| ProcessFailure::InvalidCpuTime)?;
         let nanos = u32::try_from(at.tv_nsec)
             .ok()
             .filter(|n| *n < 1_000_000_000)
             .ok_or(ProcessFailure::InvalidCpuTime)?;
-        Ok(Some(Duration::new(secs, nanos)))
+        Ok(Duration::new(secs, nanos))
     }
 }
 
@@ -813,16 +972,38 @@ mod os {
         Some(handles)
     }
 
-    /// The run state of process `id`'s thread `handle` (`pth_run_state`); none where it could
-    /// not be read, as of a thread that ended since it was listed.
-    fn run_state(id: libc::c_int, handle: u64) -> Option<libc::c_int> {
+    /// Process `pid`'s threads ([`Threads`](super::Threads)), by their handles: each one's user
+    /// and system time (`pth_user_time`, `pth_system_time`, nanoseconds, sys/proc_info.h), and
+    /// whether its run state is `TH_STATE_RUNNING` (running, or waiting for a CPU). A thread
+    /// that ended since it was listed is left out; none where they cannot be listed.
+    pub(super) fn threads_cpu(pid: u32) -> Option<super::Threads> {
+        let id = libc::c_int::try_from(pid).ok()?;
+        let mut read = super::Threads::new();
+        for handle in threads(id)? {
+            if let Some(info) = thread_info(id, handle) {
+                let cpu = info.pth_user_time.saturating_add(info.pth_system_time);
+                read.insert(handle, (cpu, info.pth_run_state == libc::TH_STATE_RUNNING));
+            }
+        }
+        Some(read)
+    }
+
+    /// Process `id`'s thread `handle` (`PROC_PIDTHREADINFO`); none where it could not be
+    /// read, as of a thread that ended since it was listed.
+    fn thread_info(id: libc::c_int, handle: u64) -> Option<libc::proc_threadinfo> {
         // SAFETY: a proc_threadinfo, plain data, for proc_pidinfo to fill.
         let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
         let size = libc::c_int::try_from(size_of::<libc::proc_threadinfo>()).ok()?;
         // SAFETY: proc_pidinfo(3) writes at most `size` bytes into `info`.
         let got =
             unsafe { libc::proc_pidinfo(id, libc::PROC_PIDTHREADINFO, handle, (&raw mut info).cast(), size) };
-        (got == size).then_some(info.pth_run_state)
+        (got == size).then_some(info)
+    }
+
+    /// The run state of process `id`'s thread `handle` (`pth_run_state`); none where it could
+    /// not be read, as of a thread that ended since it was listed.
+    fn run_state(id: libc::c_int, handle: u64) -> Option<libc::c_int> {
+        thread_info(id, handle).map(|info| info.pth_run_state)
     }
 
     fn rusage(pid: u32) -> Result<Option<libc::rusage_info_v0>, ProcessFailure> {
@@ -857,13 +1038,71 @@ mod os {
         Ok(Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX)))
     }
 
-    /// The least time a change of a process's CPU times stands for: one Mach absolute-time
-    /// unit, rounded up to whole nanoseconds (42 ns on Apple silicon's 125/3), the units in
-    /// which proc_pid_rusage(2) keeps them. Every process's alike.
+    /// The least time a change of a process's CPU times shows: one Mach absolute-time unit,
+    /// rounded up to whole nanoseconds (42 ns on Apple silicon's 125/3), the units in which
+    /// proc_pid_rusage(2) keeps them; or its kernel's clock tick where that is longer
+    /// (`kern.clockrate`'s `tick`, sysctl(3) KERN_CLOCKRATE: 10,000 µs, hz 100, on macOS 26).
+    /// XNU adds a thread's run to its task's times as the thread leaves its CPU or enters the
+    /// kernel, of which its scheduler's quantum timer makes one each quantum (osfmk
+    /// sched_prim.c, `default_preemption_rate`, 100 a second, as hz): a thread running
+    /// throughout shows nothing between. Measured
+    /// (docs/research/measurements/judge-resolution/rusage-steps.c, Mac17,6, macOS 26, load
+    /// 30): a spinning child's times read back to back, each read about 1 µs, grew in steps
+    /// of p50 12 µs, p90 182 µs, p99 3.7 ms, max 12.9 ms; the test judge's `Beside` saw none
+    /// of a spinning thread within 450 µs windows on HVF. Every process's alike.
     pub(super) fn resolution(_pid: u32) -> Result<Option<Duration>, ProcessFailure> {
         let (numer, denom) = timebase()?;
         let ns = numer.div_ceil(denom);
-        Ok(Some(Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))))
+        let unit = Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX));
+        Ok(Some(unit.max(tick()?)))
+    }
+
+    /// The kernel's clock tick, `kern.clockrate`'s `tick` (sys/time.h `struct clockinfo`,
+    /// microseconds).
+    fn tick() -> Result<Duration, ProcessFailure> {
+        #[repr(C)]
+        struct Clockinfo {
+            hz: libc::c_int,
+            tick: libc::c_int,
+            tickadj: libc::c_int,
+            stathz: libc::c_int,
+            profhz: libc::c_int,
+        }
+        let mut info = Clockinfo {
+            hz: 0,
+            tick: 0,
+            tickadj: 0,
+            stathz: 0,
+            profhz: 0,
+        };
+        let mut len = size_of::<Clockinfo>();
+        // SAFETY: sysctlbyname(3) of a NUL-terminated name, writing at most `len` bytes into
+        // `info`, a struct clockinfo's layout, and its length into `len`; nothing is set.
+        let code = unsafe {
+            libc::sysctlbyname(
+                c"kern.clockrate".as_ptr(),
+                (&raw mut info).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if code != 0 {
+            return Err(crate::taken::io_failure(
+                ProcessOperation::ClockRate,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // An answer of another size is no clockinfo, refused as `timebase` refuses a zero
+        // denominator: by the call's own code.
+        if len != size_of::<Clockinfo>() {
+            return Err(ProcessFailure::Os {
+                operation: ProcessOperation::ClockRate,
+                code,
+            });
+        }
+        let us = u64::try_from(info.tick).map_err(|_| ProcessFailure::InvalidCpuTime)?;
+        Ok(Duration::from_micros(us))
     }
 
     /// mach_timebase_info(3)'s numerator and denominator, the denominator never zero.
@@ -1367,6 +1606,69 @@ mod os {
 }
 
 #[cfg(test)]
+mod starved_tests {
+    use super::{Threads, starved};
+
+    fn threads(of: &[(u64, u64, bool)]) -> Threads {
+        of.iter()
+            .map(|&(id, cpu, runnable)| (id, (cpu, runnable)))
+            .collect()
+    }
+
+    /// A thread runnable now that ran nothing since the read before is its host's hold;
+    /// one that ran any CPU, a sleeper, and one the read before did not see are not
+    /// (ROOT's batch 26: a 64-vCPU storm's stream; the gitssh lane's ~750 µs a window).
+    #[test]
+    fn a_thread_runnable_and_unrun_since_the_read_before_is_starved() {
+        let before = threads(&[(1, 100, true), (2, 500, false), (3, 900, true)]);
+        assert!(starved(&before, &threads(&[(1, 100, true)])), "runnable, unrun");
+        assert!(!starved(&before, &threads(&[(1, 101, true)])), "it ran");
+        assert!(!starved(&before, &threads(&[(2, 500, false)])), "a sleeper");
+        assert!(!starved(&before, &threads(&[(4, 0, true)])), "a thread new since");
+        assert!(
+            !starved(&before, &threads(&[(1, 175, true), (3, 950, false)])),
+            "housekeeping: each ran a moment"
+        );
+        assert!(
+            starved(&before, &threads(&[(1, 175, false), (3, 900, true)])),
+            "one of many"
+        );
+    }
+
+    /// A live process's threads, read twice: a thread sleeping throughout is never starved,
+    /// and a thread spinning throughout ran, so is not either.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_processs_threads_read_twice_show_no_starved_sleeper_or_spinner() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let _sleeper = scope.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            let _spinner = scope.spawn(|| {
+                let mut spun = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    spun = std::hint::black_box(spun.wrapping_add(1));
+                }
+            });
+            let pid = std::process::id();
+            #[cfg(target_os = "linux")]
+            let read = || super::os::threads(pid);
+            #[cfg(not(target_os = "linux"))]
+            let read = || super::os::threads_cpu(pid);
+            let before = read().expect("this process's threads");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let now = read().expect("this process's threads");
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(now.len() >= 3, "{now:?}");
+            assert!(!starved(&before, &now), "{before:?} -> {now:?}");
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::judge::Rate;
@@ -1393,8 +1695,8 @@ mod tests {
     /// A wait that follows a process by its pid is refused `Stalled` at a look past W* that
     /// finds it ran nothing since the look before, and goes on at each look while it runs
     /// (D215; the daemon's `Wait::WhileRuns`). The sleeper is looked at until it is refused,
-    /// the first look or two taking in its start's own CPU.
-    #[cfg(unix)]
+    /// the first look or two taking in its start's own CPU. On Windows the sleeper is cmd's
+    /// pings of the loopback a second apart, its tree followed with it.
     #[test]
     fn a_process_followed_by_its_pid_is_judged_by_its_cpu() {
         let slowest = Duration::from_millis(20);
@@ -1406,9 +1708,17 @@ mod tests {
                 std::thread::sleep(due.saturating_duration_since(Instant::now()));
             }
         };
+        #[cfg(unix)]
         let mut sleeper = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        #[cfg(windows)]
+        let mut sleeper = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 61 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
         let followed = Followed::of_pid(sleeper.id()).unwrap().unwrap();
-        let mut follow = Follow::begin(&record, followed).unwrap().unwrap();
+        let mut follow = Follow::begin(&record, followed, Bound::Stillness)
+            .unwrap()
+            .unwrap();
         let refused = loop {
             until_due(&follow);
             if let Err(refused) = follow.look() {
@@ -1430,13 +1740,113 @@ mod tests {
                 }
             });
             let followed = Followed::of_pid(std::process::id()).unwrap().unwrap();
-            let mut follow = Follow::begin(&record, followed).unwrap().unwrap();
+            let mut follow = Follow::begin(&record, followed, Bound::Stillness)
+                .unwrap()
+                .unwrap();
             for _ in 0..3 {
                 until_due(&follow);
                 assert_eq!(follow.look(), Ok(()));
             }
             busy.store(false, std::sync::atomic::Ordering::Relaxed);
         });
+    }
+
+    /// D215's rate bound on real processes, a kind taught W* 200 ms, R* 1/2 and C* 100 ms
+    /// (each burst of work 10 ms or more, so that a macOS CPU counter moving in ticks of
+    /// 10 ms shows it in every window, and stillness never decides): a process asleep for
+    /// good but ticking, 10 ms of work in each 100 ms, is refused for its rate under
+    /// `Bound::Rate` and goes on under `Bound::Stillness` (a user's command asleep by design);
+    /// a busy one goes on; and one doing its kind's work over more time than any answer took
+    /// (a peer it waits on, or a host that slows it: 60 ms of work over some 600 ms) goes on
+    /// to its end, its work within C*.
+    #[test]
+    fn a_rate_bound_refuses_only_a_ticking_sleeper() {
+        let ms = Duration::from_millis;
+        let record = Record::new();
+        record.teach(ms(200), ms(100));
+        let started = |mode: &str| {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", SPINNING, "--nocapture"])
+                .env(SPIN, mode)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Its harness's own lines first ("running 1 test"), then its word. Its stdout is
+            // kept open, read on, so that what it says after is no write to a closed pipe.
+            let mut lines = std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap()));
+            assert!(
+                lines
+                    .by_ref()
+                    .any(|line| line.is_ok_and(|line| line.starts_with("started"))),
+                "{mode} said nothing of its start"
+            );
+            std::thread::spawn(move || lines.for_each(drop));
+            child
+        };
+        let followed = |child: &std::process::Child| {
+            #[cfg(unix)]
+            return Followed::of_pid(child.id()).unwrap().unwrap();
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+                let created = crate::taken::created(child.as_raw_handle()).unwrap();
+                Followed::of(
+                    child.as_handle().try_clone_to_owned().unwrap(),
+                    child.id(),
+                    created,
+                )
+                .unwrap()
+            }
+        };
+        // Looked at as each look is due, until refused, its end, or `long` past its start.
+        let judged = |child: &mut std::process::Child, bound: Bound, long: Duration| {
+            let mut follow = Follow::begin(&record, followed(child), bound).unwrap().unwrap();
+            let start = Instant::now();
+            loop {
+                let due = follow.due().unwrap();
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                if child.try_wait().unwrap().is_some() || start.elapsed() > long {
+                    return None;
+                }
+                if let Err(refused) = follow.look() {
+                    return Some((refused, start.elapsed()));
+                }
+            }
+        };
+        let end = |mut child: std::process::Child| {
+            drop(child.stdin.take());
+            let _ = child.kill();
+            child.wait().unwrap();
+        };
+        let mut ticker = started("tick");
+        let refused = judged(&mut ticker, Bound::Rate, Duration::from_secs(20));
+        end(ticker);
+        let Some((Unfollowed::Stalled(stall), at)) = refused else {
+            panic!("a ticking sleeper was not refused under its rate: {refused:?}");
+        };
+        let rate = stall
+            .rate()
+            .unwrap_or_else(|| panic!("refused for stillness, {at:?} in: {stall:?}"));
+        assert!(rate.cpu > ms(100), "{stall:?}");
+        let mut ticker = started("tick");
+        let kept = judged(&mut ticker, Bound::Stillness, Duration::from_secs(3));
+        end(ticker);
+        assert!(
+            kept.is_none(),
+            "a ticking sleeper refused under stillness: {kept:?}"
+        );
+        let mut spinner = this_binary("spin");
+        let kept = judged(&mut spinner, Bound::Rate, Duration::from_secs(3));
+        end(spinner);
+        assert!(kept.is_none(), "a busy process refused: {kept:?}");
+        let mut slow = started("pulse");
+        let kept = judged(&mut slow, Bound::Rate, Duration::from_secs(20));
+        end(slow);
+        assert!(
+            kept.is_none(),
+            "one doing its kind's work over more time refused: {kept:?}"
+        );
     }
 
     /// What a look finds of a VM process that ran no CPU since the look before is its host's
@@ -1528,7 +1938,9 @@ mod tests {
         let slowest = Duration::from_millis(20);
         let record = Record::new();
         record.teach(slowest, Duration::from_millis(1));
-        let mut follow = Follow::begin(&record, followed).unwrap().unwrap();
+        let mut follow = Follow::begin(&record, followed, Bound::Stillness)
+            .unwrap()
+            .unwrap();
         let refused = loop {
             let due = follow.due().unwrap();
             while Instant::now() < due {
@@ -1789,7 +2201,10 @@ mod tests {
         records.teach(Awaited::Boot, ms(2), ms(1));
         let learned = |slowest, cpu, over| Seen::Learned {
             slowest,
-            least: Rate { cpu, over },
+            rated: Some(crate::Rated {
+                least: Rate { cpu, over },
+                most: ms(1),
+            }),
         };
         assert_eq!(records.seen(Awaited::Boot), learned(ms(2), ms(1), ms(2)));
         records.teach(Awaited::Boot, ms(1), ms(1));
@@ -1833,6 +2248,29 @@ mod tests {
                 loop {
                     std::hint::spin_loop();
                 }
+            }
+            // D215's rate bound's children, each saying it has started first: `tick`, 10 ms
+            // of work in each 100 ms until its stdin ends; `pulse`, 10 ms of work in each
+            // 100 ms six times, then its end.
+            Ok(mode @ ("tick" | "pulse")) => {
+                use std::io::Write as _;
+                if mode == "tick" {
+                    std::thread::spawn(|| {
+                        let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
+                        std::process::exit(0);
+                    });
+                }
+                let _ = writeln!(std::io::stdout(), "started");
+                let _ = std::io::stdout().flush();
+                let rounds = if mode == "tick" { u32::MAX } else { 6 };
+                for _ in 0..rounds {
+                    let until = Instant::now() + Duration::from_millis(10);
+                    while Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    std::thread::sleep(Duration::from_millis(90));
+                }
+                return;
             }
             Ok("parent") => {
                 let mut spinner = this_binary("spin");

@@ -590,7 +590,7 @@ impl<D: Disk> Daemon<D> {
             inbox.devices.push((number, told));
         }
         let ask = [&number.to_be_bytes()[..], step].concat();
-        if let Err(e) = socket.send(kind::DEVICE, &ask, fds) {
+        if let Err(e) = socket.send(&self.answers.run_send, kind::DEVICE, &ask, fds) {
             lock(&inbox).devices.retain(|(n, _)| *n != number);
             return Err(Asked::Run(format!("asking its microVM: {e}")));
         }
@@ -614,10 +614,9 @@ impl<D: Disk> Daemon<D> {
         let quiet = self
             .exec_answered(id, &spec, 1 << 12)
             .map_err(|e| format!("its guest: {e}"))?;
-        let said = String::from_utf8_lossy(&quiet.output).trim().to_string();
-        match quiet.status {
-            Some(0) => Ok(said),
-            _ => Err(format!("its guest: {said}")),
+        match (&quiet.cut, quiet.status) {
+            (None, Some(0)) => Ok(String::from_utf8_lossy(&quiet.output).trim().to_string()),
+            _ => Err(format!("its guest: {}", super::reclaim::said_of(&quiet))),
         }
     }
 

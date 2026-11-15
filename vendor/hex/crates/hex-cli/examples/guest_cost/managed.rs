@@ -4,8 +4,10 @@
 //! evidence declares no native images takes), its native owner a node's own (`WinRuntime`, with no keeper, so its
 //! guests end with this process), its record a canonical one kept in memory ([`Scope`]: a backing of the Shards
 //! class's shared execution, as a node's shared guest is, the producer keeping no records). Each guest is held to the
-//! census's rate by its own governor (Shards' D191, D255, `ManagedGuest::rate`), whose period is the window
-//! ([`Driver::governed_window`]), once it is ready, as a node's learner holds a VM it has booted: its VM process takes
+//! census's rate by its own governor (Shards' D191, D255, `ManagedGuest::rate`) once it is ready, and read from then on
+//! at that governor's period ([`Driver::hold`]): its own, derived from the step its VM process measured itself (D191's
+//! g), so two guests may answer two; one guest's answer is the census's window, its boots read at it
+//! ([`Driver::governed_window`]). It is held as a node's learner holds a VM it has booted: its VM process takes
 //! a rate on its socket only once its machine runs (its socket listening, its microVM started), which its agent's
 //! answer shows. It is read as its node reads it: its vCPUs' guest time first, from its VM process's own answer
 //! (`ManagedGuest::host_use`, D260: WHP's run-time counter, which only that process reads), none before that process
@@ -320,27 +322,11 @@ impl Managed {
 
     /// Asks `vm`'s governor to hold `rate` milli-CPU, as a node's learner asks a managed VM's (D255), and the period it
     /// holds it over. One dial, which its VM process takes once its machine runs: a ready guest's.
-    fn hold(vm: &shards_api::ManagedGuest, rate: u64) -> Result<Duration, String> {
+    fn govern(vm: &shards_api::ManagedGuest, rate: u64) -> Result<Duration, String> {
         vm.rate(NonZeroU64::new(rate), Duration::MAX)
             .map_err(|e| format!("asking the guest's governor to hold {rate} milli-CPU: {e}"))?;
         vm.rate_period()
             .ok_or_else(|| "the guest's governor answered no period".to_owned())
-    }
-
-    /// Holds ready guest `vm` to the census's rate ([`Self::hold`]), its governor's period the census's window.
-    fn governed(&self, vm: &shards_api::ManagedGuest) -> Result<(), String> {
-        let (rate, window) = self
-            .held
-            .as_ref()
-            .ok_or("no census window was asked before a guest's hold")?;
-        let period = Self::hold(vm, *rate)?;
-        if period != window.length {
-            return Err(format!(
-                "the guest's governor answered a period of {period:?}, not the census's window of {:?}",
-                window.length
-            ));
-        }
-        Ok(())
     }
 
     /// Ends `vm` as a node deletes a backing (hex-runtime's shared release): drained, stopped and followed to its end
@@ -487,9 +473,17 @@ impl Driver for Managed {
         Ok(())
     }
 
+    fn hold(&mut self, guest: &Guest) -> Result<Option<Duration>, String> {
+        // Ready, it is held to the census's rate for its idle hold, as a node's learner holds a VM it has booted, over
+        // its own governor's period (Shards' D191: its VM process's own g), which it is read at from then on.
+        let (rate, _) = self
+            .held
+            .as_ref()
+            .ok_or("no census window was asked before a guest's hold")?;
+        Self::govern(&guest.vm, *rate).map(Some)
+    }
+
     fn idle(&mut self, guest: &Guest, until: Instant) -> Result<(), String> {
-        // Ready, it is held to the census's rate for its idle hold, as a node's learner holds a VM it has booted.
-        self.governed(&guest.vm)?;
         // The hold is a wait on the guest's end, until `until`: it must not come.
         match shards_api::Guest::wait_for(
             guest.vm.as_ref(),
@@ -531,7 +525,7 @@ impl Driver for Managed {
         // deadline (decision 9), and its boot-to-ready time is the window's evidence.
         let held = self.ready(&mut guest).and_then(|()| {
             let ready = began.elapsed();
-            Self::hold(&guest.vm, rate).map(|period| (period, ready))
+            Self::govern(&guest.vm, rate).map(|period| (period, ready))
         });
         let ended = self.tear_down(guest);
         let (length, ready) = match (held, ended) {
@@ -542,7 +536,7 @@ impl Driver for Managed {
         let window = Window {
             length,
             source: format!(
-                "the period a guest's governor holds {rate} milli-CPU over, as its VM process answered it, a guest booted for it alone, told no deadline and followed to its agent's answer, ready {} ns after its launch, and asked once ready (ManagedGuest::rate and rate_period; Shards' D191, D255): the CPU control a node holds a managed VM's rate with, and every guest of the census held to it once ready",
+                "the period a guest's governor holds {rate} milli-CPU over, as its VM process answered it, a guest booted for it alone, told no deadline and followed to its agent's answer, ready {} ns after its launch, and asked once ready (ManagedGuest::rate and rate_period; Shards' D191, D255): the CPU control a node holds a managed VM's rate with; each guest of the census read at it through its boot, then held to the rate once ready and read at its own governor's period, its VM process's own (D191's g, which each measures itself)",
                 ready.as_nanos()
             ),
         };
@@ -679,13 +673,17 @@ fn entries(process: &Handle) -> Result<Vec<(u64, u64, bool)>, String> {
 impl VmmHolds {
     /// Its guest's RAM: the one region of exactly its size in its VM process's map, Shards' confined VM process
     /// (its `reserve_ram`), as `ManagedGuest::vm_process` names it by pid and start (Shards 9d8a05f6a); none while that
-    /// process has no such region yet. The process is named again once its handle is open, so the handle is the one
+    /// process isn't recorded yet (its `shards` records it as it starts it, before it runs) or has no such region yet,
+    /// looked at again at the next reading. The process is named again once its handle is open, so the handle is the one
     /// named, never another that took its pid.
     fn find(&self) -> Result<Option<Mapped>, String> {
-        let named = self
-            .vm
-            .vm_process()
-            .map_err(|e| format!("naming the guest's VM process: {e}"))?;
+        let named = match self.vm.vm_process() {
+            Ok(named) => named,
+            Err(shards_api::Refusal::VmProcess(shards_api::VmProcessRefusal::Unrecorded)) => {
+                return Ok(None);
+            }
+            Err(e) => return Err(format!("naming the guest's VM process: {e}")),
+        };
         let process = sys::open_for_reading(named.pid)
             .map_err(|e| format!("opening the guest's VM process {}: {e}", named.pid))?
             .ok_or_else(|| format!("the guest's VM process {} is gone", named.pid))?;
@@ -749,8 +747,9 @@ mod tests {
     /// AC-T7.4.1 (light smoke, few boots), Windows' managed driver natively under WHP: produce a pair over the
     /// configured Shards guest with SEEDABLE two, through the same census, evidence and output the measurement uses:
     /// the governed window's guest booted, held and ended, then two guests each launched, read from their launch,
-    /// held idle at the census's rate and torn down. Expect the pair written and loaded as a node loads it, its
-    /// envelope the configured guest's, its window the governor's period, two guests in its evidence, and no guest
+    /// held at the census's rate once ready and read from then on at their own governor's period, and torn down. Expect
+    /// the pair written and loaded as a node loads it, its envelope the configured guest's, its window the governor's
+    /// period, two guests in its evidence, and no guest
     /// leaving anything on disk: its native owner releases the AppContainer profiles and records its VM process made
     /// as it ends its scope (Shards' D141, shards_api::release_app_containers), which the census would refuse. Needs
     /// SHARDS_BIN, HEX_GUEST_KERNEL, HEX_GUEST_INITRD, HEX_GUEST_CPUS, HEX_GUEST_MEMORY_MIB and GUEST_COST_SMOKE_OUT (a

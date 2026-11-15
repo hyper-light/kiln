@@ -133,6 +133,21 @@ fn eventually(home: &Path, what: &str, mut check: impl FnMut() -> bool) {
     patience.done();
 }
 
+/// Waits until daemon process `daemon` of `home` has exited, followed by its pid ([`Patience::
+/// client`]): its record, by which a home's patience finds its daemon, goes as the daemon
+/// finishes (`Daemon::finish`), before its last work and its exit, and that patience then
+/// finds none of its party running (KVM batch 22, refused 3 ms in; KVM batch 26,
+/// `stop_ends_runs_and_waiting_vms` refused 3.8 ms in, the daemon still ending).
+#[track_caller]
+fn exits(home: &Path, daemon: i32, what: &str) {
+    let mut patience = Patience::client(daemon.unsigned_abs(), home);
+    while alive(daemon) {
+        assert!(patience.holds(), "{what}");
+        std::thread::sleep(patience.next_look());
+    }
+    patience.done();
+}
+
 fn daemon_pid(home: &Path) -> Option<i32> {
     std::fs::read_to_string(home.join("daemon.pid"))
         .ok()?
@@ -815,7 +830,7 @@ fn stop_ends_runs_and_waiting_vms() {
     // It has let go of its home; the process ends as the kernel finishes its exit, and
     // init, which adopted it, reaps it (kill(2) finds a zombie too).
     assert!(home_is_free(&home), "stop returned before the daemon exited");
-    eventually(&home, "the daemon outlived its stop", || !alive(daemon));
+    exits(&home, daemon, "the daemon outlived its stop");
     assert_eq!(
         wait(&mut sleeper, &home),
         Some(128 + 15),
@@ -1081,7 +1096,7 @@ fn a_rebuilt_binary_replaces_the_daemon() {
     );
     let after = daemon_pid(&home).expect("a daemon pid");
     assert_ne!(before, after, "the old daemon still serves");
-    eventually(&home, "the old daemon did not exit", || !alive(before));
+    exits(&home, before, "the old daemon did not exit");
 }
 
 /// The event that a daemon's idle time of a second (`SHARDS_DAEMON_IDLE=1`) has run, which
@@ -1099,10 +1114,10 @@ fn an_idle_time_ran() {
     let started = run_shards_env(&["daemon"], &["--detached"], &env);
     assert_eq!(started.status, Some(0), "{}", started.stderr);
     let daemon = daemon_pid(&home).expect("a daemon pid");
-    eventually(
+    exits(
         &home,
+        daemon,
         "a daemon with nothing to hold it did not exit idle",
-        || !alive(daemon),
     );
 }
 
@@ -1123,7 +1138,7 @@ fn idle_daemons_exit() {
     let run = run_shards_env(&["run"], &[image.as_str(), "exit", "0"], &env);
     assert_eq!(run.status, Some(0), "{}", run.stderr);
     let daemon = daemon_pid(&home).expect("a daemon pid");
-    eventually(&home, "the idle daemon did not exit", || !alive(daemon));
+    exits(&home, daemon, "the idle daemon did not exit");
     assert!(daemon_pid(&home).is_none(), "the daemon left its pid file");
 }
 
@@ -1168,9 +1183,7 @@ fn an_engine_stream_ends_with_its_client() {
         an_idle_time_ran();
         assert!(alive(daemon), "the daemon exited while a stream was open");
     }
-    eventually(&home, "the daemon kept a stream whose client had gone", || {
-        !alive(daemon)
-    });
+    exits(&home, daemon, "the daemon kept a stream whose client had gone");
 }
 
 /// A daemon's idle time runs from its last run's end, which nothing else need follow: the
@@ -1208,10 +1221,10 @@ fn a_daemon_idles_from_its_last_runs_end() {
     assert!(alive(daemon), "the daemon exited while a run went on");
     drop(stdin);
     assert_eq!(wait(&mut client, &home), Some(0));
-    eventually(
+    exits(
         &home,
+        daemon,
         "the daemon did not exit once idle after its last run",
-        || !alive(daemon),
     );
 }
 
@@ -1573,24 +1586,38 @@ fn try_slot(home: &Path) -> Taken {
     else {
         return Taken::Gone;
     };
-    let mut record = [0u8; 16];
-    match free.read(&mut record) {
-        Ok(16) => {}
-        // No writer: no daemon.
-        Ok(0) => return Taken::Gone,
-        Ok(n) => panic!("a record of {n} bytes on free"),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Taken::Busy,
-        Err(e) => panic!("free: {e}"),
+    // A slot removed since it was offered, its record left on the list, is passed over for
+    // the next, as a client passes it (`shards_ipc::slots::take`): one whose thread ended
+    // before its client came, as a daemon out of descriptors may (KVM, ENOENT on its `say`).
+    let removed = |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENXIO));
+    loop {
+        let mut record = [0u8; 16];
+        match free.read(&mut record) {
+            Ok(16) => {}
+            // No writer: no daemon.
+            Ok(0) => return Taken::Gone,
+            Ok(n) => panic!("a record of {n} bytes on free"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Taken::Busy,
+            Err(e) => panic!("free: {e}"),
+        }
+        let n: u64 = std::str::from_utf8(&record).unwrap().trim_end().parse().unwrap();
+        // Its daemon holds the other end of each: neither open waits.
+        let answer = match std::fs::File::open(dir.join(format!("{n}.answer"))) {
+            Ok(answer) => answer,
+            Err(e) if removed(&e) => continue,
+            Err(e) => panic!("slot {n}'s answer: {e}"),
+        };
+        let mut say = match std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(format!("{n}.say")))
+        {
+            Ok(say) => say,
+            Err(e) if removed(&e) => continue,
+            Err(e) => panic!("slot {n}'s say: {e}"),
+        };
+        say.write_all(&[0]).unwrap();
+        return Taken::Slot(Silent { _say: say, answer });
     }
-    let n: u64 = std::str::from_utf8(&record).unwrap().trim_end().parse().unwrap();
-    // Its daemon holds the other end of each: neither open waits.
-    let answer = std::fs::File::open(dir.join(format!("{n}.answer"))).unwrap();
-    let mut say = std::fs::OpenOptions::new()
-        .write(true)
-        .open(dir.join(format!("{n}.say")))
-        .unwrap();
-    say.write_all(&[0]).unwrap();
-    Taken::Slot(Silent { _say: say, answer })
 }
 
 /// How many bytes wait in the pipe `out` reads: FIONREAD on Unix, PeekNamedPipe on Windows.
@@ -1740,7 +1767,7 @@ fn a_client_that_says_nothing_holds_up_no_stop() {
     let stopped = run_shards_env(&["daemon"], &["stop"], &env);
     assert_eq!(stopped.status, Some(0), "{stopped}");
     common::measured("a daemon's stop with a silent client in hand", &[t0.elapsed()]);
-    eventually(&home, "the daemon outlived its stop", || !alive(daemon));
+    exits(&home, daemon, "the daemon outlived its stop");
     // Let go: told, as it asked nothing yet, to ask the next daemon (RESTART), and shut.
     let heard = || shards_ipc::slots::read_frame(&silent.answer).map(|f| f.map(|f| f.kind));
     let mut got = heard();
@@ -1903,7 +1930,8 @@ fn a_home_removed_once_is_gone_with_its_daemon() {
     std::fs::create_dir(path.join("networks")).unwrap();
     std::fs::write(path.join("networks").join("made-as-it-went.json"), "{}").unwrap();
     std::fs::remove_file(&lock).unwrap();
-    eventually(&home, "the daemon outlived its home", || !alive(daemon));
+    // Its record went with the rest of the home.
+    exits(&home, daemon, "the daemon outlived its home");
     eventually(&home, "what was left of the home was left", || !path.exists());
 }
 
@@ -2298,13 +2326,19 @@ fn a_daemon_out_of_descriptors_waits_for_room() {
     // it has yet to see the end of (the `ps` that started it), or one that takes a slot as it
     // runs out, gives it room for more first (CI 41eab0d5: 270 µs after). Waited on while it
     // goes on ([`Patience`]).
-    let fill = |silent: &mut Vec<Silent>| {
+    // Where in its log it said it ran out, as judged: the window starts there, so that room
+    // it found between that look and the window's start is room found (KVM: said before a
+    // window read from the log's length, its collection, with room, taken for one without).
+    let fill = |silent: &mut Vec<Silent>| -> usize {
         let mut patience = Patience::of(&home);
-        loop {
+        let from = loop {
             match try_slot(&home) {
                 Taken::Slot(client) => silent.push(client),
-                Taken::Busy | Taken::Gone if out(&said()) => break,
                 Taken::Busy | Taken::Gone => {
+                    let log = said();
+                    if out(&log) {
+                        break log.rfind(OUT).unwrap_or_default();
+                    }
                     assert!(
                         patience.holds(),
                         "the daemon never ran out of descriptors, {} clients in; its log:\n{}",
@@ -2314,8 +2348,9 @@ fn a_daemon_out_of_descriptors_waits_for_room() {
                     std::thread::sleep(patience.next_look());
                 }
             }
-        }
+        };
         patience.done();
+        from
     };
     // Its clients each take a slot it offers and say nothing past their first byte. On macOS
     // a wait past what one select(2) takes failed every slot at once, so that the daemon
@@ -2323,9 +2358,8 @@ fn a_daemon_out_of_descriptors_waits_for_room() {
     // found meanwhile was its last take's own, the stop pipe of the slot taken, which a
     // busy daemon came to after this test stopped taking slots (PM M334): that slot is
     // taken, and the window run again.
-    fill(&mut silent);
+    let mut from = fill(&mut silent);
     let last_window = loop {
-        let from = said().len();
         // Its CPU over a second's window as it waits for room, told: what it costs, which no
         // later event orders (D209).
         let before = cpu_time(daemon);
@@ -2345,7 +2379,7 @@ fn a_daemon_out_of_descriptors_waits_for_room() {
             break from;
         }
         eprintln!("the daemon found room as its window went; its slot taken");
-        fill(&mut silent);
+        from = fill(&mut silent);
     };
     // Let go: the daemon has room, says so, and only then collects what was left, as its log
     // orders it (no window after the mark stands for its wait, D209).
@@ -3166,7 +3200,7 @@ fn a_daemon_whose_home_is_removed_exits_without_making_it_again() {
     eventually(&home, "the home could not be removed", || {
         matches!(std::fs::remove_dir_all(&path), Ok(())) || !path.exists()
     });
-    eventually(&home, "the daemon outlived its home", || !alive(daemon));
+    exits(&home, daemon, "the daemon outlived its home");
     eventually(&home, "VMs outlived their home", || {
         processes_with(&named).is_empty()
     });

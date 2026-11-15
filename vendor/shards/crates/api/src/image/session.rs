@@ -36,7 +36,7 @@ const AHEAD: u64 = shards_abi::run::CHUNK as u64;
 /// How many of the run host's last bytes of diagnostics are kept to quote: shards' longest
 /// report of a VM's end, its console's last bytes escaped (`crate::client::tail` for the
 /// console a direct boot keeps by default).
-fn said_kept() -> usize {
+pub(crate) fn said_kept() -> usize {
     crate::client::tail(shards_abi::bounds::console_said(
         shards_abi::bounds::ConsoleRecords::default(),
         shards_abi::bounds::ConsoleRecords::default(),
@@ -604,11 +604,11 @@ impl Shared {
 }
 
 /// The run host started, and the ends of its standard streams this process holds.
-struct Host {
-    process: shards_ipc::Child,
-    to_host: io::PipeWriter,
-    from_host: Output,
-    said: Output,
+pub(crate) struct Host {
+    pub(crate) process: shards_ipc::Child,
+    pub(crate) to_host: io::PipeWriter,
+    pub(crate) from_host: Output,
+    pub(crate) said: Output,
 }
 
 /// The read end of a run host's answers' or diagnostics' pipe, as its reader waits on it
@@ -616,10 +616,10 @@ struct Host {
 /// Windows, a named pipe's overlapped end, whose read an event cancels (std's anonymous
 /// pipes there are synchronous: a read of one waits for bytes or its writers' end alone).
 #[cfg(unix)]
-type Output = io::PipeReader;
+pub(crate) type Output = io::PipeReader;
 
 #[cfg(windows)]
-type Output = shards_ipc::Pipe;
+pub(crate) type Output = shards_ipc::Pipe;
 
 /// Starts `program` with `args`, its environment this process's with `env` over it, holding
 /// its stdin, stdout and stderr, pipes to this process, and nothing else this process holds
@@ -628,7 +628,11 @@ type Output = shards_ipc::Pipe;
 /// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` of its three on Windows), where std's would hand it
 /// whatever another thread of the orchestrator holds inheritable at that moment. A variable's
 /// name that is not UTF-8 is refused, as that spawn names variables in UTF-8.
-fn start_host(program: &Path, args: &[&OsStr], env: &[(OsString, OsString)]) -> Result<Host, ImageRefusal> {
+pub(crate) fn start_host(
+    program: &Path,
+    args: &[&OsStr],
+    env: &[(OsString, OsString)],
+) -> Result<Host, ImageRefusal> {
     let os = |what: &'static str| move |e: io::Error| ImageRefusal::Os { what, kind: e.kind() };
     let set = env
         .iter()
@@ -642,7 +646,7 @@ fn start_host(program: &Path, args: &[&OsStr], env: &[(OsString, OsString)]) -> 
         })
         .collect::<Result<Vec<(&str, &OsStr)>, ImageRefusal>>()?;
     let boot = |e: io::Error| ImageRefusal::Boot(format!("{}: {e}", program.display()));
-    let found = on_path(program).map_err(boot)?;
+    let found = shards_ipc::on_path(program, None).map_err(boot)?;
     let (child_in, to_host) = io::pipe().map_err(os("the run host's pipes"))?;
     #[cfg(unix)]
     let output = io::pipe;
@@ -687,38 +691,12 @@ fn start_host(program: &Path, args: &[&OsStr], env: &[(OsString, OsString)]) -> 
     })
 }
 
-/// `program` as std's spawn finds one: itself where it names a directory; else the first file
-/// of that name in a directory of this process's `PATH` (on Windows `.exe` added to a name
-/// with no extension, as CreateProcessW adds it); else refused, not found. Never one in the
-/// current directory, where std's spawn never looks for a name alone either: posix_spawn(2)
-/// would take that name as relative to it, and CreateProcessW looks there before `PATH`
-/// (D248). A directory of `PATH` that is empty, which exec(3) reads as the current one, is
-/// skipped, as std's Windows spawn skips it.
-fn on_path(program: &Path) -> io::Result<PathBuf> {
-    if !program.parent().is_some_and(|dir| dir.as_os_str().is_empty()) {
-        return Ok(program.to_path_buf());
-    }
-    let name = if cfg!(windows) && program.extension().is_none() {
-        program.with_extension("exe")
-    } else {
-        program.to_path_buf()
-    };
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .filter(|dir| !dir.as_os_str().is_empty())
-                .map(|dir| dir.join(&name))
-                .find(|candidate| candidate.is_file())
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "in no directory of PATH"))
-}
-
 /// Kills the host at once, and every process it started, unless it is reaped: on Unix its
 /// process group, which it leads (`start_host`), and which its VM, network and share
 /// processes are in (api_run.rs starts each in it); on Windows its group's job, which they
 /// are made in, nested in the host's own (D141, D197), each of them held to be followed to
 /// its end (`shards_ipc::Child::end_group`, D231).
-pub(super) fn kill(host: &shards_ipc::Child) {
+pub(crate) fn kill(host: &shards_ipc::Child) {
     let _ = host.kill_group(shards_ipc::signal::SIGKILL);
 }
 
@@ -1973,19 +1951,19 @@ fn watch(shared: &Shared, host: &shards_ipc::Child, layers: Option<&Path>, gone:
 /// never read, so that it stays readable; on Windows an event set, manual-reset, which stays
 /// so. Either holds for every reader and every read after it.
 #[cfg(unix)]
-struct Gone(io::PipeWriter);
+pub(crate) struct Gone(pub(crate) io::PipeWriter);
 
 #[cfg(windows)]
-struct Gone(shards_ipc::Event);
+pub(crate) struct Gone(pub(crate) shards_ipc::Event);
 
 impl Gone {
     #[cfg(unix)]
-    fn tell(self) {
+    pub(crate) fn tell(self) {
         let _ = (&self.0).write_all(&[0]);
     }
 
     #[cfg(windows)]
-    fn tell(self) {
+    pub(crate) fn tell(self) {
         self.0.set();
     }
 }
@@ -1999,14 +1977,14 @@ impl Gone {
 /// for its child's handle list (Windows: CreateProcessW with bInheritHandles TRUE and no
 /// list, as std's and an embedder's are, takes every inheritable handle of the process).
 #[cfg(unix)]
-struct UntilGone {
+pub(crate) struct UntilGone {
     pipe: io::PipeReader,
     gone: io::PipeReader,
 }
 
 #[cfg(unix)]
 impl UntilGone {
-    fn new(pipe: Output, told: &io::PipeReader) -> io::Result<UntilGone> {
+    pub(crate) fn new(pipe: Output, told: &io::PipeReader) -> io::Result<UntilGone> {
         Ok(UntilGone {
             pipe,
             gone: told.try_clone()?,
@@ -2033,7 +2011,7 @@ impl io::Read for UntilGone {
 /// set, draining the bytes the pipe held as the reader first saw it set (PeekNamedPipe), and
 /// no more, then ended: a writer outside the run, which no stop ends, cannot keep it reading.
 #[cfg(windows)]
-struct UntilGone {
+pub(crate) struct UntilGone {
     pipe: shards_ipc::Pipe,
     gone: shards_ipc::Event,
     state: Draining,
@@ -2051,7 +2029,7 @@ enum Draining {
 
 #[cfg(windows)]
 impl UntilGone {
-    fn new(pipe: Output, told: &shards_ipc::Event) -> io::Result<UntilGone> {
+    pub(crate) fn new(pipe: Output, told: &shards_ipc::Event) -> io::Result<UntilGone> {
         Ok(UntilGone {
             pipe,
             gone: told.try_clone()?,
@@ -2629,10 +2607,12 @@ mod tests {
     }
 
     /// Do write a run host's diagnostics past their file's bound, what the file held as it was
-    /// named counted, a file opened to write in place and one opened to append. Expect: each
-    /// part written after the last while the file is within its bound; the part that would
-    /// pass it cutting the file back to the tail, exactly its latest bytes; the next parts
-    /// written after that tail, the file growing again.
+    /// named counted, a file opened to write in place and one opened to append, each named as
+    /// a caller names it. Expect: each part written after the last while the file is within
+    /// its bound; the part that would pass it cutting the file back to the tail, exactly its
+    /// latest bytes; the next parts written after that tail, the file growing again. On
+    /// Windows the file opened to append refused `Os` as named and left as it was: std opens
+    /// it without `FILE_WRITE_DATA`, which a cut needs (D258).
     #[test]
     fn a_bounded_diagnostics_file_is_cut_back_to_the_tail_and_grows_again() {
         let dir = shards_testdir::TempDir::new("api-bound").unwrap();
@@ -2644,6 +2624,19 @@ mod tests {
                 .append(append)
                 .open(&path)
                 .unwrap();
+            let named = shared().keep_diagnostics(file.try_clone().unwrap(), u64::MAX);
+            if append && cfg!(windows) {
+                assert_eq!(
+                    named,
+                    Err(ImageRefusal::Os {
+                        what: "the run host's diagnostics",
+                        kind: io::ErrorKind::PermissionDenied
+                    })
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), b"ab", "left as it was");
+                continue;
+            }
+            assert_eq!(named, Ok(()));
             let mut kept = Diagnostics {
                 size: file.metadata().unwrap().len(),
                 file,
@@ -3043,6 +3036,7 @@ mod tests {
 
     /// Whether every write end of `read`'s pipe is gone, every process's: a read that would
     /// wait finds its end (Unix), or a look at it finds it broken (Windows), at once.
+    #[cfg(any(target_os = "macos", windows))]
     fn writers_gone(read: &io::PipeReader) -> bool {
         #[cfg(unix)]
         {
@@ -3158,28 +3152,6 @@ mod tests {
                 })
             ));
         }
-    }
-
-    /// Do find programs named alone that no directory of `PATH` holds, one of them in the
-    /// current directory (the crate's, where cargo runs its tests). Expect: each refused as
-    /// not found, none taken from the current directory, where posix_spawn(2) would take it
-    /// and CreateProcessW would look before `PATH`. Do find one named with its directory, and
-    /// a shell named alone. Expect: the first as it is, the second in a directory of `PATH`.
-    #[test]
-    fn a_program_named_alone_is_found_on_path_alone() {
-        assert!(Path::new("Cargo.toml").is_file());
-        for alone in ["Cargo.toml", "shards-api-no-such-program"] {
-            let found = on_path(Path::new(alone)).map_err(|e| e.kind());
-            assert_eq!(found, Err(io::ErrorKind::NotFound), "{alone}");
-        }
-        let named = Path::new("target").join("shards");
-        assert_eq!(on_path(&named).unwrap(), named);
-        let shell = on_path(Path::new(if cfg!(windows) { "cmd" } else { "sh" })).unwrap();
-        let path = std::env::var_os("PATH").unwrap();
-        assert!(
-            std::env::split_paths(&path).any(|dir| shell.parent() == Some(dir.as_path())),
-            "{shell:?}"
-        );
     }
 
     /// A refusal comes back typed by its cause, its host's words unchanged: the nesting
@@ -4395,13 +4367,13 @@ mod tests {
     /// The stand-in run host of a boot that never starts: it makes a writable layer's file in
     /// its home's `layers`, named as the real host names one (layers.rs `fresh`), holds
     /// `$HOST_SEEN` open as long as it runs, starts a stand-in VM that never looks at its host
-    /// (as a VM mid-boot does not), tells the VM's pid, and never answers.
+    /// (as a VM mid-boot does not), tells its own pid and the VM's, and never answers.
     #[cfg(unix)]
     const NEVER_STARTS: &str = "#!/bin/sh\n\
         : >\"$SHARDS_HOME/layers/$$-0\"\n\
         exec 3>\"$HOST_SEEN\"\n\
         tail -f /dev/null 3>&- &\n\
-        echo \"$!\" >&3\n\
+        echo \"$$ $!\" >&3\n\
         wait\n";
 
     /// A valid CREATE can fill the pipe before STARTED waits begin. Its stop must own
@@ -4535,8 +4507,10 @@ mod tests {
     /// returns `Ended(Stopped)`, the run host gone and the VM it started gone with it, no
     /// orphan left, and no file of the host's left in its home's `layers`, another host's
     /// kept. The boot waits on its host alone: only the stop ends it. A boot that ends
-    /// before its host tells the VM's pid ends the test's wait with it, refused with the
-    /// boot's outcome.
+    /// before its host tells its own and its VM's pids ends the test's wait with it, refused
+    /// with the boot's outcome. Each is judged gone by its ID and start, never by its pipe's
+    /// end: a write end of `h` that another test's spawn copied as it forked is held until
+    /// that child's exec, after both have gone (PM M583, M586).
     #[cfg(unix)]
     #[test]
     fn a_stop_mid_boot_ends_the_boot_its_host_and_all_its_host_started() {
@@ -4564,16 +4538,20 @@ mod tests {
             });
             // Told once the host holds `h` and has started its VM: both running.
             let said = line(&host_end);
-            let Ok(vm) = said.trim().parse::<libc::pid_t>() else {
-                panic!("its host told no VM ({said:?}), the boot {:?}", booting.join());
+            let pids: Vec<libc::pid_t> = said.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+            let [host, vm] = pids[..] else {
+                panic!(
+                    "its host told no host and VM ({said:?}), the boot {:?}",
+                    booting.join()
+                );
             };
             leftover.0 = Some(vm);
-            let vm = named(vm);
+            let (host, vm) = (named(host), named(vm));
             let stopped_at = Instant::now();
             stop.stop();
             let booted = booting.join().unwrap();
             let took = stopped_at.elapsed();
-            let host_gone = writers_gone(&host_end);
+            let host_gone = !host.lives();
             let vm_gone = !vm.lives();
             if vm_gone {
                 leftover.0 = None;
@@ -4697,7 +4675,9 @@ mod tests {
     /// ended: Linux releases an exiting process's files in no set order (kernel/task_work.c:
     /// "no ordering guarantee", LIFO), its stderr's before another's, while it has not yet
     /// exited, so a pipe's end is no word that its holders have (7 in 800 on adacachy2, PM
-    /// M583).
+    /// M583). The host and its VM are each judged gone by its ID and start, never by `h`'s
+    /// end: a copy of its write end another test's fork holds until that child's exec (PM
+    /// M586, M589).
     #[cfg(unix)]
     #[test]
     fn a_stop_returns_once_its_host_and_every_process_it_started_are_gone() {
@@ -4714,14 +4694,19 @@ mod tests {
             &request,
             "exec 3>\"$HOST_SEEN\"\n\
              tail -f /dev/null 3>&- &\n\
-             echo \"$!\" >&3",
+             echo \"$$ $!\" >&3",
         );
         // Its start comes after its host has told its VM's pid.
         let session = Session::start(&spec, &request, Duration::MAX, &super::super::BootStop::new()).unwrap();
-        let vm: libc::pid_t = line(&host_end).trim().parse().unwrap();
+        let said = line(&host_end);
+        let pids: Vec<libc::pid_t> = said.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+        let [host, vm] = pids[..] else {
+            panic!("its host told no host and VM ({said:?})");
+        };
         let mut leftover = Leftover(Some(vm));
-        let vm = named(vm);
+        let (host, vm) = (named(host), named(vm));
         let stopped = session.stop();
+        let host_gone = !host.lives();
         let vm_gone = !vm.lives();
         if vm_gone {
             leftover.0 = None;
@@ -4731,7 +4716,7 @@ mod tests {
             vm_gone,
             "the stop returned while the VM its run host started still ran"
         );
-        assert!(writers_gone(&host_end), "the run host outlived its stop");
+        assert!(host_gone, "the run host outlived its stop");
         assert!(lock(&session.shared.state).said_all);
         assert_eq!(
             session.wait_for(Duration::ZERO),
@@ -5129,13 +5114,16 @@ mod tests {
     #[test]
     fn a_stop_returns_though_a_process_outside_its_hosts_job_holds_its_pipes() {
         let me = std::env::current_exe().unwrap();
-        let mut outside = std::process::Command::new(&me);
-        outside
-            .env(STAND_IN, "vm")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let mut outside = shards_ipc::spawn_std(&mut outside).unwrap();
+        let null = shards_ipc::null().unwrap();
+        let outside = {
+            use std::os::windows::io::AsHandle as _;
+            let fds = [
+                (null.as_handle(), 0),
+                (null.as_handle(), 1),
+                (null.as_handle(), 2),
+            ];
+            shards_ipc::spawn_with(&me, &[], &fds, false, &[(STAND_IN, OsStr::new("vm"))]).unwrap()
+        };
         let mut held = Held::open(outside.id());
         let spec = stand_in_spec(
             &me,
@@ -5157,7 +5145,7 @@ mod tests {
             session.wait_for(Duration::ZERO),
             Ok(Some(untold(RunEnd::Exited(0))))
         );
-        outside.kill().unwrap();
+        outside.kill(shards_ipc::signal::SIGKILL).unwrap();
         outside.wait().unwrap();
     }
 

@@ -263,10 +263,15 @@ impl GuestConfig {
 
 impl GuestConfig {
     fn cmdline_parts(&self, mut emit: impl FnMut(&str)) {
+        // Shards' console (D261, `shards_api::CONSOLE`): virtio-console alone since Shards 35e2de91e (the 16550 gone),
+        // the one every default line Shards boots with begins with. Named, since a line naming none leaves the kernel no
+        // console and Shards keeps none of the boot's lines; taken from Shards, never a copy of Hex's, since one naming
+        // another (`console=ttyS0`) left init no /dev/console (g121, 2026-11-15).
         // `panic=-1`: a negative timeout reboots at once on a panic (kernel-parameters.txt, `panic=`;
         // kernel/panic.c `panic_timeout`), so the VM ends and the host sees it rather than a guest that
         // hangs.
-        emit("console=ttyS0 panic=-1");
+        emit(shards_api::CONSOLE);
+        emit(" panic=-1");
         if !self.shares.is_empty() {
             emit(" ");
             emit(shares::CMDLINE);

@@ -14,8 +14,8 @@ use super::machine::{self, Machine};
 use super::{AfterSnapshot, Config, ExitReason, Precopied, Precopying, RestoreConfig, Save, SnapshotPolicy};
 use crate::devices::control::Control;
 use crate::devices::power::PowerEvent;
-use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Join;
+use crate::devices::virtio::console::Port as ConsolePort;
 use crate::devices::virtio::{head, pmem};
 use crate::hv;
 use crate::memory::GuestMemory;
@@ -25,7 +25,7 @@ use crate::{debug, info, platform, warn};
 use shards_ipc::device::Refusal;
 
 /// Ok when this host can run VMs; otherwise, why not.
-pub fn check_host() -> Result<(), String> {
+pub fn check_host() -> Result<(), shards_abi::host::Unusable> {
     hv::check_host()
 }
 
@@ -76,7 +76,7 @@ impl<W: std::io::Write> std::io::Write for Carried<'_, W> {
 #[derive(Debug, Clone)]
 pub struct Handle {
     shared: Arc<Shared>,
-    serial: Arc<Serial>,
+    console: Arc<ConsolePort>,
     control: Arc<Control>,
     memory: Arc<GuestMemory>,
 }
@@ -825,17 +825,38 @@ impl Handle {
         self.shared.released_at_us.get().copied()
     }
 
-    /// Feeds bytes to the guest console as if typed, waiting while its UART has no room
-    /// for them (`Serial::input`).
+    /// Feeds bytes to the guest console as if typed, into the buffers its guest posted,
+    /// waiting while it has posted none (`console::Port::input`).
     pub fn console_input(&self, bytes: &[u8]) {
-        self.serial.input(bytes);
+        self.console.input(bytes);
     }
 
     /// The whole lines of the last bytes its guest wrote to its console, as many as it was
     /// told to keep ([`Config::said`]), and whether that was all it said: a kernel's panic
     /// says there why it resets its machine (`panic=-1`).
-    pub fn console_said(&self) -> crate::devices::serial::Said {
-        self.serial.said()
+    ///
+    /// A kernel that stopped before its console registered (hvc0 does as its driver probes)
+    /// said it to its printk ring alone: where the console carried nothing, its last lines
+    /// are read from the guest's memory instead, under the same bound (`printk::read`).
+    pub fn console_said(&self) -> crate::devices::said::Said {
+        let said = self.console.said();
+        let keep = self.console.keep();
+        if !said.lines.is_empty() || keep == 0 {
+            return said;
+        }
+        match crate::printk::read(&self.memory, keep) {
+            Ok(logged) if !logged.lines.is_empty() => logged,
+            Ok(_) => said,
+            Err(e) => {
+                crate::debug!("the guest's kernel log: {e}");
+                said
+            }
+        }
+    }
+
+    /// Whether its guest's kernel said it panicked (pvpanic): what a reset alone does not say.
+    pub fn panicked(&self) -> bool {
+        self.console.panicked()
     }
 
     /// Whether the VM is recording a working set ([`SnapshotPolicy::working_set`]).
@@ -1540,7 +1561,7 @@ fn launch(
         vm,
         memory,
         bus,
-        serial,
+        console,
         control,
         power,
         finish,
@@ -1685,7 +1706,7 @@ fn launch(
     Ok((
         Handle {
             shared,
-            serial,
+            console,
             control,
             memory: memory.clone(),
         },

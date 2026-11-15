@@ -12,7 +12,7 @@ use crate::arch::aarch64::{self, Entry, boot, layout};
 use crate::devices::control::Control;
 use crate::devices::power::Power;
 use crate::devices::rtc::Pl031;
-use crate::devices::serial::Serial;
+use crate::devices::virtio::console::Port as ConsolePort;
 use crate::devices::virtio::{mmio as virtio_mmio, pmem};
 use crate::devices::vmgenid::VmGenId;
 use crate::devices::{Interrupt, MmioBus};
@@ -207,7 +207,8 @@ pub struct Machine {
     pub vm: hv::Vm,
     pub memory: Arc<GuestMemory>,
     pub bus: Bus,
-    pub serial: Arc<Serial>,
+    /// Its console, hvc0: what it said, and its input.
+    pub console: Arc<ConsolePort>,
     pub control: Arc<Control>,
     /// Device-raised power events; on arm64 power management is PSCI, so none do yet.
     pub power: Arc<Power>,
@@ -433,7 +434,7 @@ fn ram_ranges(ram: u64) -> Result<[(u64, usize); 1], String> {
 struct Assembled {
     vm: hv::Vm,
     bus: MmioBus,
-    serial: Arc<Serial>,
+    console: Arc<ConsolePort>,
     control: Arc<Control>,
     vmgenid: VmGenId,
     gic_dist_size: u64,
@@ -460,8 +461,7 @@ struct Assembled {
 fn assemble(
     memory: &Arc<GuestMemory>,
     config: &MachineConfig,
-    console: Console,
-    said: usize,
+    console: super::ConsoleSetup,
     hosts: super::Hosts<'_>,
     gpu: Option<super::MachineGpu<'_, '_>>,
     pci: super::Pci<'_>,
@@ -640,8 +640,9 @@ fn assemble(
     let swap_device = swap
         .clone()
         .map(|w| Box::new(pmem::Pmem::swap(w)) as Box<dyn crate::devices::virtio::VirtioDevice>);
-    let last = gpu
-        .into_iter()
+    let (console_device, console) = console.device()?;
+    let last = std::iter::once(Box::new(console_device) as Box<dyn crate::devices::virtio::VirtioDevice>)
+        .chain(gpu)
         .chain(hotplug)
         .chain(reporting)
         .chain(swap_device)
@@ -680,15 +681,11 @@ fn assemble(
             iommu: iommu_at == Some(i),
         });
     }
-    let serial = Arc::new(Serial::new(
-        super::console_out(console)?,
-        Arc::new(GicLine {
-            gic: gic.clone(),
-            intid: SPI_INTID_BASE + layout::SPI_UART,
-        }),
-        said,
-    ));
-    bus.insert(layout::UART, 0x1000, serial.clone())?;
+    bus.insert(
+        layout::PVPANIC,
+        0x1000,
+        Arc::new(crate::devices::pvpanic::PvPanic::new(console.clone())),
+    )?;
     bus.insert(layout::RTC, 0x1000, Arc::new(Pl031::default()))?;
     let control = Arc::new(Control::default());
     control.on_disks(disk_sizes);
@@ -770,7 +767,7 @@ fn assemble(
     Ok(Assembled {
         vm,
         bus,
-        serial,
+        console,
         control,
         vmgenid,
         gic_dist_size: gp.dist_size,
@@ -865,8 +862,7 @@ pub fn build_reported(cfg: &Config, report: Option<&mut super::GpuReportTo<'_>>)
         let a = assemble(
             &memory,
             &config,
-            cfg.console,
-            cfg.said,
+            super::ConsoleSetup::booted(cfg),
             hosts,
             (cfg.gpu || !cfg.gpu_devices.is_empty()).then_some(super::MachineGpu { saw: 0, report }),
             super::Pci {
@@ -916,7 +912,7 @@ pub fn build_reported(cfg: &Config, report: Option<&mut super::GpuReportTo<'_>>)
         vm: a.vm,
         memory,
         bus: a.bus,
-        serial: a.serial,
+        console: a.console,
         control: a.control,
         power: Arc::new(Power::default()),
         finish: a.vmgenid,
@@ -1107,8 +1103,7 @@ pub fn restore(
     let a = assemble(
         &memory,
         &snap.config,
-        console,
-        said,
+        super::ConsoleSetup::restored(console, said),
         hosts,
         snap.config.gpu.map(|saw| super::MachineGpu { saw, report }),
         super::Pci {
@@ -1148,7 +1143,7 @@ pub fn restore(
         vm: a.vm,
         memory,
         bus: a.bus,
-        serial: a.serial,
+        console: a.console,
         control: a.control,
         power: Arc::new(Power::default()),
         finish: a.vmgenid,

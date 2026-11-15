@@ -153,7 +153,10 @@ fn fallible_fixture_spec_preserves_existing_kernel_and_ordered_share_grammar() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = config(dir.path());
     let spec = config.try_spec().unwrap();
-    assert_eq!(spec.cmdline, "console=ttyS0 panic=-1 hex.shares=ro,rw");
+    assert_eq!(
+        spec.cmdline,
+        format!("{} panic=-1 hex.shares=ro,rw", shards_api::CONSOLE)
+    );
     assert_eq!(spec.kernel, config.direct().unwrap().0);
     assert_eq!(
         spec.shares.first().unwrap().dir,
@@ -172,7 +175,10 @@ fn fallible_fixture_spec_preserves_existing_kernel_and_ordered_share_grammar() {
         ]
     );
     config.shares.clear();
-    assert_eq!(config.try_spec().unwrap().cmdline, "console=ttyS0 panic=-1");
+    assert_eq!(
+        config.try_spec().unwrap().cmdline,
+        format!("{} panic=-1", shards_api::CONSOLE)
+    );
     config.shares.resize(
         crate::guest::shares::MAX_SHARES.checked_add(1).unwrap(),
         Share {

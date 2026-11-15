@@ -1,5 +1,5 @@
 //! The x86_64 machine on any backend: RAM around the 32-bit MMIO gap, the in-kernel
-//! IOAPIC, ACPI tables, COM1, the i8042 and ACPI sleep ports the guest resets and powers
+//! IOAPIC, ACPI tables, the i8042 and ACPI sleep ports the guest resets and powers
 //! off through (docs/research/kvm-x86_64-ground-truth.md §3-§6), and the VM generation ID
 //! that makes each restored copy reseed its RNG.
 
@@ -12,7 +12,7 @@ use crate::devices::acpi_sleep::AcpiSleep;
 use crate::devices::control::Control;
 use crate::devices::i8042::I8042;
 use crate::devices::power::Power;
-use crate::devices::serial::Serial;
+use crate::devices::virtio::console::Port as ConsolePort;
 use crate::devices::virtio::{mmio as virtio_mmio, pmem};
 use crate::devices::vmgenid::VmGenId;
 use crate::devices::{Interrupt, MmioBus, SharedLine};
@@ -206,7 +206,8 @@ pub struct Machine {
     pub vm: hv::Vm,
     pub memory: Arc<GuestMemory>,
     pub bus: Bus,
-    pub serial: Arc<Serial>,
+    /// Its console, hvc0: what it said, and its input.
+    pub console: Arc<ConsolePort>,
     pub control: Arc<Control>,
     /// Power-off (ACPI sleep control) and reset (i8042).
     pub power: Arc<Power>,
@@ -337,7 +338,7 @@ impl Interrupt for EdgeLine {
 struct Assembled {
     vm: hv::Vm,
     bus: Bus,
-    serial: Arc<Serial>,
+    console: Arc<ConsolePort>,
     control: Arc<Control>,
     power: Arc<Power>,
     vmgenid: VmGenId,
@@ -378,15 +379,10 @@ fn ram_ranges(memory_mib: u64) -> Result<(u64, Vec<(u64, usize)>), String> {
 /// `gpu`, whether it has a GPU, and its window's length: as its renderer offers, where
 /// `Some(0)`, a boot's; that long, a restore's, where its renderer offers at least as much
 /// (D150, D201).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a boot's CPU baseline (D245) beside the machine's config, which a snapshot keeps without one"
-)]
 fn assemble(
     memory: &Arc<GuestMemory>,
     config: &MachineConfig,
-    console: Console,
-    said: usize,
+    console: super::ConsoleSetup,
     hosts: super::Hosts<'_>,
     gpu: Option<super::MachineGpu<'_, '_>>,
     pci: super::Pci<'_>,
@@ -510,6 +506,7 @@ fn assemble(
     let gpu = gpu
         .map(|(renderer, region)| super::gpu_device(&vm, renderer, region, ram))
         .transpose()?;
+    let (console_device, console) = console.device()?;
     let (devices, disk_sizes) = super::virtio_devices(
         config,
         &regions,
@@ -517,7 +514,8 @@ fn assemble(
         &windows,
         Some(&vm),
         hosts,
-        gpu.into_iter()
+        std::iter::once(Box::new(console_device) as Box<dyn crate::devices::virtio::VirtioDevice>)
+            .chain(gpu)
             .chain(hotplug)
             .chain(reporting)
             .chain(
@@ -577,17 +575,13 @@ fn assemble(
         control.on_mac(net.mac);
     }
     bus.mmio.insert(layout::CONTROL, 0x1000, control.clone())?;
+    bus.mmio.insert(
+        layout::PVPANIC,
+        0x1000,
+        Arc::new(crate::devices::pvpanic::PvPanic::new(console.clone())),
+    )?;
 
-    let serial = Arc::new(Serial::new(
-        super::console_out(console)?,
-        Arc::new(LevelLine {
-            irqs: irqs.clone(),
-            gsi: layout::GSI_COM1,
-        }),
-        said,
-    ));
     let power = Arc::new(Power::default());
-    bus.pio.insert(u64::from(layout::COM1), 8, serial.clone())?;
     bus.pio
         .insert(u64::from(layout::I8042), 5, Arc::new(I8042::new(power.clone())))?;
     bus.pio.insert(
@@ -652,7 +646,7 @@ fn assemble(
     Ok(Assembled {
         vm,
         bus,
-        serial,
+        console,
         control,
         power,
         vmgenid,
@@ -742,8 +736,7 @@ pub fn build_reported(
         let a = assemble(
             &memory,
             &config,
-            cfg.console,
-            cfg.said,
+            super::ConsoleSetup::booted(cfg),
             hosts,
             (cfg.gpu || !cfg.gpu_devices.is_empty()).then_some(super::MachineGpu { saw: 0, report }),
             super::Pci {
@@ -796,7 +789,7 @@ pub fn build_reported(
         vm: a.vm,
         memory,
         bus: a.bus,
-        serial: a.serial,
+        console: a.console,
         control: a.control,
         power: a.power,
         finish: a.vmgenid,
@@ -833,8 +826,7 @@ pub fn restore(
     let a = assemble(
         &memory,
         &snap.config,
-        console,
-        said,
+        super::ConsoleSetup::restored(console, said),
         hosts,
         snap.config.gpu.map(|saw| super::MachineGpu { saw, report }),
         super::Pci {
@@ -865,7 +857,7 @@ pub fn restore(
         vm: a.vm,
         memory,
         bus: a.bus,
-        serial: a.serial,
+        console: a.console,
         control: a.control,
         power: a.power,
         finish: a.vmgenid,

@@ -84,7 +84,7 @@ impl<D: crate::containers::Disk> Daemon<D> {
             _ => None,
         };
         if let Some(socket) = socket
-            && let Err(e) = socket.send(kind::SIGNAL, &9u32.to_be_bytes(), &[])
+            && let Err(e) = socket.send(&self.answers.run_send, kind::SIGNAL, &9u32.to_be_bytes(), &[])
         {
             log(format!("container {id}: ending a visit: {e}"));
         }
@@ -243,7 +243,7 @@ impl<D: crate::containers::Disk> Daemon<D> {
                 link_local: Vec::new(),
                 engine: None,
             },
-            || self.warm_for(threads, &prepared, &start, &|_| {}),
+            || self.warm_for(threads, &prepared, &start, &|_| {}, &|_| {}),
         );
         drop(prepared.lease.take());
         drop(fds);
@@ -304,10 +304,11 @@ impl<D: crate::containers::Disk> Daemon<D> {
                 }
             }
             let follow = follow.get_or_insert_with(|| {
-                shards_api::Followed::of_pid(pid)
-                    .ok()
-                    .flatten()
-                    .and_then(|f| shards_api::Follow::begin(&self.answers.held, f).ok().flatten())
+                shards_api::Followed::of_pid(pid).ok().flatten().and_then(|f| {
+                    shards_api::Follow::begin(&self.answers.held, f, shards_api::Bound::Rate)
+                        .ok()
+                        .flatten()
+                })
             });
             let wait = follow
                 .as_ref()

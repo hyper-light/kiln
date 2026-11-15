@@ -85,6 +85,12 @@ impl From<String> for StartError {
     }
 }
 
+impl From<shards_abi::host::Unusable> for StartError {
+    fn from(why: shards_abi::host::Unusable) -> Self {
+        Self::Legacy(why.into())
+    }
+}
+
 impl From<&str> for StartError {
     fn from(message: &str) -> Self {
         Self::Legacy(message.into())
@@ -1212,7 +1218,62 @@ fn kernel_cmdline(cfg: &Config) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Where the serial console's output goes.
+/// Whether a booted machine's console is given what its kernel logged before it registered
+/// (`devices::virtio::console`, D261): where the kernel's command line, as it boots, tells
+/// it no level to print at, every record it logs is one its console prints.
+#[cfg(hv)]
+fn console_backfill(cfg: &Config) -> bool {
+    !cmdline::kernel_part(&kernel_cmdline(cfg))
+        .split_whitespace()
+        .any(|word| word == "quiet" || word.starts_with("loglevel="))
+}
+
+/// What a machine's console is made of: where its output goes, how much of it is kept to
+/// quote (D12), and whether it is given what its kernel logged before it registered (D261).
+#[cfg(hv)]
+#[derive(Debug, Clone, Copy)]
+struct ConsoleSetup {
+    console: Console,
+    said: usize,
+    backfill: bool,
+}
+
+#[cfg(hv)]
+impl ConsoleSetup {
+    /// A booted machine's, as `cfg` has it.
+    fn booted(cfg: &Config) -> ConsoleSetup {
+        ConsoleSetup {
+            console: cfg.console,
+            said: cfg.said,
+            backfill: console_backfill(cfg),
+        }
+    }
+
+    /// A restored machine's: its guest's console registered before its snapshot, so
+    /// nothing was missed.
+    fn restored(console: Console, said: usize) -> ConsoleSetup {
+        ConsoleSetup {
+            console,
+            said,
+            backfill: false,
+        }
+    }
+
+    /// The console's device, and its port for the machine's handle.
+    fn device(
+        self,
+    ) -> Result<
+        (
+            crate::devices::virtio::console::Console,
+            Arc<crate::devices::virtio::console::Port>,
+        ),
+        String,
+    > {
+        crate::devices::virtio::console::Console::new(console_out(self.console)?, self.said, self.backfill)
+    }
+}
+
+/// Where the console's output goes.
 #[cfg(hv)]
 fn console_out(console: Console) -> Result<Box<dyn std::io::Write + Send>, String> {
     Ok(match console {
@@ -1299,7 +1360,7 @@ pub struct Config {
     pub cmdline: String,
     pub vcpus: u32,
     pub memory_mib: u64,
-    /// Where guest console (UART) output goes.
+    /// Where guest console (hvc0, virtio-console) output goes.
     pub console: Console,
     /// How many of its console's last bytes it keeps to quote (`Handle::console_said`):
     /// what its spawner learned its kernel's failure reports need
@@ -1461,7 +1522,7 @@ pub fn passthrough_refused() -> PassthroughRefusal {
     }
     #[cfg(not(any(target_os = "macos", hv = "whp")))]
     {
-        PassthroughRefusal::NoBackend(check_host().err().unwrap_or_default())
+        PassthroughRefusal::NoBackend(check_host().err().map(String::from).unwrap_or_default())
     }
 }
 
@@ -2507,7 +2568,7 @@ impl Config {
             kernel,
             initrd: None,
             init,
-            cmdline: "console=ttyS0 earlycon panic=-1".into(),
+            cmdline: format!("{} panic=-1", shards_abi::CONSOLE),
             vcpus: 1,
             memory_mib: MEMORY_MIB,
             console: Console::Stdout,
@@ -2946,7 +3007,7 @@ mod tests {
             cfg.console = console;
             kernel_cmdline(&cfg).into_owned()
         };
-        let base = "console=ttyS0 earlycon panic=-1";
+        let base = "console=hvc0 panic=-1";
         assert_eq!(told(base, Console::Discard), format!("{base} quiet"));
         assert_eq!(told(base, Console::Stdout), base);
         for own in [format!("{base} loglevel=7"), format!("{base} quiet")] {
@@ -2969,10 +3030,10 @@ mod tests {
             kernel_cmdline(&cfg).into_owned()
         };
         assert_eq!(
-            told("console=ttyS0 -- managed-network capabilities"),
-            "console=ttyS0 quiet -- managed-network capabilities"
+            told("console=hvc0 -- managed-network capabilities"),
+            "console=hvc0 quiet -- managed-network capabilities"
         );
-        assert_eq!(told("console=ttyS0 -- quiet"), "console=ttyS0 quiet -- quiet");
+        assert_eq!(told("console=hvc0 -- quiet"), "console=hvc0 quiet -- quiet");
         assert_eq!(told("loglevel=7 -- x"), "loglevel=7 -- x");
     }
 
