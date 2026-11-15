@@ -1468,6 +1468,16 @@ enum Arrival {
     Restore,
 }
 
+/// A run the rebuild after a restart found had never started (W05-R25): none of its legs made,
+/// nothing in its plan's log, as one held behind its workflow-level group is. It arrives in that
+/// group again (`group`; a run with none starts) once every run under way holds its place there,
+/// in the order such runs arrived before: `at`, when it last arrived.
+struct Unstarted {
+    run: String,
+    at: i64,
+    group: Option<(String, String, GroupConfig)>,
+}
+
 /// The run's supersession, when its workflow declares one and its event is one `when` names: on
 /// the repository, the workflow, and the branch or pull request (or W14 stack).
 fn sup_of(wf: &Workflow, repo: &Repo, path: &str, event: &str, github: &serde_json::Value) -> Option<Sup> {
@@ -3981,11 +3991,12 @@ impl Dispatch {
         runs::log(&self.hub, run, seq, "cancel", None, Some(serde_json::json!({ "reason": reason }).to_string())).await?;
         Box::pin(self.actions(run, acts)).await?;
         // Cancelled, with no leg of it left to stop, and its plan hasn't ended it: its plan waits
-        // for legs that were never made, so none will ever report to it. A run held behind its
-        // concurrency group as the server stopped is rebuilt so (W05-R25: its plan's first actions
-        // aren't given again, so its plan says its first legs are queued, and none has a row):
-        // production's runs #2758 to #2761 stayed queued through two restarts, whatever cancelled
-        // them (2026-11-13). It ends here, as a run that never started does.
+        // for legs that were never made, so none will ever report to it. A run the server stopped
+        // on as it started is rebuilt so (W05-R25): some of its first legs made and the others
+        // not, its plan waiting for them all. (A run held behind its concurrency group came back
+        // so too, until the rebuild gave it its plan's first actions again: production's runs
+        // #2758 to #2761 stayed queued through two restarts, whatever cancelled them, 2026-11-13.)
+        // It ends here, as a run that never started does.
         let stranded = self.runs.get(run).is_some_and(|r| !r.keys.values().any(|id| self.legs.contains_key(id)));
         if stranded {
             return Box::pin(self.actions(run, vec![PlanAction::Finish(PlanC::Cancelled)])).await;
@@ -4062,17 +4073,32 @@ impl Dispatch {
             Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
+        // The runs that never started (W05-R25), to arrive in their groups once every run is rebuilt.
+        let mut unstarted: Vec<Unstarted> = Vec::new();
         for (run, model, input) in rows {
-            let r = self.replay(&run, &model, &input).await;
-            if let Err(e) = r {
-                tracing::warn!(run, error = %format!("{e:#}"), "a CI run could not be rebuilt; it fails");
-                runs::finish_run(&self.hub, &run, Status::Failed, "failure", Some(format!("The run could not be rebuilt after a restart: {e:#}")), false).await?;
+            match self.replay(&run, &model, &input).await {
+                Ok(found) => unstarted.extend(found),
+                Err(e) => {
+                    tracing::warn!(run, error = %format!("{e:#}"), "a CI run could not be rebuilt; it fails");
+                    runs::finish_run(&self.hub, &run, Status::Failed, "failure", Some(format!("The run could not be rebuilt after a restart: {e:#}")), false).await?;
+                }
             }
+        }
+        // Every run under way holds its place in its workflow-level group by now. Those that never
+        // started arrive there again, in the order they arrived before (those that arrived
+        // together, in the order they were rebuilt): each starts in its turn, at once when nothing
+        // holds its group, or it has none.
+        unstarted.sort_by_key(|u| u.at);
+        for Unstarted { run, group, .. } in unstarted {
+            let cmds = self.sched.handle(Input::RunQueued { run, group, supersede: None }, now_ms());
+            Box::pin(self.commands(cmds)).await;
         }
         Ok(())
     }
 
-    async fn replay(&mut self, run: &str, model: &str, input: &str) -> anyhow::Result<()> {
+    /// Rebuilds one run. One that never started is given back: [`Dispatch::restore`] has it arrive
+    /// in its workflow-level group once every run is rebuilt.
+    async fn replay(&mut self, run: &str, model: &str, input: &str) -> anyhow::Result<Option<Unstarted>> {
         let wf: Arc<Workflow> = Arc::new(serde_json::from_str(model)?);
         let v: serde_json::Value = serde_json::from_str(input)?;
         let changed: Option<Vec<String>> = v.get("changed").and_then(|c| serde_json::from_value(c.clone()).ok());
@@ -4111,9 +4137,12 @@ impl Dispatch {
         // for those not ended yet: a leg that was running ends cancelled however it ends (lost
         // with its runner across the restart, say), not run again.
         let mut cancelled: Vec<(String, String)> = Vec::new();
+        // Whether the run itself was cancelled, as its log has it.
+        let mut run_cancelled = false;
         for (_, kind, leg, report) in log {
             match kind.as_str() {
                 "cancel" => {
+                    run_cancelled = true;
                     for act in plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree }) {
                         if let PlanAction::Cancel { leg, reason, .. } = act {
                             cancelled.push((leg, reason));
@@ -4196,21 +4225,32 @@ impl Dispatch {
             })
             .unwrap_or_default();
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
+        // None of this attempt's legs made (W05-R25).
+        let unmade = legs.is_empty();
+        // It never started: none of its legs made, nothing in its plan's log. Held behind its
+        // workflow-level group as the server stopped, a run has its row and its plan and no more.
+        // It comes back as it was, holding its plan's first actions, and `restore` has it arrive
+        // in its group again, to start in its turn. Taken for one that had started, nothing ever
+        // started it: its plan said its first legs were queued, and none was ever made
+        // (production's runs #2758 to #2761 stayed queued for good, 2026-11-13).
+        let unstarted = unmade && !logged;
         // Still waiting for a maintainer's approval (W18-R06): it starts from the plan's first
         // actions once approved.
-        let unapproved = !logged && legs.is_empty() && runs::approval(&self.hub, run).await?.as_deref() == Some("required");
+        let unapproved = unstarted && runs::approval(&self.hub, run).await?.as_deref() == Some("required");
         // A culprit-finding try (W28-R57) joins no run-level group and supersedes nothing.
         let culprit = Try::of_input(&v);
-        let (held, awaiting) = if unapproved {
-            let group = plan.concurrency.as_ref().filter(|_| culprit.is_none()).map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
-            (Some(initial), Some(Awaiting { group }))
+        let group = plan.concurrency.as_ref().filter(|_| culprit.is_none()).map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
+        let (held, awaiting, group) = if unapproved {
+            (Some(initial), Some(Awaiting { group }), None)
+        } else if unstarted {
+            (Some(initial), None, group)
         } else {
-            (None, None)
+            (None, None, group)
         };
         let sup = if culprit.is_some() { None } else { sup_of(&wf, &repo, &path, &event.name, &input.github) };
         // Where a person's retry asked its legs to run (W05-R28), those queued after a restart too.
         let placed = v.get("placed").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, dependencies, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unstarted, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, dependencies, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
         let mut owned = Vec::with_capacity(legs.len());
@@ -4287,12 +4327,36 @@ impl Dispatch {
         self.runs.insert(run.to_owned(), st);
         if waits {
             // Still waiting for a maintainer: nothing goes to the scheduler until then.
-            return Ok(());
+            return Ok(None);
+        }
+        if unmade && run_cancelled {
+            // Cancelled with none of its legs made, and the server stopped before it ended (a run
+            // an older kiln's rebuild took for started, cancelled then): nothing of it is left to
+            // stop and nothing will ever report to its plan. It ends here, and holds no group.
+            Box::pin(self.actions(run, vec![PlanAction::Finish(PlanC::Cancelled)])).await?;
+            return Ok(None);
+        }
+        // Under way, it holds its place in its workflow-level group again, so the runs behind it
+        // wait for it as they did, and a newer one cancels it where its group says so.
+        if !unstarted && let Some((key, _, cfg)) = group.clone() {
+            let cmds = self.sched.handle(Input::RunResumed { run: run.to_owned(), key, cfg }, now_ms());
+            Box::pin(self.commands(cmds)).await;
         }
         // Its demand again, so withdrawals are worked out afresh in creation order (W28-R46). It has
-        // started already.
+        // started already, or starts when `restore` has it arrive in its group.
         let cmds: Vec<Command> = self.run_queued(run, None, Arrival::Restore).into_iter().filter(|c| !matches!(c, Command::StartRun { .. })).collect();
         Box::pin(self.commands(cmds)).await;
+        if unstarted {
+            // When it arrived there before; where that can't be read, when it was made.
+            let at = match runs::arrived_at(&self.hub, run).await {
+                Ok(at) => at,
+                Err(e) => {
+                    tracing::warn!(run, error = %format!("{e:#}"), "when a run arrived at its group couldn't be read: it arrives as of when it was made");
+                    row.created_at
+                }
+            };
+            return Ok(Some(Unstarted { run: run.to_owned(), at, group }));
+        }
         let mut waits = Vec::new();
         for li in queued {
             // Held for its environment before the restart: held again, its wait counted from then.
@@ -4358,7 +4422,7 @@ impl Dispatch {
             runs::log(&self.hub, run, seq, "leg", Some(key), Some(report_json(&report))).await?;
             self.actions(run, acts).await?;
         }
-        Ok(())
+        Ok(None)
     }
 }
 
