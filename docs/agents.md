@@ -585,6 +585,12 @@ W21-R02):
   seen. Until they're in, its line is empty, in the room it always takes; no other text stands in
   for them. Where the list opens some other way than in the order (another sort, a filter kept from
   before), its first rows wait for theirs before the list is drawn.
+- **What changes after** comes lean too: the page's events socket asks for the agents lean
+  (`/api/events?lean=1`, [wire.md](wire.md), "The events socket"), and is told each agent's entry
+  once, then only what changed of it, and nothing while only what it's saying does (its last
+  words come as its turn ends, when a row first shows them). With one agent of the 137 at work,
+  the socket brought 7.9 to 9.3 KB in the twelve seconds after the page's reads, where it brought
+  50 to 54 KB: all the page takes in over them, 65 to 67 KB, where 108 to 112 KB.
 
 ## API
 

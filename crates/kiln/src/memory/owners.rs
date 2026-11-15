@@ -115,7 +115,9 @@ pub static UI_EVENTS: Owner = Owner::new("ui_events");
 /// page after them loads what it shows again: `resync`). An agent's info said again whole lets go of what it
 /// said before: most of what's pushed, an agent's info at each change (goal 11, plan 01a1a87b2e56 step 5), whose
 /// newest text its copy holds for the feed (`feed::Lent`, counted here while held; goal 9, plan 01a1a87b2cec step
-/// 5). The texts are the ones [`UI_EVENTS`] counts while its listeners hold them.
+/// 5). The texts are the ones [`UI_EVENTS`] counts while its listeners hold them. And what a socket that takes
+/// the agents lean keeps of them (`feed::Outbox`, `events::roster::Roster`; W21-R02): the lean entry it was last
+/// sent of each agent, about a kilobyte an agent, of at most `RING` agents.
 pub static EVENTS_FEED: Owner = Owner::new("events_feed");
 
 /// Each live job's log on its way to the job's viewers (`crate::logs`), kept until their slowest takes

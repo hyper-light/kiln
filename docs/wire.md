@@ -1308,7 +1308,7 @@ on the server sampler's existing `[telemetry] sample_seconds` deadline (W21-R15)
 the final reading even when the runner goes quiet, and keeps job and OS events from multiplying
 a page's sampling cadence. Every sample event that is published goes through the feed normally.
 
-The UI asks for three things (`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in,
+The UI asks for four things (`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in,
 so an older page or server goes on as it did:
 
 - **Batches** (`?batch=1`, or `?after=`): the socket's first frame, and every one after it but
@@ -1336,6 +1336,22 @@ so an older page or server goes on as it did:
   past which its oldest go as past its 4,096. An agent's `harness` frame lets go of that agent's
   last one (it says the agent whole): readers pass over what's let go of so, with no gap and no
   `resync`, and are sent the newest (goal 11, plan 01a1a87b2e56 step 5).
+- **The agents lean** (`?lean=1`, with batches; docs/ci.md W21-R02; `crate::wire::events::roster`,
+  `ui/src/api/roster-feed.ts`): an agent's every change is a `harness` event that says it whole,
+  1.2 KB, and one at work changes three times a second, of which a page shows nothing new (its
+  last words, said as it goes, which a row shows only once its turn is over; when it was last at
+  work). A socket that asks is sent each agent's entry once, lean, as a `harness` event: without
+  where its harness started (`starts`, `runs`, as the sessions' list read lean leaves them out)
+  and, while its turn runs (`running`, `starting`), without its last words (`summary`). From then
+  on, in that agent's `harness` events' place, it is sent only what changed of that entry:
+  `{"type": "harness_patch", "id", "set": {…}, "unset": […]}`, the fields that are new or have
+  another value, each whole, and those gone (`unset` left out when none are); and nothing at all
+  when nothing of it changed. The page keeps each agent's entry as its socket last said it and
+  applies what changed, so everything that listens for `harness` events hears the entry whole.
+  An agent's entry is said whole again after anything the socket may have missed (a `resync`, its
+  topics changed), once the agent is gone and back (`harness_closed`), and to every new socket (a
+  resume included). The socket keeps the lean entry it last sent of each agent, about a kilobyte
+  an agent, of as many agents as the ring has frames (counted in `events_feed` on `/metrics`).
 
 ### Lists as columns
 

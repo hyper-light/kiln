@@ -75,6 +75,19 @@ const LAUNCH: &[&str] = &[
     "/api/push/notices",
 ];
 
+/// The events socket as Mission control's page opens it (`ui/src/api/events.ts`): in batches, the agents lean
+/// (W21-R02: each one's entry once, then what changed of it), the types its page listens to as it opens.
+const EVENTS: &str = "/api/events?batch=1&lean=1&topics=agent,harness,harness_closed,queue,update_job";
+/// The same socket as a page asked for it before the agents came lean: every change of an agent, its entry whole.
+const EVENTS_WHOLE: &str = "/api/events?batch=1&topics=agent,harness,harness_closed,queue,update_job";
+/// How long the events socket is counted beside the launch's reads: as long as T3 Code counted what its own
+/// client was sent at launch ("socket frames counted on the client for 12 seconds after each socket opened",
+/// pingdotgg/t3code#35072), so the two are the same count: what a client takes in over its first twelve seconds.
+const LAUNCH_SOCKET: Duration = Duration::from_secs(12);
+/// How long a read of an events socket waits before the clock is looked at again: the window the socket gathers
+/// a batch for (`kiln::wire::events::feed::WINDOW`), so no oftener than a frame can come.
+const EVENTS_WINDOW: Duration = Duration::from_millis(50);
+
 #[derive(clap::Args, Clone)]
 pub struct Args {
     /// The build's `kiln` binary.
@@ -182,6 +195,15 @@ pub struct Read {
     pub server_us: Option<u64>,
 }
 
+/// What a socket brought over a while: its frames and their bytes, as sent (the lab asks for no packing).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Brought {
+    pub path: String,
+    pub seconds: u64,
+    pub frames: usize,
+    pub bytes: usize,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Report {
     pub command: String,
@@ -197,6 +219,9 @@ pub struct Report {
     pub pages: Vec<Page>,
     pub send: Option<Page>,
     pub launch: Vec<Read>,
+    /// What the events socket brought beside the launch's reads, as the page asks for it and as it did before the
+    /// agents came lean, both over the same [`LAUNCH_SOCKET`].
+    pub launch_events: Vec<Brought>,
     pub cold: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -448,6 +473,19 @@ pub fn markdown(r: &Report) -> String {
         s.push_str(&format!("| {} | {} | {} | {} | {} |\n", l.path, l.status, l.sent, l.unpacked, l.server_us.map_or_else(|| "-".to_owned(), ms)));
     }
     s.push_str(&format!("| all | | {sent} | {unpacked} | |\n"));
+    if let Some(lean) = r.launch_events.first() {
+        s.push_str(&format!(
+            "\nIts events socket meanwhile (`{}`), for the {} s T3 Code counted its own client's launch: {} frames, {} B. Reads and socket, all told: {} B.\n",
+            lean.path,
+            lean.seconds,
+            lean.frames,
+            lean.bytes,
+            unpacked + lean.bytes
+        ));
+    }
+    for whole in r.launch_events.iter().skip(1) {
+        s.push_str(&format!("The same {} s of the socket asked for without the agents lean (`{}`): {} frames, {} B.\n", whole.seconds, whole.path, whole.frames, whole.bytes));
+    }
     for (title, lines) in [("Cold", &r.cold), ("Notes", &r.notes)] {
         if !lines.is_empty() {
             s.push_str(&format!("\n## {title}\n\n"));
@@ -588,6 +626,31 @@ pub fn main(a: &Args, started_secs: u64) -> anyhow::Result<()> {
         for path in LAUNCH {
             let (p, u) = (packed.send("GET", path, None)?, plain.send("GET", path, None)?);
             report.launch.push(Read { path: (*path).to_owned(), status: p.status, sent: p.body.len(), unpacked: u.body.len(), server_us: p.server.map(|s| s.took_us) });
+        }
+    }
+    // And what its events socket brings meanwhile, for as long as T3 Code counted its own launch: the fleet's
+    // news, as the page asks for it (the agents lean) and, side by side over the same seconds, as it came before.
+    {
+        let mut sockets = Vec::new();
+        for path in [EVENTS, EVENTS_WHOLE] {
+            sockets.push((Brought { path: path.to_owned(), seconds: LAUNCH_SOCKET.as_secs(), ..Brought::default() }, Socket::open(port, &admin, path, EVENTS_WINDOW)?));
+        }
+        let began = Instant::now();
+        while began.elapsed() < LAUNCH_SOCKET {
+            for (brought, socket) in &mut sockets {
+                match socket.next()? {
+                    Frame::Text(text) => {
+                        brought.frames += 1;
+                        brought.bytes += text.len();
+                    }
+                    Frame::Closed => anyhow::bail!("the events socket closed within {} s of opening: {}", LAUNCH_SOCKET.as_secs(), brought.path),
+                    Frame::Binary | Frame::Nothing => {}
+                }
+            }
+        }
+        for (brought, socket) in sockets {
+            socket.close();
+            report.launch_events.push(brought);
         }
     }
 

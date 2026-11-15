@@ -5617,18 +5617,25 @@ impl Narrow {
 }
 
 /// How an events socket's page asked to be sent (docs/wire.md, "The events socket"): batched
-/// (`?batch=1`, or `?after=`), only some types (`?topics=a,b`), from where it was (`?after=<at>`).
-/// A page that asks for none of it is sent every frame as it comes, as before.
+/// (`?batch=1`, or `?after=`), only some types (`?topics=a,b`), from where it was (`?after=<at>`),
+/// the agents lean (`?lean=1`, in batches: W21-R02). A page that asks for none of it is sent every
+/// frame as it comes, as before.
 struct Asked {
     batch: bool,
     topics: Option<std::collections::HashSet<String>>,
     after: Option<String>,
+    lean: bool,
 }
 
 impl Asked {
     fn of(q: &HashMap<String, String>) -> Asked {
         let after = q.get("after").filter(|a| !a.is_empty()).cloned();
-        Asked { batch: after.is_some() || q.get("batch").is_some_and(|b| b == "1"), topics: q.get("topics").map(|t| crate::wire::events::feed::topics(t)), after }
+        Asked {
+            batch: after.is_some() || q.get("batch").is_some_and(|b| b == "1"),
+            topics: q.get("topics").map(|t| crate::wire::events::feed::topics(t)),
+            after,
+            lean: q.get("lean").is_some_and(|lean| lean == "1"),
+        }
     }
 }
 
@@ -5691,6 +5698,10 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, asked:
     let batch = asked.batch;
     let (mut cursor, missed) = if batch { fd.resume(asked.after.as_deref()) } else { (fd.head(), false) };
     let mut out = feed::Outbox::new(asked.topics);
+    // The agents lean, to a page that asked: what its batches say of each is what changed of it (W21-R02).
+    if asked.lean && batch {
+        out = out.lean();
+    }
     if missed {
         out.resync();
     }
@@ -8952,6 +8963,52 @@ mod tests {
             take_since(&hub, &mut four, at, &mut out, false, true, &mut None, &mut None).await?;
             let said: Vec<String> = four.sent.iter().filter_map(text).collect();
             anyhow::ensure!(said.iter().any(|s| s == after) && !said.iter().any(|s| s.starts_with(r#"{"type":"updates","n":"#) && s != after), "then what comes after it: {said:?}");
+            Ok(())
+        })
+    }
+
+    /// W21-R02: an events socket whose page asks for the agents lean (`?lean=1`, in batches) reads an agent's
+    /// changes off the feed as any socket does, and writes its entry once, lean, then only what changed of it; a
+    /// page that asks for batches alone is written each entry whole.
+    #[test]
+    fn w21_r02_an_events_socket_that_takes_the_agents_lean_writes_what_changed_of_them() -> anyhow::Result<()> {
+        use crate::harness::model::Status;
+        use crate::wire::events::feed::{At, Outbox};
+        let asks = |query: &str| Asked::of(&query.split('&').filter_map(|part| part.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect());
+        anyhow::ensure!(asks("batch=1&lean=1").lean && !asks("batch=1").lean && !asks("batch=1&lean=0").lean && asks("batch=1&lean=1").batch, "what a page asks");
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut from = hub.feed.head();
+            let entry = |summary: &str, at: i64| crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), status: Status::Running, summary: summary.into(), last_activity: at, ..Default::default() };
+            let (mut lean, mut whole) = (Outbox::new(None).lean(), Outbox::new(None));
+            let mut nothing = Written::default();
+            // What each socket's next batch says of the agent: the events that name it.
+            let mut said = Vec::new();
+            for (summary, at) in [("One", 1), ("One two", 2), ("One two three", 2)] {
+                // Its text held, as its copy holds it until its next info: the sockets read it.
+                let _held = hub.emit_harness("s1", &serde_json::to_vec(&entry(summary, at))?);
+                let mut each = Vec::new();
+                let mut at_now = from;
+                for out in [&mut lean, &mut whole] {
+                    at_now = take_since(&hub, &mut nothing, from, out, true, false, &mut None, &mut None).await?;
+                    let batch: serde_json::Value = out.flush(At { epoch: hub.feed.epoch(), seq: at_now }, false).map_or(Ok(json!({"events": []})), |text| serde_json::from_str(&text))?;
+                    let ours: Vec<serde_json::Value> = batch.get("events").and_then(|e| e.as_array()).into_iter().flatten().filter(|e| e.pointer("/info/id") == Some(&json!("s1")) || e.get("id") == Some(&json!("s1"))).cloned().collect();
+                    each.push(ours);
+                }
+                from = at_now;
+                said.push(each);
+            }
+            anyhow::ensure!(nothing.sent.is_empty(), "a batched socket's frames go by its outbox");
+            let kinds = |events: &[serde_json::Value]| events.iter().filter_map(|e| e.get("type").and_then(|t| t.as_str()).map(str::to_owned)).collect::<Vec<_>>();
+            let of = |step: usize, socket: usize| said.get(step).and_then(|each| each.get(socket)).cloned().unwrap_or_default();
+            // The lean socket: whole and lean, then when it was last at work, then nothing (only what it's saying changed).
+            assert_eq!((kinds(&of(0, 0)), of(0, 0).first().and_then(|e| e.pointer("/info/starts")).cloned(), of(0, 0).first().and_then(|e| e.pointer("/info/summary")).cloned()), (vec!["harness".to_owned()], None, None));
+            assert_eq!(of(1, 0), vec![json!({"type": "harness_patch", "id": "s1", "set": {"last_activity": 2}})]);
+            assert_eq!(of(2, 0), Vec::<serde_json::Value>::new());
+            // The other: its entry whole each time.
+            for step in 0..3 {
+                assert_eq!((kinds(&of(step, 1)), of(step, 1).first().and_then(|e| e.pointer("/info/starts")).is_some()), (vec!["harness".to_owned()], true), "step {step}");
+            }
             Ok(())
         })
     }
