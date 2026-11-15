@@ -1346,7 +1346,9 @@ tailscale = false
     runs::mark(&work);
     let child = cmd.spawn()?;
     let mut server = Server { child, port, quic, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), leave: false };
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Up once it answers as this test's server; followed by its process alone, never a clock: a
+    // server's start is its cold start (its store's migrations, its keys, its runner's), as long as it
+    // takes on a loaded machine, and one that ends has said it won't (vm_e2e's `setup` waits alike).
     loop {
         if let Some(status) = server.child.try_wait()? {
             return Ok(Err(format!("it exited ({status}) on ports {port} and {quic}")));
@@ -1370,7 +1372,6 @@ tailscale = false
                 _ => {}
             }
         }
-        anyhow::ensure!(Instant::now() < deadline, "the server didn't start");
         std::thread::sleep(Duration::from_millis(200));
     }
 }

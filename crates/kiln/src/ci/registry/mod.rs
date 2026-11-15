@@ -179,7 +179,8 @@ fn upload_path(hub: &Hub, id: &str) -> PathBuf {
 enum Who {
     Anonymous,
     Token(Access),
-    Caller(crate::authz::Caller),
+    /// Boxed: a caller is many times a token's access (clippy's `large_enum_variant`).
+    Caller(Box<crate::authz::Caller>),
 }
 
 impl Who {
@@ -187,7 +188,7 @@ impl Who {
         match self {
             Who::Anonymous => auth::may(hub, None, name, &[action]).contains(&action),
             Who::Token(a) => a.allows(name, action) || (action == Action::Pull && auth::anonymous(hub, name)),
-            Who::Caller(c) => auth::may(hub, Some(c), name, &[action]).contains(&action),
+            Who::Caller(c) => auth::may(hub, Some(c.as_ref()), name, &[action]).contains(&action),
         }
     }
 
@@ -212,7 +213,7 @@ async fn who(hub: &Hub, req: &Request) -> Result<Who, Error> {
     match auth::credentials(hub, srv::header_str(req, &header::AUTHORIZATION)) {
         Credentials::None => Ok(Who::Anonymous),
         Credentials::Registry(a) => Ok(Who::Token(a)),
-        Credentials::Secret(s) => caller_of(hub, &s).await.map(Who::Caller).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "those credentials aren't kiln's")),
+        Credentials::Secret(s) => caller_of(hub, &s).await.map(|c| Who::Caller(Box::new(c))).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "those credentials aren't kiln's")),
         Credentials::Invalid => Err(err(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "the token is invalid or expired")),
     }
 }
