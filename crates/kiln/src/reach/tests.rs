@@ -1732,7 +1732,7 @@ fn e5_a_queued_run_stopped_never_starts_and_says_so() -> anyhow::Result<()> {
             let e = crate::rt::timeout(HANG, ev_rx.recv()).await.map_err(|_| anyhow::anyhow!("timed out: {evs:?}"))?.map_err(|_| anyhow::anyhow!("its events ended: {evs:?}"))?;
             let queued = matches!(&e, Ev::Placed { json } if json.contains("\"queued\""));
             if queued && !evs.iter().any(|x| matches!(x, Ev::Placed { .. })) {
-                ctl_tx.send(super::wire::Req::Signal(super::wire::Signal::Interrupt)).await.map_err(|_| anyhow::anyhow!("its run took no signal"))?;
+                ctl_tx.send(local::Req::Signal(super::wire::Signal::Interrupt)).await.map_err(|_| anyhow::anyhow!("its run took no signal"))?;
             }
             let end = matches!(e, Ev::Exit { .. } | Ev::Error(_));
             evs.push(e);
