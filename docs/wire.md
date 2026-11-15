@@ -670,6 +670,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   person, listing with its own past sessions those kept in that person's microVM volumes there, each
   saying it ran in one (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5); a runner that didn't name it
   is asked `HarnessHistory` and lists its own alone.
+  `runner.engine`: the runner takes its engine as its owner set it on the server
+  (`ServerMsg::RunnerEngine`; kiln plan 01a1dd2e…, P2.3), keeps it for its restarts and writes it into
+  its facts, so its own admission holds it; a runner that didn't name it is held to it by the server
+  alone.
 
 ## Registry
 
@@ -731,6 +735,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 78 | `SkillFile` | | this line: a piece of an installed package's file a runner asked for, to a runner that named `skills` |
 | `ServerMsg` | 79 | `HarnessMailTransfer` | | this line: durable journal transfer phase, to a runner that named `mail-transfer` |
 | `ServerMsg` | 80 | `HarnessHistoryFor` | | main (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5): a machine's past sessions for a person, JSON, to a runner that named `harness.history-volumes` |
+| `ServerMsg` | 81 | `RunnerEngine` | | main (kiln plan 01a1dd2e…, P2.3): a runner's engine as its owner set it, JSON, to a runner that named `runner.engine` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -988,6 +993,7 @@ Four edges are left, and the lab steers clear of each:
 | `SkillFile` | answer | A piece of an installed package's file the runner asked for (`AgentMsg::Skills` `want`), by its SHA-256, at its offset; the last says so. | New: to runners that named `skills`, in pieces of 512 KiB. |
 | `HarnessMailTransfer` | command, refused while away | Apply the authoritative durable transfer phase for one exact manifest. | Persisted destination readiness precedes source permission to send; Committed precedes activation. |
 | `HarnessHistoryFor` | ask | `HarnessHistory` for a person (`aisessions::Asked`, JSON: `{kind, limit, person}`, the person whoever asked the server): the machine's past sessions with those kept in that person's microVM volumes there, each saying it ran in one (`isolation`). Answered by `HarnessHistory`. | New: to runners that named `harness.history-volumes`; a runner that didn't is asked `HarnessHistory`, and lists its own alone. |
+| `RunnerEngine` | state | What the runner's owner set on the server for its engine (`harness::engine::Asked`, JSON: `{engine}`, `host`, `microvm` or null for what it can do): kept in its state folder for its restarts and written into its facts (`isolation.engine`, `virt.microvm` only on `microvm`), which it says again at once. The newest wins. | New: to runners that named `runner.engine`, as they name it and whenever it changes. |
 
 ## Commands to a session: `Command`
 

@@ -1076,6 +1076,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let name = (*name).to_owned();
             boxed(|| crate::harness::limit::put(&hub, &name, req)).await.map_err(|(c, m)| err(c, m))
         }
+        // How a runner runs new agent sessions, its engine (`crate::harness::engine`; kiln plan 01a1dd2e…, P2.3).
+        (&Method::GET, ["api", "runners", name, "engine"]) => boxed(|| crate::harness::engine::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::PUT, ["api", "runners", name, "engine"]) => {
+            let name = (*name).to_owned();
+            boxed(|| crate::harness::engine::put(&hub, &name, req, &caller.name)).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(boxed(|| crate::frontdoor::control::renew(&hub, name)).await),
         (&Method::GET, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::get(&hub)).await),
         (&Method::PUT, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::put(&hub, req)).await),

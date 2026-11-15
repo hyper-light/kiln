@@ -693,6 +693,29 @@ pub fn list_ops() -> Vec<Op> {
             },
         },
         Op {
+            name: "runners.engine",
+            summary: "How a runner runs new agent sessions, its engine: `host` (each a process on the machine, no microVM) or `microvm` (each in a Shards microVM of its own, through Hex); where that comes from (its owner set it, or what the runner can do: `microvm` where it can hold microVMs, else `host`) and why; whether it can hold microVMs now and why not; its isolation facts; and how many of its sessions run on its engine and how many on the other, which finish there (`draining`).",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::RunnersEngine>(),
+            route: |v| Ok((Method::GET, path(&["api", "runners", &runner_of(v)?, "engine"]))),
+            run: |cx, v| Box::pin(async move { crate::harness::engine::read(&cx.hub, &runner_of(&v)?).await }),
+        },
+        Op {
+            name: "runners.engine.set",
+            summary: "Set how a runner runs new agent sessions: `host` or `microvm`, or null for what it can do (`microvm` where it can hold microVMs, else `host`). `microvm` is refused, saying why, where the runner can't hold microVMs now. Nothing running stops: its sessions on the other engine finish there, and new sessions take the new one.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::RunnersEngineSet>(),
+            route: |v| Ok((Method::PUT, path(&["api", "runners", &runner_of(v)?, "engine"]))),
+            run: |cx, v| {
+                Box::pin(async move {
+                    let body = json!({"engine": v.get("engine").cloned().unwrap_or(Value::Null)});
+                    crate::harness::engine::set(&cx.hub, &runner_of(&v)?, &body, &cx.caller.name).await
+                })
+            },
+        },
+        Op {
             name: "updates.list",
             summary: "The kiln of every runner you may read against the newest: its build, whether it's up to date, what it does next, the ways it can be upgraded now (or why not), its policy; and their latest upgrades with their state, error and log.",
             read_only: true,
@@ -771,6 +794,29 @@ pub mod input {
         pub action: RunnersRepairAction,
         /// For retry-upgrade: how; by default the way kiln can.
         pub way: Option<RunnersRepairWay>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct RunnersEngine {
+        /// The runner (machine) by name, as Runners lists it.
+        pub runner: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "lowercase")]
+    pub enum RunnerEngine {
+        Host,
+        Microvm,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct RunnersEngineSet {
+        /// The runner (machine) by name, as Runners lists it.
+        pub runner: String,
+        /// `host` or `microvm`; null for what the runner can do.
+        pub engine: Option<RunnerEngine>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

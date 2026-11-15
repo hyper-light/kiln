@@ -262,6 +262,42 @@ pub struct Isolation {
     pub hypervisor: Option<String>,
     /// Why agents here can't be held isolated.
     pub why_not: Option<String>,
+    /// How the runner runs new agent sessions now, its engine (kiln plan 01a1dd2e…, P2.3): what its
+    /// owner set on the server, else `microvm` where agents here can be held isolated (`available`;
+    /// the person's decision 3), else `host`. `virt.microvm` holds only on a `microvm` one. Absent
+    /// from a runner and a server from before engines.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<Engine>,
+}
+
+/// How a runner runs new agent sessions (kiln plan 01a1dd2e…, P2.3): as processes on its host, or
+/// each in a Shards microVM of its own, through Hex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(rename = "RunnerEngine"))]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    /// A process of its machine's, with no microVM.
+    Host,
+    /// A Shards microVM of its own, through Hex.
+    Microvm,
+}
+
+impl Engine {
+    /// Its name, as the API and the facts say it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Engine::Host => "host",
+            Engine::Microvm => "microvm",
+        }
+    }
+}
+
+impl std::fmt::Display for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Agents' workspaces of their own on a machine: Slates volumes over their folders.
