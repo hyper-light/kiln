@@ -225,10 +225,13 @@ fills in at each start `<like this>`: `kiln-about` (the card that answers "ask a
 agent's conversation), `kiln-about-code` (the same in a change no agent made), `kiln-attach` (an
 attachment's agent, woken by an incident), `kiln-review` (a review agent) and `kiln-toolfix` (the
 agent that installs a tool a job lacks on a runner). Changing, restoring or deleting one of kiln's is
-refused, 403: `copy` makes it yours. A UI agent kiln starts for a person that's `replaceable`
-(`kiln-about`, `kiln-about-code`) may have their own definition stand in for it, for them alone
-(`use`): where kiln starts that card for them, it starts theirs, its harness, model and Agentfile,
-first told its instructions and then kiln's brief, which carries what was asked. Deleting the
+refused, 403: `copy` makes it yours. Each UI agent is `replaceable`: its `brief` is what kiln tells
+it at each start, after the instructions of whichever definition starts (kiln's own have none). A
+person's own definition may stand in for one, for them alone (`use`): where kiln starts that agent
+for them, it starts theirs, its harness, model and Agentfile, first told its instructions and then
+kiln's brief. The most specific wins: a harness set where it's started (an attachment's `harness.kind`
+its person set, a tool fix's `kind`; left unset, it's stored unset), then the person's own, then
+kiln's. An attachment's agent and a review agent are their attachment person's (`by`). Deleting the
 definition makes it kiln's own again.
 
 A run starts an agent through `agents.start`, as its route starts one (the caller's right to start
@@ -242,7 +245,7 @@ interface Limits { seconds?; cents?; tokens? }
 interface AgentDef { id; owner /* "owner" | "user:<id>" */; name; version; created_at; updated_at;
   harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
 type AgentDefBrief = Pick<AgentDef, "id"|"owner"|"name"|"harness"|"model"|"agentfile"|"version"|"created_at"|"updated_at">;
-interface KilnAgentDef { id /* "kiln:<name>" */; name; about; replaceable: boolean;
+interface KilnAgentDef { id /* "kiln:<name>" */; name; about; replaceable: boolean; brief?: string;
   harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
 ```
 

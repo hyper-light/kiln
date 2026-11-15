@@ -31,6 +31,11 @@ pub struct Builtin {
     /// A UI agent kiln starts for a person, which their own copy may stand in for, for them alone
     /// (`agentdefs.use`).
     pub replaceable: bool,
+    /// A UI agent's: what kiln tells it at each start, after the instructions of whichever definition
+    /// it starts (kiln's own have none), with what that start fills in shown `<like this>`. Kiln's to
+    /// make; a copy has its own instructions and gets the same brief.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brief: Option<String>,
     #[serde(flatten)]
     pub settings: Settings,
 }
@@ -40,13 +45,25 @@ fn settings(harness: &str, instructions: String, skills: Vec<String>, agentfile:
 }
 
 fn one(name: &str, about: String, settings: Settings) -> Builtin {
-    Builtin { id: format!("{PREFIX}{name}"), name: name.to_owned(), about, replaceable: false, settings }
+    Builtin { id: format!("{PREFIX}{name}"), name: name.to_owned(), about, replaceable: false, brief: None, settings }
+}
+
+/// One of kiln's UI agents, on `harness`, whose start tells it `brief`: replaceable, its own
+/// instructions none.
+fn ui(name: &str, about: &str, brief: String) -> Builtin {
+    Builtin { replaceable: true, brief: Some(brief), ..one(name, about.to_owned(), settings("claude", String::new(), Vec::new(), None)) }
 }
 
 /// The about card, in an agent's conversation (`agents.about`): "ask about this code".
 pub const ABOUT: &str = "kiln:kiln-about";
 /// The about card, in a change no agent made (`ci.repos.about`).
 pub const ABOUT_CODE: &str = "kiln:kiln-about-code";
+/// An attachment's agent, woken by an incident (`crate::ci::attach`).
+pub const ATTACH: &str = "kiln:kiln-attach";
+/// An attachment's agent asked to review a change (`crate::ci::attach`, wake `review`).
+pub const REVIEW: &str = "kiln:kiln-review";
+/// The agent that installs a tool a job lacks on a runner (`crate::toolfix`).
+pub const TOOLFIX: &str = "kiln:kiln-toolfix";
 
 /// Every one, in the order they're listed: the CI skills', the harnesses', then kiln's own agents'.
 pub fn all() -> Vec<Builtin> {
@@ -66,7 +83,7 @@ pub fn all() -> Vec<Builtin> {
     }
     let tapped = crate::harness::ops::Tapped { path: "<path>", line: None, end: None, selection: Some("<selection>"), change: false, question: Some("<question>") };
     let about = crate::harness::ops::about_prompt(&tapped, "<the code around it>");
-    out.push(Builtin { replaceable: true, ..one("kiln-about", "The card that answers \"ask about this code\" in an agent's conversation: a child of that agent, reading and changing nothing".into(), settings("claude", about.clone(), Vec::new(), None)) });
+    out.push(ui("kiln-about", "The card that answers \"ask about this code\" in an agent's conversation: a child of that agent, reading and changing nothing", about.clone()));
     let repo = crate::store::Repo {
         id: String::new(),
         name: "<owner/name>".into(),
@@ -82,17 +99,17 @@ pub fn all() -> Vec<Builtin> {
         mirror: None,
     };
     let fetch = crate::ci::about::fetch_brief("", &repo, "<commit>", "<a folder of its own>");
-    out.push(Builtin { replaceable: true, ..one("kiln-about-code", "The card that answers \"ask about this code\" in a change no agent made: kiln starts it with the repository at that commit".into(), settings("claude", format!("{fetch}\n\n{about}"), Vec::new(), None)) });
+    out.push(ui("kiln-about-code", "The card that answers \"ask about this code\" in a change no agent made: kiln starts it with the repository at that commit", format!("{fetch}\n\n{about}")));
     let attachment = crate::ci::attach::Attachment { name: "<attachment>".into(), on: "<what it looks after>".into(), can: vec!["<what it may do>".into()], playbook: "<its playbook>".into(), ..Default::default() };
     let incident = crate::ci::attach::Incident { id: "<incident>".into(), ..Default::default() };
     let woke = crate::ci::attach::Trigger { wake: "<what woke it>", title: "<what happened>".into(), detail: "<what kiln gives it of that>".into(), ..Default::default() };
-    out.push(one("kiln-attach", "An attachment's agent: woken by what it looks after (a failure, a stuck job, a mention, a schedule), it finds out what happened, acts within what it may do and reports".into(), settings("claude", crate::ci::attach::bundle(&attachment, &incident, &woke, &[]), Vec::new(), None)));
+    out.push(ui("kiln-attach", "An attachment's agent: woken by what it looks after (a failure, a stuck job, a mention, a schedule), it finds out what happened, acts within what it may do and reports", crate::ci::attach::bundle(&attachment, &incident, &woke, &[])));
     let detail = format!("<who> asked you to review <diff>, \"<its title>\" by <its author>, on <its trunk> (<its page>), its versions and open threads.\n\n{}", crate::ci::attach::review_how("<diff>"));
     let review = crate::ci::attach::Trigger { wake: "review", title: "<who> asked you to review <diff>".into(), detail, ..Default::default() };
-    out.push(one("kiln-review", "A review agent: an attachment asked to review a change (`git push -o reviewer=agent:review`), which comments, answers threads and gives its verdict, signed as itself".into(), settings("claude", crate::ci::attach::bundle(&Attachment { name: "review".into(), ..attachment }, &incident, &review, &[]), Vec::new(), None)));
+    out.push(ui("kiln-review", "A review agent: an attachment asked to review a change (`git push -o reviewer=agent:review`), which comments, answers threads and gives its verdict, signed as itself", crate::ci::attach::bundle(&Attachment { name: "review".into(), ..attachment }, &incident, &review, &[])));
     let tools = ["<tool>".to_owned()];
     let fix = crate::toolfix::brief("<runner>", "<job>", "<owner/name>", "<number>", &tools, Some("<the command that wasn't there>"), None);
-    out.push(one("kiln-toolfix", "The agent kiln starts on a runner to install a tool a job lacks there, then runs the job again".into(), settings("claude", fix, Vec::new(), None)));
+    out.push(ui("kiln-toolfix", "The agent kiln starts on a runner to install a tool a job lacks there, then runs the job again", fix));
     out
 }
 

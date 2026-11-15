@@ -227,9 +227,10 @@ fn p5_1_kilns_own_agent_definitions_are_listed_copied_and_read_only() -> anyhow:
         anyhow::ensure!(s(&b, "/harness") == h && s(&b, "/agentfile") == format!("harness-{h}"), "{b}");
     }
     let replaceable: Vec<String> = builtin.iter().filter(|b| b.get("replaceable") == Some(&json!(true))).map(|b| s(b, "/name")).collect();
-    anyhow::ensure!(replaceable == ["kiln-about", "kiln-about-code"] && listed.get("uses") == Some(&json!({})), "{replaceable:?} {listed}");
+    anyhow::ensure!(replaceable == ["kiln-about", "kiln-about-code", "kiln-attach", "kiln-review", "kiln-toolfix"] && listed.get("uses") == Some(&json!({})), "{replaceable:?} {listed}");
     let review = builtin.iter().find(|b| s(b, "/name") == "kiln-review").cloned().unwrap_or_default();
-    anyhow::ensure!(s(&review, "/instructions").contains("ci.diffs.review gives your verdict") && s(&review, "/instructions").contains("incidents.report"), "{review}");
+    // A UI agent's brief is kiln's, told after the instructions of whichever definition starts: kiln's own have none.
+    anyhow::ensure!(s(&review, "/brief").contains("ci.diffs.review gives your verdict") && s(&review, "/brief").contains("incidents.report") && s(&review, "/instructions").is_empty(), "{review}");
     let (failed, said) = mcp(&srv, &ada, "agentdefs_get", json!({ "id": "kiln:kiln-about" }))?;
     anyhow::ensure!(!failed && said.contains("## What it is") && said.contains("<selection>"), "the about card's brief: {said}");
 
@@ -259,7 +260,7 @@ fn p5_1_kilns_own_agent_definitions_are_listed_copied_and_read_only() -> anyhow:
     let (st, said) = call(&srv, &ada, "POST", "/api/agentdefs/use", Some(json!({ "builtin": "kiln:kiln-about", "id": s(&his, "/id") })))?;
     anyhow::ensure!(st == 404, "his copy: {st} {said}");
     let (st, said) = call(&srv, &ada, "POST", "/api/agentdefs/use", Some(json!({ "builtin": "kiln:kiln-ci-author", "id": id })))?;
-    anyhow::ensure!(st == 400 && said.to_string().contains("kiln:kiln-about, kiln:kiln-about-code"), "{st} {said}");
+    anyhow::ensure!(st == 400 && said.to_string().contains("kiln:kiln-about, kiln:kiln-about-code, kiln:kiln-attach, kiln:kiln-review, kiln:kiln-toolfix"), "{st} {said}");
     let (st, used) = call(&srv, &ada, "POST", "/api/agentdefs/use", Some(json!({ "builtin": "kiln:kiln-about", "id": id })))?;
     anyhow::ensure!(st == 200 && used == json!({ "uses": { "kiln:kiln-about": id } }), "{st} {used}");
     let (_, his_list) = call(&srv, &bo, "GET", "/api/agentdefs", None)?;

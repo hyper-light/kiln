@@ -72,6 +72,17 @@ pub async fn settings_for(hub: &Hub, person: &str, kiln_agent: &str) -> R<Option
     Ok(Some(super::get(hub, &mine, &id).await?.settings))
 }
 
+/// What kiln starts for `person` (none: no person) as its own `kiln_agent`: their definition standing in
+/// for it, else kiln's own.
+pub async fn or_kilns(hub: &Hub, person: Option<&str>, kiln_agent: &str) -> R<Settings> {
+    if let Some(p) = person
+        && let Some(s) = settings_for(hub, p, kiln_agent).await?
+    {
+        return Ok(s);
+    }
+    builtin::get(kiln_agent).map(|b| b.settings).ok_or_else(|| Error::Bad(format!("{kiln_agent} isn't one of kiln's agent definitions")))
+}
+
 /// `ask`, kiln's start of its `kiln_agent` for `person` (its brief its prompt), as `person`'s own
 /// definition standing in for it makes it: that one's harness, model and Agentfile, first told its
 /// instructions and then kiln's brief, its mode `mode_for` its harness says. As it was where none does.

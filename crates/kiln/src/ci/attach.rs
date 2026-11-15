@@ -600,8 +600,9 @@ pub fn check(a: &mut Attachment) -> Result<(), String> {
     a.session = a.session.take().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
     match (&a.harness, &a.session) {
         (Some(_), Some(_)) => return Err("an attachment starts an agent (`harness`) or tells a live one (`session`), not both".into()),
-        (None, None) => return Err("say which agent: `harness` (one kiln starts for each incident) or `session` (a live agent it tells)".into()),
-        (Some(h), None) if crate::harness::kinds::Kind::get(&h.kind).is_none() => return Err(format!("`harness.kind`: unknown harness {:?}", h.kind)),
+        // No harness of its own (none, or `kind` unset): its person's copy of kiln's agent for it, else
+        // kiln's own ([`start`]; kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.1b).
+        (Some(h), None) if !h.kind.trim().is_empty() && crate::harness::kinds::Kind::get(&h.kind).is_none() => return Err(format!("`harness.kind`: unknown harness {:?}", h.kind)),
         _ => {}
     }
     let l = &a.limits;
@@ -1311,21 +1312,20 @@ async fn start(hub: &Arc<Hub>, a: &Attachment, i: &Incident) -> Result<String, S
         let _ = hub.store.kv_set(agent_key(s), a.id.clone()).await;
         return Ok(s.clone());
     }
-    let h = a.harness.clone().ok_or_else(|| "it names no agent".to_owned())?;
+    let h = a.harness.clone().unwrap_or_default();
     let starter = crate::harness::lineage::Starter { parent: None, opener: Some(a.by.clone()), actor: format!("attachment:{}", a.name), plan_run: None, asker: None };
     let name: String = format!("{}: {}", a.name, i.title).chars().take(80).collect();
-    let ask = crate::harness::lineage::Ask {
-        kind: h.kind,
-        on: h.on,
-        cwd: h.cwd,
-        prompt: Some(i.bundle.clone()),
-        model: h.model,
-        effort: h.effort,
-        mode: h.mode,
-        name: Some(name),
-        count: Some(1),
-        ..Default::default()
-    };
+    let mut ask = crate::harness::lineage::Ask { kind: h.kind.trim().to_owned(), on: h.on, cwd: h.cwd, prompt: Some(i.bundle.clone()), model: h.model, effort: h.effort, mode: h.mode, name: Some(name), count: Some(1), ..Default::default() };
+    // The most specific agent wins (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.1b): the harness its
+    // person set on the attachment; else their own copy of kiln's agent for it (`agentdefs.use`), its
+    // harness, model, Agentfile and instructions before the bundle; else kiln's own. Where it runs
+    // (`on`, `cwd`) stays the attachment's.
+    if ask.kind.is_empty() {
+        let kiln_agent = if i.wake == "review" { crate::agentdefs::builtin::REVIEW } else { crate::agentdefs::builtin::ATTACH };
+        let s = crate::agentdefs::uses::or_kilns(hub, Some(&a.by), kiln_agent).await.map_err(|e| e.to_string())?;
+        ask.prompt = crate::agentdefs::first_message(&s, Some(&i.bundle));
+        (ask.kind, ask.model, ask.image, ask.effort, ask.mode) = (s.harness, s.model, s.agentfile, None, None);
+    }
     let infos = crate::harness::lineage::start(hub, &starter, ask).await.map_err(|(_, m)| m)?;
     let id = infos.first().map(|x| x.id.clone()).ok_or_else(|| "no agent started".to_owned())?;
     let _ = hub.store.kv_set(agent_key(&id), a.id.clone()).await;
@@ -2126,7 +2126,9 @@ mod tests {
         assert!(refused(Attachment { wake: vec!["schedule".into()], schedule: Some("every day".into()), ..doctor("repo:acme/app") }).contains("five fields"));
         assert_eq!(check(&mut Attachment { wake: vec!["schedule".into()], schedule: Some("0 6 * * 1".into()), ..doctor("repo:acme/app") }), Ok(()));
         assert!(refused(Attachment { can: vec!["approve".into()], ..doctor("repo:acme/app") }).contains("`can`"));
-        assert!(refused(Attachment { harness: None, ..doctor("repo:acme/app") }).contains("which agent"));
+        // No harness of its own is kiln's agent for it, or its person's copy (P5.1b): kept.
+        assert!(check(&mut Attachment { harness: None, ..doctor("repo:acme/app") }).is_ok());
+        assert!(check(&mut Attachment { harness: Some(Harness::default()), ..doctor("repo:acme/app") }).is_ok());
         assert!(refused(Attachment { session: Some("s1".into()), ..doctor("repo:acme/app") }).contains("not both"));
         assert!(refused(Attachment { harness: Some(Harness { kind: "nope".into(), ..Harness::default() }), ..doctor("repo:acme/app") }).contains("unknown harness"));
         assert!(refused(Attachment { name: "@doc".into(), ..doctor("repo:acme/app") }).contains("`name`"));
@@ -2726,6 +2728,64 @@ mod end_to_end {
             let list = call(cx, "attachments.list", json!({})).await.map_err(fail)?;
             let names: Vec<&str> = list.get("attachments").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.pointer("/attachment/name").and_then(Value::as_str)).collect();
             anyhow::ensure!(names == ["ci-doctor", "deploy-doctor", "runner-doctor"], "{names:?}");
+            Ok(())
+        })
+    }
+
+    /// kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.1b, ROOT's precedence (2026-11-14): the most
+    /// specific agent wins. Ada's own copy of kiln's attachment agent is Codex, standing in for it for
+    /// her (agentdefs.use). Her attachment saved as the attach form saves one whose Agent is left as it
+    /// is (`harness` without `kind`, `ui/src/views/attach/defaults.ts`) starts her copy; one where she
+    /// picked Claude Code starts Claude Code; Bo's, saved the same way as her first, starts kiln's own
+    /// (Claude Code), not hers. Taking the copy out of `start` starts kiln's own for her first; storing
+    /// an unset kind as Claude Code starts Claude Code for it.
+    #[test]
+    fn p5_1b_an_attachments_own_agent_then_its_persons_copy_then_kilns() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = super::run(h).await;
+            });
+            let person = |name: &str| -> anyhow::Result<Caller> {
+                let admin = crate::authz::Grant::parse("admin").map_err(anyhow::Error::msg)?;
+                let mut c = Caller::with(crate::authz::gate::Kind::User, &format!("user:{name}"), Some(crate::authz::Rights { grants: vec![admin], ..Default::default() }), None);
+                c.user = Some(name.to_owned());
+                Ok(c)
+            };
+            let (ada, bo) = (Cx { hub: Arc::clone(&hub), caller: person("ada")? }, Cx { hub: Arc::clone(&hub), caller: person("bo")? });
+            let fail = |(c, m): crate::ops::Fail| anyhow::anyhow!("{c}: {m}");
+            let folder = tempfile::tempdir()?;
+            let cwd = folder.path().to_string_lossy().into_owned();
+
+            let copy = call(ada.clone(), "agentdefs.copy", json!({"id": crate::agentdefs::builtin::ATTACH, "name": "my-doctor"})).await.map_err(fail)?;
+            let id = copy.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            call(ada.clone(), "agentdefs.update", json!({"id": id, "harness": "codex"})).await.map_err(fail)?;
+            call(ada.clone(), "agentdefs.use", json!({"builtin": crate::agentdefs::builtin::ATTACH, "id": id})).await.map_err(fail)?;
+
+            // Each phase: one attachment on acme/app, a failure of a workflow of its own, its agent's harness.
+            let phase = |cx: Cx, name: &'static str, harness: Value, n: i64| {
+                let hub = Arc::clone(&hub);
+                async move {
+                    call(cx.clone(), "attachments.save", json!({"name": name, "on": "repo:acme/app", "harness": harness, "wake": ["failure"], "can": ["read"]})).await.map_err(fail)?;
+                    hub.emit(&failed(n, &format!(".github/workflows/w{n}.yml")));
+                    let i = wait_for(&hub, name, |i| i.name == name && i.agent.is_some()).await?;
+                    let kind = i.agent.as_deref().and_then(|a| hub.harness.info(a)).map(|x| x.kind).unwrap_or_default();
+                    call(cx, "attachments.remove", json!({"attachment": name})).await.map_err(fail)?;
+                    anyhow::Ok(kind)
+                }
+            };
+            let hers = phase(ada.clone(), "ada-doctor", json!({"on": "local", "cwd": cwd}), 1).await?;
+            anyhow::ensure!(hers == "codex", "her copy, the attachment's Agent left unset: {hers}");
+            let set = phase(ada.clone(), "ada-picked", json!({"kind": "claude", "on": "local", "cwd": cwd}), 2).await?;
+            anyhow::ensure!(set == "claude", "the harness she picked on it: {set}");
+            let his = phase(bo.clone(), "bo-doctor", json!({"on": "local", "cwd": cwd}), 3).await?;
+            anyhow::ensure!(his == "claude", "kiln's own for Bo: {his}");
             Ok(())
         })
     }
