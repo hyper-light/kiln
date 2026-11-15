@@ -2735,7 +2735,7 @@ mod end_to_end {
     /// kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.1b, ROOT's precedence (2026-11-14): the most
     /// specific agent wins. Ada's own copy of kiln's attachment agent is Codex, standing in for it for
     /// her (agentdefs.use). Her attachment saved as the attach form saves one whose Agent is left as it
-    /// is (`harness` without `kind`, `ui/src/views/attach/defaults.ts`) starts her copy; one where she
+    /// is (`harness.kind` "", unset: `ui/src/views/attach/defaults.ts`) starts her copy; one where she
     /// picked Claude Code starts Claude Code; Bo's, saved the same way as her first, starts kiln's own
     /// (Claude Code), not hers. Taking the copy out of `start` starts kiln's own for her first; storing
     /// an unset kind as Claude Code starts Claude Code for it.
@@ -2780,11 +2780,11 @@ mod end_to_end {
                     anyhow::Ok(kind)
                 }
             };
-            let hers = phase(ada.clone(), "ada-doctor", json!({"on": "local", "cwd": cwd}), 1).await?;
+            let hers = phase(ada.clone(), "ada-doctor", json!({"kind": "", "on": "local", "cwd": cwd}), 1).await?;
             anyhow::ensure!(hers == "codex", "her copy, the attachment's Agent left unset: {hers}");
             let set = phase(ada.clone(), "ada-picked", json!({"kind": "claude", "on": "local", "cwd": cwd}), 2).await?;
             anyhow::ensure!(set == "claude", "the harness she picked on it: {set}");
-            let his = phase(bo.clone(), "bo-doctor", json!({"on": "local", "cwd": cwd}), 3).await?;
+            let his = phase(bo.clone(), "bo-doctor", json!({"kind": "", "on": "local", "cwd": cwd}), 3).await?;
             anyhow::ensure!(his == "claude", "kiln's own for Bo: {his}");
             Ok(())
         })

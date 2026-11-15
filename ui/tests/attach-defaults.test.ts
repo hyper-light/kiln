@@ -5,10 +5,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { defaultsFor, KILNS } from "../src/views/attach/defaults.ts";
 
-test("p5_1b: an Agent left as it is saves no harness kind; one picked saves it", () => {
+test("p5_1b: an Agent left as it is saves its harness kind unset; one picked saves it", () => {
   const left = defaultsFor({ name: "ci-doctor", on: "repo:acme/app", harness: KILNS, wake: ["failure"], playbook: "", machine: "local", cwd: "/w" });
-  assert.deepEqual(left.harness, { on: "local", cwd: "/w" });
-  assert.equal("kind" in left.harness, false);
+  assert.deepEqual(left.harness, { kind: "", on: "local", cwd: "/w" });
   const picked = defaultsFor({ name: "ci-doctor", on: "repo:acme/app", harness: "codex", wake: ["failure"], playbook: "" });
   assert.deepEqual(picked.harness, { kind: "codex" });
 });
