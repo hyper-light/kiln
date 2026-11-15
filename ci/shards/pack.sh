@@ -28,14 +28,12 @@ esac
 exe=""
 case $target in *-windows-*) exe=.exe ;; esac
 
-# The zig Shards pins (its scripts/install-zig): one compiler for the guests' C wherever they're built, so their
+# The zig Shards pins (its scripts/zig-pin, which its scripts/install-zig installs): one compiler for the guests' C wherever they're built, so their
 # bytes, which name a microVM's template, are the same everywhere (Shards' crates/shards/build.rs).
-zig_version=$(sed -n 's/^version=//p' vendor/shards/scripts/install-zig)
+zig_version=$(sed -n 's/^zig_version=//p' vendor/shards/scripts/zig-pin)
+# install-zig keeps it where zig-pin says (its user's cache), checked by its digest, and prints its directory.
 if [ "$(zig version 2>/dev/null)" != "$zig_version" ]; then
-  zig_dir=${KILN_ZIG_DIR:-${CARGO_TARGET_DIR:-$root/target}/zig}
-  mkdir -p "$zig_dir"
-  zig_bin=$(ls -d "$zig_dir"/zig-*-"$zig_version" 2>/dev/null | head -n 1 || true)
-  [ -n "$zig_bin" ] || zig_bin=$(TMPDIR=$zig_dir sh vendor/shards/scripts/install-zig)
+  zig_bin=$(sh vendor/shards/scripts/install-zig)
   export PATH="$zig_bin:$PATH"
 fi
 echo "pack: shards for $target (its helpers for $helpers), profile $profile, with $(zig version 2>/dev/null | sed 's/^/zig /')"

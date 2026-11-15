@@ -24,7 +24,7 @@ the one Shards revision kiln and Hex build on.
   root `[patch.crates-io]` points `shards-api` and `shards-agentfile` here, and `rquickjs-sys` at
   `vendor/rquickjs-sys`.
 - **What is here:** upstream's tree less what no build reads: `docs/`, `examples/`, `fuzz/`, `.github/`, `.kiln/`;
-  its scripts but `zig-cc`, `zig-ar` and `install-zig` (the C compiler its guests' build names) and `hvf-run`
+  its scripts but `zig-cc`, `zig-ar`, `install-zig` and `zig-pin` (the C compiler its guests' build names) and `hvf-run`
   (cargo's runner on macOS, `.cargo/config.toml`); its crates' recorded test data (each `testdata/`, which only
   their tests include); and its copies of aws-lc-rs and aws-lc-sys (the change below). `vendor/rquickjs-sys`
   (crates.io's rquickjs-sys 0.14.0, QuickJS-NG's C) stays: no other project kiln vendors holds it, so it is kiln's

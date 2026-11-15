@@ -228,6 +228,7 @@ take = [
   "scripts/hvf-run",
   "scripts/install-zig",
   "scripts/zig-ar",
+  "scripts/zig-pin",
   "scripts/zig-cc",
   "vendor/rquickjs-sys",
 ]
