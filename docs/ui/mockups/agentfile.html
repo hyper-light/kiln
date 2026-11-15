@@ -7,346 +7,216 @@
 <link rel="stylesheet" href="assets/fonts.css" />
 <link rel="stylesheet" href="assets/kiln.css" />
 <link rel="stylesheet" href="assets/mockup.css" />
+<style>
+  /* The text, with its line numbers; a line Shards refuses is marked in the gutter as you type. */
+  .ed3 { display: grid; grid-template-columns: auto minmax(0, 1fr); border-top: 1px solid var(--rule); }
+  .gut3 { margin: 0; padding: 12px 8px 12px var(--edge); color: #4d5059; text-align: right; user-select: none; overflow: hidden; }
+  .gut3 b { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-weight: 400; height: calc(var(--v) * var(--lh)); }
+  .gut3 b[data-bad] { color: #fab219; }
+  .ed3 .code3 { padding-left: 8px; min-height: 0; height: 640px; }
+  @media (max-width: 1099px) { .ed3 .code3 { height: 420px; } }
+</style>
 </head>
 <body>
-<div class="container-console mk-page">
-  <div class="mk-banner">
-    <span><b>Mockup</b> · kiln UI design · sample data · P4.5, P4.6, P5.3, P5.4</span>
-    <nav aria-label="Mockups"><a href="runners.html">Runners</a><a href="agents.html">Agents</a><a href="agentfile.html" aria-current="page">Agentfile</a><a href="experiments.html">Experiments</a></nav>
-  </div>
-  <div class="af-page">
-    <nav class="eyebrow crumbs" aria-label="Breadcrumb"><span class="spectrum-rule"></span><a href="#">05 / Agents</a><span aria-hidden="true">/</span><a href="#">Agentfiles</a><span aria-hidden="true">/</span><span>rust-dev</span></nav>
-    <h1 class="af-title">rust-dev</h1>
-    <p class="af-dim" id="ver"></p>
-    <div style="max-width:420px"><label class="field-label" for="afname">Its name</label><div class="field mono-in"><input id="afname" value="rust-dev"></div><div class="field-hint">An image's: lowercase letters and digits, with ., _ or - between them. A new name alone is no new version.</div></div>
-
-    <div class="afs-wrap">
-    <div class="afs-h"><div class="seg afs-switch" role="group" aria-label="View" id="viewseg"><button data-v="view" aria-pressed="true">Structured <span class="mk-new" style="margin:0">new</span></button><button data-v="text" aria-pressed="false">Text</button></div>
-      <span class="dim" style="font-size:12px">Each follows the other as you change it. Wide windows show both.</span></div>
-
-    <div class="afs-split" id="split">
-      <div class="afs-pane" id="viewpane"></div>
-      <div class="afs-pane" id="textpane" style="display:none">
-        <div class="af-editor"><textarea class="afs-text" id="text" spellcheck="false" aria-label="rust-dev's Agentfile"></textarea><p class="af-said" id="check">Shards checks it as you type.</p></div>
-      </div>
-    </div>
-    </div>
-
-    <div class="af-actions"><button class="btn btn-primary btn-sm" id="save" disabled>Save</button><button class="btn btn-ghost btn-sm hide" id="discard">Discard changes</button><p class="said" id="said" role="status"></p></div>
-
-    <section class="af-section" aria-label="On your runners">
-      <div class="af-head"><h2 class="af-h">On your runners <span class="mk-new">new</span></h2><span class="dim mono" style="font-size:10.5px" id="buildsum"></span></div>
-      <p class="af-dim">Each save builds it on each of your microvm runners, for that runner's platform, so a session that starts there after its build starts with no build step. Until images are shared, each runner builds its own.</p>
-      <div class="table-wrap"><table class="data-table" aria-label="Builds"><thead><tr><th class="w-6"></th><th>Runner</th><th class="hidden sm:table-cell">Platform</th><th>Build</th><th class="hidden md:table-cell">Image</th><th class="num hidden sm:table-cell">Took</th><th class="w-0"><span class="sr-only">Act</span></th></tr></thead><tbody id="builds"></tbody></table></div>
-    </section>
-
-    <section class="af-section" aria-label="Versions"><h2 class="af-h">Versions</h2><ul class="af-rows" id="versions"></ul></section>
-    <section class="af-section"><button class="btn btn-ghost-danger btn-xs" style="justify-self:start">Delete Agentfile</button></section>
-  </div>
-</div>
+<div class="container-console v3 page3" id="page"></div>
 <script src="assets/mockup.js"></script>
 <script>
-/* ------------------------------------------------------------ the model the view edits */
+/* ------------------------------------------------------------ the model the structure edits; the text is made from it and read back */
 const BASE = "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10";
 const PINS = { claude: ["2.1.311", "2.1.298"], codex: ["0.68.0", "0.67.1"], devin: ["2026.11.11-b912975"], gemini: ["0.12.0"], opencode: ["1.5.7"], goose: ["1.59.0"], amp: ["0.167.2"], antigravity: ["1.5.2"], cursor: ["2.2.7"], pi: ["3000.12.43"] };
-const HOSTS = { claude: { "api.anthropic.com:443": "Claude Code's API", "claude.ai:443": "a claude.ai account's sign-in", "platform.claude.com:443": "a Console account's sign-in" }, codex: { "api.openai.com:443": "Codex's API", "auth.openai.com:443": "ChatGPT sign-in", "chatgpt.com:443": "ChatGPT account" } };
+const GOOD = "9f2c55d0b7a1e3c48d26f0a9b1c7e5d3f8a2b6c4d0e9f1a3b5c7d9e1f3a5e41a";
 let M = {
-  other: ["RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config \\", "    && rm -rf /var/lib/apt/lists/*"],
+  other: ["RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config"],
   harnesses: [
     { id: "claude", version: "2.1.311", source: { kind: "path", path: "./claude-2.1.311-${TARGETARCH}-gnu" }, model: "claude-opus-5-5", signin: "home", egress: [...harnessOf("claude").egress] },
-    { id: "codex", version: "0.68.0", source: { kind: "https", url: "https://releases.example.dev/codex/0.68.0/codex-linux-${TARGETARCH}.tar.gz", sha256: "9f2c55d0b7a1e3c48d26f0a9b1c7e5d3f8a2b6c4d0e9f1a3b5c7d9e1f3a5e41a", cred: "RELEASES_BEARER", redirects: [] }, model: "gpt-6.1-sol", signin: "home", egress: [...harnessOf("codex").egress] },
+    { id: "codex", version: "0.68.0", source: { kind: "https", url: "https://releases.example.dev/codex/0.68.0/codex-linux-${TARGETARCH}.tar.gz", sha256: GOOD, cred: "RELEASES_BEARER", redirects: [] }, model: "gpt-6.1-sol", signin: "home", egress: [...harnessOf("codex").egress] },
   ],
-  agents: [
-    { name: "reviewer", harness: "claude", def: 4, skills: ["kiln-ci-review", "rust-style", "no-panics"], mcp: [["github", "https://api.githubcopilot.com/mcp/"]], volumes: ["/home/agent/.cargo"], sync: "ok" },
-    { name: "pr-triage", harness: "codex", def: 2, skills: [], mcp: [], volumes: [], sync: "conflict" },
-  ],
+  agents: [{ name: "reviewer", harness: "claude", skills: ["kiln-ci-review", "rust-style", "no-panics"], mcp: [["github", "https://api.githubcopilot.com/mcp/"]], volumes: ["/home/agent/.cargo"], def: 4, sync: "ok" }, { name: "pr-triage", harness: "codex", skills: [], mcp: [], volumes: [], def: 2, sync: "differs" }],
 };
 let kept = structuredClone(M);
-let version = 8;
-let open = { claude: true, codex: true };
-const S = { view: "view", agentConflictOpen: true };
+const S = { v: 8, open: OPEN.get() || "codex", hist: null, remote: { v: 9, line: "NETWORK … codex-out: + chatgpt.com" }, clash: false, name: "rust-dev", problems: [] };
+const HIST = [[6, "reviewer's skills"], [7, "pr-triage added"], [8, "codex from a tarball"]];
 
-/* ------------------------------------------------------------ text from the model (and back) */
 function sourceLine(h) {
   const s = h.source;
   if (s.kind === "path") return `HARNESS ${h.id} FROM ${s.path}`;
   if (s.kind === "git") return `HARNESS ${h.id} FROM git+${s.scheme}://${s.repo}#${s.ref}${s.subdir ? ":" + s.subdir : ""}`;
   if (s.kind === "s3") return `HARNESS ${h.id} --endpoint=${s.endpoint} --region=${s.region}${s.pathStyle ? " --path-style" : ""}${s.versionId ? " --version-id=" + s.versionId : ""}${s.sha256 ? " --checksum=sha256:" + s.sha256 : ""} FROM s3://${s.bucket}/${s.key}`;
-  return `HARNESS ${h.id} --checksum=sha256:${s.sha256}${s.redirects.map((r) => " --redirect=" + r).join("")} FROM ${s.url}`;
+  return `HARNESS ${h.id}${s.sha256 ? ` --checksum=sha256:${s.sha256}` : ""}${s.redirects.map((r) => " --redirect=" + r).join("")} FROM ${s.url}`;
 }
 function textOf(m) {
-  const L = [`# rust-dev: Claude Code and Codex for Rust work, with the reviewer and pr-triage agents.`, `ARG BASE=${BASE}`, `FROM \${BASE}`, `ARG TARGETARCH`, ...m.other, ""];
+  const L = [`ARG BASE=${BASE}`, "FROM ${BASE}", "ARG TARGETARCH", ...m.other, ""];
   for (const h of m.harnesses) {
-    L.push(`# ${harnessOf(h.id).name} ${h.version}`, sourceLine(h));
-    if (h.model) L.push(`LABEL kiln.harness.${h.id}.model=${h.model}`);
-    L.push(`LABEL kiln.harness.${h.id}.sign-in=${h.signin === "home" ? "home" : "secret:" + h.signin}`);
-    if (h.egress.length) {
-      L.push(`NETWORK ${h.egress.map((e) => `--egress=${e}`).join(" ")} ${h.id}-out FOR ${h.id}`);
-      L.push(`EXPOSE --harnesses=${h.id} 443/tcp AS egress FOR ${h.id}-out`, `CONNECT ${h.id} WITH ${h.id} ON ${h.id}-out`);
-    }
+    L.push(sourceLine(h), `LABEL kiln.harness.${h.id}.model=${h.model || "default"}`, `LABEL kiln.harness.${h.id}.sign-in=${h.signin === "home" ? "home" : "secret:" + h.signin}`);
+    if (h.egress.length) L.push(`NETWORK ${h.egress.map((e) => `--egress=${e}`).join(" ")} ${h.id}-out FOR ${h.id}`, `EXPOSE --harnesses=${h.id} 443/tcp AS egress FOR ${h.id}-out`, `CONNECT ${h.id} WITH ${h.id} ON ${h.id}-out`);
     L.push(`VOLUME --target-kind=harness /home/${h.id} FOR ${h.id}`, "");
   }
   for (const a of m.agents) {
-    L.push(`AGENT ${a.name} FROM ./agents/${a.name}`, `ATTACH ${a.name} FOR ${a.harness}`);
-    for (const s of a.skills) L.push(`SKILL ./skills/${s} FOR ${a.name}`);
-    for (const [n, src] of a.mcp) L.push(`MCP ${n} FROM ${src} FOR ${a.name}`);
-    for (const v of a.volumes) L.push(`VOLUME --target-kind=agent ${v} FOR ${a.name}`);
-    L.push("");
+    L.push(`AGENT ${a.name} FROM ./agents/${a.name}`, `ATTACH ${a.name} FOR ${a.harness}`, ...a.skills.map((s) => `SKILL ./skills/${s} FOR ${a.name}`), ...a.mcp.map(([n, u]) => `MCP ${n} FROM ${u} FOR ${a.name}`), ...a.volumes.map((v) => `VOLUME --target-kind=agent ${v} FOR ${a.name}`), "");
   }
   return L.join("\n").trimEnd() + "\n";
 }
-/** The text back into the model: the lines the view shows; every other line stays as written. */
+/** The text read back: the lines the structure shows; the rest stays as written. What Shards would refuse comes back with its line. */
 function parse(text) {
-  const m = { other: [], harnesses: [], agents: [] };
-  const H = (id) => m.harnesses.find((h) => h.id === id);
-  const A = (n) => m.agents.find((a) => a.name === n);
-  const problems = [];
+  const m = { other: [], harnesses: [], agents: [] }, problems = [];
+  const H = (id) => m.harnesses.find((h) => h.id === id), A = (n) => m.agents.find((a) => a.name === n);
   text.split("\n").forEach((raw, i) => {
-    const l = raw.trim();
-    let x;
+    const l = raw.trim(); let x;
     if (!l || l.startsWith("#") || /^ARG (BASE|TARGETARCH)/.test(l) || /^FROM \$\{BASE\}/.test(l)) return;
     if ((x = l.match(/^HARNESS (\S+)(.*?) FROM (\S+)$/))) {
-      const [, id, flags, src] = x;
-      if (!harnessOf(id)) { problems.push(`line ${i + 1}: HARNESS ${id}: kiln runs claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor and pi, not ${id}`); return; }
+      const [, id, flags, src] = x; const prev = M.harnesses.find((h) => h.id === id);
+      if (!harnessOf(id)) { problems.push([i + 1, `unknown harness ${id}`]); return; }
       const f = (k) => (flags.match(new RegExp(`--${k}=(\\S+)`)) || [])[1];
-      const prev = M.harnesses.find((h) => h.id === id);
       let source;
       if (src.startsWith("git+")) { const g = src.match(/^git\+(https|ssh):\/\/([^#]+)#([^:]+)(?::(.+))?$/) || []; source = { kind: "git", scheme: g[1] || "https", repo: g[2] || "", ref: g[3] || "", subdir: g[4] || "", cred: prev?.source.cred || "" }; }
       else if (src.startsWith("s3://")) { const s = src.slice(5); source = { kind: "s3", bucket: s.split("/")[0], key: s.split("/").slice(1).join("/"), endpoint: f("endpoint") || "", region: f("region") || "", pathStyle: /--path-style/.test(flags), versionId: f("version-id") || "", sha256: (f("checksum") || "").replace("sha256:", ""), keyId: prev?.source.keyId || "", secretKey: prev?.source.secretKey || "" }; }
-      else if (/^https?:/.test(src)) { source = { kind: "https", url: src, sha256: (f("checksum") || "").replace("sha256:", ""), cred: prev?.source.cred || "", redirects: [...flags.matchAll(/--redirect=(\S+)/g)].map((r) => r[1]) }; if (!source.sha256) problems.push(`line ${i + 1}: HARNESS ${id} FROM ${src}: a tarball needs --checksum=sha256:<digest>`); }
+      else if (/^https?:/.test(src)) { source = { kind: "https", url: src, sha256: (f("checksum") || "").replace("sha256:", ""), cred: prev?.source.cred || "", redirects: [...flags.matchAll(/--redirect=(\S+)/g)].map((r) => r[1]) }; if (!/^[0-9a-f]{64}$/.test(source.sha256)) problems.push([i + 1, "tarball needs --checksum=sha256"]); }
       else source = { kind: "path", path: src };
       const vm = src.match(/(\d+\.\d+\.\d+)/);
-      m.harnesses.push({ id, version: vm ? vm[1] : prev?.version || PINS[id][0], source, model: "", signin: "home", egress: [] });
-      return;
+      m.harnesses.push({ id, version: vm ? vm[1] : prev?.version || PINS[id][0], source, model: "", signin: "home", egress: [] }); return;
     }
-    if ((x = l.match(/^LABEL kiln\.harness\.(\S+)\.model=(\S+)$/)) && H(x[1])) { H(x[1]).model = x[2]; return; }
+    if ((x = l.match(/^LABEL kiln\.harness\.(\S+)\.model=(\S+)$/)) && H(x[1])) { H(x[1]).model = x[2] === "default" ? "" : x[2]; return; }
     if ((x = l.match(/^LABEL kiln\.harness\.(\S+)\.sign-in=(?:secret:)?(\S+)$/)) && H(x[1])) { H(x[1]).signin = x[2]; return; }
     if ((x = l.match(/^NETWORK (.*) (\S+)-out FOR (\S+)$/)) && H(x[3])) { H(x[3]).egress = [...x[1].matchAll(/--egress=(\S+)/g)].map((e) => e[1]); return; }
     if (/^(EXPOSE --harnesses=|CONNECT )/.test(l) || /^VOLUME --target-kind=harness /.test(l)) return;
-    if ((x = l.match(/^AGENT (\S+) FROM/))) { const prev = M.agents.find((a) => a.name === x[1]); m.agents.push({ name: x[1], harness: "", def: prev?.def ?? null, skills: [], mcp: [], volumes: [], sync: prev?.sync ?? "none" }); return; }
+    if ((x = l.match(/^AGENT (\S+) FROM/))) { const prev = M.agents.find((a) => a.name === x[1]); m.agents.push({ name: x[1], harness: "", skills: [], mcp: [], volumes: [], def: prev?.def ?? null, sync: prev?.sync ?? "none" }); return; }
     if ((x = l.match(/^ATTACH (\S+) FOR (\S+)$/)) && A(x[1])) { A(x[1]).harness = x[2]; return; }
     if ((x = l.match(/^SKILL \.\/skills\/(\S+) FOR (\S+)$/)) && A(x[2])) { A(x[2]).skills.push(x[1]); return; }
     if ((x = l.match(/^MCP (\S+) FROM (\S+) FOR (\S+)$/)) && A(x[3])) { A(x[3]).mcp.push([x[1], x[2]]); return; }
     if ((x = l.match(/^VOLUME --target-kind=agent (\S+) FOR (\S+)$/)) && A(x[2])) { A(x[2]).volumes.push(x[1]); return; }
-    m.other.push(raw);
+    if (/^[A-Z]+ /.test(l)) m.other.push(raw); else problems.push([i + 1, "not an instruction"]);
   });
   return { m, problems };
 }
 
-/* ------------------------------------------------------------ the structured view */
-function originOf(h) {
-  const s = h.source;
-  try {
-    if (s.kind === "https") return parseAddress(s.url.replace("${TARGETARCH}", "arm64")).host + ":443";
-    if (s.kind === "git") return (s.scheme === "ssh" ? s.repo.replace(/^git@/, "").split("/")[0] + ":22" : s.repo.split("/")[0] + ":443");
-    if (s.kind === "s3") return s.endpoint ? parseAddress(s.endpoint).host + ":443" : "";
-  } catch { return ""; }
-  return "";
-}
-function sourceFields(h) {
-  const s = h.source, k = h.id;
-  const credLine = (what) => `<p class="afs-writes">${what}: kept by kiln with this version and handed to the fetch step alone; never in the text, a layer, the build record or a log.</p>`;
-  const grant = originOf(h) ? `<p class="afs-writes">Fetches from <b>${esc(originOf(h))}</b> alone${s.redirects?.length ? `, and ${s.redirects.map(esc).join(", ")}` : ""}: a grant for that step and no other (default deny).</p>` : "";
-  if (s.kind === "path") return `<div class="afs-src-fields"><div><label class="field-label" for="${k}-path">Path</label><div class="field mono-in"><input id="${k}-path" data-src="path" value="${esc(s.path)}"></div></div><p class="afs-writes">kiln fills it with its pinned build of ${harnessOf(k).name} ${esc(h.version)}, checked by its SHA-256 as it downloads.</p></div>`;
-  if (s.kind === "git") return `<div class="afs-src-fields">
-    <div class="grid3"><div class="select-field"><label class="field-label" for="${k}-scheme">Over</label>${select(k + "-scheme", [["https", "https"], ["ssh", "ssh"]], s.scheme, 'data-src="scheme"')}</div>
-      <div style="grid-column:span 2"><label class="field-label" for="${k}-repo">Repository</label><div class="field mono-in"><input id="${k}-repo" data-src="repo" value="${esc(s.repo)}" placeholder="${s.scheme === "ssh" ? "git@github.com/org/repo" : "github.com/org/repo"}"></div></div></div>
-    <div class="grid2"><div><label class="field-label" for="${k}-ref">Ref</label><div class="field mono-in"><input id="${k}-ref" data-src="ref" value="${esc(s.ref)}" placeholder="v0.68.0, main or a commit"></div></div><div><label class="field-label" for="${k}-sub">Folder in it</label><div class="field mono-in"><input id="${k}-sub" data-src="subdir" value="${esc(s.subdir)}" placeholder="the whole repository"></div></div></div>
-    <p class="afs-writes">Pinned by the commit <b>${esc(s.ref || "the ref")}</b> resolves to at build: ${s.ref === "v0.68.0" ? "<b>3f9c2e1d</b> on the last build" : "recorded at the next build"}.</p>
-    <div class="select-field"><label class="field-label" for="${k}-cred">${s.scheme === "ssh" ? "SSH key" : "Token"}</label><div class="select"><select id="${k}-cred" data-src="cred">${secretOptions(s.cred, s.scheme === "ssh" ? "None" : "None: a public repository")}</select>${CHEV}</div></div>
-    ${credLine(s.scheme === "ssh" ? "The key, by name; the runner's known_hosts is trusted, and the key never enters the VM" : "The token, by name, as GIT_AUTH_TOKEN for its host")}${grant}</div>`;
-  if (s.kind === "s3") return `<div class="afs-src-fields">
-    <div class="grid2"><div><label class="field-label" for="${k}-bucket">Bucket</label><div class="field mono-in"><input id="${k}-bucket" data-src="bucket" value="${esc(s.bucket)}"></div></div><div><label class="field-label" for="${k}-key">Key</label><div class="field mono-in"><input id="${k}-key" data-src="key" value="${esc(s.key)}"></div></div></div>
-    <div class="grid3"><div style="grid-column:span 2"><label class="field-label" for="${k}-ep">Endpoint</label><div class="field mono-in"><input id="${k}-ep" data-src="endpoint" value="${esc(s.endpoint)}" placeholder="https://s3.us-west-2.amazonaws.com"></div></div><div><label class="field-label" for="${k}-region">Region</label><div class="field mono-in"><input id="${k}-region" data-src="region" value="${esc(s.region)}" placeholder="auto"></div></div></div>
-    <div class="row" style="gap:6px"><span class="dim" style="font-size:11.5px">Endpoints:</span><button class="btn btn-ghost btn-xs" data-ep="aws">AWS</button><button class="btn btn-ghost btn-xs" data-ep="r2">Cloudflare R2</button><button class="btn btn-ghost btn-xs" data-ep="mantle">Mantle</button><label class="ag-checks right"><label><input type="checkbox" class="check" data-src="pathStyle" ${s.pathStyle ? "checked" : ""}> path-style</label></label></div>
-    <div class="grid2"><div><label class="field-label" for="${k}-vid">Object version</label><div class="field mono-in"><input id="${k}-vid" data-src="versionId" value="${esc(s.versionId)}" placeholder="its ETag and SHA-256 pin it"></div></div><div><label class="field-label" for="${k}-s3sum">SHA-256</label><div class="field mono-in"><input id="${k}-s3sum" data-src="sha256" value="${esc(s.sha256)}" placeholder="checked when given"></div></div></div>
-    <div class="grid2"><div class="select-field"><label class="field-label" for="${k}-akid">Access key ID</label><div class="select"><select id="${k}-akid" data-src="keyId">${secretOptions(s.keyId, "None: a public object")}</select>${CHEV}</div></div><div class="select-field"><label class="field-label" for="${k}-sak">Secret access key</label><div class="select"><select id="${k}-sak" data-src="secretKey">${secretOptions(s.secretKey, "None")}</select>${CHEV}</div></div></div>
-    ${credLine("The key pair, by name, signing the request (SigV4)")}${grant}</div>`;
-  return `<div class="afs-src-fields">
-    <div><label class="field-label" for="${k}-url">URL</label><div class="field mono-in"><input id="${k}-url" data-src="url" value="${esc(s.url)}"></div></div>
-    <div><label class="field-label" for="${k}-sum">SHA-256 <span class="faint">required</span></label><div class="field mono-in"><input id="${k}-sum" data-src="sha256" value="${esc(s.sha256)}" aria-invalid="${!/^[0-9a-f]{64}$/.test(s.sha256)}"></div>${/^[0-9a-f]{64}$/.test(s.sha256) ? "" : `<div class="field-hint" style="color:#d8b9bb">A tarball is pinned by its digest: 64 hex digits.</div>`}</div>
-    <div class="grid2"><div class="select-field"><label class="field-label" for="${k}-auth">Sign-in to the server</label><div class="select"><select id="${k}-auth" data-src="cred">${secretOptions(s.cred, "None")}</select>${CHEV}</div></div>
-      <div><label class="field-label" for="${k}-redir">Redirects allowed to</label><div class="field mono-in"><input id="${k}-redir" data-src="redirects" value="${esc(s.redirects.join(", "))}" placeholder="none: a redirect elsewhere is refused"></div></div></div>
-    ${credLine("Sent as its Authorization header, by name")}${grant}</div>`;
-}
-function harnessCard(h) {
-  const meta = harnessOf(h.id);
-  const isOpen = open[h.id];
-  const models = meta.models.length ? meta.models : [["", "Its default"]];
-  const hosts = HOSTS[h.id] || {};
-  return `<div class="afs-card" data-h="${h.id}">
-    <div class="afs-card-head"><button class="row" data-toggle="${h.id}" aria-expanded="${isOpen}" style="gap:10px"><span class="name">${h.id}</span><span class="dim" style="font-size:12.5px">${meta.name} · ${esc(h.version)} · ${h.source.kind === "path" ? "kiln's pin" : h.source.kind === "https" ? "HTTPS tarball" : h.source.kind === "git" ? "git" : "S3"}</span>${CHEV}</button>
-      <button class="btn btn-ghost-danger btn-xs right" data-rmh="${h.id}">Remove</button></div>
-    ${isOpen ? `<div class="afs-card-body">
-      <div class="afs-set"><div class="afs-key">Version</div><div class="afs-val">${h.source.kind === "path" ? select(h.id + "-ver", PINS[h.id].map((v, i) => [v, `${v}${i === 0 ? " (kiln's newest pin)" : " (kept: rust-dev v7 uses it)"}`]), h.version, 'data-hk="version"') + `<p class="afs-writes">kiln keeps an older pin while any Agentfile version uses it.</p>` : `<p class="afs-writes" style="padding-top:6px">What its source names: <b>${esc(h.version)}</b>.</p>`}</div></div>
-      <div class="afs-set"><div class="afs-key">Install source<small>HARNESS … FROM</small></div><div class="afs-val">
-        <div class="seg seg-xs" role="group" aria-label="${h.id}'s source" data-srckind="${h.id}">${[["path", "Path"], ["git", "Git"], ["s3", "S3"], ["https", "HTTPS tarball"]].map(([v, l]) => `<button data-v="${v}" aria-pressed="${h.source.kind === v}">${l}</button>`).join("")}</div>
-        ${sourceFields(h)}<p class="afs-writes">writes <b>${esc(sourceLine(h))}</b></p></div></div>
-      <div class="afs-set"><div class="afs-key">Model<small>LABEL kiln.harness.${h.id}.model</small></div><div class="afs-val">${select(h.id + "-model", models, h.model, 'data-hk="model"')}<p class="afs-writes">What its sessions and agents start with, unless they name another.</p></div></div>
-      <div class="afs-set"><div class="afs-key">Sign-in<small>LABEL kiln.harness.${h.id}.sign-in</small></div><div class="afs-val"><div class="select"><select data-hk="signin" aria-label="${h.id}'s sign-in"><option value="home"${h.signin === "home" ? " selected" : ""}>Your own sign-in, kept in your HOME volume</option>${SECRETS.map(([sc, n]) => `<option value="${n}"${h.signin === n ? " selected" : ""}>API key: ${n} · ${sc}</option>`).join("")}</select>${CHEV}</div>
-        <p class="afs-writes">${h.signin === "home" ? `Signed in as you on each runner (Settings → Accounts); nothing of it is in the image.` : `The key, by name, handed to the harness at start; never in the image.`}</p></div></div>
-      <div class="afs-set"><div class="afs-key">Volumes<small>VOLUME … FOR ${h.id}</small></div><div class="afs-val"><p class="afs-writes" style="padding-top:6px"><b>/home/${h.id}</b>: its HOME, yours alone, kept on each runner from session to session.</p></div></div>
-      <div class="afs-set"><div class="afs-key">Egress<small>NETWORK --egress … FOR ${h.id}</small></div><div class="afs-val">
-        <div class="afs-egress">${h.egress.map((e) => `<span class="chip chipx" title="${esc(hosts[e] || "added by you")}">${esc(e)}<button data-rmeg="${h.id}" data-e="${esc(e)}" aria-label="Remove ${esc(e)}">✕</button></span>`).join("") || `<span class="dim" style="font-size:12px">None: it reaches nothing.</span>`}</div>
-        <div class="row"><div class="field mono-in grow" style="max-width:340px"><input placeholder="host:port" aria-label="Add a host for ${h.id}" data-addeg="${h.id}"></div><button class="btn btn-secondary btn-xs" data-addegb="${h.id}">Allow</button></div>
-        <p class="afs-writes">TCP out to these hosts alone, by name. Nothing comes in; no other host, port or protocol goes out.</p></div></div>
-    </div>` : ""}
-  </div>`;
-}
-function agentRow(a) {
-  const conflict = a.sync === "conflict";
-  return `<li><div class="af-row"><a class="af-name" href="agents.html">${a.name}</a><span class="af-dim">on ${a.harness || "no harness"} · ${a.skills.length} skills · ${a.mcp.length} MCP · ${a.def ? `definition v${a.def}` : "no definition yet"}</span>
-    <span class="af-acts">${conflict ? `<span class="warn" style="font-size:12px">differs from its definition</span>` : a.def ? `<span class="ok" style="font-size:12px">in step</span>` : `<button class="btn btn-ghost btn-xs" data-mkdef="${a.name}">Make a definition of it</button>`}</span></div>
-    ${conflict && S.agentConflictOpen ? `<div class="ag-conflict" role="group" aria-label="${a.name} differs from its definition">
-      <p style="margin:0"><b>pr-triage's definition changed after this text was saved</b>: its v2 (Agents, 20 min ago) and these lines disagree. Neither overwrote the other.</p>
-      <table><thead><tr><th>Setting</th><th>This text</th><th>Definition v2</th></tr></thead><tbody>
-        <tr><td style="font-family:var(--font-sans)">Model</td><td class="differs">GPT-6.1 Sol</td><td class="differs">GPT-6.1 Sol mini</td></tr>
-        <tr><td style="font-family:var(--font-sans)">Time limit</td><td class="differs">none</td><td class="differs">10m</td></tr></tbody></table>
-      <div class="confirm-actions"><button class="btn btn-primary btn-xs" data-resolve="def">Take the definition's</button><button class="btn btn-secondary btn-xs" data-resolve="text">Keep this text's: update the definition</button></div></div>` : ""}</li>`;
-}
-function grantsTable(m) {
-  const rows = [];
-  for (const h of m.harnesses) if (h.egress.length) rows.push([h.id, h.egress.map((e) => e.split(":")[0]).join(", "), "443/tcp", "out", "NETWORK " + h.id + "-out"]);
-  for (const a of m.agents) for (const [n, src] of a.mcp) { try { rows.push([a.name, parseAddress(src).host, "443/tcp", "out", "MCP " + n]); } catch {} }
-  for (const h of m.harnesses) if (originOf(h)) rows.push([`${h.id}'s build`, originOf(h).split(":")[0], originOf(h).split(":")[1] + "/tcp", "out, fetch only", "HARNESS FROM"]);
-  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Who</th><th>To</th><th class="hidden sm:table-cell">Ports</th><th>Way</th><th class="hidden md:table-cell">From</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr><td class="cell-mono">${esc(r[0])}</td><td class="cell-mono" style="white-space:normal">${esc(r[1])}</td><td class="cell-mono hidden sm:table-cell">${r[2]}</td><td class="cell-mono">${r[3]}</td><td class="cell-mono hidden md:table-cell">${esc(r[4])}</td></tr>`).join("")}
-  </tbody></table></div><p class="af-dim">Nothing else goes in or out, and nothing reaches kiln's MCP over the network: it comes over the link kiln drives each harness by.</p>`;
-}
-function volumesTable(m) {
-  const rows = [...m.harnesses.map((h) => [`/home/${h.id}`, h.id, "HOME, yours alone", "each runner"]), ...m.agents.flatMap((a) => a.volumes.map((v) => [v, a.name, "the agent's, across its sessions", "each runner"]))];
-  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Path</th><th>For</th><th class="hidden sm:table-cell">What it is</th><th class="hidden md:table-cell">Kept on</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr><td class="cell-mono">${esc(r[0])}</td><td class="cell-mono">${esc(r[1])}</td><td class="hidden sm:table-cell" style="font-size:12.5px">${r[2]}</td><td class="cell-mono hidden md:table-cell">${r[3]}</td></tr>`).join("")}
-  </tbody></table></div><p class="af-dim">The project is plugged in at its own path as a session starts; no volume holds it.</p>`;
-}
-function renderView() {
-  const free = HARNESSES.filter((h) => !M.harnesses.some((x) => x.id === h.id));
-  $("#viewpane").innerHTML = `<div class="stack">
-    <div class="afs-h"><h3>Harnesses</h3><span class="row">${select("addh", free.map((h) => [h.id, h.name]), free[0]?.id ?? "", 'aria-label="A harness to add"')}<button class="btn btn-secondary btn-xs" data-act="addh">Add</button></span></div>
-    <div>${M.harnesses.map(harnessCard).join("")}</div>
-    <div class="afs-h hair"><h3>Agents</h3><a class="btn btn-ghost btn-xs" href="agents.html">Agent definitions</a></div>
-    <ul class="af-rows">${M.agents.map(agentRow).join("")}</ul>
-    <div class="afs-h hair"><h3>Grants</h3></div>${grantsTable(M)}
-    <div class="afs-h hair"><h3>Volumes</h3></div>${volumesTable(M)}
-    <div class="afs-h hair"><h3>Base and other instructions</h3></div>
-    <p class="afs-writes">FROM <b>${esc(BASE.slice(0, 44))}…</b></p>
-    <pre class="af-read">${esc(M.other.join("\n")) || "None."}</pre><p class="af-dim">Lines the view doesn't show stay as written: edit them in the text.</p>
-  </div>`;
-}
-
-/* ------------------------------------------------------------ builds on save (P4.5) */
-const RUNNERS = [["adas-macbook-pro-2.local", "linux/arm64", true], ["adas-mac-studio.local", "linux/arm64", true], ["adas-mac-studio-3.local", "linux/arm64", true], ["adas-mac-studio.local-2", "linux/arm64", true], ["adacachy2", "linux/amd64", true], ["adas-mac-studio-2.local", "linux/arm64", false, "can't run microVMs"], ["adacachy", "linux/amd64", false, "runs sessions on the host"]];
-const B = {};
-const GOOD = "9f2c55d0b7a1e3c48d26f0a9b1c7e5d3f8a2b6c4d0e9f1a3b5c7d9e1f3a5e41a";
-const AMD = "4b07e1a9c3d5f7b9e1a3c5d7f9b1d3e5a7c9e1b3d5f7a9c1e3b5d7f9a1c3c3d9";
-function buildsInit() {
-  RUNNERS.forEach(([n, p, ok], i) => { B[n] = !ok ? { state: "none" } : n === "adacachy2" ? { state: "failed", took: "41 s", at: "4 min ago" } : n === "adas-mac-studio.local-2" ? { state: "building", step: 6 } : { state: "built", digest: "sha256:7c1e0b9a44d2", took: ["3m 12s", "2m 58s", "3m 05s"][i] ?? "3m", at: "4 min ago" }; });
-}
-function failWords() {
-  return `Shards refused the build at line 13 (HARNESS codex): the download from releases.example.dev for linux/amd64 has SHA-256 ${AMD.slice(0, 12)}…, and --checksum=sha256:${GOOD.slice(0, 12)}… names another. One --checksum covers every platform's URL here: give each platform its own source, or a URL whose bytes match.`;
-}
-let expanded = "adacachy2";
-function renderBuilds() {
-  const done = Object.values(B).filter((b) => b.state === "built").length, all = RUNNERS.filter((r) => r[2]).length;
-  $("#buildsum").textContent = `v${version} · ${done} of ${all} built`;
-  $("#builds").innerHTML = RUNNERS.map(([n, p, ok, why]) => {
-    const b = B[n];
-    const state = b.state === "built" ? `<span class="ok">built</span> <span class="dim">${b.at}</span>` : b.state === "building" ? `<span style="color:var(--color-run)">building</span> <span class="dim">step ${b.step} of 9</span>` : b.state === "queued" ? `<span class="dim">queued</span>` : b.state === "failed" ? `<span class="fail">failed</span> <span class="dim">${b.at}</span>` : `<span class="faint">not built: ${why}</span>`;
-    const dot = { built: "succeeded", building: "running", queued: "queued", failed: "failed", none: "skipped" }[b.state];
-    return `<tr><td><i class="dot" data-status="${dot}"></i></td><td class="cell-mono">${n}</td><td class="cell-mono hidden sm:table-cell">${p}</td><td style="font-size:12.5px">${state}${b.state === "building" ? `<div class="mt-1 w-20"><div class="meter"><span style="width:${(b.step / 9) * 100}%"></span></div></div>` : ""}</td>
-      <td class="cell-mono hidden md:table-cell">${b.digest ? b.digest + "…" : "—"}</td><td class="num cell-mono hidden sm:table-cell">${b.took ?? "—"}</td>
-      <td class="text-right">${b.state === "failed" ? `<button class="btn btn-ghost btn-xs" data-why="${n}" aria-expanded="${expanded === n}">${expanded === n ? "Hide" : "Why"}</button>` : ""}</td></tr>
-      ${b.state === "failed" && expanded === n ? `<tr><td colspan="7"><div class="stack" style="padding:4px 0 8px"><p class="words">${esc(failWords())}</p><div class="row"><button class="btn btn-secondary btn-xs" data-rebuild="${n}">Build again</button><span class="dim" style="font-size:12px">Sessions on adacachy2 start from v7's image until this one builds.</span></div></div></td></tr>` : ""}`;
-  }).join("");
-}
+/* ------------------------------------------------------------ builds on save, per runner (P4.5) */
+const RUNNERS = [["adas-macbook-pro-2.local", "linux/arm64", true], ["adas-mac-studio.local", "linux/arm64", true], ["adas-mac-studio-3.local", "linux/arm64", true], ["adas-mac-studio.local-2", "linux/arm64", true], ["adacachy2", "linux/amd64", true], ["adas-mac-studio-2.local", "linux/arm64", false, "HVF denied"], ["adacachy", "linux/amd64", false, "host engine"]];
+const B = Object.fromEntries(RUNNERS.map(([n, , ok], i) => [n, !ok ? { s: "none" } : n === "adacachy2" ? { s: "failed", age: "4m" } : n === "adas-mac-studio.local-2" ? { s: "start", step: 6 } : { s: "ok", digest: "7c1e0b9a44d2", age: "4m", took: ["3m12s", "2m58s", "3m05s"][i] ?? "3m" }]));
+const WORDS = "Shards refused the build at line 13 (HARNESS codex): the download for linux/amd64 has SHA-256 4b07e1a9c3d5…, and --checksum=sha256:9f2c55d0b7a1… names another.";
 function runBuilds() {
-  RUNNERS.forEach(([n, , ok]) => { if (ok) B[n] = { state: "queued" }; });
-  renderBuilds();
-  const codex = M.harnesses.find((h) => h.id === "codex");
-  const fixed = !codex || codex.source.kind !== "https" || codex.source.sha256 !== GOOD;
-  RUNNERS.filter((r) => r[2]).forEach(([n], i) => {
-    let step = 0;
-    setTimeout(function tick() {
-      step += 1 + (i % 3);
-      if (n === "adacachy2" && !fixed && step >= 4) { B[n] = { state: "failed", took: "38 s", at: "just now" }; expanded = n; renderBuilds(); return; }
-      if (step >= 9) { B[n] = { state: "built", digest: "sha256:" + (version * 7919).toString(16).padStart(12, "e"), took: `${2 + (i % 2)}m ${10 + i * 7}s`, at: "just now" }; renderBuilds(); return; }
-      B[n] = { state: "building", step }; renderBuilds(); setTimeout(tick, 650);
-    }, 500 + i * 300);
-  });
+  const codex = M.harnesses.find((h) => h.id === "codex"); const fixed = !codex || codex.source.kind !== "https" || codex.source.sha256 !== GOOD;
+  RUNNERS.forEach(([n, , ok], i) => { if (!ok) return; B[n] = { s: "queued" }; let step = 0;
+    setTimeout(function tick() { step += 1 + (i % 3); if (n === "adacachy2" && !fixed && step >= 4) { B[n] = { s: "failed", age: "now" }; draw(); return; } if (step >= 9) { B[n] = { s: "ok", digest: (S.v * 7919).toString(16).padStart(12, "e"), age: "now", took: `${2 + (i % 2)}m${10 + i * 7}s` }; draw(); return; } B[n] = { s: "start", step }; draw(); setTimeout(tick, 600); }, 400 + i * 250); });
+  draw();
 }
 
-/* ------------------------------------------------------------ versions */
-const VERS = [[8, "4 min ago", "you", "codex from an HTTPS tarball"], [7, "yesterday", "you", "pr-triage added"], [6, "2 days ago", "you · from reviewer's definition", "reviewer's skills"]];
-function renderVersions() {
-  $("#versions").innerHTML = VERS.map(([v, at, by, what]) => `<li><div class="af-row"><span class="af-name">v${v}</span><span class="af-dim">${at} · ${by} · ${what}${v === version ? " · current" : ""}</span><span class="af-acts"><button class="btn btn-ghost btn-xs">Read</button>${v === version ? "" : `<button class="btn btn-ghost btn-xs">Make current</button>`}</span></div></li>`).join("");
+/* ------------------------------------------------------------ the structure */
+/** Every table in the structure shares one grid: the name, three slots, the controls. */
+const AG = (h) => [{ h: h[0], name: true }, { h: h[1], w: 84, c: "h640" }, { h: h[2], w: narrow() ? 104 : 150 }, { h: h[3], w: 92, c: "h900" }, { h: "", w: 64 }];
+const HCOLS = () => AG(["Harness", "Version", "Source", "Model"]);
+const ACOLS = () => AG(["Agent", "Harness", "Skills · MCP", "Definition"]);
+const GCOLS = () => AG(["Who", "Port", "To", "Kind"]);
+const VOLS = () => AG(["Path", "Kind", "For", ""]);
+const BCOLS = () => AG(["Runner", "Platform", "Build", "Age"]);
+const srcText = (s) => (s.kind === "path" ? s.path : s.kind === "git" ? `${s.repo}#${s.ref}` : s.kind === "s3" ? `s3://${s.bucket}/${s.key}` : s.url.replace(/^https:\/\//, ""));
+const originOf = (h) => { const s = h.source; try { if (s.kind === "https") return new URL(s.url.replace("${TARGETARCH}", "arm64")).host + ":443"; if (s.kind === "git") return s.scheme === "ssh" ? s.repo.replace(/^git@/, "").split("/")[0] + ":22" : s.repo.split("/")[0] + ":443"; if (s.kind === "s3" && s.endpoint) return new URL(s.endpoint).host + ":443"; } catch {} return ""; };
+const credSel = (k, v, none) => sel([["", none], ...SECRETS.map((n) => [n, `${n} · user`])], v, `data-src="${k}" aria-label="${k}"`);
+function sourceForm(h) {
+  const s = h.source; const f = (label, k, v, ph = "") => `<div class="f"><span class="lbl">${label}</span><input class="in3" data-src="${k}" value="${esc(v)}" placeholder="${esc(ph)}" aria-label="${label}"></div>`;
+  const kinds = `<div class="f wide"><span class="lbl">Source</span><span class="sg3" role="group" aria-label="Source">${[["path", "folder"], ["git", "git"], ["s3", "bucket"], ["https", "archive"]].map(([k, ic]) => `<button data-kind="${k}" aria-pressed="${s.kind === k}" title="${SOURCE_TIP[k]}">${icon(ic)}${k}</button>`).join("")}</span></div>`;
+  let fields = "";
+  if (s.kind === "path") fields = f("Path", "path", s.path);
+  if (s.kind === "git") fields = `<div class="f"><span class="lbl">Over</span>${sel([["https", "https"], ["ssh", "ssh"]], s.scheme, 'data-src="scheme"')}</div>${f("Repository", "repo", s.repo)}${f("Ref", "ref", s.ref, "tag, branch or commit")}${f("Folder", "subdir", s.subdir, "whole repository")}<div class="f"><span class="lbl">${s.scheme === "ssh" ? "SSH key" : "Token"}</span>${credSel("cred", s.cred, "none")}</div>`;
+  if (s.kind === "s3") fields = `${f("Bucket", "bucket", s.bucket)}${f("Key", "key", s.key)}${f("Endpoint", "endpoint", s.endpoint)}${f("Region", "region", s.region)}${f("Version", "versionId", s.versionId, "ETag + SHA-256")}${f("SHA-256", "sha256", s.sha256)}<div class="f"><span class="lbl">Key ID</span>${credSel("keyId", s.keyId, "none")}</div><div class="f"><span class="lbl">Secret key</span>${credSel("secretKey", s.secretKey, "none")}</div>`;
+  if (s.kind === "https") fields = `${f("URL", "url", s.url)}<div class="f"><span class="lbl">SHA-256</span><input class="in3" data-src="sha256" value="${esc(s.sha256)}" aria-invalid="${!/^[0-9a-f]{64}$/.test(s.sha256)}" aria-label="SHA-256"></div><div class="f"><span class="lbl">Sign-in</span>${credSel("cred", s.cred, "none")}</div>${f("Redirects", "redirects", s.redirects.join(","), "none")}`;
+  const models = harnessOf(h.id).models;
+  return `<div class="form3">${kinds}${fields}
+    <div class="f"><span class="lbl">Version</span>${s.kind === "path" ? sel(PINS[h.id].map((v, i) => [v, i ? `${v} · kept` : v]), h.version, 'data-hk="version"') : `<span class="val" style="height:28px;display:flex;align-items:center">${esc(h.version)}</span>`}</div>
+    <div class="f"><span class="lbl">Model</span>${sel(models.length ? models : [["", "default"]], h.model, 'data-hk="model"')}</div>
+    <div class="f"><span class="lbl">Sign-in</span>${sel([["home", "your sign-in · home"], ...SECRETS.map((n) => [n, `${n} · user`])], h.signin, 'data-hk="signin"')}</div>
+    <div class="f wide"><span class="lbl">Egress</span><span class="chips3">${h.egress.map((e) => `<span class="chip3"><span class="val">${esc(e)}</span><button data-rmeg="${esc(e)}" title="Remove" aria-label="Remove ${esc(e)}">${icon("x", "", 12)}</button></span>`).join("")}<input class="in3" data-addeg placeholder="host:port" aria-label="Add a host" style="width:160px"></span></div>
+  </div>`;
 }
+function harnessRow(h) {
+  const open = S.open === h.id; const origin = originOf(h);
+  return `<tr class="pick" tabindex="0" data-h="${h.id}" aria-expanded="${open}" aria-selected="${open}">${td3(HCOLS(), [
+    named(B.adacachy2.s === "failed" && h.id === "codex" ? "failed" : "ok", h.id, "", B.adacachy2.s === "failed" && h.id === "codex" ? "Build failed on adacachy2" : "Builds", `${icon(h.signin === "home" ? "home" : "key", h.signin === "home" ? "Your sign-in, in your HOME" : `${h.signin} · user`, 12)}<span class="dim" title="${esc(h.egress.join(" · ") || "No egress")}">${icon("out", "", 12)}</span><span class="dim">${h.egress.length}</span>`),
+    `<span class="ell">${esc(h.version)}</span>`,
+    `<span class="cr">${icon(SOURCE_ICON[h.source.kind], SOURCE_TIP[h.source.kind])}<span class="ell mid" title="${esc(srcText(h.source))}${origin ? ` · fetches from ${esc(origin)} alone` : ""}" data-full="${esc(srcText(h.source))}">${esc(srcText(h.source))}</span></span>`,
+    `<span class="ell">${esc(modelName(h.id, h.model))}</span>`,
+    `<span class="acts ctl">${ib("edit", "Edit (↵)", `data-do="open" data-h="${h.id}"`)}${ib("trash", "Remove", `data-do="rmh" data-h="${h.id}" data-tone="danger" data-confirm="Remove?"`)}</span>`,
+  ])}</tr>${open ? `<tr><td class="detail" colspan="${shown(HCOLS())}">${sourceForm(h)}</td></tr>` : ""}`;
+}
+function draw() {
+  const free = HARNESSES.filter((h) => !M.harnesses.some((x) => x.id === h.id));
+  const grants = [...M.harnesses.flatMap((h) => h.egress.map((e) => [h.id, e.split(":")[0], e.split(":")[1], "egress"])), ...M.agents.flatMap((a) => a.mcp.map(([n, u]) => [a.name, parseAddress(u).host, "443", "MCP"])), ...M.harnesses.filter(originOf).map((h) => [`${h.id} build`, originOf(h).split(":")[0], originOf(h).split(":")[1], "fetch"])];
+  const vols = [...M.harnesses.map((h) => [`/home/${h.id}`, h.id, "home"]), ...M.agents.flatMap((a) => a.volumes.map((v) => [v, a.name, "agent"]))];
+  const built = RUNNERS.filter(([n, , ok]) => ok && B[n].s === "ok").length, can = RUNNERS.filter((r) => r[2]).length;
+  const dirty = JSON.stringify(M) !== JSON.stringify(kept) || S.name !== "rust-dev";
+  const hist = S.hist ? (() => { const [v, what] = HIST.find((h) => h[0] === S.hist); return `<div class="fr">${icon("history")}<span class="lbl hi">v${v}</span><span class="val dim ell">${esc(what)}</span><span class="acts">${v === S.v ? `<span class="lbl">current</span>` : `<button class="b3" data-do="restore" data-v="${v}">Restore</button>`}${ib("x", "Close", 'data-do="nohist"')}</span></div>`; })() : "";
+  const clash = S.clash ? diffBlock(`v${S.remote.v} saved meanwhile`, "you, in another tab", [["codex egress", "chatgpt.com", "chatgpt.com, chat.openai.com"]], [["clashmine", "Keep mine"], ["clashtheirs", `Take v${S.remote.v}`]]) : "";
+  const differs = M.agents.filter((a) => a.sync === "differs").map((a) => diffBlock(`${a.name} differs from its definition`, `definition v${a.def}`, [["model", "gpt-6.1-sol", "gpt-6.1-sol-mini"]], [["synctext", "Keep this text"], ["syncdef", `Take definition v${a.def}`]], a.name)).join("");
+  $("#page").innerHTML = `${mockBar("agentfile")}
+    <div class="title3"><h1>${esc(S.name)}</h1><span class="right"><span class="kv3"><span class="val">v${S.v}</span><span class="lbl">version</span></span><span class="kv3 h640"><span class="val">${M.harnesses.length}</span><span class="lbl">harnesses</span></span><span class="kv3 h640"><span class="val">${M.agents.length}</span><span class="lbl">agents</span></span></span></div>
+    <div class="bar-row"><span class="lbl">Name</span><input class="in3" id="nm" value="${esc(S.name)}" aria-label="Name" style="width:180px"><span class="kv3 h640" title="${S.problems.length ? esc(S.problems.map(([l, w]) => `line ${l}: ${w}`).join(" · ")) : "agentfiles_check"}">${st(S.problems.length ? "warn" : "ok")}<span class="val">${S.problems.length ? `line ${S.problems[0][0]}` : "0 problems"}</span></span>
+      <span class="right"><button class="b3 g" data-do="discard" ${dirty ? "" : "disabled"}>Discard</button><button class="b3 p" data-do="save" ${dirty && !S.problems.length ? "" : "disabled"} title="Saves over v${S.v}">${icon("check")}Save</button></span></div>
+    <div class="split3">
+      <div class="card3">
+        <div class="ch"><span class="lbl hi">Structure</span><span class="acts"><span class="lbl h640">v${S.v}</span><span class="vd3">${HIST.map(([v, what]) => `<button data-do="hist" data-v="${v}" aria-current="${v === S.v}" title="v${v} · ${esc(what)}" aria-label="v${v}"></button>`).join("")}</span></span></div>${hist}${clash}
+        <div class="sh"><span class="lbl hi">Harnesses</span><span class="val dim">${M.harnesses.length}</span><span class="acts">${sel(free.map((h) => [h.id, h.id]), free[0]?.id ?? "", 'id="addh" aria-label="Harness to add"')}${ib("plus", "Add harness", 'data-do="addh"')}</span></div>
+        <table class="t3" data-grid="f">${th3(HCOLS())}<tbody>${M.harnesses.map(harnessRow).join("")}</tbody></table>
+        <div class="sh"><span class="lbl hi">Agents</span><span class="val dim">${M.agents.length}</span></div>
+        <table class="t3" data-grid="f">${th3(ACOLS())}<tbody>${M.agents.map((a) => `<tr>${td3(ACOLS(), [named(a.sync === "differs" ? "warn" : "ok", a.name, "", a.sync === "differs" ? "Differs from its definition" : "In step with its definition"), `<span class="ell">${a.harness}</span>`, `${a.skills.length} · ${a.mcp.length}`, a.def ? `v${a.def}` : `<span class="dim">—</span>`, `<span class="acts ctl">${ib("open", "Open in Agents")}</span>`])}</tr>`).join("")}</tbody></table>
+        ${differs}
+        <div class="sh"><span class="lbl hi">Grants</span><span class="val dim">${grants.length}</span></div>
+        <table class="t3" data-grid="f">${th3(GCOLS())}<tbody>${grants.map(([w, to, port, kind]) => `<tr>${td3(GCOLS(), [{ lead: icon("out", "Out"), body: `<span class="cr"><span class="ell">${esc(w)}</span></span>` }, port, `<span class="cr"><span class="ell mid" data-full="${esc(to)}" title="${esc(to)}">${esc(to)}</span></span>`, `<span class="dim">${kind}</span>`, ""])}</tr>`).join("")}</tbody></table>
+        <div class="sh"><span class="lbl hi">Volumes</span><span class="val dim">${vols.length}</span></div>
+        <table class="t3" data-grid="f">${th3(VOLS())}<tbody>${vols.map(([p, f, k]) => `<tr>${td3(VOLS(), [{ lead: icon("folder", "Volume"), body: `<span class="cr"><span class="ell mid" data-full="${esc(p)}" title="${esc(p)}">${esc(p)}</span></span>` }, `<span class="dim">${k}</span>`, `<span class="ell">${esc(f)}</span>`, "", ""])}</tr>`).join("")}</tbody></table>
+        <div class="sh"><span class="lbl hi">Builds</span><span class="val dim">${built}/${can}</span></div>
+        <table class="t3" data-grid="f">${th3(BCOLS())}<tbody>${RUNNERS.map(([n, p, ok, why]) => { const b = B[n]; const state = { ok: "ok", start: "start", queued: "start", failed: "failed", none: "off" }[b.s];
+          const cell = b.s === "ok" ? ubar(100, b.took, 44, "#0ca30c") : b.s === "start" ? ubar((b.step / 9) * 100, `${b.step}/9`, 44, "#3987e5") : b.s === "queued" ? ubar(0, "queued", 44) : b.s === "failed" ? `<span class="u" title="${esc(WORDS)}"><span class="u-t" style="width:44px"><i style="width:100%;background:#d03b3b"></i></span><span class="ell">checksum</span></span>` : `<span class="dim" title="${esc(why)}">—</span>`;
+          return `<tr>${td3(BCOLS(), [named(state, n, "", b.s === "none" ? why : b.digest ? `image ${b.digest}` : undefined), `<span class="dim">${p.replace("linux/", "")}</span>`, cell, `<span class="dim">${b.age || ""}</span>`, `<span class="acts ctl">${ok ? ib("restart", "Build again", `data-do="rebuild" data-r="${n}"`) : ""}${b.s === "failed" ? ib("copy", "Copy Shards' words", 'data-do="copywords"') : ""}</span>`])}</tr>`; }).join("")}</tbody></table>
+      </div>
+      <div class="card3 sticky"><div class="ch"><span class="lbl hi">Text</span><span class="acts">${st(S.problems.length ? "warn" : "ok", S.problems.length ? S.problems.map(([l, w]) => `line ${l}: ${w}`).join(" · ") : "Shards: no problems")}<span class="val">${S.problems.length ? `line ${S.problems[0][0]}` : "0 problems"}</span></span></div>
+        <div class="ed3"><pre class="gut3" id="gut" aria-hidden="true"></pre><textarea class="code3" id="text" spellcheck="false" aria-label="${esc(S.name)}'s Agentfile"></textarea></div></div>
+    </div>`;
+  $("#text").value = textOf(M); gutter(); liveScan(); refit();
+}
+function gutter() { const n = $("#text").value.split("\n").length; const bad = new Map(S.problems); $("#gut").innerHTML = Array.from({ length: n }, (_, i) => bad.has(i + 1) ? `<b data-bad title="${esc(bad.get(i + 1))}">${st("warn", bad.get(i + 1))}${i + 1}</b>` : `<b>${i + 1}</b>`).join(""); $("#gut").scrollTop = $("#text").scrollTop; }
+draw = ((inner) => () => { const t = $("#text"); const at = t ? [t.selectionStart, t.scrollTop, document.activeElement === t] : null; inner(); if (at && at[2]) { const n = $("#text"); n.focus(); n.selectionStart = n.selectionEnd = at[0]; n.scrollTop = at[1]; } })(draw);
+onBand(() => draw());
 
-/* ------------------------------------------------------------ wiring */
-function dirty() { return JSON.stringify(M) !== JSON.stringify(kept) || $("#afname").value !== "rust-dev"; }
-function fit() { const t = $("#text"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight + 4, 1400) + "px"; }
-function sync(from) {
-  if (from !== "text") { $("#text").value = textOf(M); fit(); $("#check").textContent = "Shards: no problems."; $("#check").removeAttribute("data-tone"); }
-  if (from !== "view") renderView();
-  $("#save").disabled = !dirty(); $("#discard").classList.toggle("hide", !dirty());
-}
-function render() {
-  $("#ver").innerHTML = `v${version} · changed 4 min ago · <span class="mono">${M.harnesses.map((h) => h.id).join(", ")}</span> · agents <span class="mono">${M.agents.map((a) => a.name).join(", ")}</span>`;
-  renderView(); $("#text").value = textOf(M); fit(); renderBuilds(); renderVersions();
-}
-segmented($("#viewseg"), (v) => { segSet($("#viewseg"), v); $("#viewpane").style.display = v === "view" ? "" : "none"; $("#textpane").style.display = v === "text" ? "" : "none"; fit(); });
-let typing;
-$("#text").addEventListener("input", () => {
-  clearTimeout(typing);
-  typing = setTimeout(() => {
-    const { m, problems } = parse($("#text").value);
-    $("#check").textContent = problems.length ? `Shards: ${problems[0]}` : "Shards: no problems.";
-    problems.length ? $("#check").setAttribute("data-tone", "error") : $("#check").removeAttribute("data-tone");
-    // Model and sign-in come from their lines; a harness whose lines went keeps none.
-    M = m; sync("text");
-  }, 300);
-});
+/* ------------------------------------------------------------ edit in place; the text follows, and back */
 const H = (id) => M.harnesses.find((h) => h.id === id);
-$("#viewpane").addEventListener("click", (e) => {
-  const t = e.target.closest("button"); if (!t) return;
-  if (t.dataset.toggle) { open[t.dataset.toggle] = !open[t.dataset.toggle]; renderView(); return; }
-  if (t.dataset.rmh) { M.harnesses = M.harnesses.filter((h) => h.id !== t.dataset.rmh); M.agents.forEach((a) => { if (a.harness === t.dataset.rmh) a.harness = ""; }); sync(); return; }
-  if (t.dataset.act === "addh") { const id = $("#addh").value; if (!id) return; M.harnesses.push({ id, version: PINS[id][0], source: { kind: "path", path: `./${id}-${PINS[id][0]}-\${TARGETARCH}` }, model: harnessOf(id).models[0]?.[0] ?? "", signin: "home", egress: [...harnessOf(id).egress] }); open[id] = true; sync(); return; }
-  const kindSeg = t.closest("[data-srckind]");
-  if (kindSeg) {
-    const h = H(kindSeg.dataset.srckind), v = t.dataset.v; if (h.source.kind === v) return;
-    h.source = v === "path" ? { kind: "path", path: `./${h.id}-${h.version}-\${TARGETARCH}` } : v === "git" ? { kind: "git", scheme: "ssh", repo: `git@github.com/hyper-light/${h.id}-fork`, ref: `v${h.version}`, subdir: "dist", cred: "GH_DEPLOY_KEY" } : v === "s3" ? { kind: "s3", bucket: "agent-builds", key: `${h.id}/${h.version}/${h.id}-linux-\${TARGETARCH}.tar.gz`, endpoint: "https://mantle.lan:9000", region: "local", pathStyle: true, versionId: "", sha256: "", keyId: "MANTLE_ACCESS_KEY_ID", secretKey: "MANTLE_SECRET_ACCESS_KEY" } : { kind: "https", url: `https://releases.example.dev/${h.id}/${h.version}/${h.id}-linux-\${TARGETARCH}.tar.gz`, sha256: "", cred: "", redirects: [] };
-    sync(); return;
-  }
-  if (t.dataset.ep) { const card = t.closest("[data-h]"); const h = H(card.dataset.h); Object.assign(h.source, { aws: { endpoint: "https://s3.us-west-2.amazonaws.com", region: "us-west-2", pathStyle: false }, r2: { endpoint: "https://<account>.r2.cloudflarestorage.com", region: "auto", pathStyle: false }, mantle: { endpoint: "https://mantle.lan:9000", region: "local", pathStyle: true } }[t.dataset.ep]); sync(); return; }
-  if (t.dataset.rmeg) { const h = H(t.dataset.rmeg); h.egress = h.egress.filter((x) => x !== t.dataset.e); sync(); return; }
-  if (t.dataset.addegb) { const inp = $(`[data-addeg="${t.dataset.addegb}"]`); const v = inp.value.trim(); if (/^[a-z0-9.-]+:\d+$/i.test(v)) { H(t.dataset.addegb).egress.push(v); sync(); } else inp.setAttribute("aria-invalid", "true"); return; }
-  if (t.dataset.resolve) { press(t, 600, () => { const a = M.agents.find((x) => x.name === "pr-triage"); a.sync = "ok"; a.def = t.dataset.resolve === "def" ? 2 : 3; sync(); }); return; }
-  if (t.dataset.mkdef) { press(t, 600, () => { const a = M.agents.find((x) => x.name === t.dataset.mkdef); a.def = 1; a.sync = "ok"; sync(); }); return; }
+document.addEventListener("click", (e) => {
+  const kind = e.target.closest("[data-kind]"); const row = e.target.closest("tr.pick");
+  if (kind) { const h = H(S.open); const k = kind.dataset.kind; if (h.source.kind === k) return; h.source = k === "path" ? { kind: "path", path: `./${h.id}-${h.version}-\${TARGETARCH}` } : k === "git" ? { kind: "git", scheme: "ssh", repo: `git@github.com/hyper-light/${h.id}-fork`, ref: `v${h.version}`, subdir: "dist", cred: "GH_DEPLOY_KEY" } : k === "s3" ? { kind: "s3", bucket: "agent-builds", key: `${h.id}/${h.version}/${h.id}-\${TARGETARCH}.tar.gz`, endpoint: "https://mantle.lan:9000", region: "local", pathStyle: true, versionId: "", sha256: "", keyId: "MANTLE_ACCESS_KEY_ID", secretKey: "MANTLE_SECRET_ACCESS_KEY" } : { kind: "https", url: `https://releases.example.dev/${h.id}/${h.version}/${h.id}-\${TARGETARCH}.tar.gz`, sha256: "", cred: "", redirects: [] }; S.problems = parse(textOf(M)).problems; draw(); return; }
+  const rm = e.target.closest("[data-rmeg]"); if (rm) { const h = H(S.open); h.egress = h.egress.filter((x) => x !== rm.dataset.rmeg); draw(); return; }
+  const b = e.target.closest("[data-do]");
+  if (!b && row && !e.target.closest("button,input,select")) { S.open = S.open === row.dataset.h ? null : row.dataset.h; setOpen(S.open, draw); return; }
+  if (!b || b.closest("#pal")) return; const d = b.dataset.do;
+  if (d === "open") { S.open = S.open === b.dataset.h ? null : b.dataset.h; setOpen(S.open, draw); return; }
+  if (d === "rmh") { M.harnesses = M.harnesses.filter((h) => h.id !== b.dataset.h); draw(); return; }
+  if (d === "addh") { const id = $("#addh").value; if (!id) return; M.harnesses.push({ id, version: PINS[id][0], source: { kind: "path", path: `./${id}-${PINS[id][0]}-\${TARGETARCH}` }, model: harnessOf(id).models[0]?.[0] ?? "", signin: "home", egress: [...harnessOf(id).egress] }); S.open = id; setOpen(id, draw); return; }
+  if (d === "hist") { S.hist = Number(b.dataset.v); draw(); return; }
+  if (d === "nohist") { S.hist = null; draw(); return; }
+  if (d === "restore") { press(b, 500, () => { S.v += 1; HIST.push([S.v, `v${b.dataset.v} restored`]); S.hist = null; draw(); }); return; }
+  if (d === "discard") { M = structuredClone(kept); S.name = "rust-dev"; S.problems = []; draw(); return; }
+  if (d === "save") { press(b, 600, () => { if (S.remote) { S.clash = true; draw(); return; } commit(); }); return; }
+  if (d === "clashmine" || d === "clashtheirs") { press(b, 500, () => { S.v = S.remote.v; HIST.push([S.remote.v, "saved elsewhere"]); if (d === "clashtheirs") { M.harnesses.find((h) => h.id === "codex")?.egress.push("chat.openai.com:443"); } S.remote = null; S.clash = false; commit(); }); return; }
+  if (d === "synctext" || d === "syncdef") { press(b, 400, () => { const ag = M.agents.find((x) => x.name === b.dataset.ag); ag.sync = "ok"; if (d === "synctext") ag.def += 1; draw(); toast(d === "synctext" ? `${ag.name}'s definition is now v${ag.def}` : `Took definition v${ag.def}`); }); return; }
+  if (d === "sync") { press(b, 400, () => { M.agents.find((a) => a.name === b.dataset.ag).sync = "ok"; draw(); }); return; }
+  if (d === "rebuild") { press(b, 400, () => { B[b.dataset.r] = { s: "queued" }; draw(); setTimeout(() => { B[b.dataset.r] = b.dataset.r === "adacachy2" && H("codex")?.source.sha256 === GOOD ? { s: "failed", age: "now" } : { s: "ok", digest: "8d2f11c0a9b4", age: "now", took: "2m51s" }; draw(); }, 1500); }); return; }
+  if (d === "copywords") { navigator.clipboard?.writeText(WORDS).catch(() => {}); toast("Copied"); return; }
 });
-$("#viewpane").addEventListener("input", (e) => {
-  const t = e.target; const card = t.closest("[data-h]"); if (!card) return; const h = H(card.dataset.h);
-  if (t.dataset.hk) { h[t.dataset.hk] = t.value; if (t.dataset.hk === "version" && h.source.kind === "path") h.source.path = `./${h.id}-${t.value}-\${TARGETARCH}${h.id === "claude" ? "-gnu" : ""}`; sync(t.tagName === "SELECT" ? undefined : "view"); return; }
-  if (t.dataset.src) {
-    const k = t.dataset.src; h.source[k] = t.type === "checkbox" ? t.checked : k === "redirects" ? t.value.split(",").map((x) => x.trim()).filter(Boolean) : t.value.trim();
-    const vm = (h.source.url || h.source.ref || h.source.key || "").match(/(\d+\.\d+\.\d+)/); if (vm && h.source.kind !== "path") h.version = vm[1];
-    // Typing stays in its field: the text follows; the card's own lines are drawn again on a select.
-    t.tagName === "SELECT" || t.type === "checkbox" ? sync() : sync("view");
-    if (t.tagName !== "SELECT") { const w = card.querySelectorAll(".afs-writes b"); const last = [...card.querySelectorAll(".afs-writes")].find((p) => p.textContent.startsWith("writes")); if (last) last.innerHTML = `writes <b>${esc(sourceLine(h))}</b>`; }
-  }
+function commit() { S.v += 1; HIST.push([S.v, "saved here"]); kept = structuredClone(M); toast(`Saved v${S.v}`); runBuilds(); }
+document.addEventListener("input", (e) => {
+  const t = e.target;
+  if (t.id === "nm") { S.name = t.value.trim(); $('[data-do="save"]').disabled = false; return; }
+  if (t.id === "text") { clearTimeout(t._k); t._k = setTimeout(() => { const { m, problems } = parse(t.value); S.problems = problems; if (!problems.length) M = m; draw(); }, 300); gutter(); return; }
+  const h = H(S.open); if (!h) return;
+  if (t.dataset.src) { const k = t.dataset.src; h.source[k] = k === "redirects" ? t.value.split(",").map((x) => x.trim()).filter(Boolean) : t.value.trim(); if (k === "sha256") t.setAttribute("aria-invalid", String(!/^[0-9a-f]{64}$/.test(t.value.trim()))); const vm = srcText(h.source).match(/(\d+\.\d+\.\d+)/); if (vm && h.source.kind !== "path") h.version = vm[1]; S.problems = parse(textOf(M)).problems; $("#text").value = textOf(M); gutter(); return; }
+  if (t.dataset.hk) { h[t.dataset.hk] = t.value; if (t.dataset.hk === "version") h.source.path = `./${h.id}-${t.value}-\${TARGETARCH}`; draw(); }
 });
-$("#viewpane").addEventListener("change", (e) => { if (e.target.dataset.src === "sha256" || e.target.dataset.src === "url" || e.target.dataset.src === "redirects") renderView(); });
-$("#afname").addEventListener("input", () => sync("view"));
-$("#save").addEventListener("click", () => press($("#save"), 700, () => {
-  version += 1; kept = structuredClone(M); VERS.unshift([version, "just now", "you", "saved here"]);
-  $("#said").dataset.tone = "ok"; $("#said").textContent = `Kept as v${version}. Its builds start on your microvm runners.`;
-  render(); sync(); runBuilds();
-}));
-$("#discard").addEventListener("click", () => { M = structuredClone(kept); $("#afname").value = "rust-dev"; render(); sync(); });
-$("#builds").addEventListener("click", (e) => {
-  const w = e.target.closest("[data-why]"); if (w) { expanded = expanded === w.dataset.why ? null : w.dataset.why; renderBuilds(); return; }
-  const r = e.target.closest("[data-rebuild]"); if (r) press(r, 500, () => { B[r.dataset.rebuild] = { state: "queued" }; renderBuilds(); setTimeout(() => { B[r.dataset.rebuild] = { state: "failed", took: "37 s", at: "just now" }; renderBuilds(); }, 1600); });
-});
-buildsInit(); render(); sync(); document.fonts?.ready.then(fit);
+document.addEventListener("keydown", (e) => { if (e.target.matches?.("[data-addeg]") && e.key === "Enter") { const v = e.target.value.trim(); if (/^[a-z0-9.-]+:\d+$/i.test(v)) { H(S.open).egress.push(v); draw(); } else e.target.setAttribute("aria-invalid", "true"); } if (e.key === "Escape" && S.open && !e.target.matches?.("input,select,textarea")) { S.open = null; setOpen(null, draw); } if (e.key === "Enter" && e.target.matches?.("tr.pick")) { S.open = S.open === e.target.dataset.h ? null : e.target.dataset.h; setOpen(S.open, draw); } });
+document.addEventListener("scroll", (e) => { if (e.target.id === "text") $("#gut").scrollTop = e.target.scrollTop; }, true);
+onOpenChange((id) => { S.open = id; draw(); });
+paletteItems = () => fromOps([
+  ["agentfiles.update", "rust-dev", () => $('[data-do="save"]')?.click(), "Agentfiles"],
+  ["images.build", "rust-dev · adacachy2", () => { B.adacachy2 = { s: "queued" }; draw(); }, "Images"],
+  ["agentdefs.run", "reviewer", () => { location.href = "agents.html?open=reviewer"; }, "Agents"],
+]);
+draw();
 </script>
 </body>
 </html>

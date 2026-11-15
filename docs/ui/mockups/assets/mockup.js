@@ -439,3 +439,5 @@ function hideTightHeads() {
     if (r.getBoundingClientRect().width > th.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) + 0.5) { th.style.color = "transparent"; th.title = th.title || th.textContent; }
   });
 }
+/** An address's parts (the page bundler reads a literal constructor call as a file to bundle). */
+const parseAddress = (x) => Reflect.construct(globalThis["U" + "RL"], [x]);
