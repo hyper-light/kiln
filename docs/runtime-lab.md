@@ -440,7 +440,10 @@ It reports, over loopback and by the lab's clock around each whole exchange:
 - **older pages**: the page before the window, then pages a quarter, half and three quarters of the
   way back and at the session's start, each with the server's own time (`Server-Timing`);
 - **send**: a message to the longest session, to its answer;
-- **launch**: what Mission control's first reads bring for the fleet, as sent and unpacked.
+- **launch**: what Mission control's first reads bring for the fleet, as sent and unpacked; and
+  what its events socket brings meanwhile, for the 12 s T3 Code counted what its own client was
+  sent at launch (pingdotgg/t3code#35072), as the page asks for it (the agents lean: docs/wire.md,
+  "The events socket") and, over the same seconds, as it came before that.
 
 Two builds are compared by running each (`--out` a folder each): the sessions are the same events in
 both. On a busy machine its times hold whatever else ran; a statement's or a read's own count of its

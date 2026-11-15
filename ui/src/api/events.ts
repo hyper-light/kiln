@@ -1,8 +1,9 @@
 import { useSyncExternalStore } from "react";
 import { api, wsUrl } from "./client";
+import { isRosterEvent, Roster } from "./roster-feed";
 import { readFrame, unread } from "./frames";
 import type { ServerEvent } from "./types";
-import type { EventsUp, UnreadFrame } from "./wire";
+import type { EventsUp, RosterEvent, UnreadFrame } from "./wire";
 
 /**
  * One shared, reconnecting WebSocket to /api/events for the whole app (docs/wire.md, "The events
@@ -304,6 +305,9 @@ class EventStream {
     if (this.snap.state === "closed" || this.snap.state === "idle") this.connect();
   }
 
+  /** The agents as this socket says them, lean (W21-R02, roster-feed.ts): each one's entry, for what's said to change of it. */
+  private roster = new Roster();
+
   /** Each listener hears `ev`. */
   private deliver(ev: ServerEvent) {
     this.handlers.forEach((h) => {
@@ -359,20 +363,33 @@ class EventStream {
     }
     this.snap = { ...this.snap, lastMessageAt: Date.now() };
     for (const e of events) {
-      const read = readEvent(e);
+      // What changed of an agent's entry (W21-R02): heard as its `harness` event, the entry whole.
+      const read = isRosterEvent(e) ? this.patched(e) : readEvent(e);
       if ("unread" in read) {
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(read.unread satisfies UnreadFrame));
         continue;
       }
-      if (read.frame.type !== "refused") this.deliver(read.frame);
+      const ev = read.frame;
+      // Events were missed: what's said to change next changes entries this socket says again first.
+      if (ev.type === "resync") this.roster.clear();
+      else if (ev.type === "harness") this.roster.whole(ev.info);
+      else if (ev.type === "harness_closed") this.roster.closed(ev.id);
+      if (ev.type !== "refused") this.deliver(ev);
     }
+  }
+
+  /** What changed of an agent's entry, as the `harness` event of the entry it makes; unread when this socket never said that entry. */
+  private patched(e: RosterEvent): { frame: ServerEvent } | { unread: UnreadFrame } {
+    const frame = this.roster.changed(e);
+    return frame ? { frame } : unread("harness_patch", "what changed of an agent's entry this socket never said");
   }
 
   private url(): string {
     const topics = this.topics();
     this.told = topics === null ? null : topics.join(",");
     this.grewAt = undefined;
-    let q = "?batch=1";
+    // Batches, and the agents lean: each one's entry once, then what changed of it (W21-R02, roster-feed.ts).
+    let q = "?batch=1&lean=1";
     if (topics !== null) q += `&topics=${encodeURIComponent(this.told ?? "")}`;
     if (this.at) q += `&after=${encodeURIComponent(this.at)}`;
     return `/api/events${q}`;
@@ -386,6 +403,8 @@ class EventStream {
     let ws: WebSocket;
     const resume = this.at !== null;
     this.batched = false;
+    // Another socket: its server says each agent's entry again before what changes of it.
+    this.roster.clear();
     try {
       ws = new WebSocket(wsUrl(this.url()));
     } catch {

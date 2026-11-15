@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod feed;
+pub mod roster;
 
 /// What goes down the events socket to a page that asked for batches (`?batch=1`, or `?after=`),
 /// besides `refused`: the events of a window, each a [`ServerEvent`], and where the feed is.
@@ -24,7 +25,9 @@ pub enum EventsDown {
     /// The events since the last batch: only the newest of each thing they carry whole, none that
     /// says again what this socket was last sent, `resync` first when some were missed. `at`
     /// (`<epoch>.<seq>`) is where the feed is: a page that reconnects with `?after=<at>` is sent
-    /// what it missed. Every socket's first frame is one, its events perhaps none.
+    /// what it missed. Every socket's first frame is one, its events perhaps none. To a socket that
+    /// takes the agents lean (`?lean=1`), an agent's `harness` event is, after its first, what changed
+    /// of its entry ([`roster::RosterEvent`]) in that event's place.
     Batch { at: String, events: Vec<ServerEvent> },
 }
 

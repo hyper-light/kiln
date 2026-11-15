@@ -90,6 +90,8 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<super::events::ServerEvent>();
     c.visit::<super::events::EventsDown>();
     c.visit::<super::events::EventsUp>();
+    // What a socket that takes the agents lean is sent of each after its first (docs/wire.md, "The events socket").
+    c.visit::<super::events::roster::RosterEvent>();
     // The offers view (`GET /api/reach/offers`, docs/reach.md §2.2).
     c.visit::<crate::offers::view::OffersView>();
     // The Changes tab's Commits (`agents.commits`).

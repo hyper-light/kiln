@@ -208,6 +208,7 @@ export type { ReleaseOrigin } from "./ReleaseOrigin";
 export type { ReleaseState } from "./ReleaseState";
 export type { RepoRef } from "./RepoRef";
 export type { Review } from "./Review";
+export type { RosterEvent } from "./RosterEvent";
 export type { Route } from "./Route";
 export type { Run } from "./Run";
 export type { RunNotice } from "./RunNotice";
