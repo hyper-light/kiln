@@ -88,12 +88,14 @@ impl Microvms {
         Ok(lanes)
     }
 
-    /// `launch` in a microVM of its own: in box `name` where placement named one for its run (its reservation's,
-    /// `Holder::box_of`) and its sandbox is Hex's; else named as its sandbox names one (placement's numbering).
-    pub async fn launch(&self, name: Option<kiln_ci::place::holder::BoxName>, launch: kiln_seams::sandbox::Launch) -> Result<Box<dyn Run>, Refusal> {
+    /// `launch` in a microVM of its own, `size` (vCPUs, MiB) where its session gives one: in box `name` where placement
+    /// named one for its run (its reservation's, `Holder::box_of`) and its sandbox is Hex's; else named as its sandbox
+    /// names one (placement's numbering). A stand-in's sandbox sizes none.
+    pub async fn launch(&self, name: Option<kiln_ci::place::holder::BoxName>, launch: kiln_seams::sandbox::Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
         match (&self.hex, name) {
-            (Some(hex), Some(name)) => hex.launch_as(name, launch).await,
-            _ => self.sandbox.launch(launch).await,
+            (Some(hex), Some(name)) => hex.launch_as(name, launch, size).await,
+            (Some(hex), None) => hex.launch_sized(launch, size).await,
+            (None, _) => self.sandbox.launch(launch).await,
         }
     }
 }
@@ -449,7 +451,7 @@ mod tests {
             let vms = super::of_hex(hex, images, Some(Arc::<kiln_seams::records::SimRecords>::clone(&records) as Arc<dyn kiln_seams::Records>));
             let launch = Launch { limits: Limits::NONE, egress: Egress::Only(Vec::new()), folder: Some("/work/project".into()), boundary: Boundary::MicroVm { image: hex_api::sim::SIM_IMAGE.to_owned() }, ..Launch::of("claude", &[]) };
             let reserved = BoxName::Reserved(hex_api::capacity::ReservationId { epoch: 3, seq: 9 });
-            let run = vms.launch(Some(reserved), launch.clone()).await?;
+            let run = vms.launch(Some(reserved), launch.clone(), None).await?;
             anyhow::ensure!(run.id().as_deref() == Some("kiln-r3-9"), "its box isn't placement's: {:?}", run.id());
             let group = super::group_of(&vms, run.as_ref());
             anyhow::ensure!(matches!(&group, Some(crate::reach::place::Group::Hex(m)) if format!("{m:?}") == "Meter(\"kiln-r3-9\")"), "{group:?}");
@@ -457,7 +459,7 @@ mod tests {
             while run.next().await.is_some() {}
             let kept = records.get(super::hexvm::USE, b"kiln-r3-9", kiln_seams::records::Consistency::Linearizable).await?;
             anyhow::ensure!(kept.is_some(), "its charge wasn't kept in the ledger it was given");
-            let unnamed = vms.launch(None, launch).await.err();
+            let unnamed = vms.launch(None, launch, None).await.err();
             anyhow::ensure!(matches!(&unnamed, Some(Refusal::Unsupported(why)) if why == super::hexvm::UNNAMED), "no placement here names its box: {unnamed:?}");
             Ok(())
         })

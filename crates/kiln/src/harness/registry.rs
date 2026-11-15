@@ -4321,6 +4321,7 @@ impl Registry {
                         max_subagents: None,
                         parent: spec.parent.clone(),
                         plan_run: spec.plan_run.clone(),
+                        experiment: spec.experiment.clone(),
                         helper: spec.helper.clone(),
                         subagent: spec.subagent,
                         variant_of: spec.variant_of.clone(),

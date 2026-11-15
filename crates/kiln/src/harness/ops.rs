@@ -1133,6 +1133,10 @@ pub mod input {
         /// The conversation to take up again: its harness's own session id (an agent's
         /// `harness_session`, as agents_get gives it), in its folder on its machine; one agent.
         pub resume: Option<String>,
+        /// The agent definition it runs (as agentdefs_run starts one), and its task apart from the
+        /// definition's words: a split of that agent (experiments_start's `target`) matches it.
+        pub agentdef: Option<String>,
+        pub task: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

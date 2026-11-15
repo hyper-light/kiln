@@ -3900,6 +3900,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         max_subagents: None,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        experiment: spec.experiment.clone(),
         helper: spec.helper.clone(),
         subagent: spec.subagent,
         variant_of: spec.variant_of.clone(),

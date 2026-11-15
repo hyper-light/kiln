@@ -36,8 +36,8 @@ pub async fn spawn_duplex_in_pool(cmd: std::process::Command, group: Option<crat
 /// 01a1cd8e862e7169a074db3d5fa33f3d step 17) as the [`Duplex`] a
 /// session drives it through: its pipes, end and stop the run's (`crate::sandbox::held`), served on
 /// the caller's shard, as a spawned harness's pipes are.
-pub fn duplex_of_run(run: Box<dyn kiln_seams::sandbox::Run>, image: String, reach: crate::sandbox::narrow::Reach, kept_in: Option<String>, declared: crate::sandbox::held::Declared) -> Duplex {
-    Duplex::held(crate::sandbox::held::pump(run, image, reach, kept_in, declared))
+pub fn duplex_of_run(run: Box<dyn kiln_seams::sandbox::Run>, image: String, reach: crate::sandbox::narrow::Reach, kept_in: Option<String>, declared: crate::sandbox::held::Declared, started: Option<crate::sandbox::held::Started>) -> Duplex {
+    Duplex::held(crate::sandbox::held::pump(run, image, reach, kept_in, declared, started))
 }
 
 #[cfg(all(test, unix))]
