@@ -549,6 +549,11 @@ pub struct Ask {
     /// the caller answers then rather than past its own wait: never from what's asked.
     #[serde(skip)]
     pub queued: Queued,
+    /// The agent definition it's started from, and its version (an `agentdefs.run`, a UI agent kiln
+    /// starts from its person's own definition or its own: `crate::agentdefs::uses`), kept for each
+    /// session it opens (`crate::agentdefs::sessions`): kiln's to say, never from what's asked.
+    #[serde(skip)]
+    pub definition: Option<crate::agentdefs::sessions::Definition>,
 }
 
 /// Where a start waiting for room says so, once ([`Ask::queued`]).
@@ -1754,6 +1759,10 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
         if let Some(p) = &by.parent {
             let _ = hub.store.kv_set(parent_key(&i.id), p.id.clone()).await;
+        }
+        // The definition it started from, for that definition's sessions and its own `agents.get`.
+        if let Some(d) = &ask.definition {
+            crate::agentdefs::sessions::record(hub, &i.id, d, person.as_deref(), &i.target).await;
         }
         if ask.prompt.as_deref().is_some_and(|p| !p.trim().is_empty()) {
             super::wait::sent(&i.id, None);

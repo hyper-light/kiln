@@ -246,6 +246,7 @@ runs and its runners: a definition's run is one of those agents.)
 | POST | `/api/agentdefs/{id}/restore` | `{ version }` → `AgentDef`, that version's settings as a new version |
 | DELETE | `/api/agentdefs/{id}` | `{ deleted: true }` |
 | POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }`; `id` one of yours or kiln's |
+| GET | `/api/agentdefs/{id}/sessions` | `{ sessions: { id, version, at, runner, state, engine, agent }[], starts: { n, by_kind: { [kind]: { n, timed, p50_ms } }, warm } }`: the sessions you started from it (`id` one of yours, or kiln's `kiln:<name>`), newest first, each with the version it started from, its `state` (as agents.list's `stand`; `gone` once kiln no longer has it), runner and engine; and what their starts took, by how each started |
 | POST | `/api/agentdefs/{id}/copy` | `{ name? }` → `AgentDef`: one of kiln's (`kiln:<name>`) or yours, made yours, version 1 |
 | POST | `/api/agentdefs/use` | `{ builtin, id }` → `{ uses }`: your own `id` stands in for kiln's UI agent `builtin` for you (null `id`: kiln's own again) |
 
@@ -271,10 +272,20 @@ its person set, a tool fix's `kind`; left unset, it's stored unset), then the pe
 kiln's. An attachment's agent and a review agent are their attachment person's (`by`). Deleting the
 definition makes it kiln's own again.
 
-A run starts an agent through `agents.start`, as its route starts one (the caller's right to start
-agents there checked and audited as such): the definition's harness and model, `isolation`
+A run starts an agent as `agents.start` starts one, through the one start path (the caller's right
+to start agents there checked, and the start audited): the definition's harness and model, `isolation`
 `microvm`, `image` its Agentfile (left out: the start's own for its harness), and as its first
 message its instructions, then the run's `prompt`.
+
+Each session kiln opens from a definition keeps which, and at which version (kiln's own: 0), kiln's to
+say and never what was asked: a run's, and one of kiln's UI agents started from the person's own
+definition standing in for it or from kiln's. `agents.get` says it (`definition: { id, version, name,
+current }`, `current` the definition's version now: a session behind it has a lesser `version`), and
+`sessions` lists a definition's. Their starts are read off kiln's record of each start of a session's
+harness on its machine (every one recorded, of the sessions kiln still has): by how each started, which
+that record says by its engine (`host`, `microvm`), and, for a session's first start, the time from its
+open on its machine to its harness running, room waits and image builds included. Deleting the
+definition drops what its sessions say of it.
 
 ```ts
 interface Mcp { name; url?; command?: string[] }
