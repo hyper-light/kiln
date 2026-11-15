@@ -152,7 +152,11 @@ its own through Hex (`sandbox::hexvm`).
   (`local`) runs sessions on its host. Once kiln vendors Hex's `shards-image` class (P2.2), a `microvm` runner
   must also list it (`engine::node_images`).
 - **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view), and
-  new sessions take the new one.
+  new sessions take the new one. Each setting has a version (the one before's plus one, kept with it), and a
+  start carries the version its boundary was decided under, taken before it waits to be placed
+  (`Spec::engine_version`). The runner refuses one decided under another (`engine::stale`), naming its engine
+  now, so a session placed just before a switch never starts on the engine the runner had. The push is ordered
+  against starts on the runner's link (a barrier).
 
 ## Facts
 

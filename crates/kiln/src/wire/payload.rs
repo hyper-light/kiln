@@ -1386,7 +1386,7 @@ mod tests {
             case("Identity", |json| ServerMsg::Identity { json }, &crate::proto::IdentityGiven { kind: "runner".into(), uri: "kiln://runner/m1".into(), ..Default::default() }, None),
             case("Observe", |json| ServerMsg::Observe { json, bytes: Vec::new() }, &crate::observe::wire::Msg::Release, Some(r#"{"kind":"teleport"}"#)),
             case("Headroom", |json| ServerMsg::Headroom { json }, &crate::headroom::Push::default(), None),
-            case("RunnerEngine", |json| ServerMsg::RunnerEngine { json }, &crate::harness::engine::Asked { engine: Some(crate::harness::engine::Engine::Host) }, None),
+            case("RunnerEngine", |json| ServerMsg::RunnerEngine { json }, &crate::harness::engine::Asked { engine: Some(crate::harness::engine::Engine::Host), version: 1 }, None),
         ];
         cases.push(Case { of: "StreamOpen", make: |json| ServerMsg::StreamOpen { stream: "st1".into(), session: "s1".into(), json }, good: r#"{"url":"https://example.com"}"#.into(), unknown: None, any: false });
         cases

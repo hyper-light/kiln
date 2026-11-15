@@ -110,19 +110,19 @@ fn p2_3_a_runner_without_microvms_runs_host_says_why_and_cant_be_set_to_microvm(
     assert!(failed && said.contains("can't run its sessions in microVMs") && said.contains(&why), "MCP: {said}");
     let (failed, said) = mcp(&s, "code_run", json!({"program": "return await kiln.runners.engine.set({ runner: input.runner, engine: 'microvm' })", "input": {"runner": machine("box")}}))?;
     assert!(failed && said.contains("can't run its sessions in microVMs"), "code mode: {said}");
-    assert_eq!(engine(&s, "box")?.get("asked"), Some(&Value::Null), "a refusal sets nothing");
+    assert_eq!((engine(&s, "box")?.get("asked"), engine(&s, "box")?.get("version")), (Some(&Value::Null), Some(&json!(0))), "a refusal sets nothing");
 
     // Its owner sets `host`: held, from the server, and kept on the runner for its restarts.
     let (st, v) = put(&s, "box", json!({"engine": "host"}))?;
-    assert_eq!((st, v.get("engine"), v.get("from"), v.get("asked")), (200, Some(&json!("host")), Some(&json!("server")), Some(&json!("host"))), "{v}");
-    until("kept host on the runner", &log, || Ok(std::fs::read_to_string(&kept).unwrap_or_default()), |t| t.contains("host"))?;
+    assert_eq!((st, v.get("engine"), v.get("from"), v.get("asked"), v.get("version")), (200, Some(&json!("host")), Some(&json!("server")), Some(&json!("host")), Some(&json!(1))), "{v}");
+    until("kept host on the runner", &log, || Ok(std::fs::read_to_string(&kept).unwrap_or_default()), |t| t.contains("host") && t.contains("\"version\":1"))?;
     let (failed, said) = mcp(&s, "code_run", json!({"program": "return (await kiln.runners.engine({ runner: input.runner })).from", "input": {"runner": machine("box")}}))?;
     assert!(!failed && said.contains("server"), "code mode reads it: {said}");
     // Taken away through MCP: what it can do decides again, and the runner keeps nothing.
     let (failed, said) = mcp(&s, "runners_engine_set", json!({"runner": machine("box"), "engine": null}))?;
     assert!(!failed, "{said}");
-    assert_eq!((engine(&s, "box")?.get("from"), engine(&s, "box")?.get("asked")), (Some(&json!("default")), Some(&Value::Null)));
-    until("let go of what it kept", &log, || Ok(kept.exists()), |k| !k)?;
+    assert_eq!((engine(&s, "box")?.get("from"), engine(&s, "box")?.get("asked"), engine(&s, "box")?.get("version")), (Some(&json!("default")), Some(&Value::Null), Some(&json!(2))));
+    until("kept nothing set, at setting 2", &log, || Ok(std::fs::read_to_string(&kept).unwrap_or_default()), |t| t.contains("\"engine\":null") && t.contains("\"version\":2"))?;
 
     // What isn't an engine; a runner the server doesn't know.
     for bad in [json!({}), json!({"engine": "docker"}), json!({"engin": "host"}), json!({"engine": 1}), json!(["host"])] {

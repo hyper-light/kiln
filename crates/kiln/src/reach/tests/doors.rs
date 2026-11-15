@@ -395,7 +395,7 @@ fn step32_an_agent_a_microvm_agent_starts_is_isolated_and_placed_with_its_microv
         // server pushed it (its own facts, `engine::here`), while the server's view of it is from
         // before. Its parent's runner, linux, places the agent itself, and its own admission refuses a
         // microVM's ask: never in a microVM on a host runner, whoever places it.
-        let host = crate::harness::engine::Asked { engine: Some(crate::harness::engine::Engine::Host) };
+        let host = crate::harness::engine::Asked { engine: Some(crate::harness::engine::Engine::Host), version: 1 };
         lab.linux.feed(In::LocalFacts(Box::new(vm_facts(true, host)))).await;
         lab.linux.directory().await?;
         let never = crate::rt::timeout(HANG, place_start(&hub, Some(&parent), &Ask { kind: "claude".into(), ..Ask::default() })).await?;

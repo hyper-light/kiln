@@ -895,8 +895,8 @@ pub fn session_needs(mut asked: kiln_ci::sched::needs::Needs, isolation: Option<
 /// its start to its end. However an isolated agent is started, the balancer places it.
 pub async fn place_on(hub: &Hub, target: &str, spec: &Spec, count: usize, parent: Option<&Info>) -> Result<Vec<crate::reach::place::Claim>, Refused> {
     let want = named(hub, target).unwrap_or_else(|| Ok(target.to_owned()))?;
-    let want = spec.isolation.as_ref().map(|_| Engine::Microvm);
-    let placed = place_agents(hub, parent, Some(target), &spec.kind, count, spec.isolation.as_ref(), want, &Queued::default()).await?;
+    let engine = spec.isolation.as_ref().map(|_| Engine::Microvm);
+    let placed = place_agents(hub, parent, Some(target), &spec.kind, count, spec.isolation.as_ref(), engine, &Queued::default()).await?;
     let mut claims = Vec::new();
     for (t, c) in &placed {
         match c {
@@ -1509,6 +1509,10 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
     let agentfile = kept_agentfile(hub, isolation.as_ref(), person.as_deref()).await.map_err(bad)?;
     let want = wanted(ask.isolation.as_deref(), isolation.as_ref());
+    // The engine settings its boundary is decided under, as they are before it's placed: a runner set
+    // again since refuses it (kiln plan 01a1dd2e…, P2.3).
+    let settings = hub.engines.now();
+    let decided_under = |target: &str| target.strip_prefix("agent:").map(|m| settings.get(m).map_or(0, |a| a.version));
     let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.as_ref(), want, &ask.queued).await?;
     // Each one's boundary (kiln plan 01a1dd2e…, P2.3): as it asked, or else its runner's engine's.
     // A conversation taken up (`resume`) stays where its harness keeps it.
@@ -1589,7 +1593,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     let mut at = 0;
     while let Some((t, claim)) = placed.get(at) {
         let n = if claim.is_none() { placed.iter().skip(at).take_while(|(u, c)| u == t && c.is_none()).count() } else { 1 };
-        let spec = Spec { claim: claim.clone(), isolation: with_person(boundary(t), person.as_deref()), ..spec.clone() };
+        let spec = Spec { claim: claim.clone(), isolation: with_person(boundary(t), person.as_deref()), engine_version: decided_under(t), ..spec.clone() };
         match hub.harness.open(hub, t, spec, n).await {
             Ok(i) => infos.extend(i),
             Err(e) => {
@@ -1827,7 +1831,7 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let runner = |name: &str, can: bool, asked: Option<Engine>| {
                 let mut facts = kiln_ci::facts::RunnerFacts { isolation: Some(kiln_ci::facts::Isolation { available: can, ..Default::default() }), ..Default::default() };
-                crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked { engine: asked });
+                crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked { engine: asked, version: 0 });
                 crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
             };
             hub.put_agent(runner("vm", true, None));

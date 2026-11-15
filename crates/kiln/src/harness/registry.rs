@@ -4166,6 +4166,12 @@ impl Registry {
         if spec.isolation.is_none() {
             spec.isolation = spec.parent.as_deref().and_then(|p| self.info(p)).and_then(|i| i.isolation);
         }
+        // The engine setting its boundary is decided under (kiln plan 01a1dd2e…, P2.3), before anything
+        // it waits for: its runner refuses it where it's been set again since. One `agents.start`
+        // decided keeps the one it was decided under.
+        if spec.engine_version.is_none() {
+            spec.engine_version = crate::harness::engine::version_at(hub, target);
+        }
         // A new conversation that asks for no microVM takes its runner's engine (kiln plan 01a1dd2e…,
         // P2.3): on a `microvm` runner, a microVM of its own. One taken up (`resume`: a found session
         // taken over or branched, a conversation continued) stays where its harness keeps it.
