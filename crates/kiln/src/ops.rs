@@ -311,6 +311,7 @@ pub fn own() -> &'static [Op] {
             .into_iter()
             .chain(crate::plans::ops::list_ops())
             .chain(crate::agentfiles::ops::list_ops())
+            .chain(crate::secrets::mine::list_ops())
             .chain(crate::agentdefs::ops::list_ops())
             .chain(crate::goals::ops::list_ops())
             .chain(crate::programs::ops::list_ops())
@@ -498,8 +499,8 @@ mod tests {
             let rule = crate::authz::rule(&method, &s);
             assert_ne!(rule.pattern, crate::authz::UNNAMED.pattern, "{} ({method} /{}) has a rule of its own", op.name, s.join("/"));
             let needs = match op.name {
-                "runners.list" | "runners.diagnose" | "updates.list" => "runners.read",
-                "runners.repair" | "updates.retry" | "updates.policy" => "runners.manage",
+                "runners.list" | "runners.diagnose" | "runners.engine" | "updates.list" => "runners.read",
+                "runners.repair" | "runners.engine.set" | "updates.retry" | "updates.policy" => "runners.manage",
                 // Attachments and incidents: reading them is reading runs (each narrowed to what it
                 // looks after); attaching is `agents.attach`; reporting, the incident's own check.
                 "attachments.list" | "attachments.get" | "incidents.list" | "incidents.get" => "runs.read",
@@ -511,6 +512,8 @@ mod tests {
                 n if n.starts_with("users.") || n.starts_with("grants.") || n.starts_with("roles.") => "users.manage",
                 n if n.starts_with("tokens.") => "tokens.manage",
                 "audit.list" => "audit.read",
+                // A person's own secrets (P4.7): each signed-in person's, held to them by the operation.
+                n if n.starts_with("secrets.mine.") => crate::authz::SIGNED_IN,
                 _ => "agents.run",
             };
             assert_eq!(rule.capability, needs, "{}", op.name);

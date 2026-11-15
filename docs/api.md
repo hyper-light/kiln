@@ -114,6 +114,8 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
 | GET | `/api/runners/:name/agent-limit` | `{ runner, own, connected, runs_agents, supported, max_sessions, held: { max_sessions, from: "server" \| "config" \| "default", config? } \| null, working, waiting, sessions, default, max }`: the most agent sessions the runner has at work at once, what's set here (`max_sessions`, null for none), what it holds and why as it last said, how many of its sessions are at work now (`working`, what the limit counts) and wait for room to go to work (`waiting`; both null while it's offline), and how many it has in all (`sessions`, finished, paused and ended ones too) ([agents.md](agents.md#how-many-agents-a-machine-runs)); 404 for an unknown runner |
 | PUT | `/api/runners/:name/agent-limit` | `{ max_sessions: n }` (1 to 4096), or `{ max_sessions: null }` to take it away (its config's, or kiln's default of 64, holds again) → the same view. Wins over the runner's config; stored and pushed to the runner (held when it next connects if it's offline). 400 for anything else, saying why; audited `agent_limit.update` |
+| GET | `/api/runners/:name/engine` | `{ runner, engine: "host" \| "microvm" \| null, from: "server" \| "default" \| null, why, asked, microvm: { usable, why } \| null, isolation, virt, sessions, draining }`: how the runner runs new agent sessions (its engine), where that comes from (its owner set it, or what it can do: `microvm` where it can hold microVMs, else `host`) and why, what's set here (`asked`, null for none), whether it can hold microVMs now and why not, its isolation facts, and how many of its running sessions are on its engine (`sessions`) and on the other (`draining`, which finish there); null fields until its facts come ([isolation.md](isolation.md#a-runners-engine)); 404 for an unknown runner |
+| PUT | `/api/runners/:name/engine` | `{ engine: "host" \| "microvm" }`, or `{ engine: null }` for what the runner can do → the same view. `microvm` is refused (409), saying why, where the runner can't hold microVMs now. Stored, held in the server's facts of it at once (`isolation.engine`, `virt.microvm` only on `microvm`) and pushed to the runner; nothing running stops. 400 for anything else, saying why; audited `runner_engine.update` |
 | GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
 | GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |
 | PUT | `/api/runners/:name/front-door` | `FrontDoorSettings` → `FrontDoorView`. Checked, stored and pushed to the runner (applied when it next connects if it is offline); 400 with the reason (`Domain: kiln needs a dot, like kiln.dev`); audited `front_door.update` |
@@ -270,6 +272,37 @@ starts microVMs, and is refused anywhere else (400, `an agent can't run isolated
 kiln's balancer places it, asking that size, and refuses it where it can't (step 32). The console
 keeps them at `/agents/agentfiles` and chooses one as an agent starts (docs/agents.md, "From an
 Agentfile, in a microVM of its own").
+
+## Your secrets
+
+A person's own secrets (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, decision 6): the `user` scope of
+CI's secrets (docs/ci.md W09), sealed as every scope's are (`crate::secrets::mine`). Each person sets,
+lists and deletes their own; no one else sees them, by name or value: not an admin, not
+`secrets.manage` (`/api/ci/secrets` refuses `scope=user:…` for everyone, 400), not the server's
+owner, whose admin token reaches the owner's own alone. No answer carries a value. An agent lists its
+person's names, to name them in an Agentfile, and sets none (403). Each route is an operation too
+(`secrets.mine.*`: `POST /api/ops/<name>`, kiln's MCP tools `secrets_mine_*`, code mode's
+`kiln.secrets.mine.*`), and each change is audited, by name.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/me/secrets` | `{ secrets: { name, size, created_at, updated_at, last_used_at }[] }`: yours |
+| PUT | `/api/me/secrets/<name>` | `{ value }` → `{ set: true, name }`. `name`: letters, digits and `_`, not starting with a digit (kept upper-case); `value`: 64 KiB at the most (422) |
+| DELETE | `/api/me/secrets/<name>` | `{ deleted: true }`; 404 for a name you hold none of |
+
+One of your own Agentfiles names each secret a build of it is given, by reference:
+`LABEL kiln.secret.<ID>=user:<NAME>`, `<ID>` the build secret Shards reads (`GIT_AUTH_TOKEN`,
+`GIT_AUTH_TOKEN.<host>`, `HTTP_AUTH_HEADER_<host>`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for
+an `AGENT` or `HARNESS` source; any `RUN --mount=type=secret,id=<ID>`), `<NAME>` one of yours. A label
+under `kiln.secret.` that isn't such a reference isn't kept (422, rule `SecretReference`), its words
+never repeating what it held. As an agent of yours starts from that Agentfile, kiln reads each named
+secret from yours; one you hold none of refuses the start before anything is placed (400,
+`… kiln.secret.<ID> names user:<NAME>, which isn't one of your secrets`), whoever's Agentfile has the
+same text. Its runner gives them to that build alone (`shards build --secret id=<ID>,env=…`, the value in
+the build's environment, never on its command line, in a layer or in the session it starts). The build
+is given the Agentfile without its `kiln.secret.` labels (each line kept, so Shards' words name your
+lines), so neither a reference nor a secret's name reaches the image: its config's labels, its build's
+definition and source map, its provenance.
 
 ## WebSockets
 

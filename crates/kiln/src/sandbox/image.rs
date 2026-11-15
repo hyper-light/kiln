@@ -24,6 +24,7 @@ use std::process::Command;
 
 use crate::agentfiles::builtin::Builtin;
 use crate::agentfiles::context;
+use crate::secrets::mine::BuildSecret;
 
 /// How a person's own Agentfile's image is named in the home's store, before its id.
 const KEPT: &str = "agentfile-";
@@ -105,8 +106,8 @@ impl Images {
     }
 
     /// `source`'s image for this machine, pinned by its digest: the one the home's store holds of its
-    /// content, else built.
-    pub async fn pinned(&self, source: Source<'_>) -> Result<String, Refusal> {
+    /// content, else built, given `secrets` (P4.7: a person's own, which its Agentfile names).
+    pub async fn pinned(&self, source: Source<'_>, secrets: &[BuildSecret]) -> Result<String, Refusal> {
         let plan = Plan::of(source)?;
         if let Some(digest) = self.held(&plan).await? {
             return Ok(plan.pinned(&digest));
@@ -115,7 +116,7 @@ impl Images {
         if let Some(digest) = self.held(&plan).await? {
             return Ok(plan.pinned(&digest));
         }
-        let digest = self.build(source, &plan).await?;
+        let digest = self.build(source, &plan, secrets).await?;
         Ok(plan.pinned(&digest))
     }
 
@@ -130,31 +131,39 @@ impl Images {
     }
 
     /// Builds `plan` in a folder of its own under `scratch`, removed after: its image's digest.
-    async fn build(&self, source: Source<'_>, plan: &Plan) -> Result<String, Refusal> {
+    async fn build(&self, source: Source<'_>, plan: &Plan, secrets: &[BuildSecret]) -> Result<String, Refusal> {
         let dir = self.scratch.join(format!("{}.{}", plan.recipe, crate::util::new_id()));
-        let built = self.build_in(&dir, source, plan).await;
+        let built = self.build_in(&dir, source, plan, secrets).await;
         // A harness's tree may hold a directory its owner may not search, which `discard` makes searchable.
         let _ = crate::rt::blocking(move || crate::agentfiles::unpack::discard(&dir)).await;
         built
     }
 
-    async fn build_in(&self, dir: &Path, source: Source<'_>, plan: &Plan) -> Result<String, Refusal> {
+    async fn build_in(&self, dir: &Path, source: Source<'_>, plan: &Plan, secrets: &[BuildSecret]) -> Result<String, Refusal> {
         let (context_dir, config, iid) = (dir.join("context"), dir.join("docker-config"), dir.join("iid"));
         let (d, c) = (dir.to_path_buf(), config.clone());
         let made = crate::rt::blocking(move || crate::shards::private_dir(&d).and_then(|()| crate::shards::private_dir(&c))).await;
         made.and_then(|r| r).map_err(|e| Refusal::Context(format!("{e:#}")))?;
+        // Its text without its references to its person's secrets (P4.7): their names are kiln's, never the image's.
+        let built = crate::secrets::mine::built_text(source.text());
         match &plan.beside {
             Some(b) => {
-                context::materialize_with(b.harness, source.text(), std::slice::from_ref(&plan.platform), b.variant.as_deref(), &context_dir).await.map_err(|e| Refusal::Context(e.to_string()))?;
+                context::materialize_with(b.harness, &built, std::slice::from_ref(&plan.platform), b.variant.as_deref(), &context_dir).await.map_err(|e| Refusal::Context(e.to_string()))?;
             }
             None => {
-                let (into, at, text) = (context_dir.clone(), context_dir.join("Agentfile"), source.text().to_owned());
+                let (into, at, text) = (context_dir.clone(), context_dir.join("Agentfile"), built);
                 let written = crate::rt::blocking(move || crate::shards::private_dir(&into).and_then(|()| Ok(std::fs::write(&at, text)?))).await;
                 written.and_then(|r| r).map_err(|e| Refusal::Context(format!("{e:#}")))?;
             }
         }
         let mut cmd = Command::new(&self.shards);
         cmd.arg("build").arg("--progress=quiet").arg("--platform").arg(&plan.platform);
+        // Each secret it's given, as Shards' build takes one (buildx's `--secret id=<ID>,env=<VAR>`): its
+        // value in this build's environment alone, never on its command line, in its context or in a layer.
+        for (i, s) in secrets.iter().enumerate() {
+            let var = format!("KILN_BUILD_SECRET_{i}");
+            cmd.arg("--secret").arg(format!("id={},env={var}", s.id)).env(&var, &s.value);
+        }
         cmd.arg("--file").arg(context_dir.join("Agentfile")).arg("--tag").arg(&plan.tag).arg("--iidfile").arg(&iid).arg(&context_dir);
         // Its own home, and a Docker configuration of its own: none of the machine's credential helpers.
         cmd.env("SHARDS_HOME", &self.home).env("DOCKER_CONFIG", &config);
@@ -462,7 +471,7 @@ pub(crate) mod tests {
             let source = Source::Builtin(builtin("ARG BASE=scratch\nFROM ${BASE}\nHARNESS claude FROM ./claude-${TARGETARCH}\n", &[]));
             shards.ready(source, &digest_of("one"))?;
             let images = shards.images();
-            let pinned = images.pinned(source).await?;
+            let pinned = images.pinned(source, &[]).await?;
             assert_eq!(pinned, format!("harness-t@{}", digest_of("one")));
             let builds = shards.builds();
             let plan = Plan::of(source)?;
@@ -471,7 +480,7 @@ pub(crate) mod tests {
             let home = shards.dir.path().join("home");
             assert!(build.starts_with(&format!("{} build --progress=quiet --platform {} ", home.display(), plan.platform)), "{build}");
             assert!(build.contains(&format!(" --tag {} ", plan.tag)), "{build}");
-            assert_eq!(images.pinned(source).await?, pinned, "the same image, found in the store");
+            assert_eq!(images.pinned(source, &[]).await?, pinned, "the same image, found in the store");
             assert_eq!(shards.builds().len(), 1, "found without a build");
             let scratch = shards.dir.path().join("scratch");
             assert_eq!(std::fs::read_dir(&scratch)?.count(), 0, "nothing of its build is left");
@@ -492,11 +501,11 @@ pub(crate) mod tests {
             let (a, b) = (Source::Kept { id: &id, text: "FROM scratch\n", beside }, Source::Kept { id: &id, text: "FROM scratch\nLABEL changed=1\n", beside });
             shards.ready(a, &digest_of("a"))?;
             shards.ready(b, &digest_of("b"))?;
-            let (first, second) = futures::join!(images.pinned(a), images.pinned(a));
+            let (first, second) = futures::join!(images.pinned(a, &[]), images.pinned(a, &[]));
             assert_eq!((first?, second?), (format!("agentfile-{id}@{}", digest_of("a")), format!("agentfile-{id}@{}", digest_of("a"))));
             assert_eq!(shards.builds().len(), 1, "two starts at once, one build: {:?}", shards.builds());
-            assert_eq!(images.pinned(b).await?, format!("agentfile-{id}@{}", digest_of("b")), "its changed text, built");
-            assert_eq!(images.pinned(a).await?, format!("agentfile-{id}@{}", digest_of("a")), "the first text's, still held");
+            assert_eq!(images.pinned(b, &[]).await?, format!("agentfile-{id}@{}", digest_of("b")), "its changed text, built");
+            assert_eq!(images.pinned(a, &[]).await?, format!("agentfile-{id}@{}", digest_of("a")), "the first text's, still held");
             assert_eq!(shards.builds().len(), 2, "{:?}", shards.builds());
             Ok(())
         })
@@ -518,8 +527,8 @@ pub(crate) mod tests {
             let stand_in = Source::Kept { id: &id, text: "FROM scratch\nHARNESS claude FROM https://example.com/stand-in.git#0123456789abcdef0123456789abcdef01234567:harness\n", beside };
             shards.ready(copy, &digest_of("copy"))?;
             shards.ready(stand_in, &digest_of("stand-in"))?;
-            assert_eq!(images.pinned(copy).await?, format!("agentfile-{id}@{}", digest_of("copy")));
-            assert_eq!(images.pinned(stand_in).await?, format!("agentfile-{id}@{}", digest_of("stand-in")));
+            assert_eq!(images.pinned(copy, &[]).await?, format!("agentfile-{id}@{}", digest_of("copy")));
+            assert_eq!(images.pinned(stand_in, &[]).await?, format!("agentfile-{id}@{}", digest_of("stand-in")));
             let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
             assert_eq!(shards.contexts(), [vec!["Agentfile".to_owned(), format!("claude-{arch}-musl")], vec!["Agentfile".to_owned()]]);
             Ok(())
@@ -535,16 +544,60 @@ pub(crate) mod tests {
             let shards = StandIn::new()?;
             let images = shards.images();
             let source = Source::Builtin(builtin("FROM scratch\nRUN exit 3\n", &[]));
-            let refused = images.pinned(source).await.err();
+            let refused = images.pinned(source, &[]).await.err();
             assert_eq!(refused, Some(Refusal::Build(FAILED.to_owned())));
             assert!(refused.map(|r| r.to_string()).unwrap_or_default().contains("did not complete successfully: exit code: 3"));
             assert_eq!(std::fs::read_dir(shards.dir.path().join("scratch"))?.count(), 0, "nothing of its build is left");
-            assert!(images.pinned(source).await.is_err());
+            assert!(images.pinned(source, &[]).await.is_err());
             assert_eq!(shards.builds().len(), 2, "refused, it's no image of the store's");
             // A `shards` that isn't there is refused, saying where it was looked for.
             let none = Images::new(shards.dir.path().join("gone"), shards.dir.path().join("home"), shards.dir.path().join("scratch"));
-            let said = none.pinned(source).await.err().map(|r| r.to_string()).unwrap_or_default();
+            let said = none.pinned(source, &[]).await.err().map(|r| r.to_string()).unwrap_or_default();
             assert!(said.starts_with("Shards didn't build it: ") && said.contains("gone"), "{said}");
+            Ok(())
+        })
+    }
+
+    /// P4.7: a build of a person's own Agentfile whose source needs a secret is given the one its start
+    /// read, by Shards' id for it, its value through the build's environment alone: without it Shards
+    /// refuses the build in its words; with it the build makes its image; its value is never on the
+    /// build's command line, and its context's Agentfile names no secret. Taking out `build_in`'s
+    /// `--secret` loop fails the second build.
+    #[cfg(unix)]
+    #[test]
+    fn p4_7_a_build_is_given_its_persons_secret_by_id_and_never_on_its_command_line() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        const TOKEN: &str = "ghp_p47_build_secret_value";
+        const REFUSED: &str = "ERROR: failed to solve: https://github.com/acme/harness.git: authentication required";
+        crate::rt::block_on(async move {
+            let shards = StandIn::new()?;
+            // Shards' fetch of the source: it answers only with the token its build was given as GIT_AUTH_TOKEN.
+            let inner = shards.dir.path().join("shards-inner");
+            std::fs::rename(&shards.program, &inner)?;
+            let (want, seen) = (shards.dir.path().join("want"), shards.dir.path().join("seen"));
+            std::fs::write(&want, TOKEN)?;
+            let gate = "#!/bin/sh\nwant=$(cat 'WANT')\ngot=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = --secret ]; then\n    id=${a#id=}; id=${id%%,*}; var=${a##*env=}\n    [ \"$id\" = GIT_AUTH_TOKEN ] && eval \"got=\\${$var}\"\n  fi\n  prev=$a\ndone\n[ \"$got\" = \"$want\" ] || { echo 'REFUSED' >&2; exit 1; }\nfor last; do :; done\ncp \"$last/Agentfile\" 'SEEN'\nexec 'INNER' \"$@\"\n"
+                .replace("WANT", &want.display().to_string())
+                .replace("REFUSED", REFUSED)
+                .replace("INNER", &inner.display().to_string())
+                .replace("SEEN", &seen.display().to_string());
+            std::fs::write(&shards.program, gate)?;
+            std::fs::set_permissions(&shards.program, std::fs::Permissions::from_mode(0o755))?;
+            let images = shards.images();
+            let id = crate::util::new_id();
+            let text = "FROM scratch\nLABEL kiln.secret.GIT_AUTH_TOKEN=user:GH_TOKEN\nHARNESS claude FROM https://github.com/acme/harness.git#0123456789abcdef0123456789abcdef01234567\n";
+            let source = Source::Kept { id: &id, text, beside: None };
+            shards.ready(source, &digest_of("private"))?;
+            assert_eq!(images.pinned(source, &[]).await.err(), Some(Refusal::Build(REFUSED.to_owned())), "not given it, Shards refuses it");
+            let given = [BuildSecret { id: "GIT_AUTH_TOKEN".into(), value: TOKEN.into() }];
+            assert_eq!(images.pinned(source, &given).await?, format!("agentfile-{id}@{}", digest_of("private")), "given it, the build makes its image");
+            let builds = shards.builds();
+            assert_eq!(builds.len(), 1, "{builds:?}");
+            assert!(builds.iter().all(|b| b.contains(" --secret id=GIT_AUTH_TOKEN,env=KILN_BUILD_SECRET_0 ") && !b.contains(TOKEN)), "{builds:?}");
+            assert!(!text.contains(TOKEN));
+            // Its context's Agentfile carries no reference: the name is kiln's, never the image's.
+            let given_text = std::fs::read_to_string(&seen)?;
+            assert!(!given_text.contains("kiln.secret") && !given_text.contains("GH_TOKEN") && given_text.contains("HARNESS claude FROM https://github.com/acme/harness.git"), "{given_text}");
             Ok(())
         })
     }

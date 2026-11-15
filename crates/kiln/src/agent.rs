@@ -2454,6 +2454,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // config's, else kiln's default. What the server sets is taken as it says it, and the config is
     // read again as it changes.
     let mut limit_asked = crate::harness::limit::kept(&o.state_dir);
+    // Its engine as its owner set it on the server (`crate::harness::engine`), kept here for its
+    // restarts: its facts say it from the first.
+    crate::harness::engine::hold(crate::harness::engine::kept(&o.state_dir));
     let mut limit_config = o.declared.max_agent_sessions;
     // What the server was told this machine holds, on this connection; and whether it takes that.
     let mut limit_said: Option<crate::harness::limit::Held> = None;
@@ -4449,6 +4452,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         continue;
                     }
+                    // Its engine as its owner set it on the server (kiln plan 01a1dd2e…, P2.3): kept for its
+                    // restarts, written into its facts from now on, and said at once, so its own
+                    // admission and the server's placement hold it alike.
+                    Carried::Read(FromServer::RunnerEngine(asked)) => {
+                        let dir = o.state_dir.clone();
+                        if let Err(e) = crate::rt::blocking(move || crate::harness::engine::keep(&dir, asked)).await.and_then(|r| r.map_err(anyhow::Error::from)) {
+                            tracing::warn!(error = %format!("{e:#}"), "this runner's engine couldn't be kept: started again, it holds what it can do until the server says it again");
+                        }
+                        crate::harness::engine::hold(asked);
+                        probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
+                        continue;
+                    }
                     // A leg of the CI engine (docs/ci.md W06): this runner announces `CAP_CI2`.
                     Carried::Read(FromServer::AssignV2(a)) => {
                         let mut a = *a;
@@ -5595,7 +5610,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     | ServerMsg::Undeploy { .. }
                     | ServerMsg::Cluster { .. }
                     | ServerMsg::AgentLimit { .. }
-                    | ServerMsg::HarnessHistoryFor { .. } => {}
+                    | ServerMsg::HarnessHistoryFor { .. }
+                    | ServerMsg::RunnerEngine { .. } => {}
                 }
             }
             Ev::Headroom => {

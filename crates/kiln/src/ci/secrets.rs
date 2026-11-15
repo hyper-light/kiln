@@ -62,8 +62,42 @@ pub async fn parse_scope(hub: &Hub, s: &str) -> Result<Scope, String> {
             }
             Ok(Scope { kind: k, id: format!("{}:{tail}", repo(r).await?.id) })
         }
+        // Decision 6: a person's own are theirs alone, never a scope another names, the owner included.
+        Some(ScopeKind::User) => Err(format!("`{s}`: a person's own secrets are theirs alone: each sets and lists their own at /api/me/secrets (secrets.mine.*), and no one names another's")),
         _ => Err(format!("`{s}` is not a scope: server, org:<owner>, repo:<owner/name>, workflow:<repo>:<path> or env:<repo>:<name>")),
     }
+}
+
+/// `person`'s own scope (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, decision 6): `person` as
+/// `harness::lineage::person_of` names them (`owner`, `user:<id>`).
+pub fn user_scope(person: &str) -> Scope {
+    Scope { kind: ScopeKind::User, id: person.to_owned() }
+}
+
+/// Of `names`, the values `person`'s own secrets hold, for a build of one of their own Agentfiles
+/// (decision 6): those they hold, each marked used, then the names they hold none of.
+pub(crate) async fn for_build(hub: &Hub, person: &str, names: &[String]) -> anyhow::Result<(BTreeMap<String, String>, Vec<String>)> {
+    let scope = user_scope(person);
+    let (mut held, mut missing) = (BTreeMap::new(), Vec::new());
+    for name in names {
+        match reveal(hub, &scope, name).await? {
+            Some(value) => {
+                held.insert(name.to_ascii_uppercase(), value);
+            }
+            None => missing.push(name.to_ascii_uppercase()),
+        }
+    }
+    let (s, used): (Scope, Vec<String>) = (scope, held.keys().cloned().collect());
+    hub.store
+        .call(move |c| {
+            let now = crate::util::now_unix();
+            for name in &used {
+                c.execute("UPDATE ci_secrets SET last_used_at = ?4 WHERE scope_kind = ?1 AND scope_id = ?2 AND name = ?3", params![s.kind.as_str(), s.id, name, now])?;
+            }
+            Ok(())
+        })
+        .await?;
+    Ok((held, missing))
 }
 
 /// The scopes a leg of `repo`'s `workflow` reads, bound to `environment`, from the most
@@ -470,7 +504,9 @@ pub async fn rotate(hub: &Hub) -> anyhow::Result<usize> {
                 r.collect::<Result<Vec<_>, _>>()?
             };
             for (id, kind, scope_id, name, sealed, nonce, key_id) in &rows {
-                let s = Scope { kind: ScopeKind::parse(kind).unwrap_or(ScopeKind::Server), id: scope_id.clone() };
+                // As it was sealed: its stored kind, every kind (an integration's and a person's own too).
+                let kind = ScopeKind::stored(kind).ok_or_else(|| anyhow::anyhow!("secret {name}: its scope {kind:?} is no kind kiln seals under"))?;
+                let s = Scope { kind, id: scope_id.clone() };
                 let k = keys.get(key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
                 let plain = open(k, sealed, nonce, &s.aad(name))?;
                 let (resealed, n) = seal(&fresh, &plain, &s.aad(name))?;
