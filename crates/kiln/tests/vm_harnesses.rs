@@ -406,6 +406,31 @@ mod checks {
         assert!(mcp_round_trip(&[json!({"kind": "tool", "name": "mcp__github__search", "server": "github", "status": "done"})], &[]).is_err());
     }
 
+    /// A run's one pulled store seeds each runner's Shards home (`VM_E2E_SHARDS_STORE`): its blobs and references
+    /// copied, nothing else of the seed's home (its ingest, its daemon's files), and refused, saying so, where the seed
+    /// holds no image store.
+    #[test]
+    fn s35_a_runners_shards_home_starts_with_the_runs_pulled_store() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (seed, state) = (dir.path().join("seed"), dir.path().join("runner-state"));
+        let blob = seed.join("images/blobs/sha256/4f34e1d6");
+        std::fs::create_dir_all(blob.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?)?;
+        std::fs::write(&blob, b"an index")?;
+        std::fs::create_dir_all(seed.join("images/refs/v1"))?;
+        std::fs::write(seed.join("images/refs/v1/buildpack-deps"), b"sha256:4f34e1d6")?;
+        std::fs::create_dir_all(seed.join("images/ingest"))?;
+        std::fs::write(seed.join("images/ingest/half"), b"half a layer")?;
+        std::fs::write(seed.join("daemon.pid"), b"1")?;
+        crate::vm_e2e::seed_store_from(&seed, &state)?;
+        let store = kiln::sandbox::shards_home(&state).join("images");
+        anyhow::ensure!(std::fs::read(store.join("blobs/sha256/4f34e1d6"))? == b"an index", "its blob");
+        anyhow::ensure!(std::fs::read(store.join("refs/v1/buildpack-deps"))? == b"sha256:4f34e1d6", "its reference");
+        anyhow::ensure!(!store.join("ingest").exists() && !kiln::sandbox::shards_home(&state).join("daemon.pid").exists(), "nothing else of the seed's home");
+        let none = crate::vm_e2e::seed_store_from(&dir.path().join("empty"), &state);
+        anyhow::ensure!(none.as_ref().is_err_and(|e| e.to_string().contains("VM_E2E_SHARDS_STORE")), "{none:?}");
+        Ok(())
+    }
+
     #[test]
     fn s34_a_runner_without_microvms_skips_in_its_own_words() {
         let why = "no hypervisor: /dev/kvm is missing";

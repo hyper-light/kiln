@@ -1058,6 +1058,7 @@ fn runner(dir: &Path, port: u16, name: &str, env: &[(&str, &str)]) -> anyhow::Re
     std::fs::create_dir_all(&home)?;
     let log_path = dir.join(format!("{name}.log"));
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    seed_store(&own_state(dir, name))?;
     let mut cmd = common::kiln();
     cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name])
         .arg("--work-dir")
@@ -1073,6 +1074,52 @@ fn runner(dir: &Path, port: u16, name: &str, env: &[(&str, &str)]) -> anyhow::Re
     cmd.env("USERPROFILE", &home).env("APPDATA", home.join("AppData").join("Roaming")).env("LOCALAPPDATA", home.join("AppData").join("Local"));
     let child = cmd.envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?;
     Ok((Runner(child), log_path))
+}
+
+/// `VM_E2E_SHARDS_STORE`: a Shards home whose image store holds the bases this run's images are built from,
+/// pulled once for the whole run (tests/vm_e2e/README.md). The runner whose state is `state` starts with a copy of
+/// that store's blobs and references in its own Shards home (`kiln::sandbox::shards_home`), so each build finds its
+/// digest-pinned base there (Shards' D78: a base pinned by a digest the store holds is resolved from the store) and
+/// asks no registry for it: no pull from Docker Hub per test, and no lookup of its name. Unset: none.
+fn seed_store(state: &Path) -> anyhow::Result<()> {
+    match std::env::var_os("VM_E2E_SHARDS_STORE") {
+        Some(seed) => seed_store_from(Path::new(&seed), state),
+        None => Ok(()),
+    }
+}
+
+/// The runner whose state is `state` given a copy of Shards home `seed`'s image store ([`seed_store`]).
+pub fn seed_store_from(seed: &Path, state: &Path) -> anyhow::Result<()> {
+    let from = seed.join("images");
+    anyhow::ensure!(from.join("blobs").is_dir(), "VM_E2E_SHARDS_STORE names no Shards home with an image store: {}", from.display());
+    let to = kiln::sandbox::shards_home(state).join("images");
+    for part in ["blobs", "refs"] {
+        copy_tree(&from.join(part), &to.join(part))?;
+    }
+    // Private to its user, as Shards keeps its store (its `pull::store`; D18).
+    #[cfg(unix)]
+    for dir in [kiln::sandbox::shards_home(state), to] {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// `from`'s directories and files, copied to `to` (made as it goes); anything else in it (a link, a socket) is left
+/// out, as a store holds none.
+fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from).map_err(|e| anyhow::anyhow!("{}: {e}", from.display()))? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if kind.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else if kind.is_file() {
+            std::fs::copy(&src, &dst).map_err(|e| anyhow::anyhow!("{} to {}: {e}", src.display(), dst.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The gate: whether the fixture's runner starts microVMs. Ok(false) after saying why it skips;
