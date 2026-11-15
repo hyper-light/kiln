@@ -1082,6 +1082,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let name = (*name).to_owned();
             boxed(|| crate::harness::engine::put(&hub, &name, req, &caller.name)).await.map_err(|(c, m)| err(c, m))
         }
+        // While a switch of it drains (decision 8): "End them now", and the switch cancelled.
+        (&Method::POST, ["api", "runners", name, "engine", "end"]) => boxed(|| own_op(&hub, &caller, "runners.engine.end_draining", json!({ "runner": name }))).await,
+        (&Method::POST, ["api", "runners", name, "engine", "cancel"]) => boxed(|| own_op(&hub, &caller, "runners.engine.cancel", json!({ "runner": name }))).await,
         (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(boxed(|| crate::frontdoor::control::renew(&hub, name)).await),
         (&Method::GET, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::get(&hub)).await),
         (&Method::PUT, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::put(&hub, req)).await),
@@ -1397,6 +1400,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::GET, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.get", json!({ "id": id }))).await,
         (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "agentdefs", id, "sessions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.sessions", json!({ "id": id }))).await,
         // A change over the version it was made over (`If-Match`, or `base`): refused, with what it is now, where
         // another change came first.
         (&Method::PATCH, ["api", "agentdefs", id]) => {

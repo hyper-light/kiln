@@ -114,7 +114,9 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
 | GET | `/api/runners/:name/agent-limit` | `{ runner, own, connected, runs_agents, supported, max_sessions, held: { max_sessions, from: "server" \| "config" \| "default", config? } \| null, working, waiting, sessions, default, max }`: the most agent sessions the runner has at work at once, what's set here (`max_sessions`, null for none), what it holds and why as it last said, how many of its sessions are at work now (`working`, what the limit counts) and wait for room to go to work (`waiting`; both null while it's offline), and how many it has in all (`sessions`, finished, paused and ended ones too) ([agents.md](agents.md#how-many-agents-a-machine-runs)); 404 for an unknown runner |
 | PUT | `/api/runners/:name/agent-limit` | `{ max_sessions: n }` (1 to 4096), or `{ max_sessions: null }` to take it away (its config's, or kiln's default of 64, holds again) → the same view. Wins over the runner's config; stored and pushed to the runner (held when it next connects if it's offline). 400 for anything else, saying why; audited `agent_limit.update` |
-| GET | `/api/runners/:name/engine` | `{ runner, engine: "host" \| "microvm" \| null, from: "server" \| "default" \| null, why, asked, version, microvm: { usable, why } \| null, isolation, virt, sessions, draining }`: how the runner runs new agent sessions (its engine), where that comes from (its owner set it, or what it can do: `microvm` where it can hold microVMs, else `host`) and why, what's set here (`asked`, null for none) and how many times it was set (`version`, which a start placed under an older one is refused by), whether it can hold microVMs now and why not, its isolation facts, and how many of its running sessions are on its engine (`sessions`) and on the other (`draining`, which finish there); null fields until its facts come ([isolation.md](isolation.md#a-runners-engine)); 404 for an unknown runner |
+| GET | `/api/runners/:name/engine` | `{ runner, engine: "host" \| "microvm" \| null, from: "server" \| "default" \| null, why, asked, version, microvm: { usable, why } \| null, isolation, virt, sessions, draining }`: how the runner runs new agent sessions (its engine), where that comes from (its owner set it, or what it can do: `microvm` where it can hold microVMs, else `host`) and why, what's set here (`asked`, null for none) and how many times it was set (`version`, which a start placed under an older one is refused by), whether it can hold microVMs now and why not, its isolation facts, and how many of its running sessions are on its engine (`sessions`) and on the other (`draining`, which finish there), each of those (`draining_sessions: { id, name, kind, state, engine, created_at }[]`, those an agent started before it), and while any drains the switch they drain for (`switch: { from, to, at } \| null`, `from` and `to` as `asked` says them); null fields until its facts come ([isolation.md](isolation.md#a-runners-engine)); 404 for an unknown runner |
+| POST | `/api/runners/:name/engine/end` | "End them now": each draining session ended, after the agents it started → the same view, with `ended: string[]` (the sessions ended). `runners.manage`; destructive (`runners.engine.end_draining`: an agent's call waits for its person's click); audited `runner_engine.end_draining` |
+| POST | `/api/runners/:name/engine/cancel` | its engine set back to `switch.from` while what the switch drains runs, as a `PUT` sets it (a new `version`) → the same view; 409 where it wasn't switched, or nothing drains (`runners.engine.cancel`) |
 | PUT | `/api/runners/:name/engine` | `{ engine: "host" \| "microvm" }`, or `{ engine: null }` for what the runner can do → the same view. `microvm` is refused (409), saying why, where the runner can't hold microVMs now. Stored, held in the server's facts of it at once (`isolation.engine`, `virt.microvm` only on `microvm`) and pushed to the runner; nothing running stops. 400 for anything else, saying why; audited `runner_engine.update` |
 | GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
 | GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |
@@ -246,6 +248,7 @@ runs and its runners: a definition's run is one of those agents.)
 | POST | `/api/agentdefs/{id}/restore` | `{ version }` → `AgentDef`, that version's settings as a new version |
 | DELETE | `/api/agentdefs/{id}` | `{ deleted: true }` |
 | POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }`; `id` one of yours or kiln's |
+| GET | `/api/agentdefs/{id}/sessions` | `{ sessions: { id, version, at, runner, state, engine, agent }[], starts: { n, by_kind: { [kind]: { n, timed, p50_ms } }, warm } }`: the sessions you started from it (`id` one of yours, or kiln's `kiln:<name>`), newest first, each with the version it started from, its `state` (as agents.list's `stand`; `gone` once kiln no longer has it), runner and engine; and what their starts took, by how each started |
 | POST | `/api/agentdefs/{id}/copy` | `{ name? }` → `AgentDef`: one of kiln's (`kiln:<name>`) or yours, made yours, version 1 |
 | POST | `/api/agentdefs/use` | `{ builtin, id }` → `{ uses }`: your own `id` stands in for kiln's UI agent `builtin` for you (null `id`: kiln's own again) |
 
@@ -271,10 +274,20 @@ its person set, a tool fix's `kind`; left unset, it's stored unset), then the pe
 kiln's. An attachment's agent and a review agent are their attachment person's (`by`). Deleting the
 definition makes it kiln's own again.
 
-A run starts an agent through `agents.start`, as its route starts one (the caller's right to start
-agents there checked and audited as such): the definition's harness and model, `isolation`
+A run starts an agent as `agents.start` starts one, through the one start path (the caller's right
+to start agents there checked, and the start audited): the definition's harness and model, `isolation`
 `microvm`, `image` its Agentfile (left out: the start's own for its harness), and as its first
 message its instructions, then the run's `prompt`.
+
+Each session kiln opens from a definition keeps which, and at which version (kiln's own: 0), kiln's to
+say and never what was asked: a run's, and one of kiln's UI agents started from the person's own
+definition standing in for it or from kiln's. `agents.get` says it (`definition: { id, version, name,
+current }`, `current` the definition's version now: a session behind it has a lesser `version`), and
+`sessions` lists a definition's. Their starts are read off kiln's record of each start of a session's
+harness on its machine (every one recorded, of the sessions kiln still has): by how each started, which
+that record says by its engine (`host`, `microvm`), and, for a session's first start, the time from its
+open on its machine to its harness running, room waits and image builds included. Deleting the
+definition drops what its sessions say of it.
 
 ```ts
 interface Mcp { name; url?; command?: string[] }

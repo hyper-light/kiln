@@ -1322,9 +1322,11 @@ async fn start(hub: &Arc<Hub>, a: &Attachment, i: &Incident) -> Result<String, S
     // (`on`, `cwd`) stays the attachment's.
     if ask.kind.is_empty() {
         let kiln_agent = if i.wake == "review" { crate::agentdefs::builtin::REVIEW } else { crate::agentdefs::builtin::ATTACH };
-        let s = crate::agentdefs::uses::or_kilns(hub, Some(&a.by), kiln_agent).await.map_err(|e| e.to_string())?;
+        let (s, definition) = crate::agentdefs::uses::or_kilns(hub, Some(&a.by), kiln_agent).await.map_err(|e| e.to_string())?;
         ask.prompt = crate::agentdefs::first_message(&s, Some(&i.bundle));
         (ask.kind, ask.model, ask.image, ask.effort, ask.mode) = (s.harness, s.model, s.agentfile, None, None);
+        // Its session says the definition it started from (`crate::agentdefs::sessions`).
+        ask.definition = Some(definition);
     }
     let infos = crate::harness::lineage::start(hub, &starter, ask).await.map_err(|(_, m)| m)?;
     let id = infos.first().map(|x| x.id.clone()).ok_or_else(|| "no agent started".to_owned())?;

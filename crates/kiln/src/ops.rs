@@ -511,7 +511,7 @@ mod tests {
             assert_ne!(rule.pattern, crate::authz::UNNAMED.pattern, "{} ({method} /{}) has a rule of its own", op.name, s.join("/"));
             let needs = match op.name {
                 "runners.list" | "runners.diagnose" | "runners.engine" | "updates.list" => "runners.read",
-                "runners.repair" | "runners.engine.set" | "updates.retry" | "updates.policy" => "runners.manage",
+                "runners.repair" | "runners.engine.set" | "runners.engine.end_draining" | "runners.engine.cancel" | "updates.retry" | "updates.policy" => "runners.manage",
                 // Attachments and incidents: reading them is reading runs (each narrowed to what it
                 // looks after); attaching is `agents.attach`; reporting, the incident's own check.
                 "attachments.list" | "attachments.get" | "incidents.list" | "incidents.get" => "runs.read",

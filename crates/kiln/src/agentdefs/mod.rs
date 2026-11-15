@@ -14,6 +14,7 @@
 
 pub mod builtin;
 pub mod ops;
+pub mod sessions;
 pub mod uses;
 
 use rusqlite::{OptionalExtension as _, params};
@@ -554,6 +555,8 @@ pub async fn delete(hub: &Hub, who: &Who, id: &str) -> R<AgentDef> {
             tx.execute("DELETE FROM agent_def_versions WHERE agent_def_id = ?1", params![i])?;
             // Where it stood in for one of kiln's agents (`uses`), kiln's own again.
             tx.execute("DELETE FROM agent_def_uses WHERE agent_def_id = ?1", params![i])?;
+            // The sessions it started no longer say it (`sessions`).
+            sessions::forget_in(&tx, &i)?;
             tx.commit()?;
             Ok(n)
         })

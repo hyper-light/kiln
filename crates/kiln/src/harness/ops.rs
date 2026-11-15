@@ -124,11 +124,21 @@ async fn get(cx: Cx, v: Value) -> Out {
     // Its live overrides, and the operations that change them on its engine (kiln plan 01a1dd2e…, P6b.4): the network's
     // offered only on a microVM session.
     let live = super::overrides::view(&info, &state);
-    Ok(json!({"agent": wait::brief(&info), "info": info, "state": state, "live": live}))
+    // The agent definition it started from, at which version, and where that definition is now (kiln plan 01a1dd2e…,
+    // P5.2's page): none for one that started from none.
+    let definition = crate::agentdefs::sessions::of(&cx.hub, &id).await.map_err(crate::agentdefs::ops::fail)?;
+    Ok(json!({"agent": wait::brief(&info), "info": info, "state": state, "live": live, "definition": definition}))
 }
 
 async fn start(cx: Cx, v: Value) -> Out {
     let ask: Ask = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    start_ask(cx, ask).await
+}
+
+/// `agents.start`'s start of `ask`, which kiln may have made with what only it says (the definition an
+/// `agentdefs.run` starts from, `Ask::definition`): answered as soon as its agents start, or as soon as
+/// it waits for room, saying so.
+pub(crate) async fn start_ask(cx: Cx, ask: Ask) -> Out {
     if ask.kind.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "`kind` is required: the harness (claude, codex, …)".into()));
     }
@@ -1133,9 +1143,9 @@ pub mod input {
         /// The conversation to take up again: its harness's own session id (an agent's
         /// `harness_session`, as agents_get gives it), in its folder on its machine; one agent.
         pub resume: Option<String>,
-        /// The agent definition it runs (as agentdefs_run starts one), and its task apart from the
-        /// definition's words: a split of that agent (experiments_start's `target`) matches it.
-        pub agentdef: Option<String>,
+        /// Its task apart from the words of the agent definition it runs (as agentdefs_run starts one): what
+        /// a split's variant that's another agent is told after that agent's words. Which definition it runs is
+        /// kiln's to say, as agentdefs_run starts it.
         pub task: Option<String>,
     }
 
