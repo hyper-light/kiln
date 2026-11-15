@@ -192,9 +192,9 @@ pub struct Pass {
 pub async fn gate(cx: Cx, name: &str, input: &Value) -> Result<Pass, Fail> {
     let Some(me) = cx.caller.agent.clone() else { return Ok(Pass { cx, note: None }) };
     let turn = cx.caller.turn().map(str::to_owned);
-    let note = turn.as_ref().map(|p| format!("in {p}'s chat turn"));
-    let Some(info) = crate::ops::find(&cx.hub, |n| n == name) else { return Ok(Pass { cx, note }) };
-    let Some((says, version)) = needs_click(&cx, &me, name, info.read_only, info.destructive, input).await else { return Ok(Pass { cx, note }) };
+    // The turn's person goes on the audit row as its caller makes it (`crate::audit::request`).
+    let Some(info) = crate::ops::find(&cx.hub, |n| n == name) else { return Ok(Pass { cx, note: None }) };
+    let Some((says, version)) = needs_click(&cx, &me, name, info.read_only, info.destructive, input).await else { return Ok(Pass { cx, note: None }) };
     let input = canonical(input);
     // Confirmed already: run once, as the person whose click it was.
     if let Some((id, person)) = confirmed(&cx.hub, &me, name, &input).await? {

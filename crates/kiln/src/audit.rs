@@ -141,7 +141,12 @@ where
     let rule = crate::authz::rule(method, &segs);
     let scope = crate::authz::gate::scope_of(hub, rule, &segs, q).await.text();
     let (principal, on_behalf_of) = who(caller);
-    let notes = std::mem::take(&mut slot.lock().notes);
+    let mut notes = std::mem::take(&mut slot.lock().notes);
+    // An agent serving a person's chat turn says so, whichever operation it is (kiln plan
+    // 01a1dd2e8618733a87f2793aab1322a8 P5.6: CI's, deployments' and kiln's own alike).
+    if let Some(person) = caller.turn() {
+        notes.push(format!("chat: in {person}'s chat turn"));
+    }
     let action = if rule.pattern == crate::authz::UNNAMED.pattern { format!("{method} {path}") } else { format!("{method} {}", rule.pattern) };
     write(
         &hub.store,

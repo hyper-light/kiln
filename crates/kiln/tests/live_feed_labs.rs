@@ -484,7 +484,7 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
     }
 
     // The session ends: both viewers are told.
-    let (st, body) = common::http(port, "DELETE", &format!("/api/harness/sessions/{id}"), &admin, None)?;
+    let (st, body) = common::http(port, "DELETE", &format!("/api/harness/agents/{id}"), &admin, None)?;
     anyhow::ensure!((200..300).contains(&st), "closing the session: {st} {body}");
     wait_for("both viewers told the session ended", Duration::from_secs(60), || Ok(whole.shown()?.closed && patched.shown()?.closed))?;
     whole.end()?;

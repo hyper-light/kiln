@@ -687,7 +687,7 @@ fn w26_ac10_agents_fix_one_thread_at_most_three_times() -> anyhow::Result<()> {
 fn w26_ac10_an_ended_agent_is_sent_nothing() -> anyhow::Result<()> {
     let w = Ac10::new(true)?;
     let cr = w.open(false)?;
-    let (st, body) = http(w.s.port, "DELETE", &format!("/api/harness/sessions/{}", w.matrix.id), &w.s.admin, None)?;
+    let (st, body) = http(w.s.port, "DELETE", &format!("/api/harness/agents/{}", w.matrix.id), &w.s.admin, None)?;
     anyhow::ensure!((200..300).contains(&st), "the Matrix agent ends: {st} {body}");
     let heard = w.heard().len();
     w.comment(&cr, "comment", "an empty matrix should mean no legs")?;
