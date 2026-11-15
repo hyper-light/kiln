@@ -38,7 +38,15 @@ export function EngineCell({ e }: { e: EngineView | undefined }) {
   if (!e) return <span className="cell-dim">—</span>;
   const Icon = ENGINE_ICON[e.switching ? e.switching.to : e.engine];
   return (
-    <span className="rv-engine" data-switching={e.switching ? "" : undefined} title={e.switching ? `Switching to ${e.switching.to}: ${e.switching.draining.length} draining` : e.why ?? (e.engine === "microvm" ? `microVMs on ${e.hypervisor}` : e.origin === "owner" ? "Host, its owner's choice" : "Host")}>
+    <span
+      className="rv-engine"
+      data-switching={e.switching ? "" : undefined}
+      title={
+        e.switching
+          ? `Switching to ${e.switching.to}: ${e.switching.draining.length} draining`
+          : (e.why ?? (e.engine === "microvm" ? `microVMs on ${e.hypervisor}` : e.origin === "owner" ? "Host, its owner's choice" : "Host"))
+      }
+    >
       <Icon size={13} aria-hidden="true" />
       <span className="rv-engine-word">{e.switching ? `→ ${e.switching.to}` : e.engine}</span>
       {!e.can && <Ban size={12} className="rv-ban" role="img" aria-label={e.why ?? "Can't run microVMs"} />}
@@ -94,7 +102,17 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
           options={(["microvm", "host"] as Engine[]).map((x) => {
             const Icon = ENGINE_ICON[x];
             const disabled = !manage || Boolean(e.switching) || (x === "microvm" && !e.can);
-            return { value: x, disabled, title: !manage ? "Only those who manage runners switch its engine" : x === "microvm" && !e.can ? (e.why ?? undefined) : undefined, label: (<><Icon size={13} aria-hidden="true" />{x === "microvm" ? "microVM" : "host"}</>) };
+            return {
+              value: x,
+              disabled,
+              title: !manage ? "Only those who manage runners switch its engine" : x === "microvm" && !e.can ? (e.why ?? undefined) : undefined,
+              label: (
+                <>
+                  <Icon size={13} aria-hidden="true" />
+                  {x === "microvm" ? "microVM" : "host"}
+                </>
+              ),
+            };
           })}
         />
         <span className="rv-checks">
@@ -186,8 +204,8 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
             <span className="label">Memory</span>
             <span className="rv-meter">
               <Meter value={usedMem} max={room.memory_total} label="Memory used of the node's room" />
-              <span>
-                {formatBytes(usedMem)} / {formatBytes(room.memory_total)}
+              <span title={`${formatBytes(usedMem)} of ${formatBytes(room.memory_total)} held`}>
+                {Math.round(usedMem / 2 ** 30)}/{Math.round(room.memory_total / 2 ** 30)}G
               </span>
             </span>
           </span>
@@ -204,7 +222,7 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
             <span className="label">Network</span>
             <span className="rv-meter">
               <Sparkline values={r.net} width={72} height={18} />
-              <span>{(r.net.at(-1) ?? 0) / 10} MB/s</span>
+              <span>{((r.net.at(-1) ?? 0) / 10).toFixed(1)} MB/s</span>
             </span>
           </span>
           {total > 0 && (
@@ -241,7 +259,20 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
           <div className="label rv-label">MicroVMs · {r.vms.length}</div>
           <ul className="rv-rows" aria-label={`${name}'s microVMs`}>
             {r.vms.map((v) => (
-              <VmRow key={v.id} v={v} open={charts.has(v.id)} onCharts={() => setCharts((s) => { const n = new Set(s); if (n.has(v.id)) n.delete(v.id); else n.add(v.id); return n; })} onChanged={() => res.reload()} />
+              <VmRow
+                key={v.id}
+                v={v}
+                open={charts.has(v.id)}
+                onCharts={() =>
+                  setCharts((s) => {
+                    const n = new Set(s);
+                    if (n.has(v.id)) n.delete(v.id);
+                    else n.add(v.id);
+                    return n;
+                  })
+                }
+                onChanged={() => res.reload()}
+              />
             ))}
           </ul>
         </>
@@ -339,7 +370,17 @@ function VmRow({ v, open, onCharts, onChanged }: { v: MicroVm; open: boolean; on
         {asking ? (
           <span className="rv-confirm" role="group" aria-label={`Stop ${v.agent}?`}>
             Stop?
-            <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Stop ${v.agent}`} onClick={() => { setAsking(false); toast({ title: `Stopping ${v.agent}`, tone: "info" }); }}>
+            <button
+              type="button"
+              className="icon-btn"
+              data-variant="bare"
+              data-size="sm"
+              aria-label={`Stop ${v.agent}`}
+              onClick={() => {
+                setAsking(false);
+                toast({ title: `Stopping ${v.agent}`, tone: "info" });
+              }}
+            >
               <Check size={14} />
             </button>
             <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Keep it" onClick={() => setAsking(false)}>
@@ -348,13 +389,39 @@ function VmRow({ v, open, onCharts, onChanged }: { v: MicroVm; open: boolean; on
           </span>
         ) : (
           <>
-            <button type="button" className="icon-btn" data-variant="bare" data-size="sm" disabled={busy || v.state === "failed" || v.state === "draining"} title={paused ? "Resume (P)" : "Pause (P)"} aria-label={`${paused ? "Resume" : "Pause"} ${v.agent}`} onClick={() => pause(!paused)}>
+            <button
+              type="button"
+              className="icon-btn"
+              data-variant="bare"
+              data-size="sm"
+              disabled={busy || v.state === "failed" || v.state === "draining"}
+              title={paused ? "Resume (P)" : "Pause (P)"}
+              aria-label={`${paused ? "Resume" : "Pause"} ${v.agent}`}
+              onClick={() => pause(!paused)}
+            >
               {paused ? <Play size={14} /> : <Pause size={14} />}
             </button>
-            <button type="button" className="icon-btn" data-variant="bare" data-size="sm" title="Restart (R)" aria-label={`Restart ${v.agent}`} onClick={() => toast({ title: `Restarting ${v.agent}`, tone: "running" })}>
+            <button
+              type="button"
+              className="icon-btn"
+              data-variant="bare"
+              data-size="sm"
+              title="Restart (R)"
+              aria-label={`Restart ${v.agent}`}
+              onClick={() => toast({ title: `Restarting ${v.agent}`, tone: "running" })}
+            >
               <RotateCcw size={14} />
             </button>
-            <button type="button" className="icon-btn" data-variant="bare" data-size="sm" disabled={v.state === "failed"} title="Stop (S)" aria-label={`Stop ${v.agent}`} onClick={() => setAsking(true)}>
+            <button
+              type="button"
+              className="icon-btn"
+              data-variant="bare"
+              data-size="sm"
+              disabled={v.state === "failed"}
+              title="Stop (S)"
+              aria-label={`Stop ${v.agent}`}
+              onClick={() => setAsking(true)}
+            >
               <Square size={13} />
             </button>
           </>
@@ -419,7 +486,17 @@ function PoolRow({ p, manage }: { p: WarmPool; manage: boolean }) {
           (asking ? (
             <span className="rv-confirm" role="group" aria-label={`Release ${p.agent}'s pool?`}>
               Release?
-              <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Release it" onClick={() => { setAsking(false); toast({ title: `Released ${p.agent}'s pool`, tone: "info" }); }}>
+              <button
+                type="button"
+                className="icon-btn"
+                data-variant="bare"
+                data-size="sm"
+                aria-label="Release it"
+                onClick={() => {
+                  setAsking(false);
+                  toast({ title: `Released ${p.agent}'s pool`, tone: "info" });
+                }}
+              >
                 <Check size={14} />
               </button>
               <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Keep it" onClick={() => setAsking(false)}>
@@ -463,7 +540,17 @@ function ImageRow({ im }: { im: RunnerImage }) {
         {asking ? (
           <span className="rv-confirm" role="group" aria-label={`Remove ${im.name}?`}>
             Remove?
-            <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Remove it" onClick={() => { setAsking(false); toast({ title: `Removed ${im.from}`, tone: "info" }); }}>
+            <button
+              type="button"
+              className="icon-btn"
+              data-variant="bare"
+              data-size="sm"
+              aria-label="Remove it"
+              onClick={() => {
+                setAsking(false);
+                toast({ title: `Removed ${im.from}`, tone: "info" });
+              }}
+            >
               <Check size={14} />
             </button>
             <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Keep it" onClick={() => setAsking(false)}>
@@ -472,7 +559,15 @@ function ImageRow({ im }: { im: RunnerImage }) {
           </span>
         ) : (
           <>
-            <button type="button" className="icon-btn" data-variant="bare" data-size="sm" title="Build again" aria-label={`Build ${im.from} again`} onClick={() => toast({ title: `Building ${im.from}`, tone: "running" })}>
+            <button
+              type="button"
+              className="icon-btn"
+              data-variant="bare"
+              data-size="sm"
+              title="Build again"
+              aria-label={`Build ${im.from} again`}
+              onClick={() => toast({ title: `Building ${im.from}`, tone: "running" })}
+            >
               <RotateCcw size={14} />
             </button>
             <button type="button" className="icon-btn" data-variant="bare" data-size="sm" title="Remove" aria-label={`Remove ${im.from}`} onClick={() => setAsking(true)}>
@@ -498,7 +593,13 @@ function BuildForm({ name, onDone }: { name: string; onDone: () => void }) {
           </option>
         ))}
       </select>
-      <Button size="xs" onClick={() => { onDone(); toast({ title: `Building ${from} on ${name}`, tone: "running" }); }}>
+      <Button
+        size="xs"
+        onClick={() => {
+          onDone();
+          toast({ title: `Building ${from} on ${name}`, tone: "running" });
+        }}
+      >
         Build
       </Button>
       <Button size="xs" variant="ghost" onClick={onDone}>

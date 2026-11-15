@@ -60,7 +60,7 @@
 /* The node's room: a label over a mark and its number, each in its own cell. */
 .rv-room {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 12px 20px;
 }
 .rv-room > span {
@@ -80,7 +80,7 @@
   white-space: nowrap;
 }
 .rv-meter .meter {
-  width: 56px;
+  width: 48px;
   flex: none;
 }
 .rv-starts > span,

@@ -37,6 +37,8 @@ import { handleReap } from "./reap.ts";
 import { handleExperiments } from "./experiments.ts";
 import { handleAgentdefs } from "./agentdefs.ts";
 import { handleMicrovms } from "./microvms.ts";
+import { handlePeersOpen, handleRunnersCi } from "./runners-ci.ts";
+import { handleAgentPage } from "./agent-page.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleLongTimeline, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { handleMockHistory } from "./history.ts";
@@ -1817,6 +1819,9 @@ const server = http.createServer(async (req, res) => {
     if (await handleExperiments(req, res, url, { json, body })) return;
     if (await handleAgentdefs(req, res, url, { json, body })) return;
     if (await handleMicrovms(req, res, url, { json, body })) return;
+    if (await handleRunnersCi(req, res, url, { json, body })) return;
+    if (handlePeersOpen(req, res, url, { json })) return;
+    if (handleAgentPage(req, res, url, { json })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 

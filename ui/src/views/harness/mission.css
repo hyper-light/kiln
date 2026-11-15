@@ -2036,17 +2036,7 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
   }
 }
 
-/* Definitions (definitions.tsx): agents as you define them, in the list's own rows; their sessions and
-   experiment open under them as a row's subagents do. */
-.ms-defs {
-  margin-bottom: 22px;
-}
-.ms-defs-title {
-  color: #ededee;
-}
-.ms-defs .ms-listhead {
-  justify-content: space-between;
-}
+/* Agents you manage (definitions.tsx), in the dropdown under a row: the experiment's split and its variants. */
 /* A split's share of new sessions: one bar, each variant's part in the prism's own stops. */
 .ms-split {
   display: inline-flex;
@@ -2060,21 +2050,6 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
   display: block;
   height: 100%;
 }
-.ms-vkey {
-  display: inline-grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
-  margin: 1px 0 0 2px;
-  border-radius: 5px;
-  color: #0b0c0e;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  font-weight: 600;
-}
-.ms-vkey[data-current] {
-  box-shadow: 0 0 0 2px #0a0b0d, 0 0 0 3px #ededee;
-}
 .ms-weight {
   width: 64px;
 }
@@ -2084,36 +2059,6 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 }
 .ms-measure[data-win] {
   color: #bfdccf;
-}
-.ms-defs .ms-name {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.ms-defs .ms-name > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.ms-defs .ms-meta {
-  min-width: 0;
-  overflow: hidden;
-}
-.ms-defs .ms-meta > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ms-defs-title + .ms-swap {
-  margin-left: 10px;
-  color: #7b7e88;
-}
-/* Narrow, Run takes the meta line's place as a row's answers do (above): its Agentfile and version are in its open block. */
-@container (max-width: 760px) {
-  .ms-defs .ms-row .ms-meta {
-    display: none;
-  }
 }
 /* A split dragged but not applied: hatched until Apply. */
 .ms-split[data-staged] > i {

@@ -1,0 +1,383 @@
+/* An agent's Sandbox / Host tab (sandbox.tsx), in the inspector's own sections (console.css .in-secs):
+   one left edge, mono keys, one row height, nothing wraps; what doesn't fit ends in an ellipsis. */
+.sb {
+  container-type: inline-size;
+}
+.sb .in-sec-head .sb-where {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  overflow: hidden;
+  color: #c8cad0;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  white-space: nowrap;
+}
+.sb-hostline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -4px 0 12px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+/* Now: CPU, memory and disk side by side where they fit, each its own cell, else one under another. */
+.sb-bars {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px 18px;
+}
+.sb-bars .hx-limit-top {
+  white-space: nowrap;
+}
+.sb-ctl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+}
+.sb-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding-left: 10px;
+  border-radius: 999px;
+  background: rgb(209 170 173 / 10%);
+  color: #e2b9bd;
+  font-size: 12px;
+  white-space: nowrap;
+}
+/* Keys and values, one a line. */
+.sb-list,
+.sb-rows {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sb-kv {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-height: 30px;
+  border-bottom: 1px solid #191b1f;
+  font-size: 12.5px;
+}
+.sb-k {
+  overflow: hidden;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.sb-v {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  overflow: hidden;
+  color: #e4e5e7;
+  white-space: nowrap;
+}
+.sb-mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.sb-dim {
+  color: #7b7e88;
+}
+.sb-clip {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sb-pool {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.sb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sb-chip > svg {
+  color: #d8cbb0;
+}
+.sb-chip > i {
+  color: #7b7e88;
+  font-style: normal;
+}
+.sb-note {
+  margin: 0 0 6px;
+  overflow: hidden;
+  color: #8f929b;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A row: its glyph, its name, then what it is, and its controls at the end. */
+.sb-row {
+  display: grid;
+  align-items: center;
+  gap: 0 10px;
+  min-height: 32px;
+  border-bottom: 1px solid #191b1f;
+  font-size: 12.5px;
+}
+.sb-comp {
+  grid-template-columns: 14px minmax(0, 1fr) 76px;
+}
+/* A row of two lines, each whole: what it is and its version or mode; then where, from what, and who. */
+.sb-two {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  padding: 5px 0;
+}
+.sb-two-top,
+.sb-two-sub {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  line-height: 16px;
+}
+.sb-two-sub {
+  font-size: 11px;
+}
+.sb-comp[data-swapped] .sb-ver {
+  color: #e2cfae;
+}
+.sb-flow {
+  grid-template-columns: 14px minmax(0, 1.4fr) minmax(0, 0.8fr) auto 28px;
+}
+.sb-net {
+  grid-template-columns: minmax(84px, 0.6fr) minmax(0, 1.4fr);
+}
+.sb-vol {
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+}
+.sb-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #e4e5e7;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sb-mark {
+  border-radius: 4px;
+}
+.sb-src {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #c8cad0;
+  white-space: nowrap;
+}
+.sb-src > svg {
+  color: #a6c4ed;
+}
+.sb-ver {
+  overflow: hidden;
+  color: #c8cad0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sb-acts {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 2px;
+}
+.sb-sub {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 30px;
+  margin-top: 6px;
+}
+.sb-in-glyph {
+  color: #b8d9d2;
+}
+.sb-out-glyph {
+  color: #b8a6d5;
+}
+.sb-tags {
+  display: inline-flex;
+  gap: 4px;
+}
+.sb-tags > i {
+  padding: 0 5px;
+  border: 1px solid #2a2d34;
+  border-radius: 999px;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-style: normal;
+  line-height: 16px;
+}
+/* Default deny, said: the row after the grants. */
+.sb-deny {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  padding-left: 24px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sb-members {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+.sb-member {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid #2a2d34;
+  border-radius: 999px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sb-member > i {
+  width: 6px;
+  height: 6px;
+  border: 1.5px solid #6b6e78;
+  border-radius: 50%;
+}
+.sb-member[aria-pressed="true"] {
+  border-color: rgb(168 201 188 / 45%);
+  color: #e4e5e7;
+}
+.sb-member[aria-pressed="true"] > i {
+  border-color: #a8c9bc;
+  background: #a8c9bc;
+}
+.sb-member:hover {
+  border-color: #3a3d45;
+}
+.sb-mode {
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.sb-mode[data-mode="rw"] {
+  color: #e2cfae;
+}
+/* Allowed directories: one path a line under its member, each whole (a very long one breaks, never ends in an ellipsis). */
+.sb-stacked {
+  align-items: start;
+  padding: 7px 0;
+}
+.sb-stacked > .sb-k {
+  line-height: 18px;
+}
+.sb-paths {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: #e4e5e7;
+}
+.sb-paths > .sb-path {
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+.sb-path[data-mode="ro"]::after {
+  margin-left: 4px;
+  color: #7b7e88;
+  content: "ro";
+}
+/* An inline form: its fields on the row's line, its refusal in Shards' words under them. */
+.sb-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 0;
+  border-bottom: 1px solid #191b1f;
+}
+.sb-in {
+  height: 26px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid #303239;
+  border-radius: 6px;
+  background: #0b0c0e;
+  color: #ededee;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sb-grow {
+  flex: 1 1 160px;
+}
+.sb-pin {
+  flex: 1 1 120px;
+}
+.sb-addr {
+  width: 128px;
+}
+.sb-port {
+  width: 58px;
+}
+.sb-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sb-why {
+  flex-basis: 100%;
+  color: #e2b9bd;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+/* The last hour: each plot the section's full width. */
+.sb-plots {
+  display: grid;
+  gap: 14px;
+}
+.sb-plot {
+  display: grid;
+  gap: 6px;
+}
+.sb-plot-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.sb-wide {
+  width: 100%;
+}
+/* A phone's width: paths and members give way first; a row keeps its glyph, name, pin and control. */
+@container (max-width: 420px) {
+  .sb-flow {
+    grid-template-columns: 14px minmax(0, 1fr) auto 28px;
+  }
+  .sb-flow > .sb-dim {
+    display: none;
+  }
+  .sb-kv {
+    grid-template-columns: 76px minmax(0, 1fr);
+  }
+}

@@ -9,7 +9,7 @@ import * as React from "react";
 import { useRouter } from "@tanstack/react-router";
 import "./harness.css";
 import "./mission.css";
-import { Link, useNavigate } from "@/lib/router";
+import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ArrowUpRight, Pin, ChevronDown, ChevronRight, ChevronUp, GitFork, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
@@ -40,7 +40,7 @@ import { BulkBar, Slide } from "./bulk";
 import { DEFAULT_VIEW, intervention, isFiltered, ListBar, sortOf, useGlide, useListHold, useShownList, type ListView } from "./list-tools";
 import { SaidInConversations } from "./said";
 import { byStart, FoundSessions, sessionKey } from "./found";
-import { Ago, machineName, machineShown } from "./parts";
+import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
 import { activityAt, missionAgents, missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
@@ -58,8 +58,9 @@ import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
-import { Definitions } from "./definitions";
+import { DefGroups, GroupHead, ownDefOf, SandboxLine } from "./definitions";
 import { agentdefsRes } from "@/api/agentdefs";
+import { sandboxesRes } from "@/api/microvms";
 import { KindGlyph } from "./kind-glyph";
 import { NODE_WORD, subagentTree, treePaths, type SubagentNode, type SubagentRow } from "./subagent-tree";
 import { PauseButton } from "./subagent-pause";
@@ -224,6 +225,7 @@ const Row = React.memo(function Row({
   onSelect,
   tree,
   onTree,
+  manages,
   updated,
   mark,
   reason,
@@ -247,9 +249,11 @@ const Row = React.memo(function Row({
   selected: boolean;
   picking?: boolean;
   onSelect: (id: string, on: boolean) => void;
-  /** Its subagents' tree is open under it (undefined: it has none). */
+  /** Its dropdown is open under it (undefined: it has none): its subagents' tree, and the agent it was started from when it's one of yours. */
   tree?: boolean;
   onTree?: (id: string) => void;
+  /** It was started from a definition of yours: its dropdown manages that agent too. */
+  manages?: boolean;
   /** It came back since you last looked: opening it, or Clear Updated from its menu, takes that off. */
   updated?: boolean;
   /** Where it's kept for you, as the server has it. */
@@ -406,15 +410,12 @@ const Row = React.memo(function Row({
         </button>
       )}
       <span className="ms-meta">
-        <span>
-          {machineShown(a.target)}{" "}
-          {activityAt(a) > 0 && (
-            <>
-              · <Ago className="ms-time" ts={Math.floor(activityAt(a) / 1000)} />
-            </>
-          )}
+        {/* Where it runs: its engine, its runner, how it started; then when it was last at work, and its harness. */}
+        <span className="ms-where">
+          <SandboxLine id={a.id} target={a.target} />
         </span>
         <span className="ms-meta-2">
+          {activityAt(a) > 0 && <Ago className="ms-time" ts={Math.floor(activityAt(a) / 1000)} />}
           {kind && <span className="ms-kind">{a.kind_name}</span>}
           {(a.files_changed ?? 0) > 0 && (
             <span className="ms-changes">
@@ -469,7 +470,7 @@ const Row = React.memo(function Row({
               type="button"
               className="ms-subs"
               aria-expanded={tree}
-              aria-label={tree ? `Hide ${label}'s subagents` : `Show ${label}'s subagents`}
+              aria-label={`${tree ? "Hide" : "Show"} ${label}'s ${manages ? "subagents and agent" : "subagents"}`}
               data-on={tree || undefined}
               onClick={() => onTree?.(a.id)}
             >
@@ -525,17 +526,36 @@ const Row = React.memo(function Row({
  * row's own columns: the path where the checkbox is, its name and what it's at, its machine and
  * time, what to answer and its way in. `rowAsk`: the request the row itself answers, not again here.
  */
-function MissionTree({ id, list, rowAsk }: { id: string; list: readonly AgentInfo[]; rowAsk?: string }) {
+function MissionTree({ id, list, rowAsk, grouped }: { id: string; list: readonly AgentInfo[]; rowAsk?: string; grouped?: boolean }) {
   const root = list.find((x) => x.id === id);
   const { going, remove } = useRemoving();
   const rows = React.useMemo(() => (root ? drawn(subagentTree(root, list).filter((n) => !going.has(n.key))) : []), [root, list, going]);
+  // Beside the agent's own groups (definitions.tsx), its subagents are the first group: open, its head one line.
+  const [shut, setShut] = React.useState(false);
   if (!root || rows.length === 0) return null;
+  const atWork = rows.filter((r) => r.stand === "working" || r.stand === "needs").length;
   return (
     <li className="ms-tree" data-glide={`${id}:tree`}>
       <ul className="ms-tree-rows" aria-label={`${agentLabel(root)}'s subagents`}>
-        {rows.map((r) => (
-          <MissionNode key={r.key} r={r} owner={list.find((x) => x.id === r.session)} rowAsk={rowAsk} onRemove={(el) => remove([r], [el])} />
-        ))}
+        {grouped && (
+          <GroupHead
+            label="Subagents"
+            open={!shut}
+            onOpen={() => setShut(!shut)}
+            stand={atWork ? "working" : "done"}
+            summary={
+              <>
+                <span className="df-stands" aria-hidden="true">
+                  {rows.map((r) => (
+                    <i key={r.key} data-stand={r.stand} />
+                  ))}
+                </span>
+                {rows.length} · {atWork} at work
+              </>
+            }
+          />
+        )}
+        {!shut && rows.map((r) => <MissionNode key={r.key} r={r} owner={list.find((x) => x.id === r.session)} rowAsk={rowAsk} onRemove={(el) => remove([r], [el])} />)}
       </ul>
     </li>
   );
@@ -701,6 +721,7 @@ export default function Mission() {
   ask(agentfileChoicesRes);
   ask(agentsRes);
   ask(agentdefsRes);
+  ask(sandboxesRes);
   ask(pushStateRes);
   ask(thisDeviceRes);
   ask(pushDevicesRes);
@@ -966,13 +987,16 @@ function anchorOf(ids: readonly string[]): Anchor | null {
 }
 
 function Agents() {
+  const defs = useRes(agentdefsRes).data;
   const [showParked, setShowParked] = React.useState(false);
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.view", DEFAULT_VIEW);
   const [q, setQ] = React.useState("");
   const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
   const [picking, setPicking] = React.useState(false);
-  const [trees, setTrees] = React.useState<ReadonlySet<string>>(() => new Set());
+  // `?open=ID,ID`: those rows' dropdowns open (a link to an agent's subagents, or the agent of yours it was started from).
+  const [params] = useSearchParams();
+  const [trees, setTrees] = React.useState<ReadonlySet<string>>(() => new Set((params.get("open") ?? "").split(",").filter(Boolean)));
   // The one line open under a row (Park until…, Archive…, a Restore that didn't go), and the Undo where a row was.
   const [asked, setAsked] = React.useState<{ id: string; ask: RowAsk } | null>(null);
   const [undo, setUndo] = React.useState<UndoState | null>(null);
@@ -1291,7 +1315,8 @@ function Agents() {
   const renderRow = (row: MissionRow, where: "live" | "parked" | "ended") => {
     const { a, stand, asking, updated, stale, urgency, correction } = row;
     const subs = (a.subagents?.length ?? 0) > 0;
-    const open = subs && trees.has(a.id);
+    const own = ownDefOf(defs, a.id);
+    const open = (subs || own !== null) && trees.has(a.id);
     const mark = snapshot.agents[a.id];
     const pinAt = stand === "archived" ? -1 : pins.indexOf(a.id);
     // What holds it where it is: when a park ends and why it was parked; otherwise why it came back, or
@@ -1327,10 +1352,12 @@ function Agents() {
           selected={selected.has(a.id)}
           picking={touchScreen && selecting}
           onSelect={select}
-          tree={subs ? open : undefined}
+          tree={subs || own ? open : undefined}
           onTree={toggleTree}
+          manages={own !== null}
         />
-        {open && <MissionTree id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} />}
+        {open && subs && <MissionTree id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} grouped={own !== null} />}
+        {open && own && <DefGroups d={own.d} list={answeredList} />}
       </React.Fragment>
     );
   };
@@ -1371,7 +1398,6 @@ function Agents() {
       )}
 
       {/* Read with the agents, under the page's own loading: the list's place is held, nothing moves as it comes. */}
-      <Definitions list={list} />
 
       {everyRow.length === 0 ? (
         <div className="ms-empty">

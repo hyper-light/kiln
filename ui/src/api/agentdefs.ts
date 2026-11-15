@@ -5,8 +5,11 @@ import { request } from "./client";
 /** A measure of one variant: a 95% interval of its median and the median, [low, mid, high]. */
 export type Interval = [number, number, number];
 
+/** A variant: a deployment new sessions start in. Its id is never shown: it reads as its swatch and its name. */
 export interface Variant {
-  key: string;
+  id: string;
+  /** The name a person gave it; none: what sets it apart from the others (definitions.tsx variantName). */
+  name: string | null;
   agentfile: string;
   engine: "microvm" | "host";
   cpus: number;
@@ -43,7 +46,9 @@ export interface AgentDef {
   mcp: number;
   skills: number;
   limit: string;
-  /** Sessions started from it: each a harness session's id, the version it started on and its variant. */
+  /** Where its sessions run and how fast they start: its engine, warm hosts kept of the target, start p50 by kind (ms). */
+  runs: { engine: "microvm" | "host"; warm: number; target: number; p50_ms: { warm?: number; template?: number; cold?: number } };
+  /** Sessions started from it: each a harness session's id, the version it started on and its variant's id. */
   sessions: { id: string; version: number; variant?: string }[];
   experiment?: Experiment;
   /** Its Agentfile's AGENT lines and it changed apart: shown, never settled for you. */

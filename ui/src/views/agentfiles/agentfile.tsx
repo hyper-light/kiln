@@ -7,7 +7,8 @@
  * link) says so.
  */
 import * as React from "react";
-import { agentfileRes, agentfilesApi, agentfileVersionsRes } from "@/api/agentfiles";
+import type { EditorView } from "@codemirror/view";
+import { agentfileBuildsRes, agentfileRes, agentfilesApi, agentfileVersionsRes, type AgentfileImage, type AgentfileSource } from "@/api/agentfiles";
 import type { Agentfile, AgentfileSaved } from "@/api/wire";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
@@ -19,8 +20,10 @@ import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate, useParams } from "@/lib/router";
+import { Builds, ImageCells, Sources, useImages } from "./builds";
 import { keptWords, restoredWords } from "./lint";
 import { named } from "./names";
+import { lineOf, writeSource, type SourceForm } from "./sources";
 import { AgentfileRead, AgentfileText } from "./text";
 import "./agentfiles.css";
 
@@ -45,7 +48,8 @@ function AgentfileHold() {
     <>
       <title>Agentfile · kiln</title>
       <AgentfileCrumbs />
-      <Hold height={420} label="Loading the Agentfile" />
+      {/* A screen tall at least: what's under the page (its footer) stays out of view until the Agentfile is in, so nothing in view moves as it lands. */}
+      <Hold height="max(420px, 100svh)" label="Loading the Agentfile" />
     </>
   );
 }
@@ -83,8 +87,13 @@ interface Base {
 
 const baseOf = (a: Agentfile): Base => ({ version: a.version, name: a.name, text: a.text });
 
+const NO_IMAGES: ReadonlyMap<number, AgentfileImage> = new Map();
+
 function AgentfileEditor({ id }: { id: string }) {
   const res = useRes(agentfileRes(id));
+  // Its builds and sources come with it, under the page's one loader: nothing below them moves as they land.
+  useRes(agentfileBuildsRes(id));
+  const images = useImages(id);
   const kept = res.data;
   const [base, setBase] = React.useState<Base | null>(() => (kept === "gone" ? null : baseOf(kept)));
   const [name, setName] = React.useState(base?.name ?? "");
@@ -99,6 +108,26 @@ function AgentfileEditor({ id }: { id: string }) {
     setOpened((n) => n + 1);
   };
   const dirty = base !== null && (name !== base.name || text !== base.text);
+  // The editor's view: a source's line opened, or written again by the source picker, from its row.
+  const view = React.useRef<EditorView | null>(null);
+  const textNow = () => view.current?.state.doc.toString() ?? text;
+  const jump = (s: AgentfileSource) => {
+    const v = view.current;
+    if (!v) return;
+    const line = v.state.doc.line(Math.min(v.state.doc.lines, Math.max(1, lineOf(v.state.doc.toString(), s))));
+    v.dispatch({ selection: { anchor: line.from, head: line.to }, scrollIntoView: true });
+    v.focus();
+  };
+  const write = (s: AgentfileSource, f: SourceForm): boolean => {
+    const v = view.current;
+    if (!v) return false;
+    const line = v.state.doc.line(Math.min(v.state.doc.lines, Math.max(1, lineOf(v.state.doc.toString(), s))));
+    const next = writeSource(line.text, f);
+    if (next === null) return false;
+    v.dispatch({ changes: { from: line.from, to: line.to, insert: next }, selection: { anchor: line.from, head: line.from + next.length }, scrollIntoView: true });
+    v.focus();
+    return true;
+  };
   // A newer version kept elsewhere comes in, unless there are unsaved changes here.
   if (kept !== "gone" && base && (kept.version !== base.version || kept.name !== base.name) && !dirty) take(kept);
 
@@ -127,6 +156,10 @@ function AgentfileEditor({ id }: { id: string }) {
       <p className="af-dim">
         v{kept.version} · changed {relativeTime(kept.updated_at)}
       </p>
+      <Loadable label="its builds" fallback={<RowsHold rows={5} rowHeight={36} label="Loading its builds" />}>
+        <Builds id={id} />
+        <Sources id={id} text={textNow} onJump={jump} onWrite={write} />
+      </Loadable>
       <TextField
         label="Its name"
         className="af-name-field"
@@ -135,7 +168,7 @@ function AgentfileEditor({ id }: { id: string }) {
         hint="An image's: lowercase letters and digits, with ., _ or - between them. A new name alone is no new version."
       />
       {name && !named(name) && <p className="af-error">An Agentfile&rsquo;s name is lowercase letters and digits, with ., _ or - between them.</p>}
-      <AgentfileText value={text} opened={opened} onChange={setText} label={`${kept.name}'s Agentfile`} />
+      <AgentfileText value={text} opened={opened} onChange={setText} label={`${kept.name}'s Agentfile`} onView={(v) => (view.current = v)} />
       <div className="af-actions">
         <Button size="sm" disabled={!dirty || !named(name) || !text.trim()} pending={saving} onClick={save}>
           {saving ? "Saving…" : "Save"}
@@ -155,6 +188,7 @@ function AgentfileEditor({ id }: { id: string }) {
         <Versions
           a={kept}
           dirty={dirty}
+          images={images}
           onRestored={(saved, version) => {
             res.setData(() => saved.agentfile);
             take(saved.agentfile);
@@ -168,8 +202,20 @@ function AgentfileEditor({ id }: { id: string }) {
   );
 }
 
-/** Every version, newest first; any read in place, and any but the current made current again. */
-export function Versions({ a, dirty, onRestored, onFailed }: { a: Agentfile; dirty: boolean; onRestored: (saved: AgentfileSaved, version: number) => void; onFailed: (e: unknown) => void }) {
+/** Every version, newest first, each beside its image (`images`, by version, where built); any read in place, and any but the current made current again. */
+export function Versions({
+  a,
+  dirty,
+  images = NO_IMAGES,
+  onRestored,
+  onFailed,
+}: {
+  a: Agentfile;
+  dirty: boolean;
+  images?: ReadonlyMap<number, AgentfileImage>;
+  onRestored: (saved: AgentfileSaved, version: number) => void;
+  onFailed: (e: unknown) => void;
+}) {
   const versions = useRes(agentfileVersionsRes(a.id));
   const [open, setOpen] = React.useState<number | null>(null);
   // Each Make current says it's on its way until kiln has made it so (W21-R15).
@@ -186,9 +232,10 @@ export function Versions({ a, dirty, onRestored, onFailed }: { a: Agentfile; dir
       <ul className="af-rows">
         {versions.data.map((v) => (
           <li key={v.version}>
-            <div className="af-row">
-              <span className="af-name">v{v.version}</span>
-              <span className="af-dim">
+            <div className="af-row afv-row" data-current={v.version === a.version || undefined}>
+              <span className="af-name afv-v">v{v.version}</span>
+              <ImageCells i={images.get(v.version)} />
+              <span className="af-dim afv-when">
                 {relativeTime(v.at)} · {v.by}
                 {v.version === a.version ? " · current" : ""}
               </span>

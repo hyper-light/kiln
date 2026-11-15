@@ -1,4 +1,3 @@
-/* A definition's values (definitions.tsx DefFields), in Mission's rows and the agent's Tools tab alike. */
 /* A definition's values (definitions.tsx DefNode): each one pressed becomes its control, in place. */
 .ms-fields {
   display: flex;
@@ -79,7 +78,7 @@
   }
 }
 
-/* In the agent's Tools tab (definition-panel.tsx): what it was started from. */
+/* In the agent's Agents tab (definition-panel.tsx): what it was started from. */
 .df-panel {
   display: grid;
   gap: 10px;
@@ -100,17 +99,6 @@
 }
 .df-old {
   color: #e2cfae;
-}
-.df-key {
-  display: inline-grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
-  color: #0b0c0e;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  font-weight: 600;
 }
 .df-panel .meter {
   width: 64px;
@@ -158,9 +146,181 @@
 .df-crumb:hover {
   color: #ededee;
 }
-.df-crumb .df-key {
-  width: 15px;
-  height: 15px;
-  font-size: 9.5px;
-  letter-spacing: 0;
+.df-crumb 
+/* A variant: its swatch, a short bar the colour of its slice of the split (never a letter: kiln's
+   research grades are lettered squares), and its name. The current one is ringed. */
+.df-swatch {
+  display: inline-block;
+  flex: none;
+  width: 14px;
+  height: 6px;
+  border-radius: 3px;
+}
+.df-swatch[data-current] {
+  box-shadow:
+    0 0 0 2px #0a0b0d,
+    0 0 0 3px #ededee;
+}
+.df-swatch-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 20px;
+}
+.df-variant {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.df-vname {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+}
+.df-vname > svg {
+  flex: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.df-vname:hover > svg,
+.df-vname:focus-visible > svg {
+  opacity: 1;
+}
+.df-version[data-behind] {
+  color: #e2cfae;
+}
+/* The dropdown's groups (definitions.tsx DefGroups): one line each until opened, its label in Mission's
+   mono, its summary beside it; opened, its rows at the tree's indentation. */
+.df-chev {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 20px;
+  color: #7b7e88;
+}
+.df-chev > svg {
+  transition: transform 0.15s;
+}
+.df-group-main {
+  justify-content: center;
+}
+.df-group-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  height: 20px;
+}
+.df-group-k {
+  flex: none;
+  width: 84px;
+}
+.df-group[data-open] .df-group-k {
+  color: #ededee;
+}
+.df-group-sum {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  color: #97999f;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.df-strong {
+  color: #ededee;
+}
+.df-weights {
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+/* Its sessions' stands, a dot each, in the tree's own stand colours. */
+.df-stands {
+  display: inline-flex;
+  gap: 3px;
+}
+.df-stands > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7e818a;
+}
+.df-stands > i[data-stand="working"] {
+  background: #bab0e3;
+}
+.df-stands > i[data-stand="needs"] {
+  background: #d8bb95;
+}
+.df-stands > i[data-stand="paused"] {
+  background: #a6b2c6;
+}
+.df-stands > i[data-stand="failed"] {
+  background: #d1aaad;
+}
+/* Where it runs and how fast it starts; a session's sandbox in short. */
+.df-runs,
+.df-sandbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+.df-runner {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A session row's CPU and memory now: two compact bars side by side, no plots. */
+.df-bars {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  width: 100%;
+}
+.df-bars .hx-limit-top {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+/* What a narrow window shows in place of the meta column it hides. */
+.df-narrow {
+  display: none;
+}
+@container (max-width: 520px) {
+  .df-narrow {
+    display: flex;
+  }
+}
+/* A narrow line keeps where it runs and its fastest start; its warm hosts and other starts are in its values, opened. */
+@container (max-width: 520px) {
+  .df-group-sum .df-runs .sm-warm,
+  .df-group-sum .df-runs .sm-start:not([data-first]) {
+    display: none;
+  }
+}
+/* A definition as a row of its own (the Agents tab, chat): the chevron in the checkbox's place. */
+.df-row .df-chev {
+  height: auto;
+}
+@media (prefers-reduced-motion: reduce) {
+  .df-chev > svg,
+  .df-vname > svg {
+    transition: none;
+  }
+}
+/* The Agents tab (agents-tab.tsx): Mission's rows in the inspector's width, so its narrow layout holds there. */
+.at {
+  container-type: inline-size;
+}
+/* A definition's own row (definitions.tsx DefRow), at the list's edge: its name in the row's own size. */
+.df-defrow .df-defname {
+  font-size: 14px;
+}
+.df-defrow + .ms-tree,
+.ms-tree + .df-defrow {
+  border-top: 1px solid #25272c;
 }

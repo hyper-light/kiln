@@ -1,11 +1,13 @@
 /**
- * Beside the conversation, three places: everything the agent changed as one reviewable changeset;
- * its plan, subagents and the commands it ran; and what it works with — MCP servers, skills, usage.
+ * Beside the conversation, five places: everything the agent changed as one reviewable changeset;
+ * its plan, subagents and the commands it ran; what it works with — MCP servers, skills, usage; its
+ * sandbox (its microVM, or the host it runs on) and what it may reach; and agents, managed from here.
  */
 import * as React from "react";
 import { harnessApi, useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type SessionStore, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { useRes } from "@/lib/data";
+import { sandboxesRes } from "@/api/microvms";
 import { agentLabel, changesetOf, editsOf, runsOf, useSameList } from "./derive";
 import { isBackground } from "./background";
 import { workingNow } from "./tasks";
@@ -34,6 +36,29 @@ function PlanTab(props: React.ComponentProps<Tabs["PlanTab"]>) {
 function ToolsTab(props: React.ComponentProps<Tabs["ToolsTab"]>) {
   const { ToolsTab: Content } = useRes(inspectorTabsRes).data;
   return <Content {...props} />;
+}
+
+function SandboxTab(props: React.ComponentProps<Tabs["SandboxTab"]>) {
+  const { SandboxTab: Content } = useRes(inspectorTabsRes).data;
+  return <Content {...props} />;
+}
+
+function AgentsTab(props: React.ComponentProps<Tabs["AgentsTab"]>) {
+  const { AgentsTab: Content } = useRes(inspectorTabsRes).data;
+  return <Content {...props} />;
+}
+
+/** Its sandbox tab's name: "Sandbox" for a session in a microVM, "Host" for one on the host, so the tab says where it runs. */
+function SandboxName({ agentId }: { agentId?: string }) {
+  const all = useRes(sandboxesRes).data;
+  return <>{agentId && all[agentId]?.engine === "host" ? "Host" : "Sandbox"}</>;
+}
+export function SandboxTabName({ agentId }: { agentId?: string }) {
+  return (
+    <React.Suspense fallback="Sandbox">
+      <SandboxName agentId={agentId} />
+    </React.Suspense>
+  );
 }
 
 /** Its harness's subagents (their runs' ids, what each was asked, its kind), the same list while they stay the same: what the Changes tab's By names. */
@@ -173,10 +198,16 @@ export function Inspector({
   const mcp = state?.mcp ?? [];
   // A plan waiting on your review: its tab says so, and it's first in it.
   const reviewing = useReviewWaits(store);
-  const tabs: { id: InspectorTab; label: string; count?: string; waits?: boolean }[] = [
+  const tabs: { id: InspectorTab; label: React.ReactNode; count?: string; waits?: boolean }[] = [
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
     { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools", count: subagents ? String(subagents) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
+    ...(agentId
+      ? [
+          { id: "sandbox" as const, label: <SandboxTabName agentId={agentId} /> },
+          { id: "agents" as const, label: "Agents" },
+        ]
+      : []),
   ];
   return (
     <BodiesContext.Provider value={store}>
@@ -212,6 +243,16 @@ export function Inspector({
           {tab === "tools" && (
             <Loadable label="Loading its tools" fallback={<Hold label="Loading its tools" />}>
               <ToolsTab agentId={agentId} send={send} state={state} subagents={subagents} meta={meta} store={store} onOpenTask={onOpenTask} kiln={kiln} runs={runs} />
+            </Loadable>
+          )}
+          {tab === "sandbox" && agentId && (
+            <Loadable label="Loading its sandbox" fallback={<Hold label="Loading its sandbox" />}>
+              <SandboxTab agentId={agentId} />
+            </Loadable>
+          )}
+          {tab === "agents" && agentId && (
+            <Loadable label="Loading its agents" fallback={<Hold label="Loading its agents" />}>
+              <AgentsTab agentId={agentId} />
             </Loadable>
           )}
         </div>

@@ -1,7 +1,8 @@
 /**
- * The inspector's Plan and Tools tabs (inspector.tsx), in a chunk of their own: neither is in a
- * conversation's first view (Changes is), so their code (plans, research, goals, background tasks,
- * tools, usage) comes once a tab is opened or pointed at (goal 8, plan 01a1a832ebfd step 6).
+ * The inspector's Plan, Tools, Sandbox and Agents tabs (inspector.tsx), in a chunk of their own: none
+ * is in a conversation's first view (Changes is), so their code (plans, research, goals, background
+ * tasks, tools, usage, its sandbox, agents) comes once a tab is opened or pointed at (goal 8, plan
+ * 01a1a832ebfd step 6).
  */
 import * as React from "react";
 import { Bot, Square } from "lucide-react";
@@ -24,10 +25,12 @@ import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
 import { Fold, FoldOpen } from "./fold";
-import { DefinitionPanel } from "./definition-panel";
 import { Whole } from "./whole";
 import { SubagentOutput } from "./task-output";
 import type { useReviewWaits } from "@/views/plans/review";
+
+export { SandboxTab } from "./sandbox";
+export { AgentsTab } from "./agents-tab";
 
 const NO_AGENTS: readonly AgentInfo[] = [];
 
@@ -322,11 +325,6 @@ export function ToolsTab({
     <div className="in-secs">
       {/* What it has going: shells and monitors it left running, subagents; what it works with; then
             every command it ran, last, since that list only grows. */}
-      {agentId && (
-        <Loadable label="Loading its definition" fallback={null}>
-          <DefinitionPanel agentId={agentId} />
-        </Loadable>
-      )}
       {agentId && send && <Background state={state} agent={agentId} send={send} />}
       {agentId && (
         <Fold id="live-pages" title="Live pages">

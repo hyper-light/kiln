@@ -357,7 +357,8 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .pt > button {
   position: relative;
   display: inline-flex;
-  flex: 1 1 0;
+  /* Each keeps its words: more tabs than fit scroll the rail (above), never squeeze. */
+  flex: 1 0 auto;
   align-items: center;
   justify-content: center;
   gap: 6px;

@@ -1,160 +1,292 @@
 /**
- * Mission control's definitions (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P5.2, P7.2): each agent as
- * you define it is a row in Mission's own style (its sessions' stand, its harness and model, Run),
- * and opens in place, as an agent's subagents do, to the sessions started from it and to the live
- * experiment splitting its new sessions between microVM deployments. kiln's own are in the same
- * list, read only.
+ * Agents you manage (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P5.2, P7.2), inside the dropdown
+ * that opens under an agent's row (Mission control's ⫷, the Agents tab, chat), each kind of thing a
+ * small labelled group in a fixed order, one line until opened:
+ *
+ *   SUBAGENTS   the agent's own tree (mission.tsx, unchanged)
+ *   DEFINITION  its version and values, edited in place; where it runs and how fast it starts
+ *   SESSIONS    how many, who's at work; each session its sandbox, CPU and memory, its controls
+ *   EXPERIMENT  the split between deployments, each variant a swatch and a name, Promote
+ *
+ * A variant is never a letter (kiln's research grades are): it's its prism swatch, the colour of its
+ * slice of the split, and a name, by default what sets it apart from the others ("4 vCPU · 8 GiB").
  */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { Check, ChevronDown, ChevronUp, ArrowUpRight, Lock, MoreHorizontal, Pause, Pencil, Play, Repeat2, RotateCw, Square, X } from "lucide-react";
+import { ArrowUpRight, Check, ChevronRight, Lock, MoreHorizontal, Pause, Pencil, Play, Repeat2, RotateCw, Square, X } from "lucide-react";
 import { useAgentList } from "./use-agents";
 import "./mission.css";
 import { harnessApi } from "@/api/harness";
 import { errorMessage } from "@/lib/hooks";
 import { agentdefsRes, type AgentDef, type Experiment, type Variant } from "@/api/agentdefs";
+import { rebalance, variantName, variantTone } from "./variants";
+import { sandboxesRes, type SandboxBrief } from "@/api/microvms";
 import type { AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { labelOf, useRes } from "@/lib/data";
 import { useNavigate } from "@/lib/router";
+import { EngineGlyph, START, StartMark, WarmDots, msText } from "@/views/sandbox-marks";
 import { chatStand, type ChatStand } from "./chat-state";
 import { agentLabel, modelLabel } from "./derive";
-import { KindGlyph } from "./kind-glyph";
+import { LimitMeter } from "./limits";
 import { Shimmer } from "./signals";
 import "./definition.css";
 
+/* ------------------------------------------------ variants: a swatch and a name */
 
-/** A variant's colour: its place along kiln's prism (index.css --prism), so any number of variants reads apart, in kiln's own colours. */
-const PRISM: [number, number, number][] = [[0xb8, 0xd9, 0xd2], [0xa6, 0xc4, 0xed], [0xb8, 0xa6, 0xd5], [0xd6, 0xa2, 0xaa], [0xd8, 0xcb, 0xb0]];
-export function variantTone(i: number, n: number): string {
-  const t = n <= 1 ? 0 : (i / (n - 1)) * (PRISM.length - 1);
-  const k = Math.min(PRISM.length - 2, Math.floor(t));
-  const f = t - k;
-  const a = PRISM[k]!, b = PRISM[k + 1]!;
-  return `rgb(${a.map((x, j) => Math.round(x + (b[j]! - x) * f)).join(" ")})`;
-}
-/** A variant's letter: A, B, … Z, then AA, AB …: as many as the experiment has. */
-export const variantKey = (i: number): string => (i < 26 ? String.fromCharCode(65 + i) : variantKey(Math.floor(i / 26) - 1) + String.fromCharCode(65 + (i % 26)));
-
-const WORD: Record<ChatStand, string> = { needs: "Needs you", crashed: "Stopped", paused: "Paused", working: "Working", finished: "Finished", ready: "Ready", offline: "Offline", ended: "Ended" };
-/** A session's stand as the tree's nodes draw it (mission.css .ms-node[data-stand]). */
-const NODE: Record<ChatStand, string> = { needs: "needs", crashed: "failed", paused: "paused", working: "working", finished: "done", ready: "done", offline: "offline", ended: "stopped" };
-const NODE_WORD: Record<string, string> = { needs: "Needs you", failed: "Stopped", paused: "Paused", working: "Working", done: "Done", offline: "Offline", stopped: "Ended" };
-/** The stand a definition's row shows: its sessions', the one that most needs you first. */
-const ORDER: ChatStand[] = ["needs", "crashed", "working", "paused", "finished", "ready", "offline", "ended"];
-
-export function Definitions({ list }: { list: readonly AgentInfo[] }) {
-  const defs = useRes(agentdefsRes).data;
-  const [show, setShow] = React.useState<"yours" | "kiln">("yours");
-  const [open, setOpen] = React.useState<string | null>("reviewer");
-  const shown = defs.filter((d) => (show === "yours" ? d.own : !d.own));
+/** A variant's swatch: the colour of its slice of the split, a short bar as that slice is. */
+export function Swatch({ tone, title, current }: { tone: string; title?: string; current?: boolean }) {
   return (
-    <section className="ms-defs" aria-label="Definitions">
-      <div className="ms-listhead">
-        <span className="ms-all">
-          <span className="ms-defs-title">Definitions</span>
-          <span className="ms-swap">{shown.length}</span>
-        </span>
-        <Segmented
-          size="xs"
-          label="Whose"
-          value={show}
-          onChange={setShow}
-          options={[
-            { value: "yours", label: "Yours", count: defs.filter((d) => d.own).length },
-            { value: "kiln", label: "kiln's", count: defs.filter((d) => !d.own).length },
-          ]}
-        />
-      </div>
-      <ul className="ms-list" data-list="defs">
-        {shown.map((d) => (
-          <DefRow key={d.id} d={d} list={list} open={open === d.id} onOpen={() => setOpen(open === d.id ? null : d.id)} />
-        ))}
-      </ul>
-    </section>
+    <i
+      className="df-swatch"
+      style={{ background: tone }}
+      title={title}
+      data-current={current || undefined}
+      aria-hidden={title ? undefined : true}
+      role={title ? "img" : undefined}
+      aria-label={title}
+    />
   );
 }
 
-function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly AgentInfo[]; open: boolean; onOpen: () => void }) {
+/** The variant a session started in, as its swatch and name; none outside an experiment. */
+export function sessionVariant(d: AgentDef | undefined, id: string): { tone: string; name: string } | null {
+  const s = d?.sessions.find((x) => x.id === id);
+  const vs = d?.experiment?.variants ?? [];
+  const i = s?.variant ? vs.findIndex((v) => v.id === s.variant) : -1;
+  return i < 0 ? null : { tone: variantTone(i, vs.length), name: variantName(vs, i) };
+}
+
+/** The definition of yours a session started from, and the version it started on. */
+export function ownDefOf(defs: readonly AgentDef[], id: string): { d: AgentDef; version: number } | null {
+  for (const d of defs) {
+    if (!d.own) continue;
+    const s = d.sessions.find((x) => x.id === id);
+    if (s) return { d, version: s.version };
+  }
+  return null;
+}
+
+/* ------------------------------------------------ where it runs, how fast it starts */
+
+/** Where a definition's sessions run and how fast they start: its engine, warm hosts of the target, start p50 by kind. */
+export function RunsMarks({ d }: { d: AgentDef }) {
+  const r = d.runs;
+  return (
+    <span className="df-runs">
+      <EngineGlyph engine={r.engine} />
+      {r.target > 0 && <WarmDots n={r.warm} of={r.target} />}
+      {(["warm", "template", "cold"] as const).map((k) => {
+        const ms = r.p50_ms[k];
+        if (ms === undefined) return null;
+        const S = START[k];
+        const first = (["warm", "template", "cold"] as const).find((x) => r.p50_ms[x] !== undefined) === k;
+        return (
+          <span key={k} className="sm-start" data-kind={k} data-first={first || undefined} title={`${S.word}: p50 ${msText(ms)}`}>
+            <S.icon size={12} aria-hidden="true" />
+            {msText(ms)}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+/** A session's sandbox in short: its engine, its runner, how it started. */
+export function SandboxLine({ id, target }: { id: string; target: string }) {
+  return (
+    <React.Suspense fallback={<span>{labelOf(target.replace(/^agent:/, ""))}</span>}>
+      <SandboxLineRead id={id} target={target} />
+    </React.Suspense>
+  );
+}
+function SandboxLineRead({ id, target }: { id: string; target: string }) {
+  const b: SandboxBrief | undefined = useRes(sandboxesRes).data[id];
+  if (!b) return <span>{labelOf(target.replace(/^agent:/, ""))}</span>;
+  return (
+    <span className="df-sandbox">
+      <EngineGlyph engine={b.engine} />
+      <span className="df-runner">{labelOf(b.runner)}</span>
+      {b.start && <StartMark kind={b.start.kind} ms={b.start.ms} />}
+    </span>
+  );
+}
+
+/* ------------------------------------------------ the groups */
+
+/** A session's stand as the tree's nodes draw it (mission.css .ms-node[data-stand]). */
+const NODE: Record<ChatStand, string> = { needs: "needs", crashed: "failed", paused: "paused", working: "working", finished: "done", ready: "done", offline: "offline", ended: "stopped" };
+const NODE_WORD: Record<string, string> = { needs: "Needs you", failed: "Stopped", paused: "Paused", working: "Working", done: "Done", offline: "Offline", stopped: "Ended" };
+
+type Group = "definition" | "sessions" | "experiment";
+
+/**
+ * A definition's groups under its row: DEFINITION, SESSIONS and EXPERIMENT in that order, each one
+ * line until opened, in the tree's own columns (its rows at the tree's indentation).
+ */
+/** `inRow`: under the definition's own row (the Agents tab, chat), which says where it runs and has Run already. */
+export function DefGroups({ d, list, first, inRow }: { d: AgentDef; list: readonly AgentInfo[]; first?: Group; inRow?: boolean }) {
+  const [open, setOpen] = React.useState<ReadonlySet<Group>>(() => new Set(first ? [first] : []));
   const [setup, setSetup] = React.useState(false);
+  const toggle = (g: Group) =>
+    setOpen((s) => {
+      const n = new Set(s);
+      if (!n.delete(g)) n.add(g);
+      return n;
+    });
   const sessions = d.sessions.map((s) => ({ ...s, a: list.find((x) => x.id === s.id) })).filter((s): s is typeof s & { a: AgentInfo } => s.a !== undefined);
-  const stands = sessions.map((s) => chatStand(s.a));
-  const stand = ORDER.find((o) => stands.includes(o)) ?? "ready";
-  const at = stands.filter((s) => s === "working" || s === "needs").length;
-  const line = [sessions.length ? `${sessions.length} session${sessions.length === 1 ? "" : "s"}${at ? `, ${at} at work` : ""}` : "No sessions", d.experiment && `split ${d.experiment.variants.map((v) => v.weight).join("/")}`, d.conflict && `${d.conflict.from} differs`]
-    .filter(Boolean)
-    .join(" · ");
-  const canOpen = d.own || sessions.length > 0 || d.experiment !== undefined;
+  return (
+    <li className="ms-tree df-groups">
+      <ul className="ms-tree-rows" aria-label={`${d.name}: definition, sessions, experiment`}>
+        <DefinitionGroup
+          d={d}
+          inRow={inRow}
+          open={open.has("definition")}
+          onOpen={() => toggle("definition")}
+          onSetup={() => {
+            setSetup(true);
+            setOpen((s) => new Set([...s, "experiment"]));
+          }}
+        />
+        <SessionsGroup d={d} sessions={sessions} open={open.has("sessions")} onOpen={() => toggle("sessions")} />
+        {(d.experiment || setup) && <ExperimentGroup d={d} open={open.has("experiment")} onOpen={() => toggle("experiment")} setup={setup} onSetupDone={() => setSetup(false)} />}
+      </ul>
+    </li>
+  );
+}
+
+/** A group's line: its label in Mission's mono, its one-line summary, what belongs at its end. */
+export function GroupHead({
+  label,
+  open,
+  onOpen,
+  summary,
+  meta,
+  actions,
+  stand = "done",
+}: {
+  label: string;
+  open: boolean;
+  onOpen: () => void;
+  summary: React.ReactNode;
+  meta?: React.ReactNode;
+  actions?: React.ReactNode;
+  stand?: string;
+}) {
+  return (
+    <li className="ms-node df-group" data-stand={stand} data-depth={1} data-open={open || undefined}>
+      <span className="ms-node-path df-chev">
+        <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
+      </span>
+      <button type="button" className="ms-node-main df-group-main" aria-expanded={open} onClick={onOpen}>
+        <span className="df-group-line">
+          <span className="ms-sep-h df-group-k">{label}</span>
+          <span className="df-group-sum">{summary}</span>
+        </span>
+      </button>
+      <span className="ms-node-meta">{meta}</span>
+      {/* Its controls stay together at its end, a phone's too (where a row's actions are laid out apart). */}
+      <span className="ms-node-actions">{actions && <span className="ms-tail">{actions}</span>}</span>
+    </li>
+  );
+}
+
+function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; open: boolean; onOpen: () => void; onSetup: () => void; inRow?: boolean }) {
   return (
     <>
-      <li className="ms-row" data-stand={sessions.length ? stand : "ready"} data-def={d.id}>
-        <span className="ms-check" aria-hidden="true" />
-        <button type="button" className="ms-main" onClick={onOpen} aria-expanded={canOpen ? open : undefined}>
-          <span className="ms-name">
-            <span>{d.name}</span>
-            {!d.own && <Lock size={12} className="ms-flag-pin" role="img" aria-label="kiln's: copy it to change it" />}
-            {(d.replaces || d.replaced_by) && <Repeat2 size={12} className="ms-flag-pin" role="img" aria-label={d.replaces ? `Stands in for kiln's ${d.replaces}` : `You use ${d.replaced_by}`} />}
-          </span>
-          <span className="ms-line">
-            <Shimmer on={stand === "working" && sessions.length > 0} flow={d.id} className="ms-word">
-              <i aria-hidden="true" />
-              {sessions.length ? WORD[stand] : `v${d.version}`}
-            </Shimmer>
+      <GroupHead
+        label="Definition"
+        open={open}
+        onOpen={onOpen}
+        summary={
+          <>
+            <span className="df-strong">{d.name}</span>
+            <span>v{d.version}</span>
             {d.conflict && <span className="ms-flag" data-flag="stale" title={`${d.conflict.field}: ${d.conflict.here} here, ${d.conflict.there} in ${d.conflict.from}`} />}
-            <span className="ms-text">{line}</span>
+            {!inRow && <RunsMarks d={d} />}
+            {inRow && d.model && <span>{modelLabel(d.model)}</span>}
+          </>
+        }
+        meta={!inRow && d.model ? <span>{modelLabel(d.model)}</span> : undefined}
+        actions={
+          inRow ? undefined : (
+            <>
+              <Button size="xs" variant="secondary" onClick={() => toast({ title: `Starting ${d.name}`, tone: "running" })}>
+                Run
+              </Button>
+              <DefMenu d={d} onSetup={onSetup} />
+            </>
+          )
+        }
+      />
+      {open && (
+        <li className="ms-node ms-defnode" data-stand="done" data-depth={2}>
+          <span className="ms-node-path" />
+          <span className="ms-node-main">
+            <span className="df-narrow">
+              <RunsMarks d={d} />
+            </span>
+            <DefFields d={d} />
           </span>
-        </button>
-        <span className="ms-meta">
-          <span>
-            {d.agentfile} · v{d.version}
+          <span className="ms-node-meta">
+            <span>
+              {d.agentfile} · {d.harness}
+            </span>
+            <span>
+              {d.tools} kiln · {d.mcp} MCP · {d.skills} skills
+            </span>
           </span>
-          <span className="ms-meta-2">
-            <span className="ms-kind">{d.harness}</span>
-            {d.model && <span>{modelLabel(d.model)}</span>}
-          </span>
-        </span>
-        <span className="ms-actions">
-          <span className="ms-decide">
-            <Button size="xs" variant="secondary" onClick={() => toast({ title: `Starting ${d.name}`, tone: "running" })}>
-              Run
-            </Button>
-          </span>
-          <span className="ms-tail">
-            {canOpen && (
-              <button type="button" className="ms-subs" aria-expanded={open} aria-label={open ? `Hide ${d.name}'s sessions` : `Show ${d.name}'s sessions`} data-on={open || undefined} onClick={onOpen}>
-                <KindGlyph kind="agent" live={at > 0} />
-                {open ? <ChevronUp size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
-              </button>
-            )}
-            <DefMenu d={d} onSetup={() => { setSetup(true); if (!open) onOpen(); }} />
-          </span>
-        </span>
-      </li>
-      {open && canOpen && (
-        <li className="ms-tree">
-          <ul className="ms-tree-rows" aria-label={`${d.name}'s sessions`}>
-            {d.own && <DefNode d={d} />}
-            {sessions.map((s) => (
-              <SessionNode key={s.id} a={s.a} version={s.version} current={d.version} variant={s.variant} />
-            ))}
-            {d.experiment && <ExperimentNodes e={d.experiment} />}
-            {setup && <SetupNodes d={d} onDone={() => setSetup(false)} />}
-          </ul>
+          <span className="ms-node-actions" />
         </li>
       )}
     </>
   );
 }
 
-/** A session started from a definition, in the tree's own columns: the version it started on and its variant beside its stand. */
-function SessionNode({ a, version, current, variant }: { a: AgentInfo; version: number; current: number; variant?: string }) {
+/** Its sessions: how many, and who's at work, a dot each in its stand's colour; opened, a plain row each. */
+function SessionsGroup({ d, sessions, open, onOpen }: { d: AgentDef; sessions: { id: string; version: number; a: AgentInfo }[]; open: boolean; onOpen: () => void }) {
+  const stands = sessions.map((s) => NODE[chatStand(s.a)]);
+  const atWork = stands.filter((s) => s === "working" || s === "needs").length;
+  return (
+    <>
+      <GroupHead
+        label="Sessions"
+        open={open}
+        onOpen={onOpen}
+        stand={atWork ? "working" : "done"}
+        summary={
+          sessions.length ? (
+            <>
+              <span className="df-stands" aria-hidden="true">
+                {stands.map((s, i) => (
+                  <i key={i} data-stand={s} />
+                ))}
+              </span>
+              {sessions.length} · {atWork} at work
+            </>
+          ) : (
+            "none yet"
+          )
+        }
+      />
+      {open &&
+        sessions.map((s) => {
+          const v = sessionVariant(d, s.id);
+          return <SessionNode key={s.id} a={s.a} version={s.version} current={d.version} variant={v} />;
+        })}
+    </>
+  );
+}
+
+/** A session started from a definition, a plain row at the tree's indentation: its stand, version and variant; its sandbox; CPU and memory; its controls. */
+function SessionNode({ a, version, current, variant }: { a: AgentInfo; version: number; current: number; variant: { tone: string; name: string } | null }) {
   const navigate = useNavigate();
   const stand = NODE[chatStand(a)];
   const to = `/agents/${a.id}`;
   return (
-    <li className="ms-node" data-stand={stand} data-depth={1}>
+    <li className="ms-node df-session" data-stand={stand} data-depth={2}>
       <span className="ms-node-path" />
       <button type="button" className="ms-node-main" onClick={() => navigate(to)}>
         <span className="ms-node-name">{agentLabel(a)}</span>
@@ -163,15 +295,28 @@ function SessionNode({ a, version, current, variant }: { a: AgentInfo; version: 
             <i aria-hidden="true" />
             {NODE_WORD[stand]}
           </Shimmer>
-          <span className="ms-node-text" title={version === current ? "Current version" : `Started on v${version}; new sessions get v${current}`}>
+          <span
+            className="ms-node-text df-version"
+            title={version === current ? "The current version" : `Started on v${version}; new sessions get v${current}`}
+            data-behind={version < current || undefined}
+          >
             v{version}
-            {variant ? ` · variant ${variant}` : ""}
           </span>
+          {variant && (
+            <span className="df-variant">
+              <Swatch tone={variant.tone} />
+              <span className="ms-node-text">{variant.name}</span>
+            </span>
+          )}
+        </span>
+        {/* A phone has no meta column: its sandbox goes under its words. */}
+        <span className="df-narrow ms-node-text">
+          <SandboxLine id={a.id} target={a.target} />
         </span>
       </button>
       <span className="ms-node-meta">
-        <span>{labelOf(a.target.replace(/^agent:/, ""))}</span>
-        <span>{a.kind_name}</span>
+        <SandboxLine id={a.id} target={a.target} />
+        <SessionBars id={a.id} />
       </span>
       <span className="ms-node-actions">
         <span className="ms-decide">
@@ -187,57 +332,92 @@ function SessionNode({ a, version, current, variant }: { a: AgentInfo; version: 
   );
 }
 
-/** A live experiment under its agent: the split (dragging a weight stages a new one, drawn hatched, live only once applied), then each variant. */
-function ExperimentNodes({ e: given }: { e: Experiment }) {
-  const [e, setE] = React.useState(given);
+/** A session's CPU and memory now, as compact bars (a list row's: no plots). */
+function SessionBars({ id }: { id: string }) {
+  return (
+    <React.Suspense fallback={null}>
+      <SessionBarsRead id={id} />
+    </React.Suspense>
+  );
+}
+function SessionBarsRead({ id }: { id: string }) {
+  const b = useRes(sandboxesRes).data[id];
+  if (!b || b.state === "ended") return null;
+  return (
+    <span className="df-bars">
+      <LimitMeter compact live limit={{ id: "cpu", label: "CPU", used_percent: b.cpu_pct }} />
+      <LimitMeter compact live limit={{ id: "memory", label: "Mem", used_percent: (b.memory.used / b.memory.total) * 100 }} />
+    </span>
+  );
+}
+
+/** Its experiment: one line of its split's swatches until opened, then each variant, Promote on all but the current. */
+function ExperimentGroup({ d, open, onOpen, setup, onSetupDone }: { d: AgentDef; open: boolean; onOpen: () => void; setup: boolean; onSetupDone: () => void }) {
+  const [e, setE] = React.useState<Experiment | undefined>(d.experiment);
   const [staged, setStaged] = React.useState<number[] | null>(null);
   const [asking, setAsking] = React.useState<string | null>(null);
-  const weights = staged ?? e.variants.map((v) => v.weight);
-  const stage = (i: number, w: number) => setStaged(rebalance(weights, i, w));
+  const [names, setNames] = React.useState<Record<string, string>>({});
+  if (!e)
+    return setup ? (
+      <SetupNodes
+        d={d}
+        onDone={onSetupDone}
+        onStart={(next) => {
+          setE(next);
+          onSetupDone();
+        }}
+      />
+    ) : null;
+  const vs = e.variants.map((v) => ({ ...v, name: names[v.id] ?? v.name }));
+  const weights = staged ?? vs.map((v) => v.weight);
+  const live = e.state === "live";
   const apply = () => {
     const before = e;
     const next = { ...e, version: e.version + 1, variants: e.variants.map((v, i) => ({ ...v, weight: weights[i] ?? v.weight })) };
     setE(next);
     setStaged(null);
-    toast({ title: `Split v${next.version}: ${next.variants.map((v) => v.weight).join("/")}`, description: "New sessions take it; running ones keep their variant", tone: "info", action: { label: "Undo", run: () => setE(before) } });
+    toast({ title: `Split v${next.version}: ${next.variants.map((v) => v.weight).join("/")}`, tone: "info", action: { label: "Undo", run: () => setE(before) } });
   };
   const pause = () => {
     const before = e;
-    setE({ ...e, state: e.state === "live" ? "paused" : "live" });
-    if (e.state === "live") toast({ title: `Paused ${e.id}`, description: "New sessions start on the current variant", tone: "info", action: { label: "Undo", run: () => setE(before) } });
+    setE({ ...e, state: live ? "paused" : "live" });
+    if (live) toast({ title: `Paused ${e.id}`, tone: "info", action: { label: "Undo", run: () => setE(before) } });
   };
-  const promote = (key: string) => {
+  const promote = (id: string) => {
     const before = e;
-    setE({ ...e, state: "promoted", variants: e.variants.map((v) => ({ ...v, current: v.key === key })) });
+    const name = variantName(
+      vs,
+      vs.findIndex((v) => v.id === id),
+    );
+    setE({ ...e, state: "promoted", variants: e.variants.map((v) => ({ ...v, current: v.id === id })) });
     setAsking(null);
-    toast({ title: `Promoted ${key}`, description: "New sessions start on it; the split has ended", tone: "succeeded", action: { label: "Undo", run: () => setE(before) } });
+    toast({ title: `Promoted ${name}`, tone: "succeeded", action: { label: "Undo", run: () => setE(before) } });
   };
+  const split = (
+    <span className="ms-split" data-staged={staged ? "" : undefined} aria-label={`Split ${vs.map((_, i) => `${variantName(vs, i)} ${weights[i]}%`).join(", ")}${staged ? ", not yet applied" : ""}`}>
+      {vs.map((v, i) => (
+        <i key={v.id} style={{ flexGrow: weights[i], background: variantTone(i, vs.length) }} title={`${variantName(vs, i)} · ${weights[i]}%`} />
+      ))}
+    </span>
+  );
   return (
     <>
-      <li className="ms-node" data-stand={e.state === "live" ? "working" : e.state === "paused" ? "paused" : "done"} data-depth={1}>
-        <span className="ms-node-path" />
-        <span className="ms-node-main">
-          <span className="ms-node-name">{e.id}</span>
-          <span className="ms-node-line">
-            <Shimmer on={e.state === "live"} flow={e.id} className="ms-word">
-              <i aria-hidden="true" />
-              {e.state === "live" ? "Splitting" : e.state === "paused" ? "Paused" : "Promoted"}
-            </Shimmer>
-            <span className="ms-node-text">
-              {e.sessions} sessions · split v{e.version}
+      <GroupHead
+        label="Experiment"
+        open={open}
+        onOpen={onOpen}
+        stand={live ? "working" : e.state === "paused" ? "paused" : "done"}
+        summary={
+          <>
+            {split}
+            <span className="df-weights">{weights.join("/")}</span>
+            <span>
+              {e.sessions} · {live ? "splitting" : e.state}
             </span>
-          </span>
-        </span>
-        <span className="ms-node-meta">
-          <span className="ms-split" data-staged={staged ? "" : undefined} aria-label={`Split ${e.variants.map((v, i) => `${v.key} ${weights[i]}%`).join(", ")}${staged ? ", not yet applied" : ""}`}>
-            {e.variants.map((v, i) => (
-              <i key={v.key} style={{ flexGrow: weights[i], background: variantTone(i, e.variants.length) }} />
-            ))}
-          </span>
-          <span>{weights.join("/")}</span>
-        </span>
-        <span className="ms-node-actions">
-          <span className="ms-decide">
+          </>
+        }
+        actions={
+          <>
             {staged && (
               <>
                 <Button size="xs" variant="secondary" onClick={apply}>
@@ -248,59 +428,103 @@ function ExperimentNodes({ e: given }: { e: Experiment }) {
                 </Button>
               </>
             )}
-          </span>
-          <span className="ms-tail">
             {e.state !== "promoted" && (
-              <button type="button" className="ms-go" title={e.state === "live" ? "Pause the split" : "Resume the split"} aria-label={e.state === "live" ? "Pause the split" : "Resume the split"} onClick={pause}>
-                {e.state === "live" ? <Pause size={15} /> : <Play size={15} />}
+              <button type="button" className="ms-go" title={live ? "Pause the split" : "Resume the split"} aria-label={live ? "Pause the split" : "Resume the split"} onClick={pause}>
+                {live ? <Pause size={15} /> : <Play size={15} />}
               </button>
             )}
-          </span>
-        </span>
-      </li>
-      {e.variants.map((v, i) => (
-        <VariantNode
-          key={v.key}
-          v={v}
-          i={i}
-          all={e.variants}
-          weight={weights[i] ?? v.weight}
-          fixed={e.state === "promoted"}
-          onWeight={(w) => stage(i, w)}
-          asking={asking === v.key}
-          onAsk={() => setAsking(asking === v.key ? null : v.key)}
-          onPromote={() => promote(v.key)}
-        />
-      ))}
+          </>
+        }
+      />
+      {open &&
+        vs.map((v, i) => (
+          <VariantNode
+            key={v.id}
+            all={vs}
+            i={i}
+            weight={weights[i] ?? v.weight}
+            fixed={e.state === "promoted"}
+            onWeight={(w) => setStaged(rebalance(weights, i, w))}
+            onName={(name) => setNames({ ...names, [v.id]: name })}
+            asking={asking === v.id}
+            onAsk={() => setAsking(asking === v.id ? null : v.id)}
+            onPromote={() => promote(v.id)}
+          />
+        ))}
     </>
   );
 }
 
-/** Moving one weight moves the others in proportion, so they always add up to 100. */
-export function rebalance(ws: readonly number[], i: number, w: number): number[] {
-  const rest = 100 - w;
-  const others = ws.reduce((a, x, j) => (j === i ? a : a + x), 0);
-  const out = ws.map((x, j) => (j === i ? w : others ? Math.round((x / others) * rest) : Math.round(rest / (ws.length - 1))));
-  const drift = 100 - out.reduce((a, x) => a + x, 0);
-  const last = out.length - 1 === i ? out.length - 2 : out.length - 1;
-  out[last] = (out[last] ?? 0) + drift;
-  return out;
-}
-
-function VariantNode({ v, i, all, weight, fixed, onWeight, asking, onAsk, onPromote }: { v: Variant; i: number; all: Variant[]; weight: number; fixed: boolean; onWeight: (w: number) => void; asking: boolean; onAsk: () => void; onPromote: () => void }) {
+/** A variant: its swatch and name (renamed in place), its measures, its weight, Promote. */
+function VariantNode({
+  all,
+  i,
+  weight,
+  fixed,
+  onWeight,
+  onName,
+  asking,
+  onAsk,
+  onPromote,
+}: {
+  all: Variant[];
+  i: number;
+  weight: number;
+  fixed: boolean;
+  onWeight: (w: number) => void;
+  onName: (n: string) => void;
+  asking: boolean;
+  onAsk: () => void;
+  onPromote: () => void;
+}) {
+  const v = all[i]!;
+  const [naming, setNaming] = React.useState(false);
+  const tone = variantTone(i, all.length);
+  const name = variantName(all, i);
   const win = (k: keyof Variant["measures"]) => all.every((o) => o === v || v.measures[k][2] < o.measures[k][0]);
-  const gib = Math.round(v.memory / 2 ** 30);
   return (
     <li className="ms-node ms-variant" data-stand="done" data-depth={2}>
-      <span className="ms-node-path">
-        <span className="ms-vkey" style={{ background: variantTone(i, all.length) }} title={v.current ? `Variant ${v.key}, what it runs on now` : `Variant ${v.key}`} data-current={v.current || undefined}>
-          {v.key}
-        </span>
+      <span className="ms-node-path df-swatch-cell">
+        <Swatch tone={tone} current={v.current} title={v.current ? `${name}: what new sessions start on` : name} />
       </span>
       <span className="ms-node-main">
-        <span className="ms-node-name">
-          {v.agentfile} · {v.cpus} vCPU · {gib} GiB
-        </span>
+        {naming ? (
+          <span className="ms-edit">
+            <input
+              className="ms-edit-in"
+              autoFocus
+              defaultValue={v.name ?? ""}
+              placeholder={variantName(
+                all.map((x, j) => (j === i ? { ...x, name: null } : x)),
+                i,
+              )}
+              aria-label="Variant name"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  onName(e.currentTarget.value.trim());
+                  setNaming(false);
+                }
+                if (e.key === "Escape") setNaming(false);
+              }}
+            />
+            <button
+              type="button"
+              className="ms-go"
+              aria-label="Save the name"
+              onClick={(e) => {
+                onName((e.currentTarget.previousElementSibling as HTMLInputElement).value.trim());
+                setNaming(false);
+              }}
+            >
+              <Check size={15} />
+            </button>
+          </span>
+        ) : (
+          <button type="button" className="ms-node-name df-vname" title="Rename it" onClick={() => setNaming(true)}>
+            {name}
+            <Pencil size={11} aria-hidden="true" />
+          </button>
+        )}
         <span className="ms-node-line">
           <span className="ms-node-text">
             <Measure label="warm" iv={v.measures.warm_ms} f={(x) => `${Math.round(x)}ms`} win={win("warm_ms")} />
@@ -310,7 +534,17 @@ function VariantNode({ v, i, all, weight, fixed, onWeight, asking, onAsk, onProm
         </span>
       </span>
       <span className="ms-node-meta">
-        <input type="range" className="ms-weight-in" style={{ accentColor: variantTone(i, all.length) }} min={0} max={100} value={weight} disabled={fixed} aria-label={`Variant ${v.key}'s weight`} onChange={(e) => onWeight(Number(e.target.value))} />
+        <input
+          type="range"
+          className="ms-weight-in"
+          style={{ accentColor: tone }}
+          min={0}
+          max={100}
+          value={weight}
+          disabled={fixed}
+          aria-label={`${name}'s weight`}
+          onChange={(e) => onWeight(Number(e.target.value))}
+        />
         <span>
           {weight}% · {v.sessions} sessions
         </span>
@@ -323,9 +557,9 @@ function VariantNode({ v, i, all, weight, fixed, onWeight, asking, onAsk, onProm
             </Button>
           )}
           {asking && (
-            <span className="ms-confirm" role="group" aria-label={`Promote ${v.key}?`}>
-              <span>Promote {v.key}?</span>
-              <button type="button" className="ms-go" aria-label={`Promote ${v.key}`} onClick={onPromote}>
+            <span className="ms-confirm" role="group" aria-label={`Promote ${name}?`}>
+              <span>Promote?</span>
+              <button type="button" className="ms-go" aria-label={`Promote ${name}`} onClick={onPromote}>
                 <Check size={15} />
               </button>
               <button type="button" className="ms-go" aria-label="Keep the split" onClick={onAsk}>
@@ -339,71 +573,89 @@ function VariantNode({ v, i, all, weight, fixed, onWeight, asking, onAsk, onProm
   );
 }
 
-/** A new experiment, set up on its agent's row: two to four variants, each a deployment and a weight; Start splits new sessions. */
-function SetupNodes({ d, onDone }: { d: AgentDef; onDone: () => void }) {
-  const [vs, setVs] = React.useState([
-    { agentfile: d.agentfile, engine: "microvm", cpus: 2, mem: 4, weight: 80 },
-    { agentfile: d.agentfile, engine: "microvm", cpus: 4, mem: 8, weight: 20 },
+type Draft = { agentfile: string; engine: "microvm" | "host"; cpus: number; memory: number; weight: number };
+
+/** A new experiment, set up in place: variants (as many as you add), each a deployment and a weight; Start splits new sessions. */
+function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; onStart: (e: Experiment) => void }) {
+  const G = 2 ** 30;
+  const [vs, setVs] = React.useState<Draft[]>([
+    { agentfile: d.agentfile, engine: "microvm", cpus: 2, memory: 4 * G, weight: 80 },
+    { agentfile: d.agentfile, engine: "microvm", cpus: 4, memory: 8 * G, weight: 20 },
   ]);
-  const set = (i: number, k: string, val: string | number) => setVs(vs.map((v, j) => (j === i ? { ...v, [k]: val } : v)));
+  const set = (i: number, patch: Partial<Draft>) => setVs(vs.map((v, j) => (j === i ? { ...v, ...patch } : v)));
+  const start = () => {
+    onStart({
+      id: `${d.name}-split`,
+      state: "live",
+      version: 1,
+      sessions: 0,
+      variants: vs.map((v, i) => ({ id: `new-${i}`, name: null, ...v, sessions: 0, current: i === 0, measures: { warm_ms: [0, 0, 0], peak_gib: [0, 0, 0], failed_pct: [0, 0, 0] } })),
+    });
+    toast({ title: `Splitting ${d.name}'s new sessions`, tone: "running" });
+  };
   return (
     <>
-      <li className="ms-node" data-stand="paused" data-depth={1}>
-        <span className="ms-node-path" />
-        <span className="ms-node-main">
-          <span className="ms-node-name">New experiment</span>
-          <span className="ms-node-line">
-            <span className="ms-node-text">Splits every new session of {d.name}</span>
-          </span>
-        </span>
-        <span className="ms-node-meta">
-          <span className="ms-split" data-staged="">
-            {vs.map((v, i) => (
-              <i key={i} style={{ flexGrow: v.weight, background: variantTone(i, vs.length) }} />
-            ))}
-          </span>
-          <span>{vs.map((v) => v.weight).join("/")}</span>
-        </span>
-        <span className="ms-node-actions">
-          <span className="ms-decide">
+      <GroupHead
+        label="Experiment"
+        open
+        onOpen={onDone}
+        stand="paused"
+        summary={
+          <>
+            <span className="ms-split" data-staged="">
+              {vs.map((v, i) => (
+                <i key={i} style={{ flexGrow: v.weight, background: variantTone(i, vs.length) }} />
+              ))}
+            </span>
+            <span className="df-weights">{vs.map((v) => v.weight).join("/")}</span>
+            <span>new</span>
+          </>
+        }
+        actions={
+          <>
             <Button size="xs" variant="secondary" onClick={() => setVs([...vs, { ...vs[vs.length - 1]!, weight: 0 }])}>
               Add variant
             </Button>
-            <Button size="xs" onClick={() => { onDone(); toast({ title: `Splitting ${d.name}'s new sessions`, tone: "running" }); }}>
+            <Button size="xs" onClick={start}>
               Start
             </Button>
-          </span>
-          <span className="ms-tail">
             <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
               <X size={15} />
             </button>
-          </span>
-        </span>
-      </li>
+          </>
+        }
+      />
       {vs.map((v, i) => (
         <li key={i} className="ms-node ms-variant" data-stand="done" data-depth={2}>
-          <span className="ms-node-path">
-            <span className="ms-vkey" style={{ background: variantTone(i, vs.length) }}>
-              {variantKey(i)}
-            </span>
+          <span className="ms-node-path df-swatch-cell">
+            <Swatch tone={variantTone(i, vs.length)} title={variantName(vs, i)} />
           </span>
           <span className="ms-node-main ms-setup">
-            <select className="ms-edit-in" value={v.agentfile} aria-label="Agentfile" onChange={(e) => set(i, "agentfile", e.target.value)}>
+            <select className="ms-edit-in" value={v.agentfile} aria-label="Agentfile" onChange={(e) => set(i, { agentfile: e.target.value })}>
               {["rust-dev", "docs-site", `harness-${d.harness}`].map((a) => (
                 <option key={a}>{a}</option>
               ))}
             </select>
-            <Segmented size="xs" label="Engine" value={v.engine} onChange={(x) => set(i, "engine", x)} options={[{ value: "microvm", label: "microVM" }, { value: "host", label: "host" }]} />
+            <Segmented
+              size="xs"
+              label="Engine"
+              value={v.engine}
+              onChange={(x) => set(i, { engine: x })}
+              options={[
+                { value: "microvm", label: "microVM" },
+                { value: "host", label: "host" },
+              ]}
+            />
             {v.engine === "microvm" && (
               <>
-                <select className="ms-edit-in ms-narrow" value={v.cpus} aria-label="vCPUs" onChange={(e) => set(i, "cpus", Number(e.target.value))}>
+                <select className="ms-edit-in ms-narrow" value={v.cpus} aria-label="vCPUs" onChange={(e) => set(i, { cpus: Number(e.target.value) })}>
                   {[1, 2, 4, 8].map((n) => (
                     <option key={n} value={n}>
                       {n} vCPU
                     </option>
                   ))}
                 </select>
-                <select className="ms-edit-in ms-narrow" value={v.mem} aria-label="Memory" onChange={(e) => set(i, "mem", Number(e.target.value))}>
+                <select className="ms-edit-in ms-narrow" value={v.memory / G} aria-label="Memory" onChange={(e) => set(i, { memory: Number(e.target.value) * G })}>
                   {[2, 4, 8, 16].map((n) => (
                     <option key={n} value={n}>
                       {n} GiB
@@ -414,7 +666,23 @@ function SetupNodes({ d, onDone }: { d: AgentDef; onDone: () => void }) {
             )}
           </span>
           <span className="ms-node-meta">
-            <input type="range" className="ms-weight-in" style={{ accentColor: variantTone(i, vs.length) }} min={0} max={100} value={v.weight} aria-label={`Variant ${variantKey(i)}'s weight`} onChange={(e) => { const ws = rebalance(vs.map((x) => x.weight), i, Number(e.target.value)); setVs(vs.map((x, j) => ({ ...x, weight: ws[j] ?? x.weight }))); }} />
+            <input
+              type="range"
+              className="ms-weight-in"
+              style={{ accentColor: variantTone(i, vs.length) }}
+              min={0}
+              max={100}
+              value={v.weight}
+              aria-label={`${variantName(vs, i)}'s weight`}
+              onChange={(e) => {
+                const ws = rebalance(
+                  vs.map((x) => x.weight),
+                  i,
+                  Number(e.target.value),
+                );
+                setVs(vs.map((x, j) => ({ ...x, weight: ws[j] ?? x.weight })));
+              }}
+            />
             <span>{v.weight}%</span>
           </span>
           <span className="ms-node-actions">
@@ -482,7 +750,13 @@ function SessionControls({ a, stand }: { a: AgentInfo; stand: string }) {
     setBusy(true);
     harnessApi
       .command(a.id, { type: "pause", on })
-      .then(() => toast({ title: on ? `Paused ${agentLabel(a)}` : `Resumed ${agentLabel(a)}`, tone: "info", action: on ? { label: "Undo", run: () => void harnessApi.command(a.id, { type: "pause", on: false }) } : undefined }))
+      .then(() =>
+        toast({
+          title: on ? `Paused ${agentLabel(a)}` : `Resumed ${agentLabel(a)}`,
+          tone: "info",
+          action: on ? { label: "Undo", run: () => void harnessApi.command(a.id, { type: "pause", on: false }) } : undefined,
+        }),
+      )
       .catch((e: unknown) => toast.error(on ? "Couldn't pause" : "Couldn't resume", errorMessage(e)))
       .finally(() => setBusy(false));
   };
@@ -491,7 +765,15 @@ function SessionControls({ a, stand }: { a: AgentInfo; stand: string }) {
     return (
       <span className="ms-confirm" role="group" aria-label={`Stop ${agentLabel(a)}?`}>
         <span>Stop?</span>
-        <button type="button" className="ms-go" aria-label="Stop it" onClick={() => { setAsking(false); toast({ title: `Stopping ${agentLabel(a)}`, tone: "info" }); }}>
+        <button
+          type="button"
+          className="ms-go"
+          aria-label="Stop it"
+          onClick={() => {
+            setAsking(false);
+            toast({ title: `Stopping ${agentLabel(a)}`, tone: "info" });
+          }}
+        >
           <Check size={15} />
         </button>
         <button type="button" className="ms-go" aria-label="Keep it" onClick={() => setAsking(false)}>
@@ -520,13 +802,22 @@ export function DefFields({ d }: { d: AgentDef }) {
     setVals({ ...vals, [k]: v });
     setEditing(null);
     setVersion((n) => n + 1);
-    toast({ title: `Saved v${version + 1}`, description: "Running sessions keep theirs; new ones get it", tone: "info" });
+    toast({ title: `Saved v${version + 1}`, tone: "info" });
   };
   const field = (k: keyof typeof vals, label: string, shown: string) =>
     editing === k ? (
       <span className="ms-edit">
         <span className="ms-edit-k">{label}</span>
-        <input className="ms-edit-in" autoFocus defaultValue={vals[k]} aria-label={label} onKeyDown={(e) => { if (e.key === "Enter") save(k, e.currentTarget.value); if (e.key === "Escape") setEditing(null); }} />
+        <input
+          className="ms-edit-in"
+          autoFocus
+          defaultValue={vals[k]}
+          aria-label={label}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") save(k, e.currentTarget.value);
+            if (e.key === "Escape") setEditing(null);
+          }}
+        />
         <button type="button" className="ms-go" aria-label={`Save ${label}`} onClick={(e) => save(k, (e.currentTarget.previousElementSibling as HTMLInputElement).value)}>
           <Check size={15} />
         </button>
@@ -553,22 +844,63 @@ export function DefFields({ d }: { d: AgentDef }) {
   );
 }
 
-/** A definition's own values, first under its row. */
-function DefNode({ d }: { d: AgentDef }) {
+/* ------------------------------------------------ a definition as a row of its own (the Agents tab, chat) */
+
+/**
+ * A definition as a row (the Agents tab's list, chat's card), in the dropdown's own columns: its
+ * name, its sessions' stand and how many are at work; where it runs and how fast it starts; Run and
+ * its rarer acts. Its chevron opens its groups under it.
+ */
+export function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly AgentInfo[]; open: boolean; onOpen: () => void }) {
+  const sessions = d.sessions.map((s) => list.find((x) => x.id === s.id)).filter((a): a is AgentInfo => a !== undefined);
+  const stands = sessions.map((a) => NODE[chatStand(a)]);
+  const ORDER = ["needs", "failed", "working", "paused", "done", "offline", "stopped"];
+  const stand = ORDER.find((o) => stands.includes(o)) ?? "done";
+  const atWork = stands.filter((s) => s === "working" || s === "needs").length;
   return (
-    <li className="ms-node ms-defnode" data-stand="done" data-depth={1}>
-      <span className="ms-node-path" />
-      <span className="ms-node-main">
-        <DefFields d={d} />
-      </span>
-      <span className="ms-node-meta">
-        <span>
-          {d.tools} kiln · {d.mcp} MCP
+    <>
+      <li className="ms-node df-defrow" data-stand={stand} data-depth={0} data-open={open || undefined} data-def={d.id}>
+        <span className="ms-node-path df-chev">
+          <ChevronRight size={13} aria-hidden="true" className={open ? "rotate-90" : undefined} />
         </span>
-        <span>{d.skills} skills</span>
-      </span>
-      <span className="ms-node-actions" />
-    </li>
+        <button type="button" className="ms-node-main df-group-main" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${d.name}`} onClick={onOpen}>
+          <span className="df-group-line">
+            <span className="df-strong df-defname">{d.name}</span>
+            {!d.own && <Lock size={12} className="ms-flag-pin" role="img" aria-label="kiln's: copy it to change it" />}
+            {(d.replaces || d.replaced_by) && <Repeat2 size={12} className="ms-flag-pin" role="img" aria-label={d.replaces ? `Stands in for kiln's ${d.replaces}` : `You use ${d.replaced_by}`} />}
+            {sessions.length > 0 ? (
+              <span className="df-group-sum">
+                <span className="df-stands" aria-hidden="true">
+                  {stands.map((st, i) => (
+                    <i key={i} data-stand={st} />
+                  ))}
+                </span>
+                {sessions.length} · {atWork} at work
+              </span>
+            ) : (
+              <span className="df-group-sum">v{d.version}</span>
+            )}
+          </span>
+        </button>
+        <span className="ms-node-meta">
+          <RunsMarks d={d} />
+        </span>
+        <span className="ms-node-actions">
+          <span className="ms-tail">
+            <Button size="xs" variant="secondary" onClick={() => toast({ title: `Starting ${d.name}`, tone: "running" })}>
+              Run
+            </Button>
+            <DefMenu
+              d={d}
+              onSetup={() => {
+                if (!open) onOpen();
+              }}
+            />
+          </span>
+        </span>
+      </li>
+      {open && <DefGroups d={d} list={list} first="definition" inRow />}
+    </>
   );
 }
 
@@ -580,14 +912,14 @@ export function defCall(c: { server?: string; tool_short?: string; input?: unkno
 }
 
 /**
- * An agent definition in chat: the same rows, with the same controls, as in Mission control. Live
+ * An agent definition in chat: the same row and groups, with the same controls, as everywhere. Live
  * while it's on screen; further back, as it stood when the agent asked ("as of"), with ↻ to go live.
  */
 export function DefinitionCard({ id, at }: { id: string; at?: number }) {
   const defs = useRes(agentdefsRes).data;
   const list = useAgentList();
   const [live, setLive] = React.useState(false);
-  const [open, setOpen] = React.useState(true);
+  const [open, setOpen] = React.useState(false);
   const d = defs.find((x) => x.id === id);
   if (!d) return null;
   const old = at !== undefined && Date.now() - at > 60_000 && !live;

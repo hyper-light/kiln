@@ -50,7 +50,8 @@ function amount(l: Limit): string {
   return [of, pct].filter(Boolean).join(" · ") || "—";
 }
 
-export function LimitMeter({ limit, compact }: { limit: Limit; compact?: boolean }) {
+/** `live`: a reading that moves as you watch (a sandbox's CPU, memory, disk): no window, no reset, kiln's prism breathing over its bar. */
+export function LimitMeter({ limit, compact, live }: { limit: Limit; compact?: boolean; live?: boolean }) {
   const now = useClock(30_000);
   const pct = limit.used_percent;
   const reset = resetsIn(limit.resets_at, now);
@@ -58,7 +59,7 @@ export function LimitMeter({ limit, compact }: { limit: Limit; compact?: boolean
   const hours = /^(\d+)h$/.exec(limit.window ?? "")?.[1];
   const said = limit.status === "rejected" ? "Limit reached" : limit.status === "warning" ? "Close to the limit" : null;
   return (
-    <div className={cn("hx-limit", compact && "hx-limit-compact")} data-tone={limit.status === "rejected" ? "fail" : tone(pct)}>
+    <div className={cn("hx-limit", compact && "hx-limit-compact")} data-tone={limit.status === "rejected" ? "fail" : tone(pct)} data-live={live || undefined}>
       <div className="hx-limit-top">
         <span className="hx-limit-label">
           {limit.label}

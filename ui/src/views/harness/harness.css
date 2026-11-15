@@ -2678,6 +2678,25 @@ textarea.hx-input {
 .hx-limit-compact .hx-limit-bar {
   height: 4px;
 }
+/* A live reading (a sandbox's CPU, memory, disk): its bar keeps its tone, and kiln's prism breathes
+   over it, opacity only (index.css prism-breathe), as what works now does. */
+.hx-limit[data-live] .hx-limit-bar > span {
+  position: relative;
+}
+.hx-limit[data-live] .hx-limit-bar > span::after {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--prism);
+  mix-blend-mode: soft-light;
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
+  content: "";
+}
+@media (prefers-reduced-motion: reduce) {
+  .hx-limit[data-live] .hx-limit-bar > span::after {
+    animation: none;
+  }
+}
 .hx-limit-badge {
   height: 18px;
   padding: 0 7px;

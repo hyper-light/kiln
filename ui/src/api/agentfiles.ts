@@ -5,6 +5,7 @@
  * read and change; which one an agent starts from is views/agentfiles/choose.ts's.
  */
 import type { Res } from "@/lib/data";
+import { setData } from "@/lib/resource";
 import { ApiError, request } from "./client";
 import type { Agentfile, AgentfileCheck, AgentfileListing, AgentfileSaved, AgentfileVersion } from "./wire";
 
@@ -46,4 +47,94 @@ export const agentfileVersionsRes = (id: string): Res<AgentfileVersion[]> => ({
   key: `agentfiles/versions/${id}`,
   fetch: (s) => agentfilesApi.versions(id, s),
   opts: { on: ["agentfile"], relevant: (ev) => ev.type === "agentfile" && ev.id === id },
+});
+
+/* ------------------------------------------------ what it installs from, and its builds (P4.5, P4.6) */
+
+/** An install source's kind, as Shards tells a `HARNESS` or `AGENT` source apart (crates/agentfile `source_of`). */
+export type AgentfileSourceKind = "path" | "git-https" | "git-ssh" | "s3" | "https" | "oci";
+
+/** An install source, as Shards reads a `HARNESS` or `AGENT` line: what pins it, and the credential its fetch uses, by name. */
+export interface AgentfileSource {
+  line: number;
+  directive: "HARNESS" | "AGENT";
+  name: string;
+  kind: AgentfileSourceKind;
+  /** The source without its `#ref`. */
+  source: string;
+  /** A SHA-256, an S3 object's version, a Git ref (and the commit it named at the last build), or kiln's own pin for a path. */
+  pin: { by: "sha256" | "version-id" | "ref" | "kiln"; value: string; resolved: string | null } | null;
+  /** The secret its fetch is handed, by name and scope: never a value. */
+  credential: { name: string; scope: string } | null;
+  /** The origin its fetch alone is granted (default deny). */
+  grant: string | null;
+}
+
+export type AgentfileBuildState = "built" | "building" | "queued" | "failed" | "none";
+
+/** Its image on one runner: built from which version, building (which step), or why not. */
+export interface AgentfileBuild {
+  runner: string;
+  /** Its OCI platform; none where it doesn't build. */
+  platform: "linux/amd64" | "linux/arm64" | null;
+  state: AgentfileBuildState;
+  version: number;
+  digest: string | null;
+  size: number | null;
+  took_s: number | null;
+  /** Unix seconds: asked for, or done. */
+  at: number | null;
+  step: [number, number] | null;
+  /** Shards' words when it refused; kiln's when a runner doesn't build. */
+  why: string | null;
+  /** While its newer image isn't built: the version sessions there start from. */
+  serving: number | null;
+}
+
+/** One of its versions' images: built or not, its digest per platform, and the runners whose sessions start from it now. */
+export interface AgentfileImage {
+  version: number;
+  built: boolean;
+  digests: Record<string, string>;
+  size: number | null;
+  at: number;
+  runners: string[];
+  current: boolean;
+}
+
+export interface AgentfileBuilds {
+  version: number;
+  sources: AgentfileSource[];
+  builds: AgentfileBuild[];
+  images: AgentfileImage[];
+}
+
+export const agentfileBuildsApi = {
+  get: (id: string, signal?: AbortSignal) => request<AgentfileBuilds>("GET", `/api/agentfiles/${enc(id)}/builds`, undefined, { signal }),
+  /** Its current version built there, or on every runner that builds (without `runner`). */
+  build: (id: string, runner?: string) => request<AgentfileBuilds>("POST", `/api/agentfiles/${enc(id)}/builds`, runner ? { runner } : {}),
+};
+
+/** A build asked for and not done: queued or under way. */
+export const moving = (b: AgentfileBuilds) => b.builds.some((x) => x.state === "queued" || x.state === "building");
+
+/** Its sources and builds, as its versions change. */
+export const agentfileBuildsRes = (id: string): Res<AgentfileBuilds> => ({
+  key: `agentfiles/builds/${id}`,
+  fetch: (s) => agentfileBuildsApi.get(id, s),
+  opts: { on: ["agentfile"], relevant: (ev) => ev.type === "agentfile" && ev.id === id },
+});
+
+/**
+ * The same, read every 2 s while a build moves: shown in its place only then, and once every build
+ * has settled it hands what it read to `agentfileBuildsRes`, which shows again and ends the reading.
+ */
+export const agentfileBuildingRes = (id: string): Res<AgentfileBuilds> => ({
+  key: `agentfiles/building/${id}`,
+  fetch: async (s) => {
+    const b = await agentfileBuildsApi.get(id, s);
+    if (!moving(b)) setData<AgentfileBuilds>(`agentfiles/builds/${id}`, () => b);
+    return b;
+  },
+  opts: { pollMs: 2000 },
 });

@@ -35,7 +35,7 @@ import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
 import { AgentHeader } from "./head";
-import { Inspector, prepareInspectorTab, type InspectorTab } from "./inspector";
+import { Inspector, prepareInspectorTab, SandboxTabName, type InspectorTab } from "./inspector";
 import { prepareAgentNavigation } from "@/lib/agent-navigation";
 import { INSPECTOR_COLLAPSED } from "./desktop";
 import { AgentFrame, AgentFrameContent } from "./agent-frame";
@@ -154,10 +154,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const wide = useMediaQuery("(min-width: 1100px)");
   const [, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
   // `?tab=plan`: opened on its plans (the way back from one of them, or its research).
-  // `?tab=tools`: opened on what it works with, its definition first (a definition's session, from Mission control).
+  // `?tab=tools|sandbox|agents`: opened on what it works with, where it runs, or its agents (a definition's session, from Mission control).
   const tabAsked = params.get("tab");
-  const [tab, setTab] = React.useState<InspectorTab>(() => (tabAsked === "plan" ? "plan" : tabAsked === "tools" ? "tools" : "changes"));
-  const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => (tabAsked === "plan" ? "plan" : tabAsked === "tools" ? "tools" : "work"));
+  const tabWanted: InspectorTab | null = tabAsked === "plan" || tabAsked === "tools" || tabAsked === "sandbox" || tabAsked === "agents" ? tabAsked : null;
+  const [tab, setTab] = React.useState<InspectorTab>(() => tabWanted ?? "changes");
+  const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => tabWanted ?? "work");
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [settings, setSettings] = React.useState(false);
   /** /login or /logout: the harness's account on its machine, opened in place over the composer. */
@@ -286,6 +287,13 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setTrayCollapsed(false);
     setTab("tools");
     setPhoneTab("tools");
+  }, [setTrayCollapsed]);
+  /** Its agent, managed from here: the Agents tab (the head's definition crumb). */
+  const showAgents = React.useCallback(() => {
+    prepareInspectorTab("agents");
+    setTrayCollapsed(false);
+    setTab("agents");
+    setPhoneTab("agents");
   }, [setTrayCollapsed]);
   const showPlan = () => {
     void prepareAgentNavigation({ id, tab: "plan" });
@@ -433,7 +441,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       head={
         <>
           <title>{info ? `${agentLabel(info)} · Agents · kiln` : "Agent · kiln"}</title>
-          <Head store={store} cwd={cwd} send={send} onUsage={showTools} onSettings={() => setSettings(true)} onFind={openFind} />
+          <Head store={store} cwd={cwd} send={send} onUsage={showTools} onAgents={showAgents} onSettings={() => setSettings(true)} onFind={openFind} />
         </>
       }
       work={work}
@@ -513,7 +521,23 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
 }
 
 /** The head: who it is, how it's doing, how it runs, and what can be done to it. */
-function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: SessionStore; cwd: string; send: (c: Command) => void; onUsage: () => void; onSettings: () => void; onFind: () => void }) {
+function Head({
+  store,
+  cwd,
+  send,
+  onUsage,
+  onAgents,
+  onSettings,
+  onFind,
+}: {
+  store: SessionStore;
+  cwd: string;
+  send: (c: Command) => void;
+  onUsage: () => void;
+  onAgents: () => void;
+  onSettings: () => void;
+  onFind: () => void;
+}) {
   const navigate = useNavigate();
   const info = useSession(store, (s) => s.info);
   const state = useSession(store, (s) => s.state);
@@ -554,7 +578,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
         actions={actions}
         send={send}
         onBackground={onUsage}
-        onDefinition={onUsage}
+        onDefinition={onAgents}
         onSettings={onSettings}
         onFind={onFind}
         stopAt={stopAt}
@@ -984,11 +1008,13 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
   const todosDone = todos.filter((t) => t.status === "completed").length;
   // A plan waiting on your review: its tab says so (review.tsx).
   const reviewing = useReviewWaits(store);
-  const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean; waits?: boolean }[] = [
+  const tabs: { id: PhoneTab; label: React.ReactNode; n?: string; warn?: boolean; waits?: boolean }[] = [
     { id: "work", label: "Work", n: approvals ? String(approvals) : undefined, warn: approvals > 0 },
     { id: "changes", label: "Changes", n: fileCount ? String(fileCount) : undefined },
     { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools" },
+    { id: "sandbox", label: <SandboxTabName agentId={store.id} /> },
+    { id: "agents", label: "Agents" },
   ];
   return (
     <div className="pt" role="tablist" aria-label="Agent">

@@ -149,3 +149,427 @@ a.af-name:hover {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* Builds and sources (builds.tsx): a row a runner or a source, one line each, in fixed columns that
+   give way in order as the section narrows; the page's one left edge. */
+.afb,
+.afs {
+  container-type: inline-size;
+}
+.afb-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.afb-head .af-h {
+  flex: none;
+}
+.afb-sum {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.afb-bad {
+  color: var(--color-fail);
+}
+.afb-build {
+  flex: none;
+  margin-left: auto;
+}
+/* Each runner a short bar in its state's colour: kiln's status colours, building the prism drifting. */
+.afb-tally {
+  display: inline-flex;
+  gap: 3px;
+}
+.afb-tally > i {
+  width: 10px;
+  height: 4px;
+  border-radius: 2px;
+  background: #2a2d34;
+}
+.afb-tally > i[data-state="built"] {
+  background: #a5c8b3;
+}
+.afb-tally > i[data-state="failed"] {
+  background: #d1aaad;
+}
+.afb-tally > i[data-state="queued"] {
+  box-shadow: inset 0 0 0 1px #a6b2c6;
+  background: transparent;
+}
+.afb-tally > i[data-state="building"],
+.afb-row[data-state="building"] .meter > span {
+  background: var(--prism);
+  background-size: 250% 100%;
+  animation: hl-drift 1.4s ease-in-out infinite alternate;
+}
+.afb-tally > i[data-state="none"] {
+  display: none;
+}
+.afb-rows,
+.afs-rows {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.afb-row {
+  display: grid;
+  grid-template-columns: 14px minmax(110px, 1fr) 48px 132px 92px 72px 48px 36px 60px;
+  align-items: center;
+  gap: 0 12px;
+  min-height: 36px;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--color-line);
+  font-size: 12.5px;
+}
+.afb-row:hover {
+  background: #101114;
+}
+.afb-row > .dot {
+  justify-self: center;
+}
+.afb-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-foreground);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.afb-dim {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.afb-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.afb-state .meter {
+  width: 64px;
+  flex: none;
+}
+.afb-num {
+  color: #c9c1ec;
+  font-variant-numeric: tabular-nums;
+}
+.afb-ver {
+  min-width: 0;
+  overflow: hidden;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.afb-acts {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 2px;
+}
+.afb-chev {
+  transition: transform 0.15s var(--ease);
+}
+[aria-expanded="true"] > .afb-chev {
+  transform: rotate(180deg);
+}
+/* Shards' words, as Shards said them, under the row they refused; built again from there. */
+.afb-why {
+  grid-column: 2 / -1;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 0 0 10px;
+}
+.afb-why p {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--color-fail);
+  color: #e2b9bd;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+@container (max-width: 760px) {
+  .afb-row {
+    grid-template-columns: 14px minmax(90px, 1fr) 44px 120px 84px 60px;
+  }
+  .afb-digest,
+  .afb-size,
+  .afb-when {
+    display: none;
+  }
+}
+@container (max-width: 480px) {
+  .afb-row {
+    grid-template-columns: 14px minmax(80px, 1fr) 112px 60px;
+  }
+  .afb-plat,
+  .afb-ver {
+    display: none;
+  }
+}
+
+/* A source: the whole row opens its line; its pencil opens the picker under it. Kinds take their
+   places along kiln's prism, each beside its word. */
+.afs-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 0 6px;
+  border-bottom: 1px solid var(--color-line);
+}
+.afs-main {
+  display: grid;
+  grid-template-columns: 58px 132px minmax(80px, 1fr) 148px 176px 196px;
+  align-items: center;
+  gap: 0 12px;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.afs-main:hover {
+  background: #101114;
+}
+.afs-main:focus-visible {
+  outline: 2px solid rgb(165 160 191 / 40%);
+  outline-offset: -2px;
+}
+.afs-kind,
+.afs-pin,
+.afs-cred,
+.afs-grant {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.afs-kind > svg {
+  flex: none;
+  color: #8c8f98;
+}
+.afs-kind[data-kind="git-https"] > svg {
+  color: #b8d9d2;
+}
+.afs-kind[data-kind="git-ssh"] > svg {
+  color: #a6c4ed;
+}
+.afs-kind[data-kind="s3"] > svg {
+  color: #b8a6d5;
+}
+.afs-kind[data-kind="https"] > svg {
+  color: #d6a2aa;
+}
+.afs-kind[data-kind="path"] > svg {
+  color: #d8cbb0;
+}
+.afs-name,
+.afs-src {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.afs-name {
+  color: var(--color-foreground);
+}
+.afs-name > i,
+.afs-cred i,
+.afv-digest > i {
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-style: normal;
+}
+.afs-src {
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.afs-pin > span,
+.afs-cred > span,
+.afs-grant > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.afs-loose {
+  color: var(--color-warn);
+}
+.afs-pin > svg {
+  flex: none;
+  color: var(--color-ok);
+}
+.afs-pin[data-none] {
+  color: var(--color-warn);
+}
+.afs-pin[data-none] > svg {
+  color: var(--color-warn);
+}
+.afs-cred > svg,
+.afs-grant > svg {
+  flex: none;
+  color: #8c8f98;
+}
+@container (max-width: 1000px) {
+  .afs-main {
+    grid-template-columns: 58px 124px minmax(80px, 1fr) 148px 168px;
+  }
+  .afs-grant {
+    display: none;
+  }
+}
+@container (max-width: 760px) {
+  .afs-main {
+    grid-template-columns: 58px 116px minmax(60px, 1fr) 140px;
+  }
+  .afs-main > .afs-cred {
+    display: none;
+  }
+}
+@container (max-width: 480px) {
+  .afs-main {
+    grid-template-columns: 54px minmax(0, 1fr) 128px;
+  }
+  .afs-src {
+    display: none;
+  }
+}
+/* The source picker, in place under its row: kind, source and pin, written into its line. */
+.afs-pick {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 4px 4px 12px;
+}
+.afs-field {
+  --field-h: 30px;
+  flex: 0 1 220px;
+  min-width: 0;
+}
+.afs-field input {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.afs-wide {
+  flex: 1 1 300px;
+}
+.afs-narrow {
+  flex: 0 1 150px;
+}
+.afs-k {
+  flex: none;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.afs-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.afs-problem {
+  color: var(--color-warn);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* A version's row: its number (current: kiln's prism dot), its image, when and by whom, its actions. */
+.af-row.afv-row {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) 150px auto;
+  flex-wrap: nowrap;
+  gap: 0 12px;
+}
+.afv-v {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.afv-row[data-current] .afv-v::after {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--prism);
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
+  content: "";
+}
+.afv-image {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  overflow: hidden;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.afv-digest > i {
+  margin-right: 5px;
+}
+.afv-runners {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.afv-runners[data-none] {
+  color: var(--color-meta);
+}
+.afv-when {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 640px) {
+  .af-row.afv-row {
+    grid-template-columns: 44px minmax(0, 1fr) auto;
+  }
+  .afv-when,
+  .afv-digest {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .afb-tally > i[data-state="building"],
+  .afb-row[data-state="building"] .meter > span,
+  .afv-row[data-current] .afv-v::after {
+    animation: none;
+  }
+}

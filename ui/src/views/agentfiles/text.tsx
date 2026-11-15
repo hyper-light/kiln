@@ -5,6 +5,7 @@
  * 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
  */
 import * as React from "react";
+import type { EditorView } from "@codemirror/view";
 import { agentfilesApi } from "@/api/agentfiles";
 import { Highlighted } from "@/components/code/highlighted";
 import { Hold } from "@/components/ui/hold";
@@ -15,8 +16,20 @@ import "./agentfiles.css";
 
 const CodeEditor = React.lazy(() => import("@/components/code/editor"));
 
-/** The editor, opened with `value` (a new `opened` opens another text in it), and what Shards said of what's in it. */
-export function AgentfileText({ value, opened, onChange, label }: { value: string; opened: string | number; onChange: (text: string) => void; label: string }) {
+/** The editor, opened with `value` (a new `opened` opens another text in it), and what Shards said of what's in it; `onView`, its view, for a line opened or written from outside it. */
+export function AgentfileText({
+  value,
+  opened,
+  onChange,
+  label,
+  onView,
+}: {
+  value: string;
+  opened: string | number;
+  onChange: (text: string) => void;
+  label: string;
+  onView?: (view: EditorView | null) => void;
+}) {
   const [said, setSaid] = React.useState<{ text: string; error: boolean } | null>(null);
   const lint = async (text: string): Promise<Diagnostic[]> => {
     try {
@@ -32,7 +45,7 @@ export function AgentfileText({ value, opened, onChange, label }: { value: strin
   return (
     <div className="af-editor">
       <React.Suspense fallback={<Hold height={320} label="Loading the editor" />}>
-        <CodeEditor key={opened} language="agentfile" value={value} onChange={onChange} lint={lint} label={label} />
+        <CodeEditor key={opened} language="agentfile" value={value} onChange={onChange} lint={lint} label={label} onView={onView} />
       </React.Suspense>
       <p className="af-said" data-tone={said?.error ? "error" : undefined}>
         {said?.text ?? "Shards checks it as you type."}
