@@ -20,7 +20,7 @@ import { harnessApi } from "@/api/harness";
 import { errorMessage } from "@/lib/hooks";
 import { agentdefsRes, type AgentDef, type Experiment, type Variant } from "@/api/agentdefs";
 import { rebalance, variantName, variantTone } from "./variants";
-import { sandboxesRes, type SandboxBrief } from "@/api/microvms";
+import { enginesRes, sandboxesRes, type SandboxBrief } from "@/api/microvms";
 import type { AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Segmented } from "@/components/ui/tabs";
@@ -104,7 +104,16 @@ export function SandboxLine({ id, target }: { id: string; target: string }) {
 }
 function SandboxLineRead({ id, target }: { id: string; target: string }) {
   const b: SandboxBrief | undefined = useRes(sandboxesRes).data[id];
-  if (!b) return <span>{labelOf(target.replace(/^agent:/, ""))}</span>;
+  const machine = target.replace(/^agent:/, "");
+  // A session the sandboxes don't list yet (just started): where it runs, from its machine's engine.
+  const engine = useRes(enginesRes).data[machine]?.engine;
+  if (!b)
+    return (
+      <span className="df-sandbox">
+        {engine && <EngineGlyph engine={engine} />}
+        <span className="df-runner">{labelOf(machine)}</span>
+      </span>
+    );
   return (
     <span className="df-sandbox">
       <EngineGlyph engine={b.engine} />
@@ -225,7 +234,7 @@ function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; ope
         <li className="ms-node ms-defnode" data-stand="done" data-depth={2}>
           <span className="ms-node-path" />
           <span className="ms-node-main">
-            <span className="df-narrow">
+            <span className="df-runs-full">
               <RunsMarks d={d} />
             </span>
             <DefFields d={d} />

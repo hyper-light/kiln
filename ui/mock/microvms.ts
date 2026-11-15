@@ -724,7 +724,7 @@ export async function handleMicrovms(req: http.IncomingMessage, res: http.Server
   const one = p.match(/^\/api\/microvm\/runners\/([^/]+)$/);
   if (one && m === "GET") {
     const r = RUNNERS[decodeURIComponent(one[1]!)] ?? { vms: [], pools: [], images: [], starts: { warm: 0, template: 0, cold: 0 }, net: [] };
-    return (ctx.json(res, 200, { ...r, vms: r.vms.map(({ mem: _m, net: _n, footprint: _f, box: _b, ...v }) => v) }), true);
+    return (ctx.json(res, 200, { ...r, vms: r.vms.map(({ footprint: _f, box: _b, ...v }) => v) }), true);
   }
   const sw = p.match(/^\/api\/microvm\/runners\/([^/]+)\/engine$/);
   if (sw && m === "PUT") {

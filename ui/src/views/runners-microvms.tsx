@@ -6,9 +6,8 @@
  * built there.
  */
 import * as React from "react";
-import { Ban, Box, ChartLine, Flame, Hammer, Layers, Pause, Play, RotateCcw, Server, Snowflake, Square, Trash2, X, Check } from "lucide-react";
-import { harnessApi } from "@/api/harness";
-import { microvmsApi, runnerVmsRes, enginesRes, type Engine, type EngineView, type MicroVm, type RunnerImage, type WarmPool } from "@/api/microvms";
+import { Ban, ChartLine, Hammer, Pause, Play, RotateCcw, Square, Trash2, X, Check } from "lucide-react";
+import { microvmsApi, runnerVmsRes, enginesRes, sandboxApi, type Engine, type EngineView, type MicroVm, type RunnerImage, type WarmPool } from "@/api/microvms";
 import { Button } from "@/components/ui/button";
 import { Confirm, Meter, Sparkline } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
@@ -19,19 +18,15 @@ import { formatBytes } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link } from "@/lib/router";
+import { LimitMeter } from "./harness/limits";
+import { ENGINE_ICON, START, StartMark, WarmDots } from "./sandbox-marks";
 import "./runners-microvms.css";
 
-const ENGINE_ICON: Record<Engine, typeof Box> = { microvm: Box, host: Server };
-/** A start's kind as its icon, in its place along kiln's prism: warm the rose, template the blue, cold the teal. */
-const START: Record<MicroVm["start"]["kind"], { icon: typeof Flame; word: string }> = {
-  warm: { icon: Flame, word: "Warm start" },
-  template: { icon: Layers, word: "From its template" },
-  cold: { icon: Snowflake, word: "Cold start" },
-};
 const VM_STATUS: Record<MicroVm["state"], string> = { running: "running", idle: "succeeded", paused: "queued", failed: "failed", draining: "timed_out" };
 const VM_WORD: Record<MicroVm["state"], string> = { running: "Running", idle: "Idle", paused: "Paused", failed: "Failed", draining: "Draining" };
 const ago = (s: number) => (s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`);
-const ms = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`);
+const G = 2 ** 30;
+const gib = (n: number) => Math.round((n / G) * 100) / 100;
 
 /** The table's cell: its engine as an icon and a word; one that can't run microVMs carries ⊘, its reason in the tooltip. */
 export function EngineCell({ e }: { e: EngineView | undefined }) {
@@ -93,6 +88,9 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
   return (
     <section className="rv-block" aria-label="Engine">
       <div className="rv-head">
+        <span className="label" title="Where agents' sessions run here (CI's jobs run on its executors: the facts' CI in)">
+          Agents in
+        </span>
         <Segmented
           size="xs"
           label={`Engine of ${name}`}
@@ -198,35 +196,13 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
   const total = r.starts.warm + r.starts.template + r.starts.cold;
   return (
     <section className="rv-block" aria-label="MicroVMs">
+      {/* Where we are now, first: the node's room as live bars, then how its microVMs start and its warm hosts. */}
       {room && (
         <div className="rv-room">
-          <span>
-            <span className="label">Memory</span>
-            <span className="rv-meter">
-              <Meter value={usedMem} max={room.memory_total} label="Memory used of the node's room" />
-              <span title={`${formatBytes(usedMem)} of ${formatBytes(room.memory_total)} held`}>
-                {Math.round(usedMem / 2 ** 30)}/{Math.round(room.memory_total / 2 ** 30)}G
-              </span>
-            </span>
-          </span>
-          <span>
-            <span className="label">vCPUs</span>
-            <span className="rv-meter">
-              <Meter value={usedCpu} max={room.vcpus_total} label="vCPUs held of the node's" />
-              <span>
-                {usedCpu} / {room.vcpus_total}
-              </span>
-            </span>
-          </span>
-          <span>
-            <span className="label">Network</span>
-            <span className="rv-meter">
-              <Sparkline values={r.net} width={72} height={18} />
-              <span>{((r.net.at(-1) ?? 0) / 10).toFixed(1)} MB/s</span>
-            </span>
-          </span>
+          <LimitMeter live limit={{ id: "memory", label: "Memory", used_percent: (usedMem / room.memory_total) * 100, used: gib(usedMem), limit: gib(room.memory_total), unit: "GiB" }} />
+          <LimitMeter live limit={{ id: "vcpus", label: "vCPUs", used_percent: (usedCpu / room.vcpus_total) * 100, used: usedCpu, limit: room.vcpus_total, unit: "held" }} />
           {total > 0 && (
-            <span>
+            <span className="rv-cell">
               <span className="label" title="Flame: warm · layers: from its template · snowflake: cold">
                 Starts
               </span>
@@ -234,8 +210,8 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
                 {(["warm", "template", "cold"] as const).map((k) => {
                   const Icon = START[k].icon;
                   return (
-                    <span key={k} data-kind={k} title={`${START[k].word}: ${r.starts[k]}`}>
-                      <Icon size={13} aria-hidden="true" />
+                    <span key={k} className="sm-start" data-kind={k} title={`${START[k].word}: ${r.starts[k]}`}>
+                      <Icon size={12} aria-hidden="true" />
                       {r.starts[k]}
                     </span>
                   );
@@ -244,7 +220,7 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
             </span>
           )}
           {bound > 0 && (
-            <span>
+            <span className="rv-cell">
               <span className="label">Warm</span>
               <span className="rv-meter">
                 <WarmDots n={warm} of={bound} />
@@ -313,58 +289,45 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
   );
 }
 
-function WarmDots({ n, of }: { n: number; of: number }) {
-  return (
-    <span className="rv-warm" role="img" aria-label={`${n} warm of ${of}`} title={`${n} warm of ${of}`}>
-      {Array.from({ length: of }, (_, i) => (
-        <i key={i} data-on={i < n || undefined} />
-      ))}
-    </span>
-  );
-}
-
-/** One microVM: its stand, the session it holds, how it started, what it uses, and its controls in fixed places (pause, stop, telemetry). */
+/** One microVM: its stand, the session it holds, how it started, CPU and memory now, and its controls in fixed places (pause, restart, stop, telemetry). */
 function VmRow({ v, open, onCharts, onChanged }: { v: MicroVm; open: boolean; onCharts: () => void; onChanged: () => void }) {
   const [asking, setAsking] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
-  const S = START[v.start.kind];
   const paused = v.state === "paused";
-  const pause = (on: boolean) => {
+  const act = (a: "pause" | "resume" | "restart" | "stop") => {
     setBusy(true);
-    harnessApi
-      .command(v.session, { type: "pause", on })
+    sandboxApi
+      .act(v.session, a)
       .then(() => {
         onChanged();
-        if (on) toast({ title: `Paused ${v.agent}`, tone: "info", action: { label: "Undo", run: () => void harnessApi.command(v.session, { type: "pause", on: false }).then(onChanged) } });
+        if (a === "pause") toast({ title: `Paused ${v.agent}'s vCPUs`, tone: "info", action: { label: "Undo", run: () => void sandboxApi.act(v.session, "resume").then(onChanged) } });
+        else if (a === "restart") toast({ title: `Restarting ${v.agent}`, tone: "running" });
+        else if (a === "stop") toast({ title: `Stopped ${v.agent}`, tone: "info" });
       })
-      .catch((err: unknown) => toast.error(on ? "Couldn't pause" : "Couldn't resume", errorMessage(err)))
+      .catch((err: unknown) => toast.error(`Couldn't ${a}`, errorMessage(err)))
       .finally(() => setBusy(false));
   };
+  const cpu = paused ? 0 : (v.cpu.at(-1) ?? 0);
   return (
     <li className="rv-row" data-state={v.state}>
       <StatusDot status={VM_STATUS[v.state]} title={VM_WORD[v.state]} />
-      <Link to={`/agents/${v.session}`} className="rv-name" title={`${v.agent} · ${v.session}`}>
+      <Link to={`/agents/${v.session}?tab=sandbox`} className="rv-name" title={`${v.agent} · ${v.session}`}>
         {v.agent}
       </Link>
       <span className="rv-dim rv-image" title={v.image}>
         {v.image}
       </span>
-      <span className="rv-start" data-kind={v.start.kind} title={`${S.word} in ${ms(v.start.ms)}`}>
-        <S.icon size={13} aria-hidden="true" />
-        {ms(v.start.ms)}
+      <span className="rv-start">
+        <StartMark kind={v.start.kind} ms={v.start.ms} />
       </span>
       <span className="rv-dim rv-up" title="Up">
         {ago(v.up_s)}
       </span>
-      <span className="rv-meter rv-cpu" title="CPU, the last hour">
-        <Sparkline values={v.state === "paused" ? v.cpu.map(() => 0) : v.cpu} max={100} width={44} height={16} />
-        <span>{v.state === "paused" ? 0 : (v.cpu.at(-1) ?? 0)}%</span>
+      <span className="rv-cpu" title={`CPU ${cpu}% of its ${v.state === "paused" ? "paused " : ""}vCPUs`}>
+        <LimitMeter compact live limit={{ id: "cpu", label: "CPU", used_percent: cpu }} />
       </span>
-      <span className="rv-meter rv-mem" title="Memory">
-        <Meter value={v.memory.used} max={v.memory.total} label="Memory used" />
-        <span>
-          {(v.memory.used / 2 ** 30).toFixed(1)}/{Math.round(v.memory.total / 2 ** 30)}G
-        </span>
+      <span className="rv-mem" title={`Memory ${gib(v.memory.used)} of ${gib(v.memory.total)} GiB`}>
+        <LimitMeter compact live limit={{ id: "memory", label: "Mem", used_percent: (v.memory.used / v.memory.total) * 100 }} />
       </span>
       <span className="rv-acts">
         {asking ? (
@@ -378,7 +341,7 @@ function VmRow({ v, open, onCharts, onChanged }: { v: MicroVm; open: boolean; on
               aria-label={`Stop ${v.agent}`}
               onClick={() => {
                 setAsking(false);
-                toast({ title: `Stopping ${v.agent}`, tone: "info" });
+                act("stop");
               }}
             >
               <Check size={14} />
@@ -395,21 +358,13 @@ function VmRow({ v, open, onCharts, onChanged }: { v: MicroVm; open: boolean; on
               data-variant="bare"
               data-size="sm"
               disabled={busy || v.state === "failed" || v.state === "draining"}
-              title={paused ? "Resume (P)" : "Pause (P)"}
+              title={paused ? "Resume its vCPUs (P)" : "Pause its vCPUs (P)"}
               aria-label={`${paused ? "Resume" : "Pause"} ${v.agent}`}
-              onClick={() => pause(!paused)}
+              onClick={() => act(paused ? "resume" : "pause")}
             >
               {paused ? <Play size={14} /> : <Pause size={14} />}
             </button>
-            <button
-              type="button"
-              className="icon-btn"
-              data-variant="bare"
-              data-size="sm"
-              title="Restart (R)"
-              aria-label={`Restart ${v.agent}`}
-              onClick={() => toast({ title: `Restarting ${v.agent}`, tone: "running" })}
-            >
+            <button type="button" className="icon-btn" data-variant="bare" data-size="sm" disabled={busy} title="Restart (R)" aria-label={`Restart ${v.agent}`} onClick={() => act("restart")}>
               <RotateCcw size={14} />
             </button>
             <button
@@ -430,28 +385,24 @@ function VmRow({ v, open, onCharts, onChanged }: { v: MicroVm; open: boolean; on
           <ChartLine size={14} />
         </button>
       </span>
+      {/* Its telemetry: the last hour, each plot the row's full width. */}
       {open && (
         <div className="rv-charts">
-          <span>
-            <span className="label">CPU · last hour</span>
-            <Sparkline values={v.cpu} max={100} width={320} height={48} className="rv-wide" />
-          </span>
-          <span>
-            <span className="label">Memory</span>
-            <span className="rv-meter">
-              <Meter value={v.memory.used} max={v.memory.total} label="Memory used" />
-              <span>
-                {formatBytes(v.memory.used)} of {formatBytes(v.memory.total)}
+          {(
+            [
+              ["CPU", v.cpu, 100, `${cpu}%`],
+              ["Memory", v.mem ?? [], 100, `${Math.round((v.memory.used / v.memory.total) * 100)}%`],
+              ["Network", v.net ?? [], undefined, `${(((v.net ?? []).at(-1) ?? 0) / 10).toFixed(1)} MB/s`],
+            ] as const
+          ).map(([label, values, max, now]) => (
+            <span key={label} className="rv-plot">
+              <span className="rv-plot-head">
+                <span className="label">{label} · last hour</span>
+                <span className="rv-dim">{now}</span>
               </span>
+              <Sparkline values={[...values]} max={max} width={480} height={40} className="rv-wide" />
             </span>
-            <span className="label">Disk</span>
-            <span className="rv-meter">
-              <Meter value={v.disk.used} max={v.disk.total} label="Disk used" />
-              <span>
-                {formatBytes(v.disk.used)} of {formatBytes(v.disk.total)}
-              </span>
-            </span>
-          </span>
+          ))}
         </div>
       )}
     </li>

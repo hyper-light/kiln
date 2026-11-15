@@ -3,6 +3,8 @@
 .rv-block {
   container-type: inline-size;
   display: grid;
+  /* One column the block's own width: a row's least never widens the rest past the details' edge. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   margin-top: 22px;
   padding-top: 16px;
@@ -57,13 +59,22 @@
 .rv-ban {
   color: #8b8e96;
 }
-/* The node's room: a label over a mark and its number, each in its own cell. */
+/* Where we are now, first: the node's room as live bars, then its starts and warm hosts, each its own cell. */
 .rv-room {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  /* No track wider than the block, however narrow (a phone's details). */
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 170px), 1fr));
+  align-items: end;
   gap: 12px 20px;
+  min-width: 0;
 }
-.rv-room > span {
+.rv-room > * {
+  min-width: 0;
+}
+.rv-room .hx-limit-top {
+  white-space: nowrap;
+}
+.rv-cell {
   display: grid;
   gap: 5px;
   min-width: 0;
@@ -89,29 +100,6 @@
   align-items: center;
   gap: 4px;
 }
-/* Start kinds take their places along kiln's prism: warm its rose, from a template its blue, cold its teal. */
-[data-kind="warm"] > svg {
-  color: #d6a2aa;
-}
-[data-kind="template"] > svg {
-  color: #a6c4ed;
-}
-[data-kind="cold"] > svg {
-  color: #b8d9d2;
-}
-.rv-warm {
-  display: inline-flex;
-  gap: 3px;
-}
-.rv-warm > i {
-  width: 7px;
-  height: 7px;
-  border: 1.5px solid #a8c9bc;
-  border-radius: 50%;
-}
-.rv-warm > i[data-on] {
-  background: #a8c9bc;
-}
 .rv-label {
   margin-top: 6px;
 }
@@ -133,7 +121,8 @@
 }
 .rv-row {
   display: grid;
-  grid-template-columns: 14px minmax(120px, 1fr) 130px 84px 48px 100px 118px auto;
+  /* The controls' column holds the most a row has: four 32px buttons and their 2px gaps (a microVM's), or its question asked in place. */
+  grid-template-columns: 14px minmax(120px, 1fr) 130px 76px 44px 96px 96px 134px;
   align-items: center;
   gap: 0 12px;
   min-height: 36px;
@@ -146,6 +135,11 @@
 }
 .rv-row > .dot {
   justify-self: center;
+}
+/* A row's bars: its label and its percent on one line over the bar, never broken. */
+.rv-row .hx-limit-top {
+  font-size: 11px;
+  white-space: nowrap;
 }
 .rv-name {
   min-width: 0;
@@ -186,17 +180,21 @@ a.rv-name:hover {
   color: #e2b9bd;
   font-size: 12px;
 }
+/* Its telemetry: each plot the row's full width. */
 .rv-charts {
   grid-column: 2 / -1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 8px 24px;
+  gap: 12px;
   padding: 6px 0 12px;
 }
-.rv-charts > span {
+.rv-plot {
   display: grid;
   gap: 6px;
-  align-content: start;
+}
+.rv-plot-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
 }
 .rv-wide {
   width: 100%;
@@ -226,31 +224,27 @@ a.rv-name:hover {
   font-family: var(--font-mono);
   font-size: 12px;
 }
-/* Narrower details: the image and uptime go first, then memory; a row keeps its stand, name, start, CPU and controls. */
+/* Narrower details: the image and uptime go first; a row keeps its stand, name, start, CPU and memory, and controls. */
 @container (max-width: 820px) {
   .rv-row {
-    grid-template-columns: 14px minmax(100px, 1fr) 84px 100px auto;
+    grid-template-columns: 14px minmax(100px, 1fr) 76px 96px 96px 134px;
   }
   .rv-row > .rv-image,
-  .rv-row > .rv-up,
-  .rv-row > .rv-mem {
+  .rv-row > .rv-up {
     display: none;
   }
 }
 @container (max-width: 520px) {
   .rv-row {
-    grid-template-columns: 14px minmax(80px, 1fr) 64px auto;
+    grid-template-columns: 14px minmax(0, 1fr) 64px 134px;
+    gap: 0 8px;
   }
-  .rv-row > .rv-start {
-    display: none;
-  }
-  .rv-cpu .spark {
+  /* A phone's row: its name, its CPU as the one bar a list row keeps, its controls. */
+  .rv-row > .rv-start,
+  .rv-row > .rv-mem {
     display: none;
   }
   .rv-default {
     margin-left: 0;
-  }
-  .rv-charts {
-    grid-template-columns: minmax(0, 1fr);
   }
 }

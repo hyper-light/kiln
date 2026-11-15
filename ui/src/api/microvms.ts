@@ -39,6 +39,9 @@ export interface MicroVm {
   state: "running" | "idle" | "paused" | "failed" | "draining";
   /** CPU %, the last hour, oldest first. */
   cpu: number[];
+  /** Memory % of its own, and network MB/s × 10, the last hour: its telemetry's plots. */
+  mem?: number[];
+  net?: number[];
   memory: { used: number; total: number };
   disk: { used: number; total: number };
 }

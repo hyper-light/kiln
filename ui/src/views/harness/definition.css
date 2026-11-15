@@ -286,18 +286,29 @@
   font-family: var(--font-mono);
   font-size: 10.5px;
 }
-/* What a narrow window shows in place of the meta column it hides. */
-.df-narrow {
+/* What a narrow window shows in place of what it hides: a session's sandbox (a phone's rows have no meta
+   column), and a definition's warm hosts and every start (its head's line drops them first). */
+.df-narrow,
+.df-runs-full {
   display: none;
+}
+@container (max-width: 960px) {
+  .df-runs-full {
+    display: flex;
+  }
 }
 @container (max-width: 520px) {
   .df-narrow {
     display: flex;
   }
 }
-/* A narrow line keeps where it runs and its fastest start; its warm hosts and other starts are in its values, opened. */
+/* A narrower line keeps where it runs and its starts, then (a phone's) only its fastest; its warm hosts and the rest are in its values, opened. */
+@container (max-width: 960px) {
+  .df-group-sum .df-runs .sm-warm {
+    display: none;
+  }
+}
 @container (max-width: 520px) {
-  .df-group-sum .df-runs .sm-warm,
   .df-group-sum .df-runs .sm-start:not([data-first]) {
     display: none;
   }
@@ -323,4 +334,11 @@
 .df-defrow + .ms-tree,
 .ms-tree + .df-defrow {
   border-top: 1px solid #25272c;
+}
+/* A definition's own row (chat's card, the Agents tab) stands alone, not under a tree: wide, its
+   columns are what they hold (all of where it runs, then Run and ⋯), where a tree's are fixed. */
+@container (min-width: 761px) {
+  .df-defrow {
+    grid-template-columns: 22px minmax(0, 1fr) auto auto;
+  }
 }

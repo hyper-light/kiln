@@ -49,9 +49,9 @@ import { offlineLabel, staleWhy } from "./runner-stale";
 import { limitLine, parseLimit, settable, standing, withEvent } from "./agent-limit";
 import { refusedLately, refusedLine } from "./refused";
 import { useClock } from "./harness/dom";
-import { ImagesPanel, PoolsPanel } from "./runners-pools";
+import { ImagesPanel, PoolsPanel, poolsRes, imagesRes } from "./runners-pools";
 import { EngineBlock, EngineCell, MicrovmsSection } from "./runners-microvms";
-import { enginesRes } from "@/api/microvms";
+import { enginesRes, runnerVmsRes } from "@/api/microvms";
 import { useAuth } from "@/lib/auth";
 
 /** The facets runners are filtered by, with each runner's values. */
@@ -129,7 +129,10 @@ export default function Runners() {
 function RunnersBody() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, enginesRes);
+  const selected = params.get("agent");
+  // All of it asked for at once, the open runner's microVMs and the CI panels below too: each read
+  // would otherwise wait for the one before it, and the page move as each came.
+  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, enginesRes, poolsRes, imagesRes, ...(selected ? [runnerVmsRes(selected)] : []));
   const engines = useRes(enginesRes).data;
   const agents = useAgentsLive();
   const history = useMetricsHistory().data;
@@ -138,9 +141,9 @@ function RunnersBody() {
   const [view, setView] = usePref<"table" | "cards">("kiln.agents.view", "table");
   const [q, setQ] = React.useState("");
   const [chosen, setChosen] = React.useState<Chosen>({});
-  const selected = params.get("agent");
 
   const openAgent = (name: string | null) => {
+    if (name) warm(runnerVmsRes(name));
     const n = new URLSearchParams(params);
     if (name) n.set("agent", name);
     else n.delete("agent");
@@ -428,8 +431,11 @@ function RunnersHead() {
         <th className="w-6" aria-label="State" />
         <th>Runner</th>
         <th className="hidden md:table-cell">Labels</th>
-        <th>Engine</th>
-        <th className="hidden lg:table-cell">Executors</th>
+        {/* Two things that both say "host": where agents' sessions run, and how CI's jobs run. */}
+        <th title="Where agents' sessions run here: in Shards microVMs, or on the host">Agents in</th>
+        <th className="hidden lg:table-cell" title="How CI jobs run here: kiln's executors (host, docker, shards, k8s)">
+          CI in
+        </th>
         <th>Slots</th>
         <th className="num hidden sm:table-cell">CPU</th>
         <th className="num hidden lg:table-cell">Mem</th>
@@ -826,7 +832,8 @@ function RunnerFactsList({ facts }: { facts: RunnerFacts }) {
     { label: "Processor", value: `${facts.cpu.model ?? "—"} · ${facts.cpu.cores} cores, ${facts.cpu.threads} threads` },
     ...(facts.gpus.length > 0 ? [{ label: "GPU", value: facts.gpus.map((g) => [g.model, g.memory > 0 && formatBytes(g.memory)].filter(Boolean).join(" · ")).join(", ") }] : []),
     { label: "Virtualization", value: [facts.virt.kvm && "KVM", facts.virt.nested && "nested", facts.virt.hvf && "Hypervisor.framework"].filter(Boolean).join(", ") || "none" },
-    { label: "Executors", value: executors.join(", ") },
+    // How CI jobs run here (an agent's session runs in the engine above, "Agents in").
+    { label: "CI in", value: executors.join(", ") },
     {
       label: "Tools",
       value:
