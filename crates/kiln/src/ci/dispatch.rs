@@ -4978,40 +4978,186 @@ mod tests {
         })
     }
 
-    /// W05-R25: a run the rebuild brings back with none of its legs made ends when it's cancelled.
-    /// Held behind its concurrency group as the server stopped, a run never started: it has its row
-    /// and its plan, and no leg. The rebuild takes it for one that had started (its plan's first
-    /// actions aren't given again), so its plan says its first legs are queued, and waits for them.
-    /// A cancel then changed nothing: the plan cancelled legs the dispatcher never made, and went on
-    /// waiting for their reports (production's runs #2758 to #2761, 2026-11-13: queued through two
-    /// restarts, whatever cancelled them). With no leg left to stop it ends cancelled, as a run that
-    /// never started does.
+    /// A repository `acme/x` and the workflow `src` as its runs keep it.
+    async fn workflow_in(hub: &std::sync::Arc<crate::hub::Hub>, src: &str) -> anyhow::Result<(crate::store::Repo, String)> {
+        let (wf, diags) = kiln_ci::wf::parse_workflow(".kiln/ci.yaml", src, kiln_ci::expr::Dialect::Kiln);
+        let model = serde_json::to_string(&wf.ok_or_else(|| anyhow::anyhow!("{diags:?}"))?)?;
+        hub.store.call(|c| Ok(c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/x', '', 0)")?)).await?;
+        let repo = hub.store.repos().await?.into_iter().find(|r| r.id == "r").ok_or_else(|| anyhow::anyhow!("no repository"))?;
+        Ok((repo, model))
+    }
+
+    /// A run as `start` leaves one it holds behind its group: its row and its plan, no leg.
+    async fn made(hub: &std::sync::Arc<crate::hub::Hub>, repo: &crate::store::Repo, model: &str, id: &str) -> anyhow::Result<()> {
+        let new = super::runs::NewRun { id: id.into(), workflow: ".kiln/ci.yaml".into(), name: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), model: model.to_owned(), input: "{}".into(), ..Default::default() };
+        super::runs::create(hub, repo, new).await?;
+        Ok(())
+    }
+
+    /// How run `id` stands: its status and conclusion, whether its plan is done, and each of its
+    /// legs' status.
+    async fn stands(hub: &std::sync::Arc<crate::hub::Hub>, id: &str) -> anyhow::Result<(String, Option<String>, bool, Vec<String>)> {
+        let id = id.to_owned();
+        hub.store
+            .call(move |c| {
+                let (status, conclusion, done) = c.query_row("SELECT r.status, r.conclusion, p.done FROM runs r JOIN ci_plans p ON p.run_id = r.id WHERE r.id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                let mut st = c.prepare("SELECT status FROM jobs WHERE run_id = ?1 ORDER BY key")?;
+                let legs = st.query_map([&id], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                Ok((status, conclusion, done, legs))
+            })
+            .await
+    }
+
+    /// `(status, conclusion, done, legs)` as [`stands`] gives them.
+    fn stand(status: &str, conclusion: Option<&str>, done: bool, legs: &[&str]) -> (String, Option<String>, bool, Vec<String>) {
+        (status.to_owned(), conclusion.map(str::to_owned), done, legs.iter().map(|l| (*l).to_owned()).collect())
+    }
+
+    /// W05-R25: a run held behind its workflow-level group as the server stopped comes back
+    /// waiting there, and starts in its turn. Held, a run has its row and its plan and none of its
+    /// legs. The rebuild took it for one that had started, so nothing ever started it: its plan
+    /// said its first legs were queued, none was made, and it stayed queued for good (production's
+    /// runs #2758 to #2761, 2026-11-13). Rebuilt, the run under way holds the group again (the one
+    /// behind it makes no leg while it goes on), and as it ends the one behind it starts.
     #[test]
-    fn w05_r25_a_run_rebuilt_with_none_of_its_legs_made_ends_when_cancelled() -> anyhow::Result<()> {
+    fn w05_r25_a_run_waiting_behind_its_group_over_a_restart_starts_in_its_turn() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            let src = "on: push\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: x\n";
-            let (wf, diags) = kiln_ci::wf::parse_workflow(".kiln/ci.yaml", src, kiln_ci::expr::Dialect::Kiln);
-            let model = serde_json::to_string(&wf.ok_or_else(|| anyhow::anyhow!("{diags:?}"))?)?;
-            // As `start` leaves a run it holds behind its group: its row and its plan, no leg.
-            hub.store.call(|c| Ok(c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/x', '', 0)")?)).await?;
-            let repo = hub.store.repos().await?.into_iter().find(|r| r.id == "r").ok_or_else(|| anyhow::anyhow!("no repository"))?;
-            let new = super::runs::NewRun { id: "R".into(), workflow: ".kiln/ci.yaml".into(), name: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), model, input: "{}".into(), ..Default::default() };
-            super::runs::create(&hub, &repo, new).await?;
+            let (repo, model) = workflow_in(&hub, "on: push\nconcurrency: { group: one, cancel-in-progress: false }\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: x\n").await?;
+            // The first run: nothing holds its group, so it starts. Its leg is made, and waits for a
+            // runner (there is none here).
+            made(&hub, &repo, &model, "A").await?;
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            assert_eq!(stands(&hub, "A").await?, stand("queued", None, false, &["queued"]), "nothing holds its group: the first run starts, its leg made");
+            // The second, held behind it; and the server stops.
+            made(&hub, &repo, &model, "B").await?;
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            assert_eq!(stands(&hub, "B").await?, stand("queued", None, false, &[]), "the first holds the group again: the second waits, none of its legs made");
+            assert_eq!(stands(&hub, "A").await?, stand("queued", None, false, &["queued"]), "the first goes on as it was");
+            // The first ends (cancelled: no runner took its leg), and the second starts.
+            d.handle(super::Msg::Cancel { run: "A".into(), reason: "cancelled by a test".into() }).await;
+            assert_eq!(stands(&hub, "A").await?, stand("cancelled", Some("cancelled"), true, &["cancelled"]));
+            assert_eq!(stands(&hub, "B").await?, stand("queued", None, false, &["queued"]), "its turn: the second run starts, its leg made");
+            Ok(())
+        })
+    }
+
+    /// W05-R25: the runs under way come back before the ones waiting behind them, whatever the
+    /// order they were made in. An outside contributor's run, made first, waits for a maintainer
+    /// (W18-R06) while a later push's run starts; approved, it waits behind that one. Rebuilt in the
+    /// order they were made, it would find its group empty and start beside the run under way.
+    #[test]
+    fn w05_r25_a_run_under_way_holds_its_group_before_an_older_one_waiting_arrives() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (repo, model) = workflow_in(&hub, "on: push\nconcurrency: { group: one, cancel-in-progress: false }\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: x\n").await?;
+            made(&hub, &repo, &model, "B").await?;
+            super::runs::set_approval(&hub, "B", "required", None).await?;
+            made(&hub, &repo, &model, "A").await?;
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            assert_eq!(stands(&hub, "A").await?, stand("queued", None, false, &["queued"]), "the later run starts: the older one waits for a maintainer");
+            assert_eq!(stands(&hub, "B").await?, stand("queued", None, false, &[]));
+            // Approved, it waits behind the run under way; and the server stops.
+            anyhow::ensure!(d.approve_run("B", "a maintainer", true).await?, "it was waiting for approval");
+            assert_eq!(stands(&hub, "B").await?, stand("queued", None, false, &[]), "approved, it waits behind the run under way");
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            assert_eq!(stands(&hub, "B").await?, stand("queued", None, false, &[]), "made first, it still waits behind the run under way");
+            d.handle(super::Msg::Cancel { run: "A".into(), reason: "cancelled by a test".into() }).await;
+            assert_eq!(stands(&hub, "B").await?, stand("queued", None, false, &["queued"]), "its turn: it starts");
+            Ok(())
+        })
+    }
+
+    /// W05-R25: the runs that never started arrive in their group again in the order they arrived
+    /// there before, which isn't always the order they were made in. In a group that keeps every
+    /// waiting run (`queue: max`), an outside contributor's run made first and approved last
+    /// (W18-R06) is behind a later push's run that was waiting already: rebuilt, the push's run
+    /// still starts before it.
+    #[test]
+    fn w05_r25_runs_that_never_started_arrive_in_the_order_they_arrived_before() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (repo, model) = workflow_in(&hub, "on: push\nconcurrency: { group: one, queue: max }\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: x\n").await?;
+            // P, an outside contributor's, waits for a maintainer; A, made after it, starts.
+            made(&hub, &repo, &model, "P").await?;
+            super::runs::set_approval(&hub, "P", "required", None).await?;
+            made(&hub, &repo, &model, "A").await?;
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            assert_eq!(stands(&hub, "A").await?, stand("queued", None, false, &["queued"]), "the later run starts: the older one waits for a maintainer");
+            // Q is made and waits behind A; then P is approved, and waits behind Q. The store keeps
+            // times to the second: each is put where it fell, a while apart.
+            made(&hub, &repo, &model, "Q").await?;
+            anyhow::ensure!(d.approve_run("P", "a maintainer", true).await?, "it was waiting for approval");
+            hub.store
+                .call(|c| {
+                    Ok(c.execute_batch(
+                        "UPDATE runs SET created_at = 100 WHERE id = 'P';
+                         UPDATE runs SET created_at = 200 WHERE id = 'A';
+                         UPDATE runs SET created_at = 300 WHERE id = 'Q';
+                         UPDATE runs SET approved_at = 400 WHERE id = 'P';",
+                    )?)
+                })
+                .await?;
             // The server starts again.
             let mut d = dispatcher(&hub);
             d.restore().await?;
-            // Its status and conclusion, whether its plan is done, and how many legs it has.
-            let stands = || {
-                hub.store.call(|c| {
-                    let read = "SELECT r.status, r.conclusion, p.done, (SELECT COUNT(*) FROM jobs WHERE run_id = r.id) FROM runs r JOIN ci_plans p ON p.run_id = r.id WHERE r.id = 'R'";
-                    Ok(c.query_row(read, [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, bool>(2)?, r.get::<_, i64>(3)?)))?)
-                })
-            };
-            anyhow::ensure!(d.runs.contains_key("R") && d.legs.is_empty(), "rebuilt, with none of its legs made");
-            assert_eq!(stands().await?, ("queued".to_owned(), None, false, 0));
+            assert_eq!((stands(&hub, "P").await?, stands(&hub, "Q").await?), (stand("queued", None, false, &[]), stand("queued", None, false, &[])), "both wait behind the run under way");
+            d.handle(super::Msg::Cancel { run: "A".into(), reason: "cancelled by a test".into() }).await;
+            assert_eq!(stands(&hub, "Q").await?, stand("queued", None, false, &["queued"]), "the run that was waiting first starts first");
+            assert_eq!(stands(&hub, "P").await?, stand("queued", None, false, &[]), "the one approved after it arrived still waits");
+            d.handle(super::Msg::Cancel { run: "Q".into(), reason: "cancelled by a test".into() }).await;
+            assert_eq!(stands(&hub, "P").await?, stand("queued", None, false, &["queued"]), "then its turn");
+            Ok(())
+        })
+    }
+
+    /// W05-R25: a run cancelled with none of its legs made, the server stopped before it ended, ends
+    /// as it's rebuilt. An older kiln's rebuild took a waiting run for one that had started, and a
+    /// cancel then was logged and changed nothing: such a run has a cancel in its plan's log and no
+    /// leg. Nothing of it is left to stop, so it ends cancelled, and holds no place in its group.
+    #[test]
+    fn w05_r25_a_run_cancelled_with_none_of_its_legs_made_ends_as_its_rebuilt() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (repo, model) = workflow_in(&hub, "on: push\nconcurrency: { group: one, cancel-in-progress: false }\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: x\n").await?;
+            made(&hub, &repo, &model, "R").await?;
+            super::runs::log(&hub, "R", 1, "cancel", None, Some(serde_json::json!({ "reason": "cancelled by a test" }).to_string())).await?;
+            made(&hub, &repo, &model, "N").await?;
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            assert_eq!(stands(&hub, "R").await?, stand("cancelled", Some("cancelled"), true, &[]), "cancelled, nothing of it made: it ended");
+            anyhow::ensure!(!d.runs.contains_key("R"), "the dispatcher let go of it");
+            assert_eq!(stands(&hub, "N").await?, stand("queued", None, false, &["queued"]), "it holds no group: the next run starts");
+            Ok(())
+        })
+    }
+
+    /// W05-R25: a run cancelled with no leg of it left to stop, its plan still waiting, ends
+    /// cancelled. The server stopped as a run started, one of its two first legs made and the other
+    /// not: rebuilt, its plan waits for both. Cancelled, the leg it has stops, and the plan would
+    /// wait on for the one never made. With nothing left to stop, the run ends.
+    #[test]
+    fn w05_r25_a_run_with_a_leg_never_made_ends_when_cancelled() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (repo, model) = workflow_in(&hub, "on: push\njobs:\n  a:\n    runs-on: linux\n    steps:\n      - run: x\n  b:\n    runs-on: linux\n    steps:\n      - run: x\n").await?;
+            made(&hub, &repo, &model, "R").await?;
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            assert_eq!(stands(&hub, "R").await?, stand("queued", None, false, &["queued", "queued"]), "it starts: both its legs made");
+            // As if the server had stopped between the two.
+            let gone = hub.store.call(|c| Ok(c.execute("DELETE FROM jobs WHERE run_id = 'R' AND key = 'b'", [])?)).await?;
+            anyhow::ensure!(gone == 1, "one leg's row removed: {gone}");
+            let mut d = dispatcher(&hub);
+            d.restore().await?;
+            assert_eq!(stands(&hub, "R").await?, stand("queued", None, false, &["queued"]));
             d.handle(super::Msg::Cancel { run: "R".into(), reason: "cancelled by a test".into() }).await;
-            assert_eq!(stands().await?, ("cancelled".to_owned(), Some("cancelled".to_owned()), true, 0), "cancelled, it ended");
+            assert_eq!(stands(&hub, "R").await?, stand("cancelled", Some("cancelled"), true, &["cancelled"]), "cancelled, it ended");
             anyhow::ensure!(!d.runs.contains_key("R"), "the dispatcher let go of it");
             Ok(())
         })
