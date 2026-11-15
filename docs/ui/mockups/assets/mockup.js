@@ -239,15 +239,47 @@ window.addEventListener("load", () => { if (window.AUDIT) setTimeout(audit, 400)
 const narrow = () => innerWidth < 640;
 /** cols: [{h, w (px or %), c (hide class), name (the first column), spacer, ctl}] */
 function th3(cols) {
-  return `<thead><tr>${cols.map((c) => `<th class="${c.c || ""}${c.spacer ? " sp" : ""}" style="${c.spacer ? "" : c.name ? (narrow() ? "" : `width:${c.w}`) : `width:${c.w}px`}">${c.h || ""}</th>`).join("")}</tr></thead>`;
+  return `<thead><tr>${cols[0]?.name ? '<th class="lead"></th>' : ""}${cols.map((c) => `<th title="${esc(c.tip || "")}" class="${c.c || ""}${c.spacer ? " sp" : ""}" style="${c.spacer ? "" : c.name ? (narrow() ? "" : `width:${c.w}`) : `width:${c.w}px`}">${c.h || ""}</th>`).join("")}</tr></thead>`;
 }
-const td3 = (cols, cells) => cells.map((x, i) => `<td class="${cols[i].c || ""}${cols[i].spacer ? " sp" : ""}">${x ?? ""}</td>`).join("");
+/** A row's cells; when the table leads with a name, the first cell's glyph sits in its own lead column. */
+const td3 = (cols, cells) => cells.map((x, i) => { const cls = `${cols[i].c || ""}${cols[i].spacer ? " sp" : ""}`; if (i === 0 && cols[0]?.name) { const o = typeof x === "object" && x ? x : { lead: "", body: x ?? "" }; return `<td class="lead">${o.lead}</td><td class="${cls}">${o.body}</td>`; } return `<td class="${cls}">${x ?? ""}</td>`; }).join("");
 /** The first cell: a status glyph and a name, on the card's edge. */
-const named = (state, name, attrs = "", tip) => `<span class="cr">${st(state, tip)}<span class="ell" ${attrs} ${attrs.includes("data-peek") ? 'tabindex="0"' : ""} title="${esc(name)}">${esc(name)}</span></span>`;
+/** A status glyph (for the lead column) and a name, cut in the middle when it doesn't fit, its tail kept. */
+const named = (state, name, attrs = "", tip, extra = "") => ({ lead: st(state, tip), body: `<span class="cr"><span class="ell mid" ${attrs} ${attrs.includes("data-peek") ? 'tabindex="0"' : ""} title="${esc(name)}" data-full="${esc(name)}">${esc(name)}</span>${extra}</span>` });
+/** Names that don't fit lose their middle, never their tail: adas-mac…local-2. */
+function fitMiddle() {
+  const cut = (full, head, tail) => (head + tail >= full.length ? full : full.slice(0, head) + "…" + full.slice(full.length - tail));
+  const fits = (el, t) => { el.textContent = t; return el.scrollWidth <= el.clientWidth + 1; };
+  // First the longest cut that fits, keeping the tail; then, where two names in one table read alike, the cut moves until each reads apart.
+  const els = $$(".mid");
+  els.forEach((el) => {
+    const full = el.dataset.full; el._k = full.length;
+    if (fits(el, full)) { el._shown = full; return; }
+    let lo = 3, hi = full.length - 1, best = 3;
+    while (lo <= hi) { const k = (lo + hi) >> 1; if (fits(el, cut(full, k - Math.min(Math.ceil(k / 2), 9), Math.min(Math.ceil(k / 2), 9)))) { best = k; lo = k + 1; } else hi = k - 1; }
+    el._k = best; el._shown = cut(full, best - Math.min(Math.ceil(best / 2), 9), Math.min(Math.ceil(best / 2), 9)); el.textContent = el._shown;
+  });
+  els.forEach((el) => {
+    if (el._shown === el.dataset.full) return;
+    const peers = $$(".mid", el.closest("table") || document).filter((x) => x !== el && x.dataset.full !== el.dataset.full);
+    const full = el.dataset.full, k = el._k;
+    for (let tail = Math.min(Math.ceil(k / 2), 9); tail <= k - 1; tail++) {
+      const t = cut(full, k - tail, tail);
+      if (!peers.some((x) => (x._shown || x.textContent) === t)) { el._shown = t; el.textContent = t; return; }
+    }
+  });
+}
+addEventListener("resize", () => requestAnimationFrame(fitMiddle));
+/** A count of a whole as blocks: ▮▮▮▮▮▯▯ 5 of 7. */
+const blocks = (n, of, color, tip) => `<span class="u" title="${esc(tip)}"><span class="blk">${Array.from({ length: of }, (_, i) => `<i style="${i < n ? `background:${color}` : ""}"></i>`).join("")}</span></span>`;
+/** Start kinds as their icons, each with its count, in the colours their bars use. */
+const starts3 = (w, t, c) => `<span class="u" title="Warm ${w} · template ${t} · cold ${c}">${[["warm", w], ["template", t], ["cold", c]].map(([k, n]) => `<span class="kv3">${startIcon(k)}<span>${n}</span></span>`).join("")}</span>`;
+/** A mock-only control, outside the page: it isn't part of the design. */
+function mockChip(html) { let c = $("#mockchip"); if (!c) { document.body.insertAdjacentHTML("beforeend", `<div id="mockchip" class="v3 mockchip"><span class="lbl">mock</span><span id="mockchip-in"></span></div>`); c = $("#mockchip"); } $("#mockchip-in").innerHTML = html; }
 /** Which width band the window is in: tables lose columns at 640, 900 and 1100. */
 const band = () => (innerWidth < 640 ? 0 : innerWidth < 900 ? 1 : innerWidth < 1100 ? 2 : 3);
 /** How many of a table's columns show at this width: what a row spanning the table spans. */
-const shown = (cols) => cols.filter((c) => !(c.spacer && narrow()) && !(c.c === "h1100" && innerWidth < 1100) && !(c.c === "h900" && innerWidth < 900) && !(c.c === "h640" && innerWidth < 640)).length;
+const shown = (cols) => (cols[0]?.name ? 1 : 0) + cols.filter((c) => !(c.spacer && narrow()) && !(c.c === "h1100" && innerWidth < 1100) && !(c.c === "h900" && innerWidth < 900) && !(c.c === "h640" && innerWidth < 640)).length;
 /** Draw again when the window crosses a band. */
 function onBand(render) { let b = band(); addEventListener("resize", () => { if (band() !== b) { b = band(); render(); } }); }
 

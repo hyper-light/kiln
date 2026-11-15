@@ -43,7 +43,10 @@ const vmState = (v, r) => (S.moving[r.id] && r.engine === "microvm" && v.state !
 const last = (a) => a[a.length - 1];
 
 /* ------------------------------------------------------------ the fleet */
-const FLEET = () => [{ h: "Runner", name: true, w: "24%" }, { h: narrow() ? "" : "Engine", w: narrow() ? 36 : 104 }, { h: "VMs", w: 88, c: "h640" }, { h: "CPU", w: narrow() ? 76 : 100 }, { h: "Memory", w: 96, c: "h900" }, { h: "Disk", w: 96, c: "h1100" }, { h: "Warm", w: 80, c: "h900" }, { spacer: true }, { h: "", w: narrow() ? 64 : 96 }];
+/** Every table on this page shares one grid: the name, then six slots, then the controls. Like content lines up: name, then kind, then CPU. */
+const GRID = (heads, tips = {}) => [{ h: heads[0], name: true }, { h: narrow() ? "" : heads[1], w: narrow() ? 36 : 104, tip: tips[1] }, { h: heads[2], w: 116, c: "h640", tip: tips[2] }, { h: heads[3], w: narrow() ? 52 : 100 }, { h: heads[4], w: 112, c: "h900" }, { h: heads[5], w: 96, c: "h1100" }, { h: heads[6], w: 72, c: "h900" }, { h: "", w: narrow() ? 92 : 154 }];
+const START_TIP3 = "Flame: warm · layers: from template · snowflake: cold";
+const FLEET = () => GRID(["Runner", "Engine", "VMs", "CPU", "Memory", "Disk", "Warm"]);
 function engineCell(r) {
   const m = S.moving[r.id];
   if (m) return `<span class="cr">${st("drain", "Switching: draining")}${icon(m.to, ENGINE_TIP[m.to])}<span class="ell h640">${m.to}</span></span>`;
@@ -58,19 +61,18 @@ function fleetRow(r) {
     named(r.draining ? "drain" : "ok", r.name, "", r.draining ? "Draining" : `Connected · ${r.host} · ${r.plat} · kiln 0.9.41`),
     engineCell(r),
     r.vms.length ? vmMix(r) : `<span class="dim">0</span>`,
-    spark(r.cpu, `${Math.round(last(r.cpu))}%`, "#3987e5", narrow() ? 24 : 40, 16, `rc:${r.id}`),
+    spark(r.cpu, `${Math.round(last(r.cpu))}%`, "#3987e5", narrow() ? 0 : 40, 16, `rc:${r.id}`),
     ubar(memPct, `${memPct}%`, 36),
     ubar(r.disk, `${r.disk}%`, 36),
     of ? wdots(warm, of) : `<span class="dim">0</span>`,
-    "",
     `<span class="acts ctl">${ib(r.draining ? "play" : "pause", r.draining ? "Resume" : "Drain", `data-do="${r.draining ? "resume" : "drain"}" data-r="${r.id}"`)}${narrow() ? "" : ib("terminal", "Terminal")}${ib("more", "More", `data-do="rmore" data-r="${r.id}"`)}</span>`,
   ])}</tr>${open ? `<tr><td class="detail" colspan="${shown(FLEET())}">${detail(r)}</td></tr>` : ""}`;
 }
 
 /* ------------------------------------------------------------ one runner, in place */
-const VMCOLS = [{ h: "Agent", name: true, w: "20%" }, { h: "Project", w: 150, c: "h900" }, { h: "Image", w: 116, c: "h1100" }, { h: "Start", w: 84, c: "h640" }, { h: "Up", w: 52, c: "h640" }, { h: "CPU", w: 92 }, { h: "Memory", w: 104, c: "h640" }, { h: "Disk", w: 88, c: "h1100" }, { spacer: true }, { h: "", w: 150 }];
-const POOLCOLS = [{ h: "Agent", name: true, w: "20%" }, { h: "Size", w: 120, c: "h900" }, { h: "Warm", w: 76 }, { h: "Hits", w: 104 }, { h: "Idle", w: 56, c: "h640" }, { spacer: true }, { h: "", w: 44 }];
-const IMGCOLS = [{ h: "Image", name: true, w: "20%" }, { h: "From", w: 120, c: "h900" }, { h: "Size", w: 112, c: "h640" }, { h: "Age", w: 56 }, { spacer: true }, { h: "", w: 70 }];
+const VMCOLS = () => GRID(["Agent", "Start", "Image", "CPU", "Memory", "Disk", "Up"], { 1: START_TIP3 });
+const POOLCOLS = () => GRID(["Agent", "Warm", "Size", "Hits", "Idle", "", ""]);
+const IMGCOLS = () => GRID(["Image", "Size", "From", "Age", "", "", ""]);
 function detail(r) {
   const m = S.moving[r.id];
   const want = m ? m.to : r.engine;
@@ -87,9 +89,9 @@ function detail(r) {
   const room = r.engine === "microvm" ? Math.round((used / r.memG) * 100) : 0;
   const tot = r.starts.reduce((a, b) => a + b, 0);
   const warm = r.pools.reduce((a, p) => a + p.warm, 0), of = r.pools.reduce((a, p) => a + p.of, 0);
-  return `<div class="ch">
+  return `<div class="ch wrap3">
       <span class="seg-w">${S.owner ? "" : icon("lock", "Needs runners.manage")}<span class="sg3" role="group" aria-label="Engine">${["microvm", "host"].map((e) => `<button data-do="engine" data-e="${e}" data-r="${r.id}" aria-pressed="${want === e}" ${!S.owner || m || (e === "microvm" && !r.can) ? "disabled" : ""} title="${e === "microvm" && !r.can ? esc(r.why) : ENGINE_TIP[e]}">${icon(e)}${e}</button>`).join("")}</span></span>
-      <span class="checks3">${checks.map(([l, s, tip]) => `<span title="${esc(tip)}">${st(s, tip)}<span class="lbl h900">${l}</span></span>`).join("")}</span>
+      <span class="checks3">${checks.map(([l, s, tip]) => `<span title="${esc(tip)}">${st(s, tip)}<span class="lbl">${l}</span></span>`).join("")}</span>
       <span class="acts"><span class="kv3 h640" title="Workspace default · Settings → Runners"><span class="lbl">Default</span><span class="val">microvm</span></span>${r.override ? `<span class="kv3 h1100" title="${esc(`${r.override[0]} asks for ${r.override[1]}`)}">${st("warn", "Project override")}<span class="val">kiln → ${r.override[1]}</span></span>` : ""}</span>
     </div>${fr}
     <div class="sum3 body3">
@@ -97,48 +99,46 @@ function detail(r) {
       <div><span class="lbl">vCPUs</span><span class="v">${ubar((r.vcpu[0] / r.vcpu[1]) * 100, `${r.vcpu[0]}/${r.vcpu[1]}`, 56)}</span></div>
       <div><span class="lbl">Disk</span><span class="v">${ubar(r.disk, `${r.disk}%`, 56)}</span></div>
       <div><span class="lbl">Network</span><span class="v">${spark(W(r.net, r.net / 2 + 0.2, 51), `${r.net} MB/s`, "#3987e5", 56)}</span></div>
-      <div><span class="lbl">Starts</span><span class="v">${tot ? stack([{ v: r.starts[0], color: START_COLORS.warm, tip: "Warm" }, { v: r.starts[1], color: START_COLORS.template, tip: "Template" }, { v: r.starts[2], color: START_COLORS.cold, tip: "Cold" }], 56, String(tot)) : `<span class="dim">0</span>`}</span></div>
+      <div><span class="lbl" title="${START_TIP3}">Starts</span><span class="v">${tot ? starts3(...r.starts) : `<span class="dim">0</span>`}</span></div>
       <div><span class="lbl">Warm</span><span class="v">${of ? wdots(warm, of) : `<span class="dim">0</span>`}</span></div>
     </div>
     <div class="sh"><button class="lbl hi kv3" data-do="nodecharts" aria-expanded="${S.nodeCharts}">${icon("chart")}Telemetry${icon("chev")}</button></div>
     ${S.nodeCharts ? `<div class="charts3">${chart("CPU", [{ name: "CPU", color: "#3987e5", values: r.cpu }], "%")}${chart("Memory", [{ name: "Used", color: "#3987e5", values: W(used, 1.2, 61) }], "G")}${chart("Network", [{ name: "In", color: "#3987e5", values: W(r.net, 0.8, 63) }, { name: "Out", color: "#d95926", values: W(r.net / 2, 0.5, 67) }], "MB/s")}${chart("Start", [{ name: "Warm", color: START_COLORS.warm, values: W(215, 14, 71) }, { name: "Template", color: START_COLORS.template, values: W(440, 30, 73) }], "ms")}</div>` : ""}
-    <div class="sh"><span class="lbl hi">MicroVMs</span><span class="val dim">${r.vms.length}</span></div>
-    ${r.vms.length ? `<table class="t3">${th3(VMCOLS)}<tbody>${r.vms.map((v) => vmRow(v, r)).join("")}</tbody></table>` : ""}
-    <div class="sh"><span class="lbl hi">Pools</span><span class="val dim">${r.pools.length}</span></div>
-    ${r.pools.length ? `<table class="t3">${th3(POOLCOLS)}<tbody>${r.pools.map((p, i) => `<tr>${td3(POOLCOLS, [named(p.leaving ? "warn" : "ok", p.agent, `data-peek="agent:${esc(p.agent)}"`, p.leaving ? "Releasing soon" : "Kept"), `<span class="ell">${esc(p.size)}</span>`, wdots(p.warm, p.of), ubar((p.hits[0] / p.hits[1]) * 100, `${Math.round((p.hits[0] / p.hits[1]) * 100)}%`, 44, "#3987e5"), `<span class="${p.leaving ? "" : "dim"}">${p.idle}</span>`, "", `<span class="acts ctl">${ib("x", "Release", `data-do="release" data-r="${r.id}" data-i="${i}" data-tone="danger" data-confirm="Release?"`)}</span>`])}</tr>`).join("")}</tbody></table>` : ""}
-    <div class="sh"><span class="lbl hi">Images</span><span class="val dim">${r.images.length}</span><span class="acts">${r.can ? `<button class="b3" data-do="build" aria-expanded="${S.building}">${icon("build")}Build image</button>` : ""}</span></div>
+    ${r.vms.length ? `<div class="sh"><span class="lbl hi">MicroVMs</span><span class="val dim">${r.vms.length}</span></div>` : ""}
+    ${r.vms.length ? `<table class="t3">${th3(VMCOLS())}<tbody>${r.vms.map((v) => vmRow(v, r)).join("")}</tbody></table>` : ""}
+    ${r.pools.length ? `<div class="sh"><span class="lbl hi">Pools</span><span class="val dim">${r.pools.length}</span></div>` : ""}
+    ${r.pools.length ? `<table class="t3">${th3(POOLCOLS())}<tbody>${r.pools.map((p, i) => `<tr>${td3(POOLCOLS(), [named(p.leaving ? "warn" : "ok", p.agent, `data-peek="agent:${esc(p.agent)}"`, p.leaving ? "Releasing soon" : "Kept"), wdots(p.warm, p.of), `<span class="ell" title="${esc(p.size)}">${esc(p.size.replace(" vCPU · ", "c · ").replace(" GiB", "G"))}</span>`, ubar((p.hits[0] / p.hits[1]) * 100, `${Math.round((p.hits[0] / p.hits[1]) * 100)}%`, 44, "#3987e5"), `<span class="${p.leaving ? "" : "dim"}">${p.idle}</span>`, "", "", `<span class="acts ctl">${ib("x", "Release", `data-do="release" data-r="${r.id}" data-i="${i}" data-tone="danger" data-confirm="Release?"`)}</span>`])}</tr>`).join("")}</tbody></table>` : ""}
+    ${r.images.length ? `<div class="sh"><span class="lbl hi">Images</span><span class="val dim">${r.images.length}</span><span class="acts">${r.can ? `<button class="b3" data-do="build" aria-expanded="${S.building}">${icon("build")}Build image</button>` : ""}</span></div>` : r.can ? `<div class="sh"><button class="b3" data-do="build" aria-expanded="${S.building}">${icon("build")}Build image</button></div>` : ""}
     ${S.building && r.can ? `<div class="fr">${sel([["rust-dev", "rust-dev v9"], ["docs-site", "docs-site v3"], ["harness-claude", "harness-claude"]], "rust-dev", 'id="bfrom" aria-label="Agentfile"')}<span class="val dim">${r.plat.startsWith("linux/x86") ? "linux/amd64" : "linux/arm64"}</span><span class="acts"><button class="b3 p" data-do="dobuild" data-r="${r.id}">Build</button><button class="b3 g" data-do="build">Cancel</button></span></div>` : ""}
-    ${r.images.length ? `<table class="t3">${th3(IMGCOLS)}<tbody>${r.images.map(([n, from, size, age, s], i) => `<tr>${td3(IMGCOLS, [named(s === "start" ? "start" : s, n, "", s === "start" ? "Building" : s === "failed" ? "Failed: checksum mismatch, line 13" : "Built"), `<span class="ell">${esc(from)}</span>`, size ? ubar((size / 1.5) * 100, `${size.toFixed(2)}G`, 44, "#3987e5") : `<span class="dim">—</span>`, `<span class="dim">${age}</span>`, "", `<span class="acts ctl">${ib("restart", "Build again", `data-do="rebuild" data-r="${r.id}" data-i="${i}"`)}${ib("trash", "Remove", `data-do="rmimg" data-r="${r.id}" data-i="${i}" data-tone="danger" data-confirm="Remove?"`)}</span>`])}</tr>`).join("")}</tbody></table>` : ""}`;
+    ${r.images.length ? `<table class="t3">${th3(IMGCOLS())}<tbody>${r.images.map(([n, from, size, age, s], i) => `<tr>${td3(IMGCOLS(), [named(s === "start" ? "start" : s, n, "", s === "start" ? "Building" : s === "failed" ? "Failed: checksum mismatch, line 13" : "Built"), size ? ubar((size / 1.5) * 100, narrow() ? "" : `${size.toFixed(2)}G`, narrow() ? 28 : 44, "#3987e5") : `<span class="dim">—</span>`, `<span class="ell">${esc(from)}</span>`, `<span class="dim">${age}</span>`, "", "", "", `<span class="acts ctl">${ib("restart", "Build again", `data-do="rebuild" data-r="${r.id}" data-i="${i}"`)}${ib("trash", "Remove", `data-do="rmimg" data-r="${r.id}" data-i="${i}" data-tone="danger" data-confirm="Remove?"`)}</span>`])}</tr>`).join("")}</tbody></table>` : ""}`;
 }
 function vmRow(v, r) {
   const s = vmState(v, r);
   const charts = S.vmCharts.has(v.id);
-  return `<tr tabindex="0" data-vm="${v.id}" data-r="${r.id}">${td3(VMCOLS, [
-    named(s, v.agent, `data-peek="vm:${v.id}"`),
-    `<span class="ell">${esc(v.proj)}</span>`,
-    `<span class="ell">${esc(v.image)}</span>`,
-    `<span class="cr">${startIcon(v.start[0])}<span>${v.start[1] >= 1000 ? (v.start[1] / 1000).toFixed(1) + "s" : v.start[1] + "ms"}</span></span>`,
-    `<span class="dim">${v.up}</span>`,
+  return `<tr tabindex="0" data-vm="${v.id}" data-r="${r.id}">${td3(VMCOLS(), [
+    named(s, v.agent, `data-peek="vm:${v.id}"`, `${STATES[s][1]} · ${v.proj}`),
+    `<span class="cr">${startIcon(v.start[0])}<span class="h640">${v.start[1] >= 1000 ? (v.start[1] / 1000).toFixed(1) + "s" : v.start[1] + "ms"}</span></span>`,
+    `<span class="cr"><span class="ell mid" data-full="${esc(v.image)}" title="${esc(v.image)}">${esc(v.image)}</span></span>`,
     spark(v.cpu, s === "paused" || s === "stopped" ? "0%" : `${Math.round(last(v.cpu))}%`, "#3987e5", 36, 16, `vc:${v.id}`),
     ubar((v.mem[0] / v.mem[1]) * 100, `${v.mem[0]}/${v.mem[1]}G`, 36),
     ubar((v.disk[0] / v.disk[1]) * 100, `${v.disk[0]}G`, 36),
-    "",
+    `<span class="dim">${v.up}</span>`,
     `<span class="acts ctl">${ib("play", "Resume (P)", `data-do="vm-play" data-vm="${v.id}" ${["paused", "stopped", "failed"].includes(v.state) ? "" : "disabled"}`)}${ib("pause", "Pause (P)", `data-do="vm-pause" data-vm="${v.id}" ${["run", "idle"].includes(v.state) ? "" : "disabled"}`)}${ib("restart", "Restart (R)", `data-do="vm-restart" data-vm="${v.id}"`)}${ib("stop", "Stop (S)", `data-do="vm-stop" data-vm="${v.id}" data-tone="danger" data-confirm="Stop?" ${v.state === "stopped" ? "disabled" : ""}`)}${ib("chart", "Telemetry (T)", `data-do="vm-charts" data-vm="${v.id}" aria-expanded="${charts}"`)}</span>`,
-  ])}</tr>${charts ? `<tr><td class="detail" colspan="${shown(VMCOLS)}"><div class="charts3">${chart("CPU", [{ name: "CPU", color: "#3987e5", values: v.cpu }], "%")}${chart("Memory", [{ name: "Used", color: "#3987e5", values: W(v.mem[0], 0.3, 81) }], "G")}${chart("Network", [{ name: "In", color: "#3987e5", values: W(0.6, 0.4, 83) }, { name: "Out", color: "#d95926", values: W(0.3, 0.3, 87) }], "MB/s")}</div></td></tr>` : ""}`;
+  ])}</tr>${charts ? `<tr><td class="detail" colspan="${shown(VMCOLS())}"><div class="charts3">${chart("CPU", [{ name: "CPU", color: "#3987e5", values: v.cpu }], "%")}${chart("Memory", [{ name: "Used", color: "#3987e5", values: W(v.mem[0], 0.3, 81) }], "G")}${chart("Network", [{ name: "In", color: "#3987e5", values: W(0.6, 0.4, 83) }, { name: "Out", color: "#d95926", values: W(0.3, 0.3, 87) }], "MB/s")}</div></td></tr>` : ""}`;
 }
 
 /* ------------------------------------------------------------ render, act */
 function render() {
   const mv = R.filter((r) => r.engine === "microvm").length, vms = R.reduce((a, r) => a + r.vms.length, 0);
+  mockChip(`<span class="sg3" role="group" aria-label="View as">${[["owner", "Owner"], ["viewer", "Viewer"]].map(([v, l]) => `<button data-do="as" data-v="${v}" aria-pressed="${S.owner === (v === "owner")}">${l}</button>`).join("")}</span>`);
   $("#page").innerHTML = `${mockBar("runners")}
-    <div class="head3"><div class="crumb">04 / Runners</div><h1>Fleet</h1><div class="sub">Machines, engines and their microVMs</div></div>
-    <div class="bar-row"><span class="sg3" role="group" aria-label="View as">${[["owner", "Owner"], ["viewer", "Viewer"]].map(([v, l]) => `<button data-do="as" data-v="${v}" aria-pressed="${S.owner === (v === "owner")}">${l}</button>`).join("")}</span></div>
-    <div class="card3"><div class="ch"><span class="lbl hi">Runners</span><span class="val dim">${R.length}</span><span class="acts">${stack([{ v: mv, color: "#3987e5", tip: "microVM" }, { v: R.length - mv, color: "#898781", tip: "Host" }], 64, `${mv} microVM`)}<span class="kv3 h640" style="margin-left:16px"><span class="lbl">VMs</span><span class="val">${vms}</span></span></span></div>
+    <div class="title3"><h1>Fleet</h1><span class="right"><span class="kv3">${blocks(mv, R.length, "#3987e5", `${mv} of ${R.length} runners run microVMs; ${R.length - mv} run on the host`)}<span class="val">${mv}/${R.length}</span><span class="lbl">microVM</span></span><span class="kv3"><span class="val">${vms}</span><span class="lbl">VMs</span></span></span></div>
+    <div class="card3">
       <table class="t3">${th3(FLEET())}<tbody>${R.map(fleetRow).join("")}</tbody></table></div>`;
-  liveScan();
+  liveScan(); fitMiddle();
 }
 liveStream(2000, () => { R.forEach((r) => { r.cpu.push(Math.max(1, Math.min(99, last(r.cpu) + (Math.random() - 0.5) * 8))); r.cpu.shift(); r.vms.forEach((v) => { if (v.state === "run" || v.state === "idle") { v.cpu.push(Math.max(0, Math.min(99, last(v.cpu) + (Math.random() - 0.5) * 10))); v.cpu.shift(); } }); }); },
-  (k) => { const [kind, id] = k.split(":"); if (kind === "rc") { const r = R.find((x) => x.id === id); return r && spark(r.cpu, `${Math.round(last(r.cpu))}%`, "#3987e5", narrow() ? 24 : 40, 16, k); } const [v] = VM(id); return v && spark(v.cpu, ["paused", "stopped"].includes(v.state) ? "0%" : `${Math.round(last(v.cpu))}%`, "#3987e5", 36, 16, k); });
+  (k) => { const [kind, id] = k.split(":"); if (kind === "rc") { const r = R.find((x) => x.id === id); return r && spark(r.cpu, `${Math.round(last(r.cpu))}%`, "#3987e5", narrow() ? 0 : 40, 16, k); } const [v] = VM(id); return v && spark(v.cpu, ["paused", "stopped"].includes(v.state) ? "0%" : `${Math.round(last(v.cpu))}%`, "#3987e5", 36, 16, k); });
 onBand(() => render());
 onOpenChange((id) => { S.open = id; render(); });
 const VM = (id) => { for (const r of R) { const v = r.vms.find((x) => x.id === id); if (v) return [v, r]; } return [null, null]; };

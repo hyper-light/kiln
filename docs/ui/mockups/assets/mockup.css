@@ -203,3 +203,16 @@
 .srch3:hover { border-color: #5b5f69; }
 .key3[data-current] { box-shadow: 0 0 0 2px #0a0c0f, 0 0 0 3px #d4d6dc; }
 @media (max-width: 639px) { .srch3 { min-width: 0; } }
+
+/* The status glyph's own column: its header empty, so every header starts where its text starts. */
+.t3 th.lead, .t3 td.lead { width: 34px; padding-right: 0; }
+.t3 th.lead + th, .t3 td.lead + td { padding-left: 0; }
+.mid { text-overflow: clip !important; }
+.blk { display: inline-flex; gap: 2px; }
+.blk i { width: 6px; height: 10px; border-radius: 1.5px; background: #262a31; }
+.u .kv3 + .kv3 { margin-left: 4px; }
+.mockchip { position: fixed; right: 12px; bottom: 12px; z-index: 90; display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px; border: 1px dashed #5b5f69; border-radius: 999px; background: #0b0c0e; }
+.mockchip .lbl { text-transform: uppercase; letter-spacing: .08em; }
+.title3 { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; min-height: 32px; }
+.title3 .right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+@media (max-width: 639px) { .checks3 { display: grid; grid-template-columns: repeat(2, auto); gap: 6px 16px; } .ch.wrap3 { flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px; } }
