@@ -151,7 +151,7 @@ fn a_runner_agent_that_couldnt_start_keeps_its_first_message_moved_or_started_ag
     let restarted = open(&s, &on_bare, &work)?;
     stopped(&s, &restarted)?;
     install_claude(&bare_bin)?;
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{restarted}/command"), &s.admin, Some(&json!({"type": "restart"})))?;
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/agents/{restarted}/restart"), &s.admin, Some(&json!({})))?;
     anyhow::ensure!((200..300).contains(&code), "the restart was refused: {code} {body}");
     answered(&s, &restarted, &on_bare, &logs)?;
     Ok(())

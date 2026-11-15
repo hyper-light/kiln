@@ -611,9 +611,16 @@ export const harnessApi = {
    * however often it's sent under it (docs/wire.md, "The UI's sockets").
    */
   command: (id: string, c: Command, key: string = clientId()) =>
-    ownAgentAction(call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }), [
-      id,
-    ]),
+    ownAgentAction(
+      // An interrupt, a control and a restart are operations of their own (agents.interrupt, agents.control, agents.restart: kiln plan
+      // 01a1dd2e8618733a87f2793aab1322a8 P5.6, S2); the rest go as commands.
+      c.type === "interrupt" || c.type === "restart"
+        ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/${c.type}`, {})
+        : c.type === "control"
+          ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/control`, { control: c.id, value: c.value ?? null })
+          : call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }),
+      [id],
+    ),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
   said: (p: { q: string; agent?: string; until?: number; beforeSeq?: number; limit?: number }) => {
     const qs = new URLSearchParams({ q: p.q });

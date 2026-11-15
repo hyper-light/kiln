@@ -101,13 +101,18 @@ pub async fn response_to(hub: &Hub, caller: &Caller, agent: &str, key: &str, res
 /// goals, asking about its conversation, a change request from its work, and landing its workspace. Reads, waits and an
 /// agent's own git credential aren't.
 pub fn tracks_operation(name: &str) -> bool {
-    matches!(name, "agents.send" | "agents.start" | "agents.interrupt" | "agents.stop" | "agents.about" | "agents.change" | "agents.land") || name.starts_with("goals.") && !matches!(name, "goals.get")
+    matches!(name, "agents.send" | "agents.start" | "agents.interrupt" | "agents.control" | "agents.restart" | "agents.stop" | "agents.about" | "agents.change" | "agents.land") || name.starts_with("goals.") && !matches!(name, "goals.get")
 }
 
 pub fn prepare_operation(hub:&Hub,name:&str,input:&Value)->Option<super::attention::HumanResponse>{
-    if name!="goals.control" || !matches!(input.get("action").and_then(Value::as_str),Some("resume"|"start")){return None;}
+    // A restart is a person's answer to an agent that exited, as its command is (`prepare_from_info`).
+    let response = match name {
+        "agents.restart" => super::attention::HumanResponse::Restart,
+        "goals.control" if matches!(input.get("action").and_then(Value::as_str),Some("resume"|"start")) => super::attention::HumanResponse::Goals,
+        _ => return None,
+    };
     let info=hub.harness.info(input.get("agent")?.as_str()?)?;
-    super::attention::bind_response(&info,&super::attention::HumanResponse::Goals)
+    super::attention::bind_response(&info,&response)
 }
 
 /// MCP, CLI, and HTTP operation routes all meet here, after authorization and a successful action.

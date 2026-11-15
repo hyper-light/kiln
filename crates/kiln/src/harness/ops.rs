@@ -726,13 +726,31 @@ async fn changes(cx: Cx, v: Value) -> Out {
 }
 
 async fn interrupt(cx: Cx, v: Value) -> Out {
-    let info = known(&cx, &agent_of(&v)?)?;
+    commanded(&cx, &v, Command::Interrupt, "interrupted").await
+}
+
+/// One of an agent's controls set, or an action of its run (`control`, its value in `value`): what the
+/// Agents page's rename and keep going are (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S2).
+async fn control(cx: Cx, v: Value) -> Out {
+    let c = Command::Control { id: text(&v, "control")?, value: v.get("value").cloned() };
+    commanded(&cx, &v, c, "set").await
+}
+
+/// The agent's harness started again where it left off, after it exited (S2).
+async fn restart(cx: Cx, v: Value) -> Out {
+    commanded(&cx, &v, Command::Restart, "restarted").await
+}
+
+/// Command `c` given to the agent `v` names, by a caller that may steer it: `done` true once its machine
+/// has it, else why not.
+async fn commanded(cx: &Cx, v: &Value, c: Command, done: &str) -> Out {
+    let info = known(cx, &agent_of(v)?)?;
     let id = info.id.clone();
-    may_steer(&cx, &id).await?;
-    match cx.hub.harness.command(&cx.hub, &id, Command::Interrupt).await {
+    may_steer(cx, &id).await?;
+    match cx.hub.harness.command(&cx.hub, &id, c).await {
         Sent::Published(receipt) => Ok(json!({"publication": receipt})),
         Sent::PublicationRefused(error) => Err(mail_failed(error)),
-        Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({"interrupted": true})),
+        Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({done: true})),
         Sent::Refused(r) => Err(refused(&r)),
         s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => Err(s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
@@ -1009,6 +1027,24 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentsStop>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "stop"]))),
             run: |cx, v| Box::pin(stop(cx, v)),
+        },
+        Op {
+            name: "agents.control",
+            summary: "Set one of an agent's controls, or run one of its actions: `control` is its id (`rename` with the new name as `value`, `keep_going` with true or false, or another its harness offers), `value` its value.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsControl>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "control"]))),
+            run: |cx, v| Box::pin(control(cx, v)),
+        },
+        Op {
+            name: "agents.restart",
+            summary: "Start an agent's harness again where it left off, after it exited (its conversation goes on).",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsRestart>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "restart"]))),
+            run: |cx, v| Box::pin(restart(cx, v)),
         },
         Op {
             name: "agents.remove",
@@ -1341,6 +1377,24 @@ pub mod input {
         pub agent: String,
         /// End the agents it started (and theirs) too.
         pub children: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsControl {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// The control's id: `rename`, `keep_going`, or another its harness offers.
+        pub control: String,
+        /// Its value (`rename`: the new name; `keep_going`: true or false).
+        pub value: Option<serde_json::Value>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRestart {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

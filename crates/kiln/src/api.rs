@@ -1467,7 +1467,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let op = format!("agents.{what}");
             boxed(|| own_op(&hub, &caller, &op, v)).await
         }
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land" | "about" | "credential")]) => {
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "control" | "restart" | "stop" | "change" | "land" | "about" | "credential")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             // A send's idempotency key may come as the standard header (CP-T3.2).
             let key = idempotency_key(&req);
@@ -6743,6 +6743,17 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     }
     let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
     let mut c: crate::harness::model::Command = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // The Agents page's interrupt, controls and restart are operations (kiln plan 01a1dd2e8618733a87f2793aab1322a8
+    // P5.6, S2): one way in for each, held to what every operation is held to.
+    let op = match &c {
+        crate::harness::model::Command::Interrupt => Some("interrupt"),
+        crate::harness::model::Command::Control { .. } => Some("control"),
+        crate::harness::model::Command::Restart => Some("restart"),
+        _ => None,
+    };
+    if let Some(op) = op {
+        return Err(err(StatusCode::BAD_REQUEST, format!("an agent's {op} is agents.{op}'s: POST /api/harness/agents/{id}/{op}")));
+    }
     if let Some(k) = &key {
         let made = crate::util::derive_id(&["api.command", &crate::harness::ops::key_scope(&caller), id, k]);
         match &mut c {

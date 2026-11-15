@@ -232,3 +232,26 @@ fn p5_6_s1_remove_is_an_operation_held_to_the_gate_as_deployments_are() -> anyho
         Ok(())
     })
 }
+
+/// P5.6's slice S2: the Agents page's controls (rename, keep going), restart and interrupt are
+/// operations, held to the gate: in the owner's chat turn its own child's run at once, another of
+/// theirs waits on their click.
+#[test]
+fn p5_6_s2_controls_and_restart_are_operations_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        for (op, input) in [("agents.control", json!({"agent": "kid", "control": "rename", "value": "Kid"})), ("agents.restart", json!({"agent": "kid"})), ("agents.interrupt", json!({"agent": "kid"}))] {
+            let at_once = call(chat.clone(), op, input).await;
+            anyhow::ensure!(code(&at_once) == 200, "{op} on its own child: {at_once:?}");
+        }
+        for (op, input) in [("agents.control", json!({"agent": "other", "control": "keep_going", "value": true})), ("agents.restart", json!({"agent": "other"}))] {
+            let waits = call(chat.clone(), op, input).await;
+            anyhow::ensure!(code(&waits) == 428, "{op} on another of the owner's: {waits:?}");
+        }
+        let by_person = call(person(&hub), "agents.control", json!({"agent": "other", "control": "rename", "value": "Other"})).await;
+        anyhow::ensure!(code(&by_person) == 200, "the owner's own: {by_person:?}");
+        Ok(())
+    })
+}
