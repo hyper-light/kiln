@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Runners · engine · kiln mockup</title>
+<link rel="stylesheet" href="assets/fonts.css" />
+<link rel="stylesheet" href="assets/kiln.css" />
+<link rel="stylesheet" href="assets/mockup.css" />
+</head>
+<body>
+<div class="container-console mk-page">
+  <div class="mk-banner">
+    <span><b>Mockup</b> · kiln UI design · sample data · P2.3, P3.2</span>
+    <nav aria-label="Mockups"><a href="runners.html" aria-current="page">Runners</a><a href="agents.html">Agents</a><a href="agentfile.html">Agentfile</a><a href="experiments.html">Experiments</a></nav>
+  </div>
+
+  <header class="page-intro">
+    <div class="min-w-0">
+      <div class="eyebrow"><span class="spectrum-rule"></span>04 / Runners</div>
+      <h1>Fleet</h1>
+      <p class="lead" id="lead"></p>
+    </div>
+    <div class="row">
+      <a class="btn btn-secondary btn-default" href="#">Offers</a>
+      <a class="btn btn-primary btn-default" href="#">+ Add machines</a>
+    </div>
+  </header>
+
+  <div class="filter-bar runners-tools">
+    <div class="filter-bar-row">
+      <div class="field search-field grow"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input aria-label="Filter runners" placeholder="Filter by name, state, label, platform, engine…" id="q" /></div>
+      <div class="select-field"><label class="sr-only" for="layout">Layout</label><div class="select"><select id="layout"><option>Table</option><option>Cards</option></select><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></div></div>
+    </div>
+  </div>
+  <p class="mk-note">The filter's facets gain <span class="mono">Engine</span> (host, microvm) beside State, Labels and Platform. Try typing <span class="mono">host</span>.</p>
+
+  <div class="table-wrap mt-3">
+    <table class="data-table">
+      <thead><tr>
+        <th class="w-6" aria-label="State"></th>
+        <th>Runner</th>
+        <th class="hidden md:table-cell">Labels</th>
+        <th class="hidden sm:table-cell">Engine <span class="mk-new">new</span></th>
+        <th class="hidden lg:table-cell">Executors</th>
+        <th>Slots</th>
+        <th class="num hidden sm:table-cell">CPU</th>
+        <th class="num hidden lg:table-cell">Mem</th>
+        <th class="num hidden xl:table-cell">Disk</th>
+        <th class="hidden md:table-cell">Drain</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <p class="mk-note">Press a runner to open it in place. Try <b>adas-mac-studio.local</b> (switch it to host: its microVM session drains first), <b>adas-mac-studio-2.local</b> (can't run microVMs: Shards says why) and <b>adas-mac-studio-3.local</b> (warm pools).</p>
+</div>
+
+<script src="assets/mockup.js"></script>
+<script>
+
+const HVF = "Hypervisor.framework";
+const R = [
+  { id: "e301", name: "adas-macbook-pro-2.local", host: "Adas-MacBook-Pro-2.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 4, busy: 0, cpu: 27, mem: 25, disk: 58,
+    can: true, hv: HVF, engine: "microvm", origin: "default", cores: 18, memG: 128, room: "88.0 GiB · 14 vCPUs", sessions: [], images: ["rust-dev", "harness-claude", "harness-codex", "harness-devin"], pools: [] },
+  { id: "cec3", name: "adas-mac-studio.local", host: "Adas-Mac-Studio-3.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 3, busy: 1, cpu: 12, mem: 12, disk: 61,
+    can: true, hv: HVF, engine: "microvm", origin: "default", cores: 14, memG: 36, room: "21.4 GiB · 9 vCPUs", images: ["rust-dev", "harness-claude", "harness-codex"],
+    sessions: [{ who: "reviewer", kind: "Claude Code", state: "on a turn", since: "6 min" }], pools: [{ agent: "reviewer", yours: true, image: "rust-dev v8", size: "2 vCPU · 4 GiB", warm: 1, hits: [7, 9] }] },
+  { id: "b24c", name: "adas-mac-studio-2.local", host: "Adas-Mac-Studio-2.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 3, busy: 0, cpu: 13, mem: 21, disk: 74,
+    can: false, hv: null, engine: "host", origin: "cannot", cores: 14, memG: 36,
+    why: "Hypervisor.framework refused the VM process (HV_DENIED): kiln's shards-vm on this machine isn't signed with com.apple.security.hypervisor.",
+    sessions: [], images: [], pools: [] },
+  { id: "2768", name: "adas-mac-studio-3.local", host: "Adas-Mac-Studio-4.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 3, busy: 2, cpu: 29, mem: 26, disk: 66,
+    can: true, hv: HVF, engine: "microvm", origin: "default", cores: 14, memG: 36, room: "14.9 GiB · 6 vCPUs", images: ["rust-dev", "harness-claude", "harness-codex"],
+    sessions: [{ who: "ci-diagnose", kind: "Claude Code", state: "idle", since: "2 min" }, { who: "reviewer", kind: "Claude Code", state: "on a turn", since: "40 s" }],
+    pools: [{ agent: "reviewer", yours: true, image: "rust-dev v8", size: "2 vCPU · 4 GiB", warm: 2, hits: [41, 47] }, { agent: "ci-diagnose", yours: false, image: "harness-claude", size: "2 vCPU · 2 GiB", warm: 1, hits: [9, 12] }, { agent: "pr-triage", yours: true, image: "rust-dev v8", size: "1 vCPU · 2 GiB", warm: 0, hits: [0, 1], idle: true }] },
+  { id: "d132", name: "adas-mac-studio.local-2", host: "Adas-Mac-Studio.local", plat: "macos/aarch64", ver: "0.9.41", labels: ["baremetal", "macos", "aarch64"], slots: 8, busy: 0, cpu: 10, mem: 34, disk: 22,
+    can: true, hv: HVF, engine: "microvm", origin: "default", cores: 32, memG: 96, room: "58.2 GiB · 28 vCPUs", sessions: [], images: ["harness-claude", "harness-codex"], pools: [] },
+  { id: "4513", name: "adacachy", host: "adacachy", plat: "linux/x86_64", ver: "0.9.41", labels: ["baremetal", "bench", "local"], slots: 8, busy: 1, cpu: 15, mem: 27, disk: 93,
+    can: true, hv: "KVM", engine: "host", origin: "owner", originWhen: "3 days ago", cores: 32, memG: 123, room: "—", sessions: [], images: [], pools: [] },
+  { id: "00aa", name: "adacachy2", host: "adacachy2", plat: "linux/x86_64", ver: "0.9.41", labels: ["baremetal", "linux", "x86_64"], slots: 8, busy: 2, cpu: 5, mem: 37, disk: 81,
+    can: true, hv: "KVM", engine: "microvm", origin: "default", cores: 32, memG: 123, room: "71.6 GiB · 24 vCPUs", images: ["rust-dev", "harness-claude", "harness-codex"],
+    sessions: [{ who: "opus-kiln-12", kind: "Codex", state: "on a turn", since: "14 min" }, { who: "reviewer", kind: "Claude Code", state: "waiting on you", since: "3 min" }], pools: [{ agent: "reviewer", yours: true, image: "rust-dev v8", size: "2 vCPU · 4 GiB", warm: 1, hits: [12, 15] }] },
+];
+const IMAGES = {
+  "rust-dev": { by: "yours · v8", for: "claude, codex", digest: "sha256:7c1e0b9a44d2", size: "1.42 GiB", got: "prebuilt 4 min ago", used: "12 min ago" },
+  "harness-claude": { by: "kiln's", for: "claude", digest: "sha256:3a90d1c2fe07", size: "611 MiB", got: "prebuilt 2 days ago", used: "1 hour ago" },
+  "harness-codex": { by: "kiln's", for: "codex", digest: "sha256:91fe72b04c3d", size: "588 MiB", got: "prebuilt 2 days ago", used: "yesterday" },
+  "harness-devin": { by: "kiln's", for: "devin", digest: "sha256:c40a8e19b2d6", size: "702 MiB", got: "prebuilt 2 days ago", used: "3 days ago" },
+};
+let open = null;
+let asking = null; // runner id whose switch is being confirmed
+const ui = {}; // per-runner transient: {moving:{to, left:[...]}}
+
+function stateDot(r) { return r.busy > 0 ? "running" : "succeeded"; }
+function engineCell(r) {
+  const t = ui[r.id]?.moving;
+  if (t) return `<span class="eng-cell" data-moving>${r.engine} → ${t.to}</span><span class="cell-sub">draining ${t.left.length}</span>`;
+  const sub = r.engine === "microvm" ? r.hv : r.origin === "owner" ? "your choice" : "can't run microVMs";
+  return `<span class="eng-cell" data-engine="${r.engine}">${r.engine}</span><span class="cell-sub">${sub}</span>`;
+}
+function lead() {
+  const mv = R.filter((r) => r.engine === "microvm").length;
+  $("#lead").textContent = `7 of 8 runners connected · 6/37 slots busy · ${mv} run sessions in microVMs, ${R.length - mv} on the host. Runners are long-lived machines that take CI jobs; Kubernetes job pods show up under their jobs.`;
+}
+function render() {
+  lead();
+  const q = $("#q").value.trim().toLowerCase();
+  const list = R.filter((r) => !q || `${r.name} ${r.host} ${r.labels.join(" ")} ${r.plat} ${r.engine}`.toLowerCase().includes(q));
+  $("#rows").innerHTML = list.map((r) => `
+    <tr data-href tabindex="0" aria-expanded="${open === r.id}" data-id="${r.id}">
+      <td><i class="dot" data-status="${stateDot(r)}" role="img" aria-label="${r.busy ? "busy" : "idle"}"></i></td>
+      <td class="max-w-[260px] max-sm:w-full max-sm:max-w-0">
+        <div class="truncate text-[#e4e5e7]">${esc(r.name)}</div>
+        <div class="truncate font-mono text-[10px] text-[#7b7e88]">${esc(r.host)} · ${r.plat} · v${r.ver}<span class="sm:hidden"> · ${r.engine}</span></div>
+      </td>
+      <td class="hidden md:table-cell"><span class="inline-flex flex-wrap gap-1">${r.labels.map((l) => `<span class="chip" ${l === "baremetal" || l === "bench" ? `data-tone="${l}"` : ""}>${l}</span>`).join("")}</span></td>
+      <td class="hidden sm:table-cell">${engineCell(r)}</td>
+      <td class="cell-mono hidden lg:table-cell">host${r.engine === "microvm" ? ", shards" : ""}</td>
+      <td class="min-w-[90px]"><div class="font-mono text-[11px] text-[#c8cad0] tabular-nums">${r.busy}/${r.slots}</div><div class="mt-1 w-20"><div class="meter"><span style="width:${(r.busy / r.slots) * 100}%"></span></div></div></td>
+      <td class="num cell-mono hidden sm:table-cell">${r.cpu}%</td>
+      <td class="num cell-mono hidden lg:table-cell">${r.mem}%</td>
+      <td class="num cell-mono hidden xl:table-cell">${r.disk}%</td>
+      <td class="hidden md:table-cell"><label class="inline-flex min-h-8 items-center gap-2"><input type="checkbox" class="check" aria-label="Drain ${esc(r.name)}"><span class="font-mono text-[10px] text-[#7b7e88]">off</span></label></td>
+    </tr>
+    ${open === r.id ? `<tr class="runner-detail-row"><td colspan="10">${details(r)}</td></tr>` : ""}`).join("");
+}
+
+function details(r) {
+  const moving = ui[r.id]?.moving;
+  return `<section class="runner-details" aria-label="${esc(r.name)} in depth">
+    <div class="runner-details-head">
+      <div class="min-w-0">
+        <div class="runner-details-eyebrow">Runner · ${r.busy ? "busy" : "idle"}</div>
+        <h3>${esc(r.name)}</h3>
+        <p>${esc(r.host)} · ${r.plat} · kiln v${r.ver}</p>
+      </div>
+      <button class="btn btn-ghost btn-xs" data-act="close">✕ Close</button>
+    </div>
+    <div class="row"><span class="inline-flex flex-wrap gap-1">${r.labels.map((l) => `<span class="chip">${l}</span>`).join("")}</span></div>
+    <div class="row mt-4">
+      <button class="btn btn-secondary btn-xs">Terminal</button><button class="btn btn-secondary btn-xs">Insights</button><button class="btn btn-secondary btn-xs">Drain</button><button class="btn btn-secondary btn-xs" style="color:#d1aaad">Forget</button>
+    </div>
+    ${engineBlock(r, moving)}
+    <div class="mt-6"><dl class="facts">
+      <div><dt>Slots</dt><dd>${r.busy} / ${r.slots} busy</dd></div>
+      <div data-tone="pass"><dt>Connected</dt><dd>yes</dd></div>
+      <div><dt>CPU</dt><dd>${r.cpu}.0% · ${r.cores} cores</dd></div>
+      <div><dt>Memory</dt><dd>${Math.round((r.memG * r.mem) / 100)} GB / ${r.memG} GB</dd></div>
+    </dl></div>
+    <p class="mk-note">Name, the rest of the facts, agent sessions, running jobs and the last hour sit here unchanged.</p>
+    ${microvmBlock(r)}
+  </section>`;
+}
+
+function engineBlock(r, moving) {
+  const want = moving ? moving.to : r.engine;
+  const other = r.engine === "microvm" ? "host" : "microvm";
+  let line;
+  if (moving) line = `Switching to <b>${moving.to}</b>. New sessions here start on the ${moving.to === "host" ? "host" : "microVM engine"} already; ${moving.left.length ? `the ${moving.left.length} ${r.engine} session${moving.left.length === 1 ? "" : "s"} below finish${moving.left.length === 1 ? "es" : ""} first, then the switch is done.` : "nothing is left to drain."}`;
+  else if (r.engine === "microvm") line = `Sessions here run in microVMs of their own (Shards, through Hex) on ${r.hv}. The default for a runner that can: you can opt out.`;
+  else if (r.origin === "owner") line = `Sessions here run on the host, as processes of the machine: set by you ${r.originWhen}. It can run microVMs (${r.hv}).`;
+  else line = `Sessions here run on the host: this runner can't run microVMs.`;
+  const why = !r.can ? `<p class="eng-why">${esc(r.why)}</p><p class="mk-note" style="margin:0">Shards' host check, 4 min ago, without booting a VM. <button class="text-link" data-act="recheck">Check again</button></p>` : "";
+  const confirm = asking === r.id ? `
+    <div class="confirm" role="group" aria-label="Confirm switching the engine">
+      <p>Switch <b>${esc(r.name)}</b> to <b>${other}</b>? New sessions start on the ${other === "host" ? "host, with no microVM," : "microVM engine"} at once. ${r.sessions.length ? `Its ${r.sessions.length} ${r.engine} session${r.sessions.length === 1 ? " drains" : "s drain"} first: ${r.sessions.length === 1 ? "it goes" : "they go"} on until ${r.sessions.length === 1 ? "it ends" : "they end"}, and none is stopped.` : `Nothing runs on ${r.engine} here, so it switches at once.`}</p>
+      ${r.sessions.length ? `<ul class="eng-drain">${r.sessions.map((s) => `<li><i class="dot" data-status="${s.state === "idle" ? "succeeded" : "running"}"></i><span class="mono">${s.who}</span><span class="dim">${s.kind} · ${s.state} · ${s.since}</span></li>`).join("")}</ul>` : ""}
+      <div class="confirm-actions"><button class="btn btn-primary btn-xs" data-act="switch" data-to="${other}">${r.sessions.length ? "Switch and drain" : "Switch"}</button><button class="btn btn-ghost btn-xs" data-act="keep">Keep ${r.engine}</button></div>
+    </div>` : "";
+  const drain = moving && moving.left.length ? `
+    <ul class="eng-drain">${moving.left.map((s) => `<li><i class="dot" data-status="running"></i><span class="mono">${s.who}</span><span class="dim">${s.kind} · ${s.state} · ${s.since}</span><span class="right dim mono" style="font-size:10.5px">${r.engine} until it ends</span></li>`).join("")}</ul>
+    <div class="row"><button class="btn btn-ghost btn-xs" data-act="cancel">Cancel the switch</button></div>` : "";
+  return `<div class="eng-block" aria-label="Engine">
+    <div class="label-row"><div class="label">Engine <span class="mk-new">new</span></div><span class="dim mono" style="font-size:10.5px">workspace → runner → project → session</span></div>
+    <div class="seg" role="group" aria-label="Engine of ${esc(r.name)}" data-runner="${r.id}">
+      <button type="button" data-v="host" aria-pressed="${want === "host"}" ${moving ? "disabled" : ""}>host</button>
+      <button type="button" data-v="microvm" aria-pressed="${want === "microvm"}" ${!r.can || moving ? "disabled" : ""} ${!r.can ? `title="${esc(r.why)}"` : ""}>microvm</button>
+    </div>
+    <p class="eng-line">${line}</p>${why}${confirm}${drain}
+  </div>`;
+}
+
+function microvmBlock(r) {
+  const facts = r.can
+    ? [["microVMs", "yes", "pass", "virt.microvm"], ["Isolation", "available", "pass", "isolation.available"], ["Hypervisor", r.hv, null, "isolation.hypervisor"], ["Why not", "—", null, "isolation.why_not"],
+       ["Host check", `usable · ${r.hv === "KVM" ? "kvm" : "hvf"} · 2 min ago`, "pass", "Shards host_check"], ["Hex node", r.engine === "microvm" ? "lists shards-image" : "lists shards-image (unused: host)", null, "class"], ["Room", r.engine === "microvm" ? r.room + " free" : "—", null, "Hex keeper"]]
+    : [["microVMs", "no", "fail", "virt.microvm"], ["Isolation", "not available", "fail", "isolation.available"], ["Hypervisor", "—", null, "isolation.hypervisor"], ["Why not", r.why, "error", "isolation.why_not"], ["Host check", "not usable · hvf · 4 min ago", "fail", "Shards host_check"], ["Hex node", "lists no shards-image", null, "class"]];
+  const imgs = r.images.map((n) => ({ n, ...IMAGES[n] }));
+  const imagesHtml = !r.can ? "" : `
+    <div class="eng-sub"><div class="label-row"><div class="label">Images here <span class="mk-new">new</span></div><span class="dim mono" style="font-size:10.5px">${imgs.length} · built on this runner</span></div>
+    ${imgs.length === 0 ? `<p class="empty-line">None yet: an Agentfile saved by you builds here once this runner runs microVMs.</p>` : `
+    <div class="table-wrap"><table class="data-table" aria-label="Images on ${esc(r.name)}"><thead><tr><th>Image</th><th class="hidden sm:table-cell">Harnesses</th><th class="hidden md:table-cell">Digest</th><th class="num">Size</th><th class="hidden sm:table-cell">Got</th><th class="num hidden md:table-cell">Last used</th></tr></thead><tbody>
+      ${imgs.map((i) => `<tr><td><span class="font-mono text-[12.5px]">${i.n}</span><span class="cell-sub">${i.by}</span></td><td class="cell-mono hidden sm:table-cell">${i.for}</td><td class="cell-mono hidden md:table-cell">${i.digest}…</td><td class="num cell-mono">${i.size}</td><td class="cell-mono hidden sm:table-cell">${i.got}</td><td class="num cell-mono hidden md:table-cell">${i.used}</td></tr>`).join("")}
+    </tbody></table></div>`}</div>`;
+  const poolsHtml = !r.can ? "" : `
+    <div class="eng-sub"><div class="label-row"><div class="label">Warm pools <span class="mk-new">new</span></div><span class="dim mono" style="font-size:10.5px">named by kiln · sized by Shards</span></div>
+    ${r.pools.length === 0 ? `<p class="empty-line">${r.engine === "microvm" ? "None: no agent starts here often enough for kiln to keep one warm." : "None: sessions here run on the host."}</p>` : `
+    <div class="table-wrap"><table class="data-table" aria-label="Warm pools on ${esc(r.name)}"><thead><tr><th>Agent</th><th class="hidden sm:table-cell">Image · size</th><th class="num">Warm</th><th class="num">Hits, 24 h</th><th class="hidden md:table-cell">Kept</th><th class="w-0"><span class="sr-only">Release</span></th></tr></thead><tbody>
+      ${r.pools.map((p, i) => `<tr><td><a class="text-link font-mono text-[12.5px]" href="agents.html">${p.agent}</a><span class="cell-sub">${p.yours ? "yours" : "kiln's"}</span></td>
+        <td class="cell-mono hidden sm:table-cell">${p.image} · ${p.size}</td>
+        <td class="num cell-mono">${p.warm}</td>
+        <td class="num cell-mono">${p.hits[0]} of ${p.hits[1]}<span class="cell-sub">starts warm</span></td>
+        <td class="cell-mono hidden md:table-cell">${p.idle ? `<span class="warn">no starts for 31 min · goes at 38</span>` : "while its starts come"}</td>
+        <td class="text-right"><button class="btn btn-ghost btn-xs" data-act="release" data-i="${i}">Release</button></td></tr>`).join("")}
+    </tbody></table></div>
+    <p class="mk-note" style="margin:0">kiln keeps a pool for an agent whose starts are placed here. Its size is Shards' rule: the largest burst of starts within a refill window, inside this node's room, which pays for its memory. One with no starts for its keep window is released.</p>`}</div>`;
+  return `<div class="eng-block"><div class="label">MicroVMs here <span class="mk-new">new</span></div>
+    <dl class="facts eng-facts">${facts.map(([k, v, t, src]) => `<div ${t ? `data-tone="${t}"` : ""}><dt>${k}<span class="src">${src}</span></dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
+    ${imagesHtml}${poolsHtml}</div>`;
+}
+
+$("#rows").addEventListener("click", (e) => {
+  const act = e.target.closest("[data-act]");
+  const tr = e.target.closest("tr[data-id]");
+  const detail = e.target.closest(".runner-detail-row");
+  const id = detail ? detail.previousElementSibling.dataset.id : tr?.dataset.id;
+  const r = R.find((x) => x.id === id);
+  const seg = e.target.closest(".seg button");
+  if (seg && r) {
+    if (seg.disabled || seg.dataset.v === r.engine) { asking = null; render(); return; }
+    asking = r.id; render(); return;
+  }
+  if (act && r) {
+    const a = act.dataset.act;
+    if (a === "close") { open = null; asking = null; render(); return; }
+    if (a === "keep") { asking = null; render(); return; }
+    if (a === "recheck") { press(act, 900, () => render()); return; }
+    if (a === "release") { press(act, 600, () => { r.pools.splice(Number(act.dataset.i), 1); render(); }); return; }
+    if (a === "cancel") { delete ui[r.id]; render(); return; }
+    if (a === "switch") {
+      const to = act.dataset.to;
+      press(act, 500, () => {
+        asking = null;
+        if (r.sessions.length === 0) { r.engine = to; r.origin = to === "host" ? "owner" : "default"; r.originWhen = "just now"; render(); return; }
+        ui[r.id] = { moving: { to, left: [...r.sessions] } };
+        render();
+        // The sessions end one by one (here: on a timer), then the switch is done.
+        const tick = () => {
+          const m = ui[r.id]?.moving; if (!m) return;
+          m.left.shift(); r.sessions = [...m.left]; r.busy = Math.max(0, r.busy - 1);
+          if (m.left.length === 0) { delete ui[r.id]; r.engine = to; r.origin = to === "host" ? "owner" : "default"; r.originWhen = "just now"; if (to === "host") r.pools = []; render(); }
+          else { render(); setTimeout(tick, 2600); }
+        };
+        setTimeout(tick, 2600);
+      });
+      return;
+    }
+    return;
+  }
+  if (detail) return;
+  if (tr && !e.target.closest("button,a,input,label")) { open = open === id ? null : id; asking = null; render(); }
+});
+$("#rows").addEventListener("keydown", (e) => { const tr = e.target.closest("tr[data-id]"); if (e.key === "Enter" && tr && e.target === tr) { open = open === tr.dataset.id ? null : tr.dataset.id; render(); } });
+$("#q").addEventListener("input", render);
+open = "cec3";
+render();
+</script>
+</body>
+</html>

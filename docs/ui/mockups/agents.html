@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agents · definitions · kiln mockup</title>
+<link rel="stylesheet" href="assets/fonts.css" />
+<link rel="stylesheet" href="assets/kiln.css" />
+<link rel="stylesheet" href="assets/mockup.css" />
+</head>
+<body>
+<div class="container-console mk-page">
+  <div class="mk-banner">
+    <span><b>Mockup</b> · kiln UI design · sample data · P5.1, P5.2, P5.4</span>
+    <nav aria-label="Mockups"><a href="runners.html">Runners</a><a href="agents.html" aria-current="page">Agents</a><a href="agentfile.html">Agentfile</a><a href="experiments.html">Experiments</a></nav>
+  </div>
+  <div class="af-page" id="page"></div>
+</div>
+<script src="assets/mockup.js"></script>
+<script>
+const AGENTFILES = [["rust-dev", "rust-dev (yours, v8): claude, codex"], ["docs-site", "docs-site (yours, v3): gemini"], ["harness-claude", "harness-claude (kiln's)"], ["harness-codex", "harness-codex (kiln's)"], ["harness-gemini", "harness-gemini (kiln's)"]];
+const TOOLGROUPS = ["CI runs and legs", "Deployments", "Agents", "Plans and goals", "Research", "Machines (run, code_run)", "Code search"];
+const SKILLS = [["kiln-ci-review", "kiln's"], ["kiln-ci-diagnose", "kiln's"], ["kiln-ci-performance", "kiln's"], ["rust-style", "yours"], ["no-panics", "yours"]];
+const A = {
+  reviewer: { name: "reviewer", yours: true, v: 4, changed: "3 hours ago", harness: "claude", model: "claude-opus-5-5", agentfile: "rust-dev",
+    instructions: "Review the change in front of you against this repository's AGENTS.md. Say what breaks a rule, with the file and line, and what to write instead. Don't rewrite what's fine.",
+    playbook: "1. Read AGENTS.md and the docs it names.\n2. Read the diff, then each changed file in full.\n3. Run the focused tests the change touches.\n4. Report findings by severity; propose fixes as suggestions.",
+    tools: ["CI runs and legs", "Agents", "Code search"], mcp: [["github", "https://api.githubcopilot.com/mcp/"]], skills: ["kiln-ci-review", "rust-style", "no-panics"], limits: { time: "45m", tokens: "", cost: "" } },
+  "pr-triage": { name: "pr-triage", yours: true, v: 2, changed: "yesterday", harness: "codex", model: "gpt-6.1-sol-mini", agentfile: "rust-dev", instructions: "Label and route new pull requests.", playbook: "", tools: ["CI runs and legs"], mcp: [], skills: [], limits: { time: "10m", tokens: "", cost: "" } },
+  "release-notes": { name: "release-notes", yours: true, v: 1, changed: "4 days ago", harness: "gemini", model: "", agentfile: "docs-site", instructions: "Write the release's notes from its landed diffs.", playbook: "", tools: [], mcp: [], skills: [], limits: { time: "", tokens: "", cost: "" } },
+};
+const KILNS = [["ci-diagnose", "claude", "Sonnet 5.5", "kiln-ci-diagnose"], ["ci-review", "claude", "Sonnet 5.5", "kiln-ci-review"], ["ci-performance", "codex", "GPT-6.1 Sol", "kiln-ci-performance"], ["ci-migrate", "claude", "Opus 5.5", "kiln-ci-migrate"], ["ci-author", "claude", "Sonnet 5.5", "kiln-ci-author"], ["ci-secrets", "claude", "Sonnet 5.5", "kiln-ci-secrets"], ["ci-runners", "codex", "GPT-6.1 Sol", "kiln-ci-runners"]];
+const VERSIONS = [[4, "3 hours ago", "you", "model Sonnet 5.5 → Opus 5.5"], [3, "yesterday", "you · from rust-dev's text", "skill no-panics added"], [2, "2 days ago", "you", "limits: 45m"], [1, "5 days ago", "you", "copied from kiln's ci-review"]];
+const HISTORY = [["12 min ago", "hyper-light/kiln", "adas-mac-studio-3.local", "microvm", "v4", "warm · 212 ms", "succeeded", "reviewed 3 files · 2 findings"], ["1 hour ago", "hyper-light/kiln", "adacachy2", "microvm", "v4", "template · 0.41 s", "succeeded", "reviewed 11 files · 0 findings"], ["yesterday", "hyper-light/shards", "adas-mac-studio.local", "microvm", "v3", "cold · 1.9 s", "failed", "limit: 45m reached on a turn"], ["2 days ago", "hyper-light/kiln", "adacachy", "host", "v2", "process · 0.3 s", "succeeded", "reviewed 5 files · 1 finding"]];
+const S = { view: "list", id: null, tab: "settings", making: false, running: null, ran: null, draft: null, said: null, conflict: false, simulateConflict: false, asking: false, reading: null, kilnRead: null };
+
+const harnessName = (id) => harnessOf(id)?.name ?? id;
+const modelName = (h, m) => (harnessOf(h)?.models.find(([id]) => id === m)?.[1]) ?? (m || "its default");
+function crumbs(items) {
+  return `<nav class="eyebrow crumbs" aria-label="Breadcrumb"><span class="spectrum-rule"></span>${items.map(([l, to], i) => `${i ? '<span aria-hidden="true">/</span>' : ""}${to ? `<a href="${to}">${i === 0 ? "05 / " : ""}${l}</a>` : `<span>${i === 0 ? "05 / " : ""}${l}</span>`}`).join("")}</nav>`;
+}
+
+function render() {
+  const p = $("#page");
+  p.innerHTML = S.view === "list" ? listView() : editorView();
+}
+
+/* ------------------------------------------------------------ the list */
+function listView() {
+  const yours = Object.values(A);
+  return `${crumbs([["Agents", "#"], ["Definitions"]])}
+  <h1 class="af-title">Agent definitions <span class="mk-new">new</span></h1>
+  <p class="af-dim af-lead">An agent as you define it: one of kiln's ten harnesses and its model, its instructions, tools, skills and limits, and the Agentfile its microVM is made from. Yours are kept with every version and written into that Agentfile's <span class="mono">AGENT</span> line; kiln's are read only: copy one to make it yours.</p>
+  <section class="af-section" aria-label="Yours">
+    <div class="af-head"><h2 class="af-h">Yours</h2>${S.making ? "" : `<button class="btn btn-secondary btn-xs" data-act="new">New agent</button>`}</div>
+    ${S.making ? newAgent() : ""}
+    <ul class="af-rows">${yours.map((a) => `<li>
+      <div class="af-row"><a class="af-name" href="#" data-open="${a.name}">${a.name}</a>
+        <span class="af-dim">${harnessName(a.harness)} · ${modelName(a.harness, a.model)} · in ${a.agentfile} · v${a.v} · changed ${a.changed}</span>
+        <span class="af-acts"><button class="btn btn-secondary btn-xs" data-act="run" data-id="${a.name}" aria-expanded="${S.running === a.name}">Run</button></span></div>
+      ${S.running === a.name ? runPanel(a) : ""}</li>`).join("")}</ul>
+  </section>
+  <p class="mk-note">Press <b>reviewer</b> to open its editor (settings, versions, history, the sync conflict), or <b>Run</b> to start it in place.</p>
+  <section class="af-section" aria-label="kiln's">
+    <h2 class="af-h">kiln&rsquo;s</h2>
+    <p class="af-dim">One for each of kiln's CI skills, read only. Each runs in its harness's own Agentfile.</p>
+    <ul class="af-rows">${KILNS.map(([n, h, m, sk]) => `<li><div class="af-row"><span class="af-name">${n}</span><span class="af-dim">${harnessName(h)} · ${m} · skill ${sk}</span>
+      <span class="af-acts"><button class="btn btn-ghost btn-xs" data-act="kread" data-id="${n}">${S.kilnRead === n ? "Hide" : "Read"}</button><button class="btn btn-secondary btn-xs" data-act="copy" data-id="${n}">Copy as yours</button></span></div>
+      ${S.kilnRead === n ? `<pre class="af-read">harness   ${harnessName(h)} · ${m}\nagentfile harness-${h} (kiln's)\nskills    ${sk}\ntools     kiln: CI runs and legs, Code search\nlimits    none\n\n${sk === "kiln-ci-diagnose" ? "Find out why a kiln CI run failed, classify it and fix it, using a failed leg kept to look into." : "As the skill says."}</pre>` : ""}</li>`).join("")}</ul>
+  </section>`;
+}
+function newAgent() {
+  return `<div class="af-new" role="group" aria-label="A new agent">
+    <div class="grid3">
+      <div><label class="field-label" for="nn">Its name</label><div class="field mono-in"><input id="nn" placeholder="reviewer" value="docs-checker"></div></div>
+      <div class="select-field"><label class="field-label" for="nh">Harness</label>${select("nh", HARNESSES.map((h) => [h.id, h.name]), "claude")}</div>
+      <div class="select-field"><label class="field-label" for="nf">Agentfile</label>${select("nf", AGENTFILES, "rust-dev")}</div>
+    </div>
+    <div class="af-actions"><button class="btn btn-primary btn-sm" data-act="keepnew">Keep it</button><button class="btn btn-ghost btn-sm" data-act="cancelnew">Cancel</button></div>
+  </div>`;
+}
+
+/* ------------------------------------------------------------ run this agent (in place) */
+function runPanel(a) {
+  if (S.ran === a.name) return `<div class="ag-run" role="status"><p class="said" data-tone="ok">Started ${a.name} on adas-mac-studio-3.local from a warm microVM in 212 ms: ${harnessName(a.harness)} · ${modelName(a.harness, a.model)} · ${a.agentfile} v8.</p><div class="row"><a class="btn btn-secondary btn-xs" href="#">Open it in Mission control</a><button class="btn btn-ghost btn-xs" data-act="runclose">Done</button></div></div>`;
+  return `<div class="ag-run" role="group" aria-label="Run ${a.name}">
+    <div class="grid2">
+      <div class="select-field"><label class="field-label" for="rp">Project</label>${select("rp", [["kiln", "hyper-light/kiln"], ["shards", "hyper-light/shards"], ["none", "No project: an empty folder"]], "kiln")}</div>
+      <div class="select-field"><label class="field-label" for="rw">Where</label>${select("rw", [["auto", "kiln places it"], ["s3", "adas-mac-studio-3.local"], ["c2", "adacachy2"], ["m1", "adas-mac-studio.local"]], "auto")}</div>
+    </div>
+    <p class="ag-place">kiln places it on adas-mac-studio-3.local: a microvm runner with ${a.agentfile} v8 built for linux/arm64 and a warm ${a.name} waiting (41 of 47 starts warm today).</p>
+    <div><label class="field-label" for="rm">First message</label><div class="field"><textarea id="rm" placeholder="What should ${a.name} do?">Review the top diff of my stack.</textarea></div></div>
+    <div class="af-actions"><button class="btn btn-primary btn-sm" data-act="start" data-id="${a.name}">Start</button><button class="btn btn-ghost btn-sm" data-act="runclose">Cancel</button>
+      <span class="af-dim">It starts with this definition's settings, v${a.v}, in ${a.agentfile}'s microVM.</span></div>
+  </div>`;
+}
+
+/* ------------------------------------------------------------ the editor */
+function editorView() {
+  const a = A[S.id];
+  const d = S.draft;
+  const dirty = JSON.stringify(d) !== JSON.stringify(strip(a));
+  return `${crumbs([["Agents", "#"], ["Definitions", "#list"], [a.name]])}
+  <div class="af-head"><h1 class="af-title">${a.name}</h1><button class="btn btn-primary btn-sm" data-act="run" data-id="${a.name}" aria-expanded="${S.running === a.name}">Run</button></div>
+  <p class="af-dim">v${a.v} · changed ${a.changed} · written as <span class="mono">AGENT ${a.name}</span> in <a class="text-link" href="agentfile.html">${a.agentfile}</a> · <span class="ok">in step with it</span></p>
+  ${S.running === a.name ? runPanel(a) : ""}
+  <div class="pt" role="tablist" aria-label="Definition">
+    ${[["settings", "Settings"], ["versions", "Versions", a.v], ["history", "History", HISTORY.length]].map(([id, l, n]) => `<button role="tab" aria-selected="${S.tab === id}" data-tab="${id}">${l}${n ? ` <span class="pt-n">${n}</span>` : ""}</button>`).join("")}
+  </div>
+  ${S.tab === "settings" ? settings(a, d, dirty) : S.tab === "versions" ? versions(a) : history()}
+  ${S.tab === "settings" ? deleteBlock(a) : ""}`;
+}
+const strip = (a) => ({ name: a.name, harness: a.harness, model: a.model, agentfile: a.agentfile, instructions: a.instructions, playbook: a.playbook, tools: [...a.tools], mcp: a.mcp.map((m) => [...m]), skills: [...a.skills], limits: { ...a.limits } });
+
+function settings(a, d, dirty) {
+  const h = harnessOf(d.harness);
+  const models = h.models.length ? h.models : [["", "Its default"]];
+  return `
+  <section class="af-section" aria-label="Harness and model">
+    <div class="grid3">
+      <div><label class="field-label" for="fname">Its name</label><div class="field mono-in"><input id="fname" data-k="name" value="${esc(d.name)}"></div></div>
+      <div class="select-field"><label class="field-label" for="fh">Harness</label>${select("fh", HARNESSES.map((x) => [x.id, x.name]), d.harness, 'data-k="harness"')}</div>
+      <div class="select-field"><label class="field-label" for="fm">Model</label>${select("fm", models, d.model, 'data-k="model"')}</div>
+    </div>
+    ${h.models.length ? "" : `<p class="af-dim">${h.name} lists its models once it has run on one of your machines: until then it starts with its own default.</p>`}
+    <p class="af-dim">kiln runs these ten harnesses, each with its own adapter. Its version, install source, sign-in and egress are its Agentfile's, per harness.</p>
+  </section>
+  <section class="af-section" aria-label="Agentfile">
+    <h2 class="af-h">Its microVM</h2>
+    <div class="grid2"><div class="select-field"><label class="field-label" for="ff">Agentfile</label>${select("ff", AGENTFILES, d.agentfile, 'data-k="agentfile"')}</div></div>
+    <p class="af-dim">${d.agentfile.startsWith("harness-") ? `kiln's own Agentfile for ${harnessName(d.agentfile.slice(8))}, read only: the agent's lines go into a copy of it, made yours when you save.` : `Saving writes its <span class="mono">AGENT ${esc(d.name)}</span>, <span class="mono">ATTACH ${esc(d.name)} FOR ${d.harness}</span>, <span class="mono">SKILL</span> and <span class="mono">MCP … FOR ${esc(d.name)}</span> lines into ${d.agentfile}, as a new version of it, and its runners build it again.`}</p>
+  </section>
+  <section class="af-section" aria-label="Instructions">
+    <h2 class="af-h">Instructions</h2>
+    <div class="field"><textarea data-k="instructions" aria-label="Instructions">${esc(d.instructions)}</textarea></div>
+    <label class="field-label" for="fpb">Playbook</label>
+    <div class="field"><textarea id="fpb" data-k="playbook">${esc(d.playbook)}</textarea></div>
+    <p class="af-dim">Given to ${harnessName(d.harness)} as its own instruction file (${d.harness === "claude" ? "CLAUDE.md" : d.harness === "goose" ? ".goosehints" : "AGENTS.md"}) in the agent's folder.</p>
+  </section>
+  <section class="af-section" aria-label="Tools and MCP">
+    <h2 class="af-h">Tools and MCP</h2>
+    <div class="label">kiln's own, over the link kiln drives it by</div>
+    <div class="ag-checks">${TOOLGROUPS.map((t) => `<label><input type="checkbox" class="check" data-tool="${esc(t)}" ${d.tools.includes(t) ? "checked" : ""}> ${esc(t)}</label>`).join("")}</div>
+    <div class="label mt-2">Other MCP servers</div>
+    <ul class="ag-mcp">${d.mcp.map(([n, src], i) => `<li><span class="mono">${esc(n)}</span><span class="dim mono" style="font-size:11px">${esc(src)}</span><span class="dim">reaches ${esc(new URL(src).host)}:443 alone</span><button class="btn btn-ghost btn-xs right" data-act="rmmcp" data-i="${i}">Remove</button></li>`).join("") || `<li class="dim">None.</li>`}</ul>
+    <div class="row"><div class="field mono-in" style="flex:0 1 160px"><input id="mcpn" placeholder="name" aria-label="MCP server name"></div><div class="field mono-in grow"><input id="mcps" placeholder="https://host/mcp or git+https://… or ./dir" aria-label="MCP server source"></div><button class="btn btn-secondary btn-xs" data-act="addmcp">Add</button></div>
+    <p class="af-dim">Each server is a grant to its own origin and no other (default deny), written as <span class="mono">MCP &lt;name&gt; FROM &lt;source&gt; FOR ${esc(d.name)}</span>.</p>
+  </section>
+  <section class="af-section" aria-label="Skills">
+    <h2 class="af-h">Skills</h2>
+    <div class="ag-checks">${SKILLS.map(([s, by]) => `<label><input type="checkbox" class="check" data-skill="${s}" ${d.skills.includes(s) ? "checked" : ""}> <span class="mono">${s}</span> <span class="dim">${by}</span></label>`).join("")}</div>
+  </section>
+  <section class="af-section" aria-label="Limits">
+    <h2 class="af-h">Limits</h2>
+    <div class="grid3">
+      <div><label class="field-label" for="lt">Time, each session</label><div class="field mono-in"><input id="lt" data-l="time" value="${esc(d.limits.time)}" placeholder="none"></div></div>
+      <div><label class="field-label" for="lk">Tokens, each session</label><div class="field mono-in"><input id="lk" data-l="tokens" value="${esc(d.limits.tokens)}" placeholder="none"></div></div>
+      <div><label class="field-label" for="lc">Cost, each session</label><div class="field mono-in"><input id="lc" data-l="cost" value="${esc(d.limits.cost)}" placeholder="none"></div></div>
+    </div>
+    <p class="af-dim">Empty is no limit. One reached ends the session's turn and says which.</p>
+  </section>
+  <div class="af-actions mt-3">
+    <button class="btn btn-primary btn-sm" data-act="save" ${dirty ? "" : "disabled"}>Save</button>
+    ${dirty ? `<button class="btn btn-ghost btn-sm" data-act="discard">Discard changes</button>` : ""}
+    <span class="ag-checks" style="margin-left:auto"><label><input type="checkbox" class="check" data-act="simconflict" ${S.simulateConflict ? "checked" : ""}> <span class="dim">Mockup: ${a.agentfile}'s text changes meanwhile</span></label></span>
+  </div>
+  ${S.said ? `<p class="said" data-tone="${S.said[0]}" role="status">${S.said[1]}</p>` : ""}
+  ${S.conflict ? conflict(a, d) : ""}`;
+}
+
+/* P5.4: the agent and its Agentfile changed apart: shown, never overwritten. */
+function conflict(a, d) {
+  const rows = [["Model", modelName(d.harness, d.model), "Sonnet 5.5", true], ["Skills", d.skills.join(", "), "kiln-ci-review, rust-style", d.skills.join(", ") !== "kiln-ci-review, rust-style"], ["Time limit", d.limits.time || "none", d.limits.time || "none", false]];
+  return `<div class="ag-conflict" role="group" aria-label="The Agentfile changed too">
+    <p style="margin:0"><b>${a.agentfile}'s text changed while you edited</b>: v9, by you in the Agentfile editor, 4 min ago, rewrote <span class="mono">AGENT ${a.name}</span>. Nothing is kept until you choose.</p>
+    <table><thead><tr><th>Setting</th><th>Here</th><th>In ${a.agentfile} v9</th></tr></thead><tbody>
+      ${rows.map(([k, here, there, differs]) => `<tr><td style="font-family:var(--font-sans)">${k}</td><td class="${differs ? "differs" : ""}">${esc(here)}</td><td class="${differs ? "differs" : ""}">${esc(there)}</td></tr>`).join("")}
+    </tbody></table>
+    <div class="confirm-actions"><button class="btn btn-primary btn-xs" data-act="keepmine">Keep mine: rewrite its lines</button><button class="btn btn-secondary btn-xs" data-act="taketheirs">Take the Agentfile's</button><a class="btn btn-ghost btn-xs" href="agentfile.html">Open ${a.agentfile}</a></div>
+  </div>`;
+}
+
+function versions(a) {
+  return `<section class="af-section" aria-label="Versions"><ul class="af-rows">${VERSIONS.map(([v, at, by, what]) => `<li>
+    <div class="af-row"><span class="af-name">v${v}</span><span class="af-dim">${at} · ${by} · ${what}${v === a.v ? " · current" : ""}</span>
+      <span class="af-acts"><button class="btn btn-ghost btn-xs" data-act="vread" data-v="${v}">${S.reading === v ? "Hide" : "Read"}</button>${v === a.v ? "" : `<button class="btn btn-ghost btn-xs" data-act="restore" data-v="${v}">Make current</button>`}</span></div>
+    ${S.reading === v ? `<pre class="af-read">harness   Claude Code · ${v >= 4 ? "Opus 5.5" : "Sonnet 5.5"}\nagentfile rust-dev\nskills    kiln-ci-review, rust-style${v >= 3 ? ", no-panics" : ""}\nlimits    ${v >= 2 ? "time 45m" : "none"}</pre>` : ""}</li>`).join("")}</ul>
+    <p class="af-dim">Making one current keeps it as a new version, and rewrites its Agentfile's lines to match: nothing is lost.</p></section>`;
+}
+function history() {
+  return `<section class="af-section" aria-label="History"><div class="table-wrap"><table class="data-table"><thead><tr><th class="w-6"></th><th>Started</th><th class="hidden sm:table-cell">Project</th><th class="hidden md:table-cell">Runner</th><th class="hidden md:table-cell">Engine</th><th>Version</th><th class="hidden sm:table-cell">Start</th><th class="hidden lg:table-cell">Outcome</th></tr></thead><tbody>
+    ${HISTORY.map(([t, p, r, e, v, st, s, o]) => `<tr data-href><td><i class="dot" data-status="${s}"></i></td><td class="cell-mono">${t}</td><td class="cell-mono hidden sm:table-cell">${p}</td><td class="cell-mono hidden md:table-cell">${r}</td><td class="cell-mono hidden md:table-cell">${e}</td><td class="cell-mono">${v}</td><td class="cell-mono hidden sm:table-cell">${st}</td><td class="hidden lg:table-cell" style="font-size:12.5px">${o}</td></tr>`).join("")}
+  </tbody></table></div><p class="af-dim">Each of its sessions: where it ran, which version of this definition, and how it started.</p></section>`;
+}
+function deleteBlock(a) {
+  return `<section class="af-section" aria-label="Delete">${S.asking ? `<div class="confirm" data-tone="danger" role="group" aria-label="Confirm deleting the agent"><p>Delete ${a.name} and its ${a.v} versions? Its <span class="mono">AGENT ${a.name}</span> lines leave ${a.agentfile} as a new version of it; its sessions keep their history.</p><div class="confirm-actions"><button class="btn btn-danger btn-xs" data-act="del">Delete</button><button class="btn btn-ghost btn-xs" data-act="nodel">Keep it</button></div></div>` : `<button class="btn btn-ghost-danger btn-xs" style="justify-self:start" data-act="askdel">Delete agent</button>`}</section>`;
+}
+
+/* ------------------------------------------------------------ events */
+function openEditor(id) { S.view = "edit"; S.id = id; S.tab = "settings"; S.draft = strip(A[id]); S.said = null; S.conflict = false; S.running = null; S.ran = null; render(); window.scrollTo(0, 0); }
+$("#page").addEventListener("click", (e) => {
+  const o = e.target.closest("[data-open]");
+  if (o) { e.preventDefault(); openEditor(o.dataset.open); return; }
+  const crumb = e.target.closest('a[href="#list"]');
+  if (crumb) { e.preventDefault(); S.view = "list"; S.running = null; S.ran = null; render(); return; }
+  const tab = e.target.closest("[data-tab]");
+  if (tab) { S.tab = tab.dataset.tab; render(); return; }
+  const b = e.target.closest("[data-act]");
+  if (!b) return;
+  const act = b.dataset.act;
+  const a = S.id ? A[S.id] : null;
+  if (act === "simconflict") { S.simulateConflict = b.checked; return; }
+  if (act === "new") { S.making = true; render(); return; }
+  if (act === "cancelnew") { S.making = false; render(); return; }
+  if (act === "keepnew") { press(b, 700, () => { const n = $("#nn").value.trim() || "docs-checker"; A[n] = { name: n, yours: true, v: 1, changed: "just now", harness: $("#nh").value, model: harnessOf($("#nh").value).models[0]?.[0] ?? "", agentfile: $("#nf").value, instructions: "", playbook: "", tools: [], mcp: [], skills: [], limits: { time: "", tokens: "", cost: "" } }; S.making = false; openEditor(n); }); return; }
+  if (act === "run") { S.running = S.running === b.dataset.id ? null : b.dataset.id; S.ran = null; render(); return; }
+  if (act === "runclose") { S.running = null; S.ran = null; render(); return; }
+  if (act === "start") { press(b, 900, () => { S.ran = b.dataset.id; render(); }); return; }
+  if (act === "kread") { S.kilnRead = S.kilnRead === b.dataset.id ? null : b.dataset.id; render(); return; }
+  if (act === "copy") { press(b, 700, () => { const k = KILNS.find((x) => x[0] === b.dataset.id); const n = `${k[0]}-1`; A[n] = { name: n, yours: true, v: 1, changed: "just now", harness: k[1], model: harnessOf(k[1]).models.find(([, l]) => l === k[2])?.[0] ?? "", agentfile: `harness-${k[1]}`, instructions: "", playbook: "", tools: ["CI runs and legs", "Code search"], mcp: [], skills: [k[3]], limits: { time: "", tokens: "", cost: "" } }; openEditor(n); }); return; }
+  if (act === "addmcp") { const n = $("#mcpn").value.trim(), s = $("#mcps").value.trim(); try { new URL(s); } catch { return; } if (n) { S.draft.mcp.push([n, s]); render(); } return; }
+  if (act === "rmmcp") { S.draft.mcp.splice(Number(b.dataset.i), 1); render(); return; }
+  if (act === "discard") { S.draft = strip(a); S.said = null; render(); return; }
+  if (act === "save") {
+    press(b, 800, () => {
+      if (S.simulateConflict) { S.conflict = true; S.said = null; render(); return; }
+      Object.assign(a, structuredClone(S.draft)); a.v += 1; a.changed = "just now"; VERSIONS.unshift([a.v, "just now", "you", "saved here"]);
+      S.draft = strip(a); S.said = ["ok", `Kept as v${a.v}. ${a.agentfile}'s AGENT ${a.name} lines changed to match, as ${a.agentfile} v10; its runners are building it.`]; render();
+    });
+    return;
+  }
+  if (act === "keepmine") { press(b, 700, () => { Object.assign(a, structuredClone(S.draft)); a.v += 1; S.conflict = false; S.simulateConflict = false; S.draft = strip(a); S.said = ["ok", `Kept as v${a.v}, and ${a.agentfile}'s AGENT ${a.name} lines rewritten to it, as ${a.agentfile} v10.`]; render(); }); return; }
+  if (act === "taketheirs") { press(b, 600, () => { a.model = "claude-sonnet-5-5"; a.skills = ["kiln-ci-review", "rust-style"]; a.v += 1; S.conflict = false; S.simulateConflict = false; S.draft = strip(a); S.said = ["ok", `Took ${a.agentfile} v9's: kept as v${a.v}.`]; render(); }); return; }
+  if (act === "vread") { const v = Number(b.dataset.v); S.reading = S.reading === v ? null : v; render(); return; }
+  if (act === "restore") { press(b, 700, () => { a.v += 1; VERSIONS.unshift([a.v, "just now", "you", `v${b.dataset.v} made current`]); render(); }); return; }
+  if (act === "askdel") { S.asking = true; render(); return; }
+  if (act === "nodel") { S.asking = false; render(); return; }
+  if (act === "del") { press(b, 700, () => { delete A[S.id]; S.asking = false; S.view = "list"; render(); }); return; }
+});
+$("#page").addEventListener("input", (e) => {
+  const t = e.target;
+  if (!S.draft) return;
+  if (t.dataset.k) { S.draft[t.dataset.k] = t.value; if (t.dataset.k === "harness") { S.draft.model = harnessOf(t.value).models[0]?.[0] ?? ""; render(); } else refreshSave(); }
+  else if (t.dataset.l) { S.draft.limits[t.dataset.l] = t.value; refreshSave(); }
+  else if (t.dataset.tool) { const l = S.draft.tools; t.checked ? l.push(t.dataset.tool) : l.splice(l.indexOf(t.dataset.tool), 1); refreshSave(); }
+  else if (t.dataset.skill) { const l = S.draft.skills; t.checked ? l.push(t.dataset.skill) : l.splice(l.indexOf(t.dataset.skill), 1); refreshSave(); }
+});
+function refreshSave() {
+  // Save and Discard follow what's typed without drawing the fields again.
+  const a = A[S.id]; const dirty = JSON.stringify(S.draft) !== JSON.stringify(strip(a));
+  const save = $('[data-act="save"]'); if (save) save.disabled = !dirty;
+  const disc = $('[data-act="discard"]');
+  if (dirty && !disc) save.insertAdjacentHTML("afterend", `<button class="btn btn-ghost btn-sm" data-act="discard">Discard changes</button>`);
+  if (!dirty && disc) disc.remove();
+}
+render();
+</script>
+</body>
+</html>

@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Experiments · kiln mockup</title>
+<link rel="stylesheet" href="assets/fonts.css" />
+<link rel="stylesheet" href="assets/kiln.css" />
+<link rel="stylesheet" href="assets/mockup.css" />
+</head>
+<body>
+<div class="container-console mk-page">
+  <div class="mk-banner">
+    <span><b>Mockup</b> · kiln UI design · sample data · P7.1, P7.2</span>
+    <nav aria-label="Mockups"><a href="runners.html">Runners</a><a href="agents.html">Agents</a><a href="agentfile.html">Agentfile</a><a href="experiments.html" aria-current="page">Experiments</a></nav>
+  </div>
+  <div class="af-page" id="page"></div>
+</div>
+<script src="assets/mockup.js"></script>
+<script>
+const COLORS = ["#a6c4ed", "#d6a2aa", "#d8cbb0", "#b8d9d2"]; // kiln's chart SERIES: blue, rose, sand, teal; every mark also carries its arm's letter
+const KEYS = "ABCD";
+const AGENTFILES = [["rust-dev", "rust-dev (yours, v9)"], ["docs-site", "docs-site (yours, v3)"], ["harness-claude", "harness-claude (kiln's)"], ["harness-codex", "harness-codex (kiln's)"]];
+const RUNS = [["agent:reviewer", "agent reviewer (Claude Code · Opus 5.5)"], ["agent:pr-triage", "agent pr-triage (Codex · GPT-6.1 Sol mini)"], ["harness:claude", "harness claude, no agent"], ["harness:codex", "harness codex, no agent"]];
+const S = {
+  phase: "setup", // setup | running | results
+  name: "reviewer-size",
+  arms: [
+    { agentfile: "rust-dev", runs: "agent:reviewer", engine: "microvm", cpus: "2", mem: "4" },
+    { agentfile: "rust-dev", runs: "agent:reviewer", engine: "microvm", cpus: "4", mem: "8" },
+  ],
+  workload: "command", project: "kiln", command: "cargo test -p kiln-ci --release", n: 10, where: "one",
+  done: 0, log: [], order: [], failed: new Set(), kept: null, applied: false, table: false,
+};
+const LIST = [["reviewer-size", "2 arms · reviewer on 2 vCPU · 4 GiB against 4 vCPU · 8 GiB", "this one"], ["codex-vs-claude-start", "2 arms · harness codex against harness claude, starts only", "done 2 days ago · kept B"], ["rust-dev-host-vs-microvm", "2 arms · rust-dev on host against microvm", "done last week · kept A"]];
+
+function armLabel(a) { return `${a.runs.replace(":", " ")} in ${a.agentfile} · ${a.engine}${a.engine === "microvm" ? ` · ${a.cpus} vCPU · ${a.mem} GiB` : ""}`; }
+function key(i) { return `<span class="ex-key" style="background:${COLORS[i]}" aria-hidden="true">${KEYS[i]}</span>`; }
+function crumbs() { return `<nav class="eyebrow crumbs" aria-label="Breadcrumb"><span class="spectrum-rule"></span><a href="#">05 / Agents</a><span aria-hidden="true">/</span><span>Experiments</span></nav>`; }
+/** A balanced interleave: ABBA BAAB … so neither arm always goes first. */
+function orderOf(k, n) { const out = []; for (let r = 0; r < n; r++) { const base = [...Array(k).keys()]; const seq = r % 2 ? base.reverse() : base; out.push(...seq); } return out; }
+
+function render() {
+  $("#page").innerHTML = `${crumbs()}<h1 class="af-title">Experiments <span class="mk-new">new</span></h1>
+  <p class="af-dim af-lead">Agents deployed different ways, measured against each other. Each arm is a microVM deployment: an Agentfile, the agent or harness it runs, its engine and its size. They run one fixed workload, interleaved, n times each, and each measure comes back as an interval. No model is asked anything, so no tokens are spent or counted.</p>
+  <section class="af-section" aria-label="Yours"><div class="af-head"><h2 class="af-h">Yours</h2><button class="btn btn-secondary btn-xs">New experiment</button></div>
+    <ul class="af-rows">${LIST.map(([n, d, s], i) => `<li><div class="af-row"><span class="af-name">${n}</span><span class="af-dim">${d}</span><span class="af-acts"><span class="dim mono" style="font-size:10.5px">${i === 0 ? phaseWord() : s}</span></span></div></li>`).join("")}</ul></section>
+  <section class="af-section" aria-label="${esc(S.name)}">
+    <div class="af-head"><h2 class="af-h">${esc(S.name)}</h2><span class="dim mono" style="font-size:10.5px">${phaseWord()}</span></div>
+    ${S.phase === "setup" ? setup() : S.phase === "running" ? running() : results()}
+  </section>`;
+}
+function phaseWord() { return S.phase === "setup" ? "setting up" : S.phase === "running" ? `running · ${S.done} of ${S.order.length}` : S.kept !== null ? `done · kept ${KEYS[S.kept]}` : "done · decide"; }
+
+/* ------------------------------------------------------------ set up */
+function setup() {
+  const total = S.arms.length * S.n;
+  const ord = orderOf(S.arms.length, Math.min(S.n, 4));
+  return `<div class="stack">
+    <div style="max-width:420px"><label class="field-label" for="xname">Its name</label><div class="field mono-in"><input id="xname" data-x="name" value="${esc(S.name)}"></div></div>
+    <div class="label-row"><div class="label">Arms</div>${S.arms.length < 4 ? `<button class="btn btn-ghost btn-xs" data-act="addarm">Add an arm</button>` : ""}</div>
+    <div class="ex-arms">${S.arms.map((a, i) => `<div class="ex-arm" data-arm="${i}">
+      <div class="ex-arm-head">${key(i)}<span class="mono" style="font-size:12.5px;color:#e4e5e7">Arm ${KEYS[i]}</span>${S.arms.length > 2 ? `<button class="btn btn-ghost-danger btn-xs right" data-act="rmarm" data-i="${i}">Remove</button>` : ""}</div>
+      <div class="select-field"><label class="field-label">Agentfile</label>${select(`af${i}`, AGENTFILES, a.agentfile, 'data-a="agentfile"')}</div>
+      <div class="select-field"><label class="field-label">Runs</label>${select(`rn${i}`, RUNS, a.runs, 'data-a="runs"')}</div>
+      <div><div class="field-label">Engine</div><div class="seg seg-xs" role="group" aria-label="Arm ${KEYS[i]}'s engine" data-seg="${i}"><button data-v="microvm" aria-pressed="${a.engine === "microvm"}">microvm</button><button data-v="host" aria-pressed="${a.engine === "host"}">host</button></div></div>
+      ${a.engine === "microvm" ? `<div class="grid2"><div class="select-field"><label class="field-label">vCPUs</label>${select(`cp${i}`, ["1", "2", "4", "8"].map((v) => [v, v]), a.cpus, 'data-a="cpus"')}</div><div class="select-field"><label class="field-label">Memory</label>${select(`mm${i}`, ["2", "4", "8", "16"].map((v) => [v, v + " GiB"]), a.mem, 'data-a="mem"')}</div></div>` : `<p class="af-dim">On the host it runs as a process of the machine: its footprint is the process tree's.</p>`}
+    </div>`).join("")}</div>
+    <p class="af-dim">${differ()}</p>
+    <div class="label hair">Workload</div>
+    <div class="seg" role="group" aria-label="Workload" data-wl><button data-v="starts" aria-pressed="${S.workload === "starts"}">Starts only</button><button data-v="command" aria-pressed="${S.workload === "command"}">A command</button></div>
+    ${S.workload === "command" ? `<div class="grid2"><div class="select-field"><label class="field-label" for="xp">Project</label>${select("xp", [["kiln", "hyper-light/kiln at b2fc6ceb"], ["shards", "hyper-light/shards at b9dfa258"]], S.project, 'data-x="project"')}</div>
+      <div><label class="field-label" for="xc">Command, in each arm's microVM</label><div class="field mono-in"><input id="xc" data-x="command" value="${esc(S.command)}"></div></div></div>
+      <p class="af-dim">A unit of work is one run of the command; it fails when the command exits non-zero. The project is plugged in at the same commit for every rep.</p>` : `<p class="af-dim">Each rep starts the arm's agent to ready and stops it: cold, from its template, and warm, in turn.</p>`}
+    <div class="grid3">
+      <div><label class="field-label" for="xn">Reps per arm (n)</label><div class="field mono-in"><input id="xn" data-x="n" inputmode="numeric" value="${S.n}"></div></div>
+      <div class="select-field" style="grid-column:span 2"><label class="field-label" for="xw">Where</label>${select("xw", [["one", "One runner for every rep, picked by kiln: linux/arm64 microvm"], ["each", "Each rep where kiln places it (comparable only across like runners)"]], S.where, 'data-x="where"')}</div>
+    </div>
+    <div><div class="field-label">Order, interleaved</div><div class="ex-order">${ord.map((k) => `<i style="border-color:${COLORS[k]}55;color:${COLORS[k]}">${KEYS[k]}</i>`).join("")}${S.n > 4 ? `<span class="dim mono" style="font-size:10.5px;align-self:center;margin-left:4px">… ${total} reps</span>` : ""}</div></div>
+    <div class="label">Measures, each arm</div>
+    <div class="afs-egress">${["start: cold", "start: template", "start: warm", "footprint", "host CPU per unit of work", "throughput", "failures"].map((m) => `<span class="chip">${m}</span>`).join("")}</div>
+    <div class="af-actions"><button class="btn btn-primary btn-sm" data-act="start">Start experiment</button><span class="af-dim">${total} reps, ${S.n} on each arm${S.workload === "command" ? "; each runs the command once" : ""}.</span></div>
+  </div>`;
+}
+function differ() {
+  const [a, b] = S.arms; const d = [];
+  for (const k of ["agentfile", "runs", "engine", "cpus", "mem"]) if (S.arms.some((x) => x[k] !== a[k])) d.push({ agentfile: "Agentfile", runs: "what runs", engine: "engine", cpus: "vCPUs", mem: "memory" }[k]);
+  return d.length ? `The arms differ in ${d.join(" and ")} alone: that is what the results measure.` : `<span class="warn">The arms are alike: change something in one.</span>`;
+}
+
+/* ------------------------------------------------------------ running */
+function running() {
+  const total = S.order.length;
+  const per = S.arms.map((_, i) => S.log.filter((l) => l.arm === i));
+  return `<div class="stack">
+    <div class="ex-progress" role="progressbar" aria-valuenow="${S.done}" aria-valuemax="${total}"><span style="width:${(S.done / total) * 100}%"></span></div>
+    <div class="row"><span style="font-size:12.5px;color:#c8cad0">Rep ${Math.min(S.done + 1, total)} of ${total} on adas-mac-studio-3.local · arm ${KEYS[S.order[S.done] ?? 0]} ${S.workload === "command" ? "running the command" : "starting"}</span><button class="btn btn-ghost-danger btn-xs right" data-act="stop">Stop</button></div>
+    <div class="ex-order">${S.order.map((k, j) => `<i data-state="${S.failed.has(j) ? "failed" : j < S.done ? "done" : j === S.done ? "now" : ""}" style="${j < S.done && !S.failed.has(j) ? `background:${COLORS[k]}` : ""}">${KEYS[k]}</i>`).join("")}</div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Arm</th><th class="num">Done</th><th class="num">Failed</th><th class="num hidden sm:table-cell">Warm start, median</th><th class="num">Units / min, median</th></tr></thead><tbody>
+      ${S.arms.map((a, i) => { const ok = per[i].filter((l) => l.ok); const med = (xs) => xs.length ? xs.sort((x, y) => x - y)[Math.floor(xs.length / 2)] : null; const w = med(ok.map((l) => l.warm)), t = med(ok.map((l) => l.tp)); return `<tr><td>${key(i)} <span class="cell-mono" style="margin-left:6px">${esc(a.engine === "microvm" ? `${a.cpus} vCPU · ${a.mem} GiB` : "host")}</span></td><td class="num cell-mono">${per[i].length} of ${S.n}</td><td class="num cell-mono">${per[i].filter((l) => !l.ok).length}</td><td class="num cell-mono hidden sm:table-cell">${w ? w + " ms" : "—"}</td><td class="num cell-mono">${t ? t.toFixed(2) : "—"}</td></tr>`; }).join("")}
+    </tbody></table></div>
+    <ul class="ex-log" aria-label="Reps, newest first">${[...S.log].reverse().map((l) => `<li>${key(l.arm)}<span class="mono">rep ${l.rep}</span><span class="dim">${l.ok ? `warm ${l.warm} ms · ${l.tp.toFixed(2)} units/min · peak ${l.rss} GiB` : `<span class="fail">failed</span>: cargo exited 137, OOM-killed at ${S.arms[l.arm].mem} GiB`}</span></li>`).join("")}</ul>
+    <p class="af-dim">A failed rep is counted, never dropped or run again.</p>
+  </div>`;
+}
+
+/* ------------------------------------------------------------ results */
+const RESULTS = [
+  { m: "Start: cold", unit: "s", better: "lower", v: [[1.84, 1.91, 1.99], [1.88, 1.97, 2.05]] },
+  { m: "Start: template", unit: "ms", better: "lower", v: [[398, 412, 431], [433, 455, 474]] },
+  { m: "Start: warm", unit: "ms", better: "lower", v: [[205, 214, 226], [208, 219, 231]] },
+  { m: "Footprint, peak", unit: "GiB", better: "lower", v: [[2.24, 2.31, 2.39], [2.91, 3.02, 3.1]] },
+  { m: "Host CPU per unit of work", unit: "CPU·s", better: "lower", v: [[39.8, 41.2, 42.9], [41.1, 43.0, 44.6]] },
+  { m: "Throughput", unit: "units/min", better: "higher", v: [[1.17, 1.21, 1.25], [1.96, 2.04, 2.11]] },
+  { m: "Failures", unit: "of 10", better: "lower", v: [[0.57, 2, 5.1], [0, 0, 2.8]], counts: ["2 of 10", "0 of 10"] },
+];
+function verdict(r) {
+  const [a, b] = r.v; const lowerWins = r.better === "lower";
+  const aBetter = lowerWins ? a[2] < b[0] : a[0] > b[2];
+  const bBetter = lowerWins ? b[2] < a[0] : b[0] > a[2];
+  if (!aBetter && !bBetter) return { w: null, t: r.counts ? "no clear difference at n = 10: B's none and A's two OOM kills overlap" : "no clear difference" };
+  const w = aBetter ? 0 : 1, o = 1 - w;
+  const ratio = r.v[w][1] / r.v[o][1];
+  return { w, t: `${KEYS[w]} ${r.better === "higher" ? `${(ratio).toFixed(2)}× the units a minute` : r.unit === "GiB" ? `${(r.v[o][1] - r.v[w][1]).toFixed(2)} GiB smaller` : `${Math.round((1 - ratio) * 100)}% ${r.m.startsWith("Start") ? "faster" : "less"}`}` };
+}
+const fmt = (x, u) => (u === "of 10" ? String(Math.round(x * 10) / 10) : u === "ms" ? String(Math.round(x)) : x.toFixed(2));
+function measure(r) {
+  const lo = Math.min(...r.v.map((x) => x[0])), hi = Math.max(...r.v.map((x) => x[2]));
+  const pad = (hi - lo) * 0.15 || 1; const a0 = Math.max(0, lo - pad), a1 = hi + pad;
+  const pos = (x) => ((x - a0) / (a1 - a0)) * 100;
+  const v = verdict(r);
+  return `<div class="ex-measure"><div class="ex-measure-head"><h3>${r.m}</h3><span class="dim mono" style="font-size:10.5px">${r.unit}, ${r.better} is better</span><span class="ex-verdict right" ${v.w !== null ? 'data-tone="win"' : ""}>${v.w !== null ? "✓ " : ""}${v.t}</span></div>
+    ${r.v.map(([l, m, h], i) => `<div class="ex-ci" title="Arm ${KEYS[i]}: median ${fmt(m, r.unit)} ${r.unit}, 95% interval ${fmt(l, r.unit)} to ${fmt(h, r.unit)}">${key(i)}<div class="ex-ci-track"><span class="ex-ci-bar" style="left:${pos(l)}%;width:${Math.max(1, pos(h) - pos(l))}%;background:${COLORS[i]}"></span><span class="ex-ci-mid" style="left:calc(${pos(m)}% - 1px);background:${COLORS[i]}"></span></div><span class="ex-ci-val">${r.counts ? r.counts[i] : `${fmt(m, r.unit)} (${fmt(l, r.unit)}–${fmt(h, r.unit)})`}</span></div>`).join("")}
+    <div class="ex-axis"><span>${fmt(a0, r.unit)}</span><span>${fmt(a1, r.unit)}</span></div></div>`;
+}
+function results() {
+  const wins = RESULTS.map(verdict);
+  const aw = wins.filter((w) => w.w === 0).length, bw = wins.filter((w) => w.w === 1).length;
+  return `<div class="stack">
+    <p class="eng-line"><b>B does ${(2.04 / 1.21).toFixed(2)}× the work a minute</b> and had no failures; <b>A</b> starts from its template faster and is 0.71 GiB smaller. Clear on ${aw + bw} of 7 measures: ${bw} for B, ${aw} for A.</p>
+    <div class="row"><span class="dim" style="font-size:12px">${S.arms.map((a, i) => `${KEYS[i]}: ${esc(armLabel(a))}`).join(" · ")}</span><button class="btn btn-ghost btn-xs right" data-act="table">${S.table ? "Show as intervals" : "Show as a table"}</button></div>
+    ${S.table ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Measure</th>${S.arms.map((_, i) => `<th class="num">${KEYS[i]}: median (95%)</th>`).join("")}<th class="hidden sm:table-cell">Clear?</th></tr></thead><tbody>${RESULTS.map((r, j) => `<tr><td style="font-size:12.5px">${r.m} <span class="cell-sub">${r.unit}</span></td>${r.v.map(([l, m, h], i) => `<td class="num cell-mono">${r.counts ? r.counts[i] : `${fmt(m, r.unit)} (${fmt(l, r.unit)}–${fmt(h, r.unit)})`}</td>`).join("")}<td class="hidden sm:table-cell" style="font-size:12px">${wins[j].w !== null ? `<span class="ok">${KEYS[wins[j].w]}</span>` : "no"}</td></tr>`).join("")}</tbody></table></div>` : RESULTS.map(measure).join("")}
+    <p class="af-dim">Intervals are 95% bootstrap intervals of each arm's median over its ${S.n} reps (failures: Wilson intervals of the rate). A measure names a winner only where the intervals don't overlap.</p>
+    <div class="label hair">Decide</div>
+    ${S.kept === null ? `<div class="row">${S.arms.map((a, i) => `<button class="btn btn-secondary btn-xs" data-act="keep" data-i="${i}">${key(i)} Keep ${KEYS[i]}</button>`).join("")}<span class="dim" style="font-size:12px">Keeping an arm records your choice; it changes nothing else until you say.</span></div>`
+    : `<div class="confirm" role="group" aria-label="Kept"><p>Kept <b>${KEYS[S.kept]}</b>: ${esc(armLabel(S.arms[S.kept]))}. By you, just now.</p>
+        ${S.applied ? `<p class="ok">reviewer's definition now starts it on ${S.arms[S.kept].cpus} vCPU · ${S.arms[S.kept].mem} GiB, as its v5.</p>` : `<div class="confirm-actions"><button class="btn btn-primary btn-xs" data-act="apply">Start reviewer this way from now on</button><button class="btn btn-ghost btn-xs" data-act="unkeep">Undo</button></div>`}</div>`}
+  </div>`;
+}
+
+/* ------------------------------------------------------------ the simulated run */
+let timer = null;
+function startRun() {
+  S.order = orderOf(S.arms.length, S.n); S.done = 0; S.log = []; S.failed = new Set(); S.phase = "running"; render();
+  const reps = S.arms.map(() => 0);
+  timer = setInterval(() => {
+    if (S.done >= S.order.length) { clearInterval(timer); S.phase = "results"; render(); return; }
+    const arm = S.order[S.done]; reps[arm] += 1;
+    const small = S.arms[arm].mem === "4";
+    const ok = !(small && (reps[arm] === 4 || reps[arm] === 8));
+    if (!ok) S.failed.add(S.done);
+    S.log.push({ arm, rep: reps[arm], ok, warm: Math.round((small ? 214 : 219) + (Math.random() - 0.5) * 18), tp: (small ? 1.21 : 2.04) + (Math.random() - 0.5) * 0.08, rss: (small ? 2.31 : 3.02).toFixed(2) });
+    S.done += 1; render();
+  }, 380);
+}
+
+$("#page").addEventListener("click", (e) => {
+  const seg = e.target.closest("[data-seg] button");
+  if (seg) { S.arms[Number(seg.parentElement.dataset.seg)].engine = seg.dataset.v; render(); return; }
+  const wl = e.target.closest("[data-wl] button");
+  if (wl) { S.workload = wl.dataset.v; render(); return; }
+  const b = e.target.closest("[data-act]"); if (!b) return;
+  const act = b.dataset.act;
+  if (act === "addarm") { S.arms.push({ ...S.arms[S.arms.length - 1] }); render(); return; }
+  if (act === "rmarm") { S.arms.splice(Number(b.dataset.i), 1); render(); return; }
+  if (act === "start") { press(b, 600, startRun); return; }
+  if (act === "stop") { clearInterval(timer); S.phase = "setup"; render(); return; }
+  if (act === "table") { S.table = !S.table; render(); return; }
+  if (act === "keep") { press(b, 500, () => { S.kept = Number(b.dataset.i); render(); }); return; }
+  if (act === "unkeep") { S.kept = null; render(); return; }
+  if (act === "apply") { press(b, 700, () => { S.applied = true; render(); }); return; }
+});
+$("#page").addEventListener("change", (e) => {
+  const t = e.target; const arm = t.closest("[data-arm]");
+  if (arm && t.dataset.a) { S.arms[Number(arm.dataset.arm)][t.dataset.a] = t.value; render(); return; }
+  if (t.dataset.x) { S[t.dataset.x] = t.dataset.x === "n" ? Math.max(2, Math.min(50, parseInt(t.value, 10) || 10)) : t.value; render(); }
+});
+render();
+</script>
+</body>
+</html>
