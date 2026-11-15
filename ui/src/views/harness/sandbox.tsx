@@ -20,6 +20,8 @@ import {
   overridesApi,
   sandboxApi,
   sandboxRes,
+  grantsRes,
+  type SessionGrants,
   type ComponentSource,
   type MemberKind,
   type OverrideAnswer,
@@ -88,6 +90,8 @@ export function SandboxTab({ agentId, store }: { agentId: string; store: Session
   const o = useSession(store, (s) => s.state?.overrides);
   const res = useRes(sandboxRes(agentId));
   const d = res.data;
+  // What its launch gave it, the base its live overrides change (`sessions.grants`).
+  const grants = useRes(grantsRes(agentId)).data;
   const host = d.engine === "host";
   const ended = d.state === "ended";
   /** An act's answer is the sandbox as it is now. */
@@ -102,7 +106,7 @@ export function SandboxTab({ agentId, store }: { agentId: string; store: Session
       {!ended && (host ? <HostFacts d={d} /> : <MicrovmFacts d={d} />)}
       {!ended && d.components.length > 0 && <Components d={d} agentId={agentId} done={done} fail={fail} />}
       {!ended && !host && d.network && <Network d={d} o={o} agentId={agentId} />}
-      {!ended && <Volumes d={d} o={o} agentId={agentId} />}
+      {!ended && <Volumes d={d} o={o} agentId={agentId} base={grants.base} />}
       {!ended && d.scope && <Reach d={d} o={o} />}
       {!ended && <Plots d={d} />}
     </div>
@@ -751,17 +755,22 @@ function ConnectForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone
  * Its folders, on either engine: its Agentfile's (read only here), then those given live, each with how
  * its harness, kiln's scope and (a microVM's) its microVM took it; taken back when confirmed.
  */
-function Volumes({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undefined; agentId: string }) {
+function Volumes({ d, o, agentId, base }: { d: SandboxDetail; o: LiveOverrides | undefined; agentId: string; base: SessionGrants["base"] }) {
   const live = useLive(agentId);
   const [adding, setAdding] = React.useState(false);
   const [asking, setAsking] = React.useState<string | null>(null);
   const host = d.engine === "host";
   const given = o?.volumes ?? [];
+  // Its base, as its launch gave it: on its host, the folders its harness is allowed; in a microVM, the
+  // machine's folders it sees, each where and whether writable.
+  const built = host
+    ? base.allowed_dirs.map((p) => ({ at: p, from: "its folder", mode: "rw" as const }))
+    : base.volumes.map((v) => ({ at: v.at, from: v.host, mode: v.writable ? ("rw" as const) : ("ro" as const) }));
   return (
     <Fold
       id="sb-volumes"
       title="Volumes"
-      count={d.volumes.length + given.length}
+      count={built.length + given.length}
       aside={
         !adding && (
           <Button size="xs" variant="ghost" onClick={() => setAdding(true)}>
@@ -773,26 +782,26 @@ function Volumes({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
     >
       <p className="sb-note">{host ? "Adds to the agent's allowed directories and this session's scope" : "Mounts into this microVM as you set, then allowed directories and scope"}</p>
       <ul className="sb-rows">
-        {d.volumes.map((v) => (
-          <li key={`base:${v.path}`} className="sb-row sb-vol" data-base="">
+        {built.map((v) => (
+          <li key={`base:${v.at}`} className="sb-row sb-vol" data-base="">
             <FolderOpen size={12} className="sb-dim" aria-hidden="true" />
             <span className="sb-two">
               <span className="sb-two-top">
-                <span className="sb-mono sb-clip" title={`${v.path}, from its Agentfile`}>
-                  {v.path}
+                <span className="sb-mono sb-clip" title={`${v.at}, as it started`}>
+                  {v.at}
                 </span>
                 <span className="sb-mode" data-mode={v.mode}>
                   {v.mode}
                 </span>
               </span>
               <span className="sb-two-sub">
-                <span className="sb-dim sb-clip" title={v.members.join(", ")}>
-                  {v.members.join(", ")}
+                <span className="sb-dim sb-clip" title={v.from}>
+                  {v.from}
                 </span>
               </span>
             </span>
             <span className="sb-tags">
-              <i title="From its Agentfile">built</i>
+              <i title="Given as it started">base</i>
             </span>
           </li>
         ))}

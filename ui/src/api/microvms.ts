@@ -205,6 +205,27 @@ export interface SandboxDetail extends SandboxBrief {
   pool: { agent: string; image: string; cpus: number; memory: number; warm: number; bound: number } | null;
 }
 
+/**
+ * What a session's launch gave it as it started, its base, beside its live overrides (`sessions.grants`,
+ * `GET /api/harness/sessions/:id/grants`): its folder, the machine's folders it sees (where, and whether
+ * writable), the folders its harness is allowed, its plug roots and egress ceiling, what it reaches past
+ * its microVM, and its secrets by name. No port or network is given at a launch (default deny).
+ */
+export interface SessionGrants {
+  agent: string;
+  engine: Engine;
+  base: {
+    folder: string | null;
+    volumes: { host: string; at: string; writable: boolean }[];
+    allowed_dirs: string[];
+    plug_roots: string[];
+    egress_ceiling: string[];
+    secrets: { name: string; toward: string[] }[];
+    reported: boolean;
+  };
+}
+export const grantsRes = (id: string): Res<SessionGrants> => ({ key: `session-grants/${id}`, fetch: (s) => request<SessionGrants>("GET", `/api/harness/sessions/${enc(id)}/grants`, undefined, { signal: s }) });
+
 const ses = (id: string, rest = "") => `/api/microvm/sessions/${enc(id)}${rest}`;
 export const sandboxApi = {
   all: (signal?: AbortSignal) => request<Record<string, SandboxBrief>>("GET", "/api/microvm/sessions", undefined, { signal }),

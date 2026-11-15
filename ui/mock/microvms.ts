@@ -487,6 +487,32 @@ export async function handleMicrovms(req: http.IncomingMessage, res: http.Server
     const all = [...AT.map((a) => a[0]), ...ON_HOST.map((h) => h[0]), ...Object.keys(ENDED)];
     return (ctx.json(res, 200, Object.fromEntries(all.flatMap((id) => (brief(id) ? [[id, brief(id)]] : [])))), true);
   }
+  // What a session's launch gave it, its base (`sessions.grants`), from its sandbox as the mock has it.
+  const gr = p.match(/^\/api\/harness\/sessions\/([^/]+)\/grants$/);
+  if (gr && m === "GET") {
+    const d = detail(decodeURIComponent(gr[1]!));
+    if (!d) return (ctx.json(res, 404, { error: "no such agent session" }), true);
+    const microvm = d.engine === "microvm";
+    // The machine's folders it sees, as its sandbox lists them (its project at /work among them); on its
+    // host, the folders its harness is allowed.
+    const volumes = microvm ? d.volumes.map((v) => ({ host: v.path === "/work" ? `~/src/${d.scope?.project ?? "project"}` : `~/.kiln/volumes${v.path}`, at: v.path, writable: v.mode === "rw" })) : [];
+    const allowed = microvm ? volumes.map((v) => v.at) : [...new Set(d.dirs.flatMap((x) => x.paths.map((q) => q.path)))];
+    const folder = microvm ? (volumes.find((v) => v.at === "/work")?.at ?? null) : (allowed[0] ?? null);
+    const roots = [...new Set(volumes.map((v) => `/${v.at.split("/")[1] ?? ""}`).filter((r) => r !== "/")), "/volumes"];
+    const base = {
+      folder,
+      volumes,
+      allowed_dirs: allowed,
+      plug_roots: microvm ? roots : [],
+      egress: microvm ? { as: "whole" } : { as: "host" },
+      egress_ceiling: [],
+      ports: [],
+      networks: [],
+      secrets: (d.secrets ?? []).map((s) => ({ name: s.name, toward: [] })),
+      reported: true,
+    };
+    return (ctx.json(res, 200, { agent: decodeURIComponent(gr[1]!), engine: d.engine, base, live: {} }), true);
+  }
   const ses = p.match(/^\/api\/microvm\/sessions\/([^/]+)$/);
   if (ses && m === "GET") {
     const d = detail(decodeURIComponent(ses[1]!));
