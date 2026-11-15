@@ -185,6 +185,40 @@ interface AgentfileListing { agentfiles: AgentfileBrief[]; reaches_all: boolean 
   project?: { repo; sha: string|null; agentfiles: { name; path; text: string|null }[] } }
 ```
 
+## Confirming an agent's act
+
+An agent can manage its person's agents from their chat, and nothing it reads can make it act for them
+unasked (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6; `crate::confirms`). A person's message to an
+agent, or goals they give it, makes the turn it starts theirs, until that turn ends; kiln records it where
+it records a person's command, by every path, and an agent's own words never count. Every operation an
+agent calls passes one gate, before any of it runs (`crate::ops::call`, so CI's, the hosts',
+experiments', Ship's and deployments' operations as much as kiln's own):
+
+- At once: reads; its acts on itself and on what it started (its children and theirs, the plan runs they
+  ran); messages and questions to its person's other agents, as their own rules have them; and every
+  other change it may already make.
+- Waiting on its person's click: an operation the registry marks destructive (`destructive`, enforced
+  here, not only a hint to MCP clients); a change to another of its person's agents it didn't start
+  (interrupting, ending or resuming it); and any change to their agent definitions. Asked in a person's
+  turn, kiln keeps the ask (the operation, its exact arguments, its target's version then: a definition's
+  version, a session's status and newest event) and answers **428**, `waiting on <person>'s click`. Asked
+  outside a person's turn, there's no one to ask: 403, and today's rules stand.
+- Another person's agents are out of reach either way, as they are today.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/confirms?agent=` | `{ asked: { id, agent, op, says, state, asked_at }[] }`: what waits on your click, newest first |
+| POST | `/api/confirms/{id}` | `{ yes }` → `{ id, state, told }`: your click; the agent is told either way |
+
+Both are a person's: an agent's call is refused. Confirmed, the agent's same call (the same operation and
+arguments, its target unchanged) runs once, as the person whose click it was, with their grants and their
+reach over their own agents, and its audit row says whose click and which ask. Another call, a second
+one, or one whose target changed since (409, and the next such call asks anew) doesn't run. A
+confirmation lasts until the person's next message to that agent, which drops what was asked before it;
+a click after the agent's turn ended still confirms. kiln keeps the confirmation and never hands it to
+the agent, so there's nothing for an agent or a page it reads to copy, guess or replay. An op an agent
+makes in a person's turn says so on its audit row (kiln's own operations).
+
 ## Agent definitions
 
 An agent definition is an agent as data (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P5.1): one of

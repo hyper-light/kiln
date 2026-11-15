@@ -10,6 +10,7 @@ import type { ExitInfo } from "./ExitInfo";
 import type { Given } from "./Given";
 import type { Inventory } from "./Inventory";
 import type { Limit } from "./Limit";
+import type { LiveOverrides } from "./LiveOverrides";
 import type { Mark } from "./Mark";
 import type { McpServer } from "./McpServer";
 import type { MovePlan } from "./MovePlan";
@@ -287,4 +288,9 @@ frozen?: number,
  * What a person lets it do (`Command::Perms`): every call of its own and of its harness's
  * subagents, within its parent's (the server narrows it so).
  */
-perms?: Perms, };
+perms?: Perms, 
+/**
+ * What a person changed of it while it runs, in place (`Command::Override`, `super::overrides`): its ports,
+ * egress, networks and volumes, each with how each place took it, given again at its harness's every start.
+ */
+overrides?: LiveOverrides, };

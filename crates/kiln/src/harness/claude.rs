@@ -80,6 +80,10 @@ pub fn args(spec: &super::session::Spec, session_id: Option<&str>) -> Vec<String
     if let Some(e) = spec.effort.as_deref().filter(|e| !e.is_empty()) {
         a.extend(["--effort".to_owned(), e.to_owned()]);
     }
+    // The folders a person gave the session (`harness::overrides`): Claude Code's own more working folders.
+    for d in &spec.dirs {
+        a.extend(["--add-dir".to_owned(), d.at.clone()]);
+    }
     match (resume, session_id) {
         (Some(r), _) => {
             a.extend(["--resume".to_owned(), r.to_owned()]);
@@ -523,6 +527,16 @@ impl Claude {
         }
     }
 
+    /// The folders a person gave the session (`harness::overrides`), every one of them now: Claude Code's
+    /// `permissions.additionalDirectories` ("Give Claude file access to directories outside the one you started in",
+    /// code.claude.com/docs/en/settings), set as a flag setting as kiln sets its others, which holds for this session
+    /// alone; read back with its settings (`Pending::ApplySettings`). As it starts, each is its `--add-dir` (`args`).
+    pub fn dirs_changed(&mut self, core: &mut Core, dirs: &[super::overrides::Dir]) -> super::overrides::Taking {
+        let all: Vec<&str> = dirs.iter().map(|d| d.at.as_str()).collect();
+        self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"permissions": {"additionalDirectories": all}}}));
+        super::overrides::Taking::Now("Claude Code took them as its additional directories (permissions.additionalDirectories, a flag setting for this session), and takes them as --add-dir as it starts".to_owned())
+    }
+
     /// Fast mode on (`FAST`) or off (""), as kiln sets it: a flag setting, so it holds for this
     /// session alone.
     fn set_fast(&mut self, core: &mut Core, speed: String) {
@@ -895,7 +909,7 @@ impl Claude {
             }
             // Restarts and snapshots are the session's (it owns the process and the sink).
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
             Command::McpEnable { name, enabled } => {
                 let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
                 self.request(core, Pending::McpChange(what), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": enabled}));

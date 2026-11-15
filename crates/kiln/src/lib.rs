@@ -12,6 +12,7 @@ pub mod audit;
 pub mod agent;
 pub mod agentdefs;
 pub mod agentfiles;
+pub mod confirms;
 pub mod aisessions;
 pub mod api;
 pub mod authz;
