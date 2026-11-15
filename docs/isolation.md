@@ -116,8 +116,12 @@ What a session does to its harness maps onto the member:
   there are its machine's. Refused as it's asked, before anything of it stops, so its member goes on.
   A move to the machine's newer runner process (an in-place upgrade) isn't refused: there it starts
   again in a microVM of the newer process, its conversation going on.
-- **A switch to another harness** (`NO_SWITCH`): its microVM runs its own harness's image. Refused as
-  it's asked, as a switch kiln can't make is.
+- **A switch to another harness** where its machine's microVMs swap none in place (`NO_SWITCH`; Hex's,
+  until its wire calls land, P6c.2): refused as it's asked, as a switch kiln can't make is. Where they swap
+  one (`Holds::swaps`, `Run::swap`), the switch swaps its member for the other harness's in the same
+  microVM (kiln plan 01a1dd2e…, P6c.5): `sandbox::isolated::ready_to_swap` pins the other's image first,
+  then its running member is handed on whole and `isolated::launch` swaps it there, its conversation
+  carried from kiln's timeline.
 - **kiln's MCP** reaches it over its link's own MCP lane (Shards D254), never the network: its harness's
   config names its microVM's bridge, `/run/shards/mcp`, and its runner serves each connection to it in its
   own process (`sandbox::isolated::bridge`, over `reach::mcp::serve_lane`), knowing its session by the lane,

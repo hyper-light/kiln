@@ -182,7 +182,7 @@ fn a_sessions_commands_are_answered_by_its_runner_through_cuts_and_lost_frames()
         std::thread::sleep(Duration::from_millis(100));
     }
     let t = Instant::now();
-    let (st, body) = http(s.port, "DELETE", &format!("/api/harness/sessions/{id}"), &s.admin, None)?;
+    let (st, body) = http(s.port, "DELETE", &format!("/api/harness/agents/{id}"), &s.admin, None)?;
     assert!((200..300).contains(&st) && t.elapsed() < Duration::from_secs(5), "a close while its runner is away waits for it, not its caller: {st} {body}");
     let (st, body) = http(s.port, "POST", &command, &s.admin, Some(&message("after-close")))?;
     assert_eq!(st, 202, "a message while its runner is away is parked: {body}");

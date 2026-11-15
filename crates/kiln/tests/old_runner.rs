@@ -75,7 +75,7 @@ fn a_runner_from_before_the_channel_connects_and_runs_agents() -> anyhow::Result
     anyhow::ensure!((200..300).contains(&st), "a message to a runner from before the channel: {st} {body}");
     until(30, "the message never reached the harness", seen, || Ok(std::fs::read_to_string(&messages)?.contains("hello from before")))?;
     // And a close ends the session.
-    let (st, body) = http(s.port, "DELETE", &format!("/api/harness/sessions/{id}"), &s.admin, None)?;
+    let (st, body) = http(s.port, "DELETE", &format!("/api/harness/agents/{id}"), &s.admin, None)?;
     anyhow::ensure!((200..300).contains(&st), "a close: {st} {body}");
     until(30, "the session never closed", seen, || Ok(http(s.port, "GET", &format!("/api/harness/sessions/{id}"), &s.admin, None)?.0 == 404))?;
     // All of it the old way: none of its session's updates went on the channel.

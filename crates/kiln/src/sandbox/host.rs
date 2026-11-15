@@ -16,7 +16,7 @@ use kiln_seams::sandbox::{Boundary, Holds, Launch, Refusal, Run, Sandbox};
 use super::ProcRun;
 
 /// What the host holds a run to: nothing of the seam's but signals, where its processes take them.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: false, egress_by_host: false, shares: false, signals: cfg!(unix), credentials: false, live: false };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: false, egress_by_host: false, shares: false, signals: cfg!(unix), credentials: false, live: false, swaps: false };
 
 /// The host's sandbox.
 #[derive(Debug, Clone, Copy, Default)]

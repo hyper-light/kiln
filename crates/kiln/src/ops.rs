@@ -402,7 +402,8 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
             // Read as its type, once its caller may run it: what doesn't fit is refused, saying
             // where and why.
             op.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(name)))?;
-            // The person whose turn the agent serves, or whose click confirmed it: on the audit line.
+            // Whose click confirmed it, and which agent asked: on the audit line (the turn's person is
+            // `audit::request`'s, from the caller).
             if let Some(n) = &note {
                 crate::audit::note("", "chat", n);
             }

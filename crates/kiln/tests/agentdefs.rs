@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{Options, Server, http, start_env};
+use common::{Options, Server, http, raw, start_env};
 use serde_json::{Value, json};
 
 const CLAUDE: &str = "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nAGENT main FROM ./agent\nATTACH main FOR claude\nCMD [\"claude\"]\n";
@@ -144,6 +144,80 @@ fn p5_1_ac1_ac2_agent_definitions_round_trip_and_stay_their_owners() -> anyhow::
     anyhow::ensure!(st == 200 && said == json!({ "deleted": true }), "{st} {said}");
     let (st, _) = call(&srv, &ada, "GET", &format!("/api/agentdefs/{id}/versions"), None)?;
     anyhow::ensure!(st == 404, "{st}");
+    Ok(())
+}
+
+/// A PATCH of an agent definition with `If-Match` (and the token's own headers): its status and its body read.
+fn patch_if(s: &Server, token: &str, id: &str, if_match: &str, body: &Value) -> anyhow::Result<(u16, Value)> {
+    let headers = format!("Authorization: Bearer {token}\r\nContent-Type: application/json\r\nIf-Match: {if_match}\r\n");
+    let (st, bytes) = raw(s.port, "PATCH", &format!("/api/agentdefs/{id}"), &headers, &serde_json::to_vec(body)?)?;
+    Ok((st, serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))))
+}
+
+/// The UI's save (kiln plan 01a1dd2e…, P5.2's page; docs/ui/principles.md 5: "saves are explicit and carry their base
+/// version; a save in between shows as an inline diff, never a silent overwrite"): two saves made over the same
+/// version, by REST's `If-Match` and its `base`, by MCP and by code mode: the first is kept, the second refused 409,
+/// saying the version it is now, and over REST carrying that version whole (`current`: what the first save made), so
+/// the page can show what changed in between; nothing of it is written. A save over the version it is now is kept.
+/// Eight saves made over one version at once: exactly one is kept, every other refused with the version it made.
+/// `If-Match` and `base` naming two versions, or `If-Match` naming no version, are refused. Taking the base check
+/// out of `agentdefs::update` keeps the second save; taking the version check out of its write can keep more than
+/// one of the eight (each read version 3 before any wrote).
+#[test]
+fn p5_2_two_saves_from_one_base_the_second_is_refused_409_with_the_current_version() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let srv = start_env(dir.path(), &Options::default(), false, &[])?;
+    let ada = person(&srv, "ada", &["developer"])?;
+    let (st, made) = call(&srv, &ada, "POST", "/api/agentdefs", Some(json!({ "name": "reviewer", "harness": "claude", "instructions": "as made" })))?;
+    anyhow::ensure!(st == 200 && made.get("version") == Some(&json!(1)), "{st} {made}\n{}", srv.log());
+    let id = s(&made, "/id");
+
+    // Two saves over version 1: the first kept (version 2), the second refused with version 2 whole.
+    let (st, first) = patch_if(&srv, &ada, &id, "\"1\"", &json!({ "instructions": "the first save" }))?;
+    anyhow::ensure!(st == 200 && first.get("version") == Some(&json!(2)), "{st} {first}");
+    let (st, second) = patch_if(&srv, &ada, &id, "\"1\"", &json!({ "instructions": "the second save", "skills": ["review"] }))?;
+    anyhow::ensure!(st == 409 && second.get("base") == Some(&json!(1)), "{st} {second}");
+    anyhow::ensure!(s(&second, "/error").contains("changed since version 1") && s(&second, "/error").contains("it's version 2 now"), "{second}");
+    anyhow::ensure!(second.pointer("/current/version") == Some(&json!(2)) && s(&second, "/current/instructions") == "the first save" && s(&second, "/current/id") == id, "the current version whole: {second}");
+    let (_, now) = call(&srv, &ada, "GET", &format!("/api/agentdefs/{id}"), None)?;
+    anyhow::ensure!(now.get("version") == Some(&json!(2)) && s(&now, "/instructions") == "the first save" && now.get("skills") == Some(&json!([])), "nothing of the second written: {now}");
+
+    // The same over `base` in the body, the operation over HTTP, MCP and code mode: each refused, saying version 2.
+    let (st, said) = call(&srv, &ada, "PATCH", &format!("/api/agentdefs/{id}"), Some(json!({ "base": 1, "instructions": "over base" })))?;
+    anyhow::ensure!(st == 409 && said.pointer("/current/version") == Some(&json!(2)), "`base`: {st} {said}");
+    let (st, said) = call(&srv, &ada, "POST", "/api/ops/agentdefs.update", Some(json!({ "id": id, "base": 1, "instructions": "the operation" })))?;
+    anyhow::ensure!(st == 409 && said.to_string().contains("it's version 2 now"), "the operation: {st} {said}");
+    let (failed, said) = mcp(&srv, &ada, "agentdefs_update", json!({ "id": id, "base": 1, "instructions": "her tool" }))?;
+    anyhow::ensure!(failed && said.contains("changed since version 1") && said.contains("it's version 2 now"), "her tool: {said}");
+    let (failed, said) = mcp(&srv, &ada, "code_run", json!({ "program": "return await kiln.agentdefs.update({ id: input.id, base: 1, instructions: 'code mode' })", "input": { "id": id } }))?;
+    anyhow::ensure!(failed && said.contains("it's version 2 now"), "code mode: {said}");
+    let (_, now) = call(&srv, &ada, "GET", &format!("/api/agentdefs/{id}"), None)?;
+    anyhow::ensure!(now.get("version") == Some(&json!(2)) && s(&now, "/instructions") == "the first save", "none of them written: {now}");
+
+    // Over the version it is now: kept.
+    let (st, third) = patch_if(&srv, &ada, &id, "\"2\"", &json!({ "instructions": "over version 2" }))?;
+    anyhow::ensure!(st == 200 && third.get("version") == Some(&json!(3)), "{st} {third}");
+
+    // Eight saves over version 3 at once: one kept, seven refused, each with the version the kept one made.
+    let answers: Vec<anyhow::Result<(u16, Value)>> = std::thread::scope(|sc| {
+        let (srv, ada, id) = (&srv, &ada, &id);
+        let handles: Vec<_> = (0..8).map(|n| sc.spawn(move || patch_if(srv, ada, id, "\"3\"", &json!({ "instructions": format!("racer {n}") })))).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("a racer's thread panicked")))).collect()
+    });
+    let answers = answers.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
+    let kept: Vec<&Value> = answers.iter().filter(|(st, _)| *st == 200).map(|(_, v)| v).collect();
+    anyhow::ensure!(kept.len() == 1 && kept.first().and_then(|v| v.get("version")) == Some(&json!(4)), "exactly one kept: {answers:?}");
+    anyhow::ensure!(answers.iter().filter(|(st, v)| *st == 409 && v.pointer("/current/version") == Some(&json!(4))).count() == 7, "every other refused with version 4: {answers:?}");
+    let (_, now) = call(&srv, &ada, "GET", &format!("/api/agentdefs/{id}"), None)?;
+    anyhow::ensure!(now.get("version") == Some(&json!(4)) && kept.first().and_then(|v| v.get("instructions")) == now.get("instructions"), "the kept one is what it is: {now}");
+
+    // Two versions named, or none: refused, nothing written.
+    let (st, said) = patch_if(&srv, &ada, &id, "\"4\"", &json!({ "base": 3, "instructions": "which?" }))?;
+    anyhow::ensure!(st == 400 && said.to_string().contains("name two versions"), "{st} {said}");
+    let (st, said) = patch_if(&srv, &ada, &id, "W/\"abc\"", &json!({ "instructions": "no version" }))?;
+    anyhow::ensure!(st == 400 && said.to_string().contains("If-Match names the version"), "{st} {said}");
+    let (_, versions) = call(&srv, &ada, "GET", &format!("/api/agentdefs/{id}/versions"), None)?;
+    anyhow::ensure!(versions.get("versions").and_then(Value::as_array).map(Vec::len) == Some(4), "four versions, no more: {versions}");
     Ok(())
 }
 

@@ -245,6 +245,11 @@ pub struct Claude {
     /// it's as Claude Code says.
     #[serde(default)]
     speed: Option<String>,
+    /// The conversation so far in words, given once with the first message it's sent: carried from another harness
+    /// where kiln can't write Claude Code's own record for it (a microVM's, whose record is its own: kiln plan
+    /// 01a1dd2e…, P6c.5).
+    #[serde(default)]
+    context: Option<String>,
     output_styles: Vec<String>,
     /// Its configuration directory (user skills and commands live under it).
     config_dir: String,
@@ -353,6 +358,7 @@ impl Claude {
             efforts: HashMap::new(),
             fast: HashMap::new(),
             speed: None,
+            context: None,
             output_styles: Vec::new(),
             config_dir: String::new(),
             commands: Vec::new(),
@@ -1608,6 +1614,16 @@ impl Claude {
         self.write_send(core, item, mode);
     }
 
+    /// The conversation so far, in words, to give with the first message it's sent (`kinds::Adapter::seed`).
+    pub fn offer_context(&mut self, text: Option<String>) {
+        self.context = text.filter(|t| !t.is_empty());
+    }
+
+    /// The conversation it was offered went with a message (or it was offered none).
+    pub fn seeded(&self) -> bool {
+        self.context.is_none()
+    }
+
     fn write_send(&mut self, core: &mut Core, item: QueueItem, mode: SendMode) {
         let QueueItem { id, text, attachments, overrides, reply_to, .. } = item;
         let text = text.trim_end().to_owned();
@@ -1621,6 +1637,11 @@ impl Claude {
             core.touch_state();
             return;
         }
+        // The conversation it was given in words comes first, once, with the first message it takes.
+        let text = match self.context.take() {
+            Some(c) => format!("{c}\n\n{text}"),
+            None => text,
+        };
         // Images as image blocks; other files by path (the agent reads them with its tools).
         let content = if attachments.is_empty() {
             json!(text)

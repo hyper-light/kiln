@@ -414,7 +414,7 @@ placeholder), so each implementation supplies its own.
 
 A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
 than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
-read-only, signals, credentials filled in at its egress, changes to a run while it runs. What it holds it enforces; a launch that
+read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another. What it holds it enforces; a launch that
 asks for what it doesn't hold is refused `Unsupported`, never taken and ignored, and the suite checks
 both halves.
 
@@ -466,7 +466,13 @@ and disconnected, a machine's folder plugged in for members, read-only or writab
 Every one names who, to whom, which ports and which way (default deny). A change after its end is
 refused `Ended`; a boundary that takes none live refuses one `Unsupported`, and its run goes on.
 
-Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, `change`.
+A run's member is swapped for another in its boundary (`swap`; kiln plan 01a1dd2e…, P6c.5, through
+Shards' P6c.1 component attached by Hex's P6c.2): its member ends as its input ends, the other starts in
+its place with what its launch gives it, and the run it gives is the other's, its boundary the same
+(the same `id`); the one swapped out says its end, which ends nothing more of its boundary, and swaps no
+more. A boundary that swaps none refuses one `Unsupported`, and its run goes on.
+
+Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, `change`, `swap`.
 
 - **SANDBOX-1** what a run writes reaches its stdout in order, then its end, then nothing
 - **SANDBOX-2** stdin reaches the program in order, and closing it is the end of its input
@@ -482,6 +488,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, 
 - **SANDBOX-12** a run on the host has no id of a boundary's and no link, and a run says the same id and link after its end as before
 - **SANDBOX-13** a run's credential, granted by reference toward a host its egress reaches, is filled in toward that host alone: never toward another host it reaches, for a credential it isn't granted, or for a run granted none; a grant toward a host its egress doesn't reach, an address, a host with a port or no host, or by a reference no store names, is refused Invalid; a sandbox that fills in no credentials refuses them Unsupported
 - **SANDBOX-14** a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on
+- **SANDBOX-15** a run's member swapped for another in its boundary ends, its end said once, and the run it gives runs the other in the same boundary; one swapped out swaps no more; a sandbox that swaps none refuses one Unsupported, and its run goes on
 
 ## Placement
 

@@ -586,7 +586,8 @@ export const harnessApi = {
   /** `ids`: one made here for each (`clientId`), so its page can open before it has started (W21-R15); asked again under them, it's refused (409), never started twice. */
   start: (target: string, spec: Spec, count = 1, ids?: string[]) =>
     ownAgentAction(call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count, ...(ids ? { ids } : {}) }), ids ?? [], (started) => started.map((a) => a.id)),
-  stop: (id: string) => ownAgentAction(call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`), [id]),
+  /** Remove an agent (`agents.remove`): ended for good and taken off kiln's lists. */
+  stop: (id: string) => ownAgentAction(call<void>("DELETE", `/api/harness/agents/${encodeURIComponent(id)}`), [id]),
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
   end: (id: string, children: boolean) => ownAgentAction(call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }), [id], (r) => r.ended),
   /** Ask about a piece of code in its conversation: a child of it answers, reading only; with no subagents, it does, in its conversation (`itself`). */

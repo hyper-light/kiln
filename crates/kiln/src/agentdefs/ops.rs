@@ -15,6 +15,7 @@ pub(crate) fn fail(e: Error) -> Fail {
         Error::Bad(m) => (StatusCode::BAD_REQUEST, m),
         Error::Missing => (StatusCode::NOT_FOUND, "no such agent definition".into()),
         Error::Conflict(m) => (StatusCode::CONFLICT, m),
+        e @ Error::Stale { .. } => (StatusCode::CONFLICT, e.to_string()),
         Error::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, format!("kiln can't run this agent: {}", why.join("; "))),
         Error::Forbidden(m) => (StatusCode::FORBIDDEN, m),
         e @ Error::ReadOnly(_) => (StatusCode::FORBIDDEN, e.to_string()),
@@ -115,7 +116,8 @@ async fn update(cx: Cx, v: Value) -> Out {
         limits: field(&v, "limits")?,
         agentfile: field(&v, "agentfile")?,
     };
-    let saved = super::update(&cx.hub, &who(&cx)?, &id, patch, &cx.caller.name).await.map_err(fail)?;
+    let base = field::<Option<i64>>(&v, "base")?.flatten();
+    let saved = super::update(&cx.hub, &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.update".into(), audit_line(&saved)).await;
     json_of(&saved)
 }
@@ -205,7 +207,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.update",
-            summary: "Change one of your agent definitions: what's given changes (null `model` or `agentfile`: back to its harness's). New settings, checked as agentdefs.create checks them, are a new version; a new `name` alone is none.",
+            summary: "Change one of your agent definitions: what's given changes (null `model` or `agentfile`: back to its harness's). New settings, checked as agentdefs.create checks them, are a new version; a new `name` alone is none. `base`, the version your change is made over (its `version` as you read it; over HTTP, `If-Match: \"<version>\"`): a change over a version another has moved on from is refused (409), saying the version it is now, and its route's answer carries that version whole (`current`), so nothing is overwritten unseen.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentdefsUpdate>(),
@@ -337,6 +339,10 @@ pub mod input {
         pub limits: Option<Limits>,
         /// Null: back to its harness's own.
         pub agentfile: Option<String>,
+        /// The version your change is made over: its `version` as you read it. Refused (409) where it
+        /// isn't current, saying the version it is now. Without it, it's made over the version kiln finds.
+        #[schemars(range(min = 1))]
+        pub base: Option<i64>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

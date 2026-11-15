@@ -1013,7 +1013,9 @@ impl Adapter {
             Self::Acp(a) => a.offer_context(words()),
             Self::Agy(a) => a.offer_context(words()),
             Self::Pi(a) => a.offer_context(words()),
-            Self::Claude(_) => {}
+            // Its own record where kiln wrote one (its transcript, resumed); the words where it couldn't (a
+            // microVM's harness, whose record is its own: kiln plan 01a1dd2e…, P6c.5).
+            Self::Claude(a) => a.offer_context(words()),
         }
     }
 
@@ -1025,7 +1027,7 @@ impl Adapter {
             Self::Acp(a) => a.seeded(),
             Self::Agy(a) => a.seeded(),
             Self::Pi(a) => a.seeded(),
-            Self::Claude(_) => true,
+            Self::Claude(a) => a.seeded(),
         }
     }
 
