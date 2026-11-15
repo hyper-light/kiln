@@ -100,6 +100,10 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
         // No credential granted by reference yet (D242): its harness signs in natively until its sign-in is captured
         // outside the microVM (plan step 33's steps 6 and 8), so nothing is filled in at its egress.
         credentials: Vec::new(),
+        // Its project, where a folder is plugged in live ([`launch`] adds its person's volumes and its session's root).
+        plug_roots: vec![project.at.clone()],
+        // The most egress it may be granted live: its person's or org's policy, as kiln's server set it at its start.
+        egress_ceiling: spec.egress_ceiling.clone(),
     })
 }
 
@@ -155,6 +159,10 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         _ => (Vec::new(), None),
     };
     launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true }));
+    // Where a folder a person gives it while it runs is plugged in live (Shards' `ImageSpec::plug_roots`): its project,
+    // its person's volumes, and its session's own root, where kiln puts such a folder by default (`harness::overrides`).
+    let roots: Vec<String> = launch.shares.iter().filter(|s| s.writable).map(|s| s.at.clone()).chain([VOLUMES.to_owned()]).collect();
+    launch.plug_roots = roots;
     for dir in plugin_folders(kind, session) {
         let at = guest_path(&dir, PLUGINS).map_err(anyhow::Error::msg)?;
         launch.args.extend(["--plugin-dir".to_owned(), at.clone()]);
@@ -175,6 +183,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
         _ => None,
     };
+    let declared = crate::sandbox::held::Declared { plug_roots: launch.plug_roots.clone(), egress_ceiling: launch.egress_ceiling.clone() };
     let run = vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
     if let Some(lanes) = lanes {
         let here = crate::reach::node::global().map(|h| crate::reach::local::Here { handle: h.clone(), me: h.name().to_owned(), host, session: session.to_owned() });
@@ -187,7 +196,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     if let (Some(claim), Some(reach), Some(group)) = (&spec.claim, crate::reach::node::global(), super::group_of(vms, run.as_ref())) {
         reach.session_grouped(claim.clone(), group).await;
     }
-    Ok(crate::proc::duplex_of_run(run, image, reach, kept_in))
+    Ok(crate::proc::duplex_of_run(run, image, reach, kept_in, declared))
 }
 
 /// Serves kiln's MCP to run `vm`'s harness in this runner's own process (Shards D254; #75 step 3): each connection
@@ -231,9 +240,17 @@ pub const PROJECTS: &str = "/work";
 /// Where a microVM sees a Windows machine's plugin folders: beneath this, each by its own name.
 pub const PLUGINS: &str = "/plugins";
 
-/// Where a microVM sees a Windows machine's folders a person gives its running session (`harness::overrides`):
-/// beneath this, each by its own name.
+/// Where a microVM sees the folders a person gives its running session (`harness::overrides`), by default: beneath
+/// this, each by its own name, one of the plug roots its launch declares ([`launch`]), so each is taken live.
 pub const VOLUMES: &str = "/volumes";
+
+/// Where a microVM sees folder `host` of the machine, given its running session (`harness::overrides`) where none was
+/// asked: beneath [`VOLUMES`] by its own name, its last part. Why not, for one with no name to go by.
+pub fn volume_at(host: &str) -> Result<String, String> {
+    let name = host.rsplit(['\\', '/']).find(|c| !c.is_empty()).filter(|c| *c != "." && *c != ".." && !c.ends_with(':') && *c != "?");
+    let name = name.ok_or_else(|| format!("{host:?} has no folder's name to plug it in by"))?;
+    Ok(format!("{VOLUMES}/{name}"))
+}
 
 /// Where a microVM sees folder `host` of the machine, as Shards plugs one in (D235): a Unix path at its
 /// own path, so what the harness says of its files names them as the machine does; a Windows one

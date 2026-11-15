@@ -89,12 +89,12 @@ pub enum Access {
     Rw,
 }
 
-/// A port published into its microVM: the host's address and port, which reach `member`'s port there.
+/// A port published into its microVM: the host's address and port, which reach its `guest_port` there, and so the
+/// members its image gives that port coming in (Shards' `ImageGuest::publish`, D269; D122).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "LivePort"))]
 pub struct Port {
-    pub member: Member,
     /// The host address it's published on: who may reach it (`127.0.0.1`: this machine alone).
     pub bind: String,
     pub host_port: u16,
@@ -150,6 +150,10 @@ pub struct Volume {
     pub access: Access,
     /// Who sees it: a host session's harness alone.
     pub members: Vec<Member>,
+    /// Its members restarted to take it: asked of one outside every plug root its microVM declared as it started
+    /// ([`Overrides::roots`]), which none takes live.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restart: bool,
 }
 
 /// One change to a session's overrides, as `Command::Override` carries it to its machine.
@@ -240,6 +244,14 @@ pub struct Overrides {
     pub networks: Vec<HeldNetwork>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<HeldVolume>,
+    /// Where its microVM takes a folder live, as its launch declared them (Shards' `ImageSpec::plug_roots`): its
+    /// project, its person's volumes and its session's volume root ([`crate::sandbox::isolated::VOLUMES`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
+    /// The most egress its microVM may be granted live, as its launch declared it (Shards' `ImageSpec::egress_ceiling`;
+    /// `[agents] egress_ceiling`), each `host:port`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ceiling: Vec<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -248,8 +260,40 @@ fn is_zero(n: &u64) -> bool {
 
 impl Overrides {
     pub fn is_empty(&self) -> bool {
-        self.revision == 0 && self.ports.is_empty() && self.egress.is_empty() && self.networks.is_empty() && self.volumes.is_empty()
+        self.revision == 0 && self.ports.is_empty() && self.egress.is_empty() && self.networks.is_empty() && self.volumes.is_empty() && self.roots.is_empty() && self.ceiling.is_empty()
     }
+}
+
+/// Whether `change` fits what its microVM declared as it started (`o`'s [`Overrides::roots`] and
+/// [`Overrides::ceiling`]): a folder beneath one of its plug roots, or one asked with its members restarted; egress
+/// within its ceiling. Why not, in words. A removal always fits.
+pub fn fits(change: &Change, o: &Overrides) -> Result<(), String> {
+    match change {
+        Change::Add(v) if !v.restart && !o.roots.iter().any(|r| beneath(&v.at, r)) => Err(format!(
+            "{} is outside every folder its microVM takes a plug in live ({}): give it beneath one (the default puts it beneath {}), or ask for its members restarted to take it (`restart`)",
+            v.at,
+            if o.roots.is_empty() { "none declared".to_owned() } else { o.roots.join(", ") },
+            crate::sandbox::isolated::VOLUMES
+        )),
+        Change::Grant(e) if !o.ceiling.iter().any(|c| within(c, &e.host, e.port)) => Err(format!(
+            "{}:{} is past the most egress this session may be granted live ({}): its person's or org's policy names what may be (`[agents] egress_ceiling`)",
+            e.host,
+            e.port,
+            if o.ceiling.is_empty() { "none".to_owned() } else { o.ceiling.join(", ") }
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Whether path `at` is `root` or beneath it.
+fn beneath(at: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    at == root || at.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether ceiling entry `entry` (`host:port`) names `host` on `port`, its host as DNS compares names (RFC 4343).
+fn within(entry: &str, host: &str, port: u16) -> bool {
+    entry.rsplit_once(':').is_some_and(|(h, p)| h.trim_start_matches('[').trim_end_matches(']').eq_ignore_ascii_case(host) && p.parse::<u16>().ok() == Some(port))
 }
 
 /// How a harness takes a session's folders among its allowed ones (each harness's own mechanism: `super::kinds::Adapter`'s
@@ -322,7 +366,6 @@ pub fn check(change: &Change, microvm: bool, harness: &str) -> Result<(), String
     match change {
         Change::Publish(p) => {
             on_host("Publishing a port")?;
-            members(std::slice::from_ref(&p.member))?;
             checked_port(p)
         }
         Change::Unpublish(_) => on_host("Unpublishing a port"),
@@ -402,7 +445,7 @@ pub fn take(o: &mut Overrides, change: &Change) -> Result<Taken, String> {
     let taken = match change {
         Change::Publish(p) => match o.ports.iter().find(|h| h.port.key() == p.key()) {
             Some(h) if h.port == *p => Taken::Same,
-            Some(h) => return Err(format!("{}:{}/{} is published already, to {}'s port {}: unpublish it first", h.port.bind, h.port.host_port, proto(h.port.protocol), h.port.member.said(), h.port.guest_port)),
+            Some(h) => return Err(format!("{}:{}/{} is published already, to its port {}: unpublish it first", h.port.bind, h.port.host_port, proto(h.port.protocol), h.port.guest_port)),
             None => {
                 o.ports.push(HeldPort { port: p.clone(), microvm: waiting() });
                 Taken::Added
@@ -533,7 +576,7 @@ pub fn seam_change(change: &Change, removed: Option<&Removed>) -> Option<kiln_se
         (Change::Grant(e), _) => Some(seam_grant(e, true)),
         (Change::Connect(n), _) => Some(seam_network(n, true)),
         (Change::Add(v), _) => Some(seam_plug(v)),
-        (_, Some(Removed::Port(p))) => Some(kiln_seams::sandbox::Change::Unpublish { bind: p.bind.clone(), host_port: p.host_port, udp: p.protocol == Protocol::Udp }),
+        (_, Some(Removed::Port(p))) => Some(kiln_seams::sandbox::Change::Unpublish { udp: p.protocol == Protocol::Udp, host: bound(&p.bind, p.host_port) }),
         (_, Some(Removed::Egress(e))) => Some(seam_grant(e, false)),
         (_, Some(Removed::Network(n))) => Some(seam_network(n, false)),
         (_, Some(Removed::Volume(v))) => Some(kiln_seams::sandbox::Change::Unplug { at: v.at.clone() }),
@@ -548,7 +591,15 @@ fn member_of(m: &Member) -> kiln_seams::sandbox::Member {
 }
 
 fn seam_publish(p: &Port) -> kiln_seams::sandbox::Change {
-    kiln_seams::sandbox::Change::Publish { member: member_of(&p.member), bind: p.bind.clone(), host_port: p.host_port, guest_port: p.guest_port, udp: p.protocol == Protocol::Udp }
+    kiln_seams::sandbox::Change::Publish { guest_port: p.guest_port, udp: p.protocol == Protocol::Udp, host: Some(p.bind.clone()), host_port: p.host_port }
+}
+
+/// `bind` and `port` as one address, as a host binds it (`127.0.0.1:8080`, `[::1]:8080`).
+fn bound(bind: &str, port: u16) -> String {
+    match bind.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{bind}:{port}"),
+    }
 }
 
 fn seam_grant(e: &Egress, grant: bool) -> kiln_seams::sandbox::Change {
@@ -562,7 +613,7 @@ fn seam_network(n: &Network, connect: bool) -> kiln_seams::sandbox::Change {
 }
 
 fn seam_plug(v: &Volume) -> kiln_seams::sandbox::Change {
-    kiln_seams::sandbox::Change::Plug { share: kiln_seams::sandbox::Share { host: v.path.clone(), at: v.at.clone(), writable: v.access == Access::Rw }, members: v.volume_members() }
+    kiln_seams::sandbox::Change::Plug { share: kiln_seams::sandbox::Share { host: v.path.clone(), at: v.at.clone(), writable: v.access == Access::Rw }, members: v.volume_members(), restart: v.restart }
 }
 
 impl Volume {
@@ -634,6 +685,12 @@ async fn session_of(cx: &Cx, v: &Value) -> Result<super::session::Info, Fail> {
 async fn send(cx: &Cx, info: &super::session::Info, change: Change) -> Out {
     let microvm = info.isolation.is_some();
     check(&change, microvm, &info.kind).map_err(|why| (if !microvm && why.contains("(engine host)") { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST }, why))?;
+    // What its microVM declared as it started, as the server last heard it: a folder outside its plug roots, or egress
+    // past its ceiling, is refused here as its session would refuse it.
+    if microvm {
+        let held: Overrides = cx.hub.harness.state_value(&info.id).and_then(|s| s.get("overrides").cloned()).and_then(|o| serde_json::from_value(o).ok()).unwrap_or_default();
+        fits(&change, &held).map_err(|why| (StatusCode::CONFLICT, why))?;
+    }
     use super::registry::Sent;
     let asked = json!(change);
     match cx.hub.harness.command(&cx.hub, &info.id, super::model::Command::Override { change }).await {
@@ -660,8 +717,7 @@ fn read<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T, Fail> {
 async fn publish(cx: Cx, v: Value) -> Out {
     let info = session_of(&cx, &v).await?;
     let i: input::Publish = read(&v)?;
-    let member = Member::read(i.member.as_deref(), &info.kind).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    send(&cx, &info, Change::Publish(Port { member, bind: i.bind.trim().to_owned(), host_port: i.host_port, guest_port: i.guest_port, protocol: i.protocol })).await
+    send(&cx, &info, Change::Publish(Port { bind: i.bind.trim().to_owned(), host_port: i.host_port, guest_port: i.guest_port, protocol: i.protocol })).await
 }
 
 async fn unpublish(cx: Cx, v: Value) -> Out {
@@ -691,9 +747,10 @@ async fn add(cx: Cx, v: Value) -> Out {
     let i: input::Add = read(&v)?;
     let path = i.path.trim().to_owned();
     let microvm = info.isolation.is_some();
+    // In a microVM, beneath its session's volume root by default, which it takes live (`Overrides::roots`).
     let at = match opt(&v, "at") {
         Some(at) => at.to_owned(),
-        None if microvm => crate::sandbox::isolated::guest_path(&path, crate::sandbox::isolated::VOLUMES).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+        None if microvm => crate::sandbox::isolated::volume_at(&path).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
         None => path.clone(),
     };
     if !microvm && at != path {
@@ -703,7 +760,11 @@ async fn add(cx: Cx, v: Value) -> Out {
         None => vec![Member::Harness(info.kind.clone())],
         Some(said) => said.iter().map(|m| Member::read(Some(m), &info.kind)).collect::<Result<Vec<_>, _>>().map_err(|e| (StatusCode::BAD_REQUEST, e))?,
     };
-    send(&cx, &info, Change::Add(Volume { path, at, access: i.access, members })).await
+    let restart = i.restart.unwrap_or(false);
+    if restart && !microvm {
+        return Err((StatusCode::BAD_REQUEST, "a session on its machine's host takes a folder with nothing restarted: `restart` is a microVM's".to_owned()));
+    }
+    send(&cx, &info, Change::Add(Volume { path, at, access: i.access, members, restart })).await
 }
 
 async fn remove(cx: Cx, v: Value) -> Out {
@@ -725,7 +786,7 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "sessions.ports.publish",
-            summary: "Publish a port into a running microVM session, in place (no rebuild, no new microVM): the host's address (`bind`: who may reach it, 127.0.0.1 this machine alone) and `host_port` to its `member`'s `guest_port` (`harness`, the default, `agent:<name>` or `mcp:<name>`), `protocol` tcp or udp. A microVM session's alone: a session on its machine's host refuses it, naming its engine. Kept on the session and given again whenever its harness starts again; agents_get shows it (state.overrides).",
+            summary: "Publish a port into a running microVM session, in place (no rebuild, no new microVM): the host's address (`bind`: who may reach it, 127.0.0.1 this machine alone) and `host_port` to its `guest_port`, `protocol` tcp or udp, reaching the members its image gives that port coming in. A microVM session's alone: a session on its machine's host refuses it, naming its engine. Kept on the session and given again whenever its harness starts again; agents_get shows it (state.overrides).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::Publish>(),
@@ -743,7 +804,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "sessions.egress.grant",
-            summary: "Grant a running microVM session's `member` (`harness`, the default, `agent:<name>` or `mcp:<name>`) egress to `host` (a DNS name or an address, an MCP server's among them) on `port`, in place: nothing else is reached (default deny). A microVM session's alone: a session on its machine's host refuses it, naming its engine.",
+            summary: "Grant a running microVM session's `member` (`harness`, the default, `agent:<name>` or `mcp:<name>`) egress to `host` (a DNS name or an address, an MCP server's among them) on `port`, in place: nothing else is reached (default deny), and nothing past the most its launch declared it may be granted live (state.overrides.ceiling, its person's or org's policy). A microVM session's alone: a session on its machine's host refuses it, naming its engine.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::Egress>(),
@@ -779,7 +840,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "sessions.volumes.add",
-            summary: "Give a running session a folder of its machine (`path`), `access` ro or rw, in place: it joins its harness's own allowed folders (each harness's way) and the session's scope (kiln holds its file calls there to `access`), and in a microVM session it's plugged into the microVM too, at `at` (else where kiln plugs that folder in) for `members` (else its harness). Every engine. Kept on the session and given again whenever its harness starts again; agents_get shows how each took it (state.overrides).",
+            summary: "Give a running session a folder of its machine (`path`), `access` ro or rw, in place: it joins its harness's own allowed folders (each harness's way) and the session's scope (kiln holds its file calls there to `access`), and in a microVM session it's plugged into the microVM too, for `members` (else its harness), at `at`: by default beneath its session's volume root (/volumes/<name>), which it takes live; a path outside every plug root it declared (state.overrides.roots) only with `restart`, its members restarted to take it. Every engine. Kept on the session and given again whenever its harness starts again; agents_get shows how each took it (state.overrides).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::Add>(),
@@ -810,8 +871,6 @@ pub mod input {
     pub struct Publish {
         /// The session: an agent's id, as agents.list gives it.
         pub agent: String,
-        /// The member the port reaches: `harness` (the default), `agent:<name>` or `mcp:<name>`.
-        pub member: Option<String>,
         /// The host address it's published on: who may reach it (127.0.0.1: this machine alone).
         pub bind: String,
         pub host_port: u16,
@@ -866,6 +925,8 @@ pub mod input {
         pub at: Option<String>,
         /// Who sees it: `harness` (the default), `agent:<name>`, `mcp:<name>`.
         pub members: Option<Vec<String>>,
+        /// A microVM session's: its members restarted to take it, for an `at` outside every plug root it declared.
+        pub restart: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

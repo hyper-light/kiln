@@ -166,7 +166,13 @@ folder, each in place: the session's `Command::Override`, which its session take
 (`State::overrides`), gives its microVM live through the seam's `Run::change` (`kiln_seams::sandbox::Change`:
 `Publish`, `Unpublish`, `Grant`, `Revoke`, `Connect`, `Disconnect`, `Plug`, `Unplug`) and a folder to its
 harness among its allowed ones. Each start of its harness gives them again: the new run is given each change once
-it runs, and its harness its folders as it starts (`Spec::dirs`). A microVM that takes no change live refuses it
+it runs, and its harness its folders as it starts (`Spec::dirs`). Each launch declares what its microVM takes live
+(Shards' `ImageSpec::plug_roots` and `egress_ceiling`, the seam's `Launch::plug_roots` and `egress_ceiling`): its
+project, its person's volumes and the session's volume root (`sandbox::isolated::VOLUMES`, where a folder goes by
+default), and the most egress it may be granted live, `[agents] egress_ceiling` as kiln's server set it at its start
+(`Spec::egress_ceiling`). A folder elsewhere is plugged in only with its members restarted (`Change::Plug`'s
+`restart`); egress past the ceiling is refused. Ports go as Shards' `ImageGuest::publish` and `unpublish` take them
+(D269): a guest port at a host address and port, let go of by the address it's bound at. A microVM that takes no change live refuses it
 in its own words, kept on the override (`took: refused`): Hex's microVMs do until its wire calls land (P6b.3,
 `sandbox::hexvm::NO_LIVE`). A session on its machine's host refuses ports, egress and networks, naming its engine.
 
