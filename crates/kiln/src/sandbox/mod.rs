@@ -370,7 +370,7 @@ mod tests {
     }
 
     /// #75 step 3 (Shards D254): a machine's microVMs say whether their runs carry kiln's MCP lane, typed: those held
-    /// with none say so; Hex's say what the Hex kiln vendors lacks; a lane that carries it is theirs.
+    /// with none say so; Hex's carry it; a lane that carries it is theirs.
     #[test]
     fn s35_mcp_microvms_say_whether_their_runs_carry_kilns_mcp_lane() -> anyhow::Result<()> {
         use kiln_seams::sandbox::Refusal;
@@ -379,7 +379,7 @@ mod tests {
         let none = super::Microvms::new(std::sync::Arc::new(kiln_seams::sandbox::SimSandbox::new()), images());
         anyhow::ensure!(none.mcp().err() == Some(Refusal::Unsupported(super::NO_LANES.into())), "no lane");
         let hex = super::held_in(state.path(), state.path().join("shards"), None, None)?;
-        anyhow::ensure!(hex.mcp().err() == Some(Refusal::Unsupported(super::hexvm::NO_MCP_LANE.into())), "the vendored Hex's");
+        anyhow::ensure!(hex.mcp().is_ok(), "Hex's carries it");
         let carried = super::Microvms::new(std::sync::Arc::new(kiln_seams::sandbox::SimSandbox::new()), images()).with_lanes(std::sync::Arc::new(super::fake::FakeLanes::default()));
         anyhow::ensure!(carried.mcp().is_ok(), "a lane that carries it");
         Ok(())

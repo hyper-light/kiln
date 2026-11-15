@@ -11,17 +11,20 @@ kiln vendors Shards (`vendor/shards`) and Hex (`vendor/hex`) as it vendors every
 each at one revision, with kiln's recorded changes, and one copy of each project in kiln's tree.
 
 - **Shards** is pinned at a revision of its `main` (`vendor/MANIFEST.toml`; `vendor/shards/UPSTREAM.md`).
-- **Hex** is pinned at its `main`, which builds on kiln's Shards revision itself, with a recorded change that
-  moves its own pin of hyper-raft to kiln's (`vendor/hex/UPSTREAM.md`). kiln's copy holds Hex's
+- **Hex** is pinned at its `main`, which builds on kiln's Shards and hyper-raft revisions itself, with kiln's
+  records of hyper-raft's changes and kiln's layout as recorded changes (`vendor/hex/UPSTREAM.md`). kiln's copy holds Hex's
   `vendor/MANIFEST.toml` and `vendor/patches`, so `scripts/vendor.py check` holds Hex's pins to kiln's as kiln's
-  copy has them: one Shards revision serves Hex and kiln. Hex is at its lead's main before its push (`c7603b0b`,
-  with its Shards image class in a process that links Hex, `ImageRuntime::new`, a member's run-time arguments, the
-  host folders it sees and a box's host use at its end), and Shards at the revision it pins (`740fa372`), where Hex
-  makes no change of its own to Shards. The two move together: `scripts/vendor.py shards <commit>` at Hex's new
-  pin, then `scripts/vendor.py hex <commit>`; and hyper-raft with them where Hex's pin of it moves (`045cf3ff`
-  since Shards' agent-control link reads the negotiated idle timeout of hyper-quic's patch Q34), each product that
-  holds a pin of it (Hex, Quiver) moved to kiln's by a recorded change. Shards names hyper-quic by its git revision,
-  which kiln's root manifest points at its copy (`[patch."https://github.com/hyper-light/hyper-raft"]`).
+  copy has them: one Shards revision serves Hex and kiln. Hex is at its `main` (`e19198bd`: its Shards image class
+  in a process that links Hex, `ImageRuntime::new` and `::leasing`, a member's run-time arguments, the host folders it
+  sees, a box's host use at its end, a member's MCP bridge, `Runtime::mcp`, and a member's own signals,
+  `Runtime::signal_member`), and Shards at the revision it pins (`fa953e3c`), where Hex makes no change of its own to
+  Shards. The two move together: `scripts/vendor.py shards <commit>` at Hex's new pin, then
+  `scripts/vendor.py hex <commit>`; and hyper-raft with them where Hex's pin of it moves (`e0613f52` since Shards'
+  agent-control link reads the negotiated idle timeout of hyper-quic's patch Q34 and a handshake's progress, Q35),
+  each product that holds a pin of it (Quiver) moved to kiln's by a recorded change, and Hex's own pin of it kiln's.
+  Shards names hyper-quic by its git revision, which kiln's root manifest points at its copy
+  (`[patch."https://github.com/hyper-light/hyper-raft"]`); Hex names Shards' crates by path into its own copy, which
+  a kiln-only change points at kiln's (`vendor/hex/UPSTREAM.md`).
 - **hyper-raft** gains Hex's one change Hex's code calls (`Endpoint::negotiated`, the suite and group a QUIC
   connection negotiated), and Quiver, which records kiln's changes to hyper-raft, records it too
   (`vendor/hyper-raft/UPSTREAM.md`, `vendor/quiver/UPSTREAM.md`).

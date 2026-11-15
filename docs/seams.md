@@ -421,7 +421,9 @@ both halves.
 A run's credentials are granted by reference (`CredentialGrant`; Shards' D242, kiln plan
 01a1d2b88be57304b972761e2a5c6781 step 6): a secret's name in kiln's store and the hosts it's filled
 in toward, never its value, which its boundary fills in at the run's egress, outside the boundary,
-into its requests to those hosts alone. A grant grants no egress: each of its hosts is one the
+into its requests to those hosts alone, where its placeholder stands: a token the launch's maker mints
+and gives the run where it reads its credential (RFC 6750 §2.1's `b64token`, refused `Invalid` otherwise), so
+the run holds the placeholder and never the value. A grant grants no egress: each of its hosts is one the
 launch's egress reaches, named as TLS names a server (a DNS name without a port, RFC 6066 §3), and
 its reference is a name the store could hold. A grant that could never be filled in is refused
 `Invalid` before anything it asks is found unheld.

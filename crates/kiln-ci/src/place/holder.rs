@@ -30,7 +30,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use hex_api::capacity::{self as hex, Close, Held, ReservationId, ToHolder, ToKeeper, Why};
-use hex_api::patience::Patience;
+use hex_api::patience::{Patience, Piece};
 
 use super::ask::{self, Amounts};
 use super::keeper::{self, Keeper, NotGranted, Unsynced, View, WaitEnded, Waits};
@@ -403,7 +403,9 @@ impl Holding {
         {
             self.ran_out = true;
             self.runs_out = self.runs_out.saturating_add(1);
-            self.patience.ran_out(Duration::from_millis(waited));
+            // Its W* the window it was due by, the slowest answer the keeper has given ([`Waits::due`]).
+            let w_star = self.waits.slowest().unwrap_or(0);
+            self.patience.ran_out(Duration::from_millis(w_star), Duration::from_millis(waited), &[Piece::Kind("the machine's capacity keeper, followed by its link")]);
         }
         self.told(Out::default(), Vec::new())
     }

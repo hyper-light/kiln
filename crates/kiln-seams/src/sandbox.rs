@@ -88,11 +88,31 @@ impl Egress {
 /// A credential a run is granted by reference (Shards' D242; kiln plan 01a1d2b88be57304b972761e2a5c6781
 /// step 6): the secret `reference` names in kiln's store ([`crate::Secrets`]), never its value, which
 /// is filled in at the run's egress, outside its boundary, into its requests to each of `toward`'s
-/// hosts and to no other. A grant grants no egress: each host is one its launch's egress reaches.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// hosts and to no other, where `placeholder` stands. A grant grants no egress: each host is one its
+/// launch's egress reaches.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CredentialGrant {
     pub reference: String,
     pub toward: Vec<String>,
+    /// What stands for the credential in the run's requests (Shards' D242): minted by whoever makes
+    /// the launch, which gives it to the run where the run reads its credential (its environment), a
+    /// token the run sends where the value would go (RFC 6750 §2.1's `b64token`). Holding it is the
+    /// capability, so it never prints.
+    pub placeholder: String,
+}
+
+/// Shows its reference and hosts, and of its placeholder its length alone.
+impl std::fmt::Debug for CredentialGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialGrant").field("reference", &self.reference).field("toward", &self.toward).field("placeholder", &format_args!("{} bytes", self.placeholder.len())).finish()
+    }
+}
+
+/// Whether `placeholder` is a token a request carries a credential as: RFC 6750 §2.1's `b64token`,
+/// `1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`, as Hex and Shards take one.
+fn token(placeholder: &str) -> bool {
+    let body = placeholder.trim_end_matches('=');
+    !body.is_empty() && body.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/'))
 }
 
 impl CredentialGrant {
@@ -107,6 +127,9 @@ impl CredentialGrant {
         }
         if self.toward.is_empty() {
             return invalid(format!("{} toward no host could never be filled in", self.reference));
+        }
+        if !token(&self.placeholder) {
+            return invalid(format!("{}'s placeholder isn't a token a request carries a credential as (RFC 6750 §2.1's b64token)", self.reference));
         }
         for host in &self.toward {
             if host.is_empty() || host.contains(|c: char| c == ':' || c == '/' || c.is_whitespace()) || host.parse::<std::net::IpAddr>().is_ok() {
@@ -916,14 +939,16 @@ fn c13<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         const CLAUDE: &str = "conformance/anthropic";
         let egress = || Egress::Only(vec!["api.anthropic.com".to_owned(), "example.com:443".to_owned()]);
-        let granted = |toward: &[&str]| vec![CredentialGrant { reference: CLAUDE.to_owned(), toward: toward.iter().map(|h| (*h).to_owned()).collect() }];
+        const STANDS: &str = "kiln-placeholder-conformance";
+        let granted = |toward: &[&str]| vec![CredentialGrant { reference: CLAUDE.to_owned(), toward: toward.iter().map(|h| (*h).to_owned()).collect(), placeholder: STANDS.to_owned() }];
         // A grant that could never be filled in is refused whatever the sandbox holds.
         let never = [
             (granted(&["other.example"]), "a host its egress doesn't reach"),
             (granted(&[]), "no host"),
             (granted(&["api.anthropic.com:443"]), "a host with a port"),
             (granted(&["192.0.2.7"]), "an address"),
-            (vec![CredentialGrant { reference: "not a name".to_owned(), toward: vec!["api.anthropic.com".to_owned()] }], "a reference no store names"),
+            (vec![CredentialGrant { reference: "not a name".to_owned(), toward: vec!["api.anthropic.com".to_owned()], placeholder: STANDS.to_owned() }], "a reference no store names"),
+            (vec![CredentialGrant { reference: CLAUDE.to_owned(), toward: vec!["api.anthropic.com".to_owned()], placeholder: "not a token".to_owned() }], "a placeholder no request carries"),
         ];
         for (credentials, what) in never {
             match f.sandbox().launch(f.fill("api.anthropic.com", CLAUDE, credentials, egress())).await {
@@ -1122,7 +1147,7 @@ mod tests {
         let granted = |toward: &[&str], egress: Egress| Launch {
             limits: Limits::NONE,
             egress,
-            credentials: vec![CredentialGrant { reference: "anthropic/ada".into(), toward: toward.iter().map(|h| (*h).to_owned()).collect() }],
+            credentials: vec![CredentialGrant { reference: "anthropic/ada".into(), toward: toward.iter().map(|h| (*h).to_owned()).collect(), placeholder: "kiln-placeholder-ada".into() }],
             ..Launch::of("fill", &[])
         };
         let named = || Egress::Only(vec!["API.anthropic.com:443".into(), "example.com".into()]);
@@ -1133,8 +1158,14 @@ mod tests {
             let got = only_memory.check(&granted(toward, egress));
             assert!(matches!(&got, Err(Refusal::Invalid { what: "a credential grant", why }) if why.starts_with("credentials[0]")), "{toward:?}: {got:?}");
         }
-        let unnamed = Launch { credentials: vec![CredentialGrant { reference: "no spaces".into(), toward: vec!["example.com".into()] }], ..granted(&[], named()) };
+        let unnamed = Launch { credentials: vec![CredentialGrant { reference: "no spaces".into(), toward: vec!["example.com".into()], placeholder: "kiln-placeholder-ada".into() }], ..granted(&[], named()) };
         assert!(matches!(Holds::ALL.check(&unnamed), Err(Refusal::Invalid { .. })), "a reference no store could name");
+        for placeholder in ["", "===", "has space", "quote\"d", "kiln-placeholder-ada=x"] {
+            let unsent = Launch { credentials: vec![CredentialGrant { reference: "anthropic/ada".into(), toward: vec!["example.com".into()], placeholder: placeholder.into() }], ..granted(&[], named()) };
+            assert!(matches!(Holds::ALL.check(&unsent), Err(Refusal::Invalid { what: "a credential grant", why }) if why.contains("placeholder")), "{placeholder:?}");
+        }
+        let padded = Launch { credentials: vec![CredentialGrant { reference: "anthropic/ada".into(), toward: vec!["example.com".into()], placeholder: "a+b/c~d.e_f-g==".into() }], ..granted(&[], named()) };
+        assert_eq!(Holds::ALL.check(&padded), Ok(()), "every b64token character, and its padding");
         assert_eq!(only_memory.check(&granted(&["api.anthropic.com"], Egress::Any)), Err(Refusal::Unsupported("credentials filled in at its egress".into())));
         assert_eq!(only_memory.check(&Launch { credentials: Vec::new(), ..granted(&[], Egress::Any) }), Ok(()), "a run granted none asks nothing held");
     }

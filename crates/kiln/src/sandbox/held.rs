@@ -110,8 +110,8 @@ impl Held {
     pub fn terminate(self: &Arc<Self>, grace: Duration) {
         match self.run.signal(Signal::Terminate) {
             Ok(()) | Err(Refusal::Ended) => {}
-            // No signal reaches it there (a microVM's member, until its control lane lands: steps
-            // 11 and 12): the end of its input is its own way out.
+            // No signal reaches it there (a boundary that holds none, `Holds::signals`): the end
+            // of its input is its own way out.
             Err(_) => self.run.close_stdin(),
         }
         let me = Arc::clone(self);

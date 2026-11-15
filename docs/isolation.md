@@ -104,7 +104,7 @@ What a session does to its harness maps onto the member:
 | steer (a message, an answer, a mode) | the harness's protocol on stdin | the same bytes on the member's stdin |
 | interrupt | the protocol's own (Claude's `interrupt` control request, Codex's `turn/interrupt`, ACP's `session/cancel`) | the same |
 | resume | the harness's own arguments or protocol (`--resume`, `thread/resume`, `session/load`) | the same, past its image's command |
-| stop | SIGTERM to its group, SIGKILL after its grace | `Run::signal(Terminate)` where the boundary delivers it, else the end of its input; its kill (the microVM's stop) after its grace |
+| stop | SIGTERM to its group, SIGKILL after its grace | `Run::signal(Terminate)`, TERM to its member alone over its run's agent-control endpoint (Hex's `Runtime::signal_member`, Shards' D238); its kill (the microVM's stop) after its grace |
 | kill | SIGKILL | the microVM's stop |
 
 ## Refused, rather than done another way
@@ -121,9 +121,10 @@ What a session does to its harness maps onto the member:
 - **kiln's MCP** reaches it over its link's own MCP lane (Shards D254), never the network: its harness's
   config names its microVM's bridge, `/run/shards/mcp`, and its runner serves each connection to it in its
   own process (`sandbox::isolated::bridge`, over `reach::mcp::serve_lane`), knowing its session by the lane,
-  with no token in the microVM. Where its microVMs carry no lane (`Microvms::mcp`; the Hex kiln vendors
-  until it passes `MemberSpec::mcp` and takes `Execs::mcp`'s connections: `hexvm::NO_MCP_LANE`), its harness
-  starts without kiln's MCP, said, and an ACP agent is offered no MCP server.
+  with no token in the microVM. Hex carries the lane: its harness member asks its bridge (`ImageMember::mcp`,
+  Shards' `MemberSpec::mcp`) and each connection is taken through Hex (`Runtime::mcp`). Where a machine's
+  microVMs carry none (`Microvms::mcp`, `NO_LANES`: a sandbox held with no lane), its harness starts without
+  kiln's MCP, said, and an ACP agent is offered no MCP server.
 - **What its boundary doesn't hold** is refused by the boundary, typed (`Refusal::Unsupported`), and the
   session's start fails in its words.
 
@@ -145,33 +146,36 @@ state), and `sandbox::hexvm::HexVms` as the runner's sandbox; its facts then say
 the one placement holds for its session (`Holder::box_of`), else the next of placement's own numbering of boxes that
 reserve nothing (`kiln-z…`, shared with its holding), so no two share a name. Its charge is kept in placement's records as it
 ends (`hexvm::USE`), and placement reads its use from its VM's meter once it's launched (`Group::Hex`). A launch adds kiln's variables
-(`isolated::env::member_env`) and kiln's MCP through the link's bridge (`isolated::mcp`) where Hex carries its lane (`hexvm::HexMcp`: its harness
-member asked for its bridge, each connection taken for the runner's `isolated::bridge`), and refuses a project built
+(`isolated::env::member_env`) and kiln's MCP through the link's bridge (`isolated::mcp`): its harness member asked for its
+bridge (`ImageMember::mcp`), each connection taken through Hex (`Runtime::mcp`) for the runner's `isolated::bridge`; and refuses a project built
 with its host's own tools (`isolated::host_tools`). A kiln that carries no Shards holds no isolated agent, and the
 launch is held by the conformance suite and a stand-in alone (below).
 
+Built, each where it is:
+
+- **The Shards implementation** of the seam (step 17): the image built and pinned as above, booted through
+  Hex's image class with the member's stdin, stdout and stderr (`sandbox::hexvm`).
+- **A member's run-time arguments** (Shards' D256, `MemberSpec::args`; Hex's `ImageMember::args`): its
+  command line is its image's command, then the session's flags (`--resume`, `--model`).
+- **The project at its host path as the harness starts**: its folder shared at its own path as its box is
+  made (Hex's `ShardsImage::shares`), and its working directory there.
+- **A member's signals** (Shards' D238, Hex's `Runtime::signal_member`): interrupt and stop reach the member
+  alone on its own lane of its run's agent-control endpoint; its kill is its box's delete.
+- **kiln's MCP from inside** (Shards' D254, Hex's `ImageMember::mcp` and `Runtime::mcp`): above.
+- **The microVM's group, charged** (step 32): placed and charged through the balancer (`hexvm::USE`,
+  `reach::place::Group::Hex`).
+- **Its configuration on a volume kiln reads on the host** (step 18): its shares are its project at its own
+  path, then each of its person's volumes for its harness at its path in the microVM, as kiln's Agentfile or
+  the person's own lays them out, made before it starts; and beside them kiln notes where its harness keeps
+  its conversations, where a history finds them.
+
 Owed, each with whose it is:
 
-- **The Shards implementation** of the seam (step 17's next slice, after step 16 lands with a Shards
-  revision at e7825cb3 or later, the first with member stdin): the image, built and pinned as above,
-  booted through Hex with the member's stdin asked for; the one real launch, red then green, and a real
-  `shards build` of each image kiln ships, on each platform.
-- **A member's run-time arguments** (Shards: steps 5 and 7). A member runs its image's command alone:
-  `MemberSpec` takes its environment, files, working directory and stdin, no arguments. Codex and the
-  ACP harnesses take everything a session asks over their protocols, so their launches carry no
-  arguments; Claude Code, Antigravity and pi take theirs as flags (`--resume`, `--session-id`,
-  `--model`, `--permission-mode`), which the Shards implementation refuses, typed, until Shards takes
-  them.
-- **The project at its host path as the harness starts** (Shards: step 8). D235 plugs a project into a
-  member that's already running, and a member's working directory must be there as it starts.
-- **A member's signals** (steps 11 and 12): until the endpoint's control lane, a stop is the end of the
-  member's input, then the microVM's stop.
-- **The microVM's group, charged** (step 32): placed and charged through the balancer.
-- **Its configuration on a volume kiln reads on the host** (step 18): transcripts, resume and rewind
-  from the host's side. The launch gives it (part 7): its shares are its project at its own path, then
-  each of its person's volumes for its harness at its path in the microVM, as kiln's Agentfile or the
-  person's own lays them out, made before it starts; and beside them kiln notes where its harness keeps
-  its conversations, where a history finds them.
+- **The real launches** (ROOT's runs, `crates/kiln/tests/vm_e2e/README.md`): `vm_harnesses`' `step35::rest`,
+  `step35::mcp` and `narrowed` in microVMs on macOS (HVF), Linux (KVM) and Windows (WHP), and a real
+  `shards build` of each image kiln ships on each; their results recorded in `vm_e2e/gaps.json`.
+- **Limits Hex's boxes don't hold** (`hexvm::HOLDS`): memory and process limits (Hex reads no OOM kill or
+  refused fork of an image VM's guest), and weights; each refused `Unsupported` as a launch asks it (Hex's).
 
 ### Part 7's clauses, where they're met
 
@@ -181,19 +185,18 @@ stop. Each clause, as kiln main has it (paths under `crates/kiln/src`):
 
 | Clause | Where | Held by |
 |---|---|---|
-| Launch through the image class | `sandbox/hexvm.rs:223-225`: the box's spec is `ClassSpec::ShardsImage`, its image pinned, its harness an `ImageMember` given the launch's environment, folder and arguments | `hexvm::tests::s17_p7_a_members_run_echoes_its_stdin_ends_and_its_box_goes` |
-| Launch through the member call | `sandbox/hexvm.rs:311-318` (`boot`): create, start, then `Runtime::member`, the call Hex's node serves for `Call::Member` (`hex-client` `calls.rs:2998`, `hex-node` `serve.rs:2105`); kiln holds Hex's image runtime in process (`sandbox/mod.rs:71-76`, `ImageRuntime::new`) | the same test, over Hex's `SimRuntime` |
-| Its `Duplex` the member's stdio | `sandbox/hexvm.rs:378-380` (the member's `Proc::streams`: stdin, stdout, stderr, all three or refused); `sandbox/isolated.rs:115,168` → `proc.rs:39` (`duplex_of_run`) → `sandbox/held.rs:43-62` (`pump`: the `Duplex`'s pipes the run's) → `os/proc_unix.rs:436`, `os/proc_windows.rs:520` (`Duplex::held`) | `hexvm::tests::s17_p7_a_members_run_…` (stdin in order, back on stdout); `held::tests::s17_a_held_run_takes_its_input_in_order_and_ends_at_its_end`, `s17_a_held_duplex_is_no_process_…` |
-| Interrupt → the member's signal | Every harness interrupts in its own protocol on the member's stdin, as on the host (`harness/claude.rs:826`, `codex.rs:1510`, `acp.rs:570`, `pi.rs:361`, `antigravity.rs:287`). The seam's `Signal::Interrupt` is Hex's INT to the box (`sandbox/hexvm.rs:526-534`), which Hex refuses for an image box's members, `Awaits(MemberSignal)` (Hex's `guest/image.rs:1333`; its simulator's `signal_vm` alike), kiln's `Unsupported` (`hexvm.rs:330`); `HOLDS.signals` stays false until Hex delivers it | `hexvm::tests::s17_p7_a_kill_and_a_drop_delete_the_box` (refused, the run going on); `harness::host::tests::s17_` (the control request at its member) |
-| Stop → the member's signal, then Hex's stop | `harness/session.rs:4953,5029,5115,5120,5135` call `Duplex::terminate` → `os/proc_unix.rs:417`, `os/proc_windows.rs:511` → `sandbox/held.rs:110-124` (`Held::terminate`): `Signal::Terminate` (Hex's TERM, refused as above), so the end of its input, then `Run::kill` once its grace passes | `held::tests::s17_terminate_signals_where_it_can_else_ends_its_input_then_kills`; `hexvm::tests::s17_p7_a_kill_…` |
-| Kill → Hex's stop | `sandbox/hexvm.rs:537-542` (`Run::kill`) and `557` (drop) → `finish`, `hexvm.rs:175`: Hex's `delete_with_host_use`, which stops the box's VM and removes it (Hex's `guest/image.rs:1470`, `delete_image_used`, its final use read "just before its delete's stop"; its `MemberProc`: "the box's stop (`signal(KILL)`, `delete`)"); its end `Exit::Killed`, said once its box is gone, its charge kept first | `hexvm::tests::s17_p7_a_kill_and_a_drop_delete_the_box`, `s17_p7_s3_the_final_use_is_kept_before_its_end_is_said`, `s17_p7_s3_a_retried_delete_finding_its_box_gone_…` |
+| Launch through the image class | `sandbox/hexvm.rs` (`HexVms::launch_as`): the box's spec is `ClassSpec::ShardsImage`, its image pinned, its harness an `ImageMember` given the launch's environment, folder and arguments | `hexvm::tests::s17_p7_a_members_run_echoes_its_stdin_ends_and_its_box_goes` |
+| Launch through the member call | `sandbox/hexvm.rs` (`boot`): create, start, then `Runtime::member`, the call Hex's node serves for `Call::Member` (`hex-client` `calls.rs:2998`, `hex-node` `serve.rs:2105`); kiln holds Hex's image runtime in process (`sandbox/mod.rs:71-76`, `ImageRuntime::new`) | the same test, over Hex's `SimRuntime` |
+| Its `Duplex` the member's stdio | `sandbox/hexvm.rs` (`HexRun::start`: the member's `Proc::streams`: stdin, stdout, stderr, all three or refused); `sandbox/isolated.rs:115,168` → `proc.rs:39` (`duplex_of_run`) → `sandbox/held.rs:43-62` (`pump`: the `Duplex`'s pipes the run's) → `os/proc_unix.rs:436`, `os/proc_windows.rs:520` (`Duplex::held`) | `hexvm::tests::s17_p7_a_members_run_…` (stdin in order, back on stdout); `held::tests::s17_a_held_run_takes_its_input_in_order_and_ends_at_its_end`, `s17_a_held_duplex_is_no_process_…` |
+| Interrupt → the member's signal | Every harness interrupts in its own protocol on the member's stdin, as on the host (`harness/claude.rs`, `codex.rs`, `acp.rs`, `pi.rs`, `antigravity.rs`). The seam's `Signal::Interrupt` is INT to the harness member alone (`sandbox/hexvm.rs`, `HexRun::signal`: Hex's `Runtime::signal_member`, on the member's own lane of its run's agent-control endpoint, Shards' D238; Hex's `guest/image.rs`, `signal_member_image`); `HOLDS.signals` is true | `hexvm::tests::s17_p7_interrupt_and_stop_reach_the_member_and_its_box_goes`; `harness::host::tests::s17_` (the control request at its member) |
+| Stop → the member's signal, then Hex's stop | `harness/session.rs:4953,5029,5115,5120,5135` call `Duplex::terminate` → `os/proc_unix.rs:417`, `os/proc_windows.rs:511` → `sandbox/held.rs:110-124` (`Held::terminate`): `Signal::Terminate`, TERM to the harness member alone (Hex's `Runtime::signal_member`, as above; the end of its input only where a boundary holds no signals), then `Run::kill` once its grace passes | `held::tests::s17_terminate_signals_where_it_can_else_ends_its_input_then_kills`; `hexvm::tests::s17_p7_interrupt_and_stop_…` |
+| Kill → Hex's stop | `sandbox/hexvm.rs` (`HexRun`'s `Run::kill` and its drop) → `finish`: Hex's `delete_with_host_use`, which stops the box's VM and removes it (Hex's `guest/image.rs`, `delete_image_used`, its final use read "just before its delete's stop"; its `MemberProc`: "the box's stop (`signal(KILL)`, `delete`)"); its end `Exit::Killed`, said once its box is gone, its charge kept first | `hexvm::tests::s17_p7_a_kill_and_a_drop_delete_the_box`, `s17_p7_s3_the_final_use_is_kept_before_its_end_is_said`, `s17_p7_s3_a_retried_delete_finding_its_box_gone_…` |
 
 A held run is never stopped by a process id: its `Duplex` has none (`host_pid`, and `detach` answers none
 at `os/proc_unix.rs:384`), so the handover paths that stop a harness by its pid (`harness/host.rs`
 `stop_process`, `agent.rs:3161,3273`) never take it, and the session terminates it through its boundary
-instead (`harness/session.rs:4953`). Hex's own member signal (`Upstream::MemberSignal`, Shards'
-agent-control endpoint) is upstream's: once Hex delivers it, `Run::signal` reaches the member with no
-change of kiln's beyond `HOLDS.signals`.
+instead (`harness/session.rs:4953`). Hex delivers a member's own signal (`Runtime::signal_member`,
+`Call::MemberSignal`, over Shards' agent-control endpoint) since its `e19198bd`, which kiln vendors.
 
 ## Tests
 
@@ -204,6 +207,18 @@ change of kiln's beyond `HOLDS.signals`.
   input in order, its end, terminate's signal or input's end then kill, a run let go of killed, and
   its `Duplex` with no pid, nothing to hand over and its stop its boundary's; an isolated session's
   image and launch; a machine without microVMs saying why in its facts.
+- `cargo test -p kiln --lib sandbox::hexvm`: the seam over Hex's simulator: a member's run (its stdin
+  in order, back on its stdout, its end, its box gone), interrupt and stop reaching the member alone
+  (`s17_p7_interrupt_and_stop_reach_the_member_and_its_box_goes`), kill and drop deleting its box, its
+  charge kept before its end is said, credentials granted by reference with their placeholders, and its
+  harness member's MCP bridge asked and its connections taken through Hex
+  (`s35_mcp_a_launch_asks_its_members_bridge_and_its_lane_takes_its_connections`).
+- The real launch, on a machine whose kiln carries Shards (`ci/shards/pack.sh`) and has a hypervisor, the
+  stand-in in each harness's place (`crates/kiln/tests/vm_e2e/README.md`, "Without a vendor's turn"):
+  `VM_E2E=1 VM_E2E_IMAGE_<KIND>=stub cargo test -p kiln --test vm_harnesses step35::rest::` and
+  `step35::mcp::`, and `VM_E2E=1 cargo test -p kiln --test vm_harnesses narrowed::`: a session launched
+  through Hex into a Shards microVM, its stdio, kiln's MCP from inside, interrupt, stop and kill, and its
+  box gone after.
 - `cargo test -p kiln --lib sandbox::image`: each image's build planned from its content (platform,
   its harness's build, its tag), with a stand-in `shards`: a built-in built once and pinned by digest,
   found in the store without a build after, a changed Agentfile built again, starts at once waiting

@@ -33,10 +33,12 @@
 //! - **What it refuses, typed:** egress to whatever its image grants (`Egress::Any`): Hex's grants are default
 //!   deny, so a run names its destinations; limits it doesn't hold ([`HOLDS`]), and credentials where no broker
 //!   leases them ([`NO_BROKER`]); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
-//! - **Its MCP lane** (Shards D254; #75 step 3): where its [`HexMcp`] carries one, its harness member is asked for its
-//!   MCP bridge (`/run/shards/mcp`) and each connection its harness makes to it is taken through Hex
-//!   (`super::Lanes`), for the runner to serve kiln's MCP over in its own process. The Hex kiln vendors carries none
-//!   ([`Unvendored`]): its member is asked for nothing, and kiln's MCP is said to be missing, typed.
+//! - **Its MCP lane** (Shards D254; #75 step 3): its harness member is asked for its MCP bridge (`/run/shards/mcp`,
+//!   `ImageMember::mcp`), and each connection its harness makes to it is taken through Hex (`Runtime::mcp`, over its
+//!   run's agent-control endpoint) as `super::Lanes`' next, for the runner to serve kiln's MCP over in its own
+//!   process. Nothing of it is a grant or an address in the microVM.
+//! - **Its signals** (Shards D238; #73 part 7) reach its harness member alone, on its own lane of its run's
+//!   agent-control endpoint (`Runtime::signal_member`): its VM runs on, and its kill is still its box's delete.
 
 use std::io::{BufRead as _, Write as _};
 use std::collections::HashMap;
@@ -55,50 +57,14 @@ use serde::{Deserialize, Serialize};
 use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Refusal, Run, Sandbox, Signal};
 
 /// What a box of Hex's holds its run to: no egress, egress to named destinations (each by TCP, to its harness
-/// member), and folders shared at any path, read-only or not (`ShardsImage::shares`). Not memory or process limits
-/// (Hex reads no OOM kill or refused fork of an image VM's guest: its `usage_of`), weights, signals (Hex awaits
-/// `MemberSignal`, Shards' agent-control endpoint: they're asked of Hex all the same, so a Hex that delivers them
-/// needs only this flag). Credentials it holds where its runtime leases them ([`HexVms::leasing`], its
-/// [`Sandbox::holds`]); these say none.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: false, credentials: false };
+/// member), folders shared at any path, read-only or not (`ShardsImage::shares`), and signals to its harness member
+/// (`Runtime::signal_member`, Shards' agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or
+/// refused fork of an image VM's guest: its `usage_of`), or weights. Credentials it holds where its runtime leases
+/// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none.
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
 pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (kiln's credential store is its server's, which this runner doesn't hold), and a run granted one is never run without it (Shards' D242)";
-/// kiln's MCP lane through Hex (Shards D254; #75 step 3), the seam kiln reaches it by: Hex passes a member's
-/// `MemberSpec::mcp` to Shards, beside the run's agent-control endpoint (`ImageSpec::control`, which Hex holds as the
-/// run's controller), and takes each connection that member's harness makes to its bridge with `Execs::mcp(member)`
-/// over that endpoint. Each answer is the seam's, typed.
-pub trait HexMcp: Send + Sync {
-    /// Whether this Hex carries the lane, and why not where it doesn't.
-    fn carried(&self) -> Result<(), Refusal>;
-    /// Asks `member` of `image` for its MCP bridge.
-    fn ask(&self, image: &mut ShardsImage, member: &Member) -> Result<(), Refusal>;
-    /// The next connection `member`'s harness makes to its bridge in box `id` of `runtime`, waited for until it
-    /// comes. `Ended` once its box or its link is gone.
-    fn next(&self, runtime: &dyn Runtime, id: &BoxId, member: &Member) -> Result<super::McpConnection, Refusal>;
-}
-
-/// Why the Hex kiln vendors gives no MCP lane: what Hex has to carry for it (Shards D254, on Shards' main at
-/// af8f1ebe5).
-pub const NO_MCP_LANE: &str = "kiln's MCP in a microVM: the Hex kiln vendors passes no member's MCP bridge to Shards (D254's `MemberSpec::mcp`, with the run's `control`) and takes none of its connections (`Execs::mcp`)";
-
-/// The lane of the Hex kiln vendors (vendor/hex), which carries none ([`NO_MCP_LANE`]).
-pub struct Unvendored;
-
-impl HexMcp for Unvendored {
-    fn carried(&self) -> Result<(), Refusal> {
-        Err(Refusal::Unsupported(NO_MCP_LANE.into()))
-    }
-
-    fn ask(&self, _: &mut ShardsImage, _: &Member) -> Result<(), Refusal> {
-        self.carried()
-    }
-
-    fn next(&self, _: &dyn Runtime, _: &BoxId, _: &Member) -> Result<super::McpConnection, Refusal> {
-        Err(Refusal::Unsupported(NO_MCP_LANE.into()))
-    }
-}
-
 /// The cost profile its allocations are made under: Shards' least VM, its envelope alone. No overhead and no guest
 /// allowance: what a VM takes past its envelope Hex learns from its windows (decision 9, `RuntimeCost::census_free`).
 const PROFILE: [u8; 32] = *b"kiln harness microVM, least size";
@@ -118,8 +84,6 @@ pub struct HexVms {
     vms: parking_lot::Mutex<HashMap<String, Weak<Vm>>>,
     /// Whether its runtime leases its VMs' credentials, given lessors over a run-lease broker ([`HexVms::leasing`]).
     leases: bool,
-    /// kiln's MCP lane through Hex ([`HexMcp`]): [`Unvendored`] unless given one ([`HexVms::with_mcp`]).
-    mcp: Box<dyn HexMcp>,
 }
 
 /// The family of kiln's records each microVM's charge is kept in as its run ends: keyed by its box's name, a
@@ -247,12 +211,7 @@ impl HexVms {
     /// Over Hex's runtime `runtime`, naming each launch's box with `names`, which answers none where nothing numbers
     /// one (a launch then refused).
     pub fn new(runtime: Arc<dyn Runtime>, names: impl Fn() -> Option<BoxName> + Send + Sync + 'static) -> Self {
-        Self { runtime, names: Box::new(names), ledger: None, vms: parking_lot::Mutex::new(HashMap::new()), mcp: Box::new(Unvendored), leases: false }
-    }
-
-    /// Takes kiln's MCP lane through `mcp` ([`HexMcp`]) from now on.
-    pub fn with_mcp(self, mcp: impl HexMcp + 'static) -> Self {
-        Self { mcp: Box::new(mcp), ..self }
+        Self { runtime, names: Box::new(names), ledger: None, vms: parking_lot::Mutex::new(HashMap::new()), leases: false }
     }
 
     /// Its runtime was given lessors over the node's run-lease broker (`hex_node::images::ImageRuntime::leasing`), so
@@ -290,12 +249,9 @@ impl HexVms {
         {
             shares.push(Mount { source: PathBuf::from(folder), destination: folder.clone(), read_only: false });
         }
-        let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone() };
-        let mut class = ShardsImage { grants, members: vec![driven], shares, credentials, ..ShardsImage::new(image) };
-        // Its MCP bridge where Hex carries the lane (Shards D254): nothing of it is a grant or an address.
-        if self.mcp.carried().is_ok() {
-            self.mcp.ask(&mut class, &member)?;
-        }
+        // Its MCP bridge (Shards D254): nothing of it is a grant or an address.
+        let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone(), mcp: true };
+        let class = ShardsImage { grants, members: vec![driven], shares, credentials, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation()?), route: None, band: 0 };
         let name = id.to_string();
@@ -354,23 +310,42 @@ fn credentials_of(member: &Member, granted: &[kiln_seams::sandbox::CredentialGra
                     toward.push(host);
                 }
             }
-            hex_api::CredentialGrant { member: member.clone(), reference: g.reference.clone(), toward }
+            hex_api::CredentialGrant { member: member.clone(), reference: g.reference.clone(), toward, placeholder: g.placeholder.clone() }
         })
         .collect()
 }
 
 impl super::Lanes for HexVms {
     fn carried(&self) -> Result<(), Refusal> {
-        self.mcp.carried()
+        Ok(())
     }
 
-    /// Run `run`'s next MCP connection, taken through Hex. `Ended` once its run is let go of. Its VM isn't held
-    /// while it waits, so a run let go of meanwhile is let go of.
+    /// Run `run`'s next MCP connection, taken through Hex (`Runtime::mcp`): what its harness sends, Hex's program's
+    /// stdout, and what it is sent, its stdin. `Ended` once its run is let go of, or its run or box has ended. Its VM
+    /// isn't held while it waits, so a run let go of meanwhile is let go of.
     fn next(&self, run: &str) -> Result<super::McpConnection, Refusal> {
         let vm = self.vms.lock().get(run).and_then(Weak::upgrade).ok_or(Refusal::Ended)?;
         let (runtime, id, member) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(seam)?, vm.member.clone());
         drop(vm);
-        self.mcp.next(&*runtime, &id, &member)
+        let mut proc = runtime.mcp(&id, &member).map_err(seam)?;
+        let given = proc.streams().map_err(seam)?;
+        let (Some(to), Some(from)) = (given.stdin, given.stdout) else {
+            return Err(Refusal::Invalid { what: "its MCP connection", why: "Hex gave its streams short".into() });
+        };
+        Ok(super::McpConnection { from: Box::new(Heard { from: hex_api::OwnedStream::from(from), _proc: proc }), to: Box::new(hex_api::OwnedStream::from(to)) })
+    }
+}
+
+/// What the harness of one MCP connection Hex took sends, held with Hex's program for it, so the connection is let
+/// go of only with what reads it.
+struct Heard {
+    from: hex_api::OwnedStream,
+    _proc: Box<dyn Proc>,
+}
+
+impl std::io::Read for Heard {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.from, buf)
     }
 }
 
@@ -638,7 +613,7 @@ impl Run for HexRun {
             Signal::Interrupt => hex_api::Signal::INT,
             Signal::Terminate => hex_api::Signal::TERM,
         };
-        self.vm.runtime.signal(&self.vm.id, to).map_err(seam)
+        self.vm.runtime.signal_member(&self.vm.id, &self.vm.member, to).map_err(seam)
     }
 
     fn kill(&self) {
@@ -743,14 +718,32 @@ pub(crate) mod tests {
         })
     }
 
-    /// #73 part 7 slice 1: a signal Hex doesn't deliver yet (`MemberSignal`) is refused `Unsupported`, the run going
-    /// on; a kill deletes its box, its end `Killed`, said once its box is gone; a run let go of takes its box with it.
+    /// #73 part 7 (Shards D238): interrupt and stop reach the harness member alone (`Runtime::signal_member`), its end
+    /// the signal's as a shell says one, said once its box is gone; a run that has ended takes no signal.
+    #[test]
+    fn s17_p7_interrupt_and_stop_reach_the_member_and_its_box_goes() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (sim, vms) = vms();
+            assert!(vms.holds().signals, "Hex's boxes hold signals to their members");
+            for (signal, number) in [(Signal::Interrupt, hex_api::Signal::INT), (Signal::Terminate, hex_api::Signal::TERM)] {
+                let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+                run.signal(signal)?;
+                let (_, ends) = drain(run.as_ref()).await;
+                assert_eq!(ends, [Exit::Code(number.number().saturating_add(128))], "{signal:?}");
+                assert_eq!(sim.list()?, [], "its box is gone once its end is said");
+                assert_eq!(run.signal(signal), Err(Refusal::Ended));
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    /// #73 part 7 slice 1: a kill deletes its box, its end `Killed`, said once its box is gone; a run let go of takes
+    /// its box with it.
     #[test]
     fn s17_p7_a_kill_and_a_drop_delete_the_box() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let (sim, vms) = vms();
             let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
-            assert!(matches!(run.signal(Signal::Interrupt), Err(Refusal::Unsupported(_))));
             run.kill();
             let (_, ends) = drain(run.as_ref()).await;
             assert_eq!(ends, [Exit::Killed]);
@@ -771,48 +764,32 @@ pub(crate) mod tests {
         })
     }
 
-    /// A stand-in for kiln's MCP lane through Hex (Shards D254's controller): each ask kept with the members of the
-    /// image it was asked in, and each box and member a connection was asked of; a connection that ends at once handed
-    /// out for each.
-    #[derive(Default, Clone)]
-    struct StandInMcp {
-        asks: Arc<parking_lot::Mutex<Vec<(Vec<Member>, Member)>>>,
-        nexts: Arc<parking_lot::Mutex<Vec<(String, Member)>>>,
-    }
-
-    impl super::HexMcp for StandInMcp {
-        fn carried(&self) -> Result<(), Refusal> {
-            Ok(())
-        }
-
-        fn ask(&self, image: &mut hex_api::ShardsImage, member: &Member) -> Result<(), Refusal> {
-            self.asks.lock().push((image.members.iter().map(|m| m.member.clone()).collect(), member.clone()));
-            Ok(())
-        }
-
-        fn next(&self, _: &dyn Runtime, id: &BoxId, member: &Member) -> Result<crate::sandbox::McpConnection, Refusal> {
-            self.nexts.lock().push((id.to_string(), member.clone()));
-            Ok(crate::sandbox::fake::connection(&[]).0)
-        }
-    }
-
-    /// #75 step 3 (Shards D254): where Hex carries kiln's MCP lane, a launch asks its harness member's bridge in its
-    /// box's image, and the lane takes that member's connections in its run's box, by the run's name; a run of no name
-    /// here, or one let go of, has none (`Ended`). Nothing of it is a grant: its egress is what its launch named.
+    /// #75 step 3 (Shards D254): a launch asks its harness member's MCP bridge in its box's spec (`ImageMember::mcp`),
+    /// and the lane takes that member's connections in its run's box through Hex (`Runtime::mcp`), by the run's name:
+    /// what the harness sends read from it, what it's sent written to it. A run of no name here, or one let go of, has
+    /// none (`Ended`). Nothing of it is a grant: its egress is what its launch named.
     #[test]
     fn s35_mcp_a_launch_asks_its_members_bridge_and_its_lane_takes_its_connections() -> anyhow::Result<()> {
         use crate::sandbox::Lanes as _;
+        use std::io::{Read as _, Write as _};
         crate::rt::block_on(async {
-            let (sim, vms) = vms();
-            let mcp = StandInMcp::default();
-            let vms = vms.with_mcp(mcp.clone());
+            let (rt, _records, vms) = metered();
             vms.carried()?;
             let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
             let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
-            assert_eq!(*mcp.asks.lock(), [(vec![harness.clone()], harness.clone())], "its harness member's bridge, asked once");
-            assert_eq!(sim.inspect(&BoxId::new("kiln-z7-0")?)?.grants, [], "no grant for kiln's MCP");
-            let _conn = vms.next("kiln-z7-0")?;
-            assert_eq!(*mcp.nexts.lock(), [("kiln-z7-0".to_owned(), harness)], "its member's connection, in its box");
+            let specs: Vec<BoxSpec> = rt.specs.lock().iter().map(|s| serde_json::from_str(s)).collect::<Result<_, _>>()?;
+            let asked: Vec<(Member, bool)> = specs.iter().flat_map(|spec| match &spec.class {
+                hex_api::ClassSpec::ShardsImage(image) => image.members.iter().map(|m| (m.member.clone(), m.mcp)).collect(),
+                _ => Vec::new(),
+            }).collect();
+            assert_eq!(asked, [(harness.clone(), true)], "its harness member's bridge, asked");
+            assert_eq!(rt.sim.inspect(&BoxId::new("kiln-z7-0")?)?.grants, [], "no grant for kiln's MCP");
+            let mut conn = vms.next("kiln-z7-0")?;
+            assert_eq!(*rt.bridged.lock(), [("kiln-z7-0".to_owned(), harness)], "its member's connection, in its box");
+            conn.to.write_all(b"{}\n")?;
+            let mut heard = String::new();
+            conn.from.read_to_string(&mut heard)?;
+            assert_eq!(heard, HELLO, "what its harness sent");
             assert!(matches!(vms.next("kiln-z7-9"), Err(Refusal::Ended)), "no run of that name");
             drop(run);
             let mut gone = false;
@@ -828,22 +805,44 @@ pub(crate) mod tests {
         })
     }
 
-    /// #75 step 3: the Hex kiln vendors carries no MCP lane (Shards D254 isn't in its API): it says so, typed, naming
-    /// what Hex must carry; a launch asks nothing of it and still runs; and no connection is taken.
-    #[test]
-    fn s35_mcp_the_vendored_hex_says_it_carries_no_lane() -> anyhow::Result<()> {
-        use crate::sandbox::Lanes as _;
-        crate::rt::block_on(async {
-            let (_sim, vms) = vms();
-            assert_eq!(vms.carried(), Err(Refusal::Unsupported(super::NO_MCP_LANE.into())));
-            assert!(super::NO_MCP_LANE.contains("MemberSpec::mcp") && super::NO_MCP_LANE.contains("Execs::mcp"), "names what Hex must carry");
-            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
-            assert!(matches!(vms.next("kiln-z7-0"), Err(Refusal::Unsupported(_))));
-            run.kill();
-            let (_, ends) = drain(run.as_ref()).await;
-            assert_eq!(ends, [Exit::Killed]);
-            anyhow::Ok(())
-        })
+    /// What a stand-in harness sends over each MCP connection [`Metered`] hands out.
+    const HELLO: &str = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+
+    /// One MCP connection [`Metered`] hands out, as Hex's `Runtime::mcp` answers one: its stdin what the harness is
+    /// sent (held here, unread), its stdout what it sends ([`HELLO`], then its end); no stderr.
+    struct Bridge {
+        given: Option<hex_api::Given>,
+        _sent: std::io::PipeReader,
+    }
+
+    impl Bridge {
+        fn new() -> Result<Self, H> {
+            use std::io::Write as _;
+            let pipe = |what: &'static str| std::io::pipe().map_err(|e| H::Broken(format!("{what}: {e}")));
+            let (sent, to) = pipe("its stdin")?;
+            let (from, mut says) = pipe("its stdout")?;
+            says.write_all(HELLO.as_bytes()).map_err(|e| H::Broken(e.to_string()))?;
+            drop(says);
+            Ok(Bridge { given: Some(hex_api::Given { stdin: Some(to.into()), stdout: Some(from.into()), stderr: None }), _sent: sent })
+        }
+    }
+
+    impl Proc for Bridge {
+        fn pid(&self) -> u32 {
+            0
+        }
+        fn try_wait(&mut self) -> Result<Option<hex_api::Exit>, H> {
+            Ok(None)
+        }
+        fn wait_for(&mut self, _: Duration) -> Result<Option<hex_api::Exit>, H> {
+            Ok(None)
+        }
+        fn kill(&mut self) -> Result<(), H> {
+            Ok(())
+        }
+        fn streams(&mut self) -> Result<hex_api::Given, H> {
+            self.given.take().ok_or_else(|| H::Invalid { what: "streams", why: "given once".into() })
+        }
     }
 
     /// Hex's simulator with a VM's host use as Hex's image runtime answers it (`host_use`, and the final use
@@ -864,6 +863,7 @@ pub(crate) mod tests {
         lessors: parking_lot::Mutex<Option<Arc<dyn hex_api::lease::Lessors>>>,
         lessees: parking_lot::Mutex<Vec<(String, Arc<dyn hex_api::lease::Lessor>)>>,
         specs: parking_lot::Mutex<Vec<String>>,
+        bridged: parking_lot::Mutex<Vec<(String, Member)>>,
     }
 
     /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
@@ -924,6 +924,20 @@ pub(crate) mod tests {
         }
         fn member(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, H> {
             self.sim.member(id, member)
+        }
+        fn signal_member(&self, id: &BoxId, member: &Member, signal: hex_api::Signal) -> Result<(), H> {
+            self.sim.signal_member(id, member, signal)
+        }
+        /// As Hex's image class answers it: `Invalid` where its box's spec asks no bridge of `member`, `NoSuchBox`
+        /// once its box is gone; else a connection ([`Bridge`]).
+        fn mcp(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, H> {
+            let info = self.sim.inspect(id)?;
+            let asked = self.specs.lock().iter().any(|s| serde_json::from_str::<BoxSpec>(s).is_ok_and(|spec| spec.id == info.id && matches!(&spec.class, hex_api::ClassSpec::ShardsImage(image) if image.members.iter().any(|m| &m.member == member && m.mcp))));
+            if !asked {
+                return Err(H::Invalid { what: "mcp", why: format!("box {id}'s spec asks no MCP bridge of {member}") });
+            }
+            self.bridged.lock().push((id.to_string(), member.clone()));
+            Ok(Box::new(Bridge::new()?))
         }
         fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, H> {
             self.deletes.fetch_add(1, Ordering::AcqRel);
@@ -1030,11 +1044,13 @@ pub(crate) mod tests {
 
     /// Credential `reference`'s value in the store the tests' broker leases from: never in a spec, a log or the VM.
     const REFERENCE: &str = "providers/anthropic";
+    /// What stands for it in its run's requests (Shards' D242), as kiln's broker mints one.
+    const STANDS: &str = "kiln-placeholder-0123456789abcdef";
     const VALUE: &str = "sk-ant-api03-s33-never-in-a-spec";
 
     /// Claude Code's launch reaching api.anthropic.com by TCP on 443, granted [`REFERENCE`] toward it.
     fn granted() -> Launch {
-        let credentials = vec![kiln_seams::sandbox::CredentialGrant { reference: REFERENCE.to_owned(), toward: vec!["api.anthropic.com".to_owned()] }];
+        let credentials = vec![kiln_seams::sandbox::CredentialGrant { reference: REFERENCE.to_owned(), toward: vec!["api.anthropic.com".to_owned()], placeholder: STANDS.to_owned() }];
         Launch { credentials, ..launch(Egress::Only(vec!["api.anthropic.com:443".into()])) }
     }
 
@@ -1063,7 +1079,7 @@ pub(crate) mod tests {
         })?;
         let id = BoxId::new("kiln-z7-0")?;
         let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
-        let by_reference = hex_api::CredentialGrant { member: harness, reference: REFERENCE.to_owned(), toward: vec!["api.anthropic.com".to_owned()] };
+        let by_reference = hex_api::CredentialGrant { member: harness, reference: REFERENCE.to_owned(), toward: vec!["api.anthropic.com".to_owned()], placeholder: STANDS.to_owned() };
         assert_eq!(rt.sim.inspect(&id)?.credentials, [by_reference], "its grant, by reference, to its harness member");
         let specs = rt.specs.lock().clone();
         anyhow::ensure!(specs.len() == 1 && specs.iter().all(|s| s.contains(REFERENCE) && !s.contains(VALUE)), "a spec holds the value or no reference: {specs:?}");
