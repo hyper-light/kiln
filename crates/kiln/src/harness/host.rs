@@ -5178,7 +5178,7 @@ mod tests {
     }
 
     /// A stand-in for Claude Code: it answers kiln's initialize and each turn (a turn that says
-    /// "long" goes on for a minute; a message that says "had already" it only says back, as Claude
+    /// "long" goes on for a minute, unless an interrupt cuts it short as Claude Code cuts one; a message that says "had already" it only says back, as Claude
     /// Code does one it has in the conversation; of one that says "says nothing" it says nothing),
     /// answers an interrupt with what it still holds, and notes in `heard` each line it reads, with
     /// its pid.
@@ -5187,9 +5187,28 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let heard = dir.join("heard.jsonl");
         let fake = dir.join("fake-claude.py");
-        std::fs::write(&fake, r##"import json, math, os, sys, time, uuid
+        std::fs::write(&fake, r##"import json, math, os, select, sys, time, uuid
 HEARD = sys.argv[1]
 args = sys.argv[2:]
+# Its input read from its descriptor with a buffer of its own, so a line waiting is never hidden from select in
+# Python's; a line read during a turn that isn't its interrupt waits in `deferred` for the turn's end.
+buf = b""
+deferred = []
+def read_line(timeout=None):
+    global buf
+    while b"\n" not in buf:
+        if timeout is not None and not select.select([0], [], [], timeout)[0]:
+            return None
+        chunk = os.read(0, 65536)
+        if not chunk:
+            line, buf = buf, b""
+            return line.decode()
+        buf += chunk
+    line, buf = buf.split(b"\n", 1)
+    return line.decode() + "\n"
+def heard(line):
+    with open(HEARD, "a") as f:
+        f.write(json.dumps({"pid": os.getpid(), "line": line.strip()}) + "\n")
 def out(o):
     sys.stdout.write(json.dumps(o) + "\n")
     sys.stdout.flush()
@@ -5201,12 +5220,11 @@ for flag in ("--session-id", "--resume"):
     if flag in args and args.index(flag) + 1 < len(args):
         session = args[args.index(flag) + 1]
 while True:
-    line = sys.stdin.readline()
+    line = deferred.pop(0) if deferred else read_line()
     if not line:
         break
     started = time.monotonic_ns()
-    with open(HEARD, "a") as f:
-        f.write(json.dumps({"pid": os.getpid(), "line": line.strip()}) + "\n")
+    heard(line)
     try:
         m = json.loads(line)
     except ValueError:
@@ -5234,7 +5252,29 @@ while True:
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
         out({"type": "system", "subtype": "init", "cwd": ".", "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": "2.1.296"})
         if "long" in json.dumps(m.get("message")):
-            time.sleep(60)
+            # A minute's work, cut short by an interrupt as Claude Code 2.1.322 cuts a turn: the interrupt answered,
+            # then its result `error_during_execution` (`aborted_streaming`) and its message cancelled.
+            cut, until = False, time.monotonic() + 60
+            while not cut and time.monotonic() < until:
+                more = read_line(0.05)
+                if more is None:
+                    continue
+                if not more:
+                    break
+                try:
+                    c = json.loads(more)
+                except ValueError:
+                    c = {}
+                if c.get("type") == "control_request" and (c.get("request") or {}).get("subtype") == "interrupt":
+                    heard(more)
+                    out({"type": "control_response", "response": {"subtype": "success", "request_id": c.get("request_id"), "response": {"still_queued": []}}})
+                    cut = True
+                else:
+                    deferred.append(more)
+            if cut:
+                out({"type": "result", "subtype": "error_during_execution", "is_error": True, "terminal_reason": "aborted_streaming", "user_message_uuid": uid, "session_id": session})
+                out({"type": "command_lifecycle", "command_uuid": uid, "state": "cancelled", "session_id": session})
+                continue
         out({"type": "assistant", "message": {"id": "msg_%s" % uuid.uuid4(), "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "done"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
         # Claude Code's result for a turn that took its message (W20): which message it took, and how long the turn
         # took, as kiln's consumption reads them (claude.rs `inputs_consumed`).
@@ -5451,6 +5491,59 @@ while True:
             until_it("every run of its member ended", 60, || members.iter().all(|p| !crate::os::pid_alive(*p))).await?;
             until_it("kiln's record, each start ended", 60, || s.info().runs.is_none() && s.info().starts.iter().all(|x| x.ended.is_some())).await?;
             assert_eq!(s.info().starts.len(), 2, "no start but the two");
+            Ok(())
+        })
+    }
+
+    /// Kiln plan P1.3 (step 17, through Hex e19198bd): an isolated Claude Code session driven as a person drives it,
+    /// its harness Hex's member (`HexVms` over Hex's simulator, the member the stand-in as a program of this machine:
+    /// `sandbox::hexvm::tests::HexProcs`). Interrupted mid-turn, its turn ends cut short and the session goes on in
+    /// the same microVM, answering its next message (AC3). Stopped, its member is sent TERM through Hex (its own
+    /// signal, `Runtime::signal_member`), its program ends, its box is deleted and kiln records its start ended (AC4).
+    #[cfg(unix)]
+    #[test]
+    fn p1_3_a_session_through_hex_interrupted_mid_turn_goes_on_and_its_stop_ends_its_member_then_its_box() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (program, heard) = stand_in(dir.path())?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let (images, _pinned) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
+            let hex = Arc::new(crate::sandbox::hexvm::tests::HexProcs::new(&program));
+            host.hold_isolated_in(crate::sandbox::of_hex(hex.vms(), images, None));
+            let cwd = dir.path().to_string_lossy().into_owned();
+            host.keep_homes(dir.path().join("homes"));
+            let isolation = session::Isolation { person: Some("owner".into()), ..session::Isolation::microvm() };
+            let spec = Spec { kind: "claude".into(), cwd: Some(cwd), isolation: Some(isolation), claim: Some(balancers_claim()), ..Spec::default() };
+            let s = host.open(Some("through-hex".into()), spec)?;
+            let heard_lines = || std::fs::read_to_string(&heard).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).collect::<Vec<_>>();
+            let heard_says = |words: &str| heard_lines().iter().any(|w| w.get("line").and_then(serde_json::Value::as_str).is_some_and(|l| l.contains(words)));
+            let idle = || s.core.lock().state.status == Status::Idle && !s.core.lock().meta.features.is_empty();
+            until_it("its start in its box", 300, idle).await?;
+            assert!(matches!(s.info().runs, Some(session::Runs::Microvm { vm: Some(ref vm), host_pid: None, .. }) if vm == "kiln-z7-0"), "{:?}", s.info().runs);
+            assert_eq!(hex.boxes()?.len(), 1, "its box");
+            // Interrupted mid-turn: the turn ends cut short, and the session goes on.
+            assert!(host.command("through-hex", message("m1", "a long piece of work")));
+            until_it("m1's turn under way", 60, || heard_says("a long piece of work") && s.core.lock().state.status == Status::Running).await?;
+            assert!(host.command("through-hex", Command::Interrupt));
+            until_it("the interrupt at its member", 60, || heard_says("\"interrupt\"")).await?;
+            until_it("m1's turn, cut short", 60, || s.core.lock().state.delivery.get("m1") == Some(&super::super::model::Delivery::Cancelled) && s.core.lock().state.status == Status::Idle).await?;
+            let answers = || s.core.lock().events().filter(|e| matches!(e.body, super::super::model::Body::Assistant { .. })).count();
+            let before = answers();
+            assert!(host.command("through-hex", message("m2", "hello")));
+            until_it("m2's turn, answered", 60, || idle() && answers() > before).await?;
+            assert_eq!(s.info().starts.len(), 1, "the same start: nothing launched again");
+            assert_eq!(hex.boxes()?.len(), 1, "the same box");
+            assert!(hex.signalled.lock().is_empty(), "an interrupt is its harness's own, no signal");
+            // Stopped: its member sent TERM through Hex, then its box deleted, and its end recorded.
+            assert!(host.close("through-hex"));
+            until_it("its box deleted", 60, || hex.boxes().is_ok_and(|b| b.is_empty())).await?;
+            until_it("kiln's record, its start ended", 60, || s.info().runs.is_none() && s.info().starts.iter().all(|x| x.ended.is_some())).await?;
+            let signalled = hex.signalled.lock().clone();
+            assert!(signalled.first().is_some_and(|(to, sig)| to.starts_with("kiln-z7-0/") && sig.number() == hex_api::Signal::TERM.number()), "TERM to its member alone, through Hex: {signalled:?}");
+            let members: std::collections::HashSet<u32> = heard_lines().iter().filter_map(|w| w.get("pid").and_then(serde_json::Value::as_u64)).filter_map(|p| u32::try_from(p).ok()).collect();
+            assert_eq!(members.len(), 1, "one run of its member: {members:?}");
+            until_it("its member's program ended", 60, || members.iter().all(|p| !crate::os::pid_alive(*p))).await?;
             Ok(())
         })
     }
