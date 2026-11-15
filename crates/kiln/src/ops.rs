@@ -311,6 +311,7 @@ pub fn own() -> &'static [Op] {
             .into_iter()
             .chain(crate::plans::ops::list_ops())
             .chain(crate::agentfiles::ops::list_ops())
+            .chain(crate::secrets::mine::list_ops())
             .chain(crate::goals::ops::list_ops())
             .chain(crate::programs::ops::list_ops())
             .chain(crate::research::ops::list_ops())
@@ -510,6 +511,8 @@ mod tests {
                 n if n.starts_with("users.") || n.starts_with("grants.") || n.starts_with("roles.") => "users.manage",
                 n if n.starts_with("tokens.") => "tokens.manage",
                 "audit.list" => "audit.read",
+                // A person's own secrets (P4.7): each signed-in person's, held to them by the operation.
+                n if n.starts_with("secrets.mine.") => crate::authz::SIGNED_IN,
                 _ => "agents.run",
             };
             assert_eq!(rule.capability, needs, "{}", op.name);

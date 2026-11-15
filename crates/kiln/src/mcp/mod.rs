@@ -232,6 +232,8 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
         .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
         .chain(crate::research::ops::list_ops())
         .chain(crate::agentfiles::ops::list_ops())
+        // Its person's own secrets' names, to name them in an Agentfile; never their values, and it sets none.
+        .chain(crate::secrets::mine::list_ops().into_iter().filter(|o| o.name == "secrets.mine.list"))
         .collect()
 }
 

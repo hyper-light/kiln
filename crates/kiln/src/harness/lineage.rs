@@ -1061,20 +1061,39 @@ pub fn isolation_on(hub: &Hub, target: &str) -> Result<(), String> {
 /// build its microVM from (`Spec::agentfile`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17).
 /// It's its owner's alone: another person's is as none, even to those who reach everyone's, and a
 /// start that acts for no person names none. Kiln's own Agentfiles, and starts that aren't isolated,
-/// read nothing.
-pub async fn kept_agentfile(hub: &Hub, isolation: Option<&Isolation>, person: Option<&str>) -> Result<Option<String>, String> {
+/// read nothing. With its text, the secrets its build is given (`Spec::build_secrets`): each it names,
+/// read from `person`'s own (decision 6, P4.7); one they hold none of refuses the start, naming it.
+pub async fn kept_agentfile(hub: &Hub, isolation: Option<&Isolation>, person: Option<&str>) -> Result<Kept, String> {
     let Some(name) = isolation.and_then(|i| i.image.as_deref()).map(str::trim) else {
-        return Ok(None);
+        return Ok(Kept::default());
     };
     let Some(id) = name.strip_prefix(crate::sandbox::isolated::KEPT) else {
-        return Ok(None);
+        return Ok(Kept::default());
     };
     let person = person.ok_or_else(|| format!("{name} is a person's own Agentfile, and this start acts for no person"))?;
     let who = crate::agentfiles::Who { person: person.to_owned(), all: false };
-    match crate::agentfiles::get(hub, hub.blobs.blobs.as_ref(), &who, id).await {
-        Ok(kept) => Ok(Some(kept.text)),
-        Err(crate::agentfiles::Error::Missing) => Err(format!("{name} names no Agentfile of yours")),
-        Err(e) => Err(format!("{name}: {e}")),
+    let text = match crate::agentfiles::get(hub, hub.blobs.blobs.as_ref(), &who, id).await {
+        Ok(kept) => kept.text,
+        Err(crate::agentfiles::Error::Missing) => return Err(format!("{name} names no Agentfile of yours")),
+        Err(e) => return Err(format!("{name}: {e}")),
+    };
+    let secrets = crate::secrets::mine::for_build(hub, person, &text).await.map_err(|why| format!("{name}: {why}"))?;
+    Ok(Kept { text: Some(text), secrets })
+}
+
+/// What [`kept_agentfile`] read for a start: its person's own Agentfile's text, and the secrets its
+/// build is given.
+#[derive(Debug, Default)]
+pub struct Kept {
+    pub text: Option<String>,
+    pub secrets: Vec<crate::secrets::mine::BuildSecret>,
+}
+
+impl Kept {
+    /// Into `spec`, as kiln says them.
+    pub fn into_spec(self, spec: &mut Spec) {
+        spec.agentfile = self.text;
+        spec.build_secrets = self.secrets;
     }
 }
 
@@ -1447,7 +1466,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
     // person they act for's. A person's own Agentfile is read as theirs before anything is placed.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
-    let agentfile = kept_agentfile(hub, isolation.as_ref(), person.as_deref()).await.map_err(bad)?;
+    let kept = kept_agentfile(hub, isolation.as_ref(), person.as_deref()).await.map_err(bad)?;
     let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.as_ref(), &ask.queued).await?;
     let checked = async {
         let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
@@ -1513,7 +1532,8 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
         isolation,
         resume,
-        agentfile,
+        agentfile: kept.text,
+        build_secrets: kept.secrets,
         // Whose its opening prompt is: its input admits it as theirs (step 35).
         opener: person.clone(),
         ..Spec::default()
@@ -1659,7 +1679,7 @@ mod tests {
             let id = kept.agentfile.id;
             crate::agentfiles::update(&hub, blobs, &ada, &id, crate::agentfiles::Patch { name: None, text: Some(V2.into()) }, "user:u-ada").await?;
             let named = Isolation { image: Some(format!(" agentfile:{id} ")), ..Isolation::microvm() };
-            assert_eq!(kept_agentfile(&hub, Some(&named), Some("user:u-ada")).await, Ok(Some(V2.to_owned())), "its latest version");
+            assert_eq!(kept_agentfile(&hub, Some(&named), Some("user:u-ada")).await.map(|k| k.text), Ok(Some(V2.to_owned())), "its latest version");
             for other in ["user:u-bo", "owner"] {
                 let refused = kept_agentfile(&hub, Some(&named), Some(other)).await.err().unwrap_or_default();
                 assert_eq!(refused, format!("agentfile:{id} names no Agentfile of yours"), "{other}");
@@ -1669,7 +1689,7 @@ mod tests {
             assert!(kept_agentfile(&hub, Some(&gone), Some("user:u-ada")).await.is_err(), "one there isn't");
             let kilns = Isolation { image: Some("harness-claude".into()), ..Isolation::microvm() };
             for isolation in [Some(&kilns), Some(&Isolation::microvm()), None] {
-                assert_eq!(kept_agentfile(&hub, isolation, Some("user:u-ada")).await, Ok(None));
+                assert_eq!(kept_agentfile(&hub, isolation, Some("user:u-ada")).await.map(|k| (k.text, k.secrets)), Ok((None, Vec::new())));
             }
             Ok(())
         })

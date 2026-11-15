@@ -1324,6 +1324,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, "plans.ready", body)).await
         }
+        // A person's own secrets (`crate::secrets::mine`, P4.7): each operation is its route, each keeping its caller to their own.
+        (&Method::GET, ["api", "me", "secrets"]) => boxed(|| own_op(&hub, &caller, "secrets.mine.list", json!({}))).await,
+        (&Method::PUT, ["api", "me", "secrets", name]) => {
+            let name = (*name).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("name".into(), json!(name));
+            }
+            boxed(|| own_op(&hub, &caller, "secrets.mine.set", body)).await
+        }
+        (&Method::DELETE, ["api", "me", "secrets", name]) => boxed(|| own_op(&hub, &caller, "secrets.mine.delete", json!({ "name": name }))).await,
         // Agentfiles (`crate::agentfiles`): each operation is its route, each keeping its caller to their own.
         (&Method::GET, ["api", "agentfiles"]) => boxed(|| own_op(&hub, &caller, "agentfiles.list", query_value(&q))).await,
         (&Method::POST, ["api", "agentfiles"]) => {
@@ -6438,8 +6449,10 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     spec.plan_run = None;
     spec.helper = None;
     spec.subagent = false;
-    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked.
+    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked,
+    // and so are the secrets its build is given (P4.7).
     spec.agentfile = None;
+    spec.build_secrets = Vec::new();
     // An isolated agent's person, whose volume its harness's configuration is on, is whoever asks
     // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked.
     if let Some(i) = spec.isolation.as_mut() {
@@ -6494,7 +6507,7 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         None if !crate::authz::gate::has_users(hub).await => Some("owner".to_owned()),
         None => None,
     };
-    body.spec.agentfile = crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?;
+    crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?.into_spec(&mut body.spec);
     let count = body.count.unwrap_or(1);
     if !body.ids.is_empty() {
         let n = count.clamp(1, 16);

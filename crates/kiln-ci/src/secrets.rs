@@ -28,6 +28,10 @@ pub enum ScopeKind {
     /// One integration's own credential (W11-R01): read by the server for that integration,
     /// never resolved for a leg, and not a scope people name.
     Integration,
+    /// One person's own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, decision 6): set, listed and
+    /// deleted by that person alone, its id their person (`owner`, `user:<id>`), and given only to
+    /// the builds of their own Agentfiles that name it; never resolved for a leg.
+    User,
 }
 
 impl ScopeKind {
@@ -39,7 +43,13 @@ impl ScopeKind {
             ScopeKind::Workflow => "workflow",
             ScopeKind::Environment => "environment",
             ScopeKind::Integration => "integration",
+            ScopeKind::User => "user",
         }
+    }
+
+    /// A kind as stored ([`ScopeKind::as_str`]'s words), every kind: what a row was sealed under.
+    pub fn stored(s: &str) -> Option<ScopeKind> {
+        [ScopeKind::Server, ScopeKind::Organization, ScopeKind::Repository, ScopeKind::Workflow, ScopeKind::Environment, ScopeKind::Integration, ScopeKind::User].into_iter().find(|k| k.as_str() == s)
     }
 
     pub fn parse(s: &str) -> Option<ScopeKind> {
@@ -49,6 +59,7 @@ impl ScopeKind {
             "repository" | "repo" => ScopeKind::Repository,
             "workflow" => ScopeKind::Workflow,
             "environment" | "env" => ScopeKind::Environment,
+            "user" => ScopeKind::User,
             _ => return None,
         })
     }
