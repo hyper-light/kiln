@@ -564,14 +564,14 @@ pub async fn delete(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str) -> R<Brie
 
 /// The Agentfiles a list shows, for `caller`: the kept ones it reaches ([`list`]), kiln's own, and with
 /// `repo`, that project's.
-pub async fn listing(hub: &Hub, caller: &Caller, everyone: bool, repo: Option<&str>) -> R<Listing> {
+pub async fn listing(hub: &Hub, caller: &Caller, everyone: bool, repo: Option<&str>, lean: bool) -> R<Listing> {
     let who = Who::of(caller)?;
     let agentfiles = list(hub, &who, everyone).await?;
     let project = match repo.map(str::trim).filter(|r| !r.is_empty()) {
         Some(r) => Some(project(hub, caller, r).await?),
         None => None,
     };
-    Ok(Listing { agentfiles, reaches_all: who.all, builtin: builtin::views(), project })
+    Ok(Listing { agentfiles, reaches_all: who.all, builtin: if lean { builtin::names() } else { builtin::views() }, project })
 }
 
 /// Project `repo`'s Agentfiles (by `owner/name` or id), for a caller that reads its runs; one it may

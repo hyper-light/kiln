@@ -3,6 +3,7 @@
  * Only your own actions move rows, and only the rows they acted on (`place`).
  */
 import type { AttentionPair } from "./attention-exposure";
+import { sameJson } from "./utils";
 export class AttentionOrder {
   private choice: { order: string[]; exposure?: string | null; pair?: AttentionPair | null } | undefined;
   take(next: string[]): string[] {
@@ -87,4 +88,27 @@ export class AttentionControls {
   get allowed() {
     return this.current !== undefined && this.drawn === this.current && !this.changed;
   }
+}
+
+/**
+ * A snapshot just read (`next`) with what says the same as before (`was`) kept as the object it
+ * was: each agent's mark, and the settings. Every read parses everything anew, though a refresh
+ * changes a mark or two: a row re-renders only when its own mark changes, not with every snapshot
+ * (W26-R15).
+ */
+export function keepSame<M extends object, T extends { agents: Record<string, M>; settings: object }>(was: T | undefined, next: T): T {
+  if (!was) return next;
+  const agents: Record<string, M> = {};
+  let same = true;
+  let count = 0;
+  for (const [id, mark] of Object.entries(next.agents)) {
+    const before = was.agents[id];
+    const kept = before !== undefined && sameJson(before, mark);
+    agents[id] = kept ? before : mark;
+    if (!kept) same = false;
+    count++;
+  }
+  // Every mark as it was, and none gone: the marks themselves are the object they were, and what's made from them stands.
+  if (same && count === Object.keys(was.agents).length) return { ...next, agents: was.agents, settings: sameJson(was.settings, next.settings) ? was.settings : next.settings };
+  return { ...next, agents, settings: sameJson(was.settings, next.settings) ? was.settings : next.settings };
 }

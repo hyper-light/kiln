@@ -549,12 +549,49 @@ server says, and counts every session it has, ended ones included, until it's up
   turns of those working. It empties as it sends, and that line says how it went; it slides open
   and shut, so the list under it moves smoothly. Every agent the list shows is Select all.
 
+### The snapshot, lean
+
+What Mission control reads as it opens grows with the agents there are, and most of it was what
+the page doesn't show: of 137 agents' list (162.6 KB), a quarter was each one's last words, which
+only the rows on the page show, and four tenths was each row's keys; and their attention snapshot
+(37.6 KB) named every agent four times by its 32 characters. The page reads both lean (docs/ci.md
+W21-R02):
+
+- **The list** (`GET /api/harness/sessions?lean=1`): each agent without where its harness started
+  and without its last words when it has some, as columns ([wire.md](wire.md), "Lists as
+  columns"): 18.0 KB for those 137. Every page reads it so: the document asks for it as it's
+  parsed, and an agent's news (an event) still carries its whole entry.
+- **The snapshot** (`GET /api/harness/attention?lean=1&said=<rows>`,
+  `crates/kiln/src/harness/attention/lean.rs`): the snapshot but for these: `ids` names every agent
+  once (a column of its own), the order's first; `order`, `request_order` and the visit's two
+  orders (`pair.order_a`, `pair.order_b`) name agents by place in `ids`, and a list that is `ids`'
+  first n in order is the number n; `agents` (the marks) and `archived` are columns, the marks
+  with `at` (whose they are, by place) when they aren't `ids`' first; and it leaves out what the
+  list's page doesn't read, saying so in `without`: the learned order's report (`model`: the
+  Settings page reads a replay's), the examination's and the urgency's, and each mark's score
+  (`rank`). 5.1 KB for those 137. An action's answer (`POST`) is the snapshot whole, as before, and
+  so is a read that doesn't ask for it lean.
+- **The last words of the rows the list opens on** come with the snapshot: `said=<rows>` asks for
+  those of the first `rows` rows the list shows as it opens (your pins in their order, then the
+  order's, without the parked, the archived and the ended; a row that has said nothing takes its
+  place among them) and of its last row (the page keeps the row Tab ends on in it, wherever it's
+  scrolled), as `said: {at, v}`, whose by place in `ids`. The page asks for as many rows as can
+  begin within two viewports' height (the rows it mounts before it's scrolled), none shorter than
+  a row's least height: 22 on a page 900 px tall, 6.6 KB when each has said as much as a summary
+  holds. So the list is drawn with its lines, with no read after the snapshot.
+- **Any other row's** are asked for as it comes to the page (`GET
+  /api/harness/sessions?summaries=`, every row of one render in one request): the list mounts the
+  rows within a viewport of what shows, so a row's are asked for a viewport's travel before it's
+  seen. Until they're in, its line is empty, in the room it always takes; no other text stands in
+  for them. Where the list opens some other way than in the order (another sort, a filter kept from
+  before), its first rows wait for theirs before the list is drawn.
+
 ## API
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
-| GET | `/api/harness/sessions` | `Info[]` |
+| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes). Without `target`, every machine's by its target; with `shared=1`, each distinct list once: `{ lists: KindInfo[][], targets: { <target>: <which of lists> } }` (machines of one kind offer the same, so by target the answer is one list as many times as there are machines) |
+| GET | `/api/harness/sessions?lean=&summaries=` | `Info[]`; with `lean=1`, the list as the pages read it as they open: each session without where its harness started (`starts`, `runs`) and without its last words when it has some (`summary`; one that has said nothing keeps its empty one), written as columns ([wire.md](wire.md), "Lists as columns"), `{rows, cols, without}`; with `summaries=<id>,<id>…`, the last words of those of them the caller sees, `{<id>: summary}`: what a lean list left out, for the rows a page shows (see "The snapshot, lean") |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?, ids?}` → `Info[]`; `ids`: the ids to start them under, one each (32 lowercase hex digits), made by the client so its page can open the agent's own page before it has started (docs/ci.md W21-R15); an id that's a session's already, or another start's under way, is refused (409) before anything starts, so a start asked again under its ids never starts twice |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good (409 while its archive or restore is under way: it goes on; end it once that's done) |
 | POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it |

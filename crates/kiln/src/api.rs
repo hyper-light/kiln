@@ -844,10 +844,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             job_logs_ws(hub.clone(), id, step, req)
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => boxed(|| get_artifacts(&hub, id)).await,
-        (&Method::GET, ["api", "agents"]) => Ok(boxed(|| agents_read(&hub, &caller)).await),
+        (&Method::GET, ["api", "agents"]) => {
+            let lean = srv::query(&req).get("lean").is_some_and(|lean| lean == "1");
+            Ok(boxed(|| async { if lean { agents_lean_read(&hub, &caller).await } else { agents_read(&hub, &caller).await } }).await)
+        }
         (&Method::GET, ["api", "reach", "runners"]) => {
-            let want = srv::query(&req).get("want").cloned();
-            reach_runners(&hub, want.as_deref())
+            let q = srv::query(&req);
+            reach_runners(&hub, q.get("want").map(String::as_str), q.get("lean").is_some_and(|lean| lean == "1"))
         }
         // The copies of runners' trees other runners keep (docs/reach.md §5.1): the rules for them,
         // what each runner holds and let go, and asking runners to let go now.
@@ -1503,7 +1506,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
         (_, ["api", "harness", "attention", rest @ ..]) => boxed(|| crate::harness::attention::route(&hub, &caller, &method, rest, req)).await.map_err(|(c, m)| err(c, m)),
-        (&Method::GET, ["api", "harness", "sessions"]) => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
+        (&Method::GET, ["api", "harness", "sessions"]) => match q.get("summaries") {
+            Some(ids) => Ok(boxed(|| harness_summaries(&hub, &caller, ids)).await),
+            None if q.get("lean").is_some_and(|lean| lean == "1") => Ok(boxed(|| harness_sessions_lean(&hub, &caller)).await),
+            None => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
+        },
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
         // As its owner encoded it once (goal 10, plan 01a1a87b2dae step 2).
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.info_json(id) {
@@ -3418,24 +3425,65 @@ async fn overview_making(hub: &Arc<Hub>, key: crate::reads::OverviewKey) -> anyh
 /// maker does, nothing of it on the request's shard (step 5: made there, `read /api/agents` held its shard
 /// 0.28 to 0.40 ms on the CPU in rt9's lab). The store's, while the rows kept are behind it.
 async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
+    match agents_whole(hub, caller).await {
+        Ok(made) => pre_named(made),
+        Err(e) => agents_unencoded(&e),
+    }
+}
+
+/// What a read of the runners answers when their list couldn't be encoded.
+fn agents_unencoded(e: &anyhow::Error) -> Response {
+    err(StatusCode::INTERNAL_SERVER_ERROR, format!("the runners' list couldn't be encoded: {e:#}")).into_response()
+}
+
+/// [`agents_read`]'s answer before it's answered: its JSON, named where it was kept ahead.
+async fn agents_whole(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> anyhow::Result<crate::reads::Made> {
     if caller.is_owner() {
         hub.harness.views.start(hub);
         if let Some(key) = agents_key(hub) {
             if let Some(made) = hub.harness.views.agents.held(&key) {
-                return pre_named(made);
+                return Ok(made);
             }
             match agents_making(hub, key).await {
-                Ok(made) => return pre_named(made),
+                Ok(made) => return Ok(made),
                 Err(e) => tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made off the shard: the store's answers"),
             }
         }
     }
+    let unnamed = |json| crate::reads::Made { json, etag: None };
     match crate::doctor::runners_made_for(hub, caller, |runners| crate::reads::encode(&runners)).await {
-        Some(Ok(json)) => pre_encoded(json),
-        Some(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("the runners' list couldn't be encoded: {e:#}")).into_response(),
+        Some(made) => made.map(unnamed),
         // Where the pool's job is lost (it panicked), here.
-        None => srv::json(StatusCode::OK, &crate::doctor::runners_for(hub, caller).await),
+        None => crate::reads::encode(&crate::doctor::runners_for(hub, caller).await).map(unnamed),
     }
+}
+
+/// `GET /api/agents?lean=1` (W21-R02): the runners `caller` may read, each with only what a page that lists the
+/// runners and starts agents on them reads of its facts: whether it starts microVMs (`facts.virt`). Its facts are
+/// seven tenths of the list (22.8 KB of the 32.8 KB of eleven runners: `kiln-lab bar`, 2026-11-14), and the rest of
+/// them only a page that shows a runner's hardware reads (the Runners page). Mission control asks so as it opens.
+/// Made of [`agents_read`]'s own answer, off the shard: the whole list is read and written again.
+async fn agents_lean_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
+    let whole = match agents_whole(hub, caller).await {
+        Ok(made) => made.json,
+        Err(e) => return agents_unencoded(&e),
+    };
+    match crate::rt::compute(move || lean_agents(&whole)).await {
+        Ok(Ok(json)) => pre_encoded(json),
+        Ok(Err(e)) | Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("the runners' list couldn't be made lean: {e:#}")).into_response(),
+    }
+}
+
+/// The runners' list `whole` (`GET /api/agents`'s JSON), each runner's facts only their `virt` (none: no facts).
+fn lean_agents(whole: &[u8]) -> anyhow::Result<bytes::Bytes> {
+    let mut runners: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(whole)?;
+    for runner in &mut runners {
+        let virt = runner.remove("facts").and_then(|mut facts| facts.get_mut("virt").map(serde_json::Value::take));
+        if let Some(virt) = virt {
+            runner.insert("facts".to_owned(), json!({ "virt": virt }));
+        }
+    }
+    crate::reads::encode(&runners)
 }
 
 /// The owner's `GET /api/agents` as `key` says it, made on the compute pool (each runner's record copied, the list
@@ -4354,14 +4402,36 @@ async fn enroll(hub: &Hub, req: Request) -> R {
 
 /// `GET /api/reach/runners?want=linux/amd64`: reach's directory, ranked for `want` (every runner
 /// without one), with why the others were passed over.
-fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
+fn reach_runners(hub: &Hub, want: Option<&str>, lean: bool) -> R {
     let runners = hub.reach_directory();
     let want = match want.map(crate::reach::directory::Want::parse).transpose() {
         Ok(w) => w.unwrap_or_default(),
         Err(e) => return Err(err(StatusCode::BAD_REQUEST, format!("{e:#}"))),
     };
+    if lean {
+        return Ok(srv::json(StatusCode::OK, &json!({ "runners": lean_runners(&runners) })));
+    }
     let (ranked, passed) = crate::reach::directory::rank(&runners, &want, "");
     Ok(srv::json(StatusCode::OK, &json!({ "want": want.describe(), "runners": runners, "ranked": ranked, "passed": passed })))
+}
+
+/// What a runner is to reach without what only a ranking reads (W21-R02): its facts, its CPUs' layout and
+/// its features, which are four fifths of it (53 KB of eleven runners to 9: `kiln-lab bar`, 2026-11-14). For
+/// a page that lists the runners by name and what they're doing (`?lean=1`): Mission control's composer as
+/// it opens, an agent's move.
+fn lean_runners<T: serde::Serialize>(runners: &[T]) -> Vec<serde_json::Value> {
+    runners
+        .iter()
+        .filter_map(|runner| serde_json::to_value(runner).ok())
+        .map(|mut runner| {
+            if let Some(fields) = runner.as_object_mut() {
+                for heavy in ["facts", "topo", "features"] {
+                    fields.remove(heavy);
+                }
+            }
+            runner
+        })
+        .collect()
 }
 
 /// `GET /api/reach/offers?after=<cursor>&limit=<n>` (docs/reach.md §2.2): every runner with what it
@@ -5842,9 +5912,10 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let cmd = q.get("cmd").cloned();
+    let screen_first = screen_first(&q);
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), cmd, "admin".into(), socket, sock).await {
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), cmd, "admin".into(), screen_first, socket, sock).await {
             tracing::debug!(error = %format!("{e:#}"), "terminal websocket ended");
         }
     });
@@ -5886,9 +5957,10 @@ async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, ca
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let sock = ui::Socket::of(Wire::TerminalUp, Wire::TerminalDown, &caller.name, Some(Page::Runner(agent.clone())));
     let (target, actor) = (format!("leg:{id}@{agent}"), caller.name.clone());
+    let screen_first = screen_first(&q);
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), None, actor, socket, sock).await {
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), None, actor, screen_first, socket, sock).await {
             tracing::debug!(error = %format!("{e:#}"), "leg terminal websocket ended");
         }
     });
@@ -5902,11 +5974,26 @@ fn terminal_page(target: &str) -> Option<Page> {
     runner.map(|m| Page::Runner(m.to_owned()))
 }
 
+/// A terminal's viewer asks (`first=screen`) to be sent what draws the session's screen ahead of its
+/// replay (W21-R02, docs/wire.md "A terminal's screen first").
+fn screen_first(q: &HashMap<String, String>) -> bool {
+    q.get("first").is_some_and(|first| first == "screen")
+}
+
+/// What a terminal's viewer is sent as it attaches, in order, before anything live: which session it's
+/// on; the part of its replay that draws its screen, where one goes ahead (to a viewer that asked:
+/// W21-R02), which the `session` frame then says; and its replay.
+fn terminal_opening(session: crate::termsess::Info, screen: Option<Vec<u8>>, replay: bytes::Bytes) -> impl Iterator<Item = ws::Message> {
+    let first = ws::text(TerminalDown::Session { session, screen: screen.is_some() }.text());
+    std::iter::once(first).chain(screen.map(ws::binary)).chain((!replay.is_empty()).then(|| ws::binary(replay)))
+}
+
 /// One browser on one session: identity, replay, then live output; input both ways. Closing the
 /// socket only detaches — the shell keeps running for the next attach. What it sends that can't be
-/// read is answered `refused` and noted (`sock`).
+/// read is answered `refused` and noted (`sock`). To a viewer that asked (`screen_first`), what draws
+/// the session's screen goes ahead of the replay where there is such a part, and its `session` frame says so.
 #[allow(clippy::too_many_arguments)]
-async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String, (cols, rows): (u16, u16), cmd: Option<String>, actor: String, socket: ws::WebSocket, sock: ui::Socket) -> anyhow::Result<()> {
+async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String, (cols, rows): (u16, u16), cmd: Option<String>, actor: String, screen_first: bool, socket: ws::WebSocket, sock: ui::Socket) -> anyhow::Result<()> {
     use crate::termsess::{Frame, Input};
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
@@ -5941,13 +6028,23 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
             }
         }
     };
-    let attachment = session.attach();
+    let attachment = if screen_first { session.attach_screen_first() } else { session.attach() };
+    let replay = bytes::Bytes::from(attachment.replay);
+    // The part that draws the screen goes ahead where the replay has one, which it's read through for: off the shard.
+    // Lost there, none goes.
+    let screen = match attachment.ahead {
+        Some(ahead) => {
+            let replay = replay.clone();
+            crate::rt::compute(move || ahead.part(&replay)).await.ok().flatten()
+        }
+        None => None,
+    };
     let mut live = attachment.live;
     let result: anyhow::Result<()> = async {
         // Read after subscribing: a resize from here on also arrives as a live size frame.
-        tx.send(ws::text(TerminalDown::Session { session: session.info() }.text())).await?;
-        if !attachment.replay.is_empty() {
-            tx.send(ws::binary(attachment.replay)).await?;
+        // Each a message of its own, on its way before the next is written: the screen isn't behind the replay.
+        for message in terminal_opening(session.info(), screen, replay) {
+            tx.send(message).await?;
         }
         if let Some((code, error)) = attachment.ended {
             let msg = match error {
@@ -6036,8 +6133,26 @@ fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
     let all = hub.harness.kinds();
     match q.get("target") {
         Some(t) => srv::json(StatusCode::OK, &all.get(t).cloned().unwrap_or_default()),
+        None if q.get("shared").is_some_and(|shared| shared == "1") => srv::json(StatusCode::OK, &shared_kinds(&all)),
         None => srv::json(StatusCode::OK, &all),
     }
+}
+
+/// What each target offers, each list written once (W21-R02): `lists`, and for each target which of them is
+/// its own (`targets`). Machines of one kind offer the same harnesses with the same models, so written a
+/// target at a time the answer is as many copies of one list as there are machines: 68 KB for twelve targets
+/// where one list is 6 KB (`kiln-lab bar`, 2026-11-14).
+fn shared_kinds(all: &HashMap<String, Vec<crate::harness::kinds::KindInfo>>) -> serde_json::Value {
+    let mut lists: Vec<&Vec<crate::harness::kinds::KindInfo>> = Vec::new();
+    let mut targets = std::collections::BTreeMap::new();
+    for (target, kinds) in all {
+        let at = lists.iter().position(|list| *list == kinds).unwrap_or_else(|| {
+            lists.push(kinds);
+            lists.len().saturating_sub(1)
+        });
+        targets.insert(target.as_str(), at);
+    }
+    json!({ "lists": lists, "targets": targets })
 }
 
 /// A machine's past conversations to continue (`?target=local|agent:<name>`, `kind=claude|codex|devin`,
@@ -6150,6 +6265,85 @@ async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Resp
         return r;
     }
     srv::json(StatusCode::OK, &crate::harness::lineage::seen(hub, caller, hub.harness.list()).await)
+}
+
+/// What the sessions' list leaves out of each session when it's asked for lean (W21-R02): what no list of them
+/// reads without asking. Its last words (`summary`, the line a row shows once the row is on the page:
+/// [`harness_summaries`]) are a quarter of a session's row, and where its harness ran each time it started
+/// (`starts`, `runs`) another twelfth. A session that has said nothing keeps its empty `summary`: there is
+/// nothing to ask for.
+const LEAN_WITHOUT: [&str; 3] = ["summary", "starts", "runs"];
+
+/// The lean list last made, and the whole list's ETag it was made of: a read that finds the sessions as they
+/// were then is answered with it (the whole list's own is kept the same way, `Registry::list_tagged`).
+static LEAN_LIST: arc_swap::ArcSwapOption<(http::HeaderValue, crate::reads::Made)> = arc_swap::ArcSwapOption::const_empty();
+
+/// `GET /api/harness/sessions?lean=1` (W21-R02): the sessions `caller` sees, each without what a list doesn't
+/// read of it ([`LEAN_WITHOUT`]), written as columns (`crate::wire::columns`): 137 sessions are 18.0 KB so, where
+/// the list itself is 162.6 KB (`kiln-lab bar`, 2026-11-14). `{"rows", "cols", "without"}`. Made of the list's
+/// own answer on the compute pool, once for every read that finds the sessions as they were.
+async fn harness_sessions_lean(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
+    let made = if crate::harness::lineage::sees_all(caller) {
+        let h = Arc::clone(hub);
+        crate::rt::compute(move || {
+            let (whole, etag) = h.harness.list_tagged();
+            if let Some(kept) = LEAN_LIST.load_full().filter(|kept| etag.as_ref() == Some(&kept.0)) {
+                return Ok(kept.1.clone());
+            }
+            let made = crate::reads::Made::of(lean_sessions(&whole)?);
+            if let Some(etag) = etag {
+                LEAN_LIST.store(Some(Arc::new((etag, made.clone()))));
+            }
+            Ok(made)
+        })
+        .await
+    } else {
+        // An agent's own view of them, by lineage: made for it as it asks.
+        let seen = crate::harness::lineage::seen(hub, caller, hub.harness.list()).await;
+        crate::rt::compute(move || Ok(crate::reads::Made { json: lean_sessions(&crate::reads::encode(&seen)?)?, etag: None })).await
+    };
+    match made {
+        Ok(Ok(made)) => pre_named(made),
+        Ok(Err(e)) | Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("the sessions' list couldn't be made lean: {e:#}")).into_response(),
+    }
+}
+
+/// A session's row (the list's JSON of it) without what a lean list leaves out of it ([`LEAN_WITHOUT`]): its
+/// last words when it has some, and where it started.
+fn lean_session(row: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in LEAN_WITHOUT {
+        if key != "summary" || row.get(key).and_then(serde_json::Value::as_str).is_some_and(|said| !said.is_empty()) {
+            row.remove(key);
+        }
+    }
+}
+
+/// The sessions' list `whole` (`GET /api/harness/sessions`'s JSON), lean: each session without [`LEAN_WITHOUT`],
+/// as columns, and what was left out said (`without`).
+fn lean_sessions(whole: &[u8]) -> anyhow::Result<bytes::Bytes> {
+    let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(whole)?;
+    rows.iter_mut().for_each(lean_session);
+    let mut lean = crate::wire::columns::pack(&rows.iter().collect::<Vec<_>>());
+    if let Some(fields) = lean.as_object_mut() {
+        fields.insert("without".to_owned(), json!(LEAN_WITHOUT));
+    }
+    crate::reads::encode(&lean)
+}
+
+/// `GET /api/harness/sessions?summaries=<id>,<id>…` (W21-R02): the last words of those sessions among them that
+/// `caller` sees, by id (`""` for one that has said none): what a lean list leaves out, for the rows a page shows.
+async fn harness_summaries(hub: &Arc<Hub>, caller: &crate::authz::Caller, ids: &str) -> Response {
+    let all = crate::harness::lineage::sees_all(caller);
+    let mut said = serde_json::Map::new();
+    for id in ids.split(',').filter(|id| !id.is_empty()) {
+        if said.contains_key(id) || !(all || crate::harness::lineage::may_see(hub, caller, id).await.is_ok()) {
+            continue;
+        }
+        if let Some(info) = hub.harness.info_shared(id) {
+            said.insert(id.to_owned(), json!(info.summary));
+        }
+    }
+    srv::json(StatusCode::OK, &said)
 }
 
 /// A cursor reader asks for a bounded canonical page; legacy callers retain their pre-encoded
@@ -7327,7 +7521,11 @@ impl Takes {
             view: crate::harness::registry::View { window: has("window=1"), lean: has("lean=1") },
             history: query.and_then(|q| {
                 let value = |key: &str| q.split('&').find_map(|x| x.strip_prefix(key)).and_then(|v| v.parse::<usize>().ok());
-                value("recent_turns=").map(|turns| crate::harness::history::Limits::new(turns, value("event_bytes=").unwrap_or(256 * 1024)))
+                // `first_bytes`: a fresh snapshot is the window's first part of that many bytes, the rest sent after it (docs/wire.md, "Windows").
+                value("recent_turns=").map(|turns| {
+                    let whole = crate::harness::history::Limits::new(turns, value("event_bytes=").unwrap_or(256 * 1024));
+                    value("first_bytes=").map_or(whole, |first| whole.first_of(first))
+                })
             }),
             timing: has("timing=1"),
         }
@@ -7556,6 +7754,8 @@ where
     // 2.4 ms on the CPU in g9p16 with hogs), and then on the blocking pool: a round trip before every attach's first piece.
     let weight = snapshot.weight(packed);
     let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), weight).await;
+    // Where it brings its window's first part, the rest of the window is sent after it (W21-R02; docs/wire.md, "Windows").
+    let rest = snapshot.rest();
     if packed {
         // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5), a piece made while the one before it is written
         // ([`send_pieces`]; the memory audit's row A6): what's in flight is those two, not the whole message, and a place of
@@ -7563,6 +7763,7 @@ where
         sent.jobs += 1;
         let first = next_piece(snapshot.packing(&synced())).await?;
         send_pieces(tx, &mut held, first, next_piece, &mut sent).await?;
+        send_rest(tx, rest, true, &mut sent).await?;
         return Ok(sent);
     }
     sent.jobs += 1;
@@ -7581,7 +7782,28 @@ where
         turns.end().await;
     }
     tx.send(ws::text(synced())).await?;
+    send_rest(tx, rest, false, &mut sent).await?;
     Ok(sent)
+}
+
+/// Sends the rest of a window whose first part the snapshot just written brought (`crate::harness::registry::Rest`): a
+/// message of its own, so its viewer shows the part while this is on its way; made on the blocking pool, as the snapshot
+/// was, and let go of there. Nothing where the snapshot brought its window at once, or the part was the window.
+async fn send_rest<S>(tx: &mut S, rest: Option<crate::harness::registry::Rest>, packed: bool, sent: &mut Sent) -> anyhow::Result<()>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    use futures::SinkExt as _;
+    // None where the snapshot's plan found its first part to be the window: nothing is asked of the pool for it.
+    let Some(rest) = rest.filter(|rest| !rest.none()) else { return Ok(()) };
+    sent.jobs += 1;
+    let Some(message) = crate::rt::blocking(move || rest.message(packed)).await?? else { return Ok(()) };
+    // Its write in a turn of its own: a window's bytes at the most, as a snapshot's piece is.
+    hyper_rt::futures::yield_now().await;
+    let message = if packed { ws::binary(message) } else { ws::text(String::from_utf8(message)?) };
+    tx.send(message).await?;
+    Ok(())
 }
 
 /// A socket's audit rows waiting for the store, at most: past that, its next command waits for room
@@ -8452,6 +8674,185 @@ mod tests {
     }
 
     use super::*;
+
+    /// W21-R02: the kinds each target offers, each list once: every target's list is the one it has, and
+    /// targets that offer the same share one.
+    #[test]
+    fn w21_r02_the_kinds_targets_offer_alike_are_written_once() -> anyhow::Result<()> {
+        let kind = |id: &str, available: bool| -> anyhow::Result<crate::harness::kinds::KindInfo> {
+            Ok(serde_json::from_value(json!({"id": id, "name": id, "verified": true, "available": available, "modes": [], "structured": true}))?)
+        };
+        let both = vec![kind("claude", true)?, kind("codex", true)?];
+        let one = vec![kind("claude", true)?, kind("codex", false)?];
+        let all: HashMap<String, Vec<crate::harness::kinds::KindInfo>> =
+            [("local", both.clone()), ("agent:a", both.clone()), ("agent:b", one.clone()), ("agent:c", both.clone()), ("agent:d", Vec::new())].into_iter().map(|(t, k)| (t.to_owned(), k)).collect();
+        let shared = shared_kinds(&all);
+        let lists = shared.get("lists").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        assert_eq!(lists.len(), 3, "{shared}");
+        for (target, kinds) in &all {
+            let at = shared.pointer(&format!("/targets/{}", target.replace('~', "~0").replace('/', "~1"))).and_then(serde_json::Value::as_u64);
+            let list = at.and_then(|at| lists.get(usize::try_from(at).ok()?));
+            assert_eq!(list, Some(&serde_json::to_value(kinds)?), "{target}");
+        }
+        assert_eq!(shared.get("targets").and_then(serde_json::Value::as_object).map(serde_json::Map::len), Some(all.len()));
+        Ok(())
+    }
+
+    /// W21-R02: a runner listed lean is itself without its facts, its CPUs' layout and its features.
+    #[test]
+    fn w21_r02_a_lean_runner_is_itself_without_what_a_ranking_reads() {
+        let runner = json!({"name": "a", "label": "box", "connected": true, "reach": true, "cpus": 8, "harnesses": ["claude"], "facts": {"os": "linux"}, "topo": {"cores": []}, "features": ["x"]});
+        let lean = lean_runners(std::slice::from_ref(&runner));
+        assert_eq!(lean, vec![json!({"name": "a", "label": "box", "connected": true, "reach": true, "cpus": 8, "harnesses": ["claude"]})]);
+        assert_eq!(lean_runners::<serde_json::Value>(&[]), Vec::<serde_json::Value>::new());
+    }
+
+    /// W21-R02: `GET /api/harness/sessions?lean=1` is the sessions' list without what a list doesn't read of each,
+    /// as columns: read back, it's the list's rows but for those fields, and it says which it left out. It
+    /// follows the list: a session that changes is in the next lean read as it changed. `?summaries=` answers
+    /// the last words of the sessions asked for, by id (none said: empty), and nothing for one there isn't.
+    #[test]
+    fn w21_r02_the_sessions_listed_lean_are_the_list_without_what_a_list_doesnt_read() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let session = |id: &str, title: &str, summary: &str| crate::harness::session::Info { id: id.into(), kind: "claude".into(), title: title.into(), summary: summary.into(), ..crate::harness::session::Info::default() };
+            for info in [session("a", "", "Done: the gate is green"), session("b", "", "")] {
+                let id = info.id.clone();
+                hub.harness.ingest(&there, &id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = |path: &'static str| {
+                let api = Arc::clone(&api);
+                async move {
+                    let r = api.handle(lab_get(path)?).await;
+                    anyhow::ensure!(r.status() == StatusCode::OK, "{path}: {}", r.status());
+                    Ok(serde_json::from_slice::<serde_json::Value>(&body_of(r).await?)?)
+                }
+            };
+            // The list's rows, each without what the lean list leaves out.
+            let without = |whole: &serde_json::Value| -> anyhow::Result<Vec<serde_json::Map<String, serde_json::Value>>> {
+                let rows = whole.as_array().ok_or_else(|| anyhow::anyhow!("the list isn't one: {whole}"))?;
+                rows.iter()
+                    .map(|row| {
+                        let mut row = row.as_object().cloned().ok_or_else(|| anyhow::anyhow!("a row isn't an object: {row}"))?;
+                        anyhow::ensure!(row.contains_key("summary") && row.contains_key("starts"), "the list's rows say what a lean one leaves out: {row:?}");
+                        lean_session(&mut row);
+                        Ok(row)
+                    })
+                    .collect()
+            };
+            let whole = read("/api/harness/sessions").await?;
+            let lean = read("/api/harness/sessions?lean=1").await?;
+            let rows = crate::wire::columns::unpack(&lean).ok_or_else(|| anyhow::anyhow!("not columns: {lean}"))?;
+            assert_eq!(rows, without(&whole)?);
+            // The one that has said something says nothing of it lean, nor where it started; the one that hasn't keeps saying so.
+            let of = |id: &str| rows.iter().find(|row| row.get("id") == Some(&json!(id))).cloned().unwrap_or_default();
+            anyhow::ensure!(!of("a").contains_key("summary") && !of("a").contains_key("starts") && of("a").get("kind") == Some(&json!("claude")), "a, lean: {:?}", of("a"));
+            assert_eq!(of("b").get("summary"), Some(&json!("")));
+            assert_eq!(lean.get("without"), Some(&json!(LEAN_WITHOUT)));
+            anyhow::ensure!(serde_json::to_vec(&lean)?.len() < serde_json::to_vec(&whole)?.len(), "lean, it's shorter than the list");
+            // The same again while nothing changed; and as a session changes, the list it's made of.
+            assert_eq!(read("/api/harness/sessions?lean=1").await?, lean);
+            hub.harness.ingest(&there, "b", Update::Open { info: Box::new(session("b", "Renamed", "And said so")), since: None }).await;
+            let (whole, lean) = (read("/api/harness/sessions").await?, read("/api/harness/sessions?lean=1").await?);
+            let rows = crate::wire::columns::unpack(&lean).ok_or_else(|| anyhow::anyhow!("not columns: {lean}"))?;
+            assert_eq!(rows, without(&whole)?);
+            anyhow::ensure!(rows.iter().any(|row| row.get("id") == Some(&json!("b")) && row.get("title") == Some(&json!("Renamed"))), "the session's new title is in the lean list: {rows:?}");
+            // What the lean list left out of them, for the rows a page shows.
+            assert_eq!(read("/api/harness/sessions?summaries=a,b,nobody,a").await?, json!({"a": "Done: the gate is green", "b": "And said so"}));
+            assert_eq!(read("/api/harness/sessions?summaries=").await?, json!({}));
+            Ok(())
+        })
+    }
+
+    /// W21-R02: `GET /api/agents?lean=1` answers the runners `GET /api/agents` does, each itself with only its facts'
+    /// `virt` of them (a runner that has said no facts, none); asked for nothing, the list is whole, as it always was.
+    #[test]
+    fn w21_r02_the_runners_listed_lean_keep_only_whether_they_start_microvms_of_their_facts() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for (name, facts) in [("box", true), ("mac", true), ("new", false)] {
+                let row = crate::store::AgentRow { name: name.into(), labels: vec![], slots: 1, hostname: name.into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, connected: true, last_seen: 0, enrolled_at: 0 };
+                hub.store.upsert_agent(row).await?;
+                let mut live = crate::hub::tests::live_runner(name, "linux", "x86_64");
+                live.facts = facts.then(|| {
+                    let mut said = kiln_ci::facts::RunnerFacts::default();
+                    said.virt.microvm = name == "box";
+                    Box::new(said)
+                });
+                hub.put_agent(live);
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = |path: &'static str| {
+                let api = Arc::clone(&api);
+                async move {
+                    let r = api.handle(lab_get(path)?).await;
+                    anyhow::ensure!(r.status() == StatusCode::OK, "{path}: {}", r.status());
+                    Ok(serde_json::from_slice::<Vec<serde_json::Value>>(&body_of(r).await?)?)
+                }
+            };
+            let whole = read("/api/agents").await?;
+            let of = |list: &[serde_json::Value], name: &str| list.iter().find(|runner| runner.get("name").and_then(serde_json::Value::as_str) == Some(name)).cloned();
+            let facts = |list: &[serde_json::Value], name: &str| of(list, name).and_then(|runner| runner.get("facts").and_then(serde_json::Value::as_object).cloned());
+            anyhow::ensure!(whole.len() == 3 && facts(&whole, "box").is_some_and(|f| f.len() > 1) && facts(&whole, "mac").is_some_and(|f| f.len() > 1) && facts(&whole, "new").is_none(), "the runners listed whole, two with all their facts: {whole:?}");
+            let kept: Vec<serde_json::Value> = whole
+                .iter()
+                .cloned()
+                .map(|mut runner| {
+                    let virt = runner.get("facts").and_then(|facts| facts.get("virt")).cloned();
+                    if let Some(fields) = runner.as_object_mut() {
+                        fields.remove("facts");
+                        if let Some(virt) = virt {
+                            fields.insert("facts".to_owned(), json!({ "virt": virt }));
+                        }
+                    }
+                    runner
+                })
+                .collect();
+            let lean = read("/api/agents?lean=1").await?;
+            assert_eq!(lean, kept);
+            let microvm = |name: &str| of(&lean, name).and_then(|runner| runner.pointer("/facts/virt/microvm").and_then(serde_json::Value::as_bool));
+            assert_eq!([microvm("box"), microvm("mac"), microvm("new")], [Some(true), Some(false), None], "whether each starts microVMs, as it said");
+            // Only `lean=1` asks for it.
+            assert_eq!(read("/api/agents?lean=0").await?, whole);
+            Ok(())
+        })
+    }
+
+    /// W21-R02: a terminal's viewer that asked for its screen first is sent it ahead of the replay, each a
+    /// message of its own, and its `session` frame says so; one that didn't is sent what it always was.
+    #[test]
+    fn w21_r02_a_terminals_viewer_is_sent_its_screen_ahead_of_its_replay() -> anyhow::Result<()> {
+        let session = crate::termsess::Session::detached("t1".into(), "local".into(), None, 80, 24);
+        for i in 0..400 {
+            session.output(format!("line {i} of a build's output, as long as a line of one is\r\n").as_bytes());
+        }
+        let said = |m: &ws::Message| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_str(m.to_text()?)?) };
+        // Asked for: the frame says a screen comes, then the screen, then the replay.
+        let a = session.attach_screen_first();
+        let replay = a.replay.clone();
+        let screen = a.ahead.and_then(|ahead| ahead.part(&replay)).unwrap_or_default();
+        let sent: Vec<ws::Message> = terminal_opening(session.info(), Some(screen.clone()), replay.clone().into()).collect();
+        let [first, second, third] = sent.as_slice() else { anyhow::bail!("{} messages to a viewer that asked", sent.len()) };
+        let frame = said(first)?;
+        assert_eq!((frame.get("type"), frame.get("screen")), (Some(&json!("session")), Some(&json!(true))), "{frame}");
+        assert!(second.is_binary() && third.is_binary());
+        assert_eq!((second.clone().into_data().as_ref(), third.clone().into_data().as_ref()), (screen.as_slice(), replay.as_slice()));
+        assert!(!screen.is_empty() && screen.len() < replay.len(), "a screen of {} bytes, a replay of {}", screen.len(), replay.len());
+        // Not asked for: the frame as it was (no `screen`), then the replay.
+        let b = session.attach();
+        assert!(b.ahead.is_none());
+        let sent: Vec<ws::Message> = terminal_opening(session.info(), None, b.replay.into()).collect();
+        let [first, second] = sent.as_slice() else { anyhow::bail!("{} messages to a viewer that didn't ask", sent.len()) };
+        let frame = said(first)?;
+        assert!(frame.get("screen").is_none() && frame.pointer("/session/id") == Some(&json!("t1")), "{frame}");
+        assert_eq!(second.clone().into_data().as_ref(), replay.as_slice());
+        Ok(())
+    }
 
     /// A socket's sending half as a test sees it: what was sent it, and how often it was flushed. One `slow` takes
     /// each frame in its shard's whole quantum, as read while it takes it (the shard's own cell, which nothing changes

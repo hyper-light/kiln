@@ -108,8 +108,12 @@ const FROM_EMIT: &[&str] = &["agent", "queue", "cd_plan", "cd_apps", "cd_app_del
 /// counted (`kiln_events_unrecorded_total`).
 const SAID_LATER: usize = 10_000;
 
-/// What wakes the relay: a row recorded where the code knows it (the triggers' rows it finds by
-/// looking, every [`LOOK_EVERY`]); and the events the hub said, which it records first.
+/// The table the events wait in: what the store names as a write records one ([`relay`]'s wake).
+const OUTBOX: &str = "event_outbox";
+
+/// What wakes the relay: a row recorded (the store says so as the write that recorded it commits, a
+/// trigger's row and [`record`]'s alike: `crate::store::Changes::watch`); the events the hub said,
+/// which it records first; and, should either go unsaid, a look every [`LOOK_EVERY`].
 #[derive(Default)]
 pub struct Relay {
     wake: crate::rt::Notify,
@@ -122,20 +126,22 @@ impl Relay {
     }
 
     /// What the hub tells its viewers (`Hub::emit`), kept for the relay to record when outgoing
-    /// webhooks take it and nothing else records it ([`FROM_EMIT`]).
+    /// webhooks take it and nothing else records it ([`FROM_EMIT`]): whether it was kept, which is
+    /// when the relay has something to do for it.
     /// `text` is the event as the hub wrote it out ([`crate::wire::events::ServerEvent::text`]): its
     /// kind read off its front, and only the kinds the relay records parsed.
-    pub fn heard(&self, text: &str) {
+    pub fn heard(&self, text: &str) -> bool {
         if !crate::wire::events::kind_of(text).is_some_and(|t| FROM_EMIT.contains(&t)) {
-            return;
+            return false;
         }
-        let Ok(v) = serde_json::from_str::<Value>(text) else { return };
+        let Ok(v) = serde_json::from_str::<Value>(text) else { return false };
         let mut said = self.said.lock();
         if said.len() >= SAID_LATER {
             crate::metrics::events().unrecorded.inc();
-            return;
+            return false;
         }
         said.push_back(v);
+        true
     }
 }
 
@@ -190,6 +196,7 @@ async fn relay(weak: Weak<Hub>) {
     let mut ready = false;
     let mut backoff = Duration::from_millis(100);
     let mut said: Option<String> = None;
+    let Some(recorded) = weak.upgrade().map(|hub| hub.store.changes().watch(&[OUTBOX])) else { return };
     loop {
         let Some(hub) = weak.upgrade() else { return };
         let rest = match relay_once(&hub, &mut ready, None).await {
@@ -212,11 +219,22 @@ async fn relay(weak: Weak<Hub>) {
             }
         };
         let Some(rest) = rest else { continue };
-        let (clock, woken) = (Arc::clone(&hub.clock), Arc::clone(&hub));
-        drop(hub);
-        let woke = Box::pin(async move { woken.relay.wake.notified().await });
-        futures::future::select(woke, clock.sleep(rest)).await;
+        rested(hub, &recorded, rest).await;
     }
+}
+
+/// The relay's rest between two passes: until a write records a row (`recorded`, the store's word
+/// for [`OUTBOX`]), the hub says something for it to record or kicks it ([`Relay`]), or `rest` has
+/// passed. Not until the hub next tells its viewers something (W21-R02): it tells them of every
+/// change of every agent session, and woken at each, the relay asked kiln.db's writer for the
+/// outbox's rows at each pass. With a fleet of 137 sessions whose feeds are live (`kiln-lab bar`,
+/// 2026-11-14) it was woken 206 to 221 times a second and the writer ran 220 to 231 calls a
+/// second; it's woken once a second there now, and the writer runs 109 to 117.
+async fn rested(hub: Arc<Hub>, recorded: &crate::rt::Notify, rest: Duration) {
+    let clock = Arc::clone(&hub.clock);
+    let woke = Box::pin(async move { hub.relay.wake.notified().await });
+    let told = futures::future::select(woke, Box::pin(recorded.notified()));
+    futures::future::select(told, clock.sleep(rest)).await;
 }
 
 /// One pass: the topic made (and its tail read) the first time, then up to [`BATCH`] rows
@@ -842,6 +860,46 @@ mod tests {
         hub.bus.halt_persisted();
         drop(hub);
         restartable_hub(crate::rt::clock(), db, bus).await
+    }
+
+    /// W21-R02: the relay's rest ends as a write records an event and as the hub hands it one to record, and not as
+    /// the hub tells its viewers what the relay records nothing of (an agent session's change, a terminal's, a
+    /// sample: every one of them woke it, to ask kiln.db's writer for rows no write had recorded). On a clock that
+    /// never moves, so that no rest here ends by its time.
+    #[test]
+    fn w21_r02_the_relay_rests_through_what_it_records_nothing_of() -> anyhow::Result<()> {
+        use crate::wire::events::{Queue, ServerEvent};
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let hub = restartable_hub(Arc::new(kiln_seams::clock::SimClock::new()), &dir.path().join("kiln.db"), &dir.path().join("bus")).await?;
+            let recorded = hub.store.changes().watch(&[OUTBOX]);
+            {
+                let mut rest = std::pin::pin!(rested(Arc::clone(&hub), &recorded, LOOK_EVERY));
+                anyhow::ensure!(futures::poll!(rest.as_mut()).is_pending(), "the relay's rest ended with nothing to end it");
+                for _ in 0..100 {
+                    hub.emit_terminals();
+                }
+                anyhow::ensure!(futures::poll!(rest.as_mut()).is_pending(), "the relay's rest ended at what the hub told its viewers of its terminals");
+                // A run made: its trigger records its event in the write that makes it.
+                hub.store
+                    .call(|c| {
+                        c.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r1', 'acme/app', '', 0)", [])?;
+                        c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, workflow_id) VALUES ('run1', 'r1', 1, 'ci', 'push', 'main', 'abc', 'queued', 0, 'ci.yml')", [])?;
+                        Ok(())
+                    })
+                    .await?;
+                anyhow::ensure!(outbox(&hub).await?.iter().map(|(_, kind)| kind.as_str()).eq(["run"]), "the run's event is in the outbox");
+                crate::rt::timeout(Duration::from_secs(30), rest).await.map_err(|_| anyhow::anyhow!("a write recorded an event and the relay rested on"))?;
+            }
+            // What the look after it asks of the store leaves no word behind: the next rest waits again.
+            let mut rest = std::pin::pin!(rested(Arc::clone(&hub), &recorded, LOOK_EVERY));
+            anyhow::ensure!(futures::poll!(rest.as_mut()).is_pending(), "the relay's rest ended with nothing new to end it");
+            // An event only the relay records (the queue's counts, which outgoing webhooks take): kept for it, and it's told.
+            hub.emit(&ServerEvent::Queue(Queue::Counts { queued: 1, running: 0 }));
+            crate::rt::timeout(Duration::from_secs(30), rest).await.map_err(|_| anyhow::anyhow!("the hub said an event for the relay to record and the relay rested on"))?;
+            anyhow::ensure!(hub.relay.said.lock().len() == 1, "the queue's counts are kept for the relay to record");
+            Ok(())
+        })
     }
 
     /// CP-T2.2 step 8 (AC-T2.2.1): do change a run and a job (each change's event recorded in its

@@ -9,6 +9,7 @@
 //! same as these tables do (`contract::docs_say_what_the_tables_say` holds them together).
 
 pub mod channel;
+pub mod columns;
 pub mod commands;
 pub mod events;
 pub mod fan;
@@ -495,6 +496,7 @@ pub const SOCKETS: &[SocketMsg] = &[
     msg(SESSION, Way::Down, "files", Class::State),
     msg(SESSION, Way::Down, "events", Class::Stream),
     msg(SESSION, Way::Down, "synced", Class::Stream),
+    msg(SESSION, Way::Down, "earlier", Class::Stream),
     msg(SESSION, Way::Down, "closed", Class::Stream),
     msg(SESSION, Way::Down, "error", Class::Answer),
     msg(SESSION, Way::Down, "mail_flow", Class::Answer),

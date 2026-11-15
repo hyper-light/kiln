@@ -4,7 +4,9 @@ import { readFrame } from "@/api/frames";
 import type { TerminalControlFrame, TerminalSessionInfo, TerminalUp } from "@/api/types";
 import type { UnreadFrame } from "@/api/wire";
 import { createTerminal, ensureFont, TERM_FONT, type KilnTerminal } from "@/components/terminal/xterm-setup";
+import { terminalsAttach } from "./attach-order";
 import { copyText, readClipboard } from "./clipboard";
+import { unanswered } from "./replies";
 
 /** A terminal socket's text frames, by tag: a frame with another isn't applied (`api/frames.ts`). */
 const TERMINAL_FRAMES = { session: true, missing: true, reconnect: true, size: true, exit: true, error: true, refused: true } satisfies Record<TerminalControlFrame["type"], true>;
@@ -66,6 +68,16 @@ interface Size {
 }
 
 const encoder = new TextEncoder();
+/**
+ * `bytes` behind a full reset (RIS), as one write: xterm reads a write whole before it draws again, so the
+ * terminal goes from what it showed to what `bytes` draw on a fresh one with no frame of it empty between.
+ */
+function fromFresh(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(bytes.length + 2);
+  out.set([0x1b, 0x63]);
+  out.set(bytes, 2);
+  return out;
+}
 /** Reattach delays: quick at first (server restarts take ~1-2 s), then patient. */
 const BACKOFF_MS = [250, 500, 1000, 1500, 2500, 4000];
 /** Window titles change constantly while AI harnesses work (spinners): report at most this often. */
@@ -88,6 +100,15 @@ const TAP_SLOP_PX = 6;
  *
  * Connection: the shell lives on the server or a machine, not in this page. When the socket drops,
  * the view keeps reattaching by session id and repaints from the server's replay.
+ *
+ * The screen first (W21-R02): a shell with a long history is sent the newest part of its replay ahead of
+ * it, the last screen of lines, which draw its screen (the replay is up to 256 KiB, which is what a slow
+ * link takes its time over). The view shows that as soon as it's in, and the replay then draws the same
+ * screen with its scrollback above it, in one write: nothing on the screen moves as it comes. What the
+ * part asks of the terminal isn't answered: the replay asks it again.
+ *
+ * In turn (W21-R02): the view in use attaches at once, and the others one at a time after it
+ * (`attach-order.ts`), so a page of terminals doesn't put the one in view behind the others' replays.
  */
 const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function TerminalSession(
   { tabId, sessionId, target, endpoint, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer },
@@ -108,6 +129,10 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
   const desired = React.useRef<Size | null>(null);
   const pendingSize = React.useRef<Size | null>(null);
   const sendTimer = React.useRef(0);
+  /** A screen sent ahead of its replay is showing: until the replay is in, this view draws at the session's size and doesn't take it. */
+  const aheadOfReplay = React.useRef(false);
+  /** The part sent ahead of a replay is still to be read: what it asks of the terminal goes unanswered (`replies.ts`). */
+  const readingPart = React.useRef(false);
 
   /** Cells that fill the view at the user's font size. Reads layout: only on layout changes. */
   const measure = React.useCallback((): Size | null => {
@@ -150,6 +175,8 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
   const claim = React.useCallback(
     (remeasure: boolean, urgent: boolean) => {
       const k = kRef.current;
+      // The screen and the replay behind it are of the session's size: this view's comes once both are drawn.
+      if (aheadOfReplay.current) return;
       const d = remeasure ? measure() : desired.current;
       if (!k || !d) return;
       const base = live.current.fontSize;
@@ -209,7 +236,7 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
 
   /** Lay the view out for its role after its space changed. */
   const layout = React.useCallback(() => {
-    if (live.current.active) claim(true, false);
+    if (live.current.active && !aheadOfReplay.current) claim(true, false);
     else follow();
   }, [claim, follow]);
 
@@ -246,6 +273,9 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
     let attempt = 0;
     let timer = 0;
     let ws: WebSocket | null = null;
+    /** Its place in the terminals' order given up, or its turn. */
+    let leaveTurn: (() => void) | null = null;
+    const turnOver = () => terminalsAttach.done(live.current.tabId);
 
     const schedule = (fast = false) => {
       if (stopped || ended) return;
@@ -256,7 +286,13 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
       timer = window.setTimeout(connect, delay);
     };
 
+    /** Attaches when it's this view's turn: at once when it's the one in view. */
     function connect() {
+      if (stopped || ended) return;
+      leaveTurn = terminalsAttach.ask(live.current.tabId, () => live.current.active, attach);
+    }
+
+    function attach() {
       if (stopped || ended) return;
       const params = new URLSearchParams();
       const reattach = sessionRef.current !== null;
@@ -267,15 +303,43 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
         params.set("cols", String(d?.cols ?? term.cols));
         params.set("rows", String(d?.rows ?? term.rows));
       }
+      // The session's screen ahead of its replay, where it has a replay worth that (a server that doesn't know this sends the replay alone).
+      params.set("first", "screen");
       const sock = new WebSocket(wsUrl(`${live.current.endpoint ?? "/api/terminal/ws"}?${params}`));
       sock.binaryType = "arraybuffer";
       ws = sock;
       wsRef.current = sock;
       if (!reattach) live.current.onState(live.current.tabId, { kind: "connecting" });
+      /** What this socket's next binary message is: the part that draws the session's screen and then its replay, when its `session` frame said so; else output. */
+      let coming: "screen" | "replay" | "output" = "output";
+      /** Its replay hasn't come: with no screen ahead of it, it's the first of the socket's output. */
+      let replayed = false;
 
       sock.onmessage = (ev) => {
         if (typeof ev.data !== "string") {
-          term.write(new Uint8Array(ev.data as ArrayBuffer));
+          const bytes = new Uint8Array(ev.data as ArrayBuffer);
+          if (coming === "screen") {
+            // In place of whatever is showing, at the session's size, which it was made for.
+            coming = "replay";
+            term.write(fromFresh(bytes), () => {
+              if (wsRef.current === sock) readingPart.current = false;
+            });
+          } else if (coming === "replay") {
+            // The session from nothing, ending on the screen that's showing. Once it's drawn this view takes
+            // its own size, as after any replay.
+            coming = "output";
+            replayed = true;
+            term.write(fromFresh(bytes), () => {
+              turnOver();
+              if (wsRef.current !== sock) return;
+              aheadOfReplay.current = false;
+              if (live.current.active) requestAnimationFrame(() => claim(true, true));
+            });
+          } else if (!replayed) {
+            // The replay, drawn: the next terminal's turn.
+            replayed = true;
+            term.write(bytes, turnOver);
+          } else term.write(bytes);
           return;
         }
         // Applied only when it reads as one of the socket's frames; else the server, which sent it, is told.
@@ -292,15 +356,19 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
           case "session": {
             sessionRef.current = msg.session.id;
             live.current.onSession(live.current.tabId, msg.session);
-            // The replay that follows repaints the session from scratch, at the session's size.
-            if (reattach) term.reset();
+            // The replay that follows repaints the session from scratch, at the session's size. A screen
+            // sent ahead of it takes the place of what's showing as it's drawn, not before.
+            coming = msg.screen ? "screen" : "output";
+            aheadOfReplay.current = msg.screen === true;
+            readingPart.current = msg.screen === true;
+            if (reattach && !msg.screen) term.reset();
             sessionSize.current = { cols: msg.session.cols, rows: msg.session.rows };
             follow();
             attempt = 0;
             live.current.onState(live.current.tabId, { kind: "open" });
             if (live.current.active) {
-              // After the replay is drawn: the program then redraws for this view's size.
-              requestAnimationFrame(() => claim(true, true));
+              // After the replay is drawn (behind a screen sent ahead of it: once it's in): the program then redraws for this view's size.
+              if (!msg.screen) requestAnimationFrame(() => claim(true, true));
               term.focus();
             }
             return;
@@ -337,7 +405,13 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
         }
       };
       sock.onclose = () => {
-        if (wsRef.current === sock) wsRef.current = null;
+        turnOver();
+        if (wsRef.current === sock) {
+          wsRef.current = null;
+          // A replay that never came: the view is its own again, and the next attach draws the session whole.
+          aheadOfReplay.current = false;
+          readingPart.current = false;
+        }
         if (stopped || ended) return;
         schedule();
       };
@@ -367,7 +441,12 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
         window.clearTimeout(timer);
         window.removeEventListener("online", kick);
         document.removeEventListener("visibilitychange", onVisible);
-        if (wsRef.current === ws) wsRef.current = null;
+        leaveTurn?.();
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+          aheadOfReplay.current = false;
+          readingPart.current = false;
+        }
         ws?.close();
       },
     };
@@ -412,6 +491,7 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
       });
 
       subs.push(
+        ...unanswered(term, () => readingPart.current),
         term.onData((d) => sendBytes(d)),
         term.onBinary((d) => {
           const buf = new Uint8Array(d.length);
@@ -641,9 +721,10 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [deviceKeyboard, applyInputMode],
   );
-  // Becoming the view in use: claim the size, take focus.
+  // Becoming the view in use: attach now if its turn hasn't come, claim the size, take focus.
   const activeSync = React.useCallback(
     (el: HTMLDivElement | null) => {
+      if (el && active) terminalsAttach.shown(tabId);
       if (!el || !active || !kRef.current) return;
       const id = requestAnimationFrame(() => {
         claim(true, true);
@@ -651,7 +732,7 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
       });
       return () => cancelAnimationFrame(id);
     },
-    [active, claim],
+    [active, claim, tabId],
   );
   // Another text size: lay the view out again.
   const fontSync = React.useCallback(

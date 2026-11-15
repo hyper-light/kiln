@@ -1978,7 +1978,11 @@ const server = http.createServer(async (req, res) => {
         hits: searchSaid(q.get("q") ?? "", q.get("agent"), q.has("until") ? Number(q.get("until")) : null, Number(q.get("limit") ?? 100), q.has("before_seq") ? Number(q.get("before_seq")) : null),
       });
     }
-    if (p === "/api/agents" && m === "GET") return json(res, 200, [...agents.values()]);
+    if (p === "/api/agents" && m === "GET") {
+      // `lean=1`: each with only its facts' `virt` of them, as the server lists them lean (docs/api.md).
+      const lean = url.searchParams.get("lean") === "1";
+      return json(res, 200, lean ? [...agents.values()].map(({ facts, ...runner }) => (facts ? { ...runner, facts: { virt: facts.virt } } : runner)) : [...agents.values()]);
+    }
     if (p === "/api/agents/join" && m === "GET") {
       planAutojoin();
       return json(res, 200, joinInfo());

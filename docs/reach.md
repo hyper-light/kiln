@@ -66,7 +66,9 @@ asking machine is weighed like any other and comes first only on a tie, where no
 cross the network; no constant puts it, or anything else, first. Each choice's `score` is the share
 of the machine the work would leave free. The
 directory comes from the server (cached 30 s, refreshed after every reconnect); the choice is the
-asking runner's. `GET /api/reach/runners?want=…` shows the same ranking.
+asking runner's. `GET /api/reach/runners?want=…` shows the same ranking; with `lean=1` it answers
+`{ runners }` alone, each without its facts, its CPUs' layout and its features (what a ranking reads,
+and four fifths of a runner): for a page that lists the runners by name and what they're doing.
 
 ### 2.1 Sizes from history
 

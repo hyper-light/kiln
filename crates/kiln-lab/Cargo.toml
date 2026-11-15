@@ -23,7 +23,7 @@ toml = "1.1.8"
 # `rate`'s OS interface (src/rate/os.rs): Linux's timer slack, the open-files limit, the CPU clocks, the clock's
 # ticks and the page's size, as kiln-rt takes them; macOS's QoS class through libc, as kiln-rt sets it.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["param", "process", "thread", "time"] }
+rustix = { version = "1.1", features = ["fs", "param", "process", "thread", "time"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2.189"

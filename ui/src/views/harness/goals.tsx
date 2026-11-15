@@ -16,6 +16,7 @@
 import * as React from "react";
 import { ChevronRight, ListTree } from "lucide-react";
 import { clientId, harnessApi, type GoalItem, type GoalStack, type SessionStore } from "@/api/harness";
+import { useSaid } from "@/api/last-words";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
@@ -127,6 +128,8 @@ function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: s
   const run = items.find((i) => i.part_of === goal.id && i.waits_on)?.waits_on;
   const view = useRunView(run);
   const sessions = useRes(harnessSessionsRes).data;
+  // Drawn again as a step's agent's last words are told: one that's done shows them (W21-R02, api/last-words.ts).
+  useSaid();
   const own = whoOf(sessions.find((x) => x.id === agent));
   if (!p || p === "gone") return null;
   const planning = p.phase === "planning" && !run && !items.some((i) => i.part_of === goal.id && i.part_kind === "plan");

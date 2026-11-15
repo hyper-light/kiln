@@ -4,7 +4,7 @@ import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkGfm from "remark-gfm";
 import remarkRehype from "remark-rehype";
-import { streamBlocks } from "../src/lib/markdown-blocks.ts";
+import { BlockCutter, streamBlocks } from "../src/lib/markdown-blocks.ts";
 
 /** What markdown renders to (hast, as react-markdown makes it), without positions or the line breaks between blocks. */
 function rendered(md: string): unknown[] {
@@ -53,6 +53,46 @@ test("text that defines links or footnotes, or holds raw HTML that runs past bla
   assert.deepEqual(streamBlocks("<!--\n\nhidden\n\n-->\n\nShown."), ["<!--\n\nhidden\n\n-->\n\nShown."]);
   assert.deepEqual(streamBlocks("<PRE>\na\n\nb\n</PRE>\n\nAfter."), ["<PRE>\na\n\nb\n</PRE>\n\nAfter."]);
   rendersAlike("Before.\n\n<!-- a comment\n\nthat goes on -->\n\nAfter.");
+});
+
+test("code that only shows a definition, a footnote's mark or raw HTML holds nothing: its reply is still cut", () => {
+  // A regular expression's character class, in a code span and in a fenced block.
+  const regex = 'Strip them with `[^a-z0-9]+`.\n\n```rust\nlet re = Regex::new(r"[^a-z]:")?;\n```\n\nDone.';
+  assert.deepEqual(streamBlocks(regex), ["Strip them with `[^a-z0-9]+`.\n\n", '```rust\nlet re = Regex::new(r"[^a-z]:")?;\n```\n\n', "Done."]);
+  rendersAlike(regex);
+  // An HTML file in a fenced block: its doctype, comment, script and pre are code.
+  const html = "The page:\n\n```html\n<!doctype html>\n<!-- head -->\n\n<script>\nlet a;\n\nlet b;\n</script>\n<pre>\n\nx\n</pre>\n[ref]: not-a-definition\n```\n\nAfter it.";
+  assert.equal(streamBlocks(html).length, 3);
+  rendersAlike(html);
+  // A footnote's mark with nothing defining it is text; defined, the text is one block again.
+  rendersAlike("A claim.[^1]\n\nMore of it.\n\nAnd more.");
+  rendersAlike("A claim.[^1]\n\nMore.\n\n> [^1]: Defined inside a quote.\n\nAfter.");
+  // Raw HTML inside a line holds nothing past its paragraph.
+  rendersAlike("Before <!-- a note --> and after.\n\nNext `<?php` and `<pre>` in code.\n\nLast.");
+  assert.equal(streamBlocks("Before <!-- a note --> and after.\n\nNext.").length, 2);
+});
+
+test("a text that grows is cut as the whole of it is, reading only what came", () => {
+  const docs = [
+    "One.\n\nTwo.\n\n- a\n\n- b\n\n```ts\nconst a = 1;\n\nconst b = 2;\n```\n\nThree.\n\n1. x\n\n   y\n\nFour.",
+    "See [the docs].\n\nMore.\n\n[the docs]: https://example.com\n\nAfter the definition.",
+    "A paragraph.\n\n<pre>\na\n\nb\n</pre>\n\nAfter.",
+    // A line that reads as raw HTML while it's coming, and as a word once it's whole.
+    "One.\n\n<prefix> is a word here.\n\nTwo.\n\n<presto\n\nThree.",
+    "Ends with a line's end.\n\nAnother.\n",
+    "",
+  ];
+  for (const md of docs)
+    for (const step of [1, 2, 3, 7, 64]) {
+      const cutter = new BlockCutter();
+      for (let n = 0; n <= md.length; n = n === md.length ? n + 1 : Math.min(md.length, n + step)) {
+        const prefix = md.slice(0, n);
+        assert.deepEqual(cutter.cut(prefix), streamBlocks(prefix), `${JSON.stringify(prefix)} by ${step}`);
+      }
+      // The same text again costs nothing and says the same; another text is cut from its start.
+      assert.deepEqual(cutter.cut(md), streamBlocks(md));
+      assert.deepEqual(cutter.cut("Another.\n\nText."), ["Another.\n\n", "Text."]);
+    }
 });
 
 test("a line still coming that's too short to tell waits", () => {
@@ -126,9 +166,20 @@ test("replies made of every kind of block render cut as they do whole, as they s
     "- [ ] a task\n- [x] done",
     "Ends with two spaces  \nand a hard break.",
     "1) parenthesised\n2) list",
+    // What only code shows, and what holds the rest when it isn't code.
+    "Inline `[^a-z]` and `<pre>` and a mark[^9] with nothing behind it.",
+    "```html\n<!-- c -->\n\n<script>\n\n</script>\n[x]: y\n```",
+    "A reference [here][ref].",
+    "[ref]: https://example.com",
+    "<!-- a comment\n\nwith a blank line -->",
+    "- item\n\n  ```\n  [^1]: in code\n  ```",
   ];
   for (let doc = 0; doc < 24; doc++) {
     const md = Array.from({ length: 3 + Math.floor(r() * 5) }, () => pick(BLOCKS)).join(pick(["\n\n", "\n\n", "\n\n\n", "\n"]));
     rendersAlike(md, 3);
+    // And cut as it grows, a few characters at a time, it's cut as each prefix is whole.
+    const cutter = new BlockCutter();
+    for (let n = 0; n < md.length; n += 5) assert.deepEqual(cutter.cut(md.slice(0, n)), streamBlocks(md.slice(0, n)));
+    assert.deepEqual(cutter.cut(md), streamBlocks(md));
   }
 });

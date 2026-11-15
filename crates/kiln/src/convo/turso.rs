@@ -525,10 +525,6 @@ impl Turso {
         }
         Ok(())
     }
-
-    fn event_rows(&self, sql: &str, params: &[Value]) -> anyhow::Result<Vec<EventRow>> {
-        self.link().event_rows(sql, params)
-    }
 }
 
 /// How long a reader beside the writer waits out a lock the writer holds for a moment (a checkpoint's) before its read
@@ -602,7 +598,7 @@ impl Link<'_> {
             kept = Some(Kept { info: s(0), meta: s(1), state: s(2), changes: s(3), updated_at: r.get::<i64>(4).unwrap_or(0), closed_at: r.get::<i64>(5).ok(), events: Vec::new() });
             Ok(())
         })?;
-        let mut events = self.event_rows(sql::EVENTS_LAST, &[Value::from_text(session.to_owned()), int(i64::try_from(last).unwrap_or(i64::MAX))])?;
+        let mut events = self.newest(session, None, last)?;
         if kept.is_none() && events.is_empty() {
             return Ok(None);
         }
@@ -675,13 +671,49 @@ impl Link<'_> {
         Ok(out)
     }
 
+    /// [`Link::event_rows`] of a statement whose rows end with their durable revision (`sql::EVENTS_BEFORE_BY_SEQ` and
+    /// its like): each event and that.
+    fn event_rows_rev(&self, sql: &str, params: &[Value]) -> anyhow::Result<Vec<(EventRow, i64)>> {
+        let mut stmt = self.prepare(sql)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, params, |r| {
+            out.push((event_of(r)?, r.get::<i64>(sql::EVENT_COLUMNS).unwrap_or(0)));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// A session's newest `limit` events (those before number `before`, where one is given), newest first, exactly as
+    /// `sql::EVENTS_BEFORE` and `sql::EVENTS_LAST` order and bound them (by number, then the newest durable revision first:
+    /// W21-R02, a replacement id at a number), read by `events_by_seq` alone: backwards from the page's end and stopped at
+    /// the limit, so a page costs its own events wherever in its session it is (those two sorted every event before it:
+    /// `sql::EVENTS_BEFORE_BY_SEQ`). The index gives the numbers in order and the events of one number in none, and the
+    /// limit may cut the last number's short: that number's events are read whole, what was read is put in the order the
+    /// sorted statements give (a stable sort, the index's order kept where number and revision are both the same), and the
+    /// limit taken again.
+    fn newest(&self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bound = int(i64::try_from(limit).unwrap_or(i64::MAX));
+        let mut rows = match before {
+            Some(b) => self.event_rows_rev(sql::EVENTS_BEFORE_BY_SEQ, &[txt(session), seq(b), bound])?,
+            None => self.event_rows_rev(sql::EVENTS_LAST_BY_SEQ, &[txt(session), bound])?,
+        };
+        if rows.len() >= limit
+            && let Some(last) = rows.last().map(|(r, _)| r.seq)
+        {
+            rows.retain(|(r, _)| r.seq != last);
+            rows.extend(self.event_rows_rev(sql::EVENTS_AT, &[txt(session), seq(last)])?);
+        }
+        rows.sort_by(|(a, a_rev), (b, b_rev)| b.seq.cmp(&a.seq).then(b_rev.cmp(a_rev)));
+        rows.truncate(limit);
+        Ok(rows.into_iter().map(|(r, _)| r).collect())
+    }
+
     /// [`Engine::events`], on this connection.
     fn events(&self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
-        let limit = int(i64::try_from(limit).unwrap_or(i64::MAX));
-        let mut rows = match before {
-            Some(b) => self.event_rows(sql::EVENTS_BEFORE, &[Value::from_text(session.to_owned()), seq(b), limit])?,
-            None => self.event_rows(sql::EVENTS_LAST, &[Value::from_text(session.to_owned()), limit])?,
-        };
+        let mut rows = self.newest(session, before, limit)?;
         rows.reverse();
         Ok(rows)
     }
@@ -1640,7 +1672,7 @@ impl Engine for Turso {
             kept = Some(Kept { info: s(0), meta: s(1), state: s(2), changes: s(3), updated_at: r.get::<i64>(4).unwrap_or(0), closed_at: r.get::<i64>(5).ok(), events: Vec::new() });
             Ok(())
         })?;
-        let mut events = self.event_rows(sql::EVENTS_LAST, &[Value::from_text(session.to_owned()), int(i64::try_from(last).unwrap_or(i64::MAX))])?;
+        let mut events = self.link().newest(session, None, last)?;
         if kept.is_none() && events.is_empty() {
             return Ok(None);
         }
@@ -1694,7 +1726,7 @@ mod tests {
     /// 2026-11-13 08:41Z: listing a session again reads its row by its key and its newest events by `events_by_seq`
     /// alone, no sort of its timeline: on a session of 100,000 events in a large store, Turso's plan for it uses the
     /// index with no temporary sort, and the read answers in a small part of the store's wait (READ_WAIT), where the
-    /// whole timeline's sorted read (`kept`, EVENTS_LAST) is measured beside it.
+    /// read of its newest 4,000 (`kept`) is measured beside it.
     #[test]
     fn restore_reads_a_huge_sessions_row_and_newest_events_by_index_alone() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1726,7 +1758,7 @@ mod tests {
         let began = Instant::now();
         let _ = reader.kept("huge", 4_000)?;
         let whole = began.elapsed();
-        eprintln!("restore read of a 100k-event session: {cheap:?} (kept with EVENTS_LAST: {whole:?}); plan: {plan_text}");
+        eprintln!("restore read of a 100k-event session: {cheap:?} (kept, its newest 4,000: {whole:?}); plan: {plan_text}");
         assert!(cheap < super::super::store::READ_WAIT / 20, "{cheap:?}");
         Ok(())
     }
@@ -1763,6 +1795,155 @@ mod tests {
         assert!(reader.thread("a1", "toolu_6", None, 100)?.is_empty());
         assert!(reader.thread("a2", "toolu_5", None, 100)?.is_empty(), "another session's call of that id isn't this one's");
         assert_eq!(seqs(t.thread("a1", "toolu_5", Some(31), 10)?), [10, 20, 30], "the writer reads it as the reader does");
+        Ok(())
+    }
+
+    /// W21-R02's "Earlier messages": a page of a session's events is read by `events_by_seq` alone, exactly the events the
+    /// sorted statements gave (`sql::EVENTS_BEFORE`, `sql::EVENTS_LAST`: by number, a number's newest revision first), for
+    /// every place a page can end and every size, a number whose events the limit cuts among them.
+    #[test]
+    fn w21_r02_a_page_read_by_the_index_alone_is_the_page_the_sorted_read_gave() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversations.db"))?;
+        for i in 1..=300u64 {
+            t.apply(&super::super::rows::of("s", &said(&format!("m{i}"), i, "words"), 0))?;
+        }
+        // Other ids that took a number later (each a newer revision), two of them one number, at a page's edges and inside.
+        for (i, id) in [(7u64, "b7"), (100, "b100"), (100, "c100"), (101, "b101"), (250, "b250"), (299, "b299"), (300, "b300"), (300, "c300")] {
+            t.apply(&super::super::rows::of("s", &said(id, i, "other words"), 0))?;
+        }
+        // Another session's events are none of this one's.
+        t.apply(&super::super::rows::of("other", &said("x1", 50, "words"), 0))?;
+        let link = t.link();
+        let ids = |rows: &[EventRow]| rows.iter().map(|e| format!("{}:{}", e.seq, e.id)).collect::<Vec<_>>();
+        for before in [None, Some(1), Some(2), Some(8), Some(100), Some(101), Some(102), Some(251), Some(300), Some(301), Some(9_999)] {
+            for limit in [1usize, 2, 3, 7, 50, 99, 100, 101, 199, 200, 201, 202, 299, 300, 308, 309, 1_000] {
+                let bound = int(i64::try_from(limit)?);
+                let mut sorted = match before {
+                    Some(b) => link.event_rows(sql::EVENTS_BEFORE, &[txt("s"), seq_v(b), bound])?,
+                    None => link.event_rows(sql::EVENTS_LAST, &[txt("s"), bound])?,
+                };
+                sorted.reverse();
+                assert_eq!(ids(&link.events("s", before, limit)?), ids(&sorted), "before {before:?}, {limit} at the most");
+            }
+        }
+        assert!(link.events("s", Some(50), 0)?.is_empty());
+        assert!(link.events("none", None, 10)?.is_empty());
+        Ok(())
+    }
+
+    /// A statement's plan, and what running it took by its own count (Turso's metrics, as SQLite counts a statement's VM
+    /// steps): the rows it gave before `enough` said so, the rows it read, its sorts and its VM steps.
+    fn counted(link: &Link<'_>, statement: &str, params: &[Value], enough: usize) -> anyhow::Result<(String, usize, u64, u64, u64)> {
+        let mut plan = link.prepare(&format!("EXPLAIN QUERY PLAN {statement}"))?;
+        let mut said_plan = Vec::new();
+        link.run(&mut plan, params, |r| {
+            said_plan.push((0..4).filter_map(|i| r.get::<String>(i).ok()).collect::<Vec<_>>().join(" "));
+            Ok(())
+        })?;
+        let mut stmt = link.prepare(statement)?;
+        stmt.reset_metrics();
+        let mut rows = 0usize;
+        link.run_while(&mut stmt, params, |_| {
+            rows += 1;
+            Ok(rows < enough)
+        })?;
+        let m = stmt.metrics();
+        Ok((said_plan.join(" | "), rows, m.rows_read, m.sort_operations, m.insn_executed))
+    }
+
+    /// A store with a long session (`long` events) and a short one (300), each event 400 bytes.
+    fn long_and_short(dir: &Path, long: u64) -> anyhow::Result<Turso> {
+        let mut t = Turso::open(&dir.join("conversations.db"))?;
+        let body = "x".repeat(400);
+        for (session, n) in [("long", long), ("short", 300)] {
+            for chunk in (1..=n).collect::<Vec<_>>().chunks(5_000) {
+                let rows: Vec<_> = chunk.iter().flat_map(|i| super::super::rows::of(session, &said(&format!("m{i}"), *i, &body), 0)).collect();
+                t.apply(&rows)?;
+            }
+        }
+        Ok(t)
+    }
+
+    /// The same page of a long session costs its own events, not the session's (W21-R02's "Earlier messages"), by the
+    /// statements' own count of their work: each page statement reads `events_by_seq` with no sort, reads no more rows
+    /// than its page holds, and takes the same VM steps in the middle of 20,000 events, at their start, at their end and
+    /// in a session of 300. (By the primary key's index, which Turso's planner takes in a process that made the store's
+    /// file, as this one did, a page read the session's every event: `sql::EVENTS_BEFORE_BY_SEQ`.)
+    #[test]
+    fn w21_r02_a_page_of_a_long_session_reads_its_own_events_by_the_index() -> anyhow::Result<()> {
+        const EVENTS: u64 = 20_000;
+        const PAGE: i64 = 101;
+        let dir = tempfile::tempdir()?;
+        let t = long_and_short(dir.path(), EVENTS)?;
+        let link = t.link();
+        let page = usize::try_from(PAGE)?;
+        let mut steps = Vec::new();
+        for (what, statement, params) in [
+            ("the middle of the long one", sql::EVENTS_BEFORE_BY_SEQ, vec![txt("long"), seq_v(EVENTS / 2), int(PAGE)]),
+            ("its start", sql::EVENTS_BEFORE_BY_SEQ, vec![txt("long"), seq_v(150), int(PAGE)]),
+            ("its end", sql::EVENTS_BEFORE_BY_SEQ, vec![txt("long"), seq_v(EVENTS + 1), int(PAGE)]),
+            ("the short one", sql::EVENTS_BEFORE_BY_SEQ, vec![txt("short"), seq_v(250), int(PAGE)]),
+            ("the long one's newest", sql::EVENTS_LAST_BY_SEQ, vec![txt("long"), int(PAGE)]),
+            ("the short one's newest", sql::EVENTS_LAST_BY_SEQ, vec![txt("short"), int(PAGE)]),
+        ] {
+            let (plan, rows, read, sorts, took) = counted(&link, statement, &params, usize::MAX)?;
+            assert!(plan.contains("events_by_seq") && !plan.to_uppercase().contains("SORTER") && !plan.to_uppercase().contains("TEMP B-TREE"), "{what}: {plan}");
+            assert_eq!(rows, page, "{what}: a whole page");
+            assert!(read <= u64::try_from(page)? && sorts == 0, "{what}: {read} rows read and {sorts} sorts for a page of {page}");
+            steps.push((what, statement, took));
+        }
+        // No more steps where there are more events: each statement's are the same wherever its page is.
+        for (what, statement, took) in &steps {
+            let least = steps.iter().filter(|(_, s, _)| s == statement).map(|(_, _, n)| *n).min().unwrap_or(0);
+            assert_eq!(*took, least, "{what}: {took} VM steps, {least} elsewhere");
+        }
+        // A number's own events: those rows, not the session's.
+        let (plan, rows, read, _, _) = counted(&link, sql::EVENTS_AT, &[txt("long"), seq_v(EVENTS / 2)], usize::MAX)?;
+        assert!(plan.contains("events_by_seq") && rows == 1 && read <= 2, "a number's events: {plan}, {rows} rows of {read} read");
+        // And the reads that run them give the pages.
+        let mut reader = t.reader().ok_or_else(|| anyhow::anyhow!("no reader"))?;
+        for before in [Some(EVENTS + 1), Some(EVENTS * 3 / 4), Some(EVENTS / 2), Some(EVENTS / 4), Some(150), None] {
+            let got = reader.events("long", before, page)?;
+            let end = before.map_or(EVENTS, |b| b - 1);
+            assert_eq!(got.len(), page.min(usize::try_from(end)?), "before {before:?}");
+            assert_eq!(got.last().map(|e| e.seq), Some(end), "before {before:?}: its newest last");
+        }
+        Ok(())
+    }
+
+    /// Find in a long conversation (W21-R02) looks at a slice of it by `events_by_seq`, whatever its length, by the
+    /// statements' own count of their work: looking at 200 events reads a few rows for each (the event, and whether its
+    /// number has a newer one), sorts nothing, and takes the same VM steps in a session of 20,000 as in one of 300. (By
+    /// the primary key's index, which Turso's planner took for "has its number a newer one", each event looked at read
+    /// the session's every event: `sql::SEARCH_CANONICAL_SESSION`.)
+    #[test]
+    fn w21_r02_find_in_a_long_conversation_looks_at_its_slice_by_the_index() -> anyhow::Result<()> {
+        const EVENTS: u64 = 20_000;
+        const SLICE: usize = 200;
+        let dir = tempfile::tempdir()?;
+        let t = long_and_short(dir.path(), EVENTS)?;
+        let link = t.link();
+        for statement in [sql::SEARCH_CANONICAL_SESSION, sql::SEARCH_SESSION] {
+            let mut steps = Vec::new();
+            for (what, params) in [("the long one's end", vec![txt("long"), int(i64::MAX)]), ("its middle", vec![txt("long"), int(i64::try_from(EVENTS / 2)?)]), ("the short one", vec![txt("short"), int(i64::MAX)])] {
+                let (plan, rows, read, sorts, took) = counted(&link, statement, &params, SLICE)?;
+                assert!(!plan.contains("sqlite_autoindex") && plan.contains("events_by_seq") && !plan.to_uppercase().contains("SORTER"), "{what}: {plan}");
+                assert_eq!(rows, SLICE, "{what}");
+                // Each event looked at, and for the canonical search the probe of its number.
+                assert!(read <= u64::try_from(SLICE * 2 + 2)? && sorts == 0, "{what}: {read} rows read and {sorts} sorts to look at {SLICE} events");
+                steps.push((what, took));
+            }
+            // The same steps whatever the session's length: within one looked-at event's (a slice that ends where the index
+            // does takes a step fewer there; measured 7,413 against 7,414).
+            let least = steps.iter().map(|(_, n)| *n).min().unwrap_or(0);
+            for (what, took) in &steps {
+                assert!(took.abs_diff(least) < least / u64::try_from(SLICE)?, "{what}: {took} VM steps, {least} at the least");
+            }
+        }
+        // And the search that runs them looks at the session newest first.
+        let found = link.search_some(&Query { session: Some("long".into()), before_seq: Some(EVENTS + 1), ..Query::default() }, None, 1_000, 3)?.0;
+        assert_eq!(found.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![EVENTS, EVENTS - 1, EVENTS - 2]);
         Ok(())
     }
 

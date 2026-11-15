@@ -30,6 +30,8 @@ async function transcript(page: Page, events: Event[]) {
         const text = typeof message === "string" ? message : gunzipSync(message).toString("utf8");
         for (const line of text.split("\n").filter(Boolean)) {
           const frame = JSON.parse(line) as Frame;
+          // The events given here are the snapshot whole, and nothing after its end is let through: no rest follows it.
+          if (frame.t === "history") delete frame.part;
           if (frame.t === "events") {
             if (added) continue;
             frame.events = events;

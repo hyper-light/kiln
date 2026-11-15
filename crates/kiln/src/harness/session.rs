@@ -721,8 +721,11 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub objective: Option<super::model::Objective>,
-    /// The agent's latest words, shortened.
+    /// The agent's latest words, shortened. A row of the sessions' list read lean (W21-R02,
+    /// `GET /api/harness/sessions?lean=1`) says nothing of them when there are some: a page asks for
+    /// those of the rows it shows (docs/agents.md, "The snapshot, lean"). So a reader's type may find none.
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<String>", optional))]
     pub summary: String,
     /// What it is doing right now, in plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -859,7 +862,10 @@ pub struct Info {
     #[cfg_attr(test, ts(optional))]
     pub runs: Option<Runs>,
     /// kiln's record of each start of its harness on its machine: when, where it ran, how it ended.
+    /// A row of the sessions' list read lean says nothing of them, nor of `runs` (W21-R02: no list
+    /// reads either), so a reader's type may find none.
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<Vec<Start>>", optional))]
     pub starts: Vec<Start>,
 }
 

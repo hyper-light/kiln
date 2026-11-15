@@ -414,6 +414,39 @@ answered T3's list 1,000 of 1,000 in one window and 312 of 1,000 in another, its
 4.8 s for a CPU for each second they ran, 10 of its 17 in `SCHED_IDLE`. Compare products where no such
 rule runs, or where its owner has turned it off for the run.
 
+### Long conversations (`kiln-lab bar`)
+
+`kiln-lab bar` reads a fresh kiln's conversations as its UI reads them, at the sizes T3 Code published
+its own speedups at (2026-11-13: a 41,000-event conversation opened, an older page of a 45,154-event
+one, a message sent to a 75,324-event one), with a fleet beside them (11 runners and 134 small
+sessions by default). Each long session is written by the lab's stand-in through its runner, as a
+session's are (`lab:history:<events>:<a turn's>`).
+
+```sh
+# one build: its report in bar/work/bar.md and bar.json
+kiln-lab bar --kiln a/kiln --out bar/work
+# then again from a fresh process (and, on Linux, with its files' pages let go of)
+kiln-lab bar --kiln a/kiln --out bar/work --cold
+# keep the kiln up afterwards for a browser's own probes (its address and token in hold.json)
+kiln-lab bar --kiln a/kiln --out bar/work --hold
+```
+
+It reports, over loopback and by the lab's clock around each whole exchange:
+
+- **open**: the session socket as `ui/src/api/harness.ts` attaches, to its snapshot's end (the first
+  open after the fill, then the median, least and most of `--samples` more), the snapshot's bytes as
+  sent and unpacked, and where the snapshot is its window's first part (docs/wire.md, "Windows"), the
+  same to the end of the rest;
+- **older pages**: the page before the window, then pages a quarter, half and three quarters of the
+  way back and at the session's start, each with the server's own time (`Server-Timing`);
+- **send**: a message to the longest session, to its answer;
+- **launch**: what Mission control's first reads bring for the fleet, as sent and unpacked.
+
+Two builds are compared by running each (`--out` a folder each): the sessions are the same events in
+both. On a busy machine its times hold whatever else ran; a statement's or a read's own count of its
+work (rows read, chunks inflated: the tests beside the code) says what a change did.
+
+
 ## Main's baseline
 
 Measured on 2026-11-04 (10:00 to 11:56 UTC) on a Linux machine with an Intel Core i9-14900HX (32
@@ -858,6 +891,33 @@ count of its arenas' locks either.
   millisecond of their runs), each caller answered once its group commits (`kiln_store_commit_seconds`,
   `kiln_store_committed_calls_total`); its WAL is checkpointed on a thread of its own at SQLite's mark,
   not inside its commits (`kiln_store_checkpoint_seconds`).
+
+  A call's journal stays in memory (W21-R02). To take a savepoint back, SQLite keeps the pages it
+  changes as they were: as it comes, in memory up to 64 KiB (15 pages) and past that in a temporary
+  file, which it makes, writes a page at a time and removes at the commit
+  (https://www.sqlite.org/tempfiles.html, 2.5). The calls an idle fleet makes are its feeds' batches'
+  custody records, two a call, and they change 34 to 66 pages (46 at the median: a lab's own records
+  replayed on its kiln.db), so every one made a file. A file's calls cost what the disk's other
+  writers leave them: the conversation stores sync each of their commits, and while a fleet's did, a
+  4 KiB write took 0.8 to 1.9 ms and a file's making and removing 9 to 17 ms, where they take 6 µs and
+  0.4 ms on the same disk left alone. In `kiln-lab bar` (eleven runners and 137 sessions on one Mac,
+  2026-11-14) the writer then ran 21 to 30 calls a second and was busy for 97 to 99% of the time, each
+  call running 29 to 49 ms, its thread sampled in `pwrite` (77 to 83%) and in `open`, `unlink` and
+  `close` (14 to 22%), for as long as the records of the fleet's start were on their way, a minute or
+  two; a message sent to an agent meanwhile, which is answered once the writer has taken it, waited
+  0.25 to 1.5 s (784, 792 and 823 ms at the median of three rounds), and Mission control's three reads
+  that take a turn there 32 to 452 ms. kiln's SQLite is built to keep that journal in memory
+  (`SQLITE_STMTJRNL_SPILL=-1`, `.cargo/config.toml`). The same lab then, the two builds in turn: the
+  writer's calls run 0.04 to 0.06 ms each, 190 to 240 of them a second with the writer busy for 2 to
+  10%, so the records wait for nothing; a send takes 1.5 and 3.4 ms at the median of two rounds (1.3
+  at the least, 174 at the most, of 22 each); those three reads 0.04 to 1.7 ms; and the lab's fleet
+  starts in 15 to 30 s where it took 79 to 98.
+  What it costs is memory while a call runs, each page the call rewrites as it was: a call that
+  rewrote 9,444 custody records (19 MB of rows) held 19.8 MB of journal, as much again as the note of
+  its rows the cluster group's entry is made of, and one that deleted them 1.6 MB. SQLite has no size
+  between to offer: a journal that spills is written to its file in one piece, of the size it spills
+  at, and its Unix files write less than 128 KiB at once (`seekAndWriteFd` masks the size to 17 bits),
+  so with any larger size every spill fails as a full disk (3.53.2; tried at 160, 192, 224 and 256 KiB).
 - **Read-mostly state** is an immutable copy swapped in whole (`crate::rcu::Rcu`, on arc-swap; f7, f9):
   readers take the current copy without waiting on anyone, a writer copies, changes and swaps it in (a
   compare-and-swap, tried again on a race). The hub's runner processes' links, the runners' labels and

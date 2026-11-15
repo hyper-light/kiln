@@ -7,7 +7,9 @@ import type { EventsUp, UnreadFrame } from "./wire";
 /**
  * One shared, reconnecting WebSocket to /api/events for the whole app (docs/wire.md, "The events
  * socket"). Backs off from 0.5 s to 5 s (jittered), so a page is back within seconds of a server
- * restart, and tries again at once when the tab is shown or the network comes back.
+ * restart, and tries again at once when the tab is shown, when the network comes back, and when a
+ * socket that had held drops (W21-R02: a link lost and found again, which a browser doesn't always
+ * say; the wait before the first try was most of a reconnect on a slow link).
  *
  * It asks for batches (`?batch=1`): the server gathers a window's events into one frame, only the
  * newest of each thing they carry whole, none it already said. It asks only for the event types
@@ -141,6 +143,9 @@ function readEvent(v: unknown): { frame: ServerEvent } | { unread: UnreadFrame }
   if (!Object.hasOwn(EVENT_FRAMES, t)) return unread(t, "unknown frame");
   return { frame: v as ServerEvent };
 }
+
+/** The first wait before a lost socket is asked for again (ms): each one after is twice the last, up to 5 s. */
+const FIRST_WAIT_MS = 500;
 
 class EventStream {
   private ws: WebSocket | null = null;
@@ -377,6 +382,7 @@ class EventStream {
     if (!this.wanted) return;
     this.set({ state: "connecting", retryAt: null });
     let opened = false;
+    let openedAt = 0;
     let ws: WebSocket;
     const resume = this.at !== null;
     this.batched = false;
@@ -391,6 +397,7 @@ class EventStream {
       // W21-R02: callbacks already queued by a stopped socket cannot announce a new one live.
       if (this.ws !== ws) return;
       opened = true;
+      openedAt = Date.now();
       this.set({ state: "open", attempts: 0 });
       this.first = { reconnect: this.wasOpen, resume };
       if (this.wasOpen) this.fire(this.reopenListeners, "reopen");
@@ -419,18 +426,21 @@ class EventStream {
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
-      this.scheduleReconnect(opened);
+      // One that held as long as the first wait is was a connection, and what was lost is the link: it's asked for
+      // again at once. One that opened and closed sooner waits, so a server that takes sockets and drops them is
+      // asked no oftener than it was.
+      this.scheduleReconnect(opened, opened && Date.now() - openedAt >= FIRST_WAIT_MS);
     };
     ws.onerror = () => {
       /* onclose follows */
     };
   }
 
-  private scheduleReconnect(wasOpen: boolean) {
+  private scheduleReconnect(wasOpen: boolean, held = false) {
     if (!this.wanted) return;
     const attempts = wasOpen ? 1 : this.snap.attempts + 1;
-    const base = Math.min(5_000, 500 * 2 ** (attempts - 1));
-    const delay = Math.round(base * (0.75 + Math.random() * 0.5));
+    const base = Math.min(5_000, FIRST_WAIT_MS * 2 ** (attempts - 1));
+    const delay = held ? 0 : Math.round(base * (0.75 + Math.random() * 0.5));
     this.set({ state: "closed", attempts, retryAt: Date.now() + delay });
     // A failed upgrade might be an expired session; /api/me flips auth state on 401.
     if (!wasOpen && attempts % 2 === 0) api.me().catch(() => undefined);

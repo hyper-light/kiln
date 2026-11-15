@@ -13,6 +13,9 @@
 //! - `lab:hog:<threads>:<secs>`: `threads` threads busy on the CPU for `secs` seconds, an event a
 //!   second meanwhile (an agent's build or test run beside the server: goal 8's headroom lab,
 //!   docs/priority.md);
+//! - `lab:history:<n>:<per>`: `n` events as fast as the runner takes them, in turns of `per` events, each
+//!   begun by a person's message as Claude Code replays one when a session resumes (a session of many
+//!   turns, as a conversation of days is: the bar's sessions, `kiln-lab bar`);
 //! - `lab:subagent:<n>:<ms>`: a subagent's turn, as Claude Code's Task tool runs one: the Task's call,
 //!   then `n` events of the subagent's own, `ms` apart, each its child (`parent_tool_use_id` the Task's
 //!   id), then the Task's result, which updates the Task's tool event `n` events after it began
@@ -143,6 +146,8 @@ fn plan(text: &str) -> (u64, Duration) {
     let mut it = text.split_whitespace().find_map(|w| w.strip_prefix("lab:")).unwrap_or("").split(':');
     match (it.next(), it.next(), it.next()) {
         (Some("prefill"), Some(n), _) => (n.parse().unwrap_or(0), Duration::ZERO),
+        // Its events come in turns ([`history_plan`]).
+        (Some("history"), _, _) => (0, Duration::ZERO),
         (Some("turn"), Some(n), Some(ms)) => (n.parse().unwrap_or(0), Duration::from_millis(ms.parse().unwrap_or(0))),
         // Its events come as it burns ([`hog_plan`]), or as its subagent works ([`subagent_plan`]).
         (Some("hog" | "subagent"), _, _) => (0, Duration::ZERO),
@@ -154,6 +159,24 @@ fn plan(text: &str) -> (u64, Duration) {
 fn hog_plan(text: &str) -> Option<(u64, Duration)> {
     let mut it = text.split_whitespace().find_map(|w| w.strip_prefix("lab:hog:"))?.split(':');
     Some((it.next()?.parse().ok()?, Duration::from_secs(it.next()?.parse().ok()?)))
+}
+
+/// A history's words (`lab:history:<n>:<per>`): how many events, and how many a turn.
+fn history_plan(text: &str) -> Option<(u64, u64)> {
+    let mut it = text.split_whitespace().find_map(|w| w.strip_prefix("lab:history:"))?.split(':');
+    Some((it.next()?.parse().ok()?, it.next()?.parse::<u64>().ok()?.max(1)))
+}
+
+/// A person's message as Claude Code replays it (`isReplay`: kiln's harness takes it as theirs, and a turn begins with it).
+fn replayed(r: &mut Lcg, session: &str, short: &str, turn: u64, k: u64) -> Value {
+    json!({
+        "type": "user",
+        "message": {"role": "user", "content": format!("{STAMP}{} {}", now_us(), words(r, 12))},
+        "session_id": session,
+        "parent_tool_use_id": null,
+        "uuid": format!("{short}-{turn}-u{k}"),
+        "isReplay": true,
+    })
 }
 
 /// A subagent turn's words (`lab:subagent:<n>:<ms>`): how many of the subagent's events, and how far apart.
@@ -317,6 +340,17 @@ pub fn main(args: &[String]) -> anyhow::Result<()> {
                 let _ = b.join();
             }
         }
+        // A history: turns of `per` events, each after a person's message, as fast as they're taken.
+        if let Some((n, per)) = history_plan(&text_of(&m)) {
+            for k in 0..n {
+                if k > 0 && k % per == 0 {
+                    say(replayed(&mut r, &session, &short, turn, k), false)?;
+                }
+                for l in event(&mut r, &short, turn, k) {
+                    say(l, k % 64 == 63)?;
+                }
+            }
+        }
         // A subagent turn: the Task's call, its subagent's events, the Task's result, `every` apart.
         if let Some((n, every)) = subagent_plan(&text_of(&m)) {
             for k in 0..n.saturating_add(2) {
@@ -365,6 +399,21 @@ mod tests {
             let _ = b.join();
         }
         assert!(t.elapsed() < Duration::from_secs(5), "burned {:?}", t.elapsed());
+    }
+
+    /// The bar's sessions (`kiln-lab bar`): a history is read from its words, and its turns begin with a person's
+    /// message replayed, which a harness takes as theirs.
+    #[test]
+    fn w21_r02_bar_a_history_comes_in_turns_each_begun_by_a_persons_message() {
+        assert_eq!(history_plan("lab:history:41000:178"), Some((41_000, 178)));
+        assert_eq!(history_plan("go lab:history:10:0 now"), Some((10, 1)), "a turn holds an event at the least");
+        assert_eq!(history_plan("lab:prefill:40"), None);
+        assert_eq!(plan("lab:history:41000:178"), (0, Duration::ZERO), "the turn's events are the history's alone");
+        let mut r = Lcg(7);
+        let line = replayed(&mut r, "s1", "s1", 1, 178);
+        assert_eq!(line.get("isReplay"), Some(&Value::Bool(true)));
+        assert_eq!(line.get("parent_tool_use_id"), Some(&Value::Null));
+        assert!(line.pointer("/message/content").and_then(Value::as_str).is_some_and(|t| t.starts_with(STAMP)), "{line}");
     }
 
     /// copies-lat2's A2(b) shape (main's ask, 2026-11-06): a subagent turn is read from its words, and its Task's tool

@@ -7,4 +7,4 @@ import type { TerminalSessionInfo } from "./TerminalSessionInfo";
  * What goes down a terminal's socket (`/api/terminal/ws`, and a leg's, `/api/ci/legs/:id/terminal`),
  * as text: its output goes as binary frames beside these.
  */
-export type TerminalDown = { "type": "session", session: TerminalSessionInfo, } | { "type": "missing", session: string, } | { "type": "reconnect" } | { "type": "size", cols: number, rows: number, } | { "type": "exit", code: number | null, } | { "type": "error", message: string, } | { "type": "refused" } & RefusedFrame;
+export type TerminalDown = { "type": "session", session: TerminalSessionInfo, screen?: boolean, } | { "type": "missing", session: string, } | { "type": "reconnect" } | { "type": "size", cols: number, rows: number, } | { "type": "exit", code: number | null, } | { "type": "error", message: string, } | { "type": "refused" } & RefusedFrame;

@@ -34,4 +34,4 @@ publication?: MailReceipt, } | { "t": "nack", id: string | null, code: string, w
 /**
  * Its inbox's refusal, when that's what it was.
  */
-refused?: Refusal, } | { "t": "history", cursor: string, before: number | null, has_more: boolean, oversized: boolean, });
+refused?: Refusal, } | { "t": "history", cursor: string, before: number | null, has_more: boolean, oversized: boolean, part?: boolean, } | { "t": "earlier", events: Array<Event>, cursor: string, before: number | null, has_more: boolean, oversized: boolean, });

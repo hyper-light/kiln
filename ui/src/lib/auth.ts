@@ -7,6 +7,7 @@ import { create } from "zustand";
 import { ApiError, isAuthed, onAuthChange, setAuthed, setMailScope } from "@/api/client";
 import { events } from "@/api/events";
 import type { Me } from "@/api/types";
+import { earlyAnswer } from "./early";
 import { bootstrapForPage, type PrivateBootstrap } from "./private-bootstrap";
 
 export type AuthState = { kind: "loading" } | { kind: "anon"; error?: string } | { kind: "authed"; me: Me | null };
@@ -23,6 +24,8 @@ let checking: Promise<void> | null = null;
 let epoch = 0;
 let started = false;
 let authRequest: AbortController | null = null;
+/** No check has been made yet: the first may take the document's own answer. */
+let first = true;
 
 /**
  * Warm the console's two typefaces independently. The document also preloads their Latin files;
@@ -48,6 +51,8 @@ export function startAuth(bootstrap: PrivateBootstrap | null, pathname: string, 
   if (typeof window === "undefined" || started) return;
   started = true;
   if (isAuthed() === null && bootstrapForPage(bootstrap, pathname)) {
+    // The document carried who this is: a check after it (a sign-in, a session gone) asks afresh.
+    first = false;
     if (bootstrap.me.authenticated) seed?.();
     accept(bootstrap.me, epoch);
   } else void checkAuth();
@@ -61,11 +66,18 @@ export function checkAuth(): Promise<void> {
   authRequest = controller;
   // Both success and 401 belong to this check's epoch. The shared request helper announces a
   // 401 immediately, before this guard could reject an obsolete response from a previous login.
-  const pending = fetch("/api/me", {
-    credentials: "same-origin",
-    cache: "no-store",
-    signal: controller.signal,
-  })
+  const fresh = () =>
+    fetch("/api/me", {
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  // This page's first check takes what the document already asked as it was parsed (lib/early.ts):
+  // one round trip fewer before anything shows. A later check (a sign-in, a session found gone)
+  // asks afresh, as does one whose early answer never came.
+  const asked = first ? earlyAnswer("/api/me") : null;
+  first = false;
+  const pending = (asked ? asked.catch(fresh) : fresh())
     .then(async (response) => {
       if (!response.ok) throw new ApiError(response.status, response.status === 401 ? "Not signed in" : `HTTP ${response.status}`);
       return (await response.json()) as Me;

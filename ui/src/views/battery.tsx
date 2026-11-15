@@ -3,7 +3,7 @@
  * the top of Runners and Mission Control while a machine on battery is low. A machine that runs
  * out sleeps, and its runner, agents and jobs with it.
  */
-import type { Agent, Battery } from "@/api/types";
+import type { Battery, LeanAgent } from "@/api/types";
 import { shownName } from "@/lib/data";
 import { cn } from "@/lib/utils";
 
@@ -34,7 +34,7 @@ export function BatteryLine({ battery }: { battery: Battery | null | undefined }
  * Connected machines on battery that are low, each said with what stops when it sleeps:
  * `what(machine)` names it ("its 3 agents", "1 job").
  */
-export function LowBattery({ agents, what }: { agents: Agent[]; what?: (machine: string) => string }) {
+export function LowBattery({ agents, what }: { agents: LeanAgent[]; what?: (machine: string) => string }) {
   const low = agents.filter((a) => a.connected && isLow(a.battery));
   if (low.length === 0) return null;
   return (

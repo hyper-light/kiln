@@ -2,6 +2,7 @@
  * same in-flight socket when clicked. Browser coverage also catches timer receiver regressions. */
 import { gunzipSync } from "node:zlib";
 import { expect, test } from "@playwright/test";
+import { wholeList } from "./mission-list";
 
 test("W21-R02 mission intent discovers agent code without running a loader or mounting the conversation", async ({ page }) => {
   test.skip(!!process.env.E2E_BASE_URL, "controlled mock navigation and code-split production assets");
@@ -14,7 +15,8 @@ test("W21-R02 mission intent discovers agent code without running a loader or mo
     if (/\/assets\/_app\.agents\._id-[^/]+\.js$/.test(path)) chunks.push(path);
     if (path.startsWith("/_serverFn/")) serverFunctions.push(path);
   });
-  await page.goto("/agents");
+  // Mission control's lists are windowed: the row asked for by its agent is in the page once the whole list is (mission-list.ts).
+  await wholeList(page);
   const open = page.locator('.ms-row[data-agent="tree-lead"] .ms-go');
   await expect(open).toBeVisible({ timeout: 30_000 });
   expect(chunks).toEqual([]);
@@ -86,7 +88,8 @@ test("W21-R02 leaving a row cancels speculation; clicking promotes without comma
         });
       },
     );
-    await page.goto("/agents");
+    // Mission control's lists are windowed: the row asked for by its agent is in the page once the whole list is (mission-list.ts).
+    await wholeList(page);
     const open = page.locator('.ms-row[data-agent="tree-lead"] .ms-go');
     await expect(open).toBeVisible({ timeout: 30_000 });
     await page.clock.pauseAt(new Date((await page.evaluate(() => Date.now())) + 60_000));
@@ -175,7 +178,8 @@ test("W21-R02 a completed prefetch shows cached history and an editable draft wh
       });
     },
   );
-  await page.goto("/agents");
+  // Mission control's lists are windowed: the row asked for by its agent is in the page once the whole list is (mission-list.ts).
+  await wholeList(page);
   const open = page.locator('.ms-row[data-agent="tree-lead"] .ms-go');
   await expect(open).toBeVisible({ timeout: 30_000 });
   await page.clock.pauseAt(new Date((await page.evaluate(() => Date.now())) + 60_000));

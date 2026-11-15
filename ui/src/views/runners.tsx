@@ -15,7 +15,7 @@ import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
 import { sendingProps, useAction, useActions, useHold } from "@/lib/action";
 import {
-  agentsRes,
+  agentsWholeRes,
   fuller,
   historyRes,
   labelOf,
@@ -25,7 +25,7 @@ import {
   shownName,
   updatesRes,
   upsert,
-  useAgentsLive,
+  useAgentsWholeLive,
   useLabels,
   useMetricsHistory,
   useRes,
@@ -127,8 +127,9 @@ export default function Runners() {
 function RunnersBody() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes);
-  const agents = useAgentsLive();
+  // Whole: each runner's row and its detail show its facts (its executors, its hardware).
+  warm(agentsWholeRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes);
+  const agents = useAgentsWholeLive();
   const history = useMetricsHistory().data;
   const joinRequests = useRes(joinRequestsRes).data;
   const discovery = useRes(discoveryRes).data;
