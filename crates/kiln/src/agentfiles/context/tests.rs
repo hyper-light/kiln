@@ -254,3 +254,82 @@ fn step19_a_context_is_written_whole_or_not_at_all() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// A server answering `/f` with `body`: its first answer cut halfway (its content-length the whole, its connection
+/// closed after half, as a network drops one); each later one asked from a byte (`Range: bytes=<n>-`) answered with
+/// the rest (206 and its `Content-Range`) where it takes `ranges`, else whole (200). Each request's `Range`, in order.
+fn cutting(body: Vec<u8>, ranges: bool) -> anyhow::Result<(String, std::sync::Arc<parking_lot::Mutex<Vec<Option<String>>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let asked = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::clone(&asked);
+    std::thread::spawn(move || {
+        for (n, stream) in listener.incoming().enumerate() {
+            let Ok(mut s) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match s.read(&mut byte) {
+                    Ok(1) => {
+                        let [b] = byte;
+                        head.push(b);
+                    }
+                    _ => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let range = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("range: ").map(|r| r.trim().to_owned()));
+            kept.lock().push(range.clone());
+            let from = range.as_deref().and_then(|r| r.strip_prefix("bytes=")?.strip_suffix('-')?.parse::<usize>().ok());
+            let answer = match (n, from) {
+                (0, _) => {
+                    let mut r = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).into_bytes();
+                    r.extend_from_slice(body.get(..body.len() / 2).unwrap_or_default());
+                    r
+                }
+                (_, Some(from)) if ranges => {
+                    let rest = body.get(from..).unwrap_or_default();
+                    let mut r = format!("HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\ncontent-range: bytes {from}-{}/{}\r\nconnection: close\r\n\r\n", rest.len(), body.len().saturating_sub(1), body.len()).into_bytes();
+                    r.extend_from_slice(rest);
+                    r
+                }
+                _ => ok(&body),
+            };
+            let _ = s.write_all(&answer);
+        }
+    });
+    Ok((base, asked))
+}
+
+/// What the network drops of a pinned file's download is fetched again from where it got, and it arrives whole, its
+/// pin's digest: its first answer cut mid-body, the next asked from that byte (`Range`) and given the rest (206);
+/// or, where its server takes no ranges, given whole again (200) and taken from its start. Before, the cut ended the
+/// build (`Error::Fetch`: "request body: connection closed", antigravity's image, Adas-Mac-Studio-3, 2026-11-14).
+#[test]
+fn a_dropped_download_is_fetched_again_from_where_it_got() -> anyhow::Result<()> {
+    let body: Vec<u8> = (0..4096_u32).map(|i| u8::try_from(i % 251).unwrap_or_default()).collect();
+    for ranges in [true, false] {
+        let (base, asked) = cutting(body.clone(), ranges)?;
+        let pin = pin_of(json!([{"platform": "linux/arm64", "files": [file(&format!("{base}/f"), &body, "bin/f", "0755")]}]));
+        let fetched = crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let made = materialize(&test_builtin(pin, &[]), &["linux/arm64".to_owned()], None, dir.path()).await?;
+            let at = made.first().ok_or_else(|| anyhow::anyhow!("nothing made"))?.join("bin/f");
+            anyhow::Ok(std::fs::read(at)?)
+        })?;
+        anyhow::ensure!(fetched == body, "ranges {ranges}: it arrived as {} bytes, not its pin's", fetched.len());
+        let asked = asked.lock().clone();
+        anyhow::ensure!(asked == [None, Some("bytes=2048-".to_owned())], "ranges {ranges}: asked {asked:?}");
+    }
+    Ok(())
+}
+
+/// A fetch asks again as TCP sends again (RFC 6298): 1 s at first, doubled after each attempt that brought nothing,
+/// at most 60 s, and 1 s again after one that brought bytes.
+#[test]
+fn a_refetch_backs_off_as_tcps_retransmission_timer_does() {
+    let mut pause = Pause::default();
+    let waits: Vec<u64> = (0..8).map(|_| pause.after(false).as_secs()).collect();
+    assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60]);
+    assert_eq!(pause.after(true).as_secs(), 1, "an attempt that brought bytes starts it again");
+}

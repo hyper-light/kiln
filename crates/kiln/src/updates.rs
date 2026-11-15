@@ -1065,9 +1065,24 @@ pub fn binaries(hub: &Hub) -> Vec<Binary> {
 
 /// GET with redirects followed (GitHub release assets redirect to their storage).
 pub(crate) async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
+    get_following_from(client, url, Some(timeout), 0).await
+}
+
+/// `url`, its redirects followed as [`get_following`] follows them, asked from byte `from` where that's past its
+/// start (RFC 9110 §14.2, `Range: bytes=<from>-`), within `timeout` where one is given, else following its
+/// connection ([`crate::http::client::RequestBuilder::followed`]).
+pub(crate) async fn get_following_from(client: &crate::http::client::Client, url: &str, timeout: Option<Duration>, from: u64) -> anyhow::Result<crate::http::client::Response> {
     let mut url = url.to_owned();
     for _ in 0..6 {
-        let resp = client.get(&url).timeout(timeout).send().await?;
+        let mut asked = client.get(&url);
+        if from > 0 {
+            asked = asked.header("range", &format!("bytes={from}-"));
+        }
+        let asked = match timeout {
+            Some(t) => asked.timeout(t),
+            None => asked.followed(),
+        };
+        let resp = asked.send().await?;
         if (300..400).contains(&resp.status())
             && let Some(loc) = resp.header("location")
         {
