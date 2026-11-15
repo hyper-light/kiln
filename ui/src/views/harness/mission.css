@@ -2210,3 +2210,33 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
     display: none;
   }
 }
+/* A split dragged but not applied: hatched until Apply. */
+.ms-split[data-staged] > i {
+  background-image: repeating-linear-gradient(45deg, rgb(10 11 13 / 55%) 0 2px, transparent 2px 4px);
+}
+.ms-weight-in {
+  width: 96px;
+  height: 14px;
+  accent-color: #a6c4ed;
+}
+.ms-weight-in[data-i="1"] {
+  accent-color: #d6a2aa;
+}
+.ms-weight-in[data-i="2"] {
+  accent-color: #b8d9d2;
+}
+.ms-weight-in[data-i="3"] {
+  accent-color: #d8cbb0;
+}
+.ms-setup {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.ms-setup .ms-edit-in {
+  width: 140px;
+}
+.ms-setup .ms-narrow {
+  width: 86px;
+}

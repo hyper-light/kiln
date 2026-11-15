@@ -7,6 +7,7 @@ import * as React from "react";
 import { X } from "lucide-react";
 import { useNavigate } from "@/lib/router";
 import { StatusDot } from "./status";
+import { Button } from "./button";
 
 export interface ToastItem {
   id: number;
@@ -15,6 +16,8 @@ export interface ToastItem {
   tone?: "succeeded" | "failed" | "timed_out" | "running" | "info";
   href?: string;
   duration?: number;
+  /** One act it offers (Undo): pressed, it runs and the toast goes. */
+  action?: { label: string; run: () => void };
 }
 
 type Shown = ToastItem & { closing?: boolean };
@@ -79,6 +82,19 @@ function hold(on: boolean) {
       t.handle = window.setTimeout(() => close(id), Math.max(t.left, 1500));
     }
   }
+}
+
+/** What's showing, for a test to read. */
+export function shownToasts(): readonly ToastItem[] {
+  return items;
+}
+
+/** A toast's act, pressed: it runs once, and the toast goes. */
+export function act(id: number) {
+  const t = items.find((i) => i.id === id);
+  if (!t?.action || t.closing) return;
+  t.action.run();
+  close(id);
 }
 
 function subscribe(cb: () => void) {
@@ -181,6 +197,11 @@ export function Toaster() {
             </div>
             {t.description && <div className="mt-1 break-words font-mono text-[10.5px] leading-relaxed text-[#9a9da6]">{t.description}</div>}
           </div>
+          {t.action && (
+            <Button size="xs" variant="ghost" className="-my-1" onClick={() => act(t.id)}>
+              {t.action.label}
+            </Button>
+          )}
           <button type="button" aria-label="Dismiss" className="icon-btn -my-2 -mr-1" data-variant="bare" data-size="sm" onClick={() => close(t.id)}>
             <X size={14} />
           </button>
