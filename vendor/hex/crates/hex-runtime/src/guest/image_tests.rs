@@ -425,6 +425,8 @@ struct ModelGuest {
     control: Option<shards_api::image::ControlAt>,
     /// Whether its boot gave its command the nesting grant (D234), whose READY it then says.
     nesting: bool,
+    /// Its run's grants past its microVM, as its boot's spec narrowed them (D273): the model changes none as it runs.
+    egress: shards_api::image::Narrowing,
 }
 
 /// Where the model's run host binds a run's agent-control endpoint, and its microVM's key (D252).
@@ -445,8 +447,29 @@ impl ImageGuest for ModelGuest {
     fn members(&self) -> &[MemberInfo] {
         &self.members
     }
-    fn published(&self) -> &[Bound] {
-        &self.published
+    fn published(&self) -> Vec<Bound> {
+        self.published.clone()
+    }
+    fn publish(
+        &self,
+        _: shards_api::image::Publish,
+        _: Duration,
+    ) -> Result<Vec<Bound>, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's live publishing",
+            why: "the class publishes at its start alone".to_owned(),
+        })
+    }
+    fn unpublish(
+        &self,
+        _: shards_api::image::Proto,
+        _: std::net::SocketAddr,
+        _: Duration,
+    ) -> Result<(), ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's live publishing",
+            why: "the class publishes at its start alone".to_owned(),
+        })
     }
     fn control(&self) -> Option<&shards_api::image::ControlAt> {
         self.control.as_ref()
@@ -548,14 +571,7 @@ impl ImageGuest for ModelGuest {
             why: "the run asked no nesting grant".to_owned(),
         })
     }
-    fn plug(
-        &self,
-        _: &MemberName,
-        _: &std::path::Path,
-        _: &str,
-        _: bool,
-        _: Duration,
-    ) -> Result<(), ImageRefusal> {
+    fn plug(&self, _: &shards_api::image::Plug, _: Duration) -> Result<(), ImageRefusal> {
         Err(ImageRefusal::Unsupported {
             what: "the model's plugs",
             why: "it has none".to_owned(),
@@ -565,6 +581,41 @@ impl ImageGuest for ModelGuest {
         Err(ImageRefusal::Unsupported {
             what: "the model's plugs",
             why: "it has none".to_owned(),
+        })
+    }
+    fn egress(&self) -> shards_api::image::Narrowing {
+        self.egress.clone()
+    }
+    fn grant_egress(
+        &self,
+        _: &shards_api::image::EgressGrant,
+        _: Duration,
+    ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's grants past its microVM",
+            why: "it changes none as its run runs".to_owned(),
+        })
+    }
+    fn revoke_egress(
+        &self,
+        _: &shards_api::image::EgressGrant,
+        _: Duration,
+    ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's grants past its microVM",
+            why: "it changes none as its run runs".to_owned(),
+        })
+    }
+    fn pause(&self, _: Duration) -> Result<shards_api::image::Paused, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's pauses",
+            why: "it pauses none: the class pauses no run yet (P5.5b)".to_owned(),
+        })
+    }
+    fn resume(&self, _: Duration) -> Result<shards_api::image::Paused, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's resumes",
+            why: "it pauses none: the class pauses no run yet (P5.5b)".to_owned(),
         })
     }
     fn save(&self, _: &std::path::Path, _: Duration) -> Result<(), ImageRefusal> {
@@ -953,6 +1004,7 @@ impl Images for ModelImages {
                 (Some(_), None, None, None) => Some(model_control()),
             },
             nesting: spec.nesting,
+            egress: spec.egress.clone(),
         }))
     }
 }
@@ -2142,6 +2194,14 @@ fn b4_an_image_vms_delete_answers_once_its_run_host_and_every_process_it_started
             wake: std::net::SocketAddr::from(([127, 0, 0, 1], 11)),
         }),
         from: StartedFrom::Booted,
+        // Its grants past its microVM once made (Shards' D273, image channel v36): it makes no network.
+        egress: wire::Narrowing {
+            egress: wire::Keep::Only(Vec::new()),
+            mcp: wire::Keep::Only(Vec::new()),
+            destinations: wire::Keep::Only(Vec::new()),
+            dns: false,
+            members: None,
+        },
     }
     .encode()
     .unwrap();
@@ -2277,6 +2337,7 @@ fn microvm(guest: Result<GuestTimes, String>) -> Option<Microvm> {
             cpu_ns: 9_000_000,
             resident_bytes: 1 << 20,
             footprint_bytes: 1 << 20,
+            charged: shards_api::image::Charged::ToThread,
         }),
         guest,
     })
@@ -2581,6 +2642,7 @@ fn w14_a_running_vm_is_told_its_room_held_to_its_rate_and_read_for_its_host_cost
             resident_bytes: 1 << 20,
             guest_ns: (1..=u64::from(vcpus)).map(|n| 1_000 * n).collect(),
             window: read.window,
+            charged: hex_api::Charged::ToThread,
         }
     );
     *images.run.stats.lock().unwrap() = Stats {

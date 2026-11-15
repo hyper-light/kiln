@@ -1813,5 +1813,6 @@ fn sampled(ns: Vec<u64>) -> ManagedGuestTime {
         ns,
         asked: at,
         answered: at,
+        charged: hex_api::Charged::ToThread,
     }
 }

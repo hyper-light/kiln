@@ -113,7 +113,51 @@ impl Handle {
             address: super::guest_address((devfn >> 3, devfn & 7)),
             size,
             steps: Vec::new(),
+            region: None,
         })
+    }
+
+    /// Plugs a component's EROFS image into the running machine (D270): a read-only
+    /// virtio-pmem function, its region `file` mapped at a free range of its components'
+    /// window, which every VM of its host mapping the same file shares in its page cache, as
+    /// an image's root is shared (D15). Its guest finds it as its init rescans its PCI bus,
+    /// and maps its files from the host's pages (DAX). Refused where the machine has no
+    /// window, no free slot, or no free range as long as the file
+    /// ([`Refusal::NoRoom`]).
+    pub fn plug_pmem(&self, file: std::fs::File) -> Result<super::Plugged, Refusal> {
+        let plugs = self.control.plugs().ok_or(Refusal::NoBus)?;
+        let window = plugs.components.clone().ok_or_else(|| {
+            Refusal::Unsupported("this microVM has no components' window to map a component in".into())
+        })?;
+        let region = Arc::new(pmem::Region::of_file(file, "a component's image").map_err(Refusal::Host)?);
+        let gpa = window.place(&region)?;
+        let len = region.len() as u64;
+        // Its pages reached by its machine's other devices as the guest names them, as a
+        // boot's pmem files' are (D189's device DMA).
+        // SAFETY: the region stays mapped while the window holds it, which it does until the
+        // unplug takes it back here first (`unplug`).
+        let given =
+            unsafe { self.memory.give_plugged(gpa, region.host(), region.len()) }.map_err(Refusal::Host);
+        let device = pmem::Pmem::new(region, gpa);
+        match given.and_then(|()| self.plug(Box::new(device))) {
+            Ok(devfn) => {
+                window.held_by(gpa, devfn);
+                Ok(super::Plugged {
+                    devfn,
+                    address: super::guest_address((devfn >> 3, devfn & 7)),
+                    size: None,
+                    steps: Vec::new(),
+                    region: Some((gpa, len)),
+                })
+            }
+            Err(refused) => {
+                self.memory.take_plugged(gpa);
+                if let Err(e) = window.release_at(gpa) {
+                    warn!("a component's range at {gpa:#x}, its plug refused, stays mapped: {e}");
+                }
+                Err(refused)
+            }
+        }
     }
 
     /// Plugs a shared directory into the running machine (D214): virtio-fs, mounted by
@@ -134,6 +178,7 @@ impl Handle {
             address: super::guest_address((devfn >> 3, devfn & 7)),
             size: None,
             steps: Vec::new(),
+            region: None,
         })
     }
 
@@ -308,13 +353,24 @@ impl Handle {
             address: super::guest_address((devfn >> 3, devfn & 7)),
             size: None,
             steps,
+            region: None,
         })
     }
 
     /// Takes the device plugged at `devfn` off its PCI bus (D214), once its guest has let
     /// it go: an error, changing nothing, where its guest's driver still drives it.
     pub fn unplug(&self, devfn: u8) -> Result<(), Refusal> {
-        self.control.plugs().ok_or(Refusal::NoBus)?.hotplug.unplug(devfn)
+        let plugs = self.control.plugs().ok_or(Refusal::NoBus)?;
+        plugs.hotplug.unplug(devfn)?;
+        // A component's range taken back once nothing of its guest's drives it (D270): from
+        // its devices first, then from the guest and this process.
+        let Some(window) = &plugs.components else {
+            return Ok(());
+        };
+        if let Some((gpa, _)) = window.range_of(devfn) {
+            self.memory.take_plugged(gpa);
+        }
+        window.release(devfn).map_err(Refusal::Host)
     }
 
     /// What grows its file disk `index` of those it was made with (D214), as its host
@@ -377,7 +433,11 @@ impl Handle {
             let shared = sh.clone();
             let made = std::thread::Builder::new()
                 .name("hold".into())
-                .spawn(move || shared.hold.govern(&|| shared.kick_all()))
+                .spawn(move || {
+                    shared
+                        .hold
+                        .govern(&|| shared.kick_all(), &|| shared.guest.charged())
+                })
                 .map_err(|e| format!("starting the hold on its vCPUs: {e}"))?;
             *governor = Some(made);
         }
@@ -402,7 +462,11 @@ impl Handle {
         let shared = sh.clone();
         let made = std::thread::Builder::new()
             .name("hold-group".into())
-            .spawn(move || shared.hold.govern_group(&group, &|| shared.kick_all()))
+            .spawn(move || {
+                shared
+                    .hold
+                    .govern_group(&group, &|| shared.kick_all(), &|| shared.guest.charged())
+            })
             .map_err(|e| format!("starting its group's hold on its vCPUs: {e}"))?;
         *governor = Some(made);
         Ok(())
@@ -898,6 +962,12 @@ impl Handle {
         self.shared.guest.sample()
     }
 
+    /// Whether this process's OS charges its vCPUs' guest time to their threads, as their
+    /// spans have told it ([`guest_time::Charged`], D265).
+    pub fn charged(&self) -> guest_time::Charged {
+        self.shared.guest.charged()
+    }
+
     /// What each of its vCPUs ran of its guest in all, by index, those gone among them at
     /// what they read as they left (D260's final use): read once the machine is down
     /// ([`Running::wait_then`]'s `free`), after its last guest instruction, it is the whole.
@@ -1076,7 +1146,7 @@ impl Shared {
             saving: Mutex::new(None),
             saved: Condvar::new(),
             hold: Hold::new(vcpus as usize),
-            guest: GuestClocks::default(),
+            guest: GuestClocks::known(crate::hv::GUEST_TIME_CHARGED),
             governor: Mutex::new(None),
             group_governor: Mutex::new(None),
         }
@@ -1750,15 +1820,22 @@ fn vcpu_thread(
     if let Some(slot) = sh.kickers.get(index) {
         let _ = slot.set(vcpu.kicker());
     }
-    // Its clock, by which the host holds the vCPUs to their run's CPUs (D191).
-    if let Err(e) = sh.hold.register(index) {
+    // Its clocks, by which the host holds the vCPUs to their run's CPUs (D191): its thread's,
+    // and its guest time, counted as its OS charges it (D265).
+    let guest_read = vcpu.guest_clock();
+    if let Err(e) = sh
+        .hold
+        .register(index, Some(Box::new(move || guest_read.read().ok())))
+    {
         warn!("vCPU {index}: its CPU time unread, so not held to its run's CPUs: {e}");
     }
     // Its guest time among its machine's, before its machine is said to be started: read a
     // last time as this goes, on this thread, before the vCPU itself goes (dropped after).
-    let _guest = sh
-        .guest
-        .join(u32::try_from(index).unwrap_or(u32::MAX), guest_clock(&vcpu));
+    let _guest = sh.guest.join(
+        u32::try_from(index).unwrap_or(u32::MAX),
+        guest_clock(&vcpu),
+        thread_clock(index),
+    );
     let _ = created.send(Ok(set_up));
     if let Some(offset) = sh.wait_release()
         && let Err(e) = machine::set_counter_offset(&mut vcpu, offset)
@@ -1773,13 +1850,28 @@ fn vcpu_thread(
             return;
         }
         // Out of the guest while its run's CPU time is spent (D191), or until a snapshot
-        // needs it parked.
-        sh.hold.wait(&|| sh.exiting() || sh.snapshot.requested());
+        // needs it parked; its guest told where it was held through a pause (D267).
+        if sh.hold.wait(&|| sh.exiting() || sh.snapshot.requested()) {
+            vcpu.went_on();
+        }
         match vcpu.run(io) {
             Ok(hv::Exit::Canceled) => sh.park_for_snapshot(index, &vcpu),
             Ok(hv::Exit::Shutdown) => return sh.stop(ExitReason::PowerOff),
             Ok(hv::Exit::Reset) => return sh.stop(ExitReason::Reset),
             Err(e) => return sh.stop(ExitReason::Error(format!("vCPU {index}: {e}"))),
+        }
+    }
+}
+
+/// How vCPU `index`'s thread's CPU time is read, from any thread: its own clock, the calling
+/// thread's, which beside its guest time tells whether its OS charges that to it (D265); none
+/// where it has none.
+fn thread_clock(index: usize) -> Option<guest_time::Ran> {
+    match crate::platform::ThreadClock::current() {
+        Ok(clock) => Some(Box::new(move || clock.read().ok())),
+        Err(e) => {
+            warn!("vCPU {index}: its thread's CPU time unread, so its guest time's charge is not told: {e}");
+            None
         }
     }
 }
@@ -2121,6 +2213,7 @@ mod tests {
                 share_window_mib: 0,
                 layer_mib: 0,
                 pci_slots: 0,
+                component_window_mib: 0,
             },
             plugged: Vec::new(),
             data: None,

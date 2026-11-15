@@ -114,7 +114,13 @@ const MAGIC: [u8; 8] = *b"SHRDSNAP";
 ///     contract only where it did: a guest that runs no shards-init (a test guest, a
 ///     `--init` of the user's own) announces none, which 30-32 wrote as contract 0 and a
 ///     resume refused as another init's (D176).
-const VERSION: u32 = 33;
+/// 34: an x86-64 machine has no i8042 among its port devices and resets through its FADT's
+///     reset register (D268): a guest saved in 33 has a FADT without one and its machine an
+///     i8042 this machine no longer has, and is refused ([`ResumeRefused::OlderMachine`]).
+/// 35: and its components' window's length in MiB, 0 for none (D270): guest addresses past
+///     its DAX windows that a guest saved in 34 had no window at, and is refused
+///     ([`ResumeRefused::OlderMachine`]).
+const VERSION: u32 = 35;
 /// The first format whose state says who saved it ([`decode_saved_by`]).
 const VERSION_WITH_SAVER: u32 = 30;
 /// The version of shards this build is (crates/shards/Cargo.toml, by build.rs): what a
@@ -295,6 +301,11 @@ pub struct MachineConfig {
     /// Its PCI bus's slots for devices plugged in as it runs (D214), 0 for none: empty in
     /// every snapshot, as a machine with a device plugged in saves none.
     pub pci_slots: u8,
+    /// The length of its components' window in MiB (D270), 0 for none: guest addresses past
+    /// its DAX windows where a read-only pmem function plugged into one of its slots maps a
+    /// component's image, as its guest's addresses fitted it; empty in every snapshot, as
+    /// its slots are.
+    pub component_window_mib: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +654,7 @@ fn encode(s: &Snapshot, generation: &str, identities: &[Identity]) -> Result<Vec
         w.u64(*len);
     });
     w.u8(s.config.pci_slots);
+    w.u64(s.config.component_window_mib);
     w.bool(s.data.is_some());
     w.seq(s.data.as_deref().unwrap_or_default(), |w, (at, len)| {
         w.u64(*at);
@@ -828,6 +840,7 @@ fn decode_body(mut r: Reader<'_>, generation: String, vcpus: u32, memory_mib: u6
     let plugged_most = most_plugged_runs(hotplug_mib).ok_or_else(|| past("memory to plug"))?;
     let plugged = r.seq(plugged_most, 16, |r| Ok((r.u64()?, r.u64()?)))?;
     let pci_slots = r.u8()?;
+    let component_window_mib = r.u64()?;
     let data = {
         let said = r.bool()?;
         let data_most = most_data_runs(memory_mib).ok_or_else(|| past("guest memory"))?;
@@ -858,6 +871,7 @@ fn decode_body(mut r: Reader<'_>, generation: String, vcpus: u32, memory_mib: u6
                 share_window_mib,
                 layer_mib,
                 pci_slots,
+                component_window_mib,
             },
             plugged,
             data,
@@ -1278,9 +1292,10 @@ pub enum ResumeRefused {
     Unrecorded { format: u32 },
     /// Saved by shards `saved_by` in format `format`, from 30 on and before this build's:
     /// its guest's drivers are bound to a machine this build no longer makes (31: its
-    /// console a 16550 UART, now virtio-console; 32: no pvpanic device), or (32) its saver's
-    /// record says its init's contract as this build no longer reads it, so its guest
-    /// cannot run on. Only its saver's version is read of it.
+    /// console a 16550 UART, now virtio-console; 32: no pvpanic device; 34: no i8042 on
+    /// x86-64, whose FADT names a reset register), or (32) its saver's record says its
+    /// init's contract as this build no longer reads it, so its guest cannot run on. Only
+    /// its saver's version is read of it.
     OlderMachine { format: u32, saved_by: String },
     /// Saved in format `format`, past this build's: by a newer shards.
     Newer { format: u32 },
@@ -1965,6 +1980,7 @@ mod tests {
                 share_window_mib: 0,
                 layer_mib: 0,
                 pci_slots: 0,
+                component_window_mib: 0,
             },
             plugged: Vec::new(),
             data: None,
@@ -2122,6 +2138,14 @@ mod tests {
                 .to_string()
                 .contains("whose machine this shards no longer makes"),
             "{machine}"
+        );
+        // 33's x86-64 machine reset through an i8042 that 34's has not (D268).
+        assert_eq!(
+            refused(&with_format(33)),
+            ResumeRefused::OlderMachine {
+                format: 33,
+                saved_by: SAVED_BY.to_string()
+            }
         );
         let released = refused(&with_format(28));
         assert_eq!(released, ResumeRefused::Unrecorded { format: 28 });

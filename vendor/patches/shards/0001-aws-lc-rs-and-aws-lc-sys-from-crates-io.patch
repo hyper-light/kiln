@@ -3,7 +3,7 @@ Why: kiln's copy leaves out vendor/aws-lc-rs and vendor/aws-lc-sys, Shards' byte
 Kiln-only: kiln's layout: Shards' tree holds the copies kiln's leaves out
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 49699944316822f180d94a1344b686b3ea0cea86..50669cf3d362bfee6829c42d47b133b8a1414ec8 100644
+index 8992ab8fcb6caac5dbce18d3c8658b5eba0c3608..bc953968dbd2fb97d0e77528d62efcdd91a02b87 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -86,6 +86,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"

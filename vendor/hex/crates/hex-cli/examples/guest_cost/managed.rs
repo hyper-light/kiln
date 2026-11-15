@@ -425,7 +425,7 @@ impl Driver for Managed {
 
     fn sources(&self) -> Lines {
         vec![
-            ("cpu".to_owned(), "as its node reads it (D260): each vCPU's guest time from its VM process's answer, read first (ManagedGuest::host_use: WHP's run-time counter, TotalRuntime100ns less HypervisorRuntime100ns), none before its VM process says it (its socket not yet listening, its microVM not yet started: its guest has run nothing) and said at every reading from its first on, then its job's CPU time (WinRuntime::managed_usage: the job's kernel and user time, its VM process's and every process it starts), so its VMM's own, the whole less its vCPUs', is never less than none; a job counting less than its VM process says it used (HostUse::cpu_ns) refused, told".to_owned()),
+            ("cpu".to_owned(), "as its node reads it (D260): each vCPU's guest time from its VM process's answer, read first (ManagedGuest::host_use: WHP's run-time counter, TotalRuntime100ns less HypervisorRuntime100ns), none before its VM process says it (its socket not yet listening, its microVM not yet started: its guest has run nothing) and said at every reading from its first on, then its job's CPU time (WinRuntime::managed_usage: the job's kernel and user time, its VM process's and every process it starts), its whole that and, where WHP runs its vCPUs apart from its threads or its VM process hasn't told (HostUse::charged, Shards' D265), their guest time beside it, so its VMM's own, the whole less its vCPUs', is never less than it ran; a job counting less than its VM process says it used (HostUse::cpu_ns) refused, told".to_owned()),
             ("memory".to_owned(), "as its node reads it: its job's committed peak (WinRuntime::managed_usage: PeakJobMemoryUsed, at most its bound), less its guest RAM's commit, the committed private read/write region of exactly its RAM (VirtualQueryEx) in its VM process (Shards' confined VM process, as ManagedGuest::vm_process names it by pid and start), which Shards' WHP reserve_ram commits whole from the start".to_owned()),
             ("disk".to_owned(), format!(
                 "the allocated bytes (FileStandardInfo's AllocationSize, a file linked twice once, by its volume and index) of every path under SHARDS_CACHE {}, SHARDS_HOME {} and the guest's socket folder",
@@ -614,11 +614,27 @@ impl Probe for VmmCpu {
                 usage.cpu_usec, host.cpu_ns
             ));
         }
+        let guest_cpu = times.map_or(Duration::ZERO, |times| {
+            Duration::from_nanos(times.total_ns())
+        });
+        let job = Duration::from_micros(usage.cpu_usec);
+        // Whether its job's CPU holds its vCPUs' guest time (Shards' D265): it does where WHP runs them on its threads
+        // (Windows' root scheduler); where it runs them apart (the classic and core schedulers, every Windows Server's)
+        // or its VM process hasn't told, its whole is its job's and its vCPUs' beside it, so its VMM's own is never read
+        // as less than it ran.
+        let charged = used
+            .as_ref()
+            .and_then(|used| used.microvm.host.as_ref().ok())
+            .map_or(shards_api::image::Charged::Unknown, |host| host.charged);
+        let cpu = match charged {
+            shards_api::image::Charged::ToThread => job,
+            shards_api::image::Charged::Apart | shards_api::image::Charged::Unknown => job
+                .checked_add(guest_cpu)
+                .ok_or("the guest's CPU overflows a duration")?,
+        };
         Ok(Use {
-            cpu: Duration::from_micros(usage.cpu_usec),
-            guest_cpu: times.map_or(Duration::ZERO, |times| {
-                Duration::from_nanos(times.total_ns())
-            }),
+            cpu,
+            guest_cpu,
             guest_threads: times
                 .map(|times| u32::try_from(times.vcpus.len()))
                 .transpose()

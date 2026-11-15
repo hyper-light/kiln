@@ -905,7 +905,10 @@ enum Started {
     /// Only macOS's launches say anything yet (`launch`).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Said(String),
-    Ended(Result<Ready, String>),
+    /// Boxed: a [`Ready`] is far larger than a line (clippy's `large_enum_variant` on
+    /// x86_64-pc-windows-msvc), and every message takes its enum's larger variant's size; a
+    /// start sends it once.
+    Ended(Box<Result<Ready, String>>),
 }
 
 /// A run, from its record's creation to its end (audit A06): what the commands on
@@ -4498,10 +4501,7 @@ impl<D: Disk> Daemon<D> {
             log_files: retention.files,
             first: container_log.seq,
             // The most memory its guest may plug, in bytes: its own (D148).
-            plug: prepared
-                .memory_max
-                .saturating_sub(prepared.size.1)
-                .saturating_mul(1 << 20),
+            plug: prepared.plug_bytes(),
             // Non-blocking, its queue (D162).
             queue: kept.and_then(|k| k.queue),
             // Its microVM's I/O limits, its VMM's to keep (D178).
@@ -7463,7 +7463,9 @@ impl<D: Disk> Daemon<D> {
         self.close();
         self.stopping.store(true, Ordering::SeqCst);
         for (_, booting) in lock(&self.booting).drain() {
-            let _ = booting.send(Started::Ended(Err("the daemon is shutting down".into())));
+            let _ = booting.send(Started::Ended(Box::new(
+                Err("the daemon is shutting down".into()),
+            )));
         }
         // Runs waiting their turn to boot look at `stopping` again.
         self.boots.wake();
@@ -8817,7 +8819,7 @@ impl<D: Disk> Daemon<D> {
             loop {
                 match rx.recv() {
                     Ok(Started::Said(line)) => told(&line),
-                    Ok(Started::Ended(ready)) => break ready,
+                    Ok(Started::Ended(ready)) => break *ready,
                     Err(_) => break Err("the VM's watcher ended without a word".into()),
                 }
             }
@@ -9095,7 +9097,7 @@ impl<D: Disk> Daemon<D> {
             }
             For::Run(tx) => match ready {
                 Ok(()) => {
-                    let _ = tx.send(Started::Ended(Ok(Ready {
+                    let _ = tx.send(Started::Ended(Box::new(Ok(Ready {
                         vm: child.clone(),
                         socket,
                         net,
@@ -9105,11 +9107,11 @@ impl<D: Disk> Daemon<D> {
                         joined: None,
                         layer,
                         pooled: None,
-                    })));
+                    }))));
                 }
                 Err(e) => {
                     let _ = child.kill(shards_ipc::signal::SIGKILL);
-                    let _ = tx.send(Started::Ended(Err(e)));
+                    let _ = tx.send(Started::Ended(Box::new(Err(e))));
                 }
             },
         }

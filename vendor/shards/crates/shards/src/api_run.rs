@@ -65,10 +65,34 @@ impl Answers {
     }
 }
 
+/// Whether this process's lines say their times (`SHARDS_TIMING`), read once.
+fn timed() -> bool {
+    static TIMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TIMED.get_or_init(|| std::env::var_os("SHARDS_TIMING").is_some())
+}
+
 /// One line of the run's progress on this process's stderr, its diagnostics, which a
-/// refusal quotes the last of.
+/// refusal quotes the last of; with `SHARDS_TIMING`, its time: microseconds since this
+/// process's `main` (`shards_vmm::log::uptime_us`), whose wall clock it says once as it
+/// starts ([`command`]). Written in one write, so that its VM's lines on the same stderr
+/// come between lines, never in one.
 fn say(what: std::fmt::Arguments<'_>) {
-    let _ = writeln!(io::stderr(), "shards api-run: {what}");
+    let _ = io::stderr().write_all(said(timed().then(shards_vmm::log::uptime_us), what).as_bytes());
+}
+
+/// [`say`]'s line, timed `at` where its lines are timed.
+fn said(at: Option<u128>, what: std::fmt::Arguments<'_>) -> String {
+    match at {
+        Some(us) => format!("shards api-run: +{us} us {what}\n"),
+        None => format!("shards api-run: {what}\n"),
+    }
+}
+
+/// A step of the run's start, said only where its lines are timed (`SHARDS_TIMING`).
+fn step(what: std::fmt::Arguments<'_>) {
+    if timed() {
+        say(what);
+    }
 }
 
 /// The run's channel from its orchestrator, this process's stdin (D231), read a frame at a
@@ -176,6 +200,14 @@ fn stdout() -> io::Result<std::fs::File> {
 /// `shards api-run`: not for people to run. The run's end is said as its VM ends, before
 /// its owner closes the channel; a run that never started is refused instead.
 pub fn command() -> ExitCode {
+    // Its clock on the wall's, said first, for lining its lines up with its caller's and its
+    // VM's (api_image's `image_start_costs`); and its launches' steps said with it.
+    if timed() {
+        crate::launch::say_steps(say);
+        if let Some(at) = shards_vmm::log::began_unix_us() {
+            say(format_args!("its clock began at unix {at} us"));
+        }
+    }
     let answers = match stdout() {
         Ok(out) => Answers(Mutex::new(Box::new(out))),
         // No channel to say anything on: its owner reads its end, and this, on its stderr.
@@ -208,6 +240,7 @@ fn host(answers: &Answers) -> Result<(), No> {
         Ok(None) => return Err(No(Cause::Request, "the channel closed before its request".into())),
         Err(e) => return Err(No(Cause::Request, format!("the request: {e}"))),
     };
+    step(format_args!("its request read"));
     input.shed();
     // A warm host's exemplar (D253's pools): its run comes once its microVM is ready.
     if kind == wire::to_host::WARM {
@@ -617,6 +650,33 @@ fn egress(
     Ok(Some(shards_net::encode_policy(&ports, &named, dns)))
 }
 
+/// `narrowing` as its run holds it (D273): what of its image's grants each list keeps, written
+/// out whole as the image writes them (`Keep::Only`), names asked where both grant them, and
+/// its members' reach as asked; any other is a widening, refused by name, as [`egress`]
+/// refuses it.
+fn resolved(
+    grants: Option<&shards_agentfile::agentfile::Grants>,
+    narrowing: &wire::Narrowing,
+) -> Result<wire::Narrowing, No> {
+    let none = shards_agentfile::agentfile::Grants::default();
+    let g = grants.unwrap_or(&none);
+    let only = |what: &str, granted: &[Vec<u8>], keep: &wire::Keep| -> Result<wire::Keep, No> {
+        Ok(wire::Keep::Only(
+            kept(what, granted, keep)?
+                .iter()
+                .map(|item| String::from_utf8_lossy(item).into_owned())
+                .collect(),
+        ))
+    };
+    Ok(wire::Narrowing {
+        egress: only("egress", &g.egress, &narrowing.egress)?,
+        mcp: only("remote MCP server", &g.mcp, &narrowing.mcp)?,
+        destinations: only("destination", &g.destinations, &narrowing.destinations)?,
+        dns: g.dns && narrowing.dns,
+        members: narrowing.members.clone(),
+    })
+}
+
 /// The run's credential grants for its network process (D242), by reference and never a
 /// value: each toward one host at least, and each host one its egress grants reach (D236),
 /// as a grant that could never be filled is refused, not kept silently; each placeholder a
@@ -986,15 +1046,26 @@ fn published(
 }
 
 /// The run's request (`kind::RUN`) as a warm VM takes one (warm.rs `head`): its head, then
-/// `spec`. It writes no log, yet its head keeps a run's default retention, as a daemon
-/// run's with no log does (`--log-driver none`, daemon.rs `DEFAULT_LOGS`): a warm VM
-/// refuses a request whose log keeps nothing.
-fn run_request(spec: &shards_abi::run::Spec, published: bool) -> Vec<u8> {
+/// `spec`; `timing` asks for its VM's timing line. It writes no log, yet its head keeps a
+/// run's default retention, as a daemon run's with no log does (`--log-driver none`,
+/// daemon.rs `DEFAULT_LOGS`): a warm VM refuses a request whose log keeps nothing. Its head
+/// carries `plug`, the most memory its guest may plug (`Prepared::plug_bytes`, D148), which
+/// its VM sets before its guest hears of the run: a run told none has what it booted with,
+/// its members' share what was free as their domains started.
+fn run_request(spec: &shards_abi::run::Spec, plug: u64, published: bool, timing: bool) -> Vec<u8> {
     let mut payload = Vec::new();
+    let flags = if published { shards_ipc::RUN_PUBLISHED } else { 0 };
     shards_ipc::RunHead {
-        flags: if published { shards_ipc::RUN_PUBLISHED } else { 0 },
+        // Its VM's timing line in its `EXIT`, its guest's markers in it, where its lines are
+        // timed (`SHARDS_TIMING`).
+        flags: if timing {
+            flags | shards_ipc::RUN_TIMING
+        } else {
+            flags
+        },
         log_size: crate::daemon::DEFAULT_LOGS.size,
         log_files: crate::daemon::DEFAULT_LOGS.files,
+        plug,
         ..Default::default()
     }
     .encode_into(&mut payload);
@@ -1145,6 +1216,8 @@ enum Ask<'a> {
     Plug(wire::PlugAsk),
     Unplug(wire::UnplugAsk),
     Save(wire::SaveAsk),
+    Pause(wire::PauseAsk),
+    Net(wire::NetAsk),
 }
 
 /// The orchestrator's next ask, from what reading its next frame gave (`read`: its kind and
@@ -1182,6 +1255,8 @@ fn judged(which: u8, payload: &[u8]) -> Result<Ask<'_>, AsksEnd> {
         wire::to_host::PLUG => ("PLUG", wire::PlugAsk::decode(payload).map(Ask::Plug)),
         wire::to_host::UNPLUG => ("UNPLUG", wire::UnplugAsk::decode(payload).map(Ask::Unplug)),
         wire::to_host::SAVE => ("SAVE", wire::SaveAsk::decode(payload).map(Ask::Save)),
+        wire::to_host::PAUSE => ("PAUSE", wire::PauseAsk::decode(payload).map(Ask::Pause)),
+        wire::to_host::NET => ("NET", wire::NetAsk::decode(payload).map(Ask::Net)),
         other => return Err(broke(format_args!("a frame of kind {other}, which is no ask"))),
     };
     ask.map_err(|e| broke(format_args!("a malformed {what}: {e}")))
@@ -1540,13 +1615,89 @@ impl std::fmt::Display for Audit<'_> {
     }
 }
 
+/// A run's network process's control as its run goes on (D242, D269): written one whole
+/// message at a time, by one thread at a time, and read by one alone ([`relay`]), which takes
+/// that process's asks (its leases and sign-ins, where the run has grants) and the answers to
+/// this host's own asks of it ([`NetControl::ask`]), which that process answers in the order
+/// asked, each with its ask's kind.
+struct NetControl<'a> {
+    control: &'a crate::netproc::Control,
+    sending: Mutex<()>,
+    /// None once the control is read no more (closed, or broken), as nothing will answer an
+    /// ask then; every waiter's sender dropped with it.
+    asked: Mutex<Option<NetAsks>>,
+}
+
+/// Each ask of a run host's of its network process sent and not yet answered, in the order
+/// sent: its kind, and who waits for its answer's payload ([`NetControl::ask`]).
+type NetAsks = std::collections::VecDeque<(u8, std::sync::mpsc::Sender<Vec<u8>>)>;
+
+impl<'a> NetControl<'a> {
+    fn new(control: &'a crate::netproc::Control) -> NetControl<'a> {
+        NetControl {
+            control,
+            sending: Mutex::new(()),
+            asked: Mutex::new(Some(std::collections::VecDeque::new())),
+        }
+    }
+
+    /// Sends `kind` with `payload` and the sockets `socks`, which its network process does not
+    /// answer (`NET_PUBLISHED`): their sender keeps its copies until it lets them go (M24).
+    fn tell(&self, kind: u8, payload: &[u8], socks: &[crate::netproc::Lent<'_>]) -> io::Result<()> {
+        let _one = lock(&self.sending);
+        crate::netproc::send(self.control, kind, payload, socks)
+    }
+
+    /// Sends `kind` with `payload`, and waits for its network process's answer of that kind,
+    /// which the relay hands back in the order asked: its payload; refused where it could not
+    /// be sent, or where the control is read no more before it is answered.
+    fn ask(&self, kind: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let (answered, answer) = std::sync::mpsc::channel();
+        {
+            let _one = lock(&self.sending);
+            match lock(&self.asked).as_mut() {
+                Some(asked) => asked.push_back((kind, answered)),
+                None => return Err("its network process's control is read no more".into()),
+            }
+            if let Err(e) = crate::netproc::send(self.control, kind, payload, &[]) {
+                // Its own entry the last: none goes in while `sending` is held.
+                if let Some(asked) = lock(&self.asked).as_mut() {
+                    asked.pop_back();
+                }
+                return Err(format!("its network process: {e}"));
+            }
+        }
+        answer
+            .recv()
+            .map_err(|_| "its network process ended before it answered".to_string())
+    }
+
+    /// The answer of `kind` its network process sent, `payload`, handed to the oldest ask,
+    /// which it must be of: whether it was.
+    fn answered(&self, kind: u8, payload: Vec<u8>) -> bool {
+        let mut asked = lock(&self.asked);
+        match asked.as_mut().and_then(|a| a.front().map(|(k, _)| *k)) {
+            Some(oldest) if oldest == kind => {
+                if let Some((_, waiter)) = asked.as_mut().and_then(std::collections::VecDeque::pop_front) {
+                    let _ = waiter.send(payload);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Nothing more is read of it: every ask waiting refused, as is every one after.
+    fn closed(&self) {
+        lock(&self.asked).take();
+    }
+}
+
 /// A run's leases, as its host relays them (D242): its ledger, and its network process's
-/// control, on which that process's asks come and their answers go, one whole message at a
-/// time.
+/// control, on which that process's asks come and their answers go.
 struct Leasing<'a> {
     ledger: Mutex<Ledger>,
-    net: &'a crate::netproc::Control,
-    sending: Mutex<()>,
+    net: &'a NetControl<'a>,
 }
 
 impl Leasing<'_> {
@@ -1557,11 +1708,11 @@ impl Leasing<'_> {
     fn tell(&self, asked_as: u32, answer: Result<(NonZeroU64, &[u8]), &Refusal>) -> io::Result<()> {
         let payload = shards_net::lease::encode_answer(asked_as, answer)
             .ok_or_else(|| io::Error::other("a lease's answer past what its lengths count"))?;
-        let _one = lock(&self.sending);
+        let _one = lock(&self.net.sending);
         #[cfg(unix)]
-        return crate::netproc::send(self.net, kind::NET_LEASE, &payload, &[]);
+        return crate::netproc::send(self.net.control, kind::NET_LEASE, &payload, &[]);
         #[cfg(windows)]
-        return shards_ipc::write_message_parts(&self.net.socket, kind::NET_LEASE, &payload);
+        return shards_ipc::write_message_parts(&self.net.control.socket, kind::NET_LEASE, &payload);
     }
 
     /// Tells the network process a sign-in's answer (D242, step 8), wiped as it drops, sent as
@@ -1570,11 +1721,11 @@ impl Leasing<'_> {
         let payload = answered
             .encode()
             .ok_or_else(|| io::Error::other("a sign-in's answer past what its lengths count"))?;
-        let _one = lock(&self.sending);
+        let _one = lock(&self.net.sending);
         #[cfg(unix)]
-        return crate::netproc::send(self.net, kind::NET_SIGN_IN, &payload, &[]);
+        return crate::netproc::send(self.net.control, kind::NET_SIGN_IN, &payload, &[]);
         #[cfg(windows)]
-        return shards_ipc::write_message_parts(&self.net.socket, kind::NET_SIGN_IN, &payload);
+        return shards_ipc::write_message_parts(&self.net.control.socket, kind::NET_SIGN_IN, &payload);
     }
 }
 
@@ -1592,15 +1743,38 @@ fn net_refusal(refusal: &wire::LeaseRefusal) -> Refusal {
     }
 }
 
-/// Relays the network process's asks to the orchestrator until its control closes (D242):
-/// each one the ledger takes asked as `LEASE`, by reference and never a value; the rest
-/// refused here, typed. A message that is no ask breaks that process's contract, and no
-/// more of its asks are relayed.
-fn relay(leasing: &Leasing<'_>, answers: &Answers) {
+/// Reads the run's network process's control until it closes (D242, D269): each answer to an
+/// ask of this host's handed to its asker ([`NetControl::answered`]); each lease that process
+/// asks that the ledger takes asked of the orchestrator as `LEASE`, by reference and never a
+/// value, the rest refused here, typed; each sign-in's word relayed. A message that is none of
+/// these, or a lease or sign-in of a run with no grants, breaks that process's contract, and
+/// nothing more of it is read. Once nothing is, every ask of this host's waiting is refused.
+fn relay(net: &NetControl<'_>, leasing: Option<&Leasing<'_>>, answers: &Answers) {
+    read_control(net, leasing, answers);
+    net.closed();
+}
+
+/// [`relay`]'s reading, until the control closes or breaks.
+fn read_control(net: &NetControl<'_>, leasing: Option<&Leasing<'_>>, answers: &Answers) {
     loop {
-        let mut m = match crate::netproc::recv(leasing.net) {
+        let mut m = match crate::netproc::recv(net.control) {
             Ok(Some(m)) => m,
             Ok(None) | Err(_) => return,
+        };
+        let asks = m.kind == kind::NET_SIGN_IN || m.kind == kind::NET_LEASE;
+        if !asks && net.answered(m.kind, std::mem::take(&mut m.payload)) {
+            continue;
+        }
+        let leasing = match leasing {
+            Some(leasing) if asks => leasing,
+            _ => {
+                zeroize::Zeroize::zeroize(&mut m.payload);
+                say(format_args!(
+                    "its network process said message kind {}, no answer to this host's oldest ask of it nor an ask of a run with grants: nothing more of it is read",
+                    m.kind
+                ));
+                return;
+            }
         };
         // A sign-in's word (D242, step 8): its message's copy of a capture's tokens wiped as it
         // goes, whatever came of it.
@@ -1609,20 +1783,16 @@ fn relay(leasing: &Leasing<'_>, answers: &Answers) {
             zeroize::Zeroize::zeroize(&mut m.payload);
             match told.map(|told| sign_in_told(leasing, answers, told)) {
                 Some(Ok(())) => continue,
-                Some(Err(why)) => say(format_args!("{why}: no more of its asks are relayed")),
+                Some(Err(why)) => say(format_args!("{why}: nothing more of it is read")),
                 None => say(format_args!(
-                    "its network process said a sign-in's word this side does not read: no more of its asks are relayed"
+                    "its network process said a sign-in's word this side does not read: nothing more of it is read"
                 )),
             }
             return;
         }
-        let ask = (m.kind == kind::NET_LEASE)
-            .then(|| shards_net::lease::decode_ask(&m.payload))
-            .flatten();
-        let Some((asked_as, reference)) = ask else {
+        let Some((asked_as, reference)) = shards_net::lease::decode_ask(&m.payload) else {
             say(format_args!(
-                "its network process said message kind {} where it asks leases and sign-ins alone: no more of its asks are relayed",
-                m.kind
+                "its network process asked a lease this side does not read: nothing more of it is read"
             ));
             return;
         };
@@ -2134,6 +2304,158 @@ impl Saving {
     }
 }
 
+/// The run's pause, as its host holds it (D267, R04). Running to pausing as its owner asks a
+/// pause, which refuses every ask of its guest from then on; pausing to paused as its VM says
+/// every vCPU is held, or back to running where its VM held none; paused to resuming as its
+/// owner asks it to go on, and resuming to running once its VM says they go on, or back to
+/// paused where it did not. Any to gone as its VM's link closes. A pause of a paused run and a
+/// resume of a running one are done already: an owner that lost an answer asks again and is
+/// answered the same. Nothing of it waits on its guest: a pause is its VM's alone.
+#[derive(Debug)]
+enum Pause {
+    Running,
+    Pausing,
+    /// Every vCPU held since `since`.
+    Paused {
+        since: Instant,
+    },
+    /// Going on, its VM asked: its guest still answers nothing until its VM says so.
+    Resuming {
+        since: Instant,
+    },
+    Gone,
+}
+
+/// The run's pause (D267): its state; the time every pause that has ended took; what its init
+/// last said of the run's stats, which its stats say while it is paused; and the pauses and
+/// resumes asked, applied in their order by one worker at a time.
+#[derive(Debug)]
+struct Pauses {
+    state: Pause,
+    ended: Duration,
+    last: Option<Vec<u8>>,
+    queue: std::collections::VecDeque<wire::PauseAsk>,
+    draining: bool,
+}
+
+/// What a pause or a resume asked now is to do ([`Pauses::pause`], [`Pauses::resume`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Done already: the run is as asked, its paused time this.
+    Done(wire::Paused),
+    /// Its VM is to be asked.
+    Ask,
+    /// Its VM has gone.
+    Gone,
+}
+
+impl Pauses {
+    fn new() -> Pauses {
+        Pauses {
+            state: Pause::Running,
+            ended: Duration::ZERO,
+            last: None,
+            queue: std::collections::VecDeque::new(),
+            draining: false,
+        }
+    }
+
+    /// The run's paused time at `now`: every pause that has ended, and the one under way so far.
+    fn paused(&self, now: Instant) -> wire::Paused {
+        match &self.state {
+            Pause::Paused { since } | Pause::Resuming { since } => wire::Paused {
+                total: self.ended.saturating_add(now.saturating_duration_since(*since)),
+                now: true,
+            },
+            Pause::Running | Pause::Pausing | Pause::Gone => wire::Paused {
+                total: self.ended,
+                now: false,
+            },
+        }
+    }
+
+    /// Whether its guest runs to answer an ask now: not while it is pausing, paused or going
+    /// on. A gone VM's asks go on, to be refused as its VM has stopped.
+    fn guest_runs(&self) -> bool {
+        matches!(self.state, Pause::Running | Pause::Gone)
+    }
+
+    /// A pause asked: to ask its VM where it runs, the pause then under way; done already where
+    /// it is paused or going on.
+    fn pause(&mut self, now: Instant) -> Step {
+        match self.state {
+            Pause::Running => {
+                self.state = Pause::Pausing;
+                Step::Ask
+            }
+            Pause::Pausing | Pause::Paused { .. } | Pause::Resuming { .. } => Step::Done(self.paused(now)),
+            Pause::Gone => Step::Gone,
+        }
+    }
+
+    /// Its VM held every vCPU at `now`: paused, and its time then; none where its VM went
+    /// meanwhile.
+    fn held(&mut self, now: Instant) -> Option<wire::Paused> {
+        if !matches!(self.state, Pause::Pausing) {
+            return None;
+        }
+        self.state = Pause::Paused { since: now };
+        Some(self.paused(now))
+    }
+
+    /// Its VM held none: it runs as it did.
+    fn unheld(&mut self) {
+        if matches!(self.state, Pause::Pausing) {
+            self.state = Pause::Running;
+        }
+    }
+
+    /// A resume asked: to ask its VM where it is paused, then going on; done already where it
+    /// runs.
+    fn resume(&mut self, now: Instant) -> Step {
+        match self.state {
+            Pause::Paused { since } => {
+                self.state = Pause::Resuming { since };
+                Step::Ask
+            }
+            Pause::Gone => Step::Gone,
+            Pause::Running | Pause::Pausing | Pause::Resuming { .. } => Step::Done(self.paused(now)),
+        }
+    }
+
+    /// Its VM let its vCPUs go on at `now`: running, the pause's time among those ended.
+    fn resumed(&mut self, now: Instant) -> Option<wire::Paused> {
+        let Pause::Resuming { since } = self.state else {
+            return None;
+        };
+        self.ended = self.ended.saturating_add(now.saturating_duration_since(since));
+        self.state = Pause::Running;
+        Some(self.paused(now))
+    }
+
+    /// Its VM did not let them go on: paused still.
+    fn unresumed(&mut self) {
+        if let Pause::Resuming { since } = self.state {
+            self.state = Pause::Paused { since };
+        }
+    }
+
+    /// What its init last said of the run's stats, while it is pausing, paused or going on
+    /// (`Some(None)`: it said none before its pause); none while its guest runs to say it.
+    fn said(&self) -> Option<Option<&[u8]>> {
+        match &self.state {
+            Pause::Pausing | Pause::Paused { .. } | Pause::Resuming { .. } => Some(self.last.as_deref()),
+            Pause::Running | Pause::Gone => None,
+        }
+    }
+
+    /// Its VM's link closed at `now`: gone, a pause under way ended then.
+    fn gone(&mut self, now: Instant) {
+        self.ended = self.paused(now).total;
+        self.state = Pause::Gone;
+    }
+}
+
 /// Where a save its owner asks at `to` is made (D259): `to` with its parent's canonical path,
 /// so that what follows names no link. Refused unless `to` is absolute and names a directory,
 /// its parent is the run's `home` or beneath it, and neither is beneath a directory its guest
@@ -2209,6 +2531,7 @@ mod hosted {
     use std::io::{self, Read as _, Write as _};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::time::Instant;
 
     use shards_abi::run::{self as protocol, managed};
     use shards_api::image::wire::{self, Cause, Channel, RunEnd};
@@ -2233,6 +2556,11 @@ mod hosted {
         members: Vec<wire::MemberInfo>,
         listeners: Vec<publish::Listener>,
         egress: Option<Vec<u8>>,
+        /// The most it could ever be granted past its microVM, its image's grants as its network
+        /// process takes them (`NET_POLICY`, D273), where its image grants any.
+        ceiling: Option<Vec<u8>>,
+        /// Its grants past its microVM as its request keeps them, written out whole (D273).
+        narrowing: wire::Narrowing,
         /// Its credential grants as its network process takes them (`NET_CREDENTIALS`), where
         /// it has any, or sign-ins.
         credentials: Option<Vec<u8>>,
@@ -2271,6 +2599,8 @@ mod hosted {
         reached: Vec<PathBuf>,
         /// Its GPU report's scope, where its orchestrator asked for one (D233).
         gpu_report: Option<[u8; 16]>,
+        /// It has a command of its own, which a port no member takes coming in reaches.
+        command: bool,
     }
 
     pub(super) fn run(
@@ -2279,11 +2609,12 @@ mod hosted {
         ready_by: Option<u64>,
         input: super::Input,
     ) -> Result<(), No> {
+        let mut checking = Checking::begin();
         let home = shards_ipc::home().map_err(no(Cause::Boot))?;
-        let shaped = shape(request, &home)?;
+        let shaped = shape(request, &home, &mut checking)?;
         let made = shaped.made.clone();
         let plan = plan(request, ready_by, shaped).inspect_err(|_| end(&home, None, &made))?;
-        launch_and_serve(answers, input, &home, plan)
+        launch_and_serve(answers, input, &home, plan, checking)
     }
 
     /// The request as `shards run` would have asked it of a daemon: the image, its own
@@ -2293,23 +2624,7 @@ mod hosted {
     /// nesting=true` asks for it (D234), with `ready_by`, its deadline as an instant
     /// (`super::deadline`).
     pub(super) fn as_run(request: &wire::Request, ready_by: Option<u64>) -> shards_ipc::Run {
-        let publish = request
-            .publish
-            .iter()
-            .map(|p| shards_ipc::Publish {
-                port: p.guest_port,
-                proto: match p.proto {
-                    wire::Proto::Tcp => "tcp".into(),
-                    wire::Proto::Udp => "udp".into(),
-                },
-                host_ip: p.host.map(|h| h.to_string()).unwrap_or_default(),
-                host_port: if p.host_port == 0 {
-                    String::new()
-                } else {
-                    p.host_port.to_string()
-                },
-            })
-            .collect();
+        let publish = request.publish.iter().map(binding).collect();
         let binds = request
             .shares
             .iter()
@@ -2360,6 +2675,24 @@ mod hosted {
         }
     }
 
+    /// A port to publish as `shards run -p` asks it of a daemon: its host address, or none for
+    /// every one, and its host port, or none for one the host picks.
+    fn binding(p: &wire::Publish) -> shards_ipc::Publish {
+        shards_ipc::Publish {
+            port: p.guest_port,
+            proto: match p.proto {
+                wire::Proto::Tcp => "tcp".into(),
+                wire::Proto::Udp => "udp".into(),
+            },
+            host_ip: p.host.map(|h| h.to_string()).unwrap_or_default(),
+            host_port: if p.host_port == 0 {
+                String::new()
+            } else {
+                p.host_port.to_string()
+            },
+        }
+    }
+
     /// What a run's microVM is made of, made before it starts (D253): its image prepared, its
     /// network chosen and its volumes open, its microVM composed. All of it a warm run host
     /// makes of its exemplar before its run asks (D253's pools), from what alone the runs of
@@ -2372,6 +2705,7 @@ mod hosted {
         labels: Vec<String>,
         active: Vec<u32>,
         egress: Option<Vec<u8>>,
+        ceiling: Option<Vec<u8>>,
         credentials: Option<Vec<u8>>,
         sign_ins: Option<Vec<u8>>,
         bridge: Option<shards_net::bridge::Bridge>,
@@ -2382,9 +2716,45 @@ mod hosted {
         made: Vec<String>,
         server: Option<PathBuf>,
         microvm: super::Microvm,
+        /// Its security's costly parts ([`secure`]), or why not, which its plan says where it
+        /// would have made them, after its run's own refusals.
+        secured: Result<Secured, No>,
     }
 
-    fn shape(request: &wire::Request, home: &Path) -> Result<Shaped, No> {
+    /// What of a run's security its microVM alone decides (D253), made once of its exemplar:
+    /// the filters its setup installs, compiled for its guest's kernel (`setup::filters`), and
+    /// its domains' filters where its image is an Agentfile's. All a run's plan made of them
+    /// before, each run's own grant entries apart (its deadline), which its plan composes.
+    struct Secured {
+        filters: crate::setup::Filters,
+        domains: Option<[Vec<u8>; 2]>,
+    }
+
+    /// [`Secured`] of the microVM `microvm` that `run` runs in, its Agentfile `agentfile`;
+    /// refused as its plan refused them: its kernel unread `Boot`, its options or a filter
+    /// `Request`, its domains' filters `Boot`. Whether its command has the nesting grant is
+    /// its microVM's: the grant asks its run's asking and its image's declaring alone (D234,
+    /// `agentfile::nesting`), a run's deadline only its entries; a run refused the grant is
+    /// refused by its plan before anything made here is taken.
+    fn secure(
+        agentfile: Option<&crate::agentfile::Agentfile>,
+        run: &shards_ipc::Run,
+        microvm: &super::Microvm,
+    ) -> Result<Secured, No> {
+        let version = crate::guest::version_of(&microvm.cfg.kernel).map_err(no(Cause::Boot))?;
+        let granted = matches!(
+            crate::agentfile::nesting(agentfile, run),
+            Ok(crate::agentfile::Nesting::Granted(_))
+        );
+        let filters = crate::setup::filters(run, version, granted).map_err(no(Cause::Request))?;
+        let domains = agentfile
+            .map(|_| crate::setup::domain_seccomp(version))
+            .transpose()
+            .map_err(no(Cause::Boot))?;
+        Ok(Secured { filters, domains })
+    }
+
+    fn shape(request: &wire::Request, home: &Path, checking: &mut Checking) -> Result<Shaped, No> {
         let mut run = as_run(request, None);
         let say = |line: &str| {
             let _ = writeln!(io::stderr(), "{line}");
@@ -2399,6 +2769,7 @@ mod hosted {
         }
         let cancel = shards_registry::http::Cancel::new();
         let mut prepared = crate::run::prepare(&run, home, &say, &cancel).map_err(no(Cause::Image))?;
+        super::step(format_args!("its image prepared"));
         if request.vcpus > 0 {
             prepared.size.0 = request.vcpus;
         }
@@ -2421,6 +2792,7 @@ mod hosted {
         }
         super::ports_granted(&request.publish, agentfile.as_ref(), request.command.is_some())?;
         let egress = super::network(agentfile.as_ref(), request, &mut run)?;
+        let ceiling = super::egress(agentfile.as_ref().map(|a| &a.grants), &wire::Narrowing::default())?;
         let sign_ins = super::sign_ins(&request.sign_ins, &request.credentials, egress.as_deref())?;
         let credentials = super::credentials(
             &request.credentials,
@@ -2429,6 +2801,7 @@ mod hosted {
             sign_ins.is_some(),
         )?;
         let bridge = if run.network == "bridge" {
+            checking.networked();
             Some(
                 shards_net::bridge::elected_here(&mut |note| say(&note))
                     .ok_or_else(|| No(Cause::Boot, shards_net::bridge::NO_SUBNET.into()))?,
@@ -2503,6 +2876,12 @@ mod hosted {
             Ok((opened, server, microvm))
         };
         let (opened, server, microvm) = rest().inspect_err(|_| end(home, None, &made))?;
+        super::step(format_args!("its microVM shaped"));
+        // Before its run asks, where its host is warm (D253): never on a warm run's way.
+        let secured = secure(agentfile.as_ref(), &run, &microvm);
+        super::step(format_args!(
+            "its security made: its guest's kernel read, its filters compiled"
+        ));
         Ok(Shaped {
             run,
             prepared,
@@ -2510,6 +2889,7 @@ mod hosted {
             labels,
             active,
             egress,
+            ceiling,
             credentials,
             sign_ins,
             bridge,
@@ -2519,11 +2899,13 @@ mod hosted {
             made,
             server,
             microvm,
+            secured,
         })
     }
 
     /// The run `request`, its deadline `ready_by`, of its microVM `shaped`: its members'
-    /// stages, its published ports bound, its nesting grant decided, its setup and spec.
+    /// stages, its published ports bound, its nesting grant decided, its setup and spec, its
+    /// security's filters its microVM's own (`Shaped::secured`).
     fn plan(request: &wire::Request, ready_by: Option<u64>, shaped: Shaped) -> Result<Plan, No> {
         let Shaped {
             mut run,
@@ -2532,6 +2914,7 @@ mod hosted {
             labels,
             active,
             egress,
+            ceiling,
             credentials,
             sign_ins,
             bridge,
@@ -2541,6 +2924,7 @@ mod hosted {
             made,
             server,
             microvm,
+            secured,
         } = shaped;
         run.ready_by = ready_by;
         let say = |line: &str| {
@@ -2566,6 +2950,7 @@ mod hosted {
             publish::InUse::Host
         })
         .map_err(no(Cause::Boot))?;
+        super::step(format_args!("its members staged, its ports bound"));
         // Its setup, as the daemon composes a run's (daemon.rs `start`): its mounts, its
         // capabilities beside its domains, its security, its domains' filter, its managed
         // output, what it stages, its members' ends asked for, and its own command or
@@ -2577,17 +2962,18 @@ mod hosted {
             setup.retain(|e| !e.starts_with(b"caps="));
             setup.push(format!("caps={}", a.caps(&run)).into_bytes());
         }
-        let version = crate::guest::version_of(&microvm.cfg.kernel).map_err(no(Cause::Boot))?;
-        crate::setup::security_setup(&mut setup, &run, version, None, &[], nesting.grant())
+        let Secured { filters, domains } = secured?;
+        crate::setup::security_setup_with(&mut setup, &run, &filters, None, &[], nesting.grant())
             .map_err(no(Cause::Request))?;
         if let Some(a) = &agentfile {
-            setup.extend(crate::setup::domain_seccomp(version).map_err(no(Cause::Boot))?);
+            setup.extend(domains.into_iter().flatten());
             setup.extend(a.image_env.iter().cloned());
         }
+        super::step(format_args!("its setup's security composed"));
         // Its domains' plug roots (D235), as a daemon's run names them: this host's own and
         // each share's top-level directory, beneath which a plug asked of it lies.
         let roots = match &agentfile {
-            Some(_) => crate::setup::plug_roots(&points),
+            Some(_) => granted_roots(crate::setup::plug_roots(&points), &request.plug_roots)?,
             None => Vec::new(),
         };
         setup.extend(roots.iter().cloned());
@@ -2669,11 +3055,22 @@ mod hosted {
             prepared.spec.builtin = protocol::builtin::ATTEND;
         }
         crate::spec::fits(&prepared.spec).map_err(no(Cause::Request))?;
+        // Each share's host directory as its guest reaches it, which no save is made in
+        // (D259); one that is not there now is none it reaches.
+        let reached = request
+            .shares
+            .iter()
+            .filter_map(|s| std::fs::canonicalize(&s.host).ok())
+            .collect();
+        super::step(format_args!("its run planned"));
+        let narrowing = super::resolved(agentfile.as_ref().map(|a| &a.grants), &request.egress)?;
         Ok(Plan {
             prepared,
             members,
             listeners: bound.listeners,
             egress,
+            ceiling,
+            narrowing,
             credentials,
             sign_ins,
             granted: request.credentials.iter().map(|g| g.reference.clone()).collect(),
@@ -2693,15 +3090,31 @@ mod hosted {
             mcps,
             roots,
             control: request.control.clone(),
-            // Each share's host directory as its guest reaches it, which no save is made in
-            // (D259); one that is not there now is none it reaches.
-            reached: request
-                .shares
-                .iter()
-                .filter_map(|s| std::fs::canonicalize(&s.host).ok())
-                .collect(),
+            reached,
             gpu_report: request.gpu_report,
+            command: request.command.is_some(),
         })
+    }
+
+    /// The setup entries of the run's plug roots (D235, D271): its host's own and its shares'
+    /// top-level directories (`setup::plug_roots`), then each its orchestrator grants that is
+    /// none of those, each checked again as its guest takes one (`plug::root_name`).
+    fn granted_roots(mut roots: Vec<Vec<u8>>, granted: &[String]) -> Result<Vec<Vec<u8>>, No> {
+        for root in granted {
+            if protocol::plug::root_name(root.as_bytes()).is_none() {
+                return Err(No(
+                    Cause::Request,
+                    format!(
+                        "{root:?}: no plug root, which is one top-level directory and none of init's own"
+                    ),
+                ));
+            }
+            let entry = [protocol::plug::ROOT_KEY, root.as_bytes()].concat();
+            if !roots.contains(&entry) {
+                roots.push(entry);
+            }
+        }
+        Ok(roots)
     }
 
     /// The run's processes, started: its network's, its shares', its VM's; how its VM
@@ -2820,14 +3233,85 @@ mod hosted {
         }
     }
 
+    /// Its VM process's binary, checked on a thread of its own from the run host's first step,
+    /// beside its run's making, which needs nothing of it: `helpers::vm` reads the binary whole
+    /// and hashes it as a process first starts it (helpers.rs `checked`, runs-10), and a run
+    /// host is a process of one run, so every run's start paid it before its launch. Its
+    /// network process's binary likewise, once its run is found to have a network
+    /// ([`networked`](Self::networked)): checked on the same thread after the VM's, and done
+    /// before its VM is launched, as `taken` waits for both, so that the network process's start
+    /// (`netproc::start`, before its VM's) finds it checked (helpers.rs `CHECKED`) and reads it
+    /// no more. Taken as its VM is launched; checked there where no thread could be started.
+    struct Checking {
+        thread: Option<std::thread::JoinHandle<Result<PathBuf, String>>>,
+        /// Tells its thread that its run has a network; untold as it is taken, none checked.
+        network: Option<std::sync::mpsc::Sender<()>>,
+        networked: bool,
+    }
+
+    impl Checking {
+        fn begin() -> Checking {
+            let (tell, told) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::Builder::new()
+                .name("api-run binaries".into())
+                .spawn(move || {
+                    let vm = crate::helpers::vm();
+                    // A network process's that cannot be checked is refused as its process
+                    // starts, which checks it again (`helpers::program`).
+                    if told.recv().is_ok() {
+                        let _ = crate::helpers::net();
+                    }
+                    vm
+                })
+                .ok();
+            Checking {
+                network: thread.as_ref().map(|_| tell),
+                thread,
+                networked: false,
+            }
+        }
+
+        /// Its run has a network: its network process's binary is checked too.
+        fn networked(&mut self) {
+            self.networked = true;
+            if let Some(tell) = self.network.take() {
+                let _ = tell.send(());
+            }
+        }
+
+        /// The VM's binary checked, or why not; and whether its network process's was too,
+        /// done by now.
+        fn taken(self) -> (Result<PathBuf, String>, bool) {
+            let Checking {
+                thread,
+                network,
+                networked,
+            } = self;
+            drop(network);
+            let vm = match thread {
+                Some(checking) => checking
+                    .join()
+                    .unwrap_or_else(|_| Err("its VM's binary: its check ended unanswered".into())),
+                None => crate::helpers::vm(),
+            };
+            (vm, networked)
+        }
+    }
+
     /// The run's processes, started as the daemon starts a run's VM (launch.rs): its share
     /// process, ended where its VM does not start; then its network process, denying all
     /// until its policy comes, and its VM, the way its template says (D253, `super::started`):
     /// restoring it, or booting and saving it, one that does not restore replaced. On Windows
     /// each is made in a job of this process's that ends them as it ends (D141, D197). Where
     /// it asks for its GPU report (D233), `reported` is what its last VM wrote of it: the
-    /// ready one's, or the one's whose start failed last.
-    fn launch(home: &Path, plan: &Launch<'_>, reported: &mut Option<Vec<u8>>) -> Result<Launched, No> {
+    /// ready one's, or the one's whose start failed last. Its VM process's binary is
+    /// `checking`'s, checked beside its run's making.
+    fn launch(
+        home: &Path,
+        plan: &Launch<'_>,
+        checking: Checking,
+        reported: &mut Option<Vec<u8>>,
+    ) -> Result<Launched, No> {
         let boot = |e: String| No(Cause::Boot, e);
         // Made before any process of the run's, and held until each is reaped.
         #[cfg(windows)]
@@ -2845,7 +3329,19 @@ mod hosted {
             .then(|| start_shares(home, plan.dirs, &job, Some(&tags)))
             .transpose()
             .map_err(boot)?;
-        let started = crate::helpers::vm().map_err(boot).and_then(|vm| {
+        if let Some(shares) = &shares {
+            super::step(format_args!("its share process {} started", shares.child.id()));
+        }
+        let (vm, networked) = checking.taken();
+        super::step(format_args!(
+            "its VM's binary checked{}",
+            if networked {
+                ", its network process's too"
+            } else {
+                ""
+            }
+        ));
+        let started = vm.map_err(boot).and_then(|vm| {
             let mut host = Host {
                 home,
                 plan,
@@ -2858,6 +3354,7 @@ mod hosted {
             let template = plan.microvm.template.as_ref().map(|t| t.dir.as_path());
             let started = super::started(&mut host, super::way_of(template, shards_vmm::snapshot::exists));
             *reported = host.reported.take();
+            super::step(format_args!("its VM's start settled"));
             started
         });
         let ((launched, link, _, _), from, held) = match started {
@@ -2948,6 +3445,7 @@ mod hosted {
                 }),
                 _ => None,
             };
+            super::step(format_args!("its network decided"));
             // Its writable layer (D190): made empty of the run's size for a boot, a clone of its
             // template's for a restore where its template keeps one.
             let (mut args, layer) = match way {
@@ -2991,6 +3489,14 @@ mod hosted {
                     )
                 }
             };
+            super::step(format_args!(
+                "its writable layer {}",
+                match (way, &layer) {
+                    (super::Way::Restore { .. }, Some(l)) if l.cloned_of().is_some() => "cloned",
+                    (_, Some(_)) => "made",
+                    (_, None) => "none",
+                }
+            ));
             args.extend(layer.iter().flat_map(crate::daemon::LayerFile::args));
             let argv: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
             // Its GPU report's pipe (D233), its write end the VM's alone once it is launched.
@@ -3001,6 +3507,7 @@ mod hosted {
                 }
                 None => (None, None),
             };
+            super::step(format_args!("launching its VM"));
             let (launched, link) = crate::launch::run_reported(
                 crate::launch::Plan {
                     args: &argv,
@@ -3021,13 +3528,17 @@ mod hosted {
 
         fn ready(&mut self, vm: &mut Self::Vm) -> Result<(), String> {
             let said = match shards_ipc::recv(&vm.1) {
-                Ok(Some(m)) if m.kind == kind::READY => Ok(()),
+                Ok(Some(m)) if m.kind == kind::READY => {
+                    super::step(format_args!("its VM said READY"));
+                    Ok(())
+                }
                 Ok(Some(m)) => Err(format!("the VM said message kind {} before it was ready", m.kind)),
                 Ok(None) => Err("the VM ended before it was ready".into()),
                 Err(e) => Err(format!("the VM was not ready: {e}")),
             };
             // Its writable layer's file is its VM's once it is ready or has failed (D190).
             vm.2 = None;
+            super::step(format_args!("its writable layer's name let go of"));
             // A ready VM's GPU report was written, and its writer closed, before its guest ran
             // (D233): read now, at once. One not ready is read once it has ended (`end`).
             if said.is_ok()
@@ -3198,8 +3709,9 @@ mod hosted {
     pub(super) fn tell_net(
         net: &crate::netproc::Control,
         address: Option<&[u8]>,
-        listeners: &[publish::Listener],
-        egress: Option<&[u8]>,
+        ports: &[Port],
+        ceiling: Option<&[u8]>,
+        granted: Option<&[u8]>,
         sign_ins: Option<&[u8]>,
         credentials: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>, String> {
@@ -3209,21 +3721,21 @@ mod hosted {
                 .map_err(|e| format!("addresses: {e}"))?;
             asked.push((kind::NET_ADDRESS, "addresses"));
         }
-        for batch in listeners.chunks(shards_ipc::MAX_FDS) {
-            let ports: Vec<u8> = batch
-                .iter()
-                .flat_map(|l| {
-                    let [hi, lo] = l.guest_port.to_be_bytes();
-                    [hi, lo, l.proto]
-                })
-                .collect();
-            let fds: Vec<crate::netproc::Lent<'_>> =
-                batch.iter().map(|l| crate::netproc::lend(&l.fd)).collect();
-            crate::netproc::send(net, kind::PUBLISH, &ports, &fds)
-                .map_err(|e| format!("published ports: {e}"))?;
-            asked.push((kind::PUBLISH, "published ports"));
+        // Each published port by a number of its own (D269), by which its owner may let it go
+        // as the run goes; unanswered, its socket held here meanwhile (M24).
+        for port in ports {
+            crate::netproc::send(
+                net,
+                kind::NET_PUBLISHED,
+                &port.told(),
+                &[crate::netproc::lend(&port.socket)],
+            )
+            .map_err(|e| format!("published ports: {e}"))?;
         }
-        if let Some(policy) = egress {
+        // The most the run could ever be granted past its microVM, its image's grants (D273),
+        // which its network process is held to (Landlock's layer on Linux), its grants as the
+        // run goes within them.
+        if let Some(policy) = ceiling {
             crate::netproc::send(net, kind::NET_POLICY, policy, &[])
                 .map_err(|e| format!("egress grants: {e}"))?;
             asked.push((kind::NET_POLICY, "egress grants"));
@@ -3233,6 +3745,26 @@ mod hosted {
                 Ok(Some(m)) if m.kind == which => {}
                 Ok(_) => return Err(format!("{what}: the network process did not take them")),
                 Err(e) => return Err(format!("{what}: the network process: {e}")),
+            }
+        }
+        // Its grants as its request keeps them (D273), where they are less than its ceiling:
+        // nothing past it where it keeps nothing. Before its sign-ins and credential grants,
+        // whose hosts its network process checks its grants reach.
+        if let Some(ceiling) = ceiling
+            && granted != Some(ceiling)
+        {
+            crate::netproc::send(net, kind::NET_GRANTS, granted.unwrap_or_default(), &[])
+                .map_err(|e| format!("its grants: {e}"))?;
+            match crate::netproc::recv(net) {
+                Ok(Some(m)) if m.kind == kind::NET_GRANTS && m.payload == [0] => {}
+                Ok(Some(m)) if m.kind == kind::NET_GRANTS => {
+                    return Err(format!(
+                        "its grants: {}",
+                        String::from_utf8_lossy(m.payload.get(1..).unwrap_or_default())
+                    ));
+                }
+                Ok(_) => return Err("its grants: the network process did not take them".into()),
+                Err(e) => return Err(format!("its grants: the network process: {e}")),
             }
         }
         // The run's sign-in grants (D242, step 8), once its policy is taken, which the network
@@ -3260,6 +3792,238 @@ mod hosted {
             Ok(_) => Err("credential grants: the network process did not take them".into()),
             Err(e) => Err(format!("credential grants: the network process: {e}")),
         }
+    }
+
+    /// A port the run publishes (D269), its start's or one published since: its host socket,
+    /// held here while it is published, as its network process is told it under its number
+    /// (`NET_PUBLISHED`, which that process does not answer), by which that process lets it go
+    /// (`NET_UNPUBLISHED`, answered once its copies are closed); and the port as its owner is
+    /// told it.
+    pub(super) struct Port {
+        id: u32,
+        bound: wire::Bound,
+        socket: crate::netproc::Sock,
+    }
+
+    impl Port {
+        /// What its network process is told of it with its socket: its number, then its guest
+        /// port and IP protocol number, as `PUBLISH` names one.
+        fn told(&self) -> [u8; 7] {
+            let [a, b, c, d] = self.id.to_be_bytes();
+            let [hi, lo] = self.bound.guest_port.to_be_bytes();
+            [a, b, c, d, hi, lo, self.bound.proto as u8]
+        }
+    }
+
+    /// The ports the run publishes, in the order published, and the number the next takes:
+    /// held through each change of them, so that changes are made one at a time and each is
+    /// answered before the next is made.
+    #[derive(Default)]
+    struct Ports {
+        held: Vec<Port>,
+        next: u32,
+    }
+
+    impl Ports {
+        /// Holds `listeners`, each as `bound` names it, in their order, under numbers of their
+        /// own (the wire's u32): refused for sockets and ports that do not pair up, and once the
+        /// numbers are spent, those not held then closed.
+        fn hold(&mut self, listeners: Vec<publish::Listener>, bound: Vec<wire::Bound>) -> Result<(), String> {
+            if listeners.len() != bound.len() {
+                return Err(format!(
+                    "{} sockets for {} ports published",
+                    listeners.len(),
+                    bound.len()
+                ));
+            }
+            for (listener, bound) in listeners.into_iter().zip(bound) {
+                let id = self.next;
+                self.next = id
+                    .checked_add(1)
+                    .ok_or_else(|| "every number a port is told by is spent".to_string())?;
+                self.held.push(Port {
+                    id,
+                    bound,
+                    socket: listener.fd,
+                });
+            }
+            Ok(())
+        }
+
+        /// Every port it holds, as its owner is told them.
+        fn published(&self) -> Vec<wire::Bound> {
+            self.held.iter().map(|p| p.bound.clone()).collect()
+        }
+    }
+
+    /// An IP protocol as a port's words name it.
+    fn proto_name(p: wire::Proto) -> &'static str {
+        match p {
+            wire::Proto::Tcp => "tcp",
+            wire::Proto::Udp => "udp",
+        }
+    }
+
+    /// The run's network changed as its owner asks (D269), in its running microVM in place:
+    /// one change at a time under its ports' lock, each answered before the next is made, with
+    /// every port the run publishes once it is.
+    fn net_change(live: &Live<'_>, ask: wire::NetAsk) {
+        let mut ports = lock(&live.ports);
+        let result = match ask.change {
+            wire::NetChange::Publish(p) => publish_live(live, &mut ports, &p),
+            wire::NetChange::Unpublish { proto, host } => unpublish_live(live, &mut ports, proto, host),
+            wire::NetChange::Egress(asked) => egress_live(live, &asked).map(|()| Vec::new()),
+        }
+        .map(|changed| wire::NetChanged {
+            changed,
+            published: ports.published(),
+            egress: lock(&live.egress).clone(),
+        });
+        net_answered(live, ask.id, result);
+        drop(ports);
+    }
+
+    /// Network change `id`'s answer told its owner.
+    fn net_answered(live: &Live<'_>, id: u32, result: Result<wire::NetChanged, (wire::NetRefusal, String)>) {
+        if let Err((cause, why)) = &result {
+            super::say(format_args!("a network change refused, {cause:?}: {why}"));
+        }
+        let payload = wire::NetAnswer { id, result }.encode().or_else(|e| {
+            wire::NetAnswer {
+                id,
+                result: Err((wire::NetRefusal::Network, format!("its answer: {e}"))),
+            }
+            .encode()
+        });
+        if let Ok(payload) = payload {
+            let _ = live.answers.send(wire::to_client::NET_CHANGED, &[&payload]);
+        }
+    }
+
+    /// What a run with no network device is refused a change of it as.
+    fn no_network() -> (wire::NetRefusal, String) {
+        (
+            wire::NetRefusal::NoNetwork,
+            "the run started with nothing published, kept or linked past its microVM, which so has no network device".into(),
+        )
+    }
+
+    /// `asked` published as the run goes (D269): checked as its start checks its own
+    /// (`super::ports_granted`), bound as its start binds them (`publish::bind`), each binding
+    /// told its network process under a number of its own and held here. What it bound.
+    fn publish_live(
+        live: &Live<'_>,
+        ports: &mut Ports,
+        asked: &wire::Publish,
+    ) -> Result<Vec<wire::Bound>, (wire::NetRefusal, String)> {
+        use wire::NetRefusal as R;
+        let net = live.net.ok_or_else(no_network)?;
+        super::ports_granted(std::slice::from_ref(asked), live.agentfile, live.command)
+            .map_err(|super::No(_, why)| (R::Widening, why))?;
+        let bound = publish::bind(&[binding(asked)], &[], None, publish::v6_listenable(), |_, _| {
+            publish::InUse::Host
+        })
+        .map_err(|why| (R::Bind, why))?;
+        let at: Vec<(u16, u8, std::net::SocketAddr)> = bound
+            .listeners
+            .iter()
+            .map(|l| (l.guest_port, l.proto, l.at))
+            .collect();
+        let receivers = live.agentfile.map(|a| a.receivers.as_slice()).unwrap_or_default();
+        let bounds =
+            super::published(&at, receivers, live.members).map_err(|super::No(_, why)| (R::Image, why))?;
+        let first = ports.held.len();
+        if let Err(why) = ports.hold(bound.listeners, bounds) {
+            ports.held.truncate(first);
+            return Err((R::Network, why));
+        }
+        let unsent = ports.held.iter().enumerate().skip(first).find_map(|(i, port)| {
+            net.tell(
+                kind::NET_PUBLISHED,
+                &port.told(),
+                &[crate::netproc::lend(&port.socket)],
+            )
+            .err()
+            .map(|e| (i, e))
+        });
+        if let Some((i, e)) = unsent {
+            // Those its network process was not told are let go of; those it was are its.
+            ports.held.truncate(i);
+            return Err((R::Network, format!("its network process: {e}")));
+        }
+        Ok(ports.held.iter().skip(first).map(|p| p.bound.clone()).collect())
+    }
+
+    /// The run's grants past its microVM made `asked` as it goes (D273), within its image's:
+    /// checked as its start's are (`super::egress`, `super::held_apart`: a grant its image does
+    /// not give, or a member's reach other than its image lets it have, is a widening), told its
+    /// network process (`NET_GRANTS`), which holds every flow to them from then on and ends
+    /// those they no longer reach, and held here once it took them.
+    fn egress_live(live: &Live<'_>, asked: &wire::Narrowing) -> Result<(), (wire::NetRefusal, String)> {
+        use wire::NetRefusal as R;
+        let net = live.net.ok_or_else(no_network)?;
+        let refused = |super::No(cause, why)| match cause {
+            Cause::Widening => (R::Widening, why),
+            _ => (R::Image, why),
+        };
+        let grants = live.agentfile.map(|a| &a.grants);
+        let policy = super::egress(grants, asked).map_err(refused)?;
+        super::held_apart(live.agentfile, asked).map_err(refused)?;
+        let resolved = super::resolved(grants, asked).map_err(refused)?;
+        if !live.ceiled {
+            // Its image grants nothing past its microVM, which its network process was told
+            // as no policy: nothing can be granted, and nothing is what it holds.
+            if policy.is_some() {
+                return Err((R::Widening, "its image grants nothing past its microVM".into()));
+            }
+            *lock(&live.egress) = resolved;
+            return Ok(());
+        }
+        let said = net
+            .ask(kind::NET_GRANTS, policy.as_deref().unwrap_or_default())
+            .map_err(|why| (R::Network, why))?;
+        if said != [0] {
+            return Err((
+                R::Network,
+                format!(
+                    "its network process: {}",
+                    String::from_utf8_lossy(said.get(1..).unwrap_or_default())
+                ),
+            ));
+        }
+        *lock(&live.egress) = resolved;
+        Ok(())
+    }
+
+    /// The port the run publishes at `host` for `proto` let go of (D269): its network process
+    /// asked to close its copies (`NET_UNPUBLISHED`), then this one closed, which frees it.
+    /// What it let go of.
+    fn unpublish_live(
+        live: &Live<'_>,
+        ports: &mut Ports,
+        proto: wire::Proto,
+        host: std::net::SocketAddr,
+    ) -> Result<Vec<wire::Bound>, (wire::NetRefusal, String)> {
+        use wire::NetRefusal as R;
+        let net = live.net.ok_or_else(no_network)?;
+        let Some(i) = ports
+            .held
+            .iter()
+            .position(|p| p.bound.proto == proto && p.bound.host == host)
+        else {
+            return Err((
+                R::Unknown,
+                format!("the run publishes no {} port at {host}", proto_name(proto)),
+            ));
+        };
+        let id = ports
+            .held
+            .get(i)
+            .map(|p| p.id)
+            .ok_or_else(|| (R::Unknown, format!("{host}")))?;
+        net.ask(kind::NET_UNPUBLISHED, &id.to_be_bytes())
+            .map_err(|why| (R::Network, why))?;
+        Ok(vec![ports.held.remove(i).bound])
     }
 
     /// The run's managed output, owned here: each active member channel's credit and what
@@ -3347,8 +4111,8 @@ mod hosted {
         /// number; none once the VM's link has closed, as nothing will answer one then.
         lanes: Mutex<Option<LaneWaits>>,
         next_lane: std::sync::atomic::AtomicU64,
-        /// What is plugged into the run's members, by the path it is at.
-        plugged: Mutex<HashMap<String, Plugged>>,
+        /// What is plugged into the run's members, by the path it is at: each member's.
+        plugged: Mutex<HashMap<String, Vec<Plugged>>>,
         /// A plug/unplug's ownership turn, held through device and guest completion;
         /// replies never need this lock. The mounted registry stays readable meanwhile.
         plug_turn: Mutex<()>,
@@ -3361,11 +4125,30 @@ mod hosted {
         leasing: Option<super::Leasing<'a>>,
         /// Its save, as its VM is asked for one (D259).
         saving: Mutex<super::Saving>,
+        /// Its pause (D267).
+        pauses: Mutex<super::Pauses>,
+        /// Each pause or resume asked of the VM and not yet answered (`PAUSED`), as devices.
+        pause_asks: Mutex<Option<Vec<Asked<Unheld>>>>,
         /// The host directories its shares give its guest, canonical (D259).
         reached: &'a [PathBuf],
         /// What its own lanes of its agent-control endpoint are served with, where its
         /// orchestrator asked for the endpoint (D238, D252, D254).
         agent: Option<Agent>,
+        /// Its network process's control, where it has a network (D242, D269).
+        net: Option<&'a super::NetControl<'a>>,
+        /// The ports it publishes (D269).
+        ports: Mutex<Ports>,
+        /// Its grants past its microVM as they stand, written out whole (D273): held under its
+        /// ports' lock's turn, as every change of its network is.
+        egress: Mutex<wire::Narrowing>,
+        /// Whether its network process was told a ceiling (`NET_POLICY`): its image grants
+        /// something past its microVM (D273).
+        ceiled: bool,
+        /// Its image's Agentfile, which a port published is checked against and reaches its
+        /// members by (D122).
+        agentfile: Option<&'a crate::agentfile::Agentfile>,
+        /// It has a command of its own, which a port no member takes coming in reaches.
+        command: bool,
         /// On Windows the run's job, which each plug's share process is made in too.
         #[cfg(windows)]
         job: &'a shards_ipc::GroupJob,
@@ -3486,6 +4269,30 @@ mod hosted {
         }
         fn said(self) -> String {
             format!("its microVM: {self}")
+        }
+    }
+
+    /// Why its VM did not pause or let go on its vCPUs (`PAUSED`, D267), in its words.
+    #[derive(Debug)]
+    struct Unheld(String);
+
+    /// `PAUSED`: nothing for done, else why not.
+    impl VmRefusal for Unheld {
+        fn read(said: &[u8]) -> Result<String, Unheld> {
+            if said.is_empty() {
+                Ok(String::new())
+            } else {
+                Err(Unheld(String::from_utf8_lossy(said).into_owned()))
+            }
+        }
+        fn stopped() -> Unheld {
+            Unheld("its microVM stopped".into())
+        }
+        fn unsent(e: &std::io::Error) -> Unheld {
+            Unheld(format!("asking its microVM: {e}"))
+        }
+        fn said(self) -> Unheld {
+            Unheld(format!("its microVM: {}", self.0))
         }
     }
 
@@ -3654,9 +4461,13 @@ mod hosted {
     /// Windows its shares' streams after it (D197), then `TAKEN`; then `STOP_ORDER`, SIGKILL
     /// with no grace, so that a VM whose link closes, this process gone, ends its run.
     /// `trust` joins its setup: the run's CA for its members' trust (D242), known only now.
+    /// Hands its VM the run `plan`, which publishes ports where it has a network (`networked`):
+    /// its start's, and those its owner publishes as it goes (D269), each of which its VM has
+    /// its network process close as the run ends, before its end is told.
     fn hand_over(
         link: &Stream,
         plan: &Plan,
+        networked: bool,
         trust: &[Vec<u8>],
         client: &Stream,
         shares: Option<&Shares>,
@@ -3664,13 +4475,15 @@ mod hosted {
     ) -> Result<(), String> {
         let null = std::fs::File::open(crate::os::NULL).map_err(|e| format!("{}: {e}", crate::os::NULL))?;
         let err = io::stderr();
+        // Its guest's most to plug, its own, as a daemon run's request carries it (D148).
+        let plug = plan.prepared.plug_bytes();
         let payload = if trust.is_empty() {
-            super::run_request(&plan.prepared.spec, !plan.listeners.is_empty())
+            super::run_request(&plan.prepared.spec, plug, networked, super::timed())
         } else {
             let mut spec = plan.prepared.spec.clone();
             spec.setup.extend_from_slice(trust);
             crate::spec::fits(&spec)?;
-            super::run_request(&spec, !plan.listeners.is_empty())
+            super::run_request(&spec, plug, networked, super::timed())
         };
         // A stream's end as a message hands it on: borrowed on Unix, a handle of its own on
         // Windows (`shards_ipc::handed`).
@@ -3719,13 +4532,19 @@ mod hosted {
         Stream::plain_pair()
     }
 
-    fn launch_and_serve(answers: &Answers, input: super::Input, home: &Path, plan: Plan) -> Result<(), No> {
+    fn launch_and_serve(
+        answers: &Answers,
+        input: super::Input,
+        home: &Path,
+        plan: Plan,
+        checking: Checking,
+    ) -> Result<(), No> {
         super::say(format_args!(
             "prepared {}, {} vCPUs, {} MiB; starting its VM",
             plan.prepared.image_id, plan.prepared.size.0, plan.prepared.size.1
         ));
         let mut reported = None;
-        let launched = launch(home, &plan.launch(), &mut reported);
+        let launched = launch(home, &plan.launch(), checking, &mut reported);
         // Its VM's GPU report (D233), relayed before its start, or before its refusal where its
         // VM did not start.
         if let Some(frame) = reported
@@ -3736,22 +4555,39 @@ mod hosted {
             }
             return Err(No(Cause::Boot, format!("its orchestrator: {e}")));
         }
-        serve_launched(answers, input, home, plan, launched?)
+        serve_launched(answers, input, home, plan, launched?, None)
+    }
+
+    /// What VM process `vm` costs its host (D241's `HostUse`): read at once, as the run's
+    /// stats and a warm host's `USED` alike read it, never asking its guest.
+    fn host_use(vm: u32) -> Result<wire::HostUse, String> {
+        shards_vmm::platform::process_usage(vm)
+            .map(|u| wire::HostUse {
+                cpu_ns: u.cpu_ns,
+                resident_bytes: u.resident,
+                footprint_bytes: u.footprint,
+                // Another process's count: its vCPUs' clocks are its own (D265).
+                charged: wire::Charged::Unknown,
+            })
+            .map_err(|e| format!("its VM process: {e}"))
     }
 
     /// A warm run host (D253's pools): its microVM made of `exemplar` and started, and once
     /// ready said (`WARMED`); then its run, as it comes (`CREATE`), served as any run of this
-    /// process is, its start said `Warm`. A run of another microVM's than its exemplar's is
-    /// refused `Unfit`, for its orchestrator to start a host of its own for it; its channel
-    /// closed first ends it, its pool having let it go.
+    /// process is, its start said `Warm`. Meanwhile each `USE` is answered `USED`, its VM
+    /// process's use as its run's stats would tell it. A run of another microVM's than its
+    /// exemplar's is refused `Unfit`, for its orchestrator to start a host of its own for it;
+    /// any other frame refuses it, and its channel closed first ends it, its pool having let
+    /// it go.
     pub(super) fn warm(
         answers: &Answers,
         exemplar: &wire::Request,
         mut input: super::Input,
     ) -> Result<(), No> {
+        let mut checking = Checking::begin();
         let home = shards_ipc::home().map_err(no(Cause::Boot))?;
-        let mut shaped = shape(exemplar, &home)?;
-        let launched = match launch(&home, &shaped.launch(), &mut None) {
+        let mut shaped = shape(exemplar, &home, &mut checking)?;
+        let launched = match launch(&home, &shaped.launch(), checking, &mut None) {
             Ok(launched) => launched,
             Err(e) => {
                 end(&home, None, &shaped.made);
@@ -3761,6 +4597,10 @@ mod hosted {
         // The ready VM holds its rootfs and settled template files itself (D26).
         // An idle spare must not keep unrelated collection waiting for its CREATE.
         drop(shaped.prepared.lease.take());
+        // Its endpoint's key, its VM started, made as it waits for a run that may ask for one
+        // (D252); none made here is made again as its endpoint binds, refused there as before.
+        let premade = ControlKey::made().ok();
+        super::step(format_args!("its agent-control key made"));
         super::say(format_args!(
             "warm, its VM process {} ready ({:?})",
             launched.vm.id(),
@@ -3772,14 +4612,26 @@ mod hosted {
             answers
                 .send(wire::to_client::WARMED, &[&wire::warmed(launched.from)])
                 .map_err(|e| No(Cause::Boot, format!("its orchestrator: {e}")))?;
-            let request = match input.next() {
-                Ok(Some(frame)) if frame.kind == wire::to_host::CREATE => {
-                    wire::Request::decode(&frame).map_err(|e| No(Cause::Request, e.to_string()))?
+            let vm = launched.vm.id();
+            let request = loop {
+                match input.next() {
+                    Ok(Some(frame)) if frame.kind == wire::to_host::CREATE => {
+                        break wire::Request::decode(&frame)
+                            .map_err(|e| No(Cause::Request, e.to_string()))?;
+                    }
+                    Ok(Some(frame)) if frame.kind == wire::to_host::USE => {
+                        wire::read_use(&frame).map_err(|e| No(Cause::Request, e.to_string()))?;
+                        let used = wire::used(&host_use(vm)).map_err(|e| No(Cause::Boot, e.to_string()))?;
+                        answers
+                            .send(wire::to_client::USED, &[&used])
+                            .map_err(|e| No(Cause::Boot, format!("its orchestrator: {e}")))?;
+                    }
+                    Ok(Some(frame)) => return Err(super::before_request(frame.kind)),
+                    Ok(None) => return Ok(None),
+                    Err(e) => return Err(No(Cause::Request, format!("the request: {e}"))),
                 }
-                Ok(Some(frame)) => return Err(super::before_request(frame.kind)),
-                Ok(None) => return Ok(None),
-                Err(e) => return Err(No(Cause::Request, format!("the request: {e}"))),
             };
+            super::step(format_args!("its run's request read"));
             input.shed();
             if request.exemplar() != *exemplar {
                 return Err(No(
@@ -3819,7 +4671,7 @@ mod hosted {
         };
         let mut launched = launched;
         launched.from = wire::StartedFrom::Warm;
-        serve_launched(answers, input, &home, plan, launched)
+        serve_launched(answers, input, &home, plan, launched, premade)
     }
 
     /// Ends what of a run was made: its processes, `launched` (its VM killed, then each reaped
@@ -3874,6 +4726,7 @@ mod hosted {
         home: &Path,
         mut plan: Plan,
         mut launched: Launched,
+        mut premade: Option<ControlKey>,
     ) -> Result<(), No> {
         // Readiness and template settlement ended the preparation lease's work.
         drop(plan.prepared.lease.take());
@@ -3885,14 +4738,29 @@ mod hosted {
         ));
         // Its share process's notices (D235), given its guest as its run starts.
         let due = launched.shares.as_mut().and_then(|s| s.notices.take());
+        let listeners = std::mem::take(&mut plan.listeners);
         let served = (|| -> Result<(), No> {
+            // Its published ports, each held under a number of its own (D269), by which its
+            // owner may let it go as the run goes.
+            let bound: Vec<(u16, u8, std::net::SocketAddr)> =
+                listeners.iter().map(|l| (l.guest_port, l.proto, l.at)).collect();
+            let receivers = plan
+                .prepared
+                .agentfile
+                .as_ref()
+                .map(|a| a.receivers.as_slice())
+                .unwrap_or_default();
+            let published = super::published(&bound, receivers, &plan.members)?;
+            let mut ports = Ports::default();
+            ports.hold(listeners, published).map_err(boot)?;
             // The run's CA for its members' trust (D242), once its network process made it.
             let mut trust = Vec::new();
             if let Some((_, control)) = &launched.net {
                 let ca = tell_net(
                     control,
                     plan.address.as_deref(),
-                    &plan.listeners,
+                    &ports.held,
+                    plan.ceiling.as_deref(),
                     plan.egress.as_deref(),
                     plan.sign_ins.as_deref(),
                     plan.credentials.as_deref(),
@@ -3916,27 +4784,16 @@ mod hosted {
             hand_over(
                 &launched.link,
                 &plan,
+                launched.net.is_some(),
                 &trust,
                 &client_theirs,
                 launched.shares.as_ref(),
                 capture.as_ref().map(|(_, theirs)| theirs),
             )
             .map_err(boot)?;
-            let bound: Vec<(u16, u8, std::net::SocketAddr)> = plan
-                .listeners
-                .iter()
-                .map(|l| (l.guest_port, l.proto, l.at))
-                .collect();
-            let receivers = plan
-                .prepared
-                .agentfile
-                .as_ref()
-                .map(|a| a.receivers.as_slice())
-                .unwrap_or_default();
-            let published = super::published(&bound, receivers, &plan.members)?;
-            // Its agent-control endpoint (D252), its key made now, past its VM's start, held by
-            // the endpoint alone: no template, and no other run, has it; and what its own lanes
-            // are served with.
+            // Its agent-control endpoint (D252), its key made past its VM's start (`ControlKey`),
+            // held by the endpoint alone once bound: no template, and no other run, has it; and
+            // what its own lanes are served with.
             let agent = plan
                 .control
                 .as_ref()
@@ -3944,14 +4801,20 @@ mod hosted {
                 .transpose()
                 .map_err(boot)?;
             let control = match (plan.control.as_ref(), agent.as_ref()) {
-                (Some(ask), Some(agent)) => Some(bind_control(ask, agent.admissions).map_err(boot)?),
+                (Some(ask), Some(agent)) => {
+                    let key = control_key(premade.take()).map_err(boot)?;
+                    let bound = bind_control(key, ask, agent.admissions).map_err(boot)?;
+                    super::step(format_args!("its agent-control endpoint bound"));
+                    Some(bound)
+                }
                 _ => None,
             };
             let started = wire::Started {
                 members: plan.members.clone(),
-                published,
+                published: ports.published(),
                 control: control.as_ref().map(|(endpoint, _)| control_at(endpoint)),
                 from: launched.from,
+                egress: plan.narrowing.clone(),
             }
             .encode()
             .map_err(|e| boot(e.to_string()))?;
@@ -3959,15 +4822,18 @@ mod hosted {
                 .link
                 .try_clone()
                 .map_err(|e| boot(format!("the VM's link: {e}")))?;
-            // Its credentials' leases (D242), where it has grants and so a network process.
-            let leasing = launched
+            // Its network process's control as the run goes on (D242, D269), and its
+            // credentials' leases, where it has grants and so a network process.
+            let net = launched
                 .net
                 .as_ref()
+                .map(|(_, control)| super::NetControl::new(control));
+            let leasing = net
+                .as_ref()
                 .filter(|_| plan.credentials.is_some())
-                .map(|(_, control)| super::Leasing {
+                .map(|net| super::Leasing {
                     ledger: Mutex::new(super::Ledger::new(plan.granted.clone(), plan.signing.clone())),
-                    net: control,
-                    sending: Mutex::new(()),
+                    net,
                 });
             let live = Live {
                 answers,
@@ -3994,18 +4860,27 @@ mod hosted {
                 notices: Mutex::new(Vec::new()),
                 leasing,
                 saving: Mutex::new(super::Saving::Idle),
+                pauses: Mutex::new(super::Pauses::new()),
+                pause_asks: Mutex::new(Some(Vec::new())),
                 reached: &plan.reached,
                 agent,
+                net: net.as_ref(),
+                ports: Mutex::new(ports),
+                egress: Mutex::new(plan.narrowing.clone()),
+                ceiled: plan.ceiling.is_some(),
+                agentfile: plan.prepared.agentfile.as_ref(),
+                command: plan.command,
                 #[cfg(windows)]
                 job: &launched.job,
             };
             answers
                 .send(wire::to_client::STARTED, &[&started])
                 .map_err(|e| boot(format!("its orchestrator: {e}")))?;
+            super::step(format_args!("its start told its orchestrator"));
             serve(&live, input, &launched, client, control);
             // What was plugged in goes with the VM: each share process ends as its streams
             // close (`Shares::end`).
-            for (_, p) in std::mem::take(&mut *lock(&live.plugged)) {
+            for p in std::mem::take(&mut *lock(&live.plugged)).into_values().flatten() {
                 p.share.end(&live.ends);
             }
             Ok(())
@@ -4030,6 +4905,9 @@ mod hosted {
         client: Stream,
         control: Option<(shards_remote::control::Endpoint, shards_remote::control::Served)>,
     ) {
+        if super::timed() {
+            timing_line(&client);
+        }
         std::thread::scope(|scope| {
             // Its agent-control endpoint's driver, and its socket lanes, each opened through the
             // VM (D251, D252); revoked as the run's asks end, which ends both.
@@ -4088,14 +4966,19 @@ mod hosted {
                     let _ = writeln!(io::stderr(), "shards api-run: its members' output: {e}");
                 }
             }
-            // Its network process's asks for leases (D242), relayed until that process ends
-            // with the VM. With none relayed, a flow that needs a value waits out the run.
-            if let Some(leasing) = &live.leasing {
+            // Its network process's control, read until that process ends with the VM (D242,
+            // D269): its asks for leases relayed, and its answers to this host's own asks handed
+            // back. With none read, a flow that needs a value waits out the run, and a change of
+            // its network is refused.
+            if let Some(net) = live.net {
                 let started = std::thread::Builder::new()
-                    .name("api-run leases".into())
-                    .spawn_scoped(scope, move || super::relay(leasing, live.answers));
+                    .name("api-run net".into())
+                    .spawn_scoped(scope, move || {
+                        super::relay(net, live.leasing.as_ref(), live.answers)
+                    });
                 if let Err(e) = started {
-                    let _ = writeln!(io::stderr(), "shards api-run: its credentials' leases: {e}");
+                    let _ = writeln!(io::stderr(), "shards api-run: its network process's control: {e}");
+                    net.closed();
                 }
             }
             let following = std::thread::Builder::new()
@@ -4113,6 +4996,7 @@ mod hosted {
                     let end = wire::RunEnded {
                         end: super::ended_by(asks.as_ref(), end, said),
                         final_use: super::final_use(used.as_deref(), asks.as_ref()),
+                        paused: lock(&live.pauses).paused(Instant::now()).total,
                     };
                     // Every end of the run's comes here, its leases released before it is said:
                     // its own command's, `STOP`, its owner's channel closed, its VM gone.
@@ -4141,28 +5025,83 @@ mod hosted {
         drop(client);
     }
 
-    /// Its VM gone and its end said, a run's network process that relays its leases (D242)
-    /// reaped as the run's end reaps it (`netproc::reap`: followed while it goes on with its
-    /// end, then ended): so that its control closes, and the relay of its asks with it,
-    /// whatever that process does.
+    /// Says its VM's timing line (`RUN_TIMING`), which comes in its `EXIT` on the run's client
+    /// as its command ends, its guest's markers in it: read on a thread of its own, not the
+    /// run's scope's, as no `EXIT` comes of a VM killed (a `STOP`) and this process holds the
+    /// VM's end of the client until its run is over; it goes as this process does.
+    fn timing_line(client: &Stream) {
+        let reading = client.try_clone().and_then(|client| {
+            std::thread::Builder::new()
+                .name("api-run timing".into())
+                .spawn(move || {
+                    if let Ok(Some(m)) = shards_ipc::recv(&client)
+                        && m.kind == kind::EXIT
+                        && let Some((_, line)) = m.payload.split_first()
+                        && !line.is_empty()
+                    {
+                        super::say(format_args!(
+                            "its VM's timing line: {}",
+                            String::from_utf8_lossy(line)
+                        ));
+                    }
+                })
+        });
+        if let Err(e) = reading {
+            super::say(format_args!("its VM's timing line is not read: {e}"));
+        }
+    }
+
+    /// Its VM gone and its end said, a run's network process, whose control is read for the
+    /// run's life (D242, D269), reaped as the run's end reaps it (`netproc::reap`: followed
+    /// while it goes on with its end, then ended): so that its control closes, and the reading
+    /// of it with it, whatever that process does.
     fn net_gone(live: &Live<'_>, launched: &Launched) {
-        if live.leasing.is_some()
+        if live.net.is_some()
             && let Some((child, _)) = &launched.net
         {
             crate::netproc::reap(child, &live.ends);
         }
     }
 
+    /// The microVM's own key for its run's agent-control endpoint (D252): made once its VM has
+    /// started, never in its guest's memory nor a template's, held by its run host until its
+    /// endpoint takes it as it binds ([`bind_control`]), then by the endpoint alone. A warm
+    /// host makes its one as it waits for its run, which may ask for an endpoint: a host
+    /// serves one run, so no two runs share one, and a warm run binds without making one on
+    /// its way.
+    pub(super) struct ControlKey(shards_remote::identity::Identity);
+
+    impl ControlKey {
+        pub(super) fn made() -> Result<ControlKey, String> {
+            shards_remote::identity::Identity::generate()
+                .map(ControlKey)
+                .map_err(|e| format!("its microVM's key: {e}"))
+        }
+
+        /// The SHA-256 its controller pins of it, which its endpoint says once bound.
+        #[cfg(test)]
+        pub(super) fn fingerprint(&self) -> shards_remote::identity::Fingerprint {
+            self.0.fingerprint()
+        }
+    }
+
+    /// The key a run's endpoint takes: the one its warm host made as it waited, else one made
+    /// now, its VM started; refused where none can be made.
+    pub(super) fn control_key(premade: Option<ControlKey>) -> Result<ControlKey, String> {
+        premade.map_or_else(ControlKey::made, Ok)
+    }
+
     /// The run's agent-control endpoint (D252), bound on loopback, as step 5's endpoints bind:
-    /// its microVM's own key, made now, and the controller's key the one it takes; serving the
-    /// run's socket lanes where its ask grants them (D251), and its execs, its members' MCP
-    /// connections (D254) and its members' own lanes, their streams admitted as `execs` says.
+    /// its microVM's own key `key`, which it takes, and the controller's key the one it admits;
+    /// serving the run's socket lanes where its ask grants them (D251), and its execs, its
+    /// members' MCP connections (D254) and its members' own lanes, their streams admitted as
+    /// `execs` says.
     pub(super) fn bind_control(
+        key: ControlKey,
         ask: &wire::ControlAsk,
         execs: shards_remote::control::exec::Admissions,
     ) -> Result<(shards_remote::control::Endpoint, shards_remote::control::Served), String> {
-        let vm =
-            shards_remote::identity::Identity::generate().map_err(|e| format!("its microVM's key: {e}"))?;
+        let ControlKey(vm) = key;
         let sockets = ask
             .sockets
             .as_ref()
@@ -4494,6 +5433,7 @@ mod hosted {
             } else if m.kind == kind::UNSERVED {
                 told.unserved = Some(String::from_utf8_lossy(&m.payload).into_owned());
             } else if m.kind == kind::STARTED {
+                super::step(format_args!("its VM said STARTED"));
                 told.started = true;
                 if let Some(agent) = &live.agent {
                     agent.stands(Begun::Started);
@@ -4521,6 +5461,8 @@ mod hosted {
                 answered(&live.rates, &m.payload);
             } else if m.kind == kind::SAVED {
                 lock(&live.saving).answered(&m.payload);
+            } else if m.kind == kind::PAUSED {
+                answered(&live.pause_asks, &m.payload);
             } else if m.kind == kind::MANAGED_INPUT {
                 input_arrived(live, &m.payload, m.fds);
             } else if m.kind == kind::MANAGED_INPUT_ENDED {
@@ -4562,7 +5504,9 @@ mod hosted {
         *lock(&live.devices) = None;
         *lock(&live.guest_times) = None;
         *lock(&live.rates) = None;
+        *lock(&live.pause_asks) = None;
         lock(&live.saving).gone();
+        lock(&live.pauses).gone(Instant::now());
         // Socket lanes no answer will come for: their asks hear the VM has gone.
         lock(&live.lanes).take();
         // Its VM gone: its own lanes hear the run is over, and what its members' bridges held
@@ -4667,9 +5611,14 @@ mod hosted {
                 super::refreshed(leasing, payload).map_err(|e| super::broke(format_args!("{e}")))?;
             }
             // On a thread of its own: an exec its guest is slow to answer holds up no
-            // credit and no stop.
+            // credit and no stop. Its command's or a member's, an ask of its guest, refused at
+            // once while it is paused (D267); the run's answered then from what it said as it
+            // paused.
             Ask::Stats(ask) => {
                 let vm = vm.id();
+                if !matches!(ask.scope, wire::StatsScope::Run) && !lock(&live.pauses).guest_runs() {
+                    return refused_paused(live, ask.id);
+                }
                 let asked = std::thread::Builder::new()
                     .name("api-run stats".into())
                     .spawn_scoped(scope, move || stats(live, ask, vm));
@@ -4682,6 +5631,9 @@ mod hosted {
             // On a thread of its own, as stats: a guest slow to hold its run holds up
             // nothing else.
             Ask::Room(ask) => {
+                if !lock(&live.pauses).guest_runs() {
+                    return refused_paused(live, ask.id);
+                }
                 let asked = std::thread::Builder::new()
                     .name("api-run room".into())
                     .spawn_scoped(scope, move || held(live, ask.id, room(live, ask.room)));
@@ -4702,6 +5654,9 @@ mod hosted {
             // On a thread of its own, as a room: a guest slow to size a member's terminal
             // holds up nothing else (D244).
             Ask::Resize(ask) => {
+                if !lock(&live.pauses).guest_runs() {
+                    return refused_paused(live, ask.id);
+                }
                 let asked = std::thread::Builder::new()
                     .name("api-run resize".into())
                     .spawn_scoped(scope, move || resized(live, ask.id, resize(live, ask)));
@@ -4712,6 +5667,9 @@ mod hosted {
             // On a thread of its own, as stats: a plug's guest steps hold up nothing else.
             Ask::Plug(ask) => {
                 let id = ask.id;
+                if !lock(&live.pauses).guest_runs() {
+                    return refused_paused(live, id);
+                }
                 let asked = std::thread::Builder::new()
                     .name("api-run plug".into())
                     .spawn_scoped(scope, move || plugged(live, id, plug(live, &ask)));
@@ -4739,13 +5697,16 @@ mod hosted {
             }
             Ask::Unplug(ask) => {
                 let id = ask.id;
+                if !lock(&live.pauses).guest_runs() {
+                    return refused_paused(live, id);
+                }
                 let asked = std::thread::Builder::new()
                     .name("api-run unplug".into())
                     .spawn_scoped(scope, move || {
-                        let (result, share) = unplug(live, &ask);
+                        let (result, shares) = unplug(live, &ask);
                         plugged(live, id, result);
-                        // Its share process ends as its device's stream closes.
-                        if let Some(share) = share {
+                        // Each share process ends as its device's stream closes.
+                        for share in shares {
                             share.end(&live.ends);
                         }
                     });
@@ -4757,8 +5718,200 @@ mod hosted {
                     );
                 }
             }
+            Ask::Pause(ask) => pause_asked(live, ask, vm.id(), scope),
+            // On a thread of its own, as a plug: a network process slow to answer holds up
+            // nothing else. Made while the run is paused too: its network process makes it,
+            // which the pause does not hold (D267, D269).
+            Ask::Net(ask) => {
+                let id = ask.id;
+                let asked = std::thread::Builder::new()
+                    .name("api-run net".into())
+                    .spawn_scoped(scope, move || net_change(live, ask));
+                if asked.is_err() {
+                    net_answered(
+                        live,
+                        id,
+                        Err((wire::NetRefusal::Network, "no thread to make it on".into())),
+                    );
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Ask `id` refused at once, its run paused or pausing (`ASK_PAUSED`, D267).
+    fn refused_paused(live: &Live<'_>, id: u32) -> Result<(), super::AsksEnd> {
+        let _ = live
+            .answers
+            .send(wire::to_client::ASK_PAUSED, &[&wire::AskPaused { id }.encode()]);
+        Ok(())
+    }
+
+    /// A pause or a resume asked (D267), queued behind those before it and applied in their
+    /// order by one worker on a thread of its own, made as one is asked with none at work and
+    /// ending once none is left: a pause waits on its guest's asks and its VM, which hold up no
+    /// other ask.
+    fn pause_asked<'scope, 'env>(
+        live: &'env Live<'env>,
+        ask: wire::PauseAsk,
+        vm: u32,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+    ) {
+        {
+            let mut pauses = lock(&live.pauses);
+            pauses.queue.push_back(ask);
+            if std::mem::replace(&mut pauses.draining, true) {
+                return;
+            }
+        }
+        let worked = std::thread::Builder::new()
+            .name("api-run pause".into())
+            .spawn_scoped(scope, move || pauses_worked(live, vm, scope));
+        if worked.is_err() {
+            let asked: Vec<wire::PauseAsk> = {
+                let mut pauses = lock(&live.pauses);
+                pauses.draining = false;
+                pauses.queue.drain(..).collect()
+            };
+            for ask in asked {
+                pause_answered(live, ask.id, Err("no thread to ask it on".into()), vm);
+            }
+        }
+    }
+
+    /// Applies the pauses and resumes asked, in their order, until none is left: VM process `vm`
+    /// held while each answer says the run is paused.
+    fn pauses_worked<'scope, 'env>(
+        live: &'env Live<'env>,
+        vm: u32,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+    ) {
+        loop {
+            let next = {
+                let mut pauses = lock(&live.pauses);
+                let next = pauses.queue.pop_front();
+                if next.is_none() {
+                    pauses.draining = false;
+                }
+                next
+            };
+            let Some(ask) = next else {
+                return;
+            };
+            let done = if ask.pause {
+                pause(live)
+            } else {
+                resume(live, scope)
+            };
+            pause_answered(live, ask.id, done, vm);
+        }
+    }
+
+    /// A pause's or a resume's outcome, told its owner (`PAUSED`), with VM process `vm` where
+    /// it says the run is paused.
+    fn pause_answered(live: &Live<'_>, id: u32, result: Result<wire::Paused, String>, vm: u32) {
+        let held = match &result {
+            Ok(paused) if paused.now => vec![vm],
+            _ => Vec::new(),
+        };
+        if let Ok(payload) = (wire::PauseAnswer { id, result, held }).encode() {
+            let _ = live.answers.send(wire::to_client::PAUSED, &[&payload]);
+        }
+    }
+
+    /// The run paused (D267): asks of its guest refused from now, its VM asked to hold every
+    /// vCPU at once (`PAUSE`, as the daemon's `pause` asks it), its paused time counted from its
+    /// word. Nothing of it waits on its guest, which may be slow or hung: an ask of it already
+    /// under way is answered as it goes on. Done already where it is paused.
+    fn pause(live: &Live<'_>) -> Result<wire::Paused, String> {
+        match lock(&live.pauses).pause(Instant::now()) {
+            super::Step::Done(paused) => return Ok(paused),
+            super::Step::Gone => return Err("its microVM has stopped".into()),
+            super::Step::Ask => {}
+        }
+        let held = ask_pause(live, true);
+        let mut pauses = lock(&live.pauses);
+        let paused = match held {
+            Ok(()) => pauses
+                .held(Instant::now())
+                .ok_or_else(|| "its microVM has stopped".to_string()),
+            Err(why) => {
+                pauses.unheld();
+                Err(why)
+            }
+        };
+        drop(pauses);
+        paused
+    }
+
+    /// The paused run goes on where it stopped (D267): its VM asked to let its vCPUs go
+    /// (`PAUSE`), the pause's time ended at its word; then its init asked, on a thread of its
+    /// own, to set its clock to its host's (`builtin::CLOCK`, as a restored VM sets its own), so
+    /// that a step its host's clock took meanwhile is its too, holding up nothing. Done already
+    /// where it runs.
+    fn resume<'scope, 'env>(
+        live: &'env Live<'env>,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+    ) -> Result<wire::Paused, String> {
+        match lock(&live.pauses).resume(Instant::now()) {
+            super::Step::Done(paused) => return Ok(paused),
+            super::Step::Gone => return Err("its microVM has stopped".into()),
+            super::Step::Ask => {}
+        }
+        let went = ask_pause(live, false);
+        let mut pauses = lock(&live.pauses);
+        let resumed = match went {
+            Ok(()) => pauses
+                .resumed(Instant::now())
+                .ok_or_else(|| "its microVM has stopped".to_string()),
+            Err(why) => {
+                pauses.unresumed();
+                Err(why)
+            }
+        };
+        drop(pauses);
+        if resumed.is_ok() {
+            let synced = std::thread::Builder::new()
+                .name("api-run clock".into())
+                .spawn_scoped(scope, move || {
+                    match builtin(live, protocol::builtin::CLOCK, Vec::new()) {
+                        Ok(Said { status: Some(0), .. }) => {}
+                        Ok(Said { err, .. }) => super::say(format_args!(
+                            "setting its clock as it went on: {}",
+                            String::from_utf8_lossy(&err).trim_end()
+                        )),
+                        Err(e) => super::say(format_args!("setting its clock as it went on: {e}")),
+                    }
+                });
+            if let Err(e) = synced {
+                super::say(format_args!("setting its clock as it went on: {e}"));
+            }
+        }
+        resumed
+    }
+
+    /// Asks the VM to hold every vCPU out of its guest (`frozen`) or let them go on, as the
+    /// daemon's `pause_vm` asks it (`PAUSE`: whether, then its number), and waits for its answer
+    /// (`PAUSED`: its number, then nothing, or why not), which comes as long as its link is open.
+    fn ask_pause(live: &Live<'_>, frozen: bool) -> Result<(), String> {
+        let number = live.next_exec.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (told, answer) = std::sync::mpsc::channel();
+        match lock(&live.pause_asks).as_mut() {
+            Some(asked) => asked.push((number, told)),
+            None => return Err(Unheld::stopped().0),
+        }
+        let ask = [&[u8::from(frozen)][..], &number.to_be_bytes()].concat();
+        if let Err(e) = shards_ipc::send(&lock(&live.link), kind::PAUSE, &ask, &[]) {
+            if let Some(asked) = lock(&live.pause_asks).as_mut() {
+                asked.retain(|(n, _)| *n != number);
+            }
+            return Err(Unheld::unsent(&e).0);
+        }
+        answer
+            .recv()
+            .unwrap_or_else(|_| Err(Unheld::stopped()))
+            .map(drop)
+            .map_err(|why| why.said().0)
     }
 
     /// A member's input connection, as its VM handed it over (`MANAGED_INPUT`): on Unix beside
@@ -5058,22 +6211,33 @@ mod hosted {
     /// for the run's, beside it what its microVM costs its host (D43's `microvm`, D241): its
     /// vCPUs' guest time, then its VM process `vm`'s use, which holds that time, so that the
     /// later read is never the less.
+    ///
+    /// The run's, while it is paused (D267), with what its init last said of it before the pause,
+    /// its guest running nothing since, its microVM read as it stands; its command's and a
+    /// member's are refused before this where it is paused. Each run's init answers is kept as
+    /// its last.
     fn stats(live: &Live<'_>, ask: wire::StatsAsk, vm: u32) {
-        let answer = |result: Result<(&[u8], Option<&wire::Microvm>), &str>| {
+        let answer = |result: Result<wire::StatsSaid<'_>, &str>| {
             if let Ok(payload) = wire::StatsAnswer::encode(ask.id, result) {
                 let _ = live.answers.send(wire::to_client::STATS, &[&payload]);
             }
         };
         let microvm = || wire::Microvm {
             guest: guest_times(live),
-            host: shards_vmm::platform::process_usage(vm)
-                .map(|u| wire::HostUse {
-                    cpu_ns: u.cpu_ns,
-                    resident_bytes: u.resident,
-                    footprint_bytes: u.footprint,
-                })
-                .map_err(|e| format!("its VM process: {e}")),
+            host: host_use(vm),
         };
+        let run = matches!(ask.scope, wire::StatsScope::Run);
+        if run {
+            let pauses = lock(&live.pauses);
+            if let Some(said) = pauses.said() {
+                // Its init's last lines, or none where it said none before: its microVM's
+                // part stands either way.
+                let lines = said.map(<[u8]>::to_vec).unwrap_or_default();
+                let paused = pauses.paused(Instant::now());
+                drop(pauses);
+                return answer(Ok((&lines, Some(&microvm()), Some(&paused))));
+            }
+        }
         let args: Vec<Vec<u8>> = match ask.scope {
             wire::StatsScope::Command => Vec::new(),
             wire::StatsScope::Run => vec![protocol::builtin::stats::RUN.to_vec()],
@@ -5086,8 +6250,13 @@ mod hosted {
             Ok(Said {
                 status: Some(0), out, ..
             }) => {
-                let microvm = matches!(ask.scope, wire::StatsScope::Run).then(microvm);
-                answer(Ok((&out, microvm.as_ref())))
+                let microvm = run.then(microvm);
+                let paused = run.then(|| {
+                    let mut pauses = lock(&live.pauses);
+                    pauses.last = Some(out.clone());
+                    pauses.paused(Instant::now())
+                });
+                answer(Ok((&out, microvm.as_ref(), paused.as_ref())))
             }
             Ok(Said { err, .. }) => answer(Err(String::from_utf8_lossy(&err).trim_end())),
             Err(e) => answer(Err(&e)),
@@ -5135,7 +6304,7 @@ mod hosted {
             ));
         }
         let mut reached = live.reached.to_vec();
-        reached.extend(lock(&live.plugged).values().map(|p| p.host.clone()));
+        reached.extend(lock(&live.plugged).values().flatten().map(|p| p.host.clone()));
         let target = super::destination(Path::new(to), live.home, &reached)?;
         let said = lock(&live.saving).ask()?;
         if let Err(refused) = super::made(&target) {
@@ -5321,30 +6490,25 @@ mod hosted {
         }
     }
 
-    /// `ask`'s host directory plugged into its member (D235), as `shards plug volume --for`
-    /// plugs one into a daemon's run (daemon/devices.rs): checked here, and by its guest's
-    /// init again; served by a share process of its own; plugged into the microVM's bus;
-    /// then mounted in the member at its path by init, the host's files the member's.
+    /// `ask`'s source plugged into each of its members (D235, D271), as `shards plug volume
+    /// --for` plugs one into a daemon's run (daemon/devices.rs): checked here, and by its
+    /// guest's init again; each member's its own device, served by a share process of its own,
+    /// plugged into the microVM's bus and mounted in the member at its path by init, the host's
+    /// files the member's. A member that refuses it has those given it first let go of it.
     fn plug(live: &Live<'_>, ask: &wire::PlugAsk) -> Result<(), (wire::PlugRefusal, String)> {
         use wire::PlugRefusal as R;
-        let member = live
-            .members
-            .iter()
-            .find(|m| m.index == ask.member)
-            .ok_or_else(|| {
-                (
-                    R::Request,
-                    format!("member {}: the image declares none", ask.member),
-                )
-            })?;
-        if !member.runs {
-            return Err((
-                R::Member,
-                format!("{}: files alone, it runs nothing", member.name),
-            ));
-        }
-        if !Path::new(&ask.host).is_absolute() {
-            return Err((R::Request, format!("{}: not an absolute path", ask.host)));
+        for &index in &ask.members {
+            let member = live
+                .members
+                .iter()
+                .find(|m| m.index == index)
+                .ok_or_else(|| (R::Request, format!("member {index}: the image declares none")))?;
+            if !member.runs {
+                return Err((
+                    R::Member,
+                    format!("{}: files alone, it runs nothing", member.name),
+                ));
+            }
         }
         let roots: Vec<&[u8]> = live.roots.iter().map(Vec::as_slice).collect();
         match protocol::plug::beneath(ask.at.as_bytes(), &roots) {
@@ -5361,16 +6525,85 @@ mod hosted {
         if lock(&live.plugged).contains_key(&ask.at) {
             return Err((R::Taken, format!("{} has something plugged in already", ask.at)));
         }
-        let dir = shards_vmm::platform::open_dir(Path::new(&ask.host))
-            .map_err(|e| (R::Host, format!("{}: {e}", ask.host)))?;
+        let host = source_dir(live, &ask.from, &ask.at)?;
+        let mut given: Vec<Plugged> = Vec::with_capacity(ask.members.len());
+        for &member in &ask.members {
+            match plug_one(live, member, &host, &ask.at, ask.read_only) {
+                Ok(plugged) => given.push(plugged),
+                Err(refused) => {
+                    // Those given it first let go of it: none of theirs has used it yet, and
+                    // one that has keeps it, for an unplug to let go of.
+                    let (kept, _, gone) = unplug_each(live, given, &ask.at);
+                    for share in gone {
+                        share.end(&live.ends);
+                    }
+                    if !kept.is_empty() {
+                        lock(&live.plugged).insert(ask.at.clone(), kept);
+                    }
+                    return Err(refused);
+                }
+            }
+        }
+        lock(&live.plugged).insert(ask.at.clone(), given);
+        Ok(())
+    }
+
+    /// The host directory a plug gives (D271): the one named, absolute; or the data of the
+    /// home's volume named, made where it is not there, as a run's `-v NAME:PATH` makes one,
+    /// and refused where its store refuses a run's own mount of it at `at` (D109's scoped
+    /// volumes, another microVM's engine's).
+    fn source_dir(
+        live: &Live<'_>,
+        from: &wire::PlugFrom,
+        at: &str,
+    ) -> Result<PathBuf, (wire::PlugRefusal, String)> {
+        use wire::PlugRefusal as R;
+        match from {
+            wire::PlugFrom::Host(host) => {
+                if !Path::new(host).is_absolute() {
+                    return Err((R::Request, format!("{host}: not an absolute path")));
+                }
+                Ok(PathBuf::from(host))
+            }
+            wire::PlugFrom::Volume(name) => {
+                let store = crate::volumes::Store::new(live.home);
+                crate::volumes::Store::valid(name).map_err(|e| (R::Volume, e))?;
+                let _held = crate::volumes::lock();
+                let (volume, _) = store
+                    .create(
+                        name,
+                        &std::collections::BTreeMap::new(),
+                        &std::collections::BTreeMap::new(),
+                        "",
+                    )
+                    .map_err(|e| (R::Volume, e))?;
+                crate::volumes::scoped_to(&volume, at, live.agentfile.map(|a| a.volumes.as_slice()))
+                    .map_err(|e| (R::Volume, e))?;
+                Ok(store.data(name))
+            }
+        }
+    }
+
+    /// Host directory `host` plugged into member `member` at `at` (D235): its own share
+    /// process, its own device on the microVM's bus, mounted in the member by init.
+    fn plug_one(
+        live: &Live<'_>,
+        member: u32,
+        host: &Path,
+        at: &str,
+        read_only: bool,
+    ) -> Result<Plugged, (wire::PlugRefusal, String)> {
+        use wire::PlugRefusal as R;
+        let dir = shards_vmm::platform::open_dir(host)
+            .map_err(|e| (R::Host, format!("{}: {e}", host.display())))?;
         if !dir
             .metadata()
-            .map_err(|e| (R::Host, format!("{}: {e}", ask.host)))?
+            .map_err(|e| (R::Host, format!("{}: {e}", host.display())))?
             .is_dir()
         {
-            return Err((R::Host, format!("{}: not a directory", ask.host)));
+            return Err((R::Host, format!("{}: not a directory", host.display())));
         }
-        let dirs = [(OwnedFd::from(dir), ask.read_only, OsString::new())];
+        let dirs = [(OwnedFd::from(dir), read_only, OsString::new())];
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tag = format!(
             "shards-plug{}",
@@ -5384,7 +6617,7 @@ mod hosted {
         let step = [&[shards_ipc::device::SHARE][..], tag.as_bytes()].concat();
         // On Unix its connection, which the share process sends and holds until it is
         // taken (M24); on Windows its stream itself, a duplex pipe made here (D197).
-        let host = |e: String| (R::Host, e);
+        let refused = |e: String| (R::Host, e);
         #[cfg(unix)]
         let answer = match shards_ipc::recv(&share.door) {
             Ok(Some(ends)) if ends.kind == kind::SHARE_ENDS => match ends.fds.first() {
@@ -5393,15 +6626,15 @@ mod hosted {
                     let _ = shards_ipc::send(&share.door, kind::TAKEN, &[], &[]);
                     answer
                 }
-                None => Err(host("its share process sent no connection".into())),
+                None => Err(refused("its share process sent no connection".into())),
             },
-            Ok(_) => Err(host("its share process sent no connection".into())),
-            Err(e) => Err(host(format!("its share process: {e}"))),
+            Ok(_) => Err(refused("its share process sent no connection".into())),
+            Err(e) => Err(refused(format!("its share process: {e}"))),
         };
         #[cfg(windows)]
         let answer = match share.ends.first() {
             Some(end) => ask_device(live, &step, &[end.as_fd()]).map_err(device_refused),
-            None => Err(host("no stream was made for its share".into())),
+            None => Err(refused("no stream was made for its share".into())),
         };
         let placed = answer.and_then(|a| {
             a.split_once(' ')
@@ -5415,11 +6648,11 @@ mod hosted {
                 return Err(e);
             }
         };
-        let flag = if ask.read_only { "ro" } else { "rw" };
-        let index = ask.member.to_string();
-        if let Err((_, e)) = guest_device(live, &["share", &address, &tag, &ask.at, flag, "member", &index]) {
+        let flag = if read_only { "ro" } else { "rw" };
+        let index = member.to_string();
+        if let Err((_, e)) = guest_device(live, &["share", &address, &tag, at, flag, "member", &index]) {
             // Taken off again, its guest having found it or not.
-            let _ = guest_device(live, &["unmount", &address, &ask.at, "member", &index]);
+            let _ = guest_device(live, &["unmount", &address, at, "member", &index]);
             let _ = ask_device(live, &[shards_ipc::device::UNPLUG, devfn], &[]);
             share.end(&live.ends);
             return Err((R::Device, e));
@@ -5427,54 +6660,84 @@ mod hosted {
         // Its guest told what its host changes beneath it from now on (D235).
         let told = share.notices.take().and_then(|pipe| {
             notice_exec(live, pipe)
-                .map_err(|e| {
-                    super::say(format_args!(
-                        "{}: its guest is told none of its changes: {e}",
-                        ask.at
-                    ))
-                })
+                .map_err(|e| super::say(format_args!("{}: its guest is told none of its changes: {e}", at)))
                 .ok()
         });
-        lock(&live.plugged).insert(
-            ask.at.clone(),
-            Plugged {
-                devfn,
-                address,
-                member: ask.member,
-                host: std::fs::canonicalize(&ask.host).unwrap_or_else(|_| PathBuf::from(&ask.host)),
-                share,
-                _told: told,
-            },
-        );
-        Ok(())
+        Ok(Plugged {
+            devfn,
+            address,
+            member,
+            host: std::fs::canonicalize(host).unwrap_or_else(|_| host.to_path_buf()),
+            share,
+            _told: told,
+        })
     }
 
-    /// What is plugged in at `ask`'s path let go of (D235): unmounted in its member by init,
-    /// refused while anything there uses it, then taken off the microVM's bus; its share
-    /// process given back, to be reaped once its stream has closed.
+    /// What is plugged in at `ask`'s path let go of in each member it was plugged into (D235,
+    /// D271): unmounted there by init, refused while anything there uses it, then taken off the
+    /// microVM's bus; each member's share process given back, to be reaped once its stream has
+    /// closed. Those a member refused stay plugged, the refusal naming them.
     fn unplug(
         live: &Live<'_>,
         ask: &wire::UnplugAsk,
-    ) -> (Result<(), (wire::PlugRefusal, String)>, Option<Shares>) {
+    ) -> (Result<(), (wire::PlugRefusal, String)>, Vec<Shares>) {
         use wire::PlugRefusal as R;
         let _turn = lock(&live.plug_turn);
-        let Some((devfn, address, member)) = lock(&live.plugged)
-            .get(&ask.at)
-            .map(|p| (p.devfn, p.address.clone(), p.member))
-        else {
+        let Some(plugged) = lock(&live.plugged).remove(&ask.at) else {
             return (
                 Err((R::Unknown, format!("nothing is plugged in at {}", ask.at))),
-                None,
+                Vec::new(),
             );
         };
-        let index = member.to_string();
-        if let Err((busy, e)) = guest_device(live, &["unmount", &address, &ask.at, "member", &index]) {
-            return (Err((if busy { R::Busy } else { R::Device }, e)), None);
+        let (kept, refused, gone) = unplug_each(live, plugged, &ask.at);
+        let result = match refused {
+            None => Ok(()),
+            Some((cause, why)) => {
+                let names: Vec<&str> = kept
+                    .iter()
+                    .filter_map(|p| live.members.iter().find(|m| m.index == p.member))
+                    .map(|m| m.name.as_str())
+                    .collect();
+                Err((
+                    cause,
+                    format!("{}: still plugged into {}: {why}", ask.at, names.join(", ")),
+                ))
+            }
+        };
+        if !kept.is_empty() {
+            lock(&live.plugged).insert(ask.at.clone(), kept);
         }
-        if let Err(e) = ask_device(live, &[shards_ipc::device::UNPLUG, devfn], &[]) {
-            return (Err(device_refused(e)), None);
+        (result, gone)
+    }
+
+    /// A plug's refusal, by what refused it (D235).
+    type PlugRefused = (wire::PlugRefusal, String);
+
+    /// Each of `plugged` at `at` let go of (D271): those a member refused, kept, and the first
+    /// refusal; and the share processes of those let go of.
+    fn unplug_each(
+        live: &Live<'_>,
+        plugged: Vec<Plugged>,
+        at: &str,
+    ) -> (Vec<Plugged>, Option<PlugRefused>, Vec<Shares>) {
+        use wire::PlugRefusal as R;
+        let (mut kept, mut gone, mut refused) = (Vec::new(), Vec::new(), None);
+        for p in plugged {
+            let index = p.member.to_string();
+            let let_go = guest_device(live, &["unmount", &p.address, at, "member", &index])
+                .map_err(|(busy, e)| (if busy { R::Busy } else { R::Device }, e))
+                .and_then(|_| {
+                    ask_device(live, &[shards_ipc::device::UNPLUG, p.devfn], &[]).map_err(device_refused)
+                });
+            match let_go {
+                Ok(_) => gone.push(p.share),
+                Err(e) => {
+                    refused.get_or_insert(e);
+                    kept.push(p);
+                }
+            }
         }
-        (Ok(()), lock(&live.plugged).remove(&ask.at).map(|p| p.share))
+        (kept, refused, gone)
     }
 
     /// Runs init's `DEVICE` built-in with `args` in the guest (init hotplug.rs): its answer,
@@ -5579,6 +6842,27 @@ mod hosted {
     mod tests {
         use super::*;
 
+        /// The VM binary checked beside a run's making is the one its launch would have checked
+        /// itself: the same path, or the same refusal (this build's carries no VM process,
+        /// `SHARDS_HELPERS=skip`, unless `SHARDS_VM_BINARY` names one); checked at once where
+        /// no thread was started for it. Its network process's is checked once its run is said
+        /// to have a network, and its taking waits for that check, told or not, and never on it
+        /// where untold.
+        #[test]
+        fn a_vm_binary_checked_beside_its_runs_making_is_its_launchs_own() {
+            // Untold of a network, its thread ends with the VM's check; told, after both.
+            assert_eq!(Checking::begin().taken(), (crate::helpers::vm(), false));
+            let mut told = Checking::begin();
+            told.networked();
+            assert_eq!(told.taken(), (crate::helpers::vm(), true));
+            let none = Checking {
+                thread: None,
+                network: None,
+                networked: false,
+            };
+            assert_eq!(none.taken(), (crate::helpers::vm(), false));
+        }
+
         /// A lane's ask, its answer waited for as long as it takes (`Duration::MAX`), as a caller
         /// with no bound of its own waits: what it answered, or why not.
         macro_rules! answered {
@@ -5621,9 +6905,443 @@ mod hosted {
                 notices: Mutex::new(Vec::new()),
                 leasing: None,
                 saving: Mutex::new(super::super::Saving::Idle),
+                pauses: Mutex::new(super::super::Pauses::new()),
+                pause_asks: Mutex::new(Some(Vec::new())),
                 reached: &[],
                 agent: None,
+                net: None,
+                ports: Mutex::new(Ports::default()),
+                egress: Mutex::new(wire::Narrowing::default()),
+                ceiled: false,
+                agentfile: None,
+                command: false,
             }
+        }
+
+        /// Do, on a run with a command of its own and a stand-in network process (D269):
+        /// publish a port on 127.0.0.1 at one the host picks; connect to it; let it go; let it
+        /// go again; publish one on a run with no command of its own and an image that gives no
+        /// member it, and one on a run with no network. Expect: the network process told the
+        /// port under a number of its own with its socket (`NET_PUBLISHED`), unanswered; its
+        /// owner answered with it and every port published; a connection taken while it is
+        /// published; the port let go by its number (`NET_UNPUBLISHED`), once that process
+        /// answered, then free to bind; and each refusal typed: `Unknown`, `Widening`,
+        /// `NoNetwork`, nothing published by any.
+        #[test]
+        fn a_port_published_live_is_told_by_its_number_and_let_go_by_it() {
+            let dir = shards_testdir::TempDir::new("api-net").unwrap();
+            let (mut orchestrator, out) = std::io::pipe().unwrap();
+            let answers = super::super::Answers(Mutex::new(Box::new(out)));
+            let (link, _vm) = Stream::pair().unwrap();
+            let (netproc, run_host) = std::os::unix::net::UnixStream::pair().unwrap();
+            netproc
+                .set_read_timeout(Some(std::time::Duration::from_secs(120)))
+                .unwrap();
+            let control = super::super::NetControl::new(&run_host);
+            let live = Live {
+                net: Some(&control),
+                command: true,
+                ..live(&answers, dir.path(), link, None)
+            };
+            let mut answered = |id| {
+                let (which, payload) = wire::read_frame(&mut orchestrator).unwrap().unwrap();
+                assert_eq!(which, wire::to_client::NET_CHANGED);
+                let answer = wire::NetAnswer::decode(&payload).unwrap();
+                assert_eq!(answer.id, id);
+                answer.result
+            };
+            let asked = wire::Publish {
+                guest_port: 8080,
+                proto: wire::Proto::Tcp,
+                host: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                host_port: 0,
+            };
+            net_change(
+                &live,
+                wire::NetAsk {
+                    id: 1,
+                    change: wire::NetChange::Publish(asked),
+                },
+            );
+            let told = shards_ipc::recv(&netproc).unwrap().unwrap();
+            assert_eq!(told.kind, kind::NET_PUBLISHED);
+            assert_eq!(told.payload, [0, 0, 0, 0, 0x1f, 0x90, 6]);
+            assert_eq!(told.fds.len(), 1);
+            let changed = answered(1).unwrap();
+            let [bound] = changed.changed.as_slice() else {
+                panic!("{changed:?}");
+            };
+            assert_eq!((bound.guest_port, bound.proto), (8080, wire::Proto::Tcp));
+            assert!(
+                bound.host.ip().is_loopback() && bound.host.port() != 0,
+                "{bound:?}"
+            );
+            assert!(
+                bound.to.is_empty(),
+                "a port no member takes reaches the run's command"
+            );
+            assert_eq!(changed.published, changed.changed);
+            std::net::TcpStream::connect(bound.host).unwrap();
+            std::thread::scope(|s| {
+                let reading = s.spawn(|| super::super::relay(&control, None, &answers));
+                let letting_go = s.spawn(|| {
+                    net_change(
+                        &live,
+                        wire::NetAsk {
+                            id: 2,
+                            change: wire::NetChange::Unpublish {
+                                proto: bound.proto,
+                                host: bound.host,
+                            },
+                        },
+                    )
+                });
+                let asked = shards_ipc::recv(&netproc).unwrap().unwrap();
+                assert_eq!(
+                    (asked.kind, asked.payload.as_slice()),
+                    (kind::NET_UNPUBLISHED, &[0, 0, 0, 0][..])
+                );
+                // Its copy closed before it answers, as the network process closes its own.
+                drop(told);
+                shards_ipc::send(&netproc, kind::NET_UNPUBLISHED, &[], &[]).unwrap();
+                letting_go.join().unwrap();
+                let gone = answered(2).unwrap();
+                assert_eq!(gone.changed, vec![bound.clone()]);
+                assert!(gone.published.is_empty());
+                std::net::TcpListener::bind(bound.host).expect("the port let go is free");
+                net_change(
+                    &live,
+                    wire::NetAsk {
+                        id: 3,
+                        change: wire::NetChange::Unpublish {
+                            proto: bound.proto,
+                            host: bound.host,
+                        },
+                    },
+                );
+                assert!(matches!(answered(3), Err((wire::NetRefusal::Unknown, _))));
+                drop(netproc);
+                reading.join().unwrap();
+            });
+            let alone = Live {
+                command: false,
+                ..live
+            };
+            net_change(
+                &alone,
+                wire::NetAsk {
+                    id: 4,
+                    change: wire::NetChange::Publish(asked),
+                },
+            );
+            assert!(matches!(answered(4), Err((wire::NetRefusal::Widening, _))));
+            let unnetworked = Live { net: None, ..alone };
+            net_change(
+                &unnetworked,
+                wire::NetAsk {
+                    id: 5,
+                    change: wire::NetChange::Publish(asked),
+                },
+            );
+            assert!(matches!(answered(5), Err((wire::NetRefusal::NoNetwork, _))));
+            assert!(lock(&unnetworked.ports).held.is_empty());
+        }
+
+        /// D273. Do, on a run whose image grants 443/tcp and a destination, its stand-in
+        /// network process taking or refusing what it is told: keep 443/tcp alone; keep a port
+        /// its image grants not; have its network process refuse; keep nothing on a run whose
+        /// image grants nothing past its microVM, and something there; and change one with no
+        /// network. Expect: `NET_GRANTS` told the policy kept, taken, and the run's grants
+        /// written out whole; `Widening` for the port, nothing told; `Network` in its network
+        /// process's words, the grants before kept; nothing told and nothing held of the run
+        /// with no ceiling, its widening refused; `NoNetwork`.
+        #[test]
+        fn a_runs_grants_change_within_its_images_as_it_goes() {
+            use wire::NetRefusal as R;
+            let dir = shards_testdir::TempDir::new("api-egress").unwrap();
+            let answers = super::super::Answers(Mutex::new(Box::new(Vec::<u8>::new())));
+            let (link, _vm) = Stream::pair().unwrap();
+            let (netproc, run_host) = std::os::unix::net::UnixStream::pair().unwrap();
+            netproc
+                .set_read_timeout(Some(std::time::Duration::from_secs(120)))
+                .unwrap();
+            let control = super::super::NetControl::new(&run_host);
+            let agentfile = crate::agentfile::Agentfile {
+                grants: shards_agentfile::agentfile::Grants {
+                    egress: vec![b"443/tcp".to_vec()],
+                    destinations: vec![b"api.example.com:443".to_vec()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let only = |items: &[&str]| wire::Keep::Only(items.iter().map(|i| i.to_string()).collect());
+            let asked = |egress: &[&str]| wire::Narrowing {
+                egress: only(egress),
+                mcp: only(&[]),
+                destinations: only(&[]),
+                dns: false,
+                members: None,
+            };
+            let live = Live {
+                net: Some(&control),
+                ceiled: true,
+                agentfile: Some(&agentfile),
+                ..live(&answers, dir.path(), link, None)
+            };
+            std::thread::scope(|s| {
+                let reading = s.spawn(|| super::super::relay(&control, None, &answers));
+                let changing = s.spawn(|| egress_live(&live, &asked(&["443/tcp"])));
+                let told = shards_ipc::recv(&netproc).unwrap().unwrap();
+                assert_eq!(told.kind, kind::NET_GRANTS);
+                assert_eq!(
+                    shards_net::decode_policy(&told.payload),
+                    Some((
+                        shards_net::Ports(vec![(shards_net::Proto::Tcp, 443, 443)]),
+                        Vec::new(),
+                        false
+                    ))
+                );
+                shards_ipc::send(&netproc, kind::NET_GRANTS, &[0], &[]).unwrap();
+                assert_eq!(changing.join().unwrap(), Ok(()));
+                assert_eq!(*lock(&live.egress), asked(&["443/tcp"]));
+                assert!(matches!(
+                    egress_live(&live, &asked(&["22/tcp"])),
+                    Err((R::Widening, _))
+                ));
+                let changing = s.spawn(|| egress_live(&live, &asked(&[])));
+                let told = shards_ipc::recv(&netproc).unwrap().unwrap();
+                assert_eq!((told.kind, told.payload.len()), (kind::NET_GRANTS, 0));
+                shards_ipc::send(&netproc, kind::NET_GRANTS, b"\x01past its ceiling", &[]).unwrap();
+                match changing.join().unwrap() {
+                    Err((R::Network, why)) => assert!(why.contains("past its ceiling"), "{why}"),
+                    other => panic!("{other:?}"),
+                }
+                assert_eq!(*lock(&live.egress), asked(&["443/tcp"]), "the grants before kept");
+                drop(netproc);
+                reading.join().unwrap();
+            });
+            let bare = crate::agentfile::Agentfile::default();
+            let unceiled = Live {
+                ceiled: false,
+                agentfile: Some(&bare),
+                ..live
+            };
+            assert_eq!(egress_live(&unceiled, &asked(&[])), Ok(()));
+            assert_eq!(*lock(&unceiled.egress), asked(&[]));
+            assert!(matches!(
+                egress_live(&unceiled, &asked(&["443/tcp"])),
+                Err((R::Widening, _))
+            ));
+            let unnetworked = Live {
+                net: None,
+                ..unceiled
+            };
+            assert!(matches!(
+                egress_live(&unnetworked, &asked(&[])),
+                Err((R::NoNetwork, _))
+            ));
+        }
+
+        /// D271. Do: ask a plug's source of a host directory, of a relative one, of a volume of
+        /// the run's home its store has not got, of that volume again, of a name no volume takes,
+        /// and of a volume an image's Agentfile gives its members elsewhere; and grant a run plug
+        /// roots beside its host's own, one of them its host's already. Expect: the host
+        /// directory as named; a relative one refused (`Request`); the volume made, its data
+        /// directory in the home, and the same one taken again; a bad name and a scoped
+        /// volume refused (`Volume`); each root granted once, after its host's, and one of
+        /// init's own refused.
+        #[test]
+        fn a_plugs_source_is_a_host_directory_or_its_homes_volume_beneath_granted_roots() {
+            use wire::PlugRefusal as R;
+            let dir = shards_testdir::TempDir::new("api-vol").unwrap();
+            let answers = super::super::Answers(Mutex::new(Box::new(Vec::<u8>::new())));
+            let (link, _vm) = Stream::pair().unwrap();
+            let live = live(&answers, dir.path(), link, None);
+            let at = "/session/x";
+            assert_eq!(
+                source_dir(&live, &wire::PlugFrom::Host("/Users/u/proj".into()), at),
+                Ok(PathBuf::from("/Users/u/proj"))
+            );
+            assert!(matches!(
+                source_dir(&live, &wire::PlugFrom::Host("proj".into()), at),
+                Err((R::Request, _))
+            ));
+            let store = crate::volumes::Store::new(dir.path());
+            assert!(store.get("sessions").is_none());
+            let made = source_dir(&live, &wire::PlugFrom::Volume("sessions".into()), at).unwrap();
+            assert_eq!(made, store.data("sessions"));
+            assert!(store.get("sessions").is_some());
+            assert_eq!(
+                source_dir(&live, &wire::PlugFrom::Volume("sessions".into()), at),
+                Ok(made)
+            );
+            assert!(matches!(
+                source_dir(&live, &wire::PlugFrom::Volume("a/b".into()), at),
+                Err((R::Volume, _))
+            ));
+            let scoped: std::collections::BTreeMap<String, String> =
+                [(crate::volumes::SCOPED.to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect();
+            {
+                let _held = crate::volumes::lock();
+                store
+                    .create("scoped", &scoped, &std::collections::BTreeMap::new(), "")
+                    .unwrap();
+            }
+            assert!(matches!(
+                source_dir(&live, &wire::PlugFrom::Volume("scoped".into()), at),
+                Err((R::Volume, _))
+            ));
+            let own = vec![b"plug-root=/Users".to_vec()];
+            assert_eq!(
+                granted_roots(own.clone(), &["/session".into(), "/Users".into()]).unwrap(),
+                vec![b"plug-root=/Users".to_vec(), b"plug-root=/session".to_vec()]
+            );
+            assert!(granted_roots(own, &["/tmp".into()]).is_err());
+        }
+
+        /// Do pause a run whose init last said its stats, its stand-in VM answering each `PAUSE`
+        /// and init's `CLOCK`; ask its guest while it is paused, pause it again, read its stats,
+        /// resume it twice, and pause it once its VM's link has closed (D267). Expect: its VM
+        /// asked to hold at once (`PAUSE` 1, its number), nothing of its guest asked first; an
+        /// ask of its guest refused while it is paused; the second pause and resume done already,
+        /// unasked; its stats what its init last said; its paused time counting from its VM's word
+        /// and ending at its resume's; its init asked to set its clock once it goes on; and a
+        /// pause after its link closed refused.
+        #[test]
+        fn a_pause_holds_its_vm_at_once_and_its_resume_sets_its_guests_clock() {
+            let dir = shards_testdir::TempDir::new("api-pause").unwrap();
+            let answers = super::super::Answers(Mutex::new(Box::new(Vec::<u8>::new())));
+            let (link, vm) = Stream::pair().unwrap();
+            vm.set_read_timeout(Some(std::time::Duration::from_secs(120)))
+                .unwrap();
+            let followed = link.try_clone().unwrap();
+            let live = live(&answers, dir.path(), link, None);
+            lock(&live.pauses).last = Some(b"cpu 5\nmemory 9\n".to_vec());
+            std::thread::scope(|scope| {
+                let (watched, followed) = (&live, &followed);
+                let following = scope.spawn(move || follow(watched, followed, scope));
+                let playing = scope.spawn(move || {
+                    // Held, then let go: each `PAUSE` its whether, then its number.
+                    for frozen in [1u8, 0] {
+                        let m = shards_ipc::recv(&vm).unwrap().unwrap();
+                        assert_eq!(m.kind, kind::PAUSE, "its VM was asked something else first");
+                        let (whether, number) = m.payload.split_first().unwrap();
+                        assert_eq!(*whether, frozen);
+                        shards_ipc::send(&vm, kind::PAUSED, number, &[]).unwrap();
+                    }
+                    // Its init's clock set, once it goes on.
+                    let m = shards_ipc::recv(&vm).unwrap().unwrap();
+                    assert_eq!(m.kind, kind::EXEC_RUN);
+                    let spec = protocol::Spec::decode(&m.payload[9..]).unwrap();
+                    assert_eq!(spec.builtin, protocol::builtin::CLOCK);
+                    let conn = Stream::from(m.fds.into_iter().next().unwrap());
+                    shards_ipc::send(&conn, kind::EXIT, &[0], &[]).unwrap();
+                    drop(vm);
+                });
+                let held = pause(&live).unwrap();
+                assert!(held.now);
+                assert!(!lock(&live.pauses).guest_runs(), "its guest asked while paused");
+                let again = pause(&live).unwrap();
+                assert!(again.now && again.total >= held.total);
+                assert_eq!(
+                    lock(&live.pauses).said(),
+                    Some(Some(&b"cpu 5\nmemory 9\n"[..])),
+                    "its stats while paused are not what its init last said"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let resumed = resume(&live, scope).unwrap();
+                assert!(!resumed.now);
+                assert!(resumed.total >= std::time::Duration::from_millis(20));
+                assert_eq!(
+                    resume(&live, scope),
+                    Ok(resumed),
+                    "a resume of a running run is done already"
+                );
+                assert!(lock(&live.pauses).guest_runs());
+                playing.join().unwrap();
+                following.join().unwrap();
+                assert_eq!(pause(&live), Err("its microVM has stopped".to_string()));
+                assert_eq!(lock(&live.pauses).paused(Instant::now()).total, resumed.total);
+            });
+        }
+
+        /// Do ask a paused run's guest for a room, a resize, a member's stats, a plug and an
+        /// unplug (D267). Expect: each refused at once, `ASK_PAUSED` by its id, none of them
+        /// sent to its VM; and its pause's own ask answered the run's paused time.
+        #[test]
+        fn asks_of_a_paused_runs_guest_are_refused_at_once() {
+            let dir = shards_testdir::TempDir::new("api-paused").unwrap();
+            let said = Said::default();
+            let answers = super::super::Answers(Mutex::new(Box::new(said.clone())));
+            let (link, vm) = Stream::pair().unwrap();
+            let live = live(&answers, dir.path(), link, None);
+            lock(&live.pauses).state = super::super::Pause::Paused {
+                since: Instant::now(),
+            };
+            let args = [OsStr::new("-c"), OsStr::new("sleep 30")];
+            let child = shards_ipc::spawn_in(Path::new("/bin/sh"), &args, &[], false, &[]).unwrap();
+            let asks = [
+                super::super::Ask::Room(wire::RoomAsk {
+                    id: 1,
+                    room: Some(1 << 20),
+                }),
+                super::super::Ask::Resize(wire::ResizeAsk {
+                    id: 2,
+                    member: 0,
+                    rows: 24,
+                    cols: 80,
+                }),
+                super::super::Ask::Stats(wire::StatsAsk {
+                    id: 3,
+                    scope: wire::StatsScope::Member(0),
+                }),
+                super::super::Ask::Plug(wire::PlugAsk {
+                    id: 4,
+                    members: vec![0],
+                    from: wire::PlugFrom::Host("/tmp".into()),
+                    at: "/work".into(),
+                    read_only: true,
+                }),
+                super::super::Ask::Unplug(wire::UnplugAsk {
+                    id: 5,
+                    at: "/work".into(),
+                }),
+                super::super::Ask::Pause(wire::PauseAsk { id: 6, pause: true }),
+            ];
+            std::thread::scope(|scope| {
+                for ask in asks {
+                    assert!(take(&live, ask, &child, scope).is_ok());
+                }
+                // Nothing of its guest's asks reached its VM; its link then closed, so that one
+                // that did is answered (its VM gone) rather than waiting on it for ever.
+                let reached = shards_ipc::recv_by(&vm, Instant::now());
+                drop(vm);
+                assert!(
+                    matches!(&reached, Err(e) if e.kind() == io::ErrorKind::TimedOut),
+                    "an ask of its paused guest reached its VM: {reached:?}"
+                );
+            });
+            let _ = child.kill(libc::SIGKILL);
+            let _ = child.wait();
+            let all = lock(&said.0).clone();
+            let mut from = &all[..];
+            let mut refused = Vec::new();
+            let mut paused = None;
+            while let Some((kind, payload)) = wire::read_frame(&mut from).unwrap() {
+                match kind {
+                    wire::to_client::ASK_PAUSED => {
+                        refused.push(wire::AskPaused::decode(&payload).unwrap().id)
+                    }
+                    wire::to_client::PAUSED => paused = Some(wire::PauseAnswer::decode(&payload).unwrap()),
+                    other => panic!("answered kind {other}"),
+                }
+            }
+            assert_eq!(refused, [1, 2, 3, 4, 5]);
+            let paused = paused.unwrap();
+            assert_eq!(paused.id, 6);
+            assert!(paused.result.unwrap().now);
         }
 
         /// Do give room to a run whose VM takes no more of its managed output, its end of it
@@ -5854,7 +7572,7 @@ mod hosted {
                 controller: kiln.fingerprint(),
                 sockets: None,
             };
-            let (endpoint, served) = bind_control(&ask, admissions).unwrap();
+            let (endpoint, served) = bind_control(ControlKey::made().unwrap(), &ask, admissions).unwrap();
             let (key, address) = (endpoint.fingerprint, endpoint.address);
             let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
             std::thread::scope(|scope| {
@@ -6178,12 +7896,104 @@ mod tests {
         );
     }
 
+    /// D267: a `PAUSE` is its owner's ask once its run runs, a malformed one breaking the
+    /// channel; before the run's request (a warm host waiting for its `CREATE`) it is refused,
+    /// typed, as every ask before a run is.
+    #[test]
+    fn a_pause_is_an_ask_of_a_run_and_refused_before_one() {
+        for pause in [true, false] {
+            let ask = wire::PauseAsk { id: 3, pause };
+            match judged(wire::to_host::PAUSE, &ask.encode()) {
+                Ok(Ask::Pause(read)) => assert_eq!(read, ask),
+                _ => panic!("the owner's PAUSE is not its ask"),
+            }
+        }
+        assert!(matches!(
+            judged(wire::to_host::PAUSE, &[0, 0, 0, 3, 7]),
+            Err(AsksEnd::Failed(_))
+        ));
+        let No(cause, why) = before_request(wire::to_host::PAUSE);
+        assert_eq!(cause, Cause::Request);
+        assert_eq!(
+            why,
+            format!("message kind {} before the run's request", wire::to_host::PAUSE)
+        );
+    }
+
     /// D259, R04: a run's saves go one at a time, and none once its VM's link has closed. Do:
     /// ask a save, ask another while it is under way, answer it, ask again and have its VM
     /// refuse, give one up before its VM heard it, answer when none was asked, then close the
     /// link with one asked. Expect: the second refused `State`; each answer told its own save
     /// alone, saved or in its VM's words; an answer none asked changing nothing; the save asked
     /// as the link closes hearing its microVM stopped; and every save after refused `State`.
+    /// Do walk the run's pause through its states (D267): a pause, a second pause, a resume, a
+    /// second resume, a pause its VM refused, a resume its VM refused, and the VM gone while
+    /// paused. Expect: its guest asked nothing from the pause's start to its resume's end; a
+    /// pause or resume of a run already so done, unasked; paused time counting from the VM's
+    /// word to its resume's and folding in a pause under way as its VM goes; what its init last
+    /// said its stats while paused alone; a refused pause leaving it running and a refused
+    /// resume paused.
+    #[test]
+    fn a_runs_pause_moves_by_its_vms_word_and_counts_its_time() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut p = Pauses::new();
+        p.last = Some(b"cpu 5\n".to_vec());
+        assert!(p.guest_runs());
+        assert_eq!(p.said(), None, "a running run's stats are its guest's to say");
+        assert_eq!(p.pause(at(0)), Step::Ask);
+        assert!(!p.guest_runs(), "its guest asked as it paused");
+        assert_eq!(p.said(), Some(Some(&b"cpu 5\n"[..])));
+        let held = p.held(at(10)).unwrap();
+        assert_eq!(
+            held,
+            wire::Paused {
+                total: Duration::ZERO,
+                now: true
+            }
+        );
+        assert_eq!(
+            p.pause(at(30)),
+            Step::Done(wire::Paused {
+                total: Duration::from_millis(20),
+                now: true
+            })
+        );
+        assert_eq!(p.resume(at(40)), Step::Ask);
+        assert!(!p.guest_runs(), "its guest asked before its VM let it go on");
+        let resumed = p.resumed(at(50)).unwrap();
+        assert_eq!(
+            resumed,
+            wire::Paused {
+                total: Duration::from_millis(40),
+                now: false
+            }
+        );
+        assert_eq!(p.resume(at(60)), Step::Done(resumed));
+        assert!(p.guest_runs());
+        // Its VM refuses the pause: running; then paused, a resume refused: paused still.
+        assert_eq!(p.pause(at(70)), Step::Ask);
+        p.unheld();
+        assert!(matches!(p.state, Pause::Running));
+        assert_eq!(p.pause(at(80)), Step::Ask);
+        assert!(p.held(at(80)).is_some());
+        assert_eq!(p.resume(at(90)), Step::Ask);
+        p.unresumed();
+        assert!(matches!(p.state, Pause::Paused { .. }));
+        // Gone while paused: the pause's time so far is kept, and nothing is asked again.
+        p.gone(at(100));
+        assert_eq!(
+            p.paused(at(500)),
+            wire::Paused {
+                total: Duration::from_millis(60),
+                now: false
+            }
+        );
+        assert_eq!(p.pause(at(500)), Step::Gone);
+        assert_eq!(p.resume(at(500)), Step::Gone);
+        assert!(p.held(at(500)).is_none());
+    }
+
     #[test]
     fn a_runs_saves_go_one_at_a_time_and_end_with_its_vm() {
         let mut saving = Saving::Idle;
@@ -6374,6 +8184,7 @@ mod tests {
             cpu_ns: 100,
             resident_bytes: 1,
             footprint_bytes: 2,
+            charged: shards_abi::guest_time::Charged::ToThread,
         };
         let told = shards_abi::rate::used(Ok(&times), Ok(&host));
         assert_eq!(
@@ -6588,6 +8399,7 @@ mod tests {
             gpu_devices: Vec::new(),
             sign_ins: Vec::new(),
             upstream_roots: Vec::new(),
+            plug_roots: Vec::new(),
             gpu_report: None,
         }
     }
@@ -7204,18 +9016,67 @@ mod tests {
     }
 
     /// The run's request is one a warm VM takes: its log keeps something by the VM's own
-    /// check (warm.rs `head`), though it writes none, and its head says whether it
-    /// publishes ports.
+    /// check (warm.rs `head`), though it writes none, its head says whether it publishes
+    /// ports, and it carries the most its guest may plug as given, none included.
     #[test]
     fn its_request_is_one_a_warm_vm_takes() {
-        for published in [false, true] {
-            let payload = run_request(&shards_abi::run::Spec::default(), published);
-            let (head, spec) = shards_ipc::RunHead::decode(&payload).unwrap();
-            assert!(head.keeps_its_log(), "{head:?}");
-            assert_eq!(head.flags & shards_ipc::RUN_PUBLISHED != 0, published);
-            assert_eq!(head.flags & shards_ipc::RUN_LOG, 0);
-            assert!(shards_abi::run::Spec::decode(spec).is_some());
+        for (published, timing) in [(false, false), (true, false), (false, true), (true, true)] {
+            for plug in [0, 1 << 20, u64::MAX] {
+                let payload = run_request(&shards_abi::run::Spec::default(), plug, published, timing);
+                let (head, spec) = shards_ipc::RunHead::decode(&payload).unwrap();
+                assert!(head.keeps_its_log(), "{head:?}");
+                assert_eq!(head.flags & shards_ipc::RUN_PUBLISHED != 0, published);
+                assert_eq!(head.flags & shards_ipc::RUN_TIMING != 0, timing);
+                assert_eq!(head.flags & shards_ipc::RUN_LOG, 0);
+                assert_eq!(head.plug, plug);
+                assert!(shards_abi::run::Spec::decode(spec).is_some());
+            }
         }
+    }
+
+    /// An orchestrator's run may plug what a daemon's run of the same size may (D148): its
+    /// most, all its host's memory where it names no limit, less what it boots with, the
+    /// least envelope's 64 MiB or any other; none where it boots with all of it. The
+    /// orchestrator's run had none: kiln's harnesses at 64 MiB were ended at what was free as
+    /// their members started (D275).
+    #[test]
+    fn an_orchestrators_run_may_plug_its_most_less_its_boot() {
+        let home = shards_testdir::TempDir::new("plug-most").unwrap();
+        let rootfs = home.path().join("root.erofs");
+        let guest = crate::guest::Guest {
+            kernel: home.path().join("vmlinux"),
+            init: home.path().join("init"),
+            kernel_digest: "sha256:k".into(),
+            init_digest: "sha256:i".into(),
+        };
+        let mut run = prepared(&rootfs, crate::run::Boot::Stored(guest), None);
+        for (boot, most, plug) in [
+            (64, 36_864, (36_864 - 64) << 20),
+            (128, 8192, (8192 - 128) << 20),
+            (256, 256, 0),
+            (512, 256, 0),
+        ] {
+            (run.size.1, run.memory_max) = (boot, most);
+            assert_eq!(run.plug_bytes(), plug, "{boot} MiB booted of {most}");
+            let payload = run_request(&run.spec, run.plug_bytes(), false, false);
+            assert_eq!(shards_ipc::RunHead::decode(&payload).unwrap().0.plug, plug);
+        }
+        run.memory_max = u64::MAX;
+        run.size.1 = 0;
+        assert_eq!(run.plug_bytes(), u64::MAX, "saturates, never wraps");
+    }
+
+    /// A line says its time only where its lines are timed, as `+US us` after the host's name.
+    #[test]
+    fn a_line_says_its_time_only_where_its_lines_are_timed() {
+        assert_eq!(
+            said(None, format_args!("its VM said READY")),
+            "shards api-run: its VM said READY\n"
+        );
+        assert_eq!(
+            said(Some(1234), format_args!("its VM said READY")),
+            "shards api-run: +1234 us its VM said READY\n"
+        );
     }
 
     /// With no command of its own, a run publishes only ports the image gives a member
@@ -7436,6 +9297,7 @@ mod tests {
                 source: b"./a".to_vec(),
                 to: None,
                 processes: Processes::Unbounded,
+                fetch: Default::default(),
             }),
             Directive::Nesting,
         ]);
@@ -7650,13 +9512,13 @@ mod tests {
             let (net, run_host) = UnixStream::pair().unwrap();
             let (mut orchestrator, out) = std::io::pipe().unwrap();
             let answers = Answers(Mutex::new(Box::new(out)));
+            let control = NetControl::new(&run_host);
             let leasing = Leasing {
                 ledger: Mutex::new(Ledger::new(vec![CLAUDE.into()], Vec::new())),
-                net: &run_host,
-                sending: Mutex::new(()),
+                net: &control,
             };
             std::thread::scope(|s| {
-                let relaying = s.spawn(|| relay(&leasing, &answers));
+                let relaying = s.spawn(|| relay(&control, Some(&leasing), &answers));
                 let mut leases = shards_net::lease::Leases::new(vec![CLAUDE.into()]);
                 assert_eq!(
                     leases.held(CLAUDE, Instant::now()),
@@ -7751,16 +9613,52 @@ mod tests {
         assert!(channel.next().unwrap().is_none());
     }
 
+    /// The network process's control read by one reader for the run's life (D242, D269). Do:
+    /// ask two answers of a stand-in network process, one on each of two threads, and answer
+    /// them in order; then send what answers no ask, of a run with no grants; then ask once
+    /// more. Expect: each asker handed the answer of its own kind, in the order asked; the
+    /// stray message ends the reading, and the ask after it refused at once, as nothing reads
+    /// an answer then.
+    #[cfg(unix)]
+    #[test]
+    fn the_network_processs_answers_reach_their_askers_in_the_order_asked() {
+        use std::os::unix::net::UnixStream;
+        let (net, run_host) = UnixStream::pair().unwrap();
+        let answers = Answers(Mutex::new(Box::new(Vec::<u8>::new())));
+        let control = NetControl::new(&run_host);
+        std::thread::scope(|s| {
+            let reading = s.spawn(|| relay(&control, None, &answers));
+            let first = s.spawn(|| control.ask(kind::NET_UNPUBLISHED, &1u32.to_be_bytes()));
+            let m = shards_ipc::recv(&net).unwrap().unwrap();
+            assert_eq!(
+                (m.kind, m.payload.as_slice()),
+                (kind::NET_UNPUBLISHED, &[0, 0, 0, 1][..])
+            );
+            let second = s.spawn(|| control.ask(kind::NET_NAMES, &[]));
+            let m = shards_ipc::recv(&net).unwrap().unwrap();
+            assert_eq!(m.kind, kind::NET_NAMES);
+            shards_ipc::send(&net, kind::NET_UNPUBLISHED, &[], &[]).unwrap();
+            assert_eq!(first.join().unwrap(), Ok(Vec::new()));
+            shards_ipc::send(&net, kind::NET_NAMES, &[7], &[]).unwrap();
+            assert_eq!(second.join().unwrap(), Ok(vec![7]));
+            // An answer no ask awaits, and no lease a run with no grants could ask: nothing
+            // more is read, and an ask is refused at once.
+            shards_ipc::send(&net, kind::NET_LEASE, &[], &[]).unwrap();
+            reading.join().unwrap();
+            assert!(control.ask(kind::NET_UNPUBLISHED, &2u32.to_be_bytes()).is_err());
+        });
+    }
+
     /// An answer to no ask of the run's breaks the orchestrator's channel; one of a run that
     /// has released its leases goes nowhere (D242).
     #[cfg(unix)]
     #[test]
     fn an_answer_to_no_ask_breaks_the_channel() {
         let (_net, run_host) = std::os::unix::net::UnixStream::pair().unwrap();
+        let control = NetControl::new(&run_host);
         let leasing = Leasing {
             ledger: Mutex::new(Ledger::new(vec![CLAUDE.into()], Vec::new())),
-            net: &run_host,
-            sending: Mutex::new(()),
+            net: &control,
         };
         let answer = wire::LeaseAnswer {
             id: 7,
@@ -7842,8 +9740,8 @@ mod tests {
         }
     }
 
-    /// D252: a run's endpoint is bound on loopback under a key of its own, made as it is bound,
-    /// which no two runs share; it hands its host the socket lanes its grant admits.
+    /// D252: a run's endpoint is bound on loopback under a key of its own, made past its VM's
+    /// start, which no two runs share; it hands its host the socket lanes its grant admits.
     #[test]
     fn a_runs_endpoint_is_bound_on_loopback_under_a_key_of_its_own() {
         let ask = wire::ControlAsk {
@@ -7855,13 +9753,43 @@ mod tests {
             }),
         };
         let execs = shards_api::control::exec_admissions();
-        let (first, served) = hosted::bind_control(&ask, execs).unwrap();
+        let (first, served) = hosted::bind_control(hosted::ControlKey::made().unwrap(), &ask, execs).unwrap();
         assert!(first.address.ip().is_loopback(), "{:?}", first.address);
         assert!(served.sockets.is_some());
         // Its execs, its members' MCP connections and its members' own lanes (D254, D238).
         assert!(served.execs.is_some() && served.members.is_some());
-        let (second, _) = hosted::bind_control(&ask, execs).unwrap();
+        let (second, _) = hosted::bind_control(hosted::ControlKey::made().unwrap(), &ask, execs).unwrap();
         assert_ne!(first.fingerprint, second.fingerprint, "two runs share one key");
+    }
+
+    /// D252, a warm host: its run's endpoint takes the key its host made as it waited for the
+    /// run, its VM started, rather than making one on the run's way; two warm hosts' keys are
+    /// never one, each host serving one run; and a run whose host made none makes its own as it
+    /// binds.
+    #[test]
+    fn a_warm_runs_endpoint_takes_the_key_its_host_made_as_it_waited() {
+        let ask = wire::ControlAsk {
+            controller: [7; 32],
+            sockets: None,
+        };
+        let execs = shards_api::control::exec_admissions();
+        let (one, other) = (
+            hosted::ControlKey::made().unwrap(),
+            hosted::ControlKey::made().unwrap(),
+        );
+        let (made, made_other) = (one.fingerprint(), other.fingerprint());
+        assert_ne!(made, made_other, "two warm hosts share one key");
+        let (endpoint, _) =
+            hosted::bind_control(hosted::control_key(Some(one)).unwrap(), &ask, execs).unwrap();
+        assert_eq!(
+            endpoint.fingerprint, made,
+            "its endpoint took another key than its host made"
+        );
+        let (own, _) = hosted::bind_control(hosted::control_key(None).unwrap(), &ask, execs).unwrap();
+        assert!(
+            own.fingerprint != made && own.fingerprint != made_other,
+            "a run whose host made none bound with another's"
+        );
     }
 
     /// D252, version 30 (Hex's ask): what the orchestrator reads of a run's endpoint names
@@ -7880,12 +9808,18 @@ mod tests {
                 window: 4096,
             }),
         };
-        let (endpoint, served) = hosted::bind_control(&ask, shards_api::control::exec_admissions()).unwrap();
+        let (endpoint, served) = hosted::bind_control(
+            hosted::ControlKey::made().unwrap(),
+            &ask,
+            shards_api::control::exec_admissions(),
+        )
+        .unwrap();
         let started = wire::Started {
             members: Vec::new(),
             published: Vec::new(),
             control: Some(hosted::control_at(&endpoint)),
             from: wire::StartedFrom::Booted,
+            egress: wire::Narrowing::default(),
         };
         let told = wire::Started::decode(&started.encode().unwrap())
             .unwrap()
@@ -8363,7 +10297,15 @@ mod tests {
                 }
                 told
             });
-            let ca = hosted::tell_net(&run_host, Some(&address), &[], Some(&policy), None, None);
+            let ca = hosted::tell_net(
+                &run_host,
+                Some(&address),
+                &[],
+                Some(&policy),
+                Some(&policy),
+                None,
+                None,
+            );
             assert_eq!(ca, Ok(None));
             drop(run_host);
             network.join().unwrap()
@@ -8431,6 +10373,7 @@ mod tests {
                     None,
                     &[],
                     Some(&policy),
+                    Some(&policy),
                     sign_ins.as_deref(),
                     grants.as_deref(),
                 );
@@ -8495,14 +10438,14 @@ mod tests {
         let (net, run_host) = UnixStream::pair().unwrap();
         let (mut orchestrator, out) = std::io::pipe().unwrap();
         let answers = Answers(Mutex::new(Box::new(out)));
+        let control = NetControl::new(&run_host);
         let leasing = Leasing {
             ledger: Mutex::new(Ledger::new(Vec::new(), vec![signs_in(false)])),
-            net: &run_host,
-            sending: Mutex::new(()),
+            net: &control,
         };
         let life = NonZeroU64::new(3_600_000_000_000).unwrap();
         std::thread::scope(|s| {
-            let relaying = s.spawn(|| relay(&leasing, &answers));
+            let relaying = s.spawn(|| relay(&control, Some(&leasing), &answers));
             let mut sign_ins = shards_net::signin::SignIns::new(vec![signs_in(false)]);
             let mut leases = shards_net::lease::Leases::new(Vec::new());
             let send = |kind, payloads: Vec<Zeroizing<Vec<u8>>>| {

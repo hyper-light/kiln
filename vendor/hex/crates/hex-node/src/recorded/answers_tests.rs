@@ -22,6 +22,7 @@ fn final_use() -> hex_api::HostUse {
         resident_bytes: 13,
         guest_ns: vec![17],
         window: Duration::from_nanos(19),
+        charged: hex_api::Charged::ToThread,
     }
 }
 

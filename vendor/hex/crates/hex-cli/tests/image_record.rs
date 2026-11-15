@@ -174,6 +174,8 @@ fn spec(
         sign_ins: Vec::new(),
         upstream_roots: Vec::new(),
         gpu_report: None,
+        // No plug root (Shards' D271, image channel v35): nothing is plugged into its run as it runs.
+        plug_roots: Vec::new(),
     }
 }
 

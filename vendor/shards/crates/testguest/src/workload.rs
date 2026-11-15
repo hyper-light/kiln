@@ -58,6 +58,7 @@ pub fn main() -> ! {
         "managed-reap-child" => crate::managed_reap::child(arg(1), arg(2)),
         "cat" => cat(),
         "plugged" => crate::plugged::main(args.get(1..).unwrap_or_default()),
+        "plugged-volumes" => crate::plugged::volumes(args.get(1..).unwrap_or_default()),
         "inotify" => crate::watch::main(arg(1)),
         // The steps of names differing in case alone in DIR, each its result (D235).
         "case" => {
@@ -490,6 +491,7 @@ pub fn main() -> ! {
         "spawn" => spawn(args.get(1..).unwrap_or_default()),
         "spawns" => spawns(arg(1).parse().unwrap_or(1), args.get(2..).unwrap_or_default()),
         "tcp" => tcp(arg(1)),
+        "reach-each" => reach_each(arg(1)),
         "fetch" => fetch(args.get(1..).unwrap_or_default()),
         "tls-ask" => crate::tls_ask::main(args.get(1..).unwrap_or_default()),
         // One call of the Engine API at $DOCKER_HOST, as a program in a run reaches its
@@ -636,6 +638,24 @@ pub fn main() -> ! {
         "swap-kept" => swap_kept(arg(1).parse().unwrap_or(0)),
         // A counter in memory, printed as it grows, every `arg(1)` ms (100 if none): what a
         // saved microVM keeps, and a restore of it goes on from (D176).
+        // The guest's watchdogs across a pause of its run (D267), into directory `arg(1)`.
+        "watchdogs" => watchdogs(std::path::Path::new(arg(1))),
+        // `ready`, then each `arg(1)` ms (100 if none) a line of its count and its clock's
+        // time, CLOCK_REALTIME in ns: a member whose run is paused goes on from its count, its
+        // clock the host's (D267).
+        "ticks" => {
+            let every = std::time::Duration::from_millis(arg(1).parse().unwrap_or(100));
+            let _ = writeln!(io::stdout(), "ready");
+            let mut n = 0u64;
+            loop {
+                n += 1;
+                let ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                let _ = writeln!(io::stdout(), "{n} {ns}");
+                std::thread::sleep(every);
+            }
+        }
         "counter" => {
             let every = std::time::Duration::from_millis(arg(1).parse().unwrap_or(100));
             let _ = writeln!(io::stdout(), "ready");
@@ -1206,6 +1226,62 @@ fn kernlog(words: &[String]) -> i32 {
     }
 }
 
+/// The guest's soft-lockup and RCU stall watchdogs across a pause of its run (D267): its
+/// threshold (`watchdog_thresh`) and whether its soft-lockup watchdog is on, then the kernel's
+/// taint (a soft lockup's report sets `L`, kernel/watchdog.c `add_taint(TAINT_SOFTLOCKUP)`) and
+/// its count of RCU stalls (`/sys/kernel/rcu_stall_count`, kernel/rcu/tree_stall.h), written to
+/// `dir/before`; then, once one sleep of the watchdog's sample period has spanned more than its
+/// soft-lockup threshold (the run paused that long, its clock running on through it), and one
+/// sample period more, so that the watchdog has looked since its vCPUs went on, the taint and
+/// the count again, to `dir/after`. The threshold is twice `watchdog_thresh` and the watchdog
+/// looks five times within it, the kernel's own rule (kernel/watchdog.c,
+/// `get_softlockup_thresh`, `NUM_SAMPLE_PERIODS`). Each file is written whole, then named.
+fn watchdogs(dir: &std::path::Path) -> i32 {
+    let read = |path: &str| match std::fs::read_to_string(path) {
+        Ok(text) => text.trim().to_string(),
+        Err(e) => format!("errno-{}", e.raw_os_error().unwrap_or(0)),
+    };
+    let state = || {
+        format!(
+            "tainted {} stalls {}",
+            read("/proc/sys/kernel/tainted"),
+            read("/sys/kernel/rcu_stall_count")
+        )
+    };
+    let write = |name: &str, text: String| {
+        let part = dir.join(format!("{name}.part"));
+        std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, dir.join(name)))
+    };
+    let thresh = read("/proc/sys/kernel/watchdog_thresh");
+    let said = format!(
+        "thresh {thresh} soft {} {}\n",
+        read("/proc/sys/kernel/soft_watchdog"),
+        state()
+    );
+    if write("before", said).is_err() {
+        return 1;
+    }
+    let Some(threshold) = thresh
+        .parse::<u64>()
+        .ok()
+        .filter(|t| *t > 0)
+        .map(|t| std::time::Duration::from_secs(t.saturating_mul(2)))
+    else {
+        return 1;
+    };
+    // kernel/watchdog.c's NUM_SAMPLE_PERIODS: the watchdog's looks within its threshold.
+    let sample = threshold / 5;
+    loop {
+        let began = std::time::Instant::now();
+        std::thread::sleep(sample);
+        if began.elapsed() > threshold {
+            break;
+        }
+    }
+    std::thread::sleep(sample);
+    i32::from(write("after", format!("{}\n", state())).is_err())
+}
+
 fn report() -> i32 {
     let mut out = String::new();
     // SAFETY: plain getters.
@@ -1566,6 +1642,26 @@ fn tcp(addr: &str) -> i32 {
             let _ = writeln!(io::stdout(), "tcp error {e}");
             1
         }
+    }
+}
+
+/// `reach-each HOST:PORT`: connects to it again and again, a connection at a time, each given
+/// a second, and says how each went as it goes, `reach ok` or `reach errno N`, until it is
+/// ended: what a run's grants let it reach as they change (D273).
+fn reach_each(addr: &str) -> i32 {
+    use std::net::ToSocketAddrs as _;
+    let wait = std::time::Duration::from_secs(1);
+    loop {
+        let said = match addr.to_socket_addrs().map(|mut a| a.next()) {
+            Ok(Some(to)) => match std::net::TcpStream::connect_timeout(&to, wait) {
+                Ok(_) => "reach ok".to_string(),
+                Err(e) => format!("reach errno {}", e.raw_os_error().unwrap_or(0)),
+            },
+            Ok(None) => "reach errno 0".to_string(),
+            Err(e) => format!("reach errno {}", e.raw_os_error().unwrap_or(0)),
+        };
+        let _ = writeln!(io::stdout(), "{said}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

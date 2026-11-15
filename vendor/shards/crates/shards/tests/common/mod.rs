@@ -190,27 +190,24 @@ fn skip(why: &str) -> bool {
 }
 
 /// The most a window's vCPU guest time, read twice, may say past what its vCPU ran between
-/// the reads: one step of its hypervisor's count (docs/research/measurements/
-/// guest-cpu-time-v1). KVM's is its thread's gtime in clock ticks, `sysconf(_SC_CLK_TCK)` a
-/// second (fs/proc/array.c), so a read may fall a step short of what ran; Hypervisor.framework's
-/// is mach_absolute_time's ticks, read as its vCPU is made to leave its guest at once
-/// (hv_vcpu.h), one tick at most in ns; WHP's its runtime counters' 100 ns
-/// (WinHvPlatformDefs.h, `TotalRuntime100ns`).
-pub fn guest_time_step() -> Duration {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: sysconf(3) takes no pointers.
-        let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap();
-        Duration::from_nanos(1_000_000_000_u64.div_ceil(hz))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Duration::from_nanos(shards_vmm::platform::mach_ns(1) + 1)
-    }
-    #[cfg(windows)]
-    {
-        Duration::from_nanos(100)
-    }
+/// the reads: one step of its count, measured as its VM process says it, `read` of a guest
+/// whose vCPU spins unheld: read until it has moved twice, the second move's size, as a thread
+/// clock's step is measured (`granule::clock_step`). A count's unit is not its step: WHP's
+/// runtime counters count 100 ns (`TotalRuntime100ns`) but moved every ~10 ms on hex-winvm,
+/// 9.4 ms of guest each (p50, n 200; D265); KVM's gtime moves in clock ticks
+/// (fs/proc/array.c); Hypervisor.framework's as its vCPU leaves its guest to be read
+/// (docs/research/measurements/guest-cpu-time-v1).
+pub fn guest_time_step(mut read: impl FnMut() -> u64) -> Duration {
+    let moved = |read: &mut dyn FnMut() -> u64, from: u64| loop {
+        let now = read();
+        if now != from {
+            return now;
+        }
+    };
+    let first = read();
+    let once = moved(&mut read, first);
+    let twice = moved(&mut read, once);
+    Duration::from_nanos(twice.saturating_sub(once))
 }
 
 /// Whether this host cannot run VMs: no backend for it yet, or no hardware virtualization
@@ -2403,7 +2400,15 @@ impl Patience {
     /// Patience with the daemon of `home` and its microVMs, and this test's own.
     #[track_caller]
     pub fn of(home: &Path) -> Patience {
-        Patience::with(Some(home), std::panic::Location::caller())
+        Patience::at(home, std::panic::Location::caller())
+    }
+
+    /// [`of`](Self::of) as the wait at `site`: for a `#[track_caller]` helper that waits on a
+    /// thread of its own, which takes its caller's site before it spawns it, as a closure
+    /// is no `#[track_caller]` and its own site would be every caller's one kind (log
+    /// lanes' `controlled`: a quick read's W* refused a run's bulk write 83 ms in).
+    pub fn at(home: &Path, site: &'static std::panic::Location<'static>) -> Patience {
+        Patience::with(Some(home), site)
     }
 
     /// Patience with client `client`, what descends from it, and the daemon of `home`: a
@@ -2426,6 +2431,15 @@ impl Patience {
     #[track_caller]
     pub fn started() -> Patience {
         Patience::on(Party::started(None), std::panic::Location::caller())
+    }
+
+    /// Patience with every process of process groups `groups`, wherever it is listed
+    /// ([`Party::groups`]): run hosts whose holder has ended, none of them this test's
+    /// process's own since, each leading its group, its VM's among it.
+    #[cfg(unix)]
+    #[track_caller]
+    pub fn groups(groups: &[u32]) -> Patience {
+        Patience::on(Party::groups(groups), std::panic::Location::caller())
     }
 
     fn with(home: Option<&Path>, site: &'static std::panic::Location<'static>) -> Patience {
@@ -2745,6 +2759,24 @@ pub fn processes() -> Vec<(u32, u32, String)> {
             ))
         })
         .collect()
+}
+
+/// The processes of `listed` ([`processes`]) in one of process groups `groups`, as
+/// getpgid(2) reads each now (POSIX.1-2024, XSH getpgid): one gone since it was listed is
+/// left out.
+#[cfg(unix)]
+pub fn grouped<'a>(
+    listed: &'a [(u32, u32, String)],
+    groups: &'a [u32],
+) -> impl Iterator<Item = &'a (u32, u32, String)> + 'a {
+    listed.iter().filter(|(pid, ..)| {
+        let Ok(id) = libc::pid_t::try_from(*pid) else {
+            return false;
+        };
+        // SAFETY: getpgid(2) of a process ID: it reads the kernel's record alone.
+        let group = unsafe { libc::getpgid(id) };
+        u32::try_from(group).is_ok_and(|group| groups.contains(&group))
+    })
 }
 
 /// Runs `cmd` as built, `shards` itself ([`run_shards_with`]) or a program that runs it
@@ -3526,7 +3558,7 @@ fn process_status(_: u32) -> Option<String> {
 const VM_PROCESS: &str = "shards-vm";
 
 /// Whose processes a [`Party`]'s are, besides its home's daemon and what descends from it.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Members {
     /// A client and what descends from it: a command [`run_command`] runs, or a `run
     /// --kernel` or `restore` (the VM process on Unix, its starter on Windows).
@@ -3544,6 +3576,12 @@ enum Members {
     /// shards-api's `ImageShards` starts and its VM process, which a call of the API's waits
     /// on ([`judged`]), the host's work before its VM starts among them.
     Started,
+    /// Every process of these process groups, wherever it is listed ([`grouped`]): a pool's
+    /// warm run hosts, each leading a group of its own with its VM, network and share
+    /// processes in it (shards-api session.rs `start_host`), which their holder's end leaves
+    /// orphans of no process of this test's.
+    #[cfg(unix)]
+    Groups(Vec<u32>),
 }
 
 /// What a [`Party`]'s processes' CPU time says of it.
@@ -3610,6 +3648,12 @@ impl Party {
         Party::with(Members::Started, home)
     }
 
+    /// The party of every process of process groups `groups` ([`Members::Groups`]).
+    #[cfg(unix)]
+    pub fn groups(groups: &[u32]) -> Party {
+        Party::with(Members::Groups(groups.to_vec()), None)
+    }
+
     fn with(members: Members, home: Option<&Path>) -> Party {
         Party {
             members,
@@ -3642,13 +3686,15 @@ impl Party {
     /// ([`processes`]); on Windows each is followed with what descends from it (shards-api's
     /// tree of a process, Toolhelp32). None for a machine of this process's.
     fn members(&mut self) -> (Vec<u32>, std::collections::BTreeSet<u32>) {
-        let listed = match self.members {
+        let listed = match &self.members {
             Members::Machine => Vec::new(),
             Members::Client(_) if cfg!(windows) => Vec::new(),
             Members::Client(_) | Members::Own | Members::Started => processes(),
+            #[cfg(unix)]
+            Members::Groups(_) => processes(),
         };
-        let own = match self.members {
-            Members::Client(client) => vec![client],
+        let own = match &self.members {
+            Members::Client(client) => vec![*client],
             Members::Own => own_vms(),
             Members::Machine => Vec::new(),
             Members::Started => listed
@@ -3656,6 +3702,8 @@ impl Party {
                 .filter(|(_, ppid, _)| *ppid == std::process::id())
                 .map(|(pid, ..)| *pid)
                 .collect(),
+            #[cfg(unix)]
+            Members::Groups(groups) => grouped(&listed, groups).map(|(pid, ..)| *pid).collect(),
         };
         let daemon = self.daemon();
         let roots: Vec<u32> = own.into_iter().chain(daemon).collect();
@@ -3944,11 +3992,13 @@ impl Party {
 
     /// Who it is, for a wait's account of itself.
     fn named(&self) -> String {
-        let who = match self.members {
+        let who = match &self.members {
             Members::Client(c) => format!("client {c}"),
             Members::Own => "this test's own VM processes".to_string(),
             Members::Machine => "a machine of this test's process".to_string(),
             Members::Started => "the processes this test's process started".to_string(),
+            #[cfg(unix)]
+            Members::Groups(groups) => format!("the processes of process groups {groups:?}"),
         };
         let who = match self.cpu {
             Cpu::Progress => who,
