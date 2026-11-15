@@ -2961,8 +2961,19 @@ impl Leg {
         super::freeze::enter(&self.a.job_id, &mut cmd);
         // On the CPUs its leg may use (W05-R03): its share, the CPUs it was lent, or what no share
         // holds, from its first instruction; and moved as a share is taken or let go.
-        let job = self.a.job_id.clone();
-        let mut running = super::cpus::spawn_on(&job, move || crate::proc::spawn_group(cmd))?;
+        // Off the shard: joining a frozen job's cgroup holds the spawn until it's let go on. A cancel
+        // (not during cleanup) or a kill meanwhile lets the job go on, as it does a running step's.
+        let cleanup = st.cleanup;
+        let ending = async {
+            let cancelled = async {
+                if cleanup {
+                    futures::future::pending::<()>().await;
+                }
+                self.cancel.cancelled().await;
+            };
+            futures::future::select(std::pin::pin!(cancelled), std::pin::pin!(self.kill.cancelled())).await;
+        };
+        let mut running = super::cpus::spawn_step(&self.a.job_id, cmd, ending).await?;
         st.groups.push(running.pgid);
         if let Some(f) = super::freeze::of(&self.a.job_id) {
             f.step(&running);

@@ -211,8 +211,8 @@ pub fn facts(kvm: bool) -> Facts {
 pub fn facts_of(kvm: bool, held: Option<&Microvms>) -> Facts {
     let hypervisor = hypervisor(kvm);
     match held {
-        Some(_) => Facts { available: true, hypervisor, why_not: None },
-        None => Facts { available: false, hypervisor, why_not: Some(NO_MICROVM.to_owned()) },
+        Some(_) => Facts { available: true, hypervisor, why_not: None, engine: None },
+        None => Facts { available: false, hypervisor, why_not: Some(NO_MICROVM.to_owned()), engine: None },
     }
 }
 

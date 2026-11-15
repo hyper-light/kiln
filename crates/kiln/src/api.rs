@@ -1076,6 +1076,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let name = (*name).to_owned();
             boxed(|| crate::harness::limit::put(&hub, &name, req)).await.map_err(|(c, m)| err(c, m))
         }
+        // How a runner runs new agent sessions, its engine (`crate::harness::engine`; kiln plan 01a1dd2e…, P2.3).
+        (&Method::GET, ["api", "runners", name, "engine"]) => boxed(|| crate::harness::engine::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::PUT, ["api", "runners", name, "engine"]) => {
+            let name = (*name).to_owned();
+            boxed(|| crate::harness::engine::put(&hub, &name, req, &caller.name)).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(boxed(|| crate::frontdoor::control::renew(&hub, name)).await),
         (&Method::GET, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::get(&hub)).await),
         (&Method::PUT, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::put(&hub, req)).await),
@@ -1324,6 +1330,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, "plans.ready", body)).await
         }
+        // A person's own secrets (`crate::secrets::mine`, P4.7): each operation is its route, each keeping its caller to their own.
+        (&Method::GET, ["api", "me", "secrets"]) => boxed(|| own_op(&hub, &caller, "secrets.mine.list", json!({}))).await,
+        (&Method::PUT, ["api", "me", "secrets", name]) => {
+            let name = (*name).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("name".into(), json!(name));
+            }
+            boxed(|| own_op(&hub, &caller, "secrets.mine.set", body)).await
+        }
+        (&Method::DELETE, ["api", "me", "secrets", name]) => boxed(|| own_op(&hub, &caller, "secrets.mine.delete", json!({ "name": name }))).await,
         // Agentfiles (`crate::agentfiles`): each operation is its route, each keeping its caller to their own.
         (&Method::GET, ["api", "agentfiles"]) => boxed(|| own_op(&hub, &caller, "agentfiles.list", query_value(&q))).await,
         (&Method::POST, ["api", "agentfiles"]) => {
@@ -1352,6 +1369,37 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
                 o.insert("id".into(), json!(id));
             }
             boxed(|| own_op(&hub, &caller, "agentfiles.restore", body)).await
+        }
+        // Agent definitions (`crate::agentdefs`): each operation is its route, each keeping its caller to their own.
+        (&Method::GET, ["api", "agentdefs"]) => boxed(|| own_op(&hub, &caller, "agentdefs.list", query_value(&q))).await,
+        (&Method::POST, ["api", "agentdefs"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.create", body)).await
+        }
+        (&Method::POST, ["api", "agentdefs", "check"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.check", body)).await
+        }
+        (&Method::POST, ["api", "agentdefs", "use"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.use", body)).await
+        }
+        (&Method::GET, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.get", json!({ "id": id }))).await,
+        (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
+        (&Method::PATCH, ["api", "agentdefs", id]) | (&Method::POST, ["api", "agentdefs", id, "restore" | "run" | "copy"]) => {
+            let name = match s.get(3).copied() {
+                Some("restore") => "agentdefs.restore",
+                Some("copy") => "agentdefs.copy",
+                Some(_) => "agentdefs.run",
+                None => "agentdefs.update",
+            };
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
         }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
@@ -6438,8 +6486,12 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     spec.plan_run = None;
     spec.helper = None;
     spec.subagent = false;
-    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked.
+    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked,
+    // and so are the secrets its build is given (P4.7).
     spec.agentfile = None;
+    spec.build_secrets = Vec::new();
+    // The engine setting its boundary is decided under is kiln's (kiln plan 01a1dd2e…, P2.3).
+    spec.engine_version = None;
     // An isolated agent's person, whose volume its harness's configuration is on, is whoever asks
     // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked.
     if let Some(i) = spec.isolation.as_mut() {
@@ -6494,7 +6546,7 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         None if !crate::authz::gate::has_users(hub).await => Some("owner".to_owned()),
         None => None,
     };
-    body.spec.agentfile = crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?;
+    crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?.into_spec(&mut body.spec);
     let count = body.count.unwrap_or(1);
     if !body.ids.is_empty() {
         let n = count.clamp(1, 16);

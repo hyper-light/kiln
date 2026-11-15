@@ -629,6 +629,45 @@ mod tests {
         })
     }
 
+    /// W26-R22: a step that starts while its job's cgroup is frozen (paused, or paced by headroom)
+    /// joins it frozen between fork and exec, and its start waits for the job to go on. That wait
+    /// holds up nothing else the shard runs (adacachy2, 2026-11-15: a step started on a shard into a
+    /// frozen job held the runner offline for half an hour); a cancel meanwhile lets the job go on,
+    /// and the step starts, to be ended.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn w26_r22_a_step_starting_in_a_frozen_job_holds_up_no_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let name = "job-w26-r22-start";
+            let started = begin(name);
+            let job = of(name).ok_or_else(|| anyhow::anyhow!("not begun"))?;
+            if job.0.lock().cgroup.is_none() {
+                eprintln!("no cgroup v2 to write here: a step can't join its job frozen");
+                return Ok(());
+            }
+            job.freeze(true).await.map_err(|e| anyhow::anyhow!(e))?;
+            let (cancel, cancelled) = futures::channel::oneshot::channel::<()>();
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "exit 0"]);
+            enter(name, &mut cmd);
+            let spawning = Box::pin(crate::runner::cpus::spawn_step(name, cmd, async {
+                let _ = cancelled.await;
+            }));
+            // The shard goes on (its timer fires) while the step waits on its frozen job to start.
+            let spawning = match futures::future::select(spawning, Box::pin(crate::rt::sleep(Duration::from_millis(500)))).await {
+                futures::future::Either::Left(_) => anyhow::bail!("a step joining a frozen job started before the job went on"),
+                futures::future::Either::Right(((), spawning)) => spawning,
+            };
+            // Cancelled meanwhile: the job goes on, and the step starts.
+            let _ = cancel.send(());
+            let mut running = crate::rt::timeout(Duration::from_secs(30), spawning).await.map_err(|_| anyhow::anyhow!("the step didn't start after the cancel"))??;
+            assert!(!job.frozen(), "a cancel lets the job go on");
+            assert_eq!(crate::rt::timeout(Duration::from_secs(30), running.wait()).await.map_err(|_| anyhow::anyhow!("the step didn't end"))?, Some(0));
+            drop(started);
+            Ok(())
+        })
+    }
+
     /// W26-R22: a job with nothing running here yet, and no cgroup, can't be frozen, and says so.
     #[test]
     fn w26_r22_nothing_to_freeze_says_so() -> anyhow::Result<()> {

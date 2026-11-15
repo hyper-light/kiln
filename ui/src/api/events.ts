@@ -388,6 +388,8 @@ class EventStream {
     }
     this.ws = ws;
     ws.onopen = () => {
+      // W21-R02: callbacks already queued by a stopped socket cannot announce a new one live.
+      if (this.ws !== ws) return;
       opened = true;
       this.set({ state: "open", attempts: 0 });
       this.first = { reconnect: this.wasOpen, resume };
@@ -395,6 +397,7 @@ class EventStream {
       this.wasOpen = true;
     };
     ws.onmessage = (msg) => {
+      if (this.ws !== ws) return;
       if (typeof msg.data === "string" && msg.data.startsWith('{"t":"batch"')) {
         this.batch(ws, msg.data);
         return;

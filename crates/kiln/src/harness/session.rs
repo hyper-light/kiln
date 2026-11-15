@@ -316,6 +316,13 @@ pub struct Spec {
     /// from. Set by kiln, never from what was asked (`POST /api/harness/sessions` drops it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agentfile: Option<String>,
+    /// The secrets a build of that Agentfile is given (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+    /// decision 6, P4.7): each its `LABEL kiln.secret.<ID>=user:<NAME>` names, read by kiln's server
+    /// from its person's own as it started (`secrets::mine::for_build`). Set by kiln, never from what
+    /// was asked; its machine takes them out of the session as it starts it, for its build alone, so
+    /// no copy of the session (a move, a hand-over, a resume) carries them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_secrets: Vec<crate::secrets::mine::BuildSecret>,
     /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +332,12 @@ pub struct Spec {
     /// the same ledger as CI legs and commands. Set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<crate::reach::place::Claim>,
+    /// The version of its runner's engine setting its boundary was decided under
+    /// (`crate::harness::engine::Asked::version`; kiln plan 01a1dd2e…, P2.3): its runner refuses it
+    /// where its own is another, so a start placed before a switch never starts on the engine it
+    /// had. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<u64>,
     /// Whom it acts for, the person whose words its opening prompt (`prompt`) is
     /// (`lineage::person_of`'s form: `owner`, `user:<id>`; kiln plan
     /// 01a1cd8e862e7169a074db3d5fa33f3d step 35): its input admits that prompt as theirs, held to
@@ -352,6 +365,7 @@ impl Default for Spec {
     fn default() -> Self {
         Self {
             claim: None,
+            engine_version: None,
             kind: String::new(),
             cwd: None,
             model: None,
@@ -378,6 +392,7 @@ impl Default for Spec {
             workspace: None,
             isolation: None,
             agentfile: None,
+            build_secrets: Vec::new(),
             variant_of: None,
             opener: None,
         }
@@ -4574,6 +4589,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
     // The models it last listed (the machine keeps the list for its "new agent" and switches): not
     // those kiln named ahead of its harness (`named_ahead`), which are the machine's list already.
     let mut models_seen = s.core.lock().meta.models.clone();
+    // The secrets its microVM's build is given (P4.7), taken out of the session as it starts: held
+    // here for its launches' builds alone, so no copy of the session (a move, a hand-over, a resume)
+    // carries them.
+    let build_secrets = std::mem::take(&mut s.spec.lock().build_secrets);
     loop {
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
@@ -4683,7 +4702,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     None if isolated => {
                         let host = files.host.as_ref().and_then(std::sync::Weak::upgrade);
                         match host.as_ref().and_then(|h| h.microvm()) {
-                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone()).await,
+                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets).await,
                             None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                         }
                     }

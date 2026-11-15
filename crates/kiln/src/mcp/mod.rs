@@ -219,8 +219,8 @@ const CI_TOOLS: &[&str] = &["experiments.suggest"];
 
 /// kiln's operations an agent has as tools of its own (`agents_start`, `goals_plan`, `plans_run`,
 /// …): `agents.*` but its credential, `goals.*` but a stack's settings, most of `plans.*`,
-/// `research.*`, and `agentfiles.*`, which reach the Agentfiles of the person it acts for and no one
-/// else's (`crate::agentfiles::Who`). The server says which ([`runner_ask`]'s registry answer), so its
+/// `research.*`, `agentfiles.*` and `agentdefs.*`, which reach the Agentfiles and agent definitions of
+/// the person it acts for and no one else's (`crate::agentfiles::Who`, `crate::agentdefs::Who`). The server says which ([`runner_ask`]'s registry answer), so its
 /// agents' MCP servers offer what it has, however old their runner: a deploy reaches the agents at work.
 pub fn agent_ops() -> Vec<crate::ops::Op> {
     crate::harness::ops::list_ops()
@@ -232,6 +232,9 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
         .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
         .chain(crate::research::ops::list_ops())
         .chain(crate::agentfiles::ops::list_ops())
+        // Its person's own secrets' names, to name them in an Agentfile; never their values, and it sets none.
+        .chain(crate::secrets::mine::list_ops().into_iter().filter(|o| o.name == "secrets.mine.list"))
+        .chain(crate::agentdefs::ops::list_ops())
         .collect()
 }
 

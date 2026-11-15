@@ -774,6 +774,7 @@ pub(crate) mod tests {
         use std::io::{Read as _, Write as _};
         crate::rt::block_on(async {
             let (rt, _records, vms) = metered();
+            rt.harnesses.lock().push_back(HELLO.to_owned());
             vms.carried()?;
             let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
             let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
@@ -787,20 +788,69 @@ pub(crate) mod tests {
             let mut conn = vms.next("kiln-z7-0")?;
             assert_eq!(*rt.bridged.lock(), [("kiln-z7-0".to_owned(), harness)], "its member's connection, in its box");
             conn.to.write_all(b"{}\n")?;
+            drop(conn.to);
             let mut heard = String::new();
             conn.from.read_to_string(&mut heard)?;
             assert_eq!(heard, HELLO, "what its harness sent");
+            let mut sent = String::new();
+            rt.answered.lock().pop().ok_or_else(|| anyhow::anyhow!("no connection's other end"))?.read_to_string(&mut sent)?;
+            assert_eq!(sent, "{}\n", "what its harness was sent");
+            assert!(matches!(vms.next("kiln-z7-0"), Err(Refusal::Ended)), "its run's connections, ended (Hex's `NotRunning`)");
             assert!(matches!(vms.next("kiln-z7-9"), Err(Refusal::Ended)), "no run of that name");
             drop(run);
-            let mut gone = false;
-            for _ in 0..1000 {
-                if matches!(vms.next("kiln-z7-0"), Err(Refusal::Ended)) {
-                    gone = true;
-                    break;
-                }
-                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(gone, "a run let go of has no more connections");
+            anyhow::Ok(())
+        })
+    }
+
+    /// P1.3 AC2 (Shards D254): a harness in its microVM that calls kiln's MCP through its bridge gets kiln's answer.
+    /// Its connection is taken through Hex (`Runtime::mcp`) and served by this runner's bridge (`isolated::bridge`) over
+    /// the runner's own reach node, as a session's launch serves it: what the harness reads back is kiln's `initialize`,
+    /// naming its session, and kiln's result for its `tools/call` of `runners`.
+    #[test]
+    fn p1_3_a_harness_in_its_box_calls_kilns_mcp_and_gets_kilns_answer() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let config = crate::reach::node::Config {
+                mirrors: dir.path().join("mirrors"),
+                adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
+                sense: false,
+                ..crate::reach::node::Config::for_runner("here", dir.path(), true)
+            };
+            let (handle, _to_server) = crate::reach::node::start(config)?;
+            let here = crate::reach::local::Here { handle, me: "here".into(), host: None, session: "iso-p13".into() };
+            let (rt, _records, vms) = metered();
+            let says = [
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "claude-code", "version": "2.1.296"}}}),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "runners", "arguments": {}}}),
+            ];
+            rt.harnesses.lock().push_back(says.iter().map(|v| format!("{v}\n")).collect());
+            let vms = Arc::new(vms);
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            let served = crate::sandbox::isolated::bridge(Arc::clone(&vms) as Arc<dyn crate::sandbox::Lanes>, "kiln-z7-0".into(), Some(here), dir.path().to_string_lossy().into_owned())?;
+            crate::rt::blocking(move || served.join()).await.map_err(|e| anyhow::anyhow!("{e}"))?.map_err(|_| anyhow::anyhow!("its bridge panicked"))?;
+            let sent = rt.answered.lock().pop().ok_or_else(|| anyhow::anyhow!("its harness made no connection through Hex"))?;
+            // Read as its harness reads: line by line, until both its asks are answered (or kiln's side ends).
+            let heard = crate::rt::blocking(move || {
+                let (mut heard, mut lines) = (String::new(), std::io::BufReader::new(sent));
+                let answered = |heard: &str| [1, 2].iter().all(|id| heard.lines().any(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|a| a.get("id").and_then(serde_json::Value::as_u64) == Some(*id))));
+                while !answered(&heard) && std::io::BufRead::read_line(&mut lines, &mut heard)? > 0 {}
+                std::io::Result::Ok(heard)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))??;
+            let answers: Vec<serde_json::Value> = heard.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            let answer = |id: u64| answers.iter().find(|a| a.get("id").and_then(serde_json::Value::as_u64) == Some(id)).ok_or_else(|| anyhow::anyhow!("no answer {id}: {heard}"));
+            let init = answer(1)?;
+            anyhow::ensure!(init.pointer("/result/serverInfo").is_some(), "not kiln's initialize: {init}");
+            anyhow::ensure!(init.pointer("/result/instructions").and_then(serde_json::Value::as_str).is_some_and(|i| i.contains("iso-p13")), "its session not named: {init}");
+            let runners = answer(2)?;
+            let listed = runners.pointer("/result/structuredContent/runners").is_some_and(serde_json::Value::is_array);
+            let nodes_own = runners.pointer("/result/structuredContent/error").and_then(serde_json::Value::as_str) == Some("not connected to the kiln server");
+            anyhow::ensure!(listed || nodes_own, "not kiln's result for runners: {runners}");
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
             anyhow::Ok(())
         })
     }
@@ -808,22 +858,23 @@ pub(crate) mod tests {
     /// What a stand-in harness sends over each MCP connection [`Metered`] hands out.
     const HELLO: &str = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
 
-    /// One MCP connection [`Metered`] hands out, as Hex's `Runtime::mcp` answers one: its stdin what the harness is
-    /// sent (held here, unread), its stdout what it sends ([`HELLO`], then its end); no stderr.
+    /// One MCP connection [`Metered`] hands out, as Hex's `Runtime::mcp` answers one: its stdout what the harness
+    /// sends (`says`, then its end), its stdin what it is sent, whose other end the caller of [`Bridge::new`] reads;
+    /// no stderr.
     struct Bridge {
         given: Option<hex_api::Given>,
-        _sent: std::io::PipeReader,
     }
 
     impl Bridge {
-        fn new() -> Result<Self, H> {
+        fn new(says: &str) -> Result<(Self, std::io::PipeReader), H> {
             use std::io::Write as _;
             let pipe = |what: &'static str| std::io::pipe().map_err(|e| H::Broken(format!("{what}: {e}")));
             let (sent, to) = pipe("its stdin")?;
-            let (from, mut says) = pipe("its stdout")?;
-            says.write_all(HELLO.as_bytes()).map_err(|e| H::Broken(e.to_string()))?;
-            drop(says);
-            Ok(Bridge { given: Some(hex_api::Given { stdin: Some(to.into()), stdout: Some(from.into()), stderr: None }), _sent: sent })
+            let (from, mut saying) = pipe("its stdout")?;
+            // Written on a thread of its own, as a harness writes: a pipe holds only so much unread.
+            let says = says.to_owned();
+            std::thread::Builder::new().name("hexvm-test-harness".into()).spawn(move || drop(saying.write_all(says.as_bytes()))).map_err(|e| H::Broken(e.to_string()))?;
+            Ok((Bridge { given: Some(hex_api::Given { stdin: Some(to.into()), stdout: Some(from.into()), stderr: None }) }, sent))
         }
     }
 
@@ -842,6 +893,155 @@ pub(crate) mod tests {
         }
         fn streams(&mut self) -> Result<hex_api::Given, H> {
             self.given.take().ok_or_else(|| H::Invalid { what: "streams", why: "given once".into() })
+        }
+    }
+
+    /// Hex's simulator for its boxes, each one's harness member a program of this machine (`program`, given its
+    /// member's arguments, environment and folder from the box's spec), as Hex's image runtime runs one in its VM:
+    /// its stdio the member's streams, a signal to it delivered to that program alone (`signal_member`, kept in
+    /// [`HexProcs::signalled`]), and its box's delete its VM's stop, the program killed. For sessions driven through
+    /// Hex as a person drives them (P1.3).
+    #[cfg(unix)]
+    pub(crate) struct HexProcs {
+        sim: SimRuntime,
+        program: std::path::PathBuf,
+        members: parking_lot::Mutex<std::collections::HashMap<String, hex_api::ImageMember>>,
+        pids: parking_lot::Mutex<std::collections::HashMap<String, u32>>,
+        /// Each signal a member was sent, by its box, in order.
+        pub(crate) signalled: parking_lot::Mutex<Vec<(String, hex_api::Signal)>>,
+    }
+
+    #[cfg(unix)]
+    impl HexProcs {
+        pub(crate) fn new(program: &std::path::Path) -> Self {
+            Self { sim: SimRuntime::new(), program: program.to_path_buf(), members: Default::default(), pids: Default::default(), signalled: Default::default() }
+        }
+
+        /// The boxes it holds.
+        pub(crate) fn boxes(&self) -> Result<Vec<BoxInfo>, H> {
+            self.sim.list()
+        }
+
+        /// The sandbox over it, its boxes named as a runner process of epoch 7 names those that reserve nothing.
+        pub(crate) fn vms(self: &Arc<Self>) -> HexVms {
+            let n = AtomicU64::new(0);
+            HexVms::new(Arc::clone(self) as Arc<dyn Runtime>, move || Some(BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) }))
+        }
+
+        /// Its member's program in box `id` stopped, as its VM's stop stops it.
+        fn stop(&self, id: &BoxId) {
+            if let Some(pid) = self.pids.lock().remove(id.as_str()).and_then(|p| i32::try_from(p).ok()) {
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+    }
+
+    /// A member's program, as Hex's `Proc` says one.
+    #[cfg(unix)]
+    struct MemberProgram(std::process::Child);
+
+    #[cfg(unix)]
+    fn exit_of(status: std::process::ExitStatus) -> hex_api::Exit {
+        use std::os::unix::process::ExitStatusExt as _;
+        match (status.code(), status.signal()) {
+            (Some(c), _) => hex_api::Exit::Code(c),
+            (None, Some(n)) => hex_api::Exit::Signal(n),
+            (None, None) => hex_api::Exit::Unknown,
+        }
+    }
+
+    #[cfg(unix)]
+    impl Proc for MemberProgram {
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+        fn try_wait(&mut self) -> Result<Option<hex_api::Exit>, H> {
+            self.0.try_wait().map(|s| s.map(exit_of)).map_err(|e| H::Broken(e.to_string()))
+        }
+        fn wait_for(&mut self, timeout: Duration) -> Result<Option<hex_api::Exit>, H> {
+            if timeout == Duration::MAX {
+                return self.0.wait().map(|s| Some(exit_of(s))).map_err(|e| H::Broken(e.to_string()));
+            }
+            let until = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(end) = self.try_wait()? {
+                    return Ok(Some(end));
+                }
+                if std::time::Instant::now() >= until {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn kill(&mut self) -> Result<(), H> {
+            self.0.kill().map_err(|e| H::Broken(e.to_string()))
+        }
+        fn streams(&mut self) -> Result<hex_api::Given, H> {
+            Ok(hex_api::Given { stdin: self.0.stdin.take().map(Into::into), stdout: self.0.stdout.take().map(Into::into), stderr: self.0.stderr.take().map(Into::into) })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Runtime for HexProcs {
+        fn classes(&self) -> Vec<Class> {
+            self.sim.classes()
+        }
+        fn create(&self, spec: BoxSpec) -> Result<BoxInfo, H> {
+            if let hex_api::ClassSpec::ShardsImage(image) = &spec.class
+                && let Some(harness) = image.members.iter().find(|m| m.member.kind == MemberKind::Harness)
+            {
+                self.members.lock().insert(spec.id.to_string(), harness.clone());
+            }
+            self.sim.create(spec)
+        }
+        fn start(&self, id: &BoxId) -> Result<(), H> {
+            self.sim.start(id)
+        }
+        fn exec(&self, id: &BoxId, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, H> {
+            self.sim.exec(id, program, stdio)
+        }
+        fn run(&self, spec: BoxSpec, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, H> {
+            self.sim.run(spec, program, stdio)
+        }
+        fn signal(&self, id: &BoxId, signal: hex_api::Signal) -> Result<(), H> {
+            self.sim.signal(id, signal)
+        }
+        fn inspect(&self, id: &BoxId) -> Result<BoxInfo, H> {
+            self.sim.inspect(id)
+        }
+        fn usage(&self, id: &BoxId) -> Result<Usage, H> {
+            self.sim.usage(id)
+        }
+        fn list(&self) -> Result<Vec<BoxInfo>, H> {
+            self.sim.list()
+        }
+        fn delete(&self, id: &BoxId) -> Result<(), H> {
+            self.stop(id);
+            self.sim.delete(id)
+        }
+        fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, H> {
+            self.delete(id).map(|()| None)
+        }
+        fn member(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, H> {
+            self.sim.inspect(id)?;
+            let spec = self.members.lock().get(id.as_str()).cloned().filter(|m| &m.member == member).ok_or_else(|| H::Invalid { what: "member", why: format!("box {id}'s spec names no {member} its caller drives") })?;
+            let mut command = std::process::Command::new(&self.program);
+            command.args(&spec.args).envs(spec.env.iter().map(|(k, v)| (k, v))).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            if let Some(dir) = &spec.workdir {
+                command.current_dir(dir);
+            }
+            let child = command.spawn().map_err(|e| H::Broken(format!("its member's program: {e}")))?;
+            self.pids.lock().insert(id.to_string(), child.id());
+            Ok(Box::new(MemberProgram(child)))
+        }
+        fn signal_member(&self, id: &BoxId, member: &Member, signal: hex_api::Signal) -> Result<(), H> {
+            self.sim.inspect(id)?;
+            let pid = self.pids.lock().get(id.as_str()).copied().ok_or_else(|| H::NotRunning(id.clone(), "signal a member"))?;
+            let to = nix::sys::signal::Signal::try_from(signal.number()).map_err(|e| H::Broken(e.to_string()))?;
+            let pid = nix::unistd::Pid::from_raw(i32::try_from(pid).map_err(|e| H::Broken(e.to_string()))?);
+            nix::sys::signal::kill(pid, to).map_err(|_| H::NotRunning(id.clone(), "signal a member: it has ended"))?;
+            self.signalled.lock().push((format!("{id}/{member}"), signal));
+            Ok(())
         }
     }
 
@@ -864,6 +1064,10 @@ pub(crate) mod tests {
         lessees: parking_lot::Mutex<Vec<(String, Arc<dyn hex_api::lease::Lessor>)>>,
         specs: parking_lot::Mutex<Vec<String>>,
         bridged: parking_lot::Mutex<Vec<(String, Member)>>,
+        /// What the harness says on each MCP connection it makes, in turn; none left, its run's connections ended.
+        harnesses: parking_lot::Mutex<std::collections::VecDeque<String>>,
+        /// The harness's end of each connection handed out: what it was sent.
+        answered: parking_lot::Mutex<Vec<std::io::PipeReader>>,
     }
 
     /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
@@ -929,7 +1133,8 @@ pub(crate) mod tests {
             self.sim.signal_member(id, member, signal)
         }
         /// As Hex's image class answers it: `Invalid` where its box's spec asks no bridge of `member`, `NoSuchBox`
-        /// once its box is gone; else a connection ([`Bridge`]).
+        /// once its box is gone; else its harness's next connection ([`Bridge`], [`Metered::harnesses`]), and
+        /// `NotRunning` where it makes no more.
         fn mcp(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, H> {
             let info = self.sim.inspect(id)?;
             let asked = self.specs.lock().iter().any(|s| serde_json::from_str::<BoxSpec>(s).is_ok_and(|spec| spec.id == info.id && matches!(&spec.class, hex_api::ClassSpec::ShardsImage(image) if image.members.iter().any(|m| &m.member == member && m.mcp))));
@@ -937,7 +1142,10 @@ pub(crate) mod tests {
                 return Err(H::Invalid { what: "mcp", why: format!("box {id}'s spec asks no MCP bridge of {member}") });
             }
             self.bridged.lock().push((id.to_string(), member.clone()));
-            Ok(Box::new(Bridge::new()?))
+            let says = self.harnesses.lock().pop_front().ok_or_else(|| H::NotRunning(id.clone(), "mcp: its run ended"))?;
+            let (bridge, sent) = Bridge::new(&says)?;
+            self.answered.lock().push(sent);
+            Ok(Box::new(bridge))
         }
         fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, H> {
             self.deletes.fetch_add(1, Ordering::AcqRel);

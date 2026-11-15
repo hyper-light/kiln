@@ -362,6 +362,49 @@ fn w05_r25_a_cancel_holds_over_a_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W05-R25 across a restart: a run held behind its concurrency group as the server went had never
+/// started, and the rebuild brings it back with none of its legs made. Cancelled then, it ends
+/// cancelled. Before, it stayed queued whatever cancelled it: its plan waited for legs that were
+/// never made (production's runs #2758 to #2761, 2026-11-13).
+#[test]
+fn w05_r25_a_run_held_behind_its_group_over_a_restart_ends_when_cancelled() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let tree = Tree::new(dir.path(), &s)?;
+    let status = |s: &Server, run: &str| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&detail)?.pointer("/run/status").and_then(Value::as_str).unwrap_or_default().to_owned())
+    };
+    // One run at a time, and the one under way finishes: the next push's waits behind it.
+    tree.commit(".kiln/one.yaml", "on: push\nconcurrency: { group: one, cancel-in-progress: false }\njobs:\n  slow:\n    runs-on: local\n    steps:\n      - run: if [ \"$KILN_ATTEMPT\" = 1 ]; then sleep 300; fi\n")?;
+    let first = run_of(&s, ".kiln/one.yaml")?;
+    until(&s, 300, "the first run's leg running", || {
+        let all = legs(&s, &first)?;
+        Ok((!all.iter().any(|(_, _, st, _)| st == "running")).then(|| format!("{all:?}")))
+    })?;
+    tree.commit("README.md", "again\n")?;
+    let mut second = String::new();
+    until(&s, 120, "the second push's run", || {
+        second = run_of(&s, ".kiln/one.yaml")?;
+        Ok((second == first).then(|| second.clone()))
+    })?;
+    anyhow::ensure!(status(&s, &second)? == "queued" && legs(&s, &second)?.is_empty(), "held behind the first, nothing of it made: {} {:?}", status(&s, &second)?, legs(&s, &second)?);
+    // The server goes while it waits. Back, it has rebuilt its runs by the time the first's leg,
+    // lost with its runner, has its next attempt.
+    s.restart()?;
+    until(&s, 300, "the first run's leg, lost with its runner, run again", || {
+        let all = legs(&s, &first)?;
+        Ok((!all.iter().any(|(_, _, _, attempt)| *attempt >= 2)).then(|| format!("{all:?}")))
+    })?;
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{second}/cancel"), &s.admin, Some(&json!({})))?;
+    anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
+    until(&s, 120, "the second run cancelled", || {
+        let now = status(&s, &second)?;
+        Ok((now != "cancelled").then(|| format!("{now}: {:?}", legs(&s, &second))))
+    })?;
+    Ok(())
+}
+
 /// A repository deleted while its legs run takes them with it, as a deleted GitHub repository
 /// does: its runner stops them, and a slot they held goes to the next repository's leg.
 #[test]

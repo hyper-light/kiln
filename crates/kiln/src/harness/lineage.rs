@@ -21,6 +21,7 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::engine::Engine;
 use super::kinds::{Kind, Protocol};
 use super::model::Status;
 use super::session::{Info, Isolation, Spec};
@@ -776,10 +777,13 @@ fn not_ready(kind: &str, target: &str, known: Option<&crate::accounts::Account>,
 /// microVM's own vCPUs and memory of runners that start microVMs ([`session_needs`]), and is placed
 /// by the balancer or not at all: where none of the runners that place agents could place it, it's
 /// refused, never picked as before, so every one holds a claim for its microVM's life.
-async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, isolation: Option<&Isolation>, queued: &Queued) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
+async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, (isolation, want): (Option<&Isolation>, Option<Engine>), queued: &Queued) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
     use crate::reach::place::{SessionAsk, SessionWord};
     let default = parent.map(target_of);
     let targets = may_start_on(hub, on, kind, default.as_deref(), isolation.is_some())?;
+    // Only where its runner's engine is the one it needs (kiln plan 01a1dd2e…, P2.4): a microVM's on a
+    // `microvm` runner, a process asked for (`none`) on a `host` one; refused, the engine named.
+    let targets = on_engine(hub, targets, want)?;
     // Chosen by what it needs, not a machine named nor its parent's: only where its harness is signed
     // in and its account has room, as far as kiln knows (2026-11-13). An isolated agent's harness
     // and sign-in are its image's.
@@ -891,7 +895,8 @@ pub fn session_needs(mut asked: kiln_ci::sched::needs::Needs, isolation: Option<
 /// its start to its end. However an isolated agent is started, the balancer places it.
 pub async fn place_on(hub: &Hub, target: &str, spec: &Spec, count: usize, parent: Option<&Info>) -> Result<Vec<crate::reach::place::Claim>, Refused> {
     let want = named(hub, target).unwrap_or_else(|| Ok(target.to_owned()))?;
-    let placed = place_agents(hub, parent, Some(target), &spec.kind, count, spec.isolation.as_ref(), &Queued::default()).await?;
+    let engine = spec.isolation.as_ref().map(|_| Engine::Microvm);
+    let placed = place_agents(hub, parent, Some(target), &spec.kind, count, (spec.isolation.as_ref(), engine), &Queued::default()).await?;
     let mut claims = Vec::new();
     for (t, c) in &placed {
         match c {
@@ -908,7 +913,7 @@ pub async fn place_on(hub: &Hub, target: &str, spec: &Spec, count: usize, parent
 /// [`place_agents`], for reach's doors tests to drive with their lab's runners (docs/ci.md W05-R03).
 #[cfg(all(test, unix))]
 pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
-    place_agents(hub, parent, on, kind, count, None, &Queued::default()).await
+    place_agents(hub, parent, on, kind, count, (None, None), &Queued::default()).await
 }
 
 /// An agent start's placement as [`start_as`] makes it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -917,7 +922,8 @@ pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on:
 #[cfg(all(test, unix))]
 pub(crate) async fn place_start_for_tests(hub: &Hub, parent: Option<&Info>, ask: &Ask) -> Result<(Option<Isolation>, Vec<(String, Option<crate::reach::place::Claim>)>), Refused> {
     let isolation = start_isolation(hub, parent, ask, None, ask.on.as_deref())?;
-    let placed = place_agents(hub, parent, ask.on.as_deref(), &ask.kind, ask.count.unwrap_or(1), isolation.as_ref(), &Queued::default()).await?;
+    let want = wanted(ask.isolation.as_deref(), isolation.as_ref());
+    let placed = place_agents(hub, parent, ask.on.as_deref(), &ask.kind, ask.count.unwrap_or(1), (isolation.as_ref(), want), &Queued::default()).await?;
     Ok((isolation, placed))
 }
 
@@ -1047,13 +1053,67 @@ pub fn isolation_on(hub: &Hub, target: &str) -> Result<(), String> {
     let Some(machine) = target.strip_prefix("agent:") else {
         return Err("the server's kiln starts no microVM itself until it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16): pick a runner that does with `on` (`microvm`)".to_owned());
     };
-    let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| (f.virt.microvm, f.isolation.as_ref().and_then(|i| i.why_not.clone()))));
+    let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| (f.virt.microvm, crate::harness::engine::of(f), crate::harness::engine::capable(f).usable, f.isolation.as_ref().and_then(|i| i.why_not.clone()))));
     match said {
-        Some((true, _)) => Ok(()),
-        Some((false, Some(why))) => Err(format!("{} doesn't start microVMs: {why}", hub.shown(machine))),
-        Some((false, None)) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
+        Some((true, _, _, _)) => Ok(()),
+        // It can, and its owner set it to run its sessions on its host (kiln plan 01a1dd2e…, P2.3).
+        Some((false, Some(Engine::Host), true, _)) => Err(format!("{} runs its sessions on its host (its engine is host): a session that needs a microVM starts only on a runner whose engine is microvm", hub.shown(machine))),
+        Some((false, _, _, Some(why))) => Err(format!("{} doesn't start microVMs (its engine is host): {why}", hub.shown(machine))),
+        Some((false, _, _, None)) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
         None => Err(format!("{} hasn't said yet whether it starts microVMs: try again in a minute", hub.shown(machine))),
     }
+}
+
+/// The engine a start needs of its runner (kiln plan 01a1dd2e…, P2.3 and P2.4): `microvm` for one held
+/// in a microVM (asked, from its Agentfile, or as its parent is), `host` for one asked to run as a
+/// process (`isolation` "none"), and none for one that asks nothing, which takes its runner's.
+pub fn wanted(asked: Option<&str>, isolation: Option<&Isolation>) -> Option<Engine> {
+    match (isolation, asked.map(str::trim)) {
+        (Some(_), _) => Some(Engine::Microvm),
+        (None, Some("none")) => Some(Engine::Host),
+        (None, _) => None,
+    }
+}
+
+/// The engine of the machine `target` names (`local`, the server itself, runs its sessions on its
+/// host), as the server has its runner's facts (`crate::harness::engine::overlay`); why not, where its
+/// runner hasn't said.
+pub fn engine_at(hub: &Hub, target: &str) -> Result<Engine, String> {
+    let Some(machine) = target.strip_prefix("agent:") else { return Ok(Engine::Host) };
+    hub.agents.load().get(machine).and_then(|a| a.facts.as_deref().and_then(crate::harness::engine::of)).ok_or_else(|| format!("{} hasn't said yet how it runs sessions", hub.shown(machine)))
+}
+
+/// What the facts the server has of `target`'s runner say of its Hex node's image class
+/// (`crate::harness::engine::node_images`).
+fn images_at(hub: &Hub, target: &str) -> crate::harness::engine::NodeImages {
+    let facts = target.strip_prefix("agent:").and_then(|m| hub.agents.load().get(m).and_then(|a| a.facts.as_deref().cloned()));
+    facts.as_ref().map_or(crate::harness::engine::NodeImages::Unknown, crate::harness::engine::node_images)
+}
+
+/// Of `targets`, those whose engine is `want` (all of them for none); refused, the engine named and
+/// what each runs on, where none is (kiln plan 01a1dd2e…, P2.4).
+fn on_engine(hub: &Hub, targets: Vec<String>, want: Option<Engine>) -> Result<Vec<String>, Refused> {
+    let Some(want) = want else { return Ok(targets) };
+    let (mut kept, mut why) = (Vec::new(), Vec::new());
+    for t in targets {
+        let shown = t.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), |m| hub.shown(m));
+        match engine_at(hub, &t) {
+            // Its Hex node must list image VMs' class too, once kiln's Hex has one (P2.2).
+            Ok(Engine::Microvm) if want == Engine::Microvm && images_at(hub, &t) == crate::harness::engine::NodeImages::NotListed => why.push(format!("{shown}'s Hex node lists no `shards-image` class")),
+            Ok(e) if e == want => kept.push(t),
+            Ok(Engine::Host) => why.push(format!("{shown} runs its sessions on its host (its engine is host)")),
+            Ok(Engine::Microvm) => why.push(format!("{shown} runs its sessions in microVMs (its engine is microvm)")),
+            Err(w) => why.push(w),
+        }
+    }
+    if kept.is_empty() {
+        let what = match want {
+            Engine::Microvm => "a session that needs a microVM starts only on a runner whose engine is microvm",
+            Engine::Host => "a session asked to run as a process on its machine (`isolation` \"none\") starts only on a runner whose engine is host",
+        };
+        return Err((StatusCode::CONFLICT, format!("{what}, and none that suits it is: {}", why.join("; "))));
+    }
+    Ok(kept)
 }
 
 /// The text of the Agentfile `isolation`'s image names where it's one of a person's own
@@ -1061,20 +1121,39 @@ pub fn isolation_on(hub: &Hub, target: &str) -> Result<(), String> {
 /// build its microVM from (`Spec::agentfile`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17).
 /// It's its owner's alone: another person's is as none, even to those who reach everyone's, and a
 /// start that acts for no person names none. Kiln's own Agentfiles, and starts that aren't isolated,
-/// read nothing.
-pub async fn kept_agentfile(hub: &Hub, isolation: Option<&Isolation>, person: Option<&str>) -> Result<Option<String>, String> {
+/// read nothing. With its text, the secrets its build is given (`Spec::build_secrets`): each it names,
+/// read from `person`'s own (decision 6, P4.7); one they hold none of refuses the start, naming it.
+pub async fn kept_agentfile(hub: &Hub, isolation: Option<&Isolation>, person: Option<&str>) -> Result<Kept, String> {
     let Some(name) = isolation.and_then(|i| i.image.as_deref()).map(str::trim) else {
-        return Ok(None);
+        return Ok(Kept::default());
     };
     let Some(id) = name.strip_prefix(crate::sandbox::isolated::KEPT) else {
-        return Ok(None);
+        return Ok(Kept::default());
     };
     let person = person.ok_or_else(|| format!("{name} is a person's own Agentfile, and this start acts for no person"))?;
     let who = crate::agentfiles::Who { person: person.to_owned(), all: false };
-    match crate::agentfiles::get(hub, hub.blobs.blobs.as_ref(), &who, id).await {
-        Ok(kept) => Ok(Some(kept.text)),
-        Err(crate::agentfiles::Error::Missing) => Err(format!("{name} names no Agentfile of yours")),
-        Err(e) => Err(format!("{name}: {e}")),
+    let text = match crate::agentfiles::get(hub, hub.blobs.blobs.as_ref(), &who, id).await {
+        Ok(kept) => kept.text,
+        Err(crate::agentfiles::Error::Missing) => return Err(format!("{name} names no Agentfile of yours")),
+        Err(e) => return Err(format!("{name}: {e}")),
+    };
+    let secrets = crate::secrets::mine::for_build(hub, person, &text).await.map_err(|why| format!("{name}: {why}"))?;
+    Ok(Kept { text: Some(text), secrets })
+}
+
+/// What [`kept_agentfile`] read for a start: its person's own Agentfile's text, and the secrets its
+/// build is given.
+#[derive(Debug, Default)]
+pub struct Kept {
+    pub text: Option<String>,
+    pub secrets: Vec<crate::secrets::mine::BuildSecret>,
+}
+
+impl Kept {
+    /// Into `spec`, as kiln says them.
+    pub fn into_spec(self, spec: &mut Spec) {
+        spec.agentfile = self.text;
+        spec.build_secrets = self.secrets;
     }
 }
 
@@ -1447,8 +1526,16 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
     // person they act for's. A person's own Agentfile is read as theirs before anything is placed.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
-    let agentfile = kept_agentfile(hub, isolation.as_ref(), person.as_deref()).await.map_err(bad)?;
-    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.as_ref(), &ask.queued).await?;
+    let kept = kept_agentfile(hub, isolation.as_ref(), person.as_deref()).await.map_err(bad)?;
+    let want = wanted(ask.isolation.as_deref(), isolation.as_ref());
+    // The engine settings its boundary is decided under, as they are before it's placed: a runner set
+    // again since refuses it (kiln plan 01a1dd2e…, P2.3).
+    let settings = hub.engines.now();
+    let decided_under = |target: &str| target.strip_prefix("agent:").map(|m| settings.get(m).map_or(0, |a| a.version));
+    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, (isolation.as_ref(), want), &ask.queued).await?;
+    // Each one's boundary (kiln plan 01a1dd2e…, P2.3): as it asked, or else its runner's engine's.
+    // A conversation taken up (`resume`) stays where its harness keeps it.
+    let boundary = |target: &str| isolation.clone().or_else(|| (want.is_none() && resume.is_none() && engine_at(hub, target) == Ok(Engine::Microvm)).then(|| sized(Isolation::microvm(), &requested(hub, on.as_deref()).request)));
     let checked = async {
         let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
         targets.dedup();
@@ -1458,14 +1545,15 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
             }
             // An isolated agent's harness is its image's, in its microVM: what the machine has
             // installed isn't its (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
-            if isolation.is_none() && lacks(hub, target, kind).await {
+            let isolated = boundary(target).is_some();
+            if !isolated && lacks(hub, target, kind).await {
                 return Err(not_installed(hub, target, kind));
             }
             if volume {
                 workspaces_on(hub, target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
             }
             // Before anything starts, so its claims are let go: a fallback's pick is checked too.
-            if isolation.is_some() {
+            if isolated {
                 isolation_on(hub, target).map_err(|why| (StatusCode::CONFLICT, format!("an agent can't run isolated there: {why}")))?;
             }
             if *target == "local" && !hub.cfg.terminal.enabled {
@@ -1494,7 +1582,6 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
     // person they act for's.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
-    let isolation = with_person(isolation, person.as_deref());
     // Its folder: the one asked for, else its parent's where they share a machine, else home.
     let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| placed.iter().all(|(t, _)| same_machine(p, t))).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
     let mut spec = Spec {
@@ -1511,9 +1598,10 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         plan_run: by.plan_run.clone(),
         helper: ask.helper.clone(),
         workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
-        isolation,
-        resume,
-        agentfile,
+        isolation: with_person(isolation.clone(), person.as_deref()),
+        resume: resume.clone(),
+        agentfile: kept.text,
+        build_secrets: kept.secrets,
         // Whose its opening prompt is: its input admits it as theirs (step 35).
         opener: person.clone(),
         ..Spec::default()
@@ -1525,7 +1613,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     let mut at = 0;
     while let Some((t, claim)) = placed.get(at) {
         let n = if claim.is_none() { placed.iter().skip(at).take_while(|(u, c)| u == t && c.is_none()).count() } else { 1 };
-        let spec = Spec { claim: claim.clone(), ..spec.clone() };
+        let spec = Spec { claim: claim.clone(), isolation: with_person(boundary(t), person.as_deref()), engine_version: decided_under(t), ..spec.clone() };
         match hub.harness.open(hub, t, spec, n).await {
             Ok(i) => infos.extend(i),
             Err(e) => {
@@ -1659,7 +1747,7 @@ mod tests {
             let id = kept.agentfile.id;
             crate::agentfiles::update(&hub, blobs, &ada, &id, crate::agentfiles::Patch { name: None, text: Some(V2.into()) }, "user:u-ada").await?;
             let named = Isolation { image: Some(format!(" agentfile:{id} ")), ..Isolation::microvm() };
-            assert_eq!(kept_agentfile(&hub, Some(&named), Some("user:u-ada")).await, Ok(Some(V2.to_owned())), "its latest version");
+            assert_eq!(kept_agentfile(&hub, Some(&named), Some("user:u-ada")).await.map(|k| k.text), Ok(Some(V2.to_owned())), "its latest version");
             for other in ["user:u-bo", "owner"] {
                 let refused = kept_agentfile(&hub, Some(&named), Some(other)).await.err().unwrap_or_default();
                 assert_eq!(refused, format!("agentfile:{id} names no Agentfile of yours"), "{other}");
@@ -1669,7 +1757,7 @@ mod tests {
             assert!(kept_agentfile(&hub, Some(&gone), Some("user:u-ada")).await.is_err(), "one there isn't");
             let kilns = Isolation { image: Some("harness-claude".into()), ..Isolation::microvm() };
             for isolation in [Some(&kilns), Some(&Isolation::microvm()), None] {
-                assert_eq!(kept_agentfile(&hub, isolation, Some("user:u-ada")).await, Ok(None));
+                assert_eq!(kept_agentfile(&hub, isolation, Some("user:u-ada")).await.map(|k| (k.text, k.secrets)), Ok((None, Vec::new())));
             }
             Ok(())
         })
@@ -1730,7 +1818,9 @@ mod tests {
     fn step32_an_isolated_agent_is_placed_by_the_balancer_or_not_at_all() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
-            let facts = kiln_ci::facts::RunnerFacts { virt: kiln_ci::facts::Virt { microvm: true, ..Default::default() }, ..Default::default() };
+            // It holds microVMs, its engine what that makes it (`engine::overlay`, as the server writes it).
+            let mut facts = kiln_ci::facts::RunnerFacts { isolation: Some(kiln_ci::facts::Isolation { available: true, ..Default::default() }), ..Default::default() };
+            crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked::default());
             hub.put_agent(crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner("vm-box", "linux", "x86_64") });
             let kinds = super::super::kinds::offered()
                 .into_iter()
@@ -1752,6 +1842,39 @@ mod tests {
         })
     }
 
+    /// Kiln plan 01a1dd2e…, P2.3 and P2.4: a start needs `microvm` when it's held in a microVM, `host`
+    /// when it asks for a process, nothing when it asks nothing. Only runners of the engine needed are
+    /// kept; where none is, it's refused, the engine named and what each runner runs on said.
+    #[test]
+    fn p2_4_a_start_is_kept_to_runners_of_the_engine_it_needs() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let runner = |name: &str, can: bool, asked: Option<Engine>| {
+                let mut facts = kiln_ci::facts::RunnerFacts { isolation: Some(kiln_ci::facts::Isolation { available: can, ..Default::default() }), ..Default::default() };
+                crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked { engine: asked, version: 0 });
+                crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
+            };
+            hub.put_agent(runner("vm", true, None));
+            hub.put_agent(runner("opted-out", true, Some(Engine::Host)));
+            hub.put_agent(runner("plain", false, None));
+            assert_eq!(wanted(None, Some(&Isolation::microvm())), Some(Engine::Microvm));
+            assert_eq!((wanted(Some(" none "), None), wanted(None, None), wanted(Some("microvm"), Some(&Isolation::microvm()))), (Some(Engine::Host), None, Some(Engine::Microvm)));
+            assert_eq!((engine_at(&hub, "agent:vm"), engine_at(&hub, "agent:opted-out"), engine_at(&hub, "local")), (Ok(Engine::Microvm), Ok(Engine::Host), Ok(Engine::Host)));
+            let all = || ["agent:opted-out", "agent:plain", "agent:vm", "local"].map(str::to_owned).to_vec();
+            assert_eq!(on_engine(&hub, all(), Some(Engine::Microvm)).map_err(|e| e.1), Ok(vec!["agent:vm".to_owned()]));
+            assert_eq!(on_engine(&hub, all(), Some(Engine::Host)).map_err(|e| e.1), Ok(vec!["agent:opted-out".to_owned(), "agent:plain".to_owned(), "local".to_owned()]));
+            assert_eq!(on_engine(&hub, all(), None).map_err(|e| e.1), Ok(all()));
+            let hosts = vec!["agent:opted-out".to_owned(), "agent:plain".to_owned()];
+            let why = on_engine(&hub, hosts, Some(Engine::Microvm)).err().map(|e| e.1).unwrap_or_default();
+            anyhow::ensure!(why.contains("needs a microVM starts only on a runner whose engine is microvm") && why.contains("opted-out runs its sessions on its host (its engine is host)"), "{why}");
+            let why = on_engine(&hub, vec!["agent:vm".to_owned()], Some(Engine::Host)).err().map(|e| e.1).unwrap_or_default();
+            anyhow::ensure!(why.contains("whose engine is host") && why.contains("vm runs its sessions in microVMs (its engine is microvm)"), "{why}");
+            let refused = isolation_on(&hub, "agent:opted-out").err().unwrap_or_default();
+            anyhow::ensure!(refused.contains("its engine is host"), "{refused}");
+            Ok(())
+        })
+    }
+
     /// Step 17: a runner that says why it holds no isolated agent (its facts' `isolation.why_not`) is
     /// refused in its own words; one from before those facts, in kiln's.
     #[test]
@@ -1763,7 +1886,7 @@ mod tests {
                 facts: Some(Box::new(kiln_ci::facts::RunnerFacts { isolation, ..Default::default() })),
                 ..crate::hub::tests::live_runner(name, "linux", "x86_64")
             };
-            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()) })));
+            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()), engine: None })));
             hub.put_agent(said("older", None));
             let refused = isolation_on(&hub, "agent:no-hypervisor").err().unwrap_or_default();
             anyhow::ensure!(refused.ends_with(why), "the runner's own reason: {refused}");

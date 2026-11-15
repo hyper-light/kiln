@@ -181,6 +181,7 @@ pub fn lint(text: &str) -> Check {
 fn with_kiln(mut c: Check, text: &str, kiln: &Kiln) -> Check {
     if c.checked && c.refusal().is_none() {
         c.diagnostics.extend(reaching_kiln(text, kiln));
+        c.diagnostics.extend(secret_references(text));
         c.diagnostics.sort_by_key(|d| (d.range.start.line, d.severity == Severity::Warning));
     }
     c
@@ -188,6 +189,16 @@ fn with_kiln(mut c: Check, text: &str, kiln: &Kiln) -> Check {
 
 /// The code of kiln's refusal of a grant that reaches kiln itself.
 pub const REACHES_KILN: &str = "ReachesKiln";
+
+/// The code of kiln's refusal of a `LABEL kiln.secret.<ID>=…` that isn't `user:<NAME>` (P4.7).
+pub const SECRET_REFERENCE: &str = "SecretReference";
+
+/// Each `kiln.secret.` label of `text` that names no build secret as one of its person's own
+/// (`secrets::mine::references`), refused at its line, its words never repeating its value.
+fn secret_references(text: &str) -> Vec<Diagnostic> {
+    let (_, misnamed) = crate::secrets::mine::references(text);
+    misnamed.into_iter().map(|m| Diagnostic { code: SECRET_REFERENCE.into(), severity: Severity::Error, message: m.message, path: "Agentfile".into(), range: range(&m.location), url: None }).collect()
+}
 
 /// The machine itself, as a microVM names it (Shards D236's name, Docker Desktop's: `.internal` is
 /// the top-level domain ICANN reserved for private use, so no name in the DNS is it).

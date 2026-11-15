@@ -1131,6 +1131,9 @@ pub enum FromServer {
     /// `HarnessHistoryFor`: this machine's past sessions, asked for a person (kiln plan
     /// 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
     HarnessHistoryFor { req: u64, asked: crate::aisessions::Asked },
+    /// `RunnerEngine`: what the runner's owner set on the server for its engine (kiln plan 01a1dd2e…,
+    /// P2.3).
+    RunnerEngine(crate::harness::engine::Asked),
 }
 
 impl Carries for ServerMsg {
@@ -1190,6 +1193,7 @@ impl Carries for ServerMsg {
             ServerMsg::Headroom { json } => FromServer::Headroom(payload(W, "Headroom", &json)?),
             ServerMsg::Custody { json } => FromServer::Custody(payload(W, "Custody", &json)?),
             ServerMsg::HarnessHistoryFor { req, json } => FromServer::HarnessHistoryFor { req, asked: payload(W, "HarnessHistoryFor", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
+            ServerMsg::RunnerEngine { json } => FromServer::RunnerEngine(payload(W, "RunnerEngine", &json)?),
             m @ (ServerMsg::Welcome { .. }
             | ServerMsg::Refused { .. }
             | ServerMsg::Assign(_)
@@ -1382,6 +1386,7 @@ mod tests {
             case("Identity", |json| ServerMsg::Identity { json }, &crate::proto::IdentityGiven { kind: "runner".into(), uri: "kiln://runner/m1".into(), ..Default::default() }, None),
             case("Observe", |json| ServerMsg::Observe { json, bytes: Vec::new() }, &crate::observe::wire::Msg::Release, Some(r#"{"kind":"teleport"}"#)),
             case("Headroom", |json| ServerMsg::Headroom { json }, &crate::headroom::Push::default(), None),
+            case("RunnerEngine", |json| ServerMsg::RunnerEngine { json }, &crate::harness::engine::Asked { engine: Some(crate::harness::engine::Engine::Host), version: 1 }, None),
         ];
         cases.push(Case { of: "StreamOpen", make: |json| ServerMsg::StreamOpen { stream: "st1".into(), session: "s1".into(), json }, good: r#"{"url":"https://example.com"}"#.into(), unknown: None, any: false });
         cases
@@ -1401,8 +1406,8 @@ mod tests {
         // On main as the plan was made, 22 of AgentMsg's and 16 of ServerMsg's, T3's HarnessSend
         // since; W24's WorkState; a machine's agent limit, AgentLimit; W27's identities and
         // observe's group, Identity and Observe, each way; and headroom's, HeadroomStatus and
-        // Headroom.
-        anyhow::ensure!(runner.len() + ANSWERS.len() == 27 && server.len() == 21, "{} and {} variants", runner.len() + ANSWERS.len(), server.len());
+        // Headroom; a runner's engine, RunnerEngine (kiln plan 01a1dd2e…, P2.3).
+        anyhow::ensure!(runner.len() + ANSWERS.len() == 27 && server.len() == 22, "{} and {} variants", runner.len() + ANSWERS.len(), server.len());
         fn check<M: Carries>(cases: Vec<Case<M>>) -> anyhow::Result<()> {
             for c in cases {
                 anyhow::ensure!(read((c.make)(c.good.clone())).map_err(|e| anyhow::anyhow!("{}: {e}", c.of))?, "{} came through as it was", c.of);
