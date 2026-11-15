@@ -313,6 +313,7 @@ pub fn own() -> &'static [Op] {
             .chain(crate::agentfiles::ops::list_ops())
             .chain(crate::secrets::mine::list_ops())
             .chain(crate::agentdefs::ops::list_ops())
+            .chain(crate::confirms::list_ops())
             .chain(crate::goals::ops::list_ops())
             .chain(crate::programs::ops::list_ops())
             .chain(crate::research::ops::list_ops())
@@ -379,6 +380,10 @@ fn yours(caller: &Caller, name: &str, mut input: Value) -> Value {
 /// Runs operation `name` for `cx`'s caller, when the route table lets it.
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let input = yours(&cx.caller, name, if input.is_null() { json!({}) } else { input });
+    // What an agent may do at once, what waits on its person's click, and whom a confirmed act runs as
+    // (`crate::confirms`; kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6): before any dispatch, so every
+    // operation is held to it, CI's, the hosts', experiments', Ship's and deployments' as much as kiln's own.
+    let crate::confirms::Pass { cx, note } = crate::confirms::gate(cx, name, &input).await?;
     // CI's, and the hosts' pull requests (W23-R06), experiments (W20-R11) and Ship's pipelines
     // (W29-R09) beside them.
     if name.starts_with("ci.") || name.starts_with("host.") || name.starts_with("experiments.") || name.starts_with("ship.") {
@@ -396,6 +401,10 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
             // Read as its type, once its caller may run it: what doesn't fit is refused, saying
             // where and why.
             op.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(name)))?;
+            // The person whose turn the agent serves, or whose click confirmed it: on the audit line.
+            if let Some(n) = &note {
+                crate::audit::note("", "chat", n);
+            }
             run_piece(&cx, at, op, input).await
         };
         if op.read_only {

@@ -758,6 +758,9 @@ pub static ROUTES: &[Rule] = &[
     // `agentdefs.manage` reach everyone's.
     any("/api/agentdefs", "agents.run", At::Server),
     any("/api/agentdefs/**", "agents.run", At::Server),
+    // A person's click on what their agent asked (`crate::confirms`): the handler keeps it to its person.
+    any("/api/confirms", "agents.run", At::Server),
+    any("/api/confirms/**", "agents.run", At::Server),
     // Multi-stack programs (docs/programs.md): the handler keeps their settings to a person.
     any("/api/programs", "agents.run", At::Server),
     any("/api/programs/**", "agents.run", At::Server),
