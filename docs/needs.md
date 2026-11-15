@@ -316,7 +316,13 @@ sessions' from what runners measured them using. They give work that asks for no
 
 - **Budget.** What kiln may place on a machine, per runner, set by the person (`[runner] budget`:
   CPUs, memory, I/O, heavy units), by default the machine less a reserve. A machine that runs
-  production gets a budget that leaves production its room (CLM-4).
+  production gets a budget that leaves production its room (CLM-4). It names what it limits:
+  `budget = "cpus=4,mem=16g"` holds CPUs and memory, and disk and GPUs stay the machine's;
+  `"cpus=0,mem=0,disk=0,gpus=0"` keeps every run that asks for room off the machine, while one that
+  asks nothing, or names the machine (`on`), still runs there. A word it doesn't know, or an amount
+  that isn't one, is refused in the runner's log, naming it, and nothing that asks for room is
+  placed there until it's mended; an unknown `[runner]` key refuses the runner's config the same
+  way, which then runs by kiln's own settings.
 - **CPUs offered** beyond the room, a factor of them (§3: CPUs are shared, the rest never): CI's
   engine's `[ci.scheduler] overcommit`, a runner's own admission's `[reach] overcommit_cpu` of its
   own config (1 until declared: none beyond; docs/reach.md §2.3).

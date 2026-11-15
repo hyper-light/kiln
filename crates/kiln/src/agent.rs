@@ -2168,16 +2168,34 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = crate::memory::queue::places::<crate::reach::node::Adoption>(&crate::memory::owners::CHANNELS, 4);
     let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
-        // `[runner] on_battery` and `[reach]`'s placement settings of its own kiln config, kiln's
-        // own without one (W05-R26; W05-R09, W05-R39, LB08).
-        let own = o.config.as_deref().and_then(|p| crate::config::Config::load(p).ok());
+        // `[runner] on_battery` and `budget`, and `[reach]`'s placement settings of its own kiln
+        // config, kiln's own without one (W05-R26; W05-R09, W05-R39, LB08; docs/needs.md §6). One it
+        // can't read is refused in words naming what's wrong, never passed over unsaid.
+        let own = o.config.as_deref().and_then(|p| match crate::config::Config::load(p) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::error!(config = %p.display(), error = %format!("{e:#}"), "this runner's kiln config is refused: it runs by kiln's own settings until it's mended");
+                None
+            }
+        });
         let on_battery = own.as_ref().map(|c| c.runner.on_battery).unwrap_or_default();
-        let place = own.as_ref().map_or_else(kiln_ci::place::runner::Settings::default, |c| {
+        let mut place = own.as_ref().map_or_else(kiln_ci::place::runner::Settings::default, |c| {
             c.reach.place().unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "placement here decides by kiln's own settings");
                 kiln_ci::place::runner::Settings::default()
             })
         });
+        if let Some(c) = &own {
+            match c.runner.budget() {
+                Ok(budget) => place.budget = budget,
+                // Its person meant to limit what's placed here: none of the room they meant to keep
+                // is given away while kiln can't read how much.
+                Err(e) => {
+                    tracing::error!(error = %e, "this runner's budget is refused: kiln places no run that asks for room here until it's mended");
+                    place.budget = Some(kiln_ci::sched::state::Resources::default());
+                }
+            }
+        }
         // `[capacity]`: the machine's capacity keeper its runs' room is held through, none until
         // both its address and its certificate's name are declared (docs/lb.md "A machine's keeper").
         let keeper = own.as_ref().and_then(|c| {

@@ -99,14 +99,32 @@ impl Capacity {
     }
 }
 
-/// `[runner]` (docs/runners.md "Pace", W05-R26).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// `[runner]` (docs/runners.md "Pace", W05-R26; docs/needs.md §6).
+///
+/// ```toml
+/// [runner]
+/// on_battery = "drain"
+/// budget = "cpus=4,mem=16g"   # what kiln may place here; disk and GPUs: the machine's
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunnerSettings {
     /// On battery: `"drain"` (the default: it takes nothing new until it's on its charger, as
     /// volunteer computing and Windows' Task Scheduler do; `kiln_ci::pace::power` says why) or
     /// `"take"` (as on its charger).
     pub on_battery: kiln_ci::pace::power::OnBattery,
+    /// What kiln may place here, the person's (docs/needs.md §6): `cpus=4,mem=16g,disk=50g,gpus=0`,
+    /// each dimension it names held to that and every other the machine's; `cpus=0,mem=0,disk=0,gpus=0`
+    /// keeps every run that asks for room off this machine, while one that asks nothing, or names it
+    /// (`on`), still runs here. None: the machine.
+    pub budget: Option<String>,
+}
+
+impl RunnerSettings {
+    /// [`Self::budget`] read ([`kiln_ci::sched::needs::budget`]): refused naming the word that's wrong.
+    pub fn budget(&self) -> Result<Option<kiln_ci::sched::state::Resources>, String> {
+        self.budget.as_deref().map(|b| kiln_ci::sched::needs::budget(b).map_err(|e| format!("[runner] budget: {e}"))).transpose()
+    }
 }
 
 /// `[reach]` (docs/reach.md, "Sizes from history" and §2.3; docs/needs.md E6 and §21): what kiln
@@ -1056,6 +1074,22 @@ impl Default for Updates {
 #[cfg(test)]
 mod reach_tests {
     use super::*;
+
+    /// docs/needs.md §6: `[runner] budget` is read as written, naming only what it limits; one that
+    /// can't be read is refused naming its word; and an unknown `[runner]` key refuses the config in
+    /// words naming it (the runner says so and runs by kiln's own), never passed over.
+    #[test]
+    fn a_runners_budget_is_read_and_a_bad_line_is_refused_naming_it() {
+        let c: Config = toml::from_str("[runner]\non_battery = \"take\"\nbudget = \"cpus=4,mem=16g\"\n").unwrap();
+        let b = c.runner.budget().unwrap().unwrap();
+        assert_eq!((b.cpu, b.mem, b.disk), (kiln_ci::sched::state::Cpus::whole(4), 16 << 30, u64::MAX));
+        assert!(Config::default().runner.budget().unwrap().is_none(), "none: the machine");
+        let bad: Config = toml::from_str("[runner]\nbudget = \"memm=4g\"\n").unwrap();
+        let e = bad.runner.budget().unwrap_err();
+        assert!(e.contains("[runner] budget") && e.contains("memm=4g"), "{e}");
+        let unknown = toml::from_str::<Config>("[runner]\nbudgett = \"cpus=4\"\n").err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(unknown.contains("budgett"), "an unknown key named: {unknown}");
+    }
 
     /// W05-R09, W05-R39, LB08: `[reach]`'s placement settings as this runner's placement takes them:
     /// kiln's own until declared, each declared one read, and one that doesn't read refused saying
