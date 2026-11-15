@@ -45,6 +45,7 @@ pub mod core;
 pub mod diff;
 pub mod elicit;
 pub mod elsewhere;
+pub mod engine;
 pub mod files;
 pub mod fill;
 pub mod gitstate;

@@ -192,6 +192,7 @@ export type { Route } from "./Route";
 export type { Run } from "./Run";
 export type { RunNotice } from "./RunNotice";
 export type { RunStatus } from "./RunStatus";
+export type { RunnerEngine } from "./RunnerEngine";
 export type { RunnerFacts } from "./RunnerFacts";
 export type { RunnerLink } from "./RunnerLink";
 export type { Said } from "./Said";

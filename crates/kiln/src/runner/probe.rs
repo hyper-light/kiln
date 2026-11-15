@@ -482,6 +482,10 @@ impl Probing {
             facts.probed_at = crate::util::now_unix();
             facts
         };
+        // Its engine as its owner set it on the server (kiln plan 01a1dd2e…, P2.3): `virt.microvm` only
+        // where it runs sessions in microVMs, for its own admission and the server's placement alike.
+        let mut facts = facts;
+        crate::harness::engine::overlay(&mut facts, crate::harness::engine::here());
         self.remember(&facts);
         facts
     }

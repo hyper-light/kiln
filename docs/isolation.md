@@ -128,6 +128,26 @@ What a session does to its harness maps onto the member:
 - **What its boundary doesn't hold** is refused by the boundary, typed (`Refusal::Unsupported`), and the
   session's start fails in its words.
 
+## A runner's engine
+
+kiln plan 01a1dd2e…, P2.3 and P2.4 (`harness::engine`). A runner's **engine** is how it runs new agent
+sessions: `host`, each a process of its machine's with no microVM, or `microvm`, each in a Shards microVM of
+its own through Hex (`sandbox::hexvm`).
+
+- **Which one.** What its owner set on the server (`PUT /api/runners/:name/engine`, `runners.engine.set` over
+  MCP and code mode; `runners.manage` on that runner), else `microvm` where it can hold microVMs now (the
+  person's decision 3), else `host`, saying why. Whether it can is read in one place, `engine::capable`: today
+  its isolation facts below; once kiln vendors Shards' `shards_api::host_check()`, the answer its facts carry.
+  `microvm` set where it can't any more is held as `host`, saying why.
+- **Refused.** `microvm` on a runner that can't hold microVMs, saying why (409).
+- **Held where it's decided.** The server keeps what's set (`kv` `runner_engine/<runner>`) and writes the engine
+  into the facts it has of the runner (`isolation.engine`; `virt.microvm` only on `microvm`), which placement
+  and the runners API read. It sends it to the runner (`ServerMsg::RunnerEngine`, feature `runner.engine`),
+  which keeps it for its restarts and writes it into its own facts, so its admission refuses a microVM ask
+  while it runs sessions on its host, whoever owns the placement.
+- **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view), and
+  new sessions take the new one.
+
 ## Facts
 
 A runner says whether it holds isolated agents (`RunnerFacts.isolation`: `available`, `hypervisor`,
