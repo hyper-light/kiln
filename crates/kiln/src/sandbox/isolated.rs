@@ -231,6 +231,10 @@ pub const PROJECTS: &str = "/work";
 /// Where a microVM sees a Windows machine's plugin folders: beneath this, each by its own name.
 pub const PLUGINS: &str = "/plugins";
 
+/// Where a microVM sees a Windows machine's folders a person gives its running session (`harness::overrides`):
+/// beneath this, each by its own name.
+pub const VOLUMES: &str = "/volumes";
+
 /// Where a microVM sees folder `host` of the machine, as Shards plugs one in (D235): a Unix path at its
 /// own path, so what the harness says of its files names them as the machine does; a Windows one
 /// (`C:\…`, `\\?\C:\…`, `\\server\share\…`), which no Linux path names, beneath `under` by its own

@@ -151,6 +151,14 @@ pub struct Acp {
     /// (CP-T3.2). New messages wait in `Core::state.queue`, never only in this adapter.
     waiting: Vec<QueueItem>,
     can_load: bool,
+    /// The folders a person gave the session past its own (`harness::overrides`), as it sees them: each session it
+    /// opens names them where it says it takes them ([`Self::dirs_capable`]).
+    #[serde(default)]
+    dirs: Vec<String>,
+    /// It says it takes more folders as a session opens: ACP's `sessionCapabilities.additionalDirectories`, on
+    /// `session/new`, `session/load` and `session/resume` alone (agentclientprotocol.com, Session Setup).
+    #[serde(default)]
+    dirs_capable: bool,
     /// The agent takes images in prompts.
     images: bool,
     /// The event being streamed into, per kind of chunk.
@@ -290,6 +298,8 @@ impl Acp {
             steering: None,
             waiting: Vec::new(),
             can_load: false,
+            dirs: Vec::new(),
+            dirs_capable: false,
             images: false,
             cur_agent: None,
             cur_thought: None,
@@ -343,7 +353,34 @@ impl Acp {
         }
         a.speed_start.clone_from(&spec.speed);
         a.seen = crate::sandbox::isolated::Seen::of(spec);
+        a.dirs = spec.dirs.iter().map(|d| d.at.clone()).collect();
         a
+    }
+
+    /// `params` of a session it opens, with the session's folders past its own where it takes them (each must be
+    /// absolute, and the whole list is sent each time: agentclientprotocol.com, Session Setup).
+    fn opening(&self, mut params: Value) -> Value {
+        if self.dirs_capable && !self.dirs.is_empty()
+            && let Some(o) = params.as_object_mut()
+        {
+            o.insert("additionalDirectories".into(), json!(self.dirs));
+        }
+        params
+    }
+
+    /// The folders a person gave the session changed (`harness::overrides`): kept for the sessions it opens, and how
+    /// it takes them, in its own words.
+    pub fn dirs_changed(&mut self, dirs: &[super::overrides::Dir]) -> super::overrides::Taking {
+        use super::overrides::Taking;
+        self.dirs = dirs.iter().map(|d| d.at.clone()).collect();
+        let name = super::kinds::Kind::get(&self.kind).map_or(self.kind.as_str(), |k| k.name);
+        if self.dirs_capable {
+            Taking::NextStart(format!("{name} takes more folders as its session opens (ACP's additionalDirectories, on session/new, load and resume alone): it opens its session again with them, its conversation going on"))
+        } else if self.kind == "gemini" {
+            Taking::NextStart("Gemini CLI takes more folders as it starts (--include-directories)".to_owned())
+        } else {
+            Taking::Nothing(format!("{name} takes no more folders over ACP (its initialize lists no sessionCapabilities.additionalDirectories) and keeps its tools to none kiln sets: kiln's scope holds the calls it asks about"))
+        }
     }
 
     /// The folder it works in, as it sees it ([`Self::seen`]).
@@ -604,7 +641,7 @@ impl Acp {
                     self.change(core, id, value);
                 }
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
             Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } | Command::Perms { task: None, .. } | Command::Branch { .. } => {}
             Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
@@ -678,9 +715,15 @@ impl Acp {
         self.replaying = core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
         let cwd = self.cwd(core);
         match self.session.clone() {
-            Some(s) if self.can_load => self.request(core, Pending::Refresh, "session/load", json!({"sessionId": s, "cwd": cwd, "mcpServers": self.mcp})),
+            Some(s) if self.can_load => {
+                let params = self.opening(json!({"sessionId": s, "cwd": cwd, "mcpServers": self.mcp}));
+                self.request(core, Pending::Refresh, "session/load", params);
+            }
             Some(_) => self.notice(core, Level::Error, "This agent cannot reload its account in an open session."),
-            None => self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp})),
+            None => {
+                let params = self.opening(json!({"cwd": cwd, "mcpServers": self.mcp}));
+                self.request(core, Pending::RefreshNew, "session/new", params);
+            }
         }
     }
 
@@ -1537,7 +1580,8 @@ impl Acp {
                     self.replaying = false;
                     core.touch_state();
                     let cwd = self.cwd(core);
-                    self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp}));
+                    let params = self.opening(json!({"cwd": cwd, "mcpServers": self.mcp}));
+                    self.request(core, Pending::RefreshNew, "session/new", params);
                 }
                 Pending::Refresh | Pending::RefreshNew => {
                     self.replaying = false;
@@ -1561,6 +1605,7 @@ impl Acp {
                 self.ready = false;
                 self.capabilities(core, &result);
                 self.can_load = result.pointer("/agentCapabilities/loadSession").and_then(Value::as_bool).unwrap_or(false);
+                self.dirs_capable = result.pointer("/agentCapabilities/sessionCapabilities/additionalDirectories").is_some_and(|c| !c.is_null() && *c != Value::Bool(false));
                 self.images = result.pointer("/agentCapabilities/promptCapabilities/image").and_then(Value::as_bool).unwrap_or(false);
                 if let Some(info) = result.get("agentInfo") {
                     core.meta.version = info.get("version").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -1577,14 +1622,16 @@ impl Acp {
                         self.context = None;
                         self.session = Some(sid.clone());
                         core.state.harness_session = Some(sid.clone());
-                        self.request(core, Pending::Session, "session/load", json!({"sessionId": sid, "cwd": cwd, "mcpServers": self.mcp}));
+                        let params = self.opening(json!({"sessionId": sid, "cwd": cwd, "mcpServers": self.mcp}));
+                        self.request(core, Pending::Session, "session/load", params);
                     }
                     None => {
                         if self.resume.is_some() {
                             let how = if self.context.is_some() { "starting a new one, given the conversation in words" } else { "starting a new one" };
                             self.notice(core, Level::Warn, format!("This agent cannot load earlier sessions; {how}."));
                         }
-                        self.request(core, Pending::Session, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp}));
+                        let params = self.opening(json!({"cwd": cwd, "mcpServers": self.mcp}));
+                        self.request(core, Pending::Session, "session/new", params);
                     }
                 }
             }
@@ -2275,6 +2322,34 @@ mod tests {
         let request = requests.next().ok_or_else(|| anyhow::anyhow!("no {method} request"))?;
         anyhow::ensure!(requests.next().is_none(), "more than one {method} request");
         Ok(request)
+    }
+
+    /// Kiln plan 01a1dd2e…, P6b.4 AC3: an ACP agent that says it takes more folders as a session opens
+    /// (`sessionCapabilities.additionalDirectories`, agentclientprotocol.com Session Setup) is given the folders a
+    /// person gave the session on its session/new, and takes a change as it opens its session again; one that doesn't
+    /// say so is given none and says it has nothing of its own to change. Gemini CLI takes them as its own flag as it
+    /// starts (`--include-directories`).
+    #[test]
+    fn p6b_4_an_acp_agent_takes_a_sessions_folders_where_it_says_it_does() -> anyhow::Result<()> {
+        use super::super::overrides::{Dir, Taking};
+        let dirs = vec![Dir { at: "/data".into(), writable: true }];
+        for (capable, init) in [(true, json!({"agentCapabilities": {"sessionCapabilities": {"additionalDirectories": {}}}})), (false, json!({"agentCapabilities": {}}))] {
+            let spec = super::super::session::Spec { kind: "opencode".into(), dirs: dirs.clone(), ..Default::default() };
+            let mut a = Acp::from_spec(&spec);
+            let mut core = Core::new();
+            a.start(&mut core);
+            let init_id = request(&mut core, "initialize")?.get("id").cloned();
+            feed(&mut a, &mut core, &[json!({"id": init_id, "result": init})]);
+            let new = request(&mut core, "session/new")?;
+            assert_eq!(new.pointer("/params/additionalDirectories").cloned(), capable.then(|| json!(["/data"])), "capable {capable}: {new}");
+            let taking = a.dirs_changed(&dirs);
+            assert_eq!(matches!(taking, Taking::NextStart(_)), capable, "{taking:?}");
+            assert_eq!(matches!(taking, Taking::Nothing(_)), !capable, "{taking:?}");
+        }
+        let gemini = super::super::kinds::Kind::get("gemini").ok_or_else(|| anyhow::anyhow!("no gemini"))?;
+        let run = gemini.elsewhere(&super::super::session::Spec { kind: "gemini".into(), dirs, ..Default::default() })?;
+        assert!(run.args.windows(2).any(|w| w == ["--include-directories", "/data"]), "{:?}", run.args);
+        Ok(())
     }
 
     /// CP-T3.2: every ACP profile (Devin included) keeps accepted startup input in the state

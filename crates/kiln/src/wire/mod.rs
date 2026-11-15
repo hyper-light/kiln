@@ -384,6 +384,7 @@ classes! {
         Command::Perms { .. } => REFUSED,
         Command::Branch { .. } => REFUSED,
         Command::RemoveTask { .. } => REFUSED,
+        Command::Override { .. } => REFUSED,
     }
 }
 

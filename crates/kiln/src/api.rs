@@ -1513,6 +1513,26 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let id = (*id).to_owned();
             boxed(|| harness_command(&hub, &id, req)).await
         }
+        // Its live overrides, in place (kiln plan 01a1dd2e…, P6b.4: `crate::harness::overrides`).
+        (&Method::POST, ["api", "harness", "sessions", id, what @ ("ports" | "egress" | "networks" | "volumes"), rest @ ..]) if rest.len() <= 1 => {
+            let name = match (*what, rest.first().copied()) {
+                ("ports", None) => "sessions.ports.publish",
+                ("ports", Some("unpublish")) => "sessions.ports.unpublish",
+                ("egress", None) => "sessions.egress.grant",
+                ("egress", Some("revoke")) => "sessions.egress.revoke",
+                ("networks", None) => "sessions.networks.connect",
+                ("networks", Some("disconnect")) => "sessions.networks.disconnect",
+                ("volumes", None) => "sessions.volumes.add",
+                ("volumes", Some("remove")) => "sessions.volumes.remove",
+                _ => return Err(err(StatusCode::NOT_FOUND, "not found")),
+            };
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
+        }
         // Its copies on other runners, and its own rules for them (docs/reach.md §5.1).
         (&Method::GET, ["api", "harness", "sessions", id, "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.agent(&hub, id)).await)),
         (m @ (&Method::PUT | &Method::DELETE), ["api", "harness", "sessions", id, "keep"]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::Agent(id), *m == Method::PUT, req)).await,

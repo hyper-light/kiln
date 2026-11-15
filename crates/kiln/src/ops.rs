@@ -309,6 +309,7 @@ pub fn own() -> &'static [Op] {
     OPS.get_or_init(|| {
         crate::harness::ops::list_ops()
             .into_iter()
+            .chain(crate::harness::overrides::list_ops())
             .chain(crate::plans::ops::list_ops())
             .chain(crate::agentfiles::ops::list_ops())
             .chain(crate::secrets::mine::list_ops())
