@@ -605,10 +605,14 @@ impl Codex {
         let (a, s, p) = policy(&core.state.mode);
         let approval = self.approval.clone().unwrap_or_else(|| a.to_owned());
         let sandbox = self.sandbox.clone().unwrap_or_else(|| s.to_owned());
+        // The folders a person gave the session to change (`harness::overrides`): Codex's writable roots, which ride
+        // each turn (its app-server's TurnStartParams: WorkspaceWriteSandboxPolicy's `writableRoots`).
+        let roots: Vec<String> = super::overrides::dirs(&core.state.overrides).into_iter().filter(|d| d.writable).map(|d| d.at).collect();
         let turn = match sandbox.as_str() {
             "read-only" => json!({"type": "readOnly"}),
             "danger-full-access" => json!({"type": "dangerFullAccess"}),
-            "workspace-write" => json!({"type": "workspaceWrite"}),
+            "workspace-write" if roots.is_empty() => json!({"type": "workspaceWrite"}),
+            "workspace-write" => json!({"type": "workspaceWrite", "writableRoots": roots}),
             _ => p,
         };
         (approval, sandbox, turn)
@@ -1573,7 +1577,7 @@ impl Codex {
             Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Codex lists for its models")),
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             // A subagent: its turn under way is interrupted, as a person asked.
@@ -5087,6 +5091,23 @@ fn file_changes(v: Option<&Value>, cwd: &str) -> Vec<FileDiff> {
 
 #[cfg(test)]
 mod tests {
+    /// Kiln plan 01a1dd2e…, P6b.4 AC3: the folders a person gave a session to change ride Codex's every turn as its
+    /// writable roots (its app-server's TurnStartParams: sandboxPolicy.writableRoots); a read-only one rides none (its
+    /// sandbox reads outside its folder already), and with none the policy is as it was.
+    #[test]
+    fn p6b_4_codex_takes_a_sessions_writable_folders_with_each_turn() {
+        use super::super::overrides::{Access, HeldVolume, Member, Took, Volume};
+        let c = super::Codex::from_spec(&super::super::session::Spec { kind: "codex".into(), ..Default::default() });
+        let mut core = super::super::core::Core::new();
+        core.state.mode = "auto".into();
+        assert_eq!(c.policies(&core).2, serde_json::json!({"type": "workspaceWrite"}), "no folder given: as it was");
+        let held = |path: &str, access| HeldVolume { volume: Volume { path: path.into(), at: path.into(), access, members: vec![Member::Harness("codex".into())] }, harness: Took::Nothing { why: String::new() }, scope: Took::Nothing { why: String::new() }, microvm: None };
+        core.state.overrides.volumes = vec![held("/data", Access::Rw), held("/docs", Access::Ro)];
+        let (_, sandbox, turn) = c.policies(&core);
+        assert_eq!(sandbox, "workspace-write");
+        assert_eq!(turn, serde_json::json!({"type": "workspaceWrite", "writableRoots": ["/data"]}));
+    }
+
     use super::*;
 
     #[test]

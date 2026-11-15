@@ -1076,6 +1076,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let name = (*name).to_owned();
             boxed(|| crate::harness::limit::put(&hub, &name, req)).await.map_err(|(c, m)| err(c, m))
         }
+        // How a runner runs new agent sessions, its engine (`crate::harness::engine`; kiln plan 01a1dd2e…, P2.3).
+        (&Method::GET, ["api", "runners", name, "engine"]) => boxed(|| crate::harness::engine::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::PUT, ["api", "runners", name, "engine"]) => {
+            let name = (*name).to_owned();
+            boxed(|| crate::harness::engine::put(&hub, &name, req, &caller.name)).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(boxed(|| crate::frontdoor::control::renew(&hub, name)).await),
         (&Method::GET, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::get(&hub)).await),
         (&Method::PUT, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::put(&hub, req)).await),
@@ -1324,6 +1330,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, "plans.ready", body)).await
         }
+        // A person's own secrets (`crate::secrets::mine`, P4.7): each operation is its route, each keeping its caller to their own.
+        (&Method::GET, ["api", "me", "secrets"]) => boxed(|| own_op(&hub, &caller, "secrets.mine.list", json!({}))).await,
+        (&Method::PUT, ["api", "me", "secrets", name]) => {
+            let name = (*name).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("name".into(), json!(name));
+            }
+            boxed(|| own_op(&hub, &caller, "secrets.mine.set", body)).await
+        }
+        (&Method::DELETE, ["api", "me", "secrets", name]) => boxed(|| own_op(&hub, &caller, "secrets.mine.delete", json!({ "name": name }))).await,
         // Agentfiles (`crate::agentfiles`): each operation is its route, each keeping its caller to their own.
         (&Method::GET, ["api", "agentfiles"]) => boxed(|| own_op(&hub, &caller, "agentfiles.list", query_value(&q))).await,
         (&Method::POST, ["api", "agentfiles"]) => {
@@ -1352,6 +1369,47 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
                 o.insert("id".into(), json!(id));
             }
             boxed(|| own_op(&hub, &caller, "agentfiles.restore", body)).await
+        }
+        // Agent definitions (`crate::agentdefs`): each operation is its route, each keeping its caller to their own.
+        (&Method::GET, ["api", "agentdefs"]) => boxed(|| own_op(&hub, &caller, "agentdefs.list", query_value(&q))).await,
+        (&Method::POST, ["api", "agentdefs"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.create", body)).await
+        }
+        (&Method::POST, ["api", "agentdefs", "check"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.check", body)).await
+        }
+        // A person's click on what their agent asked (`crate::confirms`).
+        (&Method::GET, ["api", "confirms"]) => boxed(|| own_op(&hub, &caller, "confirms.list", query_value(&q))).await,
+        (&Method::POST, ["api", "confirms", id]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "confirms.answer", body)).await
+        }
+        (&Method::POST, ["api", "agentdefs", "use"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentdefs.use", body)).await
+        }
+        (&Method::GET, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.get", json!({ "id": id }))).await,
+        (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
+        (&Method::PATCH, ["api", "agentdefs", id]) | (&Method::POST, ["api", "agentdefs", id, "restore" | "run" | "copy"]) => {
+            let name = match s.get(3).copied() {
+                Some("restore") => "agentdefs.restore",
+                Some("copy") => "agentdefs.copy",
+                Some(_) => "agentdefs.run",
+                None => "agentdefs.update",
+            };
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
         }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
@@ -1469,6 +1527,26 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
             let id = (*id).to_owned();
             boxed(|| harness_command(&hub, &id, req)).await
+        }
+        // Its live overrides, in place (kiln plan 01a1dd2e…, P6b.4: `crate::harness::overrides`).
+        (&Method::POST, ["api", "harness", "sessions", id, what @ ("ports" | "egress" | "networks" | "volumes"), rest @ ..]) if rest.len() <= 1 => {
+            let name = match (*what, rest.first().copied()) {
+                ("ports", None) => "sessions.ports.publish",
+                ("ports", Some("unpublish")) => "sessions.ports.unpublish",
+                ("egress", None) => "sessions.egress.grant",
+                ("egress", Some("revoke")) => "sessions.egress.revoke",
+                ("networks", None) => "sessions.networks.connect",
+                ("networks", Some("disconnect")) => "sessions.networks.disconnect",
+                ("volumes", None) => "sessions.volumes.add",
+                ("volumes", Some("remove")) => "sessions.volumes.remove",
+                _ => return Err(err(StatusCode::NOT_FOUND, "not found")),
+            };
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
         }
         // Its copies on other runners, and its own rules for them (docs/reach.md §5.1).
         (&Method::GET, ["api", "harness", "sessions", id, "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.agent(&hub, id)).await)),
@@ -6334,6 +6412,8 @@ async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     may_steer_goals(hub, caller, id).await?;
     let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
+    // Goals a person gives an agent are their words to it: the turn they start is theirs (P5.6).
+    crate::harness::attention_hooks::spoke(hub, caller, id, attention_at).await;
     crate::harness::attention_hooks::record(hub, caller, id, "command", &crate::util::new_id(), attention_at).await;
     hub.store.audit(caller.name.clone(), "goals.set".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
@@ -6361,6 +6441,8 @@ async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     }
     let goals = crate::goals::keyed(&crate::harness::ops::key_scope(caller), id, key.as_deref(), goals);
     let s = crate::goals::add_at(hub, id, goals, start, &crate::goals::At::End).await.map_err(goals_err)?;
+    // Goals a person gives an agent are their words to it: the turn they start is theirs (P5.6).
+    crate::harness::attention_hooks::spoke(hub, caller, id, attention_at).await;
     crate::harness::attention_hooks::record(hub, caller, id, "command", &key.unwrap_or_else(crate::util::new_id), attention_at).await;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
@@ -6438,8 +6520,12 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     spec.plan_run = None;
     spec.helper = None;
     spec.subagent = false;
-    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked.
+    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked,
+    // and so are the secrets its build is given (P4.7).
     spec.agentfile = None;
+    spec.build_secrets = Vec::new();
+    // The engine setting its boundary is decided under is kiln's (kiln plan 01a1dd2e…, P2.3).
+    spec.engine_version = None;
     // An isolated agent's person, whose volume its harness's configuration is on, is whoever asks
     // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked.
     if let Some(i) = spec.isolation.as_mut() {
@@ -6494,7 +6580,7 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         None if !crate::authz::gate::has_users(hub).await => Some("owner".to_owned()),
         None => None,
     };
-    body.spec.agentfile = crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?;
+    crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?.into_spec(&mut body.spec);
     let count = body.count.unwrap_or(1);
     if !body.ids.is_empty() {
         let n = count.clamp(1, 16);

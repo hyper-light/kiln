@@ -210,11 +210,13 @@ pub struct Holds {
     /// Credentials granted by reference, filled in at a run's egress outside its boundary
     /// ([`Launch::credentials`]).
     pub credentials: bool,
+    /// Changes to a run's network and folders while it runs ([`Run::change`]: kiln plan 01a1dd2e…, P6b.4).
+    pub live: bool,
 }
 
 impl Holds {
     /// Everything (the simulator's).
-    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true };
+    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true };
 
     /// `Ok` when `launch`'s weights are on their scale, its credential grants could each be filled
     /// in, and it asks only for what these hold; else its refusal, `Invalid` or `Unsupported`,
@@ -367,6 +369,33 @@ pub struct Link {
     pub lanes: Vec<String>,
 }
 
+/// A member of a microVM's image a change is for (Shards' D231: its HARNESS, an AGENT or an MCP
+/// server), by its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member(pub String);
+
+/// A change to a run's network or folders while it runs ([`Run::change`]; kiln plan 01a1dd2e…, P6b.4,
+/// through Hex's wire calls for Shards' P6b.1 and P6b.2): every grant explicit, who to whom, which
+/// ports and which way, as a launch's are (default deny).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// The host's `bind` address and `host_port` (UDP, else TCP) reach `member`'s `guest_port`.
+    Publish { member: Member, bind: String, host_port: u16, guest_port: u16, udp: bool },
+    /// What the host's `bind` and `host_port` reached, unpublished.
+    Unpublish { bind: String, host_port: u16, udp: bool },
+    /// `member` may reach `host` (a DNS name or an address) on `port`.
+    Grant { member: Member, host: String, port: u16 },
+    /// That grant taken back: its next connection there is refused.
+    Revoke { member: Member, host: String, port: u16 },
+    /// `member` joins the named `network`, shared with the runs connected to it.
+    Connect { member: Member, network: String },
+    Disconnect { member: Member, network: String },
+    /// The machine's folder plugged in for `members`, at its share's path, writable as it says.
+    Plug { share: Share, members: Vec<Member> },
+    /// The folder plugged in at `at`, unplugged.
+    Unplug { at: String },
+}
+
 /// A run under way: what it's given on stdin, what it says (its output, then its end, once), the
 /// signals it's sent, a way to end it, and where its boundary holds it.
 pub trait Run: Send + Sync {
@@ -391,6 +420,13 @@ pub trait Run: Send + Sync {
     /// ride no link (a process of the machine's, whose stdio are its pipes), and none where its link
     /// ends before it's made. Asked again, it says the same.
     fn link(&self) -> BoxFuture<'_, Option<Link>>;
+    /// Changes its network or its folders while it runs ([`Change`]): taken, else refused: `Ended`
+    /// once it has ended, `Unsupported` where its boundary takes no change live (`Holds::live`, and
+    /// a run's own unless it says otherwise), and in its runtime's words where that refuses it.
+    fn change(&self, change: Change) -> BoxFuture<'_, Result<(), Refusal>> {
+        drop(change);
+        Box::pin(async { Err(Refusal::Unsupported("a change to a run while it runs".into())) })
+    }
 }
 
 /// Harnesses launched in boundaries.
@@ -454,6 +490,7 @@ struct SimRun {
     said: Arc<event_listener::Event>,
     runs: Arc<Mutex<usize>>,
     signals: bool,
+    live: bool,
 }
 
 #[derive(Default)]
@@ -462,6 +499,8 @@ struct RunState {
     echo: bool,
     ended: bool,
     given_end: bool,
+    /// The changes it took while it ran ([`Run::change`]), in order.
+    changes: Vec<Change>,
 }
 
 impl RunState {
@@ -564,6 +603,21 @@ impl Run for SimRun {
     fn link(&self) -> BoxFuture<'_, Option<Link>> {
         Box::pin(async { None })
     }
+
+    fn change(&self, change: Change) -> BoxFuture<'_, Result<(), Refusal>> {
+        let out = {
+            let mut st = self.state.lock();
+            if st.ended {
+                Err(Refusal::Ended)
+            } else if !self.live {
+                Err(Refusal::Unsupported("a change to a run while it runs".into()))
+            } else {
+                st.changes.push(change);
+                Ok(())
+            }
+        };
+        Box::pin(async move { out })
+    }
 }
 
 impl Sandbox for SimSandbox {
@@ -636,7 +690,7 @@ impl Sandbox for SimSandbox {
                 return Err(Refusal::Full { limit: SIM_RUNS });
             }
             *n = n.saturating_add(1);
-            let run: Box<dyn Run> = Box::new(SimRun { state: Arc::new(Mutex::new(st)), said: Arc::new(event_listener::Event::new()), runs: Arc::clone(&self.runs), signals: self.holds.signals });
+            let run: Box<dyn Run> = Box::new(SimRun { state: Arc::new(Mutex::new(st)), said: Arc::new(event_listener::Event::new()), runs: Arc::clone(&self.runs), signals: self.holds.signals, live: self.holds.live });
             Ok(run)
         })();
         Box::pin(async move { out })
@@ -971,6 +1025,27 @@ fn c13<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c14<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let run = fine("launch", f.sandbox().launch(f.wait()).await)?;
+        let change = Change::Grant { member: Member("harness".into()), host: "example.com".into(), port: 443 };
+        if !f.sandbox().holds().live {
+            let taken = run.change(change).await;
+            let on = run.stdin(b"still here\n".to_vec()).await;
+            run.kill();
+            return match taken {
+                Err(Refusal::Unsupported(_)) => fine("its run, after the change it refused", on),
+                Err(e) => Err(format!("a change to a run while it runs: refused as {e:?}, not Unsupported")),
+                Ok(()) => Err("a change to a run while it runs: taken, though the sandbox says it doesn't hold it".into()),
+            };
+        }
+        fine("a change to a run while it runs", run.change(change.clone()).await)?;
+        run.kill();
+        same("its end", end(&drain(run.as_ref()).await), Some(Exit::Killed))?;
+        same("a change after its end", run.change(change).await, Err(Refusal::Ended))
+    })
+}
+
 /// The `Sandbox` contract, clause by clause (docs/seams.md, "Sandbox").
 pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
     vec![
@@ -1014,6 +1089,11 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
             id: "SANDBOX-13",
             says: "a run's credential, granted by reference toward a host its egress reaches, is filled in toward that host alone: never toward another host it reaches, for a credential it isn't granted, or for a run granted none; a grant toward a host its egress doesn't reach, an address, a host with a port or no host, or by a reference no store names, is refused Invalid; a sandbox that fills in no credentials refuses them Unsupported",
             check: c13::<F>,
+        },
+        Case {
+            id: "SANDBOX-14",
+            says: "a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on",
+            check: c14::<F>,
         },
     ]
 }
@@ -1109,7 +1189,7 @@ mod tests {
         let make = || async { Holding { sim: SimSandboxFixture::default(), lies: Some(Liar(SimSandbox::new())) } };
         let report = futures::executor::block_on(run("Sandbox", &cases::<Holding>(), make));
         let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
-        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13"], "{:?}", report.failed);
+        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14"], "{:?}", report.failed);
         assert!(report.failed.iter().all(|(_, why)| why.contains("doesn't hold it")), "{:?}", report.failed);
     }
 

@@ -165,6 +165,9 @@ pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> R
         return Err("whoever started this agent can't sign in here any more".to_owned());
     };
     caller.agent = Some(session.to_owned());
+    // The person whose chat turn it serves, if it serves one: what its acts on their other things wait on
+    // (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6).
+    let mut caller = caller.in_turn_of(crate::confirms::turn_of(hub, session).await);
     // An agent kiln started for an attachment does no more than its capabilities give it.
     if let Some(limit) = crate::ci::attach::limit_for(hub, session).await {
         caller = caller.limited_to(limit);
@@ -219,8 +222,8 @@ const CI_TOOLS: &[&str] = &["experiments.suggest"];
 
 /// kiln's operations an agent has as tools of its own (`agents_start`, `goals_plan`, `plans_run`,
 /// …): `agents.*` but its credential, `goals.*` but a stack's settings, most of `plans.*`,
-/// `research.*`, and `agentfiles.*`, which reach the Agentfiles of the person it acts for and no one
-/// else's (`crate::agentfiles::Who`). The server says which ([`runner_ask`]'s registry answer), so its
+/// `research.*`, `agentfiles.*` and `agentdefs.*`, which reach the Agentfiles and agent definitions of
+/// the person it acts for and no one else's (`crate::agentfiles::Who`, `crate::agentdefs::Who`). The server says which ([`runner_ask`]'s registry answer), so its
 /// agents' MCP servers offer what it has, however old their runner: a deploy reaches the agents at work.
 pub fn agent_ops() -> Vec<crate::ops::Op> {
     crate::harness::ops::list_ops()
@@ -232,6 +235,9 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
         .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
         .chain(crate::research::ops::list_ops())
         .chain(crate::agentfiles::ops::list_ops())
+        // Its person's own secrets' names, to name them in an Agentfile; never their values, and it sets none.
+        .chain(crate::secrets::mine::list_ops().into_iter().filter(|o| o.name == "secrets.mine.list"))
+        .chain(crate::agentdefs::ops::list_ops())
         .collect()
 }
 
@@ -1667,8 +1673,8 @@ mod tests {
         })
     }
 
-    /// Step 30: an agent on a runner keeps, reads, changes, restores, lists and deletes an Agentfile
-    /// through reach, each call answered as its operation answers it, the Agentfile its person's (the
+    /// Step 30: an agent on a runner keeps, reads, changes, restores and lists an Agentfile through
+    /// reach (its delete, destructive, waits on its person's click: P5.6), each call answered as its operation answers it, the Agentfile its person's (the
     /// owner's, on a kiln nobody else signs in to). One Shards refuses is refused in Shards' words and
     /// kept nowhere, and checking it answers what Shards said. Whose an agent reaches is
     /// `agentfiles::tests`'.
@@ -1702,10 +1708,12 @@ mod tests {
             let list = s1_calls(&hub, "agentfiles.list", json!({})).await?;
             let ids: Vec<Value> = at(&list, "/ok/agentfiles").as_array().into_iter().flatten().map(|a| at(a, "/id")).collect();
             anyhow::ensure!(ids == [json!(id)], "{list}");
+            // A delete is destructive: an agent's waits on its person's click, and one working on its own,
+            // serving no person's turn, has no one to ask (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6).
             let gone = s1_calls(&hub, "agentfiles.delete", json!({"id": id})).await?;
-            anyhow::ensure!(at(&gone, "/ok") == json!({"deleted": true}), "{gone}");
+            anyhow::ensure!(at(&gone, "/status") == json!(403) && at(&gone, "/error").as_str().is_some_and(|e| e.contains("needs its person's click")), "{gone}");
             let after = s1_calls(&hub, "agentfiles.get", json!({"id": id})).await?;
-            anyhow::ensure!(at(&after, "/error") == json!("no such Agentfile") && at(&after, "/status") == json!(404), "{after}");
+            anyhow::ensure!(at(&after, "/ok/version") == json!(3), "kept: {after}");
             Ok(())
         })
     }

@@ -71,6 +71,8 @@ pub const CAPABILITIES: &[&str] = &[
     "agents.attach",
     // Reaching everyone's Agentfiles (`crate::agentfiles`); without it a person reaches only their own.
     "agentfiles.manage",
+    // Reaching everyone's agent definitions (`crate::agentdefs`); without it a person reaches only their own.
+    "agentdefs.manage",
     "experiments.run",
     "settings.manage",
     "tokens.manage",
@@ -340,6 +342,11 @@ const fn any(pattern: &'static str, capability: &'static str, at: At) -> Rule {
 pub static ROUTES: &[Rule] = &[
     r("GET", "/api/openapi.json", SIGNED_IN, At::Server),
     // A person's own notification rules (W19-R06).
+    // A person's own secrets (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d decision 6, P4.7): the
+    // operations `secrets.mine.*` keep each caller to the person they are.
+    r("GET", "/api/me/secrets", SIGNED_IN, At::Server),
+    r("PUT", "/api/me/secrets/*", SIGNED_IN, At::Server),
+    r("DELETE", "/api/me/secrets/*", SIGNED_IN, At::Server),
     r("GET", "/api/me/notifications", SIGNED_IN, At::Server),
     r("PUT", "/api/me/notifications", SIGNED_IN, At::Server),
     // The HTTP/3 door's URL, hashes and a ticket (goal 4 step 6).
@@ -681,6 +688,9 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
     // How many agent sessions it runs at once: read with the runner, set by those who manage it.
     r("GET", "/api/runners/*/agent-limit", "runners.read", At::Runner(2)),
+    // How it runs new agent sessions (kiln plan 01a1dd2e…, P2.3): read with the runner, set by those
+    // who manage it (`/api/runners/*/**`).
+    r("GET", "/api/runners/*/engine", "runners.read", At::Runner(2)),
     r("GET", "/api/headroom", "runners.read", At::Server),
     r("GET", "/api/runners/*/headroom", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),
@@ -744,6 +754,13 @@ pub static ROUTES: &[Rule] = &[
     // `agentfiles.manage` reach everyone's.
     any("/api/agentfiles", "agents.run", At::Server),
     any("/api/agentfiles/**", "agents.run", At::Server),
+    // Agent definitions (`crate::agentdefs`): the handler keeps a person to their own; the owner and
+    // `agentdefs.manage` reach everyone's.
+    any("/api/agentdefs", "agents.run", At::Server),
+    any("/api/agentdefs/**", "agents.run", At::Server),
+    // A person's click on what their agent asked (`crate::confirms`): the handler keeps it to its person.
+    any("/api/confirms", "agents.run", At::Server),
+    any("/api/confirms/**", "agents.run", At::Server),
     // Multi-stack programs (docs/programs.md): the handler keeps their settings to a person.
     any("/api/programs", "agents.run", At::Server),
     any("/api/programs/**", "agents.run", At::Server),

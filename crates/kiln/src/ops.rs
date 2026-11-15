@@ -1,7 +1,7 @@
 //! Every operation, once (docs/ci.md W20-R01): deployments' ([`crate::cd::ops`]), releases by
 //! API ([`crate::deploy::ops`]), CI's ([`crate::ci::ops`]) and kiln's own: agents'
 //! ([`crate::harness::ops`]), plans' ([`crate::plans::ops`]), Agentfiles'
-//! ([`crate::agentfiles::ops`]) and goal stacks' ([`crate::goals::ops`]). Each has its name, summary, input schema and whether it changes
+//! ([`crate::agentfiles::ops`]), agent definitions' ([`crate::agentdefs::ops`]) and goal stacks' ([`crate::goals::ops`]). Each has its name, summary, input schema and whether it changes
 //! anything. The MCP tools and code mode's `kiln.*` are this list. Each operation is checked
 //! against the route table as its HTTP route is, so a caller may do through them exactly what it
 //! may do over HTTP.
@@ -309,8 +309,12 @@ pub fn own() -> &'static [Op] {
     OPS.get_or_init(|| {
         crate::harness::ops::list_ops()
             .into_iter()
+            .chain(crate::harness::overrides::list_ops())
             .chain(crate::plans::ops::list_ops())
             .chain(crate::agentfiles::ops::list_ops())
+            .chain(crate::secrets::mine::list_ops())
+            .chain(crate::agentdefs::ops::list_ops())
+            .chain(crate::confirms::list_ops())
             .chain(crate::goals::ops::list_ops())
             .chain(crate::programs::ops::list_ops())
             .chain(crate::research::ops::list_ops())
@@ -377,6 +381,10 @@ fn yours(caller: &Caller, name: &str, mut input: Value) -> Value {
 /// Runs operation `name` for `cx`'s caller, when the route table lets it.
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let input = yours(&cx.caller, name, if input.is_null() { json!({}) } else { input });
+    // What an agent may do at once, what waits on its person's click, and whom a confirmed act runs as
+    // (`crate::confirms`; kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6): before any dispatch, so every
+    // operation is held to it, CI's, the hosts', experiments', Ship's and deployments' as much as kiln's own.
+    let crate::confirms::Pass { cx, note } = crate::confirms::gate(cx, name, &input).await?;
     // CI's, and the hosts' pull requests (W23-R06), experiments (W20-R11) and Ship's pipelines
     // (W29-R09) beside them.
     if name.starts_with("ci.") || name.starts_with("host.") || name.starts_with("experiments.") || name.starts_with("ship.") {
@@ -394,6 +402,10 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
             // Read as its type, once its caller may run it: what doesn't fit is refused, saying
             // where and why.
             op.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(name)))?;
+            // The person whose turn the agent serves, or whose click confirmed it: on the audit line.
+            if let Some(n) = &note {
+                crate::audit::note("", "chat", n);
+            }
             run_piece(&cx, at, op, input).await
         };
         if op.read_only {
@@ -497,8 +509,8 @@ mod tests {
             let rule = crate::authz::rule(&method, &s);
             assert_ne!(rule.pattern, crate::authz::UNNAMED.pattern, "{} ({method} /{}) has a rule of its own", op.name, s.join("/"));
             let needs = match op.name {
-                "runners.list" | "runners.diagnose" | "updates.list" => "runners.read",
-                "runners.repair" | "updates.retry" | "updates.policy" => "runners.manage",
+                "runners.list" | "runners.diagnose" | "runners.engine" | "updates.list" => "runners.read",
+                "runners.repair" | "runners.engine.set" | "updates.retry" | "updates.policy" => "runners.manage",
                 // Attachments and incidents: reading them is reading runs (each narrowed to what it
                 // looks after); attaching is `agents.attach`; reporting, the incident's own check.
                 "attachments.list" | "attachments.get" | "incidents.list" | "incidents.get" => "runs.read",
@@ -510,6 +522,8 @@ mod tests {
                 n if n.starts_with("users.") || n.starts_with("grants.") || n.starts_with("roles.") => "users.manage",
                 n if n.starts_with("tokens.") => "tokens.manage",
                 "audit.list" => "audit.read",
+                // A person's own secrets (P4.7): each signed-in person's, held to them by the operation.
+                n if n.starts_with("secrets.mine.") => crate::authz::SIGNED_IN,
                 _ => "agents.run",
             };
             assert_eq!(rule.capability, needs, "{}", op.name);

@@ -316,6 +316,13 @@ pub struct Spec {
     /// from. Set by kiln, never from what was asked (`POST /api/harness/sessions` drops it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agentfile: Option<String>,
+    /// The secrets a build of that Agentfile is given (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+    /// decision 6, P4.7): each its `LABEL kiln.secret.<ID>=user:<NAME>` names, read by kiln's server
+    /// from its person's own as it started (`secrets::mine::for_build`). Set by kiln, never from what
+    /// was asked; its machine takes them out of the session as it starts it, for its build alone, so
+    /// no copy of the session (a move, a hand-over, a resume) carries them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_secrets: Vec<crate::secrets::mine::BuildSecret>,
     /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +332,12 @@ pub struct Spec {
     /// the same ledger as CI legs and commands. Set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<crate::reach::place::Claim>,
+    /// The version of its runner's engine setting its boundary was decided under
+    /// (`crate::harness::engine::Asked::version`; kiln plan 01a1dd2e…, P2.3): its runner refuses it
+    /// where its own is another, so a start placed before a switch never starts on the engine it
+    /// had. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<u64>,
     /// Whom it acts for, the person whose words its opening prompt (`prompt`) is
     /// (`lineage::person_of`'s form: `owner`, `user:<id>`; kiln plan
     /// 01a1cd8e862e7169a074db3d5fa33f3d step 35): its input admits that prompt as theirs, held to
@@ -332,6 +345,11 @@ pub struct Spec {
     /// it, or for a start that acts for no person, and the prompt is then held to the depth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opener: Option<String>,
+    /// The folders its harness is given past its own as it starts, as it sees them: those a person gave the running
+    /// session (`State::overrides`' volumes, `harness::overrides::dirs`), put here by its session at each start of its
+    /// harness. Never what was asked, and never kept: its state is their record.
+    #[serde(skip)]
+    pub dirs: Vec<super::overrides::Dir>,
 }
 
 /// The id of session `session`'s opening prompt (`Spec::prompt`), its own (CP-T3.2): made once,
@@ -352,6 +370,7 @@ impl Default for Spec {
     fn default() -> Self {
         Self {
             claim: None,
+            engine_version: None,
             kind: String::new(),
             cwd: None,
             model: None,
@@ -378,8 +397,10 @@ impl Default for Spec {
             workspace: None,
             isolation: None,
             agentfile: None,
+            build_secrets: Vec::new(),
             variant_of: None,
             opener: None,
+            dirs: Vec::new(),
         }
     }
 }
@@ -1244,6 +1265,102 @@ fn set_reach(s: &Session, value: Option<&serde_json::Value>) -> bool {
     core.state.reach = reach;
     core.touch_state();
     true
+}
+
+/// A person's change to a live override of it (`Command::Override`, kiln plan 01a1dd2e…, P6b.4; `super::overrides`),
+/// taken in place: checked as the server checks it (it can come by the generic command route too), taken into its
+/// record, given to its microVM live where its harness runs in one (`run`), and a volume's folder to its harness
+/// (`adapter`, while it runs) among its allowed folders and to kiln's scope, how each took it said in its record.
+/// What it refuses is said in its timeline, and nothing changes. True when its harness starts again to take its
+/// folders: one that takes them only as it starts, on its machine's host (in a microVM, kiln starts no new microVM
+/// for it: it takes them as it next starts).
+async fn take_override(s: &Session, change: super::overrides::Change, run: Option<Arc<crate::sandbox::held::Held>>, adapter: Option<&mut super::kinds::Adapter>, kind: &Kind) -> bool {
+    use super::overrides as o;
+    let microvm = s.spec.lock().isolation.is_some();
+    let said = |core: &mut Core, level: Level, text: String| core.upsert(&format!("override:{}", Core::now()), None, Body::Notice { level, text });
+    let taken = {
+        let mut core = s.core.lock();
+        match o::check(&change, microvm, kind.id).and_then(|()| o::take(&mut core.state.overrides, &change)) {
+            Ok(taken) => {
+                core.touch_state();
+                taken
+            }
+            Err(why) => {
+                said(&mut core, Level::Warn, format!("Not changed: {why}"));
+                return false;
+            }
+        }
+    };
+    let removed = match &taken {
+        o::Taken::Same => return false,
+        o::Taken::Removed(r) => Some(r.clone()),
+        o::Taken::Added => None,
+    };
+    // Its microVM's part, live: added, or let go of.
+    if microvm && let Some(seam) = o::seam_change(&change, removed.as_ref()) {
+        let took = match &run {
+            Some(held) => Some(held.change(seam).await),
+            None => None,
+        };
+        let mut core = s.core.lock();
+        match (o::place_of(&core.state.overrides, &change), took) {
+            (Some(place), Some(r)) => o::set_took(&mut core.state.overrides, place, o::microvm_took(r)),
+            (Some(place), None) => o::set_took(&mut core.state.overrides, place, o::Took::NextStart { how: "its microVM takes it as its harness next starts there".to_owned() }),
+            (None, Some(Err(why))) => said(&mut core, Level::Warn, format!("Its microVM still holds it: it refused to let go of it ({why})")),
+            (None, _) => {}
+        }
+        core.touch_state();
+    }
+    // A volume's: its harness's allowed folders, and kiln's scope.
+    if !matches!(change, o::Change::Add(_) | o::Change::Remove(_)) {
+        return false;
+    }
+    let running = adapter.is_some();
+    let mut core = s.core.lock();
+    let dirs = o::dirs(&core.state.overrides);
+    let added = match &change {
+        o::Change::Add(v) => dirs.iter().find(|d| d.at == v.at).cloned(),
+        _ => None,
+    };
+    let taking = match adapter {
+        Some(a) => a.dirs_changed(&mut core, &dirs, added.as_ref()),
+        None => o::Taking::NextStart("as its harness next starts".to_owned()),
+    };
+    let again = running && !microvm && matches!(taking, o::Taking::NextStart(_));
+    if let o::Change::Add(v) = &change
+        && let Some(h) = core.state.overrides.volumes.iter_mut().find(|h| h.volume == *v)
+    {
+        h.harness = o::harness_took(taking);
+        h.scope = o::scope_took(v);
+    }
+    core.touch_state();
+    again
+}
+
+/// What a person changed of it while it ran before (`super::overrides`), given again as its harness starts: its
+/// microVM's ports, egress, networks and volumes, each live once its run is there (`run`; a restart, a resume, a
+/// restore each start one), and its volumes' folders, which its harness took as it started (`Spec::dirs`).
+async fn reapply_overrides(s: &Session, run: Option<Arc<crate::sandbox::held::Held>>) {
+    use super::overrides as o;
+    let changes = {
+        let mut core = s.core.lock();
+        if core.state.overrides.is_empty() {
+            return;
+        }
+        for h in &mut core.state.overrides.volumes {
+            if matches!(h.harness, o::Took::NextStart { .. }) {
+                h.harness = o::Took::Now { how: "its harness took it as it started".to_owned() };
+            }
+        }
+        core.touch_state();
+        o::changes(&core.state.overrides)
+    };
+    let Some(held) = run else { return };
+    for (place, change) in changes {
+        let took = o::microvm_took(held.change(change).await);
+        o::set_took(&mut s.core.lock().state.overrides, place, took);
+    }
+    s.core.lock().touch_state();
 }
 
 /// The "reach" setting in words, for the timeline.
@@ -4574,6 +4691,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
     // The models it last listed (the machine keeps the list for its "new agent" and switches): not
     // those kiln named ahead of its harness (`named_ahead`), which are the machine's list already.
     let mut models_seen = s.core.lock().meta.models.clone();
+    // The secrets its microVM's build is given (P4.7), taken out of the session as it starts: held
+    // here for its launches' builds alone, so no copy of the session (a move, a hand-over, a resume)
+    // carries them.
+    let build_secrets = std::mem::take(&mut s.spec.lock().build_secrets);
     loop {
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
@@ -4627,6 +4748,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         if let Some(at) = rewind_to.take() {
             spec.resume_at = at;
         }
+        // The folders a person gave it while it ran (`super::overrides`): its harness takes them as it starts.
+        spec.dirs = super::overrides::dirs(&s.core.lock().state.overrides);
         // A start that takes a carried conversation is the harness's new session, not an old one.
         if seed.is_some() {
             spec.resume = None;
@@ -4683,7 +4806,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     None if isolated => {
                         let host = files.host.as_ref().and_then(std::sync::Weak::upgrade);
                         match host.as_ref().and_then(|h| h.microvm()) {
-                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone()).await,
+                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets).await,
                             None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                         }
                     }
@@ -4731,6 +4854,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 // Its process here; none for a harness its boundary holds (a microVM's member).
                 *s.pid.lock() = p.host_pid();
                 s.began(&p);
+                // What a person changed of it while it ran before, given again (a restart, a resume, a restore).
+                reapply_overrides(&s, p.boundary()).await;
                 // Where its harness keeps its conversations, as its launch laid them out: in each record of
                 // where it ran.
                 let kept_in = p.boundary().and_then(|h| h.kept_in().map(str::to_owned));
@@ -4990,6 +5115,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 core.touch_state();
                                 adapter.perms_changed(&mut core);
                                 drop(core);
+                                on_change();
+                            }
+                            // A live override, in place (`super::overrides`): a harness that takes its folders only as
+                            // it starts starts again with them, the conversation going on, once nothing is under way.
+                            Command::Override { change } => {
+                                if take_override(&s, change, p.boundary(), Some(&mut adapter), kind).await {
+                                    let mut core = s.core.lock();
+                                    let when = if settled_core(&core) { "now" } else { "once this turn ends" };
+                                    let text = format!("{} takes its folders as it starts: it starts again with them {when}; the conversation goes on", kind.name);
+                                    core.upsert(&format!("harness-switch:dirs-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                                    core.hold = true;
+                                    drop(core);
+                                    reloading = true;
+                                }
                                 on_change();
                             }
                             Command::MaxSubagents { count } => {
@@ -5590,6 +5729,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         core.state.perms = perms;
                         core.touch_state();
                         drop(core);
+                        on_change();
+                    }
+                    // A live override while it isn't running: in its record now, given its harness and its microVM as
+                    // its harness next starts.
+                    Command::Override { change } => {
+                        let _ = take_override(&s, change, None, None, kind).await;
                         on_change();
                     }
                     c => adapter.command(&mut s.core.lock(), c),

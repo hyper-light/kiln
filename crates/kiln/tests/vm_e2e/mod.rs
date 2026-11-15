@@ -1058,6 +1058,7 @@ fn runner(dir: &Path, port: u16, name: &str, env: &[(&str, &str)]) -> anyhow::Re
     std::fs::create_dir_all(&home)?;
     let log_path = dir.join(format!("{name}.log"));
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    seed_store(&own_state(dir, name))?;
     let mut cmd = common::kiln();
     cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name])
         .arg("--work-dir")
@@ -1073,6 +1074,52 @@ fn runner(dir: &Path, port: u16, name: &str, env: &[(&str, &str)]) -> anyhow::Re
     cmd.env("USERPROFILE", &home).env("APPDATA", home.join("AppData").join("Roaming")).env("LOCALAPPDATA", home.join("AppData").join("Local"));
     let child = cmd.envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?;
     Ok((Runner(child), log_path))
+}
+
+/// `VM_E2E_SHARDS_STORE`: a Shards home whose image store holds the bases this run's images are built from,
+/// pulled once for the whole run (tests/vm_e2e/README.md). The runner whose state is `state` starts with a copy of
+/// that store's blobs and references in its own Shards home (`kiln::sandbox::shards_home`), so each build finds its
+/// digest-pinned base there (Shards' D78: a base pinned by a digest the store holds is resolved from the store) and
+/// asks no registry for it: no pull from Docker Hub per test, and no lookup of its name. Unset: none.
+fn seed_store(state: &Path) -> anyhow::Result<()> {
+    match std::env::var_os("VM_E2E_SHARDS_STORE") {
+        Some(seed) => seed_store_from(Path::new(&seed), state),
+        None => Ok(()),
+    }
+}
+
+/// The runner whose state is `state` given a copy of Shards home `seed`'s image store ([`seed_store`]).
+pub fn seed_store_from(seed: &Path, state: &Path) -> anyhow::Result<()> {
+    let from = seed.join("images");
+    anyhow::ensure!(from.join("blobs").is_dir(), "VM_E2E_SHARDS_STORE names no Shards home with an image store: {}", from.display());
+    let to = kiln::sandbox::shards_home(state).join("images");
+    for part in ["blobs", "refs"] {
+        copy_tree(&from.join(part), &to.join(part))?;
+    }
+    // Private to its user, as Shards keeps its store (its `pull::store`; D18).
+    #[cfg(unix)]
+    for dir in [kiln::sandbox::shards_home(state), to] {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// `from`'s directories and files, copied to `to` (made as it goes); anything else in it (a link, a socket) is left
+/// out, as a store holds none.
+fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from).map_err(|e| anyhow::anyhow!("{}: {e}", from.display()))? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if kind.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else if kind.is_file() {
+            std::fs::copy(&src, &dst).map_err(|e| anyhow::anyhow!("{} to {}: {e}", src.display(), dst.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The gate: whether the fixture's runner starts microVMs. Ok(false) after saying why it skips;
@@ -2160,17 +2207,69 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
 /// stand-in under each harness's name and no real harness: a real one is never started here.
 #[cfg(unix)]
 pub fn host_fixture(dir: &Path) -> anyhow::Result<Fixture> {
+    let (path, shell) = stub_host_env(dir)?;
+    let f = up(dir, "box", &[("PATH", &path), ("SHELL", &shell)])?;
+    // Its sessions as processes on this host: a runner of a kiln carrying Shards runs them in microVMs
+    // unless its engine is set to host (kiln plan 01a1dd2e…, P2.3), as here. ROOT's runner
+    // (`VM_E2E_SERVER`) is left as ROOT set it.
+    if f._server.is_some() {
+        let machine = f.machine.clone();
+        set_engine(&f, &machine, "host")?;
+    }
+    Ok(f)
+}
+
+/// A runner's `PATH` and login shell with the stand-in under each harness's name and no real harness,
+/// under `dir`: [`host_fixture`]'s, and a second runner's beside it.
+#[cfg(unix)]
+pub fn stub_host_env(dir: &Path) -> anyhow::Result<(String, String)> {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin)?;
-    for k in kiln::harness::kinds::Kind::all() {
-        std::os::unix::fs::symlink(stub_path(), bin.join(k.program))?;
+    if !bin.exists() {
+        std::fs::create_dir_all(&bin)?;
+        for k in kiln::harness::kinds::Kind::all() {
+            std::os::unix::fs::symlink(stub_path(), bin.join(k.program))?;
+        }
     }
     let path = format!("{}:{}", bin.display(), common::agents::path_without_harnesses(dir)?);
     let shell = dir.join("login-shell");
     std::fs::write(&shell, format!("#!/bin/sh\nPATH='{path}'\nexport PATH\nwhile [ $# -gt 1 ]; do shift; done\nexec /bin/sh -c \"$1\"\n"))?;
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))?;
-    up(dir, "box", &[("PATH", &path), ("SHELL", &shell.to_string_lossy())])
+    Ok((path, shell.to_string_lossy().into_owned()))
+}
+
+/// Runner `machine`'s engine as kiln says it (`GET /api/runners/:name/engine`; kiln plan 01a1dd2e…, P2.3).
+pub fn engine_of(f: &Fixture, machine: &str) -> anyhow::Result<Value> {
+    f.get(&format!("/api/runners/{machine}/engine"))
+}
+
+/// Sets runner `machine`'s engine (`host`, `microvm`) and waits until the facts kiln has of it say so:
+/// its view then.
+pub fn set_engine(f: &Fixture, machine: &str, engine: &str) -> anyhow::Result<Value> {
+    let path = format!("/api/runners/{machine}/engine");
+    setup_on(f, &format!("{machine}'s engine set to {engine}"), || {
+        let (code, body) = common::http(f.port, "PUT", &path, &f.admin, Some(&json!({"engine": engine})))?;
+        Ok(if code == 200 { Setup::Ready(()) } else { server_said(code, &body) })
+    })?;
+    setup_on(f, &format!("{machine} holding engine {engine}"), || {
+        let v = engine_of(f, machine)?;
+        Ok(if v.pointer("/isolation/engine").and_then(Value::as_str) == Some(engine) { Setup::Ready(v) } else { Setup::Wait })
+    })
+}
+
+/// A second runner `name` of the fixture's own server, connected: held while it's kept.
+pub fn another_runner(f: &Fixture, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Runner> {
+    let (r, _log) = runner(&f.dir, f.port, name, env)?;
+    let machine = common::machine(name);
+    setup_on(f, &format!("runner {name} connecting"), || {
+        let (code, body) = common::http(f.port, "GET", "/api/agents", &f.admin, None)?;
+        if code != 200 {
+            return Ok(server_said(code, &body));
+        }
+        Ok(if connected(&serde_json::from_str(&body)?, &machine) { Setup::Ready(()) } else { Setup::Wait })
+    })?;
+    headroom_off(f, name)?;
+    Ok(r)
 }
 
 /// Drives `kind` as a process on this host, the stand-in behind its name, through kiln, with the

@@ -307,13 +307,22 @@ fn w05_r03_place_agents_holds_a_child_agents_claim_from_start_to_end() -> anyhow
     })
 }
 
+/// A linux runner's facts: whether it can hold microVMs, and its engine as its owner set it (`asked`),
+/// written in as its runner and the server write them (`harness::engine::overlay`; kiln plan 01a1dd2e…,
+/// P2.3).
+fn vm_facts(can: bool, asked: crate::harness::engine::Asked) -> kiln_ci::facts::RunnerFacts {
+    let mut f = kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), isolation: Some(kiln_ci::facts::Isolation { available: can, ..Default::default() }), ..Default::default() };
+    crate::harness::engine::overlay(&mut f, asked);
+    f
+}
+
 /// Runners `mac` (process 1) and `linux` (process 2) joined to `hub`, each placing sessions and
 /// having Claude Code, `linux` alone saying it starts microVMs (its facts' `virt.microvm`), each idle
 /// as the server last heard (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
 fn join_vm_runners(hub: &crate::hub::Hub) {
     for (peer, name, microvm) in [(1, "mac", false), (2, "linux", true)] {
         crate::hub::tests::join_runner(hub, peer, name, crate::proto::CAP_WIRE);
-        let facts = kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), virt: kiln_ci::facts::Virt { microvm, ..Default::default() }, ..Default::default() };
+        let facts = vm_facts(microvm, crate::harness::engine::Asked::default());
         hub.put_agent(crate::hub::AgentLive { sample: Some(reading(0.0)), facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") });
         hub.instances.update(|i| i.set_features(peer, vec![crate::proto::feature::SESSIONS.to_owned()]));
         let kinds = crate::harness::kinds::offered()
@@ -344,7 +353,7 @@ fn step32_an_agent_a_microvm_agent_starts_is_isolated_and_placed_with_its_microv
         let lab = lab_placing().await?;
         // Whether linux starts microVMs, as its own facts say it (what its admission and its owner
         // read of itself) and as the directory does (what other owners read of it); mac doesn't.
-        let microvm = |on: bool| In::LocalFacts(Box::new(kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), virt: kiln_ci::facts::Virt { microvm: on, ..Default::default() }, ..Default::default() }));
+        let microvm = |on: bool| In::LocalFacts(Box::new(vm_facts(on, crate::harness::engine::Asked::default())));
         lab.linux.feed(microvm(true)).await;
         lab.ctl.send(super::Ctl::Microvm("linux", true)).await?;
         lab.ctl.send(super::Ctl::Microvm("mac", false)).await?;
@@ -381,6 +390,18 @@ fn step32_an_agent_a_microvm_agent_starts_is_isolated_and_placed_with_its_microv
         anyhow::ensure!(lab.linux.session_started(claim.clone(), Some(crate::reach::place::vm_group("vm-child-2", homes.path()))).await?);
         anyhow::ensure!(held_and_cap(&lab.linux).await?.0 == [1_000, 2 * GIB, 0, 0], "{:?}", held_and_cap(&lab.linux).await?);
         lab.linux.session_ended(claim.clone()).await;
+
+        // Kiln plan 01a1dd2e…, P2.4: its owner set linux's engine to host, which its runner holds as the
+        // server pushed it (its own facts, `engine::here`), while the server's view of it is from
+        // before. Its parent's runner, linux, places the agent itself, and its own admission refuses a
+        // microVM's ask: never in a microVM on a host runner, whoever places it.
+        let host = crate::harness::engine::Asked { engine: Some(crate::harness::engine::Engine::Host), version: 1 };
+        lab.linux.feed(In::LocalFacts(Box::new(vm_facts(true, host)))).await;
+        lab.linux.directory().await?;
+        let never = crate::rt::timeout(HANG, place_start(&hub, Some(&parent), &Ask { kind: "claude".into(), ..Ask::default() })).await?;
+        let why = never.as_ref().err().map(|(_, w)| w.clone()).unwrap_or_default();
+        anyhow::ensure!(why.contains("never") && why.contains("microvm"), "a host runner placing for itself refuses a microVM: {never:?}");
+        anyhow::ensure!(held_and_cap(&lab.linux).await?.0 == [0; 4] && waiting(&lab.linux, "interactive").await? == 0, "nothing held or waiting on the host runner");
 
         lab.linux.feed(microvm(false)).await;
         lab.ctl.send(super::Ctl::Microvm("linux", false)).await?;
@@ -465,6 +486,55 @@ fn step32_an_isolated_agents_commands_are_refused_at_every_door_never_run_on_a_b
             anyhow::ensure!(held_and_cap(h).await?.0 == [0; 4] && waiting(h, "interactive").await? == 0, "nothing of them placed: {}", h.place_view().await?);
         }
         let _ = host.close(&session.id);
+        anyhow::Ok(())
+    })
+}
+
+/// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P5.1, its run: running an agent definition
+/// (`agentdefs.run`, as its route and MCP tool run it) starts an agent through the one start path,
+/// with the definition's harness and model, isolated in a microVM made from its Agentfile, placed by
+/// the balancer where microVMs start (linux, not mac), and first told its instructions, then the task.
+/// The session kiln runs (as `agents.get` reads it) has the definition's harness, model and Agentfile.
+/// A model kiln's machines don't list for its harness isn't kept. Taking `image` out of the run's ask
+/// starts it from kiln's own Agentfile; taking `model` out starts it on its harness's default.
+#[test]
+fn p5_1_running_an_agent_definition_starts_its_session_in_its_agentfiles_microvm() -> anyhow::Result<()> {
+    const CLAUDE: &str = "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nAGENT main FROM ./agent\nATTACH main FOR claude\nCMD [\"claude\"]\n";
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        let microvm = |on: bool| In::LocalFacts(Box::new(kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), virt: kiln_ci::facts::Virt { microvm: on, ..Default::default() }, ..Default::default() }));
+        lab.linux.feed(microvm(true)).await;
+        lab.ctl.send(super::Ctl::Microvm("linux", true)).await?;
+        lab.ctl.send(super::Ctl::Microvm("mac", false)).await?;
+        lab.mac.feed(In::Sampled(reading(0.0))).await;
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let hub = crate::hub::tests::scratch_hub().await?;
+        join_vm_runners(&hub);
+        let stop = connect(&hub, &lab);
+        let op = |name: &'static str, input: Value| crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() }, name, input);
+        let failed = |(code, why): crate::ops::Fail| anyhow::anyhow!("{code}: {why}");
+
+        let af = op("agentfiles.create", json!({"name": "claude-rust", "text": CLAUDE})).await.map_err(failed)?;
+        let agentfile = format!("agentfile:{}", af.pointer("/agentfile/id").and_then(Value::as_str).unwrap_or_default());
+        // The models kiln's machines list for Claude Code: a model none lists isn't kept.
+        let listed: Vec<String> = crate::harness::kinds::models_of("claude").into_iter().map(|m| m.id).collect();
+        let model = listed.first().cloned().ok_or_else(|| anyhow::anyhow!("no models listed for claude"))?;
+        let (code, why) = op("agentdefs.create", json!({"name": "wrong-model", "harness": "claude", "model": "gpt-6-sol"})).await.err().ok_or_else(|| anyhow::anyhow!("a model claude doesn't take was kept"))?;
+        anyhow::ensure!(code == http::StatusCode::UNPROCESSABLE_ENTITY && why.contains("Claude Code takes no model `gpt-6-sol`"), "{code}: {why}");
+
+        let made = op("agentdefs.create", json!({"name": "reviewer", "harness": "claude", "model": model, "instructions": "Review the diff.", "agentfile": agentfile})).await.map_err(failed)?;
+        let id = made.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let ran = crate::rt::timeout(HANG, op("agentdefs.run", json!({"id": id, "prompt": "src/lib.rs"}))).await?.map_err(failed)?;
+        anyhow::ensure!(ran.get("agentdef") == Some(&json!({"id": id, "version": 1})), "{ran}");
+        let agent = ran.pointer("/agents/0/id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no agent started: {ran}"))?.to_owned();
+        let got = op("agents.get", json!({"agent": agent})).await.map_err(failed)?;
+        let info = got.get("info").cloned().unwrap_or_default();
+        anyhow::ensure!(info.get("kind") == Some(&json!("claude")) && info.get("model") == Some(&json!(model)), "its harness and model: {info}");
+        anyhow::ensure!(info.pointer("/isolation/kind") == Some(&json!("microvm")) && info.pointer("/isolation/image") == Some(&json!(agentfile)), "in its Agentfile's microVM: {info}");
+        anyhow::ensure!(info.get("target") == Some(&json!("agent:linux")), "placed where microVMs start: {info}");
+        drop(stop);
         anyhow::Ok(())
     })
 }

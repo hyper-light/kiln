@@ -163,6 +163,7 @@ impl Kind {
             }
             Protocol::Acp(args) => {
                 p.args(args);
+                p.args(self.dir_args(spec));
                 // Cursor's sign-in (its ACP `authenticate`, `agent login`) opens no browser on the
                 // machine: its link is shown wherever the person is (`crate::accounts`).
                 if self.id == "cursor" {
@@ -186,6 +187,20 @@ impl Kind {
             Protocol::Terminal => {}
         }
         Ok(p)
+    }
+}
+
+impl Kind {
+    /// The flags an ACP agent takes the session's folders as (`Spec::dirs`, a person's volumes:
+    /// `harness::overrides`) as it starts, where it has its own: Gemini CLI's `--include-directories`,
+    /// "Additional directories to include in the workspace (comma-separated or multiple
+    /// --include-directories)" (gemini-cli docs/cli/cli-reference.md). The others take them over ACP
+    /// where they say they do (`acp::Acp`'s `additionalDirectories`).
+    fn dir_args(&self, spec: &Spec) -> Vec<String> {
+        if self.id != "gemini" {
+            return Vec::new();
+        }
+        spec.dirs.iter().flat_map(|d| ["--include-directories".to_owned(), d.at.clone()]).collect()
     }
 }
 
@@ -221,7 +236,7 @@ impl Kind {
                 super::claude::args(spec, session_id.as_deref())
             }
             Protocol::CodexAppServer => [super::codex::args(), codex_limit(spec)].concat(),
-            Protocol::Acp(args) => args.iter().map(|a| (*a).to_owned()).collect(),
+            Protocol::Acp(args) => args.iter().map(|a| (*a).to_owned()).chain(self.dir_args(spec)).collect(),
             Protocol::AgyStreamJson => super::antigravity::args(spec),
             Protocol::PiRpc => super::pi::args(spec),
         };
@@ -942,6 +957,21 @@ impl Adapter {
     pub fn perms_changed(&mut self, core: &mut Core) {
         if let Self::Codex(a) = self {
             a.perms_changed(core);
+        }
+    }
+
+    /// The folders a person gave the session changed (`dirs`: its volumes as its harness sees them, `added` the one
+    /// just given, if one was; `super::overrides`): its harness takes them among its allowed folders its own way, and
+    /// says how (kiln plan 01a1dd2e…, P6b.4 AC3).
+    pub fn dirs_changed(&mut self, core: &mut Core, dirs: &[super::overrides::Dir], added: Option<&super::overrides::Dir>) -> super::overrides::Taking {
+        use super::overrides::Taking;
+        match self {
+            Self::Claude(a) => a.dirs_changed(core, dirs),
+            Self::Codex(_) if added.is_some_and(|d| !d.writable) => Taking::Nothing("Codex's sandbox reads outside its folder already: it holds writes alone".to_owned()),
+            Self::Codex(_) => Taking::NextTurn("Codex takes the folders it may write with each turn (turn/start's sandboxPolicy.writableRoots)".to_owned()),
+            Self::Acp(a) => a.dirs_changed(dirs),
+            Self::Agy(_) => Taking::NextStart("Antigravity takes more folders as it starts (`--add-dir`), as it takes its other settings".to_owned()),
+            Self::Pi(_) => Taking::Nothing("Pi holds its tools to no folder: it has nothing of its own to change".to_owned()),
         }
     }
 

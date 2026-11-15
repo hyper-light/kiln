@@ -136,6 +136,15 @@ impl Held {
         self.run.id()
     }
 
+    /// Its network or its folders changed while it runs (a session's live overrides, `harness::overrides`): taken,
+    /// else its boundary's refusal (`Ended` once it has ended, `Unsupported` where it takes no change live).
+    pub async fn change(&self, change: kiln_seams::sandbox::Change) -> Result<(), Refusal> {
+        if self.ended.load(Ordering::Acquire) {
+            return Err(Refusal::Ended);
+        }
+        self.run.change(change).await
+    }
+
     /// The link its stdio rides into its boundary, as each end says it negotiated, once it's made;
     /// none where its stdio ride none.
     pub async fn linked(&self) -> Option<Link> {

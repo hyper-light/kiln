@@ -39,8 +39,15 @@ pub fn perms_over(core: &Core, task: Option<&str>) -> Option<Perms> {
 /// touching `paths` (none named: its folder): refused ("deny") or asked ("ask"), and why, in words
 /// the agent reads; none where they let it go as it would.
 pub fn verdict(core: &Core, task: Option<&str>, kind: ToolKind, paths: &[&str]) -> Option<(&'static str, String)> {
-    let perms = perms_over(core, task)?;
     let cwd = core.state.cwd.as_str();
+    // A folder a person gave it read-only (`super::overrides`, kiln plan 01a1dd2e…, P6b.4): a change there is refused,
+    // whatever else lets it.
+    if matches!(kind, ToolKind::Edit)
+        && let Some((p, v)) = paths.iter().find_map(|p| volume_of(core, p, cwd).filter(|v| v.access == super::overrides::Access::Ro).map(|v| (*p, v)))
+    {
+        return Some(("deny", format!("{p} is in {}, a folder you were given read-only (a person's grant). Don't change it.", v.at)));
+    }
+    let perms = perms_over(core, task)?;
     // Past its limits, it finishes with what it has: its own task's time and tokens, or the session's.
     let t = task.and_then(|t| core.state.tasks.iter().find(|x| x.id == t));
     let since = t.map(|t| t.started).or_else(|| core.events().next().map(|e| e.at)).unwrap_or_else(Core::now);
@@ -76,15 +83,25 @@ pub fn verdict(core: &Core, task: Option<&str>, kind: ToolKind, paths: &[&str]) 
             let paths = if paths.is_empty() { vec![cwd] } else { paths.to_vec() };
             paths
                 .into_iter()
+                // Its folder, and the folders a person gave it, are its scope.
                 .find(|p| {
                     let at = lexical(p, cwd);
-                    at != root && !at.starts_with(&format!("{root}/"))
+                    at != root && !at.starts_with(&format!("{root}/")) && volume_of(core, p, cwd).is_none()
                 })
                 .map(|p| ("deny", format!("{p} is outside your folder, {folder} (a person's limit on you). Stay in it.")))
         }
         ToolKind::Shell => Some(("ask", format!("Your folder is {folder}, and a command can reach outside it: a person sees each."))),
         _ => None,
     }
+}
+
+/// The folder a person gave the session (`super::overrides`) that path `p` (from `cwd`) is in, as its harness sees it.
+fn volume_of<'a>(core: &'a Core, p: &str, cwd: &str) -> Option<&'a super::overrides::Volume> {
+    let at = lexical(p, cwd);
+    core.state.overrides.volumes.iter().map(|h| &h.volume).find(|v| {
+        let root = lexical(&v.at, cwd);
+        at == root || at.starts_with(&format!("{root}/"))
+    })
 }
 
 /// Path `p` from folder `cwd`, its `.` and `..` worked out as written (no links followed), with

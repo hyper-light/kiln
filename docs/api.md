@@ -114,6 +114,8 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
 | GET | `/api/runners/:name/agent-limit` | `{ runner, own, connected, runs_agents, supported, max_sessions, held: { max_sessions, from: "server" \| "config" \| "default", config? } \| null, working, waiting, sessions, default, max }`: the most agent sessions the runner has at work at once, what's set here (`max_sessions`, null for none), what it holds and why as it last said, how many of its sessions are at work now (`working`, what the limit counts) and wait for room to go to work (`waiting`; both null while it's offline), and how many it has in all (`sessions`, finished, paused and ended ones too) ([agents.md](agents.md#how-many-agents-a-machine-runs)); 404 for an unknown runner |
 | PUT | `/api/runners/:name/agent-limit` | `{ max_sessions: n }` (1 to 4096), or `{ max_sessions: null }` to take it away (its config's, or kiln's default of 64, holds again) → the same view. Wins over the runner's config; stored and pushed to the runner (held when it next connects if it's offline). 400 for anything else, saying why; audited `agent_limit.update` |
+| GET | `/api/runners/:name/engine` | `{ runner, engine: "host" \| "microvm" \| null, from: "server" \| "default" \| null, why, asked, version, microvm: { usable, why } \| null, isolation, virt, sessions, draining }`: how the runner runs new agent sessions (its engine), where that comes from (its owner set it, or what it can do: `microvm` where it can hold microVMs, else `host`) and why, what's set here (`asked`, null for none) and how many times it was set (`version`, which a start placed under an older one is refused by), whether it can hold microVMs now and why not, its isolation facts, and how many of its running sessions are on its engine (`sessions`) and on the other (`draining`, which finish there); null fields until its facts come ([isolation.md](isolation.md#a-runners-engine)); 404 for an unknown runner |
+| PUT | `/api/runners/:name/engine` | `{ engine: "host" \| "microvm" }`, or `{ engine: null }` for what the runner can do → the same view. `microvm` is refused (409), saying why, where the runner can't hold microVMs now. Stored, held in the server's facts of it at once (`isolation.engine`, `virt.microvm` only on `microvm`) and pushed to the runner; nothing running stops. 400 for anything else, saying why; audited `runner_engine.update` |
 | GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
 | GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |
 | PUT | `/api/runners/:name/front-door` | `FrontDoorSettings` → `FrontDoorView`. Checked, stored and pushed to the runner (applied when it next connects if it is offline); 400 with the reason (`Domain: kiln needs a dot, like kiln.dev`); audited `front_door.update` |
@@ -183,6 +185,106 @@ interface AgentfileListing { agentfiles: AgentfileBrief[]; reaches_all: boolean 
   project?: { repo; sha: string|null; agentfiles: { name; path; text: string|null }[] } }
 ```
 
+## Confirming an agent's act
+
+An agent can manage its person's agents from their chat, and nothing it reads can make it act for them
+unasked (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6; `crate::confirms`). A person's message to an
+agent, or goals they give it, makes the turn it starts theirs, until that turn ends; kiln records it where
+it records a person's command, by every path, and an agent's own words never count. Every operation an
+agent calls passes one gate, before any of it runs (`crate::ops::call`, so CI's, the hosts',
+experiments', Ship's and deployments' operations as much as kiln's own):
+
+- At once: reads; its acts on itself and on what it started (its children and theirs, the plan runs they
+  ran); messages and questions to its person's other agents, as their own rules have them; and every
+  other change it may already make.
+- Waiting on its person's click: an operation the registry marks destructive (`destructive`, enforced
+  here, not only a hint to MCP clients); a change to another of its person's agents it didn't start
+  (interrupting, ending or resuming it); and any change to their agent definitions. Asked in a person's
+  turn, kiln keeps the ask (the operation, its exact arguments, its target's version then: a definition's
+  version, a session's status and newest event) and answers **428**, `waiting on <person>'s click`. Asked
+  outside a person's turn, there's no one to ask: 403, and today's rules stand.
+- Another person's agents are out of reach either way, as they are today.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/confirms?agent=` | `{ asked: { id, agent, op, says, state, asked_at }[] }`: what waits on your click, newest first |
+| POST | `/api/confirms/{id}` | `{ yes }` → `{ id, state, told }`: your click; the agent is told either way |
+
+Both are a person's: an agent's call is refused. Confirmed, the agent's same call (the same operation and
+arguments, its target unchanged) runs once, as the person whose click it was, with their grants and their
+reach over their own agents, and its audit row says whose click and which ask. Another call, a second
+one, or one whose target changed since (409, and the next such call asks anew) doesn't run. A
+confirmation lasts until the person's next message to that agent, which drops what was asked before it;
+a click after the agent's turn ended still confirms. kiln keeps the confirmation and never hands it to
+the agent, so there's nothing for an agent or a page it reads to copy, guess or replay. An op an agent
+makes in a person's turn says so on its audit row (kiln's own operations).
+
+## Agent definitions
+
+An agent definition is an agent as data (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P5.1): one of
+kiln's ten harnesses (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor, pi) and
+its model, its instructions and playbook, its tools and MCP servers, its skills, its limits (time,
+cost, tokens), and the Agentfile its microVM is made from (one of its owner's, `agentfile:<id>`, or
+kiln's for its harness, `harness-<harness>`; none: its harness's own). People keep their own in kiln
+(`crate::agentdefs`), each with every version of its settings: a change of settings is a new version,
+and so is a restore; a rename alone is none. The routes need `agents.run`; each keeps a person to
+their own, and answers 404 for another's. The server's owner, and whoever has `agentdefs.manage` (an
+admin), reach everyone's; an agent reaches those of the person it acts for. Each route is an
+operation too (`agentdefs.*`: `POST /api/ops/<name>`, kiln's MCP tools `agentdefs_*`, code mode's
+`kiln.agentdefs.*`), and each change is audited. (`agents.*` and `/api/agents` are the agents kiln
+runs and its runners: a definition's run is one of those agents.)
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/agentdefs?all=` | `{ agents: AgentDefBrief[], reaches_all, builtin: KilnAgentDef[], uses: { [kiln_id]: id } }`, newest change first |
+| POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile? }` → `AgentDef` (version 1); 422 `kiln can't run this agent: <why>`, 409 a name taken |
+| POST | `/api/agentdefs/check` | the settings → `{ ok, problems: string[] }`, keeping nothing |
+| GET | `/api/agentdefs/{id}` | `AgentDef` |
+| PATCH | `/api/agentdefs/{id}` | what's given changes (null `model` or `agentfile`: back to its harness's) → `AgentDef` |
+| GET | `/api/agentdefs/{id}/versions` | `{ versions: { version, at, by, ...settings }[] }`, newest first |
+| POST | `/api/agentdefs/{id}/restore` | `{ version }` → `AgentDef`, that version's settings as a new version |
+| DELETE | `/api/agentdefs/{id}` | `{ deleted: true }` |
+| POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }`; `id` one of yours or kiln's |
+| POST | `/api/agentdefs/{id}/copy` | `{ name? }` → `AgentDef`: one of kiln's (`kiln:<name>`) or yours, made yours, version 1 |
+| POST | `/api/agentdefs/use` | `{ builtin, id }` → `{ uses }`: your own `id` stands in for kiln's UI agent `builtin` for you (null `id`: kiln's own again) |
+
+Kept and restored settings are checked first, and refused, every reason said, where: the harness
+isn't one of kiln's ten; the Agentfile isn't one its owner reaches (another person's is as none) or is
+kiln's for another harness; the model isn't one kiln's machines list for that harness (what its
+sessions said they offer; a harness no machine lists models for takes any); an MCP server has no name
+of its own, or not exactly one of `url` and `command`; a tool or skill has no name; a limit is 0.
+kiln ships its own, read only, listed as `builtin` (kiln plan 01a1dd2e8618733a87f2793aab1322a8
+P5.1b), each made from what kiln itself has so that none drifts from it: one per CI skill
+(`kiln-ci-*`: the skill its own, its description its instructions), one per harness (`harness-<id>`,
+in kiln's Agentfile for it), and the agents kiln starts from its UI, their briefs shown with what kiln
+fills in at each start `<like this>`: `kiln-about` (the card that answers "ask about this code" in an
+agent's conversation), `kiln-about-code` (the same in a change no agent made), `kiln-attach` (an
+attachment's agent, woken by an incident), `kiln-review` (a review agent) and `kiln-toolfix` (the
+agent that installs a tool a job lacks on a runner). Changing, restoring or deleting one of kiln's is
+refused, 403: `copy` makes it yours. Each UI agent is `replaceable`: its `brief` is what kiln tells
+it at each start, after the instructions of whichever definition starts (kiln's own have none). A
+person's own definition may stand in for one, for them alone (`use`): where kiln starts that agent
+for them, it starts theirs, its harness, model and Agentfile, first told its instructions and then
+kiln's brief. The most specific wins: a harness set where it's started (an attachment's `harness.kind`
+its person set, a tool fix's `kind`; left unset, it's stored unset), then the person's own, then
+kiln's. An attachment's agent and a review agent are their attachment person's (`by`). Deleting the
+definition makes it kiln's own again.
+
+A run starts an agent through `agents.start`, as its route starts one (the caller's right to start
+agents there checked and audited as such): the definition's harness and model, `isolation`
+`microvm`, `image` its Agentfile (left out: the start's own for its harness), and as its first
+message its instructions, then the run's `prompt`.
+
+```ts
+interface Mcp { name; url?; command?: string[] }
+interface Limits { seconds?; cents?; tokens? }
+interface AgentDef { id; owner /* "owner" | "user:<id>" */; name; version; created_at; updated_at;
+  harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
+type AgentDefBrief = Pick<AgentDef, "id"|"owner"|"name"|"harness"|"model"|"agentfile"|"version"|"created_at"|"updated_at">;
+interface KilnAgentDef { id /* "kiln:<name>" */; name; about; replaceable: boolean; brief?: string;
+  harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
+```
+
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/api/agentfiles?repo=&all=` | `AgentfileListing`: yours, newest change first, without their texts; beside them, read only, those kiln ships per harness (`builtin`), and with `repo` (`owner/name`, a repository whose runs you read, else 404) its `.kiln/images/<name>/Agentfile` files at its default branch (`text` null past 2 MiB). `all=true`: everyone's (403 without `agentfiles.manage`) |
@@ -204,6 +306,37 @@ starts microVMs, and is refused anywhere else (400, `an agent can't run isolated
 kiln's balancer places it, asking that size, and refuses it where it can't (step 32). The console
 keeps them at `/agents/agentfiles` and chooses one as an agent starts (docs/agents.md, "From an
 Agentfile, in a microVM of its own").
+
+## Your secrets
+
+A person's own secrets (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, decision 6): the `user` scope of
+CI's secrets (docs/ci.md W09), sealed as every scope's are (`crate::secrets::mine`). Each person sets,
+lists and deletes their own; no one else sees them, by name or value: not an admin, not
+`secrets.manage` (`/api/ci/secrets` refuses `scope=user:…` for everyone, 400), not the server's
+owner, whose admin token reaches the owner's own alone. No answer carries a value. An agent lists its
+person's names, to name them in an Agentfile, and sets none (403). Each route is an operation too
+(`secrets.mine.*`: `POST /api/ops/<name>`, kiln's MCP tools `secrets_mine_*`, code mode's
+`kiln.secrets.mine.*`), and each change is audited, by name.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/me/secrets` | `{ secrets: { name, size, created_at, updated_at, last_used_at }[] }`: yours |
+| PUT | `/api/me/secrets/<name>` | `{ value }` → `{ set: true, name }`. `name`: letters, digits and `_`, not starting with a digit (kept upper-case); `value`: 64 KiB at the most (422) |
+| DELETE | `/api/me/secrets/<name>` | `{ deleted: true }`; 404 for a name you hold none of |
+
+One of your own Agentfiles names each secret a build of it is given, by reference:
+`LABEL kiln.secret.<ID>=user:<NAME>`, `<ID>` the build secret Shards reads (`GIT_AUTH_TOKEN`,
+`GIT_AUTH_TOKEN.<host>`, `HTTP_AUTH_HEADER_<host>`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for
+an `AGENT` or `HARNESS` source; any `RUN --mount=type=secret,id=<ID>`), `<NAME>` one of yours. A label
+under `kiln.secret.` that isn't such a reference isn't kept (422, rule `SecretReference`), its words
+never repeating what it held. As an agent of yours starts from that Agentfile, kiln reads each named
+secret from yours; one you hold none of refuses the start before anything is placed (400,
+`… kiln.secret.<ID> names user:<NAME>, which isn't one of your secrets`), whoever's Agentfile has the
+same text. Its runner gives them to that build alone (`shards build --secret id=<ID>,env=…`, the value in
+the build's environment, never on its command line, in a layer or in the session it starts). The build
+is given the Agentfile without its `kiln.secret.` labels (each line kept, so Shards' words name your
+lines), so neither a reference nor a secret's name reaches the image: its config's labels, its build's
+definition and source map, its provenance.
 
 ## WebSockets
 

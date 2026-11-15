@@ -4166,6 +4166,18 @@ impl Registry {
         if spec.isolation.is_none() {
             spec.isolation = spec.parent.as_deref().and_then(|p| self.info(p)).and_then(|i| i.isolation);
         }
+        // The engine setting its boundary is decided under (kiln plan 01a1dd2e…, P2.3), before anything
+        // it waits for: its runner refuses it where it's been set again since. One `agents.start`
+        // decided keeps the one it was decided under.
+        if spec.engine_version.is_none() {
+            spec.engine_version = crate::harness::engine::version_at(hub, target);
+        }
+        // A new conversation that asks for no microVM takes its runner's engine (kiln plan 01a1dd2e…,
+        // P2.3): on a `microvm` runner, a microVM of its own. One taken up (`resume`: a found session
+        // taken over or branched, a conversation continued) stays where its harness keeps it.
+        if spec.isolation.is_none() && spec.resume.is_none() && crate::harness::lineage::engine_at(hub, target) == Ok(crate::harness::engine::Engine::Microvm) {
+            spec.isolation = Some(super::session::Isolation { person: spec.opener.clone(), ..super::session::Isolation::microvm() });
+        }
         if spec.isolation.is_some() {
             crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
         }
@@ -4983,7 +4995,7 @@ impl Registry {
         // at its latest version, for its machine to build its microVM from again, as at its start (kiln
         // plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5; `lineage::kept_agentfile`).
         let person = pkg.spec.isolation.as_ref().and_then(|i| i.person.clone());
-        pkg.spec.agentfile = super::lineage::kept_agentfile(hub, pkg.spec.isolation.as_ref(), person.as_deref()).await?;
+        super::lineage::kept_agentfile(hub, pkg.spec.isolation.as_ref(), person.as_deref()).await?.into_spec(&mut pkg.spec);
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();

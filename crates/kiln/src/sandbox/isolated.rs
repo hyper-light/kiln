@@ -116,8 +116,9 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
 /// project that builds with its host's own tools is refused before anything is built (step 18,
 /// `host_tools`); its harness gets kiln's variables as a microVM's member does
 /// (`isolated::env::member_env`) and kiln's MCP through its link's lane ([`offer_mcp`]), served by this runner for
-/// `session` ([`bridge`], its asks `host`'s), where its microVMs carry the lane.
-pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>) -> anyhow::Result<crate::proc::Duplex> {
+/// `session` ([`bridge`], its asks `host`'s), where its microVMs carry the lane. A build of its image is
+/// given `secrets` (`Spec::build_secrets`, P4.7).
+pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret]) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     let mut launch = launch_of(kind, spec, source.name())?;
@@ -146,7 +147,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     };
     // Where it doesn't parse, its build says so in Shards' words; its egress stays as its image's.
     launch.egress = egress_of(&reach, granted(text).ok().flatten());
-    let image = vms.images.pinned(source).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
+    let image = vms.images.pinned(source, secrets).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
     launch.boundary = Boundary::MicroVm { image: image.clone() };
     let person = spec.isolation.as_ref().and_then(|i| i.person.as_deref());
     let (mounts, kept_in) = match (homes, person) {
@@ -229,6 +230,10 @@ pub const PROJECTS: &str = "/work";
 
 /// Where a microVM sees a Windows machine's plugin folders: beneath this, each by its own name.
 pub const PLUGINS: &str = "/plugins";
+
+/// Where a microVM sees a Windows machine's folders a person gives its running session (`harness::overrides`):
+/// beneath this, each by its own name.
+pub const VOLUMES: &str = "/volumes";
 
 /// Where a microVM sees folder `host` of the machine, as Shards plugs one in (D235): a Unix path at its
 /// own path, so what the harness says of its files names them as the machine does; a Windows one
