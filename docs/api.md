@@ -231,7 +231,10 @@ never repeating what it held. As an agent of yours starts from that Agentfile, k
 secret from yours; one you hold none of refuses the start before anything is placed (400,
 `… kiln.secret.<ID> names user:<NAME>, which isn't one of your secrets`), whoever's Agentfile has the
 same text. Its runner gives them to that build alone (`shards build --secret id=<ID>,env=…`, the value in
-the build's environment, never on its command line, in a layer or in the session it starts).
+the build's environment, never on its command line, in a layer or in the session it starts). The build
+is given the Agentfile without its `kiln.secret.` labels (each line kept, so Shards' words name your
+lines), so neither a reference nor a secret's name reaches the image: its config's labels, its build's
+definition and source map, its provenance.
 
 ## WebSockets
 

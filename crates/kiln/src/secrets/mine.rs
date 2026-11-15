@@ -19,7 +19,10 @@
 //!   ([`for_build`]), refusing a name they hold none of before anything is placed, and its runner
 //!   gives them to that build alone (`sandbox::image`), never keeping them in the session. The text
 //!   carries names only: a reference that isn't `user:<NAME>` is refused when the text is kept
-//!   (`agentfiles::check`), its words never repeating what was written.
+//!   (`agentfiles::check`), its words never repeating what was written. Its build is given the text
+//!   without its references ([`built_text`]), so no name of the person's reaches the image (its
+//!   config's labels, its build's definition and source map, its provenance): who can inspect an
+//!   image learns nothing of whose secrets built it.
 
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -115,6 +118,43 @@ pub fn references(text: &str) -> (Vec<Reference>, Vec<Misnamed>) {
         }
     }
     (refs, bad)
+}
+
+/// `text` as its build is given it: every `kiln.secret.` label pair taken out (an instruction left with
+/// none, a blank line), its other pairs as written and every other line as it was, so that Shards'
+/// words name the lines the person wrote. Its references stay kiln's: no name of theirs reaches the
+/// image's config, its build's definition and source map, or its provenance. A text Shards can't read
+/// is given as it is (its build says why, in Shards' words, as its check did).
+pub fn built_text(text: &str) -> String {
+    use shards_agentfile::instructions::{self, Kind};
+    use shards_agentfile::{lint, parser};
+    let Ok(parsed) = parser::parse_as(text.as_bytes(), parser::Dialect::Agentfile) else { return text.to_owned() };
+    let Ok(read) = instructions::parse(&parsed, &lint::Linter::default()) else { return text.to_owned() };
+    // Each line, its ending kept; a label's lines, from its first, become what's left of it.
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_owned).collect();
+    for c in read.stages.iter().flat_map(|s| &s.commands) {
+        let Kind::Label(pairs) = &c.kind else { continue };
+        let named = |k: &[u8]| unquoted(&String::from_utf8_lossy(k)).starts_with(LABEL);
+        if !pairs.iter().any(|kv| named(&kv.key)) {
+            continue;
+        }
+        let (Some(first), Some(last)) = (c.location.iter().map(|r| r.0).min(), c.location.iter().map(|r| r.1.max(r.0)).max()) else { continue };
+        let kept: Vec<String> = pairs
+            .iter()
+            .filter(|kv| !named(&kv.key))
+            .map(|kv| {
+                let (k, v) = (String::from_utf8_lossy(&kv.key), String::from_utf8_lossy(&kv.value));
+                if kv.no_delim { format!("{k} {v}") } else { format!("{k}={v}") }
+            })
+            .collect();
+        for at in first..=last {
+            let Some(line) = at.checked_sub(1).and_then(|i| lines.get_mut(i)) else { continue };
+            let ending = if line.ends_with("\r\n") { "\r\n" } else if line.ends_with('\n') { "\n" } else { "" };
+            let instead = if at == first && !kept.is_empty() { format!("{} {}", String::from_utf8_lossy(&c.name), kept.join(" ")) } else { String::new() };
+            *line = format!("{instead}{ending}");
+        }
+    }
+    lines.concat()
 }
 
 /// What a build of `person`'s own Agentfile `text` is given (decision 6): each secret it names, read
@@ -252,5 +292,50 @@ mod tests {
         assert!(said.first().is_some_and(|m| m.contains("user:<NAME>") && m.contains("never goes in an Agentfile")), "{said:?}");
         assert_eq!(bad.first().map(|m| m.location.clone()), Some(vec![(2, 2)]));
         assert!(!format!("{:?}", BuildSecret { id: "GIT_AUTH_TOKEN".into(), value: "ghp_hunter2value".into() }).contains("hunter2"));
+    }
+
+    /// Shards' store, standing in: a scratch-based plan resolves no base.
+    struct Unresolved;
+
+    impl shards_agentfile::plan::Resolver for Unresolved {
+        fn resolve(&self, name: &[u8], _: Option<&shards_agentfile::platform::Platform>, _: &[u8]) -> Result<shards_agentfile::plan::Resolved, Vec<u8>> {
+            Err([name, b": no base is resolved here"].concat())
+        }
+
+        fn epoch(&self, _: &shards_agentfile::plan::EpochSource) -> Result<Option<shards_agentfile::plan::Epoch>, Vec<u8>> {
+            Ok(None)
+        }
+    }
+
+    /// The image config's JSON and the build definition's source maps Shards plans of `text`.
+    fn planned(text: &str) -> anyhow::Result<(String, Vec<String>)> {
+        use shards_agentfile::{parser, plan, platform::Platform};
+        let host = Platform::new("linux", if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" });
+        let opts = plan::Options { target_platform: host.clone(), build_platforms: vec![host], implicit_target: true, dialect: parser::Dialect::Agentfile, image_resolve_mode: b"local".to_vec(), ..plan::Options::default() };
+        let p = plan::plan(text.as_bytes(), &opts, &Unresolved).map_err(|e| anyhow::anyhow!("{}", String::from_utf8_lossy(&e.message)))?;
+        let config = p.image.to_json().map_err(|e| anyhow::anyhow!("{}", String::from_utf8_lossy(&e)))?;
+        let sources = p.definition().sources.iter().map(|s| String::from_utf8_lossy(&s.data).into_owned()).collect();
+        Ok((config, sources))
+    }
+
+    /// P4.7 (ROOT): a build is given its Agentfile without its references: the image Shards plans of it
+    /// has no `kiln.secret.` label and no secret's name in its config, labels or build definition's
+    /// source map, while its other labels stay as written and every line keeps its number. Planned
+    /// as written, the same text's config carries them: the build's text is what keeps them out.
+    #[test]
+    fn p4_7_a_built_image_carries_no_reference_and_no_secrets_name() -> anyhow::Result<()> {
+        let text = "FROM scratch\nLABEL keep=1 kiln.secret.GIT_AUTH_TOKEN=user:GH_TOKEN \\\n  \"kiln.secret.AWS_ACCESS_KEY_ID\"=\"user:AWS_KEY\" other=\"a b\"\nLABEL kiln.secret.T=user:ONLY_ONE\nLABEL old value with spaces\nENV X=1\n";
+        let (as_written, _) = planned(text)?;
+        assert!(as_written.contains("kiln.secret.GIT_AUTH_TOKEN") && as_written.contains("GH_TOKEN"), "planned as written, it carries them: {as_written}");
+        let built = built_text(text);
+        assert_eq!(built.lines().count(), text.lines().count(), "{built}");
+        assert_eq!(built.lines().nth(5), Some("ENV X=1"), "{built}");
+        let (config, sources) = planned(&built)?;
+        for name in ["kiln.secret", "GH_TOKEN", "AWS_KEY", "ONLY_ONE", "GIT_AUTH_TOKEN", "AWS_ACCESS_KEY_ID"] {
+            assert!(!config.contains(name) && !built.contains(name) && sources.iter().all(|s| !s.contains(name)), "{name}: {config}\n{built}");
+        }
+        assert!(config.contains(r#""keep":"1""#) && config.contains(r#""other":"a b""#) && config.contains(r#""old":"value with spaces""#), "its other labels as written: {config}");
+        assert_eq!(built_text("FROM scratch\nLABEL a=1\n"), "FROM scratch\nLABEL a=1\n", "a text naming none is as it was");
+        Ok(())
     }
 }

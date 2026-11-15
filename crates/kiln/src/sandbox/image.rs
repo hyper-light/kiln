@@ -144,12 +144,14 @@ impl Images {
         let (d, c) = (dir.to_path_buf(), config.clone());
         let made = crate::rt::blocking(move || crate::shards::private_dir(&d).and_then(|()| crate::shards::private_dir(&c))).await;
         made.and_then(|r| r).map_err(|e| Refusal::Context(format!("{e:#}")))?;
+        // Its text without its references to its person's secrets (P4.7): their names are kiln's, never the image's.
+        let built = crate::secrets::mine::built_text(source.text());
         match &plan.beside {
             Some(b) => {
-                context::materialize_with(b.harness, source.text(), std::slice::from_ref(&plan.platform), b.variant.as_deref(), &context_dir).await.map_err(|e| Refusal::Context(e.to_string()))?;
+                context::materialize_with(b.harness, &built, std::slice::from_ref(&plan.platform), b.variant.as_deref(), &context_dir).await.map_err(|e| Refusal::Context(e.to_string()))?;
             }
             None => {
-                let (into, at, text) = (context_dir.clone(), context_dir.join("Agentfile"), source.text().to_owned());
+                let (into, at, text) = (context_dir.clone(), context_dir.join("Agentfile"), built);
                 let written = crate::rt::blocking(move || crate::shards::private_dir(&into).and_then(|()| Ok(std::fs::write(&at, text)?))).await;
                 written.and_then(|r| r).map_err(|e| Refusal::Context(format!("{e:#}")))?;
             }
@@ -559,7 +561,8 @@ pub(crate) mod tests {
     /// P4.7: a build of a person's own Agentfile whose source needs a secret is given the one its start
     /// read, by Shards' id for it, its value through the build's environment alone: without it Shards
     /// refuses the build in its words; with it the build makes its image; its value is never on the
-    /// build's command line. Taking out `build_in`'s `--secret` loop fails the second build.
+    /// build's command line, and its context's Agentfile names no secret. Taking out `build_in`'s
+    /// `--secret` loop fails the second build.
     #[cfg(unix)]
     #[test]
     fn p4_7_a_build_is_given_its_persons_secret_by_id_and_never_on_its_command_line() -> anyhow::Result<()> {
@@ -571,12 +574,13 @@ pub(crate) mod tests {
             // Shards' fetch of the source: it answers only with the token its build was given as GIT_AUTH_TOKEN.
             let inner = shards.dir.path().join("shards-inner");
             std::fs::rename(&shards.program, &inner)?;
-            let want = shards.dir.path().join("want");
+            let (want, seen) = (shards.dir.path().join("want"), shards.dir.path().join("seen"));
             std::fs::write(&want, TOKEN)?;
-            let gate = "#!/bin/sh\nwant=$(cat 'WANT')\ngot=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = --secret ]; then\n    id=${a#id=}; id=${id%%,*}; var=${a##*env=}\n    [ \"$id\" = GIT_AUTH_TOKEN ] && eval \"got=\\${$var}\"\n  fi\n  prev=$a\ndone\n[ \"$got\" = \"$want\" ] || { echo 'REFUSED' >&2; exit 1; }\nexec 'INNER' \"$@\"\n"
+            let gate = "#!/bin/sh\nwant=$(cat 'WANT')\ngot=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = --secret ]; then\n    id=${a#id=}; id=${id%%,*}; var=${a##*env=}\n    [ \"$id\" = GIT_AUTH_TOKEN ] && eval \"got=\\${$var}\"\n  fi\n  prev=$a\ndone\n[ \"$got\" = \"$want\" ] || { echo 'REFUSED' >&2; exit 1; }\nfor last; do :; done\ncp \"$last/Agentfile\" 'SEEN'\nexec 'INNER' \"$@\"\n"
                 .replace("WANT", &want.display().to_string())
                 .replace("REFUSED", REFUSED)
-                .replace("INNER", &inner.display().to_string());
+                .replace("INNER", &inner.display().to_string())
+                .replace("SEEN", &seen.display().to_string());
             std::fs::write(&shards.program, gate)?;
             std::fs::set_permissions(&shards.program, std::fs::Permissions::from_mode(0o755))?;
             let images = shards.images();
@@ -591,6 +595,9 @@ pub(crate) mod tests {
             assert_eq!(builds.len(), 1, "{builds:?}");
             assert!(builds.iter().all(|b| b.contains(" --secret id=GIT_AUTH_TOKEN,env=KILN_BUILD_SECRET_0 ") && !b.contains(TOKEN)), "{builds:?}");
             assert!(!text.contains(TOKEN));
+            // Its context's Agentfile carries no reference: the name is kiln's, never the image's.
+            let given_text = std::fs::read_to_string(&seen)?;
+            assert!(!given_text.contains("kiln.secret") && !given_text.contains("GH_TOKEN") && given_text.contains("HARNESS claude FROM https://github.com/acme/harness.git"), "{given_text}");
             Ok(())
         })
     }
