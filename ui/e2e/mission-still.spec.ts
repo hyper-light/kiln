@@ -18,10 +18,14 @@ const PARTS = [".sd", ".mc-mode", ".hx-compose-box", ".mc-under", ".ms-bar", ".m
 
 /** Opens Mission control, its agents a moment late (so its skeleton shows), and records every part's box every frame until it has been whole a while. */
 async function framesOf(page: Page): Promise<Frame[]> {
-  await page.route("**/api/harness/sessions", async (route) => {
-    await new Promise((r) => setTimeout(r, 400));
-    await route.continue();
-  });
+  // The list as the page asks for it (lean, W21-R02): by its path, whatever it asks of it.
+  await page.route(
+    (url) => url.pathname === "/api/harness/sessions",
+    async (route) => {
+      if (route.request().method() === "GET") await new Promise((r) => setTimeout(r, 400));
+      await route.continue();
+    },
+  );
   await page.addInitScript((parts: string[]) => {
     const w = window as unknown as { mcFrames: Frame[] };
     w.mcFrames = [];

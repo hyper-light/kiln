@@ -51,12 +51,15 @@ const TAKES_PACKED: &str = "?z=gzip&patch=state&patch=changes&window=1&lean=1&re
 const TAKES: &str = "?patch=state&patch=changes&window=1&lean=1&recent_turns=8&event_bytes=262144&first_bytes=16384";
 /// An older page as the UI asks it (`ui/src/api/harness.ts`, `OLDER_PAGE`).
 const OLDER_PAGE: &str = "limit=100&bytes=262144";
-/// Mission control's first reads: those its document asks as it's parsed (`ui/src/lib/early-script.ts`, `SHELL` and
-/// `EARLY["/agents"]`), then those its page asks as it renders (`ui/src/views/harness/mission.tsx`).
+/// Mission control's first reads: those its document asks as it's parsed (`ui/src/lib/early-script.ts`, `SHELL`,
+/// `SIGNED` and `EARLY["/agents"]`), then those its page asks as it renders (`ui/src/views/harness/mission.tsx`):
+/// its visit's attention snapshot among them, with the last words of the rows a page 900 px tall opens on
+/// (`ui/src/views/harness/first-rows.ts`: those that begin within two viewports, none shorter than 84 px: 22).
 const LAUNCH: &[&str] = &[
     "/api/me",
     "/api/peers/open",
-    "/api/harness/sessions",
+    "/api/harness/sessions?lean=1",
+    "/api/harness/attention?mode=arrival&visit=kiln-lab-bar&lean=1&said=22",
     "/api/harness/kinds?shared=1",
     "/api/agents?lean=1",
     "/api/terminal/sessions",

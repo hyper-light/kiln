@@ -3,7 +3,9 @@
  * the API to list, start and stop agents, and a live session store fed by its websocket.
  * Nothing here is specific to one harness: Claude Code, Codex and the rest all speak this.
  */
-import { KINDS_READ } from "./launch-reads";
+import { KINDS_READ, SESSIONS_READ } from "./launch-reads";
+import { fromColumns, isColumns, type Columns } from "./columns";
+import { listAsked, listedAgain } from "./last-words";
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
 import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
@@ -549,7 +551,17 @@ export const harnessApi = {
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
-  list: (signal?: AbortSignal) => call<AgentInfo[]>("GET", "/api/harness/sessions", undefined, signal).then((all) => all.filter(listed)),
+  /**
+   * The agents, as the list tells them lean and as columns (W21-R02; a server from before answers the list itself).
+   * What was known of their last words is as old as the list before: the rows that show them ask again.
+   */
+  list: (signal?: AbortSignal) => {
+    const since = listAsked();
+    return call<AgentInfo[] | Columns>("GET", SESSIONS_READ, undefined, signal).then((read) => {
+      listedAgain(since);
+      return (isColumns(read) ? fromColumns<AgentInfo>(read) : read).filter(listed);
+    });
+  },
   /** One agent, or null when there's none under `id` (yet, or any more). */
   session: (id: string) =>
     call<AgentInfo>("GET", `/api/harness/sessions/${encodeURIComponent(id)}`).catch((e: unknown) => {

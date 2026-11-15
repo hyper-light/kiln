@@ -3,6 +3,8 @@ import * as React from "react";
 import { useServerEvents } from "./events";
 import { request } from "./client";
 import { clientId, type AgentInfo } from "./harness";
+import { fromLean, isLean, type LeanSnapshot } from "./attention-lean";
+import { told } from "./last-words";
 import { AttentionControls, AttentionOrder, AttentionVisits, keepSame } from "@/lib/attention-order";
 import { AttentionPresentation, type AttentionClose, type AttentionFrame, type AttentionPair } from "@/lib/attention-exposure";
 import { onOwnAgentAction } from "@/lib/own-agent-action";
@@ -112,7 +114,8 @@ export interface AttentionSnapshot {
   undo?: AttentionUndo | null;
   exposure: string | null;
   pair: AttentionPair | null;
-  model: AttentionFit | null;
+  /** The learned order's report: left out of a snapshot read lean (the list's page; the Settings page reads a replay's). */
+  model?: AttentionFit | null;
 }
 /** The snapshot as the list shows it: the visit's order held, what you're doing applied at once, the rows you acted on (`acted`) and how many actions you've taken (`seq`) in this visit. */
 export interface AttentionView extends AttentionSnapshot {
@@ -129,6 +132,21 @@ export type AttentionCommand =
 export const commandAgents = (commands: readonly AttentionCommand[]): string[] => [...new Set(commands.flatMap((c) => ("agent" in c ? [c.agent] : "order" in c ? c.order : [])))];
 
 const post = <T>(body: object) => request<T>("POST", "/api/harness/attention", body);
+
+/**
+ * The snapshot `params` ask for, as the list's page reads one (W21-R02): lean (api/attention-lean.ts; a server from
+ * before answers the snapshot itself), with the last words of the `rows` rows the list shows first, which the rows
+ * that show them then have without asking (api/last-words.ts).
+ */
+async function leanSnapshot(params: URLSearchParams, rows: number, signal?: AbortSignal): Promise<AttentionSnapshot> {
+  params.set("lean", "1");
+  if (rows > 0) params.set("said", String(rows));
+  const read = await request<AttentionSnapshot | LeanSnapshot>("GET", `/api/harness/attention?${params}`, undefined, { signal });
+  if (!isLean(read)) return read;
+  const { snapshot, said } = fromLean(read);
+  told(said);
+  return snapshot;
+}
 const sendFrame = (frame: AttentionFrame) => void post({ action: "render", ...frame }).catch(() => undefined);
 const sendClose = (close: AttentionClose) => void post({ action: "close", ...close }).catch(() => undefined);
 
@@ -191,6 +209,8 @@ interface Scope {
   /** The server's key for this visit's draw. */
   visit: string;
   controls: AttentionControls;
+  /** How many rows the list shows first: their last words come with each snapshot. */
+  rows: number;
   needsDraw: boolean;
   departed: boolean;
   epoch: number;
@@ -206,7 +226,7 @@ interface Scope {
   local: Map<object, (s: AttentionSnapshot) => AttentionSnapshot>;
 }
 const scopes = new Map<string, Scope>();
-function scopeFor(ownKey: string, controls?: string): Scope {
+function scopeFor(ownKey: string, controls?: string, rows?: number): Scope {
   let scope = scopes.get(ownKey);
   if (!scope) {
     // An earlier visit's list is gone from the page: only its close (kept apart) is left of it.
@@ -215,6 +235,7 @@ function scopeFor(ownKey: string, controls?: string): Scope {
       key: ownKey,
       visit: clientId(),
       controls: new AttentionControls(),
+      rows: 0,
       needsDraw: true,
       departed: false,
       epoch: 0,
@@ -227,6 +248,7 @@ function scopeFor(ownKey: string, controls?: string): Scope {
     scopes.set(ownKey, scope);
   }
   if (controls !== undefined) scope.controls.bind(controls);
+  if (rows !== undefined) scope.rows = rows;
   return scope;
 }
 useAuth.subscribe((now, before) => {
@@ -269,7 +291,7 @@ const read = (signal: AbortSignal): Promise<AttentionView> => {
   const controls = scope.controls.value;
   const epoch = scope.epoch;
   const params = new URLSearchParams({ mode, visit: scope.visit });
-  const pending = request<AttentionSnapshot>("GET", `/api/harness/attention?${params}`, undefined, { signal })
+  const pending = leanSnapshot(params, scope.rows, signal)
     .then((next) => {
       if (ownKey !== key() || scope.epoch !== epoch) return scope.view ?? viewOf(scope, next);
       if (mode === "arrival") {
@@ -290,9 +312,9 @@ const read = (signal: AbortSignal): Promise<AttentionView> => {
   return pending;
 };
 
-export const preloadAttention = (controls?: string) => {
+export const preloadAttention = (controls?: string, rows?: number) => {
   const ownKey = arrivalKey();
-  scopeFor(ownKey, controls);
+  scopeFor(ownKey, controls, rows);
   preload(ownKey, read);
 };
 
@@ -379,7 +401,7 @@ async function settleOrganized(
 async function refreshActed(scope: Scope, ids: readonly string[]) {
   const visit = scope.visit;
   const params = new URLSearchParams({ mode: "refresh", visit });
-  const next = await request<AttentionSnapshot>("GET", `/api/harness/attention?${params}`);
+  const next = await leanSnapshot(params, scope.rows);
   if (scope.visit !== visit || scopes.get(scope.key) !== scope) return;
   scope.order.place(ids, next.order);
   scope.snapshot = keepSame(scope.snapshot, scope.order.snapshot(next));
@@ -406,11 +428,15 @@ export function attentionSeen(agent: string) {
   void post({ action: "seen", agent, key: clientId(), mode: "refresh" }).catch(() => undefined);
 }
 
-/** No activity polling: an arrival draws the order, your own actions move what they acted on. */
-export function useAttention(controls = "") {
+/**
+ * No activity polling: an arrival draws the order, your own actions move what they acted on. `rows`: how many rows
+ * the list shows first, whose last words come with each snapshot (W21-R02). `key`: this arrival's, the same for as
+ * long as its list is on the page.
+ */
+export function useAttention(controls = "", rows = 0) {
   useAuth();
   const ownKey = arrivalKey();
-  const scope = scopeFor(ownKey, controls);
+  const scope = scopeFor(ownKey, controls, rows);
   const resource = useSuspenseResource(ownKey, read);
   useServerEvents(["attention"], (event) => {
     if (event.principal !== resource.data.you) return;
@@ -474,6 +500,7 @@ export function useAttention(controls = "") {
   );
   return {
     data: resource.data,
+    key: ownKey,
     learningAllowed: scope.pairKey === resource.data.pair?.key && scope.controls.allowed,
     presentation: scope.presentation,
     organize: (commands: readonly AttentionCommand[], local: (s: AttentionSnapshot) => AttentionSnapshot, opts?: { reference?: readonly string[]; arrival?: boolean }) =>

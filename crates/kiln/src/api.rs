@@ -1427,7 +1427,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
         (_, ["api", "harness", "attention", rest @ ..]) => boxed(|| crate::harness::attention::route(&hub, &caller, &method, rest, req)).await.map_err(|(c, m)| err(c, m)),
-        (&Method::GET, ["api", "harness", "sessions"]) => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
+        (&Method::GET, ["api", "harness", "sessions"]) => match q.get("summaries") {
+            Some(ids) => Ok(boxed(|| harness_summaries(&hub, &caller, ids)).await),
+            None if q.get("lean").is_some_and(|lean| lean == "1") => Ok(boxed(|| harness_sessions_lean(&hub, &caller)).await),
+            None => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
+        },
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
         // As its owner encoded it once (goal 10, plan 01a1a87b2dae step 2).
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.info_json(id) {
@@ -6155,6 +6159,85 @@ async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Resp
     srv::json(StatusCode::OK, &crate::harness::lineage::seen(hub, caller, hub.harness.list()).await)
 }
 
+/// What the sessions' list leaves out of each session when it's asked for lean (W21-R02): what no list of them
+/// reads without asking. Its last words (`summary`, the line a row shows once the row is on the page:
+/// [`harness_summaries`]) are a quarter of a session's row, and where its harness ran each time it started
+/// (`starts`, `runs`) another twelfth. A session that has said nothing keeps its empty `summary`: there is
+/// nothing to ask for.
+const LEAN_WITHOUT: [&str; 3] = ["summary", "starts", "runs"];
+
+/// The lean list last made, and the whole list's ETag it was made of: a read that finds the sessions as they
+/// were then is answered with it (the whole list's own is kept the same way, `Registry::list_tagged`).
+static LEAN_LIST: arc_swap::ArcSwapOption<(http::HeaderValue, crate::reads::Made)> = arc_swap::ArcSwapOption::const_empty();
+
+/// `GET /api/harness/sessions?lean=1` (W21-R02): the sessions `caller` sees, each without what a list doesn't
+/// read of it ([`LEAN_WITHOUT`]), written as columns (`crate::wire::columns`): 137 sessions are 18.0 KB so, where
+/// the list itself is 162.6 KB (`kiln-lab bar`, 2026-11-14). `{"rows", "cols", "without"}`. Made of the list's
+/// own answer on the compute pool, once for every read that finds the sessions as they were.
+async fn harness_sessions_lean(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
+    let made = if crate::harness::lineage::sees_all(caller) {
+        let h = Arc::clone(hub);
+        crate::rt::compute(move || {
+            let (whole, etag) = h.harness.list_tagged();
+            if let Some(kept) = LEAN_LIST.load_full().filter(|kept| etag.as_ref() == Some(&kept.0)) {
+                return Ok(kept.1.clone());
+            }
+            let made = crate::reads::Made::of(lean_sessions(&whole)?);
+            if let Some(etag) = etag {
+                LEAN_LIST.store(Some(Arc::new((etag, made.clone()))));
+            }
+            Ok(made)
+        })
+        .await
+    } else {
+        // An agent's own view of them, by lineage: made for it as it asks.
+        let seen = crate::harness::lineage::seen(hub, caller, hub.harness.list()).await;
+        crate::rt::compute(move || Ok(crate::reads::Made { json: lean_sessions(&crate::reads::encode(&seen)?)?, etag: None })).await
+    };
+    match made {
+        Ok(Ok(made)) => pre_named(made),
+        Ok(Err(e)) | Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("the sessions' list couldn't be made lean: {e:#}")).into_response(),
+    }
+}
+
+/// A session's row (the list's JSON of it) without what a lean list leaves out of it ([`LEAN_WITHOUT`]): its
+/// last words when it has some, and where it started.
+fn lean_session(row: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in LEAN_WITHOUT {
+        if key != "summary" || row.get(key).and_then(serde_json::Value::as_str).is_some_and(|said| !said.is_empty()) {
+            row.remove(key);
+        }
+    }
+}
+
+/// The sessions' list `whole` (`GET /api/harness/sessions`'s JSON), lean: each session without [`LEAN_WITHOUT`],
+/// as columns, and what was left out said (`without`).
+fn lean_sessions(whole: &[u8]) -> anyhow::Result<bytes::Bytes> {
+    let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(whole)?;
+    rows.iter_mut().for_each(lean_session);
+    let mut lean = crate::wire::columns::pack(&rows.iter().collect::<Vec<_>>());
+    if let Some(fields) = lean.as_object_mut() {
+        fields.insert("without".to_owned(), json!(LEAN_WITHOUT));
+    }
+    crate::reads::encode(&lean)
+}
+
+/// `GET /api/harness/sessions?summaries=<id>,<id>…` (W21-R02): the last words of those sessions among them that
+/// `caller` sees, by id (`""` for one that has said none): what a lean list leaves out, for the rows a page shows.
+async fn harness_summaries(hub: &Arc<Hub>, caller: &crate::authz::Caller, ids: &str) -> Response {
+    let all = crate::harness::lineage::sees_all(caller);
+    let mut said = serde_json::Map::new();
+    for id in ids.split(',').filter(|id| !id.is_empty()) {
+        if said.contains_key(id) || !(all || crate::harness::lineage::may_see(hub, caller, id).await.is_ok()) {
+            continue;
+        }
+        if let Some(info) = hub.harness.info_shared(id) {
+            said.insert(id.to_owned(), json!(info.summary));
+        }
+    }
+    srv::json(StatusCode::OK, &said)
+}
+
 /// A cursor reader asks for a bounded canonical page; legacy callers retain their pre-encoded
 /// read-model path below. The cursor and lineage are checked on both sides of durable IO.
 async fn conversation_events_for(hub: &Hub, caller: &crate::authz::Caller, id: &str, q: &HashMap<String, String>) -> R {
@@ -8366,6 +8449,67 @@ mod tests {
         let lean = lean_runners(std::slice::from_ref(&runner));
         assert_eq!(lean, vec![json!({"name": "a", "label": "box", "connected": true, "reach": true, "cpus": 8, "harnesses": ["claude"]})]);
         assert_eq!(lean_runners::<serde_json::Value>(&[]), Vec::<serde_json::Value>::new());
+    }
+
+    /// W21-R02: `GET /api/harness/sessions?lean=1` is the sessions' list without what a list doesn't read of each,
+    /// as columns: read back, it's the list's rows but for those fields, and it says which it left out. It
+    /// follows the list: a session that changes is in the next lean read as it changed. `?summaries=` answers
+    /// the last words of the sessions asked for, by id (none said: empty), and nothing for one there isn't.
+    #[test]
+    fn w21_r02_the_sessions_listed_lean_are_the_list_without_what_a_list_doesnt_read() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let session = |id: &str, title: &str, summary: &str| crate::harness::session::Info { id: id.into(), kind: "claude".into(), title: title.into(), summary: summary.into(), ..crate::harness::session::Info::default() };
+            for info in [session("a", "", "Done: the gate is green"), session("b", "", "")] {
+                let id = info.id.clone();
+                hub.harness.ingest(&there, &id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = |path: &'static str| {
+                let api = Arc::clone(&api);
+                async move {
+                    let r = api.handle(lab_get(path)?).await;
+                    anyhow::ensure!(r.status() == StatusCode::OK, "{path}: {}", r.status());
+                    Ok(serde_json::from_slice::<serde_json::Value>(&body_of(r).await?)?)
+                }
+            };
+            // The list's rows, each without what the lean list leaves out.
+            let without = |whole: &serde_json::Value| -> anyhow::Result<Vec<serde_json::Map<String, serde_json::Value>>> {
+                let rows = whole.as_array().ok_or_else(|| anyhow::anyhow!("the list isn't one: {whole}"))?;
+                rows.iter()
+                    .map(|row| {
+                        let mut row = row.as_object().cloned().ok_or_else(|| anyhow::anyhow!("a row isn't an object: {row}"))?;
+                        anyhow::ensure!(row.contains_key("summary") && row.contains_key("starts"), "the list's rows say what a lean one leaves out: {row:?}");
+                        lean_session(&mut row);
+                        Ok(row)
+                    })
+                    .collect()
+            };
+            let whole = read("/api/harness/sessions").await?;
+            let lean = read("/api/harness/sessions?lean=1").await?;
+            let rows = crate::wire::columns::unpack(&lean).ok_or_else(|| anyhow::anyhow!("not columns: {lean}"))?;
+            assert_eq!(rows, without(&whole)?);
+            // The one that has said something says nothing of it lean, nor where it started; the one that hasn't keeps saying so.
+            let of = |id: &str| rows.iter().find(|row| row.get("id") == Some(&json!(id))).cloned().unwrap_or_default();
+            anyhow::ensure!(!of("a").contains_key("summary") && !of("a").contains_key("starts") && of("a").get("kind") == Some(&json!("claude")), "a, lean: {:?}", of("a"));
+            assert_eq!(of("b").get("summary"), Some(&json!("")));
+            assert_eq!(lean.get("without"), Some(&json!(LEAN_WITHOUT)));
+            anyhow::ensure!(serde_json::to_vec(&lean)?.len() < serde_json::to_vec(&whole)?.len(), "lean, it's shorter than the list");
+            // The same again while nothing changed; and as a session changes, the list it's made of.
+            assert_eq!(read("/api/harness/sessions?lean=1").await?, lean);
+            hub.harness.ingest(&there, "b", Update::Open { info: Box::new(session("b", "Renamed", "And said so")), since: None }).await;
+            let (whole, lean) = (read("/api/harness/sessions").await?, read("/api/harness/sessions?lean=1").await?);
+            let rows = crate::wire::columns::unpack(&lean).ok_or_else(|| anyhow::anyhow!("not columns: {lean}"))?;
+            assert_eq!(rows, without(&whole)?);
+            anyhow::ensure!(rows.iter().any(|row| row.get("id") == Some(&json!("b")) && row.get("title") == Some(&json!("Renamed"))), "the session's new title is in the lean list: {rows:?}");
+            // What the lean list left out of them, for the rows a page shows.
+            assert_eq!(read("/api/harness/sessions?summaries=a,b,nobody,a").await?, json!({"a": "Done: the gate is green", "b": "And said so"}));
+            assert_eq!(read("/api/harness/sessions?summaries=").await?, json!({}));
+            Ok(())
+        })
     }
 
     /// W21-R02: `GET /api/agents?lean=1` answers the runners `GET /api/agents` does, each itself with only its facts'

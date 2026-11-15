@@ -3,7 +3,7 @@
  * head), before its code is in: lib/early.ts hands those answers to the app's own reads.
  */
 
-import { AGENTS_READ, KINDS_READ, REACH_READ } from "@/api/launch-reads";
+import { AGENTS_READ, KINDS_READ, REACH_READ, SESSIONS_READ } from "@/api/launch-reads";
 import { SIGNED_OUT } from "@/api/client";
 import { SHIP_FIRST_READ } from "@/api/ship-first";
 
@@ -19,7 +19,7 @@ const SHELL = ["/api/me", "/api/peers/open"];
  * as Mission control's visit, comes before its shell reads them, and a change lets go of what the
  * document asked.)
  */
-export const SIGNED = ["/api/harness/sessions"];
+export const SIGNED = [SESSIONS_READ];
 
 /**
  * What a page reads as it opens, by its path (after a peer's base): what its first render waits on,

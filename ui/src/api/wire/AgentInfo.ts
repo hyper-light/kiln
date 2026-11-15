@@ -53,9 +53,11 @@ goal: string,
  */
 objective?: Objective, 
 /**
- * The agent's latest words, shortened.
+ * The agent's latest words, shortened. A row of the sessions' list read lean (W21-R02,
+ * `GET /api/harness/sessions?lean=1`) says nothing of them when there are some: a page asks for
+ * those of the rows it shows (docs/agents.md, "The snapshot, lean"). So a reader's type may find none.
  */
-summary: string, 
+summary?: string, 
 /**
  * What it is doing right now, in plain words.
  */
@@ -181,5 +183,7 @@ isolation?: Isolation,
 runs?: AgentRuns, 
 /**
  * kiln's record of each start of its harness on its machine: when, where it ran, how it ended.
+ * A row of the sessions' list read lean says nothing of them, nor of `runs` (W21-R02: no list
+ * reads either), so a reader's type may find none.
  */
-starts: Array<AgentStart>, };
+starts?: Array<AgentStart>, };

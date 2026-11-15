@@ -1312,3 +1312,35 @@ so an older page or server goes on as it did:
   last one (it says the agent whole): readers pass over what's let go of so, with no gap and no
   `resync`, and are sent the newest (goal 11, plan 01a1a87b2e56 step 5).
 
+### Lists as columns
+
+A list of JSON objects writes every key in every row. A list a page reads as it opens can be written
+as columns instead (docs/ci.md W21-R02, `crates/kiln/src/wire/columns.rs`; read back by
+`ui/src/api/columns.ts`): each key once, then its values in the rows' order.
+
+```json
+{"rows": 3, "cols": [["id", {"pre": "01a1dd4b", "v": ["7046", "73c9", "8a1e"]}], ["kind", {"of": ["claude", "codex"], "v": [0, 0, 1]}], ["queued", {"d": 0, "x": [2], "v": [3]}]]}
+```
+
+A column is in one of these forms:
+
+| Form | What it holds |
+|---|---|
+| `{"v": […]}` | its values, one a row |
+| `{"of": […], "v": […]}` | its distinct values once (`of`), and for each row which of them (`v`) |
+| `{"d": value, "x": […], "v": […]}` | the value most rows have (`d`), and the rows that have another (`x`), with theirs (`v`) |
+| `{"pre": "…", "v": […]}` | texts that begin alike: the beginning once, and each one's rest |
+| `{"cols": […]}` | objects, as columns of their own |
+
+A column also says `"at": […]` when only some rows have its key: those rows, in order, among which
+its values (and `x`) then count. A row that never said a key isn't given it, and one that said
+`null` is. The writer takes, for each column, whichever form is shortest written, found by writing
+each: no size is chosen. Read back, a list is its rows as they were, each key with its value; only
+the order of an object's keys isn't kept. A list that isn't of objects (ids, say) can be one column
+of its own (`pack_column`).
+
+Written so are the sessions' list read lean (`GET /api/harness/sessions?lean=1`: 137 sessions are
+18.0 KB, where the list is 162.6 KB) and the marks and the archived of an attention snapshot read
+lean (docs/agents.md, "The snapshot, lean"). A reader tells a list as columns from the list itself
+by its shape (`rows` and `cols`), so a page takes either: a server from before them answers the
+list.

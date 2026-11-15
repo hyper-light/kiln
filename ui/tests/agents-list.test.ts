@@ -43,7 +43,7 @@ Object.assign(globalThis, {
     clearInterval,
   }),
   fetch: async (url: string) => {
-    if (String(url).endsWith("/api/harness/sessions")) {
+    if (String(url).endsWith("/api/harness/sessions?lean=1")) {
       lists++;
       return new Response(JSON.stringify(fleet));
     }

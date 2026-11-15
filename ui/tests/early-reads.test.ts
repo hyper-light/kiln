@@ -91,7 +91,8 @@ test("the document asks every page's first reads and its own page's, under a pee
     return asked;
   };
   // Signed in, every page asks the agents its shell shows (once: Mission control's list reads the same).
-  assert.deepEqual(SIGNED, ["/api/harness/sessions"]);
+  // The agents lean (W21-R02): the URL the app's own list reads (api/harness.ts `list`), so the document's answer is its.
+  assert.deepEqual(SIGNED, ["/api/harness/sessions?lean=1"]);
   assert.ok(!EARLY["/agents"]!.includes("/api/harness/sessions"));
   assert.deepEqual(run("/agents/", null), ["/api/me", "/api/peers/open", ...SIGNED, ...EARLY["/agents"]!]);
   assert.deepEqual(run("/ship", null), ["/api/me", "/api/peers/open", ...SIGNED, "/api/ship/commits?by=repo&limit=100"]);

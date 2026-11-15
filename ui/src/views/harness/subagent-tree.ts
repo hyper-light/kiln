@@ -8,6 +8,7 @@
  * it. While it needs you, its own piece is tan.
  */
 import type { AgentInfo, Approval, ApprovalBrief, HEvent, SubagentBrief, Task } from "@/api/harness";
+import { lastWords } from "@/api/last-words";
 import type { Grant } from "@/api/wire/Grant";
 import type { Perms } from "@/api/wire/Perms";
 import { sameJson } from "@/lib/utils";
@@ -199,7 +200,12 @@ function kilnStand(a: AgentInfo, paused = false): NodeStand {
 function kilnLine(a: AgentInfo, stand: NodeStand): string {
   const ap = a.approvals[0];
   if (stand === "needs") return ap ? askWords(ap) : "Waiting for you";
-  if (stand === "done") return a.summary ? plain(a.summary) : a.goal || a.title || "";
+  if (stand === "done") {
+    // What it last said: not known yet of one the list told lean (W21-R02, api/last-words.ts: asked for by this read,
+    // and whoever draws this line draws it again as they're told), and then no other text stands in for it.
+    const said = lastWords(a);
+    return said === undefined ? "" : said ? plain(said) : a.goal || a.title || "";
+  }
   if (stand === "failed" || stand === "stopped") return a.exit?.error ?? "";
   if (stand === "offline") return "Its machine is offline";
   return a.doing || a.activity || "";

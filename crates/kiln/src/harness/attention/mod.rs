@@ -4,6 +4,7 @@ mod store;
 mod requests;
 mod examination;
 mod learned;
+pub mod lean;
 pub use requests::Response as HumanResponse;
 pub use requests::{approval_key,bind as bind_response};
 
@@ -366,7 +367,15 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
         let query=req.uri().query().unwrap_or_default();let field=|name:&str|query.split('&').find_map(|part|part.strip_prefix(&format!("{name}="))).filter(|v|!v.is_empty()).map(str::to_owned);
         let visit=field("visit");if visit.as_ref().is_some_and(|v|v.len()>super::ops::KEY_MAX || v.chars().any(char::is_control)){return Err((StatusCode::BAD_REQUEST,"invalid visit key".into()));}
         let mode=if field("mode").as_deref()==Some("refresh"){SnapshotMode::Refresh(visit)}else{SnapshotMode::Arrival(visit.unwrap_or_else(crate::util::new_id))};
-        return Ok(srv::json(StatusCode::OK,&snapshot_mode(hub,caller,mode).await?));
+        let whole=snapshot_mode(hub,caller,mode).await?;
+        // W21-R02: asked lean (`lean=1`), the snapshot as the list's page reads it (lean.rs), with the last words of
+        // the rows it shows first when it asks for them (`said=<rows>`): those of the agents this caller's snapshot names.
+        if field("lean").as_deref()==Some("1"){
+            let rows=field("said").and_then(|n|n.parse::<usize>().ok()).unwrap_or(0);
+            let words=|id:&str|hub.harness.info_shared(id).filter(|info|!matches!(info.status,Status::Exited)).map(|info|info.summary.clone());
+            if let Some(lean)=lean::lean(&whole,rows,crate::util::now_ms(),words){return Ok(srv::json(StatusCode::OK,&lean));}
+        }
+        return Ok(srv::json(StatusCode::OK,&whole));
     }
     if method!=Method::POST{return Err((StatusCode::METHOD_NOT_ALLOWED,"use GET or POST".into()));}
     // Match the existing API JSON body allowance; three rendered orders can exceed64KiB.

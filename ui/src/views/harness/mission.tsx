@@ -49,6 +49,8 @@ import { agentfileChoicesRes } from "@/views/agentfiles/choose";
 import { MISSION_DRAFT } from "./new-agent-draft";
 import { useDrafts } from "./state";
 import { preloadAgents, useAgentList, useAgents } from "./use-agents";
+import { lastWordsOf, useLastWords, useSaid } from "@/api/last-words";
+import { firstRows } from "./first-rows";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { agentsAnswered, answer, heldKey, resumeHeld, tried, tryKey, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
@@ -94,8 +96,15 @@ function useAgentCode() {
   return React.useCallback(() => router.loadRouteChunk(router.routesById["/_app/agents/$id"]), [router]);
 }
 
-/** The one line that matters for this agent right now. */
-function lineOf(a: AgentInfo, stand: Stand): string {
+/**
+ * What an agent last said, as its row's line (W21-R02): none while it isn't known yet (the list told the agent
+ * lean, and its row's are on their way: api/last-words.ts), never another text in its place; `none` once it's
+ * known to have said nothing.
+ */
+const saidLine = (said: string | undefined, none: string): string => (said === undefined ? "" : said ? plain(said) : none);
+
+/** The one line that matters for this agent right now. `said`: its last words, for a stand whose line they are. */
+function lineOf(a: AgentInfo, stand: Stand, said?: string): string {
   switch (stand) {
     case "needs": {
       const ap = a.approvals[0];
@@ -118,7 +127,7 @@ function lineOf(a: AgentInfo, stand: Stand): string {
     }
     case "finished":
       if (a.room_wait) return ROOM;
-      return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
+      return saidLine(said, a.goal || a.title || "Done");
     case "ready":
       return a.room_wait ? ROOM : a.goal || a.title || "No task yet";
     case "offline":
@@ -126,7 +135,7 @@ function lineOf(a: AgentInfo, stand: Stand): string {
     case "ended":
       return a.room_wait ? ROOM : a.goal || a.title || "Ended";
     case "archived":
-      return a.summary ? plain(a.summary) : a.goal || a.title || "Archived";
+      return saidLine(said, a.goal || a.title || "Archived");
   }
 }
 
@@ -280,6 +289,8 @@ const Row = React.memo(function Row({
   // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
   const who = asking ?? a;
   const ap = who.approvals[0];
+  // Its last words, where they're its line: the list told it without them (W21-R02).
+  const said = useLastWords(a, !asking && (stand === "finished" || stand === "archived"));
   // A question it asks, answered under its row: the one open, and the one shown (open, or sliding shut).
   const [answering, setAnswering] = React.useState<string | null>(null);
   const [shownAsk, setShownAsk] = React.useState<ApprovalBrief | null>(null);
@@ -356,7 +367,7 @@ const Row = React.memo(function Row({
         </span>
       )}
       {pin && <Pin size={11} className="ms-flag-pin" role="img" aria-label="Pinned" />}
-      <span className="ms-text">{asking ? `Its subagent \u201c${agentLabel(asking)}\u201d: ${lineOf(asking, "needs")}` : lineOf(a, stand)}</span>
+      <span className="ms-text">{asking ? `Its subagent \u201c${agentLabel(asking)}\u201d: ${lineOf(asking, "needs")}` : lineOf(a, stand, said)}</span>
       {reason && (
         <span className="ms-reason" title={reason}>
           {reason}
@@ -530,10 +541,13 @@ const MissionTree = React.memo(function MissionTree({ id, list, rowAsk }: { id: 
   // The tree is made again at every word from any agent (W26-R15): each row whose subagent says what it
   // said is the object it was, so of a hundred subagents only those with news are drawn again.
   const [kept] = React.useState(() => ({ rows: [] as SubagentRow[] }));
+  // And as a subagent's last words are told: one that's done shows them (W21-R02).
+  const said = useSaid();
   const rows = React.useMemo(() => {
+    void said;
     kept.rows = keepRows(kept.rows, root ? drawn(subagentTree(root, list).filter((n) => !going.has(n.key))) : []);
     return kept.rows;
-  }, [root, list, going, kept]);
+  }, [root, list, going, kept, said]);
   if (!root || rows.length === 0) return null;
   return (
     <li className="ms-tree" data-entry={`tree:${id}`} data-glide={`${id}:tree`}>
@@ -1068,7 +1082,7 @@ function Agents() {
   const selecting = picking || selected.size > 0;
   const { held, bind } = useListHold(selecting);
   const controls = JSON.stringify({ q, stored, showParked, showEnded, selected: [...selected].sort(), picking, trees: [...trees].sort(), layout: attentionLayout() });
-  const attention = useAttention(controls);
+  const attention = useAttention(controls, firstRows());
   const { list, reload } = useAgents();
   const snapshot = attention.data;
   const now = useParkTime(snapshot.agents);
@@ -1132,6 +1146,12 @@ function Agents() {
   const archivedShown = view.facets.state?.includes("archived") ?? false;
   const acted = React.useMemo(() => new Set(snapshot.acted), [snapshot.acted]);
   const { live, ended } = useShownList(everyRow, q, view, held, snapshot.pair?.key ?? "", acted);
+  // The rows the list opens on are drawn with their lines (W21-R02): what they last said comes with the snapshot
+  // (`said`), and where the list is shown some other way (another sort, a filter kept) it's asked for before they
+  // are. Once, for this arrival: a row that comes to the page later asks for its own (api/last-words.ts).
+  useSuspenseResource(`harness/last-words/${attention.key}`, () =>
+    lastWordsOf(live.slice(0, firstRows()).flatMap((r) => (r.asking || (r.stand !== "finished" && r.stand !== "archived") ? [] : [r.a]))).then(() => true),
+  );
   // What's made of every row shown is made as the rows change, not at each render (W26-R15).
   const order = React.useMemo(() => live.map((r) => `${r.a.id}:${r.stand}`).join(), [live]);
   const selectable = React.useMemo(() => [...live, ...ended].filter((r) => r.stand !== "archived"), [live, ended]);

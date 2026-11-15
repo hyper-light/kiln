@@ -9,6 +9,7 @@
 //! same as these tables do (`contract::docs_say_what_the_tables_say` holds them together).
 
 pub mod channel;
+pub mod columns;
 pub mod commands;
 pub mod events;
 pub mod fan;
