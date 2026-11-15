@@ -90,7 +90,7 @@ const SES = (id) => allSessions().find(([s]) => s.id === id) || [null, null];
 
 /* ------------------------------------------------------------ the list */
 /** Every table on this page shares one grid: the name, six slots, then the controls; alike things share a slot. */
-const G = (heads, tips = {}) => [{ h: heads[0], name: true }, { h: heads[1], w: 96, c: "h640", tip: tips[1] }, { h: heads[2], w: 124, c: "h900", tip: tips[2] }, { h: heads[3], w: narrow() ? 64 : 124, tip: tips[3] }, { h: heads[4], w: 124, c: "h640", tip: tips[4] }, { h: heads[5], w: 120, c: "h1100", tip: tips[5] }, { h: heads[6], w: 112, c: "h1100", tip: tips[6] }, { h: "", w: narrow() ? 136 : 154 }];
+const G = (heads, tips = {}, o = {}) => [{ h: heads[0], name: true }, { h: heads[1], w: 96, c: "h640", tip: tips[1] }, { h: heads[2], w: 124, c: "h900", tip: tips[2] }, { h: heads[3], w: narrow() ? 64 : 124, tip: tips[3], c: o.narrowHide3 ? "h640" : "" }, { h: heads[4], w: 124, c: "h640", tip: tips[4] }, { h: heads[5], w: 120, c: "h1100", tip: tips[5] }, { h: heads[6], w: 112, c: "h1100", tip: tips[6] }, ...(o.noCtl ? [] : [{ h: "", w: narrow() ? 136 : 154 }])];
 const START_TIP3 = "Flame: warm · layers: from template · snowflake: cold";
 const LIST = () => G(["Agent", "Harness", "Model", narrow() ? "Live" : "Sessions", "Starts", "Split", ""]);
 /** A value on the row itself that edits in place when its row is open: the row's own cell, never a copy in the block. */
@@ -124,7 +124,7 @@ function agentRow(a) {
 function prop(a, k, label, display, cls = "") {
   const ro = a.kiln || a.adhoc;
   if (S.editing === `${a.id}:${k}`) return `<div class="${cls}"><span class="lbl">${label}</span>${editor(a, k)}</div>`;
-  return `<div class="${cls}"><span class="lbl">${label}</span><button class="pv" data-edit="${k}" data-a="${a.id}" ${ro ? "disabled" : ""} title="${ro ? "kiln's · copy to change" : "Change"}">${display}${ro ? "" : icon("edit").replace('class="ic"', 'class="ic pen"')}</button></div>`;
+  return `<div class="${cls}"><span class="lbl">${label}</span><button class="pv${cls.includes("prose") ? " prose" : ""}" data-edit="${k}" data-a="${a.id}" ${ro ? "disabled" : ""} title="${ro ? "kiln's · copy to change" : "Change"}">${display}${ro ? "" : icon("edit").replace('class="ic"', 'class="ic pen"')}</button></div>`;
 }
 function editor(a, k) {
   const ok = `${ib("check", "Save (↵)", `data-do="save" data-a="${a.id}" data-k="${k}"`)}${ib("x", "Cancel (esc)", 'data-do="noedit"')}`;
@@ -137,7 +137,7 @@ function editor(a, k) {
   if (k === "skills") return `<span class="ed"><span class="chips3">${SKILLS.map((t) => `<label class="chip3"><input type="checkbox" class="check" data-skill="${t}" ${a.skills.includes(t) ? "checked" : ""}><span class="val">${t}</span></label>`).join("")}</span>${ok}</span>`;
   return "";
 }
-const SCOLS = () => G(["Session", "Start", "Project", "CPU", "Memory", "Runner", "Version"], { 1: START_TIP3, 6: "The definition version it started on, and its variant" });
+const SCOLS = () => G(["Session", "Start", "Project", "CPU", "Memory", "Runner", "Version"], { 1: START_TIP3, 6: "The definition version it started on, and its variant" }, { narrowHide3: true });
 function sessionRow(s, a) {
   return `<tr tabindex="0" data-s="${s.id}">${td3(SCOLS(), [
     named(s.state, s.title, `data-peek="session:${s.id}"`),
@@ -150,13 +150,13 @@ function sessionRow(s, a) {
     ctl(s.state, s.id, true),
   ])}</tr>`;
 }
-const VCOLS = () => G(["Variant", "Weight", "Sessions", "Warm start", "Peak", "CPU", "Failed"]);
+const VCOLS = () => G(["Variant", "Weight", "Sessions", "Warm start", "Peak", "CPU", "Failed"], {}, { narrowHide3: true });
 function expRows(a) {
   const e = a.exp; const n = [0, 1].map((v) => XS.filter((x) => x.v === v).length); const tot = n[0] + n[1];
   const cell = (m, i) => expCell(a, i, m.id, `ex:${i}:${m.id}`);
   const lead = (v, i) => (v.current ? key3(i).replace('class="key3"', 'class="key3" data-current').replace(`title="Variant ${KEYS[i]}"`, `title="Variant ${KEYS[i]} · current"`) : key3(i));
   const promote = S.promote !== null ? `<div class="fr">${icon("crown")}<span class="lbl hi">Promote ${KEYS[S.promote]}?</span><span class="val dim ell h640">${esc(depl(e.variants[S.promote]))}</span><span class="acts"><button class="b3 p" data-do="promote" data-a="${a.id}">Promote</button><button class="b3 g" data-do="nopromote">Cancel</button></span></div>` : "";
-  return `<div class="sh">${icon("split", "Experiment")}<span class="lbl hi">${esc(e.name)}</span>${st(e.state === "live" ? "run" : e.state === "paused" ? "paused" : "stopped", e.state)}<span class="val dim h640">${tot} sessions</span><span class="acts">${staged(a) ? `${stack(staged(a).map((w, i) => ({ v: w, color: SERIES4[i], tip: `Variant ${KEYS[i]} · staged` })), 64, staged(a).join("/")).replace('class="stk"', 'class="stk hatch"')}<button class="b3 p" data-do="applysplit" data-a="${a.id}">Apply</button><button class="b3 g" data-do="dropsplit">Discard</button>` : stack(e.variants.map((v, i) => ({ v: v.weight, color: SERIES4[i], tip: `Variant ${KEYS[i]}` })), 64, `${e.variants.map((v) => v.weight).join("/")} · v${e.ver || 1}`)}${e.state === "promoted" ? "" : ib(e.state === "live" ? "pause" : "play", e.state === "live" ? "Pause split" : "Resume split", `data-do="expstate" data-a="${a.id}"`)}${ib("replay", "Replay a session", `data-do="replay" data-a="${a.id}" aria-expanded="${Boolean(S.replay)}"`)}</span></div>${promote}
+  return `<div class="sh">${icon("split", "Experiment")}<span class="lbl hi">${esc(e.name)}</span>${st(e.state === "live" ? "run" : e.state === "paused" ? "paused" : "stopped", e.state)}<span class="val dim h640">${tot} sessions</span><span class="acts">${staged(a) ? `${stack(staged(a).map((w, i) => ({ v: w, color: SERIES4[i], tip: `Variant ${KEYS[i]} · staged` })), 64, staged(a).join("/")).replace('class="stk"', 'class="stk hatch"')}<button class="b3 p" data-do="applysplit" data-a="${a.id}">Apply</button><button class="b3 g" data-do="dropsplit">Discard</button>` : stack(e.variants.map((v, i) => ({ v: v.weight, color: SERIES4[i], tip: `Variant ${KEYS[i]} · split v${e.ver || 1}` })), narrow() ? 40 : 64, narrow() ? undefined : `${e.variants.map((v) => v.weight).join("/")} · v${e.ver || 1}`)}${e.state === "promoted" ? "" : ib(e.state === "live" ? "pause" : "play", e.state === "live" ? "Pause split" : "Resume split", `data-do="expstate" data-a="${a.id}"`)}${ib("replay", "Replay a session", `data-do="replay" data-a="${a.id}" aria-expanded="${Boolean(S.replay)}"`)}</span></div>${promote}
     <table class="t3" data-grid="a">${th3(VCOLS())}<tbody>${e.variants.map((v, i) => `<tr>${td3(VCOLS(), [
       { lead: lead(v, i), body: `<span class="cr">${icon(v.engine, ENGINE_TIP[v.engine])}<span class="ell mid" title="${esc(depl(v))}" data-full="${esc(short(v))}">${esc(short(v))}</span></span>` },
       `<span class="u"><input type="range" class="wr" min="0" max="100" value="${staged(a) ? staged(a)[i] : v.weight}" data-w="${i}" data-a="${a.id}" style="accent-color:${SERIES4[i]}" ${e.state === "promoted" ? "disabled" : ""} aria-label="Weight ${KEYS[i]}"><span>${staged(a) ? staged(a)[i] : v.weight}%</span></span>`,
@@ -165,14 +165,20 @@ function expRows(a) {
       `<span class="acts ctl">${ib("crown", `Promote ${KEYS[i]}`, `data-do="askpromote" data-i="${i}" ${v.current || e.state === "promoted" ? "disabled" : ""}`)}</span>`,
     ])}</tr>`).join("")}</tbody></table>
     <div class="sh"><button class="lbl hi kv3" data-do="allmeas" aria-expanded="${S.allMeas}">${icon("chart")}All measures${icon("chev")}</button></div>
-    ${S.allMeas ? `<table class="t3" data-grid="a">${th3(G(["Measure", "", "", key3(0), key3(1), "", ""]))}<tbody>${MEAS.map((m) => `<tr>${td3(G([]), [`<span class="lbl">${m.h}</span>`, "", "", cell(m, 0), cell(m, 1), "", "", ""])}</tr>`).join("")}<tr>${td3(G([]), [`<span class="lbl" title="${START_TIP3}">Start mix</span>`, "", "", mix(0), mix(1), "", "", ""])}</tr></tbody></table>` : ""}
+    ${S.allMeas ? measTable(cell) : ""}
     ${S.replay ? replayRows(a) : ""}`;
 }
+/** All measures: on a wide window in the grid's slots, on a phone the name and both variants' values alone. */
+function measTable(cell) {
+  if (narrow()) { const cols = [{ h: "Measure", name: true }, { h: key3(0), w: 84 }, { h: key3(1), w: 84 }]; return `<table class="t3">${th3(cols)}<tbody>${MEAS.map((m) => `<tr>${td3(cols, [`<span class="lbl">${m.h}</span>`, cell(m, 0), cell(m, 1)])}</tr>`).join("")}<tr>${td3(cols, [`<span class="lbl" title="${START_TIP3}">Start mix</span>`, mix(0, true), mix(1, true)])}</tr></tbody></table>`; }
+  const g = G(["Measure", "", "", key3(0), key3(1), "", ""]);
+  return `<table class="t3" data-grid="a">${th3(g)}<tbody>${MEAS.map((m) => `<tr>${td3(g, [`<span class="lbl">${m.h}</span>`, "", "", cell(m, 0), cell(m, 1), "", "", ""])}</tr>`).join("")}<tr>${td3(g, [`<span class="lbl" title="${START_TIP3}">Start mix</span>`, "", "", mix(0), mix(1), "", "", ""])}</tr></tbody></table>`;
+}
 /** A variant's starts by kind, in the flame, layers and snowflake colours: pools sized by demand give variants different mixes. */
-function mix(i) { const k = (kind) => XS.filter((x) => x.v === i && x.kind === kind).length; const all = Math.max(1, k("warm") + k("template") + k("cold")); return `<span class="cr">${stack([{ v: k("warm"), color: START_COLORS.warm, tip: "Warm" }, { v: k("template"), color: START_COLORS.template, tip: "Template" }, { v: k("cold"), color: START_COLORS.cold, tip: "Cold" }], 56)}${startIcon("warm")}<span>${Math.round((k("warm") / all) * 100)}%</span></span>`; }
+function mix(i, small) { const k = (kind) => XS.filter((x) => x.v === i && x.kind === kind).length; const all = Math.max(1, k("warm") + k("template") + k("cold")); return `<span class="cr">${stack([{ v: k("warm"), color: START_COLORS.warm, tip: "Warm" }, { v: k("template"), color: START_COLORS.template, tip: "Template" }, { v: k("cold"), color: START_COLORS.cold, tip: "Cold" }], small ? 40 : 56)}${small ? "" : startIcon("warm")}<span>${Math.round((k("warm") / all) * 100)}%</span></span>`; }
 /** One measure of one variant: whiskers on the measure's shared axis, a check where it clearly wins. */
 function expCell(a, i, mid, live) { const m = MEAS.find((x) => x.id === mid); const r = measure(m); const c = r.per[i]; const html = c ? whisk(c.map((x) => +x.toFixed(2)), r.axis, SERIES4[i], m.f(c[1]), r.win === i, narrow() ? 0 : 40) : `<span class="u"><span class="dim">—</span></span>`; return html.replace('<span class="u"', `<span class="u" data-live="${live}"`); }
-const short = (v) => (v.engine === "host" ? `${v.agentfile} · host` : `${v.agentfile} · ${v.cpus}c · ${v.mem}G`);
+const short = (v) => (narrow() ? (v.engine === "host" ? "host" : `${v.cpus}c · ${v.mem}G`) : v.engine === "host" ? `${v.agentfile} · host` : `${v.agentfile} · ${v.cpus}c · ${v.mem}G`);
 /** The split a person is dragging toward: staged, drawn hatched, live only once applied. */
 const staged = (a) => (S.staged && S.staged.a === a.id ? S.staged.list.map((x) => x.weight) : null);
 const depl = (v) => (v.engine === "host" ? `${v.agentfile} · host` : `${v.agentfile} · ${v.cpus} vCPU · ${v.mem} GiB`);
@@ -180,7 +186,7 @@ function replayRows(a) {
   const R = S.replay;
   const RES = [[[27.6, 28.9, 30.4], [41.2, 43.0, 45.1]], [[52.1, 54.3, 57.0], [55.0, 56.8, 59.2]]];
   return `<div class="fr">${icon("replay")}<span class="lbl hi">Replay</span>${sel([["s1", "Review the top diff · 214 calls"], ["s2", "Review shards #4512 · 88 calls"]], "s1", 'aria-label="Recorded session"')}<span class="acts">${R.state === "running" ? `<span class="val dim">${R.done}/10</span>` : `<button class="b3 p" data-do="doreplay">Replay</button>`}${ib("x", "Close", 'data-do="replay"')}</span></div>
-    ${R.state === "done" ? `<table class="t3" data-grid="a">${th3(G(["Variant", "", "", "Time", "CPU", "", ""]))}<tbody>${[0, 1].map((i) => `<tr>${td3(G([]), [{ lead: key3(i), body: `<span class="cr"><span class="ell mid" data-full="${esc(depl(a.exp.variants[i]))}" title="${esc(depl(a.exp.variants[i]))}">${esc(depl(a.exp.variants[i]))}</span>${st("ok", "Every call as recorded")}</span>` }, "", "", whisk(RES[0][1 - i], [24, 48], SERIES4[i], `${RES[0][1 - i][1]}s`, i === 1, narrow() ? 0 : 40), whisk(RES[1][i], [50, 61], SERIES4[i], `${RES[1][i][1]}`, false, narrow() ? 0 : 40), "", "", ""])}</tr>`).join("")}</tbody></table>` : ""}`;
+    ${R.state === "done" ? `<table class="t3" data-grid="a">${th3(G(["Variant", "", "", "Time", "CPU", "", ""], {}, { noCtl: true }))}<tbody>${[0, 1].map((i) => `<tr>${td3(G([], {}, { noCtl: true }), [{ lead: key3(i), body: `<span class="cr"><span class="ell mid" data-full="${esc(depl(a.exp.variants[i]))}" title="${esc(depl(a.exp.variants[i]))}">${esc(depl(a.exp.variants[i]))}</span>${st("ok", "Every call as recorded")}</span>` }, "", "", whisk(RES[0][1 - i], [24, 48], SERIES4[i], `${RES[0][1 - i][1]}s`, i === 1, narrow() ? 0 : 40), whisk(RES[1][i], [50, 61], SERIES4[i], `${RES[1][i][1]}`, false, narrow() ? 0 : 40), "", ""])}</tr>`).join("")}</tbody></table>` : ""}`;
 }
 function setupRows(a) {
   const V = S.setup.variants;
@@ -197,19 +203,13 @@ function setupRows(a) {
       `<span class="acts">${i > 1 ? ib("x", "Remove", `data-do="rmvar" data-i="${i}"`) : ""}</span>`,
     ])}</tr>`).join("")}</tbody></table>`;
 }
-/** A conflict, shown, never settled for you: what differs, the changed lines, and the two choices in words. */
-function diffBlock(label, from, lines, acts, id) {
-  return `<div class="fr">${st("warn")}<span class="lbl hi">${esc(label)}</span><span class="val dim ell">${esc(from)}</span></div>
-    ${lines.map(([sign, text]) => `<div class="sh dl3" data-sign="${sign}"><span class="val">${sign === "-" ? "−" : "+"}</span><span class="val ell mid" data-full="${esc(text)}" title="${esc(text)}">${esc(text)}</span></div>`).join("")}
-    <div class="fr">${acts.map(([d, l], i) => `<button class="b3 ${i ? "" : "p"}" data-do="${d}" data-a="${id}">${esc(l)}</button>`).join("")}</div>`;
-}
 function expanded(a) {
   if (a.adhoc) return `<table class="t3" data-grid="a">${th3(SCOLS())}<tbody>${a.sessions.map((s) => sessionRow(s, a)).join("")}</tbody></table>`;
   const hc = harnessOf(a.harness);
-  const conflict = a.conflict ? diffBlock("Agentfile differs", "rust-dev v9", [["-", "LABEL kiln.harness.codex.model=gpt-6.1-sol-mini"], ["+", "LABEL kiln.harness.codex.model=gpt-6.1-sol"]], [["keepmine", "Keep mine"], ["taketheirs", "Take rust-dev v9"]], a.id) : "";
+  const conflict = a.conflict ? diffBlock("Agentfile differs", "rust-dev v9", [["model", "gpt-6.1-sol-mini", "gpt-6.1-sol"]], [["keepmine", "Keep mine"], ["taketheirs", "Take rust-dev v9"]], a.id) : "";
   const run = S.run === a.id ? (S.ran === a.id ? "" : `<div class="fr">${icon("play")}<span class="lbl hi">Run</span>${sel([["kiln", "hyper-light/kiln"], ["shards", "hyper-light/shards"], ["none", "no project"]], "kiln", 'aria-label="Project"')}${sel([["auto", "auto · adas-mac-studio-3.local"], ["s3", "adas-mac-studio-3.local"], ["c2", "adacachy2"], ["m1", "adas-mac-studio.local"]], "auto", 'aria-label="Runner" title="kiln places it: warm reviewer and rust-dev v8 there"')}<input class="in3 grow" placeholder="Message" aria-label="First message"><span class="acts"><button class="b3 p" data-do="start" data-a="${a.id}">Start</button>${ib("x", "Close", `data-do="run" data-a="${a.id}"`)}</span></div>`) : "";
   const hist = S.hist && S.hist[0] === a.id ? (() => { const [v, what] = a.hist.find((h) => h[0] === S.hist[1]); return `<div class="fr">${icon("history")}<span class="lbl hi">v${v}</span><span class="val dim ell">${esc(what)}</span><span class="acts">${v === a.v ? `<span class="lbl">current</span>` : `<button class="b3" data-do="restore" data-a="${a.id}" data-v="${v}">Restore</button>`}${ib("x", "Close", 'data-do="nohist"')}</span></div>`; })() : "";
-  const clash = S.clash && S.clash.a === a.id ? diffBlock(`v${a.remote.v} saved meanwhile`, a.remote.by, [["-", `${S.clash.k} ${modelName(a.harness, S.clash.mine ?? a.model)}`], ["+", `${a.remote.field} ${modelName(a.harness, a.remote.value)}`]], [["clashmine", "Keep mine"], ["clashtheirs", `Take v${a.remote.v}`]], a.id) : "";
+  const clash = S.clash && S.clash.a === a.id ? diffBlock(`v${a.remote.v} saved meanwhile`, a.remote.by, [[a.remote.field, modelName(a.harness, S.clash.mine ?? a.model), modelName(a.harness, a.remote.value)]], [["clashmine", "Keep mine"], ["clashtheirs", `Take v${a.remote.v}`]], a.id) : "";
   const del = S.asking === a.id ? `<div class="fr">${st("warn")}<span class="lbl hi">Delete ${esc(a.id)}?</span><span class="val dim">${a.v} versions</span><span class="acts"><button class="b3 d" data-do="delete" data-a="${a.id}">Delete</button><button class="b3 g" data-do="nodelete">Cancel</button></span></div>` : "";
   return `${conflict}${clash}${run}${del}<div class="defs3">
       ${S.editing === `${a.id}:harness` || S.editing === `${a.id}:model` ? "" : `${prop(a, "harness", "Harness", `<span class="val">${a.harness}</span>`, "o640")}${prop(a, "model", "Model", `<span class="val">${esc(modelName(a.harness, a.model))}</span>`, "o900")}`}
@@ -218,7 +218,7 @@ function expanded(a) {
       ${prop(a, "skills", "Skills", `<span class="val">${a.skills.length}</span>`)}
       ${prop(a, "limit", "Limit", `<span class="val">${a.limit || "none"}</span>`)}
       ${a.kiln ? "" : `<div><span class="lbl">Version</span><span class="pv"><span class="val">v${a.v}</span><span class="vdots">${a.hist.map(([v, what]) => `<button data-do="hist" data-a="${a.id}" data-v="${v}" aria-current="${v === a.v}" title="v${v} · ${esc(what)}" aria-label="v${v}"></button>`).join("")}</span></span></div>`}
-      ${prop(a, "instr", "Instructions", `<span class="val">${esc(a.instr || "none")}</span>`, "wide")}
+      ${prop(a, "instr", "Instructions", `<span class="val">${esc(a.instr || "none")}</span>`, "wide prose")}
     </div>${hist}${S.saved === a.id ? `<div class="fr">${st("ok")}<span class="lbl hi">Saved</span><span class="val dim">v${a.v} · ${esc(a.agentfile)} rebuilding</span></div>` : ""}
     ${a.sessions.length ? `<div class="sh"><span class="lbl hi">Sessions</span><span class="val dim">${a.sessions.length}</span></div><table class="t3" data-grid="a">${th3(SCOLS())}<tbody>${a.sessions.map((s) => sessionRow(s, a)).join("")}</tbody></table>` : ""}
     ${a.exp ? expRows(a) : ""}${S.setup && S.setup.a === a.id ? setupRows(a) : ""}
@@ -236,7 +236,7 @@ function render() {
     <div class="bar-row"><span class="sg3" role="group" aria-label="Show">${[["yours", `Yours ${A.length}`], ["kiln", `kiln's ${KILN.length}`], ["all", "All"]].map(([v, l]) => `<button data-do="filter" data-v="${v}" aria-pressed="${S.filter === v}">${l}</button>`).join("")}</span><span class="right"><button class="b3 p" data-do="new">${icon("plus")}New agent</button></span></div>
     <div class="card3">
       <table class="t3" data-grid="a">${th3(LIST())}<tbody>${S.newRow ? newRow() : ""}${list.map(agentRow).join("")}</tbody></table></div>`;
-  liveScan(); fitGrid(); fitMiddle();
+  liveScan(); refit();
 }
 function newRow() {
   return `<tr><td class="detail" colspan="${shown(LIST())}"><div class="fr">${icon("plus")}<input class="in3" id="nn" placeholder="name" value="docs-checker" aria-label="Name">${sel(HARNESSES.map((h) => [h.id, h.id]), "claude", 'id="nh" aria-label="Harness"')}${sel(AGENTFILES, "rust-dev", 'id="nf" aria-label="Agentfile"')}<span class="acts"><button class="b3 p" data-do="keepnew">Keep</button>${ib("x", "Cancel", 'data-do="new"')}</span></div></td></tr>`;

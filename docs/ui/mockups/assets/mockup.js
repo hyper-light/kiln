@@ -221,7 +221,7 @@ function audit() {
   const sizes = new Map(), lhs = new Set(), wraps = [], over = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-    const t = n.textContent.trim(); const el = n.parentElement; if (!t || !el || el.closest("script,style,title,option,textarea,#pal:not([open]) ")) continue;
+    const t = n.textContent.trim(); const el = n.parentElement; if (!t || !el || el.closest("script,style,title,option,textarea,#pal:not([open]),.prose,.msg")) continue;
     const cs = getComputedStyle(el); if (cs.display === "none" || cs.visibility === "hidden" || !el.getClientRects().length) continue;
     const k = `${cs.fontSize} ${cs.fontFamily.split(",")[0].replace(/"/g, "")}`; sizes.set(k, (sizes.get(k) || 0) + 1); lhs.add((parseFloat(cs.lineHeight) / parseFloat(cs.fontSize)).toFixed(2));
     const rg = document.createRange(); rg.selectNodeContents(n); const tops = new Set([...rg.getClientRects()].map((r) => Math.round(r.top))); if (tops.size > 1) wraps.push(t.slice(0, 40));
@@ -399,7 +399,9 @@ function fitGrid() {
       const ths = [...t.querySelectorAll(":scope > thead > tr > th")]; const avail = t.clientWidth;
       const nameIdx = ths.findIndex((th) => th.hasAttribute("data-name"));
       const fixed = ths.map((th, i) => (th.offsetParent === null || i === nameIdx ? 0 : th.classList.contains("lead") ? 40 : th.hasAttribute("data-ctl") ? parseFloat(th.dataset.w) : Math.max(nat[i] || 0, 40)));
-      const floor = Math.min(160, nat[nameIdx] || 160);
+      // The name's floor is this table's own longest name, at most 120: another table's long titles never squeeze this one's glyphs.
+      let own = 0; t.querySelectorAll(":scope > tbody > tr").forEach((tr) => { const c = tr.children[nameIdx]; if (!c || tr.querySelector("td.detail")) return; const r = document.createRange(); r.selectNodeContents(c); own = Math.max(own, r.getBoundingClientRect().width); });
+      const floor = Math.min(120, Math.ceil(own) + 12);
       const flexSum = fixed.reduce((a, w, i) => a + (ths[i].hasAttribute("data-ctl") || ths[i].classList.contains("lead") ? 0 : w), 0);
       const rigid = fixed.reduce((a, w) => a + w, 0) - flexSum;
       const scale = Math.min(1, Math.max(0, (avail - floor - rigid) / (flexSum || 1)));
@@ -409,3 +411,31 @@ function fitGrid() {
 }
 addEventListener("resize", () => requestAnimationFrame(() => { fitGrid(); fitMiddle(); }));
 ICONS.adhoc = '<path d="M10.1 2.18a9.93 9.93 0 0 1 3.8 0M17.6 3.71a9.95 9.95 0 0 1 2.69 2.7M21.82 10.1a9.93 9.93 0 0 1 0 3.8M20.29 17.6a9.95 9.95 0 0 1-2.7 2.69M13.9 21.82a9.94 9.94 0 0 1-3.8 0M6.4 20.29a9.95 9.95 0 0 1-2.69-2.7M2.18 13.9a9.93 9.93 0 0 1 0-3.8M3.71 6.4a9.95 9.95 0 0 1 2.7-2.69"/>';
+/** A value's change with the differing characters marked: the common start and end plain, the rest highlighted. */
+function marked(a, b) {
+  let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let q = 0; while (q < a.length - p && q < b.length - p && a[a.length - 1 - q] === b[b.length - 1 - q]) q++;
+  const part = (x, cls) => `${esc(x.slice(0, p))}${x.slice(p, x.length - q) ? `<mark class="${cls}">${esc(x.slice(p, x.length - q))}</mark>` : ""}${esc(x.slice(x.length - q))}`;
+  return [part(a, "del3"), part(b, "add3")];
+}
+/** A conflict, shown, never settled for you: what differs; each change as its key once, then old → new with what
+ *  changed marked (the key gives way first, the values always fit); and the two choices in words. */
+function diffBlock(label, from, changes, acts, id = "") {
+  return `<div class="fr">${st("warn")}<span class="lbl hi">${esc(label)}</span><span class="val dim ell">${esc(from)}</span></div>
+    ${changes.map(([key, a, b]) => { const [x, y] = marked(a, b); return `<div class="sh dl3"><span class="lbl ell" title="${esc(key)}">${esc(key)}</span><span class="val chg3">${x}</span><span class="dim">→</span><span class="val chg3">${y}</span></div>`; }).join("")}
+    <div class="fr">${acts.map(([d, l], i) => `<button class="b3 ${i ? "" : "p"}" data-do="${d}" data-a="${id}" data-ag="${id}">${esc(l)}</button>`).join("")}</div>`;
+}
+/** Fit again once the real fonts are in, whenever one loads, and on resize: measuring with a fallback face misjudges every width. */
+function refit() { fitGrid(); fitMiddle(); hideTightHeads(); }
+document.fonts?.ready.then(refit);
+document.fonts?.addEventListener?.("loadingdone", () => requestAnimationFrame(refit));
+addEventListener("resize", () => requestAnimationFrame(refit));
+/** A header never truncates: one that doesn't fit its column shows nothing, its name kept in the tooltip. */
+function hideTightHeads() {
+  $$("table.t3 > thead > tr > th").forEach((th) => {
+    th.style.color = "";
+    if (!th.textContent.trim() || th.querySelector(".key3")) return;
+    const cs = getComputedStyle(th); const r = document.createRange(); r.selectNodeContents(th);
+    if (r.getBoundingClientRect().width > th.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) + 0.5) { th.style.color = "transparent"; th.title = th.title || th.textContent; }
+  });
+}

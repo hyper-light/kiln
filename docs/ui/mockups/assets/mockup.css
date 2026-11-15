@@ -234,3 +234,10 @@
 .t3 td .pv:hover .ic.pen { opacity: 1; }
 .t3 td .ed { display: flex; align-items: center; gap: 4px; }
 .t3 td .ed .sel3 { width: 0; flex: 1 1 auto; }
+.dl3 > .lbl { flex: 0 1 auto; min-width: 24px; }
+.chg3 { flex: none; white-space: nowrap; }
+mark.del3 { background: rgb(230 103 103 / 22%); color: #f0a3a3; border-radius: 3px; padding: 0 1px; text-decoration: line-through; }
+mark.add3 { background: rgb(12 163 12 / 22%); color: #8fe08f; border-radius: 3px; padding: 0 1px; }
+/* Prose is the one thing that wraps: an agent's instructions, a chat's words. */
+.v3 .prose, .v3 .prose * { white-space: normal !important; overflow-wrap: anywhere; }
+.defs3 .pv.prose { height: auto; min-height: 28px; align-items: flex-start; padding: 4px 0; text-align: left; }
