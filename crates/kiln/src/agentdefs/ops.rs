@@ -160,8 +160,9 @@ async fn run(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let (name, version, d) = super::settings_of(&cx.hub, &who(&cx)?, &id).await.map_err(fail)?;
     let task = v.get("prompt").and_then(Value::as_str);
-    // Its definition and its task apart, for a split of it to match and retell (P7.1).
-    let mut ask = json!({"kind": d.harness, "isolation": "microvm", "name": v.get("name").and_then(Value::as_str).unwrap_or(&name), "agentdef": id});
+    // Its task apart, for a split's variant that's another agent to retell (P7.1); its definition is kiln's to say
+    // (`Ask::definition`, below), which a split matches.
+    let mut ask = json!({"kind": d.harness, "isolation": "microvm", "name": v.get("name").and_then(Value::as_str).unwrap_or(&name)});
     if let (Some(o), Some(t)) = (ask.as_object_mut(), task) {
         o.insert("task".into(), json!(t));
     }

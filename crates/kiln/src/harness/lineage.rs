@@ -534,9 +534,9 @@ pub struct Ask {
     pub image: Option<String>,
     /// Its harness's own session to take up again, as `Spec::resume` (step 35).
     pub resume: Option<String>,
-    /// The agent definition it runs (`agentdefs.run`), and the task it was given apart from its definition's words:
-    /// what a split of that agent matches, and tells a variant that's another agent (P7.1).
-    pub agentdef: Option<String>,
+    /// The task it was given apart from its definition's words (`agentdefs.run`): what a split's variant that's
+    /// another agent is told after that agent's words (P7.1). The definition a split matches is kiln's to say
+    /// ([`Ask::definition`]), never what's asked.
     pub task: Option<String>,
     /// Its microVM's vCPUs and MiB, as a split's variant sizes it (P7.1): never from what's asked.
     #[serde(skip)]
@@ -1382,7 +1382,7 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     let mut infos = Vec::new();
     let mut refused = None;
     for k in 0..count {
-        let starting = crate::ci::experiments::Starting { agentdef: ask.agentdef.as_deref(), harness: ask.kind.trim(), agentfile: agentfile.as_deref(), person: &person };
+        let starting = crate::ci::experiments::Starting { agentdef: ask.definition.as_ref().map(|d| d.id.as_str()), harness: ask.kind.trim(), agentfile: agentfile.as_deref(), person: &person };
         let Some(draw) = crate::ci::experiments::assign(hub, &starting).await else {
             let rest = Ask { count: Some(count - k), ..ask.clone() };
             infos.extend(start_as(hub, by, rest, |_| {}).await?);
@@ -1465,7 +1465,8 @@ fn as_variant(mut ask: Ask, arm: &crate::ci::experiments::Arm) -> Ask {
     if let Some(settings) = &arm.settings {
         let task = ask.task.clone().or_else(|| ask.prompt.clone());
         ask.prompt = crate::agentdefs::first_message(settings, task.as_deref());
-        ask.agentdef.clone_from(&arm.agent);
+        // It runs that agent's words: its sessions are that definition's, at its version as the split started.
+        ask.definition = arm.agent.clone().map(|id| crate::agentdefs::sessions::Definition { id, version: arm.agent_version.unwrap_or(0) });
     }
     ask
 }

@@ -1143,9 +1143,9 @@ pub mod input {
         /// The conversation to take up again: its harness's own session id (an agent's
         /// `harness_session`, as agents_get gives it), in its folder on its machine; one agent.
         pub resume: Option<String>,
-        /// The agent definition it runs (as agentdefs_run starts one), and its task apart from the
-        /// definition's words: a split of that agent (experiments_start's `target`) matches it.
-        pub agentdef: Option<String>,
+        /// Its task apart from the words of the agent definition it runs (as agentdefs_run starts one): what
+        /// a split's variant that's another agent is told after that agent's words. Which definition it runs is
+        /// kiln's to say, as agentdefs_run starts it.
         pub task: Option<String>,
     }
 
