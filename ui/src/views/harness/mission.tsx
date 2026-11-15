@@ -59,6 +59,7 @@ import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
 import { Definitions } from "./definitions";
+import { agentdefsRes } from "@/api/agentdefs";
 import { KindGlyph } from "./kind-glyph";
 import { NODE_WORD, subagentTree, treePaths, type SubagentNode, type SubagentRow } from "./subagent-tree";
 import { PauseButton } from "./subagent-pause";
@@ -699,6 +700,7 @@ export default function Mission() {
   ask(machinesRes);
   ask(agentfileChoicesRes);
   ask(agentsRes);
+  ask(agentdefsRes);
   ask(pushStateRes);
   ask(thisDeviceRes);
   ask(pushDevicesRes);
@@ -1368,9 +1370,8 @@ function Agents() {
         </>
       )}
 
-      <React.Suspense fallback={null}>
-        <Definitions list={list} />
-      </React.Suspense>
+      {/* Read with the agents, under the page's own loading: the list's place is held, nothing moves as it comes. */}
+      <Definitions list={list} />
 
       {everyRow.length === 0 ? (
         <div className="ms-empty">

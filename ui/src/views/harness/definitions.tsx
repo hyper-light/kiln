@@ -6,7 +6,10 @@
  * list, read only.
  */
 import * as React from "react";
-import { ChevronDown, ChevronUp, ArrowUpRight, Lock, Repeat2 } from "lucide-react";
+import { DropdownMenu } from "radix-ui";
+import { Check, ChevronDown, ChevronUp, ArrowUpRight, Lock, MoreHorizontal, Pause, Pencil, Play, Repeat2, Square, X } from "lucide-react";
+import { harnessApi } from "@/api/harness";
+import { errorMessage } from "@/lib/hooks";
 import { agentdefsRes, type AgentDef, type Experiment, type Variant } from "@/api/agentdefs";
 import type { AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
@@ -66,14 +69,14 @@ function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly AgentIn
   const line = [sessions.length ? `${sessions.length} session${sessions.length === 1 ? "" : "s"}${at ? `, ${at} at work` : ""}` : "No sessions", d.experiment && `split ${d.experiment.variants.map((v) => v.weight).join("/")}`, d.conflict && `${d.conflict.from} differs`]
     .filter(Boolean)
     .join(" · ");
-  const canOpen = sessions.length > 0 || d.experiment !== undefined;
+  const canOpen = d.own || sessions.length > 0 || d.experiment !== undefined;
   return (
     <>
       <li className="ms-row" data-stand={sessions.length ? stand : "ready"} data-def={d.id}>
         <span className="ms-check" aria-hidden="true" />
         <button type="button" className="ms-main" onClick={onOpen} aria-expanded={canOpen ? open : undefined}>
           <span className="ms-name">
-            {d.name}
+            <span>{d.name}</span>
             {!d.own && <Lock size={12} className="ms-flag-pin" role="img" aria-label="kiln's: copy it to change it" />}
             {(d.replaces || d.replaced_by) && <Repeat2 size={12} className="ms-flag-pin" role="img" aria-label={d.replaces ? `Stands in for kiln's ${d.replaces}` : `You use ${d.replaced_by}`} />}
           </span>
@@ -108,12 +111,14 @@ function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly AgentIn
                 {open ? <ChevronUp size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
               </button>
             )}
+            <DefMenu d={d} />
           </span>
         </span>
       </li>
       {open && canOpen && (
         <li className="ms-tree">
           <ul className="ms-tree-rows" aria-label={`${d.name}'s sessions`}>
+            {d.own && <DefNode d={d} />}
             {sessions.map((s) => (
               <SessionNode key={s.id} a={s.a} version={s.version} current={d.version} variant={s.variant} />
             ))}
@@ -151,7 +156,9 @@ function SessionNode({ a, version, current, variant }: { a: AgentInfo; version: 
         <span>{a.kind_name}</span>
       </span>
       <span className="ms-node-actions">
-        <span className="ms-decide" />
+        <span className="ms-decide">
+          <SessionControls a={a} stand={stand} />
+        </span>
         <span className="ms-tail">
           <button type="button" className="ms-go" onClick={() => navigate(to)} aria-label={`Open ${agentLabel(a)}`}>
             <ArrowUpRight size={16} />
@@ -247,5 +254,126 @@ function Measure({ label, iv, f, win }: { label: string; iv: [number, number, nu
       {label} {f(iv[1])}
       {win ? " ✓" : ""}
     </span>
+  );
+}
+
+/** A definition's rarer acts, behind one ⋯, as a Mission row's are (actions.tsx): its history, an experiment, a copy, delete. */
+function DefMenu({ d }: { d: AgentDef }) {
+  const items: { label: string; onSelect: () => void; danger?: boolean }[] = d.own
+    ? [
+        { label: `History (v${d.version})`, onSelect: () => toast({ title: `${d.name}: v1 to v${d.version}`, tone: "info" }) },
+        { label: d.experiment ? "Experiment settings" : "New experiment…", onSelect: () => toast({ title: "Experiment setup opens on its row", tone: "info" }) },
+        { label: "Duplicate", onSelect: () => toast({ title: `Copied ${d.name}`, tone: "info" }) },
+        { label: "Delete…", onSelect: () => toast({ title: `Delete ${d.name}? Confirm on its row`, tone: "info" }), danger: true },
+      ]
+    : [{ label: "Copy as yours", onSelect: () => toast({ title: `${d.name} copied as yours`, tone: "info" }) }];
+  return (
+    <DropdownMenu.Root modal={false}>
+      <DropdownMenu.Trigger asChild>
+        <button type="button" className="hx-icon" aria-label={`Actions for ${d.name}`}>
+          <MoreHorizontal size={16} />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content className="popover w-56" sideOffset={6} align="end" collisionPadding={12}>
+          {items.map((i) => (
+            <DropdownMenu.Item key={i.label} className="menu-item" onSelect={i.onSelect} style={i.danger ? { color: "var(--color-fail)" } : undefined}>
+              <span className="flex-1">{i.label}</span>
+            </DropdownMenu.Item>
+          ))}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+/** A session's own controls on its row: pause or resume (undone from its toast), and stop, asked in place. */
+function SessionControls({ a, stand }: { a: AgentInfo; stand: string }) {
+  const [asking, setAsking] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const paused = stand === "paused";
+  const live = stand !== "stopped" && stand !== "failed";
+  const pause = (on: boolean) => {
+    setBusy(true);
+    harnessApi
+      .command(a.id, { type: "pause", on })
+      .then(() => toast({ title: on ? `Paused ${agentLabel(a)}` : `Resumed ${agentLabel(a)}`, tone: "info", description: on ? "Resume from its row (P)" : undefined }))
+      .catch((e: unknown) => toast.error(on ? "Couldn't pause" : "Couldn't resume", errorMessage(e)))
+      .finally(() => setBusy(false));
+  };
+  if (!live) return null;
+  if (asking)
+    return (
+      <span className="ms-confirm" role="group" aria-label={`Stop ${agentLabel(a)}?`}>
+        <span>Stop?</span>
+        <button type="button" className="ms-go" aria-label="Stop it" onClick={() => { setAsking(false); toast({ title: `Stopping ${agentLabel(a)}`, tone: "info" }); }}>
+          <Check size={15} />
+        </button>
+        <button type="button" className="ms-go" aria-label="Keep it" onClick={() => setAsking(false)}>
+          <X size={15} />
+        </button>
+      </span>
+    );
+  return (
+    <span className="ms-ctl">
+      <button type="button" className="ms-go" disabled={busy} title={paused ? "Resume (P)" : "Pause (P)"} aria-label={`${paused ? "Resume" : "Pause"} ${agentLabel(a)}`} onClick={() => pause(!paused)}>
+        {paused ? <Play size={15} /> : <Pause size={15} />}
+      </button>
+      <button type="button" className="ms-go" title="Stop (S)" aria-label={`Stop ${agentLabel(a)}`} onClick={() => setAsking(true)}>
+        <Square size={14} />
+      </button>
+    </span>
+  );
+}
+
+/** A definition's own values, first under its row: each a value until pressed, then its control, in place; a save is a new version. */
+function DefNode({ d }: { d: AgentDef }) {
+  const [editing, setEditing] = React.useState<string | null>(null);
+  const [vals, setVals] = React.useState({ model: d.model, limit: d.limit, instructions: d.instructions });
+  const [version, setVersion] = React.useState(d.version);
+  const field = (k: keyof typeof vals, label: string, shown: string) =>
+    editing === k ? (
+      <span className="ms-edit">
+        <span className="ms-edit-k">{label}</span>
+        <input className="ms-edit-in" autoFocus defaultValue={vals[k]} aria-label={label} onKeyDown={(e) => { if (e.key === "Enter") save(k, e.currentTarget.value); if (e.key === "Escape") setEditing(null); }} />
+        <button type="button" className="ms-go" aria-label={`Save ${label}`} onClick={(e) => save(k, (e.currentTarget.previousElementSibling as HTMLInputElement).value)}>
+          <Check size={15} />
+        </button>
+      </span>
+    ) : (
+      <button type="button" className="ms-field" title={`Change ${label}`} onClick={() => setEditing(k)}>
+        <span className="ms-edit-k">{label}</span>
+        <span className="ms-field-v">{shown || "none"}</span>
+        <Pencil size={12} aria-hidden="true" />
+      </button>
+    );
+  const save = (k: keyof typeof vals, v: string) => {
+    setVals({ ...vals, [k]: v });
+    setEditing(null);
+    setVersion((n) => n + 1);
+    toast({ title: `Saved v${version + 1}; running sessions keep theirs`, tone: "info" });
+  };
+  return (
+    <li className="ms-node ms-defnode" data-stand="done" data-depth={1}>
+      <span className="ms-node-path" />
+      <span className="ms-node-main">
+        <span className="ms-fields">
+          {field("model", "model", vals.model ? modelLabel(vals.model) : "default")}
+          {field("limit", "limit", vals.limit)}
+          <span className="ms-field" aria-label={`Version ${version}`}>
+            <span className="ms-edit-k">version</span>
+            <span className="ms-field-v">v{version}</span>
+          </span>
+        </span>
+        <span className="ms-fields">{field("instructions", "instructions", vals.instructions)}</span>
+      </span>
+      <span className="ms-node-meta">
+        <span>
+          {d.tools} kiln · {d.mcp} MCP
+        </span>
+        <span>{d.skills} skills</span>
+      </span>
+      <span className="ms-node-actions" />
+    </li>
   );
 }

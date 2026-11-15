@@ -2081,7 +2081,7 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
   place-items: center;
   width: 18px;
   height: 18px;
-  margin: 10px 0 0 22px;
+  margin: 1px 0 0 2px;
   border-radius: 5px;
   color: #0b0c0e;
   font-family: var(--font-mono);
@@ -2100,4 +2100,113 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 }
 .ms-measure[data-win] {
   color: #bfdccf;
+}
+.ms-defs .ms-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ms-defs .ms-name > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A definition's values (definitions.tsx DefNode): each one pressed becomes its control, in place. */
+.ms-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  min-width: 0;
+}
+.ms-field,
+.ms-edit {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  color: #97999f;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: left;
+}
+.ms-field svg {
+  opacity: 0;
+  align-self: center;
+  transition: opacity 0.15s;
+}
+.ms-field:hover,
+.ms-field:focus-visible {
+  color: #ededee;
+}
+.ms-field:hover svg,
+.ms-field:focus-visible svg {
+  opacity: 1;
+}
+.ms-edit-k {
+  flex: none;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ms-field-v {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #d4d6dc;
+}
+.ms-edit-in {
+  min-width: 0;
+  width: 260px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid #303239;
+  border-radius: 6px;
+  background: #0b0c0e;
+  color: #ededee;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+}
+.ms-edit-in:focus {
+  border-color: #bab0e3;
+}
+.ms-ctl,
+.ms-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.ms-confirm {
+  padding-left: 8px;
+  border-radius: 999px;
+  background: rgb(209 170 173 / 10%);
+  color: #e2b9bd;
+  font-size: 12px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ms-field svg {
+    transition: none;
+  }
+}
+.ms-defs .ms-meta {
+  min-width: 0;
+  overflow: hidden;
+}
+.ms-defs .ms-meta > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-defs-title + .ms-swap {
+  margin-left: 10px;
+  color: #7b7e88;
+}
+/* Narrow, Run takes the meta line's place as a row's answers do (above): its Agentfile and version are in its open block. */
+@container (max-width: 760px) {
+  .ms-defs .ms-row .ms-meta {
+    display: none;
+  }
 }
