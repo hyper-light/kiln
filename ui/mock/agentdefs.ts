@@ -65,6 +65,20 @@ const DEFS = [
     skills: 0,
     limit: "10m",
     conflict: { field: "model", here: "gpt-6.1-sol-mini", there: "gpt-6.1-sol", from: "rust-dev v9" },
+    experiment: {
+      id: "triage-sizes",
+      state: "live",
+      version: 3,
+      sessions: 214,
+      variants: [
+        variant("A", "rust-dev", 1, 2, 20, 44, [196, 204, 213], [1.71, 1.76, 1.82], [8, 15, 24], true),
+        variant("B", "rust-dev", 2, 2, 20, 41, [199, 207, 216], [1.74, 1.79, 1.85], [5, 11, 19]),
+        variant("C", "rust-dev", 2, 4, 20, 43, [201, 209, 218], [2.21, 2.27, 2.33], [1, 4, 10]),
+        variant("D", "rust-dev", 4, 4, 15, 31, [204, 212, 221], [2.26, 2.31, 2.38], [0, 3, 10]),
+        variant("E", "rust-dev", 4, 8, 15, 33, [207, 216, 226], [2.93, 2.99, 3.06], [0, 2, 9]),
+        variant("F", "docs-site", 2, 4, 10, 22, [188, 199, 211], [1.95, 2.02, 2.1], [2, 8, 21]),
+      ],
+    },
     sessions: [
       { id: "sub-codex", version: 2 },
       { id: "fam-tests", version: 2 },

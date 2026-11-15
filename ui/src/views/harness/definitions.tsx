@@ -21,6 +21,20 @@ import { chatStand, type ChatStand } from "./chat-state";
 import { agentLabel, modelLabel } from "./derive";
 import { KindGlyph } from "./kind-glyph";
 import { Shimmer } from "./signals";
+import "./definition.css";
+
+
+/** A variant's colour: its place along kiln's prism (index.css --prism), so any number of variants reads apart, in kiln's own colours. */
+const PRISM: [number, number, number][] = [[0xb8, 0xd9, 0xd2], [0xa6, 0xc4, 0xed], [0xb8, 0xa6, 0xd5], [0xd6, 0xa2, 0xaa], [0xd8, 0xcb, 0xb0]];
+export function variantTone(i: number, n: number): string {
+  const t = n <= 1 ? 0 : (i / (n - 1)) * (PRISM.length - 1);
+  const k = Math.min(PRISM.length - 2, Math.floor(t));
+  const f = t - k;
+  const a = PRISM[k]!, b = PRISM[k + 1]!;
+  return `rgb(${a.map((x, j) => Math.round(x + (b[j]! - x) * f)).join(" ")})`;
+}
+/** A variant's letter: A, B, … Z, then AA, AB …: as many as the experiment has. */
+export const variantKey = (i: number): string => (i < 26 ? String.fromCharCode(65 + i) : variantKey(Math.floor(i / 26) - 1) + String.fromCharCode(65 + (i % 26)));
 
 const WORD: Record<ChatStand, string> = { needs: "Needs you", crashed: "Stopped", paused: "Paused", working: "Working", finished: "Finished", ready: "Ready", offline: "Offline", ended: "Ended" };
 /** A session's stand as the tree's nodes draw it (mission.css .ms-node[data-stand]). */
@@ -215,7 +229,7 @@ function ExperimentNodes({ e: given }: { e: Experiment }) {
         <span className="ms-node-meta">
           <span className="ms-split" data-staged={staged ? "" : undefined} aria-label={`Split ${e.variants.map((v, i) => `${v.key} ${weights[i]}%`).join(", ")}${staged ? ", not yet applied" : ""}`}>
             {e.variants.map((v, i) => (
-              <i key={v.key} data-i={i} style={{ flexGrow: weights[i] }} />
+              <i key={v.key} style={{ flexGrow: weights[i], background: variantTone(i, e.variants.length) }} />
             ))}
           </span>
           <span>{weights.join("/")}</span>
@@ -277,7 +291,7 @@ function VariantNode({ v, i, all, weight, fixed, onWeight, asking, onAsk, onProm
   return (
     <li className="ms-node ms-variant" data-stand="done" data-depth={2}>
       <span className="ms-node-path">
-        <span className="ms-vkey" data-i={i} title={v.current ? `Variant ${v.key}, what it runs on now` : `Variant ${v.key}`} data-current={v.current || undefined}>
+        <span className="ms-vkey" style={{ background: variantTone(i, all.length) }} title={v.current ? `Variant ${v.key}, what it runs on now` : `Variant ${v.key}`} data-current={v.current || undefined}>
           {v.key}
         </span>
       </span>
@@ -294,7 +308,7 @@ function VariantNode({ v, i, all, weight, fixed, onWeight, asking, onAsk, onProm
         </span>
       </span>
       <span className="ms-node-meta">
-        <input type="range" className="ms-weight-in" data-i={i} min={0} max={100} value={weight} disabled={fixed} aria-label={`Variant ${v.key}'s weight`} onChange={(e) => onWeight(Number(e.target.value))} />
+        <input type="range" className="ms-weight-in" style={{ accentColor: variantTone(i, all.length) }} min={0} max={100} value={weight} disabled={fixed} aria-label={`Variant ${v.key}'s weight`} onChange={(e) => onWeight(Number(e.target.value))} />
         <span>
           {weight}% · {v.sessions} sessions
         </span>
@@ -343,14 +357,14 @@ function SetupNodes({ d, onDone }: { d: AgentDef; onDone: () => void }) {
         <span className="ms-node-meta">
           <span className="ms-split" data-staged="">
             {vs.map((v, i) => (
-              <i key={i} data-i={i} style={{ flexGrow: v.weight }} />
+              <i key={i} style={{ flexGrow: v.weight, background: variantTone(i, vs.length) }} />
             ))}
           </span>
           <span>{vs.map((v) => v.weight).join("/")}</span>
         </span>
         <span className="ms-node-actions">
           <span className="ms-decide">
-            <Button size="xs" variant="secondary" disabled={vs.length >= 4} onClick={() => setVs([...vs, { ...vs[vs.length - 1]!, weight: 0 }])}>
+            <Button size="xs" variant="secondary" onClick={() => setVs([...vs, { ...vs[vs.length - 1]!, weight: 0 }])}>
               Add variant
             </Button>
             <Button size="xs" onClick={() => { onDone(); toast({ title: `Splitting ${d.name}'s new sessions`, tone: "running" }); }}>
@@ -367,8 +381,8 @@ function SetupNodes({ d, onDone }: { d: AgentDef; onDone: () => void }) {
       {vs.map((v, i) => (
         <li key={i} className="ms-node ms-variant" data-stand="done" data-depth={2}>
           <span className="ms-node-path">
-            <span className="ms-vkey" data-i={i}>
-              {"ABCD"[i]}
+            <span className="ms-vkey" style={{ background: variantTone(i, vs.length) }}>
+              {variantKey(i)}
             </span>
           </span>
           <span className="ms-node-main ms-setup">
@@ -398,7 +412,7 @@ function SetupNodes({ d, onDone }: { d: AgentDef; onDone: () => void }) {
             )}
           </span>
           <span className="ms-node-meta">
-            <input type="range" className="ms-weight-in" data-i={i} min={0} max={100} value={v.weight} aria-label={`Variant ${"ABCD"[i]}'s weight`} onChange={(e) => { const ws = rebalance(vs.map((x) => x.weight), i, Number(e.target.value)); setVs(vs.map((x, j) => ({ ...x, weight: ws[j] ?? x.weight }))); }} />
+            <input type="range" className="ms-weight-in" style={{ accentColor: variantTone(i, vs.length) }} min={0} max={100} value={v.weight} aria-label={`Variant ${variantKey(i)}'s weight`} onChange={(e) => { const ws = rebalance(vs.map((x) => x.weight), i, Number(e.target.value)); setVs(vs.map((x, j) => ({ ...x, weight: ws[j] ?? x.weight }))); }} />
             <span>{v.weight}%</span>
           </span>
           <span className="ms-node-actions">
@@ -495,11 +509,17 @@ function SessionControls({ a, stand }: { a: AgentInfo; stand: string }) {
   );
 }
 
-/** A definition's own values, first under its row: each a value until pressed, then its control, in place; a save is a new version. */
-function DefNode({ d }: { d: AgentDef }) {
+/** A definition's values: each a value until pressed, then its control, in place; a save is a new version, running sessions keep theirs. */
+export function DefFields({ d }: { d: AgentDef }) {
   const [editing, setEditing] = React.useState<string | null>(null);
   const [vals, setVals] = React.useState({ model: d.model, limit: d.limit, instructions: d.instructions });
   const [version, setVersion] = React.useState(d.version);
+  const save = (k: keyof typeof vals, v: string) => {
+    setVals({ ...vals, [k]: v });
+    setEditing(null);
+    setVersion((n) => n + 1);
+    toast({ title: `Saved v${version + 1}`, description: "Running sessions keep theirs; new ones get it", tone: "info" });
+  };
   const field = (k: keyof typeof vals, label: string, shown: string) =>
     editing === k ? (
       <span className="ms-edit">
@@ -510,31 +530,34 @@ function DefNode({ d }: { d: AgentDef }) {
         </button>
       </span>
     ) : (
-      <button type="button" className="ms-field" title={`Change ${label}`} onClick={() => setEditing(k)}>
+      <button type="button" className="ms-field" title={d.own ? `Change ${label}` : "kiln's: copy it to change it"} disabled={!d.own} onClick={() => setEditing(k)}>
         <span className="ms-edit-k">{label}</span>
         <span className="ms-field-v">{shown || "none"}</span>
         <Pencil size={12} aria-hidden="true" />
       </button>
     );
-  const save = (k: keyof typeof vals, v: string) => {
-    setVals({ ...vals, [k]: v });
-    setEditing(null);
-    setVersion((n) => n + 1);
-    toast({ title: `Saved v${version + 1}; running sessions keep theirs`, tone: "info" });
-  };
+  return (
+    <>
+      <span className="ms-fields">
+        {field("model", "model", vals.model ? modelLabel(vals.model) : "default")}
+        {field("limit", "limit", vals.limit)}
+        <span className="ms-field">
+          <span className="ms-edit-k">version</span>
+          <span className="ms-field-v">v{version}</span>
+        </span>
+      </span>
+      <span className="ms-fields">{field("instructions", "instructions", vals.instructions)}</span>
+    </>
+  );
+}
+
+/** A definition's own values, first under its row. */
+function DefNode({ d }: { d: AgentDef }) {
   return (
     <li className="ms-node ms-defnode" data-stand="done" data-depth={1}>
       <span className="ms-node-path" />
       <span className="ms-node-main">
-        <span className="ms-fields">
-          {field("model", "model", vals.model ? modelLabel(vals.model) : "default")}
-          {field("limit", "limit", vals.limit)}
-          <span className="ms-field" aria-label={`Version ${version}`}>
-            <span className="ms-edit-k">version</span>
-            <span className="ms-field-v">v{version}</span>
-          </span>
-        </span>
-        <span className="ms-fields">{field("instructions", "instructions", vals.instructions)}</span>
+        <DefFields d={d} />
       </span>
       <span className="ms-node-meta">
         <span>

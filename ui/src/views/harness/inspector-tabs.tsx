@@ -24,6 +24,7 @@ import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
 import { Fold, FoldOpen } from "./fold";
+import { DefinitionPanel } from "./definition-panel";
 import { Whole } from "./whole";
 import { SubagentOutput } from "./task-output";
 import type { useReviewWaits } from "@/views/plans/review";
@@ -321,6 +322,11 @@ export function ToolsTab({
     <div className="in-secs">
       {/* What it has going: shells and monitors it left running, subagents; what it works with; then
             every command it ran, last, since that list only grows. */}
+      {agentId && (
+        <Loadable label="Loading its definition" fallback={null}>
+          <DefinitionPanel agentId={agentId} />
+        </Loadable>
+      )}
       {agentId && send && <Background state={state} agent={agentId} send={send} />}
       {agentId && (
         <Fold id="live-pages" title="Live pages">

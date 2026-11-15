@@ -154,8 +154,10 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const wide = useMediaQuery("(min-width: 1100px)");
   const [, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
   // `?tab=plan`: opened on its plans (the way back from one of them, or its research).
-  const [tab, setTab] = React.useState<InspectorTab>(() => (params.get("tab") === "plan" ? "plan" : "changes"));
-  const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => (params.get("tab") === "plan" ? "plan" : "work"));
+  // `?tab=tools`: opened on what it works with, its definition first (a definition's session, from Mission control).
+  const tabAsked = params.get("tab");
+  const [tab, setTab] = React.useState<InspectorTab>(() => (tabAsked === "plan" ? "plan" : tabAsked === "tools" ? "tools" : "changes"));
+  const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => (tabAsked === "plan" ? "plan" : tabAsked === "tools" ? "tools" : "work"));
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [settings, setSettings] = React.useState(false);
   /** /login or /logout: the harness's account on its machine, opened in place over the composer. */
