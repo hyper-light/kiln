@@ -1397,12 +1397,28 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::GET, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.get", json!({ "id": id }))).await,
         (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
-        (&Method::PATCH, ["api", "agentdefs", id]) | (&Method::POST, ["api", "agentdefs", id, "restore" | "run" | "copy"]) => {
+        // A change over the version it was made over (`If-Match`, or `base`): refused, with what it is now, where
+        // another change came first.
+        (&Method::PATCH, ["api", "agentdefs", id]) => {
+            let base = base_of(&req)?;
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+                if let Some(b) = base {
+                    if o.get("base").is_some_and(|given| !given.is_null() && *given != json!(b)) {
+                        return Err(err(StatusCode::BAD_REQUEST, "If-Match and `base` name two versions: name the one your change is made over"));
+                    }
+                    o.insert("base".into(), json!(b));
+                }
+            }
+            boxed(|| agentdef_update(&hub, &caller, body)).await
+        }
+        (&Method::POST, ["api", "agentdefs", id, "restore" | "run" | "copy"]) => {
             let name = match s.get(3).copied() {
                 Some("restore") => "agentdefs.restore",
                 Some("copy") => "agentdefs.copy",
-                Some(_) => "agentdefs.run",
-                None => "agentdefs.update",
+                _ => "agentdefs.run",
             };
             let id = (*id).to_owned();
             let mut body = boxed(|| body_value(req)).await?;
@@ -6476,6 +6492,39 @@ async fn programs_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, 
 async fn own_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, input: serde_json::Value) -> R {
     let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
     crate::ops::run_own(cx, name, input).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+}
+
+/// The version an agent definition's change is made over, as `If-Match` names it (`"3"`, or `3`): none where it
+/// names none, or any (`*`).
+fn base_of(req: &Request) -> Result<Option<i64>, ApiError> {
+    let Some(v) = srv::header_str(req, &header::IF_MATCH).map(str::trim) else { return Ok(None) };
+    if v == "*" {
+        return Ok(None);
+    }
+    let n = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v);
+    n.parse::<i64>().map(Some).map_err(|_| err(StatusCode::BAD_REQUEST, format!("If-Match names the version your change is made over (\"3\"), not {v}")))
+}
+
+/// `agentdefs.update` over its route (kiln plan 01a1dd2e… UI contract, principle 5): a change refused (409) for
+/// being made over a version another change has moved it on from carries what it is now (`current`, as
+/// `agentdefs.get` answers it), so the page shows what changed in between and the person makes theirs over it.
+async fn agentdef_update(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: serde_json::Value) -> R {
+    let base = body.get("base").and_then(serde_json::Value::as_i64);
+    let id = body.get("id").cloned().unwrap_or_default();
+    let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
+    match crate::ops::run_own(cx.clone(), "agentdefs.update", body).await {
+        Ok(v) => Ok(srv::json(StatusCode::OK, &v)),
+        Err((StatusCode::CONFLICT, why)) => {
+            let current = crate::ops::run_own(cx, "agentdefs.get", json!({ "id": id })).await.ok();
+            match (base, current) {
+                (Some(base), Some(current)) if current.get("version").and_then(serde_json::Value::as_i64) != Some(base) => {
+                    Ok(srv::json(StatusCode::CONFLICT, &json!({ "error": why, "base": base, "current": current })))
+                }
+                _ => Err(err(StatusCode::CONFLICT, why)),
+            }
+        }
+        Err((c, m)) => Err(err(c, m)),
+    }
 }
 
 /// A query as an operation's input: each parameter a string.
