@@ -58,7 +58,7 @@ const LAUNCH: &[&str] = &[
     "/api/peers/open",
     "/api/harness/sessions",
     "/api/harness/kinds?shared=1",
-    "/api/agents",
+    "/api/agents?lean=1",
     "/api/terminal/sessions",
     "/api/reach/runners?lean=1",
     "/api/harness/workspaces",

@@ -9,3 +9,6 @@ export const KINDS_READ = "/api/harness/kinds?shared=1";
 
 /** The runners by name and what they're doing, without what only a ranking reads of them (`?lean=1`, docs/reach.md). */
 export const REACH_READ = "/api/reach/runners?lean=1";
+
+/** The machines that have joined, each with only what starting an agent on it reads of its facts (`?lean=1`, docs/api.md). */
+export const AGENTS_READ = "/api/agents?lean=1";

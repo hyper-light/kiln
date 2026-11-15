@@ -18,7 +18,7 @@ import { ArrowUp, Check, ChevronDown, CircleAlert, Paperclip } from "lucide-reac
 import { api } from "@/api/client";
 import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type PastSession, type WorkspacesAvailable } from "@/api/harness";
 import { heldCommand, useHeld } from "@/api/held";
-import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
+import type { LeanAgent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
 import { labelOf, noteLabels, shownName, useLabels, useRes, type Res } from "@/lib/data";
@@ -66,7 +66,7 @@ import { MicButton } from "./voice";
 /** What starting agents needs to know: each machine's harnesses, the machines, their shells, the runners its commands can go to, and where it can have a workspace of its own. */
 interface Machines {
   byTarget: Record<string, KindInfo[]>;
-  machines: Agent[];
+  machines: LeanAgent[];
   shells: TerminalSessionInfo[];
   reach: ReachRunner[];
   workspaces: WorkspacesAvailable;
@@ -81,7 +81,7 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
         noteLabels(a);
         return a.filter((m) => m.connected && !m.ephemeral);
       },
-      (): Agent[] => [],
+      (): LeanAgent[] => [],
     ),
     api.terminalSessions(signal).catch((): TerminalSessionInfo[] => []),
     api.reachRunners(signal).then(

@@ -1,4 +1,4 @@
-import type { CdLogLine, CdStatus, HostSample, Job, Run, InstanceView as RunnerInstance, RunStatus as Status, UpdateJob } from "./wire";
+import type { AgentLive, CdLogLine, CdStatus, HostSample, Job, Run, InstanceView as RunnerInstance, RunnerFacts, RunStatus as Status, UpdateJob } from "./wire";
 export type {
   AgentLive as Agent,
   Battery,
@@ -2064,3 +2064,10 @@ export interface HeadroomView {
   status: HeadroomStatus | null;
   status_at: number | null;
 }
+
+/**
+ * A machine as `GET /api/agents?lean=1` lists it (W21-R02): itself, with only what starting an agent on it reads of
+ * its facts (whether it starts microVMs). A machine listed whole (`Agent`: the Runners page's, an `agent` event's) is
+ * one too.
+ */
+export type LeanAgent = Omit<AgentLive, "facts"> & { facts?: Pick<RunnerFacts, "virt"> };

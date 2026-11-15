@@ -4,7 +4,7 @@
  * control's composer (new-agent.tsx) and its tests share one reading.
  */
 import type { ControlOption, KindInfo, ModeOption, PastSession, Spec } from "@/api/harness";
-import type { Agent, ReachRunner } from "@/api/types";
+import type { LeanAgent, ReachRunner } from "@/api/types";
 import { labelOf, shownName } from "@/lib/data";
 
 /** Each harness's own permission modes, as its agents' pages name them (claude.rs and codex.rs `modes`), for runners that don't report them (what the machine reports wins). */
@@ -72,7 +72,7 @@ export const machinesWith = (byTarget: Record<string, KindInfo[]>, kind: string)
 export const targetOf = (where: string[], wanted: (string | null | undefined)[]): string => wanted.find((t): t is string => Boolean(t) && where.includes(t ?? "")) ?? where[0] ?? "";
 
 /** A machine as the composer's slot says it, short: the name it's shown by without its domain, and its host's when that's another ("kiln-a094a12d (fedora-2)"). */
-export function shortMachineLabel(target: string, machines: Agent[]): string {
+export function shortMachineLabel(target: string, machines: LeanAgent[]): string {
   if (target === "local") return "kiln server";
   const n = target.replace(/^agent:/, "");
   const first = (s: string) => s.split(".")[0] || s;
@@ -82,7 +82,7 @@ export function shortMachineLabel(target: string, machines: Agent[]): string {
 }
 
 /** A machine as people know it: the kiln server, or the name it's shown by (with its hostname when that differs). */
-export function machineLabel(target: string, machines: Agent[]): string {
+export function machineLabel(target: string, machines: LeanAgent[]): string {
   if (target === "local") return "kiln server";
   const n = target.replace(/^agent:/, "");
   const m = machines.find((x) => x.name === n);

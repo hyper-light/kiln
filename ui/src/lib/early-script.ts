@@ -3,7 +3,7 @@
  * head), before its code is in: lib/early.ts hands those answers to the app's own reads.
  */
 
-import { KINDS_READ, REACH_READ } from "@/api/launch-reads";
+import { AGENTS_READ, KINDS_READ, REACH_READ } from "@/api/launch-reads";
 import { SIGNED_OUT } from "@/api/client";
 import { SHIP_FIRST_READ } from "@/api/ship-first";
 
@@ -27,7 +27,7 @@ export const SIGNED = ["/api/harness/sessions"];
  * would only take the connections its code needs.
  */
 export const EARLY: Record<string, readonly string[]> = {
-  "/agents": [KINDS_READ, "/api/agents", "/api/terminal/sessions", REACH_READ, "/api/harness/workspaces", "/api/push", "/api/push/subscriptions", "/api/voice"],
+  "/agents": [KINDS_READ, AGENTS_READ, "/api/terminal/sessions", REACH_READ, "/api/harness/workspaces", "/api/push", "/api/push/subscriptions", "/api/voice"],
   // Ship's rows, each repository's newest commit: what its list waits on (a facet chosen in the
   // address reads another URL, and the app reads that itself).
   "/ship": [SHIP_FIRST_READ],

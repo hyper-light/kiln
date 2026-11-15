@@ -844,7 +844,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             job_logs_ws(hub.clone(), id, step, req)
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => boxed(|| get_artifacts(&hub, id)).await,
-        (&Method::GET, ["api", "agents"]) => Ok(boxed(|| agents_read(&hub, &caller)).await),
+        (&Method::GET, ["api", "agents"]) => {
+            let lean = srv::query(&req).get("lean").is_some_and(|lean| lean == "1");
+            Ok(boxed(|| async { if lean { agents_lean_read(&hub, &caller).await } else { agents_read(&hub, &caller).await } }).await)
+        }
         (&Method::GET, ["api", "reach", "runners"]) => {
             let q = srv::query(&req);
             reach_runners(&hub, q.get("want").map(String::as_str), q.get("lean").is_some_and(|lean| lean == "1"))
@@ -3328,24 +3331,65 @@ async fn overview_making(hub: &Arc<Hub>, key: crate::reads::OverviewKey) -> anyh
 /// maker does, nothing of it on the request's shard (step 5: made there, `read /api/agents` held its shard
 /// 0.28 to 0.40 ms on the CPU in rt9's lab). The store's, while the rows kept are behind it.
 async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
+    match agents_whole(hub, caller).await {
+        Ok(made) => pre_named(made),
+        Err(e) => agents_unencoded(&e),
+    }
+}
+
+/// What a read of the runners answers when their list couldn't be encoded.
+fn agents_unencoded(e: &anyhow::Error) -> Response {
+    err(StatusCode::INTERNAL_SERVER_ERROR, format!("the runners' list couldn't be encoded: {e:#}")).into_response()
+}
+
+/// [`agents_read`]'s answer before it's answered: its JSON, named where it was kept ahead.
+async fn agents_whole(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> anyhow::Result<crate::reads::Made> {
     if caller.is_owner() {
         hub.harness.views.start(hub);
         if let Some(key) = agents_key(hub) {
             if let Some(made) = hub.harness.views.agents.held(&key) {
-                return pre_named(made);
+                return Ok(made);
             }
             match agents_making(hub, key).await {
-                Ok(made) => return pre_named(made),
+                Ok(made) => return Ok(made),
                 Err(e) => tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made off the shard: the store's answers"),
             }
         }
     }
+    let unnamed = |json| crate::reads::Made { json, etag: None };
     match crate::doctor::runners_made_for(hub, caller, |runners| crate::reads::encode(&runners)).await {
-        Some(Ok(json)) => pre_encoded(json),
-        Some(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("the runners' list couldn't be encoded: {e:#}")).into_response(),
+        Some(made) => made.map(unnamed),
         // Where the pool's job is lost (it panicked), here.
-        None => srv::json(StatusCode::OK, &crate::doctor::runners_for(hub, caller).await),
+        None => crate::reads::encode(&crate::doctor::runners_for(hub, caller).await).map(unnamed),
     }
+}
+
+/// `GET /api/agents?lean=1` (W21-R02): the runners `caller` may read, each with only what a page that lists the
+/// runners and starts agents on them reads of its facts: whether it starts microVMs (`facts.virt`). Its facts are
+/// seven tenths of the list (22.8 KB of the 32.8 KB of eleven runners: `kiln-lab bar`, 2026-11-14), and the rest of
+/// them only a page that shows a runner's hardware reads (the Runners page). Mission control asks so as it opens.
+/// Made of [`agents_read`]'s own answer, off the shard: the whole list is read and written again.
+async fn agents_lean_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
+    let whole = match agents_whole(hub, caller).await {
+        Ok(made) => made.json,
+        Err(e) => return agents_unencoded(&e),
+    };
+    match crate::rt::compute(move || lean_agents(&whole)).await {
+        Ok(Ok(json)) => pre_encoded(json),
+        Ok(Err(e)) | Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("the runners' list couldn't be made lean: {e:#}")).into_response(),
+    }
+}
+
+/// The runners' list `whole` (`GET /api/agents`'s JSON), each runner's facts only their `virt` (none: no facts).
+fn lean_agents(whole: &[u8]) -> anyhow::Result<bytes::Bytes> {
+    let mut runners: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(whole)?;
+    for runner in &mut runners {
+        let virt = runner.remove("facts").and_then(|mut facts| facts.get_mut("virt").map(serde_json::Value::take));
+        if let Some(virt) = virt {
+            runner.insert("facts".to_owned(), json!({ "virt": virt }));
+        }
+    }
+    crate::reads::encode(&runners)
 }
 
 /// The owner's `GET /api/agents` as `key` says it, made on the compute pool (each runner's record copied, the list
@@ -8322,6 +8366,61 @@ mod tests {
         let lean = lean_runners(std::slice::from_ref(&runner));
         assert_eq!(lean, vec![json!({"name": "a", "label": "box", "connected": true, "reach": true, "cpus": 8, "harnesses": ["claude"]})]);
         assert_eq!(lean_runners::<serde_json::Value>(&[]), Vec::<serde_json::Value>::new());
+    }
+
+    /// W21-R02: `GET /api/agents?lean=1` answers the runners `GET /api/agents` does, each itself with only its facts'
+    /// `virt` of them (a runner that has said no facts, none); asked for nothing, the list is whole, as it always was.
+    #[test]
+    fn w21_r02_the_runners_listed_lean_keep_only_whether_they_start_microvms_of_their_facts() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for (name, facts) in [("box", true), ("mac", true), ("new", false)] {
+                let row = crate::store::AgentRow { name: name.into(), labels: vec![], slots: 1, hostname: name.into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, connected: true, last_seen: 0, enrolled_at: 0 };
+                hub.store.upsert_agent(row).await?;
+                let mut live = crate::hub::tests::live_runner(name, "linux", "x86_64");
+                live.facts = facts.then(|| {
+                    let mut said = kiln_ci::facts::RunnerFacts::default();
+                    said.virt.microvm = name == "box";
+                    Box::new(said)
+                });
+                hub.put_agent(live);
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = |path: &'static str| {
+                let api = Arc::clone(&api);
+                async move {
+                    let r = api.handle(lab_get(path)?).await;
+                    anyhow::ensure!(r.status() == StatusCode::OK, "{path}: {}", r.status());
+                    Ok(serde_json::from_slice::<Vec<serde_json::Value>>(&body_of(r).await?)?)
+                }
+            };
+            let whole = read("/api/agents").await?;
+            let of = |list: &[serde_json::Value], name: &str| list.iter().find(|runner| runner.get("name").and_then(serde_json::Value::as_str) == Some(name)).cloned();
+            let facts = |list: &[serde_json::Value], name: &str| of(list, name).and_then(|runner| runner.get("facts").and_then(serde_json::Value::as_object).cloned());
+            anyhow::ensure!(whole.len() == 3 && facts(&whole, "box").is_some_and(|f| f.len() > 1) && facts(&whole, "mac").is_some_and(|f| f.len() > 1) && facts(&whole, "new").is_none(), "the runners listed whole, two with all their facts: {whole:?}");
+            let kept: Vec<serde_json::Value> = whole
+                .iter()
+                .cloned()
+                .map(|mut runner| {
+                    let virt = runner.get("facts").and_then(|facts| facts.get("virt")).cloned();
+                    if let Some(fields) = runner.as_object_mut() {
+                        fields.remove("facts");
+                        if let Some(virt) = virt {
+                            fields.insert("facts".to_owned(), json!({ "virt": virt }));
+                        }
+                    }
+                    runner
+                })
+                .collect();
+            let lean = read("/api/agents?lean=1").await?;
+            assert_eq!(lean, kept);
+            let microvm = |name: &str| of(&lean, name).and_then(|runner| runner.pointer("/facts/virt/microvm").and_then(serde_json::Value::as_bool));
+            assert_eq!([microvm("box"), microvm("mac"), microvm("new")], [Some(true), Some(false), None], "whether each starts microVMs, as it said");
+            // Only `lean=1` asks for it.
+            assert_eq!(read("/api/agents?lean=0").await?, whole);
+            Ok(())
+        })
     }
 
     /// W21-R02: a terminal's viewer that asked for its screen first is sent it ahead of the replay, each a
