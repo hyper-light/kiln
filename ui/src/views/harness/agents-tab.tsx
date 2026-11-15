@@ -9,8 +9,9 @@ import { agentdefsRes } from "@/api/agentdefs";
 import { Loadable } from "@/components/ui/loading";
 import { Segmented } from "@/components/ui/tabs";
 import { useRes } from "@/lib/data";
+import { useSearchParams } from "@/lib/router";
 import { DefinitionPanel } from "./definition-panel";
-import { DefRow } from "./definitions";
+import { defListKeys, DefRow } from "./definitions";
 import { Fold } from "./fold";
 import { useAgentList } from "./use-agents";
 
@@ -31,8 +32,15 @@ function AgentList({ agentId }: { agentId: string }) {
   const defs = useRes(agentdefsRes).data;
   const list = useAgentList();
   const [whose, setWhose] = React.useState<"yours" | "kiln">("yours");
-  // Its own agent open first, as the one this chat is about.
-  const [open, setOpen] = React.useState<string | null>(() => defs.find((d) => d.own && d.sessions.some((s) => s.id === agentId))?.id ?? null);
+  // The one open lives in the URL (`?open=ID`; kiln's principle 1): its own agent first, as the one
+  // this chat is about, until another is opened, or none (`?open=`).
+  const [params, setParams] = useSearchParams();
+  const open = params.has("open") ? params.get("open") || null : (defs.find((d) => d.own && d.sessions.some((s) => s.id === agentId))?.id ?? null);
+  const setOpen = (id: string | null) => {
+    const next = new URLSearchParams(params);
+    next.set("open", id ?? "");
+    setParams(next, { replace: id === null });
+  };
   const shown = defs.filter((d) => (whose === "yours" ? d.own : !d.own));
   return (
     <Fold
@@ -52,7 +60,7 @@ function AgentList({ agentId }: { agentId: string }) {
         />
       }
     >
-      <ul className="ms-list" data-list="agents-tab">
+      <ul className="ms-list" data-list="agents-tab" onKeyDown={(e) => defListKeys(e, open, () => setOpen(null))}>
         {shown.map((d) => (
           <DefRow key={d.id} d={d} list={list} open={open === d.id} onOpen={() => setOpen(open === d.id ? null : d.id)} />
         ))}

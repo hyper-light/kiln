@@ -215,7 +215,8 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
   const e = useRes(enginesRes).data[name];
   const res = useRes(runnerVmsRes(name));
   const r = res.data;
-  const [charts, setCharts] = React.useState<Set<string>>(new Set());
+  // One microVM's telemetry open at a time (kiln's principle 1).
+  const [chart, setChart] = React.useState<string | null>(null);
   const [building, setBuilding] = React.useState(false);
   if (!e || (!e.can && r.vms.length === 0 && r.images.length === 0)) return null;
   const warm = r.pools.reduce((a, p) => a + p.warm, 0);
@@ -260,20 +261,7 @@ export function MicrovmsSection({ name, manage }: { name: string; manage: boolea
           <div className="label rv-label">MicroVMs · {r.vms.length}</div>
           <ul className="rv-rows" aria-label={`${name}'s microVMs`}>
             {r.vms.map((v) => (
-              <VmRow
-                key={v.id}
-                v={v}
-                open={charts.has(v.id)}
-                onCharts={() =>
-                  setCharts((s) => {
-                    const n = new Set(s);
-                    if (n.has(v.id)) n.delete(v.id);
-                    else n.add(v.id);
-                    return n;
-                  })
-                }
-                onChanged={() => res.reload()}
-              />
+              <VmRow key={v.id} v={v} open={chart === v.id} onCharts={() => setChart(chart === v.id ? null : v.id)} onChanged={() => res.reload()} />
             ))}
           </ul>
         </>

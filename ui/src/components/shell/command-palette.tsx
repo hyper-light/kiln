@@ -1,14 +1,37 @@
 /**
- * The command palette: jump to a page, a repository, a run or a terminal. It opens (Ctrl/⌘ K, or
+ * The command palette: jump to a page, a repository, a run or a terminal, or to where one of kiln's
+ * operations is done (its entries made from the server's own list of them, `GET /api/ops`, so they
+ * can't drift apart: kiln's principle 4). It opens (Ctrl/⌘ K, or
  * Search) as a modal over the page, which doesn't move under it: Escape or a press outside it closes
  * it, and focus goes back where it was. Its pages and actions are there the moment it opens; repositories, recent runs and terminals join them as they
  * arrive (asked for by the action that opens it), so what you type is never lost to a loader.
  */
 import * as React from "react";
-import { useNavigate } from "@/lib/router";
+import { useLocation, useNavigate } from "@/lib/router";
 import { create } from "zustand";
-import { Activity, ArrowUpRight, Bot, Box, CornerDownLeft, Cpu, FolderSync, GitBranch, LayoutGrid, ListTree, LogOut, Play, Rocket, Search, Server, Settings, SquareTerminal } from "lucide-react";
+import {
+  Activity,
+  ArrowUpRight,
+  Bot,
+  Box,
+  CircleCheck,
+  CornerDownLeft,
+  Cpu,
+  FolderSync,
+  GitBranch,
+  KeyRound,
+  LayoutGrid,
+  ListTree,
+  LogOut,
+  Play,
+  Rocket,
+  Search,
+  Server,
+  Settings,
+  SquareTerminal,
+} from "lucide-react";
 import { api } from "@/api/client";
+import { opLabel, opsApi, type OpInfo } from "@/api/ops";
 import type { Agent, Repo, Run } from "@/api/types";
 import { StatusDot } from "@/components/ui/status";
 import { sendingProps, useAction } from "@/lib/action";
@@ -21,10 +44,12 @@ interface PaletteState {
   repos: Repo[];
   runs: Run[];
   agents: Agent[];
+  /** kiln's operations, as the server lists them. */
+  ops: OpInfo[];
 }
 
 /** Shared by the header's Search button, the hotkey and the palette itself. */
-export const usePalette = create<PaletteState>(() => ({ open: false, repos: [], runs: [], agents: [] }));
+export const usePalette = create<PaletteState>(() => ({ open: false, repos: [], runs: [], agents: [], ops: [] }));
 
 let loading: AbortController | null = null;
 /** What had focus when it opened: it gets it back when the palette closes. */
@@ -54,6 +79,24 @@ export function setPaletteOpen(open: boolean) {
     },
     () => undefined,
   );
+  opsApi.list(ctl.signal).then(
+    (ops) => usePalette.setState({ ops }),
+    () => undefined,
+  );
+}
+
+/**
+ * Where each family of kiln's operations is done in the UI, the palette's one hand-kept part: every
+ * operation the server lists in one of them is an entry that goes there (on an agent's page, its own
+ * tab). An operation the server stops listing goes from the palette with it.
+ */
+function opPlace(name: string, agent: string | null): { group: string; to: string; icon: React.ReactNode } | null {
+  if (name.startsWith("agentdefs.")) return { group: "Agents", to: agent ? `/agents/${agent}?tab=agents` : "/agents", icon: <Bot size={15} /> };
+  if (name.startsWith("runners.engine")) return { group: "Runners", to: "/runners", icon: <Server size={15} /> };
+  if (name.startsWith("sessions.")) return { group: "Sandbox", to: agent ? `/agents/${agent}?tab=sandbox` : "/agents", icon: <Box size={15} /> };
+  if (name.startsWith("secrets.mine.")) return { group: "Your secrets", to: "/settings#secrets.mine", icon: <KeyRound size={15} /> };
+  if (name.startsWith("confirms.")) return { group: "Confirms", to: agent ? `/agents/${agent}` : "/agents", icon: <CircleCheck size={15} /> };
+  return null;
 }
 
 /** True when keystrokes belong to a terminal (xterm) and must not be hijacked. */
@@ -105,6 +148,10 @@ function Palette() {
   const repos = usePalette((s) => s.repos);
   const runs = usePalette((s) => s.runs);
   const agents = usePalette((s) => s.agents);
+  const ops = usePalette((s) => s.ops);
+  // On an agent's page, its operations go to its own tabs.
+  const here = /^\/agents\/([^/]+)$/.exec(useLocation().pathname)?.[1] ?? null;
+  const agentHere = here && !["agentfiles", "programs", "plans"].includes(here) ? decodeURIComponent(here) : null;
   const [q, setQ] = React.useState("");
   const [active, setActive] = React.useState(0);
 
@@ -204,8 +251,12 @@ function Palette() {
         icon: <Play size={15} />,
         run: () => go(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`),
       }));
-    return [...pages, ...actions, ...repoItems, ...runItems, ...agentItems];
-  }, [repos, runs, agents, go, signOut]);
+    const opItems: Item[] = ops.flatMap((o) => {
+      const place = opPlace(o.name, agentHere);
+      return place ? [{ id: `op-${o.name}`, group: place.group, label: opLabel(o.summary), hint: o.name, keywords: o.summary, icon: place.icon, run: () => go(place.to) }] : [];
+    });
+    return [...pages, ...actions, ...opItems, ...repoItems, ...runItems, ...agentItems];
+  }, [repos, runs, agents, ops, agentHere, go, signOut]);
 
   const query = q.trim().toLowerCase();
   const filtered = React.useMemo(() => {

@@ -342,3 +342,37 @@
     grid-template-columns: 22px minmax(0, 1fr) auto auto;
   }
 }
+/* An open dropdown's head (definitions.tsx OpenHead; kiln's principle 1): it takes no room and shows
+   only while its row is out of sight, sticking under kiln's header (in a panel, at its top). */
+.ms-open-head {
+  position: sticky;
+  top: var(--open-top, var(--header-h));
+  z-index: 6;
+  height: 0;
+}
+.ms-open-head > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  height: 36px;
+  padding: 0 8px 0 36px;
+  border-bottom: 1px solid #25272c;
+  background: rgb(10 11 13 / 94%);
+  backdrop-filter: blur(10px);
+  visibility: hidden;
+}
+.ms-row[data-unseen] + .ms-dropdown > .ms-open-head > div,
+.df-defrow[data-unseen] + .df-groups > .ms-open-head > div {
+  visibility: visible;
+}
+.ms-open-name {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.at {
+  --open-top: 0px;
+}

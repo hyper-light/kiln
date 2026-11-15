@@ -133,36 +133,82 @@ type Group = "definition" | "sessions" | "experiment";
 
 /**
  * A definition's groups under its row: DEFINITION, SESSIONS and EXPERIMENT in that order, each one
- * line until opened, in the tree's own columns (its rows at the tree's indentation).
+ * line until opened, one open at a time (kiln's principle 1), in the tree's own columns (its rows at
+ * the tree's indentation). `inRow`: under the definition's own row (the Agents tab, chat), which says
+ * where it runs and has Run already.
  */
-/** `inRow`: under the definition's own row (the Agents tab, chat), which says where it runs and has Run already. */
-export function DefGroups({ d, list, first, inRow }: { d: AgentDef; list: readonly AgentInfo[]; first?: Group; inRow?: boolean }) {
-  const [open, setOpen] = React.useState<ReadonlySet<Group>>(() => new Set(first ? [first] : []));
+export function DefGroupRows({ d, list, first, inRow }: { d: AgentDef; list: readonly AgentInfo[]; first?: Group; inRow?: boolean }) {
+  const [open, setOpen] = React.useState<Group | null>(first ?? null);
   const [setup, setSetup] = React.useState(false);
-  const toggle = (g: Group) =>
-    setOpen((s) => {
-      const n = new Set(s);
-      if (!n.delete(g)) n.add(g);
-      return n;
-    });
+  const toggle = (g: Group) => setOpen((was) => (was === g ? null : g));
   const sessions = d.sessions.map((s) => ({ ...s, a: list.find((x) => x.id === s.id) })).filter((s): s is typeof s & { a: AgentInfo } => s.a !== undefined);
   return (
+    <>
+      <DefinitionGroup
+        d={d}
+        inRow={inRow}
+        open={open === "definition"}
+        onOpen={() => toggle("definition")}
+        onSetup={() => {
+          setSetup(true);
+          setOpen("experiment");
+        }}
+      />
+      <SessionsGroup d={d} sessions={sessions} open={open === "sessions"} onOpen={() => toggle("sessions")} />
+      {(d.experiment || setup) && <ExperimentGroup d={d} open={open === "experiment"} onOpen={() => toggle("experiment")} setup={setup} onSetupDone={() => setSetup(false)} />}
+    </>
+  );
+}
+
+/** A definition's groups under its own row (the Agents tab, chat), under a head that stays in sight while its row is out of it. */
+export function DefGroups({ d, list, first, inRow, onClose }: { d: AgentDef; list: readonly AgentInfo[]; first?: Group; inRow?: boolean; onClose: () => void }) {
+  return (
     <li className="ms-tree df-groups">
+      <OpenHead label={d.name} onClose={onClose} />
       <ul className="ms-tree-rows" aria-label={`${d.name}: definition, sessions, experiment`}>
-        <DefinitionGroup
-          d={d}
-          inRow={inRow}
-          open={open.has("definition")}
-          onOpen={() => toggle("definition")}
-          onSetup={() => {
-            setSetup(true);
-            setOpen((s) => new Set([...s, "experiment"]));
-          }}
-        />
-        <SessionsGroup d={d} sessions={sessions} open={open.has("sessions")} onOpen={() => toggle("sessions")} />
-        {(d.experiment || setup) && <ExperimentGroup d={d} open={open.has("experiment")} onOpen={() => toggle("experiment")} setup={setup} onSetupDone={() => setSetup(false)} />}
+        <DefGroupRows d={d} list={list} first={first} inRow={inRow} />
       </ul>
     </li>
+  );
+}
+
+let unseen: IntersectionObserver | null = null;
+/**
+ * A row whose dropdown is open says when it's out of sight (`data-unseen`; under kiln's header, or
+ * scrolled past in its panel), so its dropdown's head stands in for it (kiln's principle 1). One
+ * observer for every row, as signals.tsx's.
+ */
+export function watchUnseen(el: HTMLElement | null) {
+  if (!el) return;
+  const top = getComputedStyle(document.documentElement).getPropertyValue("--header-h").trim() || "0px";
+  unseen ??= new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) e.target.toggleAttribute("data-unseen", !e.isIntersecting);
+    },
+    { rootMargin: `-${top} 0px 0px 0px` },
+  );
+  unseen.observe(el);
+  return () => {
+    unseen?.unobserve(el);
+    el.removeAttribute("data-unseen");
+  };
+}
+
+/**
+ * An open dropdown's head: its row's name and a way to close it, sticking at the top while you're in
+ * the dropdown and its row is out of sight; nothing at all while its row is in sight. It takes no room
+ * (it overlies the dropdown), so nothing moves as it comes and goes.
+ */
+export function OpenHead({ label, onClose }: { label: string; onClose: () => void }) {
+  return (
+    <div className="ms-open-head">
+      <div>
+        <span className="ms-open-name">{label}</span>
+        <button type="button" className="ms-go" tabIndex={-1} aria-label={`Close ${label}'s dropdown`} title="Close (Esc)" onClick={onClose}>
+          <ChevronRight size={14} className="-rotate-90" aria-hidden="true" />
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -868,7 +914,7 @@ export function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly 
   const atWork = stands.filter((s) => s === "working" || s === "needs").length;
   return (
     <>
-      <li className="ms-node df-defrow" data-stand={stand} data-depth={0} data-open={open || undefined} data-def={d.id}>
+      <li ref={open ? watchUnseen : undefined} className="ms-node df-defrow" data-stand={stand} data-depth={0} data-open={open || undefined} data-def={d.id}>
         <span className="ms-node-path df-chev">
           <ChevronRight size={13} aria-hidden="true" className={open ? "rotate-90" : undefined} />
         </span>
@@ -908,9 +954,33 @@ export function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly 
           </span>
         </span>
       </li>
-      {open && <DefGroups d={d} list={list} first="definition" inRow />}
+      {open && <DefGroups d={d} list={list} first="definition" inRow onClose={onOpen} />}
     </>
   );
+}
+
+/**
+ * A list of definitions' keys (kiln's principle 1): j and k move between its rows, Enter opens one
+ * (its row's press), Esc closes the one open. Not while typing.
+ */
+export function defListKeys(e: React.KeyboardEvent<HTMLUListElement>, open: string | null, close: () => void) {
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  const at = e.target instanceof HTMLElement ? e.target : null;
+  if (!at || at.closest("input, textarea, select, [contenteditable]")) return;
+  const rows = [...e.currentTarget.querySelectorAll<HTMLElement>(":scope > li.df-defrow")];
+  const row = at.closest<HTMLElement>("li.df-defrow");
+  if (e.key === "j" || e.key === "k") {
+    const i = row ? rows.indexOf(row) : -1;
+    rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "j" ? 1 : -1)))]?.querySelector<HTMLElement>(".df-group-main")?.focus();
+    e.preventDefault();
+  } else if (e.key === "Escape" && open) {
+    e.preventDefault();
+    close();
+    rows
+      .find((r) => r.dataset.def === open)
+      ?.querySelector<HTMLElement>(".df-group-main")
+      ?.focus();
+  }
 }
 
 /** A kiln MCP call about an agent definition (agentdefs_get, _update, _run …): the definition's id it names, so chat shows its rows. */

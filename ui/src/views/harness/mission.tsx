@@ -58,7 +58,7 @@ import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
-import { DefGroups, GroupHead, ownDefOf, SandboxLine } from "./definitions";
+import { DefGroupRows, GroupHead, OpenHead, ownDefOf, SandboxLine, watchUnseen } from "./definitions";
 import { agentdefsRes } from "@/api/agentdefs";
 import { enginesRes, sandboxesRes } from "@/api/microvms";
 import { KindGlyph } from "./kind-glyph";
@@ -203,6 +203,38 @@ function HeldDecide({ a }: { a: AgentInfo }) {
       </Link>
     </>
   );
+}
+
+/** Where the page was as each row's dropdown opened: closing it goes back there (kiln's principle 1). */
+const scrolledAt = new Map<string, number>();
+
+/**
+ * A list's keys (kiln's principle 1): j and k move between its rows, Enter opens the dropdown of a row
+ * that has one (a row without one opens as a press does), Esc closes the one open. Not while typing.
+ */
+function listKeys(e: React.KeyboardEvent<HTMLUListElement>, toggle: (id: string) => void, open: string | null) {
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  const at = e.target instanceof HTMLElement ? e.target : null;
+  if (!at || at.closest("input, textarea, select, [contenteditable]")) return;
+  const rows = [...e.currentTarget.querySelectorAll<HTMLElement>(":scope > li.ms-row")];
+  const row = at.closest<HTMLElement>("li.ms-row");
+  const id = row?.dataset.agent;
+  if (e.key === "j" || e.key === "k") {
+    const i = row ? rows.indexOf(row) : -1;
+    const next = rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "j" ? 1 : -1)))];
+    next?.querySelector<HTMLElement>(".ms-main")?.focus();
+    e.preventDefault();
+  } else if (e.key === "Enter" && id && at.classList.contains("ms-main") && row?.querySelector(".ms-subs")) {
+    e.preventDefault();
+    toggle(id);
+  } else if (e.key === "Escape" && open) {
+    e.preventDefault();
+    toggle(open);
+    rows
+      .find((r) => r.dataset.agent === open)
+      ?.querySelector<HTMLElement>(".ms-main")
+      ?.focus();
+  }
 }
 
 /** The line asked under a row: when to park it, archiving it, or (its Restore not gone through) going on from kiln's saved copy. */
@@ -371,6 +403,7 @@ const Row = React.memo(function Row({
   );
   return (
     <li
+      ref={tree ? watchUnseen : undefined}
       className="ms-row"
       data-entry={`row:${a.id}`}
       data-stand={stand}
@@ -526,7 +559,7 @@ const Row = React.memo(function Row({
  * row's own columns: the path where the checkbox is, its name and what it's at, its machine and
  * time, what to answer and its way in. `rowAsk`: the request the row itself answers, not again here.
  */
-function MissionTree({ id, list, rowAsk, grouped }: { id: string; list: readonly AgentInfo[]; rowAsk?: string; grouped?: boolean }) {
+function MissionTreeRows({ id, list, rowAsk, grouped }: { id: string; list: readonly AgentInfo[]; rowAsk?: string; grouped?: boolean }) {
   const root = list.find((x) => x.id === id);
   const { going, remove } = useRemoving();
   const rows = React.useMemo(() => (root ? drawn(subagentTree(root, list).filter((n) => !going.has(n.key))) : []), [root, list, going]);
@@ -535,29 +568,27 @@ function MissionTree({ id, list, rowAsk, grouped }: { id: string; list: readonly
   if (!root || rows.length === 0) return null;
   const atWork = rows.filter((r) => r.stand === "working" || r.stand === "needs").length;
   return (
-    <li className="ms-tree" data-glide={`${id}:tree`}>
-      <ul className="ms-tree-rows" aria-label={`${agentLabel(root)}'s subagents`}>
-        {grouped && (
-          <GroupHead
-            label="Subagents"
-            open={!shut}
-            onOpen={() => setShut(!shut)}
-            stand={atWork ? "working" : "done"}
-            summary={
-              <>
-                <span className="df-stands" aria-hidden="true">
-                  {rows.map((r) => (
-                    <i key={r.key} data-stand={r.stand} />
-                  ))}
-                </span>
-                {rows.length} · {atWork} at work
-              </>
-            }
-          />
-        )}
-        {!shut && rows.map((r) => <MissionNode key={r.key} r={r} owner={list.find((x) => x.id === r.session)} rowAsk={rowAsk} onRemove={(el) => remove([r], [el])} />)}
-      </ul>
-    </li>
+    <>
+      {grouped && (
+        <GroupHead
+          label="Subagents"
+          open={!shut}
+          onOpen={() => setShut(!shut)}
+          stand={atWork ? "working" : "done"}
+          summary={
+            <>
+              <span className="df-stands" aria-hidden="true">
+                {rows.map((r) => (
+                  <i key={r.key} data-stand={r.stand} />
+                ))}
+              </span>
+              {rows.length} · {atWork} at work
+            </>
+          }
+        />
+      )}
+      {!shut && rows.map((r) => <MissionNode key={r.key} r={r} owner={list.find((x) => x.id === r.session)} rowAsk={rowAsk} onRemove={(el) => remove([r], [el])} />)}
+    </>
   );
 }
 
@@ -995,9 +1026,10 @@ function Agents() {
   const [q, setQ] = React.useState("");
   const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
   const [picking, setPicking] = React.useState(false);
-  // `?open=ID,ID`: those rows' dropdowns open (a link to an agent's subagents, or the agent of yours it was started from).
-  const [params] = useSearchParams();
-  const [trees, setTrees] = React.useState<ReadonlySet<string>>(() => new Set((params.get("open") ?? "").split(",").filter(Boolean)));
+  // The one row whose dropdown is open lives in the URL (`?open=ID`): reload, back and a shared link
+  // open it again, and Back closes it (kiln's principle 1). One a list.
+  const [params, setParams] = useSearchParams();
+  const openRow = params.get("open");
   // The one line open under a row (Park until…, Archive…, a Restore that didn't go), and the Undo where a row was.
   const [asked, setAsked] = React.useState<{ id: string; ask: RowAsk } | null>(null);
   const [undo, setUndo] = React.useState<UndoState | null>(null);
@@ -1014,7 +1046,7 @@ function Agents() {
   useMediaQuery("(max-width: 640px)");
   const selecting = picking || selected.size > 0;
   const { held, bind } = useListHold(selecting);
-  const controls = JSON.stringify({ q, stored, showParked, showEnded, selected: [...selected].sort(), picking, trees: [...trees].sort(), layout: attentionLayout() });
+  const controls = JSON.stringify({ q, stored, showParked, showEnded, selected: [...selected].sort(), picking, open: openRow, layout: attentionLayout() });
   const attention = useAttention(controls);
   const { list, reload } = useAgents();
   const snapshot = attention.data;
@@ -1168,15 +1200,22 @@ function Agents() {
       focusFor={focusFor}
     />
   );
-  // The agents whose subagents' trees are open under their rows, and every agent as answered here (each tree's subagents and theirs).
+  // A row's dropdown opened (a step in history, so Back closes it) or closed (back where the page was when it opened).
   const toggleTree = React.useCallback(
-    (id: string) =>
-      setTrees((s) => {
-        const next = new Set(s);
-        if (!next.delete(id)) next.add(id);
-        return next;
-      }),
-    [],
+    (id: string) => {
+      const next = new URLSearchParams(params);
+      if (openRow === id) {
+        next.delete("open");
+        setParams(next, { replace: true });
+        const y = scrolledAt.get(id);
+        if (y !== undefined) requestAnimationFrame(() => window.scrollTo({ top: y }));
+        return;
+      }
+      scrolledAt.set(id, window.scrollY);
+      next.set("open", id);
+      setParams(next);
+    },
+    [params, openRow, setParams],
   );
   const answeredList = React.useMemo(() => list.map((agent) => asAnswered(agent, done)), [list, done]);
 
@@ -1317,7 +1356,7 @@ function Agents() {
     const { a, stand, asking, updated, stale, urgency, correction } = row;
     const subs = (a.subagents?.length ?? 0) > 0;
     const own = ownDefOf(defs, a.id);
-    const open = (subs || own !== null) && trees.has(a.id);
+    const open = (subs || own !== null) && openRow === a.id;
     const mark = snapshot.agents[a.id];
     const pinAt = stand === "archived" ? -1 : pins.indexOf(a.id);
     // What holds it where it is: when a park ends and why it was parked; otherwise why it came back, or
@@ -1357,8 +1396,16 @@ function Agents() {
           onTree={toggleTree}
           manages={own !== null}
         />
-        {open && subs && <MissionTree id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} grouped={own !== null} />}
-        {open && own && <DefGroups d={own.d} list={answeredList} />}
+        {/* Its dropdown: its subagents, then the agent of yours it was started from, under one head that stays in sight. */}
+        {open && (
+          <li className="ms-tree ms-dropdown" data-glide={`${a.id}:tree`}>
+            <OpenHead label={agentLabel(a)} onClose={() => toggleTree(a.id)} />
+            <ul className="ms-tree-rows" aria-label={`${agentLabel(a)}'s ${own ? "subagents and agent" : "subagents"}`}>
+              {subs && <MissionTreeRows id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} grouped={own !== null} />}
+              {own && <DefGroupRows d={own.d} list={answeredList} />}
+            </ul>
+          </li>
+        )}
       </React.Fragment>
     );
   };
@@ -1476,7 +1523,7 @@ function Agents() {
           </div>
           {live.length > 0 || undoShown?.list === "live" ? (
             <div {...touch.props} data-held={held || undefined}>
-              <ul className="ms-list" data-list="live" ref={glide}>
+              <ul className="ms-list" data-list="live" ref={glide} onKeyDown={(e) => listKeys(e, toggleTree, openRow)}>
                 {entries.map((e) => renderEntry(e, "live"))}
               </ul>
             </div>
@@ -1509,7 +1556,7 @@ function Agents() {
             </button>
           </div>
           {showParked && (
-            <ul className="ms-list" data-list="parked">
+            <ul className="ms-list" data-list="parked" onKeyDown={(e) => listKeys(e, toggleTree, openRow)}>
               {parkedEntries.map((e) => renderEntry(e, "parked"))}
             </ul>
           )}
@@ -1551,7 +1598,7 @@ function Agents() {
             )}
           </div>
           {showEnded && (
-            <ul className="ms-list" data-list="ended">
+            <ul className="ms-list" data-list="ended" onKeyDown={(e) => listKeys(e, toggleTree, openRow)}>
               {ended.map((row) => renderRow(row, "ended"))}
             </ul>
           )}
