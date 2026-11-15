@@ -1,12 +1,31 @@
-# An Agentfile's structured view, install sources and builds on save (design)
+# An Agentfile's builds, install sources, and its structured view
 
 Serves kiln plan 01a1cd8e862e7169a074db3d5fa33f3d's build plan P4.5 (prebuild on save), P4.6 (install sources),
 P5.3 (per-harness settings) and P5.4 (agents and the Agentfile in step), from the kiln × Hex × Shards design,
-sections B, C and D. Decision 2 holds: until Reliquary shares images, each runner builds its own.
+sections B, C and D. Decision 2 holds: until Reliquary shares images, each runner builds its own. Rules:
+[principles.md](principles.md).
 
-Status: design for the person's approval. Nothing here is built. The mockup is
-[mockups/agentfile.html](mockups/agentfile.html). Its view and its text really follow each other: change a
-model, an egress host or a source in the view and the text changes; edit the text and the view follows.
+## Built, in the app (`/agents/agentfiles/:id`)
+
+- **Builds, first**: a bar per runner in kiln's status colours (building drifts in the prism), "n/m built · k
+  refused", Build vN. A row per runner: state dot, runner, platform, step meter while building, "serving vN" while a
+  newer one isn't built, when; a refused row opens Shards' words in place with Build again; a runner that doesn't
+  build says why in a word or two ("host engine", "no microVMs"). Rows go queued → building → built while shown.
+- **Sources**: a row per `HARNESS` or `AGENT` source: kind glyph and word (https, ssh, s3, git, path), the directive
+  and name, the source cut short, its pin (sha256, object version, ref → the commit it named, kiln's pin), the
+  credential its fetch is handed by name and scope (never a value), and the origin that fetch alone is granted. A row
+  jumps the editor to its line; its pencil opens the source picker in place, which writes the line in Shards' syntax
+  and refuses a bad pin in a few words.
+- **Versions** carry their image: built or not, a digest per platform, size, how many runners start sessions from it.
+- Code: `ui/src/views/agentfiles/agentfile.tsx`, `builds.tsx`, `sources.ts`, `agentfiles.css`; data
+  `ui/src/api/agentfiles.ts`; mock `ui/mock/agentfiles.ts` (`GET|POST /api/agentfiles/:id/builds`). Tests:
+  `ui/tests/agentfile-sources.test.ts`, `ui/e2e/agentfile-builds.spec.ts`.
+
+## Designed, not built yet
+
+The structured view below (per-harness cards, agents, grants, volumes, other lines) waits on `agentfiles.check`
+returning Shards' structure; Save starting the builds waits on the server. The standalone mockup it was drawn in
+([mockups/agentfile.html](mockups/agentfile.html)) is superseded in look by the app; its structure stands.
 
 ## Where it lives
 

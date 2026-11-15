@@ -1,3 +1,6 @@
+> Superseded: the surfaces are built in kiln's own UI on this branch (see ../*.md). These standalone mockups
+> predate the person's rulings: their variant letters and separate sections are withdrawn (../principles.md).
+
 # UI mockups
 
 Interactive mockups of the designs in `docs/ui/*.md`, for the person to see and press before anything is
