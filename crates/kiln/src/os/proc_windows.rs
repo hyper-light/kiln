@@ -318,6 +318,13 @@ impl Running {
     }
 }
 
+/// [`spawn_group`]: Windows starts the step suspended and lets it go on itself, so no freezer holds
+/// up its start; its pipes are drained by threads of their own, so there's no shard to name.
+pub fn spawn_group_at(cmd: Command, home: Option<usize>) -> anyhow::Result<Running> {
+    let _ = home;
+    spawn_group(cmd)
+}
+
 /// Spawn `cmd` in a new job object with piped output: created suspended, put in a job of its own,
 /// then let run, so nothing it starts is outside the job.
 pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
