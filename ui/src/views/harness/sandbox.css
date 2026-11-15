@@ -169,7 +169,18 @@
   grid-template-columns: minmax(84px, 0.6fr) minmax(0, 1.4fr);
 }
 .sb-vol {
-  grid-template-columns: 14px minmax(0, 1fr) auto;
+  grid-template-columns: minmax(14px, auto) minmax(0, 1fr) auto;
+}
+/* How each place took a live change (its harness, kiln's scope, its microVM): a dot each. */
+.sb-took {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+/* What its Agentfile gave it: read only here (live changes are added beside them). */
+.sb-row[data-base] .sb-tags > i {
+  border-color: #23252b;
+  color: #7b7e88;
 }
 .sb-name {
   min-width: 0;

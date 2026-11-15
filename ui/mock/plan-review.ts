@@ -27,6 +27,7 @@ import type { Finding, Research, ResearchSource } from "../src/api/research.ts";
 import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
 import { planSteps } from "../src/views/plans/steps.ts";
+import { onOverrides, overridesOf } from "./overrides.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -704,8 +705,15 @@ function stateOf(m: Member): State {
     summary: m.info.summary,
     approvals: m.approval ? [m.approval] : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 3 },
+    overrides: overridesOf(m.info.id),
   } as State;
 }
+
+// A person's change to one's overrides: its state goes again to its open pages.
+onOverrides((id) => {
+  const m = members.get(id);
+  if (m) tell(m);
+});
 
 /** One of them changed: its open pages and every list hear of it. */
 function tell(m: Member, events?: HEvent[]) {

@@ -44,12 +44,16 @@ test("a microVM session's Sandbox: now on top, what it is, its components, its n
   // Its network: what's granted, then nothing else.
   await expect(body).toContainText("api.anthropic.com:443");
   await expect(body).toContainText("nothing else");
-  // A member disconnected from a network, in place.
-  const member = body.getByRole("button", { name: /^(Disconnect|Connect) (harness|agent|mcp) / }).first();
-  const was = await member.getAttribute("aria-pressed");
-  await member.click();
-  await expect(member).not.toHaveAttribute("aria-pressed", was ?? "");
-  await member.click();
+  // Egress granted live (the server's route), held in its state with how its microVM took it, then revoked.
+  await body.getByRole("button", { name: "Grant" }).click();
+  const grant = body.getByRole("listitem", { name: "Grant egress" });
+  await grant.getByRole("textbox", { name: "Host: a DNS name or an address" }).fill("docs.rs");
+  await grant.getByRole("button", { name: "Grant" }).click();
+  const granted = body.getByRole("button", { name: "Revoke docs.rs:443" });
+  await expect(granted).toBeVisible();
+  await expect(granted.locator("xpath=ancestor::li[1]").locator(".dot")).toHaveAttribute("data-status", "succeeded");
+  await granted.click();
+  await expect(body.getByRole("button", { name: "Revoke docs.rs:443" })).toHaveCount(0);
   // Components: the harness points to kiln's own switch; another swaps in place.
   await expect(body.getByRole("button", { name: "Switch" })).toBeVisible();
   await expect(body.getByRole("button", { name: "Swap" }).first()).toBeVisible();
@@ -72,8 +76,18 @@ test("a host session's tab is Host: it says it runs on the host, with no network
   // (Its last hour still plots its network traffic: what's absent is the Network section, its grants.)
   await expect(body.getByRole("button", { name: /^Network/ })).toHaveCount(0);
   for (const gone of ["Hex box", "Secrets", "nothing else", "Ingress", "Egress"]) await expect(body.getByText(gone, { exact: true })).toHaveCount(0);
-  // Volumes on the host: allowed directories and scope.
+  // Volumes on the host: allowed directories and scope; a folder given live, with how its harness and kiln's scope took it.
   await expect(body).toContainText("Adds to the agent's allowed directories and this session's scope");
+  await body.getByRole("button", { name: "Add volume" }).click();
+  const form = body.getByRole("listitem", { name: "Add a volume" });
+  await form.getByRole("textbox", { name: "Folder on its machine" }).fill("/data/fixtures");
+  await form.getByRole("button", { name: "Add" }).click();
+  const given = body.getByRole("button", { name: "Take /data/fixtures back" });
+  await expect(given).toBeVisible();
+  await expect(given.locator("xpath=ancestor::li[1]").locator(".sb-took .dot")).toHaveCount(2);
+  await given.click();
+  await body.getByRole("group", { name: "Take /data/fixtures back?" }).getByRole("button", { name: "Take /data/fixtures back" }).click();
+  await expect(body.getByRole("button", { name: "Take /data/fixtures back" })).toHaveCount(0);
   expect(said, said.join("\n")).toEqual([]);
 });
 

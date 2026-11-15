@@ -247,7 +247,7 @@ export function Inspector({
           )}
           {tab === "sandbox" && agentId && (
             <Loadable label="Loading its sandbox" fallback={<Hold label="Loading its sandbox" />}>
-              <SandboxTab agentId={agentId} />
+              <SandboxTab agentId={agentId} store={store} />
             </Loadable>
           )}
           {tab === "agents" && agentId && (

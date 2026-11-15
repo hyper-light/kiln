@@ -15,7 +15,20 @@
  */
 import * as React from "react";
 import { ArrowRight, Check, Cloud, Download, FolderOpen, GitBranch, KeyRound, Pause, Play, Plus, RotateCcw, Square, Undo2, X } from "lucide-react";
-import { sandboxApi, sandboxRes, type ComponentSource, type MemberKind, type SandboxComponent, type SandboxDetail, type SandboxMember } from "@/api/microvms";
+import {
+  memberWord,
+  overridesApi,
+  sandboxApi,
+  sandboxRes,
+  type ComponentSource,
+  type MemberKind,
+  type OverrideAnswer,
+  type SandboxComponent,
+  type SandboxDetail,
+  type SandboxMember,
+} from "@/api/microvms";
+import { useSession, type SessionStore } from "@/api/harness";
+import type { LiveMember, LiveOverrides, LiveTook } from "@/api/wire";
 import { agentdefsRes } from "@/api/agentdefs";
 import { Button } from "@/components/ui/button";
 import { Sparkline } from "@/components/ui/misc";
@@ -70,7 +83,9 @@ function openHarnessSwitch() {
   if (chip.getAttribute("aria-expanded") !== "true") chip.click();
 }
 
-export function SandboxTab({ agentId }: { agentId: string }) {
+export function SandboxTab({ agentId, store }: { agentId: string; store: SessionStore }) {
+  // What's been changed of it live, and how each place took it: its state, as the server sends it.
+  const o = useSession(store, (s) => s.state?.overrides);
   const res = useRes(sandboxRes(agentId));
   const d = res.data;
   const host = d.engine === "host";
@@ -86,9 +101,9 @@ export function SandboxTab({ agentId }: { agentId: string }) {
       <Now d={d} agentId={agentId} done={done} fail={fail} change={res.change} />
       {!ended && (host ? <HostFacts d={d} /> : <MicrovmFacts d={d} />)}
       {!ended && d.components.length > 0 && <Components d={d} agentId={agentId} done={done} fail={fail} />}
-      {!ended && !host && d.network && <Network d={d} agentId={agentId} done={done} fail={fail} />}
-      {!ended && <Volumes d={d} agentId={agentId} done={done} fail={fail} />}
-      {!ended && d.scope && <Reach d={d} />}
+      {!ended && !host && d.network && <Network d={d} o={o} agentId={agentId} />}
+      {!ended && <Volumes d={d} o={o} agentId={agentId} />}
+      {!ended && d.scope && <Reach d={d} o={o} />}
       {!ended && <Plots d={d} />}
     </div>
   );
@@ -422,14 +437,54 @@ function SwapForm({ c, agentId, done }: { c: SandboxComponent } & Acts) {
   );
 }
 
-/** In a microVM only: ports published in, egress granted out, and who is on which network. Nothing else goes in or out. */
-function Network({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
-  const net = d.network!;
-  const [adding, setAdding] = React.useState<"ingress" | "egress" | null>(null);
-  const toggle = (network: string, member: string, connected: boolean) =>
-    sandboxApi.connect(agentId, network, member, connected).then(done, fail(`Couldn't ${connected ? "connect" : "disconnect"} ${member}`));
+/** How one place (its microVM, its harness, kiln's scope) took a change: a dot in kiln's stand colours, its words in its title. */
+const TOOK: Record<LiveTook["took"], { status: string; word: string }> = {
+  now: { status: "succeeded", word: "took it now" },
+  next_turn: { status: "queued", word: "takes it from its next turn" },
+  next_start: { status: "queued", word: "takes it as it next starts" },
+  nothing: { status: "skipped", word: "has nothing to change" },
+  refused: { status: "failed", word: "refused it" },
+};
+function Took({ took, place }: { took: LiveTook; place: string }) {
+  const t = TOOK[took.took];
+  const words = "how" in took ? took.how : took.why;
+  return <StatusDot status={t.status} title={`${place} ${t.word}: ${words}`} />;
+}
+/** A member in a few words: its name, an agent's or an MCP server's marked. */
+const said = (m: LiveMember) => (m.kind === "harness" ? m.name : `${m.kind} ${m.name}`);
+
+/** An act on the session's live overrides: it goes to its machine, and its state brings back how each place took it. */
+function useLive(agentId: string) {
+  const [busy, setBusy] = React.useState(false);
+  const [why, setWhy] = React.useState<string | null>(null);
+  const run = (what: string, act: () => Promise<OverrideAnswer>, after?: () => void) => {
+    setBusy(true);
+    setWhy(null);
+    act()
+      .then(() => after?.())
+      .catch((e: unknown) => {
+        setWhy(errorMessage(e));
+        toast.error(what, errorMessage(e));
+      })
+      .finally(() => setBusy(false));
+  };
+  return { agentId, busy, why, run };
+}
+
+/**
+ * In a microVM only: ports published in, egress granted out, and who is on which network, its Agentfile's
+ * (its base grants, read only here) and what's been changed live (each with how its microVM took it).
+ * Nothing else goes in or out.
+ */
+function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undefined; agentId: string }) {
+  const base = d.network!;
+  const live = useLive(agentId);
+  const [adding, setAdding] = React.useState<"ingress" | "egress" | "network" | null>(null);
+  const ports = o?.ports ?? [];
+  const egress = o?.egress ?? [];
+  const networks = o?.networks ?? [];
   return (
-    <Fold id="sb-network" title="Network" count={`${net.ingress.length} in · ${net.egress.length} out`}>
+    <Fold id="sb-network" title="Network" count={`${base.ingress.length + ports.length} in · ${base.egress.length + egress.length} out`}>
       <div className="sb-sub">
         <span className="sb-k">Ingress</span>
         {adding !== "ingress" && (
@@ -440,33 +495,43 @@ function Network({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
         )}
       </div>
       <ul className="sb-rows">
-        {net.ingress.map((i) => (
-          <li key={`${i.host}/${i.proto}`} className="sb-row sb-flow">
+        {base.ingress.map((i) => (
+          <li key={`base:${i.host}/${i.proto}`} className="sb-row sb-flow" data-base="">
             <ArrowRight size={12} className="sb-in-glyph" aria-hidden="true" />
-            <span className="sb-mono sb-clip" title={`${i.host} on the runner → port ${i.guest}/${i.proto} in the microVM, to ${i.to}`}>
+            <span className="sb-mono sb-clip" title={`From its Agentfile: ${i.host} → ${i.guest}/${i.proto}, to ${i.to}`}>
               {i.host} → {i.guest}/{i.proto}
             </span>
             <span className="sb-dim sb-clip">{i.to}</span>
+            <span className="sb-tags">
+              <i title="From its Agentfile">built</i>
+            </span>
+            <span />
+          </li>
+        ))}
+        {ports.map((h) => (
+          <li key={`live:${h.port.bind}:${h.port.host_port}/${h.port.protocol}`} className="sb-row sb-flow">
+            <Took took={h.microvm} place="Its microVM" />
+            <span className="sb-mono sb-clip" title={`${h.port.bind}:${h.port.host_port} on its machine → ${h.port.guest_port}/${h.port.protocol}, to ${said(h.port.member)}`}>
+              {h.port.bind}:{h.port.host_port} → {h.port.guest_port}/{h.port.protocol}
+            </span>
+            <span className="sb-dim sb-clip">{said(h.port.member)}</span>
+            <span className="sb-tags" />
             <span className="sb-acts">
-              <button type="button" className="ms-go" aria-label={`Unpublish ${i.host}`} title="Unpublish" onClick={() => sandboxApi.publish(agentId, i, true).then(done, fail("Couldn't unpublish"))}>
+              <button
+                type="button"
+                className="ms-go"
+                disabled={live.busy}
+                aria-label={`Unpublish ${h.port.bind}:${h.port.host_port}`}
+                title="Unpublish"
+                onClick={() => live.run("Couldn't unpublish", () => overridesApi.unpublish(agentId, { bind: h.port.bind, host_port: h.port.host_port, protocol: h.port.protocol }))}
+              >
                 <X size={14} />
               </button>
             </span>
           </li>
         ))}
-        {net.ingress.length === 0 && <li className="sb-deny">nothing published</li>}
-        {adding === "ingress" && (
-          <PublishForm
-            d={d}
-            agentId={agentId}
-            done={(n) => {
-              done(n);
-              setAdding(null);
-            }}
-            fail={fail}
-            onCancel={() => setAdding(null)}
-          />
-        )}
+        {base.ingress.length + ports.length === 0 && <li className="sb-deny">nothing published</li>}
+        {adding === "ingress" && <PublishForm d={d} live={live} onDone={() => setAdding(null)} />}
       </ul>
       <div className="sb-sub">
         <span className="sb-k">Egress</span>
@@ -478,66 +543,95 @@ function Network({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
         )}
       </div>
       <ul className="sb-rows">
-        {net.egress.map((e) => (
-          <li key={`${e.to}:${e.ports}/${e.who}`} className="sb-row sb-flow">
+        {base.egress.map((e) => (
+          <li key={`base:${e.to}:${e.ports}/${e.who}`} className="sb-row sb-flow" data-base="">
             <ArrowRight size={12} className="sb-out-glyph" aria-hidden="true" />
-            <span className="sb-mono sb-clip" title={`${e.who} → ${e.to} on ${e.ports}${e.dns ? ", its name resolved" : ""}${e.mcp ? `, for the ${e.mcp} MCP server` : ""}`}>
+            <span className="sb-mono sb-clip" title={`From its Agentfile: ${e.who} → ${e.to} on ${e.ports}`}>
               {e.to}:{e.ports}
             </span>
             <span className="sb-dim sb-clip">{e.who}</span>
             <span className="sb-tags">
-              {e.dns && <i title="Its name resolves">dns</i>}
-              {e.mcp && <i title={`For the ${e.mcp} MCP server`}>mcp</i>}
+              <i title="From its Agentfile">built</i>
             </span>
+            <span />
+          </li>
+        ))}
+        {egress.map((h) => (
+          <li key={`live:${h.egress.host}:${h.egress.port}/${memberWord(h.egress.member)}`} className="sb-row sb-flow">
+            <Took took={h.microvm} place="Its microVM" />
+            <span className="sb-mono sb-clip" title={`${said(h.egress.member)} → ${h.egress.host} on ${h.egress.port}`}>
+              {h.egress.host}:{h.egress.port}
+            </span>
+            <span className="sb-dim sb-clip">{said(h.egress.member)}</span>
+            <span className="sb-tags" />
             <span className="sb-acts">
-              <button type="button" className="ms-go" aria-label={`Revoke ${e.to}`} title="Revoke" onClick={() => sandboxApi.grant(agentId, e, true).then(done, fail("Couldn't revoke"))}>
+              <button
+                type="button"
+                className="ms-go"
+                disabled={live.busy}
+                aria-label={`Revoke ${h.egress.host}:${h.egress.port}`}
+                title="Revoke"
+                onClick={() => live.run("Couldn't revoke", () => overridesApi.revoke(agentId, { member: memberWord(h.egress.member), host: h.egress.host, port: h.egress.port }))}
+              >
                 <X size={14} />
               </button>
             </span>
           </li>
         ))}
-        <li className="sb-deny">{net.egress.length === 0 ? "nothing granted" : "nothing else"}</li>
-        {adding === "egress" && (
-          <GrantForm
-            d={d}
-            agentId={agentId}
-            done={(n) => {
-              done(n);
-              setAdding(null);
-            }}
-            fail={fail}
-            onCancel={() => setAdding(null)}
-          />
-        )}
+        <li className="sb-deny">{base.egress.length + egress.length === 0 ? "nothing granted" : "nothing else"}</li>
+        {adding === "egress" && <GrantForm d={d} live={live} onDone={() => setAdding(null)} />}
       </ul>
       <div className="sb-sub">
         <span className="sb-k">Networks</span>
+        {adding !== "network" && (
+          <Button size="xs" variant="ghost" onClick={() => setAdding("network")}>
+            <Plus aria-hidden="true" />
+            Connect
+          </Button>
+        )}
       </div>
       <ul className="sb-rows">
-        {net.networks.map((n) => (
-          <li key={n.name} className="sb-row sb-net">
-            <span className="sb-mono sb-clip" title={n.name}>
+        {base.networks.map((n) => (
+          <li key={`base:${n.name}`} className="sb-row sb-net" data-base="">
+            <span className="sb-mono sb-clip" title={`${n.name}, from its Agentfile`}>
               {n.name}
             </span>
             <span className="sb-members">
-              {n.members.map((m) => (
-                <button
-                  key={m.name}
-                  type="button"
-                  className="sb-member"
-                  aria-pressed={m.connected}
-                  aria-label={`${m.connected ? "Disconnect" : "Connect"} ${m.kind} ${m.name}`}
-                  title={`${m.connected ? "Disconnect" : "Connect"} ${m.kind} ${m.name} (${n.name})`}
-                  onClick={() => void toggle(n.name, m.name, !m.connected)}
-                >
-                  <i aria-hidden="true" />
-                  {m.name}
-                </button>
-              ))}
+              {n.members
+                .filter((m) => m.connected)
+                .map((m) => (
+                  <span key={m.name} className="sb-member" aria-pressed="true" title={`${m.kind} ${m.name}, from its Agentfile`}>
+                    <i aria-hidden="true" />
+                    {m.name}
+                  </span>
+                ))}
             </span>
           </li>
         ))}
-        {net.networks.length === 0 && <li className="sb-deny">no networks</li>}
+        {networks.map((h) => (
+          <li key={`live:${h.network.name}/${memberWord(h.network.member)}`} className="sb-row sb-flow">
+            <Took took={h.microvm} place="Its microVM" />
+            <span className="sb-mono sb-clip" title={`${said(h.network.member)} on ${h.network.name}, shared with the runs connected to it`}>
+              {h.network.name}
+            </span>
+            <span className="sb-dim sb-clip">{said(h.network.member)}</span>
+            <span className="sb-tags" />
+            <span className="sb-acts">
+              <button
+                type="button"
+                className="ms-go"
+                disabled={live.busy}
+                aria-label={`Disconnect ${said(h.network.member)} from ${h.network.name}`}
+                title="Disconnect"
+                onClick={() => live.run("Couldn't disconnect", () => overridesApi.disconnect(agentId, { member: memberWord(h.network.member), network: h.network.name }))}
+              >
+                <X size={14} />
+              </button>
+            </span>
+          </li>
+        ))}
+        {base.networks.length + networks.length === 0 && <li className="sb-deny">no networks</li>}
+        {adding === "network" && <ConnectForm d={d} live={live} onDone={() => setAdding(null)} />}
       </ul>
     </Fold>
   );
@@ -547,84 +641,127 @@ function MemberSelect({ members, value, onChange, label }: { members: SandboxMem
   return (
     <select className="sb-in" value={value} aria-label={label} onChange={(e) => onChange(e.target.value)}>
       {members.map((m) => (
-        <option key={m.name} value={m.name}>
-          {m.name}
+        <option key={memberWord(m)} value={memberWord(m)}>
+          {m.kind === "harness" ? m.name : `${m.kind} ${m.name}`}
         </option>
       ))}
     </select>
   );
 }
 
-function PublishForm({ d, agentId, done, onCancel }: { d: SandboxDetail; onCancel: () => void } & Acts) {
-  const [host, setHost] = React.useState("127.0.0.1:8080");
+type Live = ReturnType<typeof useLive>;
+const firstAgent = (d: SandboxDetail) => memberWord(d.members.find((m) => m.kind === "agent") ?? d.members[0] ?? { kind: "harness", name: "" });
+
+function PublishForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone: () => void }) {
+  const [bind, setBind] = React.useState("127.0.0.1");
+  const [hostPort, setHostPort] = React.useState("8080");
   const [guest, setGuest] = React.useState("8080");
-  const [proto, setProto] = React.useState<"tcp" | "udp">("tcp");
-  const [to, setTo] = React.useState(d.members.find((m) => m.kind === "agent")?.name ?? d.members[0]?.name ?? "");
-  const [why, setWhy] = React.useState<string | null>(null);
+  const [protocol, setProtocol] = React.useState<"tcp" | "udp">("tcp");
+  const [member, setMember] = React.useState(firstAgent(d));
   return (
     <li className="sb-form" aria-label="Publish a port">
-      <input className="sb-in sb-addr" value={host} aria-label="Runner address and port" spellCheck={false} onChange={(e) => setHost(e.target.value)} />
+      <input
+        className="sb-in sb-addr"
+        value={bind}
+        aria-label="Address on its machine"
+        title="Who may reach it: 127.0.0.1 this machine alone"
+        spellCheck={false}
+        onChange={(e) => setBind(e.target.value)}
+      />
+      <input className="sb-in sb-port" value={hostPort} inputMode="numeric" aria-label="Port on its machine" onChange={(e) => setHostPort(e.target.value)} />
       <ArrowRight size={12} aria-hidden="true" />
-      <input className="sb-in sb-port" value={guest} inputMode="numeric" aria-label="Guest port" onChange={(e) => setGuest(e.target.value)} />
+      <input className="sb-in sb-port" value={guest} inputMode="numeric" aria-label="Port in its microVM" onChange={(e) => setGuest(e.target.value)} />
       <Segmented
         size="xs"
         label="Protocol"
-        value={proto}
-        onChange={setProto}
+        value={protocol}
+        onChange={setProtocol}
         options={[
           { value: "tcp", label: "tcp" },
           { value: "udp", label: "udp" },
         ]}
       />
-      <MemberSelect members={d.members} value={to} onChange={setTo} label="To" />
-      <Button size="xs" onClick={() => sandboxApi.publish(agentId, { host, guest: Number(guest), proto, to }).then(done, (e: unknown) => setWhy(errorMessage(e)))}>
+      <MemberSelect members={d.members} value={member} onChange={setMember} label="To" />
+      <Button
+        size="xs"
+        pending={live.busy}
+        onClick={() =>
+          live.run("Couldn't publish it", () => overridesApi.publish(live.agentId, { member, bind: bind.trim(), host_port: Number(hostPort), guest_port: Number(guest), protocol }), onDone)
+        }
+      >
         Publish
       </Button>
-      <button type="button" className="ms-go" aria-label="Cancel" onClick={onCancel}>
+      <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
         <X size={14} />
       </button>
-      {why && <span className="sb-why">{why}</span>}
+      {live.why && <span className="sb-why">{live.why}</span>}
     </li>
   );
 }
 
-function GrantForm({ d, agentId, done, onCancel }: { d: SandboxDetail; onCancel: () => void } & Acts) {
-  const [to, setTo] = React.useState("");
-  const [ports, setPorts] = React.useState("443");
-  const [who, setWho] = React.useState(d.members.find((m) => m.kind === "agent")?.name ?? d.members[0]?.name ?? "");
-  const [dns, setDns] = React.useState(true);
-  const [why, setWhy] = React.useState<string | null>(null);
-  const mcp = d.members.find((m) => m.name === who && m.kind === "mcp")?.name ?? null;
+function GrantForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone: () => void }) {
+  const [host, setHost] = React.useState("");
+  const [port, setPort] = React.useState("443");
+  const [member, setMember] = React.useState(firstAgent(d));
   return (
     <li className="sb-form" aria-label="Grant egress">
-      <input className="sb-in sb-grow" value={to} placeholder="host" aria-label="Destination host" spellCheck={false} onChange={(e) => setTo(e.target.value)} />
-      <input className="sb-in sb-port" value={ports} aria-label="Ports" spellCheck={false} onChange={(e) => setPorts(e.target.value)} />
-      <MemberSelect members={d.members} value={who} onChange={setWho} label="For" />
-      <label className="sb-check">
-        <input type="checkbox" checked={dns} onChange={(e) => setDns(e.target.checked)} />
-        dns
-      </label>
-      <Button size="xs" disabled={!to.trim()} onClick={() => sandboxApi.grant(agentId, { to: to.trim(), ports: ports.trim(), dns, mcp, who }).then(done, (e: unknown) => setWhy(errorMessage(e)))}>
+      <input className="sb-in sb-grow" value={host} placeholder="host" aria-label="Host: a DNS name or an address" spellCheck={false} onChange={(e) => setHost(e.target.value)} />
+      <input className="sb-in sb-port" value={port} inputMode="numeric" aria-label="Port" onChange={(e) => setPort(e.target.value)} />
+      <MemberSelect members={d.members} value={member} onChange={setMember} label="For" />
+      <Button
+        size="xs"
+        pending={live.busy}
+        disabled={!host.trim()}
+        onClick={() => live.run("Couldn't grant it", () => overridesApi.grant(live.agentId, { member, host: host.trim(), port: Number(port) }), onDone)}
+      >
         Grant
       </Button>
-      <button type="button" className="ms-go" aria-label="Cancel" onClick={onCancel}>
+      <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
         <X size={14} />
       </button>
-      {why && <span className="sb-why">{why}</span>}
+      {live.why && <span className="sb-why">{live.why}</span>}
     </li>
   );
 }
 
-/** Its volumes on either engine: mounted into the microVM, or added to the host's allowed directories; removed when confirmed. */
-function Volumes({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
+function ConnectForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone: () => void }) {
+  const [network, setNetwork] = React.useState("");
+  const [member, setMember] = React.useState(firstAgent(d));
+  return (
+    <li className="sb-form" aria-label="Connect to a network">
+      <MemberSelect members={d.members} value={member} onChange={setMember} label="Member" />
+      <input className="sb-in sb-grow" value={network} placeholder="network" aria-label="Network's name" spellCheck={false} onChange={(e) => setNetwork(e.target.value)} />
+      <Button
+        size="xs"
+        pending={live.busy}
+        disabled={!network.trim()}
+        onClick={() => live.run("Couldn't connect it", () => overridesApi.connect(live.agentId, { member, network: network.trim() }), onDone)}
+      >
+        Connect
+      </Button>
+      <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
+        <X size={14} />
+      </button>
+      {live.why && <span className="sb-why">{live.why}</span>}
+    </li>
+  );
+}
+
+/**
+ * Its folders, on either engine: its Agentfile's (read only here), then those given live, each with how
+ * its harness, kiln's scope and (a microVM's) its microVM took it; taken back when confirmed.
+ */
+function Volumes({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undefined; agentId: string }) {
+  const live = useLive(agentId);
   const [adding, setAdding] = React.useState(false);
   const [asking, setAsking] = React.useState<string | null>(null);
   const host = d.engine === "host";
+  const given = o?.volumes ?? [];
   return (
     <Fold
       id="sb-volumes"
       title="Volumes"
-      count={d.volumes.length}
+      count={d.volumes.length + given.length}
       aside={
         !adding && (
           <Button size="xs" variant="ghost" onClick={() => setAdding(true)}>
@@ -637,11 +774,11 @@ function Volumes({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
       <p className="sb-note">{host ? "Adds to the agent's allowed directories and this session's scope" : "Mounts into this microVM as you set, then allowed directories and scope"}</p>
       <ul className="sb-rows">
         {d.volumes.map((v) => (
-          <li key={v.path} className="sb-row sb-vol">
+          <li key={`base:${v.path}`} className="sb-row sb-vol" data-base="">
             <FolderOpen size={12} className="sb-dim" aria-hidden="true" />
             <span className="sb-two">
               <span className="sb-two-top">
-                <span className="sb-mono sb-clip" title={v.path}>
+                <span className="sb-mono sb-clip" title={`${v.path}, from its Agentfile`}>
                   {v.path}
                 </span>
                 <span className="sb-mode" data-mode={v.mode}>
@@ -654,17 +791,43 @@ function Volumes({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
                 </span>
               </span>
             </span>
+            <span className="sb-tags">
+              <i title="From its Agentfile">built</i>
+            </span>
+          </li>
+        ))}
+        {given.map((h) => (
+          <li key={`live:${h.volume.path}`} className="sb-row sb-vol">
+            <span className="sb-took">
+              <Took took={h.harness} place="Its harness" />
+              <Took took={h.scope} place="kiln's scope" />
+              {h.microvm && <Took took={h.microvm} place="Its microVM" />}
+            </span>
+            <span className="sb-two">
+              <span className="sb-two-top">
+                <span className="sb-mono sb-clip" title={h.volume.at === h.volume.path ? h.volume.path : `${h.volume.path}, seen at ${h.volume.at}`}>
+                  {h.volume.path}
+                </span>
+                <span className="sb-mode" data-mode={h.volume.access}>
+                  {h.volume.access}
+                </span>
+              </span>
+              <span className="sb-two-sub">
+                <span className="sb-dim sb-clip">{h.volume.members.map(said).join(", ")}</span>
+                {h.volume.at !== h.volume.path && <span className="sb-mono sb-dim">at {h.volume.at}</span>}
+              </span>
+            </span>
             <span className="sb-acts">
-              {asking === v.path ? (
-                <span className="sb-confirm" role="group" aria-label={`Remove ${v.path}?`}>
+              {asking === h.volume.path ? (
+                <span className="sb-confirm" role="group" aria-label={`Take ${h.volume.path} back?`}>
                   <span>Remove?</span>
                   <button
                     type="button"
                     className="ms-go"
-                    aria-label={`Remove ${v.path}`}
+                    aria-label={`Take ${h.volume.path} back`}
                     onClick={() => {
                       setAsking(null);
-                      sandboxApi.volume(agentId, v, true).then(done, fail("Couldn't remove it"));
+                      live.run("Couldn't take it back", () => overridesApi.removeVolume(agentId, h.volume.path));
                     }}
                   >
                     <Check size={14} />
@@ -674,85 +837,82 @@ function Volumes({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
                   </button>
                 </span>
               ) : (
-                <button type="button" className="ms-go" aria-label={`Remove ${v.path}`} title="Remove" onClick={() => setAsking(v.path)}>
+                <button type="button" className="ms-go" aria-label={`Take ${h.volume.path} back`} title="Remove" onClick={() => setAsking(h.volume.path)}>
                   <X size={14} />
                 </button>
               )}
             </span>
           </li>
         ))}
-        {adding && (
-          <VolumeForm
-            d={d}
-            agentId={agentId}
-            done={(n) => {
-              done(n);
-              setAdding(false);
-            }}
-            fail={fail}
-            onCancel={() => setAdding(false)}
-          />
-        )}
+        {adding && <VolumeForm d={d} live={live} onDone={() => setAdding(false)} />}
       </ul>
     </Fold>
   );
 }
 
-function VolumeForm({ d, agentId, done, onCancel }: { d: SandboxDetail; onCancel: () => void } & Acts) {
+function VolumeForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone: () => void }) {
   const people = d.members.filter((m) => m.kind !== "mcp");
   const [path, setPath] = React.useState("");
-  const [mode, setMode] = React.useState<"ro" | "rw">("ro");
-  const [members, setMembers] = React.useState<string[]>(people.map((m) => m.name));
-  const [why, setWhy] = React.useState<string | null>(null);
+  const [at, setAt] = React.useState("");
+  const [access, setAccess] = React.useState<"ro" | "rw">("ro");
+  const [members, setMembers] = React.useState<string[]>(people.map(memberWord));
+  const microvm = d.engine === "microvm";
   return (
     <li className="sb-form" aria-label="Add a volume">
-      <input className="sb-in sb-grow" value={path} placeholder="/path" aria-label="Path" spellCheck={false} onChange={(e) => setPath(e.target.value)} />
+      <input className="sb-in sb-grow" value={path} placeholder="/path on its machine" aria-label="Folder on its machine" spellCheck={false} onChange={(e) => setPath(e.target.value)} />
+      {microvm && (
+        <input className="sb-in sb-pin" value={at} placeholder="at (in its microVM)" aria-label="Where its members see it in the microVM" spellCheck={false} onChange={(e) => setAt(e.target.value)} />
+      )}
       <Segmented
         size="xs"
         label="Access"
-        value={mode}
-        onChange={setMode}
+        value={access}
+        onChange={setAccess}
         options={[
           { value: "ro", label: "ro" },
           { value: "rw", label: "rw" },
         ]}
       />
       <span className="sb-members">
-        {people.map((m) => (
-          <button
-            key={m.name}
-            type="button"
-            className="sb-member"
-            aria-pressed={members.includes(m.name)}
-            onClick={() => setMembers(members.includes(m.name) ? members.filter((x) => x !== m.name) : [...members, m.name])}
-          >
-            <i aria-hidden="true" />
-            {m.name}
-          </button>
-        ))}
+        {people.map((m) => {
+          const w = memberWord(m);
+          return (
+            <button key={w} type="button" className="sb-member" aria-pressed={members.includes(w)} onClick={() => setMembers(members.includes(w) ? members.filter((x) => x !== w) : [...members, w])}>
+              <i aria-hidden="true" />
+              {m.name}
+            </button>
+          );
+        })}
       </span>
       <Button
         size="xs"
+        pending={live.busy}
         disabled={!path.trim() || members.length === 0}
-        onClick={() => sandboxApi.volume(agentId, { path: path.trim(), mode, members }).then(done, (e: unknown) => setWhy(errorMessage(e)))}
+        onClick={() => live.run("Couldn't give it the folder", () => overridesApi.addVolume(live.agentId, { path: path.trim(), access, ...(at.trim() ? { at: at.trim() } : {}), members }), onDone)}
       >
         Add
       </Button>
-      <button type="button" className="ms-go" aria-label="Cancel" onClick={onCancel}>
+      <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
         <X size={14} />
       </button>
-      {why && <span className="sb-why">{why}</span>}
+      {live.why && <span className="sb-why">{live.why}</span>}
     </li>
   );
 }
 
-/** What each member may touch (its allowed directories), and the session's scope. */
-function Reach({ d }: { d: SandboxDetail }) {
+/** What each member may touch (its allowed directories: its Agentfile's and those given live), and the session's scope. */
+function Reach({ d, o }: { d: SandboxDetail; o: LiveOverrides | undefined }) {
   const scope = d.scope!;
+  const given = o?.volumes ?? [];
+  const dirs = d.dirs.map((m) => ({
+    ...m,
+    paths: [...m.paths, ...given.filter((h) => h.volume.members.some((x) => x.name === m.member)).map((h) => ({ path: h.volume.at, mode: h.volume.access }))],
+  }));
+  const paths = [...scope.paths, ...given.map((h) => h.volume.at)];
   return (
-    <Fold id="sb-reach" title="Directories" count={d.dirs.length}>
+    <Fold id="sb-reach" title="Directories" count={dirs.length}>
       <ul className="sb-list">
-        {d.dirs.map((m) => (
+        {dirs.map((m) => (
           // Each path whole, one a line: a directory is never cut.
           <li key={m.member} className="sb-kv sb-stacked">
             <span className="sb-k">{m.member}</span>
@@ -765,11 +925,11 @@ function Reach({ d }: { d: SandboxDetail }) {
             </span>
           </li>
         ))}
-        <Kv k="Scope" title={`${scope.project} · ${scope.branch} · ${scope.paths.join(", ")}`}>
+        <Kv k="Scope" title={`${scope.project} · ${scope.branch} · ${paths.join(", ")}`}>
           <span>{scope.project}</span>
           <span className="sb-mono sb-dim">{scope.branch}</span>
           <span className="sb-dim">
-            {scope.paths.length} path{scope.paths.length === 1 ? "" : "s"}
+            {paths.length} path{paths.length === 1 ? "" : "s"}
           </span>
         </Kv>
       </ul>

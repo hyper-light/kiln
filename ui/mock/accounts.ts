@@ -25,6 +25,7 @@ import { reviewInfos } from "./plan-review.ts";
 import { fastInfos } from "./fast.ts";
 import { MAC_MINI, MICROVM_RUNNERS } from "./data.ts";
 import type { Isolation } from "../src/api/wire/index.ts";
+import { onOverrides, overridesOf } from "./overrides.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
 const EMAIL = "ada@lundhe.audio";
@@ -329,8 +330,17 @@ function stateOf(d: Demo): State {
         { id: "extra_usage", label: "Extra usage", used_percent: 25, used: 12.4, limit: 50, unit: "USD", window: "month" },
       ],
     }),
+    overrides: overridesOf(d.info.id),
   };
 }
+
+// A person's change to one's overrides: its state goes again to its open pages.
+onOverrides((id) => {
+  const d = demos.get(id);
+  if (!d) return;
+  const state = JSON.stringify({ t: "state", state: stateOf(d) });
+  for (const ws of viewers.get(id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+});
 
 /** Each demo agent's open pages, and the server's event stream: a rename reaches both, as on the server. */
 const viewers = new Map<string, Set<WebSocket>>();

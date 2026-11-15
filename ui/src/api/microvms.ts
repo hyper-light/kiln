@@ -1,7 +1,7 @@
 /** Runners' engines and their microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2.3, P3.2). */
 import type { Res } from "@/lib/data";
 import { request } from "./client";
-import type { IsolationFacts } from "./wire";
+import type { IsolationFacts, LiveAccess, LiveChange, LiveMember, LivePortKey, LiveProtocol } from "./wire";
 
 const enc = encodeURIComponent;
 
@@ -190,10 +190,6 @@ export const sandboxApi = {
   all: (signal?: AbortSignal) => request<Record<string, SandboxBrief>>("GET", "/api/microvm/sessions", undefined, { signal }),
   get: (id: string, signal?: AbortSignal) => request<SandboxDetail>("GET", ses(id), undefined, { signal }),
   act: (id: string, act: "pause" | "resume" | "restart" | "stop", body: { version?: number } = {}) => request<SandboxDetail>("POST", ses(id, `/${act}`), body),
-  publish: (id: string, i: Ingress, remove = false) => request<SandboxDetail>(remove ? "DELETE" : "POST", ses(id, "/ingress"), i),
-  grant: (id: string, e: Egress, remove = false) => request<SandboxDetail>(remove ? "DELETE" : "POST", ses(id, "/egress"), e),
-  connect: (id: string, network: string, member: string, connected: boolean) => request<SandboxDetail>("PUT", ses(id, `/networks/${enc(network)}`), { member, connected }),
-  volume: (id: string, v: SandboxVolume, remove = false) => request<SandboxDetail>(remove ? "DELETE" : "POST", ses(id, "/volumes"), v),
   swap: (id: string, name: string, source: string, pin: string) => request<SandboxDetail>("POST", ses(id, `/components/${enc(name)}`), { source, pin }),
   restore: (id: string, name: string) => request<SandboxDetail>("DELETE", ses(id, `/components/${enc(name)}`)),
 };
@@ -202,3 +198,34 @@ export const sandboxApi = {
 export const sandboxesRes: Res<Record<string, SandboxBrief>> = { key: "microvm/sessions", fetch: (s) => sandboxApi.all(s), opts: { pollMs: 5000 } };
 /** One session's sandbox in full, live while shown. */
 export const sandboxRes = (id: string): Res<SandboxDetail> => ({ key: `microvm/session/${id}`, fetch: (s) => sandboxApi.get(id, s), opts: { pollMs: 2000 } });
+
+/* ------------------------------------------------ a session's live overrides (the server's routes) */
+
+/**
+ * What a person changes of a running session in place (`POST /api/harness/sessions/:id/…`;
+ * crates/kiln/src/harness/overrides.rs, kiln plan 01a1dd2e…, P6b.4): ports published and egress granted
+ * into a microVM, a member connected to a network (a microVM session's alone), a folder given (every
+ * engine). Each answers once its machine has it; what the session holds, and how each place took it,
+ * comes in its state (`state.overrides`).
+ */
+export interface OverrideAnswer {
+  taken: boolean;
+  agent: string;
+  engine: Engine;
+  change: LiveChange;
+  said: string;
+}
+const live = (id: string, rest: string) => `/api/harness/sessions/${enc(id)}/${rest}`;
+export const overridesApi = {
+  publish: (id: string, p: { member?: string; bind: string; host_port: number; guest_port: number; protocol: LiveProtocol }) => request<OverrideAnswer>("POST", live(id, "ports"), p),
+  unpublish: (id: string, k: LivePortKey) => request<OverrideAnswer>("POST", live(id, "ports/unpublish"), k),
+  grant: (id: string, e: { member?: string; host: string; port: number }) => request<OverrideAnswer>("POST", live(id, "egress"), e),
+  revoke: (id: string, e: { member?: string; host: string; port: number }) => request<OverrideAnswer>("POST", live(id, "egress/revoke"), e),
+  connect: (id: string, n: { member?: string; network: string }) => request<OverrideAnswer>("POST", live(id, "networks"), n),
+  disconnect: (id: string, n: { member?: string; network: string }) => request<OverrideAnswer>("POST", live(id, "networks/disconnect"), n),
+  addVolume: (id: string, v: { path: string; access: LiveAccess; at?: string; members?: string[] }) => request<OverrideAnswer>("POST", live(id, "volumes"), v),
+  removeVolume: (id: string, path: string) => request<OverrideAnswer>("POST", live(id, "volumes/remove"), { path }),
+};
+
+/** A member as the routes take it: `harness`, `agent:<name>`, `mcp:<name>`. */
+export const memberWord = (m: LiveMember | SandboxMember): string => (m.kind === "harness" ? "harness" : `${m.kind}:${m.name}`);

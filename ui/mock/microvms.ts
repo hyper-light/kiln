@@ -8,10 +8,8 @@
  *   GET  /api/microvm/sessions                    every session's sandbox, in short: engine, runner, start, state, CPU and memory now
  *   GET  /api/microvm/sessions/:id                one session's sandbox: its Hex box, its Shards microVM, grants, volumes, secret names, pool, telemetry
  *   POST /api/microvm/sessions/:id/:act           pause | resume | restart | stop its microVM
- *   POST/DELETE /api/microvm/sessions/:id/ingress {host, guest, proto, to}: publish a port, or unpublish it (microVMs only)
- *   POST/DELETE /api/microvm/sessions/:id/egress  {to, ports, dns, mcp, who}: grant a destination, or revoke it (microVMs only)
- *   PUT  /api/microvm/sessions/:id/networks/:net  {member, connected}: connect a member to a network or disconnect it (microVMs only)
- *   POST/DELETE /api/microvm/sessions/:id/volumes {path, mode, members}: add a volume, or remove it (every engine)
+ *   (what a person changes live, its ports, egress, networks and volumes, takes the server's routes:
+ *   overrides.ts; its base grants here are a proposal until `sessions.grants` lands)
  *   POST /api/microvm/sessions/:id/components/:name {source, pin}: swap a harness, agent or MCP server at its path, the rest running on
  *   DELETE /api/microvm/sessions/:id/components/:name: put back what it was built with
  */
@@ -463,6 +461,14 @@ function reachOf(session: string, harness: string, agent: string, agentfile: str
   return reach;
 }
 
+/** A session's engine and harness, as the overrides need them (overrides.ts); none for one this mock doesn't hold. */
+export function sessionOf(id: string): { engine: "microvm" | "host"; harness: string; name: string } | null {
+  const b = brief(id);
+  if (!b || b.state === "ended") return null;
+  const harness = AT.find((a) => a[0] === id)?.[2] ?? ON_HOST.find((h) => h[0] === id)?.[2] ?? "claude";
+  return { engine: b.engine, harness, name: id };
+}
+
 /** The sessions on runner `name`, each in a microVM or not, running or not: its engine's view counts them (engine.ts). */
 export function sessionsOn(name: string): { microvm: boolean; running: boolean }[] {
   const all = [...AT.map((a) => a[0]), ...ON_HOST.map((h) => h[0])];
@@ -530,50 +536,6 @@ export async function handleMicrovms(req: http.IncomingMessage, res: http.Server
     c.built ??= { ...c.from, version: c.version };
     c.from = from;
     c.version = versionOf(from);
-    return (ctx.json(res, 200, detail(id)), true);
-  }
-  const change = p.match(/^\/api\/microvm\/sessions\/([^/]+)\/(ingress|egress|volumes|networks\/([^/]+))$/);
-  if (change && (m === "POST" || m === "DELETE" || m === "PUT")) {
-    const id = decodeURIComponent(change[1]!);
-    const d = detail(id);
-    const reach = REACH.get(id);
-    if (!d || !reach) return (ctx.json(res, 404, { error: "no sandbox for that session" }), true);
-    const what = change[2]!;
-    const microvm = d.engine === "microvm" && d.state !== "ended";
-    if (what !== "volumes" && !microvm) return (ctx.json(res, 409, { error: "it runs on the host: its network is the host's, with nothing of its own to grant" }), true);
-    const b = await ctx.body<Record<string, unknown>>(req);
-    const known = (who: unknown) => typeof who === "string" && reach.members.some((x) => x.name === who);
-    if (what === "ingress") {
-      const i = { host: String(b.host ?? ""), guest: Number(b.guest), proto: b.proto === "udp" ? ("udp" as const) : ("tcp" as const), to: String(b.to ?? "") };
-      if (m === "DELETE") reach.ingress = reach.ingress.filter((x) => !(x.host === i.host && x.guest === i.guest && x.proto === i.proto));
-      else {
-        if (!/^[0-9.]+:\d{1,5}$|^\[[0-9a-f:]+\]:\d{1,5}$/i.test(i.host) || !(i.guest > 0 && i.guest < 65536) || !known(i.to))
-          return (ctx.json(res, 400, { error: "a port is published as ADDRESS:PORT on the runner → a guest port, to one of its members" }), true);
-        if (reach.ingress.some((x) => x.host === i.host && x.proto === i.proto)) return (ctx.json(res, 409, { error: `${i.host}/${i.proto} is published already` }), true);
-        reach.ingress.push(i);
-      }
-    } else if (what === "egress") {
-      const e = { to: String(b.to ?? "").toLowerCase(), ports: String(b.ports ?? ""), dns: b.dns !== false, mcp: typeof b.mcp === "string" && b.mcp ? b.mcp : null, who: String(b.who ?? "") };
-      if (m === "DELETE") reach.egress = reach.egress.filter((x) => !(x.to === e.to && x.ports === e.ports && x.who === e.who));
-      else {
-        if (!/^[a-z0-9.-]+$/.test(e.to) || !/^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$/.test(e.ports) || !known(e.who))
-          return (ctx.json(res, 400, { error: "a grant names a host, its ports (443, or 8000-8010) and who it is for" }), true);
-        reach.egress.push(e);
-      }
-    } else if (what === "volumes") {
-      const v = { path: String(b.path ?? ""), mode: b.mode === "ro" ? ("ro" as const) : ("rw" as const), members: Array.isArray(b.members) ? b.members.filter(known).map(String) : [] };
-      if (m === "DELETE") reach.volumes = reach.volumes.filter((x) => x.path !== v.path);
-      else {
-        if (!v.path.startsWith("/") || v.members.length === 0) return (ctx.json(res, 400, { error: "a volume is an absolute path, given to at least one member" }), true);
-        if (reach.volumes.some((x) => x.path === v.path)) return (ctx.json(res, 409, { error: `${v.path} is a volume already` }), true);
-        reach.volumes.push(v);
-      }
-    } else {
-      const net = reach.networks.find((n) => n.name === decodeURIComponent(change[3] ?? ""));
-      const member = net?.members.find((x) => x.name === b.member);
-      if (!net || !member) return (ctx.json(res, 404, { error: "no such network or member" }), true);
-      member.connected = b.connected === true;
-    }
     return (ctx.json(res, 200, detail(id)), true);
   }
   const act = p.match(/^\/api\/microvm\/sessions\/([^/]+)\/(pause|resume|restart|stop)$/);

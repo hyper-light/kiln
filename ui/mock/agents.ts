@@ -37,6 +37,7 @@ import { PROPOSED } from "./pages.ts";
 import { handleAttention } from "./attention.ts";
 import { forgetMarks } from "./push.ts";
 import { agentRefused, note, unreadUpdate } from "./refused.ts";
+import { onOverrides, overridesOf } from "./overrides.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -1664,8 +1665,15 @@ function stateOf(m: Member): State {
     left_behind: m.info.left_behind ?? 0,
     skills: FOUND_SKILLS,
     perms: m.info.perms,
+    overrides: overridesOf(m.info.id),
   };
 }
+
+// A person's change to one's overrides: its state goes again to its open pages.
+onOverrides((id) => {
+  const m = family.get(id);
+  if (m) tell(m);
+});
 
 /** The skills its harness found on its own (the skills panel's harness-found list). */
 const FOUND_SKILLS: State["skills"] = [
