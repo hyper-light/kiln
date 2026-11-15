@@ -14,7 +14,9 @@ use crate::ops::{Cx, Fail};
 /// A person, `user:<name>`, an admin here (they see every agent, and may start agents on the server).
 fn person(name: &str) -> anyhow::Result<Caller> {
     let admin = Grant::parse("admin").map_err(anyhow::Error::msg)?;
-    Ok(Caller { user: Some(name.to_owned()), ..Caller::with(Kind::User, &format!("user:{name}"), Some(Rights { grants: vec![admin], ..Default::default() }), None) })
+    let mut caller = Caller::with(Kind::User, &format!("user:{name}"), Some(Rights { grants: vec![admin], ..Default::default() }), None);
+    caller.user = Some(name.to_owned());
+    Ok(caller)
 }
 
 fn failed((code, why): Fail) -> anyhow::Error {
