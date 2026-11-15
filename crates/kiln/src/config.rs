@@ -1079,16 +1079,17 @@ mod reach_tests {
     /// can't be read is refused naming its word; and an unknown `[runner]` key refuses the config in
     /// words naming it (the runner says so and runs by kiln's own), never passed over.
     #[test]
-    fn a_runners_budget_is_read_and_a_bad_line_is_refused_naming_it() {
-        let c: Config = toml::from_str("[runner]\non_battery = \"take\"\nbudget = \"cpus=4,mem=16g\"\n").unwrap();
-        let b = c.runner.budget().unwrap().unwrap();
+    fn a_runners_budget_is_read_and_a_bad_line_is_refused_naming_it() -> anyhow::Result<()> {
+        let c: Config = toml::from_str("[runner]\non_battery = \"take\"\nbudget = \"cpus=4,mem=16g\"\n")?;
+        let b = c.runner.budget().map_err(anyhow::Error::msg)?.ok_or_else(|| anyhow::anyhow!("its budget wasn't read"))?;
         assert_eq!((b.cpu, b.mem, b.disk), (kiln_ci::sched::state::Cpus::whole(4), 16 << 30, u64::MAX));
-        assert!(Config::default().runner.budget().unwrap().is_none(), "none: the machine");
-        let bad: Config = toml::from_str("[runner]\nbudget = \"memm=4g\"\n").unwrap();
-        let e = bad.runner.budget().unwrap_err();
+        assert!(Config::default().runner.budget().map_err(anyhow::Error::msg)?.is_none(), "none: the machine");
+        let bad: Config = toml::from_str("[runner]\nbudget = \"memm=4g\"\n")?;
+        let e = bad.runner.budget().err().unwrap_or_default();
         assert!(e.contains("[runner] budget") && e.contains("memm=4g"), "{e}");
         let unknown = toml::from_str::<Config>("[runner]\nbudgett = \"cpus=4\"\n").err().map(|e| e.to_string()).unwrap_or_default();
         assert!(unknown.contains("budgett"), "an unknown key named: {unknown}");
+        Ok(())
     }
 
     /// W05-R09, W05-R39, LB08: `[reach]`'s placement settings as this runner's placement takes them:

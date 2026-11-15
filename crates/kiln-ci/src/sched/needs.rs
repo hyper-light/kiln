@@ -585,16 +585,18 @@ mod hex_size_tests {
     /// budget (nothing sized fits); a word naming no dimension, a bad amount, or one named twice is
     /// refused, naming the word.
     #[test]
-    fn a_runner_budget_limits_what_it_names_and_refuses_bad_words_by_name() {
-        let b = budget("cpus=4, mem=16g").unwrap();
+    fn a_runner_budget_limits_what_it_names_and_refuses_bad_words_by_name() -> Result<(), String> {
+        use crate::sched::state::Cpus;
+        let b = super::budget("cpus=4, mem=16g")?;
         assert_eq!((b.cpu, b.mem), (Cpus::whole(4), 16 << 30));
         assert_eq!((b.disk, b.gpu), (u64::MAX, u32::MAX), "unnamed: the machine's");
-        let zero = budget("cpus=0,mem=0,disk=0,gpus=0").unwrap();
+        let zero = super::budget("cpus=0,mem=0,disk=0,gpus=0")?;
         assert_eq!((zero.cpu, zero.mem, zero.disk, zero.gpu), (Cpus::ZERO, 0, 0, 0));
-        assert_eq!(budget("mem=512m").unwrap().cpu, Cpus::milli(u64::MAX), "memory alone caps memory alone");
+        assert_eq!(super::budget("mem=512m")?.cpu, Cpus::milli(u64::MAX), "memory alone caps memory alone");
         for (bad, says) in [("memm=4g", "`memm=4g`: no such dimension"), ("cpus=four", "`cpus=four`"), ("mem=16q", "`mem=16q`: not a size"), ("cpus=2,cpu=3", "named twice"), ("cpus", "a dimension and its amount"), ("", "at least one")] {
-            let e = budget(bad).unwrap_err();
+            let e = super::budget(bad).err().unwrap_or_default();
             assert!(e.contains(says), "{bad}: {e}");
         }
+        Ok(())
     }
 }
