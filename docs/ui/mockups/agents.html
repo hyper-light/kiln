@@ -54,15 +54,15 @@ const KILN = [
   ...[["about", "claude-sonnet-5-5"], ["ask", "claude-sonnet-5-5"], ["review", "claude-opus-5-5"], ["attach", "claude-sonnet-5-5"]].map(([id, m]) => ({ id, kind: "ui", harness: "claude", model: m, agentfile: "harness-claude", starts: W(4, 4, id.length * 5), sessions: [], replacedBy: id === "about" ? "about-terse" : null })),
 ];
 KILN.forEach((k) => (k.kiln = true));
-const ADHOC = { id: "adhoc", adhoc: true, sessions: [sess("s8", "Fix the flaky lane test", "hyper-light/kiln", "adacachy2", "microvm", ["cold", 1912], "14m", "run", 44, [2.8, 4]), sess("s9", "Port the docs", "hyper-light/hex", "adacachy", "host", ["process", 310], "1h", "idle", 3, [0.6, 2])] };
+const ADHOC = { id: "adhoc", adhoc: true, name: "Ad hoc", sessions: [sess("s8", "Fix the flaky lane test", "hyper-light/kiln", "adacachy2", "microvm", ["cold", 1912], "14m", "run", 44, [2.8, 4]), sess("s9", "Port the docs", "hyper-light/hex", "adacachy", "host", ["process", 310], "1h", "idle", 3, [0.6, 2])] };
 
 /* An experiment's sessions, made up as they come: every interval is computed from them. */
 const TRUTH = [{ warm: [214, 12], cold: [1910, 80], template: [412, 25], peak: [2.31, 0.1], steady: [1.62, 0.07], cpu: [0.41, 0.05], fail: 0.08, done: 0.82 }, { warm: [219, 12], cold: [1970, 85], template: [455, 26], peak: [3.02, 0.11], steady: [2.05, 0.08], cpu: [0.43, 0.05], fail: 0.01, done: 0.9 }];
 let seed = 7; const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
 const gauss = ([m, sd]) => m + sd * Math.sqrt(-2 * Math.log(rnd() || 1e-9)) * Math.cos(2 * Math.PI * rnd());
 const XS = []; // {v, kind, start, peak, steady, cpu, failed, done}
-function arrive(e) { const v = rnd() * 100 < e.variants[0].weight ? 0 : 1; const t = TRUTH[v]; const r = rnd(); const kind = r < 0.7 ? "warm" : r < 0.9 ? "template" : "cold"; const failed = rnd() < t.fail; XS.push({ v, kind, start: gauss(t[kind]), peak: gauss(t.peak), steady: gauss(t.steady), cpu: gauss(t.cpu), failed, done: !failed && rnd() < t.done }); }
-for (let i = 0; i < 96; i++) arrive(A[0].exp);
+function arrive(e, force) { const v = force ?? (rnd() * 100 < e.variants[0].weight ? 0 : 1); const t = TRUTH[v]; const r = rnd(); const kind = r < 0.7 ? "warm" : r < 0.9 ? "template" : "cold"; const failed = rnd() < t.fail; XS.push({ v, kind, start: gauss(t[kind]), peak: gauss(t.peak), steady: gauss(t.steady), cpu: gauss(t.cpu), failed, done: !failed && rnd() < t.done }); }
+for (let i = 0; i < 96; i++) arrive(A[0].exp, i === 5 ? 1 : i % 2);
 const medCI = (xs) => { const s = [...xs].sort((a, b) => a - b), n = s.length; if (n < 3) return null; const h = (1.96 * Math.sqrt(n)) / 2; const med = n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2; return [s[Math.max(0, Math.floor(n / 2 - h))], med, s[Math.min(n - 1, Math.ceil(n / 2 + h) - 1)]]; };
 const wilson = (k, n) => { if (!n) return null; const z = 1.96, p = k / n, d = 1 + (z * z) / n, c = (p + (z * z) / (2 * n)) / d, w = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / d; return [Math.max(0, c - w) * 100, p * 100, Math.min(1, c + w) * 100]; };
 const MEAS = [
@@ -92,24 +92,30 @@ const SES = (id) => allSessions().find(([s]) => s.id === id) || [null, null];
 /** Every table on this page shares one grid: the name, six slots, then the controls; alike things share a slot. */
 const G = (heads, tips = {}) => [{ h: heads[0], name: true }, { h: heads[1], w: 96, c: "h640", tip: tips[1] }, { h: heads[2], w: 124, c: "h900", tip: tips[2] }, { h: heads[3], w: narrow() ? 64 : 124, tip: tips[3] }, { h: heads[4], w: 124, c: "h640", tip: tips[4] }, { h: heads[5], w: 120, c: "h1100", tip: tips[5] }, { h: heads[6], w: 112, c: "h1100", tip: tips[6] }, { h: "", w: narrow() ? 136 : 154 }];
 const START_TIP3 = "Flame: warm · layers: from template · snowflake: cold";
-const LIST = () => G(["Agent", "Harness", "Model", "Sessions", "Starts", "Split", ""]);
+const LIST = () => G(["Agent", "Harness", "Model", narrow() ? "Live" : "Sessions", "Starts", "Split", ""]);
+/** A value on the row itself that edits in place when its row is open: the row's own cell, never a copy in the block. */
+function rowField(a, k, shownValue) {
+  if (S.editing === `${a.id}:${k}`) return editor(a, k);
+  if (S.open !== a.id || a.kiln) return `<span class="ell">${esc(shownValue)}</span>`;
+  return `<button class="pv" data-edit="${k}" data-a="${a.id}" title="Change">${`<span class="val ell">${esc(shownValue)}</span>`}${icon("edit").replace('class="ic"', 'class="ic pen"')}</button>`;
+}
 function aggregate(a) { const s = a.sessions.map((x) => x.state); return s.includes("failed") ? "failed" : s.includes("run") ? "run" : s.includes("paused") ? "paused" : s.length ? "idle" : "stopped"; }
 const glyphs = (a) => (a.sessions.length ? `<span class="gl">${a.sessions.slice(0, 5).map((s) => st(s.state, `${s.title} · ${STATES[s.state][1]}`)).join("")}</span>` : `<span class="dim">0</span>`);
 function agentRow(a) {
   const open = S.open === a.id;
-  const name = a.adhoc ? "No definition" : a.id;
+  const name = a.adhoc ? "Ad hoc" : a.id;
   const extra = a.kiln ? icon("lock", a.kind === "ui" ? "kiln's · its UI starts it" : `kiln's · one per ${a.kind}`, 12) : a.replaces ? icon("swap", `Replaces kiln's ${a.replaces} for you`, 12) : a.conflict ? st("warn", "Differs from its Agentfile") : "";
   const rep = a.replacedBy ? icon("swap", `You use ${a.replacedBy} instead`, 12) : "";
   const e = a.exp;
   const cells = [
-    named(aggregate(a), name, "", undefined, `${extra}${rep}`),
-    a.adhoc ? "" : `<span class="ell">${a.harness}</span>`,
-    a.adhoc ? "" : `<span class="ell">${esc(modelName(a.harness, a.model))}</span>`,
+    a.adhoc ? { lead: icon("adhoc", "Sessions started without a definition"), body: `<span class="cr"><span class="ell">Ad hoc</span></span>` } : named(aggregate(a), name, "", undefined, `${extra}${rep}`),
+    a.adhoc ? "" : rowField(a, "harness", a.harness),
+    a.adhoc ? "" : rowField(a, "model", modelName(a.harness, a.model)),
     glyphs(a),
     a.starts ? spark(a.starts, String(Math.round(a.starts.reduce((x, y) => x + y, 0))), "#3987e5", 36) : "",
     e ? stack(e.variants.map((v, i) => ({ v: v.weight, color: SERIES4[i], tip: `Variant ${KEYS[i]}` })), 40, e.variants.map((v) => v.weight).join("/")) : "",
     "",
-    a.adhoc ? `<span class="acts ctl">${ib("play", "Run", "disabled")}${ib("pause", "Pause all (P)", `data-do="pauseall" data-a="adhoc"`)}${ib("restart", "Restart all (R)", `data-do="restartall" data-a="adhoc"`)}${ib("stop", "Stop all (S)", 'data-do="stopall" data-a="adhoc" data-tone="danger" data-confirm="Stop all?"')}${ib("more", "More", "disabled")}</span>` : `<span class="acts ctl">${ib("play", "Run (⌘↵)", `data-do="run" data-a="${a.id}"`)}${ib("pause", "Pause all (P)", `data-do="pauseall" data-a="${a.id}" ${a.sessions.some((s) => s.state === "run" || s.state === "idle") ? "" : "disabled"}`)}${ib("restart", "Restart all (R)", `data-do="restartall" data-a="${a.id}" ${a.sessions.length ? "" : "disabled"}`)}${ib("stop", "Stop all (S)", `data-do="stopall" data-a="${a.id}" data-tone="danger" data-confirm="Stop all?" ${a.sessions.length ? "" : "disabled"}`)}${ib("more", "More", `data-do="amore" data-a="${a.id}"`)}</span>`,
+    a.adhoc ? `<span class="acts ctl">${ib("play", "Run", "disabled")}${ib("pause", "Pause all (P)", `data-do="pauseall" data-a="adhoc"`)}${ib("restart", "Restart all (R)", `data-do="restartall" data-a="adhoc"`)}${ib("stop", "Stop all (S)", 'data-do="stopall" data-a="adhoc" data-tone="danger" data-confirm="Stop all?"')}${ib("more", "More", 'data-do="adhocmore"')}</span>` : `<span class="acts ctl">${ib("play", "Run (⌘↵)", `data-do="run" data-a="${a.id}"`)}${ib("pause", "Pause all (P)", `data-do="pauseall" data-a="${a.id}" ${a.sessions.some((s) => s.state === "run" || s.state === "idle") ? "" : "disabled"}`)}${ib("restart", "Restart all (R)", `data-do="restartall" data-a="${a.id}" ${a.sessions.length ? "" : "disabled"}`)}${ib("stop", "Stop all (S)", `data-do="stopall" data-a="${a.id}" data-tone="danger" data-confirm="Stop all?" ${a.sessions.length ? "" : "disabled"}`)}${ib("more", "More", `data-do="amore" data-a="${a.id}"`)}</span>`,
   ];
   return `<tr class="pick" tabindex="0" data-a="${a.id}" aria-expanded="${open}" aria-selected="${open}">${td3(LIST(), cells)}</tr>${open ? `<tr><td class="detail" colspan="${shown(LIST())}">${expanded(a)}</td></tr>` : ""}`;
 }
@@ -150,33 +156,37 @@ function expRows(a) {
   const cell = (m, i) => expCell(a, i, m.id, `ex:${i}:${m.id}`);
   const lead = (v, i) => (v.current ? key3(i).replace('class="key3"', 'class="key3" data-current').replace(`title="Variant ${KEYS[i]}"`, `title="Variant ${KEYS[i]} · current"`) : key3(i));
   const promote = S.promote !== null ? `<div class="fr">${icon("crown")}<span class="lbl hi">Promote ${KEYS[S.promote]}?</span><span class="val dim ell h640">${esc(depl(e.variants[S.promote]))}</span><span class="acts"><button class="b3 p" data-do="promote" data-a="${a.id}">Promote</button><button class="b3 g" data-do="nopromote">Cancel</button></span></div>` : "";
-  return `<div class="sh">${icon("split", "Experiment")}<span class="lbl hi">${esc(e.name)}</span>${st(e.state === "live" ? "run" : e.state === "paused" ? "paused" : "stopped", e.state)}<span class="val dim h640">${tot} sessions</span><span class="acts">${stack(e.variants.map((v, i) => ({ v: v.weight, color: SERIES4[i], tip: `Variant ${KEYS[i]}` })), 64, e.variants.map((v) => v.weight).join("/"))}${e.state === "promoted" ? "" : ib(e.state === "live" ? "pause" : "play", e.state === "live" ? "Pause split" : "Resume split", `data-do="expstate" data-a="${a.id}"`)}${ib("replay", "Replay a session", `data-do="replay" data-a="${a.id}" aria-expanded="${Boolean(S.replay)}"`)}</span></div>${promote}
-    <table class="t3">${th3(VCOLS())}<tbody>${e.variants.map((v, i) => `<tr>${td3(VCOLS(), [
+  return `<div class="sh">${icon("split", "Experiment")}<span class="lbl hi">${esc(e.name)}</span>${st(e.state === "live" ? "run" : e.state === "paused" ? "paused" : "stopped", e.state)}<span class="val dim h640">${tot} sessions</span><span class="acts">${staged(a) ? `${stack(staged(a).map((w, i) => ({ v: w, color: SERIES4[i], tip: `Variant ${KEYS[i]} · staged` })), 64, staged(a).join("/")).replace('class="stk"', 'class="stk hatch"')}<button class="b3 p" data-do="applysplit" data-a="${a.id}">Apply</button><button class="b3 g" data-do="dropsplit">Discard</button>` : stack(e.variants.map((v, i) => ({ v: v.weight, color: SERIES4[i], tip: `Variant ${KEYS[i]}` })), 64, `${e.variants.map((v) => v.weight).join("/")} · v${e.ver || 1}`)}${e.state === "promoted" ? "" : ib(e.state === "live" ? "pause" : "play", e.state === "live" ? "Pause split" : "Resume split", `data-do="expstate" data-a="${a.id}"`)}${ib("replay", "Replay a session", `data-do="replay" data-a="${a.id}" aria-expanded="${Boolean(S.replay)}"`)}</span></div>${promote}
+    <table class="t3" data-grid="a">${th3(VCOLS())}<tbody>${e.variants.map((v, i) => `<tr>${td3(VCOLS(), [
       { lead: lead(v, i), body: `<span class="cr">${icon(v.engine, ENGINE_TIP[v.engine])}<span class="ell mid" title="${esc(depl(v))}" data-full="${esc(short(v))}">${esc(short(v))}</span></span>` },
-      `<span class="u"><input type="range" class="wr" min="0" max="100" value="${v.weight}" data-w="${i}" data-a="${a.id}" style="accent-color:${SERIES4[i]}" ${e.state === "promoted" ? "disabled" : ""} aria-label="Weight ${KEYS[i]}"><span>${v.weight}%</span></span>`,
+      `<span class="u"><input type="range" class="wr" min="0" max="100" value="${staged(a) ? staged(a)[i] : v.weight}" data-w="${i}" data-a="${a.id}" style="accent-color:${SERIES4[i]}" ${e.state === "promoted" ? "disabled" : ""} aria-label="Weight ${KEYS[i]}"><span>${staged(a) ? staged(a)[i] : v.weight}%</span></span>`,
       ubar(tot ? (n[i] / tot) * 100 : 0, String(n[i]), 36, SERIES4[i]).replace('<span class="u"', `<span class="u" data-live="exn:${i}"`),
       cell(MEAS[0], i), cell(MEAS[3], i), cell(MEAS[5], i), cell(MEAS[6], i),
       `<span class="acts ctl">${ib("crown", `Promote ${KEYS[i]}`, `data-do="askpromote" data-i="${i}" ${v.current || e.state === "promoted" ? "disabled" : ""}`)}</span>`,
     ])}</tr>`).join("")}</tbody></table>
     <div class="sh"><button class="lbl hi kv3" data-do="allmeas" aria-expanded="${S.allMeas}">${icon("chart")}All measures${icon("chev")}</button></div>
-    ${S.allMeas ? `<table class="t3">${th3(G(["Measure", "", "", key3(0), key3(1), "", ""]))}<tbody>${MEAS.map((m) => `<tr>${td3(G([]), [`<span class="lbl">${m.h}</span>`, "", "", cell(m, 0), cell(m, 1), "", "", ""])}</tr>`).join("")}</tbody></table>` : ""}
+    ${S.allMeas ? `<table class="t3" data-grid="a">${th3(G(["Measure", "", "", key3(0), key3(1), "", ""]))}<tbody>${MEAS.map((m) => `<tr>${td3(G([]), [`<span class="lbl">${m.h}</span>`, "", "", cell(m, 0), cell(m, 1), "", "", ""])}</tr>`).join("")}<tr>${td3(G([]), [`<span class="lbl" title="${START_TIP3}">Start mix</span>`, "", "", mix(0), mix(1), "", "", ""])}</tr></tbody></table>` : ""}
     ${S.replay ? replayRows(a) : ""}`;
 }
+/** A variant's starts by kind, in the flame, layers and snowflake colours: pools sized by demand give variants different mixes. */
+function mix(i) { const k = (kind) => XS.filter((x) => x.v === i && x.kind === kind).length; const all = Math.max(1, k("warm") + k("template") + k("cold")); return `<span class="cr">${stack([{ v: k("warm"), color: START_COLORS.warm, tip: "Warm" }, { v: k("template"), color: START_COLORS.template, tip: "Template" }, { v: k("cold"), color: START_COLORS.cold, tip: "Cold" }], 56)}${startIcon("warm")}<span>${Math.round((k("warm") / all) * 100)}%</span></span>`; }
 /** One measure of one variant: whiskers on the measure's shared axis, a check where it clearly wins. */
 function expCell(a, i, mid, live) { const m = MEAS.find((x) => x.id === mid); const r = measure(m); const c = r.per[i]; const html = c ? whisk(c.map((x) => +x.toFixed(2)), r.axis, SERIES4[i], m.f(c[1]), r.win === i, narrow() ? 0 : 40) : `<span class="u"><span class="dim">—</span></span>`; return html.replace('<span class="u"', `<span class="u" data-live="${live}"`); }
 const short = (v) => (v.engine === "host" ? `${v.agentfile} · host` : `${v.agentfile} · ${v.cpus}c · ${v.mem}G`);
+/** The split a person is dragging toward: staged, drawn hatched, live only once applied. */
+const staged = (a) => (S.staged && S.staged.a === a.id ? S.staged.list.map((x) => x.weight) : null);
 const depl = (v) => (v.engine === "host" ? `${v.agentfile} · host` : `${v.agentfile} · ${v.cpus} vCPU · ${v.mem} GiB`);
 function replayRows(a) {
   const R = S.replay;
   const RES = [[[27.6, 28.9, 30.4], [41.2, 43.0, 45.1]], [[52.1, 54.3, 57.0], [55.0, 56.8, 59.2]]];
   return `<div class="fr">${icon("replay")}<span class="lbl hi">Replay</span>${sel([["s1", "Review the top diff · 214 calls"], ["s2", "Review shards #4512 · 88 calls"]], "s1", 'aria-label="Recorded session"')}<span class="acts">${R.state === "running" ? `<span class="val dim">${R.done}/10</span>` : `<button class="b3 p" data-do="doreplay">Replay</button>`}${ib("x", "Close", 'data-do="replay"')}</span></div>
-    ${R.state === "done" ? `<table class="t3">${th3(G(["Variant", "", "", "Time", "CPU", "", ""]))}<tbody>${[0, 1].map((i) => `<tr>${td3(G([]), [{ lead: key3(i), body: `<span class="cr"><span class="ell mid" data-full="${esc(depl(a.exp.variants[i]))}" title="${esc(depl(a.exp.variants[i]))}">${esc(depl(a.exp.variants[i]))}</span>${st("ok", "Every call as recorded")}</span>` }, "", "", whisk(RES[0][1 - i], [24, 48], SERIES4[i], `${RES[0][1 - i][1]}s`, i === 1, narrow() ? 0 : 40), whisk(RES[1][i], [50, 61], SERIES4[i], `${RES[1][i][1]}`, false, narrow() ? 0 : 40), "", "", ""])}</tr>`).join("")}</tbody></table>` : ""}`;
+    ${R.state === "done" ? `<table class="t3" data-grid="a">${th3(G(["Variant", "", "", "Time", "CPU", "", ""]))}<tbody>${[0, 1].map((i) => `<tr>${td3(G([]), [{ lead: key3(i), body: `<span class="cr"><span class="ell mid" data-full="${esc(depl(a.exp.variants[i]))}" title="${esc(depl(a.exp.variants[i]))}">${esc(depl(a.exp.variants[i]))}</span>${st("ok", "Every call as recorded")}</span>` }, "", "", whisk(RES[0][1 - i], [24, 48], SERIES4[i], `${RES[0][1 - i][1]}s`, i === 1, narrow() ? 0 : 40), whisk(RES[1][i], [50, 61], SERIES4[i], `${RES[1][i][1]}`, false, narrow() ? 0 : 40), "", "", ""])}</tr>`).join("")}</tbody></table>` : ""}`;
 }
 function setupRows(a) {
   const V = S.setup.variants;
   const cols = () => G(["Variant", "Engine", "Agentfile", "vCPUs", "Memory", "Weight", ""]);
   return `<div class="sh">${icon("split")}<span class="lbl hi">New experiment</span><span class="acts"><button class="b3 g" data-do="addvar" ${V.length >= 4 ? "disabled" : ""}>${icon("plus")}Variant</button><button class="b3 p" data-do="startexp" data-a="${a.id}">Start</button>${ib("x", "Cancel", 'data-do="nosetup"')}</span></div>
-    <table class="t3">${th3(cols())}<tbody>${V.map((v, i) => `<tr data-var="${i}">${td3(cols(), [
+    <table class="t3" data-grid="a">${th3(cols())}<tbody>${V.map((v, i) => `<tr data-var="${i}">${td3(cols(), [
       { lead: key3(i), body: i === 0 ? `<span class="lbl">current</span>` : "" },
       `<span class="sg3">${["microvm", "host"].map((x) => `<button data-veng="${x}" aria-pressed="${v.engine === x}" title="${ENGINE_TIP[x]}" aria-label="${ENGINE_TIP[x]}">${icon(x)}</button>`).join("")}</span>`,
       sel(AGENTFILES, v.agentfile, 'data-vk="agentfile" aria-label="Agentfile" style="width:100%"'),
@@ -187,17 +197,22 @@ function setupRows(a) {
       `<span class="acts">${i > 1 ? ib("x", "Remove", `data-do="rmvar" data-i="${i}"`) : ""}</span>`,
     ])}</tr>`).join("")}</tbody></table>`;
 }
+/** A conflict, shown, never settled for you: what differs, the changed lines, and the two choices in words. */
+function diffBlock(label, from, lines, acts, id) {
+  return `<div class="fr">${st("warn")}<span class="lbl hi">${esc(label)}</span><span class="val dim ell">${esc(from)}</span></div>
+    ${lines.map(([sign, text]) => `<div class="sh dl3" data-sign="${sign}"><span class="val">${sign === "-" ? "−" : "+"}</span><span class="val ell mid" data-full="${esc(text)}" title="${esc(text)}">${esc(text)}</span></div>`).join("")}
+    <div class="fr">${acts.map(([d, l], i) => `<button class="b3 ${i ? "" : "p"}" data-do="${d}" data-a="${id}">${esc(l)}</button>`).join("")}</div>`;
+}
 function expanded(a) {
-  if (a.adhoc) return `<table class="t3">${th3(SCOLS())}<tbody>${a.sessions.map((s) => sessionRow(s, a)).join("")}</tbody></table>`;
+  if (a.adhoc) return `<table class="t3" data-grid="a">${th3(SCOLS())}<tbody>${a.sessions.map((s) => sessionRow(s, a)).join("")}</tbody></table>`;
   const hc = harnessOf(a.harness);
-  const conflict = a.conflict ? `<div class="fr">${st("warn")}<span class="lbl hi">Agentfile differs</span><span class="val dim ell h640" title="rust-dev v9 says GPT-6.1 Sol; this says GPT-6.1 Sol mini">model · GPT-6.1 Sol</span><span class="acts"><button class="b3 p" data-do="keepmine" data-a="${a.id}" title="Keep mine">${icon("check")}<span class="h640">Keep mine</span></button><button class="b3" data-do="taketheirs" data-a="${a.id}" title="Take the Agentfile's">${icon("swap")}<span class="h640">Take Agentfile's</span></button></span></div>` : "";
+  const conflict = a.conflict ? diffBlock("Agentfile differs", "rust-dev v9", [["-", "LABEL kiln.harness.codex.model=gpt-6.1-sol-mini"], ["+", "LABEL kiln.harness.codex.model=gpt-6.1-sol"]], [["keepmine", "Keep mine"], ["taketheirs", "Take rust-dev v9"]], a.id) : "";
   const run = S.run === a.id ? (S.ran === a.id ? "" : `<div class="fr">${icon("play")}<span class="lbl hi">Run</span>${sel([["kiln", "hyper-light/kiln"], ["shards", "hyper-light/shards"], ["none", "no project"]], "kiln", 'aria-label="Project"')}${sel([["auto", "auto · adas-mac-studio-3.local"], ["s3", "adas-mac-studio-3.local"], ["c2", "adacachy2"], ["m1", "adas-mac-studio.local"]], "auto", 'aria-label="Runner" title="kiln places it: warm reviewer and rust-dev v8 there"')}<input class="in3 grow" placeholder="Message" aria-label="First message"><span class="acts"><button class="b3 p" data-do="start" data-a="${a.id}">Start</button>${ib("x", "Close", `data-do="run" data-a="${a.id}"`)}</span></div>`) : "";
   const hist = S.hist && S.hist[0] === a.id ? (() => { const [v, what] = a.hist.find((h) => h[0] === S.hist[1]); return `<div class="fr">${icon("history")}<span class="lbl hi">v${v}</span><span class="val dim ell">${esc(what)}</span><span class="acts">${v === a.v ? `<span class="lbl">current</span>` : `<button class="b3" data-do="restore" data-a="${a.id}" data-v="${v}">Restore</button>`}${ib("x", "Close", 'data-do="nohist"')}</span></div>`; })() : "";
-  const clash = S.clash && S.clash.a === a.id ? `<div class="fr">${st("warn")}<span class="lbl hi">v${a.remote.v} saved meanwhile</span><span class="val dim ell" title="${esc(`${a.remote.by}: ${a.remote.field} ${modelName(a.harness, a.remote.value)}`)}">${a.remote.field} · ${esc(modelName(a.harness, a.remote.value))} there · ${esc(modelName(a.harness, S.clash.mine || a.model))} here</span><span class="acts"><button class="b3 p" data-do="clashmine" data-a="${a.id}" title="Keep mine">${icon("check")}<span class="h640">Keep mine</span></button><button class="b3" data-do="clashtheirs" data-a="${a.id}" title="Take v${a.remote.v}">${icon("swap")}<span class="h640">Take v${a.remote.v}</span></button></span></div>` : "";
+  const clash = S.clash && S.clash.a === a.id ? diffBlock(`v${a.remote.v} saved meanwhile`, a.remote.by, [["-", `${S.clash.k} ${modelName(a.harness, S.clash.mine ?? a.model)}`], ["+", `${a.remote.field} ${modelName(a.harness, a.remote.value)}`]], [["clashmine", "Keep mine"], ["clashtheirs", `Take v${a.remote.v}`]], a.id) : "";
   const del = S.asking === a.id ? `<div class="fr">${st("warn")}<span class="lbl hi">Delete ${esc(a.id)}?</span><span class="val dim">${a.v} versions</span><span class="acts"><button class="b3 d" data-do="delete" data-a="${a.id}">Delete</button><button class="b3 g" data-do="nodelete">Cancel</button></span></div>` : "";
   return `${conflict}${clash}${run}${del}<div class="defs3">
-      ${prop(a, "harness", "Harness", `<span class="val">${a.harness}</span>`)}
-      ${prop(a, "model", "Model", `<span class="val">${esc(modelName(a.harness, a.model))}</span>`)}
+      ${S.editing === `${a.id}:harness` || S.editing === `${a.id}:model` ? "" : `${prop(a, "harness", "Harness", `<span class="val">${a.harness}</span>`, "o640")}${prop(a, "model", "Model", `<span class="val">${esc(modelName(a.harness, a.model))}</span>`, "o900")}`}
       ${prop(a, "agentfile", "Agentfile", `${icon("folder")}<span class="val">${esc(a.agentfile)}</span>`)}
       ${prop(a, "tools", "Tools", `<span class="val">${a.tools.length}</span><span class="dim">kiln</span><span class="val">${a.mcp.length}</span><span class="dim">MCP</span>`)}
       ${prop(a, "skills", "Skills", `<span class="val">${a.skills.length}</span>`)}
@@ -205,7 +220,7 @@ function expanded(a) {
       ${a.kiln ? "" : `<div><span class="lbl">Version</span><span class="pv"><span class="val">v${a.v}</span><span class="vdots">${a.hist.map(([v, what]) => `<button data-do="hist" data-a="${a.id}" data-v="${v}" aria-current="${v === a.v}" title="v${v} · ${esc(what)}" aria-label="v${v}"></button>`).join("")}</span></span></div>`}
       ${prop(a, "instr", "Instructions", `<span class="val">${esc(a.instr || "none")}</span>`, "wide")}
     </div>${hist}${S.saved === a.id ? `<div class="fr">${st("ok")}<span class="lbl hi">Saved</span><span class="val dim">v${a.v} · ${esc(a.agentfile)} rebuilding</span></div>` : ""}
-    ${a.sessions.length ? `<div class="sh"><span class="lbl hi">Sessions</span><span class="val dim">${a.sessions.length}</span></div><table class="t3">${th3(SCOLS())}<tbody>${a.sessions.map((s) => sessionRow(s, a)).join("")}</tbody></table>` : ""}
+    ${a.sessions.length ? `<div class="sh"><span class="lbl hi">Sessions</span><span class="val dim">${a.sessions.length}</span></div><table class="t3" data-grid="a">${th3(SCOLS())}<tbody>${a.sessions.map((s) => sessionRow(s, a)).join("")}</tbody></table>` : ""}
     ${a.exp ? expRows(a) : ""}${S.setup && S.setup.a === a.id ? setupRows(a) : ""}
     <div class="sh"><button class="lbl hi kv3" data-do="charts" data-a="${a.id}" aria-expanded="${S.charts.has(a.id)}">${icon("chart")}Telemetry${icon("chev")}</button></div>
     ${S.charts.has(a.id) ? `<div class="charts3">${chart("Sessions", [{ name: "Sessions", color: "#3987e5", values: W(3, 2, 101) }], "")}${chart("Starts", [{ name: "Warm", color: START_COLORS.warm, values: W(4, 2, 103) }, { name: "Template", color: START_COLORS.template, values: W(1.5, 1, 107) }, { name: "Cold", color: START_COLORS.cold, values: W(0.5, 0.6, 109) }], "")}${chart("Failed", [{ name: "Failed", color: "#d03b3b", values: W(0.3, 0.4, 113) }], "")}${chart("CPU", [{ name: "CPU", color: "#3987e5", values: W(40, 12, 127) }], "%")}</div>` : ""}`;
@@ -220,8 +235,8 @@ function render() {
     <div class="title3"><h1>Agents</h1><span class="right"><span class="kv3" title="Running · paused · failed">${stack([{ v: c("run") + c("idle"), color: "#0ca30c", tip: "Running" }, { v: c("paused"), color: "#a6b2c6", tip: "Paused" }, { v: c("failed"), color: "#d03b3b", tip: "Failed" }], 56)}<span class="val">${all.length}</span><span class="lbl">sessions</span></span><span class="kv3 h640">${spark(W(14, 6, 131), "312", "#3987e5", 44)}<span class="lbl">starts</span></span></span></div>
     <div class="bar-row"><span class="sg3" role="group" aria-label="Show">${[["yours", `Yours ${A.length}`], ["kiln", `kiln's ${KILN.length}`], ["all", "All"]].map(([v, l]) => `<button data-do="filter" data-v="${v}" aria-pressed="${S.filter === v}">${l}</button>`).join("")}</span><span class="right"><button class="b3 p" data-do="new">${icon("plus")}New agent</button></span></div>
     <div class="card3">
-      <table class="t3">${th3(LIST())}<tbody>${S.newRow ? newRow() : ""}${list.map(agentRow).join("")}</tbody></table></div>`;
-  liveScan(); fitMiddle();
+      <table class="t3" data-grid="a">${th3(LIST())}<tbody>${S.newRow ? newRow() : ""}${list.map(agentRow).join("")}</tbody></table></div>`;
+  liveScan(); fitGrid(); fitMiddle();
 }
 function newRow() {
   return `<tr><td class="detail" colspan="${shown(LIST())}"><div class="fr">${icon("plus")}<input class="in3" id="nn" placeholder="name" value="docs-checker" aria-label="Name">${sel(HARNESSES.map((h) => [h.id, h.id]), "claude", 'id="nh" aria-label="Harness"')}${sel(AGENTFILES, "rust-dev", 'id="nf" aria-label="Agentfile"')}<span class="acts"><button class="b3 p" data-do="keepnew">Keep</button>${ib("x", "Cancel", 'data-do="new"')}</span></div></td></tr>`;
@@ -257,6 +272,7 @@ document.addEventListener("click", (e) => {
   if (["pauseall", "stopall", "restartall"].includes(d)) { agentDo(a, d, b); return; }
   if (["play", "pause", "restart", "stop"].includes(d)) { sessionDo(b.dataset.id, d, b); return; }
   if (d === "more" && b.dataset.id) { menu(b, [{ icon: "open", label: "Open chat", run: () => { location.href = "chat.html"; } }, { icon: "terminal", label: "Terminal", run: () => {} }]); return; }
+  if (d === "adhocmore") { menu(b, [{ icon: "plus", label: "Save as agent", run: () => { const s0 = ADHOC.sessions[0]; A.push({ id: "lane-fixer", own: true, harness: "claude", model: "claude-opus-5-5", agentfile: "rust-dev", instr: s0.title, tools: [], mcp: [], skills: [], limit: "", v: 1, hist: [[1, "saved from a session"]], starts: W(1, 1, 5), sessions: [] }); S.open = "lane-fixer"; setOpen("lane-fixer", render); toast("Saved as lane-fixer"); } }]); return; }
   if (d === "amore") { const items = a.kiln ? [{ icon: "copy", label: "Copy as yours", run: () => { const n = `${a.id}-mine`; A.push({ id: n, own: true, replaces: a.kind === "ui" ? a.id : undefined, harness: a.harness, model: a.model, agentfile: a.agentfile, instr: "", tools: [], mcp: [], skills: [], limit: "", v: 1, hist: [[1, `copied from ${a.id}`]], starts: W(0, 0.2, 5), sessions: [] }); S.filter = "yours"; S.open = n; render(); } }] : [{ icon: "history", label: "History", run: () => { S.open = a.id; S.hist = [a.id, a.v]; render(); } }, { icon: "split", label: a.exp ? "Experiment" : "New experiment", run: () => { S.open = a.id; if (!a.exp) S.setup = { a: a.id, variants: [{ agentfile: a.agentfile, engine: "microvm", cpus: 2, mem: 4, weight: 80 }, { agentfile: a.agentfile, engine: "microvm", cpus: 4, mem: 8, weight: 20 }] }; render(); } }, { icon: "copy", label: "Duplicate", run: () => {} }, { icon: "trash", label: "Delete", danger: true, run: () => { S.open = a.id; S.asking = a.id; render(); } }]; menu(b, items); return; }
   if (d === "hist") { S.hist = [a.id, Number(b.dataset.v)]; render(); return; }
   if (d === "nohist") { S.hist = null; render(); return; }
@@ -266,6 +282,8 @@ document.addEventListener("click", (e) => {
   if (d === "clashmine" || d === "clashtheirs") { press(b, 500, () => { const c = S.clash; a.v = a.remote.v; a.hist.push([a.remote.v, `${a.remote.field} → ${modelName(a.harness, a.remote.value)} (elsewhere)`]); if (d === "clashtheirs") a.model = a.remote.value; else if (c.mine !== null) a[c.k] = c.mine; a.remote = null; S.clash = null; S.editing = null; if (d === "clashmine") bump(a, `${c.k} changed`); render(); }); return; }
   if (d === "keepmine" || d === "taketheirs") { press(b, 500, () => { a.conflict = false; if (d === "taketheirs") a.model = "gpt-6.1-sol"; bump(a, d === "keepmine" ? "kept over Agentfile" : "took Agentfile's"); render(); }); return; }
   if (d === "charts") { S.charts.has(a.id) ? S.charts.delete(a.id) : S.charts.add(a.id); render(); return; }
+  if (d === "applysplit") { press(b, 500, () => { const e = a.exp, before = e.variants.map((v) => v.weight), ver = e.ver || 1; e.variants.forEach((v, i) => (v.weight = S.staged.list[i].weight)); e.ver = ver + 1; S.staged = null; render(); toast(`Split v${e.ver} applied`, () => { e.variants.forEach((v, i) => (v.weight = before[i])); e.ver = ver; render(); }); }); return; }
+  if (d === "dropsplit") { S.staged = null; render(); return; }
   if (d === "allmeas") { S.allMeas = !S.allMeas; render(); return; }
   if (d === "expstate") { press(b, 400, () => { a.exp.state = a.exp.state === "live" ? "paused" : "live"; render(); }); return; }
   if (d === "askpromote") { S.promote = Number(b.dataset.i); render(); return; }
@@ -282,7 +300,7 @@ function rebalance(list, i, w) { const others = list.map((_, j) => j).filter((j)
 document.addEventListener("input", (e) => {
   const t = e.target;
   if (t.dataset.check === "limit") { const bad = t.value !== "" && !/^\d+[smh]$/.test(t.value); t.setAttribute("aria-invalid", String(bad)); t.title = bad ? "A time: 45m, 2h, 90s" : ""; $('[data-do="save"]').disabled = bad; return; }
-  if (t.dataset.w !== undefined) { const a = byId(t.dataset.a); rebalance(a.exp.variants, Number(t.dataset.w), Number(t.value)); $$(`[data-w][data-a="${a.id}"]`).forEach((x, j) => { if (x !== t) x.value = a.exp.variants[j].weight; x.nextElementSibling.textContent = a.exp.variants[j].weight + "%"; }); return; }
+  if (t.dataset.w !== undefined) { const a = byId(t.dataset.a); if (!S.staged) S.staged = { a: a.id, list: a.exp.variants.map((v) => ({ weight: v.weight })) }; rebalance(S.staged.list, Number(t.dataset.w), Number(t.value)); $$(`[data-w][data-a="${a.id}"]`).forEach((x, j) => { if (x !== t) x.value = S.staged.list[j].weight; x.nextElementSibling.textContent = S.staged.list[j].weight + "%"; }); return; }
   if (t.dataset.sw !== undefined) { rebalance(S.setup.variants, Number(t.dataset.sw), Number(t.value)); $$("[data-sw]").forEach((x, j) => { if (x !== t) x.value = S.setup.variants[j].weight; x.nextElementSibling.textContent = S.setup.variants[j].weight + "%"; }); return; }
 });
 document.addEventListener("change", (e) => {

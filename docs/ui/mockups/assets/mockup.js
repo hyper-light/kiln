@@ -239,7 +239,7 @@ window.addEventListener("load", () => { if (window.AUDIT) setTimeout(audit, 400)
 const narrow = () => innerWidth < 640;
 /** cols: [{h, w (px or %), c (hide class), name (the first column), spacer, ctl}] */
 function th3(cols) {
-  return `<thead><tr>${cols[0]?.name ? '<th class="lead"></th>' : ""}${cols.map((c) => `<th title="${esc(c.tip || "")}" class="${c.c || ""}${c.spacer ? " sp" : ""}" style="${c.spacer ? "" : c.name ? (narrow() ? "" : `width:${c.w}`) : `width:${c.w}px`}">${c.h || ""}</th>`).join("")}</tr></thead>`;
+  return `<thead><tr>${cols[0]?.name ? '<th class="lead"></th>' : ""}${cols.map((c, i) => `<th title="${esc(c.tip || "")}" class="${c.c || ""}${c.spacer ? " sp" : ""}" ${c.name ? "data-name" : ""} ${i === cols.length - 1 && !c.h && c.w ? `data-ctl data-w="${c.w}"` : ""} style="${c.spacer ? "" : c.name ? (narrow() || !c.w ? "" : `width:${c.w}`) : `width:${c.w}px`}">${c.h || ""}</th>`).join("")}</tr></thead>`;
 }
 /** A row's cells; when the table leads with a name, the first cell's glyph sits in its own lead column. */
 const td3 = (cols, cells) => cells.map((x, i) => { const cls = `${cols[i].c || ""}${cols[i].spacer ? " sp" : ""}`; if (i === 0 && cols[0]?.name) { const o = typeof x === "object" && x ? x : { lead: "", body: x ?? "" }; return `<td class="lead">${o.lead}</td><td class="${cls}">${o.body}</td>`; } return `<td class="${cls}">${x ?? ""}</td>`; }).join("");
@@ -375,3 +375,37 @@ const OPS = {
 };
 /** Palette entries from the registry: [op, target, run, group]. */
 const fromOps = (list) => list.map(([op, obj, run, group]) => ({ op, obj, run, group, ...OPS[op] }));
+
+/** Free width first, one grid: every table marked data-grid gets each slot's widest natural width across its group,
+ *  so columns line up and nothing truncates while there's room; the name takes what's left, and only when the
+ *  window can't hold them all does anything give (the slots in proportion, the name down to its floor). */
+function fitGrid() {
+  const groups = {};
+  $$("table.t3[data-grid]").forEach((t) => { if (t.offsetParent) (groups[t.dataset.grid] ||= []).push(t); });
+  Object.values(groups).forEach((tables) => {
+    const nat = [];
+    tables.forEach((t) => {
+      t.querySelectorAll(":scope > thead > tr, :scope > tbody > tr").forEach((tr) => {
+        if (tr.querySelector("td.detail")) return;
+        [...tr.children].forEach((cell, i) => {
+          if (cell.offsetParent === null) return;
+          const cs = getComputedStyle(cell); const r = document.createRange(); r.selectNodeContents(cell);
+          const w = Math.ceil(r.getBoundingClientRect().width + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight));
+          nat[i] = Math.max(nat[i] || 0, w);
+        });
+      });
+    });
+    tables.forEach((t) => {
+      const ths = [...t.querySelectorAll(":scope > thead > tr > th")]; const avail = t.clientWidth;
+      const nameIdx = ths.findIndex((th) => th.hasAttribute("data-name"));
+      const fixed = ths.map((th, i) => (th.offsetParent === null || i === nameIdx ? 0 : th.classList.contains("lead") ? 40 : th.hasAttribute("data-ctl") ? parseFloat(th.dataset.w) : Math.max(nat[i] || 0, 40)));
+      const floor = Math.min(160, nat[nameIdx] || 160);
+      const flexSum = fixed.reduce((a, w, i) => a + (ths[i].hasAttribute("data-ctl") || ths[i].classList.contains("lead") ? 0 : w), 0);
+      const rigid = fixed.reduce((a, w) => a + w, 0) - flexSum;
+      const scale = Math.min(1, Math.max(0, (avail - floor - rigid) / (flexSum || 1)));
+      ths.forEach((th, i) => { if (i === nameIdx || th.offsetParent === null) { th.style.width = ""; return; } const flex = !(th.hasAttribute("data-ctl") || th.classList.contains("lead")); th.style.width = `${Math.floor(flex ? fixed[i] * scale : fixed[i])}px`; });
+    });
+  });
+}
+addEventListener("resize", () => requestAnimationFrame(() => { fitGrid(); fitMiddle(); }));
+ICONS.adhoc = '<path d="M10.1 2.18a9.93 9.93 0 0 1 3.8 0M17.6 3.71a9.95 9.95 0 0 1 2.69 2.7M21.82 10.1a9.93 9.93 0 0 1 0 3.8M20.29 17.6a9.95 9.95 0 0 1-2.7 2.69M13.9 21.82a9.94 9.94 0 0 1-3.8 0M6.4 20.29a9.95 9.95 0 0 1-2.69-2.7M2.18 13.9a9.93 9.93 0 0 1 0-3.8M3.71 6.4a9.95 9.95 0 0 1 2.7-2.69"/>';
