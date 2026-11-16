@@ -55,8 +55,9 @@ test("one at work turns its ring, on one clock; the rest stay still", async ({ p
   // Its word carries the prism, as Mission control's own working rows' do.
   await expect(page.locator('.dn[data-stand="working"] .dn-word.sg-shimmer').first()).toBeVisible();
   await page.goto("/agents");
-  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents" }).click();
-  expect((await turning(page, '.ms-node[data-stand="working"]')).every((n) => n === 1)).toBe(true);
+  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's details" }).click();
+  // Its subagents' rows at work (a sandbox's row in the dropdown is an .ms-node at work too, with no ring).
+  expect((await turning(page, '.ms-node:has(> .ms-node-main)[data-stand="working"]')).every((n) => n === 1)).toBe(true);
 });
 
 test("still when motion is reduced", async ({ page }) => {
@@ -153,7 +154,7 @@ test("Mission control: a question is answered right under its row, and the row g
 test("Mission control: a subagent that ended is removed from its tree", async ({ page }) => {
   const seen = await holdRemoves(page);
   await page.goto("/agents");
-  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents" }).click();
+  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's details" }).click();
   const node = page.locator(".ms-node", { has: page.locator(".ms-node-name", { hasText: "Bench the follower" }) });
   await node.getByRole("button", { name: "Remove Bench the follower" }).click();
   await expect(node).toHaveCount(0);

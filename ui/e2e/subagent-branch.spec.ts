@@ -50,11 +50,12 @@ test("Branch makes a Variant beside the subagent, marked in the tree; New agent 
 
   // Beside it, under the same agent, the fork before its name.
   await page.goto("/agents");
-  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents" }).click();
-  const tree = page.getByRole("list", { name: "Storage lead's subagents" });
-  const variant = tree.locator(".ms-node", { hasText: "Batch entries 64 at a time" });
+  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's details" }).click();
+  const tree = page.getByRole("list", { name: "Storage lead's details" });
+  // A subagent's row (the dropdown's sandbox and settings rows are .ms-node too).
+  const variant = tree.locator(".ms-node:has(> .ms-node-main)", { hasText: "Batch entries 64 at a time" });
   await expect(variant.getByRole("img", { name: "Variant" })).toHaveCount(1);
-  await expect(variant).toHaveAttribute("data-depth", (await tree.locator(".ms-node", { hasText: "Leader election over QUIC" }).getAttribute("data-depth")) ?? "");
+  await expect(variant).toHaveAttribute("data-depth", (await tree.locator(".ms-node:has(> .ms-node-main)", { hasText: "Leader election over QUIC" }).getAttribute("data-depth")) ?? "");
 
   await page.goto("/agents/tree-lead?task=tree-s1");
   await page.locator(".hx-crumbs").getByRole("button", { name: "Branch" }).click();
