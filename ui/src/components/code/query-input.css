@@ -1,0 +1,36 @@
+/* The query field (query-input.tsx): an editor in a field's frame, its height its lines'. Its frames: a
+   definition's field (`ms-edit-in`, an experiment's criterion: three lines at the least) and a page's
+   (`field`, the metrics explorer's: as tall as the fields beside it, one line, more as it wraps). The
+   pages that show it import this too, so the frame it waits in stands at its height while it loads. */
+.ms-edit-in.qi {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 68px;
+  padding: 0;
+}
+.ms-edit-in.qi:focus-within {
+  border-color: #bab0e3;
+}
+.ms-edit-in.qi .cm-content {
+  min-height: 54px;
+  padding: 6px 0;
+}
+.ms-edit-in.qi .cm-line {
+  padding: 0 8px;
+}
+/* A field's box, hover and focus (index.css .field); its words at a field's input's size and inset, a
+   line as high as its textarea's. */
+.field.qi {
+  display: block;
+  padding: 0;
+}
+.field.qi .cm-editor {
+  font-size: 12.5px;
+}
+.field.qi .cm-content {
+  padding: 10px 0;
+}
+.field.qi .cm-line {
+  padding: 0 12px;
+}

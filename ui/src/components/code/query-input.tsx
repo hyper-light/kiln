@@ -3,19 +3,23 @@
  * coloured as it's read (aggregations and functions, windows, metrics, a scope's tags and values,
  * groups, comparisons, numbers) and completed as it's typed, each part in its turn: a time aggregation,
  * its window, a space aggregation, a metric, a scope's tag and its values, `by {…}` and its groups, a
- * comparison. Lines wrap; Enter submits (`onEnter`) unless a completion is open. Uncontrolled once
- * mounted (a new `key` starts it again). Loaded on demand: import it with React.lazy.
+ * comparison (a metric query alone: from its space aggregation to its groups, its metric's own tags
+ * looked up). Lines wrap; Enter submits (`onEnter`) unless a completion is open. Uncontrolled once
+ * mounted (a new `key` starts it again). Loaded on demand: import it with React.lazy. Its frames'
+ * styles are query-input.css: a page that shows it imports that too, so the frame it waits in stands
+ * at its height.
  */
 import * as React from "react";
-import { autocompletion, closeBrackets, completionKeymap, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
+import { autocompletion, closeBrackets, completionKeymap, type CompletionContext } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { HighlightStyle, StreamLanguage, syntaxHighlighting } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap, placeholder } from "@codemirror/view";
 import { tags as t } from "@lezer/highlight";
-import { completeQuery, SPACE_AGGS, type QueryWords } from "./query-words";
+import { completeQueryWith, SPACE_AGGS, type QueryWords, type TagsOf } from "./query-words";
+import "./query-input.css";
 
-export type { QueryWords };
+export type { QueryWords, TagsOf };
 
 export interface QueryInputProps {
   value: string;
@@ -23,7 +27,15 @@ export interface QueryInputProps {
   label: string;
   placeholder?: string;
   words: QueryWords;
-  onEnter?: () => void;
+  /** Enter, with the words as they are in the editor (a render can lag the last key typed). */
+  onEnter?: (text: string) => void;
+  /** A metric's own tags, in place of `words.tags` in its scope's and its groups' braces (a metric query's). */
+  tagsOf?: TagsOf;
+  /**
+   * Its frame: a definition's field (`ms-edit-in`, three lines at the least; unless said) or a page's
+   * (`field`, as tall as the fields beside it: one line, more as it wraps).
+   */
+  frame?: "ms-edit-in" | "field";
 }
 
 /** The syntax read as it's typed: whether the cursor is in a scope or a group's braces. */
@@ -76,8 +88,7 @@ const highlight = HighlightStyle.define([
 const theme = EditorView.theme(
   {
     "&": { color: "#d4dde8", backgroundColor: "transparent", fontSize: "12px" },
-    ".cm-content": { fontFamily: "var(--font-mono)", caretColor: "#e4e5e7", padding: "6px 0", minHeight: "54px" },
-    ".cm-line": { padding: "0 8px" },
+    ".cm-content": { fontFamily: "var(--font-mono)", caretColor: "#e4e5e7" },
     ".cm-scroller": { fontFamily: "var(--font-mono)", lineHeight: "18px" },
     ".cm-placeholder": { color: "#6d7078" },
     ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection": { backgroundColor: "rgb(166 196 237 / 18%)" },
@@ -112,7 +123,14 @@ export default function QueryInput(props: QueryInputProps) {
           syntaxHighlighting(highlight),
           theme,
           autocompletion({
-            override: [(ctx: CompletionContext): CompletionResult | null => completeQuery(latest.current.words, ctx.state.doc.sliceString(0, ctx.pos), ctx.pos)],
+            override: [
+              (ctx: CompletionContext) => {
+                // A lookup of a metric's tags ends with the query it's for (CodeMirror aborts one it no longer needs).
+                const stop = new AbortController();
+                ctx.addEventListener("abort", () => stop.abort());
+                return completeQueryWith(latest.current.words, latest.current.tagsOf, ctx.state.doc.sliceString(0, ctx.pos), ctx.pos, stop.signal);
+              },
+            ],
             icons: false,
             activateOnTyping: true,
           }),
@@ -120,9 +138,9 @@ export default function QueryInput(props: QueryInputProps) {
             ...completionKeymap,
             {
               key: "Enter",
-              run: () => {
+              run: (v) => {
                 if (!latest.current.onEnter) return false;
-                latest.current.onEnter();
+                latest.current.onEnter(v.state.doc.toString());
                 return true;
               },
             },
@@ -137,5 +155,5 @@ export default function QueryInput(props: QueryInputProps) {
     });
     return () => view.destroy();
   }, []);
-  return <div ref={mount} className="ms-edit-in qi" />;
+  return <div ref={mount} className={`${props.frame ?? "ms-edit-in"} qi`} />;
 }

@@ -55,6 +55,7 @@ import { useNavigate } from "@/lib/router";
 import { EngineGlyph, START, StartMark, WarmDots, msText } from "@/views/sandbox-marks";
 import { chatStand, type ChatStand } from "./chat-state";
 import { modelLabel } from "./derive";
+import "@/components/code/query-input.css";
 import "./definition.css";
 import "./figure/figure.css";
 
