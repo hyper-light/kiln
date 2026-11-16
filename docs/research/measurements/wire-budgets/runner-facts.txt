@@ -1,4 +1,6 @@
-# docs/research/measurements/wire-budgets/runner-facts.py on kiln fc6e47db5, 2026-11-16, macOS 26.4.1 arm64, brotli 1.2.0, Python 3.9.6
+# docs/research/measurements/wire-budgets/runner-facts.py on kiln fc6e47db5, 2026-11-16, macOS 26.4.1 arm64, brotli 1.2.0, Python 3.9.6;
+# again with its every-runner section on kiln 9bc380a97 (the same fixture), adas-mac-studio-2.local, macOS 26.2 arm64,
+# brotli 1.2.1, Python 3.14.2: the three hosts' tables came out byte for byte as below.
 
 Linux x86_64 with KVM and no GPU (fedora.attlocal.net)
   two runners                                         raw   br 4  added  gzip 5
@@ -29,3 +31,14 @@ macOS arm64 with an Apple GPU (adas-macbook-pro-2.local)
   + 0909253c8 step 34 link                           4945   1364    +70    1366
   + 72d28bc0b P2.3 isolation.engine                  4977   1373     +9    1374
   all of them                                        +942   +233           +235
+
+Every production runner, every landing above applied
+  two runners                                                   raw   br 4
+  adacachy (linux x86_64, 1 GPU)                               5679   1565
+  adalundhe-macbook-pro (macos aarch64, 1 GPU)                 5109   1401
+  adas-mac-studio-2.local (macos aarch64, 1 GPU)               4983   1360
+  adas-mac-studio-3.local (macos aarch64, 1 GPU)               4981   1359
+  adas-mac-studio.local (macos aarch64, 1 GPU)                 4983   1360
+  adas-macbook-pro-2.local (macos aarch64, 1 GPU)              4967   1378
+  fedora.attlocal.net (linux x86_64, 0 GPU)                    6717   1753
+  f766f09294f2e17e3b8a631ffd4e6a4b (windows x86_64, 0 GPU)     5751   1579
