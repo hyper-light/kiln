@@ -414,7 +414,7 @@ placeholder), so each implementation supplies its own.
 
 A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
 than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
-read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another. What it holds it enforces; a launch that
+read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another, components laid over its image's own. What it holds it enforces; a launch that
 asks for what it doesn't hold is refused `Unsupported`, never taken and ignored, and the suite checks
 both halves.
 
@@ -472,6 +472,14 @@ its place with what its launch gives it, and the run it gives is the other's, it
 (the same `id`); the one swapped out says its end, which ends nothing more of its boundary, and swaps no
 more. A boundary that swaps none refuses one `Unsupported`, and its run goes on.
 
+A component is an image's AGENT, HARNESS or MCP install built alone from its pinned source (kiln plan 01a1dd2e…,
+P6c.3, through Hex's P6c.2 for Shards' P6c.1): its kind, its source as an Agentfile's `FROM` writes it, and its pin
+(`checksum`, `version_id`) where its source isn't pinned in itself. A launch lays components over its image's own, each
+at its member's directory (`components`: those a person swapped into its session while it ran before, and the one a
+`swap` of its member gives it), and a run takes one swapped in at a member's directory (`Swap`) and its image's own given
+back (`Restore`) while it runs, that member alone started again with it at once. A boundary that holds no components
+refuses both `Unsupported`, and its run goes on.
+
 Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, `change`, `swap`.
 
 - **SANDBOX-1** what a run writes reaches its stdout in order, then its end, then nothing
@@ -489,6 +497,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, 
 - **SANDBOX-13** a run's credential, granted by reference toward a host its egress reaches, is filled in toward that host alone: never toward another host it reaches, for a credential it isn't granted, or for a run granted none; a grant toward a host its egress doesn't reach, an address, a host with a port or no host, or by a reference no store names, is refused Invalid; a sandbox that fills in no credentials refuses them Unsupported
 - **SANDBOX-14** a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on
 - **SANDBOX-15** a run's member swapped for another in its boundary ends, its end said once, and the run it gives runs the other in the same boundary; one swapped out swaps no more; a sandbox that swaps none refuses one Unsupported, and its run goes on
+- **SANDBOX-16** a launch's components are laid for it, and a run takes a component swapped in and its image's own given back while it runs, and one after its end is refused Ended; a sandbox that holds no components refuses both Unsupported, and its run goes on
 
 ## Placement
 

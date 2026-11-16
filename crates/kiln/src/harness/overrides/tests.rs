@@ -57,8 +57,15 @@ fn stand_in(dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let script = dir.join("stand-in.py");
     std::fs::write(&script, r#"import json, os, sys, uuid
 log, args = sys.argv[1], sys.argv[2:]
+# Its version: 2.1.296, or as a component swapped in makes it (a copy installed with its own, or one the stand-in
+# runtime lays at its path, `claude-<version>`).
+version = os.environ.get("KILN_STAND_IN_VERSION", "2.1.296")
+for part in os.environ.get("KILN_FAKE_COMPONENTS", "").split(";"):
+    at, _, source = part.partition(" ")
+    if at == "/harness/claude" and "claude-" in source:
+        version = source.rsplit("claude-", 1)[1]
 if "--version" in args:
-    print("2.1.296 (Claude Code)")
+    print(version + " (Claude Code)")
     sys.exit(0)
 def note(kind, value):
     with open(log, "a") as f:
@@ -81,13 +88,13 @@ for line in sys.stdin:
         note("control", req)
         resp = {}
         if req.get("subtype") == "initialize":
-            resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": "2.1.296"}
+            resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": version}
         out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
     elif m.get("type") == "user":
         uid = m.get("uuid")
         note("user", m.get("message"))
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
-        out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "fixture", "permissionMode": "default", "claude_code_version": "2.1.296"})
+        out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "fixture", "permissionMode": "default", "claude_code_version": version})
         out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
 "#)?;
@@ -190,6 +197,8 @@ fn p6b_4_ac1_the_ops_are_on_rest_mcp_and_code_mode_as_changes() -> anyhow::Resul
             ("sessions.networks.disconnect", true, "networks/disconnect"),
             ("sessions.volumes.add", false, "volumes"),
             ("sessions.volumes.remove", true, "volumes/remove"),
+            ("sessions.components.swap", false, "components"),
+            ("sessions.components.restore", true, "components/restore"),
         ] {
             let listed = catalog.get("operations").and_then(Value::as_array).and_then(|a| a.iter().find(|o| o.get("name") == Some(&json!(name)))).ok_or_else(|| anyhow::anyhow!("{name} isn't in GET /api/ops"))?;
             anyhow::ensure!(listed.get("read_only") == Some(&json!(false)) && listed.get("destructive") == Some(&json!(destructive)), "{name}: {listed}");
@@ -217,7 +226,7 @@ fn p6b_4_ac2_a_host_session_refuses_network_changes_naming_its_engine() -> anyho
         opened(&hub, "host-net", dir.path(), &program, None).await?;
         let v = get(&hub, "host-net").await?;
         anyhow::ensure!(v.pointer("/live/engine") == Some(&json!("host")), "{v}");
-        anyhow::ensure!(v.pointer("/live/ops") == Some(&json!(["sessions.volumes.add", "sessions.volumes.remove"])), "only its volumes': {v}");
+        anyhow::ensure!(v.pointer("/live/ops") == Some(&json!(["sessions.volumes.add", "sessions.volumes.remove", "sessions.components.swap", "sessions.components.restore"])), "only its volumes' and components': {v}");
         for (name, input) in [
             ("sessions.ports.publish", json!({"agent": "host-net", "bind": "127.0.0.1", "host_port": 8080, "guest_port": 3000, "protocol": "tcp"})),
             ("sessions.ports.unpublish", json!({"agent": "host-net", "bind": "127.0.0.1", "host_port": 8080, "protocol": "tcp"})),
@@ -322,7 +331,7 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         let cwd = dir.path().to_string_lossy().into_owned();
         let roots: Vec<String> = crate::sandbox::isolated::plug_root_of(&cwd).into_iter().chain([crate::sandbox::isolated::VOLUMES.to_owned()]).collect();
         let v = shows(&hub, "vm-live", "what its launch declared", |v| v.pointer("/state/overrides/roots").is_some()).await?;
-        anyhow::ensure!(v.pointer("/live/engine") == Some(&json!("microvm")) && v.pointer("/live/ops").and_then(Value::as_array).is_some_and(|o| o.len() == 8), "every operation offered: {v}");
+        anyhow::ensure!(v.pointer("/live/engine") == Some(&json!("microvm")) && v.pointer("/live/ops") == Some(&json!(super::ops_for(true))) && super::ops_for(true).len() == 10, "every operation offered: {v}");
         anyhow::ensure!(v.pointer("/state/overrides/roots") == Some(&json!(roots)) && v.pointer("/state/overrides/ceiling") == Some(&json!([CEILING])), "{v}");
         let launched = vms.launched();
         anyhow::ensure!(launched.first().is_some_and(|l| l.plug_roots == roots && l.egress_ceiling == [CEILING]), "declared at its launch: {launched:?}");
@@ -599,6 +608,261 @@ fn p6c_5_a_switch_where_microvms_swap_none_is_refused_and_the_session_goes_on() 
         until("its switch refused", || session.core.lock().events().any(|e| matches!(&e.body, crate::harness::model::Body::Notice { text, .. } if text == crate::sandbox::isolated::NO_SWITCH))).await?;
         anyhow::ensure!(session.info().kind == "claude" && vms.launched().len() == 1 && vms.swapped().is_empty(), "it goes on as it was");
         anyhow::ensure!(hub.harness.close(&hub, "vm-noswap").await, "it closed");
+        Ok(())
+    })
+}
+
+/// P6c.3's record: a component's source is pinned as an Agentfile pins one (Shards' D54), at its member's directory, its
+/// harness's the session's own; on its machine's host a harness alone, from a pinned http(s) source; one held at a path,
+/// a swap there taking the place of the one before; a restore of none refused. Its microVM lays each as it starts, a
+/// harness it switched from aside; an agent's goes to its run as a change, its harness's never (it starts again).
+#[test]
+fn p6c_3_a_components_source_is_pinned_as_an_agentfiles_and_one_is_held_at_a_path() -> anyhow::Result<()> {
+    use super::*;
+    let sum = format!("sha256:{}", "ab".repeat(32));
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let c = |kind, path: &str, source: &str, checksum: Option<&str>, version_id: Option<&str>| Component { kind, path: path.into(), source: source.into(), checksum: checksum.map(str::to_owned), version_id: version_id.map(str::to_owned) };
+    let swap = |c: Component| Change::Swap { component: c, force: false };
+    let harness = |source: &str, checksum: Option<&str>| c(ComponentKind::Harness, "/harness/claude", source, checksum, None);
+    // Pinned as at a build: each kind of source, its own pin.
+    for fine in [
+        harness("https://example.com/claude-2.2.0", Some(&sum)),
+        harness("s3://dist/claude-2.2.0", Some(&sum)),
+        c(ComponentKind::Agent, "/agents/helper", &format!("https://github.com/acme/helper.git#{commit}"), None, None),
+        c(ComponentKind::Mcp, "/mcp/db", &format!("ghcr.io/acme/db-mcp@{sum}"), None, None),
+        c(ComponentKind::Harness, "/harness/claude", "s3://dist/claude", None, Some("v7")),
+    ] {
+        assert!(check(&swap(fine.clone()), true, "claude").is_ok(), "{fine:?}");
+    }
+    for (bad, why) in [
+        (harness("https://example.com/claude-2.2.0", None), "pinned by checksum"),
+        (harness("https://example.com/claude-2.2.0", Some("sha256:ABC")), "64 lowercase hex"),
+        (harness("s3://dist/claude", None), "checksum (sha256:<hex>) or version_id"),
+        (harness("s3://dist", Some(&sum)), "names no object"),
+        (c(ComponentKind::Agent, "/agents/helper", "https://github.com/acme/helper.git#main", None, None), "commit its #REF names"),
+        (c(ComponentKind::Agent, "/agents/helper", &format!("https://github.com/acme/helper.git#{commit}"), Some(&sum), None), "checksum pins an http(s) or s3:// source"),
+        (c(ComponentKind::Mcp, "/mcp/db", "ghcr.io/acme/db-mcp:1.2", None, None), "pinned by its digest"),
+        (c(ComponentKind::Agent, "/agents/helper", "./helper", None, None), "build's context"),
+    ] {
+        assert!(check(&swap(bad.clone()), true, "claude").is_err_and(|e| e.contains(why)), "{bad:?}: {:?}", check(&swap(bad.clone()), true, "claude"));
+    }
+    // At its member's directory, of its kind; a harness's, its own.
+    assert!(check(&swap(c(ComponentKind::Agent, "/harness/claude", "https://e.com/a", Some(&sum), None)), true, "claude").is_err_and(|e| e.contains("isn't where an agent is")));
+    assert!(check(&swap(harness("https://e.com/claude", Some(&sum))), true, "codex").is_err_and(|e| e.contains("its harness is at /harness/codex")));
+    assert!(check(&Change::Restore { path: "/volumes/x".into(), force: false }, true, "claude").is_err_and(|e| e.contains("no member's directory")));
+    // On its machine's host: its harness alone, from a pinned http(s) source.
+    assert!(check(&swap(harness("https://example.com/claude-2.2.0", Some(&sum))), false, "claude").is_ok());
+    assert!(check(&swap(c(ComponentKind::Harness, "/harness/claude", "s3://dist/claude", None, Some("v7"))), false, "claude").is_err_and(|e| e.contains("pinned http(s) source alone")));
+    assert!(check(&swap(c(ComponentKind::Agent, "/agents/helper", "https://e.com/a", Some(&sum), None)), false, "claude").is_err_and(|e| e.contains("one member, its harness")));
+    // One at a path.
+    let mut o = Overrides::default();
+    let v1 = harness("https://example.com/claude-2.2.0", Some(&sum));
+    let v2 = harness("https://example.com/claude-2.3.0", Some(&format!("sha256:{}", "cd".repeat(32))));
+    let agent = c(ComponentKind::Agent, "/agents/helper", &format!("https://github.com/acme/helper.git#{commit}"), None, None);
+    assert_eq!(take(&mut o, &swap(v1.clone())).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert_eq!(take(&mut o, &swap(v1.clone())).map_err(anyhow::Error::msg)?, Taken::Same);
+    assert_eq!(take(&mut o, &swap(v2.clone())).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert_eq!(o.components.iter().map(|h| &h.component).collect::<Vec<_>>(), vec![&v2], "the second took the first's place");
+    assert_eq!(take(&mut o, &swap(agent.clone())).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert_eq!(o.revision, 3);
+    // Laid as its microVM starts, a harness it switched from aside.
+    assert_eq!(laid(&o, "claude").iter().map(|l| l.at.as_str()).collect::<Vec<_>>(), ["/harness/claude", "/agents/helper"]);
+    assert_eq!(laid(&o, "codex").iter().map(|l| l.at.as_str()).collect::<Vec<_>>(), ["/agents/helper"]);
+    assert_eq!(harness_component(&o, "claude").map(|h| &h.component), Some(&v2));
+    // Its harness's starts it again; an agent's is a change to its run.
+    assert!(at_harness(&swap(v2.clone()), "claude") && !at_harness(&swap(agent.clone()), "claude"));
+    assert!(matches!(seam_change(&swap(agent.clone()), None), Some(kiln_seams::sandbox::Change::Swap { ref at, ref component }) if at == "/agents/helper" && component.source == agent.source));
+    let restore = Change::Restore { path: "/agents/helper".into(), force: true };
+    assert!(restore.forced());
+    let taken = take(&mut o, &restore).map_err(anyhow::Error::msg)?;
+    assert_eq!(taken, Taken::Removed(Removed::Component(agent)));
+    let Taken::Removed(removed) = taken else { anyhow::bail!("removed") };
+    assert_eq!(seam_change(&restore, Some(&removed)), Some(kiln_seams::sandbox::Change::Restore { at: "/agents/helper".into() }));
+    assert!(take(&mut o, &restore).is_err_and(|e| e.contains("nothing is swapped in at /agents/helper")));
+    Ok(())
+}
+
+/// The stand-in runtime's microVMs for `vms`' Claude Code image, their member the stand-in, held by the server's own
+/// machine.
+#[cfg(unix)]
+fn holding(hub: &Hub, dir: &Path, program: &Path, vms: impl FnOnce(&str, &Path) -> crate::sandbox::fake::FakeVms) -> anyhow::Result<Arc<crate::sandbox::fake::FakeVms>> {
+    let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for Claude Code"))?;
+    let (images, pinned) = crate::sandbox::image::tests::holding(dir, crate::sandbox::image::Source::Builtin(claude))?;
+    let vms = Arc::new(vms(&pinned, program));
+    hub.harness.local.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images));
+    Ok(vms)
+}
+
+/// The session `--resume`d at its harness's last start, as Claude Code is resumed.
+#[cfg(unix)]
+fn resumed(log: &Path) -> Option<String> {
+    let starts = said(log, "start");
+    let args = starts.last().map(|(_, a)| a.clone())?;
+    let args: Vec<&str> = args.as_array()?.iter().filter_map(Value::as_str).collect();
+    args.windows(2).find(|w| w.first() == Some(&"--resume")).and_then(|w| w.get(1)).map(|s| (*s).to_owned())
+}
+
+/// P6c.3's tests, in a microVM: a harness swapped through the API (as every surface calls it) starts again with its
+/// component laid in the same microVM (the stand-in runtime records its member swapped for itself there, its launch
+/// laying the component; none launched again: the same box), its version as the harness reports it the component's,
+/// `agents.get` showing what's held, and its conversation going on through its own resume. A restart of the session
+/// lays it again (`Launch::components`). Restored, it runs its image's own again, in the same microVM.
+#[cfg(unix)]
+#[test]
+fn p6c_3_a_harness_swapped_in_a_microvm_runs_its_component_in_the_same_microvm_its_conversation_going_on() -> anyhow::Result<()> {
+    use kiln_seams::sandbox::ComponentAt;
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, log) = stand_in(&dir.path().join("h"))?;
+        let vms = holding(&hub, dir.path(), &program, |image, program| crate::sandbox::fake::FakeVms::with(image, "claude", program).swapping().laying())?;
+        opened(&hub, "vm-comp", dir.path(), &program, Some(Isolation::microvm())).await?;
+        let session = hub.harness.local.get("vm-comp").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        anyhow::ensure!(session.core.lock().meta.version == "2.1.296", "its image's own: {}", session.core.lock().meta.version);
+        call(owner(&hub), "agents.send", json!({"agent": "vm-comp", "text": "Remember the word kumquat."})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("Claude Code heard it", || said(&log, "user").len() == 1 && at_rest(&session)).await?;
+        let first = said(&log, "start").len();
+        let sum = format!("sha256:{}", "ab".repeat(32));
+        let answer = call(owner(&hub), "sessions.components.swap", json!({"agent": "vm-comp", "kind": "harness", "source": "https://example.com/claude-2.2.0", "checksum": sum})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        anyhow::ensure!(answer.get("taken") == Some(&json!(true)) && answer.get("engine") == Some(&json!("microvm")), "{answer}");
+        until("its harness, started again with it", || said(&log, "start").len() == first + 1 && session.core.lock().meta.version == "2.2.0" && at_rest(&session)).await?;
+        let laid = vms.swapped();
+        anyhow::ensure!(vms.launched().len() == 1 && laid.len() == 1 && laid.iter().all(|(vm, _)| vm == "fake-vm-1"), "one microVM, its member swapped for itself there: {} {laid:?}", vms.launched().len());
+        let want = vec![ComponentAt { at: "/harness/claude".into(), component: kiln_seams::sandbox::Component { kind: kiln_seams::sandbox::ComponentKind::Harness, source: "https://example.com/claude-2.2.0".into(), checksum: Some(sum.clone()), version_id: None } }];
+        anyhow::ensure!(laid.first().is_some_and(|(_, l)| l.program == "claude" && l.components == want), "its launch lays it: {laid:?}");
+        let v = get(&hub, "vm-comp").await?;
+        anyhow::ensure!(v.pointer("/state/overrides/components/0/component/source") == Some(&json!("https://example.com/claude-2.2.0")) && v.pointer("/state/overrides/components/0/component/checksum") == Some(&json!(sum)), "agents.get shows it: {v}");
+        anyhow::ensure!(v.pointer("/live/ops").and_then(Value::as_array).is_some_and(|a| a.contains(&json!("sessions.components.swap"))), "{v}");
+        let conversation = session.core.lock().state.harness_session.clone();
+        anyhow::ensure!(conversation.is_some() && resumed(&log) == conversation, "its conversation, resumed: {:?} {conversation:?}", resumed(&log));
+        // A restart of it lays the component again, in a new run.
+        let _ = hub.harness.command(&hub, "vm-comp", Command::ForceStop).await;
+        until("started again, its component laid", || vms.launched().len() == 2 && at_rest(&session) && session.core.lock().meta.version == "2.2.0").await?;
+        anyhow::ensure!(vms.launched().last().is_some_and(|l| l.components == want), "{:?}", vms.launched().last().map(|l| l.components.clone()));
+        // Restored: its image's own again, swapped for itself in the same microVM.
+        call(owner(&hub), "sessions.components.restore", json!({"agent": "vm-comp"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its image's own, again", || vms.swapped().len() == 2 && session.core.lock().meta.version == "2.1.296" && at_rest(&session)).await?;
+        anyhow::ensure!(vms.launched().len() == 2 && vms.swapped().last().is_some_and(|(vm, l)| vm == "fake-vm-2" && l.components.is_empty()), "{:?}", vms.swapped());
+        shows(&hub, "vm-comp", "no component held", |v| v.pointer("/state/overrides/components").is_none()).await?;
+        anyhow::ensure!(hub.harness.close(&hub, "vm-comp").await, "it closed");
+        Ok(())
+    })
+}
+
+/// P6c.3 in a microVM: an agent's component goes to its run as it runs (its member alone started again there), its
+/// harness never stopped; given back, its run lets go of it. Where the machine's microVMs lay no components (Hex's until
+/// its wire calls land), a swap is refused, saying why, nothing kept, and the session goes on.
+#[cfg(unix)]
+#[test]
+fn p6c_3_an_agents_component_is_a_change_to_its_run_and_refused_where_none_is_laid() -> anyhow::Result<()> {
+    use kiln_seams::sandbox::Change as Seam;
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, log) = stand_in(&dir.path().join("h"))?;
+        let vms = holding(&hub, dir.path(), &program, |image, program| crate::sandbox::fake::FakeVms::with(image, "claude", program).laying())?;
+        opened(&hub, "vm-agent", dir.path(), &program, Some(Isolation::microvm())).await?;
+        let session = hub.harness.local.get("vm-agent").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        let source = "https://github.com/acme/helper.git#0123456789abcdef0123456789abcdef01234567";
+        call(owner(&hub), "sessions.components.swap", json!({"agent": "vm-agent", "kind": "agent", "path": "/agents/helper", "source": source})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        shows(&hub, "vm-agent", "its run took it", |v| took(v, "components", "microvm") == Some("now")).await?;
+        anyhow::ensure!(vms.changed().iter().any(|(vm, c)| vm == "fake-vm-1" && matches!(c, Seam::Swap { at, component } if at == "/agents/helper" && component.source == source)), "{:?}", vms.changed());
+        anyhow::ensure!(said(&log, "start").len() == 1 && vms.launched().len() == 1, "its harness never stopped");
+        call(owner(&hub), "sessions.components.restore", json!({"agent": "vm-agent", "path": "/agents/helper"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its run let go of it", || vms.changed().iter().any(|(_, c)| matches!(c, Seam::Restore { at } if at == "/agents/helper"))).await?;
+        anyhow::ensure!(hub.harness.close(&hub, "vm-agent").await, "it closed");
+        // Where none is laid.
+        let hub = self::hub().await?;
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&second)?;
+        let vms = holding(&hub, &second, &program, |image, program| crate::sandbox::fake::FakeVms::with(image, "claude", program).swapping())?;
+        opened(&hub, "vm-nolay", dir.path(), &program, Some(Isolation::microvm())).await?;
+        let session2 = hub.harness.local.get("vm-nolay").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        call(owner(&hub), "sessions.components.swap", json!({"agent": "vm-nolay", "kind": "harness", "source": "https://example.com/claude-2.2.0", "checksum": format!("sha256:{}", "ab".repeat(32))})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its swap refused", || session2.core.lock().events().any(|e| matches!(&e.body, crate::harness::model::Body::Notice { text, .. } if text.contains(crate::sandbox::isolated::NO_COMPONENTS)))).await?;
+        anyhow::ensure!(session2.core.lock().state.overrides.components.is_empty() && vms.swapped().is_empty() && vms.launched().len() == 1, "nothing kept, it goes on as it was");
+        drop(session);
+        anyhow::ensure!(hub.harness.close(&hub, "vm-nolay").await, "it closed");
+        Ok(())
+    })
+}
+
+/// A server on a thread of its own answering `GET path` with `body` (404 for any other path), for the test's life:
+/// its base URL.
+#[cfg(unix)]
+fn serving(path: &'static str, body: Vec<u8>) -> anyhow::Result<String> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let base = format!("http://{}", listener.local_addr()?);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match s.read(&mut byte) {
+                    Ok(1) => head.extend_from_slice(&byte),
+                    _ => break,
+                }
+            }
+            let asked = String::from_utf8_lossy(&head).split_whitespace().nth(1).unwrap_or_default().to_owned();
+            let mut answer = if asked == path { format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).into_bytes() } else { b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec() };
+            if asked == path {
+                answer.extend_from_slice(&body);
+            }
+            let _ = s.write_all(&answer);
+        }
+    });
+    Ok(base)
+}
+
+/// P6c.3 AC3 and AC4 on its machine's host: a harness swapped in through the API is installed in the session's own
+/// folder from its pinned http(s) source (held to its checksum) as its harness starts again, and run from there, its
+/// version the component's as it reports it, its conversation going on through its own resume. One whose bytes aren't
+/// its pin's is said refused, and its harness runs its machine's own meanwhile. Restored, it runs its machine's own
+/// again, and the copy it installed is let go of.
+#[cfg(unix)]
+#[test]
+fn p6c_3_a_harness_swapped_on_its_host_is_installed_in_its_own_folder_and_runs_from_there() -> anyhow::Result<()> {
+    use sha2::{Digest as _, Sha256};
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, log) = stand_in(&dir.path().join("h"))?;
+        // The component: the stand-in again, as version 2.2.0.
+        let script = dir.path().join("h").join("stand-in.py");
+        let body = format!("#!/bin/sh\nKILN_STAND_IN_VERSION=2.2.0 exec python3 {} {} \"$@\"\n", script.display(), log.display()).into_bytes();
+        let sum = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+        let base = serving("/claude-2.2.0", body)?;
+        opened(&hub, "host-comp", dir.path(), &program, None).await?;
+        let session = hub.harness.local.get("host-comp").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        call(owner(&hub), "agents.send", json!({"agent": "host-comp", "text": "Remember the word kumquat."})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("Claude Code heard it", || said(&log, "user").len() == 1 && at_rest(&session)).await?;
+        // Bytes that aren't its pin's: refused as it starts again, its machine's own run meanwhile.
+        let wrong = format!("sha256:{}", "ab".repeat(32));
+        let answer = call(owner(&hub), "sessions.components.swap", json!({"agent": "host-comp", "kind": "harness", "source": format!("{base}/claude-2.2.0"), "checksum": wrong})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        anyhow::ensure!(answer.get("engine") == Some(&json!("host")), "{answer}");
+        until("its install refused", || session.core.lock().events().any(|e| matches!(&e.body, crate::harness::model::Body::Notice { text, .. } if text.contains("couldn't install") && text.contains("SHA-256")))).await?;
+        until("its machine's own, started again", || said(&log, "start").len() == 2 && at_rest(&session)).await?;
+        anyhow::ensure!(session.core.lock().meta.version == "2.1.296", "its machine's own");
+        shows(&hub, "host-comp", "it, refused", |v| took(v, "components", "host") == Some("refused")).await?;
+        // Pinned rightly, in its place: installed, and its harness started again from there.
+        call(owner(&hub), "sessions.components.swap", json!({"agent": "host-comp", "kind": "harness", "source": format!("{base}/claude-2.2.0"), "checksum": sum})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its harness, started again from its component", || said(&log, "start").len() == 3 && session.core.lock().meta.version == "2.2.0" && at_rest(&session)).await?;
+        let v = shows(&hub, "host-comp", "it, run from its install", |v| took(v, "components", "host") == Some("now")).await?;
+        // Where its harness runs it from, as agents.get says: in the session's own folder, by its checksum.
+        let how = v.pointer("/state/overrides/components/0/host/how").and_then(Value::as_str).unwrap_or_default();
+        let exe = PathBuf::from(how.split_once(" from ").and_then(|(_, r)| r.split_once(", where")).map(|(p, _)| p).unwrap_or_default());
+        anyhow::ensure!(exe.is_file() && exe.ends_with(Path::new("components").join(sum.trim_start_matches("sha256:")).join("claude")) && exe.to_string_lossy().contains("host-comp"), "installed in its own folder: {how}");
+        let installed = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+        anyhow::ensure!(v.pointer("/state/overrides/components/0/component/source") == Some(&json!(format!("{base}/claude-2.2.0"))), "{v}");
+        let conversation = session.core.lock().state.harness_session.clone();
+        anyhow::ensure!(conversation.is_some() && resumed(&log) == conversation, "its conversation, resumed: {:?} {conversation:?}", resumed(&log));
+        // Restored: its machine's own again, the copy let go of.
+        call(owner(&hub), "sessions.components.restore", json!({"agent": "host-comp"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its machine's own, again", || said(&log, "start").len() == 4 && session.core.lock().meta.version == "2.1.296" && at_rest(&session)).await?;
+        anyhow::ensure!(!installed.exists(), "the copy it ran no longer: let go of");
+        anyhow::ensure!(hub.harness.close(&hub, "host-comp").await, "it closed");
         Ok(())
     })
 }
