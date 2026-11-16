@@ -10,7 +10,7 @@
  *   POST /api/harness/sessions/:id/egress/revoke       {member?, host, port}
  *   POST /api/harness/sessions/:id/networks            {member?, network}                                connect (microVM only)
  *   POST /api/harness/sessions/:id/networks/disconnect {member?, network}
- *   POST /api/harness/sessions/:id/volumes             {path, access, perms?, at?, members?}             add (every engine; perms {read, write, exec}: a proposal)
+ *   POST /api/harness/sessions/:id/volumes             {path, access, perms?, at?, members?}             add (every engine; perms {read, write, exec}: read always, exec until Shards' noexec)
  *   POST /api/harness/sessions/:id/volumes/remove      {path}
  *
  * Each answers `{taken, agent, engine, change, said}`; a host session's network refused (409) naming
@@ -130,22 +130,28 @@ export async function handleOverrides(req: http.IncomingMessage, res: http.Serve
       change = { op: "remove", of: path };
       o.volumes = (o.volumes ?? []).filter((v) => v.volume.path !== path);
     } else {
-      // Its permissions, each its own (a proposal beside `access`, which says ro or rw alone): any of read, write, execute.
+      // Its permissions, each its own (beside `access`, which says ro or rw alone), as a Shards mount can hold
+      // them: a mount can't stop reads, so read is always on; write is not read-only; execute stays on until
+      // Shards' noexec (`exec` on its ImageShare and Plug) is vendored.
       const p = b.perms as { read?: unknown; write?: unknown; exec?: unknown } | undefined;
-      const perms = p && typeof p === "object" ? { read: p.read === true, write: p.write === true, exec: p.exec === true } : undefined;
-      if (perms && !perms.read && !perms.write && !perms.exec) return fail(400, "`perms` grants at least one of read, write, execute");
-      const access: "ro" | "rw" | null = perms ? (perms.write ? "rw" : "ro") : b.access === "ro" || b.access === "rw" ? b.access : null;
+      const asked = p && typeof p === "object" ? { read: p.read === true, write: p.write === true, exec: p.exec === true } : undefined;
+      if (asked && !asked.read) return fail(400, "A volume always allows reading: a mount can't stop reads.");
+      if (asked && !asked.exec) return fail(409, "Turning off execute isn't possible yet: Shards adds it in a coming update.");
+      const said = b.access === "ro" || b.access === "rw" ? b.access : null;
+      if (asked && said && said !== (asked.write ? "rw" : "ro")) return fail(400, "`access` and `perms.write` disagree");
+      const access: "ro" | "rw" | null = asked ? (asked.write ? "rw" : "ro") : said;
       if (!access) return fail(400, "`access` is ro or rw");
+      const perms = { read: true, write: access === "rw", exec: true };
       const at = typeof b.at === "string" && b.at.trim() ? b.at.trim() : path;
       if (!microvm && at !== path) return fail(400, `a session on its machine's host sees ${path} at its own path, not ${at}`);
-      const said = Array.isArray(b.members) ? b.members : [undefined];
+      const named = Array.isArray(b.members) ? b.members : [undefined];
       const members: LiveMember[] = [];
-      for (const x of said) {
+      for (const x of named) {
         const mm = memberOf(x, s.harness);
         if (typeof mm === "string") return fail(400, mm);
         members.push(mm);
       }
-      const volume = { path, at, access, members, ...(perms ? { perms } : {}) };
+      const volume = { path, at, access, members, perms };
       change = { op: "add", of: volume };
       const v: LiveHeldVolume = { volume, harness: harnessTook(s.harness, access === "rw"), scope: scopeTook(at, access), ...(microvm ? { microvm: microvmTook } : {}) };
       o.volumes = [...(o.volumes ?? []).filter((x) => x.volume.path !== path), v];

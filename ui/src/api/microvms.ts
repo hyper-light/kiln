@@ -272,16 +272,18 @@ export const overridesApi = {
 };
 
 /**
- * A volume's permissions, each its own: read, write and execute, in any combination. A proposal: the
- * server's wire takes `access` (ro or rw) alone until it takes these, an optional field beside it.
+ * A volume's permissions, each its own: read, write and execute, as a person picks them. A Shards mount
+ * can't stop reads, so the server refuses read off; it refuses execute off until Shards' noexec is
+ * vendored (programs and libraries on it then can't be run); write is the mount's not being read-only.
+ * The server takes them beside `access` (ro or rw), an optional field.
  */
 export interface VolumePerms {
   read: boolean;
   write: boolean;
   exec: boolean;
 }
-/** A volume's permissions: its own where it says them, else as its access has them (ro reads, rw reads and writes). */
-export const permsOf = (v: { access: LiveAccess; perms?: VolumePerms }): VolumePerms => v.perms ?? { read: true, write: v.access === "rw", exec: false };
+/** A volume's permissions: its own where it says them, else as its access has them (ro reads, rw reads and writes; both run programs, as every mount does until Shards' noexec). */
+export const permsOf = (v: { access: LiveAccess; perms?: VolumePerms }): VolumePerms => v.perms ?? { read: true, write: v.access === "rw", exec: true };
 /** Its permissions as a mode reads, a letter each in its place: r--, rw-, r-x, rwx. */
 export const permsWord = (p: VolumePerms): string => `${p.read ? "r" : "-"}${p.write ? "w" : "-"}${p.exec ? "x" : "-"}`;
 

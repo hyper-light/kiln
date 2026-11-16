@@ -1013,7 +1013,7 @@ function VolumeForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone:
   const people = d.members.filter((m) => m.kind !== "mcp");
   const [path, setPath] = React.useState("");
   const [at, setAt] = React.useState("");
-  const [perms, setPerms] = React.useState<VolumePerms>({ read: true, write: false, exec: false });
+  const [perms, setPerms] = React.useState<VolumePerms>({ read: true, write: false, exec: true });
   const [members, setMembers] = React.useState<string[]>(people.map(memberWord));
   const microvm = d.engine === "microvm";
   const any = perms.read || perms.write || perms.exec;

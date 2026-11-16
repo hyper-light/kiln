@@ -73,12 +73,51 @@ test("a microVM session's Engine: its line and controls, its bars each with its 
   expect(said, said.join("\n")).toEqual([]);
 });
 
+test("a volume given live: read and execute by default, as every mount is; execute off refused until Shards can hold it, read off always", async ({ page }) => {
+  const said = errors(page);
+  await page.goto("/agents/fam-orch");
+  await expect(page.getByRole("textbox", { name: "Message to the agent", exact: true })).toBeEnabled({ timeout: 30_000 });
+  await tab(page, "Engine");
+  const body = page.locator(".hx-inspector-body").filter({ visible: true }).first();
+  await body.getByRole("button", { name: "Add a volume" }).click();
+  const form = body.getByRole("listitem", { name: "Add a volume" });
+  // A checkbox a row each, set as a Shards mount is today: it reads, and runs what's on it.
+  await expect(form.getByRole("checkbox", { name: "Read" })).toBeChecked();
+  await expect(form.getByRole("checkbox", { name: "Write" })).not.toBeChecked();
+  await expect(form.getByRole("checkbox", { name: "Execute" })).toBeChecked();
+  await form.getByRole("textbox", { name: "Folder on its machine" }).fill("/srv/data");
+  // Execute off: refused, saying why (Shards' noexec isn't vendored yet).
+  await form.getByRole("checkbox", { name: "Execute" }).uncheck();
+  await form.getByRole("button", { name: "Add" }).click();
+  await expect(form).toContainText("Turning off execute isn't possible yet");
+  // Read off: refused always (a mount can't stop reads).
+  await form.getByRole("checkbox", { name: "Execute" }).check();
+  await form.getByRole("checkbox", { name: "Read" }).uncheck();
+  await form.getByRole("checkbox", { name: "Write" }).check();
+  await form.getByRole("button", { name: "Add" }).click();
+  await expect(form).toContainText("A volume always allows reading");
+  // Read, write and execute: given, its row saying so.
+  await form.getByRole("checkbox", { name: "Read" }).check();
+  await form.getByRole("button", { name: "Add" }).click();
+  await expect(form).toHaveCount(0);
+  const row = body.locator("li.sb-vol", { hasText: "/srv/data" });
+  await expect(row.locator(".sb-mode")).toHaveText("rwx");
+  await row.getByRole("button", { name: "Take /srv/data back" }).click();
+  await row.getByRole("button", { name: "Take /srv/data back" }).click();
+  await expect(body.locator("li.sb-vol", { hasText: "/srv/data" })).toHaveCount(0);
+  // The two refusals are the browser's own lines about their 400 and 409; nothing else.
+  const others = said.filter((s) => !/Failed to load resource: the server responded with a status of 40[09]/.test(s));
+  expect(others, others.join("\n")).toEqual([]);
+});
+
 test("a session on bare metal: its Mission row's dropdown has its subagents only, and agent chat no Engine tab", async ({ page }) => {
   const said = errors(page);
   await page.goto("/agents?open=fam-docs");
   const row = page.locator('.ms-row[data-agent="fam-docs"]');
-  // Where it runs is known (its row's engine mark): on its machine itself.
+  // Where it runs is known (its row's engine mark): on its machine itself. Looked at, as a person would: the list
+  // mounts what's near the viewport (W21-R02), an open row's dropdown with it.
   await expect(row.locator(".sm-engine").first()).toHaveAttribute("data-engine", "host", { timeout: 30_000 });
+  await row.scrollIntoViewIfNeeded();
   const groups = page.locator(".ms-dropdown .df-group .df-group-k");
   await expect(groups).toHaveText(["Subagents"]);
   await expect(page.locator(".ms-dropdown .df-note")).toHaveText(["No subagents."]);
@@ -93,6 +132,7 @@ test("a session on bare metal: its Mission row's dropdown has its subagents only
   await expect(page.getByRole("tab", { name: "Engine" })).toHaveCount(0);
   // One in a microVM started from no agent of yours: all its groups, its settings kiln's agent for its harness.
   await page.goto("/agents?open=demo-claude");
+  await page.locator('.ms-row[data-agent="demo-claude"]').scrollIntoViewIfNeeded();
   await expect(groups).toHaveText(["Subagents", "Sandboxes", "Settings", "Experiments"]);
   await page.locator(".ms-dropdown .df-group", { hasText: "Settings" }).locator(".df-head-main").click();
   await expect(page.locator(".ms-dropdown .df-group", { hasText: "Settings" })).toContainText("harness-claude");
@@ -102,6 +142,7 @@ test("a session on bare metal: its Mission row's dropdown has its subagents only
 test("a harness's permissions, model and effort, a row each in its sandbox's components, each set from there", async ({ page }) => {
   const said = errors(page);
   await page.goto("/agents?open=demo-claude");
+  await page.locator('.ms-row[data-agent="demo-claude"]').scrollIntoViewIfNeeded();
   const harness = page.locator(".ms-dropdown .sb-comp").first();
   // Each its label on a row, its value under it (the version and its source last), nothing open till a value is tapped.
   await expect(harness.locator(".sb-set > .sb-k")).toHaveText(["Permissions", "Model", "Effort", "Version"], { timeout: 30_000 });
