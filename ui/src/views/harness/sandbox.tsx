@@ -347,6 +347,7 @@ function Components({ d, agentId, store, done, fail }: { d: SandboxDetail; store
               <SwapForm
                 c={c}
                 agentId={agentId}
+                onCancel={() => setSwapping(null)}
                 done={(next) => {
                   done(next);
                   setSwapping(null);
@@ -557,7 +558,7 @@ function HarnessSettings({ store, agentId }: { store: SessionStore; agentId: str
 }
 
 /** A new source and pin for a component, swapped at its path when pressed. */
-function SwapForm({ c, agentId, done }: { c: SandboxComponent } & Acts) {
+function SwapForm({ c, agentId, done, onCancel }: { c: SandboxComponent; onCancel: () => void } & Acts) {
   const [source, setSource] = React.useState(c.from.url);
   const [pin, setPin] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -565,13 +566,18 @@ function SwapForm({ c, agentId, done }: { c: SandboxComponent } & Acts) {
   const hint = /^s3:\/\//.test(source) ? "sha256:… or version ID" : /\.git$|^git@/.test(source) ? "tag, branch or commit" : "sha256:…";
   return (
     <li className="sb-form" aria-label={`Swap ${c.name}`}>
-      <input className="sb-in sb-grow" value={source} aria-label="Source" spellCheck={false} onChange={(e) => setSource(e.target.value)} />
-      <input className="sb-in sb-pin" value={pin} placeholder={hint} aria-label="Pin" spellCheck={false} onChange={(e) => setPin(e.target.value)} />
-      <Button
-        size="xs"
-        pending={busy}
+      <span className="sb-form-row">
+        <input className="sb-in sb-grow" value={source} aria-label="Source" spellCheck={false} onChange={(e) => setSource(e.target.value)} />
+      </span>
+      <span className="sb-form-row">
+        <input className="sb-in sb-grow" value={pin} placeholder={hint} aria-label="Pin" spellCheck={false} onChange={(e) => setPin(e.target.value)} />
+      </span>
+      <FormActs
+        word="Swap"
+        busy={busy}
         disabled={!source.trim() || !pin.trim()}
-        onClick={() => {
+        onCancel={onCancel}
+        onDo={() => {
           setBusy(true);
           setWhy(null);
           sandboxApi
@@ -583,9 +589,7 @@ function SwapForm({ c, agentId, done }: { c: SandboxComponent } & Acts) {
             .catch((e: unknown) => setWhy(errorMessage(e)))
             .finally(() => setBusy(false));
         }}
-      >
-        Swap
-      </Button>
+      />
       {why && <span className="sb-why">{why}</span>}
     </li>
   );
@@ -795,6 +799,23 @@ function MemberSelect({ members, value, onChange, label }: { members: SandboxMem
 type Live = ReturnType<typeof useLive>;
 const firstAgent = (d: SandboxDetail) => memberWord(d.members.find((m) => m.kind === "agent") ?? d.members[0] ?? { kind: "harness", name: "" });
 
+/**
+ * A form's own controls, its last row: round, its ✓ white (named for what it does: Publish, Grant…) and
+ * its × dark on a white ring (Cancel). Each of its fields is a row of its own above them.
+ */
+function FormActs({ word, busy, disabled, onDo, onCancel }: { word: string; busy: boolean; disabled?: boolean; onDo: () => void; onCancel: () => void }) {
+  return (
+    <span className="sb-form-acts">
+      <button type="button" className="fig-round" data-size="sm" data-tone="accent" aria-label={word} title={word} disabled={disabled || busy} aria-busy={busy || undefined} onClick={onDo}>
+        <Check size={15} />
+      </button>
+      <button type="button" className="fig-round" data-size="sm" data-tone="cancel" aria-label="Cancel" title="Cancel" onClick={onCancel}>
+        <X size={15} />
+      </button>
+    </span>
+  );
+}
+
 function PublishForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone: () => void }) {
   const [bind, setBind] = React.useState("127.0.0.1");
   const [hostPort, setHostPort] = React.useState("8080");
@@ -803,40 +824,40 @@ function PublishForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone
   const [member, setMember] = React.useState(firstAgent(d));
   return (
     <li className="sb-form" aria-label="Publish a port">
-      <input
-        className="sb-in sb-addr"
-        value={bind}
-        aria-label="Address on its machine"
-        title="Who may reach it: 127.0.0.1 this machine alone"
-        spellCheck={false}
-        onChange={(e) => setBind(e.target.value)}
+      <span className="sb-form-row">
+        <Segmented
+          size="xs"
+          label="Protocol"
+          value={protocol}
+          onChange={setProtocol}
+          options={[
+            { value: "tcp", label: "tcp" },
+            { value: "udp", label: "udp" },
+          ]}
+        />
+      </span>
+      <span className="sb-form-row">
+        <input
+          className="sb-in sb-addr"
+          value={bind}
+          aria-label="Address on its machine"
+          title="Who may reach it: 127.0.0.1 this machine alone"
+          spellCheck={false}
+          onChange={(e) => setBind(e.target.value)}
+        />
+        <input className="sb-in sb-port" value={hostPort} inputMode="numeric" aria-label="Port on its machine" onChange={(e) => setHostPort(e.target.value)} />
+        <ArrowRight size={12} aria-hidden="true" />
+        <input className="sb-in sb-port" value={guest} inputMode="numeric" aria-label="Port in its microVM" onChange={(e) => setGuest(e.target.value)} />
+      </span>
+      <span className="sb-form-row">
+        <MemberSelect members={d.members} value={member} onChange={setMember} label="To" />
+      </span>
+      <FormActs
+        word="Publish"
+        busy={live.busy}
+        onCancel={onDone}
+        onDo={() => live.run("Couldn't publish it", () => overridesApi.publish(live.agentId, { member, bind: bind.trim(), host_port: Number(hostPort), guest_port: Number(guest), protocol }), onDone)}
       />
-      <input className="sb-in sb-port" value={hostPort} inputMode="numeric" aria-label="Port on its machine" onChange={(e) => setHostPort(e.target.value)} />
-      <ArrowRight size={12} aria-hidden="true" />
-      <input className="sb-in sb-port" value={guest} inputMode="numeric" aria-label="Port in its microVM" onChange={(e) => setGuest(e.target.value)} />
-      <Segmented
-        size="xs"
-        label="Protocol"
-        value={protocol}
-        onChange={setProtocol}
-        options={[
-          { value: "tcp", label: "tcp" },
-          { value: "udp", label: "udp" },
-        ]}
-      />
-      <MemberSelect members={d.members} value={member} onChange={setMember} label="To" />
-      <Button
-        size="xs"
-        pending={live.busy}
-        onClick={() =>
-          live.run("Couldn't publish it", () => overridesApi.publish(live.agentId, { member, bind: bind.trim(), host_port: Number(hostPort), guest_port: Number(guest), protocol }), onDone)
-        }
-      >
-        Publish
-      </Button>
-      <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
-        <X size={14} />
-      </button>
       {live.why && <span className="sb-why">{live.why}</span>}
     </li>
   );
@@ -848,20 +869,20 @@ function GrantForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone: 
   const [member, setMember] = React.useState(firstAgent(d));
   return (
     <li className="sb-form" aria-label="Grant egress">
-      <input className="sb-in sb-grow" value={host} placeholder="host" aria-label="Host: a DNS name or an address" spellCheck={false} onChange={(e) => setHost(e.target.value)} />
-      <input className="sb-in sb-port" value={port} inputMode="numeric" aria-label="Port" onChange={(e) => setPort(e.target.value)} />
-      <MemberSelect members={d.members} value={member} onChange={setMember} label="For" />
-      <Button
-        size="xs"
-        pending={live.busy}
+      <span className="sb-form-row">
+        <input className="sb-in sb-grow" value={host} placeholder="host" aria-label="Host: a DNS name or an address" spellCheck={false} onChange={(e) => setHost(e.target.value)} />
+        <input className="sb-in sb-port" value={port} inputMode="numeric" aria-label="Port" onChange={(e) => setPort(e.target.value)} />
+      </span>
+      <span className="sb-form-row">
+        <MemberSelect members={d.members} value={member} onChange={setMember} label="For" />
+      </span>
+      <FormActs
+        word="Grant"
+        busy={live.busy}
         disabled={!host.trim()}
-        onClick={() => live.run("Couldn't grant it", () => overridesApi.grant(live.agentId, { member, host: host.trim(), port: Number(port) }), onDone)}
-      >
-        Grant
-      </Button>
-      <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
-        <X size={14} />
-      </button>
+        onCancel={onDone}
+        onDo={() => live.run("Couldn't grant it", () => overridesApi.grant(live.agentId, { member, host: host.trim(), port: Number(port) }), onDone)}
+      />
       {live.why && <span className="sb-why">{live.why}</span>}
     </li>
   );
@@ -872,19 +893,19 @@ function ConnectForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone
   const [member, setMember] = React.useState(firstAgent(d));
   return (
     <li className="sb-form" aria-label="Connect to a network">
-      <MemberSelect members={d.members} value={member} onChange={setMember} label="Member" />
-      <input className="sb-in sb-grow" value={network} placeholder="network" aria-label="Network's name" spellCheck={false} onChange={(e) => setNetwork(e.target.value)} />
-      <Button
-        size="xs"
-        pending={live.busy}
+      <span className="sb-form-row">
+        <input className="sb-in sb-grow" value={network} placeholder="network" aria-label="Network's name" spellCheck={false} onChange={(e) => setNetwork(e.target.value)} />
+      </span>
+      <span className="sb-form-row">
+        <MemberSelect members={d.members} value={member} onChange={setMember} label="Member" />
+      </span>
+      <FormActs
+        word="Connect"
+        busy={live.busy}
         disabled={!network.trim()}
-        onClick={() => live.run("Couldn't connect it", () => overridesApi.connect(live.agentId, { member, network: network.trim() }), onDone)}
-      >
-        Connect
-      </Button>
-      <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
-        <X size={14} />
-      </button>
+        onCancel={onDone}
+        onDo={() => live.run("Couldn't connect it", () => overridesApi.connect(live.agentId, { member, network: network.trim() }), onDone)}
+      />
       {live.why && <span className="sb-why">{live.why}</span>}
     </li>
   );
@@ -988,21 +1009,34 @@ function VolumeForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone:
   const microvm = d.engine === "microvm";
   return (
     <li className="sb-form" aria-label="Add a volume">
-      <input className="sb-in sb-grow" value={path} placeholder="/path on its machine" aria-label="Folder on its machine" spellCheck={false} onChange={(e) => setPath(e.target.value)} />
+      <span className="sb-form-row">
+        <Segmented
+          size="xs"
+          label="Access"
+          value={access}
+          onChange={setAccess}
+          options={[
+            { value: "ro", label: "ro" },
+            { value: "rw", label: "rw" },
+          ]}
+        />
+      </span>
+      <span className="sb-form-row">
+        <input className="sb-in sb-grow" value={path} placeholder="/path on its machine" aria-label="Folder on its machine" spellCheck={false} onChange={(e) => setPath(e.target.value)} />
+      </span>
       {microvm && (
-        <input className="sb-in sb-pin" value={at} placeholder="at (in its microVM)" aria-label="Where its members see it in the microVM" spellCheck={false} onChange={(e) => setAt(e.target.value)} />
+        <span className="sb-form-row">
+          <input
+            className="sb-in sb-grow"
+            value={at}
+            placeholder="at (in its microVM)"
+            aria-label="Where its members see it in the microVM"
+            spellCheck={false}
+            onChange={(e) => setAt(e.target.value)}
+          />
+        </span>
       )}
-      <Segmented
-        size="xs"
-        label="Access"
-        value={access}
-        onChange={setAccess}
-        options={[
-          { value: "ro", label: "ro" },
-          { value: "rw", label: "rw" },
-        ]}
-      />
-      <span className="sb-members">
+      <span className="sb-form-row sb-members">
         {people.map((m) => {
           const w = memberWord(m);
           return (
@@ -1013,17 +1047,13 @@ function VolumeForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone:
           );
         })}
       </span>
-      <Button
-        size="xs"
-        pending={live.busy}
+      <FormActs
+        word="Add"
+        busy={live.busy}
         disabled={!path.trim() || members.length === 0}
-        onClick={() => live.run("Couldn't give it the folder", () => overridesApi.addVolume(live.agentId, { path: path.trim(), access, ...(at.trim() ? { at: at.trim() } : {}), members }), onDone)}
-      >
-        Add
-      </Button>
-      <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
-        <X size={14} />
-      </button>
+        onCancel={onDone}
+        onDo={() => live.run("Couldn't give it the folder", () => overridesApi.addVolume(live.agentId, { path: path.trim(), access, ...(at.trim() ? { at: at.trim() } : {}), members }), onDone)}
+      />
       {live.why && <span className="sb-why">{live.why}</span>}
     </li>
   );

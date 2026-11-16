@@ -422,13 +422,27 @@
   content: "ro";
 }
 /* An inline form: its fields on the row's line, its refusal in Shards' words under them. */
+/* A form (sandbox.tsx PublishForm, GrantForm, ConnectForm, VolumeForm, SwapForm): each of its fields a row
+   of its own, left-aligned (a choice of two, tcp or udp, ro or rw, first), its controls the last row
+   (FormActs: a round ✓ and ×). */
 .sb-form {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #191b1f;
+}
+.sb-form-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  padding: 8px 0;
-  border-bottom: 1px solid #191b1f;
+  min-width: 0;
+}
+.sb-form-acts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 2px;
 }
 .sb-in {
   height: 26px;

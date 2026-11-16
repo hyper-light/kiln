@@ -60,6 +60,17 @@
   background: #ffffff;
   border-color: #ffffff;
 }
+/* A cancel beside an accent one: dark, on a white ring, its mark white. */
+.fig-round[data-tone="cancel"] {
+  color: #ececee;
+  background: #08090a;
+  border-color: #ececee;
+}
+.fig-round[data-tone="cancel"]:hover:not(:disabled) {
+  color: #ffffff;
+  background: #121419;
+  border-color: #ffffff;
+}
 @media (prefers-reduced-motion: reduce) {
   .fig-round {
     transition: none;
