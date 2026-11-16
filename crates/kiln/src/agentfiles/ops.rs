@@ -132,10 +132,24 @@ fn refused(r: settings::Refusal) -> Fail {
     (code, r.to_string())
 }
 
+/// Each secret `change` names for a source's credentials is one of `w`'s own (P4.6): a name that's none of theirs is
+/// refused, unrepeated (a value put where a name goes never reaches the text).
+async fn yours(cx: &Cx, w: &Who, change: &settings::HarnessChange) -> Result<(), Fail> {
+    let named: Vec<&str> = change.credentials.values().flatten().map(|n| n.trim()).collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    let kept = crate::ci::secrets::list(&cx.hub, &crate::ci::secrets::user_scope(&w.person)).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("your secrets: {e:#}")))?;
+    if named.iter().all(|n| kept.iter().any(|k| k.name.eq_ignore_ascii_case(n))) {
+        return Ok(());
+    }
+    Err((StatusCode::UNPROCESSABLE_ENTITY, "`credentials` names a secret that isn't one of yours: name one `secrets.mine.list` lists (set it at /api/me/secrets first), never its value".into()))
+}
+
 /// A text read as settings, kept nowhere: with `harness`, that harness's changed in it first (kiln plan
-/// 01a1dd2e… P5.3).
+/// 01a1dd2e… P5.3); with `agent`, that agent's source and its credentials (P4.6).
 async fn settings_of(cx: Cx, v: Value) -> Out {
-    who(&cx)?;
+    let w = who(&cx)?;
     let text = v.get("text").and_then(Value::as_str).unwrap_or_default();
     if let Some(p) = super::text_problem(text) {
         return Err((StatusCode::BAD_REQUEST, p));
@@ -147,11 +161,15 @@ async fn settings_of(cx: Cx, v: Value) -> Out {
         sign_in: field(&v, "sign_in")?,
         volumes: field(&v, "volumes")?,
         egress: field(&v, "egress")?,
+        credentials: field(&v, "credentials")?.unwrap_or_default(),
     };
-    let text = match some_text(&v, "harness") {
-        Some(h) => settings::set_harness(text, h.trim(), &change).map_err(refused)?,
-        None if change == settings::HarnessChange::default() => text.to_owned(),
-        None => return Err((StatusCode::BAD_REQUEST, "`harness` names the harness whose settings these are".into())),
+    yours(&cx, &w, &change).await?;
+    let text = match (some_text(&v, "harness"), some_text(&v, "agent")) {
+        (Some(_), Some(_)) => return Err((StatusCode::BAD_REQUEST, "`harness` or `agent`: one directive's settings at a time".into())),
+        (Some(h), None) => settings::set_harness(text, h.trim(), &change).map_err(refused)?,
+        (None, Some(a)) => settings::set_agent_source(text, a.trim(), &change).map_err(refused)?,
+        (None, None) if change == settings::HarnessChange::default() => text.to_owned(),
+        (None, None) => return Err((StatusCode::BAD_REQUEST, "`harness` or `agent` names the directive whose settings these are".into())),
     };
     let settings = settings::of(&text).map_err(refused)?;
     let check = super::check::check(&text, &super::check::Kiln::of(&cx.hub.cfg.server)).await;
@@ -244,7 +262,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentfiles.settings",
-            summary: "An Agentfile's `text` as settings, keeping nothing: each harness's (its `source` and the `version` it names, its `model` and `sign_in`, its `volumes` and the `egress` HOST:PORTs it may reach) and each agent's (its model, tools, skills and remote MCP servers), with what Shards says of the text (`check`). With `harness` and what to change of it (null takes a setting out), the text is changed to say it first, and answered: model and sign-in as `LABEL kiln.harness.<harness>.model` and `.sign-in` (a sign-in's name, `<harness>/<name>`, never its value), egress on a network of its own. Save the text with agentfiles.update.",
+            summary: "An Agentfile's `text` as settings, keeping nothing: each harness's (its `source` and the `version` it names, its `model` and `sign_in`, its `volumes` and the `egress` HOST:PORTs it may reach) and each agent's (its `source` and `version`, its model, tools, skills and remote MCP servers), each with its source's `credentials` (each id its fetch reads, and which of your secrets the text names for it), with what Shards says of the text (`check`). With `agent` in place of `harness`, that agent's `source`, `version` and `credentials` are changed. `credentials` names your secrets by name alone (`{\"GIT_AUTH_TOKEN.github.com\": \"GH_TOKEN\"}`), written as `LABEL kiln.secret.<id>=user:<NAME>` (`kiln.ssh.default` for an SSH key, which a Git source over SSH is fetched with); a name that isn't one of yours is refused. With `harness` and what to change of it (null takes a setting out), the text is changed to say it first, and answered: model and sign-in as `LABEL kiln.harness.<harness>.model` and `.sign-in` (a sign-in's name, `<harness>/<name>`, never its value), egress on a network of its own. Save the text with agentfiles.update.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentfilesSettings>(),
@@ -362,5 +380,12 @@ pub mod input {
         pub volumes: Option<Vec<String>>,
         /// The HOST:PORTs it may reach.
         pub egress: Option<Vec<String>>,
+        /// The agent whose source changes (`AGENT <agent> FROM …`), in place of a harness: its `source`, `version` and
+        /// `credentials` alone.
+        pub agent: Option<String>,
+        /// Its source's credentials, each by its id as the settings list them (`GIT_AUTH_TOKEN.github.com`,
+        /// `AWS_ACCESS_KEY_ID.<bucket>`, `default` for an SSH key): one of your secrets by its name (`secrets.mine.list`),
+        /// never its value. Null takes one out.
+        pub credentials: Option<std::collections::BTreeMap<String, Option<String>>>,
     }
 }

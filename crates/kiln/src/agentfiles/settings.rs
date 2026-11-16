@@ -10,12 +10,14 @@
 //! settings an agent definition shares with it (`crate::agentdefs::sync`). Each is read from, and
 //! written into, the stage that declares its harness or agent.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 use shards_agentfile::agentfile::{self, Direction, Directive, Scope, Source, TargetKind};
 use shards_agentfile::instructions::{self, Kind};
 use shards_agentfile::{lex, lint, parser};
+
+use crate::secrets::mine::{Given, Reference};
 
 /// What kiln's labels of a harness's settings start with: `kiln.harness.<harness>.<setting>`.
 pub const HARNESS_LABEL: &str = "kiln.harness.";
@@ -48,6 +50,24 @@ pub struct Harness {
     pub volumes: Vec<String>,
     /// The `HOST:PORT`s it may reach (`NETWORK --egress=… FOR <name>`).
     pub egress: Vec<String>,
+    /// The secrets its source is fetched with, each with the person's own the text names for it (kiln plan
+    /// 01a1dd2e… P4.6); none for a path or an OCI reference.
+    pub credentials: Vec<Credential>,
+}
+
+/// A secret an `AGENT`'s or `HARNESS`'s source is fetched with (kiln plan 01a1dd2e… P4.6): the build secret Shards
+/// reads for it, or the SSH agent, by its id ([`wanted_by`]), and the person's own secret the text names for it
+/// (`LABEL kiln.secret.<id>=user:<NAME>`, `LABEL kiln.ssh.<id>=user:<NAME>`), by its name alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentfileCredential"))]
+pub struct Credential {
+    /// `GIT_AUTH_TOKEN.<host>`, `HTTP_AUTH_TOKEN_<host>`, `AWS_ACCESS_KEY_ID.<bucket>`,
+    /// `AWS_SECRET_ACCESS_KEY.<bucket>`, or `default` for an SSH key.
+    pub id: String,
+    pub given: Given,
+    /// Which of the person's own secrets it's read from (`secrets.mine.list`); none: the text names none.
+    pub secret: Option<String>,
 }
 
 /// One agent an Agentfile declares (`AGENT <name> FROM <source>`), as the settings an agent definition
@@ -59,6 +79,10 @@ pub struct Agent {
     pub name: String,
     /// The line its `AGENT` starts on.
     pub line: u32,
+    /// `FROM`'s source as written, as a harness's is ([`Harness::source`]; P4.6).
+    pub source: String,
+    /// What its source names apart from where it is, as a harness's does ([`Harness::version`]).
+    pub version: Option<String>,
     /// Its model (`LABEL kiln.agent.<name>.model`).
     pub model: Option<String>,
     /// Its tools (`LABEL kiln.agent.<name>.tools`, a JSON array of names).
@@ -67,6 +91,8 @@ pub struct Agent {
     pub skills: Vec<String>,
     /// Its remote MCP servers (`MCP <server> FROM <http(s) URL> FOR <name>`).
     pub mcp: Vec<Remote>,
+    /// The secrets its source is fetched with, as a harness's are ([`Harness::credentials`]).
+    pub credentials: Vec<Credential>,
 }
 
 /// A remote MCP server: its name, and where it answers.
@@ -98,7 +124,8 @@ pub struct Viewed {
     pub check: super::check::Check,
 }
 
-/// A change to one harness's settings: what's given changes; `Some(None)` takes the setting out.
+/// A change to one harness's settings, or of them an agent's source and its credentials ([`set_agent_source`]): what's
+/// given changes; `Some(None)` takes the setting out.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HarnessChange {
     pub source: Option<String>,
@@ -107,6 +134,9 @@ pub struct HarnessChange {
     pub sign_in: Option<Option<String>>,
     pub volumes: Option<Vec<String>>,
     pub egress: Option<Vec<String>>,
+    /// Its source's credentials by their ids ([`Credential::id`]): each one of the person's own secrets by its name, or
+    /// none to take it out (P4.6).
+    pub credentials: BTreeMap<String, Option<String>>,
 }
 
 /// An agent's settings as an agent definition shares them with its `AGENT`: each written whole.
@@ -358,6 +388,7 @@ fn remotes_of(r: &Read, stage: usize, name: &str) -> Vec<Remote> {
 /// kiln's that holds a list doesn't hold one.
 pub fn of(t: &str) -> R<Settings> {
     let r = read(t)?;
+    let (refs, _) = crate::secrets::mine::references(t);
     let mut harnesses = Vec::new();
     let mut agents = Vec::new();
     for l in &r.lines {
@@ -373,10 +404,13 @@ pub fn of(t: &str) -> R<Settings> {
                     sign_in: set_in(&labels, "sign-in"),
                     volumes: volumes_of(&r, l.stage, &name, TargetKind::Harness),
                     egress: egress_of(&r, l.stage, &name),
+                    credentials: credentials_of(&h.source, &refs),
                     name,
                 });
             }
-            Kind::Agentfile(Directive::Agent(a)) => agents.push(agent_in(&r, l, &text(&a.name))?),
+            Kind::Agentfile(Directive::Agent(a)) => {
+                agents.push(agent_in(&r, l, &text(&a.name), &refs)?)
+            }
             _ => {}
         }
     }
@@ -542,6 +576,179 @@ fn label_edits(
     }
 }
 
+/// Each label of `stage` keyed as `wanted` says (whole keys), set or taken out ([`label_edits`]), where it asks any.
+fn labels_set(
+    r: &Read,
+    stage: usize,
+    wanted: &[(String, Option<String>)],
+    edits: &mut Vec<Edit>,
+    new: &mut Vec<String>,
+) {
+    if wanted.is_empty() {
+        return;
+    }
+    let keyed: Vec<(&str, Option<String>)> = wanted
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    label_edits(r, stage, "", &keyed, edits, new);
+}
+
+/// The secrets Shards' build fetches `source` with (P4.6), by their ids: a Git source's token for its host over
+/// HTTP(S) (`GIT_AUTH_TOKEN.<host>`; git's own `git://` takes none) or its SSH agent over SSH (`default`); an http(s)
+/// URL's Bearer token for its host (`HTTP_AUTH_TOKEN_<host>`); an `s3://` object's key pair for its bucket
+/// (`AWS_ACCESS_KEY_ID.<bucket>`, `AWS_SECRET_ACCESS_KEY.<bucket>`). A path or an OCI reference, none. Each id is the
+/// first Shards' fetch looks for (its build's `git`, `http` and `s3` sources): the host's or bucket's own.
+fn wanted_by(source: &[u8]) -> Vec<(String, Given)> {
+    match agentfile::source_of(source) {
+        Ok(Source::Git(g)) => match shards_agentfile::git::parse_url(&g.remote) {
+            Ok(u) if u.scheme == b"ssh" => vec![("default".to_owned(), Given::Ssh)],
+            Ok(u) if matches!(u.scheme.as_slice(), b"http" | b"https") => {
+                git_host(&text(&u.remote))
+                    .map(|h| vec![(format!("GIT_AUTH_TOKEN.{h}"), Given::Secret)])
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        },
+        Ok(Source::Http(url)) => http_host(&text(&url))
+            .map(|h| vec![(format!("HTTP_AUTH_TOKEN_{h}"), Given::Secret)])
+            .unwrap_or_default(),
+        Ok(Source::S3 { bucket, .. }) => {
+            let b = text(&bucket);
+            vec![
+                (format!("AWS_ACCESS_KEY_ID.{b}"), Given::Secret),
+                (format!("AWS_SECRET_ACCESS_KEY.{b}"), Given::Secret),
+            ]
+        }
+        Ok(Source::Path(_) | Source::Oci(_)) | Err(_) => Vec::new(),
+    }
+}
+
+/// A Git URL's host as Shards' git source names its token by it: its authority past any user, its port kept.
+fn git_host(url: &str) -> Option<String> {
+    let authority = url.split_once("://")?.1.split(['/', '?', '#']).next()?;
+    authority
+        .rsplit('@')
+        .next()
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned)
+}
+
+/// An http(s) URL's host as Shards' http source names its secrets by it: past any user, without its port, an IPv6
+/// address without its brackets.
+fn http_host(url: &str) -> Option<String> {
+    let authority = url.split_once("://")?.1.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next(),
+        None => host.split(':').next(),
+    };
+    name.filter(|h| !h.is_empty()).map(str::to_owned)
+}
+
+/// The secrets `source` is fetched with ([`wanted_by`]), each with the person's own `refs` names for it.
+fn credentials_of(source: &[u8], refs: &[Reference]) -> Vec<Credential> {
+    wanted_by(source)
+        .into_iter()
+        .map(|(id, given)| {
+            let secret = refs
+                .iter()
+                .find(|r| r.id == id && r.given == given)
+                .map(|r| r.name.clone());
+            Credential { id, given, secret }
+        })
+        .collect()
+}
+
+/// The labels `asked` sets for a directive in `stage` whose source is `source` (P4.6): each credential's reference by
+/// its whole key (`kiln.secret.<id>`, `kiln.ssh.<id>`), `user:<NAME>`, or none to take it out. An id its source isn't
+/// fetched with, a name no secret could have, and a reference the text keeps in another stage (a second would name it
+/// twice) are refused, never repeating what was given.
+fn credential_labels(
+    r: &Read,
+    stage: usize,
+    source: &str,
+    asked: &BTreeMap<String, Option<String>>,
+) -> R<Vec<(String, Option<String>)>> {
+    let wanted = wanted_by(source.as_bytes());
+    let mut out = Vec::new();
+    for (id, name) in asked {
+        let Some(given) = wanted.iter().find(|(w, _)| w == id).map(|(_, g)| *g) else {
+            let ids: Vec<&str> = wanted.iter().map(|(w, _)| w.as_str()).collect();
+            return Err(Refusal::Value {
+                setting: "credentials",
+                why: format!(
+                    "its source isn't fetched with {id}: it's fetched with {}",
+                    if ids.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        ids.join(", ")
+                    }
+                ),
+            });
+        };
+        let key = format!("{}{id}", given.label());
+        let elsewhere = r.lines.iter().filter(|l| l.stage != stage).any(|l| {
+            matches!(&l.kind, Kind::Label(pairs) if pairs.iter().any(|kv| word(&r.lex, &kv.key).as_deref() == Some(key.as_str())))
+        });
+        if elsewhere {
+            return Err(Refusal::InText(format!(
+                "{key} is named in another stage: change it in the text"
+            )));
+        }
+        let value = match name.as_deref() {
+            None => None,
+            Some(n) => {
+                let n = kiln_ci::secrets::check_name(n).map_err(|_| Refusal::Value {
+                    setting: "credentials",
+                    why: format!("{id}: that's no secret's name (letters, digits and `_`, as `secrets.mine.list` names them)"),
+                })?;
+                Some(format!("{}{n}", crate::secrets::mine::USER))
+            }
+        };
+        out.push((key, value));
+    }
+    Ok(out)
+}
+
+/// `t` with agent `name`'s source changed as `change` says (kiln plan 01a1dd2e… P4.6): its `AGENT` line's source and
+/// the version it names, as a harness's are ([`set_harness`]), and its source's credentials. An agent's model, tools
+/// and skills are its definition's ([`set_agent`]) and the rest a harness's: a change of them here is refused.
+pub fn set_agent_source(t: &str, name: &str, change: &HarnessChange) -> R<String> {
+    if change.model.is_some()
+        || change.sign_in.is_some()
+        || change.volumes.is_some()
+        || change.egress.is_some()
+    {
+        return Err(Refusal::Value {
+            setting: "agent",
+            why: "an agent's source, its version and its credentials are set here; its model, tools and skills are its agent definition's, and a sign-in, volumes and egress a harness's".into(),
+        });
+    }
+    let r = read(t)?;
+    let a_line = declaring(&r, "agent", name)?;
+    let Kind::Agentfile(Directive::Agent(a)) = &a_line.kind else {
+        return Err(Refusal::Undeclared {
+            what: "agent",
+            name: name.to_owned(),
+        });
+    };
+    let (mut edits, mut new) = (Vec::new(), Vec::new());
+    if change.source.is_some() || change.version.is_some() {
+        edits.push(replaced(a_line, vec![sourced(a_line, a, change)?]));
+    }
+    let source = change
+        .source
+        .as_deref()
+        .map_or_else(|| text(&a.source), |s| s.trim().to_owned());
+    let wanted = credential_labels(&r, a_line.stage, &source, &change.credentials)?;
+    labels_set(&r, a_line.stage, &wanted, &mut edits, &mut new);
+    if !new.is_empty() {
+        edits.push(after(a_line, new));
+    }
+    Ok(apply(t, edits))
+}
+
 /// The one line of `r` that declares `what` `name` (`HARNESS` or `AGENT`).
 fn declaring<'a>(r: &'a Read, what: &'static str, name: &str) -> R<&'a Line> {
     let found: Vec<&Line> = r
@@ -583,29 +790,31 @@ pub fn set_harness(t: &str, name: &str, change: &HarnessChange) -> R<String> {
     if change.source.is_some() || change.version.is_some() {
         edits.push(replaced(h_line, vec![sourced(h_line, h, change)?]));
     }
-    let mut wanted = Vec::new();
+    // kiln's labels and its credentials' references, rewritten at once: one `LABEL` may hold both.
+    let mut wanted: Vec<(String, Option<String>)> = Vec::new();
     if let Some(m) = &change.model {
         wanted.push((
-            "model",
+            format!("{HARNESS_LABEL}{name}.model"),
             m.as_deref().map(|m| plain_or("model", m)).transpose()?,
         ));
     }
     if let Some(s) = &change.sign_in {
         wanted.push((
-            "sign-in",
+            format!("{HARNESS_LABEL}{name}.sign-in"),
             s.as_deref().map(|s| sign_in_name(name, s)).transpose()?,
         ));
     }
-    if !wanted.is_empty() {
-        label_edits(
-            &r,
-            h_line.stage,
-            &format!("{HARNESS_LABEL}{name}."),
-            &wanted,
-            &mut edits,
-            &mut new,
-        );
-    }
+    let source = change
+        .source
+        .as_deref()
+        .map_or_else(|| text(&h.source), |s| s.trim().to_owned());
+    wanted.extend(credential_labels(
+        &r,
+        h_line.stage,
+        &source,
+        &change.credentials,
+    )?);
+    labels_set(&r, h_line.stage, &wanted, &mut edits, &mut new);
     if let Some(v) = &change.volumes {
         volume_edits(&r, h_line.stage, name, v, &mut edits, &mut new)?;
     }
@@ -634,9 +843,13 @@ fn sourced(l: &Line, h: &agentfile::Domain, change: &HarnessChange) -> R<String>
         why: text(&e),
     })?;
     let mut words = l.words.clone();
-    let at = words
-        .get_mut(2)
-        .ok_or_else(|| Refusal::Unread(format!("line {}: HARNESS names no source", l.first)))?;
+    let at = words.get_mut(2).ok_or_else(|| {
+        Refusal::Unread(format!(
+            "line {}: {} names no source",
+            l.first,
+            l.name.to_ascii_uppercase()
+        ))
+    })?;
     *at = source;
     Ok(written(&l.name, &flags, &words))
 }
@@ -962,7 +1175,7 @@ pub fn set_agent(t: &str, name: &str, s: &AgentSettings) -> R<String> {
         ("tools", lists(s.tools.as_slice())),
         ("skills", lists(s.skills.as_slice())),
     ];
-    let had = AgentSettings::from(&agent_in(&r, a_line, name)?);
+    let had = AgentSettings::from(&agent_in(&r, a_line, name, &[])?);
     let changed: Vec<(&str, Option<String>)> = wanted
         .into_iter()
         .filter(|(setting, _)| match *setting {
@@ -990,15 +1203,27 @@ pub fn set_agent(t: &str, name: &str, s: &AgentSettings) -> R<String> {
     Ok(apply(t, edits))
 }
 
-fn agent_in(r: &Read, l: &Line, name: &str) -> R<Agent> {
+/// Agent `name`, declared at `l`, as its settings; its credentials named by `refs` (the text's references).
+fn agent_in(r: &Read, l: &Line, name: &str, refs: &[Reference]) -> R<Agent> {
     let labels = labels(r, l.stage, &format!("{AGENT_LABEL}{name}."));
+    let (source, version, credentials) = match &l.kind {
+        Kind::Agentfile(Directive::Agent(a)) => (
+            text(&a.source),
+            version_of(&a.source, &a.fetch),
+            credentials_of(&a.source, refs),
+        ),
+        _ => (String::new(), None, Vec::new()),
+    };
     Ok(Agent {
         name: name.to_owned(),
         line: line_no(l.first),
+        source,
+        version,
         model: set_in(&labels, "model"),
         tools: listed(&labels, "tools")?,
         skills: listed(&labels, "skills")?,
         mcp: remotes_of(r, l.stage, name),
+        credentials,
     })
 }
 

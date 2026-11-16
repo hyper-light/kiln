@@ -23,6 +23,10 @@
 //!   without its references ([`built_text`]), so no name of the person's reaches the image (its
 //!   config's labels, its build's definition and source map, its provenance): who can inspect an
 //!   image learns nothing of whose secrets built it.
+//! - **SSH keys too** (kiln plan 01a1dd2e… P4.6): `LABEL kiln.ssh.<ID>=user:<NAME>` names one of
+//!   theirs that holds a private key, which its build is given as SSH agent `<ID>` (Shards' `--ssh
+//!   <ID>=<key file>`; an `AGENT` or `HARNESS` Git source over SSH asks for `default`), read, refused
+//!   and kept out of its image as a build secret's reference is ([`Given`]).
 
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -37,6 +41,38 @@ pub const LABEL: &str = "kiln.secret.";
 /// What a reference's value starts with: the scope it's read from, a person's own.
 pub const USER: &str = "user:";
 
+/// What an Agentfile's label naming an SSH key starts with: `LABEL kiln.ssh.<ID>=user:<NAME>` (P4.6).
+pub const SSH: &str = "kiln.ssh.";
+
+/// How a build is given one of its person's secrets (kiln plan 01a1dd2e… P4.6): as a build secret by its id, or as an
+/// SSH agent by its id holding the private key it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentfileGiven"))]
+#[serde(rename_all = "lowercase")]
+pub enum Given {
+    /// `LABEL kiln.secret.<ID>=…`, Shards' `--secret id=<ID>`: a token, a header, a key's half.
+    #[default]
+    Secret,
+    /// `LABEL kiln.ssh.<ID>=…`, Shards' `--ssh <ID>=<key file>`.
+    Ssh,
+}
+
+impl Given {
+    /// What an Agentfile's label naming one starts with.
+    pub fn label(self) -> &'static str {
+        match self {
+            Given::Secret => LABEL,
+            Given::Ssh => SSH,
+        }
+    }
+
+    /// The one of these an Agentfile's label `key` names, and the id past its prefix.
+    fn of(key: &str) -> Option<(Given, &str)> {
+        [Given::Secret, Given::Ssh].into_iter().find_map(|g| key.strip_prefix(g.label()).map(|id| (g, id)))
+    }
+}
+
 /// One secret a build of a person's own Agentfile is given: Shards' id for it, and its value, read
 /// from that person's own by kiln's server as the session started. Its value is never shown:
 /// `Debug` names its id alone.
@@ -44,23 +80,27 @@ pub const USER: &str = "user:";
 pub struct BuildSecret {
     pub id: String,
     pub value: String,
+    /// As a build secret, or as an SSH agent's key (P4.6); one from a server before it says none: a build secret.
+    #[serde(default)]
+    pub given: Given,
 }
 
 impl std::fmt::Debug for BuildSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BuildSecret").field("id", &self.id).finish_non_exhaustive()
+        f.debug_struct("BuildSecret").field("id", &self.id).field("given", &self.given).finish_non_exhaustive()
     }
 }
 
 /// One `LABEL kiln.secret.<ID>=user:<NAME>` of an Agentfile: the build secret, and whose own it's read
-/// from by its name.
+/// from by its name; or one `LABEL kiln.ssh.<ID>=user:<NAME>`, an SSH agent's key (`given`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     pub id: String,
     pub name: String,
+    pub given: Given,
 }
 
-/// Why a `kiln.secret.` label isn't a reference, and where: its words never repeat its value.
+/// Why a `kiln.secret.` or `kiln.ssh.` label isn't a reference, and where: its words never repeat its value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Misnamed {
     pub message: String,
@@ -85,9 +125,9 @@ fn unquoted(s: &str) -> &str {
     s
 }
 
-/// The build secrets `text` names (`LABEL kiln.secret.<ID>=user:<NAME>`, in any stage), each once by
-/// its id, and each `kiln.secret.` label that isn't one, with why. Read with Shards' own parser; a
-/// text it can't read names none (its check says why).
+/// The build secrets and SSH keys `text` names (`LABEL kiln.secret.<ID>=user:<NAME>`, `LABEL
+/// kiln.ssh.<ID>=user:<NAME>`, in any stage), each once by its id, and each such label that isn't one, with
+/// why. Read with Shards' own parser; a text it can't read names none (its check says why).
 pub fn references(text: &str) -> (Vec<Reference>, Vec<Misnamed>) {
     use shards_agentfile::instructions::{self, Kind};
     use shards_agentfile::{lint, parser};
@@ -99,18 +139,19 @@ pub fn references(text: &str) -> (Vec<Reference>, Vec<Misnamed>) {
         let location = c.location.clone();
         for kv in pairs {
             let key = String::from_utf8_lossy(&kv.key);
-            let Some(id) = unquoted(&key).strip_prefix(LABEL).map(str::to_owned) else { continue };
+            let Some((given, id)) = Given::of(unquoted(&key)).map(|(g, id)| (g, id.to_owned())) else { continue };
+            let label = given.label();
             let value = String::from_utf8_lossy(&kv.value);
             let name = unquoted(&value).strip_prefix(USER).map(str::to_owned);
             let said = match name.as_deref().map(kiln_ci::secrets::check_name) {
-                _ if !build_id(&id) => Some(format!("LABEL {LABEL}{id}: a build secret's id is letters, digits, `_`, `.` and `-` (`GIT_AUTH_TOKEN`, `GIT_AUTH_TOKEN.github.com`)")),
-                Some(Ok(_)) if refs.iter().any(|r| r.id == id) => Some(format!("LABEL {LABEL}{id} names its secret twice: once is all a build takes")),
+                _ if !build_id(&id) => Some(format!("LABEL {label}{id}: a build secret's id is letters, digits, `_`, `.` and `-` (`GIT_AUTH_TOKEN`, `GIT_AUTH_TOKEN.github.com`)")),
+                Some(Ok(_)) if refs.iter().any(|r| r.id == id && r.given == given) => Some(format!("LABEL {label}{id} names its secret twice: once is all a build takes")),
                 Some(Ok(name)) => {
-                    refs.push(Reference { id, name });
+                    refs.push(Reference { id, name, given });
                     None
                 }
-                Some(Err(why)) => Some(format!("LABEL {LABEL}{id}: user:<NAME> names one of your secrets, and {why}")),
-                None => Some(format!("LABEL {LABEL}{id} names its secret as user:<NAME>, one of your own (set at /api/me/secrets): a secret's value never goes in an Agentfile")),
+                Some(Err(why)) => Some(format!("LABEL {label}{id}: user:<NAME> names one of your secrets, and {why}")),
+                None => Some(format!("LABEL {label}{id} names its secret as user:<NAME>, one of your own (set at /api/me/secrets): a secret's value never goes in an Agentfile")),
             };
             if let Some(message) = said {
                 bad.push(Misnamed { message, location: location.clone() });
@@ -120,7 +161,7 @@ pub fn references(text: &str) -> (Vec<Reference>, Vec<Misnamed>) {
     (refs, bad)
 }
 
-/// `text` as its build is given it: every `kiln.secret.` label pair taken out (an instruction left with
+/// `text` as its build is given it: every `kiln.secret.` and `kiln.ssh.` label pair taken out (an instruction left with
 /// none, a blank line), its other pairs as written and every other line as it was, so that Shards'
 /// words name the lines the person wrote. Its references stay kiln's: no name of theirs reaches the
 /// image's config, its build's definition and source map, or its provenance. A text Shards can't read
@@ -134,7 +175,7 @@ pub fn built_text(text: &str) -> String {
     let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_owned).collect();
     for c in read.stages.iter().flat_map(|s| &s.commands) {
         let Kind::Label(pairs) = &c.kind else { continue };
-        let named = |k: &[u8]| unquoted(&String::from_utf8_lossy(k)).starts_with(LABEL);
+        let named = |k: &[u8]| Given::of(unquoted(&String::from_utf8_lossy(k))).is_some();
         if !pairs.iter().any(|kv| named(&kv.key)) {
             continue;
         }
@@ -171,10 +212,10 @@ pub async fn for_build(hub: &crate::hub::Hub, person: &str, text: &str) -> Resul
     let names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
     let (held, missing) = store::for_build(hub, person, &names).await.map_err(|e| format!("your secrets: {e:#}"))?;
     if !missing.is_empty() {
-        let named: Vec<String> = refs.iter().filter(|r| missing.contains(&r.name)).map(|r| format!("{LABEL}{} names {USER}{}", r.id, r.name)).collect();
+        let named: Vec<String> = refs.iter().filter(|r| missing.contains(&r.name)).map(|r| format!("{}{} names {USER}{}", r.given.label(), r.id, r.name)).collect();
         return Err(format!("its Agentfile's {}, which isn't one of your secrets: set it at /api/me/secrets (secrets.mine.set)", named.join(", ")));
     }
-    Ok(refs.into_iter().filter_map(|r| held.get(&r.name).map(|v| BuildSecret { id: r.id, value: v.clone() })).collect())
+    Ok(refs.into_iter().filter_map(|r| held.get(&r.name).map(|v| BuildSecret { id: r.id, value: v.clone(), given: r.given })).collect())
 }
 
 /// Whose own the caller reaches: the person they are, or the person an agent acts for.
@@ -283,7 +324,7 @@ mod tests {
         let text = "FROM scratch\nLABEL kiln.secret.GIT_AUTH_TOKEN.github.com=user:gh_token other=1\nLABEL \"kiln.secret.AWS_ACCESS_KEY_ID\"=\"user:AWS_KEY\"\nHARNESS claude FROM git+https://github.com/acme/h.git#0123456789abcdef0123456789abcdef01234567\n";
         let (refs, bad) = references(text);
         assert!(bad.is_empty(), "{bad:?}");
-        assert_eq!(refs, [Reference { id: "GIT_AUTH_TOKEN.github.com".into(), name: "GH_TOKEN".into() }, Reference { id: "AWS_ACCESS_KEY_ID".into(), name: "AWS_KEY".into() }]);
+        assert_eq!(refs, [Reference { id: "GIT_AUTH_TOKEN.github.com".into(), name: "GH_TOKEN".into(), given: Given::Secret }, Reference { id: "AWS_ACCESS_KEY_ID".into(), name: "AWS_KEY".into(), given: Given::Secret }]);
         let (refs, bad) = references("FROM scratch\nLABEL kiln.secret.GIT_AUTH_TOKEN=ghp_hunter2value\nLABEL kiln.secret.a,b=user:X\nLABEL kiln.secret.T=user:1BAD\n");
         assert!(refs.is_empty(), "{refs:?}");
         let said: Vec<&str> = bad.iter().map(|m| m.message.as_str()).collect();
@@ -291,7 +332,27 @@ mod tests {
         assert!(said.iter().all(|m| !m.contains("ghp_hunter2value")), "{said:?}");
         assert!(said.first().is_some_and(|m| m.contains("user:<NAME>") && m.contains("never goes in an Agentfile")), "{said:?}");
         assert_eq!(bad.first().map(|m| m.location.clone()), Some(vec![(2, 2)]));
-        assert!(!format!("{:?}", BuildSecret { id: "GIT_AUTH_TOKEN".into(), value: "ghp_hunter2value".into() }).contains("hunter2"));
+        assert!(!format!("{:?}", BuildSecret { id: "GIT_AUTH_TOKEN".into(), value: "ghp_hunter2value".into(), given: Given::Secret }).contains("hunter2"));
+    }
+
+    /// P4.6: an SSH key is named as a build secret is, by the agent's id and one of its person's own, beside a build
+    /// secret of the same id; its value is refused, not repeated; its build's text names neither; and a build secret from
+    /// a server before it reads as one.
+    #[test]
+    fn p4_6_an_agentfile_names_its_ssh_key_by_reference_alone() -> anyhow::Result<()> {
+        let text = "FROM scratch\nLABEL kiln.ssh.default=user:deploy_key kiln.secret.default=user:OTHER keep=1\nHARNESS claude FROM ssh://git@github.com/acme/h.git#0123456789abcdef0123456789abcdef01234567\n";
+        let (refs, bad) = references(text);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(refs, [Reference { id: "default".into(), name: "DEPLOY_KEY".into(), given: Given::Ssh }, Reference { id: "default".into(), name: "OTHER".into(), given: Given::Secret }]);
+        let (refs, bad) = references("FROM scratch\nLABEL kiln.ssh.default=-----BEGIN_OPENSSH_PRIVATE_KEY-----\nLABEL kiln.ssh.default=user:A kiln.ssh.default=user:B\n");
+        assert_eq!(refs, [Reference { id: "default".into(), name: "A".into(), given: Given::Ssh }]);
+        let said: Vec<&str> = bad.iter().map(|m| m.message.as_str()).collect();
+        assert!(said.len() == 2 && said.iter().all(|m| m.starts_with("LABEL kiln.ssh.default") && !m.contains("BEGIN")), "{said:?}");
+        let built = built_text(text);
+        assert!(!built.contains("kiln.ssh") && !built.contains("DEPLOY_KEY") && !built.contains("deploy_key") && built.to_ascii_lowercase().contains("label keep=1"), "{built}");
+        let old: BuildSecret = serde_json::from_str(r#"{"id":"GIT_AUTH_TOKEN","value":"v"}"#)?;
+        assert_eq!(old.given, Given::Secret);
+        Ok(())
     }
 
     /// Shards' store, standing in: a scratch-based plan resolves no base.
