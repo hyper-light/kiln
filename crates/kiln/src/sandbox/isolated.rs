@@ -156,9 +156,10 @@ pub const SWAPPED: &str = "swapped";
 /// given `secrets` (`Spec::build_secrets`, P4.7). With `swap_from`, the harness a session switches from in a microVM of
 /// its own (kiln plan 01a1dd2e…, P6c.5), its member is swapped for this one there (`Run::swap`): the same microVM, none
 /// started, its sign-in granted as a launch's is or the swap refused (`Microvms::swap`); refused, why, and that
-/// harness's run is let go of.
-#[allow(clippy::too_many_arguments, reason = "a launch's own, and the run a switch swaps it into")]
-pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret], swap_from: Option<crate::proc::Duplex>) -> anyhow::Result<crate::proc::Duplex> {
+/// harness's run is let go of. `waiting` is told where its sign-in begins to wait for its runner's server's word
+/// ([`sign_in_of`]), for its session to say so as it starts.
+#[allow(clippy::too_many_arguments, reason = "a launch's own, the run a switch swaps it into, and what its sign-in's wait tells")]
+pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret], swap_from: Option<crate::proc::Duplex>, waiting: impl FnOnce() + Send) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     // kiln's own state, which its project is, holds or lies in none of: where its microVMs are held, its people's volumes,
@@ -203,7 +204,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     };
     let kept_in = layout.as_ref().and_then(home::Layout::kept_in);
     let sign_ins = match signin::Provider::of_harness(kind.id) {
-        Some(provider) => sign_in_of(provider, person, layout.as_ref(), &launch.egress, vms).await?,
+        Some(provider) => sign_in_of(provider, person, layout.as_ref(), &launch.egress, vms, waiting).await?,
         None => Vec::new(),
     };
     launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true, members: Vec::new() }));
@@ -560,9 +561,10 @@ async fn home_of(root: &Path, person: &str, kind: &Kind, source: Source<'_>, ima
 /// harness then signs in itself, its tokens in its microVM, as before plan step 33. Where one could be granted, a
 /// launch before this runner's server has said whether it answers (a session restored as the runner started) waits
 /// for its word, as Hex grants a sign-in only as a box is made (its C8): granted then, or not, as any launch's is.
-async fn sign_in_of(provider: signin::Provider, person: Option<&str>, layout: Option<&home::Layout>, egress: &Egress, vms: &Microvms) -> anyhow::Result<Vec<signin::SignIn>> {
+/// `waiting` is told as it begins to, for its session to say what it waits for (`secrets::lessor::WAITS`).
+async fn sign_in_of(provider: signin::Provider, person: Option<&str>, layout: Option<&home::Layout>, egress: &Egress, vms: &Microvms, waiting: impl FnOnce()) -> anyhow::Result<Vec<signin::SignIn>> {
     let leases = vms.hex.as_ref().is_some_and(|h| kiln_seams::Sandbox::holds(&**h).credentials);
-    let leased = leases && person.is_some() && matches!(egress, Egress::Only(_)) && crate::secrets::lessor::answering().await;
+    let leased = leases && person.is_some() && matches!(egress, Egress::Only(_)) && crate::secrets::lessor::answering(waiting).await;
     let (Some(person), Egress::Only(hosts), true) = (person, egress, leased) else {
         tracing::warn!(?provider, leased, person = person.is_some(), "its harness signs in itself, its tokens in its microVM: kiln takes a sign-in outside only for a person's run in microVMs that lease credentials");
         return Ok(Vec::new());

@@ -706,7 +706,8 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `secrets.leases`: the server answers its runners' runs' credential leases and sign-ins from its
   run-lease broker (`ReachAsk`'s `lessor`; plan step 33, Shards' D242); a runner asks them only of a
   server that named it, and grants its isolated harnesses no sign-in until one has. Its launches
-  wait for that word where a sign-in could be granted: caps without `CAP_FEATURES`, features not
+  wait for that word where a sign-in could be granted, each session saying so as it starts
+  (`secrets::lessor::WAITS`): caps without `CAP_FEATURES`, features not
   naming it, or a first Welcome with no caps before it are a server that answers none
   (`secrets::lessor::Heard`). A `lessor` ask and its answer may carry a value or tokens, hex in their
   JSON, wiped once used: a runner wipes every `ReachAsk` it sends and every `ReachAnswer` it reads

@@ -84,12 +84,14 @@ the machine's network) is replaced by an Agentfile image's members.
   thread's outbox, the words a frame is read into and their tree); the transport's own buffers are
   hyper-transport's. A launch before its runner's server has said whether it answers (a session
   restored as its runner started) waits for that word, then is granted its sign-in as any launch is
-  (`secrets::lessor::answering`). Where a runner's microVMs lease no credentials, or its server
-  answers none, the harness signs in itself, as before, said in the runner's log. A harness switched
-  into its running microVM (P6c.5) is granted its sign-in as a launch is, or the switch is refused,
-  never left to sign in itself there: Hex's microVMs, which grant a sign-in only as a box is made,
-  refuse it until their swap call carries one (`sandbox::Microvms::swap`). Other harnesses sign in
-  themselves: Shards has no profile of their CLIs' sign-ins.
+  (`secrets::lessor::answering`); meanwhile its session says, as it starts, that it waits for its
+  server's word on `secrets.leases` (`secrets::lessor::WAITS`). Where a runner's microVMs lease no
+  credentials, or its server answers none, the harness signs in itself, as before, said in the
+  runner's log. A harness switched into its running microVM (P6c.5) is granted its sign-in as a
+  launch is, or the switch is refused, never left to sign in itself there: Hex's microVMs, which
+  grant a sign-in only as a box is made, refuse it until their swap call carries one
+  (`sandbox::Microvms::swap`). Other harnesses sign in themselves: Shards has no profile of their
+  CLIs' sign-ins.
 - **Its stdio are the member's streams.** The seam's run is the `Duplex` its session drives
   (`crate::proc::duplex_of_run`, `sandbox::held`): what the adapter writes reaches the member's stdin in
   order, the end of its stdin is the member's, what the member writes fills its stdout and stderr, and
