@@ -235,10 +235,14 @@
         ]
       },
       {
-        "note": "agy reads MCP servers only from its own mcp_config.json, in the person's volume and so the same for every session: kiln's entry there names no session, and the lane names it, by the member whose connection it hands the runner. Each session's agy runs as a member of its own, one lane each; two sessions' agy in one member would not be told apart (owed: ROOT's run of two isolated Antigravity sessions of one person with step 17's launch).",
+        "note": "agy reads MCP servers only from its own mcp_config.json, in the person's volume and so the same for every session: kiln's launch writes its one entry there, the lane's bridge, naming no session, token or address, and the lane names the session, by the member whose connection it hands the runner. Each session's agy is the one member of a microVM of its own, one lane each, and the runner answers each run's connections as that session; two sessions' agy in one member would not be told apart. Two sessions of one person are held so without a VM, over a stand-in lane (owed: ROOT's run of two isolated Antigravity sessions of one person in real microVMs).",
         "cites": [
           "crates/kiln/src/harness/isolated/mcp.rs#one fixed entry suits it, as the lane, not the entry, names the session",
+          "crates/kiln/src/sandbox/isolated.rs#async fn offer_mcp(",
+          "crates/kiln/src/sandbox/hexvm.rs#members: vec![driven]",
+          "crates/kiln/src/sandbox/isolated.rs#pub fn bridge(",
           "crates/kiln/src/reach/mcp.rs#a call of kiln's MCP over its agent-control lane (D254)",
+          "crates/kiln/src/sandbox/isolated.rs#fn s35_mcp_two_antigravity_sessions_of_one_person_are_each_their_own",
           "docs/research/s35-every-harness/agy-mcp/probe-1.5.7-linux-x64.log:41"
         ]
       }
@@ -248,6 +252,7 @@
       ".kiln/images/harness-antigravity/pin.json",
       "crates/kiln/src/reach/mcp.rs#pub fn agy_add(",
       "crates/kiln/src/harness/isolated/mcp.rs#pub fn agy_config(",
+      "crates/kiln/src/sandbox/isolated.rs#async fn offer_mcp(",
       "crates/kiln/src/harness/antigravity.rs#flag(\"--conversation\""
     ]
   },

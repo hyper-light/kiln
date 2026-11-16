@@ -149,7 +149,9 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
                 None => std::future::pending::<()>().await,
             }
         };
-        let woken = futures::future::select(std::pin::pin!(recorded), std::pin::pin!(until));
+        let recorded = std::pin::pin!(recorded);
+        let until = std::pin::pin!(until);
+        let woken = futures::future::select(recorded, until);
         if let futures::future::Either::Right(_) =
             futures::future::select(std::pin::pin!(hub.shutdown.cancelled()), woken).await
         {

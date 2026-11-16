@@ -140,8 +140,9 @@ struct Vm {
     runtime: Arc<dyn Runtime>,
     id: BoxId,
     name: String,
-    /// Its harness member, whose MCP connections its lane takes.
-    member: Member,
+    /// Its harness member, whose MCP connections its lane takes and which its signals reach; none for a box running its
+    /// own command alone ([`HexVms::boot_command`]).
+    member: Option<Member>,
     last: parking_lot::Mutex<Option<(HostUse, Charge)>>,
     /// The most memory any read of it said its VM held, its final use's among them (a session's peak footprint,
     /// P7.1).
@@ -240,6 +241,16 @@ async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
             *vm.last.lock() = Some((used, Charge::Final));
         }
         Ok(None) | Err(hex_api::Refusal::NoSuchBox(_)) => {}
+        // Its run ended on its own before this delete (its own command ended, or its VM failed): Hex reads no use of a
+        // run that has ended and leaves its box as it was (`NotRunning`), so it goes by a plain delete, charged the use
+        // last read.
+        Err(hex_api::Refusal::NotRunning(..)) => {
+            let (runtime, id) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(|e| e.to_string())?);
+            match crate::rt::blocking(move || runtime.delete(&id)).await.map_err(|e| format!("its delete didn't run: {e:#}"))? {
+                Ok(()) | Err(hex_api::Refusal::NoSuchBox(_)) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
         Err(e) => return Err(e.to_string()),
     }
     let charge = vm.last.lock().clone();
@@ -262,6 +273,52 @@ pub fn said(from: hex_api::StartedFrom) -> &'static str {
 
 /// Why a launch with no box named is refused where no placement numbers one.
 pub const UNNAMED: &str = "a microVM whose box no placement here names: kiln's placement isn't running on this machine";
+
+/// Why a box running its own command alone ([`HexVms::boot_command`]) takes no signal to a member and has no MCP lane.
+pub const NO_MEMBER: &str = "a microVM running its own command alone: no member of it is driven, so none takes a signal or an MCP connection";
+
+/// A box running its image's own command alone, no member of it driven ([`HexVms::boot_command`]; a replay's, kiln plan
+/// 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b): its VM, read and charged as a run's is, and deleted as it ends ([`Self::end`])
+/// or is let go of.
+pub struct Commanded {
+    vm: Arc<Vm>,
+    ended: AtomicBool,
+}
+
+impl Commanded {
+    /// What reads its use, as a run's [`Meter`] does.
+    pub fn meter(&self) -> Meter {
+        Meter(Arc::clone(&self.vm))
+    }
+
+    /// How its microVM started, as its run host said it (Hex's `Usage::started_from`): none where it said none.
+    pub async fn started_from(&self) -> Option<hex_api::StartedFrom> {
+        let (runtime, id) = (Arc::clone(&self.vm.runtime), self.vm.id.try_clone().ok()?);
+        crate::rt::blocking(move || runtime.usage(&id)).await.ok()?.ok()?.started_from
+    }
+
+    /// Deletes its box and keeps its charge ([`finish`]): what its VM lived on, as that charge has it (Hex's final use
+    /// where its run was still running, else the use last read); or why its box may still be there.
+    pub async fn end(self) -> Result<Option<Lived>, String> {
+        self.ended.store(true, Ordering::Release);
+        finish(&self.vm).await?;
+        Ok(self.meter().lived())
+    }
+}
+
+impl Drop for Commanded {
+    fn drop(&mut self) {
+        if self.ended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let vm = Arc::clone(&self.vm);
+        drop(crate::rt::spawn(async move {
+            if let Err(e) = finish(&vm).await {
+                tracing::warn!(vm = %vm.name, error = %e, "a microVM let go of wasn't deleted, or its charge wasn't kept");
+            }
+        }));
+    }
+}
 
 impl HexVms {
     /// Over Hex's runtime `runtime`, naming each launch's box with `names`, which answers none where nothing numbers
@@ -295,6 +352,38 @@ impl HexVms {
         crate::rt::blocking(move || runtime.usage(&id)).await.ok()?.ok()?.started_from
     }
 
+    /// `image` booted in a box its namer names, `command` its run's own command (`ShardsImage::command`, as `shards run
+    /// IMAGE COMMAND` runs one), no member of it driven (its members start as its image declares them, their stdin the
+    /// null device): `shares` its folders (each its command's, where no `VOLUME` of its image declares its path), no
+    /// grant, so nothing passes its VM (Hex's grants are default deny), no credential, and its size as
+    /// [`HexVms::launch_as`] sizes one. Created and started, or refused, typed, with no box left behind.
+    pub async fn boot_command(&self, image: &str, command: Vec<String>, shares: &[kiln_seams::sandbox::Share], size: Option<(u32, u64)>) -> Result<Commanded, Refusal> {
+        let name = (self.names)().ok_or_else(|| Refusal::Unsupported(UNNAMED.into()))?;
+        let id = name.id().map_err(seam)?;
+        let shares = shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
+        let class = ShardsImage { command: Some(command), shares, ..ShardsImage::new(image) };
+        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
+        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: id.to_string(), member: None, last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
+        let runtime = Arc::clone(&self.runtime);
+        let started = crate::rt::blocking(move || {
+            runtime.create(spec).map_err(|why| (why, false))?;
+            runtime.start(&id).map_err(|why| (why, true))
+        })
+        .await
+        .map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?;
+        match started {
+            Ok(()) => Ok(Commanded { vm, ended: AtomicBool::new(false) }),
+            // No box was made: none to delete (the name may be another's).
+            Err((why, false)) => Err(seam(why)),
+            Err((why, true)) => {
+                if let Err(e) = finish(&vm).await {
+                    tracing::warn!(vm = %vm.name, error = %e, "a microVM whose start failed wasn't deleted");
+                }
+                Err(seam(why))
+            }
+        }
+    }
+
     /// [`HexVms::launch_as`] in a box its namer names (the seam's launch, sized).
     pub async fn launch_sized(&self, launch: Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
         let name = (self.names)().ok_or_else(|| Refusal::Unsupported(UNNAMED.into()))?;
@@ -326,7 +415,7 @@ impl HexVms {
         let id = name.id().map_err(seam)?;
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
         let name = id.to_string();
-        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), member: member.clone(), last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
+        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), member: Some(member.clone()), last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
         let runtime = Arc::clone(&self.runtime);
         let made = crate::rt::blocking(move || boot(&*runtime, spec, &id, &member)).await.map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?;
         let started = match made {
@@ -396,7 +485,8 @@ impl super::Lanes for HexVms {
     /// isn't held while it waits, so a run let go of meanwhile is let go of.
     fn next(&self, run: &str) -> Result<super::McpConnection, Refusal> {
         let vm = self.vms.lock().get(run).and_then(Weak::upgrade).ok_or(Refusal::Ended)?;
-        let (runtime, id, member) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(seam)?, vm.member.clone());
+        let member = vm.member.clone().ok_or_else(|| Refusal::Unsupported(NO_MEMBER.into()))?;
+        let (runtime, id) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(seam)?);
         drop(vm);
         let mut proc = runtime.mcp(&id, &member).map_err(seam)?;
         let given = proc.streams().map_err(seam)?;
@@ -686,7 +776,8 @@ impl Run for HexRun {
             Signal::Interrupt => hex_api::Signal::INT,
             Signal::Terminate => hex_api::Signal::TERM,
         };
-        self.vm.runtime.signal_member(&self.vm.id, &self.vm.member, to).map_err(seam)
+        let member = self.vm.member.as_ref().ok_or_else(|| Refusal::Unsupported(NO_MEMBER.into()))?;
+        self.vm.runtime.signal_member(&self.vm.id, member, to).map_err(seam)
     }
 
     fn kill(&self) {
