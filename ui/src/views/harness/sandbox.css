@@ -223,10 +223,13 @@
   color: #c8cad0;
   white-space: nowrap;
 }
-/* A component's source and pin, then its path, on one line: the path gives way first. */
+/* A component's source and pin, then its path, on one line: the path gives way first. The line is as
+   wide as its column (in a setting's grid, whose rows are otherwise as wide as what they say), so a
+   long pin or path is cut short there rather than widening a phone's page. */
 .sb-comp > .sb-src,
 .sb-set > .sb-src {
   display: flex;
+  justify-self: stretch;
   min-width: 0;
   gap: 10px;
 }

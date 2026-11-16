@@ -172,6 +172,24 @@ test("a harness's permissions, model and effort, a row each in its sandbox's com
   expect(said, said.join("\n")).toEqual([]);
 });
 
+test("a dropdown of whole sandboxes, each its components' sources a line, scrolls nothing sideways", async ({ page }) => {
+  const said = errors(page);
+  // Storage lead's tree: its own sandbox and four of its subagents', each whole.
+  await page.request.post("/api/mock/tree-asks");
+  try {
+    await page.goto("/agents?open=tree-lead");
+    const row = page.locator('.ms-row[data-agent="tree-lead"]');
+    await row.waitFor({ timeout: 30_000 });
+    await row.scrollIntoViewIfNeeded();
+    await expect(page.locator(".ms-dropdown .sb-comp").first()).toBeVisible({ timeout: 30_000 });
+    // A long pin or path is cut short on its line, never widening the page.
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0);
+  } finally {
+    await page.request.post("/api/mock/asks");
+  }
+  expect(said, said.join("\n")).toEqual([]);
+});
+
 test("after its sandboxes, the agents: this session's first, its settings open with what it started on, then each agent's card", async ({ page }) => {
   const said = errors(page);
   await page.goto("/agents/rev-big");
