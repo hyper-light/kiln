@@ -306,29 +306,35 @@
    words start, as kiln's tree's own rows place them (mission.css .ms-node: by mouse a 22px path
    column after 6px, by touch a 38px one; then the grid's gap), so its heads, its subagents, its
    engine and its experiments all start on one left edge. */
-.ms-tree-rows,
-[data-list="agents-tab"] {
+.ms-tree-rows {
   --dd-lane: 17px;
   --dd-content: 48px;
 }
 @container (max-width: 760px) {
-  .ms-tree-rows,
-  [data-list="agents-tab"] {
+  .ms-tree-rows {
     --dd-content: 40px;
   }
 }
 @media (pointer: coarse) {
-  .ms-tree-rows,
-  [data-list="agents-tab"] {
+  .ms-tree-rows {
     --dd-lane: 12px;
     --dd-content: 58px;
   }
   @container (max-width: 760px) {
-    .ms-tree-rows,
-    [data-list="agents-tab"] {
+    .ms-tree-rows {
       --dd-content: 46px;
     }
   }
+}
+/* The Engine tab's agent cards (engine-tab.tsx): nothing in them folds, so nothing is indented for an
+   arrow: their lines, heads and sections start and end where the sandbox cards' do, the section's edges. */
+[data-list="agents-tab"],
+[data-list="agents-tab"] .ms-tree-rows {
+  --dd-lane: 0px;
+  --dd-content: 0px;
+}
+[data-list="agents-tab"] li.ms-node {
+  padding-right: 0;
 }
 
 /* A group's head and a definition's own row (definitions.tsx GroupHead, DefRow): one line, one height
@@ -439,9 +445,19 @@
 .df-values > .ms-field,
 .df-values > .ms-edit {
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr) auto;
+  grid-template-columns: 92px minmax(0, 1fr) auto;
   align-items: baseline;
-  gap: 0 10px;
+  gap: 0 12px;
+}
+/* A phone's width: the label column narrows as the sandbox card's does (sandbox.css .sb-kv). */
+@container (max-width: 420px) {
+  .df-facts > .df-fact {
+    grid-template-columns: 76px minmax(0, 1fr);
+  }
+  .df-values > .ms-field,
+  .df-values > .ms-edit {
+    grid-template-columns: 76px minmax(0, 1fr) auto;
+  }
 }
 .df-values > .ms-edit > .ms-edit-in {
   width: 100%;
@@ -824,9 +840,9 @@
 }
 .df-fact {
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr);
+  grid-template-columns: 92px minmax(0, 1fr);
   align-items: center;
-  gap: 0 10px;
+  gap: 0 12px;
   min-height: 24px;
 }
 .df-fact-v {
@@ -909,7 +925,14 @@
   margin-bottom: 12px;
 }
 
-/* A section's head that doesn't fold (definitions.tsx GroupHead fixed): its label where an arrowed one's is. */
-.ms-node.df-head[data-fixed] .df-head-main {
+/* A head that doesn't fold (definitions.tsx GroupHead fixed, an agent card's line): no arrow, its words
+   at the content's edge. */
+.ms-node.df-head[data-fixed],
+.ms-node.df-defrow.df-head {
+  padding-left: var(--dd-content, 38px);
+}
+.ms-node.df-head[data-fixed] .df-head-main,
+.ms-node.df-defrow.df-head .df-head-main {
+  gap: 10px;
   cursor: default;
 }

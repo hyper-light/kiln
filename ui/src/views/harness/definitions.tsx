@@ -374,7 +374,6 @@ export function GroupHead({
     <li className="ms-node df-group df-head" data-stand={stand} data-depth={1} data-open={open || undefined} data-fixed={fixed || undefined}>
       {fixed ? (
         <span className="df-head-main">
-          <span className="df-chev" aria-hidden="true" />
           <span className="ms-sep-h df-group-k">{label}</span>
         </span>
       ) : (
@@ -1442,7 +1441,6 @@ export function DefRow({ d, list, session }: { d: AgentDef; list: readonly Agent
       {/* Its card's line: its name and flags (this session's marked), its sessions' stands at its right, its ⋯. */}
       <li className="ms-node df-defrow df-head" data-stand={stand} data-depth={0} data-def={d.id}>
         <span className="df-head-main">
-          <span className="df-chev" aria-hidden="true" />
           <span className="df-strong df-defname">{d.name}</span>
           {session && <span className="df-head-v df-this">this session</span>}
           {!d.own && <Lock size={12} className="ms-flag-pin" role="img" aria-label="kiln's: copy it to change it" />}
