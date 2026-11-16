@@ -1,14 +1,15 @@
 /**
- * The agent's own definition (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P5.2, P7.2), first in its
- * Agents tab: the version this session started on beside the current one, its experiment's variant
- * (its swatch and name, never a letter), where it runs and how fast it starts, and the definition's
- * values, edited in place. In the head, the crumb that opens it.
+ * The agent's own definition (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P5.2, P7.2), in its Engine
+ * tab: its name, then a line each, its plain words at the left: where it runs and how fast it starts,
+ * its Agentfile, harness and what it holds, the version this session started on beside the current
+ * one, its experiment's variant (its swatch and name, never a letter), and the definition's values,
+ * edited in place. In the head, the crumb that opens it.
  */
 import { agentdefsRes, variantIn } from "@/api/agentdefs";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
-import { AgentfileName, DefValues, RunsMarks, sessionVariant, Swatch } from "./definitions";
+import { DefFacts, DefValues, sessionVariant, Swatch } from "./definitions";
 import { Loadable } from "@/components/ui/loading";
 import { Fold } from "./fold";
 import "./definition.css";
@@ -24,36 +25,40 @@ export function DefinitionPanel({ agentId }: { agentId: string }) {
   return (
     <Fold id="definition" title="This agent" count={`${d.name} v${mine.version}`}>
       <div className="df-panel">
-        <span className="df-line">
-          <b>{d.name}</b>
-          <span>{d.harness}</span>
-          <AgentfileName ref_={d.agentfile} harness={d.harness} />
-          <RunsMarks d={d} />
-        </span>
-        <span className="df-line">
-          {mine.version === d.version ? (
-            <span>v{d.version} · current</span>
-          ) : (
-            <>
-              <span className="df-old">
-                v{mine.version} → v{d.version}
+        <b className="df-panel-name">{d.name}</b>
+        <DefFacts d={d} />
+        <span className="df-facts">
+          <span className="df-fact">
+            <span className="ms-edit-k">started on</span>
+            <span className="df-fact-v">
+              {mine.version === d.version ? (
+                <span>v{d.version}, the current version</span>
+              ) : (
+                <>
+                  <span className="df-old">
+                    v{mine.version}; v{d.version} is current
+                  </span>
+                  <Button size="xs" variant="secondary" onClick={() => toast({ title: `Restarting on v${d.version}`, tone: "running" })}>
+                    Restart on v{d.version}
+                  </Button>
+                </>
+              )}
+            </span>
+          </span>
+          {variant && weight !== undefined && (
+            <span className="df-fact" title={`${variant.name}: ${weight}% of ${at?.e.name}'s new sessions`}>
+              <span className="ms-edit-k">variant</span>
+              <span className="df-fact-v">
+                <Swatch tone={variant.tone} />
+                <span>{variant.name}</span>
+                <span className="meter" role="meter" aria-valuenow={weight} aria-valuemin={0} aria-valuemax={100} aria-label={`${weight}% of new sessions`}>
+                  <span style={{ width: `${weight}%` }} />
+                </span>
+                <span>{weight}%</span>
               </span>
-              <Button size="xs" variant="secondary" onClick={() => toast({ title: `Restarting on v${d.version}`, tone: "running" })}>
-                Restart on v{d.version}
-              </Button>
-            </>
+            </span>
           )}
         </span>
-        {variant && weight !== undefined && (
-          <span className="df-line" title={`${variant.name}: ${weight}% of ${at?.e.name}'s new sessions`}>
-            <Swatch tone={variant.tone} />
-            <span>{variant.name}</span>
-            <span className="meter" role="meter" aria-valuenow={weight} aria-valuemin={0} aria-valuemax={100} aria-label={`${weight}% of new sessions`}>
-              <span style={{ width: `${weight}%` }} />
-            </span>
-            <span>{weight}%</span>
-          </span>
-        )}
         <Loadable label={`Loading ${d.name}'s values`} fallback={<span className="ms-fields" aria-busy="true" />}>
           <DefValues d={d} />
         </Loadable>
@@ -64,7 +69,7 @@ export function DefinitionPanel({ agentId }: { agentId: string }) {
 
 /**
  * In the agent's head, beside its harness and machine: the definition it was started from, the version,
- * and its variant as its swatch; pressed, the Agents tab, where they are. A session started from no
+ * and its variant as its swatch; pressed, the Engine tab, where they are. A session started from no
  * definition shows nothing here.
  */
 export function DefCrumb({ agentId, onOpen }: { agentId: string; onOpen: () => void }) {

@@ -12,15 +12,48 @@ import { cn } from "@/lib/utils";
 /** Whether the section around is open: what fills it reads only once it is. */
 export const FoldOpen = React.createContext(true);
 
+/**
+ * Sections that don't fold: a heading and what it holds, always shown (in a Mission row's dropdown,
+ * which is the one dropdown there: no dropdown nests in it).
+ */
+export const FoldFixed = React.createContext(false);
+
 /** Section `id`'s open or folded, as kept. */
 export function useFold(id: string, defaultOpen = true): [boolean, (open: boolean) => void] {
   const [open, setOpen] = useLocalStorage(`kiln.panel.fold.${id}`, defaultOpen);
   return [open, setOpen];
 }
 
-export function Fold({ id, title, count, aside, defaultOpen = true, children }: { id: string; title: React.ReactNode; count?: React.ReactNode; aside?: React.ReactNode; defaultOpen?: boolean; children: React.ReactNode }) {
+export function Fold({
+  id,
+  title,
+  count,
+  aside,
+  defaultOpen = true,
+  children,
+}: {
+  id: string;
+  title: React.ReactNode;
+  count?: React.ReactNode;
+  aside?: React.ReactNode;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}) {
   const [open, setOpen] = useFold(id, defaultOpen);
   const bodyId = React.useId();
+  if (React.useContext(FoldFixed))
+    return (
+      <section className="in-fold" data-open="">
+        <h3 className="in-sec-head">
+          <span className="in-sec-static">
+            {title}
+            {count !== undefined && <span className="in-sec-count">{count}</span>}
+          </span>
+          {aside}
+        </h3>
+        <div>{children}</div>
+      </section>
+    );
   return (
     <section className="in-fold" data-open={open || undefined}>
       <h3 className="in-sec-head">

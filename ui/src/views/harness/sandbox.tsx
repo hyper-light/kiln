@@ -13,7 +13,8 @@
  *
  * What only a microVM has is absent on the host, not greyed: one line says it runs on the host.
  * Under its line in a Mission row's dropdown (engine-rows.tsx, `inRow`), that line says where it is
- * and holds its controls: the tab's whole is the rest.
+ * and holds its controls and its engine's rows show its resources, each with its last hour: the rest
+ * is here, its sections shown whole (no dropdown nests in a row's).
  */
 import * as React from "react";
 import { ArrowRight, Check, Cloud, Download, FolderOpen, GitBranch, KeyRound, Pause, Play, Plus, RotateCcw, Square, Undo2, X } from "lucide-react";
@@ -42,7 +43,7 @@ import { toast } from "@/components/ui/toast";
 import { labelOf, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { EngineGlyph, StartMark, WarmDots } from "@/views/sandbox-marks";
-import { Fold } from "./fold";
+import { Fold, FoldFixed } from "./fold";
 import { KindGlyph } from "./kind-glyph";
 import { LimitMeter } from "./limits";
 import { HarnessMark } from "./parts";
@@ -103,22 +104,24 @@ export function SandboxTab({ agentId, store, inRow }: { agentId: string; store: 
     res.reload();
   };
   return (
-    <div className="in-secs sb">
-      <Now d={d} agentId={agentId} done={done} fail={fail} change={res.change} bare={inRow} />
-      {!ended && (host ? <HostFacts d={d} /> : <MicrovmFacts d={d} />)}
-      {!ended && d.components.length > 0 && <Components d={d} agentId={agentId} done={done} fail={fail} />}
-      {!ended && !host && d.network && <Network d={d} o={o} agentId={agentId} />}
-      {!ended && <Volumes d={d} o={o} agentId={agentId} base={grants.base} />}
-      {!ended && d.scope && <Reach d={d} o={o} />}
-      {!ended && <Plots d={d} />}
-    </div>
+    <FoldFixed.Provider value={inRow === true}>
+      <div className="in-secs sb">
+        {!inRow && <Now d={d} agentId={agentId} done={done} fail={fail} change={res.change} />}
+        {!ended && (host ? <HostFacts d={d} /> : <MicrovmFacts d={d} />)}
+        {!ended && d.components.length > 0 && <Components d={d} agentId={agentId} done={done} fail={fail} />}
+        {!ended && !host && d.network && <Network d={d} o={o} agentId={agentId} />}
+        {!ended && <Volumes d={d} o={o} agentId={agentId} base={grants.base} />}
+        {!ended && d.scope && <Reach d={d} o={o} />}
+        {!ended && !inRow && <Plots d={d} />}
+      </div>
+    </FoldFixed.Provider>
   );
 }
 
 type Acts = { agentId: string; done: (d: SandboxDetail) => void; fail: (what: string) => (e: unknown) => void };
 
 /** Where we are now: its engine and state, CPU, memory and disk as live bars, then its controls. */
-function Now({ d, agentId, done, fail, change, bare }: { d: SandboxDetail; change: (fn: (prev: SandboxDetail) => SandboxDetail) => void; bare?: boolean } & Acts) {
+function Now({ d, agentId, done, fail, change }: { d: SandboxDetail; change: (fn: (prev: SandboxDetail) => SandboxDetail) => void } & Acts) {
   const versions = useVersions(agentId);
   const [asking, setAsking] = React.useState(false);
   const host = d.engine === "host";
@@ -143,19 +146,17 @@ function Now({ d, agentId, done, fail, change, bare }: { d: SandboxDetail; chang
   const now = d.now;
   return (
     <section className="sb-now" aria-label="Now">
-      {!bare && (
-        <h3 className="in-sec-head">
-          Now
-          <span className="sb-where">
-            <EngineGlyph engine={d.engine} word />
-            <span>{labelOf(d.runner)}</span>
-            <StatusDot status={st.status} title={st.word} />
-            <span>{st.word}</span>
-            {!host && d.state !== "ended" && <span>· up {up(d.up_s)}</span>}
-          </span>
-        </h3>
-      )}
-      {host && !bare && (
+      <h3 className="in-sec-head">
+        Now
+        <span className="sb-where">
+          <EngineGlyph engine={d.engine} word />
+          <span>{labelOf(d.runner)}</span>
+          <StatusDot status={st.status} title={st.word} />
+          <span>{st.word}</span>
+          {!host && d.state !== "ended" && <span>· up {up(d.up_s)}</span>}
+        </span>
+      </h3>
+      {host && (
         <p className="sb-hostline">
           <EngineGlyph engine="host" />
           Runs on the host, without a microVM
@@ -171,7 +172,7 @@ function Now({ d, agentId, done, fail, change, bare }: { d: SandboxDetail; chang
           <LimitMeter live limit={{ id: "disk", label: "Disk", used_percent: (now.disk.used / now.disk.total) * 100, used: gib(now.disk.used), limit: gib(now.disk.total), unit: "GiB" }} />
         </div>
       )}
-      {d.state !== "ended" && !bare && (
+      {d.state !== "ended" && (
         <div className="sb-ctl">
           {asking ? (
             <span className="sb-confirm" role="group" aria-label="Stop it?">
@@ -221,10 +222,10 @@ function Now({ d, agentId, done, fail, change, bare }: { d: SandboxDetail; chang
   );
 }
 
-/** A key and its value, one line, as the rows below read. */
-function Kv({ k, children, title }: { k: string; children: React.ReactNode; title?: string }) {
+/** A key and its value, one line, as the rows below read; `stacked`, its value on its own line under it. */
+function Kv({ k, children, title, stacked }: { k: string; children: React.ReactNode; title?: string; stacked?: boolean }) {
   return (
-    <li className="sb-kv" title={title}>
+    <li className={stacked ? "sb-kv sb-stacked" : "sb-kv"} title={title}>
       <span className="sb-k">{k}</span>
       <span className="sb-v">{children}</span>
     </li>
@@ -368,43 +369,42 @@ function Components({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
 function ComponentRow({ c, open, onSwap, onRestore }: { c: SandboxComponent; open: boolean; onSwap: () => void; onRestore: () => void }) {
   const S = SOURCE[c.from.kind];
   return (
-    <li className="sb-row sb-comp" data-swapped={c.built ? "" : undefined}>
-      <MemberGlyph kind={c.kind} name={c.name} />
-      {/* Two lines, each whole: its name and version; its path, where it comes from and its pin. */}
-      <span className="sb-two">
-        <span className="sb-two-top">
-          <span className="sb-name" title={`${c.kind} ${c.name}`}>
-            {c.name}
-          </span>
-          <span className="sb-mono sb-ver" title={c.built ? `Swapped from ${c.built.version}` : "As built"}>
-            {c.version}
-          </span>
+    <li className="sb-row sb-comp sb-vol" data-swapped={c.built ? "" : undefined}>
+      {/* Its glyph, name and version on its first line, each beside the last, its control at that line's
+          end; its path, where it comes from and its pin under its name. */}
+      <span className="sb-vol-top">
+        <MemberGlyph kind={c.kind} name={c.name} />
+        <span className="sb-name" title={`${c.kind} ${c.name}`}>
+          {c.name}
         </span>
-        <span className="sb-two-sub">
-          <span className="sb-mono sb-dim sb-clip" title={c.path}>
-            {c.path}
-          </span>
-          <span className="sb-src" title={`${c.from.url} · ${c.from.pin}`}>
-            <S.icon size={11} aria-hidden="true" />
-            <span className="sb-mono">{pinShort(c.from.pin)}</span>
-          </span>
+        <span className="sb-mono sb-ver" title={c.built ? `Swapped from ${c.built.version}` : "As built"}>
+          {c.version}
+        </span>
+        <span className="sb-acts">
+          {c.kind === "harness" ? (
+            <Button size="xs" variant="ghost" onClick={openHarnessSwitch} title="kiln's harness switch, in the head">
+              Switch
+            </Button>
+          ) : c.built ? (
+            <Button size="xs" variant="ghost" onClick={onRestore} title={`Back to ${c.built.version}, as built`}>
+              <Undo2 aria-hidden="true" />
+              Restore
+            </Button>
+          ) : (
+            <Button size="xs" variant="ghost" aria-expanded={open} onClick={onSwap}>
+              Swap
+            </Button>
+          )}
         </span>
       </span>
-      <span className="sb-acts">
-        {c.kind === "harness" ? (
-          <Button size="xs" variant="ghost" onClick={openHarnessSwitch} title="kiln's harness switch, in the head">
-            Switch
-          </Button>
-        ) : c.built ? (
-          <Button size="xs" variant="ghost" onClick={onRestore} title={`Back to ${c.built.version}, as built`}>
-            <Undo2 aria-hidden="true" />
-            Restore
-          </Button>
-        ) : (
-          <Button size="xs" variant="ghost" aria-expanded={open} onClick={onSwap}>
-            Swap
-          </Button>
-        )}
+      <span className="sb-vol-sub sb-comp-sub">
+        <span className="sb-mono sb-clip" title={c.path}>
+          {c.path}
+        </span>
+        <span className="sb-src" title={`${c.from.url} · ${c.from.pin}`}>
+          <S.icon size={11} aria-hidden="true" />
+          <span className="sb-mono">{pinShort(c.from.pin)}</span>
+        </span>
       </span>
     </li>
   );
@@ -495,12 +495,6 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
     <Fold id="sb-network" title="Network" count={`${base.ingress.length + ports.length} in · ${base.egress.length + egress.length} out`}>
       <div className="sb-sub">
         <span className="sb-k">Ingress</span>
-        {adding !== "ingress" && (
-          <Button size="xs" variant="ghost" onClick={() => setAdding("ingress")}>
-            <Plus aria-hidden="true" />
-            Publish
-          </Button>
-        )}
       </div>
       <ul className="sb-rows">
         {base.ingress.map((i) => (
@@ -509,11 +503,10 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
             <span className="sb-mono sb-clip" title={`From its Agentfile: ${i.host} → ${i.guest}/${i.proto}, to ${i.to}`}>
               {i.host} → {i.guest}/{i.proto}
             </span>
-            <span className="sb-dim sb-clip">{i.to}</span>
             <span className="sb-tags">
               <i title="From its Agentfile">built</i>
             </span>
-            <span />
+            <span className="sb-dim sb-clip">to {i.to}</span>
           </li>
         ))}
         {ports.map((h) => (
@@ -522,8 +515,7 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
             <span className="sb-mono sb-clip" title={`${h.port.bind}:${h.port.host_port} on its machine → ${h.port.guest_port}/${h.port.protocol}, to ${said(h.port.member)}`}>
               {h.port.bind}:{h.port.host_port} → {h.port.guest_port}/{h.port.protocol}
             </span>
-            <span className="sb-dim sb-clip">{said(h.port.member)}</span>
-            <span className="sb-tags" />
+            <span className="sb-dim sb-clip">to {said(h.port.member)}</span>
             <span className="sb-acts">
               <button
                 type="button"
@@ -539,16 +531,10 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
           </li>
         ))}
         {base.ingress.length + ports.length === 0 && <li className="sb-deny">nothing published</li>}
-        {adding === "ingress" && <PublishForm d={d} live={live} onDone={() => setAdding(null)} />}
+        {adding === "ingress" ? <PublishForm d={d} live={live} onDone={() => setAdding(null)} /> : <AddLine word="Publish a port" onAdd={() => setAdding("ingress")} />}
       </ul>
       <div className="sb-sub">
         <span className="sb-k">Egress</span>
-        {adding !== "egress" && (
-          <Button size="xs" variant="ghost" onClick={() => setAdding("egress")}>
-            <Plus aria-hidden="true" />
-            Grant
-          </Button>
-        )}
       </div>
       <ul className="sb-rows">
         {base.egress.map((e) => (
@@ -557,11 +543,10 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
             <span className="sb-mono sb-clip" title={`From its Agentfile: ${e.who} → ${e.to} on ${e.ports}`}>
               {e.to}:{e.ports}
             </span>
-            <span className="sb-dim sb-clip">{e.who}</span>
             <span className="sb-tags">
               <i title="From its Agentfile">built</i>
             </span>
-            <span />
+            <span className="sb-dim sb-clip">for {e.who}</span>
           </li>
         ))}
         {egress.map((h) => (
@@ -570,8 +555,7 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
             <span className="sb-mono sb-clip" title={`${said(h.egress.member)} → ${h.egress.host} on ${h.egress.port}`}>
               {h.egress.host}:{h.egress.port}
             </span>
-            <span className="sb-dim sb-clip">{said(h.egress.member)}</span>
-            <span className="sb-tags" />
+            <span className="sb-dim sb-clip">for {said(h.egress.member)}</span>
             <span className="sb-acts">
               <button
                 type="button"
@@ -587,16 +571,10 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
           </li>
         ))}
         <li className="sb-deny">{base.egress.length + egress.length === 0 ? "nothing granted" : "nothing else"}</li>
-        {adding === "egress" && <GrantForm d={d} live={live} onDone={() => setAdding(null)} />}
+        {adding === "egress" ? <GrantForm d={d} live={live} onDone={() => setAdding(null)} /> : <AddLine word="Grant egress" onAdd={() => setAdding("egress")} />}
       </ul>
       <div className="sb-sub">
         <span className="sb-k">Networks</span>
-        {adding !== "network" && (
-          <Button size="xs" variant="ghost" onClick={() => setAdding("network")}>
-            <Plus aria-hidden="true" />
-            Connect
-          </Button>
-        )}
       </div>
       <ul className="sb-rows">
         {base.networks.map((n) => (
@@ -623,7 +601,6 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
               {h.network.name}
             </span>
             <span className="sb-dim sb-clip">{said(h.network.member)}</span>
-            <span className="sb-tags" />
             <span className="sb-acts">
               <button
                 type="button"
@@ -639,9 +616,21 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
           </li>
         ))}
         {base.networks.length + networks.length === 0 && <li className="sb-deny">no networks</li>}
-        {adding === "network" && <ConnectForm d={d} live={live} onDone={() => setAdding(null)} />}
+        {adding === "network" ? <ConnectForm d={d} live={live} onDone={() => setAdding(null)} /> : <AddLine word="Connect a network" onAdd={() => setAdding("network")} />}
       </ul>
     </Fold>
+  );
+}
+
+/** A list's add, its last line, at its left as its rows are. */
+function AddLine({ word, onAdd }: { word: string; onAdd: () => void }) {
+  return (
+    <li className="sb-add-line">
+      <button type="button" className="df-add" onClick={onAdd}>
+        <Plus size={13} aria-hidden="true" />
+        {word}
+      </button>
+    </li>
   );
 }
 
@@ -771,93 +760,75 @@ function Volumes({ d, o, agentId, base }: { d: SandboxDetail; o: LiveOverrides |
     ? base.allowed_dirs.map((p) => ({ at: p, from: "its folder", mode: "rw" as const }))
     : base.volumes.map((v) => ({ at: v.at, from: v.host, mode: v.writable ? ("rw" as const) : ("ro" as const) }));
   return (
-    <Fold
-      id="sb-volumes"
-      title="Volumes"
-      count={built.length + given.length}
-      aside={
-        !adding && (
-          <Button size="xs" variant="ghost" onClick={() => setAdding(true)}>
-            <Plus aria-hidden="true" />
-            Add volume
-          </Button>
-        )
-      }
-    >
+    <Fold id="sb-volumes" title="Volumes" count={built.length + given.length}>
       <p className="sb-note">{host ? "Adds to the agent's allowed directories and this session's scope" : "Mounts into this microVM as you set, then allowed directories and scope"}</p>
       <ul className="sb-rows">
         {built.map((v) => (
           <li key={`base:${v.at}`} className="sb-row sb-vol" data-base="">
-            <FolderOpen size={12} className="sb-dim" aria-hidden="true" />
-            <span className="sb-two">
-              <span className="sb-two-top">
-                <span className="sb-mono sb-clip" title={`${v.at}, as it started`}>
-                  {v.at}
-                </span>
-                <span className="sb-mode" data-mode={v.mode}>
-                  {v.mode}
-                </span>
+            <span className="sb-vol-top">
+              <FolderOpen size={12} className="sb-dim" aria-hidden="true" />
+              <span className="sb-mono sb-clip" title={`${v.at}, as it started`}>
+                {v.at}
               </span>
-              <span className="sb-two-sub">
-                <span className="sb-dim sb-clip" title={v.from}>
-                  {v.from}
-                </span>
+              <span className="sb-mode" data-mode={v.mode}>
+                {v.mode}
+              </span>
+              <span className="sb-tags">
+                <i title="Given as it started">base</i>
               </span>
             </span>
-            <span className="sb-tags">
-              <i title="Given as it started">base</i>
+            <span className="sb-vol-sub sb-dim sb-clip" title={v.from}>
+              {v.from}
             </span>
           </li>
         ))}
         {given.map((h) => (
           <li key={`live:${h.volume.path}`} className="sb-row sb-vol">
-            <span className="sb-took">
-              <Took took={h.harness} place="Its harness" />
-              <Took took={h.scope} place="kiln's scope" />
-              {h.microvm && <Took took={h.microvm} place="Its microVM" />}
-            </span>
-            <span className="sb-two">
-              <span className="sb-two-top">
-                <span className="sb-mono sb-clip" title={h.volume.at === h.volume.path ? h.volume.path : `${h.volume.path}, seen at ${h.volume.at}`}>
-                  {h.volume.path}
-                </span>
-                <span className="sb-mode" data-mode={h.volume.access}>
-                  {h.volume.access}
-                </span>
+            <span className="sb-vol-top">
+              <span className="sb-took">
+                <Took took={h.harness} place="Its harness" />
+                <Took took={h.scope} place="kiln's scope" />
+                {h.microvm && <Took took={h.microvm} place="Its microVM" />}
               </span>
-              <span className="sb-two-sub">
-                <span className="sb-dim sb-clip">{h.volume.members.map(said).join(", ")}</span>
-                {h.volume.at !== h.volume.path && <span className="sb-mono sb-dim">at {h.volume.at}</span>}
+              <span className="sb-mono sb-clip" title={h.volume.at === h.volume.path ? h.volume.path : `${h.volume.path}, seen at ${h.volume.at}`}>
+                {h.volume.path}
               </span>
-            </span>
-            <span className="sb-acts">
-              {asking === h.volume.path ? (
-                <span className="sb-confirm" role="group" aria-label={`Take ${h.volume.path} back?`}>
-                  <span>Remove?</span>
-                  <button
-                    type="button"
-                    className="ms-go"
-                    aria-label={`Take ${h.volume.path} back`}
-                    onClick={() => {
-                      setAsking(null);
-                      live.run("Couldn't take it back", () => overridesApi.removeVolume(agentId, h.volume.path));
-                    }}
-                  >
-                    <Check size={14} />
-                  </button>
-                  <button type="button" className="ms-go" aria-label="Keep it" onClick={() => setAsking(null)}>
+              <span className="sb-mode" data-mode={h.volume.access}>
+                {h.volume.access}
+              </span>
+              <span className="sb-acts">
+                {asking === h.volume.path ? (
+                  <span className="sb-confirm" role="group" aria-label={`Take ${h.volume.path} back?`}>
+                    <span>Remove?</span>
+                    <button
+                      type="button"
+                      className="ms-go"
+                      aria-label={`Take ${h.volume.path} back`}
+                      onClick={() => {
+                        setAsking(null);
+                        live.run("Couldn't take it back", () => overridesApi.removeVolume(agentId, h.volume.path));
+                      }}
+                    >
+                      <Check size={14} />
+                    </button>
+                    <button type="button" className="ms-go" aria-label="Keep it" onClick={() => setAsking(null)}>
+                      <X size={14} />
+                    </button>
+                  </span>
+                ) : (
+                  <button type="button" className="ms-go" aria-label={`Take ${h.volume.path} back`} title="Remove" onClick={() => setAsking(h.volume.path)}>
                     <X size={14} />
                   </button>
-                </span>
-              ) : (
-                <button type="button" className="ms-go" aria-label={`Take ${h.volume.path} back`} title="Remove" onClick={() => setAsking(h.volume.path)}>
-                  <X size={14} />
-                </button>
-              )}
+                )}
+              </span>
+            </span>
+            <span className="sb-vol-sub sb-dim sb-clip">
+              {h.volume.members.map(said).join(", ")}
+              {h.volume.at !== h.volume.path && ` · at ${h.volume.at}`}
             </span>
           </li>
         ))}
-        {adding && <VolumeForm d={d} live={live} onDone={() => setAdding(false)} />}
+        {adding ? <VolumeForm d={d} live={live} onDone={() => setAdding(false)} /> : <AddLine word="Add a volume" onAdd={() => setAdding(true)} />}
       </ul>
     </Fold>
   );
@@ -938,7 +909,7 @@ function Reach({ d, o }: { d: SandboxDetail; o: LiveOverrides | undefined }) {
             </span>
           </li>
         ))}
-        <Kv k="Scope" title={`${scope.project} · ${scope.branch} · ${paths.join(", ")}`}>
+        <Kv k="Scope" stacked title={`${scope.project} · ${scope.branch} · ${paths.join(", ")}`}>
           <span>{scope.project}</span>
           <span className="sb-mono sb-dim">{scope.branch}</span>
           <span className="sb-dim">

@@ -220,10 +220,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* Its warm hosts and every start, in its settings (its head repeats none of it). */
-.df-runs-full {
-  display: flex;
-}
 @media (prefers-reduced-motion: reduce) {
   .df-chev > svg,
   .df-vname > svg {
@@ -323,6 +319,35 @@
   white-space: nowrap;
 }
 
+/* A Mission row's dropdown: the tree's first lane, where every head's arrow sits, and where its rows'
+   words start, as kiln's tree's own rows place them (mission.css .ms-node: by mouse a 22px path
+   column after 6px, by touch a 38px one; then the grid's gap), so its heads, its subagents, its
+   engine and its experiments all start on one left edge. */
+.ms-tree-rows,
+[data-list="agents-tab"] {
+  --dd-lane: 17px;
+  --dd-content: 48px;
+}
+@container (max-width: 760px) {
+  .ms-tree-rows,
+  [data-list="agents-tab"] {
+    --dd-content: 40px;
+  }
+}
+@media (pointer: coarse) {
+  .ms-tree-rows,
+  [data-list="agents-tab"] {
+    --dd-lane: 12px;
+    --dd-content: 58px;
+  }
+  @container (max-width: 760px) {
+    .ms-tree-rows,
+    [data-list="agents-tab"] {
+      --dd-content: 46px;
+    }
+  }
+}
+
 /* A group's head and a definition's own row (definitions.tsx GroupHead, DefRow): one line, one height
    for every one of them at every width, its parts centred on it: its chevron and label (the press that
    opens it), what it says in short at its right end, its controls last in a column of one width, so
@@ -333,13 +358,13 @@
   align-items: center;
   gap: 0 12px;
   min-height: 44px;
-  padding: 0 8px 0 6px;
+  padding: 0 8px 0 calc(var(--dd-lane, 17px) - 11px);
 }
 .df-head-main {
   grid-area: main;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: calc(var(--dd-content, 38px) - var(--dd-lane, 17px) - 11px);
   min-width: 0;
   min-height: 44px;
   text-align: left;
@@ -583,21 +608,6 @@
 /* Its experiments (definitions.tsx ExperimentsGroup): a line each, its name and its state in the agents'
    words' scheme (live as at work, paused as paused, promoted as done); opened, what it is under it at the
    tree's indentation, each part on a line of its own, left-aligned. */
-.ms-node.df-exp.df-head {
-  padding-left: 34px;
-}
-.df-exp-name {
-  min-width: 0;
-  overflow: hidden;
-  color: #ededee;
-  font-size: 14px;
-  line-height: 20px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.df-exp-word {
-  min-width: 0;
-}
 .df-exp[data-stand="working"] .ms-word {
   color: #cdc6ea;
 }
@@ -616,26 +626,8 @@
 .df-exp[data-stand="done"] .ms-word > i {
   background: #a8c9bc;
 }
-.ms-node.df-exp-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: none;
-  justify-items: start;
-  gap: 10px;
-  padding: 10px 8px 18px 66px;
-}
 .df-exp-k {
   margin-top: 8px;
-}
-.df-exp-facts {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 14px;
-  color: #97999f;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 20px;
 }
 .df-rename {
   display: inline-flex;
@@ -836,36 +828,22 @@
   color: #c8cad0;
   font-size: 13px;
 }
-@container (max-width: 520px) {
-  .ms-node.df-exp-body {
-    padding-left: 34px;
-  }
-}
 
-/* A session's engine in its Mission row's dropdown (engine-rows.tsx): a line each sandbox, its chevron,
-   its engine and name over its stand (the agents' words' colours), where it runs and its size, and its
-   controls on its line's right end; opened, its Sandbox tab's whole under it at the tree's indentation. */
-.ms-node.df-vm {
+/* A session's engine in its Mission row's dropdown (engine-rows.tsx), and each experiment (definitions.tsx
+   ExperimentNodes), alike: a line each, its glyph and name over its stand (the agents' words' colours) and
+   what it is, its controls at the line's right end; then under it everything it holds, nothing folded,
+   all on the dropdown's left edge. */
+.ms-node.df-vm,
+.ms-node.df-exp {
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas: "main ctl";
   align-items: center;
   gap: 0 12px;
   min-height: 56px;
-  padding: 6px 8px 6px 6px;
-}
-.df-vm-main {
-  grid-area: main;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  text-align: left;
-}
-.df-vm-main > .df-chev {
-  flex: none;
-  width: 22px;
+  padding: 8px 8px 8px var(--dd-content, 38px);
 }
 .df-vm-text {
+  grid-area: main;
   display: grid;
   gap: 2px;
   min-width: 0;
@@ -879,22 +857,29 @@
   font-size: 14px;
   line-height: 20px;
 }
-.df-vm-name > span:last-child {
+.df-vm-name > span:not(.sm-engine) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.df-vm-name > .ms-edit-in {
+  width: min(260px, 100%);
+}
+.df-exp-glyph {
+  flex: none;
+  color: #b8a6d5;
+}
 .df-vm-line {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 2px 10px;
   min-width: 0;
   color: #97999f;
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 18px;
-  white-space: nowrap;
 }
 .df-vm-line > .ms-word {
   min-width: 0;
@@ -912,16 +897,71 @@
   color: #c8cad0;
   font-size: 13px;
 }
+.ms-node.df-vm-body,
+.ms-node.df-exp-body,
+.ms-node.df-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: none;
+  justify-items: start;
+  gap: 10px;
+  padding: 4px 8px 18px var(--dd-content, 38px);
+}
+/* Its sections fill its width: start would shrink the Sandbox tab's, a size container, to nothing. */
 .ms-node.df-vm-body {
   display: block;
-  padding: 4px 8px 16px 38px;
+  justify-items: normal;
 }
 .ms-node.df-vm-body:hover,
-.ms-node.df-vm-body:focus-within {
+.ms-node.df-vm-body:focus-within,
+.ms-node.df-exp-body:hover,
+.ms-node.df-exp-body:focus-within,
+.ms-node.df-body:hover,
+.ms-node.df-body:focus-within {
   background: none;
 }
-@container (max-width: 520px) {
-  .ms-node.df-vm-body {
-    padding-left: 12px;
-  }
+/* Its network's last hour: its label and rate as a bar's are (limits.tsx), its plot under them. */
+.df-unet {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: #ededee;
+  font-size: 13px;
+}
+/* A definition's facts (definitions.tsx DefFacts): a line each, its plain words in its values' column
+   at the left, then its mark and value. */
+.df-facts {
+  display: grid;
+  gap: 6px;
+  justify-self: stretch;
+}
+.df-fact {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  align-items: center;
+  gap: 0 10px;
+  min-height: 24px;
+}
+.df-fact-v {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: #d4d6dc;
+  font-size: 13px;
+}
+
+/* The Engine tab's sandboxes (engine-rows.tsx EngineList): on the tab's own left edge, as its other
+   sections are. */
+.eg-list {
+  --dd-content: 0px;
+}
+.eg-list > .ms-node.df-vm {
+  padding-right: 0;
+}
+
+/* A sandbox's resources, then its sections at their own gap (console.css .in-secs). */
+.df-vm-body .df-usage {
+  margin-bottom: 26px;
 }

@@ -1,8 +1,8 @@
 /**
- * The inspector's Plan, Tools, Sandbox and Agents tabs (inspector.tsx), in a chunk of their own: none
- * is in a conversation's first view (Changes is), so their code (plans, research, goals, background
- * tasks, tools, usage, its sandbox, agents) comes once a tab is opened or pointed at (goal 8, plan
- * 01a1a832ebfd step 6).
+ * The inspector's Plan, Tools and Engine tabs (inspector.tsx), in a chunk of their own: none is in a
+ * conversation's first view (Changes is), so their code (plans, research, goals, background tasks,
+ * tools, usage, its engine and agents) comes once a tab is opened or pointed at (goal 8, plan
+ * 01a1a832ebfd step 6). SandboxTab is the engine's sections a sandbox's body shows (engine-rows.tsx).
  */
 import * as React from "react";
 import { Bot, Square } from "lucide-react";
@@ -30,7 +30,7 @@ import { SubagentOutput } from "./task-output";
 import type { useReviewWaits } from "@/views/plans/review";
 
 export { SandboxTab } from "./sandbox";
-export { AgentsTab } from "./agents-tab";
+export { EngineTab } from "./engine-tab";
 
 const NO_AGENTS: readonly AgentInfo[] = [];
 

@@ -367,7 +367,7 @@ function VmRow({ v, open, onCharts, onChanged }: { v: MicroVm; open: boolean; on
   return (
     <li className="rv-row" data-state={v.state}>
       <StatusDot status={VM_STATUS[v.state]} title={VM_WORD[v.state]} />
-      <Link to={`/agents/${v.session}?tab=sandbox`} className="rv-name" title={`${v.agent} · ${v.session}`}>
+      <Link to={`/agents/${v.session}?tab=engine`} className="rv-name" title={`${v.agent} · ${v.session}`}>
         {v.agent}
       </Link>
       <span className="rv-dim rv-image" title={v.image}>

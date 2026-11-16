@@ -9,7 +9,19 @@ import { expect, test, type Locator } from "@playwright/test";
 /** Against a real kiln server (playwright.config.ts): these drive the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
 
-const ORDER = ["Leader election over QUIC", "Check vote timeouts", "Measure election time", "Follower catch-up", "Snapshot transfer", "Verify the checksum", "Re-read the manifest", "Docs pass", "Rotate the signing key", "Port the lexer", "Bench the follower"];
+const ORDER = [
+  "Leader election over QUIC",
+  "Check vote timeouts",
+  "Measure election time",
+  "Follower catch-up",
+  "Snapshot transfer",
+  "Verify the checksum",
+  "Re-read the manifest",
+  "Docs pass",
+  "Rotate the signing key",
+  "Port the lexer",
+  "Bench the follower",
+];
 
 const left = async (l: Locator) => Math.round((await l.boundingBox())?.x ?? -1);
 /** Where it is on the page (scrolling doesn't move it; layout does). */
@@ -25,30 +37,32 @@ test.afterAll(async ({ request }) => {
   if (!REAL) await request.post("/api/mock/asks");
 });
 
+/** A subagent's row in the tree, among the dropdown's heads, engine lines and bodies (the same list holds them all). */
+const NODE = ".ms-node:has(> .ms-node-main)";
 test("the subagents' toggle opens the tree under its row, every subagent in the order it started, and closes it", async ({ page }) => {
   await page.goto("/agents");
   const row = page.locator('.ms-row[data-agent="tree-lead"]');
-  const toggle = row.getByRole("button", { name: "Show Storage lead's subagents" });
+  const toggle = row.getByRole("button", { name: "Show Storage lead's subagents and engine" });
   await expect(toggle).toHaveAttribute("aria-expanded", "false");
-  // One with a subagent of its harness's own has one too; one with none has none.
+  // Every row has its dropdown (its engine at least), one with no subagent too.
   await expect(page.locator('.ms-row[data-agent="relay-lead"] .ms-subs')).toHaveCount(1);
-  await expect(page.locator('.ms-row[data-agent="fam-tests"] .ms-subs')).toHaveCount(0);
+  await expect(page.locator('.ms-row[data-agent="fam-tests"] .ms-subs')).toHaveCount(1);
   await expect(page.locator(".ms-tree")).toHaveCount(0);
 
   await toggle.scrollIntoViewIfNeeded();
   const top = await pageTop(row);
   await toggle.click();
-  const tree = page.getByRole("list", { name: "Storage lead's subagents" });
+  const tree = page.getByRole("list", { name: "Storage lead's subagents and engine" });
   await expect(tree.locator(".ms-node-name")).toHaveText(ORDER);
   // Opening it moves nothing above it.
   expect(await pageTop(row)).toBe(top);
-  await expect(row.getByRole("button", { name: "Hide Storage lead's subagents" })).toHaveAttribute("aria-expanded", "true");
+  await expect(row.getByRole("button", { name: "Hide Storage lead's subagents and engine" })).toHaveAttribute("aria-expanded", "true");
 
-  const stands = await tree.locator(".ms-node").evaluateAll((els) => els.map((e) => e.getAttribute("data-stand")));
+  const stands = await tree.locator(NODE).evaluateAll((els) => els.map((e) => e.getAttribute("data-stand")));
   expect(stands).toEqual(["working", "working", "done", "needs", "working", "paused", "working", "done", "needs", "stopped", "failed"]);
   // Those that need you: each its piece of the path tan, and only theirs.
-  const catchUp = tree.locator(".ms-node", { hasText: "Follower catch-up" });
-  const signing = tree.locator(".ms-node", { hasText: "Rotate the signing key" });
+  const catchUp = tree.locator(NODE, { hasText: "Follower catch-up" });
+  const signing = tree.locator(NODE, { hasText: "Rotate the signing key" });
   await expect(catchUp.locator(".ms-node-text")).toHaveText("Bash: kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up");
   await expect(signing.locator(".ms-node-text")).toHaveText("Bash: gpg --detach-sign dist/kiln-x86_64-linux");
   for (const n of [catchUp, signing]) await expect(n.locator(".tp-hot")).not.toHaveCount(0);
@@ -58,15 +72,15 @@ test("the subagents' toggle opens the tree under its row, every subagent in the 
   await expect(signing.getByRole("button", { name: "Allow" })).toHaveCount(0);
   await expect(catchUp.getByRole("button", { name: "Allow" })).toHaveCount(1);
 
-  await row.getByRole("button", { name: "Hide Storage lead's subagents" }).click();
+  await row.getByRole("button", { name: "Hide Storage lead's subagents and engine" }).click();
   await expect(page.locator(".ms-tree")).toHaveCount(0);
 });
 
 test("the tree's rows keep to one column: every name at one place, and on a wide screen where the row's own name is", async ({ page, isMobile }) => {
   await page.goto("/agents");
   const row = page.locator('.ms-row[data-agent="tree-lead"]');
-  await row.getByRole("button", { name: "Show Storage lead's subagents" }).click();
-  const names = page.getByRole("list", { name: "Storage lead's subagents" }).locator(".ms-node-name");
+  await row.getByRole("button", { name: "Show Storage lead's subagents and engine" }).click();
+  const names = page.getByRole("list", { name: "Storage lead's subagents and engine" }).locator(".ms-node-name");
   await expect(names).toHaveCount(ORDER.length);
   const xs = new Set<number>();
   for (const n of await names.all()) xs.add(await left(n));
@@ -76,8 +90,8 @@ test("the tree's rows keep to one column: every name at one place, and on a wide
 
 test("Allow on a subagent in the tree goes to it, and it works on", async ({ page }) => {
   await page.goto("/agents");
-  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents" }).click();
-  const catchUp = page.getByRole("list", { name: "Storage lead's subagents" }).locator(".ms-node", { hasText: "Follower catch-up" });
+  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents and engine" }).click();
+  const catchUp = page.getByRole("list", { name: "Storage lead's subagents and engine" }).locator(NODE, { hasText: "Follower catch-up" });
   await catchUp.getByRole("button", { name: "Allow" }).click();
   await expect(catchUp).toHaveAttribute("data-stand", "working");
   await expect(catchUp.locator(".tp-hot")).toHaveCount(0);
@@ -85,12 +99,12 @@ test("Allow on a subagent in the tree goes to it, and it works on", async ({ pag
 
 test("a subagent in the tree opens its thread on its agent's page", async ({ page }) => {
   await page.goto("/agents");
-  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents" }).click();
-  const tree = page.getByRole("list", { name: "Storage lead's subagents" });
-  await tree.locator(".ms-node", { hasText: "Follower catch-up" }).locator(".ms-node-main").click();
+  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents and engine" }).click();
+  const tree = page.getByRole("list", { name: "Storage lead's subagents and engine" });
+  await tree.locator(NODE, { hasText: "Follower catch-up" }).locator(".ms-node-main").click();
   await expect(page).toHaveURL(/\/agents\/tree-lead\?task=tree-s2$/);
   await page.goto("/agents");
-  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents" }).click();
-  await page.getByRole("list", { name: "Storage lead's subagents" }).locator(".ms-node", { hasText: "Re-read the manifest" }).locator(".ms-node-main").click();
+  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents and engine" }).click();
+  await page.getByRole("list", { name: "Storage lead's subagents and engine" }).locator(NODE, { hasText: "Re-read the manifest" }).locator(".ms-node-main").click();
   await expect(page).toHaveURL(/\/agents\/tree-s3a\?own=1&task=ts3a-a$/);
 });

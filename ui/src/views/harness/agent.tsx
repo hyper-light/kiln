@@ -35,7 +35,7 @@ import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
 import { AgentHeader } from "./head";
-import { Inspector, prepareInspectorTab, SandboxTabName, type InspectorTab } from "./inspector";
+import { Inspector, prepareInspectorTab, type InspectorTab } from "./inspector";
 import { prepareAgentNavigation } from "@/lib/agent-navigation";
 import { INSPECTOR_COLLAPSED } from "./desktop";
 import { AgentFrame, AgentFrameContent } from "./agent-frame";
@@ -156,7 +156,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // `?tab=plan`: opened on its plans (the way back from one of them, or its research).
   // `?tab=tools|sandbox|agents`: opened on what it works with, where it runs, or its agents (a definition's session, from Mission control).
   const tabAsked = params.get("tab");
-  const tabWanted: InspectorTab | null = tabAsked === "plan" || tabAsked === "tools" || tabAsked === "sandbox" || tabAsked === "agents" ? tabAsked : null;
+  const tabWanted: InspectorTab | null = tabAsked === "plan" || tabAsked === "tools" || tabAsked === "engine" ? tabAsked : null;
   const [tab, setTab] = React.useState<InspectorTab>(() => tabWanted ?? "changes");
   const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => tabWanted ?? "work");
   const [confirmStop, setConfirmStop] = React.useState(false);
@@ -288,12 +288,12 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setTab("tools");
     setPhoneTab("tools");
   }, [setTrayCollapsed]);
-  /** Its agent, managed from here: the Agents tab (the head's definition crumb). */
+  /** Its agent, managed from here: the Engine tab (the head's definition crumb). */
   const showAgents = React.useCallback(() => {
-    prepareInspectorTab("agents");
+    prepareInspectorTab("engine");
     setTrayCollapsed(false);
-    setTab("agents");
-    setPhoneTab("agents");
+    setTab("engine");
+    setPhoneTab("engine");
   }, [setTrayCollapsed]);
   const showPlan = () => {
     void prepareAgentNavigation({ id, tab: "plan" });
@@ -1013,8 +1013,7 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
     { id: "changes", label: "Changes", n: fileCount ? String(fileCount) : undefined },
     { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools" },
-    { id: "sandbox", label: <SandboxTabName agentId={store.id} /> },
-    { id: "agents", label: "Agents" },
+    { id: "engine", label: "Engine" },
   ];
   return (
     <div className="pt" role="tablist" aria-label="Agent">

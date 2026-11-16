@@ -797,6 +797,18 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .in-sec-toggle:hover {
   color: var(--color-bright);
 }
+/* A section that doesn't fold (fold.tsx FoldFixed): the toggle's place, its lettering the heading's. */
+.in-sec-head > .in-sec-static {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 44px;
+  color: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+}
 .in-sec-toggle > svg {
   flex: none;
 }

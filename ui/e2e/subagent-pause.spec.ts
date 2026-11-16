@@ -29,12 +29,14 @@ test.beforeEach(() => {
   test.skip(REAL, "the mock's agents");
 });
 
+/** A subagent's row in the tree, among the dropdown's heads, engine lines and bodies (the same list holds them all). */
+const NODE = ".ms-node:has(> .ms-node-main)";
 test("Mission control's tree pauses a subagent kiln started, with what runs in it, and resumes it", async ({ page }) => {
   await page.goto("/agents");
-  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents" }).click();
-  const tree = page.getByRole("list", { name: "Storage lead's subagents" });
-  const election = tree.locator(".ms-node", { hasText: "Leader election over QUIC" });
-  const votes = tree.locator(".ms-node", { hasText: "Check vote timeouts" });
+  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents and engine" }).click();
+  const tree = page.getByRole("list", { name: "Storage lead's subagents and engine" });
+  const election = tree.locator(NODE, { hasText: "Leader election over QUIC" });
+  const votes = tree.locator(NODE, { hasText: "Check vote timeouts" });
   await expect(election).toHaveAttribute("data-stand", "working");
 
   const sent = commandTo(page, "tree-s1");
@@ -46,7 +48,7 @@ test("Mission control's tree pauses a subagent kiln started, with what runs in i
   await expect(votes).toHaveAttribute("data-stand", "paused");
   await expect(votes.getByRole("button", { name: "Pause Check vote timeouts" })).toBeDisabled();
   // One that ended stays as it was.
-  await expect(tree.locator(".ms-node", { hasText: "Measure election time" })).toHaveAttribute("data-stand", "done");
+  await expect(tree.locator(NODE, { hasText: "Measure election time" })).toHaveAttribute("data-stand", "done");
 
   await election.getByRole("button", { name: "Resume Leader election over QUIC" }).click();
   await expect(election).toHaveAttribute("data-stand", "working");

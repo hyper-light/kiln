@@ -19,10 +19,10 @@ test("a save made in between is shown as a diff, then yours goes on the current 
   const reviewer = list.agents.find((a) => a.name === "reviewer")!;
   // A model other than the one it has, so the save is a change whatever ran before.
   const mine = reviewer.model === "claude-sonnet-5-5" ? "claude-opus-5-5" : "claude-sonnet-5-5";
-  await page.goto("/agents/rev-big?tab=agents");
+  await page.goto("/agents/rev-big?tab=engine");
   const body = page.locator(".hx-inspector-body").filter({ visible: true }).first();
   const tab = page
-    .getByRole("tab", { name: /^Agents/ })
+    .getByRole("tab", { name: /^Engine/ })
     .filter({ visible: true })
     .first();
   await tab.scrollIntoViewIfNeeded();

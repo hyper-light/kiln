@@ -7,7 +7,6 @@ import * as React from "react";
 import { harnessApi, useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type SessionStore, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { useRes } from "@/lib/data";
-import { sandboxesRes } from "@/api/microvms";
 import { agentLabel, changesetOf, editsOf, runsOf, useSameList } from "./derive";
 import { isBackground } from "./background";
 import { workingNow } from "./tasks";
@@ -38,27 +37,9 @@ function ToolsTab(props: React.ComponentProps<Tabs["ToolsTab"]>) {
   return <Content {...props} />;
 }
 
-function SandboxTab(props: React.ComponentProps<Tabs["SandboxTab"]>) {
-  const { SandboxTab: Content } = useRes(inspectorTabsRes).data;
+function EngineTab(props: React.ComponentProps<Tabs["EngineTab"]>) {
+  const { EngineTab: Content } = useRes(inspectorTabsRes).data;
   return <Content {...props} />;
-}
-
-function AgentsTab(props: React.ComponentProps<Tabs["AgentsTab"]>) {
-  const { AgentsTab: Content } = useRes(inspectorTabsRes).data;
-  return <Content {...props} />;
-}
-
-/** Its sandbox tab's name: "Sandbox" for a session in a microVM, "Host" for one on the host, so the tab says where it runs. */
-function SandboxName({ agentId }: { agentId?: string }) {
-  const all = useRes(sandboxesRes).data;
-  return <>{agentId && all[agentId]?.engine === "host" ? "Host" : "Sandbox"}</>;
-}
-export function SandboxTabName({ agentId }: { agentId?: string }) {
-  return (
-    <React.Suspense fallback="Sandbox">
-      <SandboxName agentId={agentId} />
-    </React.Suspense>
-  );
 }
 
 /** Its harness's subagents (their runs' ids, what each was asked, its kind), the same list while they stay the same: what the Changes tab's By names. */
@@ -202,12 +183,7 @@ export function Inspector({
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
     { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools", count: subagents ? String(subagents) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
-    ...(agentId
-      ? [
-          { id: "sandbox" as const, label: <SandboxTabName agentId={agentId} /> },
-          { id: "agents" as const, label: "Agents" },
-        ]
-      : []),
+    ...(agentId ? [{ id: "engine" as const, label: "Engine" }] : []),
   ];
   return (
     <BodiesContext.Provider value={store}>
@@ -245,14 +221,9 @@ export function Inspector({
               <ToolsTab agentId={agentId} send={send} state={state} subagents={subagents} meta={meta} store={store} onOpenTask={onOpenTask} kiln={kiln} runs={runs} />
             </Loadable>
           )}
-          {tab === "sandbox" && agentId && (
-            <Loadable label="Loading its sandbox" fallback={<Hold label="Loading its sandbox" />}>
-              <SandboxTab agentId={agentId} store={store} />
-            </Loadable>
-          )}
-          {tab === "agents" && agentId && (
-            <Loadable label="Loading its agents" fallback={<Hold label="Loading its agents" />}>
-              <AgentsTab agentId={agentId} />
+          {tab === "engine" && agentId && (
+            <Loadable label="Loading its engine" fallback={<Hold label="Loading its engine" />}>
+              <EngineTab agentId={agentId} />
             </Loadable>
           )}
         </div>

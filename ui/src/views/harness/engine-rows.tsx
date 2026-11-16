@@ -1,17 +1,20 @@
 /**
  * A session's engine in its Mission row's dropdown (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2,
- * P3; every session's dropdown has it): a line for each sandbox it runs in, its own and its kiln
- * subagents', each its engine and name, its stand in the agents' words' colours and where it runs, and
- * its controls on its name's line (round, small, of their intent's colour: its stop red, asked again).
- * Opened, everything its agent chat's Sandbox tab manages, under it: its live bars, what it is, its
- * harness and agents (swapped in place), its network (ports published, egress granted, networks
- * connected), its volumes and directories, and its last hour plotted.
+ * P3; every session's dropdown has it): for each sandbox it runs in, its own and its kiln subagents',
+ * its line (its engine and name, its stand in the agents' words' colours, where it runs and its size,
+ * and its controls at the line's right end: round, small, of their intent's colour, its stop red and
+ * asked again), then everything it is under that line, nothing folded (no dropdown nests in a row's):
+ * its CPU, memory and disk now, each with its last hour, its network's last hour, its harness's
+ * context and cost, then what its agent chat's Sandbox tab manages: what it is, its harness and agents
+ * (swapped in place), its network (ports published, egress granted, networks connected), its volumes
+ * and directories.
  */
 import * as React from "react";
-import { Check, ChevronRight, Pause, Play, RotateCcw, Square, X } from "lucide-react";
-import { sandboxApi, sandboxesRes, type SandboxBrief } from "@/api/microvms";
+import { Check, Pause, Play, RotateCcw, Square, X } from "lucide-react";
+import { sandboxApi, sandboxesRes, sandboxRes, type SandboxBrief } from "@/api/microvms";
 import { sessionStore, type AgentInfo } from "@/api/harness";
 import { Loadable } from "@/components/ui/loading";
+import { Sparkline } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { labelOf, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
@@ -20,6 +23,7 @@ import { EngineGlyph } from "@/views/sandbox-marks";
 import { GroupHead, StandCounts } from "./definitions";
 import { agentLabel } from "./derive";
 import { inspectorTabsRes } from "./inspector-code";
+import { LimitMeter } from "./limits";
 import { subagentTree } from "./subagent-tree";
 import "./definition.css";
 import "./figure/figure.css";
@@ -33,7 +37,7 @@ const STAND: Record<State, string> = { running: "working", draining: "working", 
 const COUNTED: Record<State, string> = { running: "working", draining: "working", idle: "done", paused: "paused", failed: "failed", ended: "stopped" };
 const COUNT_WORD: Record<string, string> = { working: "Running", done: "Idle", paused: "Paused", failed: "Failed", stopped: "Ended" };
 
-/** Its engine: the group's head (how many stand where), then a line each, the one opened its whole under it. */
+/** Its engine: the group's head (how many stand where), then each sandbox whole. */
 export function EngineRows({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
   return (
     <Loadable label={`Loading ${agentLabel(a)}'s engine`} fallback={<li className="ms-node df-head" aria-busy="true" />}>
@@ -42,15 +46,32 @@ export function EngineRows({ a, list }: { a: AgentInfo; list: readonly AgentInfo
   );
 }
 
+/** The agents a session's sandboxes are: its own, then each kiln subagent's, as its tree has them, those with one. */
+function useSandboxed(a: AgentInfo, list: readonly AgentInfo[], all: Record<string, SandboxBrief>): AgentInfo[] {
+  const kiln = React.useMemo(() => [...new Set(subagentTree(a, list).flatMap((n) => (n.kind === "kiln" ? [n.session] : [])))], [a, list]);
+  return [a, ...kiln.flatMap((id) => list.filter((x) => x.id === id))].filter((x) => all[x.id]);
+}
+
+/** Its agent chat's Engine tab's first part: each of its sandboxes whole, as its Mission row's dropdown shows them, on the tab's left edge. */
+export function EngineList({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
+  const all = useRes(sandboxesRes).data;
+  const agents = useSandboxed(a, list, all);
+  if (agents.length === 0) return <p className="in-none">It runs in no sandbox kiln knows of.</p>;
+  return (
+    <ul className="ms-list eg-list" aria-label={`${agentLabel(a)}'s engine`}>
+      {agents.map((x) => (
+        <EngineVm key={x.id} a={x} b={all[x.id]!} />
+      ))}
+    </ul>
+  );
+}
+
 function EngineRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
   const all = useRes(sandboxesRes).data;
   const [shut, setShut] = React.useState(false);
-  const [shown, setShown] = React.useState<string | null>(null);
-  // Its own, then each kiln subagent's, as its tree has them.
-  const kiln = React.useMemo(() => [...new Set(subagentTree(a, list).flatMap((n) => (n.kind === "kiln" ? [n.session] : [])))], [a, list]);
-  const ids = [a.id, ...kiln].filter((id) => all[id]);
-  if (ids.length === 0) return null;
-  const states = ids.map((id) => all[id]!.state);
+  const agents = useSandboxed(a, list, all);
+  if (agents.length === 0) return null;
+  const states = agents.map((x) => all[x.id]!.state);
   return (
     <>
       <GroupHead
@@ -60,23 +81,14 @@ function EngineRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] 
         stand={states.some((s) => s === "running" || s === "draining") ? "working" : "done"}
         summary={<StandCounts stands={states.map((s) => COUNTED[s])} words={COUNT_WORD} />}
       />
-      {!shut &&
-        ids.map((id) => (
-          <EngineLine
-            key={id}
-            id={id}
-            b={all[id]!}
-            name={id === a.id ? agentLabel(a) : agentLabel(list.find((x) => x.id === id) ?? a)}
-            open={shown === id}
-            onOpen={() => setShown(shown === id ? null : id)}
-          />
-        ))}
+      {!shut && agents.map((x) => <EngineVm key={x.id} a={x} b={all[x.id]!} />)}
     </>
   );
 }
 
-/** One sandbox: its line (its controls on its name's line, at its right end), and opened, its Sandbox tab's whole under it. */
-function EngineLine({ id, b, name, open, onOpen }: { id: string; b: SandboxBrief; name: string; open: boolean; onOpen: () => void }) {
+/** One sandbox: its line, its controls at the line's right end; under it, its resources and its Sandbox tab's whole. */
+function EngineVm({ a, b }: { a: AgentInfo; b: SandboxBrief }) {
+  const name = agentLabel(a);
   const [asking, setAsking] = React.useState(false);
   // What a press made of it until the server says what it is: a new state from the server replaces it.
   const [state, setState] = React.useState<State | null>(null);
@@ -91,7 +103,7 @@ function EngineLine({ id, b, name, open, onOpen }: { id: string; b: SandboxBrief
   const act = (what: "pause" | "resume" | "restart" | "stop") => {
     if (what === "pause" || what === "resume") setState(what === "pause" ? "paused" : "running");
     sandboxApi
-      .act(id, what)
+      .act(a.id, what)
       .then((d) => {
         setState(d.state);
         invalidate("microvm/");
@@ -107,26 +119,21 @@ function EngineLine({ id, b, name, open, onOpen }: { id: string; b: SandboxBrief
   const mem = `${Math.round((b.memory.total / 2 ** 30) * 10) / 10} GiB`;
   return (
     <>
-      <li className="ms-node df-vm" data-stand={STAND[now]} data-depth={2} data-open={open || undefined}>
-        <button type="button" className="df-vm-main" aria-expanded={open} aria-label={`${open ? "Hide" : "Show"} ${name}'s ${host ? "host" : "microVM"}`} onClick={onOpen}>
-          <span className="df-chev">
-            <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
+      <li className="ms-node df-vm" data-stand={STAND[now]} data-depth={2}>
+        <span className="df-vm-text">
+          <span className="df-vm-name">
+            <EngineGlyph engine={b.engine} />
+            <span>{name}</span>
           </span>
-          <span className="df-vm-text">
-            <span className="df-vm-name">
-              <EngineGlyph engine={b.engine} />
-              <span>{name}</span>
+          <span className="df-vm-line">
+            <span className="ms-word">
+              <i aria-hidden="true" />
+              {WORD[now]}
             </span>
-            <span className="df-vm-line">
-              <span className="ms-word">
-                <i aria-hidden="true" />
-                {WORD[now]}
-              </span>
-              <span>{labelOf(b.runner)}</span>
-              {!host && <span>{mem}</span>}
-            </span>
+            <span>{labelOf(b.runner)}</span>
+            {!host && <span>{mem}</span>}
           </span>
-        </button>
+        </span>
         {!ended && (
           <span className="df-vm-ctl">
             {asking ? (
@@ -174,14 +181,55 @@ function EngineLine({ id, b, name, open, onOpen }: { id: string; b: SandboxBrief
           </span>
         )}
       </li>
-      {open && (
-        <li className="ms-node df-vm-body" data-depth={3}>
-          <Loadable label={`Loading ${name}'s sandbox`}>
-            <SandboxBlock agentId={id} />
-          </Loadable>
-        </li>
-      )}
+      <li className="ms-node df-vm-body" data-depth={3}>
+        <Loadable label={`Loading ${name}'s sandbox`}>
+          <EngineUsage a={a} />
+          <SandboxBlock agentId={a.id} />
+        </Loadable>
+      </li>
     </>
+  );
+}
+
+/** Its resources now, a bar each with its last hour plotted under it, its network's last hour, then its harness's context and cost. */
+function EngineUsage({ a }: { a: AgentInfo }) {
+  const d = useRes(sandboxRes(a.id)).data;
+  const gib = (n: number) => Math.round((n / 2 ** 30) * 10) / 10;
+  const now = d.now;
+  const rows: { id: string; label: string; pct: number; used?: number; limit?: number; unit?: string; series: number[] }[] = now
+    ? [
+        { id: "cpu", label: "CPU", pct: now.cpu_pct, ...(d.vm ? { used: Math.round((now.cpu_pct / 100) * d.vm.vcpus * 100) / 100, limit: d.vm.vcpus, unit: "vCPU" } : {}), series: d.series.cpu },
+        { id: "memory", label: "Memory", pct: (now.memory.used / now.memory.total) * 100, used: gib(now.memory.used), limit: gib(now.memory.total), unit: "GiB", series: d.series.memory },
+        { id: "disk", label: "Disk", pct: (now.disk.used / now.disk.total) * 100, used: gib(now.disk.used), limit: gib(now.disk.total), unit: "GiB", series: d.series.disk },
+      ]
+    : [];
+  const net = d.series.net;
+  return (
+    <div className="df-usage">
+      {rows.map((r) => (
+        <div key={r.id} className="df-urow">
+          <LimitMeter live limit={{ id: r.id, label: r.label, used_percent: r.pct, used: r.used, limit: r.limit, unit: r.unit }} />
+          <Sparkline values={r.series} max={100} width={480} height={28} className="df-uplot" />
+        </div>
+      ))}
+      {net.length > 1 && (
+        <div className="df-urow">
+          <span className="df-unet">
+            <span>Network</span>
+            <span className="df-head-v">{((net.at(-1) ?? 0) / 10).toFixed(1)} MB/s</span>
+          </span>
+          <Sparkline values={net} width={480} height={28} className="df-uplot" />
+        </div>
+      )}
+      {a.context_pct !== undefined && (
+        <div className="df-urow">
+          <LimitMeter limit={{ id: "context", label: "Context", used_percent: a.context_pct }} />
+        </div>
+      )}
+      <span className="df-ucost">
+        <span className="ms-edit-k">cost</span>${a.cost_usd.toFixed(2)}
+      </span>
+    </div>
   );
 }
 

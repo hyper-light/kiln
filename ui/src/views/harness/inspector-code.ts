@@ -1,7 +1,7 @@
 /** W21-R02: selected inspector code can start with actual route navigation, before Agent mounts. */
 import { ready, warm, type Res } from "@/lib/data";
 
-export type InspectorTab = "changes" | "plan" | "tools" | "sandbox" | "agents";
+export type InspectorTab = "changes" | "plan" | "tools" | "engine";
 type Tabs = typeof import("./inspector-tabs");
 export const inspectorTabsRes: Res<Tabs> = { key: "code/agent/inspector-tabs", fetch: () => import("./inspector-tabs") };
 
