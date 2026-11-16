@@ -116,6 +116,52 @@ function SandboxLineRead({ id, target }: { id: string; target: string }) {
   );
 }
 
+/**
+ * What this session started on, beside the current version (Restart on it, where behind), and its
+ * experiment's variant (its swatch and name, never a letter), a labelled line each.
+ */
+function SessionFacts({ d, session }: { d: AgentDef; session: string }) {
+  const mine = d.sessions.find((s) => s.id === session);
+  if (!mine) return null;
+  const variant = sessionVariant(d, session);
+  const at = variantIn(d, mine.variant);
+  const weight = at?.e.variants[at.i]?.weight;
+  return (
+    <span className="df-facts">
+      <span className="df-fact">
+        <span className="ms-edit-k">started on</span>
+        <span className="df-fact-v">
+          {mine.version === d.version ? (
+            <span>v{d.version}, the current version</span>
+          ) : (
+            <>
+              <span className="df-old">
+                v{mine.version}; v{d.version} is current
+              </span>
+              <Button size="xs" variant="secondary" onClick={() => toast({ title: `Restarting on v${d.version}`, tone: "running" })}>
+                Restart on v{d.version}
+              </Button>
+            </>
+          )}
+        </span>
+      </span>
+      {variant && weight !== undefined && (
+        <span className="df-fact" title={`${variant.name}: ${weight}% of ${at?.e.name}'s new sessions`}>
+          <span className="ms-edit-k">variant</span>
+          <span className="df-fact-v">
+            <Swatch tone={variant.tone} />
+            <span>{variant.name}</span>
+            <span className="meter" role="meter" aria-valuenow={weight} aria-valuemin={0} aria-valuemax={100} aria-label={`${weight}% of new sessions`}>
+              <span style={{ width: `${weight}%` }} />
+            </span>
+            <span>{weight}%</span>
+          </span>
+        </span>
+      )}
+    </span>
+  );
+}
+
 /** How each start kind reads as a line's label. */
 const START_LABEL: Record<"warm" | "template" | "cold", string> = { warm: "Warm start", template: "Template start", cold: "Cold start" };
 
@@ -194,16 +240,17 @@ type Group = "definition" | "experiment";
  * dropdown there: they're sections, shown whole, no dropdown nested in it. Its sessions are Mission
  * control's rows, counted on its row's head.
  */
-export function DefGroupRows({ d, first, inRow }: { d: AgentDef; first?: Group; inRow?: boolean }) {
+export function DefGroupRows({ d, first, setup: setupFirst, inRow, session }: { d: AgentDef; first?: Group; setup?: boolean; inRow?: boolean; session?: string }) {
   const [open, setOpen] = React.useState<Group | null>(first ?? null);
-  const [setup, setSetup] = React.useState(false);
+  const [setup, setSetup] = React.useState(setupFirst === true);
   const toggle = (g: Group) => setOpen((was) => (was === g ? null : g));
   return (
     <>
       <DefinitionGroup
         d={d}
         inRow={inRow}
-        open={inRow === true || open === "definition"}
+        session={session}
+        open={open === "definition"}
         onOpen={() => toggle("definition")}
         onSetup={() => {
           setSetup(true);
@@ -213,8 +260,7 @@ export function DefGroupRows({ d, first, inRow }: { d: AgentDef; first?: Group; 
       {(d.experiments.length > 0 || setup || d.own) && (
         <ExperimentsGroup
           d={d}
-          fixed={inRow}
-          open={inRow === true || open === "experiment"}
+          open={open === "experiment"}
           onOpen={() => toggle("experiment")}
           setup={setup}
           onSetup={() => {
@@ -229,12 +275,11 @@ export function DefGroupRows({ d, first, inRow }: { d: AgentDef; first?: Group; 
 }
 
 /** A definition's groups under its own row (the Agents tab, chat), under a head that stays in sight while its row is out of it. */
-export function DefGroups({ d, first, inRow, onClose }: { d: AgentDef; first?: Group; inRow?: boolean; onClose: () => void }) {
+export function DefGroups({ d, first, setup, inRow, session }: { d: AgentDef; first?: Group; setup?: boolean; inRow?: boolean; session?: string }) {
   return (
     <li className="ms-tree df-groups">
-      <OpenHead label={d.name} onClose={onClose} />
       <ul className="ms-tree-rows" aria-label={`${d.name}: settings and experiments`}>
-        <DefGroupRows d={d} first={first} inRow={inRow} />
+        <DefGroupRows d={d} first={first} setup={setup} inRow={inRow} session={session} />
       </ul>
     </li>
   );
@@ -313,7 +358,6 @@ export function GroupHead({
   summary,
   actions,
   stand = "done",
-  fixed,
 }: {
   label: string;
   open: boolean;
@@ -321,37 +365,27 @@ export function GroupHead({
   summary?: React.ReactNode;
   actions?: React.ReactNode;
   stand?: string;
-  /** A section shown whole (no dropdown nests in another): its label alone, nothing to press. */
-  fixed?: boolean;
 }) {
   return (
-    <li className="ms-node df-group df-head" data-stand={stand} data-depth={1} data-open={open || undefined} data-fixed={fixed || undefined}>
-      {fixed ? (
-        <span className="df-head-main">
-          <span className="df-chev" aria-hidden="true" />
-          <span className="ms-sep-h df-group-k">{label}</span>
+    <li className="ms-node df-group df-head" data-stand={stand} data-depth={1} data-open={open || undefined}>
+      <button type="button" className="df-head-main" aria-expanded={open} onClick={onOpen}>
+        <span className="df-chev">
+          <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
         </span>
-      ) : (
-        <button type="button" className="df-head-main" aria-expanded={open} onClick={onOpen}>
-          <span className="df-chev">
-            <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
-          </span>
-          <span className="ms-sep-h df-group-k">{label}</span>
-        </button>
-      )}
+        <span className="ms-sep-h df-group-k">{label}</span>
+      </button>
       <span className="df-head-end">{summary}</span>
       <span className="df-head-acts">{actions}</span>
     </li>
   );
 }
 
-function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; open: boolean; onOpen: () => void; onSetup: () => void; inRow?: boolean }) {
+function DefinitionGroup({ d, open, onOpen, onSetup, inRow, session }: { d: AgentDef; open: boolean; onOpen: () => void; onSetup: () => void; inRow?: boolean; session?: string }) {
   const [asking, setAsking] = React.useState<DefAskKind | null>(null);
   return (
     <>
       <GroupHead
         label="Settings"
-        fixed={inRow}
         open={open}
         onOpen={onOpen}
         summary={<span className="df-head-v">{inRow ? `v${d.version}` : `${d.name} v${d.version}`}</span>}
@@ -360,6 +394,7 @@ function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; ope
       {asking && <DefAsk d={d} asking={asking} onDone={() => setAsking(null)} />}
       {open && (
         <li className="ms-node df-body" data-stand="done" data-depth={2}>
+          {session && <SessionFacts d={d} session={session} />}
           <DefFacts d={d} />
           <Loadable label={`Loading ${d.name}'s values`} fallback={<span className="ms-fields" aria-busy="true" />}>
             <DefValues d={d} />
@@ -386,23 +421,7 @@ const NO_MEASURES: Variant["measures"] = { warm_ms: [0, 0, 0], peak_gib: [0, 0, 
  * its own) and a + for another; opened, a new one being set up, then each one whole, laid out as its
  * engine's microVMs are (engine-rows.tsx): its line, then what it holds under it, nothing folded.
  */
-function ExperimentsGroup({
-  d,
-  fixed,
-  open,
-  onOpen,
-  setup,
-  onSetup,
-  onSetupDone,
-}: {
-  d: AgentDef;
-  fixed?: boolean;
-  open: boolean;
-  onOpen: () => void;
-  setup: boolean;
-  onSetup: () => void;
-  onSetupDone: () => void;
-}) {
+function ExperimentsGroup({ d, open, onOpen, setup, onSetup, onSetupDone }: { d: AgentDef; open: boolean; onOpen: () => void; setup: boolean; onSetup: () => void; onSetupDone: () => void }) {
   const [list, setList] = React.useState<Experiment[]>(d.experiments);
   const change = (id: string) => (fn: (e: Experiment) => Experiment) => setList((l) => l.map((e) => (e.id === id ? fn(e) : e)));
   const remove = (e: Experiment) => {
@@ -415,7 +434,6 @@ function ExperimentsGroup({
     <>
       <GroupHead
         label="Experiments"
-        fixed={fixed}
         open={open || setup}
         onOpen={onOpen}
         stand={list.some((e) => e.state === "live") ? "working" : "done"}
@@ -1383,63 +1401,33 @@ function Clash({ mine, was, theirs, saving, onTheirs, onMine }: { mine: Partial<
  * name, its sessions' stand and how many are at work; where it runs and how fast it starts; Run and
  * its rarer acts. Its chevron opens its groups under it.
  */
-export function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly AgentInfo[]; open: boolean; onOpen: () => void }) {
+export function DefRow({ d, list, session }: { d: AgentDef; list: readonly AgentInfo[]; session?: string }) {
   const [asking, setAsking] = React.useState<DefAskKind | null>(null);
+  const [setup, setSetup] = React.useState(0);
   const sessions = d.sessions.map((s) => list.find((x) => x.id === s.id)).filter((a): a is AgentInfo => a !== undefined);
   const stands = sessions.map((a) => NODE[chatStand(a)]);
   const ORDER = ["needs", "failed", "working", "paused", "done", "offline", "stopped"];
   const stand = ORDER.find((o) => stands.includes(o)) ?? "done";
   return (
     <>
-      {/* One line as its groups are: its name and flags, its sessions' stands at its right, its ⋯ (Start a session among them). */}
-      <li ref={open ? watchUnseen : undefined} className="ms-node df-defrow df-head" data-stand={stand} data-depth={0} data-open={open || undefined} data-def={d.id}>
-        <button type="button" className="df-head-main" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${d.name}`} onClick={onOpen}>
-          <span className="df-chev">
-            <ChevronRight size={13} aria-hidden="true" className={open ? "rotate-90" : undefined} />
-          </span>
+      {/* Its card's line: its name and flags (this session's marked), its sessions' stands at its right, its ⋯. */}
+      <li className="ms-node df-defrow df-head" data-stand={stand} data-depth={0} data-def={d.id}>
+        <span className="df-head-main">
+          <span className="df-chev" aria-hidden="true" />
           <span className="df-strong df-defname">{d.name}</span>
+          {session && <span className="df-head-v df-this">this session</span>}
           {!d.own && <Lock size={12} className="ms-flag-pin" role="img" aria-label="kiln's: copy it to change it" />}
           {(d.replaces || d.replaced_by) && <Repeat2 size={12} className="ms-flag-pin" role="img" aria-label={d.replaces ? `Stands in for kiln's ${d.replaces}` : `You use ${d.replaced_by}`} />}
-        </button>
+        </span>
         <span className="df-head-end">{sessions.length > 0 ? <StandCounts stands={stands} /> : <span className="df-head-v">v{d.version}</span>}</span>
         <span className="df-head-acts">
-          <DefMenu
-            d={d}
-            onSetup={() => {
-              if (!open) onOpen();
-            }}
-            onAsk={setAsking}
-          />
+          <DefMenu d={d} onSetup={() => setSetup((n) => n + 1)} onAsk={setAsking} />
         </span>
       </li>
       {asking && <DefAsk d={d} asking={asking} onDone={() => setAsking(null)} />}
-      {open && <DefGroups d={d} first="definition" inRow onClose={onOpen} />}
+      <DefGroups key={setup} d={d} first={setup ? "experiment" : session ? "definition" : undefined} setup={setup > 0} inRow session={session} />
     </>
   );
-}
-
-/**
- * A list of definitions' keys (kiln's principle 1): j and k move between its rows, Enter opens one
- * (its row's press), Esc closes the one open. Not while typing.
- */
-export function defListKeys(e: React.KeyboardEvent<HTMLUListElement>, open: string | null, close: () => void) {
-  if (e.altKey || e.ctrlKey || e.metaKey) return;
-  const at = e.target instanceof HTMLElement ? e.target : null;
-  if (!at || at.closest("input, textarea, select, [contenteditable]")) return;
-  const rows = [...e.currentTarget.querySelectorAll<HTMLElement>(":scope > li.df-defrow")];
-  const row = at.closest<HTMLElement>("li.df-defrow");
-  if (e.key === "j" || e.key === "k") {
-    const i = row ? rows.indexOf(row) : -1;
-    rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "j" ? 1 : -1)))]?.querySelector<HTMLElement>(".df-head-main")?.focus();
-    e.preventDefault();
-  } else if (e.key === "Escape" && open) {
-    e.preventDefault();
-    close();
-    rows
-      .find((r) => r.dataset.def === open)
-      ?.querySelector<HTMLElement>(".df-head-main")
-      ?.focus();
-  }
 }
 
 /** A kiln MCP call about an agent definition (agentdefs_get, _update, _run …): the definition's id it names, so chat shows its rows. */
@@ -1457,7 +1445,6 @@ export function DefinitionCard({ id, at }: { id: string; at?: number }) {
   const defs = useRes(agentdefsRes).data;
   const list = useAgentList();
   const [live, setLive] = React.useState(false);
-  const [open, setOpen] = React.useState(false);
   const d = defs.find((x) => x.id === id);
   if (!d) return null;
   const old = at !== undefined && Date.now() - at > 60_000 && !live;
@@ -1479,7 +1466,7 @@ export function DefinitionCard({ id, at }: { id: string; at?: number }) {
         )}
       </div>
       <ul className="ms-list" data-list="defs-chat" inert={old || undefined}>
-        <DefRow d={d} list={list} open={open} onOpen={() => setOpen(!open)} />
+        <DefRow d={d} list={list} />
       </ul>
     </div>
   );

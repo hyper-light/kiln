@@ -78,29 +78,12 @@
   }
 }
 
-/* In the agent's Agents tab (definition-panel.tsx): what it was started from. */
-.df-panel {
-  display: grid;
-  gap: 10px;
-  padding: 2px 0 6px;
-}
-.df-line {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 12px;
-  color: #97999f;
-  font-size: 13px;
-  line-height: 20px;
-}
-.df-line b {
-  color: #ededee;
-  font-weight: 450;
-}
+/* What this session started on, behind the current version (definitions.tsx SessionFacts), and its
+   variant's share of new sessions as a short meter. */
 .df-old {
   color: #e2cfae;
 }
-.df-panel .meter {
+.df-fact-v .meter {
   width: 64px;
 }
 /* A definition in chat (definitions.tsx DefinitionCard): Mission's rows in a frame, live while on screen. */
@@ -876,10 +859,12 @@
   line-height: 19px;
   white-space: normal;
 }
-/* A section's head that doesn't fold (definitions.tsx GroupHead fixed): its label where an arrowed
-   one's is, nothing to press. */
-.ms-node.df-head[data-fixed] .df-head-main {
+/* An agent's card's line (definitions.tsx DefRow): nothing to press but its ⋯; this session's marked. */
+.ms-node.df-defrow .df-head-main {
   cursor: default;
+}
+.df-this {
+  color: #cdc6ea;
 }
 
 /* A sandbox's stand in the agents' words' colours (mission.css .ms-row[data-stand]), on its engine line. */

@@ -60,7 +60,7 @@ test("a microVM session's Engine: its line and controls, its bars each with its 
   await expect(body.getByRole("button", { name: "Swap" }).first()).toBeVisible();
   // Its network's last hour, under its bars; the tab's sections each fold (none nests in another).
   await expect(body.locator(".df-unet").first()).toContainText("Network");
-  for (const s of ["MicroVM", "Components", "Network", "Volumes", "This agent"]) await expect(body.locator(".in-sec-toggle", { hasText: s }).first()).toBeVisible();
+  for (const s of ["VMs", "MicroVM", "Components", "Network", "Volumes", "Agents"]) await expect(body.locator(".in-sec-toggle", { hasText: s }).first()).toBeVisible();
   expect(said, said.join("\n")).toEqual([]);
 });
 
@@ -93,27 +93,27 @@ test("a host session's Engine: on the host, with no network, pool, Hex box or se
   expect(said, said.join("\n")).toEqual([]);
 });
 
-test("after its engine, this session's agent, its variant a swatch and a name, then the agents, found by a filter and opening in place", async ({ page }) => {
+test("after its microVMs, the agents: this session's first, its settings open with what it started on, then each agent's card", async ({ page }) => {
   const said = errors(page);
   await page.goto("/agents/rev-big");
   await expect(page.getByRole("textbox", { name: "Message to the agent", exact: true })).toBeEnabled({ timeout: 30_000 });
   await tab(page, "Engine");
   const body = page.locator(".hx-inspector-body").filter({ visible: true }).first();
-  await expect(body).toContainText("This agent");
+  const first = body.locator('[data-list="agents-tab"] > li.df-defrow').first();
+  await expect(first).toContainText("reviewer");
+  await expect(first).toContainText("this session");
   // Started on v3; the current one (whatever other tests saved since) is offered.
   await expect(body.getByRole("button", { name: /^Restart on v\d+$/ })).toBeVisible();
   await expect(body).toContainText("2 vCPU · 4 GiB");
   // No variant reads as a letter or an id.
   await expect(body).not.toContainText("variant 5e1c");
   await expect(body.locator(".df-key, .ms-vkey")).toHaveCount(0);
-  // The person's agents by default (a User chip in the filter), the system's by its facet.
-  await expect(body.getByRole("button", { name: "Open pr-triage" })).toBeVisible();
-  await expect(body.getByRole("button", { name: "Open kiln-ci-diagnose" })).toHaveCount(0);
-  // Another of yours, opened in place: its settings and experiments shown whole, no dropdown nested in it, no sessions list.
-  await body.getByRole("button", { name: "Open pr-triage" }).click();
-  const groups = body.locator('[aria-label="pr-triage: settings and experiments"]');
-  await expect(groups.locator("li.df-head[data-fixed]")).toHaveText([/Settings/, /Experiments/]);
-  await expect(groups.getByRole("button", { name: /^(Settings|Sessions|Experiments)/ })).toHaveCount(0);
-  await expect(groups.locator(".df-facts").first()).toBeVisible();
+  // Every agent a card, the system's too; its settings and experiments fold, the card doesn't.
+  await expect(body.locator("li.df-defrow[data-def]")).not.toHaveCount(0);
+  const triage = body.locator('[aria-label="pr-triage: settings and experiments"]');
+  await expect(triage.getByRole("button", { name: /^Settings/ })).toHaveAttribute("aria-expanded", "false");
+  await triage.getByRole("button", { name: /^Settings/ }).click();
+  await expect(triage.locator(".df-facts").first()).toBeVisible();
+  await expect(triage.getByRole("button", { name: /^Experiments/ })).toBeVisible();
   expect(said, said.join("\n")).toEqual([]);
 });

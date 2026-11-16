@@ -1,71 +1,12 @@
 /**
- * The agent's own definition (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P5.2, P7.2), in its Engine
- * tab: its name, then a line each, its plain words at the left: where it runs and how fast it starts,
- * its Agentfile, harness and what it holds, the version this session started on beside the current
- * one, its experiment's variant (its swatch and name, never a letter), and the definition's values,
- * edited in place. In the head, the crumb that opens it.
+ * The crumb in an agent's head (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P5.2, P7.2): the definition
+ * it was started from, its version and variant. Its agent's card in the Engine tab (engine-tab.tsx) says
+ * the rest: what it started on, its variant, its settings, edited in place.
  */
-import { agentdefsRes, variantIn } from "@/api/agentdefs";
-import { Button } from "@/components/ui/button";
-import { toast } from "@/components/ui/toast";
+import { agentdefsRes } from "@/api/agentdefs";
 import { useRes } from "@/lib/data";
-import { DefFacts, DefValues, sessionVariant, Swatch } from "./definitions";
-import { Loadable } from "@/components/ui/loading";
-import { Fold } from "./fold";
+import { sessionVariant, Swatch } from "./definitions";
 import "./definition.css";
-
-export function DefinitionPanel({ agentId }: { agentId: string }) {
-  const defs = useRes(agentdefsRes).data;
-  const d = defs.find((x) => x.sessions.some((s) => s.id === agentId));
-  if (!d) return null;
-  const mine = d.sessions.find((s) => s.id === agentId)!;
-  const variant = sessionVariant(d, agentId);
-  const at = variantIn(d, mine.variant);
-  const weight = at?.e.variants[at.i]?.weight;
-  return (
-    <Fold id="definition" title="This agent" count={`${d.name} v${mine.version}`}>
-      <div className="df-panel">
-        <b className="df-panel-name">{d.name}</b>
-        <DefFacts d={d} />
-        <span className="df-facts">
-          <span className="df-fact">
-            <span className="ms-edit-k">started on</span>
-            <span className="df-fact-v">
-              {mine.version === d.version ? (
-                <span>v{d.version}, the current version</span>
-              ) : (
-                <>
-                  <span className="df-old">
-                    v{mine.version}; v{d.version} is current
-                  </span>
-                  <Button size="xs" variant="secondary" onClick={() => toast({ title: `Restarting on v${d.version}`, tone: "running" })}>
-                    Restart on v{d.version}
-                  </Button>
-                </>
-              )}
-            </span>
-          </span>
-          {variant && weight !== undefined && (
-            <span className="df-fact" title={`${variant.name}: ${weight}% of ${at?.e.name}'s new sessions`}>
-              <span className="ms-edit-k">variant</span>
-              <span className="df-fact-v">
-                <Swatch tone={variant.tone} />
-                <span>{variant.name}</span>
-                <span className="meter" role="meter" aria-valuenow={weight} aria-valuemin={0} aria-valuemax={100} aria-label={`${weight}% of new sessions`}>
-                  <span style={{ width: `${weight}%` }} />
-                </span>
-                <span>{weight}%</span>
-              </span>
-            </span>
-          )}
-        </span>
-        <Loadable label={`Loading ${d.name}'s values`} fallback={<span className="ms-fields" aria-busy="true" />}>
-          <DefValues d={d} />
-        </Loadable>
-      </div>
-    </Fold>
-  );
-}
 
 /**
  * In the agent's head, beside its harness and machine: the definition it was started from, the version,

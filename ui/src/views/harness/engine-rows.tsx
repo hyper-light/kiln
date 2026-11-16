@@ -31,7 +31,7 @@ import "./figure/figure.css";
 type State = SandboxBrief["state"];
 
 /** A sandbox's state in its own word, coloured as the agents' stands are (definition.css .df-vm[data-stand]). */
-const WORD: Record<State, string> = { running: "Running", idle: "Idle", paused: "Paused", failed: "Failed", draining: "Draining", ended: "Ended" };
+export const WORD: Record<State, string> = { running: "Running", idle: "Idle", paused: "Paused", failed: "Failed", draining: "Draining", ended: "Ended" };
 const STAND: Record<State, string> = { running: "working", draining: "working", idle: "ready", paused: "paused", failed: "crashed", ended: "ended" };
 /** As the group's head counts them, a dot each stand (definitions.tsx StandCounts). */
 const COUNTED: Record<State, string> = { running: "working", draining: "working", idle: "done", paused: "paused", failed: "failed", ended: "stopped" };
@@ -47,23 +47,9 @@ export function EngineRows({ a, list }: { a: AgentInfo; list: readonly AgentInfo
 }
 
 /** The agents a session's sandboxes are: its own, then each kiln subagent's, as its tree has them, those with one. */
-function useSandboxed(a: AgentInfo, list: readonly AgentInfo[], all: Record<string, SandboxBrief>): AgentInfo[] {
+export function useSandboxed(a: AgentInfo, list: readonly AgentInfo[], all: Record<string, SandboxBrief>): AgentInfo[] {
   const kiln = React.useMemo(() => [...new Set(subagentTree(a, list).flatMap((n) => (n.kind === "kiln" ? [n.session] : [])))], [a, list]);
   return [a, ...kiln.flatMap((id) => list.filter((x) => x.id === id))].filter((x) => all[x.id]);
-}
-
-/** Its agent chat's Engine tab's first part: each of its sandboxes whole, as its Mission row's dropdown shows them, on the tab's left edge. */
-export function EngineList({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
-  const all = useRes(sandboxesRes).data;
-  const agents = useSandboxed(a, list, all);
-  if (agents.length === 0) return <p className="in-none">It runs in no sandbox kiln knows of.</p>;
-  return (
-    <ul className="ms-list eg-list" aria-label={`${agentLabel(a)}'s engine`}>
-      {agents.map((x) => (
-        <EngineVm key={x.id} a={x} b={all[x.id]!} />
-      ))}
-    </ul>
-  );
 }
 
 function EngineRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
@@ -87,7 +73,7 @@ function EngineRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] 
 }
 
 /** One sandbox: its line, its controls at the line's right end; under it, its resources and its sections (`fixed`: shown whole, in a dropdown). */
-function EngineVm({ a, b, fixed }: { a: AgentInfo; b: SandboxBrief; fixed?: boolean }) {
+export function EngineVm({ a, b, fixed }: { a: AgentInfo; b: SandboxBrief; fixed?: boolean }) {
   const name = agentLabel(a);
   const [asking, setAsking] = React.useState(false);
   // What a press made of it until the server says what it is: a new state from the server replaces it.

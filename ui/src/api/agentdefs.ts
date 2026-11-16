@@ -170,6 +170,8 @@ export interface AgentDef {
   /** This one of kiln's is stood in for by yours (its name). */
   replaced_by?: string;
   sessions: { id: string; version: number; variant?: string }[];
+  /** Yours: when it was made (Unix seconds); kiln's own have none. */
+  created_at?: number;
   runs: Starts;
   /** Its experiments, newest first: none, or several at once. */
   experiments: Experiment[];
@@ -194,6 +196,7 @@ export function compose(list: AgentdefsList, sessions: Record<string, DefSession
       model: a.model,
       agentfile: a.agentfile,
       version: a.version,
+      created_at: a.created_at,
       replaces: builtin ? list.builtin.find((b) => b.id === builtin)?.name : undefined,
       ...of(a.id),
     };
