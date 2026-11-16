@@ -17,6 +17,8 @@
 //! - [`hexvm`]: the machine's microVMs through Hex: each launch a Shards image box, its harness member driven.
 //! - [`held`]: a boundary's run as the `Duplex` a session drives its harness through, so a session's
 //!   loop and its adapter treat a microVM's member as they treat a process of the machine's.
+//! - [`pools`]: the warm pools kiln names on the machine's microVMs from its agents' starts, and lets
+//!   go of after their keep window (kiln plan 01a1dd2e…, P3.2), and each runner's as the server shows them.
 
 #[cfg(test)]
 pub mod fake;
@@ -26,6 +28,7 @@ pub mod host;
 pub mod image;
 pub mod isolated;
 pub mod narrow;
+pub mod pools;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +50,8 @@ pub struct Microvms {
     shards: Option<crate::shards::Held>,
     /// kiln's MCP lane of the runs launched here (Shards D254): Hex's, where they are Hex's; a stand-in's.
     lanes: Option<Arc<dyn Lanes>>,
+    /// The warm pools kiln names on them, from the starts launched here (kiln plan 01a1dd2e…, P3.2).
+    pub pools: Arc<pools::Pools>,
 }
 
 /// One connection a run's harness made to its MCP bridge in its microVM (Shards D254, `Execs::mcp`'s
@@ -73,7 +78,8 @@ pub const NO_LANES: &str = "kiln's MCP in a microVM: these microVMs carry no MCP
 impl Microvms {
     /// Runs in `sandbox`, booting `images`: a stand-in's, launched as the seam launches.
     pub fn new(sandbox: Arc<dyn Sandbox>, images: image::Images) -> Self {
-        Self { sandbox, images, hex: None, shards: None, lanes: None }
+        let pools = pools::Pools::new(Arc::clone(&sandbox), crate::rt::clock());
+        Self { sandbox, images, hex: None, shards: None, lanes: None, pools }
     }
 
     /// Their runs' MCP connections taken through `lanes` from now on (a stand-in's).
@@ -141,7 +147,9 @@ pub fn of_hex(hex: hexvm::HexVms, images: image::Images, ledger: Option<Arc<dyn 
         Some(ledger) => hex.with_ledger(ledger),
         None => hex,
     });
-    Microvms { sandbox: Arc::clone(&hex) as Arc<dyn Sandbox>, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None }
+    let sandbox = Arc::clone(&hex) as Arc<dyn Sandbox>;
+    let pools = pools::Pools::new(Arc::clone(&sandbox), crate::rt::clock());
+    Microvms { sandbox, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None, pools }
 }
 
 /// The group placement reads run `run`'s use from, launched in `vms`: its VM's meter, where Hex holds it

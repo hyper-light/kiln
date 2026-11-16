@@ -10,7 +10,9 @@
 //! its own; [`SimSandbox`] runs built-in programs that do those things. A run's credentials are
 //! granted by reference ([`CredentialGrant`], Shards' D242; kiln plan 01a1d2b88be57304b972761e2a5c6781
 //! step 6): their values are filled in at its egress, outside its boundary, toward the hosts each
-//! names alone, and never travel in a launch.
+//! names alone, and never travel in a launch. A sandbox that holds them keeps warm pools for a
+//! microVM's launches as kiln names them ([`Pool`]; kiln plan 01a1dd2e…, P3.2), each sized by its
+//! boundary's own demand rule.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -221,11 +223,13 @@ pub struct Holds {
     /// Components laid over its image's own: at a launch ([`Launch::components`]), and swapped in and given back while
     /// it runs ([`Change::Swap`], [`Change::Restore`]: kiln plan 01a1dd2e…, P6c.3).
     pub components: bool,
+    /// Warm pools kept for its launches ([`Sandbox::keep`]: kiln plan 01a1dd2e…, P3.2).
+    pub pools: bool,
 }
 
 impl Holds {
     /// Everything (the simulator's).
-    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true, swaps: true, components: true };
+    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true, swaps: true, components: true, pools: true };
 
     /// `Ok` when `launch`'s weights are on their scale, its credential grants could each be filled
     /// in, and it asks only for what these hold; else its refusal, `Invalid` or `Unsupported`,
@@ -279,6 +283,24 @@ pub enum Boundary {
     /// A microVM from `image`: an Agentfile's, whose members run in their own domains as it declares
     /// them (Shards' D231), through Hex.
     MicroVm { image: String },
+}
+
+/// A warm pool a sandbox keeps for the launches of one microVM (kiln plan 01a1dd2e…, P3.2): its image, pinned by its
+/// digest, and its size, vCPUs and MiB (none: the least its boundary boots), as Hex keys a pool of Shards' (P3.1;
+/// Shards' D253). How many hosts it keeps warm is its boundary's own demand rule's, within its machine's room (Shards'
+/// D26): kiln names a pool, never its size.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pool {
+    pub image: String,
+    pub size: Option<(u32, u64)>,
+}
+
+/// What a pool a sandbox keeps holds now ([`Sandbox::pools`]): its hosts warm, ready for a launch, and those starting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolHeld {
+    pub pool: Pool,
+    pub warm: usize,
+    pub starting: usize,
 }
 
 /// What a component of a microVM's image is: an Agentfile's AGENT, HARNESS or MCP install (Shards' D231 members).
@@ -533,7 +555,27 @@ pub trait Sandbox: Send + Sync + 'static {
     fn boundaries(&self) -> Vec<&'static str>;
     /// What it holds its runs to; a launch asking for more is refused `Unsupported`.
     fn holds(&self) -> Holds;
+    /// Keeps a warm pool for `pool`'s launches from now on, as many hosts warm as its own demand rule sizes it within its
+    /// machine's room, answered without waiting on a host's start; one kept already is kept. Refused `Unsupported`
+    /// where it keeps none ([`Holds::pools`]).
+    fn keep(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        drop(pool);
+        Box::pin(async { Err(Refusal::Unsupported(NO_POOLS.into())) })
+    }
+    /// Lets `pool` go: its warm hosts end and their room comes back, a host a launch took going on. One it doesn't
+    /// keep is let go already. Refused `Unsupported` where it keeps none.
+    fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        drop(pool);
+        Box::pin(async { Err(Refusal::Unsupported(NO_POOLS.into())) })
+    }
+    /// The pools it keeps now, and what each holds; none where it keeps none.
+    fn pools(&self) -> Vec<PoolHeld> {
+        Vec::new()
+    }
 }
+
+/// What a sandbox that keeps no warm pools ([`Holds::pools`]) refuses.
+pub const NO_POOLS: &str = "a warm pool kept for its launches";
 
 // ---------------------------------------------------------------------------------- simulator
 
@@ -558,16 +600,19 @@ pub const SIM_PENDING: usize = 10_000;
 /// - `components`: writes the components laid for it, one a line (`<at> <source>`).
 ///
 /// A signal ends any of them with its [`Signal::ended_code`]. It holds everything, unless made
-/// [`SimSandbox::holding`] less, as a real boundary may.
+/// [`SimSandbox::holding`] less, as a real boundary may. The pools it keeps are names alone: it
+/// boots no microVM, so none holds a host, and it keeps at most one for each run it may hold
+/// ([`SIM_RUNS`]), refusing one past them `Full`.
 #[derive(Clone)]
 pub struct SimSandbox {
     runs: Arc<Mutex<usize>>,
     holds: Holds,
+    pools: Arc<Mutex<std::collections::BTreeSet<Pool>>>,
 }
 
 impl Default for SimSandbox {
     fn default() -> Self {
-        Self { runs: Arc::default(), holds: Holds::ALL }
+        Self { runs: Arc::default(), holds: Holds::ALL, pools: Arc::default() }
     }
 }
 
@@ -826,6 +871,35 @@ impl Sandbox for SimSandbox {
 
     fn holds(&self) -> Holds {
         self.holds
+    }
+
+    fn keep(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        let out = (|| {
+            if !self.holds.pools {
+                return Err(Refusal::Unsupported(NO_POOLS.into()));
+            }
+            let mut pools = self.pools.lock();
+            if !pools.contains(&pool) && pools.len() >= SIM_RUNS {
+                return Err(Refusal::Full { limit: SIM_RUNS });
+            }
+            pools.insert(pool);
+            Ok(())
+        })();
+        Box::pin(async move { out })
+    }
+
+    fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        let out = if self.holds.pools {
+            self.pools.lock().remove(&pool);
+            Ok(())
+        } else {
+            Err(Refusal::Unsupported(NO_POOLS.into()))
+        };
+        Box::pin(async move { out })
+    }
+
+    fn pools(&self) -> Vec<PoolHeld> {
+        self.pools.lock().iter().map(|pool| PoolHeld { pool: pool.clone(), warm: 0, starting: 0 }).collect()
     }
 }
 
@@ -1235,6 +1309,34 @@ fn c16<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c17<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let pool = Pool { image: "conformance@sha256:00".into(), size: Some((1, 512)) };
+        let other = Pool { size: None, ..pool.clone() };
+        if !f.sandbox().holds().pools {
+            return match f.sandbox().keep(pool).await {
+                Err(Refusal::Unsupported(_)) => same("the pools it keeps", f.sandbox().pools(), Vec::new()),
+                Err(e) => Err(format!("a warm pool kept: refused as {e:?}, not Unsupported")),
+                Ok(()) => Err("a warm pool kept: taken, though the sandbox says it doesn't hold it".into()),
+            };
+        }
+        let kept = |held: Vec<PoolHeld>| {
+            let mut pools: Vec<Pool> = held.into_iter().map(|h| h.pool).collect();
+            pools.sort();
+            pools
+        };
+        fine("a pool kept", f.sandbox().keep(pool.clone()).await)?;
+        fine("the same pool kept again", f.sandbox().keep(pool.clone()).await)?;
+        fine("another pool kept", f.sandbox().keep(other.clone()).await)?;
+        let mut both = vec![pool.clone(), other.clone()];
+        both.sort();
+        same("the pools it keeps", kept(f.sandbox().pools()), both)?;
+        fine("a pool let go", f.sandbox().let_go(pool.clone()).await)?;
+        fine("a pool it doesn't keep let go", f.sandbox().let_go(pool).await)?;
+        same("the pools it keeps once one is let go", kept(f.sandbox().pools()), vec![other])
+    })
+}
+
 /// The `Sandbox` contract, clause by clause (docs/seams.md, "Sandbox").
 pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
     vec![
@@ -1294,6 +1396,11 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
             says: "a launch's components are laid for it, and a run takes a component swapped in and its image's own given back while it runs, and one after its end is refused Ended; a sandbox that holds no components refuses both Unsupported, and its run goes on",
             check: c16::<F>,
         },
+        Case {
+            id: "SANDBOX-17",
+            says: "a sandbox keeps a warm pool it's asked to keep, once however often it's asked, and lists it until it's let go; a pool it doesn't keep is let go already; a sandbox that keeps no pools refuses one Unsupported, and lists none",
+            check: c17::<F>,
+        },
     ]
 }
 
@@ -1327,6 +1434,15 @@ mod tests {
         }
         fn holds(&self) -> Holds {
             Holds::default()
+        }
+        fn keep(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+            self.0.keep(pool)
+        }
+        fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+            self.0.let_go(pool)
+        }
+        fn pools(&self) -> Vec<PoolHeld> {
+            self.0.pools()
         }
     }
 
@@ -1391,7 +1507,7 @@ mod tests {
         let make = || async { Holding { sim: SimSandboxFixture::default(), lies: Some(Liar(SimSandbox::new())) } };
         let report = futures::executor::block_on(run("Sandbox", &cases::<Holding>(), make));
         let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
-        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15", "SANDBOX-16"], "{:?}", report.failed);
+        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15", "SANDBOX-16", "SANDBOX-17"], "{:?}", report.failed);
         assert!(report.failed.iter().all(|(_, why)| why.contains("doesn't hold it")), "{:?}", report.failed);
     }
 
@@ -1480,5 +1596,21 @@ mod tests {
         assert!(matches!(futures::executor::block_on(s.launch(Launch::of("wait", &[]))), Err(Refusal::Full { .. })));
         drop(runs);
         assert!(futures::executor::block_on(s.launch(Launch::of("wait", &[]))).is_ok(), "an ended run frees its place");
+    }
+
+    /// Kiln plan 01a1dd2e…, P3.2: the simulator keeps at most one pool for each run it may hold, refusing one past them
+    /// `Full`; one kept already is kept still, and one let go frees its place.
+    #[test]
+    fn p3_2_the_simulators_pools_are_bounded() {
+        let s = SimSandbox::new();
+        let pool = |n: usize| Pool { image: format!("p@sha256:{n}"), size: None };
+        for n in 0..SIM_RUNS {
+            assert_eq!(futures::executor::block_on(s.keep(pool(n))), Ok(()));
+        }
+        assert_eq!(futures::executor::block_on(s.keep(pool(SIM_RUNS))), Err(Refusal::Full { limit: SIM_RUNS }));
+        assert_eq!(futures::executor::block_on(s.keep(pool(0))), Ok(()), "one kept already");
+        assert_eq!(s.pools().len(), SIM_RUNS);
+        assert_eq!(futures::executor::block_on(s.let_go(pool(0))), Ok(()));
+        assert_eq!(futures::executor::block_on(s.keep(pool(SIM_RUNS))), Ok(()), "a pool let go frees its place");
     }
 }

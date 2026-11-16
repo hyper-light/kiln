@@ -414,7 +414,7 @@ placeholder), so each implementation supplies its own.
 
 A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
 than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
-read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another, components laid over its image's own. What it holds it enforces; a launch that
+read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another, components laid over its image's own, warm pools kept for its launches. What it holds it enforces; a launch that
 asks for what it doesn't hold is refused `Unsupported`, never taken and ignored, and the suite checks
 both halves.
 
@@ -433,20 +433,30 @@ the boundary killed it for going over (`memory.events` counts an `oom_kill`); pr
 refused one past its limit (`pids.max` fails the fork, the run isn't stopped) and then failed. A run
 refused a process that copes and ends well ends with its code.
 
+A sandbox that holds them keeps warm pools for a microVM's launches as kiln names them (`keep`; kiln
+plan 01a1dd2e…, P3.2, through Hex's P3.1 for Shards' D253 pools): a pool is an image pinned by its
+digest and a size (vCPUs and MiB, or none for the least its boundary boots), and how many hosts it
+keeps warm is its boundary's own demand rule's, within its machine's room (Shards' D26): kiln names a
+pool, never its size. A keep is answered without waiting on a host's start, and one kept already is
+kept; `let_go` ends a pool's warm hosts and gives their room back, a host a launch took going on, and
+a pool it doesn't keep is let go already; `pools` lists those it keeps and what each holds, warm and
+starting. A sandbox that keeps none refuses a keep and a let-go `Unsupported`, and lists none.
+
 - **Implementations:** `host` (today's launch, which holds none of it: `kiln::sandbox::host`), the
   microVMs kiln's isolated harnesses run in (`kiln::sandbox`: Shards' members, through Hex, kiln plan
   01a1cd8e862e7169a074db3d5fa33f3d step 17; docs/isolation.md), then Hex's classes: `process`, `oci`,
   `firecracker`, `shards` (CP-T7.1, CP-T7.2); `kiln_seams::sandbox::SimSandbox`: built-in programs
   that do those things on the host boundary (a container or a microVM is refused `Unsupported`),
   holding everything unless made to hold less, 1000 runs at once, 10,000 outputs unread a run (past
-  it, the run is killed).
+  it, the run is killed), keeping pools as names alone, none holding a host, one at most for each run
+  it may hold (past them, a keep is refused `Full`).
 - **Used by:** every isolated harness kiln launches (step 17), and its CI legs once CP-T7.1 lands
   them.
 - **Passed by:** the simulator, every clause, holding everything and holding nothing; `host`
   (`kiln::sandbox::host`, on Unix); the microVMs' when their implementation lands on a machine that
   runs them.
 
-Methods: `launch`, `boundaries`, `holds`.
+Methods: `launch`, `boundaries`, `holds`, `keep`, `let_go`, `pools`.
 
 A launch gives a `Run`: stdin given to it in order, what it says (its output, then its end, once),
 signals (refused `Unsupported` where its boundary delivers none), and a kill (its end, unless it had
@@ -498,6 +508,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, 
 - **SANDBOX-14** a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on
 - **SANDBOX-15** a run's member swapped for another in its boundary ends, its end said once, and the run it gives runs the other in the same boundary; one swapped out swaps no more; a sandbox that swaps none refuses one Unsupported, and its run goes on
 - **SANDBOX-16** a launch's components are laid for it, and a run takes a component swapped in and its image's own given back while it runs, and one after its end is refused Ended; a sandbox that holds no components refuses both Unsupported, and its run goes on
+- **SANDBOX-17** a sandbox keeps a warm pool it's asked to keep, once however often it's asked, and lists it until it's let go; a pool it doesn't keep is let go already; a sandbox that keeps no pools refuses one Unsupported, and lists none
 
 ## Placement
 

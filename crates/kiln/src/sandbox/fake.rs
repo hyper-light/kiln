@@ -4,12 +4,13 @@
 //! stdio said to ride the link its runs are given. What it stands in for is Shards' image boot through
 //! Hex; what it holds a session to is the seam's contract alone.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use kiln_seams::sandbox::{Boundary, Change, Egress, Holds, Launch, Limits, Link, Output, Refusal, Run, Sandbox, Signal};
+use kiln_seams::sandbox::{Boundary, Change, Egress, Holds, Launch, Limits, Link, NO_POOLS, Output, Pool, PoolHeld, Refusal, Run, Sandbox, Signal};
 use parking_lot::Mutex;
 
 use super::host::HostSandbox;
@@ -28,6 +29,12 @@ pub struct FakeVms {
     swaps: bool,
     /// It lays components over its images' own (`Holds::components`): off unless asked ([`FakeVms::laying`]).
     components: bool,
+    /// It keeps warm pools for its launches (`Holds::pools`): off unless asked ([`FakeVms::pooling`]).
+    pooling: bool,
+    /// The pools it keeps now.
+    pools: Mutex<BTreeSet<Pool>>,
+    /// Each pool it was asked to keep (`keep`) or let go of (`let go`), in order.
+    pool_asks: Mutex<Vec<(&'static str, Pool)>>,
 }
 
 /// What a stand-in member's program is told of the components laid for it (`Launch::components`): each `<at> <source>`,
@@ -52,7 +59,29 @@ fn program_of(images: &[(String, String, PathBuf)], image: &str, member: &str) -
 impl FakeVms {
     /// One image, `image`, whose member `member` runs `program`.
     pub fn with(image: &str, member: &str, program: &Path) -> Self {
-        Self { images: Arc::new(vec![(image.to_owned(), member.to_owned(), program.to_path_buf())]), launched: Mutex::new(Vec::new()), link: None, changed: Arc::default(), swapped: Arc::default(), swaps: false, components: false }
+        Self {
+            images: Arc::new(vec![(image.to_owned(), member.to_owned(), program.to_path_buf())]),
+            launched: Mutex::new(Vec::new()),
+            link: None,
+            changed: Arc::default(),
+            swapped: Arc::default(),
+            swaps: false,
+            components: false,
+            pooling: false,
+            pools: Mutex::new(BTreeSet::new()),
+            pool_asks: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// It keeps warm pools for its launches, as Hex's will (kiln plan 01a1dd2e…, P3.1): each holding one host warm, as
+    /// Shards' demand rule keeps one at least while its pool is in use.
+    pub fn pooling(self) -> Self {
+        Self { pooling: true, ..self }
+    }
+
+    /// Each pool it was asked to keep (`keep`) or let go of (`let go`), in order.
+    pub fn pool_asks(&self) -> Vec<(&'static str, Pool)> {
+        self.pool_asks.lock().clone()
     }
 
     /// It swaps a member for another in its microVM, as Hex's will (P6c.2).
@@ -178,7 +207,33 @@ impl Sandbox for FakeVms {
     }
 
     fn holds(&self) -> Holds {
-        Holds { live: true, swaps: self.swaps, components: self.components, ..super::host::HOLDS }
+        Holds { live: true, swaps: self.swaps, components: self.components, pools: self.pooling, ..super::host::HOLDS }
+    }
+
+    fn keep(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        let out = if self.pooling {
+            self.pool_asks.lock().push(("keep", pool.clone()));
+            self.pools.lock().insert(pool);
+            Ok(())
+        } else {
+            Err(Refusal::Unsupported(NO_POOLS.into()))
+        };
+        Box::pin(async move { out })
+    }
+
+    fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        let out = if self.pooling {
+            self.pool_asks.lock().push(("let go", pool.clone()));
+            self.pools.lock().remove(&pool);
+            Ok(())
+        } else {
+            Err(Refusal::Unsupported(NO_POOLS.into()))
+        };
+        Box::pin(async move { out })
+    }
+
+    fn pools(&self) -> Vec<PoolHeld> {
+        self.pools.lock().iter().map(|pool| PoolHeld { pool: pool.clone(), warm: 1, starting: 0 }).collect()
     }
 }
 
