@@ -849,6 +849,10 @@ pub struct Hub {
     pub flight: crate::ci::services::memo::Flights,
     /// What wakes the relay of kiln's events from their outbox to the bus (`crate::events`).
     pub relay: crate::events::Relay,
+    /// The run-lease broker's lessors, once the server opened them for its own runner (`crate::secrets::lessor::open`):
+    /// the one broker every runner's microVMs lease from, others' over their links (`crate::secrets::lessor::answer`),
+    /// so a sign-in is refreshed one at a time across every run (Shards' D242).
+    pub lessors: std::sync::OnceLock<crate::secrets::lessor::Lessors>,
 }
 
 impl Hub {
@@ -1027,6 +1031,7 @@ impl Hub {
             search,
             flight: Default::default(),
             relay: crate::events::Relay::default(),
+            lessors: std::sync::OnceLock::new(),
         });
         // What each agent session's owner shard tells the rest of kiln goes through the hub
         // (`crate::harness::copies`).
@@ -4315,6 +4320,16 @@ impl Hub {
                     let (hub, runner) = (Arc::clone(self), agent.to_owned());
                     crate::rt::spawn(async move {
                         let answer = crate::reach::history::keep(&hub, &runner, repo, command, ask, size.map(|s| *s), *used).await;
+                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    });
+                }
+                // A run's ask of the run-lease broker, from a runner other than the server's own
+                // (Shards' D242): answered on its own, as a broker (a provider's refresh) may take
+                // its time.
+                crate::reach::Question::Lessor { ask } => {
+                    let (hub, runner) = (Arc::clone(self), agent.to_owned());
+                    crate::rt::spawn(async move {
+                        let answer = crate::secrets::lessor::answer(&hub, &runner, ask).await;
                         hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     });
                 }

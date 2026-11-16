@@ -4,10 +4,14 @@ The crates Focal's bus, Quiver and Mantle are built on (`vendor/focal-bus`, `ven
 `vendor/mantle`), at one revision of hyper-raft for all of them.
 
 - **Upstream:** https://github.com/hyper-light/hyper-raft, commit
-  `e0613f524b0df198cc61dc1e82b33c22d604cf7b` (2026-11-13), MIT (`LICENSE`): hyper-raft's `main`, the
-  revision Hex and Shards' control link (`crates/remote`) take, whose hyper-quic gives a connection its
-  negotiated idle timeout (patch Q34), taken with Hex's `c7603b0b` (kiln plan
-  01a1cd8e862e7169a074db3d5fa33f3d step 17). Before it, `fb74b59` (2026-11-07), which holds what
+  `e0613f524b0df198cc61dc1e82b33c22d604cf7b` (2026-11-13), MIT (`LICENSE`): hyper-raft's branch
+  `p/q35-handshake-progress-v1`, not its `main` (`045cf3ff`, which it is one commit past; the branch
+  becomes `main` once its consumers' suites pass), the revision Hex and Shards' control link
+  (`crates/remote`) take: its hyper-quic gives a connection its negotiated idle timeout (patch Q34,
+  `main`'s) and says how far a handshake has advanced (patch Q35, the branch's own), taken with Hex's
+  `e19198bd` and Shards' `fa953e3c` (kiln `7096a82cf`; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step
+  17). Before it, `045cf3ff` (2026-11-13), hyper-raft's `main` with Q34, taken with Hex's `c7603b0b`
+  (kiln `64f4fb537`); before that, `fb74b59` (2026-11-07), which holds what
   Mantle's `main` at `87ab09e1` snapshots its hyper-* crates at (`5e40eb9`: `0a182ae` and the driver
   fix, a driver reading what its sockets took before it judges its timers, upstream's
   docs/transport.md §4ap), taken with Quiver's `966ea139` for kiln's refresh of Mantle, so kiln holds

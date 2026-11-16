@@ -68,6 +68,20 @@ the machine's network) is replaced by an Agentfile image's members.
   provider (Claude Code's, Codex's) keeps its own whole (`"why": "one_use"`), as does a person's own
   Agentfile (`"persons_own"`), whose grants are as its person wrote them; neither is a fallback.
   `runs.reach` of a narrowed run is `{"as": "narrowed", "uses": [...], "hosts": ["host:443", ...]}`.
+- **Its sign-in is taken outside its microVM** (plan step 33, Shards' D242 step 8, Hex's C8), for
+  Claude Code and Codex, whose CLIs Shards' injector takes sign-ins of: each launch grants its harness
+  its person's sign-in (`secrets::signin::Provider::grant`, `sandbox::isolated`), named
+  `<harness>/<person>` (`claude/owner`, `codex/user-<id>`) so kiln's broker reads its provider from it.
+  Its token response is kept by the server's run-lease broker over kiln's credential store and its
+  CLI given placeholders; its access token is filled in at its egress toward its provider's API alone
+  (`api.anthropic.com`, `chatgpt.com`); its refreshes are the broker's. A later run is granted the
+  placeholders its CLI's file in its person's volume holds (`.credentials.json`, `auth.json`), so they
+  stand for the sign-in again. Every runner leases from that one broker: the server's own in its
+  process, every other over its link (`secrets::lessor::Remote`), for its own isolated agents'
+  people's sign-ins alone, of a server that names `secrets.leases` (docs/wire.md). Where a runner's
+  microVMs lease no credentials, or its server answers none yet, the harness signs in itself, as
+  before, said in the runner's log. Other harnesses sign in themselves: Shards has no profile of
+  their CLIs' sign-ins.
 - **Its stdio are the member's streams.** The seam's run is the `Duplex` its session drives
   (`crate::proc::duplex_of_run`, `sandbox::held`): what the adapter writes reaches the member's stdin in
   order, the end of its stdin is the member's, what the member writes fills its stdout and stderr, and
@@ -121,8 +135,13 @@ What a session does to its harness maps onto the member:
   AC-T4.1.5, as T4's `cp/t4-isolation` held it, 6134fd63b): the home of the user kiln runs as or a
   folder holding it (where an agent started with no folder would work); a folder that is, holds or
   lies in `~/.ssh` or kiln's own state (the folder its microVMs are held beneath, `Microvms::state`:
-  its runner's keys and records, its microVMs' store; and its people's volumes, `Host::homes`); or one
-  holding another worktree of its repository, whose files are another agent's. In a workspace of its
+  its runner's keys and records, its microVMs' store; its people's volumes, `Host::homes`; and the kiln
+  server's data folder, `Host::server_data`: kiln.db, its secrets and tokens, the server's own
+  `[server] data_dir` for its in-process runner and as the machine's kiln config names it for any
+  other runner, which on a machine that runs both holds that runner's default state); or one holding another
+  worktree of its repository, whose files are another agent's. A folder of kiln's not made yet (a
+  person's volumes, a server's data before it starts) is compared as made ones are, through the
+  folders it lies in (macOS's `/var` is `/private/var`). In a workspace of its
   own (a Slates volume kiln mounts beneath its state) it's the folder the workspace lies over that's
   judged, whose files the volume holds. Refused before anything starts, saying which; a project's own
   folder, or a worktree of its own, is shared.

@@ -131,24 +131,31 @@ fn p5_4_a_session_past_its_time_limit_is_ended_with_the_limit_named() -> anyhow:
                 && listed.pointer("/sessions/0/state") == Some(&json!("gone")),
             "{listed}"
         );
-        let quick_id = quick.clone();
-        let audited: Vec<(String, String)> = hub
-            .store
-            .read(move |c| {
-                Ok(
-                    c.prepare("SELECT principal, action FROM audit2 WHERE detail = ?1")?
-                        .query_map([quick_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
-            })
-            .await?;
-        anyhow::ensure!(
-            audited.contains(&(
-                "kiln (time limit: 1 s, agent definition quick)".to_owned(),
-                "agent.close".to_owned()
-            )),
-            "{audited:?}"
+        // The end is audited once its close returns (harness::ops::end): read the trail until it
+        // says so, as the close was waited for above.
+        let want = (
+            "kiln (time limit: 1 s, agent definition quick)".to_owned(),
+            "agent.close".to_owned(),
         );
+        let began = Instant::now();
+        let audited = loop {
+            let quick_id = quick.clone();
+            let audited: Vec<(String, String)> = hub
+                .store
+                .read(move |c| {
+                    Ok(
+                        c.prepare("SELECT principal, action FROM audit2 WHERE detail = ?1")?
+                            .query_map([quick_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )
+                })
+                .await?;
+            if audited.contains(&want) || began.elapsed() >= Duration::from_secs(60) {
+                break audited;
+            }
+            crate::rt::sleep(Duration::from_millis(50)).await;
+        };
+        anyhow::ensure!(audited.contains(&want), "{audited:?}");
         Ok(())
     })
 }

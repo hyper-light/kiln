@@ -158,6 +158,21 @@ fn placeholder() -> Result<String, Refused> {
     Ok(format!("{MARKER}{}", hex::encode(bytes)))
 }
 
+/// Whether `s` has the form [`placeholder`] mints: its marker, then [`RANDOM`] bytes in lowercase hex.
+pub fn is_placeholder(s: &str) -> bool {
+    s.strip_prefix(MARKER).is_some_and(|h| h.len() == RANDOM.saturating_mul(2) && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+/// Where sign-in `sign_in`'s access token is kept in the store ([`Broker::capture`]): the reference its runs lease it by.
+pub fn access_of(sign_in: &str) -> String {
+    format!("sign-ins/{sign_in}/access")
+}
+
+/// Where sign-in `sign_in`'s refresh token is kept in the store ([`Broker::capture`]), the longest of its names.
+pub fn refresh_of(sign_in: &str) -> String {
+    format!("sign-ins/{sign_in}/refresh")
+}
+
 /// The run of `key` as the ledger keeps it; one it has no row of has not ended.
 fn run_of(c: &Connection, key: &str) -> rusqlite::Result<Run> {
     let row: Option<(Option<i64>, Option<String>)> = c.query_row("SELECT ended_ms, replaced_by FROM broker_runs WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
@@ -320,8 +335,8 @@ impl Broker {
     /// each refresh.
     pub async fn capture(&self, sign_in: &str, tokens: Tokens) -> Result<Captured, Refused> {
         let now = self.clock.unix_ms();
-        let access = format!("sign-ins/{sign_in}/access");
-        let refresh = format!("sign-ins/{sign_in}/refresh");
+        let access = access_of(sign_in);
+        let refresh = refresh_of(sign_in);
         self.keep(&access, tokens.access).await?;
         let has_refresh = tokens.refresh.is_some();
         if let Some(r) = tokens.refresh {
@@ -377,7 +392,7 @@ impl Broker {
         if turn.made.load(Ordering::SeqCst) != seen {
             return self.captured.lock().get(sign_in).cloned().ok_or_else(|| Refused::NoSignIn(sign_in.to_owned()));
         }
-        let reference = format!("sign-ins/{sign_in}/refresh");
+        let reference = refresh_of(sign_in);
         let token = match self.read(&reference).await {
             Ok(t) => t,
             Err(Refusal::NotFound(_)) => return Err(Refused::NoSignIn(sign_in.to_owned())),

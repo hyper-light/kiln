@@ -330,7 +330,7 @@ fn private(_dir: &Path) -> std::io::Result<()> {
 }
 
 /// The person's directory's name: `owner`, or `user-<id>` for `user:<id>`.
-fn person_dir(person: &str) -> Result<String, Refusal> {
+pub(crate) fn person_dir(person: &str) -> Result<String, Refusal> {
     let refused = || Refusal::Person(person.to_owned());
     if person == "owner" {
         return Ok("owner".to_owned());
