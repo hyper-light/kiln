@@ -272,3 +272,19 @@ fn p5_6_s3_move_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// P5.6's slice S4: the Agents page's Recover (a gone machine's agents going on elsewhere) is `agents.recover`, which
+/// moves agents its chat didn't start: an agent's waits on its person's click; the person's own goes at once.
+#[test]
+fn p5_6_s4_recover_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let waits = call(chat.clone(), "agents.recover", json!({"machine": "gone"})).await;
+        anyhow::ensure!(code(&waits) == 428, "an agent's recover waits for the click: {waits:?}");
+        let by_person = call(person(&hub), "agents.recover", json!({"machine": "gone"})).await;
+        anyhow::ensure!(by_person.as_ref().is_ok_and(|v| v.get("moved") == Some(&json!([]))), "the owner's own, of a machine none of whose agents are kiln's: {by_person:?}");
+        Ok(())
+    })
+}

@@ -1521,7 +1521,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::DELETE, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.remove", json!({ "agent": id }))).await,
         (&Method::POST, ["api", "harness", "broadcast"]) => boxed(|| harness_broadcast(&hub, req)).await,
         (&Method::POST, ["api", "harness", "broadcast", "preview"]) => boxed(|| harness_broadcast_preview(&hub, req)).await,
-        (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => boxed(|| harness_recover(&hub, machine, req)).await,
+        // A gone machine's agents recovered elsewhere: `agents.recover` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S4).
+        (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => {
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("machine".into(), json!(machine));
+            }
+            boxed(|| own_op(&hub, &caller, "agents.recover", body)).await
+        }
         // A crashed agent resumed in place, under its id (`relocate::resume`).
         (&Method::POST, ["api", "harness", "sessions", id, "resume"]) => match boxed(|| crate::harness::relocate::resume(&hub, id)).await {
             Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
@@ -6933,21 +6940,6 @@ async fn open_drawn(hub: &Hub, caller: Option<&crate::authz::Caller>, target: &s
     };
     crate::ci::experiments::started(hub, d, came).await;
     opened
-}
-
-/// Every agent of a machine that's gone goes on elsewhere, from the server's copy of its
-/// conversation (`harness::relocate::recover`): `{"to"?}` puts them all on one machine.
-async fn harness_recover(hub: &Arc<Hub>, machine: &str, req: Request) -> R {
-    #[derive(serde::Deserialize, Default)]
-    struct Body {
-        #[serde(default)]
-        to: Option<String>,
-    }
-    let b: Body = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
-    let moved = crate::harness::relocate::recover(hub, machine, b.to.as_deref()).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
-    let ok = moved.iter().filter(|m| m.get("error").is_none()).count();
-    hub.store.audit("admin".into(), "agent.recover".into(), format!("{ok} of {} agents of {machine} go on elsewhere", moved.len())).await;
-    Ok(srv::json(StatusCode::OK, &serde_json::json!({ "moved": moved })))
 }
 
 /// One thing to many agents at once: a prompt or slash command, a command, or answers to every

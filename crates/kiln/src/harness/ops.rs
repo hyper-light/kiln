@@ -766,6 +766,21 @@ async fn move_to(cx: Cx, v: Value) -> Out {
     Ok(moved)
 }
 
+/// The agents of machine `machine`, which is gone (not connected), that the caller may act on, each gone on on another
+/// machine from the server's copy of its conversation (`relocate::recover`): on `to` where it's given, else where each
+/// suits best (the Agents page's Recover: kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S4); audited as whoever
+/// asked.
+async fn recover_machine(cx: Cx, v: Value) -> Out {
+    let machine = text(&v, "machine")?;
+    let to = v.get("to").and_then(Value::as_str).filter(|t| !t.trim().is_empty());
+    let among: std::collections::HashSet<String> =
+        super::lineage::reached(&cx.hub, &cx.caller, cx.hub.harness.list(), super::lineage::Access::Act).await.into_iter().map(|i| i.id).collect();
+    let moved = super::relocate::recover(&cx.hub, &machine, to, &among).await.map_err(|e| (StatusCode::CONFLICT, e))?;
+    let ok = moved.iter().filter(|m| m.get("error").is_none()).count();
+    cx.hub.store.audit(cx.caller.name.clone(), "agent.recover".into(), format!("{ok} of {} agents of {machine} go on elsewhere", moved.len())).await;
+    Ok(json!({ "moved": moved }))
+}
+
 /// Command `c` given to the agent `v` names, by a caller that may steer it: `done` true once its machine
 /// has it, else why not.
 async fn commanded(cx: &Cx, v: &Value, c: Command, done: &str) -> Out {
@@ -1079,6 +1094,16 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentsMove>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "move"]))),
             run: |cx, v| Box::pin(move_to(cx, v)),
+        },
+        Op {
+            name: "agents.recover",
+            summary: "Recover the agents of a machine that's gone (not connected): each you may act on goes on on another machine from kiln's copy of its conversation, on `to` where it's given, else where each suits best (connected, its harness installed there, the machine's platform first, then the least busy). What became of each comes back.",
+            read_only: false,
+            // It moves agents its chat didn't start: an agent asks its person's click for it.
+            destructive: true,
+            input: Input::of::<input::AgentsRecover>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "machines", &text(v, "machine")?, "recover"]))),
+            run: |cx, v| Box::pin(recover_machine(cx, v)),
         },
         Op {
             name: "agents.remove",
@@ -1448,6 +1473,15 @@ pub mod input {
         pub kind: Option<String>,
         /// The model it goes on with there.
         pub model: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRecover {
+        /// The machine that's gone: a runner's name (as runners lists it).
+        pub machine: String,
+        /// The machine they go on on; none: where each suits best.
+        pub to: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

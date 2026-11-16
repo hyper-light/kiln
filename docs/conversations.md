@@ -209,7 +209,7 @@ stays there too: the machine it goes to runs it with its own.
 Mission Control says so above the list: if it's gone, **Move them on** moves every agent of it
 that hasn't ended at once, each to the machine that suits it best (connected, its harness
 installed, the same platform first, then the one running the fewest agents) or all to one machine
-picked there (`POST /api/harness/machines/:machine/recover {"to"?}`; a machine that's connected is
+picked there (`agents.recover`: `POST /api/harness/machines/:machine/recover {"to"?}`, the agents you may act on, and an agent's waits on its person's click; a machine that's connected is
 refused, since its own runner hands its agents over). Each goes on as Move does, and the answer says
 where each went or why it couldn't. The notice's × (or a swipe on a touch screen) puts it away, and
 moving them all marks it done: either way it stays so for you on every device (a notice mark,
