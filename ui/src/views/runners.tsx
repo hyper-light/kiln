@@ -806,7 +806,10 @@ function WarmPools({ runner }: { runner: string }) {
       ) : (
         <ul className="row-list" aria-label={`Warm pools on ${shownRunner}`}>
           {pools.map((p, i) => (
-            <li key={`${p.agent_from}:${p.agent ?? i}:${p.variant?.experiment ?? ""}:${p.variant?.arm ?? ""}:${p.image}:${p.vcpus}:${p.memory_mib}`} className="flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[12.5px]">
+            <li
+              key={`${p.agent_from}:${p.agent ?? i}:${p.variant?.experiment ?? ""}:${p.variant?.arm ?? ""}:${p.image}:${p.vcpus}:${p.memory_mib}`}
+              className="flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[12.5px]"
+            >
               <span className="min-w-0 flex-1 truncate" title={p.image}>
                 {poolAgent(p)}
               </span>

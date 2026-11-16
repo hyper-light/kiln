@@ -1463,14 +1463,39 @@ function warmPools(a: Agent): WarmPoolsView {
   const pools = MICROVM_RUNNERS.has(a.name)
     ? [
         pool(
-          { agent: "01a1d0c0ffee5eed", agent_from: "definition", agent_name: "reviewer", variant: null, image: "harness-claude@sha256:3f9a0c1d", vcpus: 2, memory_mib: 2048, starts: 5, hits: 4, last_ms: at - 2 * 60_000 },
+          {
+            agent: "01a1d0c0ffee5eed",
+            agent_from: "definition",
+            agent_name: "reviewer",
+            variant: null,
+            image: "harness-claude@sha256:3f9a0c1d",
+            vcpus: 2,
+            memory_mib: 2048,
+            starts: 5,
+            hits: 4,
+            last_ms: at - 2 * 60_000,
+          },
           41 * 60_000,
         ),
         pool(
-          { agent: "01a1d0c0ffee5eed", agent_from: "definition", agent_name: "reviewer", variant: { experiment: "faster-start", arm: "b" }, image: "harness-claude@sha256:3f9a0c1d", vcpus: 4, memory_mib: 4096, starts: 2, hits: 1, last_ms: at - 7 * 60_000 },
+          {
+            agent: "01a1d0c0ffee5eed",
+            agent_from: "definition",
+            agent_name: "reviewer",
+            variant: { experiment: "faster-start", arm: "b" },
+            image: "harness-claude@sha256:3f9a0c1d",
+            vcpus: 4,
+            memory_mib: 4096,
+            starts: 2,
+            hits: 1,
+            last_ms: at - 7 * 60_000,
+          },
           12 * 60_000,
         ),
-        pool({ agent: null, agent_from: "another", agent_name: null, variant: null, image: "agent-builder@sha256:8b1e44a7", vcpus: 1, memory_mib: 512, starts: 1, hits: 0, last_ms: at - 60_000 }, 60_000),
+        pool(
+          { agent: null, agent_from: "another", agent_name: null, variant: null, image: "agent-builder@sha256:8b1e44a7", vcpus: 1, memory_mib: 512, starts: 1, hits: 0, last_ms: at - 60_000 },
+          60_000,
+        ),
       ]
     : [];
   return { runner: a.name, keep_ms: POOL_KEEP_MS, pools };
