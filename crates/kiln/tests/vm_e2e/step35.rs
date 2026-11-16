@@ -416,8 +416,10 @@ mod rest {
             // Fewer than two first turns ended, each said above.
             _ => {}
         }
+        // Each ended with any agent a real task's first turn started (the README's words ask for one).
         for (id, _, pace) in &mut agents {
-            if let Err(e) = pace.stop(&f, id) {
+            let ended = super::mcp::call(&f, super::mcp::Via::Tools, "agents.stop", json!({"agent": id, "children": true})).and_then(|_| pace.unlisted(&f, id, &format!("{KIND}: {id} still listed after agents.stop")));
+            if let Err(e) = ended {
                 failed.push(format!("{KIND}: ending {id}: {e:#}"));
             }
         }
