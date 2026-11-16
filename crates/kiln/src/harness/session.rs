@@ -462,6 +462,11 @@ pub struct Spec {
     /// (`Registry::open_as` sets it over what came).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_ceiling: Vec<String>,
+    /// The components a person swapped into the running session, laid in its microVM as it launches (kiln plan
+    /// 01a1dd2e…, P6c.3; `State::overrides`' components, `harness::overrides::laid`), put here by its session at each
+    /// start of its harness. Never what was asked, and never kept: its state is their record.
+    #[serde(skip)]
+    pub components: Vec<kiln_seams::sandbox::ComponentAt>,
 }
 
 /// The id of session `session`'s opening prompt (`Spec::prompt`), its own (CP-T3.2): made once,
@@ -515,6 +520,7 @@ impl Default for Spec {
             opener: None,
             dirs: Vec::new(),
             egress_ceiling: Vec::new(),
+            components: Vec::new(),
         }
     }
 }
@@ -1392,21 +1398,49 @@ fn set_reach(s: &Session, value: Option<&serde_json::Value>) -> bool {
     true
 }
 
-/// A person's change to a live override of it (`Command::Override`, kiln plan 01a1dd2e…, P6b.4; `super::overrides`),
-/// taken in place: checked as the server checks it (it can come by the generic command route too), taken into its
-/// record, given to its microVM live where its harness runs in one (`run`), and a volume's folder to its harness
-/// (`adapter`, while it runs) among its allowed folders and to kiln's scope, how each took it said in its record.
-/// What it refuses is said in its timeline, and nothing changes. True when its harness starts again to take its
-/// folders: one that takes them only as it starts, on its machine's host (in a microVM, kiln starts no new microVM
-/// for it: it takes them as it next starts).
-async fn take_override(s: &Session, change: super::overrides::Change, run: Option<Arc<crate::sandbox::held::Held>>, adapter: Option<&mut super::kinds::Adapter>, kind: &Kind) -> bool {
+/// How its harness takes an override it took ([`take_override`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restarts {
+    /// It has nothing more to do.
+    No,
+    /// It starts again with its folders (on its machine's host, a harness that takes them only as it starts).
+    Folders,
+    /// It starts again with the component swapped in or given back (on its machine's host, from where kiln installed it).
+    Component,
+    /// Its member is swapped for itself with the component in its microVM, kiln starting no new microVM for it.
+    InPlace,
+}
+
+/// A person's change to a live override of it (`Command::Override`, kiln plan 01a1dd2e…, P6b.4 and P6c.3;
+/// `super::overrides`), taken in place: checked as the server checks it (it can come by the generic command route too),
+/// taken into its record, given to its microVM live where its harness runs in one (`run`), and a volume's folder to its
+/// harness (`adapter`, while it runs) among its allowed folders and to kiln's scope, how each took it said in its record.
+/// What it refuses is said in its timeline, and nothing changes. Says how its harness takes it: by starting again, with
+/// its folders (one that takes them only as it starts, on its machine's host) or with a component at its own path (in a
+/// microVM, swapped for itself there; on its machine's host, installed in its session's folder as it starts,
+/// [`lay_components`], so no download holds up what its harness says meanwhile).
+async fn take_override(s: &Session, change: super::overrides::Change, run: Option<Arc<crate::sandbox::held::Held>>, adapter: Option<&mut super::kinds::Adapter>, kind: &Kind, files: &Files) -> Restarts {
     use super::overrides as o;
     let microvm = s.spec.lock().isolation.is_some();
     let said = |core: &mut Core, level: Level, text: String| core.upsert(&format!("override:{}", Core::now()), None, Body::Notice { level, text });
+    let component = matches!(change, o::Change::Swap { .. } | o::Change::Restore { .. });
+    let at_harness = o::at_harness(&change, kind.id);
+    if let Err(why) = o::check(&change, microvm, kind.id) {
+        said(&mut s.core.lock(), Level::Warn, format!("Not changed: {why}"));
+        return Restarts::No;
+    }
+    // In a microVM, where its machine's microVMs lay components, and swap its harness for itself in place for its own.
+    if microvm && component {
+        let holds = files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()).map(|v| v.sandbox.holds()).unwrap_or_default();
+        if !holds.components || (at_harness && !holds.swaps) {
+            said(&mut s.core.lock(), Level::Warn, format!("Not changed: {}", crate::sandbox::isolated::NO_COMPONENTS));
+            return Restarts::No;
+        }
+    }
     let taken = {
         let mut core = s.core.lock();
         // In a microVM, within what its launch declared too (its plug roots, its egress ceiling).
-        let fitted = o::check(&change, microvm, kind.id).and_then(|()| if microvm { o::fits(&change, &core.state.overrides) } else { Ok(()) });
+        let fitted = if microvm { o::fits(&change, &core.state.overrides) } else { Ok(()) };
         match fitted.and_then(|()| o::take(&mut core.state.overrides, &change)) {
             Ok(taken) => {
                 core.touch_state();
@@ -1414,15 +1448,42 @@ async fn take_override(s: &Session, change: super::overrides::Change, run: Optio
             }
             Err(why) => {
                 said(&mut core, Level::Warn, format!("Not changed: {why}"));
-                return false;
+                return Restarts::No;
             }
         }
     };
     let removed = match &taken {
-        o::Taken::Same => return false,
+        o::Taken::Same => return Restarts::No,
         o::Taken::Removed(r) => Some(r.clone()),
         o::Taken::Added => None,
     };
+    let running = adapter.is_some();
+    if component {
+        let mut core = s.core.lock();
+        let place = o::place_of(&core.state.overrides, &change);
+        if !microvm
+            && let Some(o::Place::Component(i)) = place
+            && let Some(h) = core.state.overrides.components.get_mut(i)
+        {
+            h.host = Some(o::Took::NextStart { how: "kiln installs it in the session's own folder as its harness starts again, and runs it from there".to_owned() });
+        }
+        // Its harness's own, in a microVM: laid as its harness is swapped for itself there (or as it next starts).
+        if microvm
+            && at_harness
+            && let Some(place) = place
+        {
+            o::set_took(&mut core.state.overrides, place, o::Took::NextStart { how: "its microVM lays it as its harness starts again there, in the same microVM".to_owned() });
+        }
+        core.touch_state();
+        drop(core);
+        if at_harness || !microvm {
+            return match (running, microvm) {
+                (false, _) => Restarts::No,
+                (true, true) => Restarts::InPlace,
+                (true, false) => Restarts::Component,
+            };
+        }
+    }
     // Its microVM's part, live: added, or let go of.
     if microvm && let Some(seam) = o::seam_change(&change, removed.as_ref()) {
         let took = match &run {
@@ -1440,9 +1501,8 @@ async fn take_override(s: &Session, change: super::overrides::Change, run: Optio
     }
     // A volume's: its harness's allowed folders, and kiln's scope.
     if !matches!(change, o::Change::Add(_) | o::Change::Remove(_)) {
-        return false;
+        return Restarts::No;
     }
-    let running = adapter.is_some();
     let mut core = s.core.lock();
     let dirs = o::dirs(&core.state.overrides);
     let added = match &change {
@@ -1461,7 +1521,63 @@ async fn take_override(s: &Session, change: super::overrides::Change, run: Optio
         h.scope = o::scope_took(v);
     }
     core.touch_state();
-    again
+    if again { Restarts::Folders } else { Restarts::No }
+}
+
+/// The components a person swapped in (`super::overrides`, P6c.3), given its harness `kind` as it starts: laid in its
+/// microVM (`spec.components`) where its machine's microVMs lay them, else each said refused; on its machine's host, the
+/// harness's own installed in the session's folder where it isn't (its first start with it, or a session moved here)
+/// and run from there (`spec.program`), and the versions it no longer runs let go of. One that can't be installed (its
+/// bytes not its pin's, its source unreachable) is said refused, kept to be tried again as it next starts, and its
+/// harness starts with its machine's own meanwhile.
+async fn lay_components(s: &Session, files: &Files, kind: &Kind, spec: &mut Spec) {
+    use super::overrides as o;
+    if spec.isolation.is_some() {
+        let holds = files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()).map(|v| v.sandbox.holds()).unwrap_or_default();
+        let mut core = s.core.lock();
+        if core.state.overrides.components.is_empty() {
+            return;
+        }
+        if holds.components {
+            spec.components = o::laid(&core.state.overrides, kind.id);
+            let laid: Vec<String> = spec.components.iter().map(|c| c.at.clone()).collect();
+            for h in core.state.overrides.components.iter_mut().filter(|h| laid.contains(&h.component.path)) {
+                h.microvm = Some(o::Took::Now { how: "its microVM laid it over its image's own as its harness started there".to_owned() });
+            }
+            core.touch_state();
+            return;
+        }
+        for h in &mut core.state.overrides.components {
+            h.microvm = Some(o::Took::Refused { why: format!("its microVM didn't take it: {}", crate::sandbox::isolated::NO_COMPONENTS) });
+        }
+        core.touch_state();
+        return;
+    }
+    let held = o::harness_component(&s.core.lock().state.overrides, kind.id).map(|h| h.component.clone());
+    let installed = match &held {
+        Some(c) => Some(super::components::installed(&files.dir, c, kind.program).await),
+        None => None,
+    };
+    let dir = files.dir.clone();
+    let keep = held.clone();
+    let _ = crate::rt::blocking(move || super::components::prune(&dir, keep.as_ref())).await;
+    let (Some(c), Some(installed)) = (held, installed) else { return };
+    let mut core = s.core.lock();
+    let took = match &installed {
+        Ok(exe) => {
+            spec.program = Some(exe.to_string_lossy().into_owned());
+            o::Took::Now { how: format!("its harness runs it from {}, where kiln installed it", exe.display()) }
+        }
+        Err(why) => {
+            let text = format!("{} starts with its machine's own: kiln couldn't install {} ({why})", kind.name, c.source);
+            core.upsert(&format!("override:{}", Core::now()), None, Body::Notice { level: Level::Warn, text });
+            o::Took::Refused { why: format!("kiln couldn't install it: {why}") }
+        }
+    };
+    if let Some(h) = core.state.overrides.components.iter_mut().find(|h| h.component == c) {
+        h.host = Some(took);
+    }
+    core.touch_state();
 }
 
 /// What a person changed of it while it ran before (`super::overrides`), given again as its harness starts: its
@@ -4866,6 +4982,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
     // A setting its harness takes when it starts (where its commands run) changed: it starts
     // again once nothing is under way.
     let mut reloading = false;
+    // Its harness starts again with a component swapped in at its path, swapped for itself in its microVM (kiln plan
+    // 01a1dd2e…, P6c.3); at once where `swap_now`, its turn under way cut short.
+    let mut in_place = false;
+    let mut swap_now = false;
     // Its harness ran here, a process of its own: one that never did has no group of processes
     // here to end when it lets go.
     let mut ran_here = false;
@@ -4933,6 +5053,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         }
         // The folders a person gave it while it ran (`super::overrides`): its harness takes them as it starts.
         spec.dirs = super::overrides::dirs(&s.core.lock().state.overrides);
+        // The components a person swapped in: laid in its microVM, or its harness run from where kiln installed it.
+        lay_components(&s, &files, kind, &mut spec).await;
         // A start that takes a carried conversation is the harness's new session, not an old one.
         if seed.is_some() {
             spec.resume = None;
@@ -5305,15 +5427,28 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             // A live override, in place (`super::overrides`): a harness that takes its folders only as
                             // it starts starts again with them, the conversation going on, once nothing is under way.
+                            // A component swapped in at its harness's path: it starts again with it (in a microVM, swapped
+                            // for itself there), once nothing is under way, or at once where forced.
                             Command::Override { change } => {
-                                if take_override(&s, change, p.boundary(), Some(&mut adapter), kind).await {
+                                let force = change.forced();
+                                let again = take_override(&s, change, p.boundary(), Some(&mut adapter), kind, &files).await;
+                                if again != Restarts::No {
                                     let mut core = s.core.lock();
-                                    let when = if settled_core(&core) { "now" } else { "once this turn ends" };
-                                    let text = format!("{} takes its folders as it starts: it starts again with them {when}; the conversation goes on", kind.name);
+                                    let when = if force || settled_core(&core) { "now" } else { "once this turn ends" };
+                                    let text = match again {
+                                        Restarts::Folders => format!("{} takes its folders as it starts: it starts again with them {when}; the conversation goes on", kind.name),
+                                        _ => format!("{} starts again with its component {when}; the conversation goes on", kind.name),
+                                    };
                                     core.upsert(&format!("harness-switch:dirs-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
                                     core.hold = true;
                                     drop(core);
                                     reloading = true;
+                                    in_place |= again == Restarts::InPlace;
+                                    match again {
+                                        Restarts::InPlace if force => swap_now = true,
+                                        Restarts::Component if force => forcing = true,
+                                        _ => {}
+                                    }
                                 }
                                 on_change();
                             }
@@ -5585,10 +5720,18 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     // input closes (its record of the conversation complete), else it is stopped.
                     let go = {
                         let core = s.core.lock();
-                        (switching.is_some() && switch_now(&core)) || ((moving.is_some() || reloading) && settled_core(&core))
+                        (switching.is_some() && switch_now(&core)) || ((moving.is_some() || reloading) && (settled_core(&core) || swap_now))
                     };
                     if go {
                         left = s.core.lock().state.tasks.iter().filter(|t| t.left_running()).count();
+                        swap_now = false;
+                        // A component at its harness's path in a microVM: its member swapped for itself there with it,
+                        // as it starts (`Launch::components`), never stopped here.
+                        if std::mem::take(&mut in_place) && switching.is_none() && s.spec.lock().isolation.is_some() && p.boundary().is_some() {
+                            swap_from = Some(p);
+                            ending = true;
+                            break;
+                        }
                         // A switch in a microVM: its member is swapped for the next harness's there, as it starts, once
                         // the next one's image is in the machine's store (built there now where it isn't).
                         if let Some(to) = switching.as_ref().map(|sw| sw.to).filter(|_| s.spec.lock().isolation.is_some() && p.boundary().is_some()) {
@@ -5951,7 +6094,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     // A live override while it isn't running: in its record now, given its harness and its microVM as
                     // its harness next starts.
                     Command::Override { change } => {
-                        let _ = take_override(&s, change, None, None, kind).await;
+                        let _ = take_override(&s, change, None, None, kind, &files).await;
                         on_change();
                     }
                     c => adapter.command(&mut s.core.lock(), c),

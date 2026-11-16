@@ -18,6 +18,15 @@
 //!   took each ([`Took`]); its harness's every start takes them again (a restart, a resume, a restore: [`dirs`] for its
 //!   launch, [`changes`] for its microVM once it runs), for the session's life. Keeping them for an agent's later
 //!   sessions (its definition) is a later step's.
+//! - **Components** (P6c.3; the person: "hot-swap agents, harnesses, and mcps at given paths in builds sans microvm
+//!   re-build"): an agent, its harness or an MCP server swapped in at its member's directory, built alone from a pinned
+//!   source as an Agentfile's AGENT, HARNESS or MCP takes one ([`Component`], held as Shards' D54 holds a source), one
+//!   at a path. Its member alone starts again with it once nothing is under way, or at once where forced, a harness's
+//!   conversation going on through its own resume. In a microVM its machine lays it over its image's own (an agent's or
+//!   an MCP server's a change to its run, `kiln_seams::sandbox::Change::Swap`; its harness's by swapping its harness for
+//!   itself in the same microVM, its launch laying it, as P6c.5's switch does), and every launch after lays each it holds
+//!   ([`laid`]). On its machine's host its harness is its one member: kiln installs it from a pinned http(s) source in the
+//!   session's own folder (`super::components`) and runs it there in place of its machine's.
 
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -152,6 +161,122 @@ pub struct Volume {
     pub members: Vec<Member>,
 }
 
+/// What a component of a session is (kiln plan 01a1dd2e…, P6c.3): its image's AGENT, its HARNESS or an MCP server.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "LiveComponentKind"))]
+#[serde(rename_all = "lowercase")]
+pub enum ComponentKind {
+    Agent,
+    Harness,
+    Mcp,
+}
+
+impl ComponentKind {
+    /// Where its members are in an image (Shards' D231): `harness`, `agents`, `mcp`.
+    fn dir(self) -> &'static str {
+        match self {
+            ComponentKind::Agent => "agents",
+            ComponentKind::Harness => "harness",
+            ComponentKind::Mcp => "mcp",
+        }
+    }
+}
+
+/// A component swapped into a session at `path` (P6c.3; the person, 2026-11-15: "the ability to hot-swap agents,
+/// harnesses, and mcps at given paths in builds sans microvm re-build"): built alone from `source` and its pin, as an
+/// Agentfile's AGENT, HARNESS or MCP takes its source (Shards' D54), never its whole image.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "LiveComponent"))]
+pub struct Component {
+    pub kind: ComponentKind,
+    /// Its member's directory in its image (`/harness/<harness>`, `/agents/<name>`, `/mcp/<name>`); on its machine's
+    /// host, where kiln installs it in the session's own folder.
+    pub path: String,
+    /// As an Agentfile's `FROM` writes it: a Git URL whose `#REF` names its commit, an http(s) URL, `s3://BUCKET/KEY`,
+    /// or an OCI reference by its digest.
+    pub source: String,
+    /// `sha256:<hex>` of what an http(s) or s3 source serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub checksum: Option<String>,
+    /// An s3 object's version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub version_id: Option<String>,
+}
+
+/// What a component's source is, as Shards tells one apart (its `agentfile::source_of`, BuildKit's remote contexts):
+/// a Git URL (`git://`, `ssh://`, `git@`, or an http(s) URL ending `.git`, its `#REF` after it), an http(s) URL, an
+/// object of an S3-compatible store, a path of a build's context, or else an OCI reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    Git,
+    Http,
+    S3,
+    Path,
+    Oci,
+}
+
+fn source_kind(source: &str) -> SourceKind {
+    let url = source.split_once('#').map_or(source, |(u, _)| u);
+    if source.starts_with("s3://") {
+        SourceKind::S3
+    } else if source.starts_with("git://") || source.starts_with("ssh://") || source.starts_with("git@") || ((source.starts_with("https://") || source.starts_with("http://")) && url.ends_with(".git")) {
+        SourceKind::Git
+    } else if source.starts_with("https://") || source.starts_with("http://") {
+        SourceKind::Http
+    } else if source == "." || source.starts_with("./") || source.starts_with("../") || source.starts_with('/') {
+        SourceKind::Path
+    } else {
+        SourceKind::Oci
+    }
+}
+
+/// Whether `s` is `sha256:` and 64 lowercase hex digits, as Shards takes a pin (D54).
+fn sha256_pin(s: &str) -> bool {
+    s.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Whether component `c` is pinned as an Agentfile's source is (Shards' D54, its `fetch_checked`): an http(s) source by
+/// its checksum; an s3 one by its checksum or its version; a Git one by the commit its `#REF` names in full; an OCI
+/// reference by its digest. Why not, in words; a path is refused, for a live swap has no build context.
+fn pinned(c: &Component) -> Result<(), String> {
+    let kind = source_kind(&c.source);
+    if c.checksum.is_some() && !matches!(kind, SourceKind::Http | SourceKind::S3) {
+        return Err("checksum pins an http(s) or s3:// source; a Git source is pinned by the commit its #REF names, an OCI one by its digest".to_owned());
+    }
+    if c.version_id.is_some() && kind != SourceKind::S3 {
+        return Err("version_id pins an s3:// source alone".to_owned());
+    }
+    if let Some(sum) = &c.checksum
+        && !sha256_pin(sum)
+    {
+        return Err(format!("checksum is sha256: and 64 lowercase hex digits, not {sum:?}"));
+    }
+    match kind {
+        SourceKind::Http if c.checksum.is_none() => Err(format!("{} is pinned by checksum, sha256:<hex> of what it serves", c.source)),
+        SourceKind::S3 if c.checksum.is_none() && c.version_id.as_deref().is_none_or(str::is_empty) => Err(format!("{} is pinned by checksum (sha256:<hex>) or version_id", c.source)),
+        SourceKind::S3 if !c.source.strip_prefix("s3://").and_then(|r| r.split_once('/')).is_some_and(|(b, k)| !b.is_empty() && !k.is_empty()) => Err(format!("{} names no object: an S3 source is s3://BUCKET/KEY", c.source)),
+        SourceKind::Git => match c.source.split_once('#').map(|(_, r)| r.split_once(':').map_or(r, |(r, _)| r)) {
+            Some(r) if (r.len() == 40 || r.len() == 64) && r.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) => Ok(()),
+            _ => Err(format!("{} is pinned by the commit its #REF names, in full (40 or 64 lowercase hex digits)", c.source)),
+        },
+        SourceKind::Oci => match c.source.rsplit_once('@') {
+            Some((name, digest)) if !name.is_empty() && sha256_pin(digest) => Ok(()),
+            _ => Err(format!("{} is pinned by its digest: <name>@sha256:<hex>", c.source)),
+        },
+        SourceKind::Path => Err(format!("{} names a file of a build's context, which a live swap has none of: give a Git, http(s), s3:// or OCI source", c.source)),
+        _ => Ok(()),
+    }
+}
+
+/// Where `kind`'s member `name` is in an image, as a component's path names it.
+pub fn component_path(kind: ComponentKind, name: &str) -> String {
+    format!("/{}/{name}", kind.dir())
+}
+
 /// One change to a session's overrides, as `Command::Override` carries it to its machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -167,6 +292,27 @@ pub enum Change {
     Add(Volume),
     /// The volume of this folder.
     Remove(String),
+    /// A component swapped in at its path (P6c.3): its member started again with it once nothing is under way, or at
+    /// once where `force`.
+    Swap {
+        component: Component,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Its image's own component back at `path` (on its machine's host, the harness its machine runs), started again as
+    /// a swap is.
+    Restore {
+        path: String,
+        #[serde(default)]
+        force: bool,
+    },
+}
+
+impl Change {
+    /// Whether its member starts again with it at once, its turn under way cut short ([`Change::Swap`]'s `force`).
+    pub fn forced(&self) -> bool {
+        matches!(self, Change::Swap { force: true, .. } | Change::Restore { force: true, .. })
+    }
 }
 
 /// How a place took an override: applied now, from the harness's next turn or start, with nothing of its own to
@@ -224,6 +370,21 @@ pub struct HeldVolume {
     pub microvm: Option<Took>,
 }
 
+/// A component as its session holds it, and how each place took it: its microVM, or on its machine's host its install
+/// in the session's own folder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "LiveHeldComponent"))]
+pub struct HeldComponent {
+    pub component: Component,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub microvm: Option<Took>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub host: Option<Took>,
+}
+
 /// What a person changed of a session while it runs ([module docs](self)): each, and how each place took it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -240,6 +401,9 @@ pub struct Overrides {
     pub networks: Vec<HeldNetwork>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<HeldVolume>,
+    /// The components swapped in (P6c.3), each at its path, laid at its harness's every start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<HeldComponent>,
     /// Where its microVM takes a folder live, as its launch declared them (Shards' `ImageSpec::plug_roots`, D271): the
     /// top-level directories of its project and its person's volumes, and its session's volume root
     /// ([`crate::sandbox::isolated::VOLUMES`]), a folder going strictly beneath one.
@@ -257,7 +421,7 @@ fn is_zero(n: &u64) -> bool {
 
 impl Overrides {
     pub fn is_empty(&self) -> bool {
-        self.revision == 0 && self.ports.is_empty() && self.egress.is_empty() && self.networks.is_empty() && self.volumes.is_empty() && self.roots.is_empty() && self.ceiling.is_empty()
+        self.revision == 0 && self.ports.is_empty() && self.egress.is_empty() && self.networks.is_empty() && self.volumes.is_empty() && self.components.is_empty() && self.roots.is_empty() && self.ceiling.is_empty()
     }
 }
 
@@ -406,7 +570,51 @@ pub fn check(change: &Change, microvm: bool, harness: &str) -> Result<(), String
                 Err(format!("{p:?} isn't a folder's absolute path on its machine"))
             }
         }
+        Change::Swap { component: c, .. } => {
+            placed(c.kind, &c.path, microvm, harness)?;
+            pinned(c)?;
+            if !microvm && source_kind(&c.source) != SourceKind::Http {
+                return Err(format!(
+                    "a session on its machine's host takes a harness from a pinned http(s) source alone, which kiln installs in its own folder: {} is built into a component first, which a microVM session's machine does",
+                    c.source
+                ));
+            }
+            Ok(())
+        }
+        Change::Restore { path, .. } => {
+            let kind = kind_at(path).ok_or_else(|| format!("{path:?} is no member's directory: /harness/<name>, /agents/<name> or /mcp/<name>"))?;
+            placed(kind, path, microvm, harness)
+        }
     }
+}
+
+/// The kind of member whose directory `path` is: `/harness/<name>`, `/agents/<name>` or `/mcp/<name>`.
+fn kind_at(path: &str) -> Option<ComponentKind> {
+    let (dir, name) = path.strip_prefix('/')?.split_once('/')?;
+    if !named(name) {
+        return None;
+    }
+    [ComponentKind::Agent, ComponentKind::Harness, ComponentKind::Mcp].into_iter().find(|k| k.dir() == dir)
+}
+
+/// Whether a component of `kind` can be at `path` in a session of engine `microvm` (else its host's) whose harness is
+/// `harness`: its member's directory, of its kind; a harness's, the session's own; on its machine's host, its harness's
+/// alone (it has no other member).
+fn placed(kind: ComponentKind, path: &str, microvm: bool, harness: &str) -> Result<(), String> {
+    if kind_at(path) != Some(kind) {
+        return Err(format!("{path:?} isn't where {} is: {}", match kind {
+            ComponentKind::Agent => "an agent",
+            ComponentKind::Harness => "its harness",
+            ComponentKind::Mcp => "an MCP server",
+        }, component_path(kind, "<name>")));
+    }
+    if kind == ComponentKind::Harness && path != component_path(kind, harness) {
+        return Err(format!("its harness is at {}, not {path}", component_path(kind, harness)));
+    }
+    if !microvm && kind != ComponentKind::Harness {
+        return Err("a session on its machine's host has one member, its harness: agents and MCP servers are a microVM's members".to_owned());
+    }
+    Ok(())
 }
 
 /// A path that names a folder from the root: a Unix one, or a Windows one (`C:\…`, `\\server\…`).
@@ -432,6 +640,7 @@ pub enum Removed {
     Egress(Egress),
     Network(Network),
     Volume(Volume),
+    Component(Component),
 }
 
 /// `change` taken into `o`, as each place has still to take it (`Took::NextStart` until it does): one held already
@@ -489,6 +698,24 @@ pub fn take(o: &mut Overrides, change: &Change) -> Result<Taken, String> {
             Some(i) => Taken::Removed(Removed::Volume(o.volumes.remove(i).volume)),
             None => return Err(format!("{p} isn't one of its volumes")),
         },
+        // One component at a path: another swapped in there takes its place.
+        Change::Swap { component: c, .. } => match o.components.iter().position(|h| h.component.path == c.path) {
+            Some(i) if o.components.get(i).is_some_and(|h| h.component == *c) => Taken::Same,
+            Some(i) => {
+                if let Some(h) = o.components.get_mut(i) {
+                    *h = HeldComponent { component: c.clone(), microvm: None, host: None };
+                }
+                Taken::Added
+            }
+            None => {
+                o.components.push(HeldComponent { component: c.clone(), microvm: None, host: None });
+                Taken::Added
+            }
+        },
+        Change::Restore { path, .. } => match o.components.iter().position(|h| h.component.path == *path) {
+            Some(i) => Taken::Removed(Removed::Component(o.components.remove(i).component)),
+            None => return Err(format!("nothing is swapped in at {path}: it runs its image's own")),
+        },
     };
     if taken != Taken::Same {
         o.revision = o.revision.saturating_add(1);
@@ -521,6 +748,44 @@ pub fn changes(o: &Overrides) -> Vec<(Place, kiln_seams::sandbox::Change)> {
     out
 }
 
+/// The components `o` lays as its microVM starts (`Launch::components`) for harness `harness`: each it holds, at its
+/// member's directory, but a harness's other than that one's (a harness it switched from: its image is another).
+pub fn laid(o: &Overrides, harness: &str) -> Vec<kiln_seams::sandbox::ComponentAt> {
+    let own = component_path(ComponentKind::Harness, harness);
+    o.components
+        .iter()
+        .filter(|h| h.component.kind != ComponentKind::Harness || h.component.path == own)
+        .map(|h| kiln_seams::sandbox::ComponentAt { at: h.component.path.clone(), component: seam_component(&h.component) })
+        .collect()
+}
+
+/// The component `o` holds at its harness's path, `harness` its harness.
+pub fn harness_component<'a>(o: &'a Overrides, harness: &str) -> Option<&'a HeldComponent> {
+    let at = component_path(ComponentKind::Harness, harness);
+    o.components.iter().find(|h| h.component.path == at)
+}
+
+/// Whether `change` is a component's at its session's harness's path (`harness`), which its harness takes by starting
+/// again with it, never as a change to a run of its.
+pub fn at_harness(change: &Change, harness: &str) -> bool {
+    let at = component_path(ComponentKind::Harness, harness);
+    match change {
+        Change::Swap { component, .. } => component.path == at,
+        Change::Restore { path, .. } => *path == at,
+        _ => false,
+    }
+}
+
+fn seam_component(c: &Component) -> kiln_seams::sandbox::Component {
+    use kiln_seams::sandbox::ComponentKind as K;
+    let kind = match c.kind {
+        ComponentKind::Agent => K::Agent,
+        ComponentKind::Harness => K::Harness,
+        ComponentKind::Mcp => K::Mcp,
+    };
+    kiln_seams::sandbox::Component { kind, source: c.source.clone(), checksum: c.checksum.clone(), version_id: c.version_id.clone() }
+}
+
 /// Which held override a took is for ([`changes`], [`set_took`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
@@ -528,6 +793,7 @@ pub enum Place {
     Egress(usize),
     Network(usize),
     Volume(usize),
+    Component(usize),
 }
 
 /// How its microVM took the override at `place`.
@@ -553,6 +819,11 @@ pub fn set_took(o: &mut Overrides, place: Place, took: Took) {
                 h.microvm = Some(took);
             }
         }
+        Place::Component(i) => {
+            if let Some(h) = o.components.get_mut(i) {
+                h.microvm = Some(took);
+            }
+        }
     }
 }
 
@@ -563,7 +834,8 @@ pub fn place_of(o: &Overrides, change: &Change) -> Option<Place> {
         Change::Grant(e) => o.egress.iter().position(|h| h.egress == *e).map(Place::Egress),
         Change::Connect(n) => o.networks.iter().position(|h| h.network == *n).map(Place::Network),
         Change::Add(v) => o.volumes.iter().position(|h| h.volume == *v).map(Place::Volume),
-        Change::Unpublish(_) | Change::Revoke(_) | Change::Disconnect(_) | Change::Remove(_) => None,
+        Change::Swap { component, .. } => o.components.iter().position(|h| h.component == *component).map(Place::Component),
+        Change::Unpublish(_) | Change::Revoke(_) | Change::Disconnect(_) | Change::Remove(_) | Change::Restore { .. } => None,
     }
 }
 
@@ -574,6 +846,8 @@ pub fn seam_change(change: &Change, removed: Option<&Removed>) -> Option<kiln_se
         (Change::Grant(e), _) => Some(seam_grant(e, true)),
         (Change::Connect(n), _) => Some(seam_network(n, true)),
         (Change::Add(v), _) => Some(seam_plug(v)),
+        (Change::Swap { component, .. }, _) => Some(kiln_seams::sandbox::Change::Swap { at: component.path.clone(), component: seam_component(component) }),
+        (_, Some(Removed::Component(c))) => Some(kiln_seams::sandbox::Change::Restore { at: c.path.clone() }),
         (_, Some(Removed::Port(p))) => Some(kiln_seams::sandbox::Change::Unpublish { udp: p.protocol == Protocol::Udp, host: bound(&p.bind, p.host_port) }),
         (_, Some(Removed::Egress(e))) => Some(seam_grant(e, false)),
         (_, Some(Removed::Network(n))) => Some(seam_network(n, false)),
@@ -644,14 +918,16 @@ pub fn scope_took(v: &Volume) -> Took {
     Took::Now { how }
 }
 
-/// The operations a session of engine `microvm` (else its host's) takes: its volumes' on every engine, and its ports',
-/// egress' and networks' only in a microVM (the person: "these options should *only* show if the session uses MicroVM
-/// runners").
+/// The operations a session of engine `microvm` (else its host's) takes: its volumes' and components' on every engine,
+/// and its ports', egress' and networks' only in a microVM (the person: "these options should *only* show if the
+/// session uses MicroVM runners").
 pub fn ops_for(microvm: bool) -> Vec<&'static str> {
     let network = ["sessions.ports.publish", "sessions.ports.unpublish", "sessions.egress.grant", "sessions.egress.revoke", "sessions.networks.connect", "sessions.networks.disconnect"];
-    let volumes = ["sessions.volumes.add", "sessions.volumes.remove"];
-    if microvm { network.into_iter().chain(volumes).collect() } else { volumes.to_vec() }
+    let every = ["sessions.volumes.add", "sessions.volumes.remove", "sessions.components.swap", "sessions.components.restore"];
+    if microvm { network.into_iter().chain(every).collect() } else { every.to_vec() }
 }
+
+
 
 /// What `agents.get` says of a session's live overrides: its engine, the operations it takes, and what it holds.
 pub fn view(info: &super::session::Info, state: &Value) -> Value {
@@ -801,6 +1077,31 @@ async fn remove(cx: Cx, v: Value) -> Out {
     send(&cx, &info, Change::Remove(i.path.trim().to_owned())).await
 }
 
+/// The path a component operation names (`path`), or by default its harness's for a harness.
+fn path_asked(path: Option<&str>, kind: Option<ComponentKind>, harness: &str) -> Result<String, Fail> {
+    match (path.map(str::trim).filter(|p| !p.is_empty()), kind) {
+        (Some(p), _) => Ok(p.trim_end_matches('/').to_owned()),
+        (None, None | Some(ComponentKind::Harness)) => Ok(component_path(ComponentKind::Harness, harness)),
+        (None, Some(k)) => Err((StatusCode::BAD_REQUEST, format!("an {} component is swapped at its member's directory: path {}", k.dir(), component_path(k, "<name>")))),
+    }
+}
+
+async fn swap(cx: Cx, v: Value) -> Out {
+    let info = session_of(&cx, &v).await?;
+    let i: input::Swap = read(&v)?;
+    let path = path_asked(i.path.as_deref(), Some(i.kind), &info.kind)?;
+    let pin = |s: Option<String>| s.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    let component = Component { kind: i.kind, path, source: i.source.trim().to_owned(), checksum: pin(i.checksum), version_id: pin(i.version_id) };
+    send(&cx, &info, Change::Swap { component, force: i.force.unwrap_or(false) }).await
+}
+
+async fn restore(cx: Cx, v: Value) -> Out {
+    let info = session_of(&cx, &v).await?;
+    let i: input::Restore = read(&v)?;
+    let path = path_asked(i.path.as_deref(), None, &info.kind)?;
+    send(&cx, &info, Change::Restore { path, force: i.force.unwrap_or(false) }).await
+}
+
 /// A route under a session's: `POST /api/harness/sessions/:agent/<parts…>`.
 fn route_of(v: &Value, parts: &[&str]) -> Result<(Method, Vec<String>), Fail> {
     let agent = text(v, "agent")?;
@@ -893,6 +1194,24 @@ pub fn list_ops() -> Vec<Op> {
             route: |v| route_of(v, &["volumes", "remove"]),
             run: |cx, v| Box::pin(remove(cx, v)),
         },
+        Op {
+            name: "sessions.components.swap",
+            summary: "Swap a running session's component in place (no rebuild, no new microVM, no Agentfile edit): `kind` agent, harness or mcp, at `path`, its member's directory (/harness/<harness>, a harness's and the default; /agents/<name>; /mcp/<name>), built alone from `source` as an Agentfile's AGENT, HARNESS or MCP writes it, pinned (a Git URL's #REF a full commit; an http(s) or s3:// source's `checksum`, sha256:<hex>; an s3 object's `version_id`; an OCI reference's digest). Its member alone starts again with it once nothing is under way (`force`: at once, its turn cut short), a harness's conversation going on through its own resume. In a microVM session its machine lays it over its image's own (through Hex); on its machine's host, a harness from a pinned http(s) source, which kiln installs in the session's own folder and runs in place of its machine's. Kept on the session and laid again whenever its harness starts again (a restart, a resume, a restore); agents_get shows how each place took it (state.overrides.components). Every engine.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::Swap>(),
+            route: |v| route_of(v, &["components"]),
+            run: |cx, v| Box::pin(swap(cx, v)),
+        },
+        Op {
+            name: "sessions.components.restore",
+            summary: "Give a running session's member its image's own component back at `path` (by default its harness's), started again as a swap is (`force`: at once); on its machine's host, its harness runs its machine's own again.",
+            read_only: false,
+            destructive: true,
+            input: Input::of::<input::Restore>(),
+            route: |v| route_of(v, &["components", "restore"]),
+            run: |cx, v| Box::pin(restore(cx, v)),
+        },
     ]
 }
 
@@ -901,7 +1220,7 @@ pub mod input {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
-    pub use super::{Access, Protocol};
+    pub use super::{Access, ComponentKind, Protocol};
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -978,6 +1297,37 @@ pub mod input {
         pub agent: String,
         /// The folder, as it was added.
         pub path: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Swap {
+        /// The session: an agent's id, as agents.list gives it.
+        pub agent: String,
+        /// What it is: agent, harness or mcp.
+        pub kind: ComponentKind,
+        /// Its member's directory: /harness/<harness> (a harness's, the default), /agents/<name>, /mcp/<name>.
+        pub path: Option<String>,
+        /// As an Agentfile's FROM writes it: a Git URL whose #REF names its commit, an http(s) URL, s3://BUCKET/KEY, or an
+        /// OCI reference by its digest.
+        pub source: String,
+        /// sha256:<hex> of what an http(s) or s3:// source serves.
+        pub checksum: Option<String>,
+        /// An s3:// object's version.
+        pub version_id: Option<String>,
+        /// Its member starts again with it at once, its turn under way cut short; else once nothing is under way.
+        pub force: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Restore {
+        /// The session: an agent's id, as agents.list gives it.
+        pub agent: String,
+        /// Its member's directory, as it was swapped: by default its harness's.
+        pub path: Option<String>,
+        /// Its member starts again with its image's own at once; else once nothing is under way.
+        pub force: Option<bool>,
     }
 }
 
