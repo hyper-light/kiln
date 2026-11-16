@@ -27,7 +27,7 @@ use kiln::sandbox::hexvm::{Charge, Charged, HexVms, USE};
 use kiln_ci::place::holder::BoxName;
 use kiln_seams::Records as _;
 use kiln_seams::records::{Consistency, SimRecords};
-use kiln_seams::sandbox::{Boundary, Egress, Launch, Limits, Output, Run as _};
+use kiln_seams::sandbox::{Boundary, Egress, Launch, Limits, Output};
 
 use crate::vm_e2e;
 
