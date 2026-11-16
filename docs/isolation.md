@@ -150,8 +150,8 @@ its own through Hex (`sandbox::hexvm`).
 
 - **Which one.** What its owner set on the server (`PUT /api/runners/:name/engine`, `runners.engine.set` over
   MCP and code mode; `runners.manage` on that runner), else `microvm` where it can hold microVMs now (the
-  person's decision 3), else `host`, saying why. Whether it can is read in one place, `engine::capable`: today
-  its isolation facts below; once kiln vendors Shards' `shards_api::host_check()`, the answer its facts carry.
+  person's decision 3), else `host`, saying why. Whether it can is read in one place, `engine::capable`, from
+  its isolation facts below, which carry Shards' own check of its host (`shards_api::host_check`).
   `microvm` set where it can't any more is held as `host`, saying why.
 - **Refused.** `microvm` on a runner that can't hold microVMs, saying why (409).
 - **Held where it's decided.** The server keeps what's set (`kv` `runner_engine/<runner>`) and writes the engine
@@ -223,8 +223,13 @@ swapped-in harness its agent's volumes, unchecked on a real microVM.
 ## Facts
 
 A runner says whether it holds isolated agents (`RunnerFacts.isolation`: `available`, `hypervisor`,
-`why_not`), and `virt.microvm` is that same `available`, one answer. `harness::lineage::isolation_on`
-refuses an isolated start on a runner that says no, in the runner's own words.
+`why_not`), and `virt.microvm` is that same `available`, one answer. One holding microVMs with the carried
+Shards says what Shards' own check of its host says at each probe (`sandbox::facts_of`; Shards' D262,
+`shards_api::host_check`: the check its VM process makes before it boots, made without booting one, by one
+launch of the carried `shards`): `available` where the host runs them, its backend the `hypervisor`; else
+`why_not` in Shards' words (`/dev/kvm` missing or not this user's to open, a platform Shards has no backend
+for, a VM given no nested virtualization), or that Shards couldn't say, and why (`sandbox::UNCHECKED`).
+`harness::lineage::isolation_on` refuses an isolated start on a runner that says no, in the runner's own words.
 
 ## What the microVMs are, and what's owed
 
@@ -234,7 +239,8 @@ boot (its D231) of the member, through Hex, its stdio carried on Shards' own mem
 endpoint (step 11) carries them over hyper-transport. A runner whose kiln carries Shards (`shards::carried`)
 holds them as it starts (`sandbox::hold`): the carried `shards` written out beneath kiln's state, Hex's image runtime
 over it (`hex_node::images::ImageRuntime`, its records in `<state>/hex-records`, Shards' home and cache beneath the
-state), and `sandbox::hexvm::HexVms` as the runner's sandbox; its facts then say `virt.microvm`. Each launch's box is
+state), and `sandbox::hexvm::HexVms` as the runner's sandbox; its facts then say `virt.microvm` where Shards' check
+says its host runs them (Facts, above). Each launch's box is
 the one placement holds for its session (`Holder::box_of`), else the next of placement's own numbering of boxes that
 reserve nothing (`kiln-z…`, shared with its holding), so no two share a name. Its charge is kept in placement's records as it
 ends (`hexvm::USE`), and placement reads its use from its VM's meter once it's launched (`Group::Hex`). A launch adds kiln's variables
