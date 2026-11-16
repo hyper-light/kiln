@@ -696,6 +696,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   server says it (`ServerMsg::AdoptPolicy`; CP-T3.2), each time it names this, and takes sessions
   over from other machines under it; a runner that didn't name it hears it only with a transfer's
   offer (`HarnessMailTransfer`), and refuses a move until then.
+  `experiments.replay`: the runner replays a recorded session's tool calls in a microVM of a split's
+  variant (`ServerMsg::Replay`; kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b) and answers what the
+  run measured; a runner that didn't name it isn't asked, and a replay on it is refused.
 
 ## Registry
 
@@ -759,6 +762,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 80 | `HarnessHistoryFor` | | main (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5): a machine's past sessions for a person, JSON, to a runner that named `harness.history-volumes` |
 | `ServerMsg` | 81 | `RunnerEngine` | | main (kiln plan 01a1dd2e…, P2.3): a runner's engine as its owner set it, JSON, to a runner that named `runner.engine` |
 | `ServerMsg` | 82 | `AdoptPolicy` | | main (CP-T3.2): the room a hand-over's spool leaves on a runner's volume, JSON, to a runner that named `reach.adopt-policy` |
+| `ServerMsg` | 83 | `Replay` | | main (kiln plan 01a1dd2e…, P7.1b): one run of a recorded session's replay in a microVM of a split's variant, JSON, to a runner that named `experiments.replay` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -1018,6 +1022,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessHistoryFor` | ask | `HarnessHistory` for a person (`aisessions::Asked`, JSON: `{kind, limit, person}`, the person whoever asked the server): the machine's past sessions with those kept in that person's microVM volumes there, each saying it ran in one (`isolation`). Answered by `HarnessHistory`. | New: to runners that named `harness.history-volumes`; a runner that didn't is asked `HarnessHistory`, and lists its own alone. |
 | `RunnerEngine` | state | What the runner's owner set on the server for its engine (`harness::engine::Asked`, JSON: `{engine, version}`, `engine` `host`, `microvm` or null for what it can do, `version` how many times it was set): kept in its state folder for its restarts and written into its facts (`isolation.engine`, `virt.microvm` only on `microvm`), which it says again at once; a `HarnessOpen` whose spec was decided under another `version` (`engine_version`) is refused. A barrier against session commands. The newest wins. | New: to runners that named `runner.engine`, as they name it and whenever it changes. |
 | `AdoptPolicy` | state | The room a hand-over's spool leaves on this runner's volume (`harness::moving::stream::Told`, JSON: `{disk_floor}`, the operator's `[ci.scheduler.admission] disk_free` in bytes, or null for none set): its reach node takes sessions over from other machines under it (docs/reach.md §8), and forgets it as its server drops. Until it knows it, it refuses every hand-over. The newest wins. | New: to runners that named `reach.adopt-policy`, as they name it (each time they connect). |
+| `Replay` | ask | One run of a split's replay (`sandbox::replay::Ask`, JSON: the split, the replay, its variant and round; the variant's harness, Agentfile (a person's own with its text and build secrets) and size; the session's folder; the plan of its calls; its limit): the calls run in a microVM of the variant's image as its own command, with no grant, no credential and no member driven. Answered by `Answer` (`sandbox::replay::Answer`: its conclusion, why, its measures as a session's, its steps' outcome). | New: to runners that named `experiments.replay`; a runner that didn't isn't asked. |
 
 ## Commands to a session: `Command`
 

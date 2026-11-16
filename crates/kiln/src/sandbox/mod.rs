@@ -17,6 +17,8 @@
 //! - [`hexvm`]: the machine's microVMs through Hex: each launch a Shards image box, its harness member driven.
 //! - [`held`]: a boundary's run as the `Duplex` a session drives its harness through, so a session's
 //!   loop and its adapter treat a microVM's member as they treat a process of the machine's.
+//! - [`replay`]: a recorded session's tool calls run in a microVM of a split's variant, and what it measured
+//!   (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b).
 
 #[cfg(test)]
 pub mod fake;
@@ -26,6 +28,7 @@ pub mod host;
 pub mod image;
 pub mod isolated;
 pub mod narrow;
+pub mod replay;
 
 use std::sync::Arc;
 use std::time::Duration;
