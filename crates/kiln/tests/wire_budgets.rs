@@ -717,14 +717,26 @@ fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
 /// (plan 01a1a87b2dae step 3): a packed snapshot deflates what it writes at open time at the fast
 /// level, and only whole chunks at the default one. A window is written at open time, so z=gzip
 /// came to median 100,766 to 102,748 and p90 244,269 to 245,133, and a tab from before the window
-/// median 202,501 to 204,054 (five runs).
+/// median 202,501 to 204,054 (five runs). Since db0f283ab (2026-11-12) kiln depends on vendored
+/// shards-image, whose flate2 asks for zlib-rs (vendor/shards/crates/image/Cargo.toml), so Cargo's
+/// feature unification puts every flate2 in kiln's build, the packer's included, on zlib-rs, whose
+/// fast level is deflate_quick, static Huffman trees only (zlib-rs 0.6.8, CONFIGURATION_TABLE in
+/// src/deflate/algorithm/mod.rs). The same kiln (257e8961f and 9c5aa60de, which differ in a test
+/// alone; adas-mac-studio-2, macOS 26.2 arm64, 2026-11-16) on miniz_oxide came to p90 whole (older)
+/// 1,588,997 to 1,589,273, and on zlib-rs to 1,611,466 to 1,611,733 (four runs); every cold open's
+/// wire grew so (z=gzip's median 102,395 to 102,557 on miniz_oxide, 105,974 to 106,204 on zlib-rs).
+/// With 05c8973431b's, e928ed39c's and 709e4ebce's source as its corpus (`Corpus`: kiln's own source,
+/// which every landing moves) p90 whole (older) came to 1,612,111, 1,611,752 and 1,614,499. Its budget
+/// is what was measured, with no margin chosen beside it: the most of those seven runs on zlib-rs
+/// (1,614,499) and their range (3,033): 1,617,532 (docs/research/measurements/wire-budgets/
+/// cold-open-flate2.sh, its runs in cold-open-flate2.txt beside it).
 const COLD_WIRE: &[(&str, &str, usize)] = &[
     ("median", "UI (z=gzip)", 111_962),
     ("median", "UI, no gzip", 75_547),
     ("median", "whole (older)", 219_903),
     ("p90", "UI (z=gzip)", 263_160),
     ("p90", "UI, no gzip", 178_844),
-    ("p90", "whole (older)", 1_604_501),
+    ("p90", "whole (older)", 1_617_532),
 ];
 /// Cold open, the frames' JSON as the page parses it. Before the tracks: median 879,337, p90
 /// 7,196,512. With the window: median 307,288 to 307,289, p90 661,169 to 661,170; a tab from before
