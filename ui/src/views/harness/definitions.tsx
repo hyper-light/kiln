@@ -35,18 +35,22 @@ import {
   type AgentDefFull,
   type Builtin,
   type Criterion,
+  type CriterionAsk,
   type Experiment,
   type Measure,
   type Op,
   type Variant,
+  type VariantAsk,
 } from "@/api/agentdefs";
 import { observeApi } from "@/api/observe";
 import { Ago } from "./parts";
 import { agentfilesRes } from "@/api/agentfiles";
+import type { AgentfileListing } from "@/api/wire";
 import { ApiError } from "@/api/client";
 import { Loadable } from "@/components/ui/loading";
-import { invalidate } from "@/lib/resource";
-import { rebalance, variantName, variantTone } from "./variants";
+import { sendingProps, useHold, type Failed, type Hold } from "@/lib/action";
+import { invalidate, resourceData, watch } from "@/lib/resource";
+import { rebalance, rescale, variantName, variantTone, type Deployment } from "./variants";
 import { sandboxesRes, type SandboxBrief } from "@/api/microvms";
 import type { AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
@@ -79,10 +83,28 @@ export function Swatch({ tone, title, current }: { tone: string; title?: string;
   );
 }
 
-/** The variant a session started in, as its swatch and name; none outside an experiment. */
-export function sessionVariant(d: AgentDef | undefined, id: string): { tone: string; name: string } | null {
+/** The variant a session started in, as its swatch and name (its Agentfiles by their `names`); none outside an experiment. */
+export function sessionVariant(d: AgentDef | undefined, id: string, names?: ReadonlyMap<string, string>): { tone: string; name: string } | null {
   const at = variantIn(d, d?.sessions.find((x) => x.id === id)?.variant);
-  return at ? { tone: variantTone(at.i, at.e.variants.length), name: variantName(at.e.variants, at.i) } : null;
+  return at ? { tone: variantTone(at.i, at.e.variants.length), name: variantName(at.e.variants, at.i, names) } : null;
+}
+
+/**
+ * Your Agentfiles as they come, never waiting on them (a variant names its Agentfile by its id): none until
+ * they're in, or where they can't be read, and a variant's name says its Agentfile's id meanwhile.
+ */
+const AGENTFILES = agentfilesRes();
+const followAgentfiles = (changed: () => void) => watch(AGENTFILES.key, AGENTFILES.fetch, AGENTFILES.opts ?? {}, changed);
+const agentfilesNow = () => resourceData(AGENTFILES);
+const notYet = () => undefined;
+function useAgentfilesSoon(): AgentfileListing | undefined {
+  return React.useSyncExternalStore(followAgentfiles, agentfilesNow, notYet);
+}
+/** Your Agentfiles' names by their `agentfile:<id>`. */
+const namesOf = (l: AgentfileListing | undefined): ReadonlyMap<string, string> => new Map((l?.agentfiles ?? []).map((a) => [`agentfile:${a.id}`, a.name]));
+function useAgentfileNamesSoon(): ReadonlyMap<string, string> {
+  const l = useAgentfilesSoon();
+  return React.useMemo(() => namesOf(l), [l]);
 }
 
 /** The definition of yours a session started from, and the version it started on. */
@@ -142,9 +164,10 @@ function SandboxLineRead({ id, target }: { id: string; target: string }) {
  * experiment's variant (its swatch and name, never a letter), a labelled line each.
  */
 function SessionFacts({ d, session }: { d: AgentDef; session: string }) {
+  const names = useAgentfileNamesSoon();
   const mine = d.sessions.find((s) => s.id === session);
   if (!mine) return null;
-  const variant = sessionVariant(d, session);
+  const variant = sessionVariant(d, session, names);
   const at = variantIn(d, mine.variant);
   const weight = at?.e.variants[at.i]?.weight;
   return (
@@ -452,12 +475,25 @@ const MEASURE: Record<Measure, { word: string; f: (x: number) => string; unit: s
   peak_gib: { word: "Peak memory", f: (x) => `${x.toFixed(2)}G`, unit: "GiB" },
   failed_pct: { word: "Failed sessions", f: (x) => `${Math.round(x)}%`, unit: "%" },
 };
-const NO_MEASURES: Variant["measures"] = { warm_ms: [0, 0, 0], peak_gib: [0, 0, 0], failed_pct: [0, 0, 0] };
+
+/**
+ * What a control of an experiment asks the server (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1), one change
+ * of a definition's experiments at a time (W21-R15): what it changes `shows` at once where that's known (null: it's
+ * gone), then the experiment as the server answers it (null: deleted), `then` after it; refused, it's as it was and
+ * `failed` says why (a toast headed so, with the server's words).
+ */
+type Ask = (which: string, e: Experiment, how: { asks: () => Promise<Experiment | null>; shows?: Experiment | null; failed: Failed; then?: (now: Experiment | null) => void }) => void;
+
+/** A variant's deployment as an added variant asks for it, its weight 0: a host's has no Agentfile or size. */
+const deploymentAsk = (v: Variant): Omit<VariantAsk, "weight"> =>
+  v.engine === "host" ? { engine: "host", ...(v.model ? { model: v.model } : {}) } : { agentfile: v.agentfile ?? undefined, cpus: v.cpus, memory: v.memory, ...(v.model ? { model: v.model } : {}) };
 
 /**
  * Its experiments (P7.1), several at once: how many stand where at its head (no split there, each has
  * its own) and a + for another; opened, a new one being set up, then each one whole, laid out as its
- * engine's microVMs are (engine-rows.tsx): its line, then what it holds under it, nothing folded.
+ * engine's microVMs are (engine-rows.tsx): its line, then what it holds under it, nothing folded. Each
+ * change is the server's (`agentdefs.experiments.*`): the list every page reads shows it as the server
+ * answers it.
  */
 function ExperimentsGroup({
   d,
@@ -476,12 +512,37 @@ function ExperimentsGroup({
   onSetup: () => void;
   onSetupDone: () => void;
 }) {
-  const [list, setList] = React.useState<Experiment[]>(d.experiments);
-  const change = (id: string) => (fn: (e: Experiment) => Experiment) => setList((l) => l.map((e) => (e.id === id ? fn(e) : e)));
-  const remove = (e: Experiment) => {
-    const before = list;
-    setList((l) => l.filter((x) => x.id !== e.id));
-    toast({ title: `Deleted ${e.name}`, tone: "info", action: { label: "Undo", run: () => setList(before) } });
+  const res = useRes(agentdefsRes);
+  // One change of its experiments at a time: each answer is an experiment whole, and one live at a time is its definition's.
+  const hold = useHold();
+  const list = res.data.find((x) => x.id === d.id)?.experiments ?? d.experiments;
+  /** Its experiments as `fn` makes them, in the list every page reads, at once (and over a load already on its way). */
+  const edit = (fn: (l: Experiment[]) => Experiment[]) => res.change((defs) => defs.map((x) => (x.id === d.id ? { ...x, experiments: fn(x.experiments) } : x)));
+  /** Experiment `id` as `e` is (null: gone), at `at` where it was taken out. */
+  const put = (id: string, e: Experiment | null, at: number) =>
+    edit((l) => {
+      if (!e) return l.filter((x) => x.id !== id);
+      if (l.some((x) => x.id === id)) return l.map((x) => (x.id === id ? e : x));
+      return [...l.slice(0, Math.max(0, at)), e, ...l.slice(Math.max(0, at))];
+    });
+  const ask: Ask = (which, e, how) =>
+    hold.change(`${e.id}/${which}`, async () => {
+      const at = list.findIndex((x) => x.id === e.id);
+      if (how.shows !== undefined) put(e.id, how.shows, at);
+      try {
+        const now = await how.asks();
+        put(e.id, now, at);
+        how.then?.(now);
+      } catch (err) {
+        if (how.shows !== undefined) put(e.id, e, at);
+        if (typeof how.failed === "function") how.failed(err);
+        else toast.error(how.failed, errorMessage(err));
+      }
+    });
+  /** A promotion made the definition its next version: its row says so at once, and its values and versions are read again. */
+  const promoted = (def: AgentDefFull) => {
+    res.change((defs) => defs.map((x) => (x.id === def.id ? { ...x, name: def.name, version: def.version, model: def.model, agentfile: def.agentfile } : x)));
+    invalidate("agentdefs/");
   };
   const stands = list.map((e) => EXP_STAND[e.state]);
   return (
@@ -502,26 +563,57 @@ function ExperimentsGroup({
         }
       />
       {(open || setup) && (
-        <>
-          {setup && (
-            <SetupNodes
-              d={d}
-              onDone={onSetupDone}
-              onStart={(e) => {
-                setList((l) => [e, ...l]);
-                onSetupDone();
-              }}
-            />
-          )}
-          {list.map((e) => (
-            <ExperimentNodes key={e.id} e={e} own={d.own} change={change(e.id)} onDelete={() => remove(e)} />
-          ))}
-          {list.length === 0 && !setup && (
-            <li className="ms-node df-exp-body" data-depth={2}>
-              <span className="df-note">No experiments.</span>
-            </li>
-          )}
-        </>
+        <ExperimentsOpen
+          d={d}
+          list={list}
+          setup={setup}
+          hold={hold}
+          ask={ask}
+          onPromoted={promoted}
+          onSetupDone={onSetupDone}
+          onStart={(e) => {
+            edit((l) => [e, ...l.filter((x) => x.id !== e.id)]);
+            onSetupDone();
+            toast({ title: `Started ${e.name}`, tone: "running" });
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+/** Its experiments opened: a new one being set up, then each one whole; your Agentfiles' names read only once they're shown. */
+function ExperimentsOpen({
+  d,
+  list,
+  setup,
+  hold,
+  ask,
+  onPromoted,
+  onSetupDone,
+  onStart,
+}: {
+  d: AgentDef;
+  list: Experiment[];
+  setup: boolean;
+  hold: Hold;
+  ask: Ask;
+  onPromoted: (def: AgentDefFull) => void;
+  onSetupDone: () => void;
+  onStart: (e: Experiment) => void;
+}) {
+  const agentfiles = useAgentfilesSoon();
+  const names = React.useMemo(() => namesOf(agentfiles), [agentfiles]);
+  return (
+    <>
+      {setup && <SetupNodes d={d} agentfiles={agentfiles} names={names} hold={hold} onDone={onSetupDone} onStart={onStart} />}
+      {list.map((e) => (
+        <ExperimentNodes key={e.id} d={d} e={e} names={names} hold={hold} ask={ask} onPromoted={onPromoted} />
+      ))}
+      {list.length === 0 && !setup && (
+        <li className="ms-node df-exp-body" data-depth={2}>
+          <span className="df-note">No experiments.</span>
+        </li>
       )}
     </>
   );
@@ -535,7 +627,9 @@ function ExperimentsGroup({
  * variant's value, the best checked, a bound missed marked, and a chart of each variant's day by day,
  * the bound drawn across it.
  */
-function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boolean; change: (fn: (e: Experiment) => Experiment) => void; onDelete: () => void }) {
+function ExperimentNodes({ d, e, names, hold, ask, onPromoted }: { d: AgentDef; e: Experiment; names: ReadonlyMap<string, string>; hold: Hold; ask: Ask; onPromoted: (def: AgentDefFull) => void }) {
+  const own = d.own;
+  const api = agentdefsApi.experiments;
   const [staged, setStaged] = React.useState<number[] | null>(null);
   const [promoting, setPromoting] = React.useState<string | null>(null);
   const [ending, setEnding] = React.useState<"stop" | "delete" | null>(null);
@@ -546,40 +640,99 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
   const live = e.state === "live";
   const running = live || e.state === "paused";
   const stand = EXP_STAND[e.state];
-  const apply = () => {
-    change((x) => ({ ...x, version: x.version + 1, variants: x.variants.map((v, i) => ({ ...v, weight: weights[i] ?? v.weight })) }));
-    setStaged(null);
-    toast({ title: `${e.name}: split v${e.version + 1}, ${weights.join("/")}`, tone: "info" });
-  };
-  const pause = () => {
-    change((x) => ({ ...x, state: live ? "paused" : "live" }));
-    toast({ title: live ? `Paused ${e.name}` : `Resumed ${e.name}`, tone: "info" });
-  };
-  const stop = () => {
-    change((x) => ({ ...x, state: "stopped" }));
-    setEnding(null);
-    toast({ title: `Stopped ${e.name}`, tone: "info" });
-  };
-  const promote = (id: string) => {
-    const name = variantName(
+  /** Control `which`'s change is on its way, or another change of the definition's experiments is (it waits). */
+  const doing = (which: string) => hold.doing(`${e.id}/${which}`);
+  const held = (which: string) => hold.held(`${e.id}/${which}`);
+  const nameOf = (id: string) =>
+    variantName(
       vs,
       vs.findIndex((v) => v.id === id),
+      names,
     );
-    change((x) => ({ ...x, state: "promoted", variants: x.variants.map((v) => ({ ...v, current: v.id === id, weight: v.id === id ? 100 : 0 })) }));
-    setPromoting(null);
-    toast({ title: `Promoted ${name}`, tone: "succeeded" });
+  // The split as staged, over the version it was read at: shown staged until the server answers, its version then the server's.
+  const apply = () =>
+    ask("weights", e, {
+      asks: () => api.weights(d.id, e.id, Object.fromEntries(vs.map((v, i) => [v.id, weights[i] ?? v.weight])), e.version),
+      failed: (err) => {
+        toast.error(`Couldn't apply ${e.name}'s split`, errorMessage(err));
+        // Another change came first (or it's over): what it is now, read again, and nothing staged over what it was.
+        if (err instanceof ApiError && err.status === 409) {
+          setStaged(null);
+          invalidate("agentdefs/list");
+        }
+      },
+      then: (now) => {
+        setStaged(null);
+        if (now) toast({ title: `${now.name}: split v${now.version}, ${now.variants.map((v) => v.weight).join("/")}`, tone: "info" });
+      },
+    });
+  const pause = () =>
+    ask("move", e, {
+      shows: { ...e, state: live ? "paused" : "live" },
+      asks: () => (live ? api.pause(d.id, e.id) : api.resume(d.id, e.id)),
+      failed: live ? `Couldn't pause ${e.name}` : `Couldn't resume ${e.name}`,
+      then: () => toast({ title: live ? `Paused ${e.name}` : `Resumed ${e.name}`, tone: "info" }),
+    });
+  const stop = () => {
+    setEnding(null);
+    ask("stop", e, { shows: { ...e, state: "stopped" }, asks: () => api.stop(d.id, e.id), failed: `Couldn't stop ${e.name}`, then: () => toast({ title: `Stopped ${e.name}`, tone: "info" }) });
   };
+  // The server's promotion keeps the split's weights: the variant is what new sessions start on, and the experiment's over.
+  const promote = (id: string) => {
+    const name = nameOf(id);
+    setPromoting(null);
+    ask("promote", e, {
+      shows: { ...e, state: "promoted", promoted: id, variants: vs.map((v) => ({ ...v, current: v.id === id })) },
+      asks: () =>
+        api.promote(d.id, e.id, id).then((r) => {
+          onPromoted(r.agentdef);
+          return r.experiment;
+        }),
+      failed: `Couldn't promote ${name}`,
+      then: () => toast({ title: `Promoted ${name}`, tone: "succeeded" }),
+    });
+  };
+  // A server-side delete can't be undone, and it's asked again in place before it goes: no Undo.
+  const remove = () => {
+    setEnding(null);
+    ask("delete", e, { shows: null, asks: () => api.remove(d.id, e.id).then(() => null), failed: `Couldn't delete ${e.name}`, then: () => toast({ title: `Deleted ${e.name}`, tone: "info" }) });
+  };
+  const rename = (name: string) => {
+    if (held("name")) return false;
+    ask("name", e, { shows: { ...e, name }, asks: () => api.rename(d.id, e.id, name), failed: `Couldn't rename ${e.name}` });
+    return true;
+  };
+  const renameVariant = (id: string, name: string) => {
+    if (held(`name/${id}`)) return false;
+    ask(`name/${id}`, e, {
+      shows: { ...e, variants: vs.map((v) => (v.id === id ? { ...v, name: name || null } : v)) },
+      asks: () => api.renameVariant(d.id, e.id, id, name),
+      failed: `Couldn't rename ${nameOf(id)}`,
+    });
+    return true;
+  };
+  // Another of the last one's deployment, at weight 0: its id is the server's, so it shows once the server answers.
   const addVariant = () => {
     const last = vs[vs.length - 1];
     if (!last) return;
-    change((x) => ({ ...x, variants: [...x.variants, { ...last, id: `${x.id}-v${x.variants.length + 1}`, name: null, weight: 0, sessions: 0, current: false, measures: NO_MEASURES, trend: {} }] }));
+    ask("variant", e, { asks: () => api.variants.add(d.id, e.id, deploymentAsk(last)), failed: `Couldn't add a variant to ${e.name}`, then: () => setStaged(null) });
   };
-  const dropVariant = (id: string) =>
-    change((x) => {
-      const rest = x.variants.filter((v) => v.id !== id);
-      const total = rest.reduce((n, v) => n + v.weight, 0) || 1;
-      return { ...x, variants: rest.map((v) => ({ ...v, weight: Math.round((v.weight / total) * 100) })) };
+  // Its share back to the others in proportion, as the server will give it (its split's next version where it had one).
+  const dropVariant = (id: string) => {
+    const gone = vs.find((v) => v.id === id);
+    const rest = vs.filter((v) => v.id !== id);
+    const ws = gone && gone.weight > 0 ? rescale(rest.map((v) => v.weight)) : null;
+    setStaged(null);
+    ask(`variant/${id}`, e, {
+      shows: gone && gone.weight > 0 && !ws ? undefined : { ...e, version: ws ? e.version + 1 : e.version, variants: rest.map((v, i) => ({ ...v, weight: ws?.[i] ?? v.weight })) },
+      asks: () => api.variants.remove(d.id, e.id, id),
+      failed: `Couldn't remove ${nameOf(id)}`,
     });
+  };
+  const addCriterion = (c: CriterionAsk, said: (why: string) => void) =>
+    ask("criterion", e, { asks: () => api.criteria.add(d.id, e.id, c), failed: (err) => said(errorMessage(err)), then: () => setAdding(false) });
+  const dropCriterion = (c: Criterion) =>
+    ask(`criterion/${c.id}`, e, { shows: { ...e, criteria: e.criteria.filter((o) => o.id !== c.id) }, asks: () => api.criteria.remove(d.id, e.id, c.id), failed: `Couldn't remove ${c.name}` });
   return (
     <>
       <li className="ms-node df-exp" data-stand={stand} data-depth={2}>
@@ -593,11 +746,7 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
                 defaultValue={e.name}
                 aria-label="Its name"
                 onKeyDown={(k) => {
-                  if (k.key === "Enter" && k.currentTarget.value.trim()) {
-                    const name = k.currentTarget.value.trim();
-                    change((x) => ({ ...x, name }));
-                    setNaming(false);
-                  }
+                  if (k.key === "Enter" && k.currentTarget.value.trim() && rename(k.currentTarget.value.trim())) setNaming(false);
                   if (k.key === "Escape") setNaming(false);
                 }}
               />
@@ -633,7 +782,8 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
                   data-size="sm"
                   data-tone="stop"
                   aria-label={ending === "stop" ? `Stop ${e.name}` : `Delete ${e.name}`}
-                  onClick={ending === "stop" ? stop : onDelete}
+                  disabled={held(ending)}
+                  onClick={ending === "stop" ? stop : remove}
                 >
                   <Check size={15} />
                 </button>
@@ -650,6 +800,8 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
                     data-size="sm"
                     title={live ? "Pause the split" : "Resume the split"}
                     aria-label={`${live ? "Pause" : "Resume"} ${e.name}`}
+                    disabled={held("move")}
+                    {...sendingProps(doing("move"))}
                     onClick={pause}
                   >
                     {live ? <Pause size={15} /> : <Play size={15} />}
@@ -672,15 +824,15 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
         <span
           className="df-exp-split"
           data-staged={staged ? "" : undefined}
-          aria-label={`Split ${vs.map((_, i) => `${variantName(vs, i)} ${weights[i]}%`).join(", ")}${staged ? ", not yet applied" : ""}`}
+          aria-label={`Split ${vs.map((_, i) => `${variantName(vs, i, names)} ${weights[i]}%`).join(", ")}${staged ? ", not yet applied" : ""}`}
         >
           {vs.map((v, i) => (
-            <i key={v.id} style={{ flexGrow: Math.max(weights[i] ?? 0, 0.5), background: variantTone(i, vs.length) }} title={`${variantName(vs, i)} · ${weights[i]}%`} />
+            <i key={v.id} style={{ flexGrow: Math.max(weights[i] ?? 0, 0.5), background: variantTone(i, vs.length) }} title={`${variantName(vs, i, names)} · ${weights[i]}%`} />
           ))}
         </span>
         {staged && (
           <span className="df-exp-ctl">
-            <Button size="xs" variant="secondary" onClick={apply}>
+            <Button size="xs" variant="secondary" pending={doing("weights")} disabled={held("weights")} onClick={apply}>
               Apply the split
             </Button>
             <Button size="xs" variant="ghost" onClick={() => setStaged(null)}>
@@ -695,19 +847,22 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
               key={v.id}
               all={vs}
               i={i}
+              names={names}
               weight={weights[i] ?? v.weight}
               fixed={!running || !own}
+              applying={doing("weights")}
+              held={hold.going}
               promoting={promoting === v.id}
               onPromoting={() => setPromoting(promoting === v.id ? null : v.id)}
               onPromote={() => promote(v.id)}
               onWeight={(w) => setStaged(rebalance(weights, i, w))}
-              onName={(name) => change((x) => ({ ...x, variants: x.variants.map((o) => (o.id === v.id ? { ...o, name: name || null } : o)) }))}
+              onName={(name) => renameVariant(v.id, name)}
               onDrop={vs.length > 2 && !v.current && running && own ? () => dropVariant(v.id) : undefined}
             />
           ))}
         </ul>
         {own && running && (
-          <button type="button" className="df-add" onClick={addVariant}>
+          <button type="button" className="df-add" disabled={held("variant")} {...sendingProps(doing("variant"))} onClick={addVariant}>
             <Plus size={13} aria-hidden="true" />
             Add a variant
           </button>
@@ -715,18 +870,11 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
         <span className="ms-sep-h df-exp-k">Criteria</span>
         {e.criteria.length === 0 && <span className="df-note">No criteria.</span>}
         {e.criteria.map((c) => (
-          <CriterionBlock key={c.id} c={c} vs={vs} onDrop={own ? () => change((x) => ({ ...x, criteria: x.criteria.filter((o) => o.id !== c.id) })) : undefined} />
+          <CriterionBlock key={c.id} c={c} vs={vs} names={names} held={hold.going} onDrop={own ? () => dropCriterion(c) : undefined} />
         ))}
         {own &&
           (adding ? (
-            <CriterionForm
-              e={e}
-              onAdd={(c) => {
-                change((x) => ({ ...x, criteria: [...x.criteria, c] }));
-                setAdding(false);
-              }}
-              onCancel={() => setAdding(false)}
-            />
+            <CriterionForm e={e} names={names} adding={doing("criterion")} held={held("criterion")} onAdd={addCriterion} onCancel={() => setAdding(false)} />
           ) : (
             <button type="button" className="df-add" onClick={() => setAdding(true)}>
               <Plus size={13} aria-hidden="true" />
@@ -738,12 +886,18 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
   );
 }
 
-/** A variant: its swatch and name (renamed in place), its measures, its weight and sessions, Promote, its removal. */
+/**
+ * A variant: its swatch and name (renamed in place), its measures where its sessions have any, its weight and
+ * sessions, Promote, its removal.
+ */
 function VariantLine({
   all,
   i,
+  names,
   weight,
   fixed,
+  applying,
+  held,
   promoting,
   onPromoting,
   onPromote,
@@ -753,20 +907,28 @@ function VariantLine({
 }: {
   all: Variant[];
   i: number;
+  names: ReadonlyMap<string, string>;
   weight: number;
   fixed: boolean;
+  /** Its split's weights are on their way to the server: they hold still until it answers. */
+  applying: boolean;
+  /** A change of its definition's experiments is on its way: its promotion and its removal wait. */
+  held: boolean;
   promoting: boolean;
   onPromoting: () => void;
   onPromote: () => void;
   onWeight: (w: number) => void;
-  onName: (n: string) => void;
+  /** Whether the name was taken (another change on its way holds it). */
+  onName: (n: string) => boolean;
   onDrop?: () => void;
 }) {
   const v = all[i]!;
   const [naming, setNaming] = React.useState(false);
   const tone = variantTone(i, all.length);
-  const name = variantName(all, i);
-  const win = (k: Measure) => all.every((o) => o === v || v.measures[k][2] < o.measures[k][0]);
+  const name = variantName(all, i, names);
+  const m = v.measures;
+  // Its 95% interval clears every other variant's: only where every one has measures.
+  const win = (k: Measure) => m !== undefined && all.every((o) => o === v || (o.measures !== undefined && m[k][2] < o.measures[k][0]));
   return (
     <li className="df-vline">
       <span className="df-vline-top">
@@ -779,13 +941,11 @@ function VariantLine({
             placeholder={variantName(
               all.map((x, j) => (j === i ? { ...x, name: null } : x)),
               i,
+              names,
             )}
             aria-label="Variant name"
             onKeyDown={(k) => {
-              if (k.key === "Enter") {
-                onName(k.currentTarget.value.trim());
-                setNaming(false);
-              }
+              if (k.key === "Enter" && onName(k.currentTarget.value.trim())) setNaming(false);
               if (k.key === "Escape") setNaming(false);
             }}
           />
@@ -797,11 +957,13 @@ function VariantLine({
         )}
         {v.current && <span className="df-head-v">current</span>}
       </span>
-      <span className="df-vline-measures">
-        <Measure label="warm" iv={v.measures.warm_ms} f={MEASURE.warm_ms.f} win={win("warm_ms")} />
-        <Measure label="peak" iv={v.measures.peak_gib} f={MEASURE.peak_gib.f} win={win("peak_gib")} />
-        <Measure label="failed" iv={v.measures.failed_pct} f={MEASURE.failed_pct.f} win={win("failed_pct")} />
-      </span>
+      {m && (
+        <span className="df-vline-measures">
+          <Measure label="warm" iv={m.warm_ms} f={MEASURE.warm_ms.f} win={win("warm_ms")} />
+          <Measure label="peak" iv={m.peak_gib} f={MEASURE.peak_gib.f} win={win("peak_gib")} />
+          <Measure label="failed" iv={m.failed_pct} f={MEASURE.failed_pct.f} win={win("failed_pct")} />
+        </span>
+      )}
       <span className="df-vline-weight">
         <input
           type="range"
@@ -810,7 +972,7 @@ function VariantLine({
           min={0}
           max={100}
           value={weight}
-          disabled={fixed}
+          disabled={fixed || applying}
           aria-label={`${name}'s weight`}
           onChange={(k) => onWeight(Number(k.target.value))}
         />
@@ -823,7 +985,7 @@ function VariantLine({
           {promoting ? (
             <span className="ms-confirm" role="group" aria-label={`Promote ${name}?`}>
               <span>Promote?</span>
-              <button type="button" className="fig-round" data-size="sm" aria-label={`Promote ${name}`} onClick={onPromote}>
+              <button type="button" className="fig-round" data-size="sm" aria-label={`Promote ${name}`} disabled={held} onClick={onPromote}>
                 <Check size={15} />
               </button>
               <button type="button" className="fig-round" data-size="sm" aria-label="Keep the split" onClick={onPromoting}>
@@ -838,7 +1000,7 @@ function VariantLine({
                 </Button>
               )}
               {onDrop && (
-                <button type="button" className="ms-go" aria-label={`Remove ${name}`} title="Remove it" onClick={onDrop}>
+                <button type="button" className="ms-go" aria-label={`Remove ${name}`} title="Remove it" disabled={held} onClick={onDrop}>
                   <X size={15} />
                 </button>
               )}
@@ -857,13 +1019,15 @@ const OP_WORD: Record<Op, string> = { ">": "greater than", ">=": "greater than o
  * A criterion: its name, its rule (its query's value against its bound, as a monitor decides it) and
  * its query; each variant's value, passing or missing, the best marked where the rule has a direction;
  * and each variant's day by day, its bound drawn across. Its values show where the query reads one of
- * kiln's session metrics (kiln's monitors evaluate the rest).
+ * kiln's session metrics and its variants' sessions measured it (kiln's monitors evaluate the rest): none
+ * is shown for a variant with no measures.
  */
-function CriterionBlock({ c, vs, onDrop }: { c: Criterion; vs: Variant[]; onDrop?: () => void }) {
+function CriterionBlock({ c, vs, names, held, onDrop }: { c: Criterion; vs: Variant[]; names: ReadonlyMap<string, string>; held: boolean; onDrop?: () => void }) {
   const k = measureOf(c.query);
   const f = k ? MEASURE[k].f : (x: number) => String(Number(x.toPrecision(4)));
-  const mids = k ? vs.map((v) => v.measures[k][1]) : [];
-  const best = c.op === "<" || c.op === "<=" ? Math.min(...mids) : c.op === ">" || c.op === ">=" ? Math.max(...mids) : null;
+  const vals = vs.map((v) => (k ? v.measures?.[k][1] : undefined));
+  const mids = vals.filter((x): x is number => x !== undefined);
+  const best = mids.length === 0 ? null : c.op === "<" || c.op === "<=" ? Math.min(...mids) : c.op === ">" || c.op === ">=" ? Math.max(...mids) : null;
   return (
     <div className="df-crit">
       <span className="df-crit-top">
@@ -872,7 +1036,7 @@ function CriterionBlock({ c, vs, onDrop }: { c: Criterion; vs: Variant[]; onDrop
           {OP_WORD[c.op]} {f(c.bound)}
         </span>
         {onDrop && (
-          <button type="button" className="ms-go" aria-label={`Remove ${c.name}`} title="Remove it" onClick={onDrop}>
+          <button type="button" className="ms-go" aria-label={`Remove ${c.name}`} title="Remove it" disabled={held} onClick={onDrop}>
             <X size={14} />
           </button>
         )}
@@ -882,21 +1046,24 @@ function CriterionBlock({ c, vs, onDrop }: { c: Criterion; vs: Variant[]; onDrop
       </code>
       {k ? (
         <>
-          <span className="df-crit-vals">
-            {vs.map((v, i) => {
-              const x = mids[i] ?? 0;
-              const ok = passes(c.op, x, c.bound);
-              return (
-                <span key={v.id} className="df-crit-val" data-best={x === best || undefined} data-missed={!ok || undefined}>
-                  <Swatch tone={variantTone(i, vs.length)} />
-                  {f(x)}
-                  {ok ? " passes" : " misses"}
-                  {x === best ? " · best" : ""}
-                </span>
-              );
-            })}
-          </span>
-          <TrendChart lines={vs.map((v, i) => ({ label: variantName(vs, i), tone: variantTone(i, vs.length), values: v.trend?.[k] ?? [] }))} bound={c.bound} label={`${c.name}, day by day`} />
+          {mids.length > 0 && (
+            <span className="df-crit-vals">
+              {vs.map((v, i) => {
+                const x = vals[i];
+                if (x === undefined) return null;
+                const ok = passes(c.op, x, c.bound);
+                return (
+                  <span key={v.id} className="df-crit-val" data-best={x === best || undefined} data-missed={!ok || undefined}>
+                    <Swatch tone={variantTone(i, vs.length)} />
+                    {f(x)}
+                    {ok ? " passes" : " misses"}
+                    {x === best ? " · best" : ""}
+                  </span>
+                );
+              })}
+            </span>
+          )}
+          <TrendChart lines={vs.map((v, i) => ({ label: variantName(vs, i, names), tone: variantTone(i, vs.length), values: v.trend?.[k] ?? [] }))} bound={c.bound} label={`${c.name}, day by day`} />
         </>
       ) : (
         <span className="df-note">Values from kiln&apos;s monitors.</span>
@@ -941,10 +1108,26 @@ const QueryInput = React.lazy(() => import("@/components/code/query-input"));
 /**
  * A criterion added in place: its name, then its whole expression in kiln's monitoring query syntax
  * (Datadog's: aggregations, a metric or a formula, its scope, by variant, a comparison and a bound),
- * coloured and completed as it's typed; Add (or Enter), which kiln's monitor check passes first, and
- * Cancel.
+ * coloured and completed as it's typed; Add (or Enter), which kiln's monitor check passes first, then
+ * the server keeps (its words in place where it refuses it), and Cancel.
  */
-function CriterionForm({ e, onAdd, onCancel }: { e: Experiment; onAdd: (c: Criterion) => void; onCancel: () => void }) {
+function CriterionForm({
+  e,
+  names,
+  adding,
+  held,
+  onAdd,
+  onCancel,
+}: {
+  e: Experiment;
+  names: ReadonlyMap<string, string>;
+  /** Its criterion is on its way to the server. */
+  adding: boolean;
+  /** Another change of its definition's experiments is: Add waits. */
+  held: boolean;
+  onAdd: (c: CriterionAsk, said: (why: string) => void) => void;
+  onCancel: () => void;
+}) {
   const [name, setName] = React.useState("");
   const [expr, setExpr] = React.useState(`${queryOf("failed_pct", e.id)} `);
   const [said, setSaid] = React.useState<string | null>(null);
@@ -954,23 +1137,24 @@ function CriterionForm({ e, onAdd, onCancel }: { e: Experiment; onAdd: (c: Crite
       metrics: Object.values(METRIC),
       tags: {
         experiment: [{ value: e.id, detail: e.name }],
-        variant: e.variants.map((v, i) => ({ value: v.id, detail: variantName(e.variants, i) })),
+        variant: e.variants.map((v, i) => ({ value: v.id, detail: variantName(e.variants, i, names) })),
       },
     }),
-    [e],
+    [e, names],
   );
   const ready = name.trim() !== "" && expr.trim() !== "";
   // The expression as the field has it (Enter passes the editor's own: a render can lag the last key typed).
   const add = (text: string) => {
     const typed = text.trim();
-    if (name.trim() === "" || typed === "" || checking) return;
+    if (name.trim() === "" || typed === "" || checking || adding || held) return;
     setChecking(true);
     observeApi
       .validateMonitor(typed)
       .then((c) => {
         if (!c.ok || c.op === undefined || c.threshold === undefined) return setSaid(c.error ?? "It needs a comparison and a bound: < 10");
         const query = typed.replace(/\s*(>=|<=|==|!=|>|<)\s*-?\d+(?:\.\d+)?\s*$/, "");
-        onAdd({ id: `c-${Date.now()}`, name: name.trim(), query, op: c.op as Op, bound: c.threshold });
+        setSaid(null);
+        onAdd({ name: name.trim(), query, op: c.op as Op, bound: c.threshold }, setSaid);
       })
       .catch((err: unknown) => setSaid(errorMessage(err)))
       .finally(() => setChecking(false));
@@ -997,7 +1181,7 @@ function CriterionForm({ e, onAdd, onCancel }: { e: Experiment; onAdd: (c: Crite
         </span>
       )}
       <span className="df-crit-acts">
-        <Button size="xs" disabled={!ready || checking} onClick={() => add(expr)}>
+        <Button size="xs" pending={checking || adding} disabled={!ready || held} onClick={() => add(expr)}>
           Add
         </Button>
         <Button size="xs" variant="ghost" onClick={onCancel}>
@@ -1009,29 +1193,54 @@ function CriterionForm({ e, onAdd, onCancel }: { e: Experiment; onAdd: (c: Crite
 }
 
 type Draft = { agentfile: string; engine: "microvm" | "host"; cpus: number; memory: number; weight: number };
+/** A draft as its deployment: on the host, no Agentfile or size (what it had stays in the draft, for a microVM again). */
+const draftDeployment = (v: Draft): Deployment => (v.engine === "host" ? { engine: "host", agentfile: null } : { engine: "microvm", agentfile: v.agentfile, cpus: v.cpus, memory: v.memory });
+/** A draft as a new experiment asks for it: a host's carries no Agentfile or size, which the server refuses for one (422). */
+const draftAsk = (v: Draft): VariantAsk => (v.engine === "host" ? { weight: v.weight, engine: "host" } : { weight: v.weight, agentfile: v.agentfile, cpus: v.cpus, memory: v.memory });
 
-/** A new experiment, set up in place: its name, its variants (as many as you add, each a deployment and a weight); Start splits new sessions, and its criteria are added on its card. */
-function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; onStart: (e: Experiment) => void }) {
+/**
+ * A new experiment, set up in place: its name, its variants (as many as you add, each a deployment and a
+ * weight: a microVM's Agentfile, of yours or kiln's for its harness, and size, or the host); Start splits new
+ * sessions once the server takes it (its words in place where it doesn't: one live at a time, a variant it
+ * can't run), and its criteria are added on its card.
+ */
+function SetupNodes({
+  d,
+  agentfiles,
+  names,
+  hold,
+  onDone,
+  onStart,
+}: {
+  d: AgentDef;
+  agentfiles: AgentfileListing | undefined;
+  names: ReadonlyMap<string, string>;
+  hold: Hold;
+  onDone: () => void;
+  onStart: (e: Experiment) => void;
+}) {
   const G = 2 ** 30;
+  // The definition's own Agentfile at first, else kiln's for its harness.
+  const first = d.agentfile ?? `harness-${d.harness}`;
   const [name, setName] = React.useState(`${d.name}'s sizes`);
   const [vs, setVs] = React.useState<Draft[]>([
-    { agentfile: setupAgentfile(d), engine: "microvm", cpus: 2, memory: 4 * G, weight: 80 },
-    { agentfile: setupAgentfile(d), engine: "microvm", cpus: 4, memory: 8 * G, weight: 20 },
+    { agentfile: first, engine: "microvm", cpus: 2, memory: 4 * G, weight: 80 },
+    { agentfile: first, engine: "microvm", cpus: 4, memory: 8 * G, weight: 20 },
   ]);
+  const [said, setSaid] = React.useState<string | null>(null);
+  const shown = vs.map(draftDeployment);
+  // What a microVM can start from: its first, yours, and kiln's for its harness.
+  const choices = [...new Set([first, ...(agentfiles?.agentfiles ?? []).map((a) => `agentfile:${a.id}`), ...(agentfiles?.builtin ?? []).filter((b) => b.harness === d.harness).map((b) => b.name)])];
   const set = (i: number, patch: Partial<Draft>) => setVs(vs.map((v, j) => (j === i ? { ...v, ...patch } : v)));
-  const start = () => {
-    onStart({
-      id: `${d.name}-${Date.now()}`,
-      name: name.trim() || `${d.name}'s split`,
-      state: "live",
-      version: 1,
-      sessions: 0,
-      started_at: Date.now(),
-      criteria: [],
-      variants: vs.map((v, i) => ({ id: `new-${i}`, name: null, ...v, sessions: 0, current: i === 0, measures: NO_MEASURES, trend: {} })),
+  const start = () =>
+    hold.change("create", async () => {
+      setSaid(null);
+      try {
+        onStart(await agentdefsApi.experiments.create(d.id, { name: name.trim() || `${d.name}'s split`, variants: vs.map(draftAsk) }));
+      } catch (err) {
+        setSaid(errorMessage(err));
+      }
     });
-    toast({ title: `Started ${name.trim()}`, tone: "running" });
-  };
   return (
     <li className="ms-node df-exp-body df-exp-new" data-stand="paused" data-depth={2}>
       <span className="ms-sep-h df-exp-k">New experiment</span>
@@ -1041,8 +1250,8 @@ function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; o
         {vs.map((v, i) => (
           <li key={i} className="df-vline">
             <span className="df-vline-top">
-              <Swatch tone={variantTone(i, vs.length)} title={variantName(vs, i)} />
-              <span className="df-vname">{variantName(vs, i)}</span>
+              <Swatch tone={variantTone(i, vs.length)} title={variantName(shown, i, names)} />
+              <span className="df-vname">{variantName(shown, i, names)}</span>
               {i > 1 && (
                 <button type="button" className="ms-go" aria-label="Remove this variant" onClick={() => setVs(vs.filter((_, j) => j !== i))}>
                   <X size={15} />
@@ -1050,11 +1259,16 @@ function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; o
               )}
             </span>
             <span className="ms-setup">
-              <select className="ms-edit-in" value={v.agentfile} aria-label="Agentfile" onChange={(k) => set(i, { agentfile: k.target.value })}>
-                {["rust-dev", "docs-site", `harness-${d.harness}`].map((a) => (
-                  <option key={a}>{a}</option>
-                ))}
-              </select>
+              {/* A microVM's Agentfile and size; a host runs its harness as a process of its machine, with neither. */}
+              {v.engine === "microvm" && (
+                <select className="ms-edit-in" value={v.agentfile} aria-label="Agentfile" onChange={(k) => set(i, { agentfile: k.target.value })}>
+                  {choices.map((a) => (
+                    <option key={a} value={a}>
+                      {names.get(a) ?? a}
+                    </option>
+                  ))}
+                </select>
+              )}
               <Segmented
                 size="xs"
                 label="Engine"
@@ -1092,7 +1306,7 @@ function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; o
                 min={0}
                 max={100}
                 value={v.weight}
-                aria-label={`${variantName(vs, i)}'s weight`}
+                aria-label={`${variantName(shown, i, names)}'s weight`}
                 onChange={(k) => {
                   const ws = rebalance(
                     vs.map((x) => x.weight),
@@ -1111,8 +1325,13 @@ function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; o
         <Plus size={13} aria-hidden="true" />
         Add a variant
       </button>
+      {said && (
+        <span className="df-note" role="alert">
+          {said}
+        </span>
+      )}
       <span className="df-exp-ctl">
-        <Button size="xs" onClick={start}>
+        <Button size="xs" pending={hold.doing("create")} disabled={hold.held("create")} onClick={start}>
           Start
         </Button>
         <Button size="xs" variant="ghost" onClick={onDone}>
@@ -1338,9 +1557,6 @@ function AgentfileNameRead({ ref_, harness }: { ref_: string | null; harness: st
   const names = useAgentfileNames();
   return <span>{ref_ ? (names.get(ref_) ?? ref_) : `harness-${harness}`}</span>;
 }
-/** The Agentfile an experiment's setup starts from: the definition's, by name where it's one of yours. */
-const setupAgentfile = (d: AgentDef) => (d.agentfile?.startsWith("agentfile:") ? (d.name === "release-notes" ? "docs-site" : "rust-dev") : (d.agentfile ?? `harness-${d.harness}`));
-
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 /** What a definition holds besides its values: its tools, MCP servers and skills, counted. */
 function Holds({ id }: { id: string }) {
