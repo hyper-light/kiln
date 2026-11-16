@@ -125,17 +125,24 @@ impl FakeVms {
 }
 
 /// A stand-in for kiln's MCP lane through Hex (Shards D254's controller, `Execs::mcp`): the connections its runs'
-/// harnesses make, handed out in turn, then `Ended`; and each run asked for one, in order.
+/// harnesses make, handed out in turn, each to whichever run asks or to its own run alone, then `Ended`; and each
+/// run asked for one, in order.
 #[derive(Default)]
 pub struct FakeLanes {
-    conns: Mutex<std::collections::VecDeque<super::McpConnection>>,
+    conns: Mutex<std::collections::VecDeque<(Option<String>, super::McpConnection)>>,
     asked: Mutex<Vec<String>>,
 }
 
 impl FakeLanes {
-    /// Handing out `conns` in turn.
+    /// Handing out `conns` in turn, to whichever run asks.
     pub fn of(conns: Vec<super::McpConnection>) -> Self {
-        Self { conns: Mutex::new(conns.into()), asked: Mutex::new(Vec::new()) }
+        Self { conns: Mutex::new(conns.into_iter().map(|c| (None, c)).collect()), asked: Mutex::new(Vec::new()) }
+    }
+
+    /// Handing out each of `conns` to its own run alone, as Hex's lane takes a run's connections by its box and member
+    /// (`Runtime::mcp`).
+    pub fn per_run(conns: Vec<(&str, super::McpConnection)>) -> Self {
+        Self { conns: Mutex::new(conns.into_iter().map(|(run, c)| (Some(run.to_owned()), c)).collect()), asked: Mutex::new(Vec::new()) }
     }
 
     /// Each run a connection was asked for, in order.
@@ -151,7 +158,9 @@ impl super::Lanes for FakeLanes {
 
     fn next(&self, run: &str) -> Result<super::McpConnection, Refusal> {
         self.asked.lock().push(run.to_owned());
-        self.conns.lock().pop_front().ok_or(Refusal::Ended)
+        let mut conns = self.conns.lock();
+        let at = conns.iter().position(|(owner, _)| owner.as_deref().is_none_or(|o| o == run)).ok_or(Refusal::Ended)?;
+        conns.remove(at).map(|(_, c)| c).ok_or(Refusal::Ended)
     }
 }
 

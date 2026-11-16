@@ -26,6 +26,12 @@
 //!   its anytime-valid confidence sequence (`kiln_ci::split`), so reading them live inflates no false winner.
 //!   Pausing stops the draws; deciding promotes one variant (a person's press), which every later session of the
 //!   target gets, and ends the split; cancelling ends both.
+//! - **A replay** (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b, an addition to the split): one of its opener's
+//!   recorded sessions, its tool calls run offline in a microVM of each of the split's microVM variants, `rounds` times,
+//!   one run at a time on one runner (runs side by side would measure each other), interleaved: every round runs each
+//!   variant once, in a shuffled order. What runs is `kiln_ci::replay`'s plan of the session's calls, on the runner
+//!   (`crate::sandbox::replay`, asked by `ServerMsg::Replay`): no model, no person, no grant past its microVM. Each run
+//!   measures what a session does, and its runs are read as a split's sessions are (`kiln_ci::split::analyze`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -149,6 +155,9 @@ pub struct Experiment {
     /// A split's variants, each a deployment with its weight.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub arms: Vec<Arm>,
+    /// A split's replays of recorded sessions (P7.1b), newest last: kept apart from it, and laid over it as it's shown.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replays: Vec<Replay>,
     pub strategy: Option<Strategy>,
     pub baseline: bool,
     pub criteria: Vec<Criterion>,
@@ -183,6 +192,8 @@ pub struct Experiment {
 /// How many variants run at once, and repetitions, by default.
 const PARALLEL: usize = 4;
 const REPETITIONS: usize = 3;
+/// The most repetitions an experiment measures each variant, and rounds a replay runs.
+const MOST_REPETITIONS: usize = 20;
 /// How long one measuring run may take.
 const ONE_RUN: Duration = Duration::from_secs(3 * 3600);
 /// How long a machine measuring beside the agent may go unheard before its measurement is given up.
@@ -212,6 +223,16 @@ fn paused_key(id: &str) -> String {
 /// A split's draws, each its own: the `n`-th session's variant, and what came of it.
 fn drawn_key(id: &str, n: u64) -> String {
     format!("ci/experiment-drawn/{id}/{n:012}")
+}
+
+/// A split's replay `n` (P7.1b).
+fn replay_key(id: &str, n: u64) -> String {
+    format!("ci/experiment-replay/{id}/{n:06}")
+}
+
+/// Run `k` of a split's replay `n`, each kept on its own as it ends.
+fn replayed_key(id: &str, n: u64, k: usize) -> String {
+    format!("ci/experiment-replayed/{id}/{n:06}/{k:06}")
 }
 
 fn bad(m: impl Into<String>) -> Fail {
@@ -483,7 +504,7 @@ pub async fn start(hub: &Arc<Hub>, caller: &Caller, body: Value) -> Result<Respo
         strategy: Some(strategy),
         baseline,
         criteria: ask.criteria.clone(),
-        repetitions: ask.repetitions.unwrap_or(REPETITIONS).clamp(1, 20),
+        repetitions: ask.repetitions.unwrap_or(REPETITIONS).clamp(1, MOST_REPETITIONS),
         max_parallel: ask.max_parallel.unwrap_or(PARALLEL).clamp(1, 16),
         budget_minutes: ask.budget_minutes,
         budget_seconds: ask.budget_seconds.or(ask.budget_minutes.map(|m| m.saturating_mul(60))).filter(|s| *s > 0),
@@ -1302,6 +1323,7 @@ pub async fn show(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fail
     let mut e = mine(hub, caller, id, "runs.read").await?;
     if e.target.is_some() {
         read_split(hub, &mut e).await;
+        e.replays = replays_of(hub, &e).await;
     }
     Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })))
 }
@@ -1356,6 +1378,16 @@ pub async fn cancel(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fa
 /// measured in beside their agents go once those agents' runners are back.
 #[allow(clippy::disallowed_methods)] // (e) an interrupted experiment waits 120 s, picked
 pub async fn interrupted(hub: &Arc<Hub>) {
+    for (key, text) in hub.store.kv_prefix("ci/experiment-replay/".to_owned()).await.unwrap_or_default() {
+        let Ok(mut r) = serde_json::from_str::<Replay>(&text) else { continue };
+        if r.state == "running" {
+            r.state = "failed".into();
+            r.why = Some("the server restarted while it ran: replay it again".into());
+            if let Ok(text) = serde_json::to_string(&r) {
+                let _ = hub.store.kv_set(key, text).await;
+            }
+        }
+    }
     for mut e in all(hub).await {
         if matches!(e.state.as_str(), "implementing" | "building" | "measuring") {
             e.state = "failed".into();
@@ -1828,6 +1860,331 @@ async fn read_split(hub: &Hub, e: &mut Experiment) {
     e.results = serde_json::to_value(split::analyze(&names, &sessions)).ok();
 }
 
+/// A replay of one of a split's opener's recorded sessions against its microVM variants (P7.1b; module docs).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Replay {
+    /// Its number within its split: `1`, `2`, ….
+    pub n: u64,
+    pub session: String,
+    /// The runner its runs run on, one at a time.
+    pub on: String,
+    pub rounds: usize,
+    /// The variants it replays in, in the split's order: each that runs in a microVM.
+    pub arms: Vec<String>,
+    /// The variants it doesn't, and why.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub not_replayed: BTreeMap<String, String>,
+    /// Of its session's recorded calls (`calls`), how many each run replays (`steps`), and why the rest aren't.
+    pub calls: usize,
+    pub steps: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped: BTreeMap<kiln_ci::replay::Skip, usize>,
+    /// `running`, `done`, `cancelled`, or `failed` (`why`).
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    pub by: String,
+    pub at: i64,
+    /// Its runs as they ended, and what they say of each variant as a split's sessions say it; laid over it as it's
+    /// shown.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<Replayed>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<Value>,
+}
+
+/// A run of a replay: its variant and round, and what it measured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Replayed {
+    pub arm: String,
+    pub round: usize,
+    #[serde(flatten)]
+    pub answer: crate::sandbox::replay::Answer,
+}
+
+/// A tool call as a replay reads its record.
+fn recorded_of(t: &crate::harness::model::ToolCall) -> kiln_ci::replay::Recorded {
+    use crate::harness::model::{ToolKind as T, ToolStatus as S};
+    use kiln_ci::replay::{Kind, Ran};
+    let kind = match t.tool {
+        T::Shell => Kind::Shell,
+        T::Edit => Kind::Edit,
+        T::Read => Kind::Read,
+        T::Search => Kind::Search,
+        T::Web => Kind::Web,
+        T::Agent => Kind::Agent,
+        T::Skill => Kind::Skill,
+        T::Todo => Kind::Todo,
+        T::Question => Kind::Question,
+        T::Plan => Kind::Plan,
+        T::Mcp => Kind::Mcp,
+        T::Other => Kind::Other,
+    };
+    let ran = match t.status {
+        S::Pending => Ran::Pending,
+        S::Running => Ran::Running,
+        S::Done => Ran::Done,
+        S::Error => Ran::Error,
+        S::Denied => Ran::Denied,
+        S::Cancelled => Ran::Cancelled,
+    };
+    let ms = t.ended.and_then(|end| u64::try_from(end.saturating_sub(t.started)).ok());
+    kiln_ci::replay::Recorded { kind, name: t.name.clone(), input: t.input.clone(), ran, exit_code: t.exit_code, ms, shortened: crate::harness::model::json_clipped(&t.input) }
+}
+
+/// Session `session`'s recorded tool calls in their order, as kiln's conversation store keeps its events, a page at a
+/// time (each event as its newest revision says it).
+async fn recorded(hub: &Hub, session: &str) -> Result<Vec<kiln_ci::replay::Recorded>, Fail> {
+    let store = hub.harness.convo.clone().ok_or_else(|| (StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off), so no session's calls to replay".to_owned()))?;
+    let s = session.to_owned();
+    let rows = crate::rt::blocking(move || -> anyhow::Result<Vec<(String, String)>> {
+        let page = crate::harness::copies::EVENTS_PAGE;
+        let (mut pages, mut before) = (Vec::new(), None);
+        loop {
+            let rows = store.events_committed(&s, before, page)?;
+            let (full, first) = (rows.len() >= page, rows.first().map(|r| r.seq));
+            pages.push(rows.into_iter().filter(|r| r.kind == "tool").map(|r| (r.id, r.body)).collect::<Vec<_>>());
+            match first {
+                Some(seq) if full => before = Some(seq),
+                _ => break,
+            }
+        }
+        Ok(pages.into_iter().rev().flatten().collect())
+    })
+    .await
+    .and_then(|r| r)
+    .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("{session}'s calls weren't read: {e:#}")))?;
+    let mut calls: Vec<kiln_ci::replay::Recorded> = Vec::new();
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (id, body) in rows {
+        let Ok(event) = serde_json::from_str::<crate::harness::model::Event>(&body) else { continue };
+        let crate::harness::model::Body::Tool(t) = event.body else { continue };
+        let call = recorded_of(&t);
+        match at.get(&id).copied() {
+            Some(k) => {
+                if let Some(kept) = calls.get_mut(k) {
+                    *kept = call;
+                }
+            }
+            None => {
+                at.insert(id, calls.len());
+                calls.push(call);
+            }
+        }
+    }
+    Ok(calls)
+}
+
+/// The most a replay's ask may be: one frame of the interactive lane it's sent on, which refuses a larger one.
+fn ask_most() -> usize {
+    usize::try_from(<crate::net::Kiln as hyper_transport::Classes>::frame_bound(crate::net::Class::Interactive)).unwrap_or(usize::MAX)
+}
+
+/// What run `round` of replay `r` of split `e` asks of its runner: `plan`'s steps in variant `a`'s microVM, from
+/// `folder`, its image's text and build secrets `kept` where it's a person's own.
+fn replay_ask(e: &Experiment, r: &Replay, a: &Arm, kept: &crate::harness::lineage::Kept, round: usize, folder: &str, plan: &kiln_ci::replay::Plan) -> crate::sandbox::replay::Ask {
+    crate::sandbox::replay::Ask {
+        experiment: e.id.clone(),
+        replay: r.n,
+        arm: a.name.clone(),
+        round,
+        harness: a.harness.clone(),
+        agentfile: a.agentfile.clone(),
+        text: kept.text.clone(),
+        secrets: kept.secrets.clone(),
+        size: a.size.map(|s| (s.cpus, s.memory_mib)),
+        folder: folder.to_owned(),
+        plan: plan.clone(),
+        limit_s: ONE_RUN.as_secs(),
+    }
+}
+
+/// Keeps replay `r` of split `id`.
+async fn keep_replay(hub: &Hub, id: &str, r: &Replay) {
+    let kept = Replay { runs: Vec::new(), results: None, ..r.clone() };
+    if let Ok(text) = serde_json::to_string(&kept)
+        && let Err(err) = hub.store.kv_set(replay_key(id, r.n), text).await
+    {
+        tracing::warn!(experiment = %id, replay = r.n, error = %format!("{err:#}"), "a replay couldn't be kept");
+    }
+}
+
+/// `POST /api/experiments/:id/replay {session, rounds?, on?}` (P7.1b): split `id`'s microVM variants each replay the
+/// caller's recorded session `session` `rounds` times (3), interleaved, one run at a time on runner `on` (the
+/// session's own machine where it's left out), from now on.
+pub async fn replay(hub: &Arc<Hub>, caller: &Caller, id: &str, body: &Value) -> Result<Response, Fail> {
+    let e = mine(hub, caller, id, "experiments.run").await?;
+    if e.target.is_none() {
+        return Err(bad(format!("{id} measures options: only a split's variants replay a session")));
+    }
+    if e.state == "cancelled" {
+        return Err((StatusCode::CONFLICT, format!("{id} was cancelled: it replays nothing")));
+    }
+    let session = body.get("session").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| bad("say which of your sessions it replays (`session`)"))?;
+    let rounds = match body.get("rounds") {
+        None | Some(Value::Null) => REPETITIONS,
+        Some(v) => v.as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| (1..=MOST_REPETITIONS).contains(n)).ok_or_else(|| bad(format!("`rounds` is from 1 to {MOST_REPETITIONS}")))?,
+    };
+    crate::harness::lineage::may_see(hub, caller, session).await?;
+    let info = hub.harness.info(session).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no session `{session}`")))?;
+    let plan = kiln_ci::replay::plan(&recorded(hub, session).await?);
+    if plan.steps.is_empty() {
+        let why: Vec<String> = plan.skipped.iter().map(|(k, n)| format!("{n} {}", serde_json::to_value(k).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default())).collect();
+        return Err((StatusCode::CONFLICT, format!("{session} has no call a replay runs: of its {} calls, none is a command or a whole file written ({})", plan.calls, why.join(", "))));
+    }
+    let (mut runs, mut not_replayed) = (Vec::new(), BTreeMap::new());
+    for a in &e.arms {
+        if a.engine != "microvm" {
+            not_replayed.insert(a.name.clone(), "it runs on its machine, in no microVM: a replay runs in its variant's microVM, as a session's commands run on the machine would change it".to_owned());
+            continue;
+        }
+        let isolation = crate::harness::session::Isolation { image: a.agentfile.clone(), ..crate::harness::session::Isolation::microvm() };
+        let kept = crate::harness::lineage::kept_agentfile(hub, Some(&isolation), Some(e.opener.as_str())).await.map_err(|why| (StatusCode::CONFLICT, format!("variant `{}`: {why}", a.name)))?;
+        runs.push((a.clone(), kept));
+    }
+    if runs.is_empty() {
+        return Err((StatusCode::CONFLICT, format!("none of {id}'s variants runs in a microVM, where a replay runs")));
+    }
+    let on = match body.get("on").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m) => m.to_owned(),
+        None => crate::harness::wait::machine(&info.target).to_owned(),
+    };
+    let speaks = {
+        let inst = hub.instances.load();
+        let Some(newest) = inst.newest(&on) else { return Err((StatusCode::CONFLICT, format!("{} is not connected", hub.shown(&on)))) };
+        inst.get(newest).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::REPLAYS))
+    };
+    if !speaks {
+        return Err((StatusCode::CONFLICT, format!("{}'s kiln replays no session: upgrade it (System → Updates)", hub.shown(&on))));
+    }
+    let replays = replays_of(hub, &e).await;
+    if let Some(running) = replays.iter().find(|r| r.state == "running") {
+        return Err((StatusCode::CONFLICT, format!("{id}'s replay {} runs: one at a time, as replays side by side would measure each other", running.n)));
+    }
+    let n = replays.iter().map(|r| r.n).max().unwrap_or(0).saturating_add(1);
+    let r = Replay {
+        n,
+        session: session.to_owned(),
+        on,
+        rounds,
+        arms: runs.iter().map(|(a, _)| a.name.clone()).collect(),
+        not_replayed,
+        calls: plan.calls,
+        steps: plan.steps.len(),
+        skipped: plan.skipped.clone(),
+        state: "running".into(),
+        by: caller.name.clone(),
+        at: crate::util::now_unix(),
+        ..Replay::default()
+    };
+    let folder = info.cwd.clone();
+    for (a, kept) in &runs {
+        let json = serde_json::to_string(&replay_ask(&e, &r, a, kept, 0, &folder, &plan)).map_err(|err| internal(err.into()))?;
+        let frame = crate::proto::encode(&crate::proto::ServerMsg::Replay { req: u64::MAX, json }).map_err(internal)?.len();
+        if frame > ask_most() {
+            return Err((StatusCode::CONFLICT, format!("replaying {session} in `{}` takes {frame} bytes to ask, past the {} one ask carries (its lane's frame)", a.name, ask_most())));
+        }
+    }
+    keep_replay(hub, id, &r).await;
+    hub.store.audit(caller.name.clone(), "experiments.replay".into(), format!("{id}: {session} replayed in {}, {rounds} rounds", r.arms.join(", "))).await;
+    let h = Arc::clone(hub);
+    let answer = r.clone();
+    drop(crate::rt::spawn(async move { drive_replay(h, e, r, runs, folder, plan).await }));
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "replay": answer })))
+}
+
+/// One run asked of runner `on`, waited for as long as the runner gives it and then as long as a machine measuring may
+/// go unheard: what it measured, or why it couldn't (a failed run, counted).
+async fn ask_replay(hub: &Hub, on: &str, ask: &crate::sandbox::replay::Ask) -> crate::sandbox::replay::Answer {
+    use crate::sandbox::replay::Answer;
+    let failed = |why: String| Answer { conclusion: "failure".into(), why: Some(why), ..Answer::default() };
+    let json = match serde_json::to_string(ask) {
+        Ok(json) => json,
+        Err(e) => return failed(format!("its ask wasn't written: {e}")),
+    };
+    match hub.ask_speaking::<Answer>(on, crate::proto::feature::REPLAYS, ONE_RUN.saturating_add(UNHEARD), move |req| crate::proto::ServerMsg::Replay { req, json }).await {
+        Ok(Some(Some(a))) => a,
+        Ok(Some(None)) => failed(format!("{} answered nothing", hub.shown(on))),
+        Ok(None) => failed(format!("{}'s kiln replays no session: upgrade it (System → Updates)", hub.shown(on))),
+        Err(e) => failed(format!("{e:#}")),
+    }
+}
+
+/// Runs replay `r` of split `e` (module docs): each round, each of its variants once, in a shuffled order, one run at a
+/// time on its runner, each run kept as it ends; then done, or cancelled where its split was meanwhile.
+async fn drive_replay(hub: Arc<Hub>, e: Experiment, mut r: Replay, runs: Vec<(Arm, crate::harness::lineage::Kept)>, folder: String, plan: kiln_ci::replay::Plan) {
+    let mut k = 0usize;
+    let seed = seed_of(&format!("{}/{}", e.id, r.n));
+    'rounds: for round in 0..r.rounds {
+        let mut order: Vec<usize> = (0..runs.len()).collect();
+        shuffle(&mut order, seed ^ (round as u64).wrapping_mul(0x9E37_79B9));
+        for i in order {
+            if hub.store.kv_get(cancel_key(&e.id)).await.ok().flatten().is_some() {
+                r.state = "cancelled".into();
+                r.why = Some("its split was cancelled".into());
+                break 'rounds;
+            }
+            let Some((arm, kept)) = runs.get(i) else { continue };
+            let answer = ask_replay(&hub, &r.on, &replay_ask(&e, &r, arm, kept, round, &folder, &plan)).await;
+            if let Ok(text) = serde_json::to_string(&Replayed { arm: arm.name.clone(), round, answer }) {
+                let _ = hub.store.kv_set(replayed_key(&e.id, r.n, k), text).await;
+            }
+            k = k.saturating_add(1);
+        }
+    }
+    if r.state == "running" {
+        r.state = "done".into();
+    }
+    keep_replay(&hub, &e.id, &r).await;
+}
+
+/// A replay's run as a split's session (P7.1b): failed where it couldn't be carried out (its microVM refused, its run
+/// ended before its steps did, its limit passed); `diverged` where it ran to its end and a step ended otherwise than
+/// its record, how many such steps a measure of its own; its start within its kind; its footprint and host CPU as a
+/// session's (`seen_of`).
+fn session_of_run(r: &Replayed) -> split::Session {
+    let a = &r.answer;
+    let finished = a.conclusion == "success";
+    let diverged = a.outcome.map_or(0, |o| o.diverged);
+    let outcome = match (finished, diverged) {
+        (false, _) => "failed",
+        (true, 0) => "ended",
+        (true, _) => "diverged",
+    };
+    let m = a.measured.clone().unwrap_or_default();
+    let mut measures = BTreeMap::new();
+    if let Some(peak) = m.footprint_peak_bytes {
+        measures.insert("footprint_peak_bytes".to_owned(), peak as f64);
+    }
+    if let Some(steady) = m.footprint_steady_bytes {
+        measures.insert("footprint_steady_bytes".to_owned(), steady as f64);
+    }
+    if let Some(cpu) = m.cpu_ns {
+        measures.insert("cpu_ms".to_owned(), cpu as f64 / 1e6);
+    }
+    if finished {
+        measures.insert("diverged_steps".to_owned(), diverged as f64);
+    }
+    let start = m.started_from.as_deref().and_then(split::kind_of).zip(m.start_us.map(|us| us as f64 / 1000.0));
+    split::Session { arm: r.arm.clone(), failed: Some(!finished), outcome: outcome.into(), start, measures }
+}
+
+/// Split `e`'s replays, oldest first, each with its runs as they ended and what they say of each of its variants.
+async fn replays_of(hub: &Hub, e: &Experiment) -> Vec<Replay> {
+    let mut out = Vec::new();
+    for (_, text) in hub.store.kv_prefix(format!("ci/experiment-replay/{}/", e.id)).await.unwrap_or_default() {
+        let Ok(mut r) = serde_json::from_str::<Replay>(&text) else { continue };
+        let prefix = format!("ci/experiment-replayed/{}/{:06}/", e.id, r.n);
+        r.runs = hub.store.kv_prefix(prefix).await.unwrap_or_default().into_iter().filter_map(|(_, t)| serde_json::from_str::<Replayed>(&t).ok()).collect();
+        let sessions: Vec<split::Session> = r.runs.iter().map(session_of_run).collect();
+        r.results = serde_json::to_value(split::analyze(&r.arms, &sessions)).ok();
+        out.push(r);
+    }
+    out
+}
+
 /// `POST /api/experiments/:id/pause` (`on`) and `/resume`: a split's draws stop, and start again.
 pub async fn pause(hub: &Hub, caller: &Caller, id: &str, on: bool) -> Result<Response, Fail> {
     let e = mine(hub, caller, id, "experiments.run").await?;
@@ -1857,7 +2214,7 @@ fn may_read(caller: &Caller, e: &Experiment) -> bool {
     caller.can("runs.read", &Scope::Repo { repo: e.repo.clone() })
 }
 
-/// `/api/experiments[/:id[/decide|/cancel|/pause|/resume]]`, `/where` and `/suggest`.
+/// `/api/experiments[/:id[/decide|/cancel|/pause|/resume|/replay]]`, `/where` and `/suggest`.
 pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: Value) -> Result<Response, Fail> {
     use http::Method;
     match (method, rest) {
@@ -1870,6 +2227,7 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &http::Method, rest:
         (&Method::POST, [id, "cancel"]) => cancel(hub, caller, id).await,
         (&Method::POST, [id, "pause"]) => pause(hub, caller, id, true).await,
         (&Method::POST, [id, "resume"]) => pause(hub, caller, id, false).await,
+        (&Method::POST, [id, "replay"]) => replay(hub, caller, id, &body).await,
         _ => Err((StatusCode::NOT_FOUND, "no such route".into())),
     }
 }
@@ -1906,6 +2264,38 @@ mod tests {
         for part in ["`redis`: Cache the parsed config in Redis", "git worktree add ../app-E3-redis", &"b".repeat(40), "ci_diffs_submit_patch", "Don't land it", ": Which cache?"] {
             assert!(told.contains(part), "{part}: {told}");
         }
+    }
+
+    /// P7.1b ("with the same measures"): a replay's run reads as a split's session does, under a session's measure names
+    /// (`seen_of`'s), its start within its kind; one that couldn't be carried out failed; one whose step ended otherwise
+    /// than recorded diverged, how many such steps a measure of its own; and each variant's runs are read by the split's
+    /// analysis.
+    #[test]
+    fn p7_1b_a_replays_runs_read_as_a_splits_sessions() {
+        use crate::harness::session::Measured;
+        use crate::sandbox::replay::Answer;
+        let run = |arm: &str, diverged: usize, from: &str| Replayed {
+            arm: arm.into(),
+            round: 0,
+            answer: Answer {
+                conclusion: "success".into(),
+                measured: Some(Measured { start_us: Some(250_000), started_from: Some(from.into()), cpu_ns: Some(3_000_000), window_ns: Some(1), footprint_steady_bytes: Some(64 << 20), footprint_peak_bytes: Some(96 << 20) }),
+                outcome: Some(kiln_ci::replay::Outcome { steps: 4, ended: 4, diverged }),
+                ..Answer::default()
+            },
+        };
+        let ended = session_of_run(&run("a", 0, "saved"));
+        assert_eq!((ended.failed, ended.outcome.as_str(), ended.start), (Some(false), "ended", Some(("cold", 250.0))));
+        let names: Vec<&str> = ended.measures.keys().map(String::as_str).collect();
+        assert_eq!(names, ["cpu_ms", "diverged_steps", "footprint_peak_bytes", "footprint_steady_bytes"]);
+        assert_eq!(ended.measures.get("cpu_ms"), Some(&3.0));
+        let diverged = session_of_run(&run("a", 2, "restored"));
+        assert_eq!((diverged.outcome.as_str(), diverged.measures.get("diverged_steps"), diverged.start.map(|s| s.0)), ("diverged", Some(&2.0), Some("template")));
+        let failed = session_of_run(&Replayed { answer: Answer { conclusion: "failure".into(), why: Some("its microVM didn't start".into()), ..Answer::default() }, ..run("b", 0, "warm") });
+        assert_eq!((failed.failed, failed.outcome.as_str(), failed.start, failed.measures.len()), (Some(true), "failed", None, 0));
+        let res = split::analyze(&["a".to_owned(), "b".to_owned()], &[ended, diverged, failed]);
+        assert!(res.arms.iter().any(|a| a.name == "a" && a.assigned == 2 && a.failures.failed == 0 && a.measures.contains_key("footprint_peak_bytes") && a.start_ms.contains_key("cold")), "{res:?}");
+        assert!(res.arms.iter().any(|a| a.name == "b" && a.failures.failed == 1 && a.outcomes.get("failed") == Some(&1)), "{res:?}");
     }
 
     #[test]

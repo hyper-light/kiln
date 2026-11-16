@@ -26,6 +26,23 @@ async function putAwayCards(page: Page) {
 /** The command a session gets over HTTP, as the page sends it. */
 const commandTo = (page: Page, session: string) => page.waitForRequest((r) => r.method() === "POST" && r.url().endsWith(`/api/harness/sessions/${session}/command`));
 
+/** The commands the page sends `agent`'s session over its socket (`SessionUp`: `{t: "cmd", id, c}`). */
+function sentOnSocket(page: Page, agent: string): Record<string, unknown>[] {
+  const sent: Record<string, unknown>[] = [];
+  page.on("websocket", (ws) => {
+    if (!ws.url().includes(`/api/harness/sessions/${agent}/`)) return;
+    ws.on("framesent", (f) => {
+      try {
+        const v = JSON.parse(String(f.payload)) as { t?: unknown; c?: Record<string, unknown> };
+        if (v.t === "cmd" && v.c) sent.push(v.c);
+      } catch {
+        // Not a command.
+      }
+    });
+  });
+  return sent;
+}
+
 test.beforeEach(() => {
   test.skip(REAL, "the mock's agents");
 });
@@ -68,17 +85,20 @@ test("Branch makes a Variant beside the subagent, marked in the tree; New agent 
 
 test("Keep on a finished variant tells its parent to use its result; one at work has none", async ({ page, request }) => {
   await request.post("/api/mock/tree-variant");
+  // Keep's words are a message to its parent (W20's sendMail): on the parent's socket, open on its page.
+  const socket = sentOnSocket(page, "tree-lead");
   await page.goto("/agents/tree-lead?task=tree-s2v");
   await putAwayCards(page);
   const end = page.locator(".hx-thread-end");
   await expect(end).toHaveAttribute("data-stand", "done");
-  const sent = commandTo(page, "tree-lead");
   await end.getByRole("button", { name: "Keep" }).click();
-  const body = (await sent).postDataJSON() as { type: string; mode: string; text: string };
+  const sent = () => socket.find((c) => c.type === "send");
+  await expect.poll(sent).toBeDefined();
+  const body = sent() as { type: string; mode: string; text: string };
   expect(body).toMatchObject({ type: "send", mode: "queue" });
   expect(body.text).toContain("“Catch up in 64-entry batches”, the variant of “Follower catch-up”");
   expect(body.text).toContain("agents_result (tree-s2v)");
-  await expect(end.getByRole("button", { name: "Kept" })).toBeDisabled();
+  await expect(end.getByRole("button", { name: "Queued" })).toBeDisabled();
 
   await page.goto("/agents/tree-lead?task=tree-s1");
   await expect(page.getByRole("button", { name: "Keep" })).toHaveCount(0);

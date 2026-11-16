@@ -502,3 +502,28 @@ fn p5_6_s2_the_agents_pages_controls_are_operations_and_the_command_route_takes_
     anyhow::ensure!(st == 404, "no such agent: {st} {said}");
     Ok(())
 }
+
+/// P6.2 (kiln plan 01a1dd2e959772a1b17bc49026448e8a): an agent definition keeps its volumes, each a name
+/// and the most bytes it may hold, through a change and a restore, so a person sees them; one whose
+/// volume has no name of its own, or a bound of 0, is checked so and isn't kept, saying why.
+#[test]
+fn p6_2_an_agent_definition_keeps_its_volumes_and_refuses_bad_ones() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let srv = start_env(dir.path(), &Options::default(), false, &[])?;
+    let ada = person(&srv, "ada", &["developer"])?;
+    let volumes = json!([{ "name": "cargo", "bytes": 10_737_418_240_u64 }, { "name": "npm.cache", "bytes": 1_073_741_824_u64 }]);
+    let (st, made) = call(&srv, &ada, "POST", "/api/agentdefs", Some(json!({ "name": "builder", "harness": "claude", "volumes": volumes })))?;
+    anyhow::ensure!(st == 200 && made.get("volumes") == Some(&volumes) && made.get("version") == Some(&json!(1)), "{st} {made}\n{}", srv.log());
+    let id = s(&made, "/id");
+    let (st, v2) = call(&srv, &ada, "PATCH", &format!("/api/agentdefs/{id}"), Some(json!({ "volumes": [] })))?;
+    anyhow::ensure!(st == 200 && v2.get("version") == Some(&json!(2)) && v2.get("volumes").is_none(), "none left, a new version: {st} {v2}");
+    let (st, v3) = call(&srv, &ada, "POST", &format!("/api/agentdefs/{id}/restore"), Some(json!({ "version": 1 })))?;
+    anyhow::ensure!(st == 200 && v3.get("version") == Some(&json!(3)) && v3.get("volumes") == Some(&volumes), "restored with them: {st} {v3}");
+    for bad in [json!([{ "name": "cache", "bytes": 0 }]), json!([{ "name": "-cache", "bytes": 1 }]), json!([{ "name": "a", "bytes": 1 }, { "name": "a", "bytes": 2 }])] {
+        let (st, checked) = call(&srv, &ada, "POST", "/api/agentdefs/check", Some(json!({ "harness": "claude", "volumes": bad })))?;
+        anyhow::ensure!(st == 200 && checked.get("ok") == Some(&json!(false)), "{bad}: {st} {checked}");
+        let (st, refused) = call(&srv, &ada, "POST", "/api/agentdefs", Some(json!({ "name": "bad", "harness": "claude", "volumes": bad })))?;
+        anyhow::ensure!(st == 422, "{bad} isn't kept: {st} {refused}");
+    }
+    Ok(())
+}

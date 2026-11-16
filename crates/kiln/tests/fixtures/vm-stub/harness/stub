@@ -18,7 +18,9 @@ prompt asks with words:
     WRITE=<name>    the file <name> written in its folder, its name as its words, as a harness at work
                     in its project writes one: `WROTE <name>`, or `WRITE_FAIL <why>`
     MCP_PING        a round trip to kiln's MCP server, the one its dialect was given (stdio or HTTP):
-                    initialize, then tools/list: `MCP_OK <tools> <first tool>`, or `MCP_FAIL <why>`
+                    initialize, then tools/list: `MCP_OK <tools> <first tool>`, then `MCP_AS <agent>`
+                    where kiln's answer to initialize names whom it serves (its instructions' "You are
+                    kiln agent <id>"); or `MCP_FAIL <why>`
     SPAWN=<kind>    an agent of that harness started through kiln's MCP server (`agents_start`), from
                     where this one runs: `SPAWN_OK <its id>`, or `SPAWN_FAIL <why>`
     SLOW=<ms>       that long between its lines, so a turn lasts long enough to steer into
@@ -54,6 +56,8 @@ LINES = int(os.environ.get("VM_STUB_LINES", "2"))
 VERSION = os.environ.get("VM_STUB_VERSION", "9.9.9-stub")
 CONNECT_WITHIN = float(os.environ.get("VM_STUB_CONNECT_SECS", "20"))
 ACP_PROGRAMS = {"acp", "agent", "cursor-agent", "gemini", "opencode", "goose", "amp-acp", "devin"}
+# Whom kiln's MCP server serves, as its answer to initialize says it (kiln's `mcp::you_are`).
+YOU_ARE = re.compile(r"\bYou are kiln agent ([^\s:]+)")
 
 _OUT = threading.Lock()
 
@@ -285,6 +289,8 @@ class Mcp:
         self.proc = None
         self.next_id = 0
         self.session = None
+        # The agent kiln's answer to initialize named, where it named one.
+        self.named = None
         if "command" in server:
             env = dict(os.environ)
             env.update(server.get("env") or {})
@@ -354,21 +360,25 @@ def _connect(servers):
     if not servers:
         raise OSError("no kiln MCP server was given to this harness")
     c = Mcp(servers[0])
-    c.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "vm-stub", "version": VERSION}})
+    init = c.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "vm-stub", "version": VERSION}})
+    named = YOU_ARE.search(str(init.get("instructions") or ""))
+    c.named = named.group(1) if named else None
     c.notify("notifications/initialized")
     return c
 
 
 def mcp_ping(servers):
+    """Its lines: `MCP_OK <tools> <first tool>` and, where kiln named whom it serves, `MCP_AS <agent>`; or
+    `MCP_FAIL <why>`."""
     c = None
     try:
         c = _connect(servers)
         tools = c.call("tools/list", {}).get("tools") or []
         if not tools:
-            return "MCP_FAIL kiln's MCP server listed no tools"
-        return "MCP_OK %d %s" % (len(tools), tools[0].get("name", "?"))
+            return ["MCP_FAIL kiln's MCP server listed no tools"]
+        return ["MCP_OK %d %s" % (len(tools), tools[0].get("name", "?"))] + (["MCP_AS " + c.named] if c.named else [])
     except (OSError, ValueError) as e:
-        return "MCP_FAIL %s" % e
+        return ["MCP_FAIL %s" % e]
     finally:
         if c:
             c.close()
@@ -432,7 +442,8 @@ class Turn:
         if name:
             self.say(write(name.group(1)))
         if "MCP_PING" in self.prompt:
-            self.say(mcp_ping(self.servers))
+            for line in mcp_ping(self.servers):
+                self.say(line)
         kind = re.search(r"\bSPAWN=([a-z]+)\b", self.prompt)
         if kind:
             self.say(spawn(self.servers, kind.group(1)))

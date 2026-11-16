@@ -241,7 +241,7 @@ runs and its runners: a definition's run is one of those agents.)
 | Method | Path | |
 |---|---|---|
 | GET | `/api/agentdefs?all=` | `{ agents: AgentDefBrief[], reaches_all, builtin: KilnAgentDef[], uses: { [kiln_id]: id } }`, newest change first |
-| POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile? }` → `AgentDef` (version 1); 422 `kiln can't run this agent: <why>`, 409 a name taken |
+| POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile?, volumes?: { name, bytes }[] }` → `AgentDef` (version 1; `volumes`: what it keeps from one of its sessions to the next on each machine, docs/isolation.md "An agent's volumes"); 422 `kiln can't run this agent: <why>`, 409 a name taken |
 | POST | `/api/agentdefs/check` | the settings → `{ ok, problems: string[] }`, keeping nothing |
 | GET | `/api/agentdefs/{id}` | `AgentDef` |
 | PATCH | `/api/agentdefs/{id}` | what's given changes (null `model` or `agentfile`: back to its harness's), over `If-Match: "<version>"` or `base` (the version it's made over, as you read it) → `AgentDef`; 409 `{ error, base, current: AgentDef }` where another change moved it on from that version (nothing is written). One naming an Agentfile of yours that declares `AGENT <its name>` writes what they share (model, tools, skills, remote MCP servers) into that Agentfile first, as a new version (P5.4); 409 where a setting changed differently on both sides since they last agreed, naming it and each side's value (neither is written) |
