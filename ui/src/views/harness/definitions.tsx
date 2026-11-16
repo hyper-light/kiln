@@ -25,6 +25,7 @@ import {
   limitSeconds,
   limitWords,
   measureOf,
+  METRIC,
   passes,
   queryOf,
   variantIn,
@@ -698,7 +699,7 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
         {own &&
           (adding ? (
             <CriterionForm
-              experiment={e.id}
+              e={e}
               onAdd={(c) => {
                 change((x) => ({ ...x, criteria: [...x.criteria, c] }));
                 setAdding(false);
@@ -830,15 +831,6 @@ function VariantLine({
 
 /** A comparator in words, as a criterion's rule reads. */
 const OP_WORD: Record<Op, string> = { ">": "greater than", ">=": "greater than or equal to", "==": "equal to", "!=": "not equal to", "<": "less than", "<=": "less than or equal to" };
-/** The comparators a criterion offers, in kiln's monitors' symbols (kiln-obs monitor.rs `Op`). */
-const OPS: { value: Op; label: string }[] = [
-  { value: ">", label: "Greater than (>)" },
-  { value: ">=", label: "Greater than or equal (>=)" },
-  { value: "==", label: "Equal (==)" },
-  { value: "!=", label: "Not equal (!=)" },
-  { value: "<", label: "Less than (<)" },
-  { value: "<=", label: "Less than or equal (<=)" },
-];
 
 /**
  * A criterion: its name, its rule (its query's value against its bound, as a monitor decides it) and
@@ -922,89 +914,60 @@ function TrendChart({ lines, bound, label }: { lines: { label: string; tone: str
   );
 }
 
+/** The query field (CodeMirror, loaded as it's first opened). */
+const QueryInput = React.lazy(() => import("@/components/code/query-input"));
+
 /**
- * A criterion added in place, a field a row: its name; the measure its query starts from (or a query of
- * its own); its query, in kiln's monitoring query syntax (Datadog's: aggregations, formulas and
- * functions, scope, by variant); its comparator; its bound; then Add, which kiln's monitor check passes
- * first (as the monitor form's does), and Cancel.
+ * A criterion added in place: its name, then its whole expression in kiln's monitoring query syntax
+ * (Datadog's: aggregations, a metric or a formula, its scope, by variant, a comparison and a bound),
+ * coloured and completed as it's typed; Add (or Enter), which kiln's monitor check passes first, and
+ * Cancel.
  */
-function CriterionForm({ experiment, onAdd, onCancel }: { experiment: string; onAdd: (c: Criterion) => void; onCancel: () => void }) {
-  const [measure, setMeasure] = React.useState<Measure | "">("failed_pct");
-  const [name, setName] = React.useState(MEASURE.failed_pct.word);
-  const [query, setQuery] = React.useState(queryOf("failed_pct", experiment));
-  const [op, setOp] = React.useState<Op>("<");
-  const [bound, setBound] = React.useState("");
+function CriterionForm({ e, onAdd, onCancel }: { e: Experiment; onAdd: (c: Criterion) => void; onCancel: () => void }) {
+  const [name, setName] = React.useState("");
+  const [expr, setExpr] = React.useState(`${queryOf("failed_pct", e.id)} `);
   const [said, setSaid] = React.useState<string | null>(null);
   const [checking, setChecking] = React.useState(false);
-  const n = Number(bound);
-  const ready = name.trim() !== "" && query.trim() !== "" && bound.trim() !== "" && Number.isFinite(n);
+  const words = React.useMemo(
+    () => ({
+      metrics: Object.values(METRIC),
+      tags: {
+        experiment: [{ value: e.id, detail: e.name }],
+        variant: e.variants.map((v, i) => ({ value: v.id, detail: variantName(e.variants, i) })),
+      },
+    }),
+    [e],
+  );
+  const ready = name.trim() !== "" && expr.trim() !== "";
   const add = () => {
-    if (!ready) return;
+    if (!ready || checking) return;
     setChecking(true);
     observeApi
-      .validateMonitor(`${query.trim()} ${op} ${n}`)
+      .validateMonitor(expr.trim())
       .then((c) => {
-        if (!c.ok) return setSaid(c.error ?? "kiln's monitors can't read it");
-        onAdd({ id: `c-${Date.now()}`, name: name.trim(), query: query.trim(), op, bound: n });
+        if (!c.ok || c.op === undefined || c.threshold === undefined) return setSaid(c.error ?? "It needs a comparison and a bound: < 10");
+        const query = expr.trim().replace(/\s*(>=|<=|==|!=|>|<)\s*-?\d+(?:\.\d+)?\s*$/, "");
+        onAdd({ id: `c-${Date.now()}`, name: name.trim(), query, op: c.op as Op, bound: c.threshold });
       })
-      .catch((e: unknown) => setSaid(errorMessage(e)))
+      .catch((err: unknown) => setSaid(errorMessage(err)))
       .finally(() => setChecking(false));
   };
   return (
     <span className="df-crit-form">
       <input className="ms-edit-in" value={name} aria-label="Name" placeholder="Name" onChange={(k) => setName(k.target.value)} />
-      <select
-        className="ms-edit-in"
-        value={measure}
-        aria-label="What it measures"
-        onChange={(k) => {
-          const next = k.target.value as Measure | "";
-          setMeasure(next);
-          setSaid(null);
-          if (next) {
-            setName(MEASURE[next].word);
-            setQuery(queryOf(next, experiment));
-          }
-        }}
-      >
-        {(Object.keys(MEASURE) as Measure[]).map((k) => (
-          <option key={k} value={k}>
-            {MEASURE[k].word}
-          </option>
-        ))}
-        <option value="">Custom query</option>
-      </select>
-      <textarea
-        className="ms-edit-in df-crit-q"
-        rows={3}
-        value={query}
-        spellCheck={false}
-        aria-label="Query"
-        placeholder="avg(last_14d):avg:kiln.session.warm_ms{experiment:…} by {variant}"
-        onChange={(k) => {
-          setQuery(k.target.value);
-          setSaid(null);
-          setMeasure(measureOf(k.target.value) ?? "");
-        }}
-      />
-      <select className="ms-edit-in" value={op} aria-label="Passes when its value is" onChange={(k) => setOp(k.target.value as Op)}>
-        {OPS.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-      <input
-        className="ms-edit-in"
-        value={bound}
-        placeholder={measure ? `Bound (${MEASURE[measure].unit})` : "Bound"}
-        aria-label="Bound"
-        inputMode="decimal"
-        onChange={(k) => {
-          setBound(k.target.value);
-          setSaid(null);
-        }}
-      />
+      <React.Suspense fallback={<span className="ms-edit-in qi" aria-busy="true" />}>
+        <QueryInput
+          value={expr}
+          words={words}
+          label="Expression"
+          placeholder="avg(last_14d):avg:kiln.session.warm_ms{experiment:…} by {variant} < 250"
+          onChange={(v) => {
+            setExpr(v);
+            setSaid(null);
+          }}
+          onEnter={add}
+        />
+      </React.Suspense>
       {said && (
         <span className="df-note" role="alert">
           {said}

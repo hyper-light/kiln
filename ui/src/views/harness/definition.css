@@ -945,3 +945,15 @@
   gap: 10px;
   cursor: default;
 }
+
+/* The query field (components/code/query-input.tsx): a field's frame, its editor inside, its height its lines'. */
+.ms-edit-in.qi {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 68px;
+  padding: 0;
+}
+.ms-edit-in.qi:focus-within {
+  border-color: #bab0e3;
+}

@@ -1,7 +1,9 @@
 /**
  * A part of the page that can't load reloads it onto the new build, once in 10 s (lib/update.ts);
  * but not while the page is being left: a navigation away cancels what it was still loading, and
- * WebKit fails those imports, so a reload then took the page back from where it was going.
+ * WebKit fails those imports, so a reload then took the page back from where it was going. Vite's
+ * error isn't taken: its import still fails, so what reads it says it couldn't load (with Try again)
+ * instead of breaking on nothing.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -23,7 +25,7 @@ Object.assign(globalThis, { window: browser, sessionStorage: storage, localStora
 const { buildIn, watchForUpdates } = await import("../src/lib/update.ts");
 watchForUpdates();
 
-/** A lazily loaded part fails, as Vite says it; whether the page took Vite's error. */
+/** A lazily loaded part fails, as Vite says it; whether the page took Vite's error (it mustn't: its import fails as it did). */
 const fails = () => {
   const e = new Event("vite:preloadError", { cancelable: true });
   window.dispatchEvent(e);
@@ -33,9 +35,9 @@ const fails = () => {
 await test("a part that can't load reloads the page, and not twice in 10 s", () => {
   values.clear();
   reloads = 0;
-  assert.equal(fails(), true);
+  assert.equal(fails(), false);
   assert.equal(reloads, 1);
-  assert.equal(fails(), true);
+  assert.equal(fails(), false);
   assert.equal(reloads, 1);
 });
 
@@ -43,10 +45,10 @@ await test("leaving the page, what its leaving cancels reloads nothing; still th
   values.clear();
   reloads = 0;
   window.dispatchEvent(new Event("beforeunload"));
-  assert.equal(fails(), true, "Vite's error is taken all the same");
+  assert.equal(fails(), false, "Vite's error isn't taken, leaving or not");
   assert.equal(reloads, 0);
   for (const fn of timers.splice(0)) fn();
-  assert.equal(fails(), true);
+  assert.equal(fails(), false);
   assert.equal(reloads, 1);
 });
 
