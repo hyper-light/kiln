@@ -242,9 +242,12 @@ fn p5_6_s2_controls_and_restart_are_operations_held_to_the_gate() -> anyhow::Res
         let hub = hub().await?;
         says(&hub, "chat").await;
         let chat = agent(&hub, "chat").await?;
-        for (op, input) in [("agents.control", json!({"agent": "kid", "control": "rename", "value": "Kid"})), ("agents.restart", json!({"agent": "kid"})), ("agents.interrupt", json!({"agent": "kid"}))] {
+        let renamed = call(chat.clone(), "agents.control", json!({"agent": "kid", "control": "rename", "value": "Kid"})).await;
+        anyhow::ensure!(code(&renamed) == 200, "agents.control on its own child: {renamed:?}");
+        // Past the gate at once; its fixture's machine isn't connected, which the operation itself then says (502).
+        for (op, input) in [("agents.restart", json!({"agent": "kid"})), ("agents.interrupt", json!({"agent": "kid"}))] {
             let at_once = call(chat.clone(), op, input).await;
-            anyhow::ensure!(code(&at_once) == 200, "{op} on its own child: {at_once:?}");
+            anyhow::ensure!(!matches!(code(&at_once), 403 | 428), "{op} on its own child goes past the gate: {at_once:?}");
         }
         for (op, input) in [("agents.control", json!({"agent": "other", "control": "keep_going", "value": true})), ("agents.restart", json!({"agent": "other"}))] {
             let waits = call(chat.clone(), op, input).await;

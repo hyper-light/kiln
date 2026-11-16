@@ -1595,7 +1595,9 @@ pub mod input {
         pub agent: String,
         /// The revision of its place you saw, refused where another device has moved it since.
         pub revision: Option<i64>,
-        /// A key that makes it once however often it's sent.
+        /// An idempotency key of yours, made once for this change (1 to 256 bytes): asked again with it
+        /// (its answer lost), the change is the same one, made once. Without it, each call is another change,
+        /// refused where the one before moved its place since (`revision`): pass it whenever you may ask again.
         pub key: Option<String>,
         /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
         pub mode: Option<String>,
@@ -1612,7 +1614,9 @@ pub mod input {
         pub until: i64,
         /// The revision of its place you saw, refused where another device has moved it since.
         pub revision: Option<i64>,
-        /// A key that makes it once however often it's sent.
+        /// An idempotency key of yours, made once for this change (1 to 256 bytes): asked again with it
+        /// (its answer lost), the change is the same one, made once. Without it, each call is another change,
+        /// refused where the one before moved its place since (`revision`): pass it whenever you may ask again.
         pub key: Option<String>,
         /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
         pub mode: Option<String>,
@@ -1627,7 +1631,9 @@ pub mod input {
         pub agent: String,
         /// From kiln's copy of its conversation, where its machine's is gone.
         pub copy: Option<bool>,
-        /// A key that makes it once however often it's sent.
+        /// An idempotency key of yours, made once for this change (1 to 256 bytes): asked again with it
+        /// (its answer lost), the change is the same one, made once. Without it, each call is another change,
+        /// refused where the one before moved its place since (`revision`): pass it whenever you may ask again.
         pub key: Option<String>,
         /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
         pub mode: Option<String>,
@@ -1650,7 +1656,9 @@ pub mod input {
         pub command: Option<serde_json::Value>,
         /// Answer every tool call waiting on you: "allow" or "deny" (questions are left to answer).
         pub approvals: Option<String>,
-        /// An idempotency key: sent again with it, each agent's message is the same one, which it gets once.
+        /// An idempotency key of yours, made once for this broadcast (1 to 256 bytes): sent again with it (its answer
+        /// lost), each agent's message is the same one, which it gets once. Without it, each call is another message to
+        /// each agent: pass it whenever you may send it again.
         pub key: Option<String>,
     }
 
