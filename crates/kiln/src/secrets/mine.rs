@@ -280,7 +280,7 @@ mod tests {
     /// anything else under `kiln.secret.` is refused without its value in the words.
     #[test]
     fn p4_7_an_agentfile_names_its_build_secrets_and_never_their_values() {
-        let text = "FROM scratch\nLABEL kiln.secret.GIT_AUTH_TOKEN.github.com=user:gh_token other=1\nLABEL \"kiln.secret.AWS_ACCESS_KEY_ID\"=\"user:AWS_KEY\"\nHARNESS claude FROM git+https://github.com/acme/h.git#0123456789abcdef0123456789abcdef01234567\n";
+        let text = "FROM scratch\nLABEL kiln.secret.GIT_AUTH_TOKEN.github.com=user:gh_token other=1\nLABEL \"kiln.secret.AWS_ACCESS_KEY_ID\"=\"user:AWS_KEY\"\nHARNESS claude FROM https://github.com/acme/h.git#0123456789abcdef0123456789abcdef01234567\n";
         let (refs, bad) = references(text);
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(refs, [Reference { id: "GIT_AUTH_TOKEN.github.com".into(), name: "GH_TOKEN".into() }, Reference { id: "AWS_ACCESS_KEY_ID".into(), name: "AWS_KEY".into() }]);
