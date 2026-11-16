@@ -40,6 +40,7 @@ pub mod carry;
 pub mod claude;
 pub mod cli;
 pub mod codex;
+pub mod components;
 pub mod copies;
 pub mod core;
 pub mod diff;

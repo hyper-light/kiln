@@ -1455,6 +1455,7 @@ What this page describes, once an isolated agent's start goes through:
 | Taking over a found session | Can't: a microVM's harness is never found on the machine. |
 | Moving it to another machine | Not yet: your volume stays on the machine it ran on. |
 | Live overrides: ports, egress, networks, volumes (above) | Taken by its microVM live where its runtime takes them (`Holds::live`): through Hex once its wire calls land (P6b.3); until then refused, each saying why in `state.overrides`, its harness's folders and kiln's scope taken all the same. |
+| Components swapped in (below) | Laid by its microVM where its runtime lays them (`Holds::components`, and `Holds::swaps` for its harness's own): through Hex once its wire calls land (P6c.2); until then refused, saying why, its image's own running on. |
 | The machine's own tools (Xcode, MSVC) | Can't: refused, saying which and why (above). |
 
 ## Live overrides: ports, egress, networks and volumes
@@ -1470,14 +1471,15 @@ a resume, a restore), for the session's life.
 | `sessions.egress.grant` / `revoke` | `agent`, `host` (a DNS name or an address), `port`, `member` | microVM |
 | `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member` | microVM |
 | `sessions.volumes.add` / `remove` | `agent`, `path` (a folder of its machine), `access` (`ro`, `rw`), `at` (where a microVM sees it), `members` | every engine |
+| `sessions.components.swap` / `restore` | `agent`, `kind` (`agent`, `harness`, `mcp`), `path` (its member's directory: `/harness/<harness>`, the default, `/agents/<name>`, `/mcp/<name>`), `source` and its pin (`checksum`, `version_id`), `force` | every engine |
 
 A `member` is `harness` (the default), `agent:<name>` or `mcp:<name>`. Every grant names who, to whom, which
 ports and which way: nothing is implied. Each is on REST (`POST /api/ops/<name>`, and
-`POST /api/harness/sessions/:id/{ports,egress,networks,volumes}`, a removal at `…/unpublish`, `…/revoke`,
-`…/disconnect` or `…/remove`), MCP (`sessions_ports_publish`, …) and code mode (`kiln.sessions.ports.publish`).
-None is read-only; the removals are destructive. `agents_get` says the session's engine and the operations it
-takes (`live`): a session on its machine's host is offered its volumes' alone, and refuses the network ones,
-naming its engine (409).
+`POST /api/harness/sessions/:id/{ports,egress,networks,volumes,components}`, a removal at `…/unpublish`,
+`…/revoke`, `…/disconnect`, `…/remove` or `…/restore`), MCP (`sessions_ports_publish`, …) and code mode
+(`kiln.sessions.ports.publish`). None is read-only; the removals are destructive. `agents_get` says the session's
+engine and the operations it takes (`live`): a session on its machine's host is offered its volumes' and
+components' alone, and refuses the network ones, naming its engine (409).
 
 `sessions.grants` (`GET /api/harness/sessions/:id/grants`, MCP `sessions_grants`, code mode
 `kiln.sessions.grants`, read-only) says what the session's launch gave it as it started, its `base`, beside
@@ -1497,6 +1499,23 @@ plug roots its launch declared (the top-level directories of its project and its
 restarted can take it (Shards' D270). Egress is granted live up to the most its launch declared
 (`state.overrides.ceiling`): the org's policy, `[agents] egress_ceiling` (`host:port` each; none by default, so
 none is granted live), declared as each session starts. Past either, it's refused (409), saying what it declared.
+
+A component (P6c.3; the person: "hot-swap agents, harnesses, and mcps at given paths in builds sans microvm
+re-build") is an Agentfile's AGENT, HARNESS or MCP install built alone from its source, pinned as the Agentfile
+pins one (Shards' D54): a Git URL whose `#REF` is a full commit, an http(s) or `s3://` source with its `checksum`
+(`sha256:<hex>`), an s3 object by its `version_id`, an OCI reference by its digest; a path, which names a build
+context's file, is refused. One component is held at a path, a swap there taking the place of the one before, and
+its member alone starts again with it once nothing is under way (`force`: at once, its turn cut short), its
+conversation going on through its harness's own resume. In a microVM its machine lays it over its image's own,
+read-only: an agent's or an MCP server's while the run runs (`Change::Swap`), its harness's by swapping its harness
+for itself in the same microVM with it laid (`Run::swap`, as the harness switch does: the same box). Each launch
+after lays every one it holds (`Launch::components`), a harness it switched from aside. On its machine's host a
+session has one member, its harness: kiln installs a harness from a pinned http(s) source (its executable, or a
+gzip tar holding it at its root or in its `bin/`) in the session's own folder, held to its checksum, and runs it
+there in place of the machine's from then on, installing it again where it's gone (a session moved to another
+machine); a Git, `s3://` or OCI source is built into a component first, which a microVM session's machine does.
+`restore` gives back the image's own (on the host, the machine's harness), and the versions no longer held are
+let go of as its harness next starts.
 
 | Harness | Its own allowed folders | A change while it runs |
 |---|---|---|

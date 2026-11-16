@@ -259,6 +259,27 @@ pub fn tar_gz(archive: &Path, url: &str, spec: &Spec, root: &Path, path: &Path, 
     done.map_err(|(entry, why)| Unpack { url: url.to_owned(), entry, why })
 }
 
+/// What gzip tar `archive` (from `url`) holds, as a [`Tree`] at strip 0 counts it: its regular files' bytes and its
+/// entries, each checked as an unpack checks it. For an archive whose checksum alone pins it (a component's source,
+/// kiln plan 01a1dd2e…, P6c.3), whose totals are then taken from what that checksum holds.
+pub fn totals(archive: &Path, url: &str) -> Result<(u64, u64), Unpack> {
+    let fault = |(entry, why): Fault| Unpack { url: url.to_owned(), entry, why };
+    let mut tar = open(archive).map_err(fault)?;
+    let (mut bytes, mut entries) = (0u64, 0u64);
+    for entry in tar.entries().map_err(|e| fault(io_fault(e)))? {
+        let entry = entry.map_err(|e| fault(io_fault(e)))?;
+        let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+        let Some((_, goes)) = taken(&entry, 0).map_err(|why| fault((Some(name), why)))? else {
+            continue;
+        };
+        entries = entries.saturating_add(1);
+        if let Goes::File { size, .. } = goes {
+            bytes = bytes.saturating_add(size);
+        }
+    }
+    Ok((bytes, entries))
+}
+
 /// The tree into staging, then staging renamed to the first directory on the way to `root/at` that
 /// isn't there: so nothing of the tree shows until all of it is in. On failure staging is discarded.
 fn unpack_tree(archive: &Path, tree: &Tree, root: &Path, at: &Path) -> Result<(), Fault> {

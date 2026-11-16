@@ -1557,8 +1557,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let id = (*id).to_owned();
             boxed(|| harness_command(&hub, &id, req)).await
         }
-        // Its live overrides, in place (kiln plan 01a1dd2e…, P6b.4: `crate::harness::overrides`).
-        (&Method::POST, ["api", "harness", "sessions", id, what @ ("ports" | "egress" | "networks" | "volumes"), rest @ ..]) if rest.len() <= 1 => {
+        // Its live overrides, in place (kiln plan 01a1dd2e…, P6b.4 and P6c.3: `crate::harness::overrides`).
+        (&Method::POST, ["api", "harness", "sessions", id, what @ ("ports" | "egress" | "networks" | "volumes" | "components"), rest @ ..]) if rest.len() <= 1 => {
             let name = match (*what, rest.first().copied()) {
                 ("ports", None) => "sessions.ports.publish",
                 ("ports", Some("unpublish")) => "sessions.ports.unpublish",
@@ -1568,6 +1568,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
                 ("networks", Some("disconnect")) => "sessions.networks.disconnect",
                 ("volumes", None) => "sessions.volumes.add",
                 ("volumes", Some("remove")) => "sessions.volumes.remove",
+                ("components", None) => "sessions.components.swap",
+                ("components", Some("restore")) => "sessions.components.restore",
                 _ => return Err(err(StatusCode::NOT_FOUND, "not found")),
             };
             let id = (*id).to_owned();

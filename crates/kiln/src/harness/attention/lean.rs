@@ -118,7 +118,7 @@ pub fn lean(snapshot: &Value, rows: usize, now: i64, words: impl Fn(&str) -> Opt
 
 /// The last words of the rows the list has in the page as it opens, each by its agent's place in `ids`: its
 /// first `rows` (your pins in their order, then the order's) and its last (the page keeps the row Tab ends on
-/// in it wherever it's scrolled: ui/src/lib/virtual.ts), without the parked and the archived (they're in lists
+/// in it wherever it's scrolled: ui/src/lib/list-window.ts), without the parked and the archived (they're in lists
 /// of their own) and those `words` knows nothing of. A row whose agent has said nothing takes its place among
 /// the `rows` and has no words here. (The list puts the agents that ask you something first, wherever the order
 /// has them: those rows show their requests, not their last words, so the rows after them are these or fewer.)

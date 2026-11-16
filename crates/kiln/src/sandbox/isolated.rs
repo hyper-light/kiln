@@ -26,8 +26,9 @@
 //!   ([`bridge`]), where its microVMs carry the lane (`super::Microvms::mcp`); where they don't, its harness starts
 //!   without it, said.
 //! - **What it can't do yet**, refused rather than done another way: move to another machine
-//!   ([`NO_MOVE`]), or switch to another harness where its microVMs swap none in place ([`NO_SWITCH`]);
-//!   where they do, a switch swaps its member there ([`ready_to_swap`], [`launch`]'s `swap_from`).
+//!   ([`NO_MOVE`]), switch to another harness where its microVMs swap none in place ([`NO_SWITCH`]), or swap a
+//!   component in where they lay none ([`NO_COMPONENTS`]); where they do, a switch swaps its member there
+//!   ([`ready_to_swap`], [`launch`]'s `swap_from`), and a component is laid at its launch (`Launch::components`).
 
 use std::path::Path;
 
@@ -43,6 +44,9 @@ use crate::harness::session::{Isolation, Spec};
 
 /// Why an isolated agent doesn't move to another machine.
 pub const NO_MOVE: &str = "an isolated agent doesn't move to another machine yet: its microVM and what its harness keeps there are its machine's; end it, or start it anew there";
+
+/// Why an isolated agent's component isn't swapped where its machine's microVMs lay none (kiln plan 01a1dd2e…, P6c.3).
+pub const NO_COMPONENTS: &str = "An isolated agent's components are swapped only where its machine's microVMs lay them over its image's own, and these don't yet (Hex's wire calls, kiln plan 01a1dd2e…, P6c.2). Its image's own run on.";
 
 /// Why an isolated agent doesn't switch to another harness where its machine's microVMs swap none in place.
 pub const NO_SWITCH: &str = "An isolated agent switches harness only where its machine's microVMs swap one in place, and these don't yet (Hex's wire calls, kiln plan 01a1dd2e…, P6c.2). End it, and start the other harness isolated.";
@@ -115,6 +119,8 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
         plug_roots: roots,
         // The most egress it may be granted live: its person's or org's policy, as kiln's server set it at its start.
         egress_ceiling: spec.egress_ceiling.clone(),
+        // The components a person swapped into its session, laid over its image's own (kiln plan 01a1dd2e…, P6c.3).
+        components: spec.components.clone(),
     })
 }
 

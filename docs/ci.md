@@ -7273,7 +7273,7 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   (Geist Mono, quiet gutters). It works on phones: the text area is first; completion appears in
   the standard dropdown.
 - **W21-R02 Live data.** Pages subscribe to `/api/events` for their objects and patch in place;
-  lists are windowed (`lib/virtual.ts`); motion only on real state changes.
+  lists are windowed (`lib/virtual.ts`, `lib/list-window.ts`); motion only on real state changes.
 
 **Requirements: pages**
 

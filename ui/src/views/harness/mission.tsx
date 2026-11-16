@@ -67,7 +67,7 @@ import { ENDED, RemoveButton, useRemoving } from "./subagent-remove";
 import { AnswerHere } from "./mission-answer";
 import { TreePath } from "./tree-path";
 import { sessionIntent } from "@/lib/session-prefetch";
-import { listWindow, useWindowed } from "@/lib/virtual";
+import { listWindow, useWindowed } from "@/lib/list-window";
 
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
@@ -1004,7 +1004,7 @@ const stopsTab = (key: string) => !key.startsWith("sep:");
 const KEEP = '.ms-answer, .ms-row-ask, .ms-name-field, [data-sending], [data-state="open"]';
 
 /**
- * One of Mission control's lists, windowed (W21-R02, lib/virtual.ts): only the lines near the
+ * One of Mission control's lists, windowed (W21-R02, lib/list-window.ts): only the lines near the
  * viewport are mounted (a row, a section's head, a tree of subagents, the Undo), gaps keeping the
  * room of the rest, so thousands of agents cost what a screenful does. It re-renders by itself as
  * the page scrolls. `order`: the list glides to its new order (list-tools.tsx `useGlide`).
