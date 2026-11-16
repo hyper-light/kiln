@@ -41,6 +41,8 @@
 //! - [`replay`]: a recorded session's tool calls replayed offline against a split's variants (P7.1b).
 //! - [`sizes`]: what a reach run used where it ran, and the size its history predicts for the
 //!   next run, its ask the ceiling (docs/reach.md, "Sizes from history"; docs/needs.md E6).
+//! - [`pools`]: the warm microVM pools kiln asks a runner's node to keep, from its agents' starts,
+//!   and when it lets each go (kiln plan 01a1dd2e313f72f69c6d93061143cc2e, P3.2).
 
 pub mod attention;
 pub mod attention_examination;
@@ -73,6 +75,7 @@ pub mod pipelines;
 pub mod place;
 pub mod plan;
 pub mod policy;
+pub mod pools;
 pub mod releases;
 pub mod replay;
 pub mod protect;

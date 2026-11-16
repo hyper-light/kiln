@@ -182,7 +182,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     };
     // Where it doesn't parse, its build says so in Shards' words; its egress stays as its image's.
     launch.egress = egress_of(&reach, granted(text).ok().flatten());
-    let image = vms.images.pinned(source, secrets).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
+    let super::image::Pinned { image, built } = vms.images.pinned(source, secrets).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
     launch.boundary = Boundary::MicroVm { image: image.clone() };
     let person = spec.isolation.as_ref().and_then(|i| i.person.as_deref());
     let (mounts, kept_in) = match (homes, person) {
@@ -229,6 +229,9 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         anyhow::bail!("{}'s agent volumes are plugged into its microVM as it starts, and this machine's microVMs take no folder live: {}", kind.name, super::hexvm::NO_LIVE);
     }
     let declared = crate::sandbox::held::Declared::of(&launch);
+    // Its microVM's size as its isolation gives it (plan step 32; a deployment experiment's variant, P7.1): whole vCPUs
+    // and MiB, rounded up.
+    let size = super::pools::size_of(spec.isolation.as_ref());
     let asked = std::time::Instant::now();
     let (run, swapped) = match swap_from {
         // A switch: its member swapped for this one in the microVM it runs in.
@@ -243,12 +246,6 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
                 (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
                 _ => None,
             };
-            // Its microVM's size as its isolation gives it (plan step 32; a deployment experiment's variant, P7.1):
-            // whole vCPUs and MiB, rounded up.
-            let size = spec.isolation.as_ref().filter(|i| i.cpus.is_some() || i.memory.is_some()).map(|i| {
-                let cpus = i.cpus.map_or(0, kiln_ci::sched::state::Cpus::ceil);
-                (u32::try_from(cpus).unwrap_or(u32::MAX), i.memory.map_or(0, |b| b.div_ceil(1 << 20)))
-            });
             (vms.launch(name, launch, size).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?, false)
         }
     };
@@ -266,7 +263,13 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         (Some(hex), Some(vm)) => (if swapped { Some(SWAPPED) } else { hex.started_from(&vm).await.map(super::hexvm::said) }, hex.meter(&vm)),
         _ => (swapped.then_some(SWAPPED), None),
     };
-    let started = super::held::Started { us, from, meter };
+    let built_us = built.map(|b| u64::try_from(b.as_micros()).unwrap_or(u64::MAX));
+    let started = super::held::Started { us, from, meter, built_us };
+    // Its microVM's warm pool on this machine, named from its starts (kiln plan 01a1dd2e…, P3.2); a swap started none.
+    if !swapped {
+        let warm = from == Some(super::hexvm::said(hex_api::StartedFrom::Warm));
+        vms.pools.started(kiln_seams::sandbox::Pool { image: image.clone(), size }, warm).await;
+    }
     if let Some(lanes) = lanes {
         let here = crate::reach::node::global().map(|h| crate::reach::local::Here { handle: h.clone(), me: h.name().to_owned(), host, session: session.to_owned() });
         let served = run.id().ok_or_else(|| std::io::Error::other("its run names no microVM")).and_then(|vm| bridge(lanes, vm, here, crate::harness::session::resolve_cwd(spec.cwd.as_deref())));

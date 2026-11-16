@@ -699,6 +699,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `experiments.replay`: the runner replays a recorded session's tool calls in a microVM of a split's
   variant (`ServerMsg::Replay`; kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b) and answers what the
   run measured; a runner that didn't name it isn't asked, and a replay on it is refused.
+  `agentfiles.prebuild`: the runner builds an Agentfile ahead of its sessions as the server asks
+  (`ServerMsg::Prebuild`; kiln plan 01a1dd2e…, P4.5), as a session of its harness there builds it,
+  and says where each build is (`AgentMsg::Prebuilt`); a runner that didn't name it is asked nothing,
+  and its sessions build their images as they start.
 
 ## Registry
 
@@ -743,6 +747,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `AgentMsg` | 70 | `Skills` | | this line: installed skills on a runner (files it wants, its packages' states, a folder's files), JSON, to a server that named `skills` |
 | `AgentMsg` | 71 | `SkillFile` | | this line: a piece of a folder's file for skills, to a server that named `skills` |
 | `AgentMsg` | 72 | `HarnessMailTransfer` | | this line: exact journal transfer phase, to a server that named `mail-transfer` |
+| `AgentMsg` | 73 | `Prebuilt` | | main (kiln plan 01a1dd2e…, P4.5): where a build of an Agentfile asked ahead of its sessions is, JSON, to a server that named `agentfiles.prebuild` |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
@@ -763,6 +768,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 81 | `RunnerEngine` | | main (kiln plan 01a1dd2e…, P2.3): a runner's engine as its owner set it, JSON, to a runner that named `runner.engine` |
 | `ServerMsg` | 82 | `AdoptPolicy` | | main (CP-T3.2): the room a hand-over's spool leaves on a runner's volume, JSON, to a runner that named `reach.adopt-policy` |
 | `ServerMsg` | 83 | `Replay` | | main (kiln plan 01a1dd2e…, P7.1b): one run of a recorded session's replay in a microVM of a split's variant, JSON, to a runner that named `experiments.replay` |
+| `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -934,6 +940,7 @@ Four edges are left, and the lab steers clear of each:
 | `Skills` | state | Installed skills on the runner (`crate::skills::heard`, JSON): the files it lacks (`want`), each package's state there (`states`: fetching, setting up, ready, needs a tool, failed), or a folder's files it was asked to read (`read`). The newest states win; a want is asked again as each manifest comes. | New: to a server that named `skills`. |
 | `SkillFile` | answer | A piece of a file of a folder the server asked the runner to read for skills, by its SHA-256, at its offset; the last says so. | New: to a server that named `skills`. |
 | `HarnessMailTransfer` | command, refused while away | Offer, readiness, adoption or abort for one exact fenced journal manifest. | Current authenticated custodian and expected destination only; durable phase acknowledges it. |
+| `Prebuilt` | state | Where a build of an Agentfile the server asked ahead of its sessions is (`agentfiles::prebuild::Said`, JSON: `{agentfile, version, harness, how}`, `how` `{state: "building"}`, `{state: "done", image}` with its image pinned by its digest, or `{state: "failed", why}` in Shards' words or kiln's): building as it begins, done or failed as it ends. The server moves the row of the version it names forward only (queued, building, then done or failed). | New: to a server that named `agentfiles.prebuild`, answering its `Prebuild`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -1023,6 +1030,7 @@ Four edges are left, and the lab steers clear of each:
 | `RunnerEngine` | state | What the runner's owner set on the server for its engine (`harness::engine::Asked`, JSON: `{engine, version}`, `engine` `host`, `microvm` or null for what it can do, `version` how many times it was set): kept in its state folder for its restarts and written into its facts (`isolation.engine`, `virt.microvm` only on `microvm`), which it says again at once; a `HarnessOpen` whose spec was decided under another `version` (`engine_version`) is refused. A barrier against session commands. The newest wins. | New: to runners that named `runner.engine`, as they name it and whenever it changes. |
 | `AdoptPolicy` | state | The room a hand-over's spool leaves on this runner's volume (`harness::moving::stream::Told`, JSON: `{disk_floor}`, the operator's `[ci.scheduler.admission] disk_free` in bytes, or null for none set): its reach node takes sessions over from other machines under it (docs/reach.md §8), and forgets it as its server drops. Until it knows it, it refuses every hand-over. The newest wins. | New: to runners that named `reach.adopt-policy`, as they name it (each time they connect). |
 | `Replay` | ask | One run of a split's replay (`sandbox::replay::Ask`, JSON: the split, the replay, its variant and round; the variant's harness, Agentfile (a person's own with its text and build secrets) and size; the session's folder; the plan of its calls; its limit): the calls run in a microVM of the variant's image as its own command, with no grant, no credential and no member driven. Answered by `Answer` (`sandbox::replay::Answer`: its conclusion, why, its measures as a session's, its steps' outcome). | New: to runners that named `experiments.replay`; a runner that didn't isn't asked. |
+| `Prebuild` | command, parked | Build an Agentfile ahead of its sessions (`agentfiles::prebuild::Ask`, JSON: `{agentfile, version, harness, text, secrets?}`): its text at a version, beside kiln's harness directory for one of kiln's harnesses, given the secrets it names (P4.7), into the store the runner's microVMs boot from, as a session of that harness builds it there, so the session that starts after it builds nothing. Answered by `Prebuilt` as it goes. | New: to the newest process of a runner that named `agentfiles.prebuild`, at each save of the Agentfile (or of an agent definition naming it), and again for those not done or failed each time one of its processes names the feature. |
 
 ## Commands to a session: `Command`
 

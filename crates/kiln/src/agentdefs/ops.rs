@@ -98,10 +98,19 @@ fn audit_line(d: &super::AgentDef) -> String {
     format!("{} ({}) v{}", d.name, d.id, d.version)
 }
 
+/// Where `d` names one of its person's Agentfiles, that Agentfile's builds ahead of its sessions asked anew, its harness
+/// one they're built for (kiln plan 01a1dd2e… P4.5).
+async fn prebuild(cx: &Cx, d: &super::AgentDef) {
+    if let Some(id) = d.settings.agentfile.as_deref().map(str::trim).and_then(|a| a.strip_prefix(crate::sandbox::isolated::KEPT)) {
+        crate::agentfiles::prebuild::queue(&cx.hub, id).await;
+    }
+}
+
 async fn create(cx: Cx, v: Value) -> Out {
     let (name, settings) = (crate::ops::text(&v, "name")?, settings_of(&v)?);
     let made = super::sync::create(&cx.hub, &who(&cx)?, &name, settings, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.create".into(), audit_line(&made)).await;
+    prebuild(&cx, &made).await;
     json_of(&made)
 }
 
@@ -122,6 +131,7 @@ async fn update(cx: Cx, v: Value) -> Out {
     let base = field::<Option<i64>>(&v, "base")?.flatten();
     let saved = super::sync::update(&cx.hub, &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.update".into(), audit_line(&saved)).await;
+    prebuild(&cx, &saved).await;
     json_of(&saved)
 }
 
@@ -137,6 +147,7 @@ async fn restore(cx: Cx, v: Value) -> Out {
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "`version` is the version to make current again".to_owned()))?;
     let saved = super::restore(&cx.hub, &who(&cx)?, &id, version, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.restore".into(), format!("{} ({}) v{version} as v{}", saved.name, saved.id, saved.version)).await;
+    prebuild(&cx, &saved).await;
     json_of(&saved)
 }
 

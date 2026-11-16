@@ -92,11 +92,16 @@ pub async fn answer(ask: Ask, under: &Path) -> Answer {
         Ok(source) => source,
         Err(why) => return Answer::failed(why),
     };
-    let image = match vms.images.pinned(source, &ask.secrets).await {
-        Ok(image) => image,
+    let pinned = match vms.images.pinned(source, &ask.secrets).await {
+        Ok(pinned) => pinned,
         Err(r) => return Answer::failed(format!("its image, {}: {r}", source.name())),
     };
-    run_on(&hex, &image, &ask, under).await
+    let mut answer = run_on(&hex, &pinned.image, &ask, under).await;
+    // The build of its image it ran, as a session's start says it (kiln plan 01a1dd2e… P4.5).
+    if let Some(m) = answer.measured.as_mut() {
+        m.built_us = pinned.built.map(|b| u64::try_from(b.as_micros()).unwrap_or(u64::MAX));
+    }
+    answer
 }
 
 /// This process's replays so far, each scratch folder's name its own.
@@ -217,6 +222,8 @@ pub async fn run_on(hex: &HexVms, image: &str, ask: &Ask, under: &Path) -> Answe
         window_ns: lived.map(|l| l.window_ns),
         footprint_steady_bytes: lived.map(|l| l.footprint_steady_bytes),
         footprint_peak_bytes: lived.map(|l| l.footprint_peak_bytes),
+        // Given its image, it builds none ([`answer`] says the build that made it).
+        built_us: None,
     };
     let finished = ends.done && why.is_none();
     Answer { conclusion: if finished { "success" } else { "failure" }.into(), why, measured: Some(measured), outcome: Some(rp::outcome(&ask.plan, &ends)) }

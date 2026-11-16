@@ -86,6 +86,15 @@ pub enum Refusal {
     Build(String),
 }
 
+/// A source's image for this machine, pinned by its digest (`NAME@sha256:…`), and how long the build its asking ran
+/// took: none where the home's store held its content already, built by an earlier start, or ahead of its sessions as
+/// its Agentfile was saved (kiln plan 01a1dd2e… P4.5), or by another's build it waited its turn for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pinned {
+    pub image: String,
+    pub built: Option<std::time::Duration>,
+}
+
 /// The images this machine's microVMs boot, built by the carried `shards` into the Shards home they
 /// boot from.
 pub struct Images {
@@ -107,17 +116,18 @@ impl Images {
 
     /// `source`'s image for this machine, pinned by its digest: the one the home's store holds of its
     /// content, else built, given `secrets` (P4.7: a person's own, which its Agentfile names).
-    pub async fn pinned(&self, source: Source<'_>, secrets: &[BuildSecret]) -> Result<String, Refusal> {
+    pub async fn pinned(&self, source: Source<'_>, secrets: &[BuildSecret]) -> Result<Pinned, Refusal> {
         let plan = Plan::of(source)?;
         if let Some(digest) = self.held(&plan).await? {
-            return Ok(plan.pinned(&digest));
+            return Ok(Pinned { image: plan.pinned(&digest), built: None });
         }
         let _turn = self.building.lock().await;
         if let Some(digest) = self.held(&plan).await? {
-            return Ok(plan.pinned(&digest));
+            return Ok(Pinned { image: plan.pinned(&digest), built: None });
         }
+        let began = std::time::Instant::now();
         let digest = self.build(source, &plan, secrets).await?;
-        Ok(plan.pinned(&digest))
+        Ok(Pinned { image: plan.pinned(&digest), built: Some(began.elapsed()) })
     }
 
     /// The Shards home's store, which holds what's built (`shards_image::store::Store`'s root).
@@ -472,7 +482,8 @@ pub(crate) mod tests {
             shards.ready(source, &digest_of("one"))?;
             let images = shards.images();
             let pinned = images.pinned(source, &[]).await?;
-            assert_eq!(pinned, format!("harness-t@{}", digest_of("one")));
+            assert_eq!(pinned.image, format!("harness-t@{}", digest_of("one")));
+            assert!(pinned.built.is_some(), "its build is said");
             let builds = shards.builds();
             let plan = Plan::of(source)?;
             assert_eq!(builds.len(), 1, "{builds:?}");
@@ -480,7 +491,7 @@ pub(crate) mod tests {
             let home = shards.dir.path().join("home");
             assert!(build.starts_with(&format!("{} build --progress=quiet --platform {} ", home.display(), plan.platform)), "{build}");
             assert!(build.contains(&format!(" --tag {} ", plan.tag)), "{build}");
-            assert_eq!(images.pinned(source, &[]).await?, pinned, "the same image, found in the store");
+            assert_eq!(images.pinned(source, &[]).await?, Pinned { image: pinned.image.clone(), built: None }, "the same image, found in the store, no build said");
             assert_eq!(shards.builds().len(), 1, "found without a build");
             let scratch = shards.dir.path().join("scratch");
             assert_eq!(std::fs::read_dir(&scratch)?.count(), 0, "nothing of its build is left");
@@ -502,10 +513,12 @@ pub(crate) mod tests {
             shards.ready(a, &digest_of("a"))?;
             shards.ready(b, &digest_of("b"))?;
             let (first, second) = futures::join!(images.pinned(a, &[]), images.pinned(a, &[]));
-            assert_eq!((first?, second?), (format!("agentfile-{id}@{}", digest_of("a")), format!("agentfile-{id}@{}", digest_of("a"))));
+            let (first, second, want) = (first?, second?, format!("agentfile-{id}@{}", digest_of("a")));
+            assert_eq!((first.image.as_str(), second.image.as_str()), (want.as_str(), want.as_str()));
             assert_eq!(shards.builds().len(), 1, "two starts at once, one build: {:?}", shards.builds());
-            assert_eq!(images.pinned(b, &[]).await?, format!("agentfile-{id}@{}", digest_of("b")), "its changed text, built");
-            assert_eq!(images.pinned(a, &[]).await?, format!("agentfile-{id}@{}", digest_of("a")), "the first text's, still held");
+            assert!(first.built.is_some() != second.built.is_some(), "the one that built says so, the one that waited its turn ran none: {first:?} {second:?}");
+            assert_eq!(images.pinned(b, &[]).await?.image, format!("agentfile-{id}@{}", digest_of("b")), "its changed text, built");
+            assert_eq!(images.pinned(a, &[]).await?.image, format!("agentfile-{id}@{}", digest_of("a")), "the first text's, still held");
             assert_eq!(shards.builds().len(), 2, "{:?}", shards.builds());
             Ok(())
         })
@@ -527,8 +540,8 @@ pub(crate) mod tests {
             let stand_in = Source::Kept { id: &id, text: "FROM scratch\nHARNESS claude FROM https://example.com/stand-in.git#0123456789abcdef0123456789abcdef01234567:harness\n", beside };
             shards.ready(copy, &digest_of("copy"))?;
             shards.ready(stand_in, &digest_of("stand-in"))?;
-            assert_eq!(images.pinned(copy, &[]).await?, format!("agentfile-{id}@{}", digest_of("copy")));
-            assert_eq!(images.pinned(stand_in, &[]).await?, format!("agentfile-{id}@{}", digest_of("stand-in")));
+            assert_eq!(images.pinned(copy, &[]).await?.image, format!("agentfile-{id}@{}", digest_of("copy")));
+            assert_eq!(images.pinned(stand_in, &[]).await?.image, format!("agentfile-{id}@{}", digest_of("stand-in")));
             let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
             assert_eq!(shards.contexts(), [vec!["Agentfile".to_owned(), format!("claude-{arch}-musl")], vec!["Agentfile".to_owned()]]);
             Ok(())
@@ -590,7 +603,7 @@ pub(crate) mod tests {
             shards.ready(source, &digest_of("private"))?;
             assert_eq!(images.pinned(source, &[]).await.err(), Some(Refusal::Build(REFUSED.to_owned())), "not given it, Shards refuses it");
             let given = [BuildSecret { id: "GIT_AUTH_TOKEN".into(), value: TOKEN.into() }];
-            assert_eq!(images.pinned(source, &given).await?, format!("agentfile-{id}@{}", digest_of("private")), "given it, the build makes its image");
+            assert_eq!(images.pinned(source, &given).await?.image, format!("agentfile-{id}@{}", digest_of("private")), "given it, the build makes its image");
             let builds = shards.builds();
             assert_eq!(builds.len(), 1, "{builds:?}");
             assert!(builds.iter().all(|b| b.contains(" --secret id=GIT_AUTH_TOKEN,env=KILN_BUILD_SECRET_0 ") && !b.contains(TOKEN)), "{builds:?}");

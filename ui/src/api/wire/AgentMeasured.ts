@@ -12,4 +12,9 @@ export type AgentMeasured = {
 /**
  * Its start, from its launch asked to its member running, in microseconds.
  */
-start_us?: number, started_from?: string, cpu_ns?: number, window_ns?: number, footprint_steady_bytes?: number, footprint_peak_bytes?: number, };
+start_us?: number, started_from?: string, cpu_ns?: number, window_ns?: number, footprint_steady_bytes?: number, footprint_peak_bytes?: number, 
+/**
+ * The build of its image its start ran, in microseconds: none where its machine held its image already, built by
+ * an earlier start or ahead of it as its Agentfile was saved (kiln plan 01a1dd2e… P4.5).
+ */
+built_us?: number, };
