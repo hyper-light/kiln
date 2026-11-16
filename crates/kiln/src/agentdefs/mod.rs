@@ -45,7 +45,8 @@ pub struct Mcp {
     pub command: Vec<String>,
 }
 
-/// The most an agent's run may take: each left out, no limit of the definition's own.
+/// The most an agent's run may take: each left out, no limit of the definition's own. Each is held to the sessions
+/// it starts ([`limits`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -195,7 +196,8 @@ pub fn name_problem(name: &str) -> Option<String> {
 /// kiln's harnesses; its Agentfile is one its owner reaches, for that harness; its model is one kiln's
 /// machines list for that harness, where they list any (what its sessions said they offer); its MCP
 /// servers each have a name of their own and one way in; its tools and skills are named; a limit
-/// it sets lets it do something; and its volumes each have a name of their own and a bound
+/// it sets lets it do something, and a cost limit is set only for a harness that says what its
+/// sessions cost (`Kind::says_cost`); and its volumes each have a name of their own and a bound
 /// ([`volumes::problems`]).
 pub async fn check(hub: &Hub, owner: &str, s: &Settings) -> R<Vec<String>> {
     let mut why = Vec::new();
@@ -246,6 +248,9 @@ pub async fn check(hub: &Hub, owner: &str, s: &Settings) -> R<Vec<String>> {
         if v == Some(0) {
             why.push(format!("a limit of 0 {limit} lets it do nothing: leave it out for none"));
         }
+    }
+    if s.limits.cents.is_some() && !kind.says_cost() {
+        why.push(format!("{} doesn't say what its sessions cost, so kiln can't hold a limit in `cents` to it: limit its `tokens` instead", kind.name));
     }
     why.extend(volumes::problems(&s.volumes));
     Ok(why)
