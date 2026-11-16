@@ -216,23 +216,53 @@ pub const NO_MICROVM: &str = "this machine's kiln carries no microVM runtime yet
 /// (`RunnerFacts::isolation`; `virt.microvm` is its `available`).
 pub type Facts = kiln_ci::facts::Isolation;
 
-/// This machine's isolation facts: whether it holds isolated agents, on what, and why not.
+/// This machine's isolation facts: whether it holds isolated agents, on what, and why not. Blocking: where it holds
+/// them with the carried Shards, Shards is asked ([`facts_of`]).
 pub fn facts(kvm: bool) -> Facts {
     facts_of(kvm, microvm().as_deref())
 }
 
-/// The isolation facts of a machine holding isolated agents in `held`, or in none.
+/// The isolation facts of a machine holding isolated agents in `held`, or in none. Held with the carried Shards
+/// ([`hold`]), they're what Shards' own check of this host says now (`shards_api::host_check`, Shards' D262: the check
+/// its VM process makes before it boots, made without booting one, by one launch of the carried `shards`), so a runner
+/// whose hypervisor can't run microVMs says so in Shards' words, and its engine is `host` (kiln plan 01a1dd2e…, P2.3).
+/// A stand-in's ([`Microvms::new`], [`held_in`] alone) carries no `shards` to ask. Blocking.
 pub fn facts_of(kvm: bool, held: Option<&Microvms>) -> Facts {
     let hypervisor = hypervisor(kvm);
-    match held {
-        Some(_) => Facts { available: true, hypervisor, why_not: None, engine: None },
+    match held.map(|vms| vms.shards.as_ref()) {
+        Some(Some(carried)) => checked(hypervisor, shards_api::host_check(Some(carried.shards.as_path()))),
+        Some(None) => Facts { available: true, hypervisor, why_not: None, engine: None },
         None => Facts { available: false, hypervisor, why_not: Some(NO_MICROVM.to_owned()), engine: None },
     }
 }
 
+/// Why a machine holds no isolated agent where its Shards couldn't say whether this host runs microVMs, before what
+/// Shards said.
+pub const UNCHECKED: &str = "this machine's Shards couldn't say whether it runs microVMs";
+
+/// The isolation facts of a machine whose Shards answered `answer` to whether this host runs microVMs now: available
+/// where it does, its backend the hypervisor; else not, and why in Shards' words, `hypervisor` the one the runner's
+/// probe found.
+fn checked(hypervisor: Option<String>, answer: Result<shards_api::HostCheck, shards_api::CheckRefusal>) -> Facts {
+    match answer {
+        Ok(shards_api::HostCheck::Usable(backend)) => Facts { available: true, hypervisor: Some(hypervisor_of(backend).to_owned()), why_not: None, engine: None },
+        Ok(shards_api::HostCheck::Unusable { why, .. }) => Facts { available: false, hypervisor, why_not: Some(why.to_string()), engine: None },
+        Err(e) => Facts { available: false, hypervisor, why_not: Some(format!("{UNCHECKED}: {e}")), engine: None },
+    }
+}
+
+/// A Shards backend as the facts name its hypervisor (`RunnerFacts::isolation`'s `hypervisor`).
+fn hypervisor_of(backend: shards_api::Backend) -> &'static str {
+    match backend {
+        shards_api::Backend::Kvm => "KVM",
+        shards_api::Backend::HypervisorFramework => "Hypervisor.framework",
+        shards_api::Backend::WindowsHypervisorPlatform => "WHP",
+    }
+}
+
 /// The hypervisor a microVM here would run on, where the runner can use one: KVM on Linux (its
-/// `/dev/kvm`, as the runner's probe found it). macOS's and Windows' are what the microVMs'
-/// runtime reports once it's carried (Shards' backend: Hypervisor.framework, WHP).
+/// `/dev/kvm`, as the runner's probe found it); where the carried Shards says this host runs
+/// microVMs, its backend ([`checked`]).
 fn hypervisor(kvm: bool) -> Option<String> {
     (cfg!(target_os = "linux") && kvm).then(|| "KVM".to_owned())
 }
@@ -381,6 +411,31 @@ mod tests {
         assert_eq!(with_kvm.why_not.as_deref(), Some(super::NO_MICROVM));
         assert_eq!(with_kvm.hypervisor.as_deref(), cfg!(target_os = "linux").then_some("KVM"));
         assert_eq!(super::facts(false).hypervisor, None);
+    }
+
+    /// Kiln plan 01a1dd2e…, P2.3 AC2: a machine holding microVMs with the carried Shards says what Shards' own check of
+    /// its host says (`shards_api::host_check`): available where it runs them, its backend the hypervisor; else not,
+    /// in Shards' words (`/dev/kvm` named where it's missing or this user can't open it, an Intel Mac's platform
+    /// named), and its engine is `host` with that why; not available either where Shards couldn't say, with its words.
+    #[test]
+    fn p2_3_a_runner_says_what_shards_check_of_its_host_says() {
+        use crate::harness::engine::{Asked, capable, held};
+        use kiln_ci::facts::{Engine, RunnerFacts};
+        use shards_api::{Backend, CheckRefusal, HostCheck, Unusable};
+        let usable = super::checked(None, Ok(HostCheck::Usable(Backend::HypervisorFramework)));
+        assert_eq!((usable.available, usable.hypervisor.as_deref(), usable.why_not.as_deref()), (true, Some("Hypervisor.framework"), None));
+        for (why, says) in [(Unusable::KvmDenied, "cannot open /dev/kvm: permission denied"), (Unusable::KvmMissing, "/dev/kvm does not exist")] {
+            let f = super::checked(None, Ok(HostCheck::Unusable { backend: Some(Backend::Kvm), why }));
+            assert!(!f.available && f.hypervisor.is_none() && f.why_not.as_deref().is_some_and(|w| w.contains(says)), "{f:?}");
+            let runner = RunnerFacts { isolation: Some(f.clone()), ..RunnerFacts::default() };
+            let h = held(Asked::default(), &capable(&runner));
+            assert_eq!((h.engine, h.why.as_deref()), (Engine::Host, f.why_not.as_deref()));
+        }
+        let intel = super::checked(None, Ok(HostCheck::Unusable { backend: None, why: Unusable::Unsupported { os: "macos".into(), arch: "x86_64".into() } }));
+        assert!(!intel.available && intel.why_not.as_deref().is_some_and(|w| w.contains("macos/x86_64")), "{intel:?}");
+        let unasked = super::checked(Some("KVM".into()), Err(CheckRefusal::Ended { status: Some(3), said: "shards: no such command: api-check".into() }));
+        assert!(!unasked.available && unasked.hypervisor.as_deref() == Some("KVM"), "{unasked:?}");
+        assert!(unasked.why_not.as_deref().is_some_and(|w| w.starts_with(super::UNCHECKED) && w.contains("no such command")), "{unasked:?}");
     }
 
     /// #75 step 3 (Shards D254): a machine's microVMs say whether their runs carry kiln's MCP lane, typed: those held

@@ -292,7 +292,7 @@ fn finish(s: &Server, id: &str, cwd: &Path, prompts: &[String]) -> anyhow::Resul
         }
         let c = json!({"type": "send", "id": format!("budget-{id}-{k}"), "text": next});
         let (st, body) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/command"), &s.admin, Some(&c))?;
-        anyhow::ensure!(st == 200, "turn {}'s prompt: {st} {body}", k + 1);
+        anyhow::ensure!(kept(st, &body), "turn {}'s prompt: {st} {body}", k + 1);
     }
     loop {
         let (frames, _) = agents::attach(s.port, &s.admin, id, "")?;
@@ -302,6 +302,21 @@ fn finish(s: &Server, id: &str, cwd: &Path, prompts: &[String]) -> anyhow::Resul
         anyhow::ensure!(Instant::now() < deadline, "the server's copy of {id} never held its end\n{}", s.log());
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Whether the server kept a person's message: since W20 (0ff338877) it answers 202 with its
+/// custody receipt, `retained`, the message waiting for its session's admission or past it, which
+/// `Sent::kept_for_person` counts unless cancelled or superseded. Its turn's file, or the session's
+/// end, says it came.
+fn kept(status: u16, body: &str) -> bool {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let retained = v.get("retained").and_then(Value::as_bool) == Some(true);
+    let disposition = v
+        .pointer("/publication/disposition")
+        .and_then(Value::as_str);
+    status == 202
+        && retained
+        && disposition.is_some_and(|d| !matches!(d, "cancelled" | "superseded"))
 }
 
 // ---------------------------------------------------------------------------------- the wire
@@ -775,7 +790,16 @@ const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
 /// 1,365 (0.4%), runners 1,521 to 1,548 (1.8%), overview 1,167 to 1,172 (0.4%). Runners raised with the
 /// load balancer line, whose runners' facts carry their storage and memory level (lb/sense): main at
 /// c9c48f77 1,589, the line 1,744 to 1,761 (spread 1.0%) over five runs on kiln-a094a12d, 2026-11-08.
-const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 1_902), ("overview", 1_260)];
+/// Raised again for what each runner's record has carried since, which the runners API serves and its
+/// page doesn't show: W13-R01's GPUs through Hex (`gpu_unavailable`, e89613f45; each GPU's `id`,
+/// `busy_per_mille` and `memory_used`, c0292187e), kiln plan 01a1cd8e862e7169a074db3d5fa33f3d's step
+/// 32 `virt.microvm` (e4064c9a5), step 17 `isolation` (f6cb63610) and step 34 `link` (0909253c8), and
+/// P2.3's `isolation.engine` (72d28bc0b, kiln plan 01a1dd2e…); main came to 2,046 at 709e4ebce
+/// (2026-11-16). They add to two runners' records, brotli 4 as the server sends them, 233 B with an
+/// Apple GPU, 244 B with an NVIDIA one and 391 B with neither, where `gpu_unavailable` says why for each
+/// vendor (docs/research/measurements/wire-budgets/runner-facts.py). So 1,761 and the most they add
+/// (391), times one plus the runs' spread (1.0%) plus 7%: 2,325.
+const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_325), ("overview", 1_260)];
 
 /// A key of Ship's that the simulated tab keeps loaded: what it GETs, how often it polls
 /// (`ui/src/views/ship/index.tsx`, `jobs.tsx`), what it last loaded, and what its loads came to.
