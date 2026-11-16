@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::Instant;
 
 use hex_api::{BoxState, Refusal as H, Runtime as _};
 use hex_node::images::ImageRuntime;
@@ -105,16 +105,18 @@ async fn listed(runtime: &Arc<ImageRuntime>, name: BoxName) -> anyhow::Result<bo
 }
 
 /// Box `name` once its run has ended, as Hex keeps that in its record (`BoxState::Empty`). Hex has no call that waits
-/// on an image box's own end, so its record is read until it says so, the test's own bound ending a run that never
-/// does.
+/// on an image box's own end, so its record is read until it says so, each read due once as long as the last took has
+/// passed (at most half the time reading, as Hex's conformance reads a box's state and a replay its steps' ends), the
+/// test's own bound ending a run that never does.
 async fn ended(runtime: &Arc<ImageRuntime>, name: BoxName) -> anyhow::Result<hex_api::BoxInfo> {
     loop {
         let r = Arc::clone(runtime);
+        let read = Instant::now();
         let info = kiln::rt::blocking(move || r.inspect(&name.id()?)).await?.map_err(hex)?;
         if info.state == BoxState::Empty {
             return Ok(info);
         }
-        kiln::rt::sleep(Duration::from_millis(50)).await;
+        kiln::rt::sleep_until(kiln_seams::clock::later(Instant::now(), read.elapsed())).await;
     }
 }
 
