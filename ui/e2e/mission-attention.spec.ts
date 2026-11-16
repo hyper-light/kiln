@@ -36,13 +36,16 @@ async function menu(page: Page, id: string, item: string) {
     .click();
   await page.getByRole("menuitem", { name: item, exact: true }).click();
 }
-/** What the page sent to /api/harness/attention, as it sent it. */
+/** What the page sent to /api/harness/attention, as it sent it, and its own operations on one agent (P5.6 S6: `POST
+ * /api/harness/agents/:id/<action>`), each as the command it is. */
 function watch(page: Page) {
   const sent: { method: string; mode: string | null; visit: string | null; body: Record<string, unknown> | null }[] = [];
   page.on("request", (r: Request) => {
     const url = new URL(r.url());
-    if (url.pathname !== "/api/harness/attention") return;
-    const body = r.method() === "POST" ? (r.postDataJSON() as Record<string, unknown>) : null;
+    const own = r.method() === "POST" ? url.pathname.match(/^\/api\/harness\/agents\/([^/]+)\/(pin|unpin|park|unpark|archive|restore)$/) : null;
+    if (url.pathname !== "/api/harness/attention" && !own) return;
+    const posted = r.method() === "POST" ? (r.postDataJSON() as Record<string, unknown>) : null;
+    const body = own && posted ? { ...posted, action: own[2] === "restore" && posted.copy ? "restore_copy" : own[2], agent: decodeURIComponent(own[1] ?? "") } : posted;
     sent.push({ method: r.method(), mode: (body?.mode as string | undefined) ?? url.searchParams.get("mode"), visit: (body?.visit as string | undefined) ?? url.searchParams.get("visit"), body });
   });
   return sent;
@@ -250,8 +253,9 @@ test("mc_attention: archive asks first; the chat is under State: Archived, where
   await expect(docs.locator(".ms-word")).toHaveText("Archived");
   // Its harness's own conversation gone: Restore says so, and offers the saved copy, asked first.
   let copies = 0;
-  await page.route(/\/api\/harness\/attention$/, async (route) => {
-    const action = (route.request().postDataJSON() as { action?: string } | null)?.action;
+  // Its Restore, `agents.restore` (P5.6 S6): from kiln's saved copy where it says `copy`.
+  await page.route(/\/api\/harness\/agents\/fam-docs\/restore$/, async (route) => {
+    const action = (route.request().postDataJSON() as { copy?: boolean } | null)?.copy ? "restore_copy" : "restore";
     if (action === "restore")
       return route.fulfill({
         status: 409,
@@ -271,7 +275,7 @@ test("mc_attention: archive asks first; the chat is under State: Archived, where
   await copy.getByRole("button", { name: "Continue from the saved copy" }).click();
   await expect.poll(() => copies).toBe(1);
   await expect(docs).toHaveCount(0);
-  await page.unroute(/\/api\/harness\/attention$/);
+  await page.unroute(/\/api\/harness\/agents\/fam-docs\/restore$/);
   await page.getByRole("button", { name: "Remove State: Archived" }).click();
   await expect(docs).toBeVisible();
 });

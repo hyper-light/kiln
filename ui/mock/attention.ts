@@ -76,7 +76,10 @@ function wakeWords(agents: AgentInfo[], id: string, mark: AttentionMark): string
 
 export async function handleAttention(req: http.IncomingMessage, res: http.ServerResponse, url: URL, all: () => AgentInfo[]): Promise<boolean> {
   const p = url.pathname;
-  if (p !== "/api/harness/attention" && p !== "/api/harness/attention/replay" && !p.startsWith("/api/mock/attention/")) return false;
+  // The Agents page's own operations on one agent (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6 S6: `agents.pin`, `unpin`,
+  // `park`, `unpark`, `archive`, `restore`, each `POST /api/harness/agents/:id/<action>`), each the attention command it is.
+  const routed = req.method === "POST" ? p.match(/^\/api\/harness\/agents\/([^/]+)\/(pin|unpin|park|unpark|archive|restore)$/) : null;
+  if (p !== "/api/harness/attention" && p !== "/api/harness/attention/replay" && !p.startsWith("/api/mock/attention/") && !routed) return false;
   const send = (code: number, value: unknown) => {
     res.writeHead(code, { "content-type": "application/json" });
     res.end(JSON.stringify(value));
@@ -169,7 +172,9 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
   let mode = url.searchParams.get("mode") ?? "arrival";
   let visit = url.searchParams.get("visit");
   if (req.method === "POST") {
-    const command = await read<Body & Partial<AttentionFrame> & Partial<AttentionClose>>();
+    const asked = await read<Body & Partial<AttentionFrame> & Partial<AttentionClose> & { copy?: boolean }>();
+    // A restore from kiln's copy is `restore` with `copy: true` (the server's `agents.restore`), the command `restore_copy`.
+    const command = routed ? { ...asked, action: routed[2] === "restore" && asked.copy ? "restore_copy" : (routed[2] ?? ""), agent: decodeURIComponent(routed[1] ?? "") } : asked;
     if (command.action === "render" && command.exposure && command.frame_revision !== undefined) {
       const record = frames.get(command.exposure) ?? {};
       if (record.bound === undefined || command.frame_revision <= record.bound) {
