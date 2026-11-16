@@ -763,7 +763,7 @@ mod tests {
             let source = source_of(agy, &spec).map_err(anyhow::Error::msg)?;
             for _ in 0..2 {
                 let mut args = Vec::new();
-                offer_mcp(agy, &source, Some("user:u1"), Some(&root), &mut args).await;
+                offer_mcp(agy, &source, Some("user:u1"), Some(root.as_path()), &mut args).await;
                 anyhow::ensure!(args.is_empty(), "agy takes kiln's MCP from its own config alone: {args:?}");
             }
             anyhow::Ok(())
