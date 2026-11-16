@@ -2590,10 +2590,6 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     });
     return true;
   }
-  if (p === "/api/harness/agents" && m === "POST") {
-    json(res, 409, { error: "the mock starts no agents: use the demo ones" });
-    return true;
-  }
   if (p === "/api/harness/agents/wait" && m === "POST") {
     const q = await body<{ agents?: string[] | string; agent?: string }>(req);
     const listed = Array.isArray(q.agents) ? q.agents : (q.agents ?? "").split(",");

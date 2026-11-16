@@ -46,21 +46,30 @@ const listed = (key: string) => {
 };
 const id = (c: string) => c.repeat(32);
 const start = (ids: string[]) => startAgents({ ids, target: "agent:m1", spec: { kind: "claude", prompt: "Fix the tests" }, kindName: "Claude Code", machine: "m1", text: "Fix the tests", files: [] });
-const ok = (infos: Partial<Info>[]) => () => new Response(JSON.stringify(infos.map((i) => ({ name: "Claude Code", status: "starting", ...i }))), { status: 200 });
+/** agents.start's answer (its agents, briefly; P5.6 S8), then each one's read whole, as the page reads them next. */
+const ok = (infos: Partial<Info>[]) => [
+  () => new Response(JSON.stringify({ agents: infos.map((i) => ({ id: i.id })), parent: null }), { status: 200 }),
+  ...infos.map((i) => () => new Response(JSON.stringify({ name: "Claude Code", status: "starting", ...i }), { status: 200 })),
+];
 const refused = (status: number, error: string) => () => new Response(JSON.stringify({ error }), { status });
+
+const settle = async () => {
+  for (let i = 0; i < 5; i++) await tick();
+};
 
 for (const key of LISTS) await loaded(key, async () => []);
 
 await test("W21-R15: an agent starts under the id made here, listed starting at once, and done once the server answers", async () => {
-  answers.push(ok([{ id: id("a") }]));
+  answers.push(...ok([{ id: id("a") }]));
   start([id("a")]);
   // Before any answer: its start under way, and it's listed, starting, on every list.
   assert.equal(useStarting.getState().starts[id("a")]?.state, "starting");
   for (const key of LISTS) assert.deepEqual(listed(key), ["aaa:starting"]);
   const ask = asked.at(-1);
-  assert.equal(ask?.url, "/api/harness/sessions");
+  assert.equal(ask?.url, "/api/harness/agents");
   assert.deepEqual((ask?.body as { ids?: string[] }).ids, [id("a")]);
-  await tick();
+  assert.equal((ask?.body as { on?: string }).on, "agent:m1");
+  await settle();
   assert.equal(useStarting.getState().starts[id("a")]?.state, "started");
   for (const key of LISTS) assert.deepEqual(listed(key), ["aaa:starting"]);
 });
@@ -68,9 +77,6 @@ await test("W21-R15: an agent starts under the id made here, listed starting at 
 /** The server's answer to a lookup of one agent: there (as it lists it), or not. */
 const there = (i: string) => () => new Response(JSON.stringify({ id: i, name: "Claude Code", status: "running" }), { status: 200 });
 const none = () => new Response(JSON.stringify({ error: "no such agent session" }), { status: 404 });
-const settle = async () => {
-  for (let i = 0; i < 5; i++) await tick();
-};
 
 await test("W21-R15: a start that's refused says why and leaves the lists; asked again, a 409 is a start only if the server has the agent", async () => {
   answers.push(refused(400, "machine m1 is not connected"), none);
@@ -111,10 +117,10 @@ await test("W21-R15: of several, those that started before another couldn't are 
     assert.ok(listed(key).includes("111:running"), listed(key).join(" "));
     assert.ok(!listed(key).some((a) => a.startsWith("222")), listed(key).join(" "));
   }
-  answers.push(ok([{ id: id("2") }]));
+  answers.push(...ok([{ id: id("2") }]));
   startAgain(id("2"));
   const retry = asked.at(-1);
-  assert.equal(retry?.url, "/api/harness/sessions");
+  assert.equal(retry?.url, "/api/harness/agents");
   assert.deepEqual((retry?.body as { ids?: string[]; count?: number }).ids, [id("2")]);
   assert.equal((retry?.body as { count?: number }).count, 1);
   await settle();
@@ -124,10 +130,10 @@ await test("W21-R15: of several, those that started before another couldn't are 
 });
 
 await test("W21-R15: from a server that makes its own ids, its agents take the place of those listed under the ids made here", async () => {
-  answers.push(ok([{ id: id("e") }, { id: id("f") }]));
+  answers.push(...ok([{ id: id("e") }, { id: id("f") }]));
   start([id("d"), id("9")]);
   for (const key of LISTS) assert.ok(listed(key).includes("ddd:starting") && listed(key).includes("999:starting"));
-  await tick();
+  await settle();
   assert.deepEqual(
     useStarting.getState().starts[id("d")]?.started?.map((a) => a.id),
     [id("e"), id("f")],
@@ -140,11 +146,11 @@ await test("W21-R15: from a server that makes its own ids, its agents take the p
 });
 
 await test("W21-R15: what the server's events said of a starting agent stands over the start's own answer, which says less", async () => {
-  answers.push(ok([{ id: id("7") }]));
+  answers.push(...ok([{ id: id("7") }]));
   start([id("7")]);
   // Its machine's word first, as an event (in place of what was listed here).
   for (const key of LISTS) setData<Info[]>(key, (l) => l.map((a) => (a.id === id("7") ? { ...a, status: "running" } : a)));
-  await tick();
+  await settle();
   assert.equal(useStarting.getState().starts[id("7")]?.state, "started");
   for (const key of LISTS) assert.ok(listed(key).includes("777:running"), listed(key).join(" "));
 });

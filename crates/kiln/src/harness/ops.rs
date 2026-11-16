@@ -1341,6 +1341,19 @@ pub mod input {
         /// The conversation to take up again: its harness's own session id (an agent's
         /// `harness_session`, as agents_get gives it), in its folder on its machine; one agent.
         pub resume: Option<String>,
+        /// The ids to start them under, one per agent, each 32 lowercase hex digits you made, so
+        /// that you know each one's id before it has started: asked again under the same ids, the
+        /// start is refused (409) rather than starting them twice.
+        pub ids: Option<Vec<String>>,
+        /// The speed to start at ("" standard, else one of its model's speeds); left out, its
+        /// harness's own.
+        pub speed: Option<String>,
+        /// Its tools for running commands on other runners: left out, it has them; `off`, it
+        /// doesn't; else where its commands go unless it says otherwise (a runner's name, or
+        /// `linux/amd64`). An agent's agents' are its own.
+        pub reach: Option<String>,
+        /// The terminal session it belongs to, where a person starts it from one.
+        pub shell: Option<String>,
         /// Its task apart from the words of the agent definition it runs (as agentdefs_run starts one): what
         /// a split's variant that's another agent is told after that agent's words. Which definition it runs is
         /// kiln's to say, as agentdefs_run starts it.
@@ -1917,6 +1930,33 @@ pub(crate) mod end_to_end {
             anyhow::ensure!(ids == copied && ids.contains(&a) && ids.contains(&b), "{listed}");
             let shared: Vec<String> = hub.harness.list_shared().iter().map(|i| i.id.clone()).collect();
             anyhow::ensure!(shared == hub.harness.list().into_iter().map(|i| i.id).collect::<Vec<_>>(), "the same sessions, in the same order");
+            Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1dd2e…, P5.6 S8: the console's start is agents.start's. A person's start under ids they made, one
+    /// per agent (W21-R15), starts each under its own, with its speed, reach and terminal session as asked; asked again
+    /// under the same ids it's refused 409, nothing started twice; ids of another count, or no id, are refused 400.
+    #[test]
+    fn p5_6_s8_a_start_under_its_callers_ids_is_refused_again_under_them() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let ids = [crate::util::new_id(), crate::util::new_id()];
+            let ask = json!({"kind": "claude", "on": "local", "cwd": NOWHERE, "count": 2, "ids": ids, "speed": "", "reach": "off", "shell": "term-1"});
+            let started = call(person.clone(), "agents.start", ask.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let got: Vec<&str> = started.get("agents").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.get("id").and_then(Value::as_str)).collect()).unwrap_or_default();
+            anyhow::ensure!(got == ids.iter().map(String::as_str).collect::<Vec<_>>(), "under its caller's ids: {started}");
+            let info = hub.harness.info(&ids[0]).ok_or_else(|| anyhow::anyhow!("not started"))?;
+            anyhow::ensure!(info.reach.as_deref() == Some("off") && info.shell.as_deref() == Some("term-1"), "as asked: {:?} {:?}", info.reach, info.shell);
+            let before = hub.harness.list().len();
+            let Err((status, why)) = call(person.clone(), "agents.start", ask).await else { anyhow::bail!("started twice under the same ids") };
+            anyhow::ensure!(status == http::StatusCode::CONFLICT, "{status} {why}");
+            anyhow::ensure!(hub.harness.list().len() == before, "nothing started twice");
+            let Err((status, _)) = call(person.clone(), "agents.start", json!({"kind": "claude", "on": "local", "cwd": NOWHERE, "count": 2, "ids": [crate::util::new_id()]})).await else { anyhow::bail!("ids of another count started") };
+            anyhow::ensure!(status == http::StatusCode::BAD_REQUEST);
+            let Err((status, _)) = call(person, "agents.start", json!({"kind": "claude", "on": "local", "cwd": NOWHERE, "ids": ["not-an-id"]})).await else { anyhow::bail!("no id started") };
+            anyhow::ensure!(status == http::StatusCode::BAD_REQUEST);
             Ok(())
         })
     }

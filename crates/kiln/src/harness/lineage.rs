@@ -534,6 +534,18 @@ pub struct Ask {
     pub image: Option<String>,
     /// Its harness's own session to take up again, as `Spec::resume` (step 35).
     pub resume: Option<String>,
+    /// The ids to start them under, one each, made by the caller (`crate::util::is_id`), so that
+    /// its page can open an agent's own page before it has started (W21-R15): asked again under
+    /// the same ids, a start is refused (409, `IdTaken`) rather than started twice. A start with
+    /// ids of its own opens as asked, no experiment's split drawn for it (P7.1).
+    pub ids: Option<Vec<String>>,
+    /// The speed to start at (`Spec::speed`: "" standard); none, its harness's own.
+    pub speed: Option<String>,
+    /// Its reach (`Spec::reach`): none, its tools for other runners; `off`, none; else where its
+    /// commands go. A subagent's is its parent's ([`hold`]).
+    pub reach: Option<String>,
+    /// The terminal session it belongs to (`Spec::shell`): a person's start from a terminal.
+    pub shell: Option<String>,
     /// The task it was given apart from its definition's words (`agentdefs.run`): what a split's variant that's
     /// another agent is told after that agent's words (P7.1). The definition a split matches is kiln's to say
     /// ([`Ask::definition`]), never what's asked.
@@ -554,6 +566,13 @@ pub struct Ask {
     /// session it opens (`crate::agentdefs::sessions`): kiln's to say, never from what's asked.
     #[serde(skip)]
     pub definition: Option<crate::agentdefs::sessions::Definition>,
+}
+
+impl Ask {
+    /// The ids it was asked to start under ([`Ask::ids`]): none where it named none.
+    pub fn ids(&self) -> &[String] {
+        self.ids.as_deref().unwrap_or_default()
+    }
 }
 
 /// Where a start waiting for room says so, once ([`Ask::queued`]).
@@ -1373,7 +1392,7 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     // target that its opener starts is one of its variants, drawn as it starts. A card's helper, and a conversation
     // taken up again, start as they were.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
-    let fresh = ask.helper.is_none() && ask.resume.as_deref().is_none_or(|r| r.trim().is_empty());
+    let fresh = ask.helper.is_none() && ask.resume.as_deref().is_none_or(|r| r.trim().is_empty()) && ask.ids().is_empty();
     let Some(person) = person.filter(|_| fresh) else {
         return start_as(hub, by, ask, |_| {}).await;
     };
@@ -1623,6 +1642,19 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     if resume.is_some() && count > 1 {
         return Err(bad("one conversation is taken up by one agent: `resume` starts one (`count` 1)"));
     }
+    let asked_ids = ask.ids();
+    if !asked_ids.is_empty() {
+        if asked_ids.len() != count {
+            return Err(bad(format!("`ids` names one id for each agent it starts: {count}, not {}", asked_ids.len())));
+        }
+        if let Some(wrong) = asked_ids.iter().find(|id| !crate::util::is_id(id)) {
+            return Err(bad(format!("{wrong:?} isn't an id: an id is 32 lowercase hex digits")));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !asked_ids.iter().all(|id| seen.insert(id.as_str())) {
+            return Err(bad("`ids` names each agent's id once"));
+        }
+    }
     // A parent's reach off holds its children to its machine.
     let on = by.parent.as_ref().filter(|p| p.reach.as_deref() == Some("off")).map(target_of).or_else(|| ask.on.clone());
     // The Agentfile it names is checked before anything is placed for it.
@@ -1692,7 +1724,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
                 }
                 Ok::<_, Refused>((held.0, held.1, !p.no_bypass))
             }
-            None => Ok((ask.mode.clone().filter(|m| !m.trim().is_empty()), None, true)),
+            None => Ok((ask.mode.clone().filter(|m| !m.trim().is_empty()), ask.reach.clone().filter(|r| !r.trim().is_empty()), true)),
         }
     };
     let (mode, reach, allow_bypass) = match checked.await {
@@ -1716,6 +1748,8 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         prompt: ask.prompt.clone().filter(|p| !p.trim().is_empty()),
         name: ask.name.clone().filter(|n| !n.trim().is_empty()),
         effort: ask.effort.clone().filter(|e| !e.trim().is_empty()),
+        speed: ask.speed.clone(),
+        shell: ask.shell.clone().filter(|s| !s.trim().is_empty()),
         allow_bypass,
         reach,
         parent: by.parent.as_ref().map(|p| p.id.clone()),
@@ -1738,7 +1772,9 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     while let Some((t, claim)) = placed.get(at) {
         let n = if claim.is_none() { placed.iter().skip(at).take_while(|(u, c)| u == t && c.is_none()).count() } else { 1 };
         let spec = Spec { claim: claim.clone(), isolation: with_person(boundary(t), person.as_deref()), engine_version: decided_under(t), ..spec.clone() };
-        match hub.harness.open(hub, t, spec, n).await {
+        // Under the caller's own ids where it named them, each placed batch its own in order.
+        let ids = asked_ids.get(at..at.saturating_add(n)).unwrap_or_default();
+        match hub.harness.open_as(hub, t, spec, n, ids).await {
             Ok(i) => infos.extend(i),
             Err(e) => {
                 let_go(hub, placed.get(at..).unwrap_or_default()).await;
@@ -1767,6 +1803,17 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
         if ask.prompt.as_deref().is_some_and(|p| !p.trim().is_empty()) {
             super::wait::sent(&i.id, None);
+        }
+    }
+    // A person's own start marks their attention on each (a message where it was told a task, a
+    // command where not), as their other actions on an agent do (`attention_hooks`).
+    if by.parent.is_none()
+        && let Some(asker) = &by.asker
+    {
+        let what = if ask.prompt.as_deref().is_some_and(|p| !p.trim().is_empty()) { "message" } else { "command" };
+        let at = crate::util::now_ms();
+        for i in &infos {
+            crate::harness::attention_hooks::record(hub, asker, &i.id, what, &i.id, at).await;
         }
     }
     // Whose they are says which installed skills they have (docs/agents.md, "Skills kiln installs").
