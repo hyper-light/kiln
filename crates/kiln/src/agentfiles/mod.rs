@@ -91,7 +91,7 @@ pub struct Saved {
     pub check: Check,
     /// The agent definitions that took what its new text says of them (kiln plan 01a1dd2e… P5.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(test, ts(optional))]
+    #[cfg_attr(test, ts(as = "Option<Vec<Synced>>", optional))]
     pub synced: Vec<Synced>,
 }
 
