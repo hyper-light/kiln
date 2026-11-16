@@ -1018,8 +1018,12 @@ enum Push {
 }
 
 impl Outbox {
-    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, data: impl Into<Queued>) -> Push {
-        let mut data: Queued = data.into();
+    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+        self.push_queued(peer, lane, kind, Queued::from(data))
+    }
+
+    /// [`Outbox::push`] of a frame as the net thread holds it, one to wipe among them ([`Queued`]).
+    fn push_queued(&mut self, peer: PeerId, lane: u32, kind: Kind, mut data: Queued) -> Push {
         if let Some(f) = &mut self.copy {
             use std::io::Write as _;
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
@@ -1315,12 +1319,12 @@ async fn run_loop(
                     match cmd {
                         // A frame to wipe is held so as it waits, and let go of so ([`Queued`]).
                         frame @ (Out::Frame { .. } | Out::Wiped { .. }) => {
-                            let (peer, lane, kind, data) = match frame {
-                                Out::Wiped { peer, lane, kind, data } => (peer, lane, kind, Queued::new(data, true)),
-                                Out::Frame { peer, lane, kind, data } => (peer, lane, kind, Queued::from(data)),
+                            let (peer, lane, pushed) = match frame {
+                                Out::Frame { peer, lane, kind, data } => (peer, lane, outbox.push(peer, lane, kind, data)),
+                                Out::Wiped { peer, lane, kind, data } => (peer, lane, outbox.push_queued(peer, lane, kind, Queued::new(data, true))),
                                 _ => continue,
                             };
-                            if outbox.push(peer, lane, kind, data) == Push::Stuck {
+                            if pushed == Push::Stuck {
                                 // Its control lane's queue is full: rather than lose control
                                 // frames, the connection closes, and the channel's resume repairs
                                 // what it carried.
