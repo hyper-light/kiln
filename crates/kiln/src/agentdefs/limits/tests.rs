@@ -1,6 +1,6 @@
 //! An agent definition's limits held to the sessions it starts (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.4's tests
-//! "a session past its time limit", "a session past its token limit" and "a session past its cost limit", and a cost
-//! limit refused for a harness that says no cost).
+//! "a session past its time limit", "a session past its token limit" and "a session past its cost limit"; a token or
+//! cost limit refused for a harness that doesn't say that of its sessions, and a session on one ended as it starts).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -489,6 +489,126 @@ fn p5_4_a_cost_limit_is_refused_for_a_harness_that_says_no_cost() -> anyhow::Res
         )
         .await?;
         anyhow::ensure!(said == refusal, "{said:?}");
+        Ok(())
+    })
+}
+
+/// P5.4: a token limit is held only to a harness that says how many tokens its sessions use. Claude Code, Codex,
+/// Antigravity and Pi do; an ACP agent's tokens are its own to give or leave out, so a definition of any of the six
+/// that sets `tokens` is refused as it's saved (422, the reason said; the check says it first), as is a change that
+/// moves a Claude Code agent with a token limit to one. A cost limit refused for an ACP agent is told to limit its
+/// time instead, as its tokens would be refused too; its time limit is kept. Making `Kind::says_tokens` true for ACP,
+/// or taking `check`'s token refusal out, fails this test.
+#[test]
+fn p5_4_a_token_limit_is_refused_for_a_harness_that_says_no_tokens() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+        let ada = person("ada")?;
+        for (harness, name) in [
+            ("devin", "Devin"),
+            ("gemini", "Gemini CLI"),
+            ("opencode", "opencode"),
+            ("goose", "Goose"),
+            ("amp", "Amp"),
+            ("cursor", "Cursor CLI"),
+        ] {
+            let why = format!(
+                "{name} doesn't say how many tokens its sessions use, so kiln can't hold a limit in `tokens` to it: limit its `seconds` instead"
+            );
+            let checked = op(
+                &hub,
+                &ada,
+                "agentdefs.check",
+                json!({"harness": harness, "limits": {"tokens": 1000}}),
+            )
+            .await?;
+            anyhow::ensure!(
+                checked == json!({"ok": false, "problems": [why]}),
+                "{harness}: {checked}"
+            );
+        }
+        for harness in ["claude", "codex", "antigravity", "pi"] {
+            let name = format!("{harness}-counter");
+            defined(&hub, &ada, &name, harness, json!({"tokens": 1000})).await?;
+        }
+        let why = "Gemini CLI doesn't say how many tokens its sessions use, so kiln can't hold a limit in `tokens` to it: limit its `seconds` instead";
+        let refusal = (
+            http::StatusCode::UNPROCESSABLE_ENTITY,
+            format!("kiln can't run this agent: {why}"),
+        );
+        let said = refused(
+            &hub,
+            &ada,
+            "agentdefs.create",
+            json!({"name": "reader", "harness": "gemini", "limits": {"tokens": 1000}}),
+        )
+        .await?;
+        anyhow::ensure!(said == refusal, "{said:?}");
+        let reader = defined(&hub, &ada, "reader", "claude", json!({"tokens": 1000})).await?;
+        let said = refused(
+            &hub,
+            &ada,
+            "agentdefs.update",
+            json!({"id": reader, "harness": "gemini"}),
+        )
+        .await?;
+        anyhow::ensure!(said == refusal, "{said:?}");
+        let checked = op(
+            &hub,
+            &ada,
+            "agentdefs.check",
+            json!({"harness": "gemini", "limits": {"cents": 50}}),
+        )
+        .await?;
+        anyhow::ensure!(
+            checked
+                == json!({"ok": false, "problems": [
+                    "Gemini CLI doesn't say what its sessions cost, so kiln can't hold a limit in `cents` to it: limit its `seconds` instead"
+                ]}),
+            "{checked}"
+        );
+        defined(&hub, &ada, "timed", "gemini", json!({"seconds": 600})).await?;
+        Ok(())
+    })
+}
+
+/// P5.4: a session held to a token limit while it runs a harness that says no tokens is ended as it starts. Ada's agent
+/// `away` (Claude Code) is limited to 1,000 tokens, and its session runs Gemini CLI all the same (a start may choose its
+/// harness over its definition's: `super::super::uses`), an ACP agent whose tokens are its own to give or leave out:
+/// it's ended before it says it spent anything, its end saying the limit can't be held, in its definition's sessions
+/// and in the audit trail. `home`, limited alike, runs Claude Code and runs on. Taking `past`'s `UnseenTokens` out
+/// leaves `away`'s session open, and this test fails.
+#[test]
+fn p5_4_a_session_on_a_harness_that_says_no_tokens_is_ended_as_it_starts() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+        let h = Arc::clone(&hub);
+        crate::rt::spawn(async move {
+            let _ = super::run(h).await;
+        });
+        let ada = person("ada")?;
+        let home = defined(&hub, &ada, "home", "claude", json!({"tokens": 1000})).await?;
+        let away = defined(&hub, &ada, "away", "claude", json!({"tokens": 1000})).await?;
+        started(&hub, "home-session", "claude", &home).await;
+        started(&hub, "away-session", "gemini", &away).await;
+        let by = closed_by(&hub, "away-session").await?;
+        anyhow::ensure!(
+            by == ["kiln (token limit: 1000 tokens, agent definition away)"],
+            "{by:?}"
+        );
+        let why = ended(&hub, &ada, &away, "away-session").await?;
+        anyhow::ensure!(
+            why.as_deref()
+                == Some(
+                    "its token limit of 1000 tokens can't be held: Gemini CLI doesn't say how many tokens its sessions use (agent definition away)"
+                ),
+            "{why:?}"
+        );
+        anyhow::ensure!(
+            ended(&hub, &ada, &home, "home-session").await?.is_none()
+                && closers(&hub, "home-session").await?.is_empty(),
+            "only the session whose limit can't be held ends: home's was"
+        );
         Ok(())
     })
 }

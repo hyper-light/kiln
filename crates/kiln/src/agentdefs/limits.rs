@@ -8,10 +8,12 @@
 //! What a session has spent is what kiln's copy of its state says (`Usage`, as an attachment's tokens a day count it,
 //! `crate::ci::attach`): its harness says it at each turn's end, and sooner where it can (Codex's token counts, Pi's
 //! replies, an ACP agent's cost). The registry tells the limits' owner of each session whose spending changed
-//! ([`Told`]), so none runs a whole turn past its limit unseen. A cost limit is held only to a harness that says what
-//! its sessions cost (`Kind::says_cost`): one set for another is refused as it's saved (`super::check`), and a session
-//! that runs another all the same (one its start chose over its definition's, `super::uses`) is ended at once, as its
-//! cost would go unseen.
+//! ([`Told`]), so none runs a whole turn past its limit unseen. A token limit is held only to a harness that says how
+//! many tokens its sessions use (`Kind::says_tokens`: no ACP agent, whose tokens are its own to give or leave out), and
+//! a cost limit only to one that says what they cost (`Kind::says_cost`). Either, set for another harness, is refused
+//! as it's saved (`super::check`), and a session held to one while it runs another all the same (a harness its start
+//! chose over its definition's, `super::uses`, or a definition saved before such limits were refused) is ended as it
+//! starts, as what it spends would go unseen.
 //!
 //! One task owns the limits ([`run`]): it looks at every session as it starts, then at each it's told of (one started
 //! from a definition, its deadline maybe the soonest, or one that spent more), and at every one again as the soonest
@@ -67,9 +69,12 @@ enum Past {
     Tokens(u64),
     /// Its cost, in US cents.
     Cents(u64),
+    /// Its tokens, while it runs `harness` (that harness's name), which doesn't say how many tokens its sessions use:
+    /// never held.
+    UnseenTokens { tokens: u64, harness: String },
     /// Its cost, in US cents, while it runs `harness` (that harness's name), which doesn't say what its sessions cost:
     /// never held.
-    Unseen { cents: u64, harness: String },
+    UnseenCents { cents: u64, harness: String },
 }
 
 impl Past {
@@ -81,7 +86,10 @@ impl Past {
                 format!("past its token limit of {n} tokens (agent definition {name})")
             }
             Past::Cents(n) => format!("past its cost limit of {n} cents (agent definition {name})"),
-            Past::Unseen { cents, harness } => format!(
+            Past::UnseenTokens { tokens, harness } => format!(
+                "its token limit of {tokens} tokens can't be held: {harness} doesn't say how many tokens its sessions use (agent definition {name})"
+            ),
+            Past::UnseenCents { cents, harness } => format!(
                 "its cost limit of {cents} cents can't be held: {harness} doesn't say what its sessions cost (agent definition {name})"
             ),
         }
@@ -92,8 +100,10 @@ impl Past {
     fn actor(&self, name: &str) -> String {
         match self {
             Past::Seconds(n) => format!("kiln (time limit: {n} s, agent definition {name})"),
-            Past::Tokens(n) => format!("kiln (token limit: {n} tokens, agent definition {name})"),
-            Past::Cents(n) | Past::Unseen { cents: n, .. } => {
+            Past::Tokens(n) | Past::UnseenTokens { tokens: n, .. } => {
+                format!("kiln (token limit: {n} tokens, agent definition {name})")
+            }
+            Past::Cents(n) | Past::UnseenCents { cents: n, .. } => {
                 format!("kiln (cost limit: {n} cents, agent definition {name})")
             }
         }
@@ -121,30 +131,36 @@ impl Held {
     }
 
     /// The limit it's past at `now`, running harness `kind` (its id) and having spent `used`: its time first, then its
-    /// tokens, then its cost. A cost limit while it runs a harness that doesn't say what its sessions cost can't be
-    /// held, so it's past at once.
+    /// tokens, then its cost. A token or cost limit while it runs a harness that doesn't say that of its sessions can't
+    /// be held, so it's past at once.
     fn past(&self, now: i64, kind: &str, used: &Usage) -> Option<Past> {
         if let (Some(n), Some(due)) = (self.limits.seconds, self.due())
             && due <= now
         {
             return Some(Past::Seconds(n));
         }
-        if let Some(n) = self.limits.tokens
-            && used.tokens() >= n
-        {
-            return Some(Past::Tokens(n));
+        let k = Kind::get(kind);
+        let harness = || k.map_or_else(|| kind.to_owned(), |k| k.name.to_owned());
+        if let Some(n) = self.limits.tokens {
+            if !k.is_some_and(Kind::says_tokens) {
+                return Some(Past::UnseenTokens {
+                    tokens: n,
+                    harness: harness(),
+                });
+            }
+            if used.tokens() >= n {
+                return Some(Past::Tokens(n));
+            }
         }
         let n = self.limits.cents?;
-        match Kind::get(kind) {
-            // In dollars, as its harness says it.
-            Some(k) if k.says_cost() => {
-                (used.cost_usd >= n as f64 / 100.0).then_some(Past::Cents(n))
-            }
-            k => Some(Past::Unseen {
+        if !k.is_some_and(Kind::says_cost) {
+            return Some(Past::UnseenCents {
                 cents: n,
-                harness: k.map_or_else(|| kind.to_owned(), |k| k.name.to_owned()),
-            }),
+                harness: harness(),
+            });
         }
+        // In dollars, as its harness says it.
+        (used.cost_usd >= n as f64 / 100.0).then_some(Past::Cents(n))
     }
 }
 

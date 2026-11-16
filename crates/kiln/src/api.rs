@@ -1080,7 +1080,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             boxed(|| crate::harness::limit::put(&hub, &name, req)).await.map_err(|(c, m)| err(c, m))
         }
         // The warm pools kiln names on a runner (`crate::sandbox::pools`; kiln plan 01a1dd2e…, P3.2).
-        (&Method::GET, ["api", "runners", name, "pools"]) => boxed(|| crate::sandbox::pools::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "runners", name, "pools"]) => boxed(|| crate::sandbox::pools::get(&hub, &caller, name)).await.map_err(|(c, m)| err(c, m)),
         // How a runner runs new agent sessions, its engine (`crate::harness::engine`; kiln plan 01a1dd2e…, P2.3).
         (&Method::GET, ["api", "runners", name, "engine"]) => boxed(|| crate::harness::engine::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::PUT, ["api", "runners", name, "engine"]) => {
