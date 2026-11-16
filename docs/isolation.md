@@ -73,7 +73,10 @@ the machine's network) is replaced by an Agentfile image's members.
   order, the end of its stdin is the member's, what the member writes fills its stdout and stderr, and
   its end is the session's exit. Its stdout and stderr hold as many chunks unread as a process's pipes
   do (`proc::STDOUT_CHUNKS`, `STDERR_CHUNKS`, one bound for both): no number of its own, and the same
-  backpressure on the member as on a process. The adapters are the ones host sessions use, unchanged.
+  backpressure on the member as on a process. The adapters are the ones host sessions use, unchanged
+  but for the folder they name: Codex's requests and ACP's `session/new` and `session/load` name the
+  project as its microVM sees it (`sandbox::isolated::Seen`, 2806f93b6: a Windows machine's `C:\src\app`
+  at `/work/app`), which is the machine's own path for a Unix project and for every session on its host.
 - **It's no process of the machine's**: its session has no pid (`Duplex::host_pid` is none), nothing
   of it is in the session's group of processes, and it is never handed across an in-place upgrade
   (it stops, and starts again in the next image, its conversation going on).
@@ -88,7 +91,9 @@ the machine's network) is replaced by an Agentfile image's members.
   the machine and the endpoint's own report from inside (Shards' agent control, step 11), and the
   lanes its controller was granted on it as it dialed (`Dialed::lanes`, Shards' names). It's
   absent until that link is made (`Run::link`, awaited once, never polled), and today's stdio are
-  Shards' run pipes, which ride no link.
+  Shards' run pipes, which ride no link: an orchestrator's run binds its agent-control endpoint with
+  no member stream (Shards' D252, `api_run.rs` `bind_control`), so Hex takes its members' stdio from
+  the image channel (`take_input`, `take_output`) and `HexRun::link` says none.
 - **kiln's record of what it started for it** (`starts`): each start of its harness, when (`at`),
   where (`runs`, as it was as it started) and how it ended (`ended`: when, and its exit code where it
   was seen), kept with the session and handed to kiln's next image with it. A harness that ran and
@@ -112,6 +117,11 @@ What a session does to its harness maps onto the member:
 - **A machine without microVMs** refuses an isolated agent before anything starts
   (`sandbox::NO_MICROVM`), never running it as a process; its runner says so in its facts
   (`isolation.why_not`, and `virt.microvm` false), where placement (step 32) reads it.
+- **A project that would hand it the machine's own** (`sandbox::isolated::kept_out`; CP-T4.1's
+  AC-T4.1.5, as T4's `cp/t4-isolation` held it, 6134fd63b): the home of the user kiln runs as or a
+  folder holding it (where an agent started with no folder would work), a folder in `~/.ssh`, or one
+  holding another worktree of its repository, whose files are another agent's. Refused before
+  anything starts, saying which; a project's own folder, or a worktree of its own, is shared.
 - **A move to another machine** (`sandbox::isolated::NO_MOVE`): its microVM and what its harness keeps
   there are its machine's. Refused as it's asked, before anything of it stops, so its member goes on.
   A move to the machine's newer runner process (an in-place upgrade) isn't refused: there it starts
@@ -238,6 +248,16 @@ Owed, each with whose it is:
   `shards build` of each image kiln ships on each; their results recorded in `vm_e2e/gaps.json`.
 - **Limits Hex's boxes don't hold** (`hexvm::HOLDS`): memory and process limits (Hex reads no OOM kill or
   refused fork of an image VM's guest), and weights; each refused `Unsupported` as a launch asks it (Hex's).
+- **The member's stdio over hyper-transport** (step 11's stdio lanes): Shards' (an orchestrator's run
+  serving its members' streams on its endpoint), then Hex's (`member_image` taking them through
+  `shards_api::control::Controller`); kiln's `HexRun` takes Hex's `Proc::streams` as it is.
+- **What T4 held that isn't carried yet**: its repository's git folder shared read-only over its project
+  (kiln's own git runs in the project on the machine, `harness::gitstate`, reading the configuration and
+  hooks its microVM can write), owed until a real VM shows Shards mounting a read-only start share
+  beneath a writable one, in order (no Shards test holds it); a project holding or lying in kiln's state
+  (its people's volumes, its runner's keys, its microVMs' records), owed with the stand-in tests'
+  fixtures, which keep their people's volumes inside their project; and the agent's header saying it's
+  in a microVM (5e66bbeaf), the console's.
 
 ### Part 7's clauses, where they're met
 
@@ -285,6 +305,9 @@ instead (`harness/session.rs:4953`). Hex delivers a member's own signal (`Runtim
   its harness's build, its tag), with a stand-in `shards`: a built-in built once and pinned by digest,
   found in the store without a build after, a changed Agentfile built again, starts at once waiting
   for one build, a refused build in Shards' words, nothing of a build left behind.
+- `cargo test -p kiln --lib sandbox::isolated::tests::s17_t4_`: a home, a folder holding it, `~/.ssh` and
+  a folder holding another worktree of its repository refused as a project, before anything starts; a
+  project's own folder and a worktree of its own taken.
 - `cargo test -p kiln --lib harness::lineage::tests::s17_`: a runner's own reason in a refusal; a
   person's own Agentfile read for them alone, at its latest version.
 - `cargo test -p kiln --lib harness::kinds::tests::s17_`: every launch beginning with its base, and each
