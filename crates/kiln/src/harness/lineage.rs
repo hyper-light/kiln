@@ -1920,7 +1920,7 @@ mod tests {
             let ada = crate::agentfiles::Who { person: "user:u-ada".into(), all: false };
             let kept = crate::agentfiles::create(&hub, blobs, &ada, "mine", V1, "user:u-ada").await?;
             let id = kept.agentfile.id;
-            crate::agentfiles::update(&hub, blobs, &ada, &id, crate::agentfiles::Patch { name: None, text: Some(V2.into()) }, "user:u-ada").await?;
+            crate::agentfiles::update(&hub, blobs, &ada, &id, crate::agentfiles::Patch { name: None, text: Some(V2.into()) }, None, "user:u-ada").await?;
             let named = Isolation { image: Some(format!(" agentfile:{id} ")), ..Isolation::microvm() };
             assert_eq!(kept_agentfile(&hub, Some(&named), Some("user:u-ada")).await.map(|k| k.text), Ok(Some(V2.to_owned())), "its latest version");
             for other in ["user:u-bo", "owner"] {

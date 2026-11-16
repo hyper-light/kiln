@@ -19,6 +19,7 @@ pub mod check;
 pub mod cli;
 pub mod context;
 pub mod ops;
+pub mod settings;
 pub mod unpack;
 
 use std::collections::HashMap;
@@ -88,6 +89,24 @@ pub struct Version {
 pub struct Saved {
     pub agentfile: Agentfile,
     pub check: Check,
+    /// The agent definitions that took what its new text says of them (kiln plan 01a1dd2e… P5.4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(optional))]
+    pub synced: Vec<Synced>,
+}
+
+/// An agent definition a change of its Agentfile was written into: the version it's at now, or why it
+/// couldn't take it (another change of it came first).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentfileSynced"))]
+pub struct Synced {
+    pub id: String,
+    pub name: String,
+    pub version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub refused: Option<String>,
 }
 
 /// The Agentfiles a list shows: those kept, and beside them, read only, kiln's own and a project's.
@@ -153,11 +172,18 @@ pub enum Error {
     /// kept that names it.
     #[error("{0}")]
     Store(String),
+    /// It and an agent definition that names it each changed a setting they share differently since they
+    /// last agreed (kiln plan 01a1dd2e… P5.4): neither is changed.
+    #[error("{}", crate::agentdefs::sync::words(.0))]
+    Diverged(Vec<crate::agentdefs::sync::Diverged>),
+    /// An agent definition that names it can't take what it says of that agent: kiln's reasons.
+    #[error("agent {agent} can't take what this Agentfile says of it: {}", .why.join("; "))]
+    Agent { agent: String, why: Vec<String> },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
-type R<T> = Result<T, Error>;
+pub(crate) type R<T> = Result<T, Error>;
 
 /// Who asks: whose Agentfiles are theirs, and whether they reach everyone's.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,7 +465,7 @@ pub async fn create(hub: &Hub, blobs: &dyn Blobs, who: &Who, name: &str, text: &
     };
     drop(held);
     told(hub, &made, false);
-    Ok(Saved { agentfile: made.with(text.to_owned()), check })
+    Ok(Saved { agentfile: made.with(text.to_owned()), check, synced: Vec::new() })
 }
 
 /// A change: what's given changes. A new text is a new version, once Shards passes it; a new name
@@ -450,10 +476,19 @@ pub struct Patch {
     pub text: Option<String>,
 }
 
-/// Agentfile `id` changed as `patch` says, by `by`: a new text kept in `blobs` before the record that
-/// names it.
-pub async fn update(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, patch: Patch, by: &str) -> R<Saved> {
+/// What refuses a change made over version `base` of an Agentfile that is at `now`: another change came
+/// first (kiln plan 01a1dd2e… P5.4: never a silent overwrite).
+fn moved(base: i64, now: i64) -> Error {
+    Error::Conflict(format!("it was changed since version {base}, which this change was made over: it's version {now} now. Read it again and make your change over that (`base` {now})"))
+}
+
+/// Agentfile `id` changed as `patch` says, by `by`, over version `base` where it names one (else over the
+/// version it finds): a new text kept in `blobs` before the record that names it.
+pub async fn update(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, patch: Patch, base: Option<i64>, by: &str) -> R<Saved> {
     let old = record(hub, who, id).await?;
+    if let Some(base) = base.filter(|b| *b != old.version) {
+        return Err(moved(base, old.version));
+    }
     let name = patch.name.map_or_else(|| old.name.clone(), |n| n.trim().to_owned());
     if let Some(p) = name_problem(&name) {
         return Err(Error::Bad(p));
@@ -467,7 +502,7 @@ pub async fn update(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, patch: Pa
     };
     let check = if new_version { checked(hub, &text).await? } else { check::check(&text, &check::Kiln::of(&hub.cfg.server)).await };
     if name == old.name && !new_version {
-        return Ok(Saved { agentfile: old.with(text), check });
+        return Ok(Saved { agentfile: old.with(text), check, synced: Vec::new() });
     }
     let held = TEXTS.lock().await;
     let digest = if new_version { keep(blobs, &text).await? } else { old.digest.clone() };
@@ -479,7 +514,7 @@ pub async fn update(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, patch: Pa
             let Some(now_is) = get_in(&tx, &id)? else { return Ok(Written::Missing) };
             // What it was when this change began: another since is its own change, not overwritten.
             if now_is.version != was {
-                return Ok(Written::Moved);
+                return Ok(Written::Moved(now_is.version));
             }
             if named_in(&tx, &now_is.owner, &n, &id)? {
                 return Ok(Written::Taken);
@@ -498,11 +533,11 @@ pub async fn update(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, patch: Pa
         Ok(Written::Done(a)) => {
             drop(held);
             told(hub, &a, false);
-            return Ok(Saved { agentfile: a.with(text), check });
+            return Ok(Saved { agentfile: a.with(text), check, synced: Vec::new() });
         }
         Ok(Written::Missing) => Error::Missing,
         Ok(Written::Taken) => taken(&name),
-        Ok(Written::Moved) => Error::Conflict("it changed since you read it: read it again, then change it".into()),
+        Ok(Written::Moved(now)) => moved(was, now),
         Err(e) => Error::from(e),
     };
     if new_version {
@@ -517,8 +552,8 @@ enum Written {
     Done(Record),
     Missing,
     Taken,
-    /// Another change came first.
-    Moved,
+    /// Another change came first: the version it's at now.
+    Moved(i64),
 }
 
 /// Version `version`'s text made current again, as a new version, so nothing is lost.
@@ -531,9 +566,9 @@ pub async fn restore(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, version:
     if digest == a.digest {
         // As it is already: nothing to make again.
         let check = check::check(&text, &check::Kiln::of(&hub.cfg.server)).await;
-        return Ok(Saved { agentfile: a.with(text), check });
+        return Ok(Saved { agentfile: a.with(text), check, synced: Vec::new() });
     }
-    update(hub, blobs, who, id, Patch { name: None, text: Some(text) }, by).await
+    crate::agentdefs::sync::agentfile_update(hub, blobs, who, id, Patch { name: None, text: Some(text) }, None, by).await
 }
 
 /// Agentfile `id` and its versions, gone: what it was. Their texts no other record names are let go
