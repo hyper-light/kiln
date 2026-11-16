@@ -219,6 +219,11 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     for share in &mut launch.shares {
         share.members = vec![member.clone()];
     }
+    // Its agent's volumes are plugged in as it starts (P6.2): where its microVMs take no plug live, refused before
+    // anything boots, never started without them.
+    if !spec.volumes.is_empty() && !vms.sandbox.holds().live {
+        anyhow::bail!("{}'s agent volumes are plugged into its microVM as it starts, and this machine's microVMs take no folder live: {}", kind.name, super::hexvm::NO_LIVE);
+    }
     let declared = crate::sandbox::held::Declared::of(&launch);
     let asked = std::time::Instant::now();
     let (run, swapped) = match swap_from {
@@ -243,6 +248,13 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
             (vms.launch(name, launch, size).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?, false)
         }
     };
+    // Before its session hands it a turn, so nothing it runs writes where its volume goes before it's there.
+    for (v, plug) in spec.volumes.iter().zip(volume_plugs(&spec.volumes, &member)) {
+        if let Err(why) = run.change(plug).await {
+            run.kill();
+            anyhow::bail!("{}'s agent volume {} couldn't be plugged in at {}: {why}", kind.name, v.name, v.at);
+        }
+    }
     let us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
     let (from, meter) = match (&vms.hex, run.id()) {
         // A swap started no microVM: its start is its member's in the one it ran in (`swapped`), never that
@@ -263,6 +275,13 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         reach.session_grouped(claim.clone(), group).await;
     }
     Ok(crate::proc::duplex_of_run(run, image, reach, kept_in, declared, Some(started)))
+}
+
+/// The plugs that give `member` its agent's `volumes` (P6.2): each by its name in its machine's store
+/// (`PlugSource::Volume`, made where it isn't there: Shards' D271), read-write, at its path.
+pub fn volume_plugs(volumes: &[crate::agentdefs::volumes::Given], member: &kiln_seams::sandbox::Member) -> Vec<kiln_seams::sandbox::Change> {
+    use kiln_seams::sandbox::{Change, PlugFor, PlugSource};
+    volumes.iter().map(|v| Change::Plug { source: PlugSource::Volume(v.store.clone()), to: PlugFor::Members(vec![member.clone()]), at: v.at.clone(), read_only: false }).collect()
 }
 
 /// Serves kiln's MCP to run `vm`'s harness in this runner's own process (Shards D254; #75 step 3): each connection
@@ -716,6 +735,19 @@ pub fn egress_of(reach: &Reach, whole: Option<Vec<String>>) -> Egress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P6.2: each of an agent's volumes is plugged into its harness alone, read-write, by its name in its machine's
+    /// store (made there where it isn't, found again by the agent's next session), strictly beneath the live plug root
+    /// every launch declares.
+    #[test]
+    fn p6_2_an_agents_volumes_are_plugged_into_its_harness_by_their_store_names() {
+        use kiln_seams::sandbox::{Change, Member, PlugFor, PlugSource};
+        let given = crate::agentdefs::volumes::given("user:a", "d1", &[crate::agentdefs::volumes::Volume { name: "cache".into(), bytes: 1 }]);
+        let store = crate::agentdefs::volumes::store_name("user:a", "d1", "cache");
+        let plugs = volume_plugs(&given, &Member("claude".into()));
+        assert_eq!(plugs, [Change::Plug { source: PlugSource::Volume(store), to: PlugFor::Members(vec![Member("claude".into())]), at: format!("{VOLUMES}/cache"), read_only: false }]);
+        assert!(volume_plugs(&[], &Member("claude".into())).is_empty(), "an agent with none is plugged none");
+    }
 
     /// An MCP `initialize`, numbered `id`, as a harness's client sends one first.
     fn initialize(id: u64) -> serde_json::Value {

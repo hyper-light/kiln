@@ -200,6 +200,26 @@ host address and port, let go of by the address it's bound at. A microVM that ta
 in its own words, kept on the override (`took: refused`): Hex's microVMs do until its wire calls land (P6b.3,
 `sandbox::hexvm::NO_LIVE`). A session on its machine's host refuses ports, egress and networks, naming its engine.
 
+## An agent's volumes
+
+kiln plan 01a1dd2e959772a1b17bc49026448e8a, P6.2 (`agentdefs::volumes`; Shards' D281). An agent definition names
+what it keeps from one of its sessions to the next on a machine, its caches, toolchains and package stores: each
+volume a `name` and the most `bytes` it may hold (`agentdefs.create`, `update`, `check`). Each session started from
+it (`Ask::definition`: `agentdefs.run`, a UI agent a person's definition stands in for, a split's agent) is given
+them, as the definition was at the version it started from: its placement asks their bytes together of its
+machine's disk past what its start asks (`Isolation::disk`, `lineage::session_needs`), so it starts only where the
+disk has room for them; and as its harness starts, before its session hands it a turn, each is plugged into its
+harness, read-write, at `/volumes/<name>`, by its name in its machine's Shards store (`Change::Plug` of
+`PlugSource::Volume`), which Shards makes where it isn't there and keeps past the session (D271, D281), so the
+agent's next session on that machine finds it. Its store's name is `kiln-agent-` and the SHA-256 of its person,
+definition and name (`volumes::store_name`): a person's own, never another's. Volumes stay per machine (the
+person, 2026-11-14): a session elsewhere has that machine's. Refused, rather than started without them: a session
+of such an agent on its machine's host, and one whose microVMs take no folder live (`Holds::live`; Hex's, until
+P6b.3), before anything boots. Owed: listing a machine's volumes with their bytes and clearing one, through
+Shards' `shards_api::volumes` (D281) once kiln vendors a Shards that carries it; a volume's bound held as it's
+written (D281's "Not built"); Hex admitting the box's `disk_bytes`; and a switch of harness (P6c.5) giving the
+swapped-in harness its agent's volumes, unchecked on a real microVM.
+
 ## Facts
 
 A runner says whether it holds isolated agents (`RunnerFacts.isolation`: `available`, `hypervisor`,
