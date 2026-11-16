@@ -33,6 +33,11 @@
 //!   node's run-lease broker), and fills it in outside the VM; the run sees placeholders alone. A sandbox whose
 //!   runtime was given none ([`HexVms::leasing`] not called) holds no credentials: a launch granting one is refused,
 //!   `Unsupported` ([`NO_BROKER`]), never run without them.
+//! - **Its sign-in** (plan step 33, Shards' D242 step 8, Hex's C8): the one its launch grants its harness member
+//!   (`secrets::signin::SignIn`, [`HexVms::launch_as`]), as `ShardsImage::sign_ins`: its CLI's own sign-in, its token
+//!   response taken outside the VM and kept by the broker through the same lessors, its CLI given placeholders, and its
+//!   access token filled in toward its provider's hosts alone. Held where credentials are, refused where they aren't
+//!   ([`NO_BROKER`]).
 //! - **What it refuses, typed:** egress to whatever its image grants (`Egress::Any`): Hex's grants are default
 //!   deny, so a run names its destinations; limits it doesn't hold ([`HOLDS`]), and credentials where no broker
 //!   leases them ([`NO_BROKER`]); a warm pool kept for its launches, until Hex's image class takes Shards' pools
@@ -68,7 +73,7 @@ use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, P
 pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
-pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (kiln's credential store is its server's, which this runner doesn't hold), and a run granted one is never run without it (Shards' D242)";
+pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (its server's broker didn't open, or this runner has no link to its server to ask it over), and a run granted one is never run without it (Shards' D242)";
 /// The cost profile its allocations are made under: Shards' least VM, its envelope alone. No overhead and no guest
 /// allowance: what a VM takes past its envelope Hex learns from its windows (decision 9, `RuntimeCost::census_free`).
 const PROFILE: [u8; 32] = *b"kiln harness microVM, least size";
@@ -386,24 +391,26 @@ impl HexVms {
     }
 
     /// [`HexVms::launch_as`] in a box its namer names (the seam's launch, sized).
-    pub async fn launch_sized(&self, launch: Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
+    pub async fn launch_sized(&self, launch: Launch, size: Option<(u32, u64)>, sign_ins: &[crate::secrets::signin::SignIn]) -> Result<Box<dyn Run>, Refusal> {
         let name = (self.names)().ok_or_else(|| Refusal::Unsupported(UNNAMED.into()))?;
-        self.launch_as(name, launch, size).await
+        self.launch_as(name, launch, size, sign_ins).await
     }
 
     /// `launch` in a box named `name`, its microVM `size` (vCPUs, MiB) where its session's isolation gives one, as
-    /// Shards' envelope keeps it (`shards_api::envelope`), else Shards' least: created, started and its harness
-    /// member's streams taken, or refused, typed, with no box left behind.
-    pub async fn launch_as(&self, name: BoxName, launch: Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
+    /// Shards' envelope keeps it (`shards_api::envelope`), else Shards' least, its harness member granted `sign_ins`
+    /// (module docs): created, started and its harness member's streams taken, or refused, typed, with no box left
+    /// behind.
+    pub async fn launch_as(&self, name: BoxName, launch: Launch, size: Option<(u32, u64)>, sign_ins: &[crate::secrets::signin::SignIn]) -> Result<Box<dyn Run>, Refusal> {
         // Its grants checked as any sandbox's would be first (`Invalid`), then refused where no broker leases them.
         Holds { credentials: true, ..HOLDS }.check(&launch)?;
-        if !launch.credentials.is_empty() && !self.leases {
+        if (!launch.credentials.is_empty() || !sign_ins.is_empty()) && !self.leases {
             return Err(Refusal::Unsupported(NO_BROKER.into()));
         }
         let Boundary::MicroVm { image } = &launch.boundary else { return Err(Refusal::Unsupported("a run outside a microVM".into())) };
         let member = Member { kind: MemberKind::Harness, name: launch.program.clone() };
         let grants = grants_of(&member, &launch.egress)?;
         let credentials = credentials_of(&member, &launch.credentials);
+        let sign_ins = sign_ins_of(&member, sign_ins);
         let mut shares: Vec<Mount> = launch.shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
         if let Some(folder) = &launch.folder
             && !shares.iter().any(|s| &s.destination == folder)
@@ -412,7 +419,7 @@ impl HexVms {
         }
         // Its MCP bridge (Shards D254): nothing of it is a grant or an address.
         let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone(), mcp: true };
-        let class = ShardsImage { grants, members: vec![driven], shares, credentials, ..ShardsImage::new(image) };
+        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
         let name = id.to_string();
@@ -445,7 +452,7 @@ impl HexVms {
 impl Sandbox for HexVms {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
         match (self.names)() {
-            Some(name) => Box::pin(self.launch_as(name, launch, None)),
+            Some(name) => Box::pin(self.launch_as(name, launch, None, &[])),
             None => Box::pin(async { Err(Refusal::Unsupported(UNNAMED.into())) }),
         }
     }
@@ -487,6 +494,24 @@ fn credentials_of(member: &Member, granted: &[kiln_seams::sandbox::CredentialGra
                 }
             }
             hex_api::CredentialGrant { member: member.clone(), reference: g.reference.clone(), toward, placeholder: g.placeholder.clone() }
+        })
+        .collect()
+}
+
+/// `granted`'s sign-ins as Hex grants them to `member` (Hex's C8): each by its name in kiln's store and its CLI, from
+/// one provider, toward each host lowercased as [`credentials_of`] takes them, each once, with what an earlier capture
+/// gave its CLI. Hex checks them against its grants and its credentials as the box is made (`check_sign_ins`).
+fn sign_ins_of(member: &Member, granted: &[crate::secrets::signin::SignIn]) -> Vec<hex_api::SignInGrant> {
+    granted
+        .iter()
+        .map(|g| {
+            let mut toward: Vec<String> = Vec::with_capacity(g.toward.len());
+            for host in g.toward.iter().map(|h| h.to_ascii_lowercase()) {
+                if !toward.contains(&host) {
+                    toward.push(host);
+                }
+            }
+            hex_api::SignInGrant { member: member.clone(), sign_in: g.name.clone(), cli: g.provider.cli(), toward, captured: g.captured.clone() }
         })
         .collect()
 }
@@ -1550,6 +1575,45 @@ pub(crate) mod tests {
             let unreached = Launch { egress: Egress::Only(vec!["example.com:443".into()]), ..granted() };
             let refused = vms.launch(unreached).await.err();
             anyhow::ensure!(matches!(&refused, Some(Refusal::Invalid { what: "a credential grant", .. })), "{refused:?}");
+            assert_eq!(sim.list()?, [], "a refused launch leaves no box");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Plan step 33 (Shards' D242, step 8; Hex's C8): a launch's sign-in reaches Hex as its harness member's, by its
+    /// name in kiln's store and its provider's CLI, toward each host once in lowercase, with the placeholders an earlier
+    /// capture gave its CLI. Where no broker leases this machine's credentials it is refused, typed, and leaves no box.
+    #[test]
+    fn s33_a_sign_in_reaches_hex_as_its_members_with_its_cli_and_earlier_capture() -> anyhow::Result<()> {
+        use crate::secrets::signin::{Provider, SignIn};
+
+        let earlier = hex_api::Captured { access: "sign-ins/claude/owner/access".into(), access_placeholder: format!("kiln-placeholder-{}", "a".repeat(64)), refresh_placeholder: Some(format!("kiln-placeholder-{}", "b".repeat(64))) };
+        let sign_in = SignIn { provider: Provider::ClaudeCode, name: "claude/owner".into(), toward: vec!["API.anthropic.com".into(), "api.anthropic.com".into()], captured: Some(earlier.clone()) };
+        let reaching = || launch(Egress::Only(vec!["api.anthropic.com:443".into(), "platform.claude.com:443".into()]));
+        let (rt, _records, hex) = metered();
+        let hex = hex.leasing();
+        let granted = [sign_in.clone()];
+        let (hex, run) = crate::rt::block_on(async move {
+            let run = hex.launch_sized(reaching(), None, &granted).await?;
+            anyhow::Ok((hex, run))
+        })?;
+        let specs = rt.specs.lock().clone();
+        let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
+        let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
+        let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
+        let want = hex_api::SignInGrant { member: harness, sign_in: "claude/owner".into(), cli: hex_api::SignInCli::ClaudeCode, toward: vec!["api.anthropic.com".into()], captured: Some(earlier) };
+        assert_eq!(image.sign_ins, [want], "its sign-in, by its name, to its harness member");
+        crate::rt::block_on(async move {
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
+            drop(hex);
+            anyhow::Ok(())
+        })?;
+        crate::rt::block_on(async move {
+            let (sim, unleased) = vms();
+            let refused = unleased.launch_sized(reaching(), None, &[sign_in]).await.err();
+            anyhow::ensure!(matches!(&refused, Some(Refusal::Unsupported(why)) if why == super::NO_BROKER), "{refused:?}");
             assert_eq!(sim.list()?, [], "a refused launch leaves no box");
             anyhow::Ok(())
         })

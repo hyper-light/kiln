@@ -303,7 +303,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
         Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } | Question::Told { session, .. } | Question::Answer { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } => return json!({"error": "not a question for kiln's operations"}),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } | Question::Lessor { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
     let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {

@@ -394,12 +394,18 @@ pub async fn for_agent(handle: &Handle, json: String) -> anyhow::Result<String> 
 }
 
 /// Why an agent may not ask `json` of the server, when it may not: what a run used is the runner's
-/// to say, as it measured it. Read both ways the server could (the question it parses, and the last
-/// `op` a reader that keeps the last of a repeated name takes).
+/// to say, as it measured it; and a run's credential leases and sign-ins are its runner's to ask of
+/// the server's broker for the microVMs it holds (`crate::secrets::lessor::Remote`), never an
+/// agent's, whose answer would hand it a credential's value (Shards' D242). Read both ways the server
+/// could (the question it parses, and the last `op` a reader that keeps the last of a repeated name
+/// takes).
 fn refused_from_agent(json: &str) -> Option<&'static str> {
-    let parsed = matches!(serde_json::from_str::<super::Question>(json), Ok(super::Question::Measured { .. }));
-    let named = serde_json::from_str::<Value>(json).ok().and_then(|v| v.get("op").and_then(Value::as_str).map(str::to_owned)).is_some_and(|op| op == "measured");
-    (parsed || named).then_some("what a run used is its runner's to tell kiln, as it measured it, never an agent's (docs/reach.md, \"Sizes from history\")")
+    let parsed = serde_json::from_str::<super::Question>(json).ok();
+    let named = serde_json::from_str::<Value>(json).ok().and_then(|v| v.get("op").and_then(Value::as_str).map(str::to_owned));
+    if matches!(parsed, Some(super::Question::Measured { .. })) || named.as_deref() == Some("measured") {
+        return Some("what a run used is its runner's to tell kiln, as it measured it, never an agent's (docs/reach.md, \"Sizes from history\")");
+    }
+    (matches!(parsed, Some(super::Question::Lessor { .. })) || named.as_deref() == Some("lessor")).then_some("a run's credential leases and sign-ins are its runner's to ask of kiln's broker, never an agent's (Shards' D242)")
 }
 
 // ---------------------------------------------------------------- the server's side
@@ -632,6 +638,22 @@ mod tests {
         }
         for j in [r#"{"op": "call", "name": "runners", "input": {}}"#, r#"{"op": "sizes", "repo": "r", "command": "c"}"#, r#"{"op": "directory"}"#, "not json"] {
             assert!(refused_from_agent(j).is_none(), "{j}");
+        }
+    }
+
+    /// Plan step 33 (Shards' D242): an agent can't ask the server's broker for a run's lease or
+    /// sign-in through its runner's socket, however it spells it: the answer would be a credential's
+    /// value, which only its runner's microVMs' egress is given.
+    #[test]
+    fn s33_an_agent_cant_ask_for_a_runs_lease() {
+        let forged = [
+            r#"{"op": "lessor", "ask": {"ask": "lease", "identity": "a", "reference": "sign-ins/claude/owner/access"}}"#,
+            r#"{"op":"lessor"}"#,
+            r#"{"op": "call", "op": "lessor", "ask": {}}"#,
+            r#"{"ask": {"ask": "refresh", "sign_in": "codex/owner"}, "op": "lessor"}"#,
+        ];
+        for j in forged {
+            assert!(refused_from_agent(j).is_some(), "{j}");
         }
     }
 

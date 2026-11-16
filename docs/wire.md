@@ -703,6 +703,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   (`ServerMsg::Prebuild`; kiln plan 01a1dd2e…, P4.5), as a session of its harness there builds it,
   and says where each build is (`AgentMsg::Prebuilt`); a runner that didn't name it is asked nothing,
   and its sessions build their images as they start.
+  `secrets.leases`: the server answers its runners' runs' credential leases and sign-ins from its
+  run-lease broker (`ReachAsk`'s `lessor`; plan step 33, Shards' D242); a runner asks them only of a
+  server that named it, and grants its isolated harnesses no sign-in until one has.
 
 ## Registry
 

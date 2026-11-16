@@ -185,6 +185,12 @@ pub enum Question {
         #[serde(default)]
         runner: String,
     },
+    /// A run's ask of its server's run-lease broker, from a runner other than the server's own
+    /// (Shards' D242; `crate::secrets::lessor::Remote`): a credential leased, given back or ended
+    /// with its run, a sign-in captured or refreshed, answered from the broker as the server's own
+    /// runner's runs are (`crate::secrets::lessor::answer`). A server from before refuses it
+    /// `unknown`, which its runner takes for its broker unavailable.
+    Lessor { ask: crate::secrets::lessor::Ask },
 }
 
 /// The MCP servers whose tools are reach's: a runner's own kiln server (`kiln`, `crate::reach::mcp`),
