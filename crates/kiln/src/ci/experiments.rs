@@ -2279,7 +2279,7 @@ mod tests {
             round: 0,
             answer: Answer {
                 conclusion: "success".into(),
-                measured: Some(Measured { start_us: Some(250_000), started_from: Some(from.into()), cpu_ns: Some(3_000_000), window_ns: Some(1), footprint_steady_bytes: Some(64 << 20), footprint_peak_bytes: Some(96 << 20) }),
+                measured: Some(Measured { start_us: Some(250_000), started_from: Some(from.into()), cpu_ns: Some(3_000_000), window_ns: Some(1), footprint_steady_bytes: Some(64 << 20), footprint_peak_bytes: Some(96 << 20), built_us: None }),
                 outcome: Some(kiln_ci::replay::Outcome { steps: 4, ended: 4, diverged }),
                 ..Answer::default()
             },

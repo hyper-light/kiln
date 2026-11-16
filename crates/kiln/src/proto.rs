@@ -356,6 +356,12 @@ pub enum AgentMsg {
     /// Exact source offer or destination receipt for journal custody. Only when both peers
     /// name mail-transfer; appended to preserve postcard variant indices. Control lane only.
     HarnessMailTransfer { json: String },
+    /// Where a build of an Agentfile the server asked for ahead of its sessions is
+    /// ([`ServerMsg::Prebuild`]; JSON `crate::agentfiles::prebuild::Said`; kiln plan 01a1dd2e…, P4.5):
+    /// building, done (its image, pinned) or failed (Shards' words). Only to a server that named
+    /// [`feature::PREBUILD`]. Appended last, after `HarnessMailTransfer`: postcard encodes variants
+    /// by index.
+    Prebuilt { json: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -810,12 +816,17 @@ pub mod feature {
     /// This runner replays a recorded session's tool calls in its microVMs ([`super::ServerMsg::Replay`]; kiln plan
     /// 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b). A runner that didn't name it isn't asked: a replay on it is refused.
     pub const REPLAYS: &str = "experiments.replay";
+    /// This runner builds an Agentfile ahead of its sessions as the server asks
+    /// ([`super::ServerMsg::Prebuild`]; kiln plan 01a1dd2e…, P4.5) and says where each build is
+    /// ([`super::AgentMsg::Prebuilt`]); a server that names it asks, and reads the answers. A
+    /// runner that didn't name it is asked nothing: its sessions build their images as they start.
+    pub const PREBUILD: &str = "agentfiles.prebuild";
     /// The server answers its runners' runs' credential leases and sign-ins from its run-lease broker
     /// (`crate::reach::Question::Lessor`, `crate::secrets::lessor::answer`; plan step 33, Shards' D242). A runner asks
     /// them only of a server that named it, and grants its isolated harnesses no sign-in until one has: they sign in
     /// themselves, as before.
     pub const LEASES: &str = "secrets.leases";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS, LEASES];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS, PREBUILD, LEASES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1229,6 +1240,13 @@ pub enum ServerMsg {
     /// [`AgentMsg::Answer`] under `req` with what it measured (`crate::sandbox::replay::Answer`). Only to runners that
     /// named [`feature::REPLAYS`]. Appended last, after `AdoptPolicy`: postcard encodes variants by index.
     Replay { req: u64, json: String },
+    /// Build an Agentfile ahead of its sessions (JSON `crate::agentfiles::prebuild::Ask`; kiln plan
+    /// 01a1dd2e…, P4.5): its text at a version, for one of kiln's harnesses, with the secrets its
+    /// build is given, built as a session of that harness here builds it, so the session that starts
+    /// after it builds nothing; answered by [`AgentMsg::Prebuilt`] as it goes. Only to runners that
+    /// named [`feature::PREBUILD`]. Appended last, after `Replay`: postcard encodes variants by
+    /// index.
+    Prebuild { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2081,8 +2099,9 @@ mod tests {
         // W20-R01 appended Skills and SkillFile in each direction (70/71 and 77/78), and W20's retained mail its
         // transfer, HarnessMailTransfer, in each (72 and 79); plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5 a history
         // asked for a person, HarnessHistoryFor (80); kiln plan 01a1dd2e… P2.3 a runner's engine, RunnerEngine (81);
-        // CP-T3.2 the room a hand-over's spool leaves, AdoptPolicy (82); kiln plan 01a1dd2e… P7.1b a replay, Replay (83).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (73, 84), "each table has every variant once");
+        // CP-T3.2 the room a hand-over's spool leaves, AdoptPolicy (82); kiln plan 01a1dd2e… P7.1b a replay, Replay (83);
+        // kiln plan 01a1dd2e… P4.5 an Agentfile's build ahead of its sessions, Prebuild (84), and where it is, Prebuilt (73).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (74, 85), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -2288,6 +2307,8 @@ mod tests {
             ("Placed", AgentMsg::Placed { req: 1, json: "{}".into() }),
             ("Skills", AgentMsg::Skills { json: "{}".into() }),
             ("SkillFile", AgentMsg::SkillFile { req: 1, sha256: "00".into(), offset: 0, data: vec![1], done: true }),
+            ("HarnessMailTransfer", AgentMsg::HarnessMailTransfer { json: "{}".into() }),
+            ("Prebuilt", AgentMsg::Prebuilt { json: "{}".into() }),
         ];
         let mut last = 63u8;
         for (name, m) in agent {
@@ -2311,6 +2332,7 @@ mod tests {
             ("RunnerEngine", ServerMsg::RunnerEngine { json: "{}".into() }),
             ("AdoptPolicy", ServerMsg::AdoptPolicy { json: "{}".into() }),
             ("Replay", ServerMsg::Replay { req: 1, json: "{}".into() }),
+            ("Prebuild", ServerMsg::Prebuild { json: "{}".into() }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

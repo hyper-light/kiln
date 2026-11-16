@@ -188,7 +188,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     };
     // Where it doesn't parse, its build says so in Shards' words; its egress stays as its image's.
     launch.egress = egress_of(&reach, granted(text).ok().flatten());
-    let image = vms.images.pinned(source, secrets).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
+    let super::image::Pinned { image, built } = vms.images.pinned(source, secrets).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
     launch.boundary = Boundary::MicroVm { image: image.clone() };
     let person = spec.isolation.as_ref().and_then(|i| i.person.as_deref());
     let (mounts, layout) = match (homes, person) {
@@ -278,7 +278,8 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         (Some(hex), Some(vm)) => (if swapped { Some(SWAPPED) } else { hex.started_from(&vm).await.map(super::hexvm::said) }, hex.meter(&vm)),
         _ => (swapped.then_some(SWAPPED), None),
     };
-    let started = super::held::Started { us, from, meter };
+    let built_us = built.map(|b| u64::try_from(b.as_micros()).unwrap_or(u64::MAX));
+    let started = super::held::Started { us, from, meter, built_us };
     // Its microVM's warm pool on this machine, named from its starts (kiln plan 01a1dd2e…, P3.2); a swap started none.
     if !swapped {
         let warm = from == Some(super::hexvm::said(hex_api::StartedFrom::Warm));

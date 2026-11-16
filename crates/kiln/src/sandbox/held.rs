@@ -31,12 +31,14 @@ pub struct Held {
 }
 
 /// How a boundary's run started, and the meter what it lives on is read from (P7.1): its launch's time, from asked to
-/// its member running, and how Hex says its microVM started.
+/// its member running, how Hex says its microVM started, and the build of its image its start ran (P4.5).
 pub struct Started {
     /// From its launch asked to its member running, in microseconds.
     pub us: u64,
     pub from: Option<&'static str>,
     pub meter: Option<super::hexvm::Meter>,
+    /// The build of its image its start ran, in microseconds (`super::image::Pinned::built`): none where none ran.
+    pub built_us: Option<u64>,
 }
 
 /// What a run's launch declared of the changes it takes while it runs (kiln plan 01a1dd2e…, P6b.4; Shards'
@@ -157,6 +159,7 @@ impl Held {
             window_ns: lived.map(|l| l.window_ns),
             footprint_steady_bytes: lived.map(|l| l.footprint_steady_bytes),
             footprint_peak_bytes: lived.map(|l| l.footprint_peak_bytes),
+            built_us: started.built_us,
         })
     }
 

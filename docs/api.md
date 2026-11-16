@@ -310,6 +310,7 @@ interface KilnAgentDef { id /* "kiln:<name>" */; name; about; replaceable: boole
 | GET | `/api/agentfiles/:id` | `Agentfile` |
 | PATCH | `/api/agentfiles/:id` | `{ name?, text?, base? }` → `AgentfileSaved`: a new text is a new version (checked as above); a new name alone is none. 409 when another change came first (over `base`, the version it's made over, as you read it, too), or the name is one of yours. Your agent definitions that name it and that its text declares (`AGENT <their name>`) take what it says of them, each a new version listed in `synced` (P5.4); 409 where a setting changed differently on both sides since they last agreed, naming it and each side's value, and 422 where one can't take it (nothing is written) |
 | GET | `/api/agentfiles/:id/versions` | `{ versions: AgentfileVersion[] }`, newest first |
+| GET | `/api/agentfiles/:id/builds` | `{ builds: { runner, harness, version, state /* "queued" \| "building" \| "done" \| "failed" */, image?, why?, at }[] }`, by runner and harness (kiln plan 01a1dd2e… P4.5): saving it, or an agent definition that names it, builds it on each of your runners whose engine is microvm (connected or not), for each of kiln's harnesses its sessions run (those it declares, and your definitions' that name it), as a session of that harness there builds it, so one started after its build is done builds nothing (its start's `measured` says no `built_us`). `image` once done, pinned by its digest; `why` where it failed, in Shards' words (or kiln's, where its secrets couldn't be read). A save asks again from `queued`; a runner's word moves a build forward only |
 | POST | `/api/agentfiles/:id/restore` | `{ version }` → `AgentfileSaved`: that version's text current again, as a new version |
 | DELETE | `/api/agentfiles/:id` | `{ deleted: true }`: it and its versions |
 
@@ -364,8 +365,9 @@ definition and source map, its provenance.
   `/api/join-requests`), `{type:"discovery"}` (an instance appeared, changed or left: refetch
   `/api/discovery`), `{type:"front_door", runner}` (a runner's front-door settings or status
   changed: refetch `/api/runners/:name/front-door`), `{type:"agentfile", owner, id, name, version,
-  deleted?}` (one of a person's Agentfiles was kept, changed or deleted: to its owner, and whoever
-  reaches everyone's; refetch `/api/agentfiles`), `{type:"ship", repo, rows: [{ row, yours?,
+  deleted?, builds?}` (one of a person's Agentfiles was kept, changed or deleted: to its owner, and whoever
+  reaches everyone's; refetch `/api/agentfiles`; with `builds`, only where its builds ahead of its sessions
+  are moved: refetch `/api/agentfiles/:id/builds`), `{type:"ship", repo, rows: [{ row, yours?,
   whose?, dv?, base?, parts?, items? }], gone?, pace?, whole?}` (ci.md W21-R15: a repository's Ship
   rows that changed in one refresh of Ship's read model, each once, as `GET /api/ship/commits`
   renders them, for everyone and for those whose turn it is; `dv` once someone read that commit's
