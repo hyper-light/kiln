@@ -747,6 +747,74 @@ mod tests {
         Ok(())
     }
 
+    /// Plan 01a1d2c16eb074f19cf7ae7f1025c0be step 4: two isolated Antigravity sessions of one person on one machine.
+    /// Both launches put kiln's entry in agy's own `mcp_config.json`, in the person's volume they share: the lane's
+    /// bridge alone, naming no session, token or address, and nothing else is written there. Each session's bridge
+    /// takes only its own run's connections from the machine's one lane, and kiln answers each as that session.
+    #[test]
+    fn s35_mcp_two_antigravity_sessions_of_one_person_are_each_their_own() -> anyhow::Result<()> {
+        use super::super::fake::{FakeLanes, connection};
+        let dir = tempfile::tempdir()?;
+        let homes = dir.path().join("homes");
+        let root = homes.clone();
+        crate::rt::block_on(async move {
+            let agy = kind("antigravity")?;
+            let spec = Spec { kind: agy.id.into(), isolation: Some(microvm(None)), ..Spec::default() };
+            let source = source_of(agy, &spec).map_err(anyhow::Error::msg)?;
+            for _ in 0..2 {
+                let mut args = Vec::new();
+                offer_mcp(agy, &source, Some("user:u1"), Some(&root), &mut args).await;
+                anyhow::ensure!(args.is_empty(), "agy takes kiln's MCP from its own config alone: {args:?}");
+            }
+            anyhow::Ok(())
+        })?;
+        let (mut written, mut dirs) = (Vec::new(), vec![homes.clone()]);
+        while let Some(d) = dirs.pop() {
+            for entry in std::fs::read_dir(&d)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    written.push(path);
+                }
+            }
+        }
+        let [kept_at] = written.as_slice() else { anyhow::bail!("written in the person's volume: {written:?}") };
+        anyhow::ensure!(kept_at.ends_with(".gemini/config/mcp_config.json"), "{}", kept_at.display());
+        let (volumes, env) = crate::harness::isolated::home::of_builtin(builtin_of("antigravity")?);
+        let layout = crate::harness::isolated::home::Layout::new(&homes, "user:u1", "antigravity", &volumes, &env)?;
+        anyhow::ensure!(layout.mounts().iter().any(|m| kept_at.starts_with(&m.host)), "not in the person's volume: {}", kept_at.display());
+        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(kept_at)?)?;
+        anyhow::ensure!(kept == serde_json::json!({"mcpServers": {"kiln": {"command": crate::harness::isolated::mcp::BRIDGE, "args": []}}}), "{kept}");
+
+        let node = crate::reach::node::Config {
+            mirrors: dir.path().join("mirrors"),
+            adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
+            sense: false,
+            ..crate::reach::node::Config::for_runner("here", dir.path(), true)
+        };
+        let (handle, _to_server) = crate::reach::node::start(node)?;
+        let here = |session: &str| crate::reach::local::Here { handle: handle.clone(), me: "here".into(), host: None, session: session.into() };
+        let (a, said_a) = connection(&[initialize(1)]);
+        let (b, said_b) = connection(&[initialize(2)]);
+        // The machine's one lane holds b's connection first, for its own run alone.
+        let lanes = std::sync::Arc::new(FakeLanes::per_run(vec![("vm-b", b), ("vm-a", a)]));
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let served = [bridge(lanes.clone(), "vm-a".into(), Some(here("agy-a")), cwd.clone())?, bridge(lanes.clone(), "vm-b".into(), Some(here("agy-b")), cwd)?];
+        for s in served {
+            s.join().map_err(|_| anyhow::anyhow!("a bridge panicked"))?;
+        }
+        let mut asked = lanes.asked();
+        asked.sort();
+        assert_eq!(asked, ["vm-a", "vm-a", "vm-b", "vm-b"], "each bridge asked for its own run's connections, until it had none");
+        for (said, id, own, other) in [(&said_a, 1, "agy-a", "agy-b"), (&said_b, 2, "agy-b", "agy-a")] {
+            let init = answer(said, id)?;
+            let told = init.pointer("/result/instructions").and_then(serde_json::Value::as_str).unwrap_or_default();
+            anyhow::ensure!(told.contains(own) && !told.contains(other), "{own}'s connection answered as {told:?}");
+        }
+        Ok(())
+    }
+
     fn microvm(image: Option<&str>) -> Isolation {
         Isolation { image: image.map(str::to_owned), ..Isolation::microvm() }
     }
