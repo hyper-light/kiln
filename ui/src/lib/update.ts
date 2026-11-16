@@ -83,8 +83,10 @@ export function watchForUpdates() {
     window.setTimeout(() => (leaving = false), 5_000);
   });
   // A part of the page (a lazily loaded view) that's gone: load the new build instead of breaking.
-  window.addEventListener("vite:preloadError", (e) => {
-    e.preventDefault();
+  // Its import still fails, as it did: prevented, it would resolve to nothing, and what reads it
+  // would break on that (a code resource keeping `undefined` as its data) instead of saying it
+  // couldn't load, with Try again, while the page reloads.
+  window.addEventListener("vite:preloadError", () => {
     if (!leaving) reloadOnce();
   });
 }
