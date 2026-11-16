@@ -308,11 +308,16 @@ reviewer)`), and the audit trail's `agent.close` names the limit as who ended it
 limit: 1000 tokens, agent definition reviewer)`). A server that restarts holds the agents it finds
 to the same limits.
 
-Only Claude Code and Pi say what their sessions cost. Codex and Antigravity say tokens alone, and
-none of kiln's ACP agents is known to say a cost, so a definition of theirs with a cost limit is
-refused as you save it: give it a token limit instead. Where an agent runs another harness than its
-definition's (one its start chose, such as an attachment's) and that harness says no cost, a cost
-limit can't be held, so the agent is ended as it starts, saying so.
+Claude Code, Codex, Antigravity and Pi say how many tokens their sessions use, and only Claude Code
+and Pi say what they cost. An ACP agent (Devin, Gemini CLI, opencode, Goose, Amp, Cursor CLI) says
+its tokens or its cost only where it chooses to: ACP leaves both to each agent, turn by turn, and no
+agent says beforehand whether it will. kiln can't hold a limit to what a harness doesn't say, so it
+refuses one as you save the definition and tells you what to limit instead: a token limit for Codex
+or Antigravity in place of a cost limit, and a time limit for an ACP agent. Where an agent runs
+another harness than its definition's (one its start chose, such as an attachment's) and that
+harness doesn't say what a limit counts, the limit can't be held, so the agent is ended as it
+starts, saying so (`ended`: `its token limit of 1000 tokens can't be held: Gemini CLI doesn't say
+how many tokens its sessions use (agent definition reviewer)`).
 
 ### Crashed agents
 
@@ -2728,6 +2733,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | restore files on rewind | ✓ | — | — | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — | ? | unit (its thinking, its levels) |
 | plan limits (`limits`) | ✓ none for an API key; unit for subscriber windows | ✓ (pushed during turns); unit for ChatGPT reads | — | — | — | — |
+| how many tokens a session used, so an agent definition's token limit holds (`limits.tokens`) | unit (`modelUsage`, at each turn's end) | unit (`thread/tokenUsage/updated`, as it goes) | — (tokens only where an agent gives them: a token limit is refused) | — (a token limit is refused) | — (a token limit is refused) | unit (each reply's `usage`) |
 | what a session cost, so an agent definition's cost limit holds (`limits.cents`) | unit (`total_cost_usd`, at each turn's end) | — (it says tokens alone: a cost limit is refused) | — (a cost only where an agent gives one: a cost limit is refused) | — (a cost limit is refused) | — (a cost limit is refused) | unit (each reply's `cost.total`) |
 | harness status (`harness_status`) | ✓ | ✓ | unit | ? | unit | unit |
 | MCP servers: list with tools, enable/disable, reconnect | ✓ | ✓ | — | — | — | — |

@@ -259,8 +259,10 @@ isn't one of kiln's ten; the Agentfile isn't one its owner reaches (another pers
 kiln's for another harness; the model isn't one kiln's machines list for that harness (what its
 sessions said they offer; a harness no machine lists models for takes any); an MCP server has no name
 of its own, or not exactly one of `url` and `command`; a tool or skill has no name; a limit is 0;
-`limits.cents` is set for a harness that doesn't say what its sessions cost (Claude Code and Pi do;
-Codex, Antigravity and the ACP agents don't, so give those a token limit).
+`limits.tokens` is set for a harness that doesn't say how many tokens its sessions use (Claude Code,
+Codex, Antigravity and Pi do; the ACP agents don't, so give those a time limit); `limits.cents` is
+set for one that doesn't say what they cost (Claude Code and Pi do; give Codex and Antigravity a
+token limit instead, and the ACP agents a time limit).
 kiln ships its own, read only, listed as `builtin` (kiln plan 01a1dd2e8618733a87f2793aab1322a8
 P5.1b), each made from what kiln itself has so that none drifts from it: one per CI skill
 (`kiln-ci-*`: the skill its own, its description its instructions), one per harness (`harness-<id>`,
