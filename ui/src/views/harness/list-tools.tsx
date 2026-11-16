@@ -306,7 +306,7 @@ export function heldRows<T extends ViewRow>(all: T[], now: T[], was: Kept | null
 
 /** After the pointer last moved over the list (or a finger left it), this long before it moves again. */
 const QUIET_MS = 1200;
-/** While one of these is open (a row's menu, a dialog from it), the list holds still (one closing doesn't count), and a windowed one unmounts no row (lib/virtual.ts). */
+/** While one of these is open (a row's menu, a dialog from it), the list holds still (one closing doesn't count), and a windowed one unmounts no row (lib/list-window.ts). */
 export const OPEN = ':is([role="menu"], [role="dialog"], [role="alertdialog"]):not([data-state="closed"])';
 
 /**
@@ -406,7 +406,7 @@ function places(root: HTMLElement): Map<string, number> {
 }
 
 /**
- * A windowed list as its glide needs it (lib/virtual.ts `ListWindow`, with the glide's `order`):
+ * A windowed list as its glide needs it (lib/list-window.ts `ListWindow`, with the glide's `order`):
  * only the rows near the viewport are on the page, so where a row that wasn't on it was (`wasAt`,
  * from the list's first row's top) is the window's to say, and the rows near the viewport stay
  * mounted, wherever they go, until the glide that takes them there is over (`holding`, `settle`).
