@@ -160,8 +160,10 @@ pub const SWAPPED: &str = "swapped";
 pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret], swap_from: Option<crate::proc::Duplex>) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
-    // kiln's own state, which its project is, holds or lies in none of: where its microVMs are held, and its people's volumes.
-    let kiln: Vec<&Path> = vms.state().into_iter().chain(homes).collect();
+    // kiln's own state, which its project is, holds or lies in none of: where its microVMs are held, its people's volumes,
+    // and its server's data folder (kiln.db, its secrets and tokens), as its runner keeps it.
+    let server = host.as_ref().and_then(|h| h.server_data().map(Path::to_path_buf));
+    let kiln: Vec<&Path> = vms.state().into_iter().chain(homes).chain(server.as_deref()).collect();
     let mut launch = launch_of(kind, spec, source.name(), &kiln)?;
     let folder = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
     let files = crate::rt::blocking(move || host_tools::tracked(Path::new(&folder))).await?;
@@ -446,7 +448,8 @@ pub fn project_share(cwd: &str) -> Result<Share, String> {
 /// (CP-T4.1's AC-T4.1.5, as T4's `cp/t4-isolation` held it, 6134fd63b): the home of the user kiln runs as, or a
 /// folder holding it, every file of theirs among it (an agent started with no folder starts there); a folder that is,
 /// holds or lies in `~/.ssh` or one of `kiln`'s own (its state: its runner's keys and records, its microVMs' store,
-/// its people's volumes); or one holding another worktree of its repository, whose files are another agent's.
+/// its people's volumes, its server's data folder with kiln.db, its secrets and tokens); or one holding another worktree
+/// of its repository, whose files are another agent's.
 /// Compared with their links resolved, where they resolve.
 pub fn kept_out(cwd: &Path, kiln: &[&Path]) -> Option<String> {
     let cwd = canonical(cwd);
@@ -1150,6 +1153,39 @@ mod tests {
         assert!(launched(&in_workspace(mine.as_path(), project.as_path())).is_ok(), "its own workspace over a project");
         assert!(refusal(&in_workspace(mine.as_path(), crate::os::home_dir().as_path())).contains("home folder"), "its own workspace over the home");
         assert!(refusal(&in_workspace(theirs.as_path(), project.as_path())).contains("lies in"), "another agent's workspace");
+        Ok(())
+    }
+
+    /// CP-T4.1's AC-T4.1.5 (step 17): the kiln server's data folder (kiln.db, its secrets and tokens; on a machine that
+    /// runs both, the parent of its runner's default state) is kiln's state too, as its runner keeps it
+    /// (`Host::server_data`). No isolated agent works in a folder that is, holds or lies in it, refused before anything
+    /// starts; with its runner's state alone kept out, the server's folders beside that state were shared. Not made yet
+    /// (its server not started), it compares as made folders do, through the folders it lies in (macOS's `/var` is
+    /// `/private/var`), whichever way it and the project are named.
+    #[test]
+    fn s17_t4_the_kiln_servers_data_folder_is_no_isolated_agents_project() -> anyhow::Result<()> {
+        let base = tempfile::tempdir()?;
+        let (data, project) = (base.path().join("kiln"), base.path().join("project"));
+        let (runner, secrets) = (data.join("agent"), data.join("secrets"));
+        for dir in [&runner, &secrets, &project] {
+            std::fs::create_dir_all(dir)?;
+        }
+        assert_eq!(kept_out(&secrets, &[runner.as_path()]), None, "the server's secrets, its runner's state alone kept out");
+        let kiln = [runner.as_path(), data.as_path()];
+        assert_eq!(kept_out(&project, &kiln), None, "a project beside kiln's data");
+        for (folder, said) in [(data.as_path(), "lies in"), (secrets.as_path(), "lies in"), (base.path(), "holds")] {
+            let why = kept_out(folder, &[data.as_path()]).unwrap_or_default();
+            assert!(why.contains(said), "{}: {why}", folder.display());
+        }
+        let spec = Spec { kind: "codex".into(), cwd: Some(secrets.to_string_lossy().into_owned()), isolation: Some(microvm(None)), ..Spec::default() };
+        let refusal = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into(), &kiln).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(refusal.contains("lies in"), "refused before anything starts: {refusal}");
+        let real = std::fs::canonicalize(base.path())?;
+        for (folder, unmade) in [(real.as_path(), base.path().join("unmade")), (base.path(), real.join("unmade"))] {
+            assert!(kept_out(folder, &[unmade.as_path()]).is_some_and(|why| why.contains("holds")), "{} holds {}", folder.display(), unmade.display());
+            let inside = folder.join("unmade").join("kiln.db");
+            assert!(kept_out(&inside, &[unmade.as_path()]).is_some_and(|why| why.contains("lies in")), "{} lies in {}", inside.display(), unmade.display());
+        }
         Ok(())
     }
 
