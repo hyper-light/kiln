@@ -13,4 +13,9 @@ owner: string, id: string, name: string, version: number,
 /**
  * Deleted.
  */
-deleted?: boolean, };
+deleted?: boolean, 
+/**
+ * Its builds ahead of its sessions changed, and nothing else of it (kiln plan 01a1dd2e… P4.5): a page that shows
+ * them loads them again (`GET /api/agentfiles/:id/builds`).
+ */
+builds?: boolean, };

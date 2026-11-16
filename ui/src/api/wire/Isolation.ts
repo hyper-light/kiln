@@ -30,4 +30,9 @@ cpus?: number,
 /**
  * Its microVM's memory, bytes (Shards' `--memory`), asked and held as its vCPUs are.
  */
-memory?: number, };
+memory?: number, 
+/**
+ * The bytes its agent's volumes may hold (P6.2, `crate::agentdefs::volumes::bytes`): what its placement asks of
+ * its machine's disk and its claim holds, set by kiln from the definition it starts from. None: it has none.
+ */
+disk?: number, };

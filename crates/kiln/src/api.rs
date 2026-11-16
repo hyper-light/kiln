@@ -1079,6 +1079,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let name = (*name).to_owned();
             boxed(|| crate::harness::limit::put(&hub, &name, req)).await.map_err(|(c, m)| err(c, m))
         }
+        // The warm pools kiln names on a runner (`crate::sandbox::pools`; kiln plan 01a1dd2e…, P3.2).
+        (&Method::GET, ["api", "runners", name, "pools"]) => boxed(|| crate::sandbox::pools::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         // How a runner runs new agent sessions, its engine (`crate::harness::engine`; kiln plan 01a1dd2e…, P2.3).
         (&Method::GET, ["api", "runners", name, "engine"]) => boxed(|| crate::harness::engine::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::PUT, ["api", "runners", name, "engine"]) => {
@@ -1357,6 +1359,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let body = boxed(|| body_value(req)).await?;
             boxed(|| own_op(&hub, &caller, "agentfiles.check", body)).await
         }
+        (&Method::POST, ["api", "agentfiles", "settings"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentfiles.settings", body)).await
+        }
         (&Method::GET, ["api", "agentfiles", id]) => boxed(|| own_op(&hub, &caller, "agentfiles.get", json!({ "id": id }))).await,
         (&Method::PATCH, ["api", "agentfiles", id]) => {
             let id = (*id).to_owned();
@@ -1368,6 +1374,15 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         }
         (&Method::DELETE, ["api", "agentfiles", id]) => boxed(|| own_op(&hub, &caller, "agentfiles.delete", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentfiles", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentfiles.versions", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "agentfiles", id, "builds"]) => boxed(|| own_op(&hub, &caller, "agentfiles.builds", json!({ "id": id }))).await,
+        (&Method::POST, ["api", "agentfiles", id, "rebuild"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "agentfiles.rebuild", body)).await
+        }
         (&Method::POST, ["api", "agentfiles", id, "restore"]) => {
             let id = (*id).to_owned();
             let mut body = boxed(|| body_value(req)).await?;
@@ -6810,10 +6825,13 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     // The engine setting its boundary is decided under is kiln's (kiln plan 01a1dd2e…, P2.3).
     spec.engine_version = None;
     // An isolated agent's person, whose volume its harness's configuration is on, is whoever asks
-    // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked.
+    // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked. Its agent's volumes, and
+    // the disk they ask, are its definition's (P6.2): never what's asked.
     if let Some(i) = spec.isolation.as_mut() {
         i.person = caller.and_then(crate::harness::lineage::person_of);
+        i.disk = None;
     }
+    spec.volumes = Vec::new();
     // Whose its opening prompt is, which its input admits as a person's, held to no depth: whoever
     // asks (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 35), never what's asked.
     spec.opener = caller.and_then(crate::harness::lineage::person_of);

@@ -24,7 +24,7 @@ use std::process::Command;
 
 use crate::agentfiles::builtin::Builtin;
 use crate::agentfiles::context;
-use crate::secrets::mine::BuildSecret;
+use crate::secrets::mine::{BuildSecret, Given};
 
 /// How a person's own Agentfile's image is named in the home's store, before its id.
 const KEPT: &str = "agentfile-";
@@ -86,6 +86,15 @@ pub enum Refusal {
     Build(String),
 }
 
+/// A source's image for this machine, pinned by its digest (`NAME@sha256:…`), and how long the build its asking ran
+/// took: none where the home's store held its content already, built by an earlier start, or ahead of its sessions as
+/// its Agentfile was saved (kiln plan 01a1dd2e… P4.5), or by another's build it waited its turn for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pinned {
+    pub image: String,
+    pub built: Option<std::time::Duration>,
+}
+
 /// The images this machine's microVMs boot, built by the carried `shards` into the Shards home they
 /// boot from.
 pub struct Images {
@@ -107,17 +116,18 @@ impl Images {
 
     /// `source`'s image for this machine, pinned by its digest: the one the home's store holds of its
     /// content, else built, given `secrets` (P4.7: a person's own, which its Agentfile names).
-    pub async fn pinned(&self, source: Source<'_>, secrets: &[BuildSecret]) -> Result<String, Refusal> {
+    pub async fn pinned(&self, source: Source<'_>, secrets: &[BuildSecret]) -> Result<Pinned, Refusal> {
         let plan = Plan::of(source)?;
         if let Some(digest) = self.held(&plan).await? {
-            return Ok(plan.pinned(&digest));
+            return Ok(Pinned { image: plan.pinned(&digest), built: None });
         }
         let _turn = self.building.lock().await;
         if let Some(digest) = self.held(&plan).await? {
-            return Ok(plan.pinned(&digest));
+            return Ok(Pinned { image: plan.pinned(&digest), built: None });
         }
+        let began = std::time::Instant::now();
         let digest = self.build(source, &plan, secrets).await?;
-        Ok(plan.pinned(&digest))
+        Ok(Pinned { image: plan.pinned(&digest), built: Some(began.elapsed()) })
     }
 
     /// The Shards home's store, which holds what's built (`shards_image::store::Store`'s root).
@@ -156,13 +166,30 @@ impl Images {
                 written.and_then(|r| r).map_err(|e| Refusal::Context(format!("{e:#}")))?;
             }
         }
+        // Each SSH key it's given (P4.6): a file of this build's own folder, which only its owner reads and which goes with
+        // the folder, never in its context or a layer.
+        let keys: Vec<(PathBuf, Vec<u8>)> = secrets.iter().enumerate().filter(|(_, s)| s.given == Given::Ssh).map(|(i, s)| (key_at(dir, i), key_file(&s.value))).collect();
+        if !keys.is_empty() {
+            let written = crate::rt::blocking(move || keys.iter().try_for_each(|(at, key)| crate::util::write_secret_unsynced(at, key, 0o600))).await;
+            written.and_then(|r| Ok(r?)).map_err(|e| Refusal::Context(format!("its SSH keys: {e:#}")))?;
+        }
         let mut cmd = Command::new(&self.shards);
         cmd.arg("build").arg("--progress=quiet").arg("--platform").arg(&plan.platform);
-        // Each secret it's given, as Shards' build takes one (buildx's `--secret id=<ID>,env=<VAR>`): its
-        // value in this build's environment alone, never on its command line, in its context or in a layer.
         for (i, s) in secrets.iter().enumerate() {
-            let var = format!("KILN_BUILD_SECRET_{i}");
-            cmd.arg("--secret").arg(format!("id={},env={var}", s.id)).env(&var, &s.value);
+            match s.given {
+                // As Shards' build takes a secret (buildx's `--secret id=<ID>,env=<VAR>`): its value in this build's
+                // environment alone, never on its command line, in its context or in a layer.
+                Given::Secret => {
+                    let var = format!("KILN_BUILD_SECRET_{i}");
+                    cmd.arg("--secret").arg(format!("id={},env={var}", s.id)).env(&var, &s.value);
+                }
+                // Served by the build as SSH agent `<ID>` from its file (buildx's `--ssh <ID>=<key file>`).
+                Given::Ssh => {
+                    let mut spec = std::ffi::OsString::from(format!("{}=", s.id));
+                    spec.push(key_at(dir, i));
+                    cmd.arg("--ssh").arg(spec);
+                }
+            }
         }
         cmd.arg("--file").arg(context_dir.join("Agentfile")).arg("--tag").arg(&plan.tag).arg("--iidfile").arg(&iid).arg(&context_dir);
         // Its own home, and a Docker configuration of its own: none of the machine's credential helpers.
@@ -177,6 +204,21 @@ impl Images {
         let digest = shards_image::reference::Digest::parse(id.trim()).map_err(|e| Refusal::Build(format!("it named its image {:?}: {e}", id.trim())))?;
         Ok(digest.to_string())
     }
+}
+
+/// Where a build in folder `dir` keeps the `i`th secret it's given, an SSH key (P4.6).
+fn key_at(dir: &Path, i: usize) -> PathBuf {
+    dir.join(format!("ssh-key-{i}"))
+}
+
+/// An SSH private key as its file holds it: its text, ending in a newline as OpenSSH writes one (a value kept trimmed
+/// is given whole).
+fn key_file(value: &str) -> Vec<u8> {
+    let mut key = value.as_bytes().to_vec();
+    if !key.ends_with(b"\n") {
+        key.push(b'\n');
+    }
+    key
 }
 
 /// The tag `source`'s image is built under and found by in the home's store (its name, then its
@@ -472,7 +514,8 @@ pub(crate) mod tests {
             shards.ready(source, &digest_of("one"))?;
             let images = shards.images();
             let pinned = images.pinned(source, &[]).await?;
-            assert_eq!(pinned, format!("harness-t@{}", digest_of("one")));
+            assert_eq!(pinned.image, format!("harness-t@{}", digest_of("one")));
+            assert!(pinned.built.is_some(), "its build is said");
             let builds = shards.builds();
             let plan = Plan::of(source)?;
             assert_eq!(builds.len(), 1, "{builds:?}");
@@ -480,7 +523,7 @@ pub(crate) mod tests {
             let home = shards.dir.path().join("home");
             assert!(build.starts_with(&format!("{} build --progress=quiet --platform {} ", home.display(), plan.platform)), "{build}");
             assert!(build.contains(&format!(" --tag {} ", plan.tag)), "{build}");
-            assert_eq!(images.pinned(source, &[]).await?, pinned, "the same image, found in the store");
+            assert_eq!(images.pinned(source, &[]).await?, Pinned { image: pinned.image.clone(), built: None }, "the same image, found in the store, no build said");
             assert_eq!(shards.builds().len(), 1, "found without a build");
             let scratch = shards.dir.path().join("scratch");
             assert_eq!(std::fs::read_dir(&scratch)?.count(), 0, "nothing of its build is left");
@@ -502,10 +545,12 @@ pub(crate) mod tests {
             shards.ready(a, &digest_of("a"))?;
             shards.ready(b, &digest_of("b"))?;
             let (first, second) = futures::join!(images.pinned(a, &[]), images.pinned(a, &[]));
-            assert_eq!((first?, second?), (format!("agentfile-{id}@{}", digest_of("a")), format!("agentfile-{id}@{}", digest_of("a"))));
+            let (first, second, want) = (first?, second?, format!("agentfile-{id}@{}", digest_of("a")));
+            assert_eq!((first.image.as_str(), second.image.as_str()), (want.as_str(), want.as_str()));
             assert_eq!(shards.builds().len(), 1, "two starts at once, one build: {:?}", shards.builds());
-            assert_eq!(images.pinned(b, &[]).await?, format!("agentfile-{id}@{}", digest_of("b")), "its changed text, built");
-            assert_eq!(images.pinned(a, &[]).await?, format!("agentfile-{id}@{}", digest_of("a")), "the first text's, still held");
+            assert!(first.built.is_some() != second.built.is_some(), "the one that built says so, the one that waited its turn ran none: {first:?} {second:?}");
+            assert_eq!(images.pinned(b, &[]).await?.image, format!("agentfile-{id}@{}", digest_of("b")), "its changed text, built");
+            assert_eq!(images.pinned(a, &[]).await?.image, format!("agentfile-{id}@{}", digest_of("a")), "the first text's, still held");
             assert_eq!(shards.builds().len(), 2, "{:?}", shards.builds());
             Ok(())
         })
@@ -527,8 +572,8 @@ pub(crate) mod tests {
             let stand_in = Source::Kept { id: &id, text: "FROM scratch\nHARNESS claude FROM https://example.com/stand-in.git#0123456789abcdef0123456789abcdef01234567:harness\n", beside };
             shards.ready(copy, &digest_of("copy"))?;
             shards.ready(stand_in, &digest_of("stand-in"))?;
-            assert_eq!(images.pinned(copy, &[]).await?, format!("agentfile-{id}@{}", digest_of("copy")));
-            assert_eq!(images.pinned(stand_in, &[]).await?, format!("agentfile-{id}@{}", digest_of("stand-in")));
+            assert_eq!(images.pinned(copy, &[]).await?.image, format!("agentfile-{id}@{}", digest_of("copy")));
+            assert_eq!(images.pinned(stand_in, &[]).await?.image, format!("agentfile-{id}@{}", digest_of("stand-in")));
             let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
             assert_eq!(shards.contexts(), [vec!["Agentfile".to_owned(), format!("claude-{arch}-musl")], vec!["Agentfile".to_owned()]]);
             Ok(())
@@ -589,8 +634,8 @@ pub(crate) mod tests {
             let source = Source::Kept { id: &id, text, beside: None };
             shards.ready(source, &digest_of("private"))?;
             assert_eq!(images.pinned(source, &[]).await.err(), Some(Refusal::Build(REFUSED.to_owned())), "not given it, Shards refuses it");
-            let given = [BuildSecret { id: "GIT_AUTH_TOKEN".into(), value: TOKEN.into() }];
-            assert_eq!(images.pinned(source, &given).await?, format!("agentfile-{id}@{}", digest_of("private")), "given it, the build makes its image");
+            let given = [BuildSecret { id: "GIT_AUTH_TOKEN".into(), value: TOKEN.into(), given: Given::Secret }];
+            assert_eq!(images.pinned(source, &given).await?.image, format!("agentfile-{id}@{}", digest_of("private")), "given it, the build makes its image");
             let builds = shards.builds();
             assert_eq!(builds.len(), 1, "{builds:?}");
             assert!(builds.iter().all(|b| b.contains(" --secret id=GIT_AUTH_TOKEN,env=KILN_BUILD_SECRET_0 ") && !b.contains(TOKEN)), "{builds:?}");
@@ -598,6 +643,42 @@ pub(crate) mod tests {
             // Its context's Agentfile carries no reference: the name is kiln's, never the image's.
             let given_text = std::fs::read_to_string(&seen)?;
             assert!(!given_text.contains("kiln.secret") && !given_text.contains("GH_TOKEN") && given_text.contains("HARNESS claude FROM https://github.com/acme/harness.git"), "{given_text}");
+            Ok(())
+        })
+    }
+
+    /// P4.6: an SSH key its Agentfile names is given to its build as SSH agent `default`, from a file of the build's own
+    /// folder that only its owner reads, holding the key whole; the key is never on the build's command line, and its
+    /// file goes with the folder. Taking out `build_in`'s `--ssh` fails the build (Shards' fetch finds no agent).
+    #[cfg(unix)]
+    #[test]
+    fn p4_6_a_build_is_given_its_ssh_key_as_an_agent_from_a_file_of_its_own() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        const KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----";
+        crate::rt::block_on(async move {
+            let shards = StandIn::new()?;
+            let inner = shards.dir.path().join("shards-inner");
+            std::fs::rename(&shards.program, &inner)?;
+            let (seen, mode) = (shards.dir.path().join("seen-key"), shards.dir.path().join("seen-mode"));
+            // Shards' fetch over SSH, standing in: it takes agent `default` from the file `--ssh` names.
+            let gate = "#!/bin/sh\nkey=\nprev=\nfor a in \"$@\"; do\n  [ \"$prev\" = --ssh ] && key=${a#default=}\n  prev=$a\ndone\n[ -n \"$key\" ] && [ -f \"$key\" ] || { echo 'no SSH agent default' >&2; exit 1; }\ncp \"$key\" 'SEEN'\nls -l \"$key\" | cut -c1-10 > 'MODE'\nexec 'INNER' \"$@\"\n"
+                .replace("SEEN", &seen.display().to_string())
+                .replace("MODE", &mode.display().to_string())
+                .replace("INNER", &inner.display().to_string());
+            std::fs::write(&shards.program, gate)?;
+            std::fs::set_permissions(&shards.program, std::fs::Permissions::from_mode(0o755))?;
+            let images = shards.images();
+            let id = crate::util::new_id();
+            let text = "FROM scratch\nLABEL kiln.ssh.default=user:DEPLOY_KEY\nHARNESS claude FROM ssh://git@github.com/acme/harness.git#0123456789abcdef0123456789abcdef01234567\n";
+            let source = Source::Kept { id: &id, text, beside: None };
+            shards.ready(source, &digest_of("ssh"))?;
+            let given = [BuildSecret { id: "default".into(), value: KEY.into(), given: Given::Ssh }];
+            assert_eq!(images.pinned(source, &given).await?.image, format!("agentfile-{id}@{}", digest_of("ssh")));
+            assert_eq!(std::fs::read_to_string(&seen)?, format!("{KEY}\n"), "the key whole, ending as OpenSSH writes one");
+            assert_eq!(std::fs::read_to_string(&mode)?.trim(), "-rw-------");
+            let builds = shards.builds();
+            assert!(builds.len() == 1 && builds.iter().all(|b| b.contains(" --ssh default=") && !b.contains("OPENSSH")), "{builds:?}");
+            assert_eq!(std::fs::read_dir(shards.dir.path().join("scratch"))?.count(), 0, "its key went with its folder");
             Ok(())
         })
     }

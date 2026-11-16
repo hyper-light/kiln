@@ -221,13 +221,14 @@ test("W21-R13 creating from Mission control gives the real view transition fitte
   const start = composer.getByRole("button", { name: /^Start:/ });
   await expect(start).toBeEnabled();
   await expect(page.locator("html")).toHaveAttribute("data-motion", "playing");
-  const response = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/harness/sessions" && r.request().method() === "POST");
+  // The console starts through agents.start (P5.6 S8): its ask flat, its answer the agents it started.
+  const response = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/harness/agents" && r.request().method() === "POST");
   await start.click();
   const created = await response;
   expect(created.ok()).toBe(true);
-  expect(created.request().postDataJSON()).toMatchObject({ count: 1, spec: { prompt: "Check viewport fitting while this mock agent opens." } });
+  expect(created.request().postDataJSON()).toMatchObject({ count: 1, prompt: "Check viewport fitting while this mock agent opens." });
   // W21-R15: the current mock, like the server, starts under the id the page made.
-  const made = (await created.json())[0].id as string;
+  const made = ((await created.json()) as { agents: { id: string }[] }).agents[0]!.id;
   expect(made).toMatch(/^[0-9a-f]{32}$/);
   expect(created.request().postDataJSON().ids).toEqual([made]);
   await expect(page).toHaveURL(new RegExp(`/agents/${made}$`));

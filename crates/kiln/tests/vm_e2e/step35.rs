@@ -7,10 +7,12 @@
 //! - `host`: the eight harnesses step 34 doesn't drive, each through kiln as a process on this host,
 //!   the stand-in behind its name (Unix: the stand-in is a Python script).
 //! - `rest`: the ten, each in a microVM from kiln's Agentfile and from a person's own, through kiln's
-//!   REST API: start, steer, interrupt, stop, resume, kiln's MCP from inside, an agent started there.
-//! - `mcp` (`mcp.rs`): the ten through kiln's MCP tools, as a person's or an agent's client drives
+//!   REST API: start, steer, interrupt, stop, resume, kiln's MCP from inside, an agent started there;
+//!   and two Antigravity agents of one person on one machine, each reaching kiln's MCP as itself.
+//! - `mcp` (`mcp.rs`): the ten through kiln's MCP server, as a person's or an agent's client drives
 //!   them: `agents_start` naming the Agentfile, `agents_send` steering, `agents_interrupt`,
-//!   `agents_stop`, and `agents_start` taking the conversation up again (`resume`).
+//!   `agents_stop`, and `agents_start` taking the conversation up again (`resume`); each as its own
+//!   tool, and in code mode (`code_run`'s `kiln.agents.start`).
 //!
 //! `rest::` and `mcp::` skip, saying why, until the runner a test starts says it starts microVMs
 //! (`facts.virt.microvm`); `VM_E2E=1` makes that a failure. A vendor's own CLI, from kiln's Agentfile
@@ -289,9 +291,9 @@ mod rest {
         Ok(Some(format!("agentfile:{id}")))
     }
 
-    /// Each harness in a microVM from kiln's Agentfile (an agent started from inside where kiln gives
-    /// it its MCP server) and from a person's own; every harness is driven and every failure said at
-    /// the end, so one run shows where each stands.
+    /// Each harness in a microVM from kiln's Agentfile and from a person's own, each starting an agent
+    /// from inside where kiln gives it its MCP server; every harness is driven and every failure said
+    /// at the end, so one run shows where each stands.
     #[test]
     fn s35_every_harness_in_a_microvm_from_kilns_agentfile_and_a_persons_own() -> anyhow::Result<()> {
         let gaps = super::gaps()?;
@@ -323,7 +325,7 @@ mod rest {
             }
             match users_own(&f, kind) {
                 Ok(Some(own)) => {
-                    if let Err(e) = vm_e2e::in_microvm(&f, kind, &own, &project, mcp, false) {
+                    if let Err(e) = vm_e2e::in_microvm(&f, kind, &own, &project, mcp, mcp) {
                         failed.push(format!("{kind} from a person's own ({own}): {e:#}"));
                     }
                 }
@@ -332,6 +334,96 @@ mod rest {
             }
         }
         anyhow::ensure!(failed.is_empty(), "{} of the drives failed:\n{}", failed.len(), failed.join("\n\n"));
+        Ok(())
+    }
+
+    /// Two Antigravity agents of one person on one machine, side by side, each in a microVM of its own
+    /// from the same Agentfile. agy takes kiln's MCP from its one config in the person's volume, the same
+    /// entry for both, and the lane names the session (gaps.json's antigravity caveat; Shards D254): each
+    /// must reach kiln's MCP as itself. The stand-in says whom kiln's answer to its `initialize` named
+    /// ([`vm_e2e::check_named_itself`]); a real agy's calls of kiln's tools are in the runner's log under
+    /// its own session ([`vm_e2e::mcp_calls_over_lane`]).
+    #[test]
+    fn s35_two_antigravity_agents_of_one_person_each_reach_kilns_mcp_as_themselves() -> anyhow::Result<()> {
+        const KIND: &str = "antigravity";
+        if !super::asked_kinds().contains(&KIND) {
+            eprintln!("SKIP: {KIND} isn't among VM_E2E_KINDS");
+            return Ok(());
+        }
+        let gaps = super::gaps()?;
+        for flag in ["linux_build", "mcp_in_microvm"] {
+            if !super::tried(&gaps, KIND, flag) {
+                super::say_gaps(&gaps, KIND, flag);
+                return Ok(());
+            }
+        }
+        let asked = vm_e2e::builtin_image(KIND);
+        if let Some(why) = super::untasked(KIND, &asked) {
+            let mut failed = Vec::new();
+            super::held_back(why, &mut failed);
+            anyhow::ensure!(failed.is_empty(), "{}", failed.join("\n"));
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let f = vm_e2e::up(dir.path(), "vm", &[])?;
+        if !vm_e2e::isolation_ready(&f)? {
+            return Ok(());
+        }
+        let project = vm_e2e::project(dir.path())?;
+        let (_stand_in, image) = vm_e2e::boots(&f, KIND, &asked)?;
+        let marker = std::env::var("VM_E2E_DONE_MARKER").unwrap_or_else(|_| vm_e2e::STUB_DONE.to_owned());
+        // Both started, as one person (the fixture's token) on one runner, before either is waited on.
+        let (mut agents, mut failed) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            let probe = vm_e2e::probe_name();
+            let prompt = vm_e2e::task("VM_E2E_PROMPT", KIND, &probe, vm_e2e::stub_prompt(KIND, true, false, &probe));
+            match vm_e2e::open(&f, &json!({"kind": KIND, "cwd": project, "prompt": prompt, "isolation": {"kind": "microvm", "image": image}})) {
+                Ok(id) => agents.push((id, probe, vm_e2e::Pace::default())),
+                Err(e) => failed.push(format!("{KIND}: starting one from {image}: {e:#}")),
+            }
+        }
+        let mut vms = Vec::new();
+        for (id, probe, pace) in &mut agents {
+            let what = format!("{KIND} {id} from {image}");
+            let first = pace.until(&f, id, vm_e2e::Asked::Opening, &format!("{what}: its first turn"), |i, e| vm_e2e::status(i) == "idle" && vm_e2e::said_marker(&vm_e2e::said(e), &marker));
+            let (info, events) = match first {
+                Ok(seen) => seen,
+                Err(e) => {
+                    failed.push(format!("{e:#}"));
+                    continue;
+                }
+            };
+            let lines = vm_e2e::said(&events);
+            let mut checks = vec![vm_e2e::mcp_round_trip(&events, &lines).map(|_| ()), vm_e2e::written_and_removed(&project, probe)];
+            // The runner logs each tool's call over a lane (`reach::mcp`), and the stand-in's round trip calls
+            // none: it says whom kiln's answer named instead.
+            if super::stand_in(KIND) {
+                checks.push(vm_e2e::check_named_itself(&lines, id));
+            } else {
+                match f.runner_log_whole() {
+                    Ok(log) if vm_e2e::mcp_calls_over_lane(&log, id) > 0 => {}
+                    Ok(_) => checks.push(Err(format!("its runner's log says no call of kiln's MCP over its lane ({:?}, session={id})", vm_e2e::MCP_LANE_SAID))),
+                    Err(e) => checks.push(Err(format!("{e:#}"))),
+                }
+            }
+            failed.extend(checks.into_iter().filter_map(Result::err).map(|e| format!("{what}: {e}")));
+            vms.push(info.pointer("/runs/vm").cloned());
+        }
+        // Each the one member of a microVM of its own, which is how its lane tells it from the other.
+        match vms.as_slice() {
+            [Some(a), Some(b)] if a != b => {}
+            [a, b] => failed.push(format!("{KIND}: the two agents' microVMs as kiln names them (runs.vm) aren't two of their own: {a:?}, {b:?}")),
+            // Fewer than two first turns ended, each said above.
+            _ => {}
+        }
+        // Each ended with any agent a real task's first turn started (the README's words ask for one).
+        for (id, _, pace) in &mut agents {
+            let ended = super::mcp::call(&f, super::mcp::Via::Tools, "agents.stop", json!({"agent": id, "children": true})).and_then(|_| pace.unlisted(&f, id, &format!("{KIND}: {id} still listed after agents.stop")));
+            if let Err(e) = ended {
+                failed.push(format!("{KIND}: ending {id}: {e:#}"));
+            }
+        }
+        anyhow::ensure!(failed.is_empty(), "{} of the checks failed:\n{}", failed.len(), failed.join("\n\n"));
         Ok(())
     }
 }

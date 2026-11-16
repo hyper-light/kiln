@@ -185,6 +185,26 @@ fn p7_1_an_experiment_round_trips_through_every_operation() -> anyhow::Result<()
     })
 }
 
+/// P7.1 beside P6.2: an agent definition's volumes are kept for its sessions in microVMs alone (a start of one on its
+/// machine's host is refused), so a definition on the host engine with volumes, and a host variant of one that has
+/// them, are refused as they're checked, saying why; its microVM variants are kept.
+#[test]
+fn p7_1_a_host_variant_of_a_definition_with_volumes_is_refused() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+        let ada = person("ada", "developer")?;
+        let call = |name: &'static str, input: Value| op(&hub, &ada, name, input);
+        let volumes = json!([{"name": "cargo", "bytes": GIB}]);
+        let why = "its volumes are kept only for its sessions in microVMs";
+        refused(call("agentdefs.create", json!({"name": "builder", "harness": "claude", "engine": "host", "volumes": volumes})).await, 422, why)?;
+        let def = s(&call("agentdefs.create", json!({"name": "builder", "harness": "claude", "volumes": volumes})).await.map_err(failed)?, "/id");
+        refused(call("agentdefs.experiments.create", json!({"id": def, "name": "x", "variants": [vm(50, 2, 4), {"weight": 50, "engine": "host"}]})).await, 422, &format!("variant 2: {why}"))?;
+        let kept = call("agentdefs.experiments.create", json!({"id": def, "name": "y", "variants": [vm(50, 2, 4), vm(50, 4, 8)]})).await.map_err(failed)?;
+        anyhow::ensure!(s(&kept, "/experiment/state") == "live", "{kept}");
+        anyhow::Ok(())
+    })
+}
+
 /// P7.1's authz ("another person's experiment is invisible"): Bo lists none of Ada's, and reads, changes, deletes or
 /// starts none on her definition (each as no such definition); his own list is his alone. An admin reaches everyone's,
 /// as agent definitions are. Taking `super::reach`'s definition check out lets Bo change hers.

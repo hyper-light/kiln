@@ -721,6 +721,10 @@ pub struct Host {
     /// (`crate::sandbox::isolated::reach_of`): as its maker keeps them ([`Host::keep_homes`]), none
     /// till then.
     homes: std::sync::OnceLock<PathBuf>,
+    /// The kiln server's data folder on this machine (kiln.db, its secrets and tokens), kiln's state, which no
+    /// isolated agent's project is, holds or lies in (`crate::sandbox::isolated::kept_out`): as its runner keeps
+    /// it ([`Host::keep_server_data`]), none till then.
+    server_data: std::sync::OnceLock<PathBuf>,
 }
 
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
@@ -1018,6 +1022,7 @@ impl Host {
             handovers,
             microvm: Mutex::new(crate::sandbox::microvm()),
             homes: std::sync::OnceLock::new(),
+            server_data: std::sync::OnceLock::new(),
         });
         shares.follow_input(&host);
         host
@@ -1032,6 +1037,17 @@ impl Host {
     /// Where this machine keeps its persons' harness homes (`<state>/homes`), if it keeps any.
     pub fn homes(&self) -> Option<&std::path::Path> {
         self.homes.get().map(PathBuf::as_path)
+    }
+
+    /// Keeps `dir` as the kiln server's data folder on this machine (`agent::Opts::server_data_dir`): the first it's
+    /// given.
+    pub fn keep_server_data(&self, dir: PathBuf) {
+        let _ = self.server_data.set(dir);
+    }
+
+    /// The kiln server's data folder on this machine, if its runner kept it ([`Host::keep_server_data`]).
+    pub fn server_data(&self) -> Option<&std::path::Path> {
+        self.server_data.get().map(PathBuf::as_path)
     }
 
     /// Where this machine holds isolated agents' harnesses (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -5372,11 +5388,13 @@ while True:
         use kiln_seams::sandbox::Boundary;
         crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
+            // kiln's state (its microVMs' store, its people's volumes) apart from its project, which may hold none of it (CP-T4.1's AC-T4.1.5).
+            let state = tempfile::tempdir()?;
             let (program, heard) = stand_in(dir.path())?;
             let (tx, _rx) = async_channel::unbounded();
             let host = with_inbox(tx);
             // Its image already in the store of the machine's microVMs, as its build left it: nothing is built.
-            let (images, pinned) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
+            let (images, pinned) = crate::sandbox::image::tests::holding(state.path(), claude_image()?)?;
             // Its stdio said to ride a link whose ends each negotiated AES-256-GCM (Shards' agent control).
             let end = || kiln_ci::facts::Negotiated { suite: "TLS13_AES_256_GCM_SHA384".into(), group: "X25519MLKEM768".into() };
             let lanes = ["control", "stdin:0", "stdout:0", "stderr:0"].map(str::to_owned).to_vec();
@@ -5387,7 +5405,7 @@ while True:
             host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images).with_lanes(Arc::clone(&lanes) as Arc<dyn crate::sandbox::Lanes>));
             let cwd = dir.path().to_string_lossy().into_owned();
             // Its person's volumes kept on the machine (goal 65's finding: where its conversation ran is kept beside them).
-            host.keep_homes(dir.path().join("homes"));
+            host.keep_homes(state.path().join("homes"));
             let isolation = session::Isolation { person: Some("owner".into()), ..session::Isolation::microvm() };
             let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), isolation: Some(isolation), claim: Some(balancers_claim()), ..Spec::default() };
             let s = host.open(Some("isolated".into()), spec)?;
@@ -5410,7 +5428,7 @@ while True:
             // HOME, made before it started (`harness::isolated::home::Layout::prepare`), and the plugin
             // folders Claude Code loads on the machine (kiln's skills, its session's), read-only at their
             // own paths and named to it as there.
-            let volume = dir.path().join("homes").join("owner").join("claude").join("home").join("claude");
+            let volume = state.path().join("homes").join("owner").join("claude").join("home").join("claude");
             // Each its harness's own, given to its member at its start.
             let claude = vec![kiln_seams::sandbox::Member("claude".into())];
             let home = kiln_seams::sandbox::Share { host: volume.to_string_lossy().into_owned(), at: "/home/claude".into(), writable: true, members: claude.clone() };
@@ -5458,7 +5476,7 @@ while True:
             // Where its conversation ran, kept beside its person's volume as its first run ended, before its
             // second started: kiln's Agentfile for Claude Code, at this kiln's text, its image pinned, and where
             // Claude Code keeps its conversations in its volume.
-            let ran_in = crate::harness::isolated::home::ran_in_dir(&dir.path().join("homes"), "owner", "claude")?;
+            let ran_in = crate::harness::isolated::home::ran_in_dir(&state.path().join("homes"), "owner", "claude")?;
             let kept = crate::harness::isolated::home::RanIn {
                 conversation: conversation_id.clone(),
                 agentfile: "harness-claude".into(),
@@ -5511,14 +5529,16 @@ while True:
     fn p1_3_a_session_through_hex_interrupted_mid_turn_goes_on_and_its_stop_ends_its_member_then_its_box() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
+            // kiln's state apart from its project, which may hold none of it (CP-T4.1's AC-T4.1.5).
+            let state = tempfile::tempdir()?;
             let (program, heard) = stand_in(dir.path())?;
             let (tx, _rx) = async_channel::unbounded();
             let host = with_inbox(tx);
-            let (images, _pinned) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
+            let (images, _pinned) = crate::sandbox::image::tests::holding(state.path(), claude_image()?)?;
             let hex = Arc::new(crate::sandbox::hexvm::tests::HexProcs::new(&program));
             host.hold_isolated_in(crate::sandbox::of_hex(hex.vms(), images, None));
             let cwd = dir.path().to_string_lossy().into_owned();
-            host.keep_homes(dir.path().join("homes"));
+            host.keep_homes(state.path().join("homes"));
             let isolation = session::Isolation { person: Some("owner".into()), ..session::Isolation::microvm() };
             let spec = Spec { kind: "claude".into(), cwd: Some(cwd), isolation: Some(isolation), claim: Some(balancers_claim()), ..Spec::default() };
             let s = host.open(Some("through-hex".into()), spec)?;

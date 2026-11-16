@@ -51,8 +51,10 @@ pub async fn record(hub: &Hub, session: &str, d: &Definition, person: Option<&st
             Ok(())
         })
         .await;
-    if let Err(e) = kept {
-        tracing::warn!(session, definition = %d.id, error = %format!("{e:#}"), "which agent definition a session started from wasn't kept");
+    match kept {
+        // Its definition's time limit, if it sets one, is held to it from now (P5.4).
+        Ok(()) => super::limits::armed(),
+        Err(e) => tracing::warn!(session, definition = %d.id, error = %format!("{e:#}"), "which agent definition a session started from wasn't kept"),
     }
 }
 
@@ -94,6 +96,9 @@ pub struct Listed {
     pub engine: Option<&'static str>,
     /// It as `agents.list` briefs it; none once it's gone.
     pub agent: Option<Value>,
+    /// Why a limit of its definition ended it (P5.4: `super::limits`), where one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
     /// The definition's experiment that drew it, and the variant it got (`super::experiments`, kiln plan
     /// 01a1cd8e862e7169a074db3d5fa33f3d P7.1); none for a session started outside one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,15 +191,16 @@ pub async fn list(hub: &Hub, who: &Who, id: &str) -> R<Value> {
         }
     }
     let (i, person, all) = (id.to_owned(), who.person.clone(), who.all);
-    // Each with the experiment's draw it started as, where one drew it.
+    // Each with why a limit of its definition ended it, and the experiment's draw it started as, where either did.
     let rows: Vec<Row> = hub
         .store
         .read(move |c| {
-            let mut st = c.prepare(
-                "SELECT s.session_id, s.version, s.target, s.at, d.experiment_id, d.variant_id FROM agent_def_sessions s LEFT JOIN agent_def_experiment_draws d ON d.session_id = s.session_id \
+            let mut st = c.prepare(&format!(
+                "SELECT s.session_id, s.version, s.target, s.at, {ENDED}, x.experiment_id, x.variant_id FROM agent_def_sessions s {} LEFT JOIN agent_def_experiment_draws x ON x.session_id = s.session_id \
                  WHERE s.agent_def_id = ?1 AND (?3 OR s.person = ?2) ORDER BY s.at DESC, s.session_id",
-            )?;
-            let rows = st.query_map(params![i, person, all], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<Vec<_>, _>>()?;
+                ended_join()
+            ))?;
+            let rows = st.query_map(params![i, person, all], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .await?;
@@ -206,15 +212,17 @@ pub async fn list(hub: &Hub, who: &Who, id: &str) -> R<Value> {
 /// they see isn't among them, nor one that's gone (deleted, or one of kiln's it no longer has).
 pub async fn all(hub: &Hub, who: &Who) -> R<Value> {
     let (person, all) = (who.person.clone(), who.all);
-    // Each with its definition's owner, and the experiment's draw it started as, where one drew it.
+    // Each with its definition's owner, why a limit of it ended it, and the experiment's draw it started as, where
+    // either did.
     let rows: Vec<(String, Option<String>, Row)> = hub
         .store
         .read(move |c| {
-            let mut st = c.prepare(
-                "SELECT s.agent_def_id, d.owner, s.session_id, s.version, s.target, s.at, x.experiment_id, x.variant_id FROM agent_def_sessions s LEFT JOIN agent_defs d ON d.id = s.agent_def_id \
+            let mut st = c.prepare(&format!(
+                "SELECT s.agent_def_id, d.owner, s.session_id, s.version, s.target, s.at, {ENDED}, x.experiment_id, x.variant_id FROM agent_def_sessions s LEFT JOIN agent_defs d ON d.id = s.agent_def_id {} \
                  LEFT JOIN agent_def_experiment_draws x ON x.session_id = s.session_id WHERE (?2 OR s.person = ?1) ORDER BY s.agent_def_id, s.at DESC, s.session_id",
-            )?;
-            let rows = st.query_map(params![person, all], |r| Ok((r.get(0)?, r.get(1)?, (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))))?.collect::<Result<Vec<_>, _>>()?;
+                ended_join()
+            ))?;
+            let rows = st.query_map(params![person, all], |r| Ok((r.get(0)?, r.get(1)?, (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .await?;
@@ -237,15 +245,22 @@ pub async fn all(hub: &Hub, who: &Who) -> R<Value> {
 }
 
 /// One session of a definition as kiln keeps it: its id, the definition's version it started from, where it was
-/// placed and when (Unix ms); and the experiment that drew it and the variant it got, where one did (`super::experiments`,
-/// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1).
-type Row = (String, i64, String, i64, Option<String>, Option<String>);
+/// placed and when (Unix ms), and why a limit of its definition ended it, where one did; and the experiment that drew
+/// it and the variant it got, where one did (`super::experiments`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1).
+type Row = (String, i64, String, i64, Option<String>, Option<String>, Option<String>);
+
+/// Why a limit ended a session, read beside it: its row of `kv` ([`super::limits::ended_key`]), joined as `e`.
+const ENDED: &str = "e.v";
+
+fn ended_join() -> String {
+    format!("LEFT JOIN kv e ON e.k = '{}' || s.session_id", super::limits::ENDED)
+}
 
 /// The sessions `rows` keep, in their order, as `agentdefs.sessions` lists them, and what their starts took.
 fn listed_of(hub: &Hub, rows: Vec<Row>) -> R<Value> {
     let mut listed = Vec::with_capacity(rows.len());
     let mut infos = Vec::new();
-    for (session, version, target, at, experiment, variant) in rows {
+    for (session, version, target, at, ended, experiment, variant) in rows {
         match hub.harness.info(&session) {
             Some(info) => {
                 listed.push(Listed {
@@ -256,12 +271,13 @@ fn listed_of(hub: &Hub, rows: Vec<Row>) -> R<Value> {
                     state: crate::harness::wait::stand(&info).to_owned(),
                     engine: Some(if info.isolation.is_some() { "microvm" } else { "host" }),
                     agent: Some(crate::harness::wait::brief(&info)),
+                    ended,
                     experiment,
                     variant,
                 });
                 infos.push(info);
             }
-            None => listed.push(Listed { id: session, version, at, runner: crate::harness::wait::machine(&target).to_owned(), state: "gone".to_owned(), engine: None, agent: None, experiment, variant }),
+            None => listed.push(Listed { id: session, version, at, runner: crate::harness::wait::machine(&target).to_owned(), state: "gone".to_owned(), engine: None, agent: None, ended, experiment, variant }),
         }
     }
     let sessions = serde_json::to_value(&listed).map_err(|e| Error::Other(e.into()))?;
@@ -270,6 +286,7 @@ fn listed_of(hub: &Hub, rows: Vec<Row>) -> R<Value> {
 
 /// Definition `id`'s sessions forgotten, as it goes.
 pub fn forget_in(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<usize> {
+    c.execute("DELETE FROM kv WHERE k IN (SELECT ?2 || session_id FROM agent_def_sessions WHERE agent_def_id = ?1)", params![id, super::limits::ENDED])?;
     c.execute("DELETE FROM agent_def_sessions WHERE agent_def_id = ?1", params![id])
 }
 

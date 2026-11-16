@@ -226,6 +226,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("terminals", h => h.terminal_loop());
         child!("agent-screens", h => crate::harness::screen::watch(h));
         child!("goal-stacks", h => crate::goals::run(h));
+        // Sessions held to their agent definitions' time limits (kiln plan 01a1dd2e… P5.4).
+        child!("agent-limits", h => crate::agentdefs::limits::run(h));
         child!("attention", h => crate::harness::attention::run(h));
         child!("plan-runs", h => crate::plans::agents::drive(h));
         child!("harness", h => crate::harness::registry::Registry::run_local(h));
@@ -655,6 +657,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             slots: cfg.local_agent.slots,
             work_dir: cfg.local_agent.work_dir.clone().unwrap_or_else(|| cfg.data("work")),
             state_dir: cfg.data("local-agent"),
+            server_data_dir: cfg.server.data_dir.clone(),
             join_token: None,
             ephemeral: false,
             dedicated_job: None,

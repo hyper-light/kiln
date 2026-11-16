@@ -46,6 +46,11 @@ pub struct Opts {
     pub slots: u32,
     pub work_dir: PathBuf,
     pub state_dir: PathBuf,
+    /// The kiln server's data folder on this machine (`[server] data_dir`: kiln.db, its secrets and tokens; on a
+    /// machine that runs both, the parent of its runner's default state): the server's own for its in-process runner,
+    /// else as this machine's kiln config names it (`config::server_data_dir`). kiln's state, which no isolated agent's
+    /// project is, holds or lies in (`sandbox::isolated::kept_out`).
+    pub server_data_dir: PathBuf,
     pub join_token: Option<String>,
     pub ephemeral: bool,
     pub dedicated_job: Option<String>,
@@ -74,8 +79,9 @@ pub struct Opts {
     pub outpost: bool,
     /// What its administrator declares of it (docs/ci.md W13-R02).
     pub declared: crate::runner::probe::Declared,
-    /// What leases its microVMs' credentials (plan step 33, Shards' D242): the server's broker, for the server's own
-    /// runner alone; none elsewhere, where a launch granting a credential is refused (`sandbox::hexvm::NO_BROKER`).
+    /// What leases its microVMs' credentials (plan step 33, Shards' D242): the server's broker in its process, for the
+    /// server's own runner. None elsewhere, where its runs' asks go to the server's broker over this runner's link to it
+    /// (`secrets::lessor::Remote`, its reach node's), or, with no link, are refused (`sandbox::hexvm::NO_BROKER`).
     pub leasing: Option<crate::sandbox::Leasing>,
 }
 
@@ -2517,6 +2523,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         let limits = crate::harness::host::Limits { per_machine: held.max_sessions };
         let h = harness_host(sink, &o.state_dir, &own_dir, limits);
+        h.keep_server_data(o.server_data_dir.clone());
         // A new build taking over takes no messages till it's promoted (`Host::hold`).
         if take_over_pending.is_some() {
             h.hold(true);
@@ -2536,7 +2543,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Some(r) => r.records().await,
             None => None,
         };
-        match crate::sandbox::hold(&o.state_dir, ledger, o.leasing.clone()).await {
+        // Its microVMs' credentials leased from its server's one broker: in this process for the server's own runner,
+        // over this runner's link to its server for every other (plan step 33, Shards' D242).
+        let leasing = o.leasing.clone().or_else(|| reach.as_ref().map(|r| crate::sandbox::Leasing(Arc::new(crate::secrets::lessor::Remote::new(r.clone())))));
+        match crate::sandbox::hold(&o.state_dir, ledger, leasing).await {
             Ok(Some(vms)) => h.hold_isolated_in(vms),
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's microVMs couldn't be held: it holds no isolated agent"),
@@ -4443,6 +4453,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         continue;
                     }
+                    // One replay of a recorded session's tool calls in a microVM of a split's variant (kiln plan
+                    // 01a1dd2e… P7.1b): run on a task of its own, its scratch beneath this runner's state, answered as
+                    // it ends.
+                    Carried::Read(FromServer::Replay { req, ask }) => {
+                        let (up, under) = (uplink.0.clone(), o.state_dir.join("replays"));
+                        drop(crate::rt::spawn(async move {
+                            let answer = crate::sandbox::replay::answer(*ask, &under).await;
+                            let json = serde_json::to_string(&answer).ok();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        }));
+                        continue;
+                    }
                     Carried::Read(FromServer::FrontDoor(push)) => {
                         // Settings (and certificates) are never logged: an upload carries a key.
                         if let Some(fd) = &front_door {
@@ -5071,6 +5093,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         sent_changes.state_pages = pages;
                         tracing::debug!(?names, "the server speaks these features");
                         crate::reach::told::server_features(&names);
+                        crate::secrets::lessor::server_features(&names);
                         // Its admission's hints go to a server that takes them (AUDIT O1).
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Offers(proto::feature::speaks(&names, proto::feature::OFFERS))).await;
@@ -5122,6 +5145,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // lays out and which session has which, a folder to read, and the files it asked for.
                     ServerMsg::Skills { json } => crate::skills::runner::told(&json, own.clone(), harness.clone()),
                     ServerMsg::SkillFile { sha256, offset, data, done } => crate::skills::runner::file(sha256, offset, data, done, own.clone(), harness.clone()).await,
+                    // An Agentfile to build ahead of its sessions, in the microVMs' store they boot from (kiln plan 01a1dd2e…
+                    // P4.5).
+                    ServerMsg::Prebuild { json } => crate::agentfiles::prebuild::told(&json, own.clone(), harness.as_ref().and_then(|h| h.microvm())),
                     // Another runner's room, for this runner's owner to choose where to probe by
                     // (docs/needs.md E5, AUDIT O1).
                     ServerMsg::Offers { json } => {
@@ -5639,7 +5665,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     | ServerMsg::AgentLimit { .. }
                     | ServerMsg::HarnessHistoryFor { .. }
                     | ServerMsg::RunnerEngine { .. }
-                    | ServerMsg::AdoptPolicy { .. } => {}
+                    | ServerMsg::AdoptPolicy { .. }
+                    | ServerMsg::Replay { .. } => {}
                 }
             }
             Ev::Headroom => {

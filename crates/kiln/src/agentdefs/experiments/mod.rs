@@ -851,8 +851,9 @@ fn promotion(s: &Settings, v: &Variant) -> Patch {
 }
 
 /// Variant `variant` promoted, while experiment `id` is live or paused: made its definition's next version (checked
-/// as any change of it is, over the version it's at as this begins: another change between refuses it), and the
-/// experiment over. The definition as it is now comes back with it. Promoted already, it's as it is.
+/// and kept as any change of it is, `super::sync::update`: what it shares with its Agentfile's `AGENT` written there
+/// first, P5.4; over the version it's at as this begins: another change between refuses it), and the experiment over.
+/// The definition as it is now comes back with it. Promoted already, it's as it is.
 pub async fn promote(hub: &Hub, who: &Who, def: &str, id: &str, variant: &str, by: &str) -> R<(Experiment, AgentDef)> {
     let d = reach(hub, who, def).await?;
     let (dd, ii) = (def.to_owned(), id.to_owned());
@@ -865,7 +866,7 @@ pub async fn promote(hub: &Hub, who: &Who, def: &str, id: &str, variant: &str, b
         State::Promoted | State::Stopped => return Err(Error::Conflict(format!("{} is {}: it's over", e.name, e.state.as_str()))),
         State::Live | State::Paused => {}
     }
-    let d = super::update(hub, who, def, promotion(&d.settings, &v), Some(d.version), by).await?;
+    let d = super::sync::update(hub, who, def, promotion(&d.settings, &v), Some(d.version), by).await?;
     let (def, id, variant, at) = (def.to_owned(), id.to_owned(), variant.to_owned(), crate::util::now_ms());
     let e = hub
         .store

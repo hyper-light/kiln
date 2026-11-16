@@ -143,15 +143,15 @@ test.describe("against the mock", () => {
     await expect(page.getByLabel("The Agentfile Codex's microVM is made from")).toHaveValue(`agentfile:${mine?.id}`);
   });
 
-  /** What the composer's start asks for as a past session is picked: the body of its `POST /api/harness/sessions`. */
-  async function pickUp(page: Page, title: string): Promise<{ target?: string; spec?: { kind?: string; resume?: string; isolation?: { kind: string; image?: string } } }> {
+  /** What the composer's start asks for as a past session is picked: the body of its `agents.start` (`POST /api/harness/agents`, P5.6 S8). */
+  async function pickUp(page: Page, title: string): Promise<{ on?: string; kind?: string; resume?: string; isolation?: string; image?: string }> {
     await page.goto("/agents");
     await toHarness(page, "Codex");
     await page.getByRole("button", { name: /^More options/ }).click();
     await toMachine(page, new RegExp(MOCK_VM));
     await page.getByRole("button", { name: /^A past session on / }).click();
     const row = page.locator(".ps-list .ps-row").filter({ hasText: title });
-    const [sent] = await Promise.all([page.waitForRequest((r) => r.method() === "POST" && new URL(r.url()).pathname === "/api/harness/sessions"), row.click()]);
+    const [sent] = await Promise.all([page.waitForRequest((r) => r.method() === "POST" && new URL(r.url()).pathname === "/api/harness/agents"), row.click()]);
     await expect(page).toHaveURL(/\/agents\/[0-9a-f]{32}$/);
     return sent.postDataJSON();
   }
@@ -168,12 +168,12 @@ test.describe("against the mock", () => {
     await expect(page.locator(".ps-list .ps-row").filter({ hasText: "Speed up the log viewer" })).not.toContainText("in a microVM");
     expect(await sideways(page)).toBe(0);
     const isolated = await pickUp(page, "Port the parser to Rust");
-    expect(isolated.spec?.resume).toBe("past-vm-1");
-    expect(isolated.spec?.isolation).toEqual({ kind: "microvm", image: "harness-codex" });
+    expect(isolated.resume).toBe("past-vm-1");
+    expect({ isolation: isolated.isolation, image: isolated.image }).toEqual({ isolation: "microvm", image: "harness-codex" });
     // One of the machine's own goes on as a process, as before.
     const own = await pickUp(page, "Speed up the log viewer");
-    expect(own.spec?.resume).toBe("past-1");
-    expect(own.spec?.isolation).toBeUndefined();
+    expect(own.resume).toBe("past-1");
+    expect(own.isolation).toBeUndefined();
   });
 });
 

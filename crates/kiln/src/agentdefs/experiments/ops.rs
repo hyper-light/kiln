@@ -153,6 +153,8 @@ async fn promote(cx: Cx, v: Value) -> Out {
     let i: input::ExperimentsVariant = read(v)?;
     let (e, d) = super::promote(&cx.hub, &who(&cx)?, &i.id, &i.experiment, &i.variant, &cx.caller.name).await.map_err(fail)?;
     audit(&cx, "agentdef.experiment.promote", &e, format!("variant {} made {} v{}", i.variant, d.name, d.version)).await;
+    // A save of the definition, as agentdefs.update's: its Agentfile's builds asked anew (P4.5).
+    crate::agentdefs::ops::prebuild(&cx, &d).await;
     Ok(json!({"experiment": json_of(&e)?, "agentdef": json_of(&d)?}))
 }
 

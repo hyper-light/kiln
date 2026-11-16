@@ -1220,9 +1220,10 @@ refused, never run as a process; where the machine picked would refuse it, the c
 under the row. Once such a start goes through, its harness runs as its image's HARNESS member, its
 stdio the member's streams, and its session drives it through the same adapter as on the host: it
 starts, is steered, interrupted, resumed and stopped as a process is (docs/isolation.md, step 17).
-A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now (docs/shards.md), but it
-doesn't yet start a harness through Hex (the plan's step 17), so until then such a start is refused
-there, saying so (its facts' `isolation.why_not`).
+A runner starts it, in a Shards microVM through Hex, where its kiln carries Shards and its engine is
+`microvm` (docs/isolation.md, "A runner's engine"). kiln's releases don't carry Shards yet
+(docs/shards.md), so on any other runner such a start is refused, saying so (its facts'
+`isolation.why_not`).
 
 **Placed and charged by kiln's balancer** (step 32). An isolated agent is placed as runs are
 (docs/lb.md), or not at all: its placement asks its microVM's own vCPUs and memory, never what its
@@ -1262,10 +1263,10 @@ given to it, no network but the ports and hosts its grants name, nothing coming 
   isolated agent's agents are isolated too: it can't start one as a process on its machine".
 - **Where it runs.** Only on a runner that says it starts microVMs (its facts' `virt.microvm`, the
   need `microvm`). Anywhere else it's refused, never run as a process.
-- **Not yet.** No runner starts microVMs yet. kiln holds Shards and Hex at one Shards revision and
-  can carry Shards' programs (docs/shards.md), but its releases don't carry them yet, and kiln
-  doesn't yet start a harness through Hex. Until then every isolated start is refused, saying so.
-  The rest of this section is what one gets once its start goes through.
+- **Not everywhere yet.** kiln holds Shards and Hex at one Shards revision and starts each harness
+  through Hex, but its releases don't carry Shards' programs yet (docs/shards.md). Only a runner
+  whose kiln carries them, with its engine `microvm`, starts isolated agents; everywhere else every
+  isolated start is refused, saying so.
 
 ### What kiln's Agentfiles give it
 
@@ -1366,20 +1367,34 @@ to `s28-pi-agentfile`).
   the first time a request needs it, held outside the microVM while its lease lasts, and every lease
   is given back as the run ends, however it ends. kiln keeps a ledger of them, so not even a restart
   of kiln leaves one live past its run's end.
-- **Signing in.** The harness's own sign-in will run inside its microVM, on its own terminal. For
-  Claude Code and Codex, the tokens their providers send back are taken out on the way in: kiln is to
-  keep them, the harness gets placeholders, and its refreshes and sign-outs are answered outside, so a
-  refresh never brings a new token in, and signing out inside ends nothing outside. Codex keeps what
-  it reads of its ID token (your email, plan and account), never its signature. A request that would
-  make an API key from a taken token is refused.
+- **Signing in.** The harness's own sign-in will run inside its microVM, on its own terminal. Claude
+  Code's, Codex's and goose's runs are granted your sign-in by name (`claude/<you>`, `codex/<you>`,
+  `goose/<you>`: goose's ChatGPT sign-in, which signs in as Codex does), and the
+  tokens their providers send back are taken out on the way in: kiln keeps them in its secret store,
+  with the scope they were granted, and the harness gets placeholders, which its file in your volume
+  keeps, so your next run's harness holds the same ones. Its access token is filled in only toward
+  its provider's API (`api.anthropic.com`, `chatgpt.com`). kiln makes each refresh itself, as that
+  CLI makes it (Claude Code's at `platform.claude.com`, Codex's and goose's at `auth.openai.com`), one at a time
+  for a sign-in however many runs use it, keeps the new tokens where the old ones were, so the
+  placeholders stay, and answers the harness with placeholders alone: a refresh never brings a new
+  token in. A refresh its provider refuses tells the harness to sign in again. Signing out inside is
+  noted in kiln's log and ends nothing outside. Codex keeps what it reads of its ID token (your email,
+  plan and account), never its signature, and a refresh's new ID token isn't passed on. A request
+  that would make an API key from a taken token is refused. Every runner leases these from kiln's
+  server, which answers a runner only for the people its own isolated agents act for. The other
+  harnesses, and goose's other sign-ins, sign in themselves, their tokens in your volume: each
+  checks or reads its token in a way a placeholder can't pass, or takes a key instead (Shards'
+  D242 says which, for each).
 - **Yours stay in your volume.** What a harness keeps of its sign-in it keeps in your volume, which
   no other person's agent is given. Once its tokens are taken outside, what it keeps there are
   placeholders.
-- **Not yet.** A request over HTTP/2 isn't filled in: the egress speaks HTTP/1.1 to the harness. A
-  sign-in isn't wired end to end: its tokens don't yet reach kiln's store, and kiln has no terminal
-  into a microVM yet. kiln doesn't yet start a harness through Hex (above), whose part of this isn't
-  on its main yet. And none of this has run in a real microVM yet: the check that no value is
-  anywhere in a run's memory, disk or environment is built, its runs still to come.
+- **Not yet.** kiln grants a run no other credential yet, an API key for one: only those
+  sign-ins. Where a runner's microVMs can't lease, or its server answers no leases yet, Claude Code,
+  Codex and goose sign in themselves too, their tokens in your volume, as the runner's log says. kiln has
+  no terminal into a microVM yet. The egress has filled in a value and masked its echo in real
+  microVMs only in Shards' own tests (Linux and Windows, on x86-64), not yet for a harness kiln
+  starts; the check that no value is anywhere in a run's memory, disk or environment is built, its
+  runs over real sessions still to come.
 - **When a value has to be inside.** Every harness kiln ships reads its trust from where its run's
   certificate authority is laid, and none pins its provider's certificates, as its own build shows,
   so none should need its value inside. Claude Code signed in
@@ -1416,7 +1431,9 @@ to `s28-pi-agentfile`).
   OS kiln runs on, Windows included: the same tools `kiln reach mcp` gives a harness on its machine.
   A run on another machine still needs the runner's own launches, which only a Unix runner holds
   today. Each call over the lane is logged on the runner (`kiln.mcp.lane`), naming its session and
-  tool. What's still to come is the launch handing each connection to it.
+  tool. Each agent's launch asks its microVM for the bridge and hands the runner every connection
+  its harness makes to it, as that agent's alone: two of your agents on one machine each reach
+  kiln's MCP as themselves, Antigravity's too, though its entry in your volume is the same for both.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
 - **Move to another machine.** Not yet: it stays where it started, and says so when asked. To go on
@@ -1428,10 +1445,9 @@ to `s28-pi-agentfile`).
   Codex's thread as its items, else in words with the next message. Where its machine's microVMs swap
   no harness in place (Hex's, until its wire calls land, P6c.2) it's refused, saying so, and it goes
   on as it was.
-- **Not yet**, as well as the start itself: a terminal into the microVM, its sign-in and exec
-  there; git signing and a git host's credentials by the microVM's own key; kiln's MCP, over that
-  lane; and the commands it asks kiln to run on other machines,
-  which run in microVMs too or not at all, never on a bare host.
+- **Not yet**: a terminal into the microVM, its sign-in and exec there; git signing and a git
+  host's credentials by the microVM's own key; and the commands it asks kiln to run on other
+  machines, which run in microVMs too or not at all, never on a bare host.
 
 ### Each feature, in a microVM of its own
 
@@ -1444,7 +1460,7 @@ What this page describes, once an isolated agent's start goes through:
 | The Changes tab, Commits, Compare, whose a file is, a subagent's edits, change requests | Works: the project is at its own path inside, so kiln reads its diffs, HEAD and checkpoints where it always does. |
 | Continuing a past session | Works: kiln reads its transcript from your volume on the machine, and the machine's past sessions name the Agentfile it ran in. |
 | Its harness's settings, sign-in and memories | Kept in your volume, yours alone; no credential leaves it. |
-| Agents that run agents, and kiln's other tools | Not yet: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane, through the bridge `/run/shards/mcp` each harness names), never the network, on every OS, answered by the runner in its own process; what it starts is isolated too. The launch handing the lane's connections to the runner is still to come. Pi takes no MCP server from kiln. |
+| Agents that run agents, and kiln's other tools | Works: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane, through the bridge `/run/shards/mcp` each harness names), never the network, on every OS, answered by the runner in its own process, each connection as its own agent's; what it starts is isolated too. Pi takes no MCP server from kiln. |
 | Skills kiln installs, and kiln's own | Its plugin folders are plugged in read-only at their own paths as it starts. |
 | Files in messages | A file in your project or in its home shows; one on the microVM's scratch (`/tmp`) can't, as it's nowhere on the machine. |
 | What it leaves running | Inside its microVM, and ends with it. |
@@ -1469,7 +1485,7 @@ a resume, a restore), for the session's life.
 |---|---|---|
 | `sessions.ports.publish` / `unpublish` | `agent`, `bind` (the host address: who may reach it), `host_port`, `guest_port`, `protocol` (`tcp`, `udp`); a port reaches the members its image gives it coming in, as Shards publishes one | microVM |
 | `sessions.egress.grant` / `revoke` | `agent`, `host` (a DNS name or an address), `port`, `member` | microVM |
-| `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member` | microVM |
+| `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member`, and one grant there, every part named (Shards' D285: joining grants nothing else): `name` (the member's name on the network, a host's name, one member's there), `peer` (a member of another run on it, by its name there), `way` (`out`: it opens flows toward its peer; `in`: its peer opens them toward it), `protocol` (`tcp`, `udp`), `port` (to `last_port`, a range); a flow between two runs' members is where the grants of both its ends take it, and a grant taken back resets the flows it let open | microVM |
 | `sessions.volumes.add` / `remove` | `agent`, `path` (a folder of its machine), `access` (`ro`, `rw`), `at` (where a microVM sees it), `members` | every engine |
 | `sessions.components.swap` / `restore` | `agent`, `kind` (`agent`, `harness`, `mcp`), `path` (its member's directory: `/harness/<harness>`, the default, `/agents/<name>`, `/mcp/<name>`), `source` and its pin (`checksum`, `version_id`), `force` | every engine |
 
