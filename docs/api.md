@@ -221,7 +221,15 @@ confirmation lasts until the person's next message to that agent, which drops wh
 a click after the agent's turn ended still confirms. kiln keeps the confirmation and never hands it to
 the agent, so there's nothing for an agent or a page it reads to copy, guess or replay. An op an agent
 makes in a person's turn says so on its audit row, whichever operation it is. The Agents page's Remove is
-`agents.remove` (`DELETE /api/harness/agents/{agent}`), held to this gate as every operation is.
+`agents.remove` (`DELETE /api/harness/agents/{agent}`), held to this gate as every operation is, and so are its
+Pause, Resume and Restart (kiln plan 01a1dd2e…, P5.5c; docs/agents.md, "Pause, resume and restart"), each yours to do
+to your own sessions and an agent's to the agents it started (and theirs), as `agents.stop` is:
+
+| Method | Path | |
+|---|---|---|
+| POST | `/api/harness/sessions/{agent}/pause` | → `{ agent, asked: "pause", engine /* "host" \| "microvm" */ }` (`sessions.pause`): its machine holds it, and the subagents kiln started under it: `agents.get` says it's paused once it is (stand `paused`, `state.frozen`), and its timeline says why where it couldn't be (a microVM's, until Hex pauses one: P5.5b). 409 when it's paused already |
+| DELETE | `/api/harness/sessions/{agent}/pause` | → `{ agent, asked: "resume", engine }` (`sessions.resume`): your pause ends, and a usage limit's. 409 when nothing pauses it |
+| POST | `/api/harness/sessions/{agent}/restart` | → `{ agent, how /* "force_stop" \| "start" \| "resume" */, engine, resumed? }` (`sessions.restart`): its harness starts again from its own launch, in a fresh microVM where it ran in one, under the same id, its conversation going on; `resumed` as `agents.resume` answers, for a crashed one. 409 while it's starting, 502 while its machine is away |
 
 ## Agent definitions
 

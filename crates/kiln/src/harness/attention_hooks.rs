@@ -97,17 +97,17 @@ pub async fn response_to(hub: &Hub, caller: &Caller, agent: &str, key: &str, res
     }
 }
 
-/// The operations that are a person's command to an agent (step 1): sending, starting, interrupting and ending it, its
-/// goals, asking about its conversation, a change request from its work, and landing its workspace. Reads, waits and an
-/// agent's own git credential aren't.
+/// The operations that are a person's command to an agent (step 1): sending, starting, interrupting, pausing, resuming,
+/// restarting and ending it, its goals, asking about its conversation, a change request from its work, and landing its
+/// workspace. Reads, waits and an agent's own git credential aren't.
 pub fn tracks_operation(name: &str) -> bool {
-    matches!(name, "agents.send" | "agents.start" | "agentdefs.run" | "agents.interrupt" | "agents.control" | "agents.restart" | "agents.stop" | "agents.about" | "agents.change" | "agents.land") || name.starts_with("goals.") && !matches!(name, "goals.get")
+    matches!(name, "agents.send" | "agents.start" | "agentdefs.run" | "agents.interrupt" | "agents.control" | "agents.restart" | "agents.stop" | "agents.about" | "agents.change" | "agents.land" | "sessions.pause" | "sessions.resume" | "sessions.restart") || name.starts_with("goals.") && !matches!(name, "goals.get")
 }
 
 pub fn prepare_operation(hub:&Hub,name:&str,input:&Value)->Option<super::attention::HumanResponse>{
     // A restart is a person's answer to an agent that exited, as its command is (`prepare_from_info`).
     let response = match name {
-        "agents.restart" => super::attention::HumanResponse::Restart,
+        "agents.restart" | "sessions.restart" => super::attention::HumanResponse::Restart,
         "goals.control" if matches!(input.get("action").and_then(Value::as_str),Some("resume"|"start")) => super::attention::HumanResponse::Goals,
         _ => return None,
     };
@@ -243,7 +243,7 @@ mod tests {
         assert!(!tracks_operation("goals.get"));
         assert!(!tracks_operation("agents.wait"), "a wait takes the waiter's own messages; it commands no agent");
         assert!(!tracks_operation("agents.credential"), "only the agent itself is given one");
-        for op in ["agents.send", "goals.control", "agents.about", "agents.change", "agents.land"] {
+        for op in ["agents.send", "goals.control", "agents.about", "agents.change", "agents.land", "sessions.pause", "sessions.resume", "sessions.restart"] {
             assert!(tracks_operation(op), "{op}");
         }
     }

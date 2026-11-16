@@ -1559,6 +1559,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
             Err(e) => Err(err(StatusCode::CONFLICT, e)),
         },
+        // A session paused, let go on, or started again now (kiln plan 01a1dd2e…, P5.5c): `sessions.pause`, `sessions.resume`
+        // (its pause taken away), `sessions.restart`.
+        (m @ (&Method::POST | &Method::DELETE), ["api", "harness", "sessions", id, "pause"]) => {
+            let name = if *m == Method::POST { "sessions.pause" } else { "sessions.resume" };
+            boxed(|| own_op(&hub, &caller, name, json!({"agent": id}))).await
+        }
+        (&Method::POST, ["api", "harness", "sessions", id, "restart"]) => boxed(|| own_op(&hub, &caller, "sessions.restart", json!({"agent": id}))).await,
         // An agent moved to another machine: `agents.move` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S3),
         // 202 as its move goes on after the answer.
         (&Method::POST, ["api", "harness", "agents", id, "move"]) => {

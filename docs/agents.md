@@ -290,6 +290,28 @@ start. Where its machine holds as many agents at work as it may, it starts again
 A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
 again the same way, from its record (above).
 
+### Pause, resume and restart
+
+You pause a session where it is, let it go on, or restart it with one press each on the Agents page,
+or as an operation (`sessions.pause`, `sessions.resume`, `sessions.restart`: "Operations", below), an
+MCP tool (`sessions_pause`, …) or code mode's `kiln.sessions.pause`, …. Each is yours to do to your own
+sessions, and an agent's to do to the agents it started (and theirs), as `agents.stop` is.
+
+- **Pause.** On its machine's host, its processes stop where they are, held by the machine's pacer
+  ("What a person does with an agent's subagents", below). In a microVM, its microVM is paused,
+  through Hex: until Hex pauses a box (kiln plan 01a1dd2e…, P5.5b), kiln refuses it, its timeline says
+  why, and the session goes on as it was. The subagents kiln started under it pause with it. Your
+  pause is asked of its machine: `agents.get` says it's paused once it is (stand `paused`,
+  `state.frozen` since when).
+- **Resume.** What pauses it ends: your pause, and a usage limit's ("Usage limits: pause and resume",
+  below), the turn the limit cut off going on first. One that isn't paused is refused.
+- **Restart.** Its harness ends, whatever it was doing, and starts again from its own launch: the
+  same agent at the version of its definition it started from, in a fresh microVM where it ran in
+  one, under the same id. Its conversation goes on in its harness's own record, as a crashed agent's
+  does ("Crashed agents", below), so its transcript, goals and subagents stay its own, and its
+  timeline says it was stopped by force. One whose harness had exited starts again, and a crashed
+  one is resumed in place. One still starting, or on a machine that's away, is refused.
+
 ### An agent definition's limits
 
 An agent started from one of your agent definitions (docs/api.md, "Agent definitions") is held to
@@ -975,6 +997,9 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
 | `agents.resume` | `POST /api/harness/sessions/:id/resume` | → `{resumed, subagents: [id]}`: a crashed agent (stand `crashed`) goes on in place, under its id ("Crashed agents", below) |
 | `agents.stop` | `POST /api/harness/agents/:id/stop` | `{children?}` → `{ended: [id]}`: with `children`, what it started (and theirs) end first |
+| `sessions.pause` | `POST /api/harness/sessions/:id/pause` | → `{agent, asked: "pause", engine}`: its machine holds it, and the subagents kiln started under it; `agents.get` says once it's paused, its timeline why not ("Pause, resume and restart", above); 409 when it's paused already |
+| `sessions.resume` | `DELETE /api/harness/sessions/:id/pause` | → `{agent, asked: "resume", engine}`: a person's pause ends, and a usage limit's; 409 when nothing pauses it |
+| `sessions.restart` | `POST /api/harness/sessions/:id/restart` | → `{agent, how: "force_stop" \| "start" \| "resume", engine, resumed?}`: its harness starts again from its own launch, in a fresh microVM where it ran in one, under its id, its conversation going on; 409 while it's starting, 502 while its machine is away |
 | `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, ready?, trunk?, fix_checks?, threads?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version; `draft` opens it a draft on every host, `ready` marks its draft ready, and `threads` names the threads a new version fixes ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
@@ -2364,7 +2389,10 @@ back.
 its machine's pacer holds its group at share 0 (cgroup.freeze on Linux, SIGSTOP on macOS, every
 thread suspended on Windows) under the pacer's guard, which starts them again should the runner
 end (docs/headroom.md, "A person's pause"). `state.frozen` says since when; a runner that can't
-pause says why, and one that restarts holds a paused session again. The server sends the pause,
+pause says why, and one that restarts holds a paused session again. In a microVM none of its
+processes is its machine's to hold: its microVM is paused instead (`Run::pause`, through Hex), only
+while it runs, and refused, said in its timeline, until Hex pauses a box (kiln plan 01a1dd2e…,
+P5.5b). The server sends the pause,
 and its end, to every subagent kiln started under it. With `task`, that subagent of its harness's
 own is held at its next tool call: kiln has a hook on every one of Claude Code's tool calls (a
 `PreToolUse` matcher for every tool, its answer awaited up to 7 days), and on each of Codex's local
