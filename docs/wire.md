@@ -699,6 +699,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `experiments.replay`: the runner replays a recorded session's tool calls in a microVM of a split's
   variant (`ServerMsg::Replay`; kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b) and answers what the
   run measured; a runner that didn't name it isn't asked, and a replay on it is refused.
+  `secrets.leases`: the server answers its runners' runs' credential leases and sign-ins from its
+  run-lease broker (`ReachAsk`'s `lessor`; plan step 33, Shards' D242); a runner asks them only of a
+  server that named it, and grants its isolated harnesses no sign-in until one has.
 
 ## Registry
 

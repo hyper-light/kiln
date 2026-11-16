@@ -74,8 +74,9 @@ pub struct Opts {
     pub outpost: bool,
     /// What its administrator declares of it (docs/ci.md W13-R02).
     pub declared: crate::runner::probe::Declared,
-    /// What leases its microVMs' credentials (plan step 33, Shards' D242): the server's broker, for the server's own
-    /// runner alone; none elsewhere, where a launch granting a credential is refused (`sandbox::hexvm::NO_BROKER`).
+    /// What leases its microVMs' credentials (plan step 33, Shards' D242): the server's broker in its process, for the
+    /// server's own runner. None elsewhere, where its runs' asks go to the server's broker over this runner's link to it
+    /// (`secrets::lessor::Remote`, its reach node's), or, with no link, are refused (`sandbox::hexvm::NO_BROKER`).
     pub leasing: Option<crate::sandbox::Leasing>,
 }
 
@@ -2536,7 +2537,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Some(r) => r.records().await,
             None => None,
         };
-        match crate::sandbox::hold(&o.state_dir, ledger, o.leasing.clone()).await {
+        // Its microVMs' credentials leased from its server's one broker: in this process for the server's own runner,
+        // over this runner's link to its server for every other (plan step 33, Shards' D242).
+        let leasing = o.leasing.clone().or_else(|| reach.as_ref().map(|r| crate::sandbox::Leasing(Arc::new(crate::secrets::lessor::Remote::new(r.clone())))));
+        match crate::sandbox::hold(&o.state_dir, ledger, leasing).await {
             Ok(Some(vms)) => h.hold_isolated_in(vms),
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's microVMs couldn't be held: it holds no isolated agent"),
@@ -5083,6 +5087,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         sent_changes.state_pages = pages;
                         tracing::debug!(?names, "the server speaks these features");
                         crate::reach::told::server_features(&names);
+                        crate::secrets::lessor::server_features(&names);
                         // Its admission's hints go to a server that takes them (AUDIT O1).
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Offers(proto::feature::speaks(&names, proto::feature::OFFERS))).await;

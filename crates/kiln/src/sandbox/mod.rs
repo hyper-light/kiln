@@ -91,21 +91,24 @@ impl Microvms {
         Ok(lanes)
     }
 
-    /// `launch` in a microVM of its own, `size` (vCPUs, MiB) where its session gives one: in box `name` where placement
-    /// named one for its run (its reservation's, `Holder::box_of`) and its sandbox is Hex's; else named as its sandbox
-    /// names one (placement's numbering). A stand-in's sandbox sizes none.
-    pub async fn launch(&self, name: Option<kiln_ci::place::holder::BoxName>, launch: kiln_seams::sandbox::Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
+    /// `launch` in a microVM of its own, `size` (vCPUs, MiB) where its session gives one, its harness granted
+    /// `sign_ins` (plan step 33; `hexvm`'s module docs): in box `name` where placement named one for its run (its
+    /// reservation's, `Holder::box_of`) and its sandbox is Hex's; else named as its sandbox names one (placement's
+    /// numbering). A stand-in's sandbox sizes none, and refuses a sign-in, which only Hex's microVMs grant.
+    pub async fn launch(&self, name: Option<kiln_ci::place::holder::BoxName>, launch: kiln_seams::sandbox::Launch, size: Option<(u32, u64)>, sign_ins: &[crate::secrets::signin::SignIn]) -> Result<Box<dyn Run>, Refusal> {
         match (&self.hex, name) {
-            (Some(hex), Some(name)) => hex.launch_as(name, launch, size).await,
-            (Some(hex), None) => hex.launch_sized(launch, size).await,
+            (Some(hex), Some(name)) => hex.launch_as(name, launch, size, sign_ins).await,
+            (Some(hex), None) => hex.launch_sized(launch, size, sign_ins).await,
+            (None, _) if !sign_ins.is_empty() => Err(Refusal::Unsupported("a harness's sign-in captured outside its microVM".into())),
             (None, _) => self.sandbox.launch(launch).await,
         }
     }
 }
 
-/// What leases a machine's microVMs' credentials (plan step 33, Shards' D242): Hex's lease seam, kiln's
-/// `secrets::lessor::Lessors` over the run-lease broker its server opens over kiln's credential store. Only the
-/// server's own runner holds one: a runner elsewhere reaches no store, so its microVMs hold no credentials
+/// What leases a machine's microVMs' credentials (plan step 33, Shards' D242): Hex's lease seam over the one run-lease
+/// broker its server opens over kiln's credential store (`secrets::lessor`): the broker itself for the server's own
+/// runner, and every other runner's asks put to it over that runner's link to its server (`secrets::lessor::Remote`).
+/// A runner given none (its server's broker didn't open, or it has no link to ask over) holds no credentials
 /// (`hexvm::NO_BROKER`).
 #[derive(Clone)]
 pub struct Leasing(pub Arc<dyn hex_api::lease::Lessors>);
@@ -454,7 +457,7 @@ mod tests {
             let vms = super::of_hex(hex, images, Some(Arc::<kiln_seams::records::SimRecords>::clone(&records) as Arc<dyn kiln_seams::Records>));
             let launch = Launch { limits: Limits::NONE, egress: Egress::Only(Vec::new()), folder: Some("/work/project".into()), boundary: Boundary::MicroVm { image: hex_api::sim::SIM_IMAGE.to_owned() }, ..Launch::of("claude", &[]) };
             let reserved = BoxName::Reserved(hex_api::capacity::ReservationId { epoch: 3, seq: 9 });
-            let run = vms.launch(Some(reserved), launch.clone(), None).await?;
+            let run = vms.launch(Some(reserved), launch.clone(), None, &[]).await?;
             anyhow::ensure!(run.id().as_deref() == Some("kiln-r3-9"), "its box isn't placement's: {:?}", run.id());
             let group = super::group_of(&vms, run.as_ref());
             anyhow::ensure!(matches!(&group, Some(crate::reach::place::Group::Hex(m)) if format!("{m:?}") == "Meter(\"kiln-r3-9\")"), "{group:?}");
@@ -462,7 +465,7 @@ mod tests {
             while run.next().await.is_some() {}
             let kept = records.get(super::hexvm::USE, b"kiln-r3-9", kiln_seams::records::Consistency::Linearizable).await?;
             anyhow::ensure!(kept.is_some(), "its charge wasn't kept in the ledger it was given");
-            let unnamed = vms.launch(None, launch, None).await.err();
+            let unnamed = vms.launch(None, launch, None, &[]).await.err();
             anyhow::ensure!(matches!(&unnamed, Some(Refusal::Unsupported(why)) if why == super::hexvm::UNNAMED), "no placement here names its box: {unnamed:?}");
             Ok(())
         })

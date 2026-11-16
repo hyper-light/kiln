@@ -810,7 +810,12 @@ pub mod feature {
     /// This runner replays a recorded session's tool calls in its microVMs ([`super::ServerMsg::Replay`]; kiln plan
     /// 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b). A runner that didn't name it isn't asked: a replay on it is refused.
     pub const REPLAYS: &str = "experiments.replay";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS];
+    /// The server answers its runners' runs' credential leases and sign-ins from its run-lease broker
+    /// (`crate::reach::Question::Lessor`, `crate::secrets::lessor::answer`; plan step 33, Shards' D242). A runner asks
+    /// them only of a server that named it, and grants its isolated harnesses no sign-in until one has: they sign in
+    /// themselves, as before.
+    pub const LEASES: &str = "secrets.leases";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS, LEASES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
