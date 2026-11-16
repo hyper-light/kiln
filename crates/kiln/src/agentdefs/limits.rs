@@ -264,7 +264,9 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
                 None => std::future::pending::<()>().await,
             }
         };
-        let woken = futures::future::select(std::pin::pin!(changed), std::pin::pin!(until));
+        let changed = std::pin::pin!(changed);
+        let until = std::pin::pin!(until);
+        let woken = futures::future::select(changed, until);
         match futures::future::select(std::pin::pin!(hub.shutdown.cancelled()), woken).await {
             futures::future::Either::Left(_) => return Ok(()),
             // Told of sessions: those alone are looked at. The soonest deadline come: every one is, as the next is found.
