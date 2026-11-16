@@ -333,7 +333,7 @@ const METRIC = { warm_ms: "kiln.session.warm_ms", peak_gib: "kiln.session.peak_m
 const criterion = (experiment: string, id: string, name: string, measure: keyof typeof METRIC, op: Op, bound: number): Criterion => ({
   id,
   name,
-  query: `avg(last_14d):avg:${METRIC[measure]}{experiment:${experiment}} by {variant}`,
+  query: `avg(last_7d):avg:${METRIC[measure]}{experiment:${experiment}} by {variant}`,
   op,
   bound,
 });

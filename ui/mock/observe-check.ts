@@ -16,9 +16,11 @@ export function checkMonitor(query: string): Record<string, unknown> {
   const m = /^\s*(avg|sum|min|max|last)\(\s*last_(\d+)([smhdw])\s*\)\s*:\s*(.+?)\s*(>=|<=|==|!=|>|<)\s*(-?\d+(?:\.\d+)?)\s*$/.exec(query);
   if (!m) {
     if (!/(>=|<=|==|!=|>|<)\s*-?\d/.test(query)) return { ok: false, error: "It ends in a comparison and a number: > 0.9, <= 250" };
-    return { ok: false, error: "Datadog's monitor syntax: avg(last_14d):avg:a.metric{scope} by {group} < 250" };
+    return { ok: false, error: "Datadog's monitor syntax: avg(last_7d):avg:a.metric{scope} by {group} < 250" };
   }
   const [, , n, unit, watched, op, threshold] = m;
+  // kiln's monitors read a week at most (kiln_obs::monitor::parse), in its words.
+  if (Number(n) * (UNIT_MS[unit!] ?? 0) > UNIT_MS.w!) return { ok: false, error: `kiln's monitors can't read \`${query.trim()}\`: the query: a window of ${n}${unit}: at most a week` };
   if (!/[a-z_][\w.]*\{[^}]*\}/i.test(watched!)) return { ok: false, error: "It names no metric with its scope: a.metric{scope}" };
   const by =
     /\bby\s*\{([^}]*)\}/

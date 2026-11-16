@@ -36,7 +36,8 @@ export type MetricsOf = (signal: AbortSignal) => Promise<readonly string[]>;
 
 const TIME_AGGS = ["avg", "sum", "min", "max", "last"];
 export const SPACE_AGGS = ["avg", "sum", "min", "max"];
-const WINDOWS = ["last_5m", "last_15m", "last_1h", "last_4h", "last_1d", "last_7d", "last_14d", "last_30d"];
+/** A monitor's windows: kiln's monitors read a week at most (kiln_obs::monitor::parse refuses a longer one). */
+const WINDOWS = ["last_5m", "last_15m", "last_1h", "last_4h", "last_1d", "last_7d"];
 const FUNCTIONS = [
   "abs",
   "log2",

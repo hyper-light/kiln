@@ -16,38 +16,40 @@ test("a query starts with a time aggregation", () => {
 });
 
 test("a time aggregation takes a window", () => {
-  assert.ok(labels("avg(").includes("last_14d"));
+  assert.ok(labels("avg(").includes("last_7d"));
+  // kiln's monitors read a week at most: nothing longer is offered.
+  assert.ok(!labels("avg(").some((w) => w === "last_14d" || w === "last_30d"));
   assert.ok(labels("avg(last_1").every((l) => l.startsWith("last_")));
 });
 
 test("after its window, a space aggregation; after that, a metric or a function", () => {
-  assert.deepEqual(labels("avg(last_14d):"), ["avg:", "sum:", "min:", "max:"]);
-  const m = labels("avg(last_14d):avg:kiln.");
+  assert.deepEqual(labels("avg(last_7d):"), ["avg:", "sum:", "min:", "max:"]);
+  const m = labels("avg(last_7d):avg:kiln.");
   assert.ok(m.includes("kiln.session.warm_ms") && m.includes("abs("));
 });
 
 test("a scope offers its tags, then a tag's values; a group's braces its tags alone", () => {
-  assert.deepEqual(labels("avg(last_14d):avg:kiln.session.warm_ms{"), ["*", "experiment:", "variant:"]);
-  assert.deepEqual(labels("avg(last_14d):avg:kiln.session.warm_ms{experiment:"), ["reviewer-size"]);
-  assert.deepEqual(labels("avg(last_14d):avg:kiln.session.warm_ms{experiment:reviewer-size,var"), ["*", "experiment:", "variant:"]);
-  assert.deepEqual(labels("avg(last_14d):avg:kiln.session.warm_ms{experiment:reviewer-size} by {"), ["experiment", "variant"]);
+  assert.deepEqual(labels("avg(last_7d):avg:kiln.session.warm_ms{"), ["*", "experiment:", "variant:"]);
+  assert.deepEqual(labels("avg(last_7d):avg:kiln.session.warm_ms{experiment:"), ["reviewer-size"]);
+  assert.deepEqual(labels("avg(last_7d):avg:kiln.session.warm_ms{experiment:reviewer-size,var"), ["*", "experiment:", "variant:"]);
+  assert.deepEqual(labels("avg(last_7d):avg:kiln.session.warm_ms{experiment:reviewer-size} by {"), ["experiment", "variant"]);
 });
 
 test("after a scope, by {…} or a comparison; after the groups, a comparison", () => {
-  const after = labels("avg(last_14d):avg:kiln.session.warm_ms{experiment:reviewer-size} ");
+  const after = labels("avg(last_7d):avg:kiln.session.warm_ms{experiment:reviewer-size} ");
   assert.ok(after.includes("by {") && after.includes("<="));
-  assert.deepEqual(labels("avg(last_14d):avg:kiln.session.warm_ms{experiment:reviewer-size} by {variant} "), [">", ">=", "==", "!=", "<", "<="]);
+  assert.deepEqual(labels("avg(last_7d):avg:kiln.session.warm_ms{experiment:reviewer-size} by {variant} "), [">", ">=", "==", "!=", "<", "<="]);
 });
 
 test("a brace's completions hold as its tag or value is typed, asked again at what ends it: a `,`, a tag's `:`", () => {
   const held = (before: string) => completeQuery(words, before, before.length)?.validFor;
-  const tag = held("avg(last_14d):avg:kiln.session.warm_ms{");
+  const tag = held("avg(last_7d):avg:kiln.session.warm_ms{");
   assert.ok(tag);
   assert.ok(tag.test("experi") && !tag.test("experiment:") && !tag.test("experiment:x,"));
-  const value = held("avg(last_14d):avg:kiln.session.warm_ms{instance:");
+  const value = held("avg(last_7d):avg:kiln.session.warm_ms{instance:");
   assert.ok(value);
   assert.ok(value.test("10.0.0.1:9100") && !value.test("web-1,") && !value.test("web-1}"));
-  const group = held("avg(last_14d):avg:kiln.session.warm_ms{*} by {");
+  const group = held("avg(last_7d):avg:kiln.session.warm_ms{*} by {");
   assert.ok(group);
   assert.ok(group.test("vari") && !group.test("variant,"));
 });
@@ -70,7 +72,7 @@ test("a metric query offers no window and no comparison: after its scope, its gr
   assert.deepEqual(metricLabels("avg:kiln.session.warm_ms{*} by {variant} "), []);
   assert.deepEqual(metricLabels("avg:kiln.session.warm_ms{*} by {variant}"), []);
   // A monitor's query, the default, still ends in one.
-  assert.ok(labels("avg(last_14d):avg:kiln.session.warm_ms{*} ").includes("<="));
+  assert.ok(labels("avg(last_7d):avg:kiln.session.warm_ms{*} ").includes("<="));
 });
 
 /** A metric's summary's tags (api/observe.ts MetricSummary): each with its values of most series. */
@@ -132,7 +134,7 @@ test("a named metric's scope and groups take its own tags, and a tag its values 
     ["*"],
   );
   // With no lookup (an experiment's criterion), the words' own tags, at once.
-  const criterion = "avg(last_14d):avg:kiln.session.warm_ms{";
+  const criterion = "avg(last_7d):avg:kiln.session.warm_ms{";
   assert.deepEqual(completeQueryWith(words, undefined, criterion, criterion.length, new AbortController().signal), completeQuery(words, criterion, criterion.length));
 });
 

@@ -1167,7 +1167,7 @@ function CriterionForm({
           value={expr}
           words={words}
           label="Expression"
-          placeholder="avg(last_14d):avg:kiln.session.warm_ms{experiment:…} by {variant} < 250"
+          placeholder="avg(last_7d):avg:kiln.session.warm_ms{experiment:…} by {variant} < 250"
           onChange={(v) => {
             setExpr(v);
             setSaid(null);

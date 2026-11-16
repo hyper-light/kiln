@@ -136,7 +136,7 @@ export interface Criterion {
   /**
    * What it measures, in kiln's monitoring query syntax (Datadog's, as its monitors take it): a time and
    * space aggregation of a metric, or a formula of several with functions, its scope, by variant
-   * (`avg(last_14d):avg:kiln.session.warm_ms{experiment:…} by {variant}`).
+   * (`avg(last_7d):avg:kiln.session.warm_ms{experiment:…} by {variant}`).
    */
   query: string;
   op: Op;
@@ -145,7 +145,7 @@ export interface Criterion {
 /** Each measure kiln keeps of a session, as its monitoring metric. */
 export const METRIC: Record<Measure, string> = { warm_ms: "kiln.session.warm_ms", peak_gib: "kiln.session.peak_memory_gib", failed_pct: "kiln.session.failed_pct" };
 /** A criterion's query over a measure, scoped to its experiment, by variant. */
-export const queryOf = (m: Measure, experiment: string) => `avg(last_14d):avg:${METRIC[m]}{experiment:${experiment}} by {variant}`;
+export const queryOf = (m: Measure, experiment: string) => `avg(last_7d):avg:${METRIC[m]}{experiment:${experiment}} by {variant}`;
 /** The measure a query reads, when it reads one of kiln's own (the first metric named in it). */
 export function measureOf(query: string): Measure | null {
   const metric = /([a-z_][\w.]*)\{/i.exec(query)?.[1];
