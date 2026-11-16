@@ -255,3 +255,20 @@ fn p5_6_s2_controls_and_restart_are_operations_held_to_the_gate() -> anyhow::Res
         Ok(())
     })
 }
+
+/// P5.6's slice S3: the Agents page's Move to… is `agents.move`, held to the gate: in the owner's chat turn a move of
+/// its own child goes past it at once (to a machine this hub hasn't, so the move itself refuses it, saying why),
+/// another of theirs waits on their click.
+#[test]
+fn p5_6_s3_move_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let own = call(chat.clone(), "agents.move", json!({"agent": "kid", "to": "nowhere"})).await;
+        anyhow::ensure!(!matches!(code(&own), 403 | 428), "a move of its own child goes past the gate: {own:?}");
+        let waits = call(chat.clone(), "agents.move", json!({"agent": "other", "to": "nowhere"})).await;
+        anyhow::ensure!(code(&waits) == 428, "a move of another of the owner's waits for the click: {waits:?}");
+        Ok(())
+    })
+}

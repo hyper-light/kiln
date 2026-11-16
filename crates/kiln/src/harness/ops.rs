@@ -751,6 +751,21 @@ async fn restart(cx: Cx, v: Value) -> Out {
     commanded(&cx, &v, Command::Restart, "restarted").await
 }
 
+/// The agent gone on on another machine, its conversation carried, by a caller that may steer it (the Agents page's
+/// Move to…: kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S3), with its subagents (`relocate::start`); audited as
+/// whoever asked. `now` moves it without waiting for its turn to end; `kind` and `model` go on there in another
+/// harness.
+async fn move_to(cx: Cx, v: Value) -> Out {
+    let id = known(&cx, &agent_of(&v)?)?.id;
+    may_steer(&cx, &id).await?;
+    let to = text(&v, "to")?;
+    let now = v.get("now").and_then(Value::as_bool).unwrap_or(false);
+    let word = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    let moved = super::relocate::start(&cx.hub, &id, &to, now, word("kind"), word("model")).await.map_err(|e| (StatusCode::CONFLICT, e))?;
+    cx.hub.store.audit(cx.caller.name.clone(), "agent.move".into(), format!("{id} to {to}")).await;
+    Ok(moved)
+}
+
 /// Command `c` given to the agent `v` names, by a caller that may steer it: `done` true once its machine
 /// has it, else why not.
 async fn commanded(cx: &Cx, v: &Value, c: Command, done: &str) -> Out {
@@ -1055,6 +1070,15 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentsRestart>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "restart"]))),
             run: |cx, v| Box::pin(restart(cx, v)),
+        },
+        Op {
+            name: "agents.move",
+            summary: "Move an agent to another machine (`to`: a runner's name), its conversation carried and its subagents with it; `now` moves it without waiting for its turn to end, and `kind` and `model` go on there in another harness.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsMove>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "move"]))),
+            run: |cx, v| Box::pin(move_to(cx, v)),
         },
         Op {
             name: "agents.remove",
@@ -1409,6 +1433,21 @@ pub mod input {
     pub struct AgentsRestart {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsMove {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// The machine it goes on on: a runner's name (as runners lists it).
+        pub to: String,
+        /// Move it now, without waiting for its turn to end.
+        pub now: Option<bool>,
+        /// The harness it goes on in there, where another (its conversation carried over).
+        pub kind: Option<String>,
+        /// The model it goes on with there.
+        pub model: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

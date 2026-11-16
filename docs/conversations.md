@@ -173,7 +173,7 @@ store.
 
 ## Resuming on another machine
 
-**Move** on an agent whose machine is away (`POST /api/harness/sessions/:id/move {to}`) goes on from
+**Move** on an agent whose machine is away (`agents.move`: `POST /api/harness/agents/:id/move {to}`) goes on from
 the server's store (`convo/resume.rs`).
 
 `GET /api/harness/sessions/:id/transcripts?records=1` reports the native records the server has durably

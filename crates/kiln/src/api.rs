@@ -1527,17 +1527,15 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
             Err(e) => Err(err(StatusCode::CONFLICT, e)),
         },
-        (&Method::POST, ["api", "harness", "sessions", id, "move"]) => {
-            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-            let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
-            let now = body.get("now").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            // Going on there in another harness, its conversation carried over (optional).
-            let text = |k: &str| body.get(k).and_then(serde_json::Value::as_str).filter(|v| !v.is_empty()).map(str::to_owned);
-            // Its machine away: from the server's copy of its conversation (`relocate::start`).
-            match boxed(|| crate::harness::relocate::start(&hub, id, &to, now, text("kind"), text("model"))).await {
-                Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
-                Err(e) => Err(err(StatusCode::CONFLICT, e)),
+        // An agent moved to another machine: `agents.move` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S3),
+        // 202 as its move goes on after the answer.
+        (&Method::POST, ["api", "harness", "agents", id, "move"]) => {
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
             }
+            let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller: caller.clone() };
+            boxed(|| crate::ops::run_own(cx, "agents.move", body)).await.map(|v| srv::json(StatusCode::ACCEPTED, &v)).map_err(|(c, m)| err(c, m))
         }
         (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
             let id = (*id).to_owned();

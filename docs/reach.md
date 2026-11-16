@@ -729,7 +729,7 @@ starts.
 
 ## 8. Moving an agent to another runner
 
-**Move to…** on an agent (or `POST /api/harness/sessions/:id/move {"to": "agent:<runner>"}`) moves
+**Move to…** on an agent (or `agents.move`, `POST /api/harness/agents/:id/move {"to": "agent:<runner>"}`) moves
 it, mid-conversation, to another runner that has its harness installed and takes reach links. Nothing
 of it is lost on the way, and nothing waits on a person: what is sent meanwhile waits in kiln's queue
 and is answered over there.
