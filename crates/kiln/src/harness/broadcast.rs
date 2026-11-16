@@ -347,8 +347,8 @@ mod tests {
         assert!(matches!(plan(&send, &info, None, &[], &client).as_deref(), Ok([Command::Send { id, .. }]) if *id == client));
     }
 
-    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: Mission Control's broadcast (`POST
-    /// /api/harness/broadcast`) and a command for several agents send each message as whoever sent
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: Mission Control's broadcast (`agents.broadcast`, `POST
+    /// /api/harness/broadcast`), a prompt or a command for several agents, sends each message as whoever sent
     /// it (`by`), never as kiln's own (`server`): a person's waits in the persons' part, held to no
     /// depth, an agent's is held to the recipient's.
     #[test]

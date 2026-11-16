@@ -766,6 +766,55 @@ async fn move_to(cx: Cx, v: Value) -> Out {
     Ok(moved)
 }
 
+/// One thing to the agents picked among those the caller may act on (the Agents page's broadcast, Mission Control's
+/// message box: kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S5): a prompt or slash command, a command, or
+/// answers to what waits on them (`super::broadcast`), each agent's message made from the key given, else a
+/// command's own message id, as whoever asked; each sent one the person's use of that agent, and the broadcast
+/// audited as whoever asked. What became of each comes back.
+async fn broadcast_to(cx: Cx, v: Value) -> Out {
+    use super::attention_hooks as hooks;
+    let at = crate::util::now_ms();
+    let mut b: super::broadcast::Broadcast = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let command = b.command.as_ref().and_then(|v| serde_json::from_value::<Command>(v.clone()).ok());
+    if b.key.is_none() {
+        b.key = command.as_ref().and_then(super::registry::message_id);
+    }
+    let among = super::lineage::reached(&cx.hub, &cx.caller, cx.hub.harness.list(), super::lineage::Access::Act).await;
+    let report = super::broadcast::run(&cx.hub, &b, &key_scope(&cx.caller), &among).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // A command that only reads or refreshes (a snapshot, MCP servers' state) isn't a use (attention plan
+    // 01a199e1b177752e84dad5dc990e6a15, step 1), as on every other path (`attention_hooks::command_kind`).
+    let kind = if b.approvals.is_some() {
+        Some("answer")
+    } else if b.text.is_some() || !b.attachments.is_empty() {
+        Some("message")
+    } else {
+        command.as_ref().map_or(Some("command"), hooks::command_kind)
+    };
+    // Sent, or retained: kiln took the person's message into its custody (W20), waiting for the receiver's admission.
+    for row in report.results.iter().filter(|r| matches!(r.result, "sent" | "retained")) {
+        let Some(kind) = kind else { break };
+        hooks::record(&cx.hub, &cx.caller, &row.id, kind, &report.id, at).await;
+        let info = among.iter().find(|i| i.id == row.id);
+        if b.approvals.is_some() {
+            for approval in info.iter().flat_map(|i| i.approvals.iter()).filter(|a| a.tool != super::model::ToolKind::Question) {
+                if let Some(response) = info.and_then(|i| super::attention::bind_response(i, &super::attention::HumanResponse::Approval(approval.id.clone()))) {
+                    hooks::response_to(&cx.hub, &cx.caller, &row.id, &report.id, response, at).await;
+                }
+            }
+        } else if let Some(c) = &command
+            && let Some(response) = hooks::prepare_from_info(c, Some(&report.id), at, info).and_then(|p| p.response)
+        {
+            hooks::response_to(&cx.hub, &cx.caller, &row.id, &report.id, response, at).await;
+        }
+    }
+    let what = b.text.as_deref().map_or_else(|| b.approvals.as_deref().map_or_else(|| "a command".to_owned(), |a| format!("{a} what waits")), |t| t.chars().take(80).collect());
+    cx.hub
+        .store
+        .audit(cx.caller.name.clone(), "agent.broadcast".into(), format!("{} to {} agents ({} sent, {} skipped, {} failed): {what}", report.id, report.results.len(), report.sent, report.skipped, report.failed))
+        .await;
+    serde_json::to_value(&report).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
+}
+
 /// The agents of machine `machine`, which is gone (not connected), that the caller may act on, each gone on on another
 /// machine from the server's copy of its conversation (`relocate::recover`): on `to` where it's given, else where each
 /// suits best (the Agents page's Recover: kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S4); audited as whoever
@@ -1094,6 +1143,16 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentsMove>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "move"]))),
             run: |cx, v| Box::pin(move_to(cx, v)),
+        },
+        Op {
+            name: "agents.broadcast",
+            summary: "Send one thing to many agents at once, among those you may act on: `to` picks them (`ids`, or `all`, or `machines`, `kinds` and `status` to match); then a prompt or slash command (`text`, with `attachments` and a `mode`: queue, steer or now), a `command` as the console sends one, or `approvals` (allow or deny every tool call waiting). `key` makes it once however often it's sent. What became of each agent comes back.",
+            read_only: false,
+            // It reaches agents its chat didn't start: an agent asks its person's click for it.
+            destructive: true,
+            input: Input::of::<input::AgentsBroadcast>(),
+            route: |_| Ok((Method::POST, path(&["api", "harness", "broadcast"]))),
+            run: |cx, v| Box::pin(broadcast_to(cx, v)),
         },
         Op {
             name: "agents.recover",
@@ -1473,6 +1532,40 @@ pub mod input {
         pub kind: Option<String>,
         /// The model it goes on with there.
         pub model: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsBroadcast {
+        /// Which agents.
+        pub to: BroadcastTo,
+        /// A prompt, or "/name args", read in each agent's catalog.
+        pub text: Option<String>,
+        /// Files with the prompt (uploaded first: `POST /api/harness/files`), each agent its own copy.
+        pub attachments: Option<Vec<serde_json::Value>>,
+        /// For a prompt: "queue" (after the current turn, the default), "steer" (into it) or "now" (stopping it).
+        pub mode: Option<String>,
+        /// A command as the console sends one: `{"type":"interrupt"}`, `{"type":"set_mode","mode":"plan"}`.
+        pub command: Option<serde_json::Value>,
+        /// Answer every tool call waiting on you: "allow" or "deny" (questions are left to answer).
+        pub approvals: Option<String>,
+        /// An idempotency key: sent again with it, each agent's message is the same one, which it gets once.
+        pub key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct BroadcastTo {
+        /// Every agent you may act on that hasn't ended.
+        pub all: Option<bool>,
+        /// Exactly these agents (as agents.list gives their ids).
+        pub ids: Option<Vec<String>>,
+        /// Those on these machines ("local" is the server's own).
+        pub machines: Option<Vec<String>>,
+        /// Those in these harnesses ("claude", "codex", ...).
+        pub kinds: Option<Vec<String>>,
+        /// Those in these states ("starting", "idle", "running", "waiting", "exited").
+        pub status: Option<Vec<String>>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

@@ -288,3 +288,21 @@ fn p5_6_s4_recover_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// P5.6's slice S5: a broadcast is `agents.broadcast` (the bare `/api/harness/command` gone, its one command to the
+/// agents listed a broadcast's `to.ids`), which reaches agents its chat didn't start: an agent's waits on its person's
+/// click; the person's own goes past the gate at once.
+#[test]
+fn p5_6_s5_broadcast_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let to = json!({"to": {"ids": ["other"]}, "command": {"type": "interrupt"}});
+        let waits = call(chat.clone(), "agents.broadcast", to.clone()).await;
+        anyhow::ensure!(code(&waits) == 428, "an agent's broadcast waits for the click: {waits:?}");
+        let by_person = call(person(&hub), "agents.broadcast", to).await;
+        anyhow::ensure!(!matches!(code(&by_person), 403 | 428), "the owner's own goes past the gate: {by_person:?}");
+        Ok(())
+    })
+}

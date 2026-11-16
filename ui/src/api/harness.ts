@@ -670,8 +670,6 @@ export const harnessApi = {
     if (!j.file_id) throw new Error("no file id");
     return j.file_id;
   },
-  /** One command to many agents (each send gets its own message id). */
-  broadcast: (ids: string[], c: Command) => ownAgentAction(call<{ sent: string[] }>("POST", "/api/harness/command", { ids, command: c }), ids),
   /** One thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits. */
   broadcastTo: (body: BroadcastBody) => ownAgentAction(call<BroadcastReport>("POST", "/api/harness/broadcast", body), body.to.ids ?? [], (r) => r.results.map((x) => x.id)),
   /** Who a broadcast to `to` would reach, and their catalogs merged (each entry with how many have it). */

@@ -1519,7 +1519,16 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         },
         // Remove an agent: `agents.remove` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S1).
         (&Method::DELETE, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.remove", json!({ "agent": id }))).await,
-        (&Method::POST, ["api", "harness", "broadcast"]) => boxed(|| harness_broadcast(&hub, req)).await,
+        // One thing to many agents: `agents.broadcast` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S5); its key may
+        // come as the standard header (CP-T3.2).
+        (&Method::POST, ["api", "harness", "broadcast"]) => {
+            let key = idempotency_key(&req);
+            let mut body = boxed(|| body_value(req)).await?;
+            if let (Some(o), Some(k)) = (body.as_object_mut(), key) {
+                o.entry("key").or_insert(json!(k));
+            }
+            boxed(|| own_op(&hub, &caller, "agents.broadcast", body)).await
+        }
         (&Method::POST, ["api", "harness", "broadcast", "preview"]) => boxed(|| harness_broadcast_preview(&hub, req)).await,
         // A gone machine's agents recovered elsewhere: `agents.recover` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S4).
         (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => {
@@ -1573,7 +1582,6 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         // Its copies on other runners, and its own rules for them (docs/reach.md §5.1).
         (&Method::GET, ["api", "harness", "sessions", id, "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.agent(&hub, id)).await)),
         (m @ (&Method::PUT | &Method::DELETE), ["api", "harness", "sessions", id, "keep"]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::Agent(id), *m == Method::PUT, req)).await,
-        (&Method::POST, ["api", "harness", "command"]) => boxed(|| harness_command_many(&hub, req)).await,
         (&Method::POST, ["api", "harness", "files"]) => boxed(|| harness_upload(&hub, &q, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
         // A page it showed: its heights, as its machine and its viewers' own browsers measured them.
@@ -6942,9 +6950,7 @@ async fn open_drawn(hub: &Hub, caller: Option<&crate::authz::Caller>, target: &s
     opened
 }
 
-/// One thing to many agents at once: a prompt or slash command, a command, or answers to every
-/// tool call waiting on you (see `crate::harness::broadcast`). Each agent's outcome comes back.
-/// The agents the request's caller acts on (docs/agents.md, "Whose agents"), what a broadcast picks among.
+/// The agents the request's caller acts on (docs/agents.md, "Whose agents"), what a broadcast's preview picks among.
 async fn acted_on(hub: &Hub, req: &Request) -> Vec<crate::harness::session::Info> {
     match req.extensions().get::<crate::authz::Caller>() {
         Some(c) => crate::harness::lineage::reached(hub, c, hub.harness.list(), crate::harness::lineage::Access::Act).await,
@@ -6952,46 +6958,6 @@ async fn acted_on(hub: &Hub, req: &Request) -> Vec<crate::harness::session::Info
     }
 }
 
-async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
-    let attention_at = crate::util::now_ms();
-    let caller = req.extensions().get::<crate::authz::Caller>().cloned();
-    let (header, by, among) = (idempotency_key(&req), key_scope(&req), acted_on(hub, &req).await);
-    let mut b: crate::harness::broadcast::Broadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    if b.key.is_none() {
-        b.key = header;
-    }
-    let report = crate::harness::broadcast::run(hub, &b, &by, &among).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    if let Some(caller) = &caller {
-        // A command that only reads or refreshes (a snapshot, MCP servers' state) isn't a use (attention plan
-        // 01a199e1b177752e84dad5dc990e6a15, step 1), as on every other path (`attention_hooks::command_kind`).
-        let kind = if b.approvals.is_some() {
-            Some("answer")
-        } else if b.text.is_some() || !b.attachments.is_empty() {
-            Some("message")
-        } else {
-            b.command.as_ref().and_then(|v| serde_json::from_value::<crate::harness::model::Command>(v.clone()).ok()).map_or(Some("command"), |c| crate::harness::attention_hooks::command_kind(&c))
-        };
-        // Sent, or retained: kiln took the person's message into its custody (W20), waiting for the receiver's admission.
-        for row in report.results.iter().filter(|r| matches!(r.result, "sent" | "retained")) {
-            let Some(kind) = kind else { break };
-            crate::harness::attention_hooks::record(hub, caller, &row.id, kind, &report.id, attention_at).await;
-            if b.approvals.is_some() && let Some(info)=among.iter().find(|i|i.id==row.id) {
-                for approval in info.approvals.iter().filter(|a|a.tool!=crate::harness::model::ToolKind::Question) {
-                    if let Some(response)=crate::harness::attention::bind_response(info,&crate::harness::attention::HumanResponse::Approval(approval.id.clone())) {
-                        crate::harness::attention_hooks::response_to(hub,caller,&row.id,&report.id,response,attention_at).await;
-                    }
-                }
-            } else if let Some(command)=b.command.as_ref().and_then(|v|serde_json::from_value::<crate::harness::model::Command>(v.clone()).ok())
-                && let Some(prepared)=crate::harness::attention_hooks::prepare_from_info(&command,Some(&report.id),attention_at,among.iter().find(|i|i.id==row.id))
-                && let Some(response)=prepared.response {
-                crate::harness::attention_hooks::response_to(hub,caller,&row.id,&report.id,response,attention_at).await;
-            }
-        }
-    }
-    let what = b.text.as_deref().map_or_else(|| b.approvals.as_deref().map_or_else(|| "a command".to_owned(), |a| format!("{a} what waits")), |t| t.chars().take(80).collect());
-    hub.store.audit("admin".into(), "agent.broadcast".into(), format!("{} to {} agents ({} sent, {} skipped, {} failed): {what}", report.id, report.results.len(), report.sent, report.skipped, report.failed)).await;
-    Ok(srv::json(StatusCode::OK, &report))
-}
 
 /// Who a broadcast to `to` would reach (the same picking as the broadcast itself), the machines
 /// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts,
@@ -7047,12 +7013,6 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     ))
 }
 
-/// Whose a request's idempotency key is: the agent it comes from (if one) and the person it acts
-/// for. Another caller's same key is another message (CP-T3.2).
-fn key_scope(req: &Request) -> String {
-    let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
-    crate::harness::ops::key_scope(&caller)
-}
 
 /// A request's `Idempotency-Key` header, when it has one (CP-T3.2).
 fn idempotency_key(req: &Request) -> Option<String> {
@@ -7155,39 +7115,6 @@ async fn harness_upload(hub: &Hub, q: &HashMap<String, String>, req: Request) ->
     Ok(srv::json(StatusCode::OK, &json!({"file_id": id, "size": size})))
 }
 
-#[derive(Deserialize)]
-struct HarnessBroadcast {
-    ids: Vec<String>,
-    command: crate::harness::model::Command,
-    /// An idempotency key: sent again with it, each agent's message is the same one (CP-T3.2).
-    #[serde(default)]
-    key: Option<String>,
-}
-
-/// `POST /api/harness/command`: one command for the sessions listed, through the same sending as
-/// `/api/harness/broadcast` (each send its own message id); `sent` lists those it reached, and the
-/// rest of the report says why the others weren't.
-async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
-    let attention_at = crate::util::now_ms();
-    use crate::harness::broadcast::{Broadcast, To};
-    let caller = req.extensions().get::<crate::authz::Caller>().cloned();
-    let (header, by, among) = (idempotency_key(&req), key_scope(&req), acted_on(hub, &req).await);
-    let b: HarnessBroadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    // Each agent's message is made from a key: the one given, else the message's own id.
-    let key = b.key.clone().or(header).or_else(|| crate::harness::registry::message_id(&b.command));
-    let command = serde_json::to_value(&b.command).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let to = To { ids: b.ids, ..To::default() };
-    let report = crate::harness::broadcast::run(hub, &Broadcast { to, text: None, attachments: Vec::new(), mode: None, command: Some(command), approvals: None, key }, &by, &among)
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let sent: Vec<&str> = report.results.iter().filter(|o| o.result == "sent").map(|o| o.id.as_str()).collect();
-    if let Some(caller) = &caller {
-        for id in &sent {
-            crate::harness::attention_hooks::command(hub, caller, id, &b.command, Some(&report.id), attention_at,among.iter().find(|i|i.id==*id)).await;
-        }
-    }
-    Ok(srv::json(StatusCode::OK, &json!({ "sent": sent, "report": report })))
-}
 
 /// `POST /api/harness/sessions/:id/streams`: stream a page from the session's machine
 /// (`crate::browser::stream::Spec`'s fields: url, width, height, scale, mobile, codec, bitrate).
