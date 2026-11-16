@@ -94,6 +94,26 @@ async fn builds(cx: Cx, v: Value) -> Out {
     json_of(&json!({"builds": super::prebuild::builds(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)?}))
 }
 
+fn unbuilt(r: super::prebuild::Refusal) -> Fail {
+    use super::prebuild::Refusal as R;
+    let code = match &r {
+        R::NoRunner(_) | R::NoHarness(_) => StatusCode::NOT_FOUND,
+        R::NotTheirs(_) => StatusCode::FORBIDDEN,
+        R::NotMicrovm(_) | R::Older(_) | R::Underway { .. } => StatusCode::CONFLICT,
+    };
+    (code, r.to_string())
+}
+
+/// One runner's builds of an Agentfile asked again (kiln plan 01a1dd2e… P4.5), reaching it as `builds` reads them.
+async fn rebuild(cx: Cx, v: Value) -> Out {
+    let (id, runner) = (id_of(&v)?, crate::ops::text(&v, "runner")?);
+    let harness = some_text(&v, "harness").map(|h| h.trim().to_owned()).filter(|h| !h.is_empty());
+    let builds = super::prebuild::rebuild(&cx.hub, &who(&cx)?, &id, &runner, harness.as_deref()).await.map_err(fail)?.map_err(unbuilt)?;
+    let only = harness.map(|h| format!(" for {h}")).unwrap_or_default();
+    cx.hub.store.audit(cx.caller.name.clone(), "agentfile.rebuild".into(), format!("{id} on {runner}{only}")).await;
+    json_of(&json!({"builds": builds}))
+}
+
 async fn restore(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let version = v
@@ -234,6 +254,15 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(builds(cx, v)),
         },
         Op {
+            name: "agentfiles.rebuild",
+            summary: "Build one of your Agentfiles again on one of your runners (kiln plan 01a1dd2e… P4.5): its builds there ahead of its sessions (each harness its sessions run, or `harness` alone), asked again as a save asks them, at its version now: `queued` (`failed` where its secrets can't be read) and sent to the runner, or asked as it comes back where it's away. One that failed is built again; one done is found in the runner's store at once. Answers its builds, as agentfiles.builds reads them. Refused, nothing asked: 404 where no runner of that name builds Agentfiles (outposts and one-job runners build none) or none of its sessions runs `harness`; 409 where the runner's engine isn't microvm, its kiln builds nothing ahead (upgrade it), or a build there is `queued` or `building` already, until its runner ends it; 403 where its person may not start agents there.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentfilesRebuild>(),
+            route: |v| Ok((Method::POST, path(&["api", "agentfiles", &id_of(v)?, "rebuild"]))),
+            run: |cx, v| Box::pin(rebuild(cx, v)),
+        },
+        Op {
             name: "agentfiles.restore",
             summary: "Make an earlier version of one of your Agentfiles current again, as a new version (nothing is lost), its text checked by Shards again.",
             read_only: false,
@@ -332,6 +361,17 @@ pub mod input {
     pub struct AgentfilesBuilds {
         /// The Agentfile's id.
         pub id: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentfilesRebuild {
+        /// The Agentfile's id.
+        pub id: String,
+        /// The runner whose builds of it are asked again, by its name as agentfiles.builds lists it.
+        pub runner: String,
+        /// One of kiln's harnesses its sessions run (`claude` …): its build alone. Left out: each of its builds there.
+        pub harness: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

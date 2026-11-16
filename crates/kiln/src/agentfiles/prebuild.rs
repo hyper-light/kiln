@@ -16,6 +16,10 @@
 //!   (Shards' words, or kiln's) as its runner says ([`Said`]). A save writes its rows anew; a runner's word moves the row
 //!   of the version it built alone, and only forward ([`State::follows`]). Each change is told to the sockets of whoever
 //!   hears of the Agentfile (`AgentfileChange::builds`).
+//! - **Built again.** Whoever reaches it asks one runner's builds of it again (`agentfiles.rebuild`, [`rebuild`]) as a
+//!   save asks them, at its version now: each that ended, done or failed, is `queued` again ([`State::ended`]). Refused,
+//!   nothing written ([`Refusal`]), where that runner builds none of its person's Agentfiles or its kiln builds nothing
+//!   ahead, where none of its sessions runs the harness named, or where one of those builds is underway.
 //! - **The runner** names [`feature::PREBUILD`]. Its newest process is sent each build (`ServerMsg::Prebuild`), and
 //!   asked again for those it hasn't said done or failed each time one of its processes names the feature (it
 //!   connected again): one already made is found in its store at once. A runner that doesn't name it is asked nothing,
@@ -77,13 +81,20 @@ impl State {
 
     /// The states a runner's word that a build is at `self` moves it from: queued to building, and either of them to its
     /// end. A word on a build already at its end (another build of it, asked again as its runner came back, ending
-    /// second) moves nothing; only a save asks again.
+    /// second) moves nothing; only a save, or a person's ask to build it again ([`State::ended`]), asks again.
     fn follows(self) -> &'static [State] {
         match self {
             State::Queued => &[],
             State::Building => &[State::Queued],
             State::Done | State::Failed => &[State::Queued, State::Building],
         }
+    }
+
+    /// Whether a build at `self` has ended, so a person's ask moves it back to queued ([`rebuild`]). One queued or
+    /// building is underway until its runner's word ends it: asked twice at one version, its runner's first word to end
+    /// it would stand over the second's ([`State::follows`]).
+    fn ended(self) -> bool {
+        matches!(self, State::Done | State::Failed)
     }
 }
 
@@ -127,6 +138,48 @@ pub struct Build {
     pub why: Option<String>,
     /// When it last changed (Unix ms).
     pub at: i64,
+}
+
+/// Why a runner's builds of an Agentfile aren't asked again ([`rebuild`]): nothing is written. Each runner by the name
+/// people see.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    /// Kiln knows no runner of that name that builds Agentfiles: none, or an outpost or a one-job runner.
+    #[error(
+        "no runner {0} builds Agentfiles ahead of their sessions: kiln knows none of that name, and outposts and one-job runners build none"
+    )]
+    NoRunner(String),
+    /// Its engine isn't `microvm`, as the server has its facts.
+    #[error(
+        "{0} builds no Agentfile: its sessions run on the machine, from no image (its engine isn't microvm)"
+    )]
+    NotMicrovm(String),
+    /// The Agentfile's person may not start agents there (`runners.terminal`), or can't sign in any more: kiln's words.
+    #[error("{0}")]
+    NotTheirs(String),
+    /// Its newest process said what it speaks, without [`feature::PREBUILD`].
+    #[error("{0}'s kiln builds no Agentfile ahead of its sessions: upgrade it (System → Updates)")]
+    Older(String),
+    /// None of its sessions runs the harness named (any of kiln's, where none is).
+    #[error("{}", no_harness(.0.as_deref()))]
+    NoHarness(Option<String>),
+    /// Its build on `runner` for `harness` is queued or building ([`State::ended`]).
+    #[error("its build on {runner} for {harness} is {} already: it can be built again once its runner says it's done or failed", .state.as_str())]
+    Underway {
+        runner: String,
+        harness: String,
+        state: State,
+    },
+}
+
+/// [`Refusal::NoHarness`]'s words.
+fn no_harness(harness: Option<&str>) -> String {
+    match harness {
+        Some(h) => format!(
+            "none of its sessions runs {h}: it declares no HARNESS {h}, and none of its person's agent definitions that name it runs {h}"
+        ),
+        None => "none of its sessions runs one of kiln's harnesses: it declares no HARNESS, and no agent definition names it, so none of it is built ahead".to_owned(),
+    }
 }
 
 /// Kiln's harnesses `text` is built for, in kiln's order: each it declares (`HARNESS <harness>`), and each of `defined`
@@ -175,9 +228,25 @@ async fn current(hub: &Hub, id: &str) -> anyhow::Result<Option<super::Agentfile>
     }
 }
 
-/// The runners `person`'s Agentfiles are built on: each whose engine is `microvm`, as the server has its facts, that
-/// `person` may start agents on, connected or not; outposts and one-job runners aside. None where `person` can't sign
-/// in any more. Sorted.
+/// Whether `caller`'s Agentfiles are built on runner `a`: its engine is `microvm`, as the server has its facts, and
+/// `caller` may start agents there; outposts and one-job runners build none. Else why not.
+fn builds_for(caller: &crate::authz::Caller, a: &crate::hub::AgentLive) -> Result<(), Refusal> {
+    if a.outpost || a.ephemeral {
+        return Err(Refusal::NoRunner(a.shown().to_owned()));
+    }
+    if a.facts.as_deref().and_then(crate::harness::engine::of) != Some(Engine::Microvm) {
+        return Err(Refusal::NotMicrovm(a.shown().to_owned()));
+    }
+    crate::harness::lineage::may_run_on(
+        caller,
+        &format!("agent:{}", a.name),
+        "build an Agentfile there",
+    )
+    .map_err(|(_, why)| Refusal::NotTheirs(why))
+}
+
+/// The runners `person`'s Agentfiles are built on ([`builds_for`]), connected or not. None where `person` can't sign in
+/// any more. Sorted.
 async fn runners_of(hub: &Hub, person: &str) -> Vec<String> {
     let Some(caller) = crate::authz::gate::person_for(hub, person).await else {
         return Vec::new();
@@ -186,31 +255,72 @@ async fn runners_of(hub: &Hub, person: &str) -> Vec<String> {
         .agents
         .load()
         .values()
-        .filter(|a| !a.outpost && !a.ephemeral)
-        .filter(|a| {
-            a.facts.as_deref().and_then(crate::harness::engine::of) == Some(Engine::Microvm)
-        })
-        .filter(|a| {
-            crate::harness::lineage::may_run_on(
-                &caller,
-                &format!("agent:{}", a.name),
-                "build an Agentfile there",
-            )
-            .is_ok()
-        })
+        .filter(|a| builds_for(&caller, a).is_ok())
         .map(|a| a.name.clone())
         .collect();
     out.sort();
     out
 }
 
+/// How a runner takes builds now, as its newest process says ([`takes`]).
+enum Takes {
+    /// It names [`feature::PREBUILD`]: each is sent to it at once.
+    Now(PeerId),
+    /// It's away, or hasn't said what it speaks (yet, or ever: a kiln from before named features): each waits, queued,
+    /// until one of its processes names the feature ([`on_features`]).
+    Later,
+    /// It said what it speaks, without the feature: its kiln builds nothing ahead.
+    Never,
+}
+
+/// How runner `runner` takes builds now. A process that has said what it speaks named every feature of its build, so
+/// one that named none hasn't said yet.
+fn takes(hub: &Hub, runner: &str) -> Takes {
+    let inst = hub.instances.load();
+    let Some((peer, said)) = inst
+        .newest(runner)
+        .and_then(|p| inst.get(p).map(|i| (p, &i.features)))
+    else {
+        return Takes::Later;
+    };
+    if feature::speaks(said, feature::PREBUILD) {
+        Takes::Now(peer)
+    } else if said.is_empty() {
+        Takes::Later
+    } else {
+        Takes::Never
+    }
+}
+
 /// Runner `runner`'s newest process, where it names [`feature::PREBUILD`].
 fn taker(hub: &Hub, runner: &str) -> Option<PeerId> {
-    let inst = hub.instances.load();
-    inst.newest(runner).filter(|p| {
-        inst.get(*p)
-            .is_some_and(|i| feature::speaks(&i.features, feature::PREBUILD))
-    })
+    match takes(hub, runner) {
+        Takes::Now(peer) => Some(peer),
+        Takes::Later | Takes::Never => None,
+    }
+}
+
+/// Whether runner `runner` builds `person`'s Agentfiles ([`builds_for`]) and its kiln builds them ahead, or may (it's
+/// away, or hasn't said yet): else why not.
+async fn builder(hub: &Hub, person: &str, runner: &str) -> Result<(), Refusal> {
+    let caller = crate::authz::gate::person_for(hub, person)
+        .await
+        .ok_or_else(|| {
+            Refusal::NotTheirs(format!(
+                "{person} can't sign in here any more: kiln builds none of their Agentfiles"
+            ))
+        })?;
+    let a = hub
+        .agents
+        .load()
+        .get(runner)
+        .cloned()
+        .ok_or_else(|| Refusal::NoRunner(runner.to_owned()))?;
+    builds_for(&caller, &a)?;
+    match takes(hub, runner) {
+        Takes::Never => Err(Refusal::Older(a.shown().to_owned())),
+        Takes::Now(_) | Takes::Later => Ok(()),
+    }
 }
 
 /// `ask` sent to runner `runner`'s process `peer` (`ServerMsg::Prebuild`).
@@ -255,30 +365,14 @@ async fn queue_in(hub: &Hub, id: &str) -> anyhow::Result<()> {
     let Some(kept) = current(hub, id).await? else {
         return Ok(());
     };
-    let owner = crate::agentdefs::Who {
-        person: kept.owner.clone(),
-        all: false,
-    };
-    let named = format!("{}{id}", crate::sandbox::isolated::KEPT);
-    let defined: Vec<String> = crate::agentdefs::list(hub, &owner, false)
-        .await
-        .map_err(|e| anyhow::anyhow!("its agent definitions: {e}"))?
-        .into_iter()
-        .filter(|d| d.agentfile.as_deref().map(str::trim) == Some(named.as_str()))
-        .map(|d| d.harness)
-        .collect();
-    let harnesses = harnesses(&kept.text, &defined);
-    let runners = runners_of(hub, &kept.owner).await;
-    let secrets = crate::secrets::mine::for_build(hub, &kept.owner, &kept.text).await;
-    let (state, why) = match &secrets {
-        Ok(_) => (State::Queued, None),
-        Err(w) => (State::Failed, Some(w.clone())),
-    };
+    let asking = Asking::of(hub, kept).await?;
+    let runners = runners_of(hub, &asking.kept.owner).await;
+    let (state, why) = asking.first();
     let rows: Vec<(String, &'static str)> = runners
         .iter()
-        .flat_map(|r| harnesses.iter().map(move |h| (r.clone(), *h)))
+        .flat_map(|r| asking.harnesses.iter().map(move |h| (r.clone(), *h)))
         .collect();
-    let (i, version, now) = (id.to_owned(), kept.version, crate::util::now_ms());
+    let (i, version, now) = (id.to_owned(), asking.kept.version, crate::util::now_ms());
     let written = hub
         .store
         .call(move |c| {
@@ -298,29 +392,75 @@ async fn queue_in(hub: &Hub, id: &str) -> anyhow::Result<()> {
     if !written {
         return Ok(());
     }
+    let kept = &asking.kept;
     changed(hub, &kept.owner, id, &kept.name, kept.version);
-    let Ok(secrets) = secrets else { return Ok(()) };
     for runner in &runners {
-        let Some(peer) = taker(hub, runner) else {
-            continue;
+        asking.send_to(hub, runner, &asking.harnesses).await;
+    }
+    Ok(())
+}
+
+/// What a save, or a person's ask to build again, asks of runners: Agentfile `kept` at its version now, kiln's harnesses
+/// its sessions run ([`harnesses`]: those it declares, and its person's agent definitions' that name it), and the
+/// secrets of its person's it names, or why they can't be read.
+struct Asking {
+    kept: super::Agentfile,
+    harnesses: Vec<&'static str>,
+    secrets: Result<Vec<BuildSecret>, String>,
+}
+
+impl Asking {
+    async fn of(hub: &Hub, kept: super::Agentfile) -> anyhow::Result<Asking> {
+        let owner = crate::agentdefs::Who {
+            person: kept.owner.clone(),
+            all: false,
         };
-        for harness in &harnesses {
+        let named = format!("{}{}", crate::sandbox::isolated::KEPT, kept.id);
+        let defined: Vec<String> = crate::agentdefs::list(hub, &owner, false)
+            .await
+            .map_err(|e| anyhow::anyhow!("its agent definitions: {e}"))?
+            .into_iter()
+            .filter(|d| d.agentfile.as_deref().map(str::trim) == Some(named.as_str()))
+            .map(|d| d.harness)
+            .collect();
+        let harnesses = harnesses(&kept.text, &defined);
+        let secrets = crate::secrets::mine::for_build(hub, &kept.owner, &kept.text).await;
+        Ok(Asking {
+            kept,
+            harnesses,
+            secrets,
+        })
+    }
+
+    /// Where its builds start: `queued`, or `failed` saying why its secrets can't be read (and none is sent).
+    fn first(&self) -> (State, Option<String>) {
+        match &self.secrets {
+            Ok(_) => (State::Queued, None),
+            Err(why) => (State::Failed, Some(why.clone())),
+        }
+    }
+
+    /// Its builds for `harnesses` sent to runner `runner`, where it takes them now ([`taker`]) and its secrets were read.
+    async fn send_to(&self, hub: &Hub, runner: &str, harnesses: &[&'static str]) {
+        let (Ok(secrets), Some(peer)) = (&self.secrets, taker(hub, runner)) else {
+            return;
+        };
+        for harness in harnesses {
             send(
                 hub,
                 runner,
                 peer,
                 &Ask {
-                    agentfile: id.to_owned(),
-                    version: kept.version,
+                    agentfile: self.kept.id.clone(),
+                    version: self.kept.version,
                     harness: (*harness).to_owned(),
-                    text: kept.text.clone(),
+                    text: self.kept.text.clone(),
                     secrets: secrets.clone(),
                 },
             )
             .await;
         }
     }
-    Ok(())
 }
 
 /// Runner `runner`'s word on a build it was asked (`AgentMsg::Prebuilt`): the row of the version it built moved to it
@@ -461,6 +601,74 @@ pub async fn builds(hub: &Hub, who: &super::Who, id: &str) -> super::R<Vec<Build
             })
         })
         .collect())
+}
+
+/// Agentfile `id`'s builds on runner `runner` asked again (`agentfiles.rebuild`), for a caller who reaches it (another's
+/// is as none), as [`queue_in`] asks a save's: for `harness` where named, else for each harness its sessions run, each
+/// written anew at its version now, `queued` (`failed` where its secrets can't be read), and sent to the runner where it
+/// takes them now ([`Takes`]). Answers its builds then, as [`builds`] reads them, or why that runner's aren't asked
+/// again ([`Refusal`]), nothing written. A save between the two leaves its own asks standing.
+pub async fn rebuild(
+    hub: &Hub,
+    who: &super::Who,
+    id: &str,
+    runner: &str,
+    harness: Option<&str>,
+) -> super::R<Result<Vec<Build>, Refusal>> {
+    let kept = super::get(hub, hub.blobs.blobs.as_ref(), who, id).await?;
+    if let Err(r) = builder(hub, &kept.owner, runner).await {
+        return Ok(Err(r));
+    }
+    let asking = Asking::of(hub, kept).await?;
+    let asked: Vec<&'static str> = asking
+        .harnesses
+        .iter()
+        .copied()
+        .filter(|h| harness.is_none_or(|named| named == *h))
+        .collect();
+    if asked.is_empty() {
+        return Ok(Err(Refusal::NoHarness(harness.map(str::to_owned))));
+    }
+    let (state, why) = asking.first();
+    let (i, r, shown, hs) = (
+        id.to_owned(),
+        runner.to_owned(),
+        hub.shown(runner),
+        asked.clone(),
+    );
+    let (version, now) = (asking.kept.version, crate::util::now_ms());
+    let written = hub
+        .store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let kept_at: Option<i64> = tx.query_row("SELECT version FROM agentfiles WHERE id = ?1", params![i], |row| row.get(0)).optional()?;
+            if kept_at != Some(version) {
+                return Ok(Ok(false));
+            }
+            for h in &hs {
+                let was: Option<(i64, String)> = tx.query_row("SELECT version, state FROM prebuilds WHERE agentfile_id = ?1 AND runner = ?2 AND harness = ?3", params![i, r, h], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+                let underway = was.filter(|(v, _)| *v == version).and_then(|(_, s)| State::of(&s)).filter(|s| !s.ended());
+                if let Some(at) = underway {
+                    return Ok(Err(Refusal::Underway { runner: shown, harness: (*h).to_owned(), state: at }));
+                }
+            }
+            for h in &hs {
+                tx.execute("INSERT OR REPLACE INTO prebuilds (agentfile_id, runner, harness, version, state, why, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![i, r, h, version, state.as_str(), why, now])?;
+            }
+            tx.commit()?;
+            Ok(Ok(true))
+        })
+        .await?;
+    match written {
+        Err(underway) => return Ok(Err(underway)),
+        Ok(true) => {
+            let kept = &asking.kept;
+            changed(hub, &kept.owner, id, &kept.name, kept.version);
+            asking.send_to(hub, runner, &asked).await;
+        }
+        Ok(false) => {}
+    }
+    builds(hub, who, id).await.map(Ok)
 }
 
 // ------------------------------------------------------------------------------ on the runner
