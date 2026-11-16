@@ -1830,6 +1830,23 @@ impl Hub {
             inst.newest_with(machine, cap)
         };
         let Some(peer) = peer else { return Ok(None) };
+        self.ask_peer(peer, machine, wait, msg).await.map(Some)
+    }
+
+    /// [`Hub::ask_runner`] of machine `machine`'s newest runner process where it named feature `feature` (docs/wire.md,
+    /// "Named features"): `Ok(None)` where it didn't.
+    pub async fn ask_speaking<T: serde::de::DeserializeOwned + Serialize + Send + 'static>(&self, machine: &str, feature: &str, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<Option<T>>> {
+        let peer = {
+            let inst = self.instances.load();
+            let Some(newest) = inst.newest(machine) else { anyhow::bail!("{} is not connected", self.shown(machine)) };
+            inst.get(newest).is_some_and(|i| proto::feature::speaks(&i.features, feature)).then_some(newest)
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        self.ask_peer(peer, machine, wait, msg).await.map(Some)
+    }
+
+    /// `msg` to runner process `peer` of `machine`, its answer waited for at most `wait`.
+    async fn ask_peer<T: serde::de::DeserializeOwned + Serialize + Send + 'static>(&self, peer: PeerId, machine: &str, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<T>> {
         let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
         let frame = proto::encode(&msg(req))?;
         let (read, rx) = asked::<T>();
@@ -1837,7 +1854,7 @@ impl Hub {
         let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
         let answer = if sent { crate::rt::timeout(wait, rx).await.ok() } else { None };
         self.ai_requests.take(&req);
-        answered(&self.shown(machine), sent, answer).map(Some)
+        answered(&self.shown(machine), sent, answer)
     }
 
     /// A machine's past sessions.

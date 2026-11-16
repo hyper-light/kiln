@@ -13,6 +13,10 @@
 //! - **What it answers** is D242's, in Hex's types (`hex_api::lease::Lease`, `LeaseRefused`): the
 //!   value, under the store's name for its lease, and how long it lives (none: until its run ends),
 //!   or a refusal of D242's kinds, in the broker's words, which never hold a value.
+//! - **A run's sign-ins** (D242, step 8's third slice): a capture's tokens kept by the broker, its
+//!   CLI given placeholders; a refresh made at the sign-in's provider by the broker alone
+//!   ([`super::signin`]), its CLI answered placeholders; a revocation in the microVM said, the
+//!   sign-in kept.
 //! - **The run's end** is its lessor let go of. Hex's image class makes it as the run boots and the
 //!   run's host holds it for as long as the run can ask (Shards' `RunLessor`), so once no one holds
 //!   it, nothing asks through it again: the run is kept ended in the broker's ledger, so nothing more
@@ -30,12 +34,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hex_api::BoxId;
-use hex_api::lease::{Lease, LeaseRefused, Lessor, Value};
+use hex_api::lease::{Lease, LeaseRefused, Lessor, SignInRefused, SignInTokens, Value};
 use kiln_seams::Clock;
-use kiln_seams::secrets::Refusal;
+use kiln_seams::secrets::{Refusal, SecretValue};
 use parking_lot::Mutex;
 
-use super::broker::{Broker, Refused};
+use super::broker::{Broker, Refused, Tokens, Unrefreshed};
+use super::signin::{self, Provider};
 
 /// The broker's refusal as D242 kinds it: a run ended or moved as such, a credential the store
 /// holds none of (or can't name) as denied, and every other, a value past its own end among them
@@ -47,6 +52,22 @@ fn refused(why: Refused) -> LeaseRefused {
         Refused::Store(e @ (Refusal::NotFound(_) | Refusal::Invalid { .. })) => LeaseRefused::Denied(e.to_string()),
         other => LeaseRefused::Unavailable(other.to_string()),
     }
+}
+
+/// A sign-in refusal of the broker's, as D242 kinds it: a run that ended as such; a sign-in nothing
+/// was captured for, and a refresh its provider refused, as denied, so its CLI signs in anew; every
+/// other as unavailable for now.
+fn sign_in_refused(why: Refused) -> SignInRefused {
+    match why {
+        Refused::RunEnded(_) => SignInRefused::Ended,
+        Refused::NoSignIn(_) | Refused::Upstream { why: Unrefreshed::Refused(_), .. } => SignInRefused::Denied(why.to_string()),
+        other => SignInRefused::Unavailable(other.to_string()),
+    }
+}
+
+/// A sign-in whose name names no provider the broker refreshes at ([`Provider::of`]): denied.
+fn unprovided(sign_in: &str) -> SignInRefused {
+    SignInRefused::Denied(format!("sign-in {sign_in:?} names no provider kiln refreshes at (claude/… or codex/…)"))
 }
 
 /// The lessors of the server's own runner's microVMs, over the run-lease broker [`Broker::open`] opens on kiln's
@@ -134,6 +155,42 @@ impl Lessor for RunLessor {
             Ok(Err(e)) => tracing::error!(run = %self.run, lease, "a run's credential lease wasn't given back: {e}"),
             Err(e) => tracing::error!(run = %self.run, lease, "a run's credential lease wasn't given back: the broker: {e:#}"),
         }
+    }
+
+    /// Sign-in `sign_in`'s tokens, as the run's injector took them from its CLI's token response,
+    /// kept by the broker (D242, step 8's third slice): the reference its access token is leased by
+    /// from now, and the placeholders its CLI holds in their places. Its ID token, inert, is not
+    /// kept. A sign-in whose name names no provider is refused, nothing kept.
+    fn capture(&self, sign_in: &str, tokens: SignInTokens, key: Option<[u8; 32]>) -> Result<hex_api::Captured, SignInRefused> {
+        self.identity(key).map_err(|why| SignInRefused::Unavailable(why.to_string()))?;
+        if Provider::of(sign_in).is_none() {
+            return Err(unprovided(sign_in));
+        }
+        let SignInTokens { access, refresh, expires_in, scope, .. } = tokens;
+        let tokens = Tokens { access: SecretValue::new(access.into_bytes()), refresh: refresh.map(|r| SecretValue::new(r.into_bytes())), expires_in_s: expires_in, scope };
+        let (broker, name) = (Arc::clone(&self.broker), sign_in.to_owned());
+        let kept = crate::rt::block_on(async move { Ok(broker.capture(&name, tokens).await) }).map_err(|e| SignInRefused::Unavailable(format!("run {}: the broker: {e:#}", self.run)))?;
+        let captured = kept.map_err(sign_in_refused)?;
+        Ok(hex_api::Captured { access: captured.access.reference, access_placeholder: captured.access.placeholder, refresh_placeholder: captured.refresh.map(|r| r.placeholder) })
+    }
+
+    /// Sign-in `sign_in` refreshed at its provider by the broker, which alone calls it, one refresh
+    /// of a sign-in at a time across every run (D242, step 8's third slice): the token response its
+    /// CLI is to have, its tokens placeholders ([`signin::answer`]).
+    fn refresh(&self, sign_in: &str, key: Option<[u8; 32]>) -> Result<Value, SignInRefused> {
+        self.identity(key).map_err(|why| SignInRefused::Unavailable(why.to_string()))?;
+        let provider = Provider::of(sign_in).ok_or_else(|| unprovided(sign_in))?;
+        let (broker, name) = (Arc::clone(&self.broker), sign_in.to_owned());
+        let got = crate::rt::block_on(async move { Ok(broker.refresh(&name, provider.upstream()).await) }).map_err(|e| SignInRefused::Unavailable(format!("run {}: the broker: {e:#}", self.run)))?;
+        let captured = got.map_err(sign_in_refused)?;
+        let answer = signin::answer(&captured, self.clock.unix_ms()).map_err(|e| SignInRefused::Unavailable(format!("run {}: its answer: {e}", self.run)))?;
+        Ok(Value::new(answer))
+    }
+
+    /// The run's microVM revoked sign-in `sign_in` (its CLI's logout, or a sign-in anew), answered
+    /// there: said, and its tokens kept, as the sign-in outlives the run (D242, step 8's question 6).
+    fn revoked(&self, sign_in: &str, _key: Option<[u8; 32]>) {
+        tracing::info!(run = %self.run, sign_in, "a run's microVM revoked its sign-in, answered there: its tokens kept");
     }
 }
 
@@ -358,11 +415,190 @@ mod tests {
             let after = keyed.lease("providers/openai", Some(A)).err();
             anyhow::ensure!(after == Some(LeaseRefused::KeyReplaced { asked: hex::encode(A), current: Some(B.to_owned()) }), "{store}: an ask under a replaced key: {after:?}");
             let b = Arc::clone(&broker);
-            let captured = crate::rt::block_on(async move { b.capture("claude/ada", super::super::broker::Tokens { access: v("oat-real"), refresh: None, expires_in_s: Some(600) }).await.map_err(anyhow::Error::msg) })?;
+            let captured = crate::rt::block_on(async move { b.capture("claude/ada", super::super::broker::Tokens { access: v("oat-real"), refresh: None, expires_in_s: Some(600), scope: None }).await.map_err(anyhow::Error::msg) })?;
             let short = run.lease(&captured.access.reference, None).map_err(anyhow::Error::msg)?;
             anyhow::ensure!(short.life == Some(Duration::from_secs(600)), "{store}: its life {:?}", short.life);
             u.clock.advance(Duration::from_secs(601));
             anyhow::ensure!(matches!(run.lease(&captured.access.reference, None), Err(LeaseRefused::Unavailable(_))), "{store}: a value past its own end");
+        }
+        Ok(())
+    }
+
+    /// Claude Code's and Codex's token endpoints stood in for, once for every test here (each
+    /// test's sign-ins its own refresh tokens): each refresh asked of it kept, by its path and
+    /// body, and answered as its refresh token says: `rt-refused` refused (RFC 6749 §5.2's 400),
+    /// `rt-broken` unavailable (503), any other given its next tokens, Codex's with an ID token.
+    struct StandIn {
+        asked: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl StandIn {
+        /// The refreshes asked of it with refresh token `rt`, by their paths and bodies.
+        fn asked(&self, rt: &str) -> Vec<(String, serde_json::Value)> {
+            self.asked.lock().iter().filter(|(_, body)| body.get("refresh_token").and_then(serde_json::Value::as_str) == Some(rt)).cloned().collect()
+        }
+    }
+
+    fn stand_in() -> anyhow::Result<&'static StandIn> {
+        use crate::http::server::{self as srv, Request, Response};
+
+        struct Fake {
+            asked: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        }
+        impl srv::Handler for Fake {
+            async fn handle(self: Arc<Self>, req: Request) -> Response {
+                let path = req.uri().path().to_owned();
+                let body = srv::body_bytes(req.into_body(), 1 << 20).await.unwrap_or_default();
+                let asked: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let rt = asked.get("refresh_token").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                self.asked.lock().push((path.clone(), asked));
+                match rt.as_str() {
+                    "rt-refused" => srv::json(http::StatusCode::BAD_REQUEST, &serde_json::json!({ "error": "invalid_grant", "error_description": "Refresh token revoked" })),
+                    "rt-broken" => srv::json(http::StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({ "error": "temporarily_unavailable" })),
+                    _ if path == "/oauth/token" => srv::json(http::StatusCode::OK, &serde_json::json!({ "id_token": format!("eyJh.eyJp.sig-{rt}"), "access_token": format!("at-{rt}"), "refresh_token": format!("{rt}-2") })),
+                    _ => srv::json(http::StatusCode::OK, &serde_json::json!({ "access_token": format!("at-{rt}"), "refresh_token": format!("{rt}-2"), "expires_in": 3600, "token_type": "Bearer" })),
+                }
+            }
+        }
+
+        /// Bound, served and made both providers' endpoint before any test asks it.
+        fn start() -> anyhow::Result<StandIn> {
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let fake = Arc::new(Fake { asked: Arc::clone(&asked) });
+            let addr = crate::rt::block_on(async move {
+                let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+                crate::rt::spawn(async move {
+                    while let Ok(s) = tcp.accept().await {
+                        let (h, r) = (Arc::clone(&fake), s.peer_addr().ok());
+                        crate::rt::spawn(srv::serve_connection(crate::http::io::RtIo::new(s), h, r));
+                    }
+                });
+                anyhow::Ok(addr)
+            })?;
+            crate::ci::integrations::override_endpoint("claude:token", &format!("http://{addr}"));
+            crate::ci::integrations::override_endpoint("codex:token", &format!("http://{addr}"));
+            Ok(StandIn { asked })
+        }
+        static S: std::sync::LazyLock<Result<StandIn, String>> = std::sync::LazyLock::new(|| start().map_err(|e| format!("{e:#}")));
+        S.as_ref().map_err(|e| anyhow::anyhow!("the stand-in token endpoint: {e}"))
+    }
+
+    fn sign_in_tokens(access: &str, refresh: &str, expires_in: Option<u64>, id_token: Option<&str>, scope: Option<&str>) -> SignInTokens {
+        let value = |s: &str| Value::new(s.as_bytes().to_vec());
+        SignInTokens { access: value(access), refresh: Some(value(refresh)), expires_in, id_token: id_token.map(value), scope: scope.map(str::to_owned) }
+    }
+
+    /// A refresh's answer as its CLI reads it: its fields, and its words whole.
+    fn read(answer: &Value) -> anyhow::Result<(serde_json::Map<String, serde_json::Value>, String)> {
+        let words = String::from_utf8(answer.expose().to_vec())?;
+        match serde_json::from_str(&words)? {
+            serde_json::Value::Object(fields) => Ok((fields, words)),
+            other => anyhow::bail!("an answer that is no object: {other}"),
+        }
+    }
+
+    fn placeholder(fields: &serde_json::Map<String, serde_json::Value>, name: &str) -> bool {
+        fields.get(name).and_then(serde_json::Value::as_str).is_some_and(|p| p.starts_with("kiln-placeholder-"))
+    }
+
+    /// Plan step 33's step 8 (D242, its third slice; CP-T8.3): through Hex's seam, a run's sign-in
+    /// is captured into the broker, its CLI given placeholders and its access token leased by
+    /// reference; its refresh is made at its provider by the broker alone, as its CLI's own would
+    /// be (Claude Code's scope asked again, Codex's none), the rotated tokens kept under the same
+    /// references and its CLI answered placeholders, never a token, Codex's ID token left out; and a
+    /// revocation in its microVM keeps the sign-in.
+    #[test]
+    fn cp_t8_3_a_runs_sign_ins_are_captured_refreshed_and_revoked_outside_through_hexs_seam() -> anyhow::Result<()> {
+        let provider = stand_in()?;
+        for (u, _, lessors) in stores()? {
+            let store = u.name;
+            let run = lessor(&lessors, &format!("box-s-{store}"))?;
+            let claude = format!("claude/ada-{store}");
+            let scope = "user:inference user:profile";
+            let c = run.capture(&claude, sign_in_tokens(&format!("at-claude-{store}"), &format!("rt-claude-{store}"), Some(28800), None, Some(scope)), None).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(c.access == format!("sign-ins/{claude}/access"), "{store}: its reference {}", c.access);
+            let refresh = c.refresh_placeholder.clone().unwrap_or_default();
+            anyhow::ensure!(c.access_placeholder.starts_with("kiln-placeholder-") && refresh.starts_with("kiln-placeholder-") && c.access_placeholder != refresh, "{store}: {c:?}");
+            let held = run.lease(&c.access, None).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(held.value.expose() == format!("at-claude-{store}").as_bytes(), "{store}: the captured access token isn't the one leased");
+
+            let (fields, words) = read(&run.refresh(&claude, None).map_err(anyhow::Error::msg)?)?;
+            let asked = provider.asked(&format!("rt-claude-{store}"));
+            let expect = serde_json::json!({ "grant_type": "refresh_token", "refresh_token": format!("rt-claude-{store}"), "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e", "scope": scope });
+            anyhow::ensure!(asked == [("/v1/oauth/token".to_owned(), expect)], "{store}: Claude Code's provider was asked {asked:?}");
+            anyhow::ensure!(!words.contains(&format!("claude-{store}")), "{store}: a token in the answer");
+            anyhow::ensure!(placeholder(&fields, "access_token") && placeholder(&fields, "refresh_token"), "{store}: {fields:?}");
+            let said = |name: &str| fields.get(name).cloned();
+            anyhow::ensure!((said("token_type"), said("expires_in"), said("scope")) == (Some("Bearer".into()), Some(3600u64.into()), Some(scope.into())), "{store}: {fields:?}");
+            anyhow::ensure!(fields.len() == 5, "{store}: its provider's other fields in the answer: {fields:?}");
+            let rotated = run.lease(&c.access, None).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(rotated.value.expose() == format!("at-rt-claude-{store}").as_bytes(), "{store}: the rotated access token isn't kept under its reference");
+            run.revoked(&claude, None);
+            let after = run.lease(&c.access, None).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(after.value.expose() == format!("at-rt-claude-{store}").as_bytes(), "{store}: a revocation in the microVM ended the sign-in");
+
+            let codex = format!("codex/ada-{store}");
+            run.capture(&codex, sign_in_tokens(&format!("at-codex-{store}"), &format!("rt-codex-{store}"), None, Some("eyJh.eyJp.shards-placeholder"), None), None).map_err(anyhow::Error::msg)?;
+            let (fields, words) = read(&run.refresh(&codex, None).map_err(anyhow::Error::msg)?)?;
+            let asked = provider.asked(&format!("rt-codex-{store}"));
+            let expect = serde_json::json!({ "client_id": "app_EMoamEEZ73f0CkXaXp7hrann", "grant_type": "refresh_token", "refresh_token": format!("rt-codex-{store}") });
+            anyhow::ensure!(asked == [("/oauth/token".to_owned(), expect)], "{store}: Codex's provider was asked {asked:?}");
+            anyhow::ensure!(!words.contains(&format!("codex-{store}")) && !words.contains("eyJ"), "{store}: a token in the answer: {fields:?}");
+            anyhow::ensure!(placeholder(&fields, "access_token") && placeholder(&fields, "refresh_token") && fields.len() == 3, "{store}: {fields:?}");
+        }
+        Ok(())
+    }
+
+    /// Plan step 33's step 8 (D242, its third slice): through Hex's seam, each sign-in refusal is
+    /// D242's kind: a sign-in whose name names no provider, captured by no one and nothing kept; a
+    /// refresh of one never captured, and one its provider refuses, denied, so its CLI signs in
+    /// anew; one its provider can't answer unavailable, its words holding no token.
+    #[test]
+    fn cp_t8_3_a_sign_ins_refusals_are_d242s_kinds() -> anyhow::Result<()> {
+        stand_in()?;
+        for (u, _, lessors) in stores()? {
+            let store = u.name;
+            let run = lessor(&lessors, &format!("box-r-{store}"))?;
+            let devin = format!("devin/ada-{store}");
+            let refused = run.capture(&devin, sign_in_tokens("at-devin", "rt-devin", None, None, None), None).err();
+            anyhow::ensure!(matches!(refused, Some(SignInRefused::Denied(_))), "{store}: {refused:?}");
+            let kept = run.lease(&format!("sign-ins/{devin}/access"), None).err();
+            anyhow::ensure!(matches!(kept, Some(LeaseRefused::Denied(_))), "{store}: a sign-in naming no provider was kept: {kept:?}");
+            anyhow::ensure!(matches!(run.refresh(&devin, None), Err(SignInRefused::Denied(_))), "{store}: a refresh naming no provider");
+            anyhow::ensure!(matches!(run.refresh(&format!("claude/none-{store}"), None), Err(SignInRefused::Denied(_))), "{store}: a refresh of a sign-in never captured");
+            for (name, rt) in [(format!("claude/refused-{store}"), "rt-refused"), (format!("codex/broken-{store}"), "rt-broken")] {
+                run.capture(&name, sign_in_tokens("at-x", rt, None, None, None), None).map_err(anyhow::Error::msg)?;
+                match (rt, run.refresh(&name, None)) {
+                    ("rt-refused", Err(SignInRefused::Denied(_))) => {}
+                    ("rt-broken", Err(SignInRefused::Unavailable(words))) => anyhow::ensure!(!words.contains(rt), "{store}: {words}"),
+                    (_, got) => anyhow::bail!("{store}: {name}: {:?}", got.map(|_| "answered")),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Plan step 33's step 8 (D242, its third slice): two refreshes of one sign-in at once, as two
+    /// runs' lessors ask them of the one broker, make one call to its provider, the second taking
+    /// the first's tokens, as a rotated refresh token retires every other holder's (RFC 6749 §6).
+    #[test]
+    fn cp_t8_3_two_refreshes_of_one_sign_in_at_once_make_one_call_to_its_provider() -> anyhow::Result<()> {
+        let provider = stand_in()?;
+        for (u, broker, _) in stores()? {
+            let store = u.name;
+            let name = format!("claude/once-{store}");
+            let rt = format!("rt-once-{store}");
+            let b = Arc::clone(&broker);
+            let (n, r) = (name.clone(), rt.clone());
+            let (one, two) = crate::rt::block_on(async move {
+                b.capture(&n, Tokens { access: v("at-once"), refresh: Some(v(&r)), expires_in_s: None, scope: None }).await.map_err(anyhow::Error::msg)?;
+                anyhow::Ok(futures::join!(b.refresh(&n, Provider::ClaudeCode.upstream()), b.refresh(&n, Provider::ClaudeCode.upstream())))
+            })?;
+            let (one, two) = (one.map_err(anyhow::Error::msg)?, two.map_err(anyhow::Error::msg)?);
+            anyhow::ensure!(one == two, "{store}: the second refresh didn't take the first's tokens");
+            let calls = provider.asked(&rt).len();
+            anyhow::ensure!(calls == 1, "{store}: {calls} calls to the provider");
         }
         Ok(())
     }
