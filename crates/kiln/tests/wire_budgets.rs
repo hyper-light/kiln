@@ -810,12 +810,15 @@ const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
 /// (2026-11-16). They add to two runners' records, brotli 4 as the server sends them, 233 B with an
 /// Apple GPU, 244 B with an NVIDIA one and 391 B with neither, where `gpu_unavailable` says why for each
 /// vendor (docs/research/measurements/wire-budgets/runner-facts.py, its output runner-facts.txt beside it).
-/// So the runners' budget is what was measured, with no margin chosen beside it (unlike the rule above):
-/// the most of the five runs (1,761), what a run's noise moved them (their range, 1,761 - 1,744 = 17) and
-/// the most the facts add on any host measured (391): 2,169. For normal noise the range of five runs
-/// averages 2.33 σ (d2, the control-chart constant) and their most lies 1.16 σ above their mean, so the
-/// bound sits about 3.5 σ above it: a run's noise passes, and a body grown past it fails.
-const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_169), ("overview", 1_260)];
+/// The value follows the host the test runs on, whose facts both runners' records carry: of the
+/// production runners', two records come to 1,359 to 1,401 B on the Macs, 1,565 on adacachy, 1,579 on
+/// the Windows one and 1,753 on fedora.attlocal.net (Linux, no GPU), every landing applied
+/// (runner-facts.txt, "Every production runner"). Main came to 1,936 and 1,938 on adas-mac-studio-2
+/// (9c5aa60de and 9bc380a97, macOS 26.2, 2026-11-16), whose two records there come to 1,360. So the
+/// runners' budget is what was measured, with no margin chosen beside it (unlike the rule above): the
+/// most on that Mac (1,938), what any production runner's facts add over its own (fedora.attlocal.net's,
+/// 1,753 - 1,360 = 393) and what a run's noise moved the five runs (their range, 17): 2,348.
+const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_348), ("overview", 1_260)];
 
 /// A key of Ship's that the simulated tab keeps loaded: what it GETs, how often it polls
 /// (`ui/src/views/ship/index.tsx`, `jobs.tsx`), what it last loaded, and what its loads came to.
