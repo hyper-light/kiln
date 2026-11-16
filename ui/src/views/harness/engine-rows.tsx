@@ -93,7 +93,7 @@ export function EngineVm({ a, b, fixed }: { a: AgentInfo; b: SandboxBrief; fixed
       .then((d) => {
         setState(d.state);
         invalidate("microvm/");
-        if (what === "pause") toast({ title: `Paused ${name}'s vCPUs`, tone: "info", action: { label: "Undo", run: () => act("resume") } });
+        if (what === "pause") toast({ title: `Paused ${name}`, tone: "info", action: { label: "Undo", run: () => act("resume") } });
         else if (what === "restart") toast({ title: `Restarting ${name}`, tone: "running" });
         else if (what === "stop") toast({ title: `Stopped ${name}`, tone: "info" });
       })
@@ -150,16 +150,16 @@ export function EngineVm({ a, b, fixed }: { a: AgentInfo; b: SandboxBrief; fixed
                     className="fig-round"
                     data-size="sm"
                     aria-label={`${now === "paused" ? "Resume" : "Pause"} ${name}`}
-                    title={now === "paused" ? "Resume its vCPUs" : "Pause its vCPUs: memory and disk stay as they are"}
+                    title={now === "paused" ? "Resume" : "Pause"}
                     onClick={() => act(now === "paused" ? "resume" : "pause")}
                   >
                     {now === "paused" ? <Play size={15} /> : <Pause size={15} />}
                   </button>
                 )}
-                <button type="button" className="fig-round" data-size="sm" aria-label={`Restart ${name}`} title="Restart it" onClick={() => act("restart")}>
+                <button type="button" className="fig-round" data-size="sm" aria-label={`Restart ${name}`} title="Restart" onClick={() => act("restart")}>
                   <RotateCcw size={14} />
                 </button>
-                <button type="button" className="fig-round" data-size="sm" data-tone="stop" aria-label={`Stop ${name}`} title="Stop it" onClick={() => setAsking(true)}>
+                <button type="button" className="fig-round" data-size="sm" data-tone="stop" aria-label={`Stop ${name}`} title="Stop" onClick={() => setAsking(true)}>
                   <Square size={13} />
                 </button>
               </>

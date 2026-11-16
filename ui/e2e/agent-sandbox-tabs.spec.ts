@@ -83,7 +83,7 @@ test("a host session's Engine: on the host, with no network, pool, Hex box or se
   await expect(body.getByRole("button", { name: /^Network/ })).toHaveCount(0);
   for (const gone of ["Hex box", "Secrets", "nothing else", "Ingress", "Egress"]) await expect(body.getByText(gone, { exact: true })).toHaveCount(0);
   // Volumes on the host: allowed directories and scope; a folder given live, with how its harness and kiln's scope took it.
-  await expect(body).toContainText("Adds to the agent's allowed directories and this session's scope");
+  await expect(body.locator(".in-sec-static", { hasText: "Volumes" })).toBeVisible();
   await body.getByRole("button", { name: "Add a volume" }).click();
   const form = body.getByRole("listitem", { name: "Add a volume" });
   await form.getByRole("textbox", { name: "Folder on its machine" }).fill("/data/fixtures");

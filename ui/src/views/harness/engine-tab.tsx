@@ -128,9 +128,9 @@ function VmsOf({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
         <SelectField label="Sort sandboxes" hideLabel value={sort} onChange={(v) => setSort(v as VmSort)} options={VM_SORTS} />
       </FilterBar>
       {vms.length === 0 ? (
-        <p className="in-none">It runs in no sandbox kiln knows of.</p>
+        <p className="in-none">No sandboxes.</p>
       ) : shown.length === 0 ? (
-        <p className="in-none">No sandbox matches.</p>
+        <p className="in-none">No matches.</p>
       ) : (
         <ul className="ms-list eg-list" aria-label={`${agentLabel(a)}'s sandboxes`}>
           {shown.map((v) => (
@@ -214,7 +214,7 @@ function Agents({ agentId }: { agentId: string }) {
         <SelectField label="Sort agents" hideLabel value={sort} onChange={(v) => setSort(v as AgentSort)} options={AGENT_SORTS} />
       </FilterBar>
       {!showsMine && shown.length === 0 ? (
-        <p className="in-none">No agent matches.</p>
+        <p className="in-none">No matches.</p>
       ) : (
         <ul className="ms-list" data-list="agents-tab">
           {showsMine && <DefRow d={mine.d} list={list} session={agentId} />}

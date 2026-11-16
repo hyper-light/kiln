@@ -121,14 +121,6 @@
   color: #7b7e88;
   font-style: normal;
 }
-.sb-note {
-  margin: 0 0 6px;
-  overflow: hidden;
-  color: #8f929b;
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 /* A row: its glyph, its name, then what it is, and its controls at the end. */
 .sb-row {
   display: grid;

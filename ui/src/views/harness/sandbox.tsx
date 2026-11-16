@@ -328,10 +328,8 @@ function MemberGlyph({ kind, name }: { kind: MemberKind; name: string }) {
 /** Its harness, agents and MCP servers, each at its path: swapped in place, put back as built. */
 function Components({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
   const [swapping, setSwapping] = React.useState<string | null>(null);
-  const host = d.engine === "host";
   return (
     <Fold id="sb-components" title="Components" count={d.components.length}>
-      <p className="sb-note">{host ? "Installs into this session's scope" : "Swaps in place: the microVM and the rest keep running"}</p>
       <ul className="sb-rows">
         {d.components.map((c) => (
           <React.Fragment key={c.name}>
@@ -760,7 +758,6 @@ function Volumes({ d, o, agentId, base }: { d: SandboxDetail; o: LiveOverrides |
     : base.volumes.map((v) => ({ at: v.at, from: v.host, mode: v.writable ? ("rw" as const) : ("ro" as const) }));
   return (
     <Fold id="sb-volumes" title="Volumes" count={built.length + given.length}>
-      <p className="sb-note">{host ? "Adds to the agent's allowed directories and this session's scope" : "Mounts into this microVM as you set, then allowed directories and scope"}</p>
       <ul className="sb-rows">
         {built.map((v) => (
           <li key={`base:${v.at}`} className="sb-row sb-vol" data-base="">

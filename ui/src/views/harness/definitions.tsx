@@ -137,11 +137,11 @@ function SessionFacts({ d, session }: { d: AgentDef; session: string }) {
         <span className="ms-edit-k">started on</span>
         <span className="df-fact-v">
           {mine.version === d.version ? (
-            <span>v{d.version}, the current version</span>
+            <span>v{d.version} (current)</span>
           ) : (
             <>
               <span className="df-old">
-                v{mine.version}; v{d.version} is current
+                v{mine.version} (v{d.version} is current)
               </span>
               <Button size="xs" variant="secondary" onClick={() => toast({ title: `Restarting on v${d.version}`, tone: "running" })}>
                 Restart on v{d.version}
@@ -496,7 +496,7 @@ function ExperimentsGroup({
           ))}
           {list.length === 0 && !setup && (
             <li className="ms-node df-exp-body" data-depth={2}>
-              <span className="df-note">No experiment yet: + splits its new sessions between deployments.</span>
+              <span className="df-note">No experiments.</span>
             </li>
           )}
         </>
@@ -536,7 +536,7 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
   const stop = () => {
     change((x) => ({ ...x, state: "stopped" }));
     setEnding(null);
-    toast({ title: `Stopped ${e.name}: new sessions start on its current variant`, tone: "info" });
+    toast({ title: `Stopped ${e.name}`, tone: "info" });
   };
   const promote = (id: string) => {
     const name = variantName(
@@ -691,7 +691,7 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
           </button>
         )}
         <span className="ms-sep-h df-exp-k">Criteria</span>
-        {e.criteria.length === 0 && <span className="df-note">None: its variants are compared on every measure alone.</span>}
+        {e.criteria.length === 0 && <span className="df-note">No criteria.</span>}
         {e.criteria.map((c) => (
           <CriterionBlock key={c.id} c={c} vs={vs} onDrop={own ? () => change((x) => ({ ...x, criteria: x.criteria.filter((o) => o.id !== c.id) })) : undefined} />
         ))}
@@ -856,7 +856,7 @@ function CriterionBlock({ c, vs, onDrop }: { c: Criterion; vs: Variant[]; onDrop
       <span className="df-crit-top">
         <span className="df-crit-name">{c.name}</span>
         <span className="df-head-v">
-          passes when {OP_WORD[c.op]} {f(c.bound)}
+          {OP_WORD[c.op]} {f(c.bound)}
         </span>
         {onDrop && (
           <button type="button" className="ms-go" aria-label={`Remove ${c.name}`} title="Remove it" onClick={onDrop}>
@@ -886,7 +886,7 @@ function CriterionBlock({ c, vs, onDrop }: { c: Criterion; vs: Variant[]; onDrop
           <TrendChart lines={vs.map((v, i) => ({ label: variantName(vs, i), tone: variantTone(i, vs.length), values: v.trend?.[k] ?? [] }))} bound={c.bound} label={`${c.name}, day by day`} />
         </>
       ) : (
-        <span className="df-note">Its values come from kiln&apos;s monitors, evaluated by variant as each session reports.</span>
+        <span className="df-note">Values from kiln&apos;s monitors.</span>
       )}
     </div>
   );
@@ -952,7 +952,7 @@ function CriterionForm({ experiment, onAdd, onCancel }: { experiment: string; on
   };
   return (
     <span className="df-crit-form">
-      <input className="ms-edit-in" value={name} aria-label="Its name" placeholder="Its name" onChange={(k) => setName(k.target.value)} />
+      <input className="ms-edit-in" value={name} aria-label="Name" placeholder="Name" onChange={(k) => setName(k.target.value)} />
       <select
         className="ms-edit-in"
         value={measure}
@@ -972,14 +972,14 @@ function CriterionForm({ experiment, onAdd, onCancel }: { experiment: string; on
             {MEASURE[k].word}
           </option>
         ))}
-        <option value="">A query of its own</option>
+        <option value="">Custom query</option>
       </select>
       <textarea
         className="ms-edit-in df-crit-q"
         rows={3}
         value={query}
         spellCheck={false}
-        aria-label="Its query"
+        aria-label="Query"
         placeholder="avg(last_14d):avg:kiln.session.warm_ms{experiment:…} by {variant}"
         onChange={(k) => {
           setQuery(k.target.value);
@@ -997,17 +997,19 @@ function CriterionForm({ experiment, onAdd, onCancel }: { experiment: string; on
       <input
         className="ms-edit-in"
         value={bound}
-        placeholder={measure ? `Its bound, ${MEASURE[measure].unit}` : "Its bound"}
-        aria-label="Its bound"
+        placeholder={measure ? `Bound (${MEASURE[measure].unit})` : "Bound"}
+        aria-label="Bound"
         inputMode="decimal"
         onChange={(k) => {
           setBound(k.target.value);
           setSaid(null);
         }}
       />
-      <span className="df-note" role={said ? "alert" : undefined}>
-        {said ?? "kiln's monitoring query syntax (Datadog's): a time and space aggregation of a metric or a formula of several, its scope, by variant."}
-      </span>
+      {said && (
+        <span className="df-note" role="alert">
+          {said}
+        </span>
+      )}
       <span className="df-crit-acts">
         <Button size="xs" disabled={!ready || checking} onClick={add}>
           Add
@@ -1042,7 +1044,7 @@ function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; o
       criteria: [],
       variants: vs.map((v, i) => ({ id: `new-${i}`, name: null, ...v, sessions: 0, current: i === 0, measures: NO_MEASURES, trend: {} })),
     });
-    toast({ title: `Splitting ${d.name}'s new sessions: ${name.trim()}`, tone: "running" });
+    toast({ title: `Started ${name.trim()}`, tone: "running" });
   };
   return (
     <li className="ms-node df-exp-body df-exp-new" data-stand="paused" data-depth={2}>
