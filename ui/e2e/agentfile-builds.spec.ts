@@ -1,7 +1,7 @@
 // An Agentfile's builds and install sources (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P4.5, P4.6),
 // against the mock: rust-dev v9's image on each runner (building step by step, queued, refused in
 // Shards' words, or why a runner doesn't build), and each install source a row with its pin and the
-// credential its fetch is handed, by name, opened at its line and written again by the source picker;
+// build secrets its fetch is given (by name, as its labels say), opened at its line and written again by the source picker;
 // claude-rust built in place, its rows going queued → building → built while shown.
 import { expect as expectNow, test, type Page } from "@playwright/test";
 
@@ -64,8 +64,8 @@ test("P4.6: each install source a row, opened at its line, and written again in 
   await expect(sources.getByRole("listitem")).toHaveCount(6);
   const reviewer = sources.getByRole("listitem").filter({ hasText: "agent reviewer" });
   await expect(reviewer).toContainText("v4 → ");
-  // The credential its fetch is handed, by name and scope: never a value.
-  await expect(reviewer.locator(".afs-cred")).toHaveText("GH_DEPLOY_KEY user");
+  // Git over ssh signs in with an SSH agent: kiln gives a build secrets alone, so no key is named.
+  await expect(reviewer.locator(".afs-cred")).toHaveText("ssh agent");
   await reviewer.getByRole("button", { name: /^AGENT reviewer: line \d+$/ }).click();
   await expect(page.locator(".af-editor .cm-activeLine")).toHaveText("AGENT reviewer FROM git@github.com:hyper-light/agents.git#v4:reviewer");
 

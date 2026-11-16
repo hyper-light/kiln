@@ -114,12 +114,24 @@ function AgentfileEditor({ id }: { id: string }) {
   // The editor's view: a source's line opened, or written again by the source picker, from its row.
   const view = React.useRef<EditorView | null>(null);
   const textNow = () => view.current?.state.doc.toString() ?? text;
-  const jump = (s: AgentfileSource) => {
-    const v = view.current;
-    if (!v) return;
+  // A row pressed before the editor has loaded: its line opened as the editor comes (onView), not lost.
+  const pending = React.useRef<AgentfileSource | null>(null);
+  const jumpIn = (v: EditorView, s: AgentfileSource) => {
     const line = v.state.doc.line(Math.min(v.state.doc.lines, Math.max(1, lineOf(v.state.doc.toString(), s))));
     v.dispatch({ selection: { anchor: line.from, head: line.to }, scrollIntoView: true });
     v.focus();
+  };
+  const jump = (s: AgentfileSource) => {
+    const v = view.current;
+    if (v) jumpIn(v, s);
+    else pending.current = s;
+  };
+  const viewed = (v: EditorView | null) => {
+    view.current = v;
+    const s = pending.current;
+    if (!v || !s) return;
+    pending.current = null;
+    jumpIn(v, s);
   };
   // Its line, and the labels naming the secrets its fetch is given: one change, the line and its labels selected.
   const write = (s: AgentfileSource, f: SourceForm, chosen: SecretChoice): boolean => {
@@ -177,7 +189,7 @@ function AgentfileEditor({ id }: { id: string }) {
         hint="An image's: lowercase letters and digits, with ., _ or - between them. A new name alone is no new version."
       />
       {name && !named(name) && <p className="af-error">An Agentfile&rsquo;s name is lowercase letters and digits, with ., _ or - between them.</p>}
-      <AgentfileText value={text} opened={opened} onChange={setText} label={`${kept.name}'s Agentfile`} onView={(v) => (view.current = v)} />
+      <AgentfileText value={text} opened={opened} onChange={setText} label={`${kept.name}'s Agentfile`} onView={viewed} />
       <div className="af-actions">
         <Button size="sm" disabled={!dirty || !named(name) || !text.trim()} pending={saving} onClick={save}>
           {saving ? "Saving…" : "Save"}

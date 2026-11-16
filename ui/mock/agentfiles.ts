@@ -21,6 +21,7 @@ import type http from "node:http";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import type { Agentfile, AgentfileBrief, AgentfileBuiltin, AgentfileCheck, AgentfileListing, AgentfileSaved, AgentfileVersion, ServerEvent } from "../src/api/wire/index.ts";
+import { secretsOf, type SourceForm } from "../src/views/agentfiles/sources.ts";
 
 type Ctx = {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
@@ -95,6 +96,7 @@ NETWORK --egress=api.openai.com:443 codex-out FOR codex
 
 AGENT reviewer FROM git@github.com:hyper-light/agents.git#v4:reviewer
 AGENT triage --version-id=3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY --region=us-east-1 FROM s3://kiln-agents/pr-triage/v2.tar.gz
+LABEL kiln.secret.AWS_ACCESS_KEY_ID.kiln-agents=user:AWS_AGENTS_KEY_ID kiln.secret.AWS_SECRET_ACCESS_KEY.kiln-agents=user:AWS_AGENTS_SECRET
 AGENT notes FROM https://github.com/hyper-light/notes-agent.git#main
 AGENT lint FROM ./agents/lint
 ATTACH reviewer FOR claude
@@ -152,7 +154,8 @@ interface Source {
   source: string;
   /** What it's pinned by: a SHA-256, an object version, a ref (resolved to its commit at the last build). */
   pin: { by: "sha256" | "version-id" | "ref" | "kiln"; value: string; resolved: string | null } | null;
-  credential: { name: string; scope: string } | null;
+  /** The build secrets its fetch is given, each one of the person's own by name (never a value). */
+  secrets: { id: string; name: string }[];
   /** The origin its fetch is granted, that step alone. */
   grant: string | null;
 }
@@ -174,11 +177,8 @@ const commitOf = (ref: string) => {
   for (const c of ref) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
   return `${(h >>> 0).toString(16).padStart(8, "0")}${((h * 31) >>> 0).toString(16).padStart(8, "0")}`.slice(0, 12);
 };
-/** The credentials the person chose for sources, by reference (kept beside the version, never in its text). */
-const CREDENTIALS: Record<string, { name: string; scope: string }> = {
-  "git@github.com:hyper-light/agents.git": { name: "GH_DEPLOY_KEY", scope: "user" },
-  "s3://kiln-agents/pr-triage/v2.tar.gz": { name: "AWS_AGENTS_READ", scope: "user" },
-};
+/** A source's kind as the picker names it, which says the build secrets its fetch reads (sources.ts `slotsOf`). */
+const formKind = (k: SourceKind): SourceForm["kind"] | null => (k === "git-https" || k === "git-ssh" ? "git" : k === "s3" || k === "https" || k === "path" ? k : null);
 function sourcesOf(text: string): Source[] {
   return text.split("\n").flatMap((l, i) => {
     const m = /^\s*(HARNESS|AGENT)\s+(\S+)((?:\s+--\S+)*)\s+FROM\s+(\S+)/.exec(l);
@@ -205,7 +205,10 @@ function sourcesOf(text: string): Source[] {
           : kind === "path" || kind === "oci"
             ? null
             : `${new URL(source.split("#")[0]!).host}:443`;
-    return [{ line: i + 1, directive: directive as "HARNESS" | "AGENT", name: name!, kind, source: source.split("#")[0]!, pin, credential: CREDENTIALS[source.split("#")[0]!] ?? null, grant: origin }];
+    const fk = formKind(kind);
+    // The build secrets its fetch is given: those the text's `LABEL kiln.secret.<ID>=user:<NAME>` lines name for it.
+    const secrets = fk ? secretsOf(text, { kind: fk, source: source.split("#")[0]! }) : [];
+    return [{ line: i + 1, directive: directive as "HARNESS" | "AGENT", name: name!, kind, source: source.split("#")[0]!, pin, secrets, grant: origin }];
   });
 }
 

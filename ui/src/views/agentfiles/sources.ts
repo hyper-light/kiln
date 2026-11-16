@@ -123,7 +123,15 @@ export function slotsOf(f: Pick<SourceForm, "kind" | "source">): SecretSlot[] {
     if (!host) return [];
     // Shards names a remote by its host and port, and a label's id can't hold a `:`: one with a port takes the token every Git source reads.
     if (!ID.test(host)) return [{ role: "token", label: "Token", ids: ["GIT_AUTH_HEADER", "GIT_AUTH_TOKEN"], own: ["GIT_AUTH_TOKEN"], id: "GIT_AUTH_TOKEN" }];
-    return [{ role: "token", label: "Token", ids: [`GIT_AUTH_HEADER.${host}`, `GIT_AUTH_TOKEN.${host}`, "GIT_AUTH_HEADER", "GIT_AUTH_TOKEN"], own: [`GIT_AUTH_HEADER.${host}`, `GIT_AUTH_TOKEN.${host}`], id: `GIT_AUTH_TOKEN.${host}` }];
+    return [
+      {
+        role: "token",
+        label: "Token",
+        ids: [`GIT_AUTH_HEADER.${host}`, `GIT_AUTH_TOKEN.${host}`, "GIT_AUTH_HEADER", "GIT_AUTH_TOKEN"],
+        own: [`GIT_AUTH_HEADER.${host}`, `GIT_AUTH_TOKEN.${host}`],
+        id: `GIT_AUTH_TOKEN.${host}`,
+      },
+    ];
   }
   if (f.kind === "https") {
     const host = authority(src)?.replace(/:\d+$/, "");
@@ -172,6 +180,19 @@ function pairsIn(text: string): Pair[] {
         })
       : [],
   );
+}
+
+/**
+ * The build secrets a source's fetch is given, as `text`'s labels name them (kiln's `references`, the
+ * server's reading): for each of its slots, the first of its ids a label names, and that secret's name.
+ */
+export function secretsOf(text: string, f: Pick<SourceForm, "kind" | "source">): { id: string; name: string }[] {
+  const named = new Map<string, string>();
+  for (const p of pairsIn(text)) if (!named.has(p.id)) named.set(p.id, p.name);
+  return slotsOf(f).flatMap((slot) => {
+    const id = slot.ids.find((i) => named.has(i));
+    return id ? [{ id, name: named.get(id)! }] : [];
+  });
 }
 
 /** Whose secret a source's fetch is given, role by role: the first of each slot's ids a label names. */
