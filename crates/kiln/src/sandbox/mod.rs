@@ -50,6 +50,9 @@ pub struct Microvms {
     shards: Option<crate::shards::Held>,
     /// kiln's MCP lane of the runs launched here (Shards D254): Hex's, where they are Hex's; a stand-in's.
     lanes: Option<Arc<dyn Lanes>>,
+    /// kiln's state they're held beneath ([`held_in`]), which no isolated agent's project is, holds or lies in
+    /// (`isolated::kept_out`); none for a stand-in's.
+    state: Option<std::path::PathBuf>,
 }
 
 /// One connection a run's harness made to its MCP bridge in its microVM (Shards D254, `Execs::mcp`'s
@@ -76,7 +79,12 @@ pub const NO_LANES: &str = "kiln's MCP in a microVM: these microVMs carry no MCP
 impl Microvms {
     /// Runs in `sandbox`, booting `images`: a stand-in's, launched as the seam launches.
     pub fn new(sandbox: Arc<dyn Sandbox>, images: image::Images) -> Self {
-        Self { sandbox, images, hex: None, shards: None, lanes: None }
+        Self { sandbox, images, hex: None, shards: None, lanes: None, state: None }
+    }
+
+    /// kiln's state they're held beneath, where [`held_in`] held them.
+    pub fn state(&self) -> Option<&std::path::Path> {
+        self.state.as_deref()
     }
 
     /// Their runs' MCP connections taken through `lanes` from now on (a stand-in's).
@@ -121,7 +129,8 @@ impl std::fmt::Debug for Leasing {
 /// kiln's state ([`shards_home`], `<state>/shards-cache`), its images built there (in `<state>/shards-builds`), each
 /// launch's box named by placement's numbering ([`box_name`]), each run's charge kept in `ledger` ([`of_hex`]), and
 /// its VMs' credentials leased through `leasing` where it is given (plan step 33; else a launch granting one is
-/// refused). Nothing boots until a launch. Blocking.
+/// refused). They keep `state` as kiln's, which no isolated agent's project is, holds or lies in
+/// ([`Microvms::state`]). Nothing boots until a launch. Blocking.
 pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Option<Arc<dyn kiln_seams::Records>>, leasing: Option<Leasing>) -> anyhow::Result<Microvms> {
     let state = std::path::absolute(state)?;
     let paths = shards_api::RuntimePaths::new(state.join("shards-cache"), shards_home(&state)).map_err(|r| anyhow::anyhow!("Shards' home and cache beneath {}: {r:?}", state.display()))?;
@@ -134,7 +143,7 @@ pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Opti
     .map_err(|r| anyhow::anyhow!("Hex's image runtime under {}: {r}", state.display()))?;
     let images = image::Images::new(shards, shards_home(&state), state.join("shards-builds"));
     let hex = hexvm::HexVms::new(runtime, box_name);
-    Ok(of_hex(if leases { hex.leasing() } else { hex }, images, ledger))
+    Ok(Microvms { state: Some(state), ..of_hex(if leases { hex.leasing() } else { hex }, images, ledger) })
 }
 
 /// The machine's microVMs as `hex` holds them, booting `images`: each run's charge kept in `ledger` as it ends (the
@@ -144,7 +153,7 @@ pub fn of_hex(hex: hexvm::HexVms, images: image::Images, ledger: Option<Arc<dyn 
         Some(ledger) => hex.with_ledger(ledger),
         None => hex,
     });
-    Microvms { sandbox: Arc::clone(&hex) as Arc<dyn Sandbox>, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None }
+    Microvms { sandbox: Arc::clone(&hex) as Arc<dyn Sandbox>, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None, state: None }
 }
 
 /// The group placement reads run `run`'s use from, launched in `vms`: its VM's meter, where Hex holds it
@@ -447,12 +456,14 @@ mod tests {
 
     /// #73 part 7 slice 2 (step 17): a runner whose kiln carries Shards holds its isolated agents' harnesses in Hex's
     /// microVMs, the sandbox `HexVms` over Hex's image runtime (its records, Shards' home and cache beneath kiln's
-    /// state), and its facts say it holds them (`virt.microvm` is their `available`). No VM boots.
+    /// state), and its facts say it holds them (`virt.microvm` is their `available`). They keep kiln's state, which no
+    /// isolated agent's project is, holds or lies in (CP-T4.1's AC-T4.1.5). No VM boots.
     #[test]
     fn s17_p7_a_carrying_runner_holds_harnesses_in_hex_and_says_so() -> anyhow::Result<()> {
         let state = tempfile::tempdir()?;
         let vms = super::held_in(state.path(), state.path().join("shards"), None, None)?;
         anyhow::ensure!(vms.hex.is_some(), "its sandbox isn't Hex's");
+        anyhow::ensure!(vms.state() == Some(state.path()), "kiln's state isn't kept: {:?}", vms.state());
         anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == super::hexvm::HOLDS, "its sandbox isn't HexVms");
         anyhow::ensure!(state.path().join("hex-records").join("state").exists(), "Hex keeps no records beneath kiln's state");
         let facts = super::facts_of(true, Some(&vms));
