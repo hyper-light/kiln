@@ -119,9 +119,13 @@ What a session does to its harness maps onto the member:
   (`isolation.why_not`, and `virt.microvm` false), where placement (step 32) reads it.
 - **A project that would hand it the machine's own** (`sandbox::isolated::kept_out`; CP-T4.1's
   AC-T4.1.5, as T4's `cp/t4-isolation` held it, 6134fd63b): the home of the user kiln runs as or a
-  folder holding it (where an agent started with no folder would work), a folder in `~/.ssh`, or one
-  holding another worktree of its repository, whose files are another agent's. Refused before
-  anything starts, saying which; a project's own folder, or a worktree of its own, is shared.
+  folder holding it (where an agent started with no folder would work); a folder that is, holds or
+  lies in `~/.ssh` or kiln's own state (the folder its microVMs are held beneath, `Microvms::state`:
+  its runner's keys and records, its microVMs' store; and its people's volumes, `Host::homes`); or one
+  holding another worktree of its repository, whose files are another agent's. In a workspace of its
+  own (a Slates volume kiln mounts beneath its state) it's the folder the workspace lies over that's
+  judged, whose files the volume holds. Refused before anything starts, saying which; a project's own
+  folder, or a worktree of its own, is shared.
 - **A move to another machine** (`sandbox::isolated::NO_MOVE`): its microVM and what its harness keeps
   there are its machine's. Refused as it's asked, before anything of it stops, so its member goes on.
   A move to the machine's newer runner process (an in-place upgrade) isn't refused: there it starts
@@ -254,10 +258,8 @@ Owed, each with whose it is:
 - **What T4 held that isn't carried yet**: its repository's git folder shared read-only over its project
   (kiln's own git runs in the project on the machine, `harness::gitstate`, reading the configuration and
   hooks its microVM can write), owed until a real VM shows Shards mounting a read-only start share
-  beneath a writable one, in order (no Shards test holds it); a project holding or lying in kiln's state
-  (its people's volumes, its runner's keys, its microVMs' records), owed with the stand-in tests'
-  fixtures, which keep their people's volumes inside their project; and the agent's header saying it's
-  in a microVM (5e66bbeaf), the console's.
+  beneath a writable one, in order (no Shards test holds it). T4's refusal of kiln's state and its
+  header's "in a microVM" (5e66bbeaf: the agent page's eyebrow, its image on hover) are carried.
 
 ### Part 7's clauses, where they're met
 
@@ -305,9 +307,11 @@ instead (`harness/session.rs:4953`). Hex delivers a member's own signal (`Runtim
   its harness's build, its tag), with a stand-in `shards`: a built-in built once and pinned by digest,
   found in the store without a build after, a changed Agentfile built again, starts at once waiting
   for one build, a refused build in Shards' words, nothing of a build left behind.
-- `cargo test -p kiln --lib sandbox::isolated::tests::s17_t4_`: a home, a folder holding it, `~/.ssh` and
-  a folder holding another worktree of its repository refused as a project, before anything starts; a
-  project's own folder and a worktree of its own taken.
+- `cargo test -p kiln --lib sandbox::isolated::tests::s17_t4_`: a home, a folder holding it, `~/.ssh`, a
+  folder that is, holds or lies in kiln's state (its people's volumes too, made or not yet) and a folder
+  holding another worktree of its repository refused as a project, before anything starts; a project's
+  own folder and a worktree of its own taken; in a workspace of its own, the folder it lies over judged
+  (a project's taken, the home's refused), and another agent's workspace refused.
 - `cargo test -p kiln --lib harness::lineage::tests::s17_`: a runner's own reason in a refusal; a
   person's own Agentfile read for them alone, at its latest version.
 - `cargo test -p kiln --lib harness::kinds::tests::s17_`: every launch beginning with its base, and each
