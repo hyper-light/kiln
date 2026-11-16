@@ -306,3 +306,19 @@ fn p5_6_s5_broadcast_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// P5.6's slice S6: an agent's place in a person's attention is changed by operations (`agents.pin` here): an agent's
+/// pin of another of the owner's agents waits on their click; the owner's own goes past the gate at once.
+#[test]
+fn p5_6_s6_attention_places_are_operations_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let waits = call(chat.clone(), "agents.pin", json!({"agent": "other"})).await;
+        anyhow::ensure!(code(&waits) == 428, "an agent's pin of another of the owner's waits for the click: {waits:?}");
+        let by_person = call(person(&hub), "agents.pin", json!({"agent": "other"})).await;
+        anyhow::ensure!(!matches!(code(&by_person), 403 | 428), "the owner's own goes past the gate: {by_person:?}");
+        Ok(())
+    })
+}
