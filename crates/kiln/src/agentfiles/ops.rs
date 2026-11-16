@@ -225,7 +225,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentfiles.settings",
-            summary: "An Agentfile's `text` as settings, keeping nothing: each harness's (its `source` and the `version` it names, its `model` and `sign_in`, its `volumes` and the `egress` HOST:PORTs it may reach) and each agent's (its model, tools, skills and remote MCP servers), with what Shards says of the text (`check`). With `harness` and what to change of it (null takes a setting out), the text is changed to say it first, and answered: model and sign-in as `LABEL kiln.harness.<harness>.model` and `.sign-in` (a sign-in's name, never its value), egress on a network of its own. Save the text with agentfiles.update.",
+            summary: "An Agentfile's `text` as settings, keeping nothing: each harness's (its `source` and the `version` it names, its `model` and `sign_in`, its `volumes` and the `egress` HOST:PORTs it may reach) and each agent's (its model, tools, skills and remote MCP servers), with what Shards says of the text (`check`). With `harness` and what to change of it (null takes a setting out), the text is changed to say it first, and answered: model and sign-in as `LABEL kiln.harness.<harness>.model` and `.sign-in` (a sign-in's name, `<harness>/<name>`, never its value), egress on a network of its own. Save the text with agentfiles.update.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentfilesSettings>(),
@@ -329,7 +329,8 @@ pub mod input {
         pub version: Option<String>,
         /// Its model. Null: its own default.
         pub model: Option<String>,
-        /// The name of the sign-in it starts as, never its value. Null: its own, kept in its HOME.
+        /// The sign-in it starts as, by its name, which says its harness (`claude/ada`), never its value.
+        /// Null: its own, kept in its HOME.
         pub sign_in: Option<String>,
         /// Its volumes' mount points.
         pub volumes: Option<Vec<String>>,

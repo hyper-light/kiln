@@ -406,10 +406,10 @@ fn p5_3_the_settings_operation_reads_and_changes_a_text() -> anyhow::Result<()> 
     crate::rt::block_on(async {
         let hub = crate::hub::tests::scratch_hub().await?;
         let ada = person("u-ada", &["admin"]);
-        let text = "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nLABEL kiln.harness.claude.sign-in=work\nAGENT main FROM ./agent\nATTACH main FOR claude\n";
+        let text = "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nLABEL kiln.harness.claude.sign-in=claude/ada\nAGENT main FROM ./agent\nATTACH main FOR claude\n";
         let read = op(&hub, &ada, "agentfiles.settings", json!({"text": text})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
         anyhow::ensure!(read.pointer("/text") == Some(&json!(text)), "{read}");
-        anyhow::ensure!(read.pointer("/settings/harnesses/0/sign_in") == Some(&json!("work")) && read.pointer("/settings/agents/0/name") == Some(&json!("main")), "{read}");
+        anyhow::ensure!(read.pointer("/settings/harnesses/0/sign_in") == Some(&json!("claude/ada")) && read.pointer("/settings/agents/0/name") == Some(&json!("main")), "{read}");
         let set = op(&hub, &ada, "agentfiles.settings", json!({"text": text, "harness": "claude", "model": "claude-opus-4-1", "sign_in": null})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
         assert_eq!(text_of(&set, "/text"), "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nLABEL kiln.harness.claude.model=claude-opus-4-1\nAGENT main FROM ./agent\nATTACH main FOR claude\n");
         anyhow::ensure!(set.pointer("/settings/harnesses/0/model") == Some(&json!("claude-opus-4-1")) && set.pointer("/settings/harnesses/0/sign_in") == Some(&Value::Null), "{set}");

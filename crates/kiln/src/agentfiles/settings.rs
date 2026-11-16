@@ -462,21 +462,19 @@ fn plain_or(setting: &'static str, v: &str) -> R<String> {
     }
 }
 
-/// A sign-in's name: letters, digits, `.`, `_` and `-`, as a name in kiln's store is; never a value.
-fn sign_in_name(v: &str) -> R<String> {
+/// A sign-in of harness `harness`, by its name: one word a build reads as written, which says its harness
+/// as kiln names a sign-in, `<harness>/<name>` (`claude/ada`: `crate::secrets::signin`'s `Provider::of`),
+/// never its value.
+fn sign_in_name(harness: &str, v: &str) -> R<String> {
     let v = v.trim();
-    if !v.is_empty()
-        && v.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        Ok(v.to_owned())
-    } else {
-        Err(Refusal::Value {
+    match v.split_once('/') {
+        Some((h, rest)) if plain(v) && h == harness && !rest.is_empty() => Ok(v.to_owned()),
+        _ => Err(Refusal::Value {
             setting: "sign-in",
             why: format!(
-                "{v:?} isn't a sign-in's name (letters, digits, `.`, `_` and `-`): it names a sign-in kiln keeps, never its value"
+                "{v:?} isn't a sign-in of harness {harness}: its name says its harness, `{harness}/<name>` (`{harness}/work`), and never holds its value"
             ),
-        })
+        }),
     }
 }
 
@@ -593,7 +591,10 @@ pub fn set_harness(t: &str, name: &str, change: &HarnessChange) -> R<String> {
         ));
     }
     if let Some(s) = &change.sign_in {
-        wanted.push(("sign-in", s.as_deref().map(sign_in_name).transpose()?));
+        wanted.push((
+            "sign-in",
+            s.as_deref().map(|s| sign_in_name(name, s)).transpose()?,
+        ));
     }
     if !wanted.is_empty() {
         label_edits(

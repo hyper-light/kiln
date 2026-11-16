@@ -151,14 +151,14 @@ fn p5_3_set_a_model_in_the_view_and_the_text_changes() -> anyhow::Result<()> {
 #[test]
 fn p5_3_edit_the_text_and_the_view_updates() -> anyhow::Result<()> {
     let text = claude()?
-        .replace("HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}", "HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}\nLABEL team=core \"kiln.harness.claude.model\"='claude-haiku-4-5' kiln.harness.claude.sign-in=work")
+        .replace("HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}", "HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}\nLABEL team=core \"kiln.harness.claude.model\"='claude-haiku-4-5' kiln.harness.claude.sign-in=claude/work")
         .replace("VOLUME --target-kind=harness /home/claude FOR claude", "VOLUME --target-kind=harness /home/claude /cache FOR claude")
         .replace("--egress=claude.ai:443 ", "");
     passes(&text)?;
     let h = harness(&of(&text)?, "claude")?.clone();
     assert_eq!(
         (h.model.as_deref(), h.sign_in.as_deref()),
-        (Some("claude-haiku-4-5"), Some("work"))
+        (Some("claude-haiku-4-5"), Some("claude/work"))
     );
     assert_eq!(h.volumes, ["/home/claude", "/cache"]);
     assert_eq!(
@@ -178,7 +178,7 @@ fn p5_3_edit_the_text_and_the_view_updates() -> anyhow::Result<()> {
     assert_eq!(
         added,
         [
-            "LABEL team=core kiln.harness.claude.model=claude-opus-4-1 kiln.harness.claude.sign-in=work"
+            "LABEL team=core kiln.harness.claude.model=claude-opus-4-1 kiln.harness.claude.sign-in=claude/work"
         ]
     );
     passes(&set)
@@ -192,7 +192,7 @@ fn p5_3_every_setting_round_trips_through_the_text_on_every_builtin() -> anyhow:
         let h = b.harness;
         let change = HarnessChange {
             model: Some(Some("some-model".into())),
-            sign_in: Some(Some(format!("{h}-work"))),
+            sign_in: Some(Some(format!("{h}/work"))),
             volumes: Some(vec![format!("/home/{h}"), "/var/cache/tools".into()]),
             egress: Some(vec![
                 "api.github.com:443".into(),
@@ -205,7 +205,7 @@ fn p5_3_every_setting_round_trips_through_the_text_on_every_builtin() -> anyhow:
         passes(&set).map_err(|e| anyhow::anyhow!("{}: {e}", b.name))?;
         let got = harness(&of(&set)?, h)?.clone();
         anyhow::ensure!(
-            got.model.as_deref() == Some("some-model") && got.sign_in == Some(format!("{h}-work")),
+            got.model.as_deref() == Some("some-model") && got.sign_in == Some(format!("{h}/work")),
             "{}: {got:?}",
             b.name
         );
@@ -369,8 +369,9 @@ fn p5_3_version_and_source_are_set_on_the_harness_line() -> anyhow::Result<()> {
     passes(&moved)
 }
 
-/// What a change can't be is refused typed, the text untouched: no such harness, a model or a sign-in
-/// that isn't one word a build reads as written, a destination that isn't HOST:PORT.
+/// What a change can't be is refused typed, the text untouched: no such harness, a model that isn't one
+/// word a build reads as written, a sign-in that isn't this harness's by its name (`claude/<name>`), a
+/// destination that isn't HOST:PORT.
 #[test]
 fn p5_3_a_change_kiln_cant_make_is_refused_typed() -> anyhow::Result<()> {
     let text = claude()?;
@@ -419,6 +420,19 @@ fn p5_3_a_change_kiln_cant_make_is_refused_typed() -> anyhow::Result<()> {
             "claude",
             HarnessChange {
                 sign_in: Some(Some("sk-ant/xyz=".into())),
+                ..HarnessChange::default()
+            }
+        ),
+        Err(Refusal::Value {
+            setting: "sign-in",
+            ..
+        })
+    ));
+    anyhow::ensure!(matches!(
+        refused(
+            "claude",
+            HarnessChange {
+                sign_in: Some(Some("codex/ada".into())),
                 ..HarnessChange::default()
             }
         ),
