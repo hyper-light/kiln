@@ -485,13 +485,25 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     ]);
     return true;
   }
-  if (p === "/api/harness/sessions" && m === "POST") {
-    // Under the ids its page made (W21-R15), as the server starts them: after a moment, a runner's
-    // answer (MOCK_START_MS); refused as there already when one is. Asked with none, the Claude demo.
-    const b = await body<{ target?: string; spec?: { kind?: string; prompt?: string; name?: string; model?: string; isolation?: Isolation }; ids?: string[] }>(req);
+  if (p === "/api/harness/agents" && m === "POST") {
+    // agents.start (P5.6 S8), under the ids its page made (W21-R15), as the server starts them: after a moment, a
+    // runner's answer (MOCK_START_MS); refused as there already when one is. Asked with none, the Claude demo.
+    const a = await body<{ kind?: string; on?: string; prompt?: string; name?: string; model?: string; isolation?: string; image?: string; ids?: string[] }>(req);
+    const b = {
+      target: a.on,
+      spec: {
+        kind: a.kind,
+        prompt: a.prompt,
+        name: a.name,
+        model: a.model,
+        isolation: a.isolation === "microvm" ? ({ kind: "microvm", ...(a.image ? { image: a.image } : {}) } as Isolation) : undefined,
+      },
+      ids: a.ids,
+    };
     const ids = b.ids ?? [];
+    const brief = (i: { id: string; name: string; kind: string; status: string }) => ({ id: i.id, name: i.name, kind: i.kind, status: i.status });
     if (ids.length === 0) {
-      json(res, 200, [demos.get("demo-claude")!.info]);
+      json(res, 200, { agents: [brief(demos.get("demo-claude")!.info)], parent: null });
       return true;
     }
     const taken = ids.find((id) => demos.has(id));
@@ -519,7 +531,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
       emitEvent({ type: "harness", info: d.info });
       return d.info;
     });
-    json(res, 200, made);
+    json(res, 200, { agents: made.map(brief), parent: null });
     return true;
   }
   if (p === "/api/harness/sessions" && m === "GET") {
