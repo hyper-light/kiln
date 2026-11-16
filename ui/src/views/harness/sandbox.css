@@ -475,6 +475,14 @@
   font-family: var(--font-mono);
   font-size: 11px;
 }
+/* A volume's permission (sandbox.tsx VolumeForm): its checkbox, then its word, a row of its own. */
+.sb-check.sb-perm {
+  gap: 8px;
+  min-height: 28px;
+  color: #d4d6dc;
+  font-size: 12.5px;
+  cursor: pointer;
+}
 .sb-why {
   flex-basis: 100%;
   color: #e2b9bd;

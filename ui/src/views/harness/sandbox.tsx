@@ -22,6 +22,8 @@ import { ArrowRight, Check, Cloud, Download, FolderOpen, GitBranch, KeyRound, Pa
 import {
   memberWord,
   overridesApi,
+  permsOf,
+  permsWord,
   sandboxApi,
   sandboxRes,
   grantsRes,
@@ -32,6 +34,7 @@ import {
   type SandboxComponent,
   type SandboxDetail,
   type SandboxMember,
+  type VolumePerms,
 } from "@/api/microvms";
 import { useSession, type Command, type SessionStore } from "@/api/harness";
 import type { LiveMember, LiveOverrides, LiveTook } from "@/api/wire";
@@ -936,8 +939,8 @@ function Volumes({ d, o, agentId, base }: { d: SandboxDetail; o: LiveOverrides |
               <span className="sb-mono sb-clip" title={`${v.at}, as it started`}>
                 {v.at}
               </span>
-              <span className="sb-mode" data-mode={v.mode}>
-                {v.mode}
+              <span className="sb-mode" data-mode={v.mode} title={v.mode === "rw" ? "Read and write" : "Read only"}>
+                {permsWord(permsOf({ access: v.mode }))}
               </span>
               <span className="sb-tags">
                 <i title="Given as it started">base</i>
@@ -960,7 +963,7 @@ function Volumes({ d, o, agentId, base }: { d: SandboxDetail; o: LiveOverrides |
                 {h.volume.path}
               </span>
               <span className="sb-mode" data-mode={h.volume.access}>
-                {h.volume.access}
+                {permsWord(permsOf(h.volume as typeof h.volume & { perms?: VolumePerms }))}
               </span>
               <span className="sb-acts">
                 {asking === h.volume.path ? (
@@ -1000,27 +1003,32 @@ function Volumes({ d, o, agentId, base }: { d: SandboxDetail; o: LiveOverrides |
   );
 }
 
+/** A volume's permissions, each a checkbox of its own in the form, in their order as a mode reads (r, w, x). */
+const PERMS: [keyof VolumePerms, string][] = [
+  ["read", "Read"],
+  ["write", "Write"],
+  ["exec", "Execute"],
+];
+
 function VolumeForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone: () => void }) {
   const people = d.members.filter((m) => m.kind !== "mcp");
   const [path, setPath] = React.useState("");
   const [at, setAt] = React.useState("");
-  const [access, setAccess] = React.useState<"ro" | "rw">("ro");
+  const [perms, setPerms] = React.useState<VolumePerms>({ read: true, write: false, exec: false });
   const [members, setMembers] = React.useState<string[]>(people.map(memberWord));
   const microvm = d.engine === "microvm";
+  const any = perms.read || perms.write || perms.exec;
   return (
     <li className="sb-form" aria-label="Add a volume">
-      <span className="sb-form-row">
-        <Segmented
-          size="xs"
-          label="Access"
-          value={access}
-          onChange={setAccess}
-          options={[
-            { value: "ro", label: "ro" },
-            { value: "rw", label: "rw" },
-          ]}
-        />
-      </span>
+      {/* Its permissions, any of them together: a checkbox each, a row each. */}
+      {PERMS.map(([k, word]) => (
+        <span key={k} className="sb-form-row">
+          <label className="sb-check sb-perm">
+            <input type="checkbox" className="check" checked={perms[k]} onChange={(e) => setPerms({ ...perms, [k]: e.target.checked })} />
+            {word}
+          </label>
+        </span>
+      ))}
       <span className="sb-form-row">
         <input className="sb-in sb-grow" value={path} placeholder="/path on its machine" aria-label="Folder on its machine" spellCheck={false} onChange={(e) => setPath(e.target.value)} />
       </span>
@@ -1050,9 +1058,15 @@ function VolumeForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone:
       <FormActs
         word="Add"
         busy={live.busy}
-        disabled={!path.trim() || members.length === 0}
+        disabled={!path.trim() || members.length === 0 || !any}
         onCancel={onDone}
-        onDo={() => live.run("Couldn't give it the folder", () => overridesApi.addVolume(live.agentId, { path: path.trim(), access, ...(at.trim() ? { at: at.trim() } : {}), members }), onDone)}
+        onDo={() =>
+          live.run(
+            "Couldn't give it the folder",
+            () => overridesApi.addVolume(live.agentId, { path: path.trim(), access: perms.write ? "rw" : "ro", perms, ...(at.trim() ? { at: at.trim() } : {}), members }),
+            onDone,
+          )
+        }
       />
       {live.why && <span className="sb-why">{live.why}</span>}
     </li>

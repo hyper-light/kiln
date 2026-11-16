@@ -267,9 +267,23 @@ export const overridesApi = {
   revoke: (id: string, e: { member?: string; host: string; port: number }) => request<OverrideAnswer>("POST", live(id, "egress/revoke"), e),
   connect: (id: string, n: { member?: string; network: string }) => request<OverrideAnswer>("POST", live(id, "networks"), n),
   disconnect: (id: string, n: { member?: string; network: string }) => request<OverrideAnswer>("POST", live(id, "networks/disconnect"), n),
-  addVolume: (id: string, v: { path: string; access: LiveAccess; at?: string; members?: string[] }) => request<OverrideAnswer>("POST", live(id, "volumes"), v),
+  addVolume: (id: string, v: { path: string; access: LiveAccess; perms?: VolumePerms; at?: string; members?: string[] }) => request<OverrideAnswer>("POST", live(id, "volumes"), v),
   removeVolume: (id: string, path: string) => request<OverrideAnswer>("POST", live(id, "volumes/remove"), { path }),
 };
+
+/**
+ * A volume's permissions, each its own: read, write and execute, in any combination. A proposal: the
+ * server's wire takes `access` (ro or rw) alone until it takes these, an optional field beside it.
+ */
+export interface VolumePerms {
+  read: boolean;
+  write: boolean;
+  exec: boolean;
+}
+/** A volume's permissions: its own where it says them, else as its access has them (ro reads, rw reads and writes). */
+export const permsOf = (v: { access: LiveAccess; perms?: VolumePerms }): VolumePerms => v.perms ?? { read: true, write: v.access === "rw", exec: false };
+/** Its permissions as a mode reads, a letter each in its place: r--, rw-, r-x, rwx. */
+export const permsWord = (p: VolumePerms): string => `${p.read ? "r" : "-"}${p.write ? "w" : "-"}${p.exec ? "x" : "-"}`;
 
 /** A member as the routes take it: `harness`, `agent:<name>`, `mcp:<name>`. */
 export const memberWord = (m: LiveMember | SandboxMember): string => (m.kind === "harness" ? "harness" : `${m.kind}:${m.name}`);

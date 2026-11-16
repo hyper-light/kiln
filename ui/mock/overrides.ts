@@ -10,7 +10,7 @@
  *   POST /api/harness/sessions/:id/egress/revoke       {member?, host, port}
  *   POST /api/harness/sessions/:id/networks            {member?, network}                                connect (microVM only)
  *   POST /api/harness/sessions/:id/networks/disconnect {member?, network}
- *   POST /api/harness/sessions/:id/volumes             {path, access, at?, members?}                     add (every engine)
+ *   POST /api/harness/sessions/:id/volumes             {path, access, perms?, at?, members?}             add (every engine; perms {read, write, exec}: a proposal)
  *   POST /api/harness/sessions/:id/volumes/remove      {path}
  *
  * Each answers `{taken, agent, engine, change, said}`; a host session's network refused (409) naming
@@ -131,7 +131,11 @@ export async function handleOverrides(req: http.IncomingMessage, res: http.Serve
       change = { op: "remove", of: path };
       o.volumes = (o.volumes ?? []).filter((v) => v.volume.path !== path);
     } else {
-      const access: "ro" | "rw" | null = b.access === "ro" || b.access === "rw" ? b.access : null;
+      // Its permissions, each its own (a proposal beside `access`, which says ro or rw alone): any of read, write, execute.
+      const p = b.perms as { read?: unknown; write?: unknown; exec?: unknown } | undefined;
+      const perms = p && typeof p === "object" ? { read: p.read === true, write: p.write === true, exec: p.exec === true } : undefined;
+      if (perms && !perms.read && !perms.write && !perms.exec) return fail(400, "`perms` grants at least one of read, write, execute");
+      const access: "ro" | "rw" | null = perms ? (perms.write ? "rw" : "ro") : b.access === "ro" || b.access === "rw" ? b.access : null;
       if (!access) return fail(400, "`access` is ro or rw");
       const at = typeof b.at === "string" && b.at.trim() ? b.at.trim() : path;
       if (!microvm && at !== path) return fail(400, `a session on its machine's host sees ${path} at its own path, not ${at}`);
@@ -142,7 +146,7 @@ export async function handleOverrides(req: http.IncomingMessage, res: http.Serve
         if (typeof mm === "string") return fail(400, mm);
         members.push(mm);
       }
-      const volume = { path, at, access, members };
+      const volume = { path, at, access, members, ...(perms ? { perms } : {}) };
       change = { op: "add", of: volume };
       const v: LiveHeldVolume = { volume, harness: harnessTook(s.harness, access === "rw"), scope: scopeTook(at, access), ...(microvm ? { microvm: microvmTook } : {}) };
       o.volumes = [...(o.volumes ?? []).filter((x) => x.volume.path !== path), v];
