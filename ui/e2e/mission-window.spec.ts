@@ -329,11 +329,17 @@ for (const anchored of [true, false]) {
       await toLead();
       await lead.getByRole("button", { name: "Show Storage lead's details" }).click();
       await expect(tree).toHaveCount(1);
+      // Whole: its sandboxes come in after it opens (till then it's a fraction of its height, and what's measured of it here wouldn't hold).
+      await settled(page);
       const tall = await tree.evaluate((t) => t.getBoundingClientRect().height);
       const typical = middle((await boxes(page)).map((r) => r.height));
       expect(tall, "the tree is no taller than two rows").toBeGreaterThan(2 * typical);
       // A window half as tall as the tree: taken for a row, then measured as tall as it is, the tree moves what's under it by more than the window shows.
-      const size = { width: full.width, height: Math.floor(tall / 2) };
+      // And half as tall as the page under the tree at most, for a window's worth of it past the tree to scroll to (a tree of whole sandboxes is taller
+      // than all the rows under it); in the page's own pixels (a phone may draw the page smaller than its screen, to fit its width).
+      const under = await tree.evaluate((t) => document.documentElement.scrollHeight - (t.getBoundingClientRect().bottom + scrollY) - 1);
+      const scale = (await page.evaluate(() => innerHeight)) / full.height;
+      const size = { width: full.width, height: Math.floor(Math.min(tall, under / scale) / 2) };
       await page.setViewportSize(size);
       await toLead();
       await expect(tree).toHaveCount(1);

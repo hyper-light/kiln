@@ -14,16 +14,29 @@
  * for, and, while gaps are still to be drawn again from heights that changed, from where that will
  * leave it.
  *
+ * For lines of any height (an open row's dropdown, each of its sandboxes whole, is many viewports
+ * tall): a gap keeps its element while the row after it is mounted, so drawing the window anew
+ * never moves a mounted row (a row moved loses the focus and a press on it, and the page laid out
+ * half-moved scrolls); a gap is never what the browser keeps where it is, a row is; the rows on the
+ * page are measured again as the window is taken, not only as their resize observers say (where the
+ * browser anchors, it has scrolled for a line that changed height before the line's observer says
+ * so, and a line let go of leaves a gap as tall as it was); and what's in view is kept where it is
+ * by the window itself, by whatever the browser didn't scroll by (it has no anchoring, or it anchors
+ * to the list itself after a jump past the rows on the page, or it pulled the page back to a foot
+ * that rose instead).
+ *
  * Apart from lib/virtual.ts (rows of one fixed height), so a page that uses only that doesn't download this.
  */
 import * as React from "react";
 
 /**
  * One piece of a windowed list as it's drawn, in order: a mounted row (`row`: its place among the
- * keys), or the room (`room`, px) of the rows between that aren't (`gap`: which gap, counted from
- * the top, for its element's key).
+ * keys), or the room (`room`, px) of the rows between that aren't (`gap`, for its element's key: the
+ * key of the row after it, "" at the list's end). A gap is named by the row it comes before, not
+ * counted from the top: it keeps its element while that row is mounted, so React never moves a
+ * mounted row to put a gap that's new before it (W21-R02).
  */
-export type Part = { key: string; row: number } | { gap: number; room: number };
+export type Part = { key: string; row: number } | { gap: string; room: number };
 
 /**
  * What a row never measured is taken to be: the middle one of the heights measured (between the
@@ -124,14 +137,13 @@ export function mountedRuns(near: readonly [number, number], keep: Iterable<numb
   return runs;
 }
 
-/** The list as drawn: each mounted row, and between the runs a gap as tall as the rows it stands for (none where they take no room). */
+/** The list as drawn: each mounted row, and between the runs a gap as tall as the rows it stands for (none where they take no room), named by the row after it. */
 export function windowParts(keys: readonly string[], tops: Float64Array, runs: readonly (readonly [number, number])[]): Part[] {
   const parts: Part[] = [];
-  let gaps = 0;
   let end = 0;
   const gap = (from: number, to: number) => {
     const room = (tops[to] ?? 0) - (tops[from] ?? 0);
-    if (room > 0) parts.push({ gap: gaps++, room });
+    if (room > 0) parts.push({ gap: keys[to] ?? "", room });
   };
   for (const [from, to] of runs) {
     gap(end, from);
@@ -149,11 +161,29 @@ export function windowParts(keys: readonly string[], tops: Float64Array, runs: r
  * How far the rows in view move down the page as rows' heights change (their tops `was`, then
  * `now`, the same rows in the same order): by what the rows wholly above the viewport's top edge
  * (`y`, from the list's top) gained between them. A browser with scroll anchoring scrolls by as much
- * itself, so nothing in view moves; one without (WebKit) is scrolled by it here.
+ * itself, so nothing in view moves; one without (WebKit) is scrolled by it here (`steadyBy`).
  */
 export function shiftAbove(was: Float64Array, now: Float64Array, y: number): number {
   const at = rowAt(was, y);
   return (now[at] ?? 0) - (was[at] ?? 0);
+}
+
+/**
+ * How far to scroll the page by hand for what's in view to stay where it is, once the page changed
+ * above it by `due` (px, down positive: what the rows over the viewport measured anew and the gaps
+ * over it drawn anew gained) and the viewport has gone `moved` over the list by itself since. Where
+ * the browser anchors (`anchored`) it has scrolled by as much already, unless what it anchors to is
+ * the list itself (it chose while the viewport showed only rows not in the page, and keeps that
+ * until the next scroll); where it doesn't, it hasn't. And either may instead have pulled the page
+ * back to a foot that rose (`pulled`: the page got shorter under the viewport). What's left is
+ * scrolled by, unless something else scrolled the page meanwhile: then what's due is added to that
+ * where the browser doesn't anchor, and where it does it's left as it is (it may have anchored for
+ * it). To the pixel: scroll offsets are whole device pixels. Nothing due, nothing to scroll by.
+ */
+export function steadyBy(due: number, moved: number, anchored: boolean, pulled: boolean): number {
+  if (due === 0 || (anchored && Math.abs(moved - due) < 1)) return 0;
+  if (pulled || Math.abs(moved) < 1) return due - moved;
+  return anchored ? 0 : due;
 }
 
 const sameKeys = (a: readonly string[], b: readonly string[]) => a === b || (a.length === b.length && a.every((k, i) => k === b[i]));
@@ -249,6 +279,14 @@ export class ListWindow {
    * Until then the window is taken from where that leaves the viewport.
    */
   private owed = 0;
+  /**
+   * What the page changed by above what's in view since the window last saw it (`seen`: the
+   * viewport's top over the list then; `seenY`: the page's scroll then), rows over it measured anew
+   * and gaps over it drawn anew: what's in view is kept where it is for it (`steady`, W21-R02).
+   */
+  private due = 0;
+  private seen = 0;
+  private seenY = 0;
   private frame = 0;
   private view: { parts: readonly Part[] } = { parts: NO_PARTS };
   private listeners = new Set<() => void>();
@@ -389,6 +427,13 @@ export class ListWindow {
     // From where the viewport is now, not where it last said it was: the page scrolls without a word
     // until its next frame (a row scrolled to, the browser keeping what's in view where it is).
     this.measure();
+    // And over the rows as they are now (W21-R02): a row's resize observer says it changed height
+    // only once the frame that laid that out ends. Where the browser anchors, it has scrolled for it
+    // already (a line grown by more than the window reaches, taken at its old height, would leave
+    // what's in view outside the window); and a row the window lets go of leaves a gap as tall as it
+    // was last measured, its observer silent once it's gone.
+    this.restate();
+    this.steady();
     const tops = this.fresh();
     const near = nearRows(tops, this.viewTop + this.owed, this.viewHeight);
     const [from, to] = near;
@@ -423,6 +468,16 @@ export class ListWindow {
     }
     const parts = windowParts(this.keys, tops, mountedRuns(near, keep));
     return sameParts(parts, this.view.parts) ? this.view : { parts };
+  }
+
+  /** The rows on the page measured again (one React is moving, off the list for the moment, aside). */
+  private restate() {
+    const el = this.el;
+    if (!el) return;
+    const was = this.fresh();
+    let changed = false;
+    for (const [row, key] of this.rows) if (row.parentElement === el && this.index.has(key) && this.put(key, outerHeight(row))) changed = true;
+    if (changed) this.weighed(was);
   }
 
   private refresh() {
@@ -479,28 +534,52 @@ export class ListWindow {
    * Heights changed (`was`: the tops before they did; `forgotten`: the heights the gaps on the page
    * were drawn from, where the list's width changed and they were let go). The typical height
    * follows, and what's in view is kept where it is. The rows on the page above it have their new
-   * heights already: the browser's scroll anchoring has scrolled by what they gained, and without it
-   * the page is scrolled by as much here. The gaps above it are drawn again only at the next render:
-   * what those gain is `owed` until then.
+   * heights already: what they gained is `due` (`steady` sees to it). The gaps above it are drawn
+   * again only at the next render: what those gain is `owed` until then.
    */
   private weighed(was: Float64Array, forgotten?: ReadonlyMap<string, number>) {
     const typical = middle(this.tally);
     // The page as it is: its rows as just measured, its gaps as they were drawn.
     const page = rowTops(this.keys, forgotten ? new Map([...forgotten, ...this.heights]) : this.heights, this.typical ?? this.unmeasured());
     const now = !forgotten && typical === this.typical ? page : rowTops(this.keys, this.heights, typical ?? this.unmeasured());
-    // The row at the viewport's top edge, as the viewport stood over the list before any of it.
-    const at = rowAt(was, this.viewTop);
+    // The row at the viewport's top edge (W21-R02): where the viewport stood over the list when the
+    // window last saw it, and where what it's still to be scrolled by takes it (gaps drawn anew, rows
+    // measured anew since). Not where it is: the browser may have scrolled for those, or not.
+    const y = this.seen + this.owed + this.due;
+    const at = rowAt(was, y);
     this.owed += (now[at] ?? 0) - (page[at] ?? 0);
+    this.due += shiftAbove(was, page, y);
     this.typical = typical;
     this.tops = now;
     this.stale = false;
-    if (!anchors()) this.scrollBy(shiftAbove(was, page, this.viewTop));
   }
 
-  private scrollBy(by: number) {
-    if (by === 0) return;
-    window.scrollBy({ top: by, behavior: "instant" });
-    this.measure();
+  /**
+   * What's in view kept where it is, for what the page changed by above it since the window last saw
+   * it (`due`, W21-R02; `steadyBy`): scrolled for here by whatever the browser didn't scroll by
+   * itself. Then the window has seen the page as it is. The page's foot is its height less the
+   * viewport's (the larger of the layout's and what shows: a phone shows more of a page drawn smaller
+   * to fit its width than its layout's height).
+   */
+  private steady() {
+    const el = this.el;
+    if (el?.isConnected) {
+      this.measure();
+      const due = this.due;
+      if (due !== 0) {
+        const root = document.scrollingElement ?? document.documentElement;
+        const foot = root.scrollHeight - Math.max(root.clientHeight, window.innerHeight);
+        const pulled = window.scrollY < this.seenY && window.scrollY >= foot - 1;
+        const by = steadyBy(due, this.viewTop - this.seen, anchors(), pulled);
+        if (by !== 0) {
+          window.scrollBy({ top: by, behavior: "instant" });
+          this.measure();
+        }
+      }
+    }
+    this.due = 0;
+    this.seen = this.viewTop;
+    this.seenY = typeof window === "undefined" ? 0 : window.scrollY;
   }
 
   /**
@@ -544,13 +623,13 @@ export class ListWindow {
   committed(el: HTMLElement, parts: readonly Part[]) {
     if (this.el !== el) this.attach(el);
     this.drawn = parts;
-    // The gaps the last change of heights made are on the page now: the browser's scroll anchoring scrolls by what they gained as it lays them out; without it, here.
-    const owed = this.owed;
+    // The gaps the last change of heights made are on the page now: what they gained above what's in view is due (the browser's scroll anchoring scrolls by it as it lays them out, or `steady` does).
+    this.due += this.owed;
     this.owed = 0;
-    if (!anchors()) this.scrollBy(owed);
     const all = this.all;
     this.all = false;
     this.children(all);
+    this.steady();
     this.show();
     this.refresh();
   }
@@ -614,7 +693,8 @@ export class ListWindow {
       el.removeEventListener("focusout", focusout);
       el.removeEventListener("pointerdown", down);
     };
-    this.measure();
+    // Where the viewport is over the list, as the window first sees it.
+    this.steady();
   }
 
   private resized(entries: ResizeObserverEntry[]) {
@@ -639,7 +719,8 @@ export class ListWindow {
       if (this.put(key, outerHeight(entry.target, entry.borderBoxSize[0]?.blockSize))) changed = true;
     }
     if (changed) this.weighed(was, forgotten);
-    this.measure();
+    // Before the page is painted: what's in view stays where it is in the frame that laid out what changed.
+    this.steady();
     this.later();
   }
 
@@ -659,6 +740,7 @@ export class ListWindow {
     this.held = null;
     this.drawn = NO_PARTS;
     this.owed = 0;
+    this.due = 0;
   }
 }
 
@@ -675,9 +757,10 @@ export function listWindow(id: string): ListWindow {
 
 /**
  * A windowed list of rows of differing heights (W21-R02): `keys` every row in order, `parts` what
- * to draw (each mounted row; for a gap an empty element of the list's own kind, `room` px tall), and
- * `ref` for the element they're drawn in, whose children they are. The window follows the page's
- * scroll and the rows' heights as they're measured, and re-renders only the component that calls this.
+ * to draw (each mounted row; for a gap an empty element of the list's own kind, `room` px tall, keyed
+ * by its `gap`, which the browser never keeps where it is: `overflow-anchor: none`), and `ref` for
+ * the element they're drawn in, whose children they are. The window follows the page's scroll and
+ * the rows' heights as they're measured, and re-renders only the component that calls this.
  */
 export function useWindowed(win: ListWindow, keys: readonly string[], opts: WindowOptions): { ref: (el: HTMLElement | null) => (() => void) | undefined; parts: readonly Part[] } {
   win.sync(keys, opts);
