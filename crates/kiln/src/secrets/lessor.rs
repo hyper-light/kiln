@@ -123,7 +123,9 @@ static MOVED: LazyLock<crate::rt::Changed> = LazyLock::new(crate::rt::Changed::n
 /// features"): its caps before its Welcome, and its named features after them where its caps say it names any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Heard {
-    /// Nothing yet: no connection of this process's has said.
+    /// Nothing yet: no connection of this process's has said whether its server answers its runners' runs' credential
+    /// leases and sign-ins (`secrets.leases`). A runner starts so, its restored sessions' launches among the first: one
+    /// whose sign-in could be granted waits for that word ([`answering`]), its session saying so as it starts ([`WAITS`]).
     Nothing,
     /// This connection's caps say its server names features (`CAP_FEATURES`): their names say whether it answers.
     Naming,
@@ -187,17 +189,35 @@ pub fn heard(word: Word) {
 /// for it (`sandbox::isolated`), so one launched before its server's word (a session restored as its runner started)
 /// is granted its sign-in as any launch is, rather than signing in itself in its microVM. Waited for as it's told,
 /// never polled, for as long as its server takes to say: with no server answering, none of its run's leases could be.
-pub async fn answering() -> bool {
-    loop {
-        let moved = MOVED.listen();
+/// `waiting` is told as it begins to wait, and never where it was known: its session says so meanwhile ([`WAITS`]).
+pub async fn answering(waiting: impl FnOnce()) -> bool {
+    let known = || {
         if OPENED_HERE.load(Ordering::Acquire) {
-            return true;
+            return Some(true);
         }
         let heard = *HEARD.lock();
-        if heard.said() {
-            return heard == Heard::Answers;
+        heard.said().then_some(heard == Heard::Answers)
+    };
+    word(&MOVED, known, waiting).await
+}
+
+/// What a session whose sign-in waits for its server's word ([`answering`]) says it does as it starts (its state's
+/// `doing`), in that word's own terms (`secrets.leases`: docs/wire.md, "Named features").
+pub const WAITS: &str = "Waiting for its server's word on secrets.leases: whether it answers its runners' runs' credential leases and sign-ins from its run-lease broker. Its sign-in is granted once it says it does; where it says it doesn't, its harness signs in itself";
+
+/// [`answering`]'s wait: what's `known` (none until its server has said) looked at again each time `moved` is told,
+/// `waiting` told once, as it first finds nothing known.
+async fn word(moved: &crate::rt::Changed, known: impl Fn() -> Option<bool>, waiting: impl FnOnce()) -> bool {
+    let mut waiting = Some(waiting);
+    loop {
+        let listen = moved.listen();
+        if let Some(answers) = known() {
+            return answers;
         }
-        moved.await;
+        if let Some(told) = waiting.take() {
+            told();
+        }
+        listen.await;
     }
 }
 
@@ -1264,6 +1284,33 @@ mod tests {
             assert_eq!(words.iter().fold(Nothing, |heard, word| heard.then(*word)), expect, "{words:?}");
         }
         assert!(Answers.said() && Refuses.said() && !Nothing.said() && !Naming.said(), "only an answer or a refusal is said");
+    }
+
+    /// Plan step 33 (D242): a launch whose sign-in waits for its server's word tells its session as it begins to wait,
+    /// once however often it looks again, so that its starting state names what it waits for ([`WAITS`], in
+    /// `secrets.leases`' own words); one whose word was known tells it nothing.
+    #[test]
+    fn s33_a_wait_for_the_servers_word_tells_its_session_once_as_it_begins() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll};
+        let (moved, said, told) = (crate::rt::Changed::new(), Mutex::new(None), AtomicUsize::new(0));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let tell = || {
+            told.fetch_add(1, Ordering::SeqCst);
+        };
+        let mut known = std::pin::pin!(word(&moved, || Some(false), tell));
+        assert_eq!(known.as_mut().poll(&mut cx), Poll::Ready(false));
+        assert_eq!(told.load(Ordering::SeqCst), 0, "a word already known is no wait");
+        let mut wait = std::pin::pin!(word(&moved, || *said.lock(), tell));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(told.load(Ordering::SeqCst), 1, "its session told as it begins to wait");
+        moved.notify();
+        assert!(wait.as_mut().poll(&mut cx).is_pending(), "a move with nothing said yet");
+        assert_eq!(told.load(Ordering::SeqCst), 1, "told once");
+        *said.lock() = Some(true);
+        moved.notify();
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(true));
+        assert!(WAITS.contains(crate::proto::feature::LEASES) && WAITS.contains("credential leases and sign-ins"), "{WAITS}");
     }
 
     /// Plan step 33 (D242): a run's ask crosses its runner's link in words made the size they come to (none left behind

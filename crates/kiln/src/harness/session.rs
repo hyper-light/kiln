@@ -3406,6 +3406,41 @@ async fn takeover_ready(s: &Session, sink: &Sink, wait: Duration) -> Option<Stri
     Some(format!("The session found running as process {pid} has not ended, so kiln did not start a second one beside it. Quit it, then restart this agent."))
 }
 
+/// An isolated harness's `launch`, its session's starting state naming what it waits for while its sign-in waits for
+/// its runner's server's word on `secrets.leases` (`secrets::lessor::answering`, which tells `waiting` as it begins to),
+/// as a session restored as its runner started does: said as a take-over's wait is ([`takeover_ready`]), and no more
+/// once that word has come or its launch ended.
+async fn launched<T>(s: &Session, sink: &Sink, launch: impl std::future::Future<Output = T>, waiting: futures::channel::oneshot::Receiver<()>) -> T {
+    use futures::future::{Either, select};
+    let launch = std::pin::pin!(launch);
+    let launch = match select(launch, waiting).await {
+        Either::Left((launched, _)) => return launched,
+        Either::Right((Err(futures::channel::oneshot::Canceled), launch)) => return launch.await,
+        Either::Right((Ok(()), launch)) => launch,
+    };
+    starting_says(s, sink, Some(crate::secrets::lessor::WAITS)).await;
+    let word = std::pin::pin!(crate::secrets::lessor::answering(|| {}));
+    let launch = match select(launch, word).await {
+        Either::Left((launched, _)) => {
+            starting_says(s, sink, None).await;
+            return launched;
+        }
+        Either::Right((_, launch)) => launch,
+    };
+    starting_says(s, sink, None).await;
+    launch.await
+}
+
+/// What its state says it does as it starts (`State::doing`) made `words`, and said.
+async fn starting_says(s: &Session, sink: &Sink, words: Option<&str>) {
+    {
+        let mut core = s.core.lock();
+        core.state.doing = words.map(str::to_owned);
+        core.touch_state();
+    }
+    flush(s, sink, None).await;
+}
+
 impl Done {
     fn apply(self, adapter: &mut super::kinds::Adapter, core: &mut Core) {
         match self {
@@ -5133,7 +5168,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     None if isolated => {
                         let host = files.host.as_ref().and_then(std::sync::Weak::upgrade);
                         match host.as_ref().and_then(|h| h.microvm()) {
-                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets, swap_from.take()).await,
+                            Some(vms) => {
+                                let (told, waiting) = futures::channel::oneshot::channel();
+                                let launch = crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets, swap_from.take(), move || {
+                                    let _ = told.send(());
+                                });
+                                launched(&s, &sink, launch, waiting).await
+                            }
                             None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                         }
                     }
