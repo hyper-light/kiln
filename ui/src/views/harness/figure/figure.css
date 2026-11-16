@@ -35,6 +35,21 @@
   color: #e8c3c7;
   border-color: #8a5d64;
 }
+/* A small one, beside a row's words (a session's controls). */
+.fig-round[data-size="sm"] {
+  width: 32px;
+  height: 32px;
+}
+/* A stop, red where it rests as the agent chat's stop is when it means it, redder under the pointer. */
+.fig-round[data-tone="stop"] {
+  color: #e2b9bd;
+  border-color: #6e4a50;
+}
+.fig-round[data-tone="stop"]:hover:not(:disabled) {
+  color: #f2d4d6;
+  border-color: #8a5d64;
+  background: rgb(209 170 173 / 8%);
+}
 .fig-round[data-tone="accent"] {
   color: #08090a;
   background: #ececee;

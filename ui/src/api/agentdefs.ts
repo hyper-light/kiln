@@ -107,12 +107,31 @@ export interface Variant {
   /** What new sessions start on now. */
   current?: boolean;
   measures: { warm_ms: Interval; peak_gib: Interval; failed_pct: Interval };
+  /** Each measure's median, day by day since its experiment started, oldest first. */
+  trend?: Partial<Record<Measure, number[]>>;
 }
+/** What a variant's sessions are measured by. */
+export type Measure = keyof Variant["measures"];
+/** What its person judges an experiment's variants by: one of their measures, which way is better, and the bound it must keep, if any (at most where lower is better, at least where higher is). */
+export interface Criterion {
+  id: string;
+  /** What its person calls it. */
+  name: string;
+  measure: Measure;
+  better: "lower" | "higher";
+  bound?: number;
+}
+/** An experiment: a split of a definition's new sessions between deployments, its variants, judged by its criteria. Several may run on one definition. */
 export interface Experiment {
   id: string;
-  state: "live" | "paused" | "promoted";
+  /** What its person named it. */
+  name: string;
+  state: "live" | "paused" | "stopped" | "promoted";
   version: number;
   sessions: number;
+  /** When it started (Unix ms). */
+  started_at: number;
+  criteria: Criterion[];
   variants: Variant[];
 }
 /** Where its sessions run and how fast they start: its engine, warm hosts kept of the target, start p50 by kind (ms). */
@@ -152,7 +171,8 @@ export interface AgentDef {
   replaced_by?: string;
   sessions: { id: string; version: number; variant?: string }[];
   runs: Starts;
-  experiment?: Experiment;
+  /** Its experiments, newest first: none, or several at once. */
+  experiments: Experiment[];
 }
 
 const NONE: Starts = { engine: "microvm", warm: 0, target: 0, p50_ms: {} };
@@ -160,10 +180,10 @@ const NONE: Starts = { engine: "microvm", warm: 0, target: 0, p50_ms: {} };
 const kindOf = (b: Builtin): AgentDef["kind"] => (b.id.startsWith("kiln:harness-") ? "harness" : b.id.startsWith("kiln:kiln-ci-") ? "skill" : "ui");
 
 /** The rows: yours (newest change first), then kiln's, each with what the proposals say of it. */
-export function compose(list: AgentdefsList, sessions: Record<string, DefSessions>, experiments: Record<string, Experiment>): AgentDef[] {
+export function compose(list: AgentdefsList, sessions: Record<string, DefSessions>, experiments: Record<string, Experiment[]>): AgentDef[] {
   const byId = new Map(list.agents.map((a) => [a.id, a]));
   const standsIn = new Map(Object.entries(list.uses).map(([builtin, own]) => [own, builtin]));
-  const of = (id: string) => ({ sessions: sessions[id]?.sessions ?? [], runs: sessions[id]?.starts ?? NONE, experiment: experiments[id] });
+  const of = (id: string) => ({ sessions: sessions[id]?.sessions ?? [], runs: sessions[id]?.starts ?? NONE, experiments: experiments[id] ?? [] });
   const yours: AgentDef[] = list.agents.map((a) => {
     const builtin = standsIn.get(a.id);
     return {
@@ -211,7 +231,7 @@ export const agentdefsApi = {
   use: (builtin: string, id: string | null) => request<{ uses: Record<string, string> }>("POST", "/api/agentdefs/use", { builtin, id }),
   // Proposals (p/uicontract), until the server has them.
   sessions: (signal?: AbortSignal) => request<Record<string, DefSessions>>("GET", "/api/agentdef-sessions", undefined, { signal }),
-  experiments: (signal?: AbortSignal) => request<Record<string, Experiment>>("GET", "/api/agentdef-experiments", undefined, { signal }),
+  experiments: (signal?: AbortSignal) => request<Record<string, Experiment[]>>("GET", "/api/agentdef-experiments", undefined, { signal }),
 };
 
 /** The rows, from the server's list and the proposals together. */
@@ -241,4 +261,14 @@ export function limitSeconds(words: string): number | null {
   const hm = /^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m?)?$/.exec(w);
   if (!hm || (!hm[1] && !hm[2])) return null;
   return (Number(hm[1] ?? 0) * 60 + Number(hm[2] ?? 0)) * 60;
+}
+
+/** The experiment a variant is of, and where among its variants: a session's variant names one. */
+export function variantIn(d: AgentDef | undefined, variant: string | undefined): { e: Experiment; i: number } | null {
+  if (!d || !variant) return null;
+  for (const e of d.experiments) {
+    const i = e.variants.findIndex((v) => v.id === variant);
+    if (i >= 0) return { e, i };
+  }
+  return null;
 }

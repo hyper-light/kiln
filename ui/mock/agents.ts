@@ -85,6 +85,8 @@ function member(id: string, kind: "claude" | "codex", target: string, name: stri
     queued: 0,
     tasks_running: 0,
     cost_usd: kind === "claude" ? 0.42 : 0.18,
+    // How full its context window is, as its harness says: steady per agent, from its id.
+    context_pct: 12 + ([...id].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 997, 7) % 70),
     last_activity: Date.now() - 20_000,
     goal: prompt,
     summary: reply,

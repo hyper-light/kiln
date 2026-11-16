@@ -12,6 +12,8 @@
  *   - the last hour as plots, full width.
  *
  * What only a microVM has is absent on the host, not greyed: one line says it runs on the host.
+ * Under its line in a Mission row's dropdown (engine-rows.tsx, `inRow`), that line says where it is
+ * and holds its controls: the tab's whole is the rest.
  */
 import * as React from "react";
 import { ArrowRight, Check, Cloud, Download, FolderOpen, GitBranch, KeyRound, Pause, Play, Plus, RotateCcw, Square, Undo2, X } from "lucide-react";
@@ -85,7 +87,7 @@ function openHarnessSwitch() {
   if (chip.getAttribute("aria-expanded") !== "true") chip.click();
 }
 
-export function SandboxTab({ agentId, store }: { agentId: string; store: SessionStore }) {
+export function SandboxTab({ agentId, store, inRow }: { agentId: string; store: SessionStore; inRow?: boolean }) {
   // What's been changed of it live, and how each place took it: its state, as the server sends it.
   const o = useSession(store, (s) => s.state?.overrides);
   const res = useRes(sandboxRes(agentId));
@@ -102,7 +104,7 @@ export function SandboxTab({ agentId, store }: { agentId: string; store: Session
   };
   return (
     <div className="in-secs sb">
-      <Now d={d} agentId={agentId} done={done} fail={fail} change={res.change} />
+      <Now d={d} agentId={agentId} done={done} fail={fail} change={res.change} bare={inRow} />
       {!ended && (host ? <HostFacts d={d} /> : <MicrovmFacts d={d} />)}
       {!ended && d.components.length > 0 && <Components d={d} agentId={agentId} done={done} fail={fail} />}
       {!ended && !host && d.network && <Network d={d} o={o} agentId={agentId} />}
@@ -116,7 +118,7 @@ export function SandboxTab({ agentId, store }: { agentId: string; store: Session
 type Acts = { agentId: string; done: (d: SandboxDetail) => void; fail: (what: string) => (e: unknown) => void };
 
 /** Where we are now: its engine and state, CPU, memory and disk as live bars, then its controls. */
-function Now({ d, agentId, done, fail, change }: { d: SandboxDetail; change: (fn: (prev: SandboxDetail) => SandboxDetail) => void } & Acts) {
+function Now({ d, agentId, done, fail, change, bare }: { d: SandboxDetail; change: (fn: (prev: SandboxDetail) => SandboxDetail) => void; bare?: boolean } & Acts) {
   const versions = useVersions(agentId);
   const [asking, setAsking] = React.useState(false);
   const host = d.engine === "host";
@@ -141,17 +143,19 @@ function Now({ d, agentId, done, fail, change }: { d: SandboxDetail; change: (fn
   const now = d.now;
   return (
     <section className="sb-now" aria-label="Now">
-      <h3 className="in-sec-head">
-        Now
-        <span className="sb-where">
-          <EngineGlyph engine={d.engine} word />
-          <span>{labelOf(d.runner)}</span>
-          <StatusDot status={st.status} title={st.word} />
-          <span>{st.word}</span>
-          {!host && d.state !== "ended" && <span>· up {up(d.up_s)}</span>}
-        </span>
-      </h3>
-      {host && (
+      {!bare && (
+        <h3 className="in-sec-head">
+          Now
+          <span className="sb-where">
+            <EngineGlyph engine={d.engine} word />
+            <span>{labelOf(d.runner)}</span>
+            <StatusDot status={st.status} title={st.word} />
+            <span>{st.word}</span>
+            {!host && d.state !== "ended" && <span>· up {up(d.up_s)}</span>}
+          </span>
+        </h3>
+      )}
+      {host && !bare && (
         <p className="sb-hostline">
           <EngineGlyph engine="host" />
           Runs on the host, without a microVM
@@ -167,7 +171,7 @@ function Now({ d, agentId, done, fail, change }: { d: SandboxDetail; change: (fn
           <LimitMeter live limit={{ id: "disk", label: "Disk", used_percent: (now.disk.used / now.disk.total) * 100, used: gib(now.disk.used), limit: gib(now.disk.total), unit: "GiB" }} />
         </div>
       )}
-      {d.state !== "ended" && (
+      {d.state !== "ended" && !bare && (
         <div className="sb-ctl">
           {asking ? (
             <span className="sb-confirm" role="group" aria-label="Stop it?">
@@ -946,12 +950,13 @@ function Reach({ d, o }: { d: SandboxDetail; o: LiveOverrides | undefined }) {
   );
 }
 
-/** The last hour, full width: CPU, memory and network as plots. */
+/** The last hour, full width: CPU, memory, disk and network as plots. */
 function Plots({ d }: { d: SandboxDetail }) {
   const s = d.series;
   const rows: [string, number[], number | undefined, string][] = [
     ["CPU", s.cpu, 100, `${s.cpu.at(-1) ?? 0}%`],
     ["Memory", s.memory, 100, `${s.memory.at(-1) ?? 0}%`],
+    ["Disk", s.disk, 100, `${s.disk.at(-1) ?? 0}%`],
     ["Network", s.net, undefined, `${((s.net.at(-1) ?? 0) / 10).toFixed(1)} MB/s`],
   ];
   return (

@@ -13,19 +13,35 @@
  */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { ArrowUpRight, Check, ChevronRight, Lock, MoreHorizontal, Pause, Pencil, Play, Repeat2, RotateCw, Square, X } from "lucide-react";
+import { ArrowUpRight, Check, ChevronRight, Lock, MoreHorizontal, Pause, Pencil, Play, Plus, Repeat2, RotateCw, Square, Trash2, X } from "lucide-react";
 import { useAgentList } from "./use-agents";
 import "./mission.css";
 import { harnessApi } from "@/api/harness";
 import { errorMessage } from "@/lib/hooks";
-import { agentdefRes, agentdefsApi, agentdefsRes, agentdefVersionsRes, limitSeconds, limitWords, type AgentDef, type AgentDefFull, type Builtin, type Experiment, type Variant } from "@/api/agentdefs";
+import {
+  agentdefRes,
+  agentdefsApi,
+  agentdefsRes,
+  agentdefVersionsRes,
+  limitSeconds,
+  limitWords,
+  variantIn,
+  type AgentDef,
+  type AgentDefFull,
+  type Builtin,
+  type Criterion,
+  type Experiment,
+  type Measure,
+  type Variant,
+} from "@/api/agentdefs";
 import { Ago } from "./parts";
 import { agentfilesRes } from "@/api/agentfiles";
 import { ApiError } from "@/api/client";
 import { Loadable } from "@/components/ui/loading";
 import { invalidate } from "@/lib/resource";
 import { rebalance, variantName, variantTone } from "./variants";
-import { engineOf, sandboxesRes, type SandboxBrief } from "@/api/microvms";
+import { engineOf, sandboxesRes, sandboxRes, type SandboxBrief } from "@/api/microvms";
+import { Sparkline } from "@/components/ui/misc";
 import type { AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Segmented } from "@/components/ui/tabs";
@@ -38,6 +54,7 @@ import { agentLabel, modelLabel } from "./derive";
 import { LimitMeter } from "./limits";
 import { Shimmer } from "./signals";
 import "./definition.css";
+import "./figure/figure.css";
 
 /* ------------------------------------------------ variants: a swatch and a name */
 
@@ -58,10 +75,8 @@ export function Swatch({ tone, title, current }: { tone: string; title?: string;
 
 /** The variant a session started in, as its swatch and name; none outside an experiment. */
 export function sessionVariant(d: AgentDef | undefined, id: string): { tone: string; name: string } | null {
-  const s = d?.sessions.find((x) => x.id === id);
-  const vs = d?.experiment?.variants ?? [];
-  const i = s?.variant ? vs.findIndex((v) => v.id === s.variant) : -1;
-  return i < 0 ? null : { tone: variantTone(i, vs.length), name: variantName(vs, i) };
+  const at = variantIn(d, d?.sessions.find((x) => x.id === id)?.variant);
+  return at ? { tone: variantTone(at.i, at.e.variants.length), name: variantName(at.e.variants, at.i) } : null;
 }
 
 /** The definition of yours a session started from, and the version it started on. */
@@ -160,7 +175,19 @@ export function DefGroupRows({ d, list, first, inRow }: { d: AgentDef; list: rea
         }}
       />
       <SessionsGroup d={d} sessions={sessions} open={open === "sessions"} onOpen={() => toggle("sessions")} />
-      {(d.experiment || setup) && <ExperimentGroup d={d} open={open === "experiment"} onOpen={() => toggle("experiment")} setup={setup} onSetupDone={() => setSetup(false)} />}
+      {(d.experiments.length > 0 || setup || d.own) && (
+        <ExperimentsGroup
+          d={d}
+          open={open === "experiment"}
+          onOpen={() => toggle("experiment")}
+          setup={setup}
+          onSetup={() => {
+            setSetup(true);
+            setOpen("experiment");
+          }}
+          onSetupDone={() => setSetup(false)}
+        />
+      )}
     </>
   );
 }
@@ -217,38 +244,57 @@ export function OpenHead({ label, onClose }: { label: string; onClose: () => voi
   );
 }
 
-/** A group's line: its label in Mission's mono, its one-line summary, what belongs at its end. */
+/**
+ * Its sessions' stands, as Mission's tree colours them: a dot each stand that has any, and how many
+ * stand there, in the order they need you (needs you, failed, at work, paused, done, ended). As many
+ * sessions as it has, the line stays one stand wide each: dots and numbers, never words beside them.
+ */
+const STAND_ORDER = ["needs", "failed", "working", "paused", "done", "offline", "stopped"] as const;
+export function StandCounts({ stands, words: named = NODE_WORD }: { stands: readonly string[]; words?: Record<string, string> }) {
+  const counts = STAND_ORDER.map((s) => [s, stands.filter((x) => x === s).length] as const).filter(([, n]) => n > 0);
+  const words = counts.map(([s, n]) => `${n} ${named[s]?.toLowerCase() ?? s}`).join(", ");
+  return (
+    <span className="df-counts" role="img" aria-label={words} title={words}>
+      {counts.map(([s, n]) => (
+        <span key={s} className="df-count" data-stand={s}>
+          <i aria-hidden="true" />
+          {n}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/**
+ * A group's head: one line, one height for every group, its parts centred on it: its chevron and
+ * label (the press that opens it), what it says in short at its right end, then its controls.
+ * Nothing in its middle: what its dropdown shows, it doesn't repeat.
+ */
 export function GroupHead({
   label,
   open,
   onOpen,
   summary,
-  meta,
   actions,
   stand = "done",
 }: {
   label: string;
   open: boolean;
   onOpen: () => void;
-  summary: React.ReactNode;
-  meta?: React.ReactNode;
+  summary?: React.ReactNode;
   actions?: React.ReactNode;
   stand?: string;
 }) {
   return (
-    <li className="ms-node df-group" data-stand={stand} data-depth={1} data-open={open || undefined}>
-      <span className="ms-node-path df-chev">
-        <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
-      </span>
-      <button type="button" className="ms-node-main df-group-main" aria-expanded={open} onClick={onOpen}>
-        <span className="df-group-line">
-          <span className="ms-sep-h df-group-k">{label}</span>
-          <span className="df-group-sum">{summary}</span>
+    <li className="ms-node df-group df-head" data-stand={stand} data-depth={1} data-open={open || undefined}>
+      <button type="button" className="df-head-main" aria-expanded={open} onClick={onOpen}>
+        <span className="df-chev">
+          <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
         </span>
+        <span className="ms-sep-h df-group-k">{label}</span>
       </button>
-      <span className="ms-node-meta">{meta}</span>
-      {/* Its controls stay together at its end, a phone's too (where a row's actions are laid out apart). */}
-      <span className="ms-node-actions">{actions && <span className="ms-tail">{actions}</span>}</span>
+      <span className="df-head-end">{summary}</span>
+      <span className="df-head-acts">{actions}</span>
     </li>
   );
 }
@@ -258,26 +304,11 @@ function DefinitionGroup({ d, open, onOpen, onSetup, inRow }: { d: AgentDef; ope
   return (
     <>
       <GroupHead
-        label="Definition"
+        label="Settings"
         open={open}
         onOpen={onOpen}
-        summary={
-          <>
-            <span className="df-strong">{d.name}</span>
-            <span>v{d.version}</span>
-            {!inRow && <RunsMarks d={d} />}
-            {inRow && d.model && <span>{modelLabel(d.model)}</span>}
-          </>
-        }
-        meta={!inRow && d.model ? <span>{modelLabel(d.model)}</span> : undefined}
-        actions={
-          inRow ? undefined : (
-            <>
-              <RunButton d={d} />
-              <DefMenu d={d} onSetup={onSetup} onAsk={setAsking} />
-            </>
-          )
-        }
+        summary={<span className="df-head-v">{inRow ? `v${d.version}` : `${d.name} v${d.version}`}</span>}
+        actions={inRow ? undefined : <DefMenu d={d} onSetup={onSetup} onAsk={setAsking} />}
       />
       {asking && <DefAsk d={d} asking={asking} onDone={() => setAsking(null)} />}
       {open && (
@@ -317,20 +348,7 @@ function SessionsGroup({ d, sessions, open, onOpen }: { d: AgentDef; sessions: {
         open={open}
         onOpen={onOpen}
         stand={atWork ? "working" : "done"}
-        summary={
-          sessions.length ? (
-            <>
-              <span className="df-stands" aria-hidden="true">
-                {stands.map((s, i) => (
-                  <i key={i} data-stand={s} />
-                ))}
-              </span>
-              {sessions.length} · {atWork} at work
-            </>
-          ) : (
-            "none yet"
-          )
-        }
+        summary={sessions.length ? <StandCounts stands={stands} /> : <span className="df-head-v">none yet</span>}
       />
       {open &&
         sessions.map((s) => {
@@ -341,260 +359,467 @@ function SessionsGroup({ d, sessions, open, onOpen }: { d: AgentDef; sessions: {
   );
 }
 
-/** A session started from a definition, a plain row at the tree's indentation: its stand, version and variant; its sandbox; CPU and memory; its controls. */
+/** A session's stand in the agent's own words (Mission's rows': mission.tsx WORD), as a session is an agent. */
+const AGENT_WORD: Record<ChatStand, string> = {
+  needs: "Needs you",
+  crashed: "Stopped",
+  paused: "Paused",
+  working: "Working",
+  finished: "Finished",
+  ready: "Ready",
+  offline: "Offline",
+  ended: "Ended",
+};
+
+/**
+ * A session started from a definition, at the tree's indentation, each thing it says on a line of its
+ * own at the left: its name (and its way in), its stand in the agent's words and colours, the version
+ * it started on, its variant (its CPU and memory), where it runs, its resources now and over the last
+ * hour, its context and cost, then its controls, round and of their intent's colour (its stop red).
+ */
 function SessionNode({ a, version, current, variant }: { a: AgentInfo; version: number; current: number; variant: { tone: string; name: string } | null }) {
   const navigate = useNavigate();
-  const stand = NODE[chatStand(a)];
+  const stand = chatStand(a);
   const to = `/agents/${a.id}`;
   return (
     <li className="ms-node df-session" data-stand={stand} data-depth={2}>
-      <span className="ms-node-path" />
-      <button type="button" className="ms-node-main" onClick={() => navigate(to)}>
-        <span className="ms-node-name">{agentLabel(a)}</span>
-        <span className="ms-node-line">
-          <Shimmer on={stand === "working"} flow={a.id} className="ms-word">
-            <i aria-hidden="true" />
-            {NODE_WORD[stand]}
-          </Shimmer>
-          <span
-            className="ms-node-text df-version"
-            title={version === current ? "The current version" : `Started on v${version}; new sessions get v${current}`}
-            data-behind={version < current || undefined}
-          >
-            v{version}
-          </span>
-          {variant && (
-            <span className="df-variant">
-              <Swatch tone={variant.tone} />
-              <span className="ms-node-text">{variant.name}</span>
-            </span>
-          )}
+      <div className="df-sess-top">
+        <button type="button" className="df-sess-name" onClick={() => navigate(to)}>
+          {agentLabel(a)}
+        </button>
+        <button type="button" className="ms-go" onClick={() => navigate(to)} aria-label={`Open ${agentLabel(a)}`}>
+          <ArrowUpRight size={16} />
+        </button>
+      </div>
+      <Shimmer on={stand === "working"} flow={a.id} className="ms-word df-sess-word">
+        <i aria-hidden="true" />
+        {AGENT_WORD[stand]}
+      </Shimmer>
+      <span
+        className="df-sess-line df-version"
+        title={version === current ? "The current version" : `Started on v${version}; new sessions get v${current}`}
+        data-behind={version < current || undefined}
+      >
+        v{version}
+      </span>
+      {variant && (
+        <span className="df-sess-line df-variant">
+          <Swatch tone={variant.tone} />
+          {variant.name}
         </span>
-        {/* A phone has no meta column: its sandbox goes under its words. */}
-        <span className="df-narrow ms-node-text">
-          <SandboxLine id={a.id} target={a.target} />
-        </span>
-      </button>
-      <span className="ms-node-meta">
+      )}
+      <span className="df-sess-line">
         <SandboxLine id={a.id} target={a.target} />
-        <SessionBars id={a.id} />
       </span>
-      <span className="ms-node-actions">
-        <span className="ms-decide">
-          <SessionControls a={a} stand={stand} />
-        </span>
-        <span className="ms-tail">
-          <button type="button" className="ms-go" onClick={() => navigate(to)} aria-label={`Open ${agentLabel(a)}`}>
-            <ArrowUpRight size={16} />
-          </button>
-        </span>
-      </span>
+      <SessionUsage a={a} />
+      <SessionControls a={a} stand={stand} />
     </li>
   );
 }
 
-/** A session's CPU and memory now, as compact bars (a list row's: no plots). */
-function SessionBars({ id }: { id: string }) {
+/** Its resources now and over the last hour, a bar and a plot each, then its context and cost (its harness's). */
+function SessionUsage({ a }: { a: AgentInfo }) {
   return (
     <React.Suspense fallback={null}>
-      <SessionBarsRead id={id} />
+      <SessionUsageRead a={a} />
     </React.Suspense>
   );
 }
-function SessionBarsRead({ id }: { id: string }) {
-  const b = useRes(sandboxesRes).data[id];
-  if (!b || b.state === "ended") return null;
+function SessionUsageRead({ a }: { a: AgentInfo }) {
+  const d = useRes(sandboxRes(a.id)).data;
+  const gib = (b: number) => Math.round((b / 2 ** 30) * 10) / 10;
+  const now = d.now;
+  const rows: { id: string; label: string; pct: number; used?: number; limit?: number; unit?: string; series: number[] }[] = now
+    ? [
+        { id: "cpu", label: "CPU", pct: now.cpu_pct, ...(d.vm ? { used: Math.round((now.cpu_pct / 100) * d.vm.vcpus * 100) / 100, limit: d.vm.vcpus, unit: "vCPU" } : {}), series: d.series.cpu },
+        { id: "memory", label: "Memory", pct: (now.memory.used / now.memory.total) * 100, used: gib(now.memory.used), limit: gib(now.memory.total), unit: "GiB", series: d.series.memory },
+        { id: "disk", label: "Disk", pct: (now.disk.used / now.disk.total) * 100, used: gib(now.disk.used), limit: gib(now.disk.total), unit: "GiB", series: d.series.disk },
+      ]
+    : [];
   return (
-    <span className="df-bars">
-      <LimitMeter compact live limit={{ id: "cpu", label: "CPU", used_percent: b.cpu_pct }} />
-      <LimitMeter compact live limit={{ id: "memory", label: "Mem", used_percent: (b.memory.used / b.memory.total) * 100 }} />
-    </span>
+    <div className="df-usage">
+      {rows.map((r) => (
+        <div key={r.id} className="df-urow">
+          <LimitMeter live limit={{ id: r.id, label: r.label, used_percent: r.pct, used: r.used, limit: r.limit, unit: r.unit }} />
+          <Sparkline values={r.series} max={100} width={480} height={28} className="df-uplot" />
+        </div>
+      ))}
+      {a.context_pct !== undefined && (
+        <div className="df-urow">
+          <LimitMeter limit={{ id: "context", label: "Context", used_percent: a.context_pct }} />
+        </div>
+      )}
+      <span className="df-ucost">
+        <span className="ms-edit-k">cost</span>${a.cost_usd.toFixed(2)}
+      </span>
+    </div>
   );
 }
 
-/** Its experiment: one line of its split's swatches until opened, then each variant, Promote on all but the current. */
-function ExperimentGroup({ d, open, onOpen, setup, onSetupDone }: { d: AgentDef; open: boolean; onOpen: () => void; setup: boolean; onSetupDone: () => void }) {
-  const [e, setE] = React.useState<Experiment | undefined>(d.experiment);
-  const [staged, setStaged] = React.useState<number[] | null>(null);
-  const [asking, setAsking] = React.useState<string | null>(null);
-  const [names, setNames] = React.useState<Record<string, string>>({});
-  if (!e)
-    return setup ? (
-      <SetupNodes
-        d={d}
-        onDone={onSetupDone}
-        onStart={(next) => {
-          setE(next);
-          onSetupDone();
-        }}
-      />
-    ) : null;
-  const vs = e.variants.map((v) => ({ ...v, name: names[v.id] ?? v.name }));
-  const weights = staged ?? vs.map((v) => v.weight);
-  const live = e.state === "live";
-  const apply = () => {
-    const before = e;
-    const next = { ...e, version: e.version + 1, variants: e.variants.map((v, i) => ({ ...v, weight: weights[i] ?? v.weight })) };
-    setE(next);
-    setStaged(null);
-    toast({ title: `Split v${next.version}: ${next.variants.map((v) => v.weight).join("/")}`, tone: "info", action: { label: "Undo", run: () => setE(before) } });
+/** An experiment's state as Mission's tree's stands (its counts' dots), and in its own words. */
+const EXP_STAND: Record<Experiment["state"], string> = { live: "working", paused: "paused", promoted: "done", stopped: "stopped" };
+const EXP_WORD: Record<string, string> = { working: "Live", paused: "Paused", done: "Promoted", stopped: "Stopped" };
+/** What each measure is, how it reads, and its unit. */
+const MEASURE: Record<Measure, { word: string; f: (x: number) => string; unit: string }> = {
+  warm_ms: { word: "Warm start", f: (x) => `${Math.round(x)}ms`, unit: "ms" },
+  peak_gib: { word: "Peak memory", f: (x) => `${x.toFixed(2)}G`, unit: "GiB" },
+  failed_pct: { word: "Failed sessions", f: (x) => `${Math.round(x)}%`, unit: "%" },
+};
+const NO_MEASURES: Variant["measures"] = { warm_ms: [0, 0, 0], peak_gib: [0, 0, 0], failed_pct: [0, 0, 0] };
+
+/**
+ * Its experiments (P7.1), several at once: how many stand where at its head (no split there, each has
+ * its own) and a + for another; opened, each one by its name, the one opened its whole (one at a time:
+ * kiln's principle 1), then a new one being set up.
+ */
+function ExperimentsGroup({ d, open, onOpen, setup, onSetup, onSetupDone }: { d: AgentDef; open: boolean; onOpen: () => void; setup: boolean; onSetup: () => void; onSetupDone: () => void }) {
+  const [list, setList] = React.useState<Experiment[]>(d.experiments);
+  const [shown, setShown] = React.useState<string | null>(d.experiments[0]?.id ?? null);
+  const change = (id: string) => (fn: (e: Experiment) => Experiment) => setList((l) => l.map((e) => (e.id === id ? fn(e) : e)));
+  const remove = (e: Experiment) => {
+    const before = list;
+    setList((l) => l.filter((x) => x.id !== e.id));
+    toast({ title: `Deleted ${e.name}`, tone: "info", action: { label: "Undo", run: () => setList(before) } });
   };
-  const pause = () => {
-    const before = e;
-    setE({ ...e, state: live ? "paused" : "live" });
-    if (live) toast({ title: `Paused ${e.id}`, tone: "info", action: { label: "Undo", run: () => setE(before) } });
-  };
-  const promote = (id: string) => {
-    const before = e;
-    const name = variantName(
-      vs,
-      vs.findIndex((v) => v.id === id),
-    );
-    setE({ ...e, state: "promoted", variants: e.variants.map((v) => ({ ...v, current: v.id === id })) });
-    setAsking(null);
-    toast({ title: `Promoted ${name}`, tone: "succeeded", action: { label: "Undo", run: () => setE(before) } });
-  };
-  const split = (
-    <span className="ms-split" data-staged={staged ? "" : undefined} aria-label={`Split ${vs.map((_, i) => `${variantName(vs, i)} ${weights[i]}%`).join(", ")}${staged ? ", not yet applied" : ""}`}>
-      {vs.map((v, i) => (
-        <i key={v.id} style={{ flexGrow: weights[i], background: variantTone(i, vs.length) }} title={`${variantName(vs, i)} · ${weights[i]}%`} />
-      ))}
-    </span>
-  );
+  const stands = list.map((e) => EXP_STAND[e.state]);
   return (
     <>
       <GroupHead
-        label="Experiment"
-        open={open}
+        label="Experiments"
+        open={open || setup}
         onOpen={onOpen}
-        stand={live ? "working" : e.state === "paused" ? "paused" : "done"}
-        summary={
-          <>
-            {split}
-            <span className="df-weights">{weights.join("/")}</span>
-            <span>
-              {e.sessions} · {live ? "splitting" : e.state}
-            </span>
-          </>
-        }
+        stand={list.some((e) => e.state === "live") ? "working" : "done"}
+        summary={list.length ? <StandCounts stands={stands} words={EXP_WORD} /> : <span className="df-head-v">none</span>}
         actions={
-          <>
-            {staged && (
-              <>
-                <Button size="xs" variant="secondary" onClick={apply}>
-                  Apply
-                </Button>
-                <Button size="xs" variant="ghost" onClick={() => setStaged(null)}>
-                  Discard
-                </Button>
-              </>
-            )}
-            {e.state !== "promoted" && (
-              <button type="button" className="ms-go" title={live ? "Pause the split" : "Resume the split"} aria-label={live ? "Pause the split" : "Resume the split"} onClick={pause}>
-                {live ? <Pause size={15} /> : <Play size={15} />}
-              </button>
-            )}
-          </>
+          d.own ? (
+            <button type="button" className="ms-go" aria-label={`New experiment on ${d.name}`} title="New experiment" onClick={onSetup}>
+              <Plus size={15} />
+            </button>
+          ) : undefined
         }
       />
-      {open &&
-        vs.map((v, i) => (
-          <VariantNode
-            key={v.id}
-            all={vs}
-            i={i}
-            weight={weights[i] ?? v.weight}
-            fixed={e.state === "promoted"}
-            onWeight={(w) => setStaged(rebalance(weights, i, w))}
-            onName={(name) => setNames({ ...names, [v.id]: name })}
-            asking={asking === v.id}
-            onAsk={() => setAsking(asking === v.id ? null : v.id)}
-            onPromote={() => promote(v.id)}
-          />
-        ))}
+      {(open || setup) && (
+        <>
+          {setup && (
+            <SetupNodes
+              d={d}
+              onDone={onSetupDone}
+              onStart={(e) => {
+                setList((l) => [e, ...l]);
+                setShown(e.id);
+                onSetupDone();
+              }}
+            />
+          )}
+          {list.map((e) => (
+            <ExperimentNodes key={e.id} e={e} own={d.own} open={shown === e.id} onOpen={() => setShown(shown === e.id ? null : e.id)} change={change(e.id)} onDelete={() => remove(e)} />
+          ))}
+          {list.length === 0 && !setup && (
+            <li className="ms-node df-exp-body" data-depth={2}>
+              <span className="df-head-v">No experiment yet: + splits its new sessions between deployments.</span>
+            </li>
+          )}
+        </>
+      )}
     </>
   );
 }
 
-/** A variant: its swatch and name (renamed in place), its measures, its weight, Promote. */
-function VariantNode({
+/**
+ * One experiment: a line of its name and state, then, opened, what it is (since when, its sessions, its
+ * split's version), its split by its named variants, its controls (pause and resume, stop, delete: round,
+ * a stop red, each asked again), its variants (renamed, weighted, added, removed, one promoted), and its
+ * criteria, each with every variant's value, the best checked, a bound missed marked, and a chart of
+ * each variant's day by day, the bound drawn across it.
+ */
+function ExperimentNodes({
+  e,
+  own,
+  open,
+  onOpen,
+  change,
+  onDelete,
+}: {
+  e: Experiment;
+  own: boolean;
+  open: boolean;
+  onOpen: () => void;
+  change: (fn: (e: Experiment) => Experiment) => void;
+  onDelete: () => void;
+}) {
+  const [staged, setStaged] = React.useState<number[] | null>(null);
+  const [promoting, setPromoting] = React.useState<string | null>(null);
+  const [ending, setEnding] = React.useState<"stop" | "delete" | null>(null);
+  const [naming, setNaming] = React.useState(false);
+  const [adding, setAdding] = React.useState(false);
+  const vs = e.variants;
+  const weights = staged ?? vs.map((v) => v.weight);
+  const live = e.state === "live";
+  const running = live || e.state === "paused";
+  const stand = EXP_STAND[e.state];
+  const apply = () => {
+    change((x) => ({ ...x, version: x.version + 1, variants: x.variants.map((v, i) => ({ ...v, weight: weights[i] ?? v.weight })) }));
+    setStaged(null);
+    toast({ title: `${e.name}: split v${e.version + 1}, ${weights.join("/")}`, tone: "info" });
+  };
+  const pause = () => {
+    change((x) => ({ ...x, state: live ? "paused" : "live" }));
+    toast({ title: live ? `Paused ${e.name}` : `Resumed ${e.name}`, tone: "info" });
+  };
+  const stop = () => {
+    change((x) => ({ ...x, state: "stopped" }));
+    setEnding(null);
+    toast({ title: `Stopped ${e.name}: new sessions start on its current variant`, tone: "info" });
+  };
+  const promote = (id: string) => {
+    const name = variantName(
+      vs,
+      vs.findIndex((v) => v.id === id),
+    );
+    change((x) => ({ ...x, state: "promoted", variants: x.variants.map((v) => ({ ...v, current: v.id === id, weight: v.id === id ? 100 : 0 })) }));
+    setPromoting(null);
+    toast({ title: `Promoted ${name}`, tone: "succeeded" });
+  };
+  const addVariant = () => {
+    const last = vs[vs.length - 1];
+    if (!last) return;
+    change((x) => ({ ...x, variants: [...x.variants, { ...last, id: `${x.id}-v${x.variants.length + 1}`, name: null, weight: 0, sessions: 0, current: false, measures: NO_MEASURES, trend: {} }] }));
+  };
+  const dropVariant = (id: string) =>
+    change((x) => {
+      const rest = x.variants.filter((v) => v.id !== id);
+      const total = rest.reduce((n, v) => n + v.weight, 0) || 1;
+      return { ...x, variants: rest.map((v) => ({ ...v, weight: Math.round((v.weight / total) * 100) })) };
+    });
+  return (
+    <>
+      <li className="ms-node df-exp df-head" data-stand={stand} data-depth={2} data-open={open || undefined}>
+        <button type="button" className="df-head-main" aria-expanded={open} onClick={onOpen}>
+          <span className="df-chev">
+            <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
+          </span>
+          <span className="df-exp-name">{e.name}</span>
+        </button>
+        <span className="df-head-end">
+          <span className="ms-word df-exp-word">
+            <i aria-hidden="true" />
+            {EXP_WORD[stand]}
+          </span>
+        </span>
+        <span className="df-head-acts" />
+      </li>
+      {open && (
+        <li className="ms-node df-exp-body" data-stand={stand} data-depth={3}>
+          {naming ? (
+            <span className="ms-edit">
+              <input
+                className="ms-edit-in"
+                autoFocus
+                defaultValue={e.name}
+                aria-label="Its name"
+                onKeyDown={(k) => {
+                  if (k.key === "Enter" && k.currentTarget.value.trim()) {
+                    const name = k.currentTarget.value.trim();
+                    change((x) => ({ ...x, name }));
+                    setNaming(false);
+                  }
+                  if (k.key === "Escape") setNaming(false);
+                }}
+              />
+            </span>
+          ) : (
+            <span className="df-exp-facts">
+              <span>
+                started <Ago ts={Math.floor(e.started_at / 1000)} />
+              </span>
+              <span>{e.sessions} sessions</span>
+              <span>split v{e.version}</span>
+              {own && (
+                <button type="button" className="df-rename" onClick={() => setNaming(true)} aria-label={`Rename ${e.name}`} title="Rename it">
+                  <Pencil size={12} aria-hidden="true" />
+                </button>
+              )}
+            </span>
+          )}
+          <span
+            className="df-exp-split"
+            data-staged={staged ? "" : undefined}
+            aria-label={`Split ${vs.map((_, i) => `${variantName(vs, i)} ${weights[i]}%`).join(", ")}${staged ? ", not yet applied" : ""}`}
+          >
+            {vs.map((v, i) => (
+              <i key={v.id} style={{ flexGrow: Math.max(weights[i] ?? 0, 0.5), background: variantTone(i, vs.length) }} title={`${variantName(vs, i)} · ${weights[i]}%`} />
+            ))}
+          </span>
+          {own && (
+            <span className="df-exp-ctl">
+              {ending ? (
+                <span className="ms-confirm" role="group" aria-label={`${ending === "stop" ? "Stop" : "Delete"} ${e.name}?`}>
+                  <span>{ending === "stop" ? "Stop it?" : "Delete it?"}</span>
+                  <button
+                    type="button"
+                    className="fig-round"
+                    data-size="sm"
+                    data-tone="stop"
+                    aria-label={ending === "stop" ? `Stop ${e.name}` : `Delete ${e.name}`}
+                    onClick={ending === "stop" ? stop : onDelete}
+                  >
+                    <Check size={15} />
+                  </button>
+                  <button type="button" className="fig-round" data-size="sm" aria-label="Keep it" onClick={() => setEnding(null)}>
+                    <X size={15} />
+                  </button>
+                </span>
+              ) : (
+                <>
+                  {running && (
+                    <button
+                      type="button"
+                      className="fig-round"
+                      data-size="sm"
+                      title={live ? "Pause the split" : "Resume the split"}
+                      aria-label={`${live ? "Pause" : "Resume"} ${e.name}`}
+                      onClick={pause}
+                    >
+                      {live ? <Pause size={15} /> : <Play size={15} />}
+                    </button>
+                  )}
+                  {running && (
+                    <button type="button" className="fig-round" data-size="sm" data-tone="stop" title="Stop it" aria-label={`Stop ${e.name}`} onClick={() => setEnding("stop")}>
+                      <Square size={13} />
+                    </button>
+                  )}
+                  <button type="button" className="fig-round" data-size="sm" data-tone="stop" title="Delete it" aria-label={`Delete ${e.name}`} onClick={() => setEnding("delete")}>
+                    <Trash2 size={14} />
+                  </button>
+                  {staged && (
+                    <>
+                      <Button size="xs" variant="secondary" onClick={apply}>
+                        Apply the split
+                      </Button>
+                      <Button size="xs" variant="ghost" onClick={() => setStaged(null)}>
+                        Discard
+                      </Button>
+                    </>
+                  )}
+                </>
+              )}
+            </span>
+          )}
+          <span className="ms-sep-h df-exp-k">Variants</span>
+          <ul className="df-vlist">
+            {vs.map((v, i) => (
+              <VariantLine
+                key={v.id}
+                all={vs}
+                i={i}
+                weight={weights[i] ?? v.weight}
+                fixed={!running || !own}
+                promoting={promoting === v.id}
+                onPromoting={() => setPromoting(promoting === v.id ? null : v.id)}
+                onPromote={() => promote(v.id)}
+                onWeight={(w) => setStaged(rebalance(weights, i, w))}
+                onName={(name) => change((x) => ({ ...x, variants: x.variants.map((o) => (o.id === v.id ? { ...o, name: name || null } : o)) }))}
+                onDrop={vs.length > 2 && !v.current && running && own ? () => dropVariant(v.id) : undefined}
+              />
+            ))}
+          </ul>
+          {own && running && (
+            <button type="button" className="df-add" onClick={addVariant}>
+              <Plus size={13} aria-hidden="true" />
+              Add a variant
+            </button>
+          )}
+          <span className="ms-sep-h df-exp-k">Criteria</span>
+          {e.criteria.length === 0 && <span className="df-head-v">None: its variants are compared on every measure alone.</span>}
+          {e.criteria.map((c) => (
+            <CriterionBlock key={c.id} c={c} vs={vs} onDrop={own ? () => change((x) => ({ ...x, criteria: x.criteria.filter((o) => o.id !== c.id) })) : undefined} />
+          ))}
+          {own &&
+            (adding ? (
+              <CriterionForm
+                onAdd={(c) => {
+                  change((x) => ({ ...x, criteria: [...x.criteria, c] }));
+                  setAdding(false);
+                }}
+                onCancel={() => setAdding(false)}
+              />
+            ) : (
+              <button type="button" className="df-add" onClick={() => setAdding(true)}>
+                <Plus size={13} aria-hidden="true" />
+                Add a criterion
+              </button>
+            ))}
+        </li>
+      )}
+    </>
+  );
+}
+
+/** A variant: its swatch and name (renamed in place), its measures, its weight and sessions, Promote, its removal. */
+function VariantLine({
   all,
   i,
   weight,
   fixed,
+  promoting,
+  onPromoting,
+  onPromote,
   onWeight,
   onName,
-  asking,
-  onAsk,
-  onPromote,
+  onDrop,
 }: {
   all: Variant[];
   i: number;
   weight: number;
   fixed: boolean;
+  promoting: boolean;
+  onPromoting: () => void;
+  onPromote: () => void;
   onWeight: (w: number) => void;
   onName: (n: string) => void;
-  asking: boolean;
-  onAsk: () => void;
-  onPromote: () => void;
+  onDrop?: () => void;
 }) {
   const v = all[i]!;
   const [naming, setNaming] = React.useState(false);
   const tone = variantTone(i, all.length);
   const name = variantName(all, i);
-  const win = (k: keyof Variant["measures"]) => all.every((o) => o === v || v.measures[k][2] < o.measures[k][0]);
+  const win = (k: Measure) => all.every((o) => o === v || v.measures[k][2] < o.measures[k][0]);
   return (
-    <li className="ms-node ms-variant" data-stand="done" data-depth={2}>
-      <span className="ms-node-path df-swatch-cell">
+    <li className="df-vline">
+      <span className="df-vline-top">
         <Swatch tone={tone} current={v.current} title={v.current ? `${name}: what new sessions start on` : name} />
-      </span>
-      <span className="ms-node-main">
         {naming ? (
-          <span className="ms-edit">
-            <input
-              className="ms-edit-in"
-              autoFocus
-              defaultValue={v.name ?? ""}
-              placeholder={variantName(
-                all.map((x, j) => (j === i ? { ...x, name: null } : x)),
-                i,
-              )}
-              aria-label="Variant name"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  onName(e.currentTarget.value.trim());
-                  setNaming(false);
-                }
-                if (e.key === "Escape") setNaming(false);
-              }}
-            />
-            <button
-              type="button"
-              className="ms-go"
-              aria-label="Save the name"
-              onClick={(e) => {
-                onName((e.currentTarget.previousElementSibling as HTMLInputElement).value.trim());
+          <input
+            className="ms-edit-in"
+            autoFocus
+            defaultValue={v.name ?? ""}
+            placeholder={variantName(
+              all.map((x, j) => (j === i ? { ...x, name: null } : x)),
+              i,
+            )}
+            aria-label="Variant name"
+            onKeyDown={(k) => {
+              if (k.key === "Enter") {
+                onName(k.currentTarget.value.trim());
                 setNaming(false);
-              }}
-            >
-              <Check size={15} />
-            </button>
-          </span>
+              }
+              if (k.key === "Escape") setNaming(false);
+            }}
+          />
         ) : (
-          <button type="button" className="ms-node-name df-vname" title="Rename it" onClick={() => setNaming(true)}>
+          <button type="button" className="df-vname" title="Rename it" onClick={() => setNaming(true)}>
             {name}
             <Pencil size={11} aria-hidden="true" />
           </button>
         )}
-        <span className="ms-node-line">
-          <span className="ms-node-text">
-            <Measure label="warm" iv={v.measures.warm_ms} f={(x) => `${Math.round(x)}ms`} win={win("warm_ms")} />
-            <Measure label="peak" iv={v.measures.peak_gib} f={(x) => `${x.toFixed(2)}G`} win={win("peak_gib")} />
-            <Measure label="failed" iv={v.measures.failed_pct} f={(x) => `${Math.round(x)}%`} win={win("failed_pct")} />
-          </span>
-        </span>
+        {v.current && <span className="df-head-v">current</span>}
       </span>
-      <span className="ms-node-meta">
+      <span className="df-vline-measures">
+        <Measure label="warm" iv={v.measures.warm_ms} f={MEASURE.warm_ms.f} win={win("warm_ms")} />
+        <Measure label="peak" iv={v.measures.peak_gib} f={MEASURE.peak_gib.f} win={win("peak_gib")} />
+        <Measure label="failed" iv={v.measures.failed_pct} f={MEASURE.failed_pct.f} win={win("failed_pct")} />
+      </span>
+      <span className="df-vline-weight">
         <input
           type="range"
           className="ms-weight-in"
@@ -604,160 +829,279 @@ function VariantNode({
           value={weight}
           disabled={fixed}
           aria-label={`${name}'s weight`}
-          onChange={(e) => onWeight(Number(e.target.value))}
+          onChange={(k) => onWeight(Number(k.target.value))}
         />
-        <span>
+        <span className="df-head-v">
           {weight}% · {v.sessions} sessions
         </span>
       </span>
-      <span className="ms-node-actions">
-        <span className="ms-decide">
-          {!v.current && !fixed && !asking && (
-            <Button size="xs" variant="secondary" onClick={onAsk}>
-              Promote
-            </Button>
-          )}
-          {asking && (
+      {!fixed && (
+        <span className="df-vline-ctl">
+          {promoting ? (
             <span className="ms-confirm" role="group" aria-label={`Promote ${name}?`}>
               <span>Promote?</span>
-              <button type="button" className="ms-go" aria-label={`Promote ${name}`} onClick={onPromote}>
+              <button type="button" className="fig-round" data-size="sm" aria-label={`Promote ${name}`} onClick={onPromote}>
                 <Check size={15} />
               </button>
-              <button type="button" className="ms-go" aria-label="Keep the split" onClick={onAsk}>
+              <button type="button" className="fig-round" data-size="sm" aria-label="Keep the split" onClick={onPromoting}>
                 <X size={15} />
               </button>
             </span>
+          ) : (
+            <>
+              {!v.current && (
+                <Button size="xs" variant="secondary" onClick={onPromoting}>
+                  Promote
+                </Button>
+              )}
+              {onDrop && (
+                <button type="button" className="ms-go" aria-label={`Remove ${name}`} title="Remove it" onClick={onDrop}>
+                  <X size={15} />
+                </button>
+              )}
+            </>
           )}
         </span>
-      </span>
+      )}
     </li>
+  );
+}
+
+/** A criterion: its name and rule, each variant's value (the best checked, a bound missed marked), a chart of each variant's day by day, its bound drawn across. */
+function CriterionBlock({ c, vs, onDrop }: { c: Criterion; vs: Variant[]; onDrop?: () => void }) {
+  const m = MEASURE[c.measure];
+  const mids = vs.map((v) => v.measures[c.measure][1]);
+  const best = c.better === "lower" ? Math.min(...mids) : Math.max(...mids);
+  const keeps = (x: number) => c.bound === undefined || (c.better === "lower" ? x <= c.bound : x >= c.bound);
+  const rule = `${c.better === "lower" ? "lower" : "higher"} is better${c.bound === undefined ? "" : ` · ${c.better === "lower" ? "at most" : "at least"} ${m.f(c.bound)}`}`;
+  return (
+    <div className="df-crit">
+      <span className="df-crit-top">
+        <span className="df-crit-name">{c.name}</span>
+        <span className="df-head-v">{rule}</span>
+        {onDrop && (
+          <button type="button" className="ms-go" aria-label={`Remove ${c.name}`} title="Remove it" onClick={onDrop}>
+            <X size={14} />
+          </button>
+        )}
+      </span>
+      <span className="df-crit-vals">
+        {vs.map((v, i) => {
+          const x = mids[i] ?? 0;
+          return (
+            <span key={v.id} className="df-crit-val" data-best={x === best || undefined} data-missed={!keeps(x) || undefined}>
+              <Swatch tone={variantTone(i, vs.length)} />
+              {m.f(x)}
+              {x === best ? " ✓" : ""}
+              {!keeps(x) ? " · misses" : ""}
+            </span>
+          );
+        })}
+      </span>
+      <TrendChart lines={vs.map((v, i) => ({ label: variantName(vs, i), tone: variantTone(i, vs.length), values: v.trend?.[c.measure] ?? [] }))} bound={c.bound} label={`${c.name}, day by day`} />
+    </div>
+  );
+}
+
+/** Each line its variant's tone, day by day, scaled to them all and the bound, which is drawn across dashed. */
+function TrendChart({ lines, bound, label }: { lines: { label: string; tone: string; values: number[] }[]; bound?: number; label: string }) {
+  const all = [...lines.flatMap((l) => l.values), ...(bound === undefined ? [] : [bound])];
+  if (all.length < 2) return null;
+  const lo = Math.min(...all);
+  const span = Math.max(...all) - lo || 1;
+  const W = 480,
+    H = 64,
+    pad = 4;
+  const y = (v: number) => H - pad - ((v - lo) / span) * (H - 2 * pad);
+  const x = (i: number, n: number) => pad + (i / Math.max(1, n - 1)) * (W - 2 * pad);
+  const days = Math.max(...lines.map((l) => l.values.length));
+  return (
+    <>
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="df-trend" role="img" aria-label={label}>
+        {bound !== undefined && <line x1={0} x2={W} y1={y(bound)} y2={y(bound)} className="df-trend-bound" />}
+        {lines.map((l) =>
+          l.values.length > 1 ? (
+            <polyline key={l.label} points={l.values.map((v, i) => `${x(i, l.values.length)},${y(v)}`).join(" ")} fill="none" stroke={l.tone} strokeWidth={1.6} vectorEffect="non-scaling-stroke" />
+          ) : null,
+        )}
+      </svg>
+      <span className="df-trend-cap" aria-hidden="true">
+        <span>{days - 1} days ago</span>
+        <span>today</span>
+      </span>
+    </>
+  );
+}
+
+/** A criterion added in place: its name, which measure, which way is better, and its bound, if any. */
+function CriterionForm({ onAdd, onCancel }: { onAdd: (c: Criterion) => void; onCancel: () => void }) {
+  const [measure, setMeasure] = React.useState<Measure>("failed_pct");
+  const [better, setBetter] = React.useState<"lower" | "higher">("lower");
+  const [name, setName] = React.useState(MEASURE.failed_pct.word);
+  const [bound, setBound] = React.useState("");
+  const n = Number(bound);
+  return (
+    <span className="df-crit-form">
+      <input className="ms-edit-in" value={name} aria-label="Its name" onChange={(k) => setName(k.target.value)} />
+      <select
+        className="ms-edit-in ms-narrow"
+        value={measure}
+        aria-label="Its measure"
+        onChange={(k) => {
+          const next = k.target.value as Measure;
+          setMeasure(next);
+          setName(MEASURE[next].word);
+        }}
+      >
+        {(Object.keys(MEASURE) as Measure[]).map((k) => (
+          <option key={k} value={k}>
+            {MEASURE[k].word}
+          </option>
+        ))}
+      </select>
+      <Segmented
+        size="xs"
+        label="Better"
+        value={better}
+        onChange={setBetter}
+        options={[
+          { value: "lower", label: "lower" },
+          { value: "higher", label: "higher" },
+        ]}
+      />
+      <input className="ms-edit-in ms-narrow" value={bound} placeholder={`bound, ${MEASURE[measure].unit}`} aria-label="Its bound" inputMode="decimal" onChange={(k) => setBound(k.target.value)} />
+      <Button size="xs" disabled={!name.trim()} onClick={() => onAdd({ id: `c-${Date.now()}`, name: name.trim(), measure, better, ...(bound.trim() && Number.isFinite(n) ? { bound: n } : {}) })}>
+        Add
+      </Button>
+      <Button size="xs" variant="ghost" onClick={onCancel}>
+        Cancel
+      </Button>
+    </span>
   );
 }
 
 type Draft = { agentfile: string; engine: "microvm" | "host"; cpus: number; memory: number; weight: number };
 
-/** A new experiment, set up in place: variants (as many as you add), each a deployment and a weight; Start splits new sessions. */
+/** A new experiment, set up in place: its name, variants (as many as you add, each a deployment and a weight), the criteria it's judged by; Start splits new sessions. */
 function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; onStart: (e: Experiment) => void }) {
   const G = 2 ** 30;
+  const [name, setName] = React.useState(`${d.name}'s sizes`);
   const [vs, setVs] = React.useState<Draft[]>([
     { agentfile: setupAgentfile(d), engine: "microvm", cpus: 2, memory: 4 * G, weight: 80 },
     { agentfile: setupAgentfile(d), engine: "microvm", cpus: 4, memory: 8 * G, weight: 20 },
   ]);
+  const [judged, setJudged] = React.useState<Measure[]>(["failed_pct", "warm_ms"]);
   const set = (i: number, patch: Partial<Draft>) => setVs(vs.map((v, j) => (j === i ? { ...v, ...patch } : v)));
   const start = () => {
     onStart({
-      id: `${d.name}-split`,
+      id: `${d.name}-${Date.now()}`,
+      name: name.trim() || `${d.name}'s split`,
       state: "live",
       version: 1,
       sessions: 0,
-      variants: vs.map((v, i) => ({ id: `new-${i}`, name: null, ...v, sessions: 0, current: i === 0, measures: { warm_ms: [0, 0, 0], peak_gib: [0, 0, 0], failed_pct: [0, 0, 0] } })),
+      started_at: Date.now(),
+      criteria: judged.map((m) => ({ id: m, name: MEASURE[m].word, measure: m, better: "lower" })),
+      variants: vs.map((v, i) => ({ id: `new-${i}`, name: null, ...v, sessions: 0, current: i === 0, measures: NO_MEASURES, trend: {} })),
     });
-    toast({ title: `Splitting ${d.name}'s new sessions`, tone: "running" });
+    toast({ title: `Splitting ${d.name}'s new sessions: ${name.trim()}`, tone: "running" });
   };
   return (
-    <>
-      <GroupHead
-        label="Experiment"
-        open
-        onOpen={onDone}
-        stand="paused"
-        summary={
-          <>
-            <span className="ms-split" data-staged="">
-              {vs.map((v, i) => (
-                <i key={i} style={{ flexGrow: v.weight, background: variantTone(i, vs.length) }} />
-              ))}
-            </span>
-            <span className="df-weights">{vs.map((v) => v.weight).join("/")}</span>
-            <span>new</span>
-          </>
-        }
-        actions={
-          <>
-            <Button size="xs" variant="secondary" onClick={() => setVs([...vs, { ...vs[vs.length - 1]!, weight: 0 }])}>
-              Add variant
-            </Button>
-            <Button size="xs" onClick={start}>
-              Start
-            </Button>
-            <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
-              <X size={15} />
-            </button>
-          </>
-        }
-      />
-      {vs.map((v, i) => (
-        <li key={i} className="ms-node ms-variant" data-stand="done" data-depth={2}>
-          <span className="ms-node-path df-swatch-cell">
-            <Swatch tone={variantTone(i, vs.length)} title={variantName(vs, i)} />
-          </span>
-          <span className="ms-node-main ms-setup">
-            <select className="ms-edit-in" value={v.agentfile} aria-label="Agentfile" onChange={(e) => set(i, { agentfile: e.target.value })}>
-              {["rust-dev", "docs-site", `harness-${d.harness}`].map((a) => (
-                <option key={a}>{a}</option>
-              ))}
-            </select>
-            <Segmented
-              size="xs"
-              label="Engine"
-              value={v.engine}
-              onChange={(x) => set(i, { engine: x })}
-              options={[
-                { value: "microvm", label: "microVM" },
-                { value: "host", label: "host" },
-              ]}
-            />
-            {v.engine === "microvm" && (
-              <>
-                <select className="ms-edit-in ms-narrow" value={v.cpus} aria-label="vCPUs" onChange={(e) => set(i, { cpus: Number(e.target.value) })}>
-                  {[1, 2, 4, 8].map((n) => (
-                    <option key={n} value={n}>
-                      {n} vCPU
-                    </option>
-                  ))}
-                </select>
-                <select className="ms-edit-in ms-narrow" value={v.memory / G} aria-label="Memory" onChange={(e) => set(i, { memory: Number(e.target.value) * G })}>
-                  {[2, 4, 8, 16].map((n) => (
-                    <option key={n} value={n}>
-                      {n} GiB
-                    </option>
-                  ))}
-                </select>
-              </>
-            )}
-          </span>
-          <span className="ms-node-meta">
-            <input
-              type="range"
-              className="ms-weight-in"
-              style={{ accentColor: variantTone(i, vs.length) }}
-              min={0}
-              max={100}
-              value={v.weight}
-              aria-label={`${variantName(vs, i)}'s weight`}
-              onChange={(e) => {
-                const ws = rebalance(
-                  vs.map((x) => x.weight),
-                  i,
-                  Number(e.target.value),
-                );
-                setVs(vs.map((x, j) => ({ ...x, weight: ws[j] ?? x.weight })));
-              }}
-            />
-            <span>{v.weight}%</span>
-          </span>
-          <span className="ms-node-actions">
-            <span className="ms-tail">
+    <li className="ms-node df-exp-body df-exp-new" data-stand="paused" data-depth={2}>
+      <span className="ms-sep-h df-exp-k">New experiment</span>
+      <input className="ms-edit-in df-exp-namein" value={name} aria-label="Its name" onChange={(k) => setName(k.target.value)} />
+      <span className="ms-sep-h df-exp-k">Variants</span>
+      <ul className="df-vlist">
+        {vs.map((v, i) => (
+          <li key={i} className="df-vline">
+            <span className="df-vline-top">
+              <Swatch tone={variantTone(i, vs.length)} title={variantName(vs, i)} />
+              <span className="df-vname">{variantName(vs, i)}</span>
               {i > 1 && (
                 <button type="button" className="ms-go" aria-label="Remove this variant" onClick={() => setVs(vs.filter((_, j) => j !== i))}>
                   <X size={15} />
                 </button>
               )}
             </span>
-          </span>
-        </li>
-      ))}
-    </>
+            <span className="ms-setup">
+              <select className="ms-edit-in" value={v.agentfile} aria-label="Agentfile" onChange={(k) => set(i, { agentfile: k.target.value })}>
+                {["rust-dev", "docs-site", `harness-${d.harness}`].map((a) => (
+                  <option key={a}>{a}</option>
+                ))}
+              </select>
+              <Segmented
+                size="xs"
+                label="Engine"
+                value={v.engine}
+                onChange={(x) => set(i, { engine: x })}
+                options={[
+                  { value: "microvm", label: "microVM" },
+                  { value: "host", label: "host" },
+                ]}
+              />
+              {v.engine === "microvm" && (
+                <>
+                  <select className="ms-edit-in ms-narrow" value={v.cpus} aria-label="vCPUs" onChange={(k) => set(i, { cpus: Number(k.target.value) })}>
+                    {[1, 2, 4, 8].map((n) => (
+                      <option key={n} value={n}>
+                        {n} vCPU
+                      </option>
+                    ))}
+                  </select>
+                  <select className="ms-edit-in ms-narrow" value={v.memory / G} aria-label="Memory" onChange={(k) => set(i, { memory: Number(k.target.value) * G })}>
+                    {[2, 4, 8, 16].map((n) => (
+                      <option key={n} value={n}>
+                        {n} GiB
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
+            </span>
+            <span className="df-vline-weight">
+              <input
+                type="range"
+                className="ms-weight-in"
+                style={{ accentColor: variantTone(i, vs.length) }}
+                min={0}
+                max={100}
+                value={v.weight}
+                aria-label={`${variantName(vs, i)}'s weight`}
+                onChange={(k) => {
+                  const ws = rebalance(
+                    vs.map((x) => x.weight),
+                    i,
+                    Number(k.target.value),
+                  );
+                  setVs(vs.map((x, j) => ({ ...x, weight: ws[j] ?? x.weight })));
+                }}
+              />
+              <span className="df-head-v">{v.weight}%</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+      <button type="button" className="df-add" onClick={() => setVs([...vs, { ...vs[vs.length - 1]!, weight: 0 }])}>
+        <Plus size={13} aria-hidden="true" />
+        Add a variant
+      </button>
+      <span className="ms-sep-h df-exp-k">Judged by</span>
+      <span className="df-judged">
+        {(Object.keys(MEASURE) as Measure[]).map((m) => (
+          <label key={m} className="df-judge">
+            <input type="checkbox" checked={judged.includes(m)} onChange={(k) => setJudged(k.target.checked ? [...judged, m] : judged.filter((x) => x !== m))} />
+            {MEASURE[m].word}, lower is better
+          </label>
+        ))}
+      </span>
+      <span className="df-exp-ctl">
+        <Button size="xs" onClick={start}>
+          Start
+        </Button>
+        <Button size="xs" variant="ghost" onClick={onDone}>
+          Cancel
+        </Button>
+      </span>
+    </li>
   );
 }
 
@@ -773,35 +1117,22 @@ function Measure({ label, iv, f, win }: { label: string; iv: [number, number, nu
 
 type DefAskKind = "delete" | "versions";
 
-/** Run one: the server starts an agent from it (a microVM, its Agentfile's latest), and its page opens; one that waits says so. */
-function RunButton({ d }: { d: AgentDef }) {
-  const navigate = useNavigate();
-  const [busy, setBusy] = React.useState(false);
-  return (
-    <Button
-      size="xs"
-      variant="secondary"
-      pending={busy}
-      onClick={() => {
-        setBusy(true);
-        agentdefsApi
-          .run(d.id)
-          .then((r) => {
-            const started = r.agents[0];
-            if (started) navigate(`/agents/${started.id}`);
-            else toast({ title: `${d.name} v${r.agentdef.version}`, description: r.queued, tone: "info" });
-          })
-          .catch((e: unknown) => toast.error(`Couldn't run ${d.name}`, errorMessage(e)))
-          .finally(() => setBusy(false));
-      }}
-    >
-      Run
-    </Button>
-  );
-}
-
-/** A definition's rarer acts, behind one ⋯, as a Mission row's are (actions.tsx): its versions, an experiment, a copy, delete; kiln's own copied as yours. */
+/**
+ * A definition's acts, behind one ⋯, as a Mission row's are (actions.tsx): a session started from it
+ * (the server starts an agent from it, a microVM of its Agentfile's latest, and its page opens; one
+ * that waits says so), its versions, an experiment, a copy, delete; kiln's own copied as yours.
+ */
 function DefMenu({ d, onSetup, onAsk }: { d: AgentDef; onSetup: () => void; onAsk: (what: DefAskKind) => void }) {
+  const navigate = useNavigate();
+  const start = () =>
+    agentdefsApi
+      .run(d.id)
+      .then((r) => {
+        const started = r.agents[0];
+        if (started) navigate(`/agents/${started.id}`);
+        else toast({ title: `${d.name} v${r.agentdef.version}`, description: r.queued, tone: "info" });
+      })
+      .catch((e: unknown) => toast.error(`Couldn't start ${d.name}`, errorMessage(e)));
   const copy = () =>
     agentdefsApi.copy(d.id).then(
       (mine) => {
@@ -835,12 +1166,16 @@ function DefMenu({ d, onSetup, onAsk }: { d: AgentDef; onSetup: () => void; onAs
       );
   const items: { label: string; onSelect: () => void; danger?: boolean }[] = d.own
     ? [
+        { label: `Start a session from ${d.name}`, onSelect: () => void start() },
         { label: `Versions (v${d.version})`, onSelect: () => onAsk("versions") },
-        ...(d.experiment ? [] : [{ label: "New experiment", onSelect: onSetup }]),
+        { label: "New experiment", onSelect: onSetup },
         { label: "Duplicate", onSelect: () => void duplicate() },
         { label: "Delete…", onSelect: () => onAsk("delete"), danger: true },
       ]
-    : [{ label: "Copy as yours", onSelect: () => void copy() }];
+    : [
+        { label: `Start a session from ${d.name}`, onSelect: () => void start() },
+        { label: "Copy as yours", onSelect: () => void copy() },
+      ];
   return (
     <DropdownMenu.Root modal={false}>
       <DropdownMenu.Trigger asChild>
@@ -917,9 +1252,9 @@ function DefVersions({ d, onDone }: { d: AgentDef; onDone: () => void }) {
         <li key={v.version} className="ms-node df-ask" data-stand="done" data-depth={2}>
           <span className="ms-node-path" />
           <span className="ms-node-main">
-            <span className="df-group-line">
+            <span className="df-ver-line">
               <span className="ms-sep-h df-group-k">v{v.version}</span>
-              <span className="df-group-sum">
+              <span className="df-ver-sum">
                 <span>{v.model ? modelLabel(v.model) : "default"}</span>
                 {limitWords(v.limits) && <span>{limitWords(v.limits)}</span>}
                 <span className="df-clip">{v.instructions || "no instructions"}</span>
@@ -969,11 +1304,11 @@ function DefVersions({ d, onDone }: { d: AgentDef; onDone: () => void }) {
 }
 
 /** A session's own controls on its row: pause or resume (undone from its toast), and stop, asked in place. */
-function SessionControls({ a, stand }: { a: AgentInfo; stand: string }) {
+function SessionControls({ a, stand }: { a: AgentInfo; stand: ChatStand }) {
   const [asking, setAsking] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const paused = stand === "paused";
-  const live = stand !== "stopped" && stand !== "failed";
+  const live = stand !== "ended" && stand !== "crashed" && stand !== "offline";
   const pause = (on: boolean) => {
     setBusy(true);
     harnessApi
@@ -989,34 +1324,46 @@ function SessionControls({ a, stand }: { a: AgentInfo; stand: string }) {
       .finally(() => setBusy(false));
   };
   if (!live) return null;
-  if (asking)
-    return (
-      <span className="ms-confirm" role="group" aria-label={`Stop ${agentLabel(a)}?`}>
-        <span>Stop?</span>
-        <button
-          type="button"
-          className="ms-go"
-          aria-label="Stop it"
-          onClick={() => {
-            setAsking(false);
-            toast({ title: `Stopping ${agentLabel(a)}`, tone: "info" });
-          }}
-        >
-          <Check size={15} />
-        </button>
-        <button type="button" className="ms-go" aria-label="Keep it" onClick={() => setAsking(false)}>
-          <X size={15} />
-        </button>
-      </span>
-    );
   return (
-    <span className="ms-ctl">
-      <button type="button" className="ms-go" disabled={busy} title={paused ? "Resume (P)" : "Pause (P)"} aria-label={`${paused ? "Resume" : "Pause"} ${agentLabel(a)}`} onClick={() => pause(!paused)}>
-        {paused ? <Play size={15} /> : <Pause size={15} />}
-      </button>
-      <button type="button" className="ms-go" title="Stop (S)" aria-label={`Stop ${agentLabel(a)}`} onClick={() => setAsking(true)}>
-        <Square size={14} />
-      </button>
+    <span className="df-sess-ctl">
+      {asking ? (
+        <span className="ms-confirm" role="group" aria-label={`Stop ${agentLabel(a)}?`}>
+          <span>Stop?</span>
+          <button
+            type="button"
+            className="fig-round"
+            data-size="sm"
+            data-tone="stop"
+            aria-label="Stop it"
+            onClick={() => {
+              setAsking(false);
+              toast({ title: `Stopping ${agentLabel(a)}`, tone: "info" });
+            }}
+          >
+            <Check size={15} />
+          </button>
+          <button type="button" className="fig-round" data-size="sm" aria-label="Keep it" onClick={() => setAsking(false)}>
+            <X size={15} />
+          </button>
+        </span>
+      ) : (
+        <>
+          <button
+            type="button"
+            className="fig-round"
+            data-size="sm"
+            disabled={busy}
+            title={paused ? "Resume (P)" : "Pause (P)"}
+            aria-label={`${paused ? "Resume" : "Pause"} ${agentLabel(a)}`}
+            onClick={() => pause(!paused)}
+          >
+            {paused ? <Play size={15} /> : <Pause size={15} />}
+          </button>
+          <button type="button" className="fig-round" data-size="sm" data-tone="stop" title="Stop (S)" aria-label={`Stop ${agentLabel(a)}`} onClick={() => setAsking(true)}>
+            <Square size={13} />
+          </button>
+        </>
+      )}
     </span>
   );
 }
@@ -1091,7 +1438,7 @@ export function DefValues({ d }: { d: AgentDef }) {
   };
   const field = (k: keyof Values, words: string) =>
     editing === k ? (
-      <span className="ms-edit">
+      <span className="ms-edit" data-k={k}>
         <span className="ms-edit-k">{VALUE_WORDS[k]}</span>
         <input
           className="ms-edit-in"
@@ -1110,23 +1457,25 @@ export function DefValues({ d }: { d: AgentDef }) {
         </button>
       </span>
     ) : (
-      <button type="button" className="ms-field" title={own ? `Change its ${VALUE_WORDS[k]}` : "kiln's: copy it to change it"} disabled={!own || saving} onClick={() => setEditing(k)}>
+      <button type="button" className="ms-field" data-k={k} title={own ? `Change its ${VALUE_WORDS[k]}` : "kiln's: copy it to change it"} disabled={!own || saving} onClick={() => setEditing(k)}>
         <span className="ms-edit-k">{VALUE_WORDS[k]}</span>
         <span className="ms-field-v">{words || "none"}</span>
         <Pencil size={12} aria-hidden="true" />
       </button>
     );
+  // Each value on a line of its own, its label in one column; its instructions' words under their label, the
+  // whole width theirs to wrap in.
   return (
     <>
-      <span className="ms-fields">
+      <span className="df-values">
         {field("model", shown.model ? modelLabel(shown.model) : "default")}
         {field("limit", shown.limit)}
-        <span className="ms-field">
+        <span className="ms-field" data-k="version">
           <span className="ms-edit-k">version</span>
           <span className="ms-field-v">{own ? `v${(base as AgentDefFull).version}` : "kiln's"}</span>
         </span>
+        {field("instructions", shown.instructions)}
       </span>
-      <span className="ms-fields">{field("instructions", shown.instructions)}</span>
       {clash && (
         <Clash
           mine={clash.mine}
@@ -1195,46 +1544,27 @@ export function DefRow({ d, list, open, onOpen }: { d: AgentDef; list: readonly 
   const stands = sessions.map((a) => NODE[chatStand(a)]);
   const ORDER = ["needs", "failed", "working", "paused", "done", "offline", "stopped"];
   const stand = ORDER.find((o) => stands.includes(o)) ?? "done";
-  const atWork = stands.filter((s) => s === "working" || s === "needs").length;
   return (
     <>
-      <li ref={open ? watchUnseen : undefined} className="ms-node df-defrow" data-stand={stand} data-depth={0} data-open={open || undefined} data-def={d.id}>
-        <span className="ms-node-path df-chev">
-          <ChevronRight size={13} aria-hidden="true" className={open ? "rotate-90" : undefined} />
-        </span>
-        <button type="button" className="ms-node-main df-group-main" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${d.name}`} onClick={onOpen}>
-          <span className="df-group-line">
-            <span className="df-strong df-defname">{d.name}</span>
-            {!d.own && <Lock size={12} className="ms-flag-pin" role="img" aria-label="kiln's: copy it to change it" />}
-            {(d.replaces || d.replaced_by) && <Repeat2 size={12} className="ms-flag-pin" role="img" aria-label={d.replaces ? `Stands in for kiln's ${d.replaces}` : `You use ${d.replaced_by}`} />}
-            {sessions.length > 0 ? (
-              <span className="df-group-sum">
-                <span className="df-stands" aria-hidden="true">
-                  {stands.map((st, i) => (
-                    <i key={i} data-stand={st} />
-                  ))}
-                </span>
-                {sessions.length} · {atWork} at work
-              </span>
-            ) : (
-              <span className="df-group-sum">v{d.version}</span>
-            )}
+      {/* One line as its groups are: its name and flags, its sessions' stands at its right, its ⋯ (Start a session among them). */}
+      <li ref={open ? watchUnseen : undefined} className="ms-node df-defrow df-head" data-stand={stand} data-depth={0} data-open={open || undefined} data-def={d.id}>
+        <button type="button" className="df-head-main" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${d.name}`} onClick={onOpen}>
+          <span className="df-chev">
+            <ChevronRight size={13} aria-hidden="true" className={open ? "rotate-90" : undefined} />
           </span>
+          <span className="df-strong df-defname">{d.name}</span>
+          {!d.own && <Lock size={12} className="ms-flag-pin" role="img" aria-label="kiln's: copy it to change it" />}
+          {(d.replaces || d.replaced_by) && <Repeat2 size={12} className="ms-flag-pin" role="img" aria-label={d.replaces ? `Stands in for kiln's ${d.replaces}` : `You use ${d.replaced_by}`} />}
         </button>
-        <span className="ms-node-meta">
-          <RunsMarks d={d} />
-        </span>
-        <span className="ms-node-actions">
-          <span className="ms-tail">
-            <RunButton d={d} />
-            <DefMenu
-              d={d}
-              onSetup={() => {
-                if (!open) onOpen();
-              }}
-              onAsk={setAsking}
-            />
-          </span>
+        <span className="df-head-end">{sessions.length > 0 ? <StandCounts stands={stands} /> : <span className="df-head-v">v{d.version}</span>}</span>
+        <span className="df-head-acts">
+          <DefMenu
+            d={d}
+            onSetup={() => {
+              if (!open) onOpen();
+            }}
+            onAsk={setAsking}
+          />
         </span>
       </li>
       {asking && <DefAsk d={d} asking={asking} onDone={() => setAsking(null)} />}
@@ -1255,14 +1585,14 @@ export function defListKeys(e: React.KeyboardEvent<HTMLUListElement>, open: stri
   const row = at.closest<HTMLElement>("li.df-defrow");
   if (e.key === "j" || e.key === "k") {
     const i = row ? rows.indexOf(row) : -1;
-    rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "j" ? 1 : -1)))]?.querySelector<HTMLElement>(".df-group-main")?.focus();
+    rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "j" ? 1 : -1)))]?.querySelector<HTMLElement>(".df-head-main")?.focus();
     e.preventDefault();
   } else if (e.key === "Escape" && open) {
     e.preventDefault();
     close();
     rows
       .find((r) => r.dataset.def === open)
-      ?.querySelector<HTMLElement>(".df-group-main")
+      ?.querySelector<HTMLElement>(".df-head-main")
       ?.focus();
   }
 }

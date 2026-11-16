@@ -122,6 +122,11 @@ export function useLocation(): { pathname: string; search: string; hash: string;
 
 type SetSearch = (next: URLSearchParams | Record<string, string> | ((prev: URLSearchParams) => URLSearchParams | Record<string, string>), opts?: { replace?: boolean }) => void;
 
+/**
+ * The page's search params and a way to set them. A change of them is a state of the page you're on
+ * (a dropdown opened, a tab chosen: kiln's principle 1), never a new page: it keeps your place,
+ * where the router's own navigations go back to the top.
+ */
 export function useSearchParams(): [URLSearchParams, SetSearch] {
   const { pathname, searchStr } = useTanLocation();
   const navigate = useTanNavigate();
@@ -130,7 +135,7 @@ export function useSearchParams(): [URLSearchParams, SetSearch] {
     (next, opts) => {
       const value = typeof next === "function" ? next(new URLSearchParams(searchStr)) : next;
       const search = Object.fromEntries(value instanceof URLSearchParams ? value : new URLSearchParams(value));
-      void navigate({ to: pathname, search, replace: opts?.replace } as never);
+      void navigate({ to: pathname, search, replace: opts?.replace, resetScroll: false } as never);
     },
     [navigate, pathname, searchStr],
   );

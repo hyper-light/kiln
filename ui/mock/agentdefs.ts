@@ -20,7 +20,7 @@
  * PROPOSALS, not the server's yet (p/uicontract is building them; they're here as the UI reads them):
  *   PATCH  /api/agentdefs/:id {version}  the version a save was based on: another saved since → 409 {error, current}
  *   GET    /api/agentdef-sessions        {[id]: {sessions: {id, version, variant?}[], starts: {engine, warm, target, p50_ms}}}
- *   GET    /api/agentdef-experiments     {[id]: Experiment}: a live split of its new sessions between deployments (P7.1)
+ *   GET    /api/agentdef-experiments     {[id]: Experiment[]}: each definition's experiments, splits of its new sessions between deployments (P7.1)
  */
 import type http from "node:http";
 import { createHash } from "node:crypto";
@@ -215,6 +215,19 @@ function given(b: Record<string, unknown>): Partial<Settings> | string {
 
 /* ---------------------------------------- proposals: sessions per definition, their starts, experiments */
 
+/** A measure's median day by day: settling toward where it stands now with a day's noise, the same each run (its seed). */
+const trendOf = (mid: number, spread: number, seed: number, days = 14) => {
+  let x = seed * 9301 + 49297;
+  const rnd = () => (x = (x * 9301 + 49297) % 233280) / 233280;
+  const out: number[] = [];
+  let v = mid + spread * (rnd() - 0.2);
+  for (let i = 0; i < days; i++) {
+    v += (mid - v) * 0.3 + (rnd() - 0.5) * spread * 0.4;
+    out.push(Math.round(v * 100) / 100);
+  }
+  out[days - 1] = mid;
+  return out;
+};
 const variant = (
   id: string,
   agentfileName: string,
@@ -226,44 +239,93 @@ const variant = (
   peak: [number, number, number],
   failed: [number, number, number],
   current = false,
-) => ({
+  name: string | null = null,
+) => {
+  const seed = [...id].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 9973, 11);
+  return {
+    id,
+    name,
+    agentfile: agentfileName,
+    engine: "microvm" as const,
+    cpus,
+    memory: memGiB * 2 ** 30,
+    weight,
+    sessions,
+    current,
+    measures: { warm_ms: warm, peak_gib: peak, failed_pct: failed },
+    trend: { warm_ms: trendOf(warm[1], warm[2] - warm[0], seed), peak_gib: trendOf(peak[1], peak[2] - peak[0], seed + 1), failed_pct: trendOf(failed[1], failed[2] - failed[0], seed + 2) },
+  };
+};
+const DAY = 86_400_000;
+const criterion = (id: string, name: string, measure: "warm_ms" | "peak_gib" | "failed_pct", bound?: number) => ({
   id,
-  name: null as string | null,
-  agentfile: agentfileName,
-  engine: "microvm" as const,
-  cpus,
-  memory: memGiB * 2 ** 30,
-  weight,
-  sessions,
-  current,
-  measures: { warm_ms: warm, peak_gib: peak, failed_pct: failed },
+  name,
+  measure,
+  better: "lower" as const,
+  ...(bound === undefined ? {} : { bound }),
 });
-/** Its live split, a deployment each variant (P7.1): a proposal until the server has experiments. */
-const EXPERIMENTS: Record<string, unknown> = {
-  [idOf("reviewer")]: {
-    id: "reviewer-size",
-    state: "live",
-    version: 1,
-    sessions: 96,
-    variants: [
-      variant("5e1c", "rust-dev", 2, 4, 50, 49, [208, 215, 223], [2.24, 2.29, 2.35], [6, 12, 20], true),
-      variant("a37d", "rust-dev", 4, 8, 50, 47, [212, 221, 229], [2.94, 3.0, 3.07], [0, 2, 8]),
-    ],
-  },
-  [idOf("pr-triage")]: {
-    id: "triage-sizes",
-    state: "live",
-    version: 3,
-    sessions: 214,
-    variants: [
-      variant("0b9e", "rust-dev", 1, 2, 20, 44, [196, 204, 213], [1.71, 1.76, 1.82], [8, 15, 24], true),
-      variant("c4a1", "rust-dev", 2, 2, 20, 41, [199, 207, 216], [1.74, 1.79, 1.85], [5, 11, 19]),
-      variant("7f20", "rust-dev", 2, 4, 20, 43, [201, 209, 218], [2.21, 2.27, 2.33], [1, 4, 10]),
-      variant("e853", "rust-dev", 4, 4, 15, 31, [204, 212, 221], [2.26, 2.31, 2.38], [0, 3, 10]),
-      variant("19d6", "rust-dev", 4, 8, 15, 33, [207, 216, 226], [2.93, 2.99, 3.06], [0, 2, 9]),
-      variant("d2fb", "docs-site", 2, 4, 10, 22, [188, 199, 211], [1.95, 2.02, 2.1], [2, 8, 21]),
-    ],
-  },
+/** Each definition's experiments, newest first, several at once on one (P7.1): a proposal until the server has experiments. */
+const EXPERIMENTS: Record<string, unknown[]> = {
+  [idOf("reviewer")]: [
+    {
+      id: "reviewer-size",
+      name: "Right-size its microVM",
+      state: "live",
+      version: 1,
+      sessions: 96,
+      started_at: Date.now() - 6 * DAY,
+      criteria: [criterion("warm", "Warm start", "warm_ms", 250), criterion("failed", "Failed sessions", "failed_pct", 10), criterion("peak", "Peak memory", "peak_gib")],
+      variants: [
+        variant("5e1c", "rust-dev", 2, 4, 50, 49, [208, 215, 223], [2.24, 2.29, 2.35], [6, 12, 20], true, "Small"),
+        variant("a37d", "rust-dev", 4, 8, 50, 47, [212, 221, 229], [2.94, 3.0, 3.07], [0, 2, 8], false, "Large"),
+      ],
+    },
+    {
+      id: "reviewer-image",
+      name: "rust-dev v9's image",
+      state: "paused",
+      version: 2,
+      sessions: 31,
+      started_at: Date.now() - 12 * DAY,
+      criteria: [criterion("failed", "Failed sessions", "failed_pct", 8), criterion("warm", "Warm start", "warm_ms")],
+      variants: [
+        variant("b10c", "rust-dev", 2, 4, 70, 22, [206, 214, 222], [2.2, 2.27, 2.33], [4, 9, 16], true, "v8 image"),
+        variant("b20d", "rust-dev-v9", 2, 4, 30, 9, [198, 207, 219], [2.1, 2.18, 2.27], [1, 5, 14], false, "v9 image"),
+      ],
+    },
+  ],
+  [idOf("pr-triage")]: [
+    {
+      id: "triage-sizes",
+      name: "Six sizes",
+      state: "live",
+      version: 3,
+      sessions: 214,
+      started_at: Date.now() - 9 * DAY,
+      criteria: [criterion("failed", "Failed sessions", "failed_pct", 10), criterion("peak", "Peak memory", "peak_gib", 3), criterion("warm", "Warm start", "warm_ms")],
+      variants: [
+        variant("0b9e", "rust-dev", 1, 2, 20, 44, [196, 204, 213], [1.71, 1.76, 1.82], [8, 15, 24], true),
+        variant("c4a1", "rust-dev", 2, 2, 20, 41, [199, 207, 216], [1.74, 1.79, 1.85], [5, 11, 19]),
+        variant("7f20", "rust-dev", 2, 4, 20, 43, [201, 209, 218], [2.21, 2.27, 2.33], [1, 4, 10]),
+        variant("e853", "rust-dev", 4, 4, 15, 31, [204, 212, 221], [2.26, 2.31, 2.38], [0, 3, 10]),
+        variant("19d6", "rust-dev", 4, 8, 15, 33, [207, 216, 226], [2.93, 2.99, 3.06], [0, 2, 9]),
+        variant("d2fb", "docs-site", 2, 4, 10, 22, [188, 199, 211], [1.95, 2.02, 2.1], [2, 8, 21]),
+      ],
+    },
+    {
+      id: "triage-docs",
+      name: "Docs image for docs PRs",
+      state: "promoted",
+      version: 1,
+      sessions: 58,
+      started_at: Date.now() - 20 * DAY,
+      criteria: [criterion("failed", "Failed sessions", "failed_pct", 10)],
+      variants: [
+        variant("d001", "rust-dev", 2, 4, 0, 29, [201, 210, 219], [2.2, 2.26, 2.32], [6, 11, 18]),
+        variant("d002", "docs-site", 2, 4, 100, 29, [186, 195, 205], [1.9, 1.96, 2.03], [2, 5, 11], true),
+      ],
+    },
+  ],
 };
 type Starts = { engine: "microvm" | "host"; warm: number; target: number; p50_ms: { warm?: number; template?: number; cold?: number } };
 const starts = (engine: "microvm" | "host", warm: number, target: number, p50_ms: Starts["p50_ms"]): Starts => ({ engine, warm, target, p50_ms });
@@ -309,8 +371,8 @@ export function sessionDef(session: string): { agent: string; agentfile: string;
     if (!mine) continue;
     const d = kept.get(id);
     const name = d?.name ?? BUILTIN.find((b) => b.id === id)?.name ?? id;
-    const exp = EXPERIMENTS[id] as { variants: { id: string; agentfile: string; cpus: number; memory: number }[] } | undefined;
-    const v = mine.variant ? exp?.variants.find((x) => x.id === mine.variant) : undefined;
+    const exps = (EXPERIMENTS[id] ?? []) as { variants: { id: string; agentfile: string; cpus: number; memory: number }[] }[];
+    const v = mine.variant ? exps.flatMap((e) => e.variants).find((x) => x.id === mine.variant) : undefined;
     const af = v?.agentfile ?? (d?.agentfile?.startsWith("agentfile:") ? (name === "release-notes" ? "docs-site" : "rust-dev") : `harness-${d?.harness ?? "claude"}`);
     return { agent: name.replace(/^kiln-ci-/, "ci-"), agentfile: af, cpus: v?.cpus ?? 2, memory: v?.memory ?? 4 * 2 ** 30 };
   }

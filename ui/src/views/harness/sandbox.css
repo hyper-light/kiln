@@ -24,10 +24,11 @@
   white-space: nowrap;
 }
 /* Now: CPU, memory and disk side by side where they fit, each its own cell, else one under another. */
+/* Each bar on a line of its own, its numbers whole at any width. */
 .sb-bars {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 12px 18px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
 }
 .sb-bars .hx-limit-top {
   white-space: nowrap;

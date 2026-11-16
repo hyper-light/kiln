@@ -146,7 +146,6 @@
 .df-crumb:hover {
   color: #ededee;
 }
-.df-crumb 
 /* A variant: its swatch, a short bar the colour of its slice of the split (never a letter: kiln's
    research grades are lettered squares), and its name. The current one is ringed. */
 .df-swatch {
@@ -160,12 +159,6 @@
   box-shadow:
     0 0 0 2px #0a0b0d,
     0 0 0 3px #ededee;
-}
-.df-swatch-cell {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 20px;
 }
 .df-variant {
   display: inline-flex;
@@ -203,16 +196,6 @@
 .df-chev > svg {
   transition: transform 0.15s;
 }
-.df-group-main {
-  justify-content: center;
-}
-.df-group-line {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-  height: 20px;
-}
 .df-group-k {
   flex: none;
   width: 84px;
@@ -220,46 +203,8 @@
 .df-group[data-open] .df-group-k {
   color: #ededee;
 }
-.df-group-sum {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  overflow: hidden;
-  color: #97999f;
-  font-size: 13px;
-  white-space: nowrap;
-}
 .df-strong {
   color: #ededee;
-}
-.df-weights {
-  color: #c8cad0;
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-/* Its sessions' stands, a dot each, in the tree's own stand colours. */
-.df-stands {
-  display: inline-flex;
-  gap: 3px;
-}
-.df-stands > i {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #7e818a;
-}
-.df-stands > i[data-stand="working"] {
-  background: #bab0e3;
-}
-.df-stands > i[data-stand="needs"] {
-  background: #d8bb95;
-}
-.df-stands > i[data-stand="paused"] {
-  background: #a6b2c6;
-}
-.df-stands > i[data-stand="failed"] {
-  background: #d1aaad;
 }
 /* Where it runs and how fast it starts; a session's sandbox in short. */
 .df-runs,
@@ -275,47 +220,9 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* A session row's CPU and memory now: two compact bars side by side, no plots. */
-.df-bars {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  width: 100%;
-}
-.df-bars .hx-limit-top {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-}
-/* What a narrow window shows in place of what it hides: a session's sandbox (a phone's rows have no meta
-   column), and a definition's warm hosts and every start (its head's line drops them first). */
-.df-narrow,
+/* Its warm hosts and every start, in its settings (its head repeats none of it). */
 .df-runs-full {
-  display: none;
-}
-@container (max-width: 960px) {
-  .df-runs-full {
-    display: flex;
-  }
-}
-@container (max-width: 520px) {
-  .df-narrow {
-    display: flex;
-  }
-}
-/* A narrower line keeps where it runs and its starts, then (a phone's) only its fastest; its warm hosts and the rest are in its values, opened. */
-@container (max-width: 960px) {
-  .df-group-sum .df-runs .sm-warm {
-    display: none;
-  }
-}
-@container (max-width: 520px) {
-  .df-group-sum .df-runs .sm-start:not([data-first]) {
-    display: none;
-  }
-}
-/* A definition as a row of its own (the Agents tab, chat): the chevron in the checkbox's place. */
-.df-row .df-chev {
-  height: auto;
+  display: flex;
 }
 @media (prefers-reduced-motion: reduce) {
   .df-chev > svg,
@@ -334,13 +241,6 @@
 .df-defrow + .ms-tree,
 .ms-tree + .df-defrow {
   border-top: 1px solid #25272c;
-}
-/* A definition's own row (chat's card, the Agents tab) stands alone, not under a tree: wide, its
-   columns are what they hold (all of where it runs, then Run and ⋯), where a tree's are fixed. */
-@container (min-width: 761px) {
-  .df-defrow {
-    grid-template-columns: 22px minmax(0, 1fr) auto auto;
-  }
 }
 /* An open dropdown's head (definitions.tsx OpenHead; kiln's principle 1): it takes no room and shows
    only while its row is out of sight, sticking under kiln's header (in a panel, at its top). */
@@ -421,4 +321,607 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* A group's head and a definition's own row (definitions.tsx GroupHead, DefRow): one line, one height
+   for every one of them at every width, its parts centred on it: its chevron and label (the press that
+   opens it), what it says in short at its right end, its controls last in a column of one width, so
+   the right ends line up whether a head has a ⋯ or not. */
+.ms-node.df-head {
+  grid-template-columns: minmax(0, 1fr) auto 32px;
+  grid-template-areas: "main end acts";
+  align-items: center;
+  gap: 0 12px;
+  min-height: 44px;
+  padding: 0 8px 0 6px;
+}
+.df-head-main {
+  grid-area: main;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 44px;
+  text-align: left;
+}
+.df-head-main > .df-chev {
+  flex: none;
+  width: 22px;
+}
+.df-head-end {
+  grid-area: end;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+}
+.df-head-acts {
+  grid-area: acts;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+.df-head-v {
+  color: #97999f;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+/* Its sessions' stands: a dot each stand that has any, in Mission's tree's colours, and how many. */
+.df-counts {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+.df-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.df-count > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7e818a;
+}
+.df-count[data-stand="working"] > i {
+  background: #bab0e3;
+}
+.df-count[data-stand="needs"] > i {
+  background: #d8bb95;
+}
+.df-count[data-stand="paused"] > i {
+  background: #a6b2c6;
+}
+.df-count[data-stand="done"] > i {
+  background: #a8c9bc;
+}
+.df-count[data-stand="failed"] > i {
+  background: #d1aaad;
+}
+/* A definition's versions (definitions.tsx DefVersions): its number, then what it said, in one line. */
+.df-ver-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  height: 20px;
+}
+.df-ver-sum {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  color: #97999f;
+  font-size: 13px;
+  white-space: nowrap;
+}
+/* A definition's values (definitions.tsx DefValues): each on a line of its own, its label in a column of
+   one width; its instructions' label on a line, their words under it with the whole width to wrap in. */
+.df-values {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.df-values > .ms-field,
+.df-values > .ms-edit {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 0 10px;
+}
+.df-values > .ms-edit > .ms-edit-in {
+  width: 100%;
+}
+.df-values > [data-k="instructions"] {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "k pen"
+    "v v";
+  gap: 4px 10px;
+  margin-top: 4px;
+}
+.df-values > [data-k="instructions"] > .ms-edit-k {
+  grid-area: k;
+}
+.df-values > [data-k="instructions"] > .ms-field-v,
+.df-values > [data-k="instructions"] > .ms-edit-in {
+  grid-area: v;
+  line-height: 1.5;
+}
+.df-values > [data-k="instructions"] > svg,
+.df-values > [data-k="instructions"] > .ms-go {
+  grid-area: pen;
+}
+/* A session started from a definition (definitions.tsx SessionNode): each thing it says on a line of its
+   own at the tree's indentation, left-aligned: its name and way in, its stand in the agent's words and
+   colours (Mission's rows'), its version, its variant, where it runs, its resources and their last hour,
+   its context and cost, its controls. */
+.ms-node.df-session {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: none;
+  justify-items: start;
+  gap: 6px;
+  padding: 12px 8px 14px 34px;
+}
+.df-sess-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  justify-self: stretch;
+  min-width: 0;
+}
+.df-sess-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #ededee;
+  font-size: 14px;
+  line-height: 20px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.df-sess-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: #97999f;
+  font-size: 13px;
+  line-height: 20px;
+}
+.df-sess-line.df-version {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.df-session[data-stand="needs"] .ms-word,
+.df-vm[data-stand="needs"] .ms-word {
+  color: #e2cfae;
+}
+.df-session[data-stand="needs"] .ms-word > i,
+.df-vm[data-stand="needs"] .ms-word > i {
+  background: #d8bb95;
+}
+.df-session[data-stand="crashed"] .ms-word,
+.df-vm[data-stand="crashed"] .ms-word {
+  color: #e2b9bd;
+}
+.df-session[data-stand="crashed"] .ms-word > i,
+.df-vm[data-stand="crashed"] .ms-word > i {
+  background: #d1aaad;
+}
+.df-session[data-stand="paused"] .ms-word,
+.df-vm[data-stand="paused"] .ms-word {
+  color: #b8c2d3;
+}
+.df-session[data-stand="paused"] .ms-word > i,
+.df-vm[data-stand="paused"] .ms-word > i {
+  background: #a6b2c6;
+}
+.df-session[data-stand="working"] .ms-word,
+.df-vm[data-stand="working"] .ms-word {
+  color: #cdc6ea;
+}
+.df-session[data-stand="working"] .ms-word > i,
+.df-vm[data-stand="working"] .ms-word > i {
+  background: #bab0e3;
+}
+.df-session[data-stand="finished"] .ms-word,
+.df-vm[data-stand="finished"] .ms-word {
+  color: #bfdccf;
+}
+.df-session[data-stand="finished"] .ms-word > i,
+.df-vm[data-stand="finished"] .ms-word > i {
+  background: #a8c9bc;
+}
+.df-session[data-stand="ready"] .ms-word > i,
+.df-vm[data-stand="ready"] .ms-word > i {
+  background: #6f8f84;
+}
+.df-session[data-stand] .ms-word.sg-shimmer > i {
+  background: #b8a6d5;
+}
+/* Its resources: a live bar each (limits.tsx LimitMeter), its last hour plotted under it, the width theirs. */
+.df-usage {
+  display: grid;
+  gap: 10px;
+  justify-self: stretch;
+  margin-top: 4px;
+}
+.df-urow {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.df-uplot {
+  width: 100%;
+  height: 28px;
+}
+.df-ucost {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  color: #d4d6dc;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+/* Its controls: round, of their intent's colour (its stop red), at the left under what it says. */
+.df-sess-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+/* Its experiments (definitions.tsx ExperimentsGroup): a line each, its name and its state in the agents'
+   words' scheme (live as at work, paused as paused, promoted as done); opened, what it is under it at the
+   tree's indentation, each part on a line of its own, left-aligned. */
+.ms-node.df-exp.df-head {
+  padding-left: 34px;
+}
+.df-exp-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #ededee;
+  font-size: 14px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.df-exp-word {
+  min-width: 0;
+}
+.df-exp[data-stand="working"] .ms-word {
+  color: #cdc6ea;
+}
+.df-exp[data-stand="working"] .ms-word > i {
+  background: #bab0e3;
+}
+.df-exp[data-stand="paused"] .ms-word {
+  color: #b8c2d3;
+}
+.df-exp[data-stand="paused"] .ms-word > i {
+  background: #a6b2c6;
+}
+.df-exp[data-stand="done"] .ms-word {
+  color: #bfdccf;
+}
+.df-exp[data-stand="done"] .ms-word > i {
+  background: #a8c9bc;
+}
+.ms-node.df-exp-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: none;
+  justify-items: start;
+  gap: 10px;
+  padding: 10px 8px 18px 66px;
+}
+.df-exp-k {
+  margin-top: 8px;
+}
+.df-exp-facts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  color: #97999f;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 20px;
+}
+.df-rename {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  color: #7b7e88;
+}
+.df-rename:hover,
+.df-rename:focus-visible {
+  color: #ededee;
+}
+/* Its split: one bar the width of what it says, each variant's part in its own tone. */
+.df-exp-split {
+  display: flex;
+  gap: 2px;
+  justify-self: stretch;
+  max-width: 480px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.df-exp-split > i {
+  display: block;
+  flex-basis: 0;
+  height: 100%;
+}
+.df-exp-split[data-staged] > i {
+  background-image: repeating-linear-gradient(45deg, rgb(10 11 13 / 55%) 0 2px, transparent 2px 4px);
+}
+.df-exp-ctl {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.df-exp-ctl .ms-confirm,
+.df-vline-ctl .ms-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #c8cad0;
+  font-size: 13px;
+}
+/* Its variants: each its swatch and name, its measures, its weight, its controls, a line each. */
+.df-vlist {
+  display: grid;
+  gap: 14px;
+  justify-self: stretch;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.df-vline {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  min-width: 0;
+}
+.df-vline-top {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: #ededee;
+  font-size: 13px;
+  line-height: 20px;
+}
+.df-vline-top > .ms-edit-in {
+  width: 180px;
+}
+.df-vline-measures {
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+}
+.df-vline-weight {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.df-vline-weight > .ms-weight-in {
+  width: 160px;
+}
+.df-vline-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.df-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  color: #a6c4ed;
+  font-size: 13px;
+}
+.df-add:hover,
+.df-add:focus-visible {
+  color: #c7daf5;
+}
+/* A criterion: its name and rule, each variant's value, the best checked and a bound missed in the
+   failed colour, then each variant's day by day, the bound dashed across. */
+.df-crit {
+  display: grid;
+  gap: 6px;
+  justify-self: stretch;
+  max-width: 560px;
+  min-width: 0;
+}
+.df-crit-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "name x"
+    "rule x";
+  align-items: center;
+  gap: 0 10px;
+}
+.df-crit-name {
+  grid-area: name;
+  color: #ededee;
+  font-size: 13px;
+  line-height: 20px;
+}
+.df-crit-top > .df-head-v {
+  grid-area: rule;
+  white-space: normal;
+}
+.df-crit-top > .ms-go {
+  grid-area: x;
+}
+.df-crit-vals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+.df-crit-val {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+}
+.df-crit-val[data-best] {
+  color: #bfdccf;
+}
+.df-crit-val[data-missed] {
+  color: #e2b9bd;
+}
+.df-trend {
+  display: block;
+  width: 100%;
+  height: 64px;
+}
+.df-trend-cap {
+  display: flex;
+  justify-content: space-between;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 14px;
+}
+.df-trend-bound {
+  stroke: #6e4a50;
+  stroke-dasharray: 4 3;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.df-crit-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.df-crit-form > .ms-edit-in {
+  width: 180px;
+}
+.df-crit-form > .ms-narrow {
+  width: 140px;
+}
+/* A new experiment: its name, its variants each a deployment and a weight, what it's judged by. */
+.df-exp-namein {
+  width: min(320px, 100%);
+}
+.df-judged {
+  display: grid;
+  gap: 6px;
+}
+.df-judge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #c8cad0;
+  font-size: 13px;
+}
+@container (max-width: 520px) {
+  .ms-node.df-exp-body {
+    padding-left: 34px;
+  }
+}
+
+/* A session's engine in its Mission row's dropdown (engine-rows.tsx): a line each sandbox, its chevron,
+   its engine and name over its stand (the agents' words' colours), where it runs and its size, and its
+   controls on its line's right end; opened, its Sandbox tab's whole under it at the tree's indentation. */
+.ms-node.df-vm {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "main ctl";
+  align-items: center;
+  gap: 0 12px;
+  min-height: 56px;
+  padding: 6px 8px 6px 6px;
+}
+.df-vm-main {
+  grid-area: main;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  text-align: left;
+}
+.df-vm-main > .df-chev {
+  flex: none;
+  width: 22px;
+}
+.df-vm-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.df-vm-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: #ededee;
+  font-size: 14px;
+  line-height: 20px;
+}
+.df-vm-name > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.df-vm-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: #97999f;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.df-vm-line > .ms-word {
+  min-width: 0;
+}
+.df-vm-ctl {
+  grid-area: ctl;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.df-vm-ctl .ms-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #c8cad0;
+  font-size: 13px;
+}
+.ms-node.df-vm-body {
+  display: block;
+  padding: 4px 8px 16px 38px;
+}
+.ms-node.df-vm-body:hover,
+.ms-node.df-vm-body:focus-within {
+  background: none;
+}
+@container (max-width: 520px) {
+  .ms-node.df-vm-body {
+    padding-left: 12px;
+  }
 }

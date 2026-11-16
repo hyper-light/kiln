@@ -189,8 +189,8 @@ export interface SandboxDetail extends SandboxBrief {
   vm: { id: string; agent: string; image: string; version: number; digest: string; vcpus: number; memory: number; footprint: { peak: number; steady: number } } | null;
   /** Now; none once ended. */
   now: { cpu_pct: number; memory: { used: number; total: number }; disk: { used: number; total: number } } | null;
-  /** The last hour: CPU %, memory % of its own, network MB/s × 10. */
-  series: { cpu: number[]; memory: number[]; net: number[] };
+  /** The last hour: CPU %, memory % of its own, network MB/s × 10, disk % of its own. */
+  series: { cpu: number[]; memory: number[]; net: number[]; disk: number[] };
   /** In a microVM only: what's published, granted and connected; everything else is denied. */
   network: { ingress: Ingress[]; egress: Egress[]; networks: SandboxNetwork[] } | null;
   members: SandboxMember[];
@@ -224,7 +224,10 @@ export interface SessionGrants {
     reported: boolean;
   };
 }
-export const grantsRes = (id: string): Res<SessionGrants> => ({ key: `session-grants/${id}`, fetch: (s) => request<SessionGrants>("GET", `/api/harness/sessions/${enc(id)}/grants`, undefined, { signal: s }) });
+export const grantsRes = (id: string): Res<SessionGrants> => ({
+  key: `session-grants/${id}`,
+  fetch: (s) => request<SessionGrants>("GET", `/api/harness/sessions/${enc(id)}/grants`, undefined, { signal: s }),
+});
 
 const ses = (id: string, rest = "") => `/api/microvm/sessions/${enc(id)}${rest}`;
 export const sandboxApi = {
