@@ -315,6 +315,7 @@ pub fn own() -> &'static [Op] {
             .chain(crate::secrets::mine::list_ops())
             .chain(crate::agentdefs::ops::list_ops())
             .chain(crate::confirms::list_ops())
+            .chain(crate::push::api::list_ops())
             .chain(crate::goals::ops::list_ops())
             .chain(crate::programs::ops::list_ops())
             .chain(crate::research::ops::list_ops())

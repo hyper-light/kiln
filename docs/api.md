@@ -140,7 +140,7 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET, POST | `/api/push/subscriptions` | your devices; a browser's subscription with its name and what it hears (at most 20 devices each) |
 | DELETE | `/api/push/subscriptions/:id` | forgets one of your devices |
 | POST | `/api/push/test` | `{ id? }`: a test to your devices → `{ sent, results }` |
-| PUT, DELETE | `/api/push/mutes/:agent` | mutes or unmutes an agent's notifications for you |
+| PUT, DELETE | `/api/push/mutes/:agent` | mutes or unmutes an agent's notifications for you: `push.mute`, `push.unmute` |
 | GET | `/sw.js`, `/manifest.webmanifest` | **open** · the service worker that shows pushes (no fetch handler: it never intercepts the app), and the web app manifest |
 | GET | `/api/voice` | `{ transcribe, language }`: whether kiln transcribes recordings ([voice.md](voice.md)) |
 | POST | `/api/voice/transcribe?lang=` | body: the recording (`Content-Type: audio/*`, up to 25 MiB) → `{ text }`; 501 not set up, 415 not a recording, 413 too big, 502 the service failed |

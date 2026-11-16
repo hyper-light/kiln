@@ -9,7 +9,7 @@
 //! | `POST /api/push/subscriptions` | `{subscription, device, hears?}`: a browser's subscription (again: the same device) |
 //! | `DELETE /api/push/subscriptions/:id` | forgets one of yours |
 //! | `POST /api/push/test` | `{id?}`: a test to your devices (or one), each tried once: `{sent, results}` |
-//! | `PUT`/`DELETE /api/push/mutes/:agent` | mutes, or unmutes, an agent for you |
+//! | `PUT`/`DELETE /api/push/mutes/:agent` | mutes, or unmutes, an agent for you: `push.mute`, `push.unmute` |
 
 use std::sync::Arc;
 
@@ -175,15 +175,63 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &Method, rest: &[&st
             let sent = results.iter().filter(|r| r.get("ok") == Some(&Value::Bool(true))).count();
             Ok(srv::json(StatusCode::OK, &json!({ "sent": sent, "results": results })))
         }
+        // `push.mute` and `push.unmute` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S7).
         (&Method::PUT | &Method::DELETE, ["mutes", agent]) => {
-            let (agent, on) = ((*agent).to_owned(), method == Method::PUT);
-            let a = agent.clone();
-            hub.store.call(move |c| if on { store::mute(c, &who, &a, crate::util::now_unix()) } else { store::unmute(c, &who, &a) }).await.map_err(store_err)?;
-            hub.store.audit(caller.name.clone(), if on { "push.mute".into() } else { "push.unmute".into() }, agent).await;
-            hub.emit(&crate::wire::events::ServerEvent::Push);
+            let name = if method == Method::PUT { "push.mute" } else { "push.unmute" };
+            let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
+            crate::ops::run_own(cx, name, json!({ "agent": agent })).await?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         _ => Err((StatusCode::NOT_FOUND, "no such route".into())),
+    }
+}
+
+/// An agent's notifications muted, or unmuted, for whoever asks (`on`), as their person; audited as whoever asked.
+async fn mute(cx: crate::ops::Cx, v: Value, on: bool) -> crate::ops::Out {
+    let who = principal(&cx.caller)?;
+    let agent = crate::ops::text(&v, "agent")?;
+    let a = agent.clone();
+    cx.hub.store.call(move |c| if on { store::mute(c, &who, &a, crate::util::now_unix()) } else { store::unmute(c, &who, &a) }).await.map_err(store_err)?;
+    cx.hub.store.audit(cx.caller.name.clone(), if on { "push.mute".into() } else { "push.unmute".into() }, agent.clone()).await;
+    cx.hub.emit(&crate::wire::events::ServerEvent::Push);
+    Ok(json!({ "agent": agent, "muted": on }))
+}
+
+/// `/api/push`'s operations: an agent's notifications muted or unmuted for you (the Agents page's mute: kiln plan
+/// 01a1dd2e8618733a87f2793aab1322a8 P5.6, S7), on REST, MCP and code mode.
+pub fn list_ops() -> Vec<crate::ops::Op> {
+    use crate::ops::{Input, Op, path, text};
+    vec![
+        Op {
+            name: "push.mute",
+            summary: "Mute an agent's notifications for you: none of its reaches your devices until you unmute it. Notifications are a person's: an agent asks its person's click for it.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::PushMute>(),
+            route: |v| Ok((Method::PUT, path(&["api", "push", "mutes", &text(v, "agent")?]))),
+            run: |cx, v| Box::pin(mute(cx, v, true)),
+        },
+        Op {
+            name: "push.unmute",
+            summary: "Unmute an agent's notifications for you: they reach your devices again.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::PushMute>(),
+            route: |v| Ok((Method::DELETE, path(&["api", "push", "mutes", &text(v, "agent")?]))),
+            run: |cx, v| Box::pin(mute(cx, v, false)),
+        },
+    ]
+}
+
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PushMute {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
     }
 }
 
