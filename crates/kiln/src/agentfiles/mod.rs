@@ -19,6 +19,7 @@ pub mod check;
 pub mod cli;
 pub mod context;
 pub mod ops;
+pub mod prebuild;
 pub mod settings;
 pub mod unpack;
 
@@ -278,7 +279,7 @@ fn taken(name: &str) -> Error {
 /// Tells the events sockets an Agentfile changed or went: its owner's, and those of whoever reaches
 /// everyone's (`api`'s `AgentsSeen`).
 fn told(hub: &Hub, a: &Record, deleted: bool) {
-    hub.emit(&ServerEvent::Agentfile(AgentfileChange { owner: a.owner.clone(), id: a.id.clone(), name: a.name.clone(), version: a.version, deleted }));
+    hub.emit(&ServerEvent::Agentfile(AgentfileChange { owner: a.owner.clone(), id: a.id.clone(), name: a.name.clone(), version: a.version, deleted, builds: false }));
 }
 
 /// Where an Agentfile's text is kept in kiln's store of bytes: under its content's SHA-256, once for
@@ -585,6 +586,7 @@ pub async fn delete(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str) -> R<Brie
             drop(st);
             let n = tx.execute("DELETE FROM agentfiles WHERE id = ?1", params![i])?;
             tx.execute("DELETE FROM agentfile_versions WHERE agentfile_id = ?1", params![i])?;
+            tx.execute("DELETE FROM prebuilds WHERE agentfile_id = ?1", params![i])?;
             tx.commit()?;
             Ok((n > 0).then_some(digests))
         })

@@ -1085,7 +1085,9 @@ impl Carries for AgentMsg {
             // Installed skills' JSON is read by `crate::skills`, which keeps what it can.
             | AgentMsg::Skills { .. }
             | AgentMsg::SkillFile { .. }
-            | AgentMsg::HarnessMailTransfer { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::HarnessMailTransfer { .. }
+            // A build's word is read by `crate::agentfiles::prebuild`, which keeps what it can (P4.5).
+            | AgentMsg::Prebuilt { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -1254,7 +1256,9 @@ impl Carries for ServerMsg {
             | ServerMsg::SkillFile { .. }
             | ServerMsg::HarnessMailTransfer { .. }
             | ServerMsg::Later { .. }
-            | ServerMsg::Back { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::Back { .. }
+            // A build asked ahead of its sessions is read by `crate::agentfiles::prebuild` (P4.5).
+            | ServerMsg::Prebuild { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

@@ -236,6 +236,11 @@ pub struct Measured {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub footprint_peak_bytes: Option<u64>,
+    /// The build of its image its start ran, in microseconds: none where its machine held its image already, built by
+    /// an earlier start or ahead of it as its Agentfile was saved (kiln plan 01a1dd2e… P4.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub built_us: Option<u64>,
 }
 
 /// How a start of a session's harness ended.

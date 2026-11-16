@@ -147,6 +147,7 @@ const PLAIN: &[&str] = &[
     "Placed",
     "Skills",
     "SkillFile",
+    "Prebuilt",
 ];
 
 /// `AgentMsg`'s variants that are a session's update, or may carry one: a `Harness` message, and the

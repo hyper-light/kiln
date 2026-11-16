@@ -1372,6 +1372,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         }
         (&Method::DELETE, ["api", "agentfiles", id]) => boxed(|| own_op(&hub, &caller, "agentfiles.delete", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentfiles", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentfiles.versions", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "agentfiles", id, "builds"]) => boxed(|| own_op(&hub, &caller, "agentfiles.builds", json!({ "id": id }))).await,
         (&Method::POST, ["api", "agentfiles", id, "restore"]) => {
             let id = (*id).to_owned();
             let mut body = boxed(|| body_value(req)).await?;

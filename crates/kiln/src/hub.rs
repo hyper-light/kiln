@@ -3697,6 +3697,9 @@ impl Hub {
                 // One that takes it is told the room a hand-over's spool leaves there: a session
                 // moved to it from another machine is taken over (CP-T3.2).
                 crate::harness::mail_transfer::on_features(self, &agent, peer, &names).await;
+                // One that builds Agentfiles ahead of their sessions is asked again for each it hasn't said done or
+                // failed (kiln plan 01a1dd2e… P4.5).
+                crate::api::boxed(|| crate::agentfiles::prebuild::on_features(self, &agent, &names)).await;
                 self.harness.mail_delivery.changed();
                 // One that installs skills is told what it lays out (docs/agents.md, "Skills kiln installs").
                 if skills {
@@ -3749,6 +3752,8 @@ impl Hub {
                 metrics::global().runner_net_dropped.replace_owned(&std::collections::BTreeSet::from([String::from(&*agent)]), series);
                 self.change_agent(&agent, |a| a.dropped.clone_from(&dropped));
             }
+            // Where a build of an Agentfile asked ahead of its sessions is (kiln plan 01a1dd2e… P4.5).
+            AgentMsg::Prebuilt { json } => crate::api::boxed(|| crate::agentfiles::prebuild::heard(self, &agent, &json)).await,
             // Hand-overs between a machine's runner processes (`crate::handovers`).
             AgentMsg::HarnessMailTransfer { json } => crate::api::boxed(|| crate::harness::mail_transfer::heard(self, peer, json)).await,
             AgentMsg::HarnessHandOver { session, offset, data, done } => crate::api::boxed(|| self.handover_piece(&agent, peer, session, offset, data, done)).await,

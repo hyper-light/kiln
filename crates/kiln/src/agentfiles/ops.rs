@@ -64,6 +64,7 @@ async fn create(cx: Cx, v: Value) -> Out {
     let (name, text) = (crate::ops::text(&v, "name")?, v.get("text").and_then(Value::as_str).unwrap_or_default().to_owned());
     let saved = super::create(&cx.hub, blobs(&cx), &who(&cx)?, &name, &text, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.create".into(), format!("{} ({}) v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
+    super::prebuild::queue(&cx.hub, &saved.agentfile.id).await;
     json_of(&saved)
 }
 
@@ -75,14 +76,22 @@ fn field<T: serde::de::DeserializeOwned>(v: &Value, k: &str) -> Result<Option<T>
 async fn update(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let patch = Patch { name: some_text(&v, "name"), text: some_text(&v, "text") };
+    let texted = patch.text.is_some();
     let base = field::<Option<i64>>(&v, "base")?.flatten();
     let saved = crate::agentdefs::sync::agentfile_update(&cx.hub, blobs(&cx), &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.update".into(), format!("{} ({}) v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
+    if texted {
+        super::prebuild::queue(&cx.hub, &saved.agentfile.id).await;
+    }
     json_of(&saved)
 }
 
 async fn versions(cx: Cx, v: Value) -> Out {
     json_of(&json!({"versions": super::versions(&cx.hub, blobs(&cx), &who(&cx)?, &id_of(&v)?).await.map_err(fail)?}))
+}
+
+async fn builds(cx: Cx, v: Value) -> Out {
+    json_of(&json!({"builds": super::prebuild::builds(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)?}))
 }
 
 async fn restore(cx: Cx, v: Value) -> Out {
@@ -93,6 +102,7 @@ async fn restore(cx: Cx, v: Value) -> Out {
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "`version` is the version to make current again".to_owned()))?;
     let saved = super::restore(&cx.hub, blobs(&cx), &who(&cx)?, &id, version, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.restore".into(), format!("{} ({}) v{version} as v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
+    super::prebuild::queue(&cx.hub, &saved.agentfile.id).await;
     json_of(&saved)
 }
 
@@ -197,6 +207,15 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(versions(cx, v)),
         },
         Op {
+            name: "agentfiles.builds",
+            summary: "Where one of your Agentfiles' builds ahead of its sessions are (kiln plan 01a1dd2e… P4.5): saving it, or an agent definition that names it, builds it on each of your runners whose engine is microvm, for each of kiln's harnesses its sessions run (those it declares, and your agent definitions' that name it), as a session there builds it, so one started after its build is done builds nothing. Each: its `runner`, `harness`, the `version` it builds, its `state` (`queued`, `building`, `done` or `failed`), its `image` pinned by its digest once done, `why` it failed (Shards' words, or kiln's), and when it last changed (`at`, Unix ms).",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentfilesBuilds>(),
+            route: |v| Ok((Method::GET, path(&["api", "agentfiles", &id_of(v)?, "builds"]))),
+            run: |cx, v| Box::pin(builds(cx, v)),
+        },
+        Op {
             name: "agentfiles.restore",
             summary: "Make an earlier version of one of your Agentfiles current again, as a new version (nothing is lost), its text checked by Shards again.",
             read_only: false,
@@ -286,6 +305,13 @@ pub mod input {
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct AgentfilesVersions {
+        /// The Agentfile's id.
+        pub id: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentfilesBuilds {
         /// The Agentfile's id.
         pub id: String,
     }
