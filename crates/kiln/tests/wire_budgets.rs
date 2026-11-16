@@ -717,14 +717,26 @@ fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
 /// (plan 01a1a87b2dae step 3): a packed snapshot deflates what it writes at open time at the fast
 /// level, and only whole chunks at the default one. A window is written at open time, so z=gzip
 /// came to median 100,766 to 102,748 and p90 244,269 to 245,133, and a tab from before the window
-/// median 202,501 to 204,054 (five runs).
+/// median 202,501 to 204,054 (five runs). Since db0f283ab (2026-11-12) kiln depends on vendored
+/// shards-image, whose flate2 asks for zlib-rs (vendor/shards/crates/image/Cargo.toml), so Cargo's
+/// feature unification puts every flate2 in kiln's build, the packer's included, on zlib-rs, whose
+/// fast level is deflate_quick, static Huffman trees only (zlib-rs 0.6.8, CONFIGURATION_TABLE in
+/// src/deflate/algorithm/mod.rs). The same kiln (257e8961f and 9c5aa60de, which differ in a test
+/// alone; adas-mac-studio-2, macOS 26.2 arm64, 2026-11-16) on miniz_oxide came to p90 whole (older)
+/// 1,588,997 to 1,589,273, and on zlib-rs to 1,611,466 to 1,611,733 (four runs); every cold open's
+/// wire grew so (z=gzip's median 102,395 to 102,557 on miniz_oxide, 105,974 to 106,204 on zlib-rs).
+/// With 05c8973431b's, e928ed39c's and 709e4ebce's source as its corpus (`Corpus`: kiln's own source,
+/// which every landing moves) p90 whole (older) came to 1,612,111, 1,611,752 and 1,614,499. Its budget
+/// is what was measured, with no margin chosen beside it: the most of those seven runs on zlib-rs
+/// (1,614,499) and their range (3,033): 1,617,532 (docs/research/measurements/wire-budgets/
+/// cold-open-flate2.sh, its runs in cold-open-flate2.txt beside it).
 const COLD_WIRE: &[(&str, &str, usize)] = &[
     ("median", "UI (z=gzip)", 111_962),
     ("median", "UI, no gzip", 75_547),
     ("median", "whole (older)", 219_903),
     ("p90", "UI (z=gzip)", 263_160),
     ("p90", "UI, no gzip", 178_844),
-    ("p90", "whole (older)", 1_604_501),
+    ("p90", "whole (older)", 1_617_532),
 ];
 /// Cold open, the frames' JSON as the page parses it. Before the tracks: median 879,337, p90
 /// 7,196,512. With the window: median 307,288 to 307,289, p90 661,169 to 661,170; a tab from before
@@ -797,9 +809,16 @@ const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
 /// P2.3's `isolation.engine` (72d28bc0b, kiln plan 01a1dd2e…); main came to 2,046 at 709e4ebce
 /// (2026-11-16). They add to two runners' records, brotli 4 as the server sends them, 233 B with an
 /// Apple GPU, 244 B with an NVIDIA one and 391 B with neither, where `gpu_unavailable` says why for each
-/// vendor (docs/research/measurements/wire-budgets/runner-facts.py). So 1,761 and the most they add
-/// (391), times one plus the runs' spread (1.0%) plus 7%: 2,325.
-const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_325), ("overview", 1_260)];
+/// vendor (docs/research/measurements/wire-budgets/runner-facts.py, its output runner-facts.txt beside it).
+/// The value follows the host the test runs on, whose facts both runners' records carry: of the
+/// production runners', two records come to 1,359 to 1,401 B on the Macs, 1,565 on adacachy, 1,579 on
+/// the Windows one and 1,753 on fedora.attlocal.net (Linux, no GPU), every landing applied
+/// (runner-facts.txt, "Every production runner"). Main came to 1,936 and 1,938 on adas-mac-studio-2
+/// (9c5aa60de and 9bc380a97, macOS 26.2, 2026-11-16), whose two records there come to 1,360. So the
+/// runners' budget is what was measured, with no margin chosen beside it (unlike the rule above): the
+/// most on that Mac (1,938), what any production runner's facts add over its own (fedora.attlocal.net's,
+/// 1,753 - 1,360 = 393) and what a run's noise moved the five runs (their range, 17): 2,348.
+const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_348), ("overview", 1_260)];
 
 /// A key of Ship's that the simulated tab keeps loaded: what it GETs, how often it polls
 /// (`ui/src/views/ship/index.tsx`, `jobs.tsx`), what it last loaded, and what its loads came to.

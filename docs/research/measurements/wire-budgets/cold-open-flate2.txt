@@ -1,0 +1,19 @@
+# The agent page's cold opens, wire bytes to `synced`, by flate2's backend and corpus (cold-open-flate2.sh's steps, run by
+# lane kiln-green's carrier on adas-mac-studio-2.local, macOS 26.2 arm64, debug build, 2026-11-16). Budgets as at 90b35b940.
+# kiln 9c5aa60de and 257e8961f differ in a #[cfg(test)] block of crates/kiln/src/sandbox/pools.rs alone.
+
+                                       median                          p90
+backend      kiln       corpus         UI z=gzip  UI no gzip  whole    UI z=gzip  UI no gzip  whole (older)
+zlib-rs      9c5aa60de  its own        106,204    71,635      210,568  244,393    165,157     1,611,733
+zlib-rs      9c5aa60de  its own                               210,596                         1,611,642
+zlib-rs      9c5aa60de  its own                               210,521                         1,611,592
+zlib-rs      9c5aa60de  709e4ebce's                           211,018                         1,614,499
+zlib-rs      9c5aa60de  e928ed39c's                           208,355                         1,611,752
+zlib-rs      9c5aa60de  05c8973431b's                         208,390                         1,612,111
+zlib-rs      257e8961f  its own        105,974    71,583      210,621  244,266    165,007     1,611,466
+miniz_oxide  257e8961f  its own        102,395    71,202      205,548  236,519    163,833     1,589,273
+miniz_oxide  257e8961f  its own        102,557    71,183      205,490  236,502    163,874     1,588,997
+budget (COLD_WIRE)                     111,962    75,547      219,903  263,160    178,844     1,604,501
+
+Decoded bytes are the backend's alike (p90 whole (older) 7,214,561 with its own corpus on both). Blank cells: that run's
+log kept the whole (older) lines alone. p90 whole (older) on zlib-rs: most 1,614,499, range 3,033 over the seven runs.
