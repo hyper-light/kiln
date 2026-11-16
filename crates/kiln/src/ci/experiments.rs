@@ -2310,6 +2310,37 @@ mod tests {
         }
     }
 
+    /// P7.1 ("per-variant measures come from those sessions as intervals: start cold/template/warm, footprint peak and
+    /// steady, host CPU, failures, session outcome"): a split reads each session's own record of its microVM's starts
+    /// (`Start::measured`): its first start's kind and time, its peak the most any start held, its steady its last
+    /// start's, its host CPU all its starts'. Running, it hasn't failed once it ran; ended in error, or having never run,
+    /// it failed.
+    #[test]
+    fn p7_1_a_split_reads_its_sessions_microvm_measures_from_their_records() {
+        use crate::harness::model::{ExitInfo, Status};
+        use crate::harness::session::{Info, Measured, Runs, Start};
+        let start = |from: &str, start_us: u64, cpu_ns: u64, steady: u64, peak: u64| Start {
+            at: 0,
+            runs: Runs::Host { pid: 0 },
+            ended: None,
+            measured: Some(Measured { start_us: Some(start_us), started_from: Some(from.into()), cpu_ns: Some(cpu_ns), window_ns: Some(1), footprint_steady_bytes: Some(steady), footprint_peak_bytes: Some(peak), built_us: None }),
+        };
+        let restarted = vec![start("restored", 40_000, 2_000_000, 64 << 20, 80 << 20), start("warm", 9_000, 3_000_000, 70 << 20, 72 << 20)];
+        let running = seen_of(&Info { status: Status::Running, starts: restarted.clone(), ..Info::default() });
+        assert_eq!((running.ended, running.failed, running.outcome.as_str()), (false, Some(false), "running"));
+        assert_eq!((running.start_kind.as_deref(), running.start_ms), (Some("template"), Some(40.0)), "its first start's");
+        let of = |m: &str| running.measures.get(m).copied();
+        assert_eq!((of("footprint_peak_bytes"), of("footprint_steady_bytes"), of("cpu_ms")), (Some(f64::from(80u32 << 20)), Some(f64::from(70u32 << 20)), Some(5.0)));
+        let ended = seen_of(&Info { status: Status::Exited, starts: restarted.clone(), ..Info::default() });
+        assert_eq!((ended.ended, ended.failed, ended.outcome.as_str()), (true, Some(false), "ended"));
+        let errored = seen_of(&Info { status: Status::Exited, exit: Some(ExitInfo { error: Some("its microVM failed".into()), ..ExitInfo::default() }), starts: restarted, ..Info::default() });
+        assert_eq!((errored.failed, errored.outcome.as_str()), (Some(true), "failed"));
+        let never = seen_of(&Info { status: Status::Exited, ..Info::default() });
+        assert_eq!((never.failed, never.outcome.as_str(), never.start_kind, never.measures.len()), (Some(true), "failed", None, 0));
+        let starting = seen_of(&Info::default());
+        assert_eq!((starting.failed, starting.outcome.as_str()), (None, "running"));
+    }
+
     /// P7.1b ("with the same measures"): a replay's run reads as a split's session does, under a session's measure names
     /// (`seen_of`'s), its start within its kind; one that couldn't be carried out failed; one whose step ended otherwise
     /// than recorded diverged, how many such steps a measure of its own; and each variant's runs are read by the split's
