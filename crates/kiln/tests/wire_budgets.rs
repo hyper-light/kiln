@@ -760,12 +760,22 @@ const COLD_FRAMES: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 8), ("me
 const EVENTS_CI_PER_JOB: usize = 809;
 /// Events: `harness` frames per agent-hour (one an agent's record, about: [`RECORD_EVERY_MS`]).
 /// Before the tracks 1,161 (seven runs, spread 3.8%); with them 1,101 to 1,165 (5.8%: the rule
-/// would raise it, so it stays). The events track's (coalescing per entity, batching).
-const EVENTS_HARNESS_FRAMES_PER_AGENT_HOUR: usize = 1_286;
+/// would raise it, so it stays). The events track's (coalescing per entity, batching). On
+/// 2026-11-16 seven runs of one kiln (9c5aa60de to ad5cb237c, which differ in tests alone;
+/// adas-mac-studio-2, macOS 26.2) came to 1,137 to 1,390: 90 to 114 harness frames in windows of
+/// 47 to 49 s, as many as its agents' records and turn starts fall in each (most frames change an
+/// agent's `doing` and `last_activity` alone: docs/research/measurements/wire-budgets/
+/// harness-frames.txt). Its budget is what was measured, with no margin chosen beside it: their
+/// most (1,390) and their range (253): 1,643.
+const EVENTS_HARNESS_FRAMES_PER_AGENT_HOUR: usize = 1_643;
 /// Events: `harness` wire bytes per agent-minute (each frame the agent's whole entry, about 990 B).
 /// Before the tracks 19,177 (seven runs, spread 3.7%); with the compress track's permessage-deflate
-/// 1,308 to 1,647 (25.9%).
-const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 2_190;
+/// 1,308 to 1,647 (25.9%). Each entry has carried more since: W20's `admission` (137 B, 0ff338877)
+/// and step 17's `starts` (64 B) and `runs` (33 B) (519613951 and the commits after it, kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d), so a frame came to 1,248 B decoded and 105 B on the wire
+/// (harness-frames.txt, at ad5cb237c). The same seven runs came to 1,960 to 2,432; its budget is
+/// their most (2,432) and their range (472), no margin chosen: 2,904.
+const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 2_904;
 /// Events: `headroom` frames (about 65 B each) per runner-minute: a runner reports its headroom's
 /// state whenever it changes, which a loaded machine's readings do often. Before the tracks 326 to
 /// 583 over seven runs; with them 305 to 528 over five (spread 73%: it follows the host's load, so
