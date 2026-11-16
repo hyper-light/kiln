@@ -1,6 +1,6 @@
 /**
  * Your machines as moving an agent sees them (GET /api/reach/runners, /api/harness/kinds with each
- * harness's models), and the moves asked for (POST /api/harness/sessions/:id/move), kept for the
+ * harness's models), and the moves asked for (POST /api/harness/agents/:id/move), kept for the
  * browser checks to read (GET /api/mock/moves).
  */
 import type http from "node:http";
@@ -105,7 +105,9 @@ export async function handleMachines(req: http.IncomingMessage, res: http.Server
     const target = url.searchParams.get("target");
     return (ctx.json(res, 200, target ? (all[target] ?? []) : all), true);
   }
-  if ((mm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/move$/)) && m === "POST") {
+  // `agents.move` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6 S3: `POST /api/harness/agents/:id/move`, which took the
+  // place of `POST /api/harness/sessions/:id/move`).
+  if ((mm = p.match(/^\/api\/harness\/agents\/([^/]+)\/move$/)) && m === "POST") {
     const b = await ctx.body<{ to: string; now?: boolean; kind?: string; model?: string }>(req);
     moves.push({ id: decodeURIComponent(mm[1]!), to: b.to, now: Boolean(b.now), ...(b.kind ? { kind: b.kind } : {}), ...(b.model ? { model: b.model } : {}) });
     return (ctx.json(res, 202, { moving: b.to.replace(/^agent:/, "") }), true);
