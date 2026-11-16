@@ -2310,6 +2310,21 @@ impl Hub {
         }
     }
 
+    /// [`Hub::send_peer`] of a question's answer that may carry a credential's value (a run's lease answered over its
+    /// runner's link: `crate::secrets::lessor::answer`): its JSON wiped once its frame is made, and its frame as the net
+    /// thread lets go of it (`crate::net::Out::Wiped`; Shards' D242).
+    pub(crate) async fn send_wiped(&self, peer: PeerId, mut msg: ServerMsg) {
+        let encoded = proto::encode(&msg);
+        #[cfg(test)]
+        self.sent.lock().push((peer, msg.clone()));
+        if let ServerMsg::ReachAnswer { json, .. } = &mut msg {
+            crate::secrets::lessor::wipe_text(json);
+        }
+        if let Ok(b) = encoded {
+            self.net.send_wiped(peer, LANE_CONTROL, Kind::Control, b).await;
+        }
+    }
+
     /// [`Hub::send_peer`] of a message handed over: the test hub keeps it as it was sent, not a clone of it (goal 9, plan
     /// 01a1a87b2cec step 3: each channel item's answer was cloned for it).
     async fn send_owned(&self, peer: PeerId, msg: ServerMsg) {
@@ -4329,8 +4344,8 @@ impl Hub {
                 crate::reach::Question::Lessor { ask } => {
                     let (hub, runner) = (Arc::clone(self), agent.to_owned());
                     crate::rt::spawn(async move {
-                        let answer = crate::secrets::lessor::answer(&hub, &runner, ask).await;
-                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                        let json = crate::secrets::lessor::answer(&hub, &runner, ask).await.into_text();
+                        hub.send_wiped(peer, ServerMsg::ReachAnswer { req, json }).await;
                     });
                 }
                 // A runner's process that takes reach, as kiln names it (its identity's URI), for

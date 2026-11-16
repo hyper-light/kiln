@@ -887,7 +887,7 @@ fn timed(read: impl FnOnce() -> Frame) -> (Frame, u64) {
 
 /// [`read_frame`]'s work, where it runs, of the message lying in `data` from `at`: an agent session's update where its JSON
 /// lies ([`read_update`]), any other message as `crate::proto::read_agent` reads it.
-fn read_now(data: Vec<u8>, at: usize, hello: bool) -> Frame {
+fn read_now(mut data: Vec<u8>, at: usize, hello: bool) -> Frame {
     let message = data.get(at..).unwrap_or_default();
     if hello && let Some(update) = crate::proto::harness_at(message) {
         let (session, json) = (update.session.to_owned(), at.saturating_add(update.at));
@@ -896,7 +896,13 @@ fn read_now(data: Vec<u8>, at: usize, hello: bool) -> Frame {
     match crate::proto::read_agent(message) {
         Err(e) => Frame::Unreadable(e),
         Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } | AgentMsg::Admit) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
-        Ok(msg) => Frame::Read { label: super::agent_label(&msg), carried: payload_of(msg) },
+        Ok(msg) => {
+            // A runner's question may carry a sign-in's tokens (`crate::secrets::lessor`): its frame wiped once read.
+            if matches!(msg, AgentMsg::ReachAsk { .. }) {
+                hex_api::lease::wipe(&mut data);
+            }
+            Frame::Read { label: super::agent_label(&msg), carried: payload_of(msg) }
+        }
     }
 }
 
@@ -1013,9 +1019,18 @@ impl Carries for AgentMsg {
             AgentMsg::JobEvent { job, json } => FromRunner::JobEvent { job, event: payload_owned(W, "JobEvent", json)? },
             AgentMsg::Facts { json } => FromRunner::Facts(payload_owned(W, "Facts", json)?),
             AgentMsg::ReachHello { json } => FromRunner::ReachHello(payload_owned(W, "ReachHello", json)?),
-            AgentMsg::ReachAsk { req, json } => {
-                let ask = payload(W, "ReachAsk", &json).map_err(|e| e.waits(Waits::Asking(req)))?;
-                FromRunner::ReachAsk { req, ask, raw: serde_json::from_str(&json).unwrap_or_default() }
+            // A run's ask of its server's broker may carry a sign-in's tokens (`crate::secrets::lessor`): read straight,
+            // none of its words copied to be looked at for fields this build doesn't know, or kept as they came (only an
+            // agent's act is checked against them); and every question's words wiped once read (Shards' D242).
+            AgentMsg::ReachAsk { req, mut json } => {
+                let lessor = crate::secrets::lessor::asked(&json).then(|| serde_json::from_str::<crate::reach::Question>(&json).ok()).flatten();
+                let read = match lessor {
+                    Some(ask) => Ok((Box::new(ask), Value::Null)),
+                    None => payload(W, "ReachAsk", &json).map(|ask| (ask, serde_json::from_str(&json).unwrap_or_default())),
+                };
+                crate::secrets::lessor::wipe_text(&mut json);
+                let (ask, raw) = read.map_err(|e| e.waits(Waits::Asking(req)))?;
+                FromRunner::ReachAsk { req, ask, raw }
             }
             AgentMsg::Convo { json, data } => FromRunner::Convo { msg: payload_owned(W, "Convo", json)?, data },
             AgentMsg::Power { json } => FromRunner::Power(payload_owned(W, "Power", json)?),
@@ -1169,7 +1184,14 @@ impl Carries for ServerMsg {
             ServerMsg::FrontDoor { json } => FromServer::FrontDoor(payload(W, "FrontDoor", &json)?),
             ServerMsg::AssignV2 { json } => FromServer::AssignV2(payload(W, "AssignV2", &json)?),
             ServerMsg::SecretsFor { job, json } => FromServer::SecretsFor { job, secrets: payload(W, "SecretsFor", &json)? },
-            ServerMsg::ReachAnswer { req, json } => FromServer::ReachAnswer { req, answer: payload(W, "ReachAnswer", &json)? },
+            // A question's answer may carry a run's leased value (`crate::secrets::lessor`): read straight into its tree,
+            // which keeps every field and so has none to look for, its words wiped once read; what isn't JSON is refused
+            // as any payload is.
+            ServerMsg::ReachAnswer { req, mut json } => {
+                let answer = serde_json::from_str::<Value>(&json).or_else(|_| payload(W, "ReachAnswer", &json));
+                crate::secrets::lessor::wipe_text(&mut json);
+                FromServer::ReachAnswer { req, answer: answer? }
+            }
             ServerMsg::Convo { json, data } => FromServer::Convo { msg: payload(W, "Convo", &json)?, data },
             ServerMsg::StreamOpen { stream, session, json } => match payload(W, "StreamOpen", &json) {
                 Ok(spec) => FromServer::StreamOpen { stream, session, spec },
