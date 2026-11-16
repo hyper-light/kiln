@@ -109,10 +109,11 @@ test("after its engine, this session's agent, its variant a swatch and a name, t
   // The person's agents by default (a User chip in the filter), the system's by its facet.
   await expect(body.getByRole("button", { name: "Open pr-triage" })).toBeVisible();
   await expect(body.getByRole("button", { name: "Open kiln-ci-diagnose" })).toHaveCount(0);
-  // Another of yours, opened in place: its groups, one line each.
+  // Another of yours, opened in place: its settings and experiments shown whole, no dropdown nested in it, no sessions list.
   await body.getByRole("button", { name: "Open pr-triage" }).click();
-  await expect(body.getByRole("button", { name: /^Settings/ }).first()).toBeVisible();
-  await expect(body.getByRole("button", { name: /^Sessions/ }).first()).toBeVisible();
-  await expect(body.getByRole("button", { name: /^Experiment/ }).first()).toBeVisible();
+  const groups = body.locator('[aria-label="pr-triage: settings and experiments"]');
+  await expect(groups.locator("li.df-head[data-fixed]")).toHaveText([/Settings/, /Experiments/]);
+  await expect(groups.getByRole("button", { name: /^(Settings|Sessions|Experiments)/ })).toHaveCount(0);
+  await expect(groups.locator(".df-facts").first()).toBeVisible();
   expect(said, said.join("\n")).toEqual([]);
 });

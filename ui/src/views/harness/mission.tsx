@@ -1384,7 +1384,7 @@ function Agents() {
             <ul className="ms-tree-rows" aria-label={`${agentLabel(a)}'s ${own ? "subagents, engine and agent" : "subagents and engine"}`}>
               {subs && <MissionTreeRows id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} />}
               <EngineRows a={a} list={answeredList} />
-              {own && <DefGroupRows d={own.d} list={answeredList} />}
+              {own && <DefGroupRows d={own.d} />}
             </ul>
           </li>
         )}

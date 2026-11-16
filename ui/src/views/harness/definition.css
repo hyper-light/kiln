@@ -483,97 +483,7 @@
 .df-values > [data-k="instructions"] > .ms-go {
   grid-area: pen;
 }
-/* A session started from a definition (definitions.tsx SessionNode): each thing it says on a line of its
-   own at the tree's indentation, left-aligned: its name and way in, its stand in the agent's words and
-   colours (Mission's rows'), its version, its variant, where it runs, its resources and their last hour,
-   its context and cost, its controls. */
-.ms-node.df-session {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: none;
-  justify-items: start;
-  gap: 6px;
-  padding: 12px 8px 14px 34px;
-}
-.df-sess-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  justify-self: stretch;
-  min-width: 0;
-}
-.df-sess-name {
-  min-width: 0;
-  overflow: hidden;
-  color: #ededee;
-  font-size: 14px;
-  line-height: 20px;
-  text-align: left;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.df-sess-line {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  color: #97999f;
-  font-size: 13px;
-  line-height: 20px;
-}
-.df-sess-line.df-version {
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-.df-session[data-stand="needs"] .ms-word,
-.df-vm[data-stand="needs"] .ms-word {
-  color: #e2cfae;
-}
-.df-session[data-stand="needs"] .ms-word > i,
-.df-vm[data-stand="needs"] .ms-word > i {
-  background: #d8bb95;
-}
-.df-session[data-stand="crashed"] .ms-word,
-.df-vm[data-stand="crashed"] .ms-word {
-  color: #e2b9bd;
-}
-.df-session[data-stand="crashed"] .ms-word > i,
-.df-vm[data-stand="crashed"] .ms-word > i {
-  background: #d1aaad;
-}
-.df-session[data-stand="paused"] .ms-word,
-.df-vm[data-stand="paused"] .ms-word {
-  color: #b8c2d3;
-}
-.df-session[data-stand="paused"] .ms-word > i,
-.df-vm[data-stand="paused"] .ms-word > i {
-  background: #a6b2c6;
-}
-.df-session[data-stand="working"] .ms-word,
-.df-vm[data-stand="working"] .ms-word {
-  color: #cdc6ea;
-}
-.df-session[data-stand="working"] .ms-word > i,
-.df-vm[data-stand="working"] .ms-word > i {
-  background: #bab0e3;
-}
-.df-session[data-stand="finished"] .ms-word,
-.df-vm[data-stand="finished"] .ms-word {
-  color: #bfdccf;
-}
-.df-session[data-stand="finished"] .ms-word > i,
-.df-vm[data-stand="finished"] .ms-word > i {
-  background: #a8c9bc;
-}
-.df-session[data-stand="ready"] .ms-word > i,
-.df-vm[data-stand="ready"] .ms-word > i {
-  background: #6f8f84;
-}
-.df-session[data-stand] .ms-word.sg-shimmer > i {
-  background: #b8a6d5;
-}
-/* Its resources: a live bar each (limits.tsx LimitMeter), its last hour plotted under it, the width theirs. */
+/* A sandbox's resources (engine-rows.tsx EngineUsage): a live bar each (limits.tsx LimitMeter), its last hour plotted under it, the width theirs. */
 .df-usage {
   display: grid;
   gap: 10px;
@@ -596,13 +506,6 @@
   color: #d4d6dc;
   font-family: var(--font-mono);
   font-size: 12px;
-}
-/* Its controls: round, of their intent's colour (its stop red), at the left under what it says. */
-.df-sess-ctl {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 6px;
 }
 
 /* Its experiments (definitions.tsx ExperimentsGroup): a line each, its name and its state in the agents'
@@ -964,4 +867,52 @@
 /* A sandbox's resources, then its sections at their own gap (console.css .in-secs). */
 .df-vm-body .df-usage {
   margin-bottom: 26px;
+}
+
+/* A note in words (an empty list's, a criterion's absence): it wraps, never cut. */
+.df-note {
+  color: #97999f;
+  font-size: 13px;
+  line-height: 19px;
+  white-space: normal;
+}
+/* A section's head that doesn't fold (definitions.tsx GroupHead fixed): its label where an arrowed
+   one's is, nothing to press. */
+.ms-node.df-head[data-fixed] .df-head-main {
+  cursor: default;
+}
+
+/* A sandbox's stand in the agents' words' colours (mission.css .ms-row[data-stand]), on its engine line. */
+.df-vm[data-stand="needs"] .ms-word {
+  color: #e2cfae;
+}
+.df-vm[data-stand="needs"] .ms-word > i {
+  background: #d8bb95;
+}
+.df-vm[data-stand="crashed"] .ms-word {
+  color: #e2b9bd;
+}
+.df-vm[data-stand="crashed"] .ms-word > i {
+  background: #d1aaad;
+}
+.df-vm[data-stand="paused"] .ms-word {
+  color: #b8c2d3;
+}
+.df-vm[data-stand="paused"] .ms-word > i {
+  background: #a6b2c6;
+}
+.df-vm[data-stand="working"] .ms-word {
+  color: #cdc6ea;
+}
+.df-vm[data-stand="working"] .ms-word > i {
+  background: #bab0e3;
+}
+.df-vm[data-stand="finished"] .ms-word {
+  color: #bfdccf;
+}
+.df-vm[data-stand="finished"] .ms-word > i {
+  background: #a8c9bc;
+}
+.df-vm[data-stand="ready"] .ms-word > i {
+  background: #6f8f84;
 }
