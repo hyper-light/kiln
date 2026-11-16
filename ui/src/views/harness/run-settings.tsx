@@ -48,7 +48,7 @@ export interface Word {
 
 const KEY: Record<Kind, string> = { mode: "Permissions", model: "Model", effort: "Effort" };
 const KINDS: Kind[] = ["mode", "model", "effort"];
-const CONFIRM = "No checks at all.";
+export const CONFIRM = "No checks at all.";
 /** How long Undo stays offered after a change. */
 const UNDO_MS = 5000;
 /** The setting folds away this long after the last change (not while keyboard focus or a mouse is in it, or a confirmation is waiting). */
@@ -95,7 +95,7 @@ function byLatitude<T extends { id: string; label: string; dangerous?: boolean }
     .map((x) => x.m);
 }
 
-function modeWords(modes: ModeOption[], current: string): Word[] {
+export function modeWords(modes: ModeOption[], current: string): Word[] {
   const list: ModeOption[] = current && !modes.some((m) => m.id === current) ? [...modes, { id: current, label: current, description: "" }] : modes;
   return byLatitude(list).map((m) => {
     const full = m.label || m.id;
@@ -114,14 +114,14 @@ function modelWord(m: { id: string; label?: string; description?: string }, pret
   return { id: m.id, text: p !== m.id ? p : m.label || m.id, full: m.label || p, hint: m.description?.trim() || undefined };
 }
 
-function modelWords(models: ModelOption[], current: string, pretty: (id: string) => string): Word[] {
+export function modelWords(models: ModelOption[], current: string, pretty: (id: string) => string): Word[] {
   const list = models.map((m) => modelWord(m, pretty));
   // The agent's own model, when the harness doesn't list it, goes last: the families keep the harness's order. Another
   // harness's (a switch waiting) reads as its model, or "Default".
   return current && !list.some((w) => w.id === current) ? [...list, { ...modelWord({ id: modelOfWord(current) || "default" }, pretty), id: current }] : list;
 }
 
-function effortWords(efforts: ControlOption[], current: string): Word[] {
+export function effortWords(efforts: ControlOption[], current: string): Word[] {
   const list = efforts.map((e) => {
     const name = e.label || capital(e.id);
     return { id: e.id, text: name, full: name, hint: e.description?.trim() || undefined, dangerous: e.dangerous };
@@ -595,7 +595,7 @@ function PermissionLine({ at, stops, warns }: { at: number; stops: number; warns
 /* ------------------------------------------------------------------ the model */
 
 /** The model as its family, with the family's versions one tap further. */
-function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; onPick: (w: Word) => void }) {
+export function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; onPick: (w: Word) => void }) {
   const [versions, setVersions] = React.useState(false);
   const fams = families(words);
   const chosen = words.find((w) => w.id === value);

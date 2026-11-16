@@ -952,14 +952,16 @@ function CriterionForm({ e, onAdd, onCancel }: { e: Experiment; onAdd: (c: Crite
     [e],
   );
   const ready = name.trim() !== "" && expr.trim() !== "";
-  const add = () => {
-    if (!ready || checking) return;
+  // The expression as the field has it (Enter passes the editor's own: a render can lag the last key typed).
+  const add = (text: string) => {
+    const typed = text.trim();
+    if (name.trim() === "" || typed === "" || checking) return;
     setChecking(true);
     observeApi
-      .validateMonitor(expr.trim())
+      .validateMonitor(typed)
       .then((c) => {
         if (!c.ok || c.op === undefined || c.threshold === undefined) return setSaid(c.error ?? "It needs a comparison and a bound: < 10");
-        const query = expr.trim().replace(/\s*(>=|<=|==|!=|>|<)\s*-?\d+(?:\.\d+)?\s*$/, "");
+        const query = typed.replace(/\s*(>=|<=|==|!=|>|<)\s*-?\d+(?:\.\d+)?\s*$/, "");
         onAdd({ id: `c-${Date.now()}`, name: name.trim(), query, op: c.op as Op, bound: c.threshold });
       })
       .catch((err: unknown) => setSaid(errorMessage(err)))
@@ -987,7 +989,7 @@ function CriterionForm({ e, onAdd, onCancel }: { e: Experiment; onAdd: (c: Crite
         </span>
       )}
       <span className="df-crit-acts">
-        <Button size="xs" disabled={!ready || checking} onClick={add}>
+        <Button size="xs" disabled={!ready || checking} onClick={() => add(expr)}>
           Add
         </Button>
         <Button size="xs" variant="ghost" onClick={onCancel}>

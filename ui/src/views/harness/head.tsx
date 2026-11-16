@@ -16,6 +16,7 @@ import { useSuspenseResource } from "@/lib/resource";
 import { newestFirst, refusedCounts, refusedFlag, refusedWhen, whatWhy } from "@/views/refused";
 import { agentLabel, hasOwnName, modelLabel } from "./derive";
 import { useClock, useListener } from "./dom";
+import { usePicked } from "./picked";
 import { RoundButton } from "./figure/figure";
 import { AtLimit } from "./elsewhere";
 import { LimitBadge, topLimit, UsagePanel } from "./limits";
@@ -67,20 +68,6 @@ function TurnTook({ ms }: { ms: number }) {
       {took}
     </span>
   );
-}
-
-/** How long a setting picked here shows as picked before its agent says it back (most do at once). */
-const SAID_BACK_MS = 3500;
-
-/**
- * A setting as the head shows it: picked here, at once (W21-R15), until its agent says it back, or
- * hasn't within a while (then as the agent has it; a command still waiting says so, asked.tsx).
- */
-function usePicked(said: string): [string, (v: string) => void] {
-  const [picked, setPicked] = React.useState<{ v: string; at: number } | null>(null);
-  const now = useClock(picked ? 1000 : 60_000);
-  if (picked && (picked.v === said || now - picked.at > SAID_BACK_MS)) setPicked(null);
-  return [picked ? picked.v : said, (v) => setPicked({ v, at: Date.now() })];
 }
 
 export function AgentHeader({

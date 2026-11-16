@@ -223,6 +223,40 @@
   color: #c8cad0;
   white-space: nowrap;
 }
+/* A component's source and pin, then its path, on one line: the path gives way first. */
+.sb-comp > .sb-src {
+  display: flex;
+  min-width: 0;
+  gap: 10px;
+}
+.sb-src-pin {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+}
+.sb-comp > .sb-src > .sb-clip {
+  min-width: 0;
+}
+/* A harness's permissions, model and effort (sandbox.tsx HarnessSettings): a row each under its source,
+   its label in the key column the rows below read by (.sb-kv), its control beside it. */
+.sb-comp > .sb-set {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 12px 0 0 22px;
+}
+.sb-set > .sb-k {
+  line-height: 20px;
+}
+/* The model's words stand in their taps' height (run-settings.css .rs-word): its label on their line. */
+.sb-set[data-kind="model"] > .sb-k {
+  padding-top: 10px;
+}
+.sb-set-v {
+  min-width: 0;
+}
 .sb-src > svg {
   color: #a6c4ed;
 }
@@ -421,7 +455,8 @@
 }
 /* A phone's width: paths and members give way first; a row keeps its glyph, name, pin and control. */
 @container (max-width: 420px) {
-  .sb-kv {
+  .sb-kv,
+  .sb-comp > .sb-set {
     grid-template-columns: 76px minmax(0, 1fr);
   }
 }

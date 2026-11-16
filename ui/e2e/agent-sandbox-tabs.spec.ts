@@ -56,8 +56,12 @@ test("a microVM session's Engine: its line and controls, its bars each with its 
   await expect(granted.locator("xpath=ancestor::li[1]").locator(".dot")).toHaveAttribute("data-status", "succeeded");
   await granted.click();
   await expect(body.getByRole("button", { name: "Revoke docs.rs:443" })).toHaveCount(0);
-  // Components: the harness points to kiln's own switch; another swaps in place.
-  await expect(body.getByRole("button", { name: "Switch" })).toBeVisible();
+  // Components: the harness's settings a row each under it (what its harness lets change: here its
+  // permissions, a plain scale), its source, pin and path one line; another swaps in place.
+  const harness = body.locator(".sb-comp").first();
+  await expect(harness.getByRole("slider", { name: "Permissions" })).toBeVisible();
+  await expect(harness.locator(".sb-src")).toContainText("/opt/kiln/harness/claude");
+  await expect(body.getByRole("button", { name: "Switch" })).toHaveCount(0);
   await expect(body.getByRole("button", { name: "Swap" }).first()).toBeVisible();
   // Its network's last hour, under its bars; the tab's sections each fold (none nests in another).
   await expect(body.locator(".df-unet").first()).toContainText("Network");
@@ -90,6 +94,32 @@ test("a session on bare metal: its Mission row's dropdown has its subagents only
   await expect(groups).toHaveText(["Subagents", "Sandboxes", "Settings", "Experiments"]);
   await page.locator(".ms-dropdown .df-group", { hasText: "Settings" }).locator(".df-head-main").click();
   await expect(page.locator(".ms-dropdown .df-group", { hasText: "Settings" })).toContainText("harness-claude");
+  expect(said, said.join("\n")).toEqual([]);
+});
+
+test("a harness's permissions, model and effort, a row each in its sandbox's components, each set from there", async ({ page }) => {
+  const said = errors(page);
+  await page.goto("/agents?open=demo-claude");
+  const harness = page.locator(".ms-dropdown .sb-comp").first();
+  await expect(harness.locator(".sb-set > .sb-k")).toHaveText(["Permissions", "Model", "Effort"], { timeout: 30_000 });
+  // Effort: its plain scale, Home to its first stop.
+  const effort = harness.getByRole("slider", { name: "Effort" });
+  await effort.focus();
+  await page.keyboard.press("Home");
+  await expect(effort).toHaveAttribute("aria-valuetext", "Low");
+  // The model by its family.
+  await harness
+    .getByRole("radio", { name: /^Sonnet/i })
+    .first()
+    .click();
+  await expect(harness.locator('.sb-set[data-kind="model"] .rs-now-name').first()).toHaveText("Sonnet");
+  // A mode that turns checks off waits for "Turn them off".
+  const permissions = harness.getByRole("slider", { name: "Permissions" });
+  await permissions.focus();
+  await page.keyboard.press("End");
+  await expect(harness.locator(".rs-confirm-line")).toBeVisible();
+  await harness.getByRole("button", { name: "Turn them off" }).click();
+  await expect(harness.locator(".rs-confirm-line")).toHaveCount(0);
   expect(said, said.join("\n")).toEqual([]);
 });
 

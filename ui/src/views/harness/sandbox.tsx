@@ -33,7 +33,7 @@ import {
   type SandboxDetail,
   type SandboxMember,
 } from "@/api/microvms";
-import { useSession, type SessionStore } from "@/api/harness";
+import { useSession, type Command, type SessionStore } from "@/api/harness";
 import type { LiveMember, LiveOverrides, LiveTook } from "@/api/wire";
 import { agentdefsRes } from "@/api/agentdefs";
 import { Button } from "@/components/ui/button";
@@ -44,10 +44,14 @@ import { toast } from "@/components/ui/toast";
 import { labelOf, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { EngineGlyph, StartMark, WarmDots } from "@/views/sandbox-marks";
+import { sendCommand } from "./answered";
+import { modelLabel } from "./derive";
 import { Fold, FoldFixed } from "./fold";
 import { KindGlyph } from "./kind-glyph";
 import { LimitMeter } from "./limits";
 import { HarnessMark } from "./parts";
+import { usePicked } from "./picked";
+import { CONFIRM, effortWords, ModelChoice, modelWords, modeWords, Scale } from "./run-settings";
 import "./sandbox.css";
 
 const G = 2 ** 30;
@@ -80,15 +84,6 @@ function useVersions(agentId: string): { started: number; current: number } | nu
   return null;
 }
 
-/** Press the head's own harness switch (its model chip, which lists the other harnesses' models): the switch stays where it is. */
-function openHarnessSwitch() {
-  const chip = [...document.querySelectorAll<HTMLButtonElement>('.rs-v[data-kind="model"]')].find((b) => b.offsetParent !== null);
-  if (!chip) return toast({ title: "This harness can't switch here", tone: "info" });
-  chip.scrollIntoView({ block: "nearest" });
-  chip.focus();
-  if (chip.getAttribute("aria-expanded") !== "true") chip.click();
-}
-
 export function SandboxTab({ agentId, store, inRow, fixed }: { agentId: string; store: SessionStore; inRow?: boolean; fixed?: boolean }) {
   // What's been changed of it live, and how each place took it: its state, as the server sends it.
   const o = useSession(store, (s) => s.state?.overrides);
@@ -109,7 +104,7 @@ export function SandboxTab({ agentId, store, inRow, fixed }: { agentId: string; 
       <div className="in-secs sb">
         {!inRow && <Now d={d} agentId={agentId} done={done} fail={fail} change={res.change} />}
         {!ended && (host ? <HostFacts d={d} /> : <MicrovmFacts d={d} />)}
-        {!ended && d.components.length > 0 && <Components d={d} agentId={agentId} done={done} fail={fail} />}
+        {!ended && d.components.length > 0 && <Components d={d} agentId={agentId} store={store} done={done} fail={fail} />}
         {!ended && !host && d.network && <Network d={d} o={o} agentId={agentId} />}
         {!ended && <Volumes d={d} o={o} agentId={agentId} base={grants.base} />}
         {!ended && d.scope && <Reach d={d} o={o} />}
@@ -325,8 +320,8 @@ function MemberGlyph({ kind, name }: { kind: MemberKind; name: string }) {
   return kind === "harness" ? <HarnessMark kind={name} size={14} className="sb-mark" /> : <KindGlyph kind={kind === "agent" ? "agent" : "mcp"} />;
 }
 
-/** Its harness, agents and MCP servers, each at its path: swapped in place, put back as built. */
-function Components({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
+/** Its harness (its permissions, model and effort set under it), agents and MCP servers, each at its path: swapped in place, put back as built. */
+function Components({ d, agentId, store, done, fail }: { d: SandboxDetail; store: SessionStore } & Acts) {
   const [swapping, setSwapping] = React.useState<string | null>(null);
   return (
     <Fold id="sb-components" title="Components" count={d.components.length}>
@@ -335,6 +330,7 @@ function Components({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
           <React.Fragment key={c.name}>
             <ComponentRow
               c={c}
+              settings={c.kind === "harness" ? <HarnessSettings store={store} agentId={agentId} /> : null}
               open={swapping === c.name}
               onSwap={() => setSwapping(swapping === c.name ? null : c.name)}
               onRestore={() =>
@@ -365,12 +361,13 @@ function Components({ d, agentId, done, fail }: { d: SandboxDetail } & Acts) {
   );
 }
 
-function ComponentRow({ c, open, onSwap, onRestore }: { c: SandboxComponent; open: boolean; onSwap: () => void; onRestore: () => void }) {
+function ComponentRow({ c, settings, open, onSwap, onRestore }: { c: SandboxComponent; settings: React.ReactNode; open: boolean; onSwap: () => void; onRestore: () => void }) {
   const S = SOURCE[c.from.kind];
   return (
     <li className="sb-row sb-comp sb-vol" data-swapped={c.built ? "" : undefined}>
       {/* Its glyph, name and version on its first line, each beside the last, its control at that line's
-          end; under its name, its path on a line, then where it comes from and its pin on the next. */}
+          end (a harness has none: its settings are rows under it); under its name, where it comes from,
+          its pin and its path, on one line; then a harness's permissions, model and effort, a row each. */}
       <span className="sb-vol-top">
         <MemberGlyph kind={c.kind} name={c.name} />
         <span className="sb-name" title={`${c.kind} ${c.name}`}>
@@ -380,11 +377,7 @@ function ComponentRow({ c, open, onSwap, onRestore }: { c: SandboxComponent; ope
           {c.version}
         </span>
         <span className="sb-acts">
-          {c.kind === "harness" ? (
-            <Button size="xs" variant="ghost" onClick={openHarnessSwitch} title="kiln's harness switch, in the head">
-              Switch
-            </Button>
-          ) : c.built ? (
+          {c.kind === "harness" ? null : c.built ? (
             <Button size="xs" variant="ghost" onClick={onRestore} title={`Back to ${c.built.version}, as built`}>
               <Undo2 aria-hidden="true" />
               Restore
@@ -396,14 +389,95 @@ function ComponentRow({ c, open, onSwap, onRestore }: { c: SandboxComponent; ope
           )}
         </span>
       </span>
-      <span className="sb-vol-sub sb-mono sb-clip" title={c.path}>
-        {c.path}
+      <span className="sb-vol-sub sb-src">
+        <span className="sb-src-pin" title={`${c.from.url} · ${c.from.pin}`}>
+          <S.icon size={11} aria-hidden="true" />
+          <span className="sb-mono">{pinShort(c.from.pin)}</span>
+        </span>
+        <span className="sb-mono sb-clip" title={c.path}>
+          {c.path}
+        </span>
       </span>
-      <span className="sb-vol-sub sb-src" title={`${c.from.url} · ${c.from.pin}`}>
-        <S.icon size={11} aria-hidden="true" />
-        <span className="sb-mono">{pinShort(c.from.pin)}</span>
-      </span>
+      {settings}
     </li>
+  );
+}
+
+/**
+ * Its harness's permissions, model and effort, a row each, set as agent chat's line sets them: the
+ * permissions and the effort each a scale (its plain bar: tap a stop or slide to it), a mode that turns
+ * checks off waiting for "Turn them off"; the model by its family, its versions one tap further. Each
+ * shows picked at once, until the agent says it back. Only what its harness lets change, and has more
+ * than one of.
+ */
+function HarnessSettings({ store, agentId }: { store: SessionStore; agentId: string }) {
+  const meta = useSession(store, (s) => s.meta);
+  const state = useSession(store, (s) => s.state);
+  const info = useSession(store, (s) => s.info);
+  const [mode, pickMode] = usePicked(state?.mode ?? info?.mode ?? "");
+  const [model, pickModel] = usePicked(state?.model ?? info?.model ?? "");
+  const [effort, pickEffort] = usePicked(state?.effort ?? "");
+  const [armed, setArmed] = React.useState<string | null>(null);
+  const features = meta?.features ?? [];
+  const send = (c: Command, what: string) => void sendCommand(store, agentId, c).catch((e: unknown) => toast.error(`Couldn't change its ${what}`, errorMessage(e)));
+  const modes = modeWords(meta?.modes ?? [], mode);
+  const models = modelWords(meta?.models ?? [], model, modelLabel);
+  const efforts = effortWords(meta?.efforts ?? [], effort);
+  const setMode = (id: string) => {
+    setArmed(null);
+    pickMode(id);
+    send({ type: "set_mode", mode: id }, "permissions");
+  };
+  return (
+    <>
+      {features.includes("set_mode") && modes.length > 1 && (
+        <span className="sb-set">
+          <span className="sb-k">Permissions</span>
+          <span className="sb-set-v">
+            <Scale label="Permissions" words={modes} value={mode} armed={armed ?? undefined} onPick={(w) => (w.dangerous && w.id !== mode ? setArmed(w.id) : setMode(w.id))} />
+            {armed && (
+              <p className="rs-desc rs-confirm-line" data-tone="warn">
+                {CONFIRM}{" "}
+                <button type="button" className="rs-confirm" onClick={() => setMode(armed)}>
+                  Turn them off
+                </button>
+              </p>
+            )}
+          </span>
+        </span>
+      )}
+      {features.includes("set_model") && models.length > 1 && (
+        <span className="sb-set" data-kind="model">
+          <span className="sb-k">Model</span>
+          <span className="sb-set-v">
+            <ModelChoice
+              words={models}
+              value={model}
+              onPick={(w) => {
+                pickModel(w.id);
+                send({ type: "set_model", model: w.id }, "model");
+              }}
+            />
+          </span>
+        </span>
+      )}
+      {(features.includes("set_effort") || efforts.length > 0) && efforts.length > 1 && (
+        <span className="sb-set">
+          <span className="sb-k">Effort</span>
+          <span className="sb-set-v">
+            <Scale
+              label="Effort"
+              words={efforts}
+              value={effort}
+              onPick={(w) => {
+                pickEffort(w.id);
+                send({ type: "set_effort", effort: w.id }, "effort");
+              }}
+            />
+          </span>
+        </span>
+      )}
+    </>
   );
 }
 

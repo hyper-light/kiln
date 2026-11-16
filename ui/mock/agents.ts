@@ -68,7 +68,8 @@ const CWD = "/home/ada/src/kiln";
 
 function member(id: string, kind: "claude" | "codex", target: string, name: string, status: AgentInfo["status"], mode: string, prompt: string, reply: string, extra: Partial<AgentInfo> = {}): Member {
   const at = t0 + (id === "fam-orch" ? 0 : 60_000);
-  const info: AgentInfo = {
+  // `tokens` beside what the wire's AgentInfo says: a proposal (engine-tab.tsx sorts by it).
+  const info: AgentInfo & { tokens: number } = {
     ...defaultInfo(),
     id,
     kind,
