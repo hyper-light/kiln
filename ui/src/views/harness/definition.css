@@ -342,15 +342,19 @@ button.df-crumb:hover {
 
 /* A group's head and a definition's own row (definitions.tsx GroupHead, DefRow): one line, one height
    for every one of them at every width, its parts centred on it: its chevron and label (the press that
-   opens it), what it says in short at its right end, its controls last in a column of one width, so
-   the right ends line up whether a head has a ⋯ or not. */
+   opens it), what it says in short at its right end; a head with controls (a ⋯, a +) has them last, in
+   a column of one width, so those heads' right ends line up, and one with none says it at the edge. */
 .ms-node.df-head {
-  grid-template-columns: minmax(0, 1fr) auto 32px;
-  grid-template-areas: "main end acts";
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "main end";
   align-items: center;
   gap: 0 12px;
   min-height: 44px;
   padding: 0 8px 0 calc(var(--dd-lane, 17px) - 11px);
+}
+.ms-node.df-head:has(> .df-head-acts) {
+  grid-template-columns: minmax(0, 1fr) auto 32px;
+  grid-template-areas: "main end acts";
 }
 .df-head-main {
   grid-area: main;

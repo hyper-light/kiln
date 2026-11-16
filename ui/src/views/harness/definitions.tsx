@@ -403,7 +403,7 @@ export function GroupHead({
         </button>
       )}
       <span className="df-head-end">{summary}</span>
-      <span className="df-head-acts">{actions}</span>
+      {actions && <span className="df-head-acts">{actions}</span>}
     </li>
   );
 }
