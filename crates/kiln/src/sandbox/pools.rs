@@ -9,9 +9,10 @@
 //!   keep window ([`KEEP`]), by a waiter armed for the earliest window's end while any pool is named, and none
 //!   otherwise. A refusal is held and said once a pool, and asked again only as a new pool of its key begins. Hex's
 //!   microVMs keep none until its image class takes Shards' pools (`super::hexvm::NO_POOLS`, P3.1).
-//! - **On the server** ([`of_runner`], `GET /api/runners/:name/pools`): the same rule (`kiln_ci::pools`) over the starts
-//!   its sessions keep shows each runner's pools, each agent's apart and each of a deployment experiment's variants
-//!   apart (P7.1): a variant that boots another image or size is a pool of its own on the node, sized by its own starts.
+//! - **On the server** ([`of_runner`], `GET /api/runners/:name/pools`, on the Runners page under each runner): the same
+//!   rule (`kiln_ci::pools`) over the starts its sessions keep shows each runner's pools, each agent's apart and each of
+//!   a deployment experiment's variants apart (P7.1): a variant that boots another image or size is a pool of its own on
+//!   the node, sized by its own starts. Each pool's agent is named as its caller may know it ([`Whose`]).
 //!
 //! Both read the same starts the same way, so they name the same pools; what the node holds of each (its warm hosts)
 //! is the node's, which no runner reports to the server yet.
@@ -28,6 +29,8 @@ use parking_lot::Mutex;
 use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 
+use crate::agentdefs::Who;
+use crate::authz::Caller;
 use crate::harness::session::{Info, Isolation, Runs};
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
@@ -154,14 +157,55 @@ impl Pools {
     }
 }
 
-/// A pool as the server shows it: whose, the agent definition its sessions started from (else their harness), the
-/// deployment experiment and variant they ran as (P7.1), and its microVM.
+/// A pool as the server shows it: whose, the deployment experiment and variant its sessions ran as (P7.1), and its
+/// microVM.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Shown {
-    agent: String,
+    agent: Whose,
     variant: Option<(String, String)>,
     image: String,
     size: Option<(u32, u64)>,
+}
+
+/// Whose a pool is, as the caller of [`of_runner`] may know it: the agent definition its sessions started from where it
+/// reaches it (one of its person's, everyone's where it reaches everyone's, and kiln's own), by its id and name;
+/// another person's, which it doesn't (`crate::agentdefs`: another's is as none to the rest), by nothing, its id only
+/// telling its pool apart; or, for sessions started from no definition, their harness.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Whose {
+    Definition { id: String, name: String },
+    Another(String),
+    Harness { id: String, name: String },
+}
+
+/// A session's agent definition as kiln.db keeps it (`agent_def_sessions`): its id, and, for one of a person's, its
+/// owner and name (`agent_defs`).
+struct Def {
+    id: String,
+    owned: Option<(String, String)>,
+}
+
+/// Whose the pools of a session of harness `kind` (`kind_name`) started from `def` are, as `who` may know it
+/// ([`Whose`]); none reaches no person's.
+fn whose(def: Option<Def>, kind: &str, kind_name: &str, who: Option<&Who>) -> Whose {
+    let Some(def) = def else {
+        return Whose::Harness {
+            id: kind.to_owned(),
+            name: kind_name.to_owned(),
+        };
+    };
+    if let Some(own) = crate::agentdefs::builtin::get(&def.id) {
+        return Whose::Definition {
+            id: own.id,
+            name: own.name,
+        };
+    }
+    match def.owned {
+        Some((owner, name)) if who.is_some_and(|w| w.reaches(&owner)) => {
+            Whose::Definition { id: def.id, name }
+        }
+        _ => Whose::Another(def.id),
+    }
 }
 
 /// Whether a session placed on `target` runs on runner `runner`: by its name, or the server's own runner's sessions,
@@ -188,12 +232,17 @@ fn microvm_starts(info: &Info) -> impl Iterator<Item = (&str, i64, bool)> {
 }
 
 /// The warm pools kiln names on runner `runner` at `now_ms` (kiln plan 01a1dd2e…, P3.2), by the rule its runner asks
-/// its node by, over the starts its sessions keep: each pool's agent (its sessions' definition, else their harness), its
-/// deployment experiment's variant where they ran as one (P7.1), its microVM (image, vCPUs, MiB), its starts and hits
-/// (starts whose microVM started on a warm host of it), when it began, its latest start and when it's let go
-/// (`until_ms`); and `warm_hosts`, its node's warm hosts, which no runner reports yet (P3.1). One without starts for its
-/// keep window is gone.
-pub async fn of_runner(hub: &Hub, runner: &str, now_ms: i64) -> anyhow::Result<Value> {
+/// its node by, over the starts its sessions keep: each pool's agent as `who` may know it ([`Whose`]), its deployment
+/// experiment's variant where they ran as one (P7.1), its microVM (image, vCPUs, MiB), its starts and hits (starts
+/// whose microVM started on a warm host of it), when it began, its latest start and when it's let go (`until_ms`); and
+/// `warm_hosts`, its node's warm hosts, which no runner reports yet (P3.1). One without starts for its keep window is
+/// gone.
+pub async fn of_runner(
+    hub: &Hub,
+    runner: &str,
+    now_ms: i64,
+    who: Option<&Who>,
+) -> anyhow::Result<Value> {
     let infos: Vec<Arc<Info>> = hub
         .harness
         .list_shared()
@@ -205,15 +254,29 @@ pub async fn of_runner(hub: &Hub, runner: &str, now_ms: i64) -> anyhow::Result<V
         })
         .collect();
     let ids: Vec<String> = infos.iter().map(|i| i.id.clone()).collect();
-    let defs: HashMap<String, String> = hub
+    let mut defs: HashMap<String, Def> = hub
         .store
         .read(move |c| {
-            let mut st =
-                c.prepare("SELECT agent_def_id FROM agent_def_sessions WHERE session_id = ?1")?;
+            let mut st = c.prepare(
+                "SELECT s.agent_def_id, d.owner, d.name FROM agent_def_sessions s \
+                 LEFT JOIN agent_defs d ON d.id = s.agent_def_id WHERE s.session_id = ?1",
+            )?;
             let mut defs = HashMap::new();
             for id in ids {
                 let def = st
-                    .query_row(rusqlite::params![id], |r| r.get::<_, String>(0))
+                    .query_row(rusqlite::params![id], |r| {
+                        let owned = match (
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ) {
+                            (Some(owner), Some(name)) => Some((owner, name)),
+                            _ => None,
+                        };
+                        Ok(Def {
+                            id: r.get(0)?,
+                            owned,
+                        })
+                    })
                     .optional()?;
                 if let Some(def) = def {
                     defs.insert(id, def);
@@ -224,10 +287,7 @@ pub async fn of_runner(hub: &Hub, runner: &str, now_ms: i64) -> anyhow::Result<V
         .await?;
     let mut starts: Vec<(Shown, i64, bool)> = Vec::new();
     for info in &infos {
-        let agent = defs
-            .get(&info.id)
-            .cloned()
-            .unwrap_or_else(|| info.kind.clone());
+        let agent = whose(defs.remove(&info.id), &info.kind, &info.kind_name, who);
         let variant = info
             .experiment
             .as_ref()
@@ -261,8 +321,15 @@ fn view(runner: &str, mut starts: Vec<(Shown, i64, bool)>, now_ms: i64) -> Value
     let pools: Vec<Value> = named
         .kept()
         .map(|(k, p)| {
+            let (agent, from, name) = match &k.agent {
+                Whose::Definition { id, name } => (Some(id), "definition", Some(name)),
+                Whose::Harness { id, name } => (Some(id), "harness", Some(name)),
+                Whose::Another(_) => (None, "another", None),
+            };
             json!({
-                "agent": k.agent,
+                "agent": agent,
+                "agent_from": from,
+                "agent_name": name,
                 "variant": k.variant.as_ref().map(|(experiment, arm)| json!({"experiment": experiment, "arm": arm})),
                 "image": k.image,
                 "vcpus": k.size.map(|s| s.0),
@@ -279,12 +346,14 @@ fn view(runner: &str, mut starts: Vec<(Shown, i64, bool)>, now_ms: i64) -> Value
     json!({"runner": runner, "keep_ms": keep, "pools": pools})
 }
 
-/// `GET /api/runners/:name/pools` ([`of_runner`], now): a runner the server doesn't know is `404`.
-pub async fn get(hub: &Hub, name: &str) -> Result<Response, (StatusCode, String)> {
+/// `GET /api/runners/:name/pools` ([`of_runner`], now, its agents named as `caller` may know them): a runner the server
+/// doesn't know is `404`.
+pub async fn get(hub: &Hub, caller: &Caller, name: &str) -> Result<Response, (StatusCode, String)> {
     if !crate::harness::limit::known(hub, name).await {
         return Err((StatusCode::NOT_FOUND, format!("no runner named {name}")));
     }
-    let view = of_runner(hub, name, crate::util::now_ms())
+    let who = Who::of(caller).ok();
+    let view = of_runner(hub, name, crate::util::now_ms(), who.as_ref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::OK, &view))
@@ -301,7 +370,8 @@ mod tests {
     use kiln_seams::{Clock, clock::SimClock};
 
     use super::super::fake::FakeVms;
-    use super::{KEEP, Pools, Shown, keep_ms, view};
+    use super::{Def, KEEP, Pools, Shown, Whose, keep_ms, view, whose};
+    use crate::agentdefs::Who;
 
     /// A clock whose time moves only as a test sets it, and whose sleeps never end: a test lets pools go itself
     /// ([`Pools::expire`]), its waiter never waking.
@@ -456,7 +526,10 @@ mod tests {
 
     fn shown(agent: &str, arm: Option<&str>) -> Shown {
         Shown {
-            agent: agent.to_owned(),
+            agent: Whose::Definition {
+                id: agent.to_owned(),
+                name: format!("{agent}-name"),
+            },
             variant: arm.map(|a| ("exp-1".to_owned(), a.to_owned())),
             image: "harness-claude@sha256:00".to_owned(),
             size: Some((2, 2048)),
@@ -501,6 +574,8 @@ mod tests {
         );
         let first = pools.first().map(|p| {
             (
+                p["agent_from"].clone(),
+                p["agent_name"].clone(),
                 p["vcpus"].clone(),
                 p["memory_mib"].clone(),
                 p["until_ms"].clone(),
@@ -510,6 +585,8 @@ mod tests {
         assert_eq!(
             first,
             Some((
+                serde_json::json!("definition"),
+                serde_json::json!("agent-a-name"),
                 serde_json::json!(2),
                 serde_json::json!(2048),
                 serde_json::json!(2_000 + k),
@@ -521,5 +598,117 @@ mod tests {
             serde_json::json!([]),
             "no start of it for its keep window: the pool is gone"
         );
+    }
+
+    /// P3.2: a pool's agent is named as its caller may know it (`crate::agentdefs`: a person reaches their own, the
+    /// server's owner and whoever has `agentdefs.manage` everyone's, and another's is as none to the rest): its person's
+    /// definition, or everyone's for one who reaches them, by its name; another person's, or any person's for a caller
+    /// acting for none, by nothing; kiln's own by its name, for anyone; a session from no definition by its harness.
+    #[test]
+    fn p3_2_a_pools_agent_is_named_as_its_caller_may_know_it() {
+        let def = |id: &str, owner: Option<&str>| {
+            Some(Def {
+                id: id.to_owned(),
+                owned: owner.map(|o| (o.to_owned(), "reviewer".to_owned())),
+            })
+        };
+        let ada = Who {
+            person: "user:ada".to_owned(),
+            all: false,
+        };
+        let admin = Who {
+            person: "user:root".to_owned(),
+            all: true,
+        };
+        let named = Whose::Definition {
+            id: "d1".to_owned(),
+            name: "reviewer".to_owned(),
+        };
+        let another = Whose::Another("d1".to_owned());
+        let of = |d: Option<Def>, who: Option<&Who>| whose(d, "claude", "Claude Code", who);
+        assert_eq!(
+            of(def("d1", Some("user:ada")), Some(&ada)),
+            named,
+            "its person's own"
+        );
+        assert_eq!(
+            of(def("d1", Some("user:bo")), Some(&admin)),
+            named,
+            "everyone's, for one who reaches them"
+        );
+        assert_eq!(
+            of(def("d1", Some("user:bo")), Some(&ada)),
+            another,
+            "another person's"
+        );
+        assert_eq!(
+            of(def("d1", Some("user:ada")), None),
+            another,
+            "a caller acting for no person"
+        );
+        assert_eq!(
+            of(def("d1", None), Some(&admin)),
+            another,
+            "one kiln.db keeps no owner of"
+        );
+        let about = crate::agentdefs::builtin::get(crate::agentdefs::builtin::ABOUT);
+        assert!(
+            about.is_some(),
+            "kiln's own {}",
+            crate::agentdefs::builtin::ABOUT
+        );
+        assert_eq!(
+            Some(of(def(crate::agentdefs::builtin::ABOUT, None), None)),
+            about.map(|b| Whose::Definition {
+                id: b.id,
+                name: b.name
+            }),
+            "kiln's own, for anyone"
+        );
+        assert_eq!(
+            of(None, Some(&ada)),
+            Whose::Harness {
+                id: "claude".to_owned(),
+                name: "Claude Code".to_owned()
+            },
+            "a session from no definition"
+        );
+    }
+
+    /// P3.2: another person's agent's pool shows, its size, starts and hits with it, and nothing of its agent: its
+    /// definition's id is nowhere in the view.
+    #[test]
+    fn p3_2_another_persons_pool_shows_nothing_of_its_agent() {
+        let theirs = Shown {
+            agent: Whose::Another("def-of-bo".to_owned()),
+            ..shown("agent-a", None)
+        };
+        let v = view(
+            "runner-1",
+            vec![(theirs.clone(), 0, false), (theirs, 10, true)],
+            20,
+        );
+        let row = v["pools"].as_array().and_then(|p| p.first()).map(|p| {
+            (
+                p["agent"].clone(),
+                p["agent_from"].clone(),
+                p["agent_name"].clone(),
+                p["starts"].clone(),
+                p["hits"].clone(),
+                p["vcpus"].clone(),
+            )
+        });
+        assert_eq!(
+            row,
+            Some((
+                serde_json::Value::Null,
+                serde_json::json!("another"),
+                serde_json::Value::Null,
+                serde_json::json!(2),
+                serde_json::json!(1),
+                serde_json::json!(2)
+            ))
+        );
+        assert!(!v.to_string().contains("def-of-bo"), "{v}");
     }
 }
