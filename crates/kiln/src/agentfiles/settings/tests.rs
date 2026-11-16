@@ -526,8 +526,9 @@ fn p5_4_an_agents_settings_round_trip_through_its_directives() -> anyhow::Result
 #[test]
 fn p4_6_a_sources_credentials_are_its_fetchs_secrets_and_the_names_the_text_gives_them()
 -> anyhow::Result<()> {
-    let text = "FROM ubuntu:24.04\nLABEL kiln.secret.GIT_AUTH_TOKEN.github.com=user:GH_TOKEN\nHARNESS claude FROM https://github.com/acme/claude.git#v1:dist\nHARNESS --version-id=a1 codex FROM s3://tools/codex.tgz\nAGENT main FROM ssh://git@github.com/acme/agent.git#v2\nAGENT helper FROM ./helper\n";
+    let text = "FROM ubuntu:24.04\nLABEL kiln.secret.GIT_AUTH_TOKEN.github.com=user:GH_TOKEN\nHARNESS claude FROM https://github.com/acme/claude.git#v1:dist\nAGENT main FROM ssh://git@github.com/acme/agent.git#v2\nAGENT helper FROM ./helper\n";
     let s = of(text)?;
+    let s3 = of("FROM ubuntu:24.04\nHARNESS --version-id=a1 codex FROM s3://tools/codex.tgz\n")?;
     let ids = |c: &[Credential]| {
         c.iter()
             .map(|c| (c.id.clone(), c.given, c.secret.clone()))
@@ -542,7 +543,7 @@ fn p4_6_a_sources_credentials_are_its_fetchs_secrets_and_the_names_the_text_give
         )]
     );
     assert_eq!(
-        ids(&harness(&s, "codex")?.credentials),
+        ids(&harness(&s3, "codex")?.credentials),
         [
             ("AWS_ACCESS_KEY_ID.tools".to_owned(), Given::Secret, None),
             (
