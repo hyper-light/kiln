@@ -392,3 +392,244 @@ fn p4_5_the_asks_and_words_read_back_and_an_ask_never_shows_a_secret() -> anyhow
     }
     Ok(())
 }
+
+/// A person, `user:<id>`, holding `developer` on the server.
+fn developer(id: &str) -> Caller {
+    use crate::authz::gate::{Kind, Rights};
+    let rights = Rights {
+        grants: ["developer"]
+            .iter()
+            .filter_map(|g| crate::authz::Grant::parse(g).ok())
+            .collect(),
+        custom: std::collections::HashMap::new(),
+    };
+    let mut c = Caller::with(Kind::User, &format!("user:{id}"), Some(rights), None);
+    c.user = Some(id.to_owned());
+    c
+}
+
+/// `caller`'s ask to build Agentfile `id` again on `runner` (`agentfiles.rebuild`; for `harness` alone, where named): its
+/// answer, or the status and words it was refused with.
+async fn again(
+    hub: &Arc<Hub>,
+    caller: &Caller,
+    id: &str,
+    runner: &str,
+    harness: Option<&str>,
+) -> Result<Value, (http::StatusCode, String)> {
+    let mut input = json!({"id": id, "runner": runner});
+    if let (Some(h), Some(o)) = (harness, input.as_object_mut()) {
+        o.insert("harness".into(), json!(h));
+    }
+    crate::ops::call(
+        crate::ops::Cx {
+            hub: Arc::clone(hub),
+            caller: caller.clone(),
+        },
+        "agentfiles.rebuild",
+        input,
+    )
+    .await
+}
+
+/// Runner `runner`'s build for Claude Code in an answer listing builds (`{builds: [...]}`); null where there's none.
+fn build_on(answer: &Value, runner: &str) -> Value {
+    answer
+        .get("builds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|b| {
+            b.get("runner") == Some(&json!(runner)) && b.get("harness") == Some(&json!("claude"))
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A runner's builds of an Agentfile asked again (`agentfiles.rebuild`) by whoever reaches it as they read its builds
+/// (another person's is as none): one that failed, or one done, is queued again at its version now, and its runner's words
+/// move it forward as they move a save's; one on a runner away waits, queued, until it's back. Refused, nothing written,
+/// where the runner can't build it (none of that name, its engine host, its kiln saying it builds nothing ahead), where no
+/// session of it runs the harness named, or where its build there is underway.
+#[test]
+fn p4_5_a_runners_build_is_asked_again_and_refused_where_it_cant_be() -> anyhow::Result<()> {
+    use http::StatusCode;
+    anyhow::ensure!(
+        [State::Done, State::Failed].iter().all(|s| s.ended())
+            && ![State::Queued, State::Building].iter().any(|s| s.ended()),
+        "only a build at its end is asked again"
+    );
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        // Its newest process said what it speaks, without building ahead: its kiln is older.
+        crate::hub::tests::join_runner(&hub, 1, "older", 0);
+        hub.instances
+            .update(|i| i.set_features(1, vec![feature::PLACE.to_owned()]));
+        for (name, microvm, connected) in [
+            ("older", true, true),
+            ("mac", true, true),
+            ("away", true, false),
+            ("host", false, true),
+        ] {
+            hub.put_agent(runner(name, microvm, connected));
+        }
+        let owner = Caller::owner();
+        let made = op(
+            &hub,
+            &owner,
+            "agentfiles.create",
+            json!({"name": "reviewer", "text": TEXT}),
+        )
+        .await?;
+        let id = made
+            .pointer("/agentfile/id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let got = rows(&hub, &id).await?;
+        anyhow::ensure!(
+            got == [
+                row("away", "claude", 1, "queued"),
+                row("mac", "claude", 1, "queued"),
+                row("older", "claude", 1, "queued")
+            ],
+            "{got:?}"
+        );
+
+        // Underway, queued and then building, until its runner ends it.
+        let r = again(&hub, &owner, &id, "mac", None).await;
+        anyhow::ensure!(
+            matches!(&r, Err((StatusCode::CONFLICT, m)) if m.contains("for claude is queued already")),
+            "{r:?}"
+        );
+        word(&hub, "mac", &id, 1, How::Building).await?;
+        let r = again(&hub, &owner, &id, "mac", Some("claude")).await;
+        anyhow::ensure!(
+            matches!(&r, Err((StatusCode::CONFLICT, m)) if m.contains("for claude is building already")),
+            "{r:?}"
+        );
+
+        // Failed: queued again at its version, and its runner's words move it as they move a save's.
+        word(
+            &hub,
+            "mac",
+            &id,
+            1,
+            How::Failed {
+                why: "Shards didn't build it: exit code: 3".into(),
+            },
+        )
+        .await?;
+        let asked = again(&hub, &owner, &id, "mac", None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mac = build_on(&asked, "mac");
+        anyhow::ensure!(
+            mac.get("state") == Some(&json!("queued"))
+                && mac.get("version") == Some(&json!(1))
+                && mac.get("why").is_none(),
+            "{asked}"
+        );
+        word(&hub, "mac", &id, 1, How::Building).await?;
+        let image = format!("agentfile-{id}@sha256:{}", "0".repeat(64));
+        word(
+            &hub,
+            "mac",
+            &id,
+            1,
+            How::Done {
+                image: image.clone(),
+            },
+        )
+        .await?;
+        let got = rows(&hub, &id).await?;
+        anyhow::ensure!(
+            got.get(1) == Some(&row("mac", "claude", 1, "done")),
+            "{got:?}"
+        );
+
+        // Done: queued again too (its runner finds its image in its store at once).
+        let asked = again(&hub, &owner, &id, "mac", Some("claude"))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mac = build_on(&asked, "mac");
+        anyhow::ensure!(
+            mac.get("state") == Some(&json!("queued")) && mac.get("image").is_none(),
+            "{asked}"
+        );
+
+        // Away: queued again, asked as it comes back.
+        word(
+            &hub,
+            "away",
+            &id,
+            1,
+            How::Failed {
+                why: "Shards didn't build it".into(),
+            },
+        )
+        .await?;
+        let asked = again(&hub, &owner, &id, "away", None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(
+            build_on(&asked, "away").get("state") == Some(&json!("queued")),
+            "{asked}"
+        );
+
+        // Refused, nothing written.
+        let before = rows(&hub, &id).await?;
+        let r = again(&hub, &owner, &id, "nowhere", None).await;
+        anyhow::ensure!(
+            matches!(&r, Err((StatusCode::NOT_FOUND, m)) if m.starts_with("no runner nowhere builds Agentfiles")),
+            "{r:?}"
+        );
+        let r = again(&hub, &owner, &id, "host", None).await;
+        anyhow::ensure!(
+            matches!(&r, Err((StatusCode::CONFLICT, m)) if m.starts_with("host builds no Agentfile")),
+            "{r:?}"
+        );
+        let r = again(&hub, &owner, &id, "older", None).await;
+        anyhow::ensure!(
+            matches!(&r, Err((StatusCode::CONFLICT, m)) if m.starts_with("older's kiln builds no Agentfile ahead")),
+            "{r:?}"
+        );
+        let r = again(&hub, &owner, &id, "mac", Some("codex")).await;
+        anyhow::ensure!(
+            matches!(&r, Err((StatusCode::NOT_FOUND, m)) if m.starts_with("none of its sessions runs codex")),
+            "{r:?}"
+        );
+        let plain = op(&hub, &owner, "agentfiles.create", json!({"name": "plain", "text": "FROM ubuntu:24.04\nAGENT main FROM ./agent\nCMD [\"claude\"]\n"})).await?;
+        let plain = plain
+            .pointer("/agentfile/id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let r = again(&hub, &owner, &plain, "mac", None).await;
+        anyhow::ensure!(
+            matches!(&r, Err((StatusCode::NOT_FOUND, m)) if m.starts_with("none of its sessions runs one of kiln's harnesses")),
+            "{r:?}"
+        );
+        // Another person reaches its builds as none, to read them or to ask them again.
+        let bo = developer("u-bo");
+        let read = crate::ops::call(
+            crate::ops::Cx {
+                hub: Arc::clone(&hub),
+                caller: bo.clone(),
+            },
+            "agentfiles.builds",
+            json!({"id": id}),
+        )
+        .await;
+        let asked = again(&hub, &bo, &id, "mac", None).await;
+        for (name, r) in [("agentfiles.builds", read), ("agentfiles.rebuild", asked)] {
+            anyhow::ensure!(
+                matches!(&r, Err((StatusCode::NOT_FOUND, m)) if m == "no such Agentfile"),
+                "bo's {name}: {r:?}"
+            );
+        }
+        let after = rows(&hub, &id).await?;
+        anyhow::ensure!(after == before, "{before:?} became {after:?}");
+        Ok(())
+    })
+}

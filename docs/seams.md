@@ -472,8 +472,16 @@ are its pipes, and none where its link ends before it's made.
 A run's network and folders change while it runs (`change`; kiln plan 01a1dd2e…, P6b.4, through Hex's
 wire calls for Shards' P6b.1 and P6b.2): a host port published to a member's port and unpublished,
 egress granted to a member toward a host and port and revoked, a member connected to a named network
-and disconnected, a machine's folder plugged in for members, read-only or writable, and unplugged.
-Every one names who, to whom, which ports and which way (default deny). A change after its end is
+shared with other runs and its grant there taken back, a machine's folder plugged in for members,
+read-only or writable, and unplugged. Every one names who, to whom, which ports and which way
+(default deny). A connection (Shards' D285) grants nothing but its grant (`NetworkGrant`): the
+member's name on the network (a host's name, one member's there, as its peers name it), its peer (a
+member of another run on it, by its name there, which outlasts that run's restarts as its `id`
+doesn't), its ports (TCP or UDP, a range) and which way a flow opens (`Out`, toward its peer; `In`,
+from it); a flow between two runs' members is where the grants of both its ends take it, and its
+replies come back by its state. Taking a grant back resets the flows it let open, and the member
+leaves the network with its last grant there. A connection whose grant names no host's name or peer,
+itself as its peer, port 0 or its ports out of order is refused `Invalid`. A change after its end is
 refused `Ended`; a boundary that takes none live refuses one `Unsupported`, and its run goes on.
 
 A run's member is swapped for another in its boundary (`swap`; kiln plan 01a1dd2e…, P6c.5, through
@@ -505,7 +513,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, 
 - **SANDBOX-11** a run sent a signal to end ends, its end said once, and a signal after its end is refused Ended; a sandbox that delivers no signals refuses one Unsupported, and its run goes on
 - **SANDBOX-12** a run on the host has no id of a boundary's and no link, and a run says the same id and link after its end as before
 - **SANDBOX-13** a run's credential, granted by reference toward a host its egress reaches, is filled in toward that host alone: never toward another host it reaches, for a credential it isn't granted, or for a run granted none; a grant toward a host its egress doesn't reach, an address, a host with a port or no host, or by a reference no store names, is refused Invalid; a sandbox that fills in no credentials refuses them Unsupported
-- **SANDBOX-14** a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on
+- **SANDBOX-14** a run takes a change to its network or folders while it runs, a member connected to a network and its grant there taken back among them; a connection whose grant names no host's name or peer, itself as its peer, port 0 or its ports out of order is refused Invalid; a change after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on
 - **SANDBOX-15** a run's member swapped for another in its boundary ends, its end said once, and the run it gives runs the other in the same boundary; one swapped out swaps no more; a sandbox that swaps none refuses one Unsupported, and its run goes on
 - **SANDBOX-16** a launch's components are laid for it, and a run takes a component swapped in and its image's own given back while it runs, and one after its end is refused Ended; a sandbox that holds no components refuses both Unsupported, and its run goes on
 - **SANDBOX-17** a sandbox keeps a warm pool it's asked to keep, once however often it's asked, and lists it until it's let go; a pool it doesn't keep is let go already; a sandbox that keeps no pools refuses one Unsupported, and lists none

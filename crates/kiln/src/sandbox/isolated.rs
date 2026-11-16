@@ -567,7 +567,7 @@ async fn sign_in_of(provider: signin::Provider, person: Option<&str>, layout: Op
         tracing::warn!(?provider, leased, person = person.is_some(), "its harness signs in itself, its tokens in its microVM: kiln takes a sign-in outside only for a person's run in microVMs that lease credentials");
         return Ok(Vec::new());
     };
-    let file = layout.and_then(|l| l.kept_in().and_then(|dir| l.host_of(&format!("{}/{}", dir.trim_end_matches('/'), provider.file()))));
+    let file = layout.and_then(|l| provider.file_in(l).and_then(|guest| l.host_of(&guest)));
     let (person, hosts) = (person.to_owned(), hosts.clone());
     let granted = crate::rt::blocking(move || {
         let text = file.as_deref().and_then(cli_file);
