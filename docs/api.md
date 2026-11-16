@@ -386,7 +386,17 @@ refused and kept out of the image as a `kiln.secret.` one is.
   changed: refetch `/api/runners/:name/front-door`), `{type:"agentfile", owner, id, name, version,
   deleted?, builds?}` (one of a person's Agentfiles was kept, changed or deleted: to its owner, and whoever
   reaches everyone's; refetch `/api/agentfiles`; with `builds`, only where its builds ahead of its sessions
-  are moved: refetch `/api/agentfiles/:id/builds`), `{type:"ship", repo, rows: [{ row, yours?,
+  are moved: refetch `/api/agentfiles/:id/builds`), `{type:"experiment", repo, experiment: { id, repo,
+  state, measured?, runs?, decision?, opener?, draw?, replay? }}` (an experiment changed. A split's frame
+  names its `opener`, and only they and the owner get it. `draw: { n, arm }`: a session you started was
+  drawn variant `arm`, the split's draw `n` (from 0). The same draw comes again with `refused: { status,
+  why }` when its session couldn't start, a failure of that variant: `status` is the one kiln answers a
+  start with (409: the machine can't run the variant as it asks; 400: what it asks can't start; 403:
+  you may not start it there). A drawn session that did start shows in its own `harness` frames, its
+  `info.experiment` naming the split. `replay: { n, state, why?, ran, runs, run? }`: replay `n` started
+  (`ran` 0 of its `runs`, each variant once a round), one of its runs ended (`run: { arm, round,
+  conclusion }`), or it ended (`state` `done`, or `cancelled` and `why` where its split was); its measures are
+  in `GET /api/experiments/:id`'s `replays`. A decision comes with its split `done`), `{type:"ship", repo, rows: [{ row, yours?,
   whose?, dv?, base?, parts?, items? }], gone?, pace?, whole?}` (ci.md W21-R15: a repository's Ship
   rows that changed in one refresh of Ship's read model, each once, as `GET /api/ship/commits`
   renders them, for everyone and for those whose turn it is; `dv` once someone read that commit's

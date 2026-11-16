@@ -48,6 +48,7 @@ use crate::authz::{Caller, Scope};
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 use crate::store::Repo;
+use crate::wire::events::{ExperimentBrief, ExperimentDraw, ExperimentRefused, ExperimentReplay, ExperimentReplayRun, ServerEvent};
 use kiln_ci::split;
 
 /// An option: its name, what was given for it, and the commits it adds (`from..to`).
@@ -250,7 +251,20 @@ async fn save(hub: &Hub, e: &mut Experiment) {
     {
         tracing::warn!(experiment = %e.id, error = %format!("{err:#}"), "an experiment couldn't be kept");
     }
-    hub.emit(&crate::wire::events::ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(crate::wire::events::ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), measured: Some(e.runs.iter().filter(|r| r.conclusion.is_some()).count()), runs: Some(planned(e)), decision: None }) });
+    let (measured, runs) = (e.runs.iter().filter(|r| r.conclusion.is_some()).count(), planned(e));
+    told(hub, e, ExperimentBrief { measured: Some(measured), runs: Some(runs), ..ExperimentBrief::default() });
+}
+
+/// Tells the pages `e` changed (its `experiment` frame), what changed given in `what`. A split's frame names its opener,
+/// and goes to them and the server's owner alone ([`reads_split`]).
+fn told(hub: &Hub, e: &Experiment, what: ExperimentBrief) {
+    let brief = ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), opener: e.target.is_some().then(|| e.opener.clone()), ..what };
+    hub.emit(&ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(brief) });
+}
+
+/// Whether `caller` reads, and acts on, a split `opener` opened: its opener, and the server's owner.
+pub fn reads_split(caller: &Caller, opener: &str) -> bool {
+    caller.is_owner() || crate::harness::lineage::person_of(caller).as_deref() == Some(opener)
 }
 
 /// The runs an experiment plans: each buildable variant, each pass/fail criterion, each round.
@@ -304,7 +318,11 @@ async fn record_decision(hub: &Hub, e: &mut Experiment, d: Decision) {
         let _ = hub.store.kv_set(decision_key(&e.id), text).await;
     }
     e.decision = Some(d);
-    hub.emit(&crate::wire::events::ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(crate::wire::events::ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), measured: None, runs: None, decision: e.decision.clone() }) });
+    // A split decided is done ([`overlay`]): its frame says so.
+    if e.target.is_some() {
+        e.state = "done".into();
+    }
+    told(hub, e, ExperimentBrief { decision: e.decision.clone(), ..ExperimentBrief::default() });
 }
 
 /// The next experiment's id: `E1`, `E2`, ….
@@ -1307,7 +1325,7 @@ async fn mine(hub: &Hub, caller: &Caller, id: &str, cap: &str) -> Result<Experim
     let e = get(hub, id).await.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no experiment `{id}`")))?;
     if e.target.is_some() {
         // A split is its opener's: it splits their sessions alone.
-        if !caller.is_owner() && crate::harness::lineage::person_of(caller).as_deref() != Some(e.opener.as_str()) {
+        if !reads_split(caller, &e.opener) {
             return Err((StatusCode::NOT_FOUND, format!("no experiment `{id}`")));
         }
         return Ok(e);
@@ -1369,7 +1387,7 @@ pub async fn cancel(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fa
             let _ = super::runs_api::cancel(hub, run).await;
         }
     }
-    hub.emit(&crate::wire::events::ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(crate::wire::events::ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), measured: None, runs: None, decision: None }) });
+    told(hub, &e, ExperimentBrief::default());
     hub.store.audit(caller.name.clone(), "experiments.cancel".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })))
 }
@@ -1770,20 +1788,33 @@ pub async fn assign(hub: &Hub, s: &Starting<'_>) -> Option<Draw> {
     let drawn = Drawn { arm: arm.name.clone(), at: crate::util::now_ms(), ..Drawn::default() };
     let text = serde_json::to_string(&drawn).ok()?;
     hub.store.kv_set(drawn_key(&e.id, n), text).await.ok()?;
+    told(hub, &e, ExperimentBrief { draw: Some(ExperimentDraw { n, arm: arm.name.clone(), refused: None }), ..ExperimentBrief::default() });
     Some(Draw { assigned: crate::harness::session::Assigned { experiment: e.id.clone(), arm: arm.name.clone(), promoted: false }, arm, n: Some(n) })
 }
 
-/// What draw `d`'s start came to: its session, or why it was refused (its variant's failure).
-pub async fn started(hub: &Hub, d: &Draw, came: Result<String, String>) {
+/// What draw `d`'s start came to: its session, or kiln's refusal of it (its variant's failure), which the split's
+/// opener is told of.
+pub async fn started(hub: &Hub, d: &Draw, came: Result<String, (StatusCode, String)>) {
     let Some(n) = d.n else { return };
     let key = drawn_key(&d.assigned.experiment, n);
     let mut drawn: Drawn = hub.store.kv_get(key.clone()).await.ok().flatten().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| Drawn { arm: d.arm.name.clone(), ..Drawn::default() });
-    match came {
-        Ok(session) => drawn.session = Some(session),
-        Err(why) => drawn.refused = Some(why),
-    }
+    let refused = match came {
+        Ok(session) => {
+            drawn.session = Some(session);
+            None
+        }
+        Err((status, why)) => {
+            drawn.refused = Some(why.clone());
+            Some(ExperimentRefused { status: status.as_u16(), why })
+        }
+    };
     if let Ok(text) = serde_json::to_string(&drawn) {
         let _ = hub.store.kv_set(key, text).await;
+    }
+    if let Some(refused) = refused
+        && let Some(e) = get(hub, &d.assigned.experiment).await
+    {
+        told(hub, &e, ExperimentBrief { draw: Some(ExperimentDraw { n, arm: d.arm.name.clone(), refused: Some(refused) }), ..ExperimentBrief::default() });
     }
 }
 
@@ -2011,6 +2042,14 @@ async fn keep_replay(hub: &Hub, id: &str, r: &Replay) {
     }
 }
 
+/// Tells split `e`'s opener its replay `r` moved on: `ran` of its runs ended, the last of them `run`; the split as it
+/// stands now, not as it stood when the replay started.
+async fn replay_moved(hub: &Hub, e: &Experiment, r: &Replay, ran: usize, run: Option<ExperimentReplayRun>) {
+    let e = overlay(hub, e.clone()).await;
+    let replay = ExperimentReplay { n: r.n, state: r.state.clone(), why: r.why.clone(), ran, runs: r.rounds.saturating_mul(r.arms.len()), run };
+    told(hub, &e, ExperimentBrief { replay: Some(replay), ..ExperimentBrief::default() });
+}
+
 /// `POST /api/experiments/:id/replay {session, rounds?, on?}` (P7.1b): split `id`'s microVM variants each replay the
 /// caller's recorded session `session` `rounds` times (3), interleaved, one run at a time on runner `on` (the
 /// session's own machine where it's left out), from now on.
@@ -2113,8 +2152,10 @@ async fn ask_replay(hub: &Hub, on: &str, ask: &crate::sandbox::replay::Ask) -> c
 }
 
 /// Runs replay `r` of split `e` (module docs): each round, each of its variants once, in a shuffled order, one run at a
-/// time on its runner, each run kept as it ends; then done, or cancelled where its split was meanwhile.
+/// time on its runner, each run kept as it ends; then done, or cancelled where its split was meanwhile. Its opener is
+/// told as it starts, as each run ends and as it ends ([`replay_moved`]).
 async fn drive_replay(hub: Arc<Hub>, e: Experiment, mut r: Replay, runs: Vec<(Arm, crate::harness::lineage::Kept)>, folder: String, plan: kiln_ci::replay::Plan) {
+    replay_moved(&hub, &e, &r, 0, None).await;
     let mut k = 0usize;
     let seed = seed_of(&format!("{}/{}", e.id, r.n));
     'rounds: for round in 0..r.rounds {
@@ -2128,16 +2169,19 @@ async fn drive_replay(hub: Arc<Hub>, e: Experiment, mut r: Replay, runs: Vec<(Ar
             }
             let Some((arm, kept)) = runs.get(i) else { continue };
             let answer = ask_replay(&hub, &r.on, &replay_ask(&e, &r, arm, kept, round, &folder, &plan)).await;
+            let conclusion = answer.conclusion.clone();
             if let Ok(text) = serde_json::to_string(&Replayed { arm: arm.name.clone(), round, answer }) {
                 let _ = hub.store.kv_set(replayed_key(&e.id, r.n, k), text).await;
             }
             k = k.saturating_add(1);
+            replay_moved(&hub, &e, &r, k, Some(ExperimentReplayRun { arm: arm.name.clone(), round, conclusion })).await;
         }
     }
     if r.state == "running" {
         r.state = "done".into();
     }
     keep_replay(&hub, &e.id, &r).await;
+    replay_moved(&hub, &e, &r, k, None).await;
 }
 
 /// A replay's run as a split's session (P7.1b): failed where it couldn't be carried out (its microVM refused, its run
@@ -2201,7 +2245,7 @@ pub async fn pause(hub: &Hub, caller: &Caller, id: &str, on: bool) -> Result<Res
     }
     hub.store.audit(caller.name.clone(), if on { "experiments.pause" } else { "experiments.resume" }.into(), id.to_owned()).await;
     let e = overlay(hub, e).await;
-    hub.emit(&crate::wire::events::ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(crate::wire::events::ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), measured: None, runs: None, decision: None }) });
+    told(hub, &e, ExperimentBrief::default());
     Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })))
 }
 
@@ -2209,7 +2253,7 @@ pub async fn pause(hub: &Hub, caller: &Caller, id: &str, on: bool) -> Result<Res
 /// repository's runs.
 fn may_read(caller: &Caller, e: &Experiment) -> bool {
     if e.target.is_some() {
-        return caller.is_owner() || crate::harness::lineage::person_of(caller).as_deref() == Some(e.opener.as_str());
+        return reads_split(caller, &e.opener);
     }
     caller.can("runs.read", &Scope::Repo { repo: e.repo.clone() })
 }
@@ -2296,6 +2340,94 @@ mod tests {
         let res = split::analyze(&["a".to_owned(), "b".to_owned()], &[ended, diverged, failed]);
         assert!(res.arms.iter().any(|a| a.name == "a" && a.assigned == 2 && a.failures.failed == 0 && a.measures.contains_key("footprint_peak_bytes") && a.start_ms.contains_key("cold")), "{res:?}");
         assert!(res.arms.iter().any(|a| a.name == "b" && a.failures.failed == 1 && a.outcomes.get("failed") == Some(&1)), "{res:?}");
+    }
+
+    /// P7.1's live split: each draw is told to the split's opener as it's drawn, a refused one again with kiln's
+    /// refusal of its start (its status and words), a start that came to a session not again (its session's own
+    /// frames say it); and its decision, the split done. Each frame names the opener, whom alone the events socket
+    /// sends it to (`feed::Meta::person`, [`reads_split`]).
+    #[test]
+    fn p7_1_each_draw_a_refused_draw_and_the_decision_are_told_to_the_splits_opener() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let arm = |name: &str, engine: &str| Arm { name: name.into(), weight: 50.0, harness: "claude".into(), engine: engine.into(), ..Arm::default() };
+            let target = Target { harness: Some("claude".into()), ..Target::default() };
+            let mut e = Experiment {
+                id: "E7".into(),
+                opener: "user:ada".into(),
+                target: Some(target),
+                arms: vec![arm("host", "host"), arm("vm", "microvm")],
+                decide: "ask".into(),
+                state: "running".into(),
+                ..Experiment::default()
+            };
+            save(&hub, &mut e).await;
+            let mut events = hub.subscribe_events()?;
+            let ada = Starting { agentdef: None, harness: "claude", agentfile: None, person: "user:ada" };
+            let first = assign(&hub, &ada).await.ok_or_else(|| anyhow::anyhow!("ada's start is a draw"))?;
+            let second = assign(&hub, &ada).await.ok_or_else(|| anyhow::anyhow!("ada's start is a draw"))?;
+            anyhow::ensure!(assign(&hub, &Starting { agentdef: None, harness: "claude", agentfile: None, person: "user:bo" }).await.is_none(), "bo's start is no draw of ada's split");
+            started(&hub, &first, Ok("s1".into())).await;
+            let why = "an agent can't run isolated there: box starts no microVMs";
+            started(&hub, &second, Err((StatusCode::CONFLICT, why.into()))).await;
+            decide(&hub, &Caller::owner(), "E7", &json!({ "variant": "host" })).await.map_err(|(st, m)| anyhow::anyhow!("{st} {m}"))?;
+            let mut told = Vec::new();
+            while let Ok(t) = events.try_recv() {
+                let v: Value = serde_json::from_str(&t)?;
+                if v.get("type") == Some(&json!("experiment")) {
+                    let whose = crate::wire::events::feed::Meta::of(&t).person;
+                    anyhow::ensure!(whose.as_deref() == Some("user:ada") && v.pointer("/experiment/opener") == Some(&json!("user:ada")), "a split's frame is its opener's: {v}");
+                    told.push(v.get("experiment").cloned().unwrap_or_default());
+                }
+            }
+            let draws: Vec<Value> = told.iter().filter_map(|b| b.get("draw").cloned()).collect();
+            let expected = [json!({ "n": 0, "arm": first.arm.name }), json!({ "n": 1, "arm": second.arm.name }), json!({ "n": 1, "arm": second.arm.name, "refused": { "status": 409, "why": why } })];
+            anyhow::ensure!(draws == expected, "{told:?}");
+            anyhow::ensure!(told.iter().take(3).all(|b| b.get("state") == Some(&json!("running"))), "drawn while it runs: {told:?}");
+            let decided = told.last().cloned().unwrap_or_default();
+            anyhow::ensure!(told.len() == 4 && decided.pointer("/decision/variant") == Some(&json!("host")) && decided.get("state") == Some(&json!("done")), "the decision, the split done: {told:?}");
+            let mut bo = Caller::with(crate::authz::gate::Kind::User, "user:bo", None, None);
+            bo.user = Some("bo".into());
+            anyhow::ensure!(reads_split(&Caller::owner(), "user:ada") && !reads_split(&bo, "user:ada") && reads_split(&bo, "user:bo"), "a split's frames reach its opener and the owner alone");
+            Ok(())
+        })
+    }
+
+    /// P7.1b: a replay is told to its split's opener as it starts (none of its runs ended, of each variant's once a
+    /// round), as each of its runs ends (its variant, round and conclusion, how many have), and as it ends (done, with
+    /// how many ran). Here its runner isn't there, so each run fails, and is told so.
+    #[test]
+    fn p7_1b_a_replay_tells_its_start_each_run_and_its_end() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let arm = |name: &str| Arm { name: name.into(), weight: 50.0, harness: "claude".into(), engine: "microvm".into(), ..Arm::default() };
+            let target = Target { harness: Some("claude".into()), ..Target::default() };
+            let mut e =
+                Experiment { id: "E8".into(), opener: "owner".into(), target: Some(target), arms: vec![arm("a"), arm("b")], decide: "ask".into(), state: "running".into(), ..Experiment::default() };
+            save(&hub, &mut e).await;
+            let r = Replay { n: 1, session: "s".into(), on: "box".into(), rounds: 2, arms: vec!["a".into(), "b".into()], state: "running".into(), by: "owner".into(), ..Replay::default() };
+            let runs = vec![(arm("a"), crate::harness::lineage::Kept::default()), (arm("b"), crate::harness::lineage::Kept::default())];
+            let mut events = hub.subscribe_events()?;
+            drive_replay(Arc::clone(&hub), e, r, runs, "/w".into(), kiln_ci::replay::Plan::default()).await;
+            let mut told = Vec::new();
+            while let Ok(t) = events.try_recv() {
+                let v: Value = serde_json::from_str(&t)?;
+                if let Some(replay) = v.pointer("/experiment/replay") {
+                    anyhow::ensure!(v.pointer("/experiment/opener") == Some(&json!("owner")), "{v}");
+                    told.push(replay.clone());
+                }
+            }
+            anyhow::ensure!(told.len() == 6, "its start, its four runs, its end: {told:?}");
+            anyhow::ensure!(told.first() == Some(&json!({ "n": 1, "state": "running", "ran": 0, "runs": 4 })), "{told:?}");
+            for (k, ran) in told.iter().skip(1).take(4).enumerate() {
+                anyhow::ensure!(ran.get("ran") == Some(&json!(k + 1)) && ran.get("runs") == Some(&json!(4)) && ran.get("state") == Some(&json!("running")), "{ran}");
+                anyhow::ensure!(ran.pointer("/run/conclusion") == Some(&json!("failure")) && ran.pointer("/run/round") == Some(&json!(k / 2)), "{ran}");
+            }
+            let arms: Vec<&str> = told.iter().filter_map(|t| t.pointer("/run/arm").and_then(Value::as_str)).collect();
+            anyhow::ensure!(arms.iter().filter(|a| **a == "a").count() == 2 && arms.iter().filter(|a| **a == "b").count() == 2, "each variant once a round: {arms:?}");
+            anyhow::ensure!(told.last() == Some(&json!({ "n": 1, "state": "done", "ran": 4, "runs": 4 })), "{told:?}");
+            Ok(())
+        })
     }
 
     #[test]
