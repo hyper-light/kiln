@@ -1404,6 +1404,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentdefs", id, "sessions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.sessions", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "agentdef-sessions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.sessions", json!({}))).await,
         // A change over the version it was made over (`If-Match`, or `base`): refused, with what it is now, where
         // another change came first.
         (&Method::PATCH, ["api", "agentdefs", id]) => {

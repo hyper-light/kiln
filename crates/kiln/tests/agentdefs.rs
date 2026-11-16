@@ -249,9 +249,11 @@ fn agent_until(s: &Server, id: &str, what: &str, holds: impl Fn(&Value) -> bool)
 /// `agents.get` says her copy at version 2; her copy's sessions list it (its version, runner, state and engine), and
 /// its start (on its machine's host, timed from its open to its harness running); a new version of her copy leaves it
 /// behind (`current` 3). With kiln's own again, the next card says kiln's (`kiln:kiln-about`, version 0) and is listed
-/// under kiln's, as hers alone. Another person reaches neither her copy's list nor her cards in kiln's. A session that
-/// started from no definition says none. On REST, MCP and code mode. Taking the definition out of `uses::ask_for`
-/// lists no session; taking `record` out of `lineage::start` lists none either.
+/// under kiln's, as hers alone. Every definition's at once (`/api/agentdef-sessions`, the Agents page's rows) holds
+/// each as its own list answers it, and none once it's deleted. Another person reaches neither her copy's list nor
+/// her cards in kiln's, alone or in every definition's. A session that started from no definition says none. On REST,
+/// MCP and code mode. Taking the definition out of `uses::ask_for` lists no session; taking `record` out of
+/// `lineage::start` lists none either; taking the person out of `sessions::all`'s read shows Bo kiln's card he didn't start.
 #[test]
 fn p5_2_a_session_says_the_definition_it_started_from_and_the_definition_lists_its_sessions() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -290,6 +292,14 @@ fn p5_2_a_session_says_the_definition_it_started_from_and_the_definition_lists_i
     let host = listed.pointer("/starts/by_kind/host").cloned().unwrap_or_default();
     anyhow::ensure!(listed.pointer("/starts/n").and_then(Value::as_u64) >= Some(1) && host.get("timed") == Some(&json!(1)) && host.get("p50_ms").is_some_and(Value::is_u64), "its start: {listed}");
     anyhow::ensure!(listed.pointer("/starts/warm") == Some(&Value::Null) && listed.pointer("/starts/by_kind/microvm").is_none(), "no warm pools, no microVM starts: {listed}");
+    // Every definition's at once: hers as its own list answers it (what doesn't move as her card works).
+    let held = |l: &Value| -> Vec<Value> {
+        let sessions = l.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default();
+        let each = sessions.iter().map(|x| json!([x.get("id"), x.get("version"), x.get("runner"), x.get("engine")]));
+        each.chain([json!(l.pointer("/starts/n"))]).collect()
+    };
+    let (st, every) = call(&srv, &srv.admin, "GET", "/api/agentdef-sessions", None)?;
+    anyhow::ensure!(st == 200 && every.get(&mine).map(held) == Some(held(&listed)), "every definition's: {st} {every}");
 
     // A new version of her copy: her card is behind it.
     let (st, v3) = call(&srv, &srv.admin, "PATCH", &format!("/api/agentdefs/{mine}"), Some(json!({ "base": 2, "instructions": "Answer in two sentences." })))?;
@@ -302,12 +312,18 @@ fn p5_2_a_session_says_the_definition_it_started_from_and_the_definition_lists_i
     anyhow::ensure!(!failed && said.contains(&card), "the tool: {said}");
     let (failed, said) = mcp(&srv, &srv.admin, "code_run", json!({ "program": "const l = await kiln.agentdefs.sessions({ id: input.id }); return `${l.sessions[0].version}/${l.starts.n >= 1}`", "input": { "id": mine } }))?;
     anyhow::ensure!(!failed && said.contains("2/true"), "code mode: {said}");
+    let (failed, said) = mcp(&srv, &srv.admin, "agentdefs_sessions", json!({}))?;
+    anyhow::ensure!(!failed && said.contains(&mine) && said.contains(&card), "the tool, every definition's: {said}");
+    let (failed, said) = mcp(&srv, &srv.admin, "code_run", json!({ "program": "const e = await kiln.agentdefs.sessions({}); return `${e[input.id].sessions[0].version}`", "input": { "id": mine } }))?;
+    anyhow::ensure!(!failed && said.contains('2'), "code mode, every definition's: {said}");
 
     // Another person reaches none of it.
     let (st, said) = call(&srv, &bo, "GET", &format!("/api/agentdefs/{mine}/sessions"), None)?;
     anyhow::ensure!(st == 404 && said.to_string().contains("no such agent definition"), "{st} {said}");
     let (st, said) = call(&srv, &bo, "GET", "/api/agentdefs/kiln:nothing/sessions", None)?;
     anyhow::ensure!(st == 404, "{st} {said}");
+    let (st, his) = call(&srv, &bo, "GET", "/api/agentdef-sessions", None)?;
+    anyhow::ensure!(st == 200 && his == json!({}), "his every definition's: {st} {his}");
 
     // Kiln's own again: the next card says kiln's, listed under kiln's as hers alone.
     let (st, used) = call(&srv, &srv.admin, "POST", "/api/agentdefs/use", Some(json!({ "builtin": "kiln:kiln-about", "id": null })))?;
@@ -320,6 +336,10 @@ fn p5_2_a_session_says_the_definition_it_started_from_and_the_definition_lists_i
     anyhow::ensure!(st == 200 && s(&listed, "/sessions/0/id") == kilns && listed.pointer("/sessions/0/version") == Some(&json!(0)), "{st} {listed}");
     let (st, his) = call(&srv, &bo, "GET", "/api/agentdefs/kiln:kiln-about/sessions", None)?;
     anyhow::ensure!(st == 200 && his.get("sessions") == Some(&json!([])), "his of kiln's: {st} {his}");
+    let (st, every) = call(&srv, &srv.admin, "GET", "/api/agentdef-sessions", None)?;
+    anyhow::ensure!(st == 200 && s(&every, "/kiln:kiln-about/sessions/0/id") == kilns && every.pointer(&format!("/{mine}/sessions/0/id")) == Some(&json!(card)), "kiln's under kiln's, hers under hers: {st} {every}");
+    let (st, his) = call(&srv, &bo, "GET", "/api/agentdef-sessions", None)?;
+    anyhow::ensure!(st == 200 && his == json!({}), "his every definition's: {st} {his}");
     let (_, listed) = call(&srv, &srv.admin, "GET", &format!("/api/agentdefs/{mine}/sessions"), None)?;
     anyhow::ensure!(listed.get("sessions").and_then(Value::as_array).map(Vec::len) == Some(1), "her copy's still its one: {listed}");
 
@@ -332,6 +352,8 @@ fn p5_2_a_session_says_the_definition_it_started_from_and_the_definition_lists_i
     anyhow::ensure!(st == 200, "{st}");
     let (_, got) = op(&srv, &srv.admin, "agents.get", json!({ "agent": card }))?;
     anyhow::ensure!(got.get("definition") == Some(&Value::Null), "{got}");
+    let (st, every) = call(&srv, &srv.admin, "GET", "/api/agentdef-sessions", None)?;
+    anyhow::ensure!(st == 200 && every.get(&mine).is_none() && every.get("kiln:kiln-about").is_some(), "deleted, hers are no definition's: {st} {every}");
     drop(runner);
     Ok(())
 }

@@ -496,6 +496,49 @@ export function kindsByTarget(read: Record<string, KindInfo[]> | SharedKinds): R
   return Object.fromEntries(Object.entries(targets).map(([target, at]) => [target, lists[at] ?? []]));
 }
 
+/** What `agents.start` answers: its agents, briefly; `queued`, the words of a start that waits for room on its machine. */
+interface StartAnswer {
+  agents: { id: string }[];
+  parent?: string | null;
+  queued?: string;
+}
+
+/** A start asked as `agents.start` takes it, of the console's spec on its machine (`local`, `agent:<machine>`). */
+export function startAsk(target: string, spec: Spec, count: number, ids?: string[]) {
+  return {
+    kind: spec.kind,
+    on: target,
+    ...(spec.cwd ? { cwd: spec.cwd } : {}),
+    ...(spec.prompt ? { prompt: spec.prompt } : {}),
+    ...(spec.model ? { model: spec.model } : {}),
+    ...(spec.effort ? { effort: spec.effort } : {}),
+    ...(spec.mode ? { mode: spec.mode } : {}),
+    ...(spec.name ? { name: spec.name } : {}),
+    count,
+    ...(spec.workspace ? { workspace: spec.workspace.kind } : {}),
+    ...(spec.isolation ? { isolation: "microvm", ...(spec.isolation.image ? { image: spec.isolation.image } : {}) } : {}),
+    ...(spec.resume ? { resume: spec.resume } : {}),
+    ...(ids ? { ids } : {}),
+    ...(spec.speed !== undefined ? { speed: spec.speed } : {}),
+    ...(spec.reach !== undefined ? { reach: spec.reach } : {}),
+    ...(spec.shell ? { shell: spec.shell } : {}),
+  };
+}
+
+/** How long a start waiting for room is waited on here before its page goes on without it (it starts all the same). */
+const QUEUED_MS = 10 * 60_000;
+
+/** The agents `answer` started, each read whole; one that waits for room is read under its id once it has started there. */
+async function startedOf(answer: StartAnswer, ids: string[]): Promise<AgentInfo[]> {
+  const wanted = answer.agents.length > 0 ? answer.agents.map((a) => a.id) : ids;
+  const until = Date.now() + QUEUED_MS;
+  for (;;) {
+    const there = (await Promise.all(wanted.map((id) => harnessApi.session(id).catch(() => null)))).filter((a): a is AgentInfo => a !== null);
+    if (there.length === wanted.length || !answer.queued || Date.now() > until) return there;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
 export const harnessApi = {
   /**
    * The page of a session's events just before number `before`, where what's shown begins
@@ -610,9 +653,18 @@ export const harnessApi = {
     call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/takeover`, opts?.stop ? { stop: true } : undefined),
   /** Continue a copy of a found session's conversation as an agent; the session keeps running. */
   fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
-  /** `ids`: one made here for each (`clientId`), so its page can open before it has started (W21-R15); asked again under them, it's refused (409), never started twice. */
+  /**
+   * The op an agent in chat starts one with (`agents.start`, kiln plan 01a1dd2e…, P5.6 S8): one start, whatever asks
+   * it. `ids`: one made here for each (`clientId`), so its page can open before it has started (W21-R15); asked again
+   * under them, it's refused (409), never started twice. Each started one read whole, as the lists show it; one that
+   * waits for room on its machine starts there under its id, read once it has.
+   */
   start: (target: string, spec: Spec, count = 1, ids?: string[]) =>
-    ownAgentAction(call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count, ...(ids ? { ids } : {}) }), ids ?? [], (started) => started.map((a) => a.id)),
+    ownAgentAction(
+      call<StartAnswer>("POST", "/api/harness/agents", startAsk(target, spec, count, ids)).then((answer) => startedOf(answer, ids ?? [])),
+      ids ?? [],
+      (started) => started.map((a) => a.id),
+    ),
   /** Remove an agent (`agents.remove`): ended for good and taken off kiln's lists. */
   stop: (id: string) => ownAgentAction(call<void>("DELETE", `/api/harness/agents/${encodeURIComponent(id)}`), [id]),
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
