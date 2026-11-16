@@ -19,7 +19,7 @@
  *
  * PROPOSALS, not the server's yet (p/uicontract is building them; they're here as the UI reads them):
  *   PATCH  /api/agentdefs/:id {version}  the version a save was based on: another saved since → 409 {error, current}
- *   GET    /api/agentdef-sessions        {[id]: {sessions: {id, version, variant?}[], starts: {engine, warm, target, p50_ms}}}
+ *   GET    /api/agentdef-sessions        {[id]: {sessions: {id, version, variant?}[], starts: {n, by_kind, by_start, warm}}} (agentdefs.sessions for all, as uicontract serves it)
  *   GET    /api/agentdef-experiments     {[id]: Experiment[]}: each definition's experiments, splits of its new sessions between deployments (P7.1)
  */
 import type http from "node:http";
@@ -337,10 +337,30 @@ const EXPERIMENTS: Record<string, unknown[]> = {
     },
   ],
 };
-type Starts = { engine: "microvm" | "host"; warm: number; target: number; p50_ms: { warm?: number; template?: number; cold?: number } };
-const starts = (engine: "microvm" | "host", warm: number, target: number, p50_ms: Starts["p50_ms"]): Starts => ({ engine, warm, target, p50_ms });
+/** How fast each starts where, as its data is kept here: the engine its sessions run in, its warm hosts, each kind of start's median (ms). */
+type StartsKept = { engine: "microvm" | "host"; warm: number; target: number; p50_ms: { warm?: number; template?: number; cold?: number } };
+const starts = (engine: "microvm" | "host", warm: number, target: number, p50_ms: StartsKept["p50_ms"]): StartsKept => ({ engine, warm, target, p50_ms });
+/** Shards' word for each kind of start (its D253: `booted` cold, `restored` from its image's template, `warm` from a warm host). */
+const WORD: Record<string, string> = { cold: "booted", template: "restored", warm: "warm" };
+/**
+ * Its starts as the server answers them (agentdefs.sessions' `starts`, crates/kiln/src/agentdefs/sessions.rs): how many
+ * started, by engine (median in ms), by how each started (median in µs, and Shards' words for it), and its warm hosts
+ * (a proposal: the server says none until its runners' Hex nodes report them).
+ */
+function served(k: StartsKept, sessions: number) {
+  const kinds = Object.entries(k.p50_ms).filter((e): e is [string, number] => e[1] !== undefined);
+  const each = Math.max(1, Math.round(sessions / Math.max(1, kinds.length)));
+  const sorted = kinds.map(([, ms]) => ms).sort((a, b) => a - b);
+  const mid = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : null;
+  return {
+    n: sessions,
+    by_kind: sessions ? { [k.engine]: { n: sessions, timed: sessions, p50_ms: mid } } : {},
+    by_start: Object.fromEntries(kinds.map(([kind, ms]) => [kind, { n: each, timed: each, p50_us: Math.round(ms * 1000), from: { [WORD[kind] ?? kind]: each } }])),
+    warm: k.target > 0 ? { warm: k.warm, target: k.target } : null,
+  };
+}
 /** The sessions started from each, the version each started on and its variant, and how fast it starts where: a proposal (p/uicontract). */
-const SESSIONS: Record<string, { sessions: { id: string; version: number; variant?: string }[]; starts: Starts }> = {
+const SESSIONS: Record<string, { sessions: { id: string; version: number; variant?: string }[]; starts: StartsKept }> = {
   [idOf("reviewer")]: {
     sessions: [
       { id: "fam-orch", version: 4, variant: "5e1c" },
@@ -395,7 +415,8 @@ export function sessionDef(session: string): { agent: string; agentfile: string;
 export async function handleAgentdefs(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";
-  if (p === "/api/agentdef-sessions" && m === "GET") return (seed(), ctx.json(res, 200, SESSIONS), true);
+  if (p === "/api/agentdef-sessions" && m === "GET")
+    return (seed(), ctx.json(res, 200, Object.fromEntries(Object.entries(SESSIONS).map(([id, d]) => [id, { sessions: d.sessions, starts: served(d.starts, d.sessions.length) }]))), true);
   if (p === "/api/agentdef-experiments" && m === "GET") return (seed(), ctx.json(res, 200, EXPERIMENTS), true);
   if (p !== "/api/agentdefs" && !p.startsWith("/api/agentdefs/")) return false;
   seed();

@@ -22,12 +22,14 @@ import {
   agentdefsApi,
   agentdefsRes,
   agentdefVersionsRes,
+  enginesOf,
   limitSeconds,
   limitWords,
   measureOf,
   METRIC,
   passes,
   queryOf,
+  startMs,
   variantIn,
   type AgentDef,
   type AgentDefFull,
@@ -191,25 +193,30 @@ const START_LABEL: Record<"warm" | "template" | "cold", string> = { warm: "Warm 
  */
 export function DefFacts({ d }: { d: AgentDef }) {
   const r = d.runs;
+  const engines = enginesOf(r);
   return (
     <span className="df-facts">
-      <span className="df-fact">
-        <span className="ms-edit-k">runs in</span>
-        <span className="df-fact-v">
-          <EngineGlyph engine={r.engine} word />
+      {engines.length > 0 && (
+        <span className="df-fact">
+          <span className="ms-edit-k">runs in</span>
+          <span className="df-fact-v">
+            {engines.map((e) => (
+              <EngineGlyph key={e} engine={e} word />
+            ))}
+          </span>
         </span>
-      </span>
-      {r.target > 0 && (
+      )}
+      {r.warm && r.warm.target > 0 && (
         <span className="df-fact">
           <span className="ms-edit-k">warm hosts</span>
           <span className="df-fact-v">
-            <WarmDots n={r.warm} of={r.target} />
-            {r.warm} of {r.target} warm
+            <WarmDots n={r.warm.warm} of={r.warm.target} />
+            {r.warm.warm} of {r.warm.target} warm
           </span>
         </span>
       )}
       {(["warm", "template", "cold"] as const).map((k) => {
-        const ms = r.p50_ms[k];
+        const ms = startMs(r, k);
         if (ms === undefined) return null;
         const S = START[k];
         return (

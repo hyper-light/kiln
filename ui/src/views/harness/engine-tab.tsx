@@ -13,7 +13,7 @@
  * Only the two sections fold: inside them nothing does (no collapsible nested in another).
  */
 import * as React from "react";
-import { agentdefsRes, type AgentDef } from "@/api/agentdefs";
+import { agentdefsRes, enginesOf, type AgentDef } from "@/api/agentdefs";
 import type { AgentInfo } from "@/api/harness";
 import { sandboxesRes, type SandboxBrief } from "@/api/microvms";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
@@ -183,7 +183,8 @@ const AGENT_ORDER: Record<AgentSort, (x: Def, y: Def) => number> = {
 const AGENT_FACETS: FacetOf<Def>[] = [
   { id: "source", label: "Source", of: (x) => (x.d.own ? "user" : "system"), word: (v) => (v === "user" ? "User" : "System") },
   { id: "harness", label: "Harness", of: (x) => x.d.harness, word: (v) => v },
-  { id: "engine", label: "Runs in", of: (x) => x.d.runs.engine, word: (v) => (v === "microvm" ? "microVM" : "host") },
+  // Where its sessions ran, the engine more ran in (agentdefs.sessions' by_kind); one that's run nowhere yet, none.
+  { id: "engine", label: "Runs in", of: (x) => enginesOf(x.d.runs)[0] ?? "none", word: (v) => (v === "microvm" ? "microVM" : v === "host" ? "host" : "no sessions yet") },
 ];
 const defWords = (x: Def) => `${x.d.name} ${x.d.harness}`;
 

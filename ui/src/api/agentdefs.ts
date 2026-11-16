@@ -155,16 +155,43 @@ export interface Experiment {
   variants: Variant[];
 }
 /** Where its sessions run and how fast they start: its engine, warm hosts kept of the target, start p50 by kind (ms). */
+/**
+ * What a definition's sessions' starts took (agentdefs.sessions' `starts`, crates/kiln/src/agentdefs/sessions.rs): how
+ * many started; by engine, how many and each's median start in milliseconds; by how each microVM started (`cold`,
+ * `template`, `warm`, `swapped`, or a word kiln doesn't know yet), how many, how many were timed, the median in
+ * microseconds and how many each of Shards' words gave; and its warm pool's hosts, where its runners' Hex nodes report
+ * them (none does yet: kiln plan 01a1dd2e…, P3.1, P3.2).
+ */
 export interface Starts {
-  engine: "microvm" | "host";
-  warm: number;
-  target: number;
-  p50_ms: { warm?: number; template?: number; cold?: number };
+  n: number;
+  by_kind: Partial<Record<"host" | "microvm", { n: number; timed: number; p50_ms: number | null }>>;
+  by_start: Record<string, { n: number; timed: number; p50_us: number | null; from: Record<string, number> }>;
+  warm: { warm: number; target: number } | null;
+}
+/** One of its sessions (agentdefs.sessions' `sessions`), newest first: `gone` once kiln no longer has it; its variant where an experiment gave it one. */
+export interface DefSession {
+  id: string;
+  version: number;
+  at?: number;
+  runner?: string;
+  state?: string;
+  engine?: "host" | "microvm" | null;
+  agent?: string | null;
+  variant?: string;
 }
 interface DefSessions {
-  sessions: { id: string; version: number; variant?: string }[];
+  sessions: DefSession[];
   starts: Starts;
 }
+
+/** Where its sessions ran, the engine more ran in first (`by_kind`): none for one that's run nowhere yet. */
+export const enginesOf = (s: Starts): ("microvm" | "host")[] =>
+  (["microvm", "host"] as const).filter((k) => (s.by_kind[k]?.n ?? 0) > 0).sort((a, b) => (s.by_kind[b]?.n ?? 0) - (s.by_kind[a]?.n ?? 0));
+/** A kind of start's median in milliseconds, of those timed (`by_start`'s microseconds): none where none was timed. */
+export const startMs = (s: Starts, kind: string): number | undefined => {
+  const us = s.by_start[kind]?.p50_us;
+  return us == null ? undefined : us / 1000;
+};
 
 /* ------------------------------------------------ what the UI draws */
 
@@ -189,7 +216,7 @@ export interface AgentDef {
   replaces?: string;
   /** This one of kiln's is stood in for by yours (its name). */
   replaced_by?: string;
-  sessions: { id: string; version: number; variant?: string }[];
+  sessions: DefSession[];
   /** Yours: when it was made (Unix seconds); kiln's own have none. */
   created_at?: number;
   runs: Starts;
@@ -197,7 +224,7 @@ export interface AgentDef {
   experiments: Experiment[];
 }
 
-const NONE: Starts = { engine: "microvm", warm: 0, target: 0, p50_ms: {} };
+const NONE: Starts = { n: 0, by_kind: {}, by_start: {}, warm: null };
 /** kiln's own's kind, from its id as the server names them (crates/kiln/src/agentdefs/builtin.rs). */
 const kindOf = (b: Builtin): AgentDef["kind"] => (b.id.startsWith("kiln:harness-") ? "harness" : b.id.startsWith("kiln:kiln-ci-") ? "skill" : "ui");
 
