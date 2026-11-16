@@ -797,11 +797,19 @@ const EVENTS_REST_WIRE_PER_MIN: usize = 3_809;
 const SHIP_WIRE_PER_LOAD: &[(&str, usize)] = &[("Ship list", 1_079), ("opened row", 1_601)];
 /// Ship's loads a minute over both keys. Before `ship` frames, 87 to 111, held to what
 /// `resource.ts` allowed (128 for two keys: each once a second after its last and its 15 s polls);
-/// with them (W21-R15), 10 to 11 (spread 10%): its polls, and a frame it can't place.
-const SHIP_LOADS_PER_MIN: usize = 13;
+/// with them (W21-R15), 10 to 11 (spread 10%): its polls, and a frame it can't place. On 2026-11-16
+/// nine runs of one kiln (9c5aa60de to 50a03a9dd, which differ in tests alone; adas-mac-studio-2,
+/// macOS 26.2) loaded 10 or 11 times in windows of 47 to 50 s: each key at the window's start and
+/// at its 15 s polls, and again after a frame it couldn't take in place (3 or 4 a run). So a
+/// shorter window (the push's runs ending sooner) counts more a minute: 12 or 13. Its budget is
+/// what was measured, with no margin chosen beside it: their most (13) and their range (1): 14.
+const SHIP_LOADS_PER_MIN: usize = 14;
 /// Those loads' wire bytes a minute. Before `ship` frames, 290 to 370 KiB; with them and
-/// compression, 10,510 to 11,179 (spread 6.4%).
-const SHIP_LOAD_WIRE_PER_MIN: usize = 12_674;
+/// compression, 10,510 to 11,179 (spread 6.4%). Each load costs what it did (the list 704 to 771 B,
+/// the opened row 1,284 to 1,350, against 694 to 841 and 1,223 to 1,357 then); a minute's follow
+/// its loads (above). The same nine runs came to 11,717 to 12,860, one over 12,674 (11 loads in
+/// 49.6 s, at 50a03a9dd); its budget is their most (12,860) and their range (1,143): 14,003.
+const SHIP_LOAD_WIRE_PER_MIN: usize = 14_003;
 /// The `ship` frames a Ship tab is sent instead, wire bytes a minute: 3,668 to 5,207 (spread 42%:
 /// how many rows a refresh finds changed follows when the legs end).
 const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
