@@ -138,13 +138,8 @@
   border-bottom: 1px solid #191b1f;
   font-size: 12.5px;
 }
-/* A component: laid out as a volume is (.sb-vol): its path and source under its name. */
-.sb-comp-sub {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px 10px;
-  min-width: 0;
+/* A component: laid out as a volume is (.sb-vol): its path, then its source and pin, each a line under its name. */
+.sb-comp > .sb-vol-sub {
   padding-left: 22px;
 }
 /* A row of two lines, each whole: what it is and its version or mode; then where, from what, and who. */

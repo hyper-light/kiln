@@ -372,7 +372,7 @@ function ComponentRow({ c, open, onSwap, onRestore }: { c: SandboxComponent; ope
   return (
     <li className="sb-row sb-comp sb-vol" data-swapped={c.built ? "" : undefined}>
       {/* Its glyph, name and version on its first line, each beside the last, its control at that line's
-          end; its path, where it comes from and its pin under its name. */}
+          end; under its name, its path on a line, then where it comes from and its pin on the next. */}
       <span className="sb-vol-top">
         <MemberGlyph kind={c.kind} name={c.name} />
         <span className="sb-name" title={`${c.kind} ${c.name}`}>
@@ -398,14 +398,12 @@ function ComponentRow({ c, open, onSwap, onRestore }: { c: SandboxComponent; ope
           )}
         </span>
       </span>
-      <span className="sb-vol-sub sb-comp-sub">
-        <span className="sb-mono sb-clip" title={c.path}>
-          {c.path}
-        </span>
-        <span className="sb-src" title={`${c.from.url} · ${c.from.pin}`}>
-          <S.icon size={11} aria-hidden="true" />
-          <span className="sb-mono">{pinShort(c.from.pin)}</span>
-        </span>
+      <span className="sb-vol-sub sb-mono sb-clip" title={c.path}>
+        {c.path}
+      </span>
+      <span className="sb-vol-sub sb-src" title={`${c.from.url} · ${c.from.pin}`}>
+        <S.icon size={11} aria-hidden="true" />
+        <span className="sb-mono">{pinShort(c.from.pin)}</span>
       </span>
     </li>
   );

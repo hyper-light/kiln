@@ -843,7 +843,8 @@
 .eg-list {
   --dd-content: 0px;
 }
-.eg-list > .ms-node.df-vm {
+.eg-list > .ms-node.df-vm,
+.eg-list > .ms-node.df-vm-body {
   padding-right: 0;
 }
 
