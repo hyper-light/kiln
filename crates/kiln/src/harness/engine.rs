@@ -75,10 +75,9 @@ pub enum Source {
 
 /// Whether a runner can hold agents in microVMs now, and why not: the one place kiln reads that from.
 ///
-/// From its facts as its runner says them: its kiln carries Shards and its machine has a hypervisor it
-/// can use (`isolation.available`, `why_not`: `crate::sandbox::facts`). Once kiln vendors a Shards with
-/// `shards_api::host_check()` (d993d83ee or later), the runner's facts say its answer
-/// (`{backend, usable, why}`) in `isolation`, and this reads it there, unchanged for every caller.
+/// From its facts as its runner says them: its kiln carries Shards, and Shards' own check of its host says it
+/// runs microVMs now (`shards_api::host_check`'s `{backend, usable, why}` as `isolation`'s `hypervisor`,
+/// `available` and `why_not`: `crate::sandbox::facts`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capable {
     pub usable: bool,

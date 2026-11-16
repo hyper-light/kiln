@@ -4,12 +4,13 @@
 //! stdio said to ride the link its runs are given. What it stands in for is Shards' image boot through
 //! Hex; what it holds a session to is the seam's contract alone.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use kiln_seams::sandbox::{Boundary, Change, Egress, Holds, Launch, Limits, Link, Output, Refusal, Run, Sandbox, Signal};
+use kiln_seams::sandbox::{Boundary, Change, Egress, Holds, Launch, Limits, Link, NO_POOLS, Output, Pool, PoolHeld, Refusal, Run, Sandbox, Signal};
 use parking_lot::Mutex;
 
 use super::host::HostSandbox;
@@ -28,6 +29,12 @@ pub struct FakeVms {
     swaps: bool,
     /// It lays components over its images' own (`Holds::components`): off unless asked ([`FakeVms::laying`]).
     components: bool,
+    /// It keeps warm pools for its launches (`Holds::pools`): off unless asked ([`FakeVms::pooling`]).
+    pooling: bool,
+    /// The pools it keeps now.
+    pools: Mutex<BTreeSet<Pool>>,
+    /// Each pool it was asked to keep (`keep`) or let go of (`let go`), in order.
+    pool_asks: Mutex<Vec<(&'static str, Pool)>>,
 }
 
 /// What a stand-in member's program is told of the components laid for it (`Launch::components`): each `<at> <source>`,
@@ -52,7 +59,29 @@ fn program_of(images: &[(String, String, PathBuf)], image: &str, member: &str) -
 impl FakeVms {
     /// One image, `image`, whose member `member` runs `program`.
     pub fn with(image: &str, member: &str, program: &Path) -> Self {
-        Self { images: Arc::new(vec![(image.to_owned(), member.to_owned(), program.to_path_buf())]), launched: Mutex::new(Vec::new()), link: None, changed: Arc::default(), swapped: Arc::default(), swaps: false, components: false }
+        Self {
+            images: Arc::new(vec![(image.to_owned(), member.to_owned(), program.to_path_buf())]),
+            launched: Mutex::new(Vec::new()),
+            link: None,
+            changed: Arc::default(),
+            swapped: Arc::default(),
+            swaps: false,
+            components: false,
+            pooling: false,
+            pools: Mutex::new(BTreeSet::new()),
+            pool_asks: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// It keeps warm pools for its launches, as Hex's will (kiln plan 01a1dd2e…, P3.1): each holding one host warm, as
+    /// Shards' demand rule keeps one at least while its pool is in use.
+    pub fn pooling(self) -> Self {
+        Self { pooling: true, ..self }
+    }
+
+    /// Each pool it was asked to keep (`keep`) or let go of (`let go`), in order.
+    pub fn pool_asks(&self) -> Vec<(&'static str, Pool)> {
+        self.pool_asks.lock().clone()
     }
 
     /// It swaps a member for another in its microVM, as Hex's will (P6c.2).
@@ -96,17 +125,24 @@ impl FakeVms {
 }
 
 /// A stand-in for kiln's MCP lane through Hex (Shards D254's controller, `Execs::mcp`): the connections its runs'
-/// harnesses make, handed out in turn, then `Ended`; and each run asked for one, in order.
+/// harnesses make, handed out in turn, each to whichever run asks or to its own run alone, then `Ended`; and each
+/// run asked for one, in order.
 #[derive(Default)]
 pub struct FakeLanes {
-    conns: Mutex<std::collections::VecDeque<super::McpConnection>>,
+    conns: Mutex<std::collections::VecDeque<(Option<String>, super::McpConnection)>>,
     asked: Mutex<Vec<String>>,
 }
 
 impl FakeLanes {
-    /// Handing out `conns` in turn.
+    /// Handing out `conns` in turn, to whichever run asks.
     pub fn of(conns: Vec<super::McpConnection>) -> Self {
-        Self { conns: Mutex::new(conns.into()), asked: Mutex::new(Vec::new()) }
+        Self { conns: Mutex::new(conns.into_iter().map(|c| (None, c)).collect()), asked: Mutex::new(Vec::new()) }
+    }
+
+    /// Handing out each of `conns` to its own run alone, as Hex's lane takes a run's connections by its box and member
+    /// (`Runtime::mcp`).
+    pub fn per_run(conns: Vec<(&str, super::McpConnection)>) -> Self {
+        Self { conns: Mutex::new(conns.into_iter().map(|(run, c)| (Some(run.to_owned()), c)).collect()), asked: Mutex::new(Vec::new()) }
     }
 
     /// Each run a connection was asked for, in order.
@@ -122,7 +158,9 @@ impl super::Lanes for FakeLanes {
 
     fn next(&self, run: &str) -> Result<super::McpConnection, Refusal> {
         self.asked.lock().push(run.to_owned());
-        self.conns.lock().pop_front().ok_or(Refusal::Ended)
+        let mut conns = self.conns.lock();
+        let at = conns.iter().position(|(owner, _)| owner.as_deref().is_none_or(|o| o == run)).ok_or(Refusal::Ended)?;
+        conns.remove(at).map(|(_, c)| c).ok_or(Refusal::Ended)
     }
 }
 
@@ -178,7 +216,33 @@ impl Sandbox for FakeVms {
     }
 
     fn holds(&self) -> Holds {
-        Holds { live: true, swaps: self.swaps, components: self.components, ..super::host::HOLDS }
+        Holds { live: true, swaps: self.swaps, components: self.components, pools: self.pooling, ..super::host::HOLDS }
+    }
+
+    fn keep(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        let out = if self.pooling {
+            self.pool_asks.lock().push(("keep", pool.clone()));
+            self.pools.lock().insert(pool);
+            Ok(())
+        } else {
+            Err(Refusal::Unsupported(NO_POOLS.into()))
+        };
+        Box::pin(async move { out })
+    }
+
+    fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        let out = if self.pooling {
+            self.pool_asks.lock().push(("let go", pool.clone()));
+            self.pools.lock().remove(&pool);
+            Ok(())
+        } else {
+            Err(Refusal::Unsupported(NO_POOLS.into()))
+        };
+        Box::pin(async move { out })
+    }
+
+    fn pools(&self) -> Vec<PoolHeld> {
+        self.pools.lock().iter().map(|pool| PoolHeld { pool: pool.clone(), warm: 1, starting: 0 }).collect()
     }
 }
 
@@ -224,9 +288,14 @@ impl Run for FakeRun {
         Box::pin(async move { link })
     }
 
-    /// Taken and recorded, as Hex's wire calls will take one (P6b.3); a held run that ended refuses one before it comes
-    /// here (`Held::change`).
+    /// Taken and recorded, as Hex's wire calls will take one (P6b.3), a connection's grant checked as the seam has it
+    /// (Shards' D285); a held run that ended refuses one before it comes here (`Held::change`).
     fn change(&self, change: Change) -> BoxFuture<'_, Result<(), Refusal>> {
+        if let Change::Connect { grant, .. } | Change::Disconnect { grant, .. } = &change
+            && let Err(e) = grant.check()
+        {
+            return Box::pin(async move { Err(e) });
+        }
         if matches!(change, Change::Swap { .. } | Change::Restore { .. }) && !self.components {
             return Box::pin(async { Err(Refusal::Unsupported("a component swapped into a run while it runs".into())) });
         }

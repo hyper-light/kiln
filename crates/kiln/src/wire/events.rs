@@ -257,6 +257,11 @@ pub struct AgentfileChange {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(test, ts(as = "Option<bool>", optional))]
     pub deleted: bool,
+    /// Its builds ahead of its sessions changed, and nothing else of it (kiln plan 01a1dd2e… P4.5): a page that shows
+    /// them loads them again (`GET /api/agentfiles/:id/builds`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub builds: bool,
 }
 
 /// The two frames tagged `queue`.

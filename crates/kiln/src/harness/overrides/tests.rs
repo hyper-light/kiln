@@ -173,6 +173,11 @@ async fn opened(hub: &Arc<Hub>, id: &str, dir: &Path, program: &Path, isolation:
 /// The org's policy the tests' microVM sessions start under: the most egress each may be granted live.
 const CEILING: &str = "api.example.com:443";
 
+/// A grant on a network to TCP port 8080: the member there as `name`, its peer `peer`, which `way`.
+fn grant(name: &str, peer: &str, way: super::Way) -> super::NetworkGrant {
+    super::NetworkGrant { name: name.into(), peer: peer.into(), protocol: super::Protocol::Tcp, first: 8080, last: 8080, way }
+}
+
 /// The first held override of `list` (`ports`, `egress`, `networks`, `volumes`) in an `agents.get`, and how `place` took it.
 fn took<'a>(v: &'a Value, list: &str, place: &str) -> Option<&'a str> {
     v.pointer(&format!("/state/overrides/{list}/0/{place}/took")).and_then(Value::as_str)
@@ -232,8 +237,8 @@ fn p6b_4_ac2_a_host_session_refuses_network_changes_naming_its_engine() -> anyho
             ("sessions.ports.unpublish", json!({"agent": "host-net", "bind": "127.0.0.1", "host_port": 8080, "protocol": "tcp"})),
             ("sessions.egress.grant", json!({"agent": "host-net", "host": "api.example.com", "port": 443})),
             ("sessions.egress.revoke", json!({"agent": "host-net", "host": "api.example.com", "port": 443})),
-            ("sessions.networks.connect", json!({"agent": "host-net", "network": "team"})),
-            ("sessions.networks.disconnect", json!({"agent": "host-net", "network": "team"})),
+            ("sessions.networks.connect", json!({"agent": "host-net", "network": "team", "name": "alice", "peer": "bob", "way": "out", "protocol": "tcp", "port": 8080})),
+            ("sessions.networks.disconnect", json!({"agent": "host-net", "network": "team", "name": "alice", "peer": "bob", "way": "out", "protocol": "tcp", "port": 8080})),
         ] {
             let refused = call(owner(&hub), name, input).await.err().ok_or_else(|| anyhow::anyhow!("{name} was taken on a host session"))?;
             anyhow::ensure!(refused.0 == http::StatusCode::CONFLICT && refused.1.contains("engine host") && refused.1.contains("microvm"), "{name}: {refused:?}");
@@ -241,7 +246,7 @@ fn p6b_4_ac2_a_host_session_refuses_network_changes_naming_its_engine() -> anyho
         let after = get(&hub, "host-net").await?;
         anyhow::ensure!(after.pointer("/state/overrides").is_none_or(|o| o.as_object().is_none_or(|o| o.is_empty())), "nothing changed: {after}");
         // The same session's runner refuses one sent by the generic command route too, in its timeline, nothing kept.
-        let generic = Command::Override { change: super::Change::Connect(super::Network { member: super::Member::Harness("claude".into()), name: "team".into() }) };
+        let generic = Command::Override { change: super::Change::Connect(super::Network { member: super::Member::Harness("claude".into()), name: "team".into(), grant: Some(grant("alice", "bob", super::Way::Out)) }) };
         let _ = hub.harness.command(&hub, "host-net", generic).await;
         let session = hub.harness.local.get("host-net").ok_or_else(|| anyhow::anyhow!("no session"))?;
         until("its refusal in its timeline", || session.core.lock().events().any(|e| matches!(&e.body, crate::harness::model::Body::Notice { text, .. } if text.contains("engine host")))).await?;
@@ -316,7 +321,7 @@ fn microvms(hub: &Hub, dir: &Path, program: &Path) -> anyhow::Result<Arc<crate::
 #[cfg(unix)]
 #[test]
 fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> anyhow::Result<()> {
-    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, PlugFor, PlugSource};
+    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, NetworkGrant as SeamGrant, PlugFor, PlugSource, Ports, Way as SeamWay};
     run(async {
         let hub = hub().await?;
         let dir = tempfile::tempdir()?;
@@ -342,7 +347,15 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         };
         ask("sessions.ports.publish", json!({"agent": "vm-live", "bind": "127.0.0.1", "host_port": 8080, "guest_port": 3000, "protocol": "tcp"})).await?;
         ask("sessions.egress.grant", json!({"agent": "vm-live", "host": "API.example.com", "port": 443})).await?;
-        ask("sessions.networks.connect", json!({"agent": "vm-live", "network": "team"})).await?;
+        // Every part of a network's grant named (Shards' D285): a connection naming less, or ports out of order, is
+        // refused, nothing changed.
+        let connection = json!({"agent": "vm-live", "network": "team", "name": "Alice", "peer": "bob.team", "way": "out", "protocol": "tcp", "port": 8080, "last_port": 8081});
+        let half = call(owner(&hub), "sessions.networks.connect", json!({"agent": "vm-live", "network": "team"})).await.err().ok_or_else(|| anyhow::anyhow!("a connection naming no grant was taken"))?;
+        anyhow::ensure!(half.0 == http::StatusCode::BAD_REQUEST, "{half:?}");
+        let backwards = json!({"agent": "vm-live", "network": "team", "name": "alice", "peer": "bob.team", "way": "out", "protocol": "tcp", "port": 8081, "last_port": 8080});
+        let backwards = call(owner(&hub), "sessions.networks.connect", backwards).await.err().ok_or_else(|| anyhow::anyhow!("ports out of order were taken"))?;
+        anyhow::ensure!(backwards.0 == http::StatusCode::BAD_REQUEST && backwards.1.contains("the first at most the last"), "{backwards:?}");
+        ask("sessions.networks.connect", connection.clone()).await?;
         ask("sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "ro"})).await?;
         // Past what its launch declared: egress past its ceiling, a folder outside its plug roots with nothing restarted.
         let past = call(owner(&hub), "sessions.egress.grant", json!({"agent": "vm-live", "host": "elsewhere.example.com", "port": 443})).await.err().ok_or_else(|| anyhow::anyhow!("egress past its ceiling was taken"))?;
@@ -352,10 +365,12 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         // Beneath its session's volume root by default, plugged as Shards' ImageGuest::plug takes one.
         let at = format!("{}/data", crate::sandbox::isolated::VOLUMES);
         let plug = Seam::Plug { source: PlugSource::Host(data.clone()), to: PlugFor::Members(vec![member()]), at: at.clone(), read_only: true };
+        // Its name lowercased, as Shards' D285 leases a name (RFC 4343).
+        let granted = || SeamGrant { name: "alice".into(), peer: "bob.team".into(), ports: Ports { udp: false, first: 8080, last: 8081 }, way: SeamWay::Out };
         let all = vec![
             Seam::Publish { guest_port: 3000, udp: false, host: Some("127.0.0.1".into()), host_port: 8080 },
             Seam::Grant { member: member(), host: "api.example.com".into(), port: 443 },
-            Seam::Connect { member: member(), network: "team".into() },
+            Seam::Connect { member: member(), network: "team".into(), grant: granted() },
             plug.clone(),
         ];
         let on = |vm: &str| vms.changed().into_iter().filter(|(on, _)| on == vm).map(|(_, c)| c).collect::<Vec<_>>();
@@ -378,12 +393,12 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         // Each taken back: its microVM lets go of each.
         ask("sessions.ports.unpublish", json!({"agent": "vm-live", "bind": "127.0.0.1", "host_port": 8080, "protocol": "tcp"})).await?;
         ask("sessions.egress.revoke", json!({"agent": "vm-live", "host": "api.example.com", "port": 443})).await?;
-        ask("sessions.networks.disconnect", json!({"agent": "vm-live", "network": "team"})).await?;
+        ask("sessions.networks.disconnect", connection).await?;
         ask("sessions.volumes.remove", json!({"agent": "vm-live", "path": data})).await?;
         let gone = vec![
             Seam::Unpublish { udp: false, host: "127.0.0.1:8080".into() },
             Seam::Revoke { member: member(), host: "api.example.com".into(), port: 443 },
-            Seam::Disconnect { member: member(), network: "team".into() },
+            Seam::Disconnect { member: member(), network: "team".into(), grant: granted() },
             Seam::Unplug { at: at.clone() },
         ];
         until("its microVM let go of each", || on("fake-vm-2").get(4..) == Some(gone.as_slice())).await?;
@@ -495,7 +510,7 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
     assert_eq!(take(&mut o, &Change::Unpublish(key.clone())).map_err(anyhow::Error::msg)?, Taken::Removed(Removed::Port(port.clone())));
     assert!(take(&mut o, &Change::Unpublish(key)).is_err_and(|e| e.contains("isn't published")));
     assert_eq!(o.revision, 2);
-    for change in [Change::Publish(port), Change::Grant(Egress { member: harness(), host: "example.com".into(), port: 443 }), Change::Connect(Network { member: harness(), name: "team".into() })] {
+    for change in [Change::Publish(port), Change::Grant(Egress { member: harness(), host: "example.com".into(), port: 443 }), Change::Connect(Network { member: harness(), name: "team".into(), grant: Some(grant("alice", "bob", Way::Out)) })] {
         assert!(check(&change, false, "claude").is_err_and(|e| e.contains("engine host")), "{change:?}");
         assert!(check(&change, true, "claude").is_ok(), "{change:?}");
     }
@@ -503,7 +518,7 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
         Change::Grant(Egress { member: harness(), host: "-bad-.example".into(), port: 443 }),
         Change::Grant(Egress { member: harness(), host: "example.com".into(), port: 0 }),
         Change::Publish(Port { bind: "localhost".into(), host_port: 1, guest_port: 1, protocol: Protocol::Udp }),
-        Change::Connect(Network { member: Member::Harness("codex".into()), name: "team".into() }),
+        Change::Connect(Network { member: Member::Harness("codex".into()), name: "team".into(), grant: Some(grant("alice", "bob", Way::Out)) }),
         Change::Add(Volume { path: "relative/dir".into(), at: "relative/dir".into(), access: Access::Rw, members: vec![harness()] }),
     ] {
         assert!(check(&bad, true, "claude").is_err(), "{bad:?}");
@@ -534,6 +549,53 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
     assert_eq!(Member::read(None, "claude"), Ok(harness()));
     assert_eq!(Member::read(Some("agent:helper"), "claude"), Ok(Member::Agent("helper".into())));
     assert!(Member::read(Some("worker"), "claude").is_err());
+    Ok(())
+}
+
+/// Shards' D285 through the record: a connection names its grant whole (its member's name on the network, its peer
+/// there, its ports and which way), else it's refused; a member keeps one name on a network and a name is one member's
+/// there, whatever its case; its microVM is given each grant whole, connected and taken back; and a connection held from
+/// before grants named their parts grants nothing, none of it going to a microVM.
+#[test]
+fn p6b_4_a_connection_names_its_grant_whole() -> anyhow::Result<()> {
+    use super::*;
+    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, NetworkGrant as SeamGrant, Ports, Way as SeamWay};
+    let harness = || Member::Harness("claude".into());
+    let on = |member: Member, g: Option<NetworkGrant>| Network { member, name: "team".into(), grant: g };
+    let alice = grant("alice", "bob", Way::Out);
+    assert!(check(&Change::Connect(on(harness(), None)), true, "claude").is_err_and(|e| e.contains("names its grant whole")));
+    for bad in [
+        NetworkGrant { peer: "alice".into(), ..alice.clone() },
+        NetworkGrant { peer: "bob_1".into(), ..alice.clone() },
+        NetworkGrant { first: 0, last: 0, ..alice.clone() },
+        NetworkGrant { first: 9000, last: 8080, ..alice.clone() },
+    ] {
+        assert!(check(&Change::Connect(on(harness(), Some(bad.clone()))), true, "claude").is_err_and(|e| e.contains("a grant on a network")), "{bad:?}");
+        assert!(check(&Change::Disconnect(on(harness(), Some(bad.clone()))), true, "claude").is_err(), "{bad:?}");
+    }
+    assert!(check(&Change::Connect(on(harness(), Some(alice.clone()))), true, "claude").is_ok());
+    let mut o = Overrides::default();
+    assert_eq!(take(&mut o, &Change::Connect(on(harness(), Some(alice.clone())))).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert_eq!(take(&mut o, &Change::Connect(on(harness(), Some(alice.clone())))).map_err(anyhow::Error::msg)?, Taken::Same);
+    // Another grant under its name there is a grant of its own; another name for it there, or its name for another member, isn't.
+    assert_eq!(take(&mut o, &Change::Connect(on(harness(), Some(grant("alice", "bob", Way::In))))).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert!(take(&mut o, &Change::Connect(on(harness(), Some(grant("carol", "bob", Way::Out))))).is_err_and(|e| e.contains("as alice already")));
+    assert!(take(&mut o, &Change::Connect(on(Member::Agent("helper".into()), Some(grant("ALICE", "bob", Way::Out))))).is_err_and(|e| e.contains("one member's")));
+    assert_eq!(take(&mut o, &Change::Connect(on(Member::Agent("helper".into()), Some(grant("dave", "bob", Way::Out))))).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert_eq!(take(&mut o, &Change::Connect(Network { member: harness(), name: "other".into(), grant: Some(grant("carol", "bob", Way::Out)) })).map_err(anyhow::Error::msg)?, Taken::Added, "another network, another name");
+    assert_eq!(o.networks.len(), 4);
+    let whole = SeamGrant { name: "alice".into(), peer: "bob".into(), ports: Ports { udp: false, first: 8080, last: 8080 }, way: SeamWay::Out };
+    assert_eq!(seam_change(&Change::Connect(on(harness(), Some(alice.clone()))), None), Some(Seam::Connect { member: SeamMember("claude".into()), network: "team".into(), grant: whole.clone() }));
+    let removed = take(&mut o, &Change::Disconnect(on(harness(), Some(alice.clone())))).map_err(anyhow::Error::msg)?;
+    let Taken::Removed(r) = removed else { anyhow::bail!("nothing taken back") };
+    assert_eq!(seam_change(&Change::Disconnect(on(harness(), Some(alice.clone()))), Some(&r)), Some(Seam::Disconnect { member: SeamMember("claude".into()), network: "team".into(), grant: whole }));
+    assert!(take(&mut o, &Change::Disconnect(on(harness(), Some(alice)))).is_err_and(|e| e.contains("isn't on network")));
+    // A record of then: its connection named no grant.
+    let then: Overrides = serde_json::from_value(serde_json::json!({"networks": [{"network": {"member": {"kind": "harness", "name": "claude"}, "name": "team"}, "microvm": {"took": "refused", "why": "its microVM didn't take it"}}]}))?;
+    assert_eq!(then.networks.first().map(|h| h.network.grant.is_none()), Some(true));
+    assert!(changes(&then).is_empty(), "{:?}", changes(&then));
+    let held = then.networks.first().map(|h| Removed::Network(h.network.clone()));
+    assert_eq!(seam_change(&Change::Disconnect(on(harness(), None)), held.as_ref()), None);
     Ok(())
 }
 

@@ -47,7 +47,7 @@ pub enum Refused {
     NoSignIn(String),
     /// Its provider refused or failed the refresh, in its words.
     #[error("refreshing sign-in {sign_in:?}: {why}")]
-    Upstream { sign_in: String, why: String },
+    Upstream { sign_in: String, why: Unrefreshed },
     /// The store refused.
     #[error(transparent)]
     Store(#[from] Refusal),
@@ -67,13 +67,14 @@ pub struct Leased {
     pub until_ms: Option<i64>,
 }
 
-/// A token response as a provider gives one (RFC 6749 §5.1): the tokens, and the access
-/// token's life in seconds where it says.
+/// A token response as a provider gives one (RFC 6749 §5.1): the tokens, the access token's
+/// life in seconds where it says, and the scope it was granted where it says.
 #[derive(Debug)]
 pub struct Tokens {
     pub access: SecretValue,
     pub refresh: Option<SecretValue>,
     pub expires_in_s: Option<u64>,
+    pub scope: Option<String>,
 }
 
 /// A captured token as the microVM is given it: its placeholder, and the reference the value
@@ -91,10 +92,25 @@ pub struct Captured {
     pub refresh: Option<Placed>,
     /// When the access token ends (Unix ms), where its provider says.
     pub expires_ms: Option<i64>,
+    /// The scope its access token was granted, where its provider said.
+    pub scope: Option<String>,
 }
 
-/// A provider's refresh: given the refresh token, the new tokens (RFC 6749 §6).
-pub type Upstream = Box<dyn FnOnce(SecretValue) -> BoxFuture<'static, Result<Tokens, String>> + Send>;
+/// Why a provider's refresh gave no tokens (R04).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Unrefreshed {
+    /// It refused the refresh token or its client (RFC 6749 §5.2's error response): the sign-in is
+    /// to be made anew.
+    #[error("its provider refused it: {0}")]
+    Refused(String),
+    /// It couldn't be asked, or answered no token response: a later refresh may be answered.
+    #[error("its provider couldn't answer it: {0}")]
+    Failed(String),
+}
+
+/// A provider's refresh: given the refresh token and the scope the sign-in holds, the new tokens
+/// (RFC 6749 §6).
+pub type Upstream = Box<dyn FnOnce(SecretValue, Option<String>) -> BoxFuture<'static, Result<Tokens, Unrefreshed>> + Send>;
 
 /// A run as the ledger keeps it (R04): running, or ended, or moved to another key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +156,21 @@ fn identity(key: &str) -> Result<(), Refused> {
 fn placeholder() -> Result<String, Refused> {
     let bytes = super::kiln::random::<RANDOM>().map_err(|e| Refused::Ledger(format!("{e:#}")))?;
     Ok(format!("{MARKER}{}", hex::encode(bytes)))
+}
+
+/// Whether `s` has the form [`placeholder`] mints: its marker, then [`RANDOM`] bytes in lowercase hex.
+pub fn is_placeholder(s: &str) -> bool {
+    s.strip_prefix(MARKER).is_some_and(|h| h.len() == RANDOM.saturating_mul(2) && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+/// Where sign-in `sign_in`'s access token is kept in the store ([`Broker::capture`]): the reference its runs lease it by.
+pub fn access_of(sign_in: &str) -> String {
+    format!("sign-ins/{sign_in}/access")
+}
+
+/// Where sign-in `sign_in`'s refresh token is kept in the store ([`Broker::capture`]), the longest of its names.
+pub fn refresh_of(sign_in: &str) -> String {
+    format!("sign-ins/{sign_in}/refresh")
 }
 
 /// The run of `key` as the ledger keeps it; one it has no row of has not ended.
@@ -300,14 +331,19 @@ impl Broker {
 
     /// Keeps a sign-in's tokens (its harness's, captured outside the microVM) under references of
     /// its own, `sign-ins/<sign_in>/access` and `/refresh`, and gives back placeholders for them.
+    /// The scope they were granted is kept beside them (`/scope`), as its CLI asks it again at
+    /// each refresh.
     pub async fn capture(&self, sign_in: &str, tokens: Tokens) -> Result<Captured, Refused> {
         let now = self.clock.unix_ms();
-        let access = format!("sign-ins/{sign_in}/access");
-        let refresh = format!("sign-ins/{sign_in}/refresh");
+        let access = access_of(sign_in);
+        let refresh = refresh_of(sign_in);
         self.keep(&access, tokens.access).await?;
         let has_refresh = tokens.refresh.is_some();
         if let Some(r) = tokens.refresh {
             self.keep(&refresh, r).await?;
+        }
+        if let Some(scope) = &tokens.scope {
+            self.keep(&format!("sign-ins/{sign_in}/scope"), SecretValue::new(scope.as_bytes().to_vec())).await?;
         }
         let expires_ms = tokens.expires_in_s.map(|s| now.saturating_add(i64::try_from(s.saturating_mul(1000)).unwrap_or(i64::MAX)));
         let a = access.clone();
@@ -323,6 +359,7 @@ impl Broker {
             access: Placed { placeholder: placeholder()?, reference: access },
             refresh: if has_refresh { Some(Placed { placeholder: placeholder()?, reference: refresh }) } else { None },
             expires_ms,
+            scope: tokens.scope,
         };
         self.captured.lock().insert(sign_in.to_owned(), captured.clone());
         Ok(captured)
@@ -355,17 +392,26 @@ impl Broker {
         if turn.made.load(Ordering::SeqCst) != seen {
             return self.captured.lock().get(sign_in).cloned().ok_or_else(|| Refused::NoSignIn(sign_in.to_owned()));
         }
-        let reference = format!("sign-ins/{sign_in}/refresh");
+        let reference = refresh_of(sign_in);
         let token = match self.read(&reference).await {
             Ok(t) => t,
             Err(Refusal::NotFound(_)) => return Err(Refused::NoSignIn(sign_in.to_owned())),
             Err(e) => return Err(e.into()),
         };
+        let scope = match self.read(&format!("sign-ins/{sign_in}/scope")).await {
+            Ok(s) => Some(String::from_utf8(s.expose().to_vec()).map_err(|_| Refusal::Invalid { what: "a sign-in's kept scope", why: "it isn't UTF-8".into() })?),
+            Err(Refusal::NotFound(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
         let kept = token.clone();
-        let mut tokens = upstream(token).await.map_err(|why| Refused::Upstream { sign_in: sign_in.to_owned(), why })?;
-        // A provider that doesn't rotate keeps the refresh token it had (RFC 6749 §6).
+        let mut tokens = upstream(token, scope.clone()).await.map_err(|why| Refused::Upstream { sign_in: sign_in.to_owned(), why })?;
+        // A provider that doesn't rotate keeps the refresh token it had (RFC 6749 §6), and one
+        // that says no scope granted the one asked (§5.1).
         if tokens.refresh.is_none() {
             tokens.refresh = Some(kept);
+        }
+        if tokens.scope.is_none() {
+            tokens.scope = scope;
         }
         let captured = self.capture(sign_in, tokens).await?;
         turn.made.fetch_add(1, Ordering::SeqCst);
@@ -453,7 +499,7 @@ pub(super) mod tests {
                 let after = b.lease(A, "providers/anthropic").await;
                 anyhow::ensure!(after.as_ref().is_err_and(|e| *e == Refused::RunEnded(A.into())), "{store}: an ask after the run ended: {after:?}");
                 // A token captured with its life is leased until then.
-                b.capture("claude/ada", Tokens { access: v("oat-real"), refresh: None, expires_in_s: Some(600) }).await.map_err(anyhow::Error::msg)?;
+                b.capture("claude/ada", Tokens { access: v("oat-real"), refresh: None, expires_in_s: Some(600), scope: None }).await.map_err(anyhow::Error::msg)?;
                 let short = b.lease(B, "sign-ins/claude/ada/access").await.map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(short.until_ms == Some(u.clock.unix_ms() + 600_000), "{store}: its end {:?}", short.until_ms);
                 u.clock.advance(Duration::from_secs(601));
@@ -561,7 +607,7 @@ pub(super) mod tests {
         crate::rt::block_on(async {
             for u in unders().await? {
                 let (store, b) = (u.name, u.broker().await?);
-                let c = b.capture("codex/ada", Tokens { access: v("eyJ-access-real"), refresh: Some(v("rt-real")), expires_in_s: Some(3600) }).await.map_err(anyhow::Error::msg)?;
+                let c = b.capture("codex/ada", Tokens { access: v("eyJ-access-real"), refresh: Some(v("rt-real")), expires_in_s: Some(3600), scope: None }).await.map_err(anyhow::Error::msg)?;
                 let refresh = c.refresh.clone().ok_or_else(|| anyhow::anyhow!("{store}: no refresh placeholder"))?;
                 for p in [&c.access.placeholder, &refresh.placeholder] {
                     anyhow::ensure!(p.starts_with(MARKER) && p.len() == MARKER.len() + 2 * RANDOM, "{store}: {p}");
@@ -584,18 +630,22 @@ pub(super) mod tests {
         crate::rt::block_on(async {
             for u in unders().await? {
                 let (store, b) = (u.name, Arc::new(u.broker().await?));
-                b.capture("claude/ada", Tokens { access: v("at-1"), refresh: Some(v("rt-1")), expires_in_s: Some(60) }).await.map_err(anyhow::Error::msg)?;
+                b.capture("claude/ada", Tokens { access: v("at-1"), refresh: Some(v("rt-1")), expires_in_s: Some(60), scope: Some("user:inference".into()) }).await.map_err(anyhow::Error::msg)?;
                 let calls = Arc::new(AtomicUsize::new(0));
                 let up = |calls: Arc<AtomicUsize>| -> Upstream {
-                    Box::new(move |rt: SecretValue| -> BoxFuture<'static, Result<Tokens, String>> {
+                    Box::new(move |rt: SecretValue, scope: Option<String>| -> BoxFuture<'static, Result<Tokens, Unrefreshed>> {
                         Box::pin(async move {
                             let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
                             // Long enough that the other refresh is asked meanwhile.
                             crate::rt::sleep(Duration::from_millis(50)).await;
                             if rt.expose() != format!("rt-{n}").as_bytes() {
-                                return Err(format!("refresh token {} retired", String::from_utf8_lossy(rt.expose())));
+                                return Err(Unrefreshed::Refused(format!("refresh token {} retired", String::from_utf8_lossy(rt.expose()))));
                             }
-                            Ok(Tokens { access: v(&format!("at-{}", n + 1)), refresh: Some(v(&format!("rt-{}", n + 1))), expires_in_s: Some(60) })
+                            // The scope its capture was granted is asked again, as its CLI asks it.
+                            if scope.as_deref() != Some("user:inference") {
+                                return Err(Unrefreshed::Refused(format!("asked scope {scope:?}")));
+                            }
+                            Ok(Tokens { access: v(&format!("at-{}", n + 1)), refresh: Some(v(&format!("rt-{}", n + 1))), expires_in_s: Some(60), scope: None })
                         })
                     })
                 };
@@ -603,6 +653,7 @@ pub(super) mod tests {
                 let (one, two) = (one.map_err(anyhow::Error::msg)?, two.map_err(anyhow::Error::msg)?);
                 anyhow::ensure!(calls.load(Ordering::SeqCst) == 1, "{store}: {} calls to the provider", calls.load(Ordering::SeqCst));
                 anyhow::ensure!(one == two, "{store}: the second refresh didn't take the first's tokens");
+                anyhow::ensure!(one.scope.as_deref() == Some("user:inference"), "{store}: a response saying no scope lost the one granted: {:?}", one.scope);
                 let rt = b.lease(A, "sign-ins/claude/ada/refresh").await.map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(rt.value.expose() == b"rt-2", "{store}: the rotated refresh token wasn't kept");
                 // One asked after both gets one call of its own, with the rotated token.

@@ -630,6 +630,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::ExperimentsPause>(),
                 route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "resume"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::experiments::pause(&cx.hub, &cx.caller, &text(&v, "experiment")?, false).await).await }),
+            op!("experiments.replay", "Replay one of your recorded sessions against a split's variants (P7.1b): its tool calls run offline in a microVM of each of its microVM variants, `rounds` times (3), interleaved, one run at a time on one runner (`on`; the session's machine by default). What runs is its commands and the files it wrote whole; no model, no person and nothing past the microVM, so its other calls are counted by why, not run. Each run is measured as a session is: its start (cold, from a template, warm), footprint peak and steady, host CPU, failures, and its outcome (`diverged` where a step ended otherwise than its record). `experiments.get` shows each replay under `replays`, with each variant's intervals.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::ExperimentsReplay>(),
+                route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "replay"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::experiments::replay(&cx.hub, &cx.caller, &text(&v, "experiment")?, &v).await).await }),
             op!("ci.store.verify", "Re-hash every chunk of the store on the server's disk (W08-R01): how many and how much, and any whose contents aren't their digest (each moved aside, so it's stored again on its next write).", ro: false, destructive: false,
                 input: Input::of::<input::CiStoreVerify>(),
                 route: |_| Ok((Method::POST, path(&["store", "verify"]), HashMap::new())),
@@ -2165,6 +2169,20 @@ pub mod input {
     #[serde(deny_unknown_fields)]
     pub struct ExperimentsPause {
         pub experiment: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ExperimentsReplay {
+        /// The split's id: `E12`.
+        pub experiment: String,
+        /// One of your sessions, its tool calls recorded.
+        pub session: String,
+        /// How many times each variant replays it (3 by default).
+        #[schemars(range(min = 1, max = 20))]
+        pub rounds: Option<i64>,
+        /// The runner its runs run on: the session's own machine by default.
+        pub on: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

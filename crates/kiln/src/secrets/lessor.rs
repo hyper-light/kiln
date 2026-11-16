@@ -13,6 +13,10 @@
 //! - **What it answers** is D242's, in Hex's types (`hex_api::lease::Lease`, `LeaseRefused`): the
 //!   value, under the store's name for its lease, and how long it lives (none: until its run ends),
 //!   or a refusal of D242's kinds, in the broker's words, which never hold a value.
+//! - **A run's sign-ins** (D242, step 8's third slice): a capture's tokens kept by the broker, its
+//!   CLI given placeholders; a refresh made at the sign-in's provider by the broker alone
+//!   ([`super::signin`]), its CLI answered placeholders; a revocation in the microVM said, the
+//!   sign-in kept.
 //! - **The run's end** is its lessor let go of. Hex's image class makes it as the run boots and the
 //!   run's host holds it for as long as the run can ask (Shards' `RunLessor`), so once no one holds
 //!   it, nothing asks through it again: the run is kept ended in the broker's ledger, so nothing more
@@ -21,21 +25,32 @@
 //! - Hex asks on threads of its own, off kiln's runtime, so each call blocks on the broker there
 //!   ([`crate::rt::block_on`]); a lessor let go of on one of the runtime's shards, where nothing may
 //!   block, ends its run on a task of its own.
+//! - **Every runner leases from the one broker** its server opens over kiln's credential store
+//!   ([`open`], kept in `Hub::lessors`), so a sign-in is refreshed one at a time across every run
+//!   (the broker's `Turn`). The server's own runner asks it in its process ([`Lessors`]); every
+//!   other runner puts each of its runs' asks ([`Ask`]) to its server over its link
+//!   ([`Remote`]: `crate::reach::Question::Lessor`), which answers them from the broker as the
+//!   server's own runner's are answered ([`answer`]), values hex on the link's JSON. A runner's
+//!   runs lease their own people's sign-ins alone: the server answers a lease, a capture or a
+//!   refresh only of a sign-in of a person one of that runner's isolated agents of its harness
+//!   acts for, and no other credential.
 //!
-//! The server opens its broker over kiln's credential store and gives these lessors to its own runner
-//! ([`open`]), whose sandbox hands them to Hex's image runtime and carries each launch's credential
-//! grants into its image's, by reference (`sandbox::hexvm`, `hex_node::images::ImageRuntime::leasing`).
+//! Each runner's sandbox hands its lessors to Hex's image runtime and carries each launch's
+//! credential grants and sign-in into its image's, by reference (`sandbox::hexvm`,
+//! `hex_node::images::ImageRuntime::leasing`).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hex_api::BoxId;
-use hex_api::lease::{Lease, LeaseRefused, Lessor, Value};
+use hex_api::lease::{Lease, LeaseRefused, Lessor, SignInRefused, SignInTokens, Value};
 use kiln_seams::Clock;
-use kiln_seams::secrets::Refusal;
+use kiln_seams::secrets::{Refusal, SecretValue};
 use parking_lot::Mutex;
 
-use super::broker::{Broker, Refused};
+use super::broker::{Broker, Refused, Tokens, Unrefreshed};
+use super::signin::{self, Provider};
 
 /// The broker's refusal as D242 kinds it: a run ended or moved as such, a credential the store
 /// holds none of (or can't name) as denied, and every other, a value past its own end among them
@@ -49,13 +64,54 @@ fn refused(why: Refused) -> LeaseRefused {
     }
 }
 
+/// A sign-in refusal of the broker's, as D242 kinds it: a run that ended as such; a sign-in nothing
+/// was captured for, and a refresh its provider refused, as denied, so its CLI signs in anew; every
+/// other as unavailable for now.
+fn sign_in_refused(why: Refused) -> SignInRefused {
+    match why {
+        Refused::RunEnded(_) => SignInRefused::Ended,
+        Refused::NoSignIn(_) | Refused::Upstream { why: Unrefreshed::Refused(_), .. } => SignInRefused::Denied(why.to_string()),
+        other => SignInRefused::Unavailable(other.to_string()),
+    }
+}
+
+/// A sign-in whose name names no provider the broker refreshes at ([`Provider::of`]): denied.
+fn unprovided(sign_in: &str) -> SignInRefused {
+    SignInRefused::Denied(format!("sign-in {sign_in:?} names no provider kiln refreshes at (claude/… or codex/…)"))
+}
+
 /// The lessors of the server's own runner's microVMs, over the run-lease broker [`Broker::open`] opens on kiln's
 /// credential store (`KilnSecrets`) with its ledger in the server's store, on the process's clock: what its runner's
-/// sandbox leases its VMs' credentials through (`sandbox::Leasing`). Opening it revokes what a restart left leased.
+/// sandbox leases its VMs' credentials through (`sandbox::Leasing`), and what answers every other runner's runs
+/// ([`answer`]). Opened once for the server (`Hub::lessors`): opening it revokes what a restart left leased.
 pub async fn open(hub: &Arc<crate::hub::Hub>) -> anyhow::Result<Lessors> {
+    if let Some(opened) = hub.lessors.get() {
+        return Ok(opened.shared());
+    }
     let secrets: Arc<dyn kiln_seams::secrets::Secrets> = Arc::new(super::seam::KilnSecrets::new(Arc::clone(hub), crate::rt::clock()));
     let broker = Broker::open(secrets, hub.store.clone(), crate::rt::clock()).await?;
-    Ok(Lessors::new(Arc::new(broker), crate::rt::clock()))
+    OPENED_HERE.store(true, Ordering::Release);
+    Ok(hub.lessors.get_or_init(|| Lessors::new(Arc::new(broker), crate::rt::clock())).shared())
+}
+
+/// Whether this process opened its server's broker ([`open`]): its own runner's runs ask it here.
+static OPENED_HERE: AtomicBool = AtomicBool::new(false);
+
+/// Whether this runner's server answers its runs' asks over its link: it named
+/// [`crate::proto::feature::LEASES`] ([`server_features`]). A [`Remote`]'s runs ask it only while it does.
+static SERVER_ANSWERS: AtomicBool = AtomicBool::new(false);
+
+/// The features this runner's server says it speaks, by name (`ServerMsg::Features`): whether it answers its runs'
+/// leases and sign-ins.
+pub fn server_features(names: &[String]) {
+    SERVER_ANSWERS.store(crate::proto::feature::speaks(names, crate::proto::feature::LEASES), Ordering::Release);
+}
+
+/// Whether this process's runs are answered their leases and sign-ins now: its server's broker is open here (the
+/// server's own runner), or this runner's server says it answers them over its link. Until then an isolated harness
+/// is granted no sign-in (`sandbox::isolated`), as a server from before answers none.
+pub fn answered() -> bool {
+    OPENED_HERE.load(Ordering::Acquire) || SERVER_ANSWERS.load(Ordering::Acquire)
 }
 
 /// The lessors of a machine's runs: one for each run, over the broker.
@@ -69,22 +125,313 @@ impl Lessors {
     pub fn new(broker: Arc<Broker>, clock: Arc<dyn Clock>) -> Lessors {
         Lessors { broker, clock }
     }
+
+    /// Lessors over the same broker, on the same clock.
+    fn shared(&self) -> Lessors {
+        Lessors { broker: Arc::clone(&self.broker), clock: Arc::clone(&self.clock) }
+    }
 }
 
 impl hex_api::lease::Lessors for Lessors {
     /// The lessor of box `id`'s run, as the run boots (its id for words alone), with a channel of its
-    /// own made now.
+    /// own made now, asking the broker in this process.
     fn lessor(&self, id: &BoxId) -> Result<Arc<dyn Lessor>, hex_api::Refusal> {
-        let channel = super::kiln::random::<32>().map_err(|e| hex_api::Refusal::Os { op: "making a run's lease channel", why: format!("{e:#}") })?;
-        Ok(Arc::new(RunLessor { broker: Arc::clone(&self.broker), clock: Arc::clone(&self.clock), run: id.as_str().to_owned(), channel: hex::encode(channel), key: Mutex::new(None) }))
+        RunLessor::made(To::Broker { broker: Arc::clone(&self.broker), clock: Arc::clone(&self.clock) }, id)
     }
+}
+
+/// The lessors of a runner other than the server's own: each of its runs' asks put to the broker its server opened,
+/// over this runner's link to it (`crate::reach::node::Handle::query`), and answered there ([`answer`]).
+pub struct Remote(crate::reach::node::Handle);
+
+impl Remote {
+    /// Over this runner's reach node, its link to its server.
+    pub fn new(node: crate::reach::node::Handle) -> Remote {
+        Remote(node)
+    }
+}
+
+impl hex_api::lease::Lessors for Remote {
+    /// The lessor of box `id`'s run, as the run boots, with a channel of its own made now, asking the server.
+    fn lessor(&self, id: &BoxId) -> Result<Arc<dyn Lessor>, hex_api::Refusal> {
+        RunLessor::made(To::Server(self.0.clone()), id)
+    }
+}
+
+/// A value or a token as an ask or an answer carries it: in Hex's holder, wiped as it drops and never printed; hex on
+/// a link's JSON.
+pub struct Carried(Value);
+
+impl Carried {
+    pub fn new(value: Value) -> Carried {
+        Carried(value)
+    }
+}
+
+impl Clone for Carried {
+    fn clone(&self) -> Carried {
+        Carried(Value::new(self.0.expose().to_vec()))
+    }
+}
+
+impl PartialEq for Carried {
+    fn eq(&self, other: &Carried) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl std::fmt::Debug for Carried {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Carried({} bytes)", self.0.expose().len())
+    }
+}
+
+impl serde::Serialize for Carried {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(self.0.expose()))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Carried {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Carried, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(d)?;
+        let bytes = hex::decode(&text).map_err(<D::Error as serde::de::Error>::custom);
+        let mut text = text.into_bytes();
+        hex_api::lease::wipe(&mut text);
+        bytes.map(|b| Carried(Value::new(b)))
+    }
+}
+
+/// A run's ask of the broker, as its lessor asks it (`hex_api::lease::Lessor`): by the identity its leases are issued
+/// to, the run's key's SHA-256 or its channel's ([`RunLessor`]). What a runner other than the server's own puts to its
+/// server over its link (`crate::reach::Question::Lessor`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "ask", rename_all = "snake_case")]
+pub enum Ask {
+    /// Credential `reference`'s value, leased to the run.
+    Lease { identity: String, reference: String },
+    /// Lease `lease` given back.
+    Given { identity: String, lease: String },
+    /// The run has ended, under each of the identities it had.
+    Ended { identities: Vec<String> },
+    /// Sign-in `sign_in`'s tokens, as its run's injector took them, kept.
+    Capture {
+        sign_in: String,
+        access: Carried,
+        #[serde(default)]
+        refresh: Option<Carried>,
+        #[serde(default)]
+        expires_in: Option<u64>,
+        #[serde(default)]
+        scope: Option<String>,
+    },
+    /// Sign-in `sign_in` refreshed at its provider.
+    Refresh { sign_in: String },
+}
+
+/// A refusal on a link, by D242's kinds (`LeaseRefused`, `SignInRefused`), each in its words.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Said {
+    Denied { why: String },
+    Unavailable { why: String },
+    Ended,
+    KeyReplaced { asked: String, current: Option<String> },
+    Lapsed,
+    Unanswered,
+}
+
+impl From<LeaseRefused> for Said {
+    fn from(why: LeaseRefused) -> Said {
+        match why {
+            LeaseRefused::Denied(why) => Said::Denied { why },
+            LeaseRefused::Unavailable(why) => Said::Unavailable { why },
+            LeaseRefused::Ended => Said::Ended,
+            LeaseRefused::KeyReplaced { asked, current } => Said::KeyReplaced { asked, current },
+            LeaseRefused::Lapsed => Said::Lapsed,
+        }
+    }
+}
+
+impl From<SignInRefused> for Said {
+    fn from(why: SignInRefused) -> Said {
+        match why {
+            SignInRefused::Denied(why) => Said::Denied { why },
+            SignInRefused::Unavailable(why) => Said::Unavailable { why },
+            SignInRefused::Ended => Said::Ended,
+            SignInRefused::Unanswered => Said::Unanswered,
+        }
+    }
+}
+
+impl Said {
+    /// As a lease's refusal: kind for kind, an orchestrator answering no sign-in's unavailable.
+    fn lease(self) -> LeaseRefused {
+        match self {
+            Said::Denied { why } => LeaseRefused::Denied(why),
+            Said::Unavailable { why } => LeaseRefused::Unavailable(why),
+            Said::Ended => LeaseRefused::Ended,
+            Said::KeyReplaced { asked, current } => LeaseRefused::KeyReplaced { asked, current },
+            Said::Lapsed => LeaseRefused::Lapsed,
+            Said::Unanswered => LeaseRefused::Unavailable("its server answers no lease".into()),
+        }
+    }
+
+    /// As a sign-in's refusal: kind for kind, a lease's own kinds (a replaced key, a lapse) unavailable.
+    fn sign_in(self) -> SignInRefused {
+        match self {
+            Said::Denied { why } => SignInRefused::Denied(why),
+            Said::Unavailable { why } => SignInRefused::Unavailable(why),
+            Said::Ended => SignInRefused::Ended,
+            Said::Unanswered => SignInRefused::Unanswered,
+            other @ (Said::KeyReplaced { .. } | Said::Lapsed) => SignInRefused::Unavailable(other.lease().to_string()),
+        }
+    }
+}
+
+/// The broker's answer to an [`Ask`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "as", rename_all = "snake_case")]
+pub enum Answer {
+    /// Its value and its lease, living `life_ms` from now (none: until its run ends).
+    Leased {
+        lease: String,
+        value: Carried,
+        life_ms: Option<u64>,
+    },
+    Given,
+    /// How many leases the run's end revoked that its host hadn't given back.
+    Ended {
+        revoked: usize,
+    },
+    Captured {
+        captured: hex_api::Captured,
+    },
+    /// The token response its CLI is to have, its tokens placeholders ([`signin::answer`]).
+    Refreshed {
+        response: Carried,
+    },
+    Refused {
+        said: Said,
+    },
+}
+
+impl Answer {
+    /// Its kind, for words: never what it carries.
+    fn kind(&self) -> &'static str {
+        match self {
+            Answer::Leased { .. } => "leased",
+            Answer::Given => "given",
+            Answer::Ended { .. } => "ended",
+            Answer::Captured { .. } => "captured",
+            Answer::Refreshed { .. } => "refreshed",
+            Answer::Refused { .. } => "refused",
+        }
+    }
+}
+
+/// `ask` answered by `broker`, on `clock`: a value leased (its life from now, none of it left where its end has
+/// passed, which its run then has lapsed), given back, a run's end kept and its leases revoked, a sign-in captured
+/// (one whose name names no provider refused, nothing kept) or refreshed by the broker alone.
+async fn answered(broker: Arc<Broker>, clock: Arc<dyn Clock>, ask: Ask) -> Answer {
+    let no = |said: Said| Answer::Refused { said };
+    match ask {
+        Ask::Lease { identity, reference } => match broker.lease(&identity, &reference).await {
+            Ok(leased) => {
+                let life_ms = leased.until_ms.map(|end| u64::try_from(end.saturating_sub(clock.unix_ms())).unwrap_or(0));
+                // Handed on in Hex's holder, which wipes it as it drops, as the broker's own does.
+                Answer::Leased { lease: leased.lease, value: Carried(Value::new(leased.value.expose().to_vec())), life_ms }
+            }
+            Err(why) => no(refused(why).into()),
+        },
+        Ask::Given { identity, lease } => match broker.release_lease(&identity, &lease).await {
+            Ok(_) => Answer::Given,
+            Err(e) => no(Said::Unavailable { why: e.to_string() }),
+        },
+        Ask::Ended { identities } => {
+            let mut revoked = 0usize;
+            for name in identities {
+                match broker.release(&name).await {
+                    Ok(n) => revoked = revoked.saturating_add(n),
+                    Err(e) => return no(Said::Unavailable { why: e.to_string() }),
+                }
+            }
+            Answer::Ended { revoked }
+        }
+        Ask::Capture { sign_in, access, refresh, expires_in, scope } => {
+            if Provider::of(&sign_in).is_none() {
+                return no(unprovided(&sign_in).into());
+            }
+            let tokens = Tokens { access: SecretValue::new(access.0.into_bytes()), refresh: refresh.map(|r| SecretValue::new(r.0.into_bytes())), expires_in_s: expires_in, scope };
+            match broker.capture(&sign_in, tokens).await {
+                Ok(c) => Answer::Captured { captured: hex_api::Captured { access: c.access.reference, access_placeholder: c.access.placeholder, refresh_placeholder: c.refresh.map(|r| r.placeholder) } },
+                Err(why) => no(sign_in_refused(why).into()),
+            }
+        }
+        Ask::Refresh { sign_in } => {
+            let Some(provider) = Provider::of(&sign_in) else { return no(unprovided(&sign_in).into()) };
+            match broker.refresh(&sign_in, provider.upstream()).await {
+                Ok(c) => match signin::answer(&c, clock.unix_ms()) {
+                    Ok(response) => Answer::Refreshed { response: Carried(Value::new(response)) },
+                    Err(e) => no(Said::Unavailable { why: format!("its answer: {e}") }),
+                },
+                Err(why) => no(sign_in_refused(why).into()),
+            }
+        }
+    }
+}
+
+/// The server's answer to `ask`, from a run of runner `runner` other than its own (`crate::reach::Question::Lessor`;
+/// [`Remote`]), from the broker it opened ([`open`]), as its own runner's runs are answered: JSON of an [`Answer`].
+/// Denied, typed, where the runner may not ask it ([`unheld`]); unavailable where the broker isn't open.
+pub async fn answer(hub: &crate::hub::Hub, runner: &str, ask: Ask) -> serde_json::Value {
+    let said = match (unheld(hub, runner, &ask), hub.lessors.get()) {
+        (Some(why), _) => Answer::Refused { said: Said::Denied { why } },
+        (None, None) => Answer::Refused { said: Said::Unavailable { why: "its server's run-lease broker isn't open".into() } },
+        (None, Some(lessors)) => answered(Arc::clone(&lessors.broker), Arc::clone(&lessors.clock), ask).await,
+    };
+    serde_json::to_value(&said).unwrap_or_else(|e| serde_json::json!({ "error": format!("its answer: {e}") }))
+}
+
+/// Why runner `runner`'s run may not ask `ask`, where it may not: a runner kiln doesn't know, or a job's, which holds no
+/// isolated agent; a lease of anything but a sign-in's access token (the one credential kiln grants a run); and a
+/// lease, a capture or a refresh of a sign-in no isolated agent on that runner is granted ([`holds_sign_in`]). A
+/// give-back and a run's end are its identity's, which only its run knows.
+fn unheld(hub: &crate::hub::Hub, runner: &str, ask: &Ask) -> Option<String> {
+    if hub.agents.load().get(runner).is_none_or(|a| a.ephemeral) {
+        return Some("a job's runner holds no isolated agent to lease for".into());
+    }
+    let name = match ask {
+        Ask::Lease { reference, .. } => match reference.strip_prefix("sign-ins/").and_then(|r| r.strip_suffix("/access")) {
+            Some(name) => name,
+            None => return Some(format!("{reference:?} is no sign-in's access token, the one credential a runner's run is leased")),
+        },
+        Ask::Capture { sign_in, .. } | Ask::Refresh { sign_in } => sign_in.as_str(),
+        Ask::Given { .. } | Ask::Ended { .. } => return None,
+    };
+    (!holds_sign_in(hub, runner, name)).then(|| format!("{} holds no isolated agent granted sign-in {name}", hub.shown(runner)))
+}
+
+/// Whether runner `runner` holds an isolated agent granted sign-in `name`: one of its person's, of its provider's
+/// harness, as its launch names it (`Provider::sign_in`).
+fn holds_sign_in(hub: &crate::hub::Hub, runner: &str, name: &str) -> bool {
+    hub.harness.list_shared().iter().any(|s| {
+        let granted = s.isolation.as_ref().and_then(|i| i.person.as_deref()).zip(Provider::of_harness(&s.kind)).and_then(|(person, p)| p.sign_in(person));
+        granted.as_deref() == Some(name) && hub.harness.located_on(&s.id, runner)
+    })
+}
+
+/// Where a run's asks are answered: the broker in this process (the server's own runner's runs), or the server that
+/// opened it, over this runner's link to it (every other runner's).
+enum To {
+    Broker { broker: Arc<Broker>, clock: Arc<dyn Clock> },
+    Server(crate::reach::node::Handle),
 }
 
 /// One run's lessor: its leases issued to the run's own key where it has one, else to its channel;
 /// its run ended as it is let go of.
 struct RunLessor {
-    broker: Arc<Broker>,
-    clock: Arc<dyn Clock>,
+    to: To,
     run: String,
     channel: String,
     /// The SHA-256 of the run's key, once an ask has told it (D252), in the broker's form.
@@ -92,6 +439,12 @@ struct RunLessor {
 }
 
 impl RunLessor {
+    /// Box `id`'s run's lessor (its id for words alone), its asks answered `to`, with a channel of its own made now.
+    fn made(to: To, id: &BoxId) -> Result<Arc<dyn Lessor>, hex_api::Refusal> {
+        let channel = super::kiln::random::<32>().map_err(|e| hex_api::Refusal::Os { op: "making a run's lease channel", why: format!("{e:#}") })?;
+        Ok(Arc::new(RunLessor { to, run: id.as_str().to_owned(), channel: hex::encode(channel), key: Mutex::new(None) }))
+    }
+
     /// The identity the run's leases are issued to: its key where `key` tells one (the first ask's,
     /// kept, and every later ask's the same), else its channel.
     fn identity(&self, key: Option<[u8; 32]>) -> Result<String, LeaseRefused> {
@@ -109,31 +462,89 @@ impl RunLessor {
             Some(k) => Err(LeaseRefused::Unavailable(format!("run {}: asked under key {told}, where it was told key {k}: a run binds one key (D252)", self.run))),
         }
     }
+
+    /// `ask`'s answer, blocking on it off kiln's runtime: from the broker in this process, or from the server over this
+    /// runner's link. Why not, in words, where it couldn't be asked or answered.
+    fn ask(&self, ask: Ask) -> Result<Answer, String> {
+        match &self.to {
+            To::Broker { broker, clock } => {
+                let (broker, clock) = (Arc::clone(broker), Arc::clone(clock));
+                crate::rt::block_on(async move { Ok(answered(broker, clock, ask).await) }).map_err(|e| format!("run {}: the broker: {e:#}", self.run))
+            }
+            To::Server(_) if !SERVER_ANSWERS.load(Ordering::Acquire) => Err(format!("run {}: its server doesn't answer runs' leases (it names no `{}`): a kiln from before", self.run, crate::proto::feature::LEASES)),
+            To::Server(node) => {
+                let json = serde_json::to_string(&crate::reach::Question::Lessor { ask }).map_err(|e| format!("run {}: its ask: {e}", self.run))?;
+                let node = node.clone();
+                let said = crate::rt::block_on(async move { node.query(json).await }).map_err(|e| format!("run {}: its server: {e:#}", self.run))?;
+                let answer = serde_json::from_str::<Answer>(&said).map_err(|e| format!("run {}: its server gave no lessor's answer (line {}, column {})", self.run, e.line(), e.column()));
+                let mut said = said.into_bytes();
+                hex_api::lease::wipe(&mut said);
+                answer
+            }
+        }
+    }
 }
 
 impl Lessor for RunLessor {
     /// Credential `reference`'s value, leased to the run now, or why not, typed.
     fn lease(&self, reference: &str, key: Option<[u8; 32]>) -> Result<Lease, LeaseRefused> {
         let identity = self.identity(key)?;
-        let (broker, reference) = (Arc::clone(&self.broker), reference.to_owned());
-        let got = crate::rt::block_on(async move { Ok(broker.lease(&identity, &reference).await) }).map_err(|e| LeaseRefused::Unavailable(format!("run {}: the broker: {e:#}", self.run)))?;
-        let leased = got.map_err(refused)?;
-        // Its end, from now: none of it left where it has passed, which its run then has lapsed.
-        let life = leased.until_ms.map(|end| Duration::from_millis(u64::try_from(end.saturating_sub(self.clock.unix_ms())).unwrap_or(0)));
-        // Its value handed on in Hex's holder, which wipes it as it drops, as the broker's own does.
-        Ok(Lease { lease: leased.lease, value: Value::new(leased.value.expose().to_vec()), life })
+        match self.ask(Ask::Lease { identity, reference: reference.to_owned() }).map_err(LeaseRefused::Unavailable)? {
+            Answer::Leased { lease, value, life_ms } => Ok(Lease { lease, value: value.0, life: life_ms.map(Duration::from_millis) }),
+            Answer::Refused { said } => Err(said.lease()),
+            other => Err(LeaseRefused::Unavailable(format!("run {}: a lease answered {}", self.run, other.kind()))),
+        }
     }
 
     /// Lease `lease` given back: the run let go of it, or ended. A give-back the broker couldn't
     /// make is said, never dropped unsaid: the run's end revokes what it holds still.
     fn release(&self, lease: &str) {
         let identity = self.key.lock().clone().unwrap_or_else(|| self.channel.clone());
-        let (broker, id) = (Arc::clone(&self.broker), lease.to_owned());
-        match crate::rt::block_on(async move { Ok(broker.release_lease(&identity, &id).await) }) {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::error!(run = %self.run, lease, "a run's credential lease wasn't given back: {e}"),
-            Err(e) => tracing::error!(run = %self.run, lease, "a run's credential lease wasn't given back: the broker: {e:#}"),
+        match self.ask(Ask::Given { identity, lease: lease.to_owned() }) {
+            Ok(Answer::Given) => {}
+            Ok(Answer::Refused { said }) => tracing::error!(run = %self.run, lease, "a run's credential lease wasn't given back: {}", said.lease()),
+            Ok(other) => tracing::error!(run = %self.run, lease, "a run's credential lease wasn't given back: its give-back answered {}", other.kind()),
+            Err(e) => tracing::error!(run = %self.run, lease, "a run's credential lease wasn't given back: {e}"),
         }
+    }
+
+    /// Sign-in `sign_in`'s tokens, as the run's injector took them from its CLI's token response,
+    /// kept by the broker (D242, step 8's third slice): the reference its access token is leased by
+    /// from now, and the placeholders its CLI holds in their places. Its ID token, inert, is not
+    /// kept. A sign-in whose name names no provider is refused, nothing kept.
+    fn capture(&self, sign_in: &str, tokens: SignInTokens, key: Option<[u8; 32]>) -> Result<hex_api::Captured, SignInRefused> {
+        self.identity(key).map_err(|why| SignInRefused::Unavailable(why.to_string()))?;
+        if Provider::of(sign_in).is_none() {
+            return Err(unprovided(sign_in));
+        }
+        let SignInTokens { access, refresh, expires_in, scope, .. } = tokens;
+        let ask = Ask::Capture { sign_in: sign_in.to_owned(), access: Carried(access), refresh: refresh.map(Carried), expires_in, scope };
+        match self.ask(ask).map_err(SignInRefused::Unavailable)? {
+            Answer::Captured { captured } => Ok(captured),
+            Answer::Refused { said } => Err(said.sign_in()),
+            other => Err(SignInRefused::Unavailable(format!("run {}: a capture answered {}", self.run, other.kind()))),
+        }
+    }
+
+    /// Sign-in `sign_in` refreshed at its provider by the broker, which alone calls it, one refresh
+    /// of a sign-in at a time across every run (D242, step 8's third slice): the token response its
+    /// CLI is to have, its tokens placeholders ([`signin::answer`]).
+    fn refresh(&self, sign_in: &str, key: Option<[u8; 32]>) -> Result<Value, SignInRefused> {
+        self.identity(key).map_err(|why| SignInRefused::Unavailable(why.to_string()))?;
+        if Provider::of(sign_in).is_none() {
+            return Err(unprovided(sign_in));
+        }
+        match self.ask(Ask::Refresh { sign_in: sign_in.to_owned() }).map_err(SignInRefused::Unavailable)? {
+            Answer::Refreshed { response } => Ok(response.0),
+            Answer::Refused { said } => Err(said.sign_in()),
+            other => Err(SignInRefused::Unavailable(format!("run {}: a refresh answered {}", self.run, other.kind()))),
+        }
+    }
+
+    /// The run's microVM revoked sign-in `sign_in` (its CLI's logout, or a sign-in anew), answered
+    /// there: said, and its tokens kept, as the sign-in outlives the run (D242, step 8's question 6).
+    fn revoked(&self, sign_in: &str, _key: Option<[u8; 32]>) {
+        tracing::info!(run = %self.run, sign_in, "a run's microVM revoked its sign-in, answered there: its tokens kept");
     }
 }
 
@@ -143,15 +554,23 @@ impl Drop for RunLessor {
     /// [`Broker::release`]), under its channel and its key alike. Off the runtime it ends here; on
     /// one of its shards, where nothing may block, on a task of its own.
     fn drop(&mut self) {
-        let mut names = vec![std::mem::take(&mut self.channel)];
-        names.extend(self.key.get_mut().take());
-        let (broker, run) = (Arc::clone(&self.broker), std::mem::take(&mut self.run));
-        let ending = async move {
-            let mut revoked = 0usize;
-            for name in names {
-                revoked = revoked.saturating_add(broker.release(&name).await.map_err(anyhow::Error::msg)?);
+        let mut identities = vec![std::mem::take(&mut self.channel)];
+        identities.extend(self.key.get_mut().take());
+        let run = std::mem::take(&mut self.run);
+        let ask = Ask::Ended { identities };
+        let ending = match &self.to {
+            To::Broker { broker, clock } => {
+                let (broker, clock) = (Arc::clone(broker), Arc::clone(clock));
+                futures::future::FutureExt::boxed(async move { anyhow::Ok(answered(broker, clock, ask).await) })
             }
-            anyhow::Ok(revoked)
+            To::Server(node) => {
+                let node = node.clone();
+                futures::future::FutureExt::boxed(async move {
+                    let json = serde_json::to_string(&crate::reach::Question::Lessor { ask })?;
+                    let said = node.query(json).await?;
+                    anyhow::Ok(serde_json::from_str::<Answer>(&said)?)
+                })
+            }
         };
         if crate::rt::on_shard() {
             drop(crate::rt::spawn(async move { ended(&run, ending.await) }));
@@ -163,10 +582,12 @@ impl Drop for RunLessor {
 
 /// Says what a run's end revoked that its host hadn't given back, or why it couldn't: a lease the
 /// store couldn't revoke is revoked as the broker next opens, where the run's end was kept.
-fn ended(run: &str, revoked: anyhow::Result<usize>) {
-    match revoked {
-        Ok(0) => {}
-        Ok(revoked) => tracing::info!(run, revoked, "a run's credential leases its host hadn't given back, revoked at its end"),
+fn ended(run: &str, said: anyhow::Result<Answer>) {
+    match said {
+        Ok(Answer::Ended { revoked: 0 }) => {}
+        Ok(Answer::Ended { revoked }) => tracing::info!(run, revoked, "a run's credential leases its host hadn't given back, revoked at its end"),
+        Ok(Answer::Refused { said }) => tracing::error!(run, "a run's credential leases weren't revoked at its end: {}", said.lease()),
+        Ok(other) => tracing::error!(run, "a run's credential leases weren't revoked at its end: it answered {}", other.kind()),
         Err(e) => tracing::error!(run, "a run's credential leases weren't revoked at its end: {e:#}"),
     }
 }
@@ -358,11 +779,252 @@ mod tests {
             let after = keyed.lease("providers/openai", Some(A)).err();
             anyhow::ensure!(after == Some(LeaseRefused::KeyReplaced { asked: hex::encode(A), current: Some(B.to_owned()) }), "{store}: an ask under a replaced key: {after:?}");
             let b = Arc::clone(&broker);
-            let captured = crate::rt::block_on(async move { b.capture("claude/ada", super::super::broker::Tokens { access: v("oat-real"), refresh: None, expires_in_s: Some(600) }).await.map_err(anyhow::Error::msg) })?;
+            let captured = crate::rt::block_on(async move { b.capture("claude/ada", super::super::broker::Tokens { access: v("oat-real"), refresh: None, expires_in_s: Some(600), scope: None }).await.map_err(anyhow::Error::msg) })?;
             let short = run.lease(&captured.access.reference, None).map_err(anyhow::Error::msg)?;
             anyhow::ensure!(short.life == Some(Duration::from_secs(600)), "{store}: its life {:?}", short.life);
             u.clock.advance(Duration::from_secs(601));
             anyhow::ensure!(matches!(run.lease(&captured.access.reference, None), Err(LeaseRefused::Unavailable(_))), "{store}: a value past its own end");
+        }
+        Ok(())
+    }
+
+    /// Claude Code's and Codex's token endpoints stood in for, once for every test here (each
+    /// test's sign-ins its own refresh tokens): each refresh asked of it kept, by its path and
+    /// body, and answered as its refresh token says: `rt-refused` refused (RFC 6749 §5.2's 400),
+    /// `rt-broken` unavailable (503), any other given its next tokens, Codex's with an ID token.
+    struct StandIn {
+        asked: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl StandIn {
+        /// The refreshes asked of it with refresh token `rt`, by their paths and bodies.
+        fn asked(&self, rt: &str) -> Vec<(String, serde_json::Value)> {
+            self.asked.lock().iter().filter(|(_, body)| body.get("refresh_token").and_then(serde_json::Value::as_str) == Some(rt)).cloned().collect()
+        }
+    }
+
+    fn stand_in() -> anyhow::Result<&'static StandIn> {
+        use crate::http::server::{self as srv, Request, Response};
+
+        struct Fake {
+            asked: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        }
+        impl srv::Handler for Fake {
+            async fn handle(self: Arc<Self>, req: Request) -> Response {
+                let path = req.uri().path().to_owned();
+                let body = srv::body_bytes(req.into_body(), 1 << 20).await.unwrap_or_default();
+                let asked: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let rt = asked.get("refresh_token").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                self.asked.lock().push((path.clone(), asked));
+                match rt.as_str() {
+                    "rt-refused" => srv::json(http::StatusCode::BAD_REQUEST, &serde_json::json!({ "error": "invalid_grant", "error_description": "Refresh token revoked" })),
+                    "rt-broken" => srv::json(http::StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({ "error": "temporarily_unavailable" })),
+                    _ if path == "/oauth/token" => srv::json(http::StatusCode::OK, &serde_json::json!({ "id_token": format!("eyJh.eyJp.sig-{rt}"), "access_token": format!("at-{rt}"), "refresh_token": format!("{rt}-2") })),
+                    _ => srv::json(http::StatusCode::OK, &serde_json::json!({ "access_token": format!("at-{rt}"), "refresh_token": format!("{rt}-2"), "expires_in": 3600, "token_type": "Bearer" })),
+                }
+            }
+        }
+
+        /// Bound, served and made both providers' endpoint before any test asks it.
+        fn start() -> anyhow::Result<StandIn> {
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let fake = Arc::new(Fake { asked: Arc::clone(&asked) });
+            let addr = crate::rt::block_on(async move {
+                let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+                crate::rt::spawn(async move {
+                    while let Ok(s) = tcp.accept().await {
+                        let (h, r) = (Arc::clone(&fake), s.peer_addr().ok());
+                        crate::rt::spawn(srv::serve_connection(crate::http::io::RtIo::new(s), h, r));
+                    }
+                });
+                anyhow::Ok(addr)
+            })?;
+            crate::ci::integrations::override_endpoint("claude:token", &format!("http://{addr}"));
+            crate::ci::integrations::override_endpoint("codex:token", &format!("http://{addr}"));
+            Ok(StandIn { asked })
+        }
+        static S: std::sync::LazyLock<Result<StandIn, String>> = std::sync::LazyLock::new(|| start().map_err(|e| format!("{e:#}")));
+        S.as_ref().map_err(|e| anyhow::anyhow!("the stand-in token endpoint: {e}"))
+    }
+
+    fn sign_in_tokens(access: &str, refresh: &str, expires_in: Option<u64>, id_token: Option<&str>, scope: Option<&str>) -> SignInTokens {
+        let value = |s: &str| Value::new(s.as_bytes().to_vec());
+        SignInTokens { access: value(access), refresh: Some(value(refresh)), expires_in, id_token: id_token.map(value), scope: scope.map(str::to_owned) }
+    }
+
+    /// A refresh's answer as its CLI reads it: its fields, and its words whole.
+    fn read(answer: &Value) -> anyhow::Result<(serde_json::Map<String, serde_json::Value>, String)> {
+        let words = String::from_utf8(answer.expose().to_vec())?;
+        match serde_json::from_str(&words)? {
+            serde_json::Value::Object(fields) => Ok((fields, words)),
+            other => anyhow::bail!("an answer that is no object: {other}"),
+        }
+    }
+
+    fn placeholder(fields: &serde_json::Map<String, serde_json::Value>, name: &str) -> bool {
+        fields.get(name).and_then(serde_json::Value::as_str).is_some_and(|p| p.starts_with("kiln-placeholder-"))
+    }
+
+    /// Plan step 33's step 8 (D242, its third slice; CP-T8.3): through Hex's seam, a run's sign-in
+    /// is captured into the broker, its CLI given placeholders and its access token leased by
+    /// reference; its refresh is made at its provider by the broker alone, as its CLI's own would
+    /// be (Claude Code's scope asked again, Codex's none), the rotated tokens kept under the same
+    /// references and its CLI answered placeholders, never a token, Codex's ID token left out; and a
+    /// revocation in its microVM keeps the sign-in.
+    #[test]
+    fn cp_t8_3_a_runs_sign_ins_are_captured_refreshed_and_revoked_outside_through_hexs_seam() -> anyhow::Result<()> {
+        let provider = stand_in()?;
+        for (u, _, lessors) in stores()? {
+            let store = u.name;
+            let run = lessor(&lessors, &format!("box-s-{store}"))?;
+            let claude = format!("claude/ada-{store}");
+            let scope = "user:inference user:profile";
+            let c = run.capture(&claude, sign_in_tokens(&format!("at-claude-{store}"), &format!("rt-claude-{store}"), Some(28800), None, Some(scope)), None).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(c.access == format!("sign-ins/{claude}/access"), "{store}: its reference {}", c.access);
+            let refresh = c.refresh_placeholder.clone().unwrap_or_default();
+            anyhow::ensure!(c.access_placeholder.starts_with("kiln-placeholder-") && refresh.starts_with("kiln-placeholder-") && c.access_placeholder != refresh, "{store}: {c:?}");
+            let held = run.lease(&c.access, None).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(held.value.expose() == format!("at-claude-{store}").as_bytes(), "{store}: the captured access token isn't the one leased");
+
+            let (fields, words) = read(&run.refresh(&claude, None).map_err(anyhow::Error::msg)?)?;
+            let asked = provider.asked(&format!("rt-claude-{store}"));
+            let expect = serde_json::json!({ "grant_type": "refresh_token", "refresh_token": format!("rt-claude-{store}"), "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e", "scope": scope });
+            anyhow::ensure!(asked == [("/v1/oauth/token".to_owned(), expect)], "{store}: Claude Code's provider was asked {asked:?}");
+            anyhow::ensure!(!words.contains(&format!("claude-{store}")), "{store}: a token in the answer");
+            anyhow::ensure!(placeholder(&fields, "access_token") && placeholder(&fields, "refresh_token"), "{store}: {fields:?}");
+            let said = |name: &str| fields.get(name).cloned();
+            anyhow::ensure!((said("token_type"), said("expires_in"), said("scope")) == (Some("Bearer".into()), Some(3600u64.into()), Some(scope.into())), "{store}: {fields:?}");
+            anyhow::ensure!(fields.len() == 5, "{store}: its provider's other fields in the answer: {fields:?}");
+            let rotated = run.lease(&c.access, None).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(rotated.value.expose() == format!("at-rt-claude-{store}").as_bytes(), "{store}: the rotated access token isn't kept under its reference");
+            run.revoked(&claude, None);
+            let after = run.lease(&c.access, None).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(after.value.expose() == format!("at-rt-claude-{store}").as_bytes(), "{store}: a revocation in the microVM ended the sign-in");
+
+            let codex = format!("codex/ada-{store}");
+            run.capture(&codex, sign_in_tokens(&format!("at-codex-{store}"), &format!("rt-codex-{store}"), None, Some("eyJh.eyJp.shards-placeholder"), None), None).map_err(anyhow::Error::msg)?;
+            let (fields, words) = read(&run.refresh(&codex, None).map_err(anyhow::Error::msg)?)?;
+            let asked = provider.asked(&format!("rt-codex-{store}"));
+            let expect = serde_json::json!({ "client_id": "app_EMoamEEZ73f0CkXaXp7hrann", "grant_type": "refresh_token", "refresh_token": format!("rt-codex-{store}") });
+            anyhow::ensure!(asked == [("/oauth/token".to_owned(), expect)], "{store}: Codex's provider was asked {asked:?}");
+            anyhow::ensure!(!words.contains(&format!("codex-{store}")) && !words.contains("eyJ"), "{store}: a token in the answer: {fields:?}");
+            anyhow::ensure!(placeholder(&fields, "access_token") && placeholder(&fields, "refresh_token") && fields.len() == 3, "{store}: {fields:?}");
+        }
+        Ok(())
+    }
+
+    /// Plan step 33's step 8 (D242, its third slice): through Hex's seam, each sign-in refusal is
+    /// D242's kind: a sign-in whose name names no provider, captured by no one and nothing kept; a
+    /// refresh of one never captured, and one its provider refuses, denied, so its CLI signs in
+    /// anew; one its provider can't answer unavailable, its words holding no token.
+    #[test]
+    fn cp_t8_3_a_sign_ins_refusals_are_d242s_kinds() -> anyhow::Result<()> {
+        stand_in()?;
+        for (u, _, lessors) in stores()? {
+            let store = u.name;
+            let run = lessor(&lessors, &format!("box-r-{store}"))?;
+            let devin = format!("devin/ada-{store}");
+            let refused = run.capture(&devin, sign_in_tokens("at-devin", "rt-devin", None, None, None), None).err();
+            anyhow::ensure!(matches!(refused, Some(SignInRefused::Denied(_))), "{store}: {refused:?}");
+            let kept = run.lease(&format!("sign-ins/{devin}/access"), None).err();
+            anyhow::ensure!(matches!(kept, Some(LeaseRefused::Denied(_))), "{store}: a sign-in naming no provider was kept: {kept:?}");
+            anyhow::ensure!(matches!(run.refresh(&devin, None), Err(SignInRefused::Denied(_))), "{store}: a refresh naming no provider");
+            anyhow::ensure!(matches!(run.refresh(&format!("claude/none-{store}"), None), Err(SignInRefused::Denied(_))), "{store}: a refresh of a sign-in never captured");
+            for (name, rt) in [(format!("claude/refused-{store}"), "rt-refused"), (format!("codex/broken-{store}"), "rt-broken")] {
+                run.capture(&name, sign_in_tokens("at-x", rt, None, None, None), None).map_err(anyhow::Error::msg)?;
+                match (rt, run.refresh(&name, None)) {
+                    ("rt-refused", Err(SignInRefused::Denied(_))) => {}
+                    ("rt-broken", Err(SignInRefused::Unavailable(words))) => anyhow::ensure!(!words.contains(rt), "{store}: {words}"),
+                    (_, got) => anyhow::bail!("{store}: {name}: {:?}", got.map(|_| "answered")),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Plan step 33's step 8 (D242, its third slice): two refreshes of one sign-in at once, as two
+    /// runs' lessors ask them of the one broker, make one call to its provider, the second taking
+    /// the first's tokens, as a rotated refresh token retires every other holder's (RFC 6749 §6).
+    #[test]
+    fn cp_t8_3_two_refreshes_of_one_sign_in_at_once_make_one_call_to_its_provider() -> anyhow::Result<()> {
+        let provider = stand_in()?;
+        for (u, broker, _) in stores()? {
+            let store = u.name;
+            let name = format!("claude/once-{store}");
+            let rt = format!("rt-once-{store}");
+            let b = Arc::clone(&broker);
+            let (n, r) = (name.clone(), rt.clone());
+            let (one, two) = crate::rt::block_on(async move {
+                b.capture(&n, Tokens { access: v("at-once"), refresh: Some(v(&r)), expires_in_s: None, scope: None }).await.map_err(anyhow::Error::msg)?;
+                anyhow::Ok(futures::join!(b.refresh(&n, Provider::ClaudeCode.upstream()), b.refresh(&n, Provider::ClaudeCode.upstream())))
+            })?;
+            let (one, two) = (one.map_err(anyhow::Error::msg)?, two.map_err(anyhow::Error::msg)?);
+            anyhow::ensure!(one == two, "{store}: the second refresh didn't take the first's tokens");
+            let calls = provider.asked(&rt).len();
+            anyhow::ensure!(calls == 1, "{store}: {calls} calls to the provider");
+        }
+        Ok(())
+    }
+
+    /// Plan step 33 (D242): a run's ask and the broker's answer cross a runner's link as JSON
+    /// (`crate::reach::Question::Lessor`) and come back as they went: a value and a sign-in's
+    /// tokens hex there, never in a `Debug`, and each refusal kind for kind.
+    #[test]
+    fn s33_a_runs_asks_and_answers_cross_a_link_as_they_went() -> anyhow::Result<()> {
+        let carried = |s: &str| Carried::new(Value::new(s.as_bytes().to_vec()));
+        let ask = Ask::Capture { sign_in: "claude/owner".into(), access: carried("at-real"), refresh: Some(carried("rt-real")), expires_in: Some(60), scope: Some("user:inference".into()) };
+        let question = crate::reach::Question::Lessor { ask };
+        let json = serde_json::to_string(&question)?;
+        anyhow::ensure!(!json.contains("at-real") && json.contains(&hex::encode("at-real")), "{json}");
+        anyhow::ensure!(serde_json::from_str::<crate::reach::Question>(&json)? == question, "the ask came back otherwise");
+        let shown = format!("{question:?}");
+        anyhow::ensure!(!shown.contains("at-real") && !shown.contains(&hex::encode("at-real")), "an ask shows a token: {shown}");
+        let leased = Answer::Leased { lease: "l1".into(), value: carried("sk-real"), life_ms: Some(5) };
+        anyhow::ensure!(!format!("{leased:?}").contains("sk-real"), "an answer shows its value");
+        match serde_json::from_str::<Answer>(&serde_json::to_string(&leased)?)? {
+            Answer::Leased { lease, value, life_ms } => anyhow::ensure!((lease.as_str(), value.0.expose(), life_ms) == ("l1", &b"sk-real"[..], Some(5)), "came back otherwise"),
+            other => anyhow::bail!("{other:?}"),
+        }
+        let leases = [LeaseRefused::Denied("d".into()), LeaseRefused::Unavailable("u".into()), LeaseRefused::Ended, LeaseRefused::KeyReplaced { asked: "a".into(), current: Some("c".into()) }, LeaseRefused::Lapsed];
+        for why in leases {
+            let said: Said = serde_json::from_str(&serde_json::to_string(&Said::from(why.clone()))?)?;
+            anyhow::ensure!(said.lease() == why, "{why:?}");
+        }
+        for why in [SignInRefused::Denied("d".into()), SignInRefused::Unavailable("u".into()), SignInRefused::Ended, SignInRefused::Unanswered] {
+            anyhow::ensure!(Said::from(why.clone()).sign_in() == why, "{why:?}");
+        }
+        Ok(())
+    }
+
+    /// Plan step 33 (D242): the broker answers a run's asks as a runner's link carries them, the
+    /// answer a runner other than the server's own is given: a capture's placeholders and its
+    /// access token leased by their reference, a give-back, and the run's end revoking what it
+    /// still held.
+    #[test]
+    fn s33_the_broker_answers_a_links_asks_as_its_own_runners() -> anyhow::Result<()> {
+        for (u, broker, _) in stores()? {
+            let store = u.name;
+            let clock: Arc<dyn Clock> = Arc::new(u.clock.clone());
+            let ask = |a: Ask| {
+                let (broker, clock) = (Arc::clone(&broker), Arc::clone(&clock));
+                crate::rt::block_on(async move { anyhow::Ok(answered(broker, clock, a).await) })
+            };
+            let identity = "a1".repeat(32);
+            let capture = Ask::Capture { sign_in: format!("claude/link-{store}"), access: Carried::new(Value::new(b"at-link".to_vec())), refresh: None, expires_in: None, scope: None };
+            let Answer::Captured { captured } = ask(capture)? else { anyhow::bail!("{store}: no capture") };
+            anyhow::ensure!(captured.access == format!("sign-ins/claude/link-{store}/access") && captured.refresh_placeholder.is_none(), "{store}: {captured:?}");
+            let Answer::Leased { lease, value, life_ms } = ask(Ask::Lease { identity: identity.clone(), reference: captured.access.clone() })? else { anyhow::bail!("{store}: no lease") };
+            anyhow::ensure!(value.0.expose() == b"at-link" && life_ms.is_none(), "{store}: its value or its life");
+            anyhow::ensure!(matches!(ask(Ask::Given { identity: identity.clone(), lease: lease.clone() })?, Answer::Given), "{store}: its give-back");
+            anyhow::ensure!(!reads(&u, &lease)?, "{store}: a lease given back still reads");
+            let Answer::Leased { lease: held, .. } = ask(Ask::Lease { identity: identity.clone(), reference: captured.access.clone() })? else { anyhow::bail!("{store}: no second lease") };
+            anyhow::ensure!(matches!(ask(Ask::Ended { identities: vec![identity.clone()] })?, Answer::Ended { revoked: 1 }), "{store}: its end");
+            anyhow::ensure!(!reads(&u, &held)?, "{store}: a run's lease outlived its end");
+            let after = ask(Ask::Lease { identity, reference: captured.access })?;
+            anyhow::ensure!(matches!(after, Answer::Refused { said: Said::Ended }), "{store}: an ask after its run's end: {after:?}");
+            let unprovided = ask(Ask::Refresh { sign_in: "devin/link".into() })?;
+            anyhow::ensure!(matches!(unprovided, Answer::Refused { said: Said::Denied { .. } }), "{store}: {unprovided:?}");
         }
         Ok(())
     }

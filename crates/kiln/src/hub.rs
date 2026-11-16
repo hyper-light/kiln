@@ -849,6 +849,10 @@ pub struct Hub {
     pub flight: crate::ci::services::memo::Flights,
     /// What wakes the relay of kiln's events from their outbox to the bus (`crate::events`).
     pub relay: crate::events::Relay,
+    /// The run-lease broker's lessors, once the server opened them for its own runner (`crate::secrets::lessor::open`):
+    /// the one broker every runner's microVMs lease from, others' over their links (`crate::secrets::lessor::answer`),
+    /// so a sign-in is refreshed one at a time across every run (Shards' D242).
+    pub lessors: std::sync::OnceLock<crate::secrets::lessor::Lessors>,
 }
 
 impl Hub {
@@ -1027,6 +1031,7 @@ impl Hub {
             search,
             flight: Default::default(),
             relay: crate::events::Relay::default(),
+            lessors: std::sync::OnceLock::new(),
         });
         // What each agent session's owner shard tells the rest of kiln goes through the hub
         // (`crate::harness::copies`).
@@ -1830,6 +1835,23 @@ impl Hub {
             inst.newest_with(machine, cap)
         };
         let Some(peer) = peer else { return Ok(None) };
+        self.ask_peer(peer, machine, wait, msg).await.map(Some)
+    }
+
+    /// [`Hub::ask_runner`] of machine `machine`'s newest runner process where it named feature `feature` (docs/wire.md,
+    /// "Named features"): `Ok(None)` where it didn't.
+    pub async fn ask_speaking<T: serde::de::DeserializeOwned + Serialize + Send + 'static>(&self, machine: &str, feature: &str, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<Option<T>>> {
+        let peer = {
+            let inst = self.instances.load();
+            let Some(newest) = inst.newest(machine) else { anyhow::bail!("{} is not connected", self.shown(machine)) };
+            inst.get(newest).is_some_and(|i| proto::feature::speaks(&i.features, feature)).then_some(newest)
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        self.ask_peer(peer, machine, wait, msg).await.map(Some)
+    }
+
+    /// `msg` to runner process `peer` of `machine`, its answer waited for at most `wait`.
+    async fn ask_peer<T: serde::de::DeserializeOwned + Serialize + Send + 'static>(&self, peer: PeerId, machine: &str, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<T>> {
         let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
         let frame = proto::encode(&msg(req))?;
         let (read, rx) = asked::<T>();
@@ -1837,7 +1859,7 @@ impl Hub {
         let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
         let answer = if sent { crate::rt::timeout(wait, rx).await.ok() } else { None };
         self.ai_requests.take(&req);
-        answered(&self.shown(machine), sent, answer).map(Some)
+        answered(&self.shown(machine), sent, answer)
     }
 
     /// A machine's past sessions.
@@ -3697,6 +3719,9 @@ impl Hub {
                 // One that takes it is told the room a hand-over's spool leaves there: a session
                 // moved to it from another machine is taken over (CP-T3.2).
                 crate::harness::mail_transfer::on_features(self, &agent, peer, &names).await;
+                // One that builds Agentfiles ahead of their sessions is asked again for each it hasn't said done or
+                // failed (kiln plan 01a1dd2e… P4.5).
+                crate::api::boxed(|| crate::agentfiles::prebuild::on_features(self, &agent, &names)).await;
                 self.harness.mail_delivery.changed();
                 // One that installs skills is told what it lays out (docs/agents.md, "Skills kiln installs").
                 if skills {
@@ -3749,6 +3774,8 @@ impl Hub {
                 metrics::global().runner_net_dropped.replace_owned(&std::collections::BTreeSet::from([String::from(&*agent)]), series);
                 self.change_agent(&agent, |a| a.dropped.clone_from(&dropped));
             }
+            // Where a build of an Agentfile asked ahead of its sessions is (kiln plan 01a1dd2e… P4.5).
+            AgentMsg::Prebuilt { json } => crate::api::boxed(|| crate::agentfiles::prebuild::heard(self, &agent, &json)).await,
             // Hand-overs between a machine's runner processes (`crate::handovers`).
             AgentMsg::HarnessMailTransfer { json } => crate::api::boxed(|| crate::harness::mail_transfer::heard(self, peer, json)).await,
             AgentMsg::HarnessHandOver { session, offset, data, done } => crate::api::boxed(|| self.handover_piece(&agent, peer, session, offset, data, done)).await,
@@ -4293,6 +4320,16 @@ impl Hub {
                     let (hub, runner) = (Arc::clone(self), agent.to_owned());
                     crate::rt::spawn(async move {
                         let answer = crate::reach::history::keep(&hub, &runner, repo, command, ask, size.map(|s| *s), *used).await;
+                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    });
+                }
+                // A run's ask of the run-lease broker, from a runner other than the server's own
+                // (Shards' D242): answered on its own, as a broker (a provider's refresh) may take
+                // its time.
+                crate::reach::Question::Lessor { ask } => {
+                    let (hub, runner) = (Arc::clone(self), agent.to_owned());
+                    crate::rt::spawn(async move {
+                        let answer = crate::secrets::lessor::answer(&hub, &runner, ask).await;
                         hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     });
                 }

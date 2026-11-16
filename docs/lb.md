@@ -1263,9 +1263,12 @@ however many came.
   runner's node driving the holding over it ("The runner's node": `[capacity]`, the holding's
   durable epoch and its survivors from its records, every start path on its reserve's grant, each
   run's reservation released as it ends; `reach::place::holder`'s tests against the seam's
-  simulator) and its boxes' names (`BoxName`). Not yet: kiln's link to Hex's keeper on two machines
-  (`hex schedule serve` on one, a runner whose `[capacity]` names it on the other), and kiln's
-  boxes named so once kiln starts Hex's boxes (it starts none yet).
+  simulator), its boxes' names (`BoxName`), which every Hex box kiln starts takes (`sandbox::hexvm`:
+  its run's reservation's, `Holder::box_of`, else placement's numbering; none started unnamed), the
+  keeper's certificate from kiln's CA (`POST /api/capacity/keeper`, answering `hex node enroll`'s
+  request) and the held set HEX-CV-2K reads (`HEX_CV_HELD`). Not yet: kiln's link to Hex's keeper on
+  two machines (HEX-CV-2K: `hex schedule serve` on one, a runner whose `[capacity]` names it on the
+  other).
 
 ## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
 

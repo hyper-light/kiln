@@ -215,13 +215,15 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
 
 ## Owed
 
-- Wiring into step 17's launch seam (above): goal 60's launch, as it lands.
+- Wiring into step 17's launch seam (above): built with step 17's part 7 (`sandbox::isolated`,
+  `sandbox::hexvm`; docs/isolation.md, "What the microVMs are, and what's owed").
 - Steps 6 and 11's terminal lane and the microVM's key: sign-in, git signing, credential helpers
   (design above).
 - kiln's MCP over the `mcp` lane (D254, ROOT's word of 2026-11-13) is built: each harness's MCP
   config and the check's `ReachesKiln` in part 3a, the runner's end in part 3b (kiln main
-  dace992a6). The launch handing it each connection is goal 60's (part 3b's owed list). The
-  runner's loopback `/api/mcp` (plan step 35's part 3) was the withdrawn design's.
+  dace992a6), and the launch handing it each connection through Hex (`Runtime::mcp`; b2fc6cebb,
+  c44bed4da), each session's connections its own (a47a16aab). The runner's loopback `/api/mcp`
+  (plan step 35's part 3) was the withdrawn design's.
 - Real-VM runs (ROOT's): an isolated session's transcript read from its volume and resumed; kiln's
   MCP over the lane; H6's notices from a live microVM.
 

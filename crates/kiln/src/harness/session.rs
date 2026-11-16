@@ -47,6 +47,11 @@ pub struct Isolation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub memory: Option<u64>,
+    /// The bytes its agent's volumes may hold (P6.2, `crate::agentdefs::volumes::bytes`): what its placement asks of
+    /// its machine's disk and its claim holds, set by kiln from the definition it starts from. None: it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub disk: Option<u64>,
 }
 
 impl Isolation {
@@ -55,7 +60,7 @@ impl Isolation {
 
     /// A microVM of its own, its image not yet chosen and its size not given.
     pub fn microvm() -> Self {
-        Self { kind: Self::MICROVM.to_owned(), image: None, person: None, cpus: None, memory: None }
+        Self { kind: Self::MICROVM.to_owned(), image: None, person: None, cpus: None, memory: None, disk: None }
     }
 }
 
@@ -236,6 +241,11 @@ pub struct Measured {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub footprint_peak_bytes: Option<u64>,
+    /// The build of its image its start ran, in microseconds: none where its machine held its image already, built by
+    /// an earlier start or ahead of it as its Agentfile was saved (kiln plan 01a1dd2e… P4.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub built_us: Option<u64>,
 }
 
 /// How a start of a session's harness ended.
@@ -467,6 +477,11 @@ pub struct Spec {
     /// start of its harness. Never what was asked, and never kept: its state is their record.
     #[serde(skip)]
     pub components: Vec<kiln_seams::sandbox::ComponentAt>,
+    /// Its agent's volumes (P6.2, `crate::agentdefs::volumes`), plugged into its microVM by their names in its machine's
+    /// store as its harness starts, where they outlive it for its agent's next session there. Set by kiln from the
+    /// definition it starts from, never from what was asked (`POST /api/harness/sessions` drops them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<crate::agentdefs::volumes::Given>,
 }
 
 /// The id of session `session`'s opening prompt (`Spec::prompt`), its own (CP-T3.2): made once,
@@ -521,6 +536,7 @@ impl Default for Spec {
             dirs: Vec::new(),
             egress_ceiling: Vec::new(),
             components: Vec::new(),
+            volumes: Vec::new(),
         }
     }
 }
@@ -1595,6 +1611,12 @@ async fn reapply_overrides(s: &Session, run: Option<Arc<crate::sandbox::held::He
                 core.state.overrides.ceiling.clone_from(&declared.egress_ceiling);
                 core.touch_state();
             }
+        }
+        // A connection held from before each grant on a network named its parts (Shards' D285) granted nothing, default
+        // deny, and no microVM took one (Hex's refused every change): let go of, once.
+        if core.state.overrides.networks.iter().any(|h| h.network.grant.is_none()) {
+            core.state.overrides.networks.retain(|h| h.network.grant.is_some());
+            core.touch_state();
         }
         if core.state.overrides.ports.is_empty() && core.state.overrides.egress.is_empty() && core.state.overrides.networks.is_empty() && core.state.overrides.volumes.is_empty() {
             return;

@@ -162,7 +162,6 @@ brotli = "9.1.0"
 # (goal 9, plan 01a1a87b2cec step 5; `api::write_live_batch`), each one write where each was a write of its own.
 async-tungstenite = { version = "0.35.0", default-features = false, features = ["handshake", "futures-03-sink"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
-async-lock = "3.4.2"
 argon2 = "0.6"
 rpassword = "7"
 vt100 = "0.16.2"

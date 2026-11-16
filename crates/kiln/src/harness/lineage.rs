@@ -909,13 +909,16 @@ pub fn sized(mut isolation: Isolation, asked: &kiln_ci::sched::state::Resources)
 /// What an agent's placement asks of a machine (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32):
 /// what its start asks (`asked`, as `on` spells it); for an isolated agent, its microVM's own vCPUs
 /// and memory in place of any its start asked of the machine for a process, and a runner that starts
-/// microVMs (`microvm`). Its claim holds exactly that, from its start to its end: what its microVM
-/// uses past it is charged as it's measured (`crate::reach::place::vm_group`). A microVM its start
-/// gave no size asks none, and is charged what it's measured using alone.
+/// microVMs (`microvm`); and of its machine's disk, the bytes its agent's volumes may hold (P6.2,
+/// `Isolation::disk`) past any its start asked. Its claim holds exactly that, from its start to its
+/// end: what its microVM uses past it is charged as it's measured (`crate::reach::place::vm_group`).
+/// A microVM its start gave no size asks none, and is charged what it's measured using alone. A
+/// volume already on a machine is asked in whole again: its bytes there are among the disk's used.
 pub fn session_needs(mut asked: kiln_ci::sched::needs::Needs, isolation: Option<&Isolation>) -> Result<kiln_ci::sched::needs::Needs, String> {
     let Some(i) = isolation else { return Ok(asked) };
     asked.request.cpu = i.cpus.unwrap_or_default();
     asked.request.mem = i.memory.unwrap_or(0);
+    asked.request.disk = asked.request.disk.checked_add(i.disk.unwrap_or(0)).ok_or("its volumes and the disk its start asks for together pass 2^64 bytes")?;
     asked.add("microvm")?;
     Ok(asked)
 }
@@ -1683,6 +1686,18 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // person they act for's. A person's own Agentfile is read as theirs before anything is placed.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
     let kept = kept_agentfile(hub, isolation.as_ref(), person.as_deref()).await.map_err(bad)?;
+    // Its agent's volumes (P6.2), as the definition it starts from had them at its version then: the disk its
+    // placement asks for them, and each given to its microVM as its harness starts ([`Spec::volumes`]).
+    let volumes = match &ask.definition {
+        Some(d) => crate::agentdefs::volumes::of(hub, d).await.map_err(|e| (StatusCode::CONFLICT, format!("its agent definition's volumes couldn't be read: {e}")))?,
+        None => Vec::new(),
+    };
+    let disk = match crate::agentdefs::volumes::bytes(&volumes) {
+        Some(0) => None,
+        Some(bytes) => Some(bytes),
+        None => return Err(bad("its agent's volumes' bounds together pass 2^64 bytes")),
+    };
+    let isolation = isolation.map(|i| Isolation { disk, ..i });
     let want = wanted(ask.isolation.as_deref(), isolation.as_ref());
     // The engine settings its boundary is decided under, as they are before it's placed: a runner set
     // again since refuses it (kiln plan 01a1dd2e…, P2.3).
@@ -1691,7 +1706,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, (isolation.as_ref(), want), &ask.queued).await?;
     // Each one's boundary (kiln plan 01a1dd2e…, P2.3): as it asked, or else its runner's engine's.
     // A conversation taken up (`resume`) stays where its harness keeps it.
-    let boundary = |target: &str| isolation.clone().or_else(|| (want.is_none() && resume.is_none() && engine_at(hub, target) == Ok(Engine::Microvm)).then(|| sized(Isolation::microvm(), &requested(hub, on.as_deref()).request)));
+    let boundary = |target: &str| isolation.clone().or_else(|| (want.is_none() && resume.is_none() && engine_at(hub, target) == Ok(Engine::Microvm)).then(|| sized(Isolation { disk, ..Isolation::microvm() }, &requested(hub, on.as_deref()).request)));
     let checked = async {
         let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
         targets.dedup();
@@ -1702,6 +1717,11 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
             // An isolated agent's harness is its image's, in its microVM: what the machine has
             // installed isn't its (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
             let isolated = boundary(target).is_some();
+            // Its agent's volumes are kept in a machine's microVM store alone (P6.2): never given to a harness on
+            // its machine's host.
+            if !isolated && !volumes.is_empty() {
+                return Err((StatusCode::CONFLICT, format!("its agent's volumes are kept only for its sessions in microVMs, and on {target} it would run on the machine's host: start it isolated (`isolation`: `microvm`)")));
+            }
             if !isolated && lacks(hub, target, kind).await {
                 return Err(not_installed(hub, target, kind));
             }
@@ -1760,6 +1780,8 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         resume: resume.clone(),
         agentfile: kept.text,
         build_secrets: kept.secrets,
+        // Its agent's volumes, its person's own on each machine (P6.2).
+        volumes: ask.definition.as_ref().map(|d| crate::agentdefs::volumes::given(person.as_deref().unwrap_or_default(), &d.id, &volumes)).unwrap_or_default(),
         // Whose its opening prompt is: its input admits it as theirs (step 35).
         opener: person.clone(),
         ..Spec::default()
@@ -1920,7 +1942,7 @@ mod tests {
             let ada = crate::agentfiles::Who { person: "user:u-ada".into(), all: false };
             let kept = crate::agentfiles::create(&hub, blobs, &ada, "mine", V1, "user:u-ada").await?;
             let id = kept.agentfile.id;
-            crate::agentfiles::update(&hub, blobs, &ada, &id, crate::agentfiles::Patch { name: None, text: Some(V2.into()) }, "user:u-ada").await?;
+            crate::agentfiles::update(&hub, blobs, &ada, &id, crate::agentfiles::Patch { name: None, text: Some(V2.into()) }, None, "user:u-ada").await?;
             let named = Isolation { image: Some(format!(" agentfile:{id} ")), ..Isolation::microvm() };
             assert_eq!(kept_agentfile(&hub, Some(&named), Some("user:u-ada")).await.map(|k| k.text), Ok(Some(V2.to_owned())), "its latest version");
             for other in ["user:u-bo", "owner"] {
@@ -1982,6 +2004,22 @@ mod tests {
         assert_eq!(isolated.requires, ["os == linux", "arch == x86_64", "virt.microvm"], "its other needs kept, and a runner that starts microVMs");
         let bare = session_needs(Needs::default(), Some(&Isolation::microvm()))?;
         assert_eq!((bare.request.cpu, bare.request.mem, bare.requires), (Cpus::ZERO, 0, vec!["virt.microvm".to_owned()]));
+        Ok(())
+    }
+
+    /// P6.2: an agent's volumes are asked of its machine's disk, past what its start asks of it, so
+    /// it's placed only where the disk has room for them; an agent with none asks none.
+    #[test]
+    fn p6_2_an_agents_volumes_are_asked_of_its_machines_disk() -> Result<(), String> {
+        use kiln_ci::sched::needs::Needs;
+        const GIB: u64 = 1 << 30;
+        let vm = Isolation { disk: Some(10 * GIB), ..Isolation::microvm() };
+        assert_eq!(session_needs(Needs::default(), Some(&vm))?.request.disk, 10 * GIB, "its volumes' bounds");
+        let mut asked = Needs::default();
+        asked.request.disk = 5 * GIB;
+        assert_eq!(session_needs(asked.clone(), Some(&vm))?.request.disk, 15 * GIB, "past the disk its start asks");
+        assert_eq!(session_needs(Needs::default(), Some(&Isolation::microvm()))?.request.disk, 0, "no volumes, no disk");
+        assert!(session_needs(asked, Some(&Isolation { disk: Some(u64::MAX), ..Isolation::microvm() })).is_err(), "never wrapped");
         Ok(())
     }
 

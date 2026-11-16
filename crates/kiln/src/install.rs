@@ -537,6 +537,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         slots: a.slots.unwrap_or(1),
         work_dir: state_dir.join("work"),
         state_dir: state_dir.clone(),
+        server_data_dir: crate::config::server_data_dir(&crate::config::default_config_path()),
         join_token: a.token.clone(),
         ephemeral: false,
         dedicated_job: None,

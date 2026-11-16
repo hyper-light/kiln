@@ -33,9 +33,15 @@
 //!   node's run-lease broker), and fills it in outside the VM; the run sees placeholders alone. A sandbox whose
 //!   runtime was given none ([`HexVms::leasing`] not called) holds no credentials: a launch granting one is refused,
 //!   `Unsupported` ([`NO_BROKER`]), never run without them.
+//! - **Its sign-in** (plan step 33, Shards' D242 step 8, Hex's C8): the one its launch grants its harness member
+//!   (`secrets::signin::SignIn`, [`HexVms::launch_as`]), as `ShardsImage::sign_ins`: its CLI's own sign-in, its token
+//!   response taken outside the VM and kept by the broker through the same lessors, its CLI given placeholders, and its
+//!   access token filled in toward its provider's hosts alone. Held where credentials are, refused where they aren't
+//!   ([`NO_BROKER`]).
 //! - **What it refuses, typed:** egress to whatever its image grants (`Egress::Any`): Hex's grants are default
 //!   deny, so a run names its destinations; limits it doesn't hold ([`HOLDS`]), and credentials where no broker
-//!   leases them ([`NO_BROKER`]); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
+//!   leases them ([`NO_BROKER`]); a warm pool kept for its launches, until Hex's image class takes Shards' pools
+//!   ([`NO_POOLS`]; kiln plan 01a1dd2e…, P3.1); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
 //! - **Its MCP lane** (Shards D254; #75 step 3): its harness member is asked for its MCP bridge (`/run/shards/mcp`,
 //!   `ImageMember::mcp`), and each connection its harness makes to it is taken through Hex (`Runtime::mcp`, over its
 //!   run's agent-control endpoint) as `super::Lanes`' next, for the runner to serve kiln's MCP over in its own
@@ -57,17 +63,17 @@ use kiln_ci::place::holder::BoxName;
 use kiln_seams::Records;
 use kiln_seams::records::{Tx, Write};
 use serde::{Deserialize, Serialize};
-use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Refusal, Run, Sandbox, Signal};
+use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Pool, Refusal, Run, Sandbox, Signal};
 
 /// What a box of Hex's holds its run to: no egress, egress to named destinations (each by TCP, to its harness
 /// member), folders shared at any path, read-only or not (`ShardsImage::shares`), and signals to its harness member
 /// (`Runtime::signal_member`, Shards' agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or
 /// refused fork of an image VM's guest: its `usage_of`), or weights. Credentials it holds where its runtime leases
 /// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
-pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (kiln's credential store is its server's, which this runner doesn't hold), and a run granted one is never run without it (Shards' D242)";
+pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (its server's broker didn't open, or this runner has no link to its server to ask it over), and a run granted one is never run without it (Shards' D242)";
 /// The cost profile its allocations are made under: Shards' least VM, its envelope alone. No overhead and no guest
 /// allowance: what a VM takes past its envelope Hex learns from its windows (decision 9, `RuntimeCost::census_free`).
 const PROFILE: [u8; 32] = *b"kiln harness microVM, least size";
@@ -140,8 +146,9 @@ struct Vm {
     runtime: Arc<dyn Runtime>,
     id: BoxId,
     name: String,
-    /// Its harness member, whose MCP connections its lane takes.
-    member: Member,
+    /// Its harness member, whose MCP connections its lane takes and which its signals reach; none for a box running its
+    /// own command alone ([`HexVms::boot_command`]).
+    member: Option<Member>,
     last: parking_lot::Mutex<Option<(HostUse, Charge)>>,
     /// The most memory any read of it said its VM held, its final use's among them (a session's peak footprint,
     /// P7.1).
@@ -240,6 +247,16 @@ async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
             *vm.last.lock() = Some((used, Charge::Final));
         }
         Ok(None) | Err(hex_api::Refusal::NoSuchBox(_)) => {}
+        // Its run ended on its own before this delete (its own command ended, or its VM failed): Hex reads no use of a
+        // run that has ended and leaves its box as it was (`NotRunning`), so it goes by a plain delete, charged the use
+        // last read.
+        Err(hex_api::Refusal::NotRunning(..)) => {
+            let (runtime, id) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(|e| e.to_string())?);
+            match crate::rt::blocking(move || runtime.delete(&id)).await.map_err(|e| format!("its delete didn't run: {e:#}"))? {
+                Ok(()) | Err(hex_api::Refusal::NoSuchBox(_)) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
         Err(e) => return Err(e.to_string()),
     }
     let charge = vm.last.lock().clone();
@@ -262,6 +279,52 @@ pub fn said(from: hex_api::StartedFrom) -> &'static str {
 
 /// Why a launch with no box named is refused where no placement numbers one.
 pub const UNNAMED: &str = "a microVM whose box no placement here names: kiln's placement isn't running on this machine";
+
+/// Why a box running its own command alone ([`HexVms::boot_command`]) takes no signal to a member and has no MCP lane.
+pub const NO_MEMBER: &str = "a microVM running its own command alone: no member of it is driven, so none takes a signal or an MCP connection";
+
+/// A box running its image's own command alone, no member of it driven ([`HexVms::boot_command`]; a replay's, kiln plan
+/// 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b): its VM, read and charged as a run's is, and deleted as it ends ([`Self::end`])
+/// or is let go of.
+pub struct Commanded {
+    vm: Arc<Vm>,
+    ended: AtomicBool,
+}
+
+impl Commanded {
+    /// What reads its use, as a run's [`Meter`] does.
+    pub fn meter(&self) -> Meter {
+        Meter(Arc::clone(&self.vm))
+    }
+
+    /// How its microVM started, as its run host said it (Hex's `Usage::started_from`): none where it said none.
+    pub async fn started_from(&self) -> Option<hex_api::StartedFrom> {
+        let (runtime, id) = (Arc::clone(&self.vm.runtime), self.vm.id.try_clone().ok()?);
+        crate::rt::blocking(move || runtime.usage(&id)).await.ok()?.ok()?.started_from
+    }
+
+    /// Deletes its box and keeps its charge ([`finish`]): what its VM lived on, as that charge has it (Hex's final use
+    /// where its run was still running, else the use last read); or why its box may still be there.
+    pub async fn end(self) -> Result<Option<Lived>, String> {
+        self.ended.store(true, Ordering::Release);
+        finish(&self.vm).await?;
+        Ok(self.meter().lived())
+    }
+}
+
+impl Drop for Commanded {
+    fn drop(&mut self) {
+        if self.ended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let vm = Arc::clone(&self.vm);
+        drop(crate::rt::spawn(async move {
+            if let Err(e) = finish(&vm).await {
+                tracing::warn!(vm = %vm.name, error = %e, "a microVM let go of wasn't deleted, or its charge wasn't kept");
+            }
+        }));
+    }
+}
 
 impl HexVms {
     /// Over Hex's runtime `runtime`, naming each launch's box with `names`, which answers none where nothing numbers
@@ -295,25 +358,59 @@ impl HexVms {
         crate::rt::blocking(move || runtime.usage(&id)).await.ok()?.ok()?.started_from
     }
 
-    /// [`HexVms::launch_as`] in a box its namer names (the seam's launch, sized).
-    pub async fn launch_sized(&self, launch: Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
+    /// `image` booted in a box its namer names, `command` its run's own command (`ShardsImage::command`, as `shards run
+    /// IMAGE COMMAND` runs one), no member of it driven (its members start as its image declares them, their stdin the
+    /// null device): `shares` its folders (each its command's, where no `VOLUME` of its image declares its path), no
+    /// grant, so nothing passes its VM (Hex's grants are default deny), no credential, and its size as
+    /// [`HexVms::launch_as`] sizes one. Created and started, or refused, typed, with no box left behind.
+    pub async fn boot_command(&self, image: &str, command: Vec<String>, shares: &[kiln_seams::sandbox::Share], size: Option<(u32, u64)>) -> Result<Commanded, Refusal> {
         let name = (self.names)().ok_or_else(|| Refusal::Unsupported(UNNAMED.into()))?;
-        self.launch_as(name, launch, size).await
+        let id = name.id().map_err(seam)?;
+        let shares = shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
+        let class = ShardsImage { command: Some(command), shares, ..ShardsImage::new(image) };
+        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
+        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: id.to_string(), member: None, last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
+        let runtime = Arc::clone(&self.runtime);
+        let started = crate::rt::blocking(move || {
+            runtime.create(spec).map_err(|why| (why, false))?;
+            runtime.start(&id).map_err(|why| (why, true))
+        })
+        .await
+        .map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?;
+        match started {
+            Ok(()) => Ok(Commanded { vm, ended: AtomicBool::new(false) }),
+            // No box was made: none to delete (the name may be another's).
+            Err((why, false)) => Err(seam(why)),
+            Err((why, true)) => {
+                if let Err(e) = finish(&vm).await {
+                    tracing::warn!(vm = %vm.name, error = %e, "a microVM whose start failed wasn't deleted");
+                }
+                Err(seam(why))
+            }
+        }
+    }
+
+    /// [`HexVms::launch_as`] in a box its namer names (the seam's launch, sized).
+    pub async fn launch_sized(&self, launch: Launch, size: Option<(u32, u64)>, sign_ins: &[crate::secrets::signin::SignIn]) -> Result<Box<dyn Run>, Refusal> {
+        let name = (self.names)().ok_or_else(|| Refusal::Unsupported(UNNAMED.into()))?;
+        self.launch_as(name, launch, size, sign_ins).await
     }
 
     /// `launch` in a box named `name`, its microVM `size` (vCPUs, MiB) where its session's isolation gives one, as
-    /// Shards' envelope keeps it (`shards_api::envelope`), else Shards' least: created, started and its harness
-    /// member's streams taken, or refused, typed, with no box left behind.
-    pub async fn launch_as(&self, name: BoxName, launch: Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
+    /// Shards' envelope keeps it (`shards_api::envelope`), else Shards' least, its harness member granted `sign_ins`
+    /// (module docs): created, started and its harness member's streams taken, or refused, typed, with no box left
+    /// behind.
+    pub async fn launch_as(&self, name: BoxName, launch: Launch, size: Option<(u32, u64)>, sign_ins: &[crate::secrets::signin::SignIn]) -> Result<Box<dyn Run>, Refusal> {
         // Its grants checked as any sandbox's would be first (`Invalid`), then refused where no broker leases them.
         Holds { credentials: true, ..HOLDS }.check(&launch)?;
-        if !launch.credentials.is_empty() && !self.leases {
+        if (!launch.credentials.is_empty() || !sign_ins.is_empty()) && !self.leases {
             return Err(Refusal::Unsupported(NO_BROKER.into()));
         }
         let Boundary::MicroVm { image } = &launch.boundary else { return Err(Refusal::Unsupported("a run outside a microVM".into())) };
         let member = Member { kind: MemberKind::Harness, name: launch.program.clone() };
         let grants = grants_of(&member, &launch.egress)?;
         let credentials = credentials_of(&member, &launch.credentials);
+        let sign_ins = sign_ins_of(&member, sign_ins);
         let mut shares: Vec<Mount> = launch.shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
         if let Some(folder) = &launch.folder
             && !shares.iter().any(|s| &s.destination == folder)
@@ -322,11 +419,11 @@ impl HexVms {
         }
         // Its MCP bridge (Shards D254): nothing of it is a grant or an address.
         let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone(), mcp: true };
-        let class = ShardsImage { grants, members: vec![driven], shares, credentials, ..ShardsImage::new(image) };
+        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
         let name = id.to_string();
-        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), member: member.clone(), last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
+        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), member: Some(member.clone()), last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
         let runtime = Arc::clone(&self.runtime);
         let made = crate::rt::blocking(move || boot(&*runtime, spec, &id, &member)).await.map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?;
         let started = match made {
@@ -355,7 +452,7 @@ impl HexVms {
 impl Sandbox for HexVms {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
         match (self.names)() {
-            Some(name) => Box::pin(self.launch_as(name, launch, None)),
+            Some(name) => Box::pin(self.launch_as(name, launch, None, &[])),
             None => Box::pin(async { Err(Refusal::Unsupported(UNNAMED.into())) }),
         }
     }
@@ -367,7 +464,22 @@ impl Sandbox for HexVms {
     fn holds(&self) -> Holds {
         Holds { credentials: self.leases, ..HOLDS }
     }
+
+    // None yet (`HOLDS.pools`): the Hex kiln vendors boots each box on Shards' `ImageShards`, not its `ImagePools`
+    // (kiln plan 01a1dd2e…, P3.1).
+    fn keep(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        drop(pool);
+        Box::pin(async { Err(Refusal::Unsupported(NO_POOLS.to_owned())) })
+    }
+
+    fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        drop(pool);
+        Box::pin(async { Err(Refusal::Unsupported(NO_POOLS.to_owned())) })
+    }
 }
+
+/// Why a box's image keeps no warm pool here yet.
+pub const NO_POOLS: &str = "a warm pool kept for its launches: the Hex kiln vendors keeps none yet, its image class booting each box on Shards' ImageShards rather than its ImagePools (kiln plan 01a1dd2e…, P3.1)";
 
 /// `granted`'s credentials as Hex grants them to `member`: by reference alone, toward each host lowercased as its
 /// egress grants name it ([`grants_of`]; RFC 4343), each once. Hex checks them against its grants as the box is made.
@@ -386,6 +498,24 @@ fn credentials_of(member: &Member, granted: &[kiln_seams::sandbox::CredentialGra
         .collect()
 }
 
+/// `granted`'s sign-ins as Hex grants them to `member` (Hex's C8): each by its name in kiln's store and its CLI, from
+/// one provider, toward each host lowercased as [`credentials_of`] takes them, each once, with what an earlier capture
+/// gave its CLI. Hex checks them against its grants and its credentials as the box is made (`check_sign_ins`).
+fn sign_ins_of(member: &Member, granted: &[crate::secrets::signin::SignIn]) -> Vec<hex_api::SignInGrant> {
+    granted
+        .iter()
+        .map(|g| {
+            let mut toward: Vec<String> = Vec::with_capacity(g.toward.len());
+            for host in g.toward.iter().map(|h| h.to_ascii_lowercase()) {
+                if !toward.contains(&host) {
+                    toward.push(host);
+                }
+            }
+            hex_api::SignInGrant { member: member.clone(), sign_in: g.name.clone(), cli: g.provider.cli(), toward, captured: g.captured.clone() }
+        })
+        .collect()
+}
+
 impl super::Lanes for HexVms {
     fn carried(&self) -> Result<(), Refusal> {
         Ok(())
@@ -396,7 +526,8 @@ impl super::Lanes for HexVms {
     /// isn't held while it waits, so a run let go of meanwhile is let go of.
     fn next(&self, run: &str) -> Result<super::McpConnection, Refusal> {
         let vm = self.vms.lock().get(run).and_then(Weak::upgrade).ok_or(Refusal::Ended)?;
-        let (runtime, id, member) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(seam)?, vm.member.clone());
+        let member = vm.member.clone().ok_or_else(|| Refusal::Unsupported(NO_MEMBER.into()))?;
+        let (runtime, id) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(seam)?);
         drop(vm);
         let mut proc = runtime.mcp(&id, &member).map_err(seam)?;
         let given = proc.streams().map_err(seam)?;
@@ -686,7 +817,8 @@ impl Run for HexRun {
             Signal::Interrupt => hex_api::Signal::INT,
             Signal::Terminate => hex_api::Signal::TERM,
         };
-        self.vm.runtime.signal_member(&self.vm.id, &self.vm.member, to).map_err(seam)
+        let member = self.vm.member.as_ref().ok_or_else(|| Refusal::Unsupported(NO_MEMBER.into()))?;
+        self.vm.runtime.signal_member(&self.vm.id, member, to).map_err(seam)
     }
 
     fn kill(&self) {
@@ -854,6 +986,42 @@ pub(crate) mod tests {
                 crate::rt::sleep(std::time::Duration::from_millis(10)).await;
             }
             assert_eq!(sim.list()?, [], "a run let go of takes its box with it");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1dd2e…, P3.2: until Hex's image class takes Shards' pools (P3.1), Hex's mapping keeps none: a keep
+    /// and a let-go are refused, typed, and it lists none.
+    #[test]
+    fn p3_2_hexs_mapping_refuses_a_warm_pool_typed_until_p3_1() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (_, vms) = vms();
+            let pool = kiln_seams::sandbox::Pool { image: SIM_IMAGE.to_owned(), size: None };
+            assert!(!vms.holds().pools, "it says it keeps pools");
+            let refused = Err(Refusal::Unsupported(super::NO_POOLS.to_owned()));
+            assert_eq!(vms.keep(pool.clone()).await, refused);
+            assert_eq!(vms.let_go(pool).await, refused);
+            assert!(vms.pools().is_empty(), "it lists pools");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1dd2e…, P6b.3, for Shards' D285: until the Hex kiln vendors has a wire call for it, Hex's mapping
+    /// refuses a member connected to a network shared with other runs, its grant whole, typed (`Unsupported`, saying
+    /// why), its run going on; once the run has ended, `Ended`.
+    #[test]
+    fn p6b_3_hexs_mapping_refuses_a_connection_typed_until_hex_has_the_call() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{Change, Member as Who, NetworkGrant, Ports as SeamPorts, Way};
+        crate::rt::block_on(async {
+            let (_, vms) = vms();
+            assert!(!vms.holds().live, "it says it takes changes live");
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            let connect = || Change::Connect { member: Who("claude".into()), network: "team".into(), grant: NetworkGrant { name: "alice".into(), peer: "bob".into(), ports: SeamPorts { udp: false, first: 8080, last: 8080 }, way: Way::Out } };
+            assert_eq!(run.change(connect()).await, Err(Refusal::Unsupported(super::NO_LIVE.to_owned())));
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed], "its run went on until it was killed");
+            assert_eq!(run.change(connect()).await, Err(Refusal::Ended));
             anyhow::Ok(())
         })
     }
@@ -1427,6 +1595,45 @@ pub(crate) mod tests {
             let unreached = Launch { egress: Egress::Only(vec!["example.com:443".into()]), ..granted() };
             let refused = vms.launch(unreached).await.err();
             anyhow::ensure!(matches!(&refused, Some(Refusal::Invalid { what: "a credential grant", .. })), "{refused:?}");
+            assert_eq!(sim.list()?, [], "a refused launch leaves no box");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Plan step 33 (Shards' D242, step 8; Hex's C8): a launch's sign-in reaches Hex as its harness member's, by its
+    /// name in kiln's store and its provider's CLI, toward each host once in lowercase, with the placeholders an earlier
+    /// capture gave its CLI. Where no broker leases this machine's credentials it is refused, typed, and leaves no box.
+    #[test]
+    fn s33_a_sign_in_reaches_hex_as_its_members_with_its_cli_and_earlier_capture() -> anyhow::Result<()> {
+        use crate::secrets::signin::{Provider, SignIn};
+
+        let earlier = hex_api::Captured { access: "sign-ins/claude/owner/access".into(), access_placeholder: format!("kiln-placeholder-{}", "a".repeat(64)), refresh_placeholder: Some(format!("kiln-placeholder-{}", "b".repeat(64))) };
+        let sign_in = SignIn { provider: Provider::ClaudeCode, name: "claude/owner".into(), toward: vec!["API.anthropic.com".into(), "api.anthropic.com".into()], captured: Some(earlier.clone()) };
+        let reaching = || launch(Egress::Only(vec!["api.anthropic.com:443".into(), "platform.claude.com:443".into()]));
+        let (rt, _records, hex) = metered();
+        let hex = hex.leasing();
+        let granted = [sign_in.clone()];
+        let (hex, run) = crate::rt::block_on(async move {
+            let run = hex.launch_sized(reaching(), None, &granted).await?;
+            anyhow::Ok((hex, run))
+        })?;
+        let specs = rt.specs.lock().clone();
+        let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
+        let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
+        let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
+        let want = hex_api::SignInGrant { member: harness, sign_in: "claude/owner".into(), cli: hex_api::SignInCli::ClaudeCode, toward: vec!["api.anthropic.com".into()], captured: Some(earlier) };
+        assert_eq!(image.sign_ins, [want], "its sign-in, by its name, to its harness member");
+        crate::rt::block_on(async move {
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
+            drop(hex);
+            anyhow::Ok(())
+        })?;
+        crate::rt::block_on(async move {
+            let (sim, unleased) = vms();
+            let refused = unleased.launch_sized(reaching(), None, &[sign_in]).await.err();
+            anyhow::ensure!(matches!(&refused, Some(Refusal::Unsupported(why)) if why == super::NO_BROKER), "{refused:?}");
             assert_eq!(sim.list()?, [], "a refused launch leaves no box");
             anyhow::Ok(())
         })

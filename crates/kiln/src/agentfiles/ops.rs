@@ -6,7 +6,7 @@
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::{Error, Patch, Who};
+use super::{Error, Patch, Who, settings};
 use crate::ops::{Cx, Fail, Input, Op, Out, path};
 
 fn fail(e: Error) -> Fail {
@@ -18,6 +18,8 @@ fn fail(e: Error) -> Fail {
         Error::Refused(m) => (StatusCode::UNPROCESSABLE_ENTITY, format!("Shards refuses this Agentfile: {m}")),
         Error::Forbidden(m) => (StatusCode::FORBIDDEN, m),
         Error::Store(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+        e @ Error::Diverged(_) => (StatusCode::CONFLICT, e.to_string()),
+        e @ Error::Agent { .. } => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
         Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -62,19 +64,54 @@ async fn create(cx: Cx, v: Value) -> Out {
     let (name, text) = (crate::ops::text(&v, "name")?, v.get("text").and_then(Value::as_str).unwrap_or_default().to_owned());
     let saved = super::create(&cx.hub, blobs(&cx), &who(&cx)?, &name, &text, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.create".into(), format!("{} ({}) v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
+    super::prebuild::queue(&cx.hub, &saved.agentfile.id).await;
     json_of(&saved)
+}
+
+/// A field read as `T` where it's given (null included, as `T` reads it); none where it's left out.
+fn field<T: serde::de::DeserializeOwned>(v: &Value, k: &str) -> Result<Option<T>, Fail> {
+    v.get(k).map(|f| serde_json::from_value(f.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("`{k}`: {e}")))).transpose()
 }
 
 async fn update(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let patch = Patch { name: some_text(&v, "name"), text: some_text(&v, "text") };
-    let saved = super::update(&cx.hub, blobs(&cx), &who(&cx)?, &id, patch, &cx.caller.name).await.map_err(fail)?;
+    let texted = patch.text.is_some();
+    let base = field::<Option<i64>>(&v, "base")?.flatten();
+    let saved = crate::agentdefs::sync::agentfile_update(&cx.hub, blobs(&cx), &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.update".into(), format!("{} ({}) v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
+    if texted {
+        super::prebuild::queue(&cx.hub, &saved.agentfile.id).await;
+    }
     json_of(&saved)
 }
 
 async fn versions(cx: Cx, v: Value) -> Out {
     json_of(&json!({"versions": super::versions(&cx.hub, blobs(&cx), &who(&cx)?, &id_of(&v)?).await.map_err(fail)?}))
+}
+
+async fn builds(cx: Cx, v: Value) -> Out {
+    json_of(&json!({"builds": super::prebuild::builds(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)?}))
+}
+
+fn unbuilt(r: super::prebuild::Refusal) -> Fail {
+    use super::prebuild::Refusal as R;
+    let code = match &r {
+        R::NoRunner(_) | R::NoHarness(_) => StatusCode::NOT_FOUND,
+        R::NotTheirs(_) => StatusCode::FORBIDDEN,
+        R::NotMicrovm(_) | R::Older(_) | R::Underway { .. } => StatusCode::CONFLICT,
+    };
+    (code, r.to_string())
+}
+
+/// One runner's builds of an Agentfile asked again (kiln plan 01a1dd2e… P4.5), reaching it as `builds` reads them.
+async fn rebuild(cx: Cx, v: Value) -> Out {
+    let (id, runner) = (id_of(&v)?, crate::ops::text(&v, "runner")?);
+    let harness = some_text(&v, "harness").map(|h| h.trim().to_owned()).filter(|h| !h.is_empty());
+    let builds = super::prebuild::rebuild(&cx.hub, &who(&cx)?, &id, &runner, harness.as_deref()).await.map_err(fail)?.map_err(unbuilt)?;
+    let only = harness.map(|h| format!(" for {h}")).unwrap_or_default();
+    cx.hub.store.audit(cx.caller.name.clone(), "agentfile.rebuild".into(), format!("{id} on {runner}{only}")).await;
+    json_of(&json!({"builds": builds}))
 }
 
 async fn restore(cx: Cx, v: Value) -> Out {
@@ -85,6 +122,7 @@ async fn restore(cx: Cx, v: Value) -> Out {
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "`version` is the version to make current again".to_owned()))?;
     let saved = super::restore(&cx.hub, blobs(&cx), &who(&cx)?, &id, version, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.restore".into(), format!("{} ({}) v{version} as v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
+    super::prebuild::queue(&cx.hub, &saved.agentfile.id).await;
     json_of(&saved)
 }
 
@@ -102,6 +140,60 @@ async fn check(cx: Cx, v: Value) -> Out {
         return Err((StatusCode::BAD_REQUEST, p));
     }
     json_of(&super::check::check(text, &super::check::Kiln::of(&cx.hub.cfg.server)).await)
+}
+
+fn refused(r: settings::Refusal) -> Fail {
+    let code = match &r {
+        settings::Refusal::Unread(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        settings::Refusal::Undeclared { .. } => StatusCode::NOT_FOUND,
+        settings::Refusal::Twice { .. } | settings::Refusal::InText(_) => StatusCode::CONFLICT,
+        settings::Refusal::Value { .. } => StatusCode::BAD_REQUEST,
+    };
+    (code, r.to_string())
+}
+
+/// Each secret `change` names for a source's credentials is one of `w`'s own (P4.6): a name that's none of theirs is
+/// refused, unrepeated (a value put where a name goes never reaches the text).
+async fn yours(cx: &Cx, w: &Who, change: &settings::HarnessChange) -> Result<(), Fail> {
+    let named: Vec<&str> = change.credentials.values().flatten().map(|n| n.trim()).collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    let kept = crate::ci::secrets::list(&cx.hub, &crate::ci::secrets::user_scope(&w.person)).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("your secrets: {e:#}")))?;
+    if named.iter().all(|n| kept.iter().any(|k| k.name.eq_ignore_ascii_case(n))) {
+        return Ok(());
+    }
+    Err((StatusCode::UNPROCESSABLE_ENTITY, "`credentials` names a secret that isn't one of yours: name one `secrets.mine.list` lists (set it at /api/me/secrets first), never its value".into()))
+}
+
+/// A text read as settings, kept nowhere: with `harness`, that harness's changed in it first (kiln plan
+/// 01a1dd2e… P5.3); with `agent`, that agent's source and its credentials (P4.6).
+async fn settings_of(cx: Cx, v: Value) -> Out {
+    let w = who(&cx)?;
+    let text = v.get("text").and_then(Value::as_str).unwrap_or_default();
+    if let Some(p) = super::text_problem(text) {
+        return Err((StatusCode::BAD_REQUEST, p));
+    }
+    let change = settings::HarnessChange {
+        source: field(&v, "source")?,
+        version: field(&v, "version")?,
+        model: field(&v, "model")?,
+        sign_in: field(&v, "sign_in")?,
+        volumes: field(&v, "volumes")?,
+        egress: field(&v, "egress")?,
+        credentials: field(&v, "credentials")?.unwrap_or_default(),
+    };
+    yours(&cx, &w, &change).await?;
+    let text = match (some_text(&v, "harness"), some_text(&v, "agent")) {
+        (Some(_), Some(_)) => return Err((StatusCode::BAD_REQUEST, "`harness` or `agent`: one directive's settings at a time".into())),
+        (Some(h), None) => settings::set_harness(text, h.trim(), &change).map_err(refused)?,
+        (None, Some(a)) => settings::set_agent_source(text, a.trim(), &change).map_err(refused)?,
+        (None, None) if change == settings::HarnessChange::default() => text.to_owned(),
+        (None, None) => return Err((StatusCode::BAD_REQUEST, "`harness` or `agent` names the directive whose settings these are".into())),
+    };
+    let settings = settings::of(&text).map_err(refused)?;
+    let check = super::check::check(&text, &super::check::Kiln::of(&cx.hub.cfg.server)).await;
+    json_of(&settings::Viewed { text, settings, check })
 }
 
 /// The operations, in the order they are listed.
@@ -136,7 +228,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentfiles.update",
-            summary: "Change one of your Agentfiles: a new `text` (checked by Shards as agentfiles.create checks it) is a new version; a new `name` alone is none.",
+            summary: "Change one of your Agentfiles: a new `text` (checked by Shards as agentfiles.create checks it) is a new version; a new `name` alone is none. `base`, the version your change is made over (its `version` as you read it): a change over a version another has moved on from is refused (409), saying the version it is now. Your agent definitions that name it (`agentfile:<id>`) and that it declares (`AGENT <their name>`) take what the text says of them (model, tools, skills, remote MCP servers), each a new version (`synced`); a setting changed differently on both sides since they last agreed is refused (409), naming it and each side's value.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentfilesUpdate>(),
@@ -151,6 +243,24 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentfilesVersions>(),
             route: |v| Ok((Method::GET, path(&["api", "agentfiles", &id_of(v)?, "versions"]))),
             run: |cx, v| Box::pin(versions(cx, v)),
+        },
+        Op {
+            name: "agentfiles.builds",
+            summary: "Where one of your Agentfiles' builds ahead of its sessions are (kiln plan 01a1dd2e… P4.5): saving it, or an agent definition that names it, builds it on each of your runners whose engine is microvm, for each of kiln's harnesses its sessions run (those it declares, and your agent definitions' that name it), as a session there builds it, so one started after its build is done builds nothing. Each: its `runner`, `harness`, the `version` it builds, its `state` (`queued`, `building`, `done` or `failed`), its `image` pinned by its digest once done, `why` it failed (Shards' words, or kiln's), and when it last changed (`at`, Unix ms).",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentfilesBuilds>(),
+            route: |v| Ok((Method::GET, path(&["api", "agentfiles", &id_of(v)?, "builds"]))),
+            run: |cx, v| Box::pin(builds(cx, v)),
+        },
+        Op {
+            name: "agentfiles.rebuild",
+            summary: "Build one of your Agentfiles again on one of your runners (kiln plan 01a1dd2e… P4.5): its builds there ahead of its sessions (each harness its sessions run, or `harness` alone), asked again as a save asks them, at its version now: `queued` (`failed` where its secrets can't be read) and sent to the runner, or asked as it comes back where it's away. One that failed is built again; one done is found in the runner's store at once. Answers its builds, as agentfiles.builds reads them. Refused, nothing asked: 404 where no runner of that name builds Agentfiles (outposts and one-job runners build none) or none of its sessions runs `harness`; 409 where the runner's engine isn't microvm, its kiln builds nothing ahead (upgrade it), or a build there is `queued` or `building` already, until its runner ends it; 403 where its person may not start agents there.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentfilesRebuild>(),
+            route: |v| Ok((Method::POST, path(&["api", "agentfiles", &id_of(v)?, "rebuild"]))),
+            run: |cx, v| Box::pin(rebuild(cx, v)),
         },
         Op {
             name: "agentfiles.restore",
@@ -178,6 +288,15 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentfilesCheck>(),
             route: |_| Ok((Method::POST, path(&["api", "agentfiles", "check"]))),
             run: |cx, v| Box::pin(check(cx, v)),
+        },
+        Op {
+            name: "agentfiles.settings",
+            summary: "An Agentfile's `text` as settings, keeping nothing: each harness's (its `source` and the `version` it names, its `model` and `sign_in`, its `volumes` and the `egress` HOST:PORTs it may reach) and each agent's (its `source` and `version`, its model, tools, skills and remote MCP servers), each with its source's `credentials` (each id its fetch reads, and which of your secrets the text names for it), with what Shards says of the text (`check`). With `agent` in place of `harness`, that agent's `source`, `version` and `credentials` are changed. `credentials` names your secrets by name alone (`{\"GIT_AUTH_TOKEN.github.com\": \"GH_TOKEN\"}`), written as `LABEL kiln.secret.<id>=user:<NAME>` (`kiln.ssh.default` for an SSH key, which a Git source over SSH is fetched with); a name that isn't one of yours is refused. With `harness` and what to change of it (null takes a setting out), the text is changed to say it first, and answered: model and sign-in as `LABEL kiln.harness.<harness>.model` and `.sign-in` (a sign-in's name, `<harness>/<name>`, never its value), egress on a network of its own. Save the text with agentfiles.update.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentfilesSettings>(),
+            route: |_| Ok((Method::POST, path(&["api", "agentfiles", "settings"]))),
+            run: |cx, v| Box::pin(settings_of(cx, v)),
         },
     ]
 }
@@ -224,6 +343,10 @@ pub mod input {
         pub id: String,
         pub name: Option<String>,
         pub text: Option<String>,
+        /// The version your change is made over: its `version` as you read it. Refused (409) where it
+        /// isn't current, saying the version it is now. Without it, it's made over the version kiln finds.
+        #[schemars(range(min = 1))]
+        pub base: Option<i64>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -231,6 +354,24 @@ pub mod input {
     pub struct AgentfilesVersions {
         /// The Agentfile's id.
         pub id: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentfilesBuilds {
+        /// The Agentfile's id.
+        pub id: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentfilesRebuild {
+        /// The Agentfile's id.
+        pub id: String,
+        /// The runner whose builds of it are asked again, by its name as agentfiles.builds lists it.
+        pub runner: String,
+        /// One of kiln's harnesses its sessions run (`claude` …): its build alone. Left out: each of its builds there.
+        pub harness: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -255,5 +396,36 @@ pub mod input {
     pub struct AgentfilesCheck {
         /// The Agentfile's text.
         pub text: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentfilesSettings {
+        /// The Agentfile's text.
+        pub text: String,
+        /// The harness whose settings change (`HARNESS <harness> FROM …`); left out, nothing changes.
+        pub harness: Option<String>,
+        /// Its source: a path of its build context, a Git or http(s) URL, `s3://BUCKET/KEY`, or an OCI
+        /// reference.
+        pub source: Option<String>,
+        /// What its source names apart from where it is: an OCI tag or digest, a Git ref, an S3 object's
+        /// version id. Null: none.
+        pub version: Option<String>,
+        /// Its model. Null: its own default.
+        pub model: Option<String>,
+        /// The sign-in it starts as, by its name, which says its harness (`claude/ada`), never its value.
+        /// Null: its own, kept in its HOME.
+        pub sign_in: Option<String>,
+        /// Its volumes' mount points.
+        pub volumes: Option<Vec<String>>,
+        /// The HOST:PORTs it may reach.
+        pub egress: Option<Vec<String>>,
+        /// The agent whose source changes (`AGENT <agent> FROM …`), in place of a harness: its `source`, `version` and
+        /// `credentials` alone.
+        pub agent: Option<String>,
+        /// Its source's credentials, each by its id as the settings list them (`GIT_AUTH_TOKEN.github.com`,
+        /// `AWS_ACCESS_KEY_ID.<bucket>`, `default` for an SSH key): one of your secrets by its name (`secrets.mine.list`),
+        /// never its value. Null takes one out.
+        pub credentials: Option<std::collections::BTreeMap<String, Option<String>>>,
     }
 }

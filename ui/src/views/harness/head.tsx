@@ -245,6 +245,12 @@ export function AgentHeader({
           </>
         )}
         {info && <span title={cwd}>{machineShown(info.target)}</span>}
+        {info?.isolation?.kind === "microvm" && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span title={info.isolation.image ? `Isolated, in a Shards microVM of its own (${info.isolation.image})` : "Isolated, in a Shards microVM of its own"}>in a microVM</span>
+          </>
+        )}
         {info && (
           <React.Suspense fallback={null}>
             <DefCrumb agentId={info.id} target={info.target} onOpen={() => onDefinition?.()} />

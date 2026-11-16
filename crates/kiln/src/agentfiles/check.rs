@@ -190,10 +190,11 @@ fn with_kiln(mut c: Check, text: &str, kiln: &Kiln) -> Check {
 /// The code of kiln's refusal of a grant that reaches kiln itself.
 pub const REACHES_KILN: &str = "ReachesKiln";
 
-/// The code of kiln's refusal of a `LABEL kiln.secret.<ID>=…` that isn't `user:<NAME>` (P4.7).
+/// The code of kiln's refusal of a `LABEL kiln.secret.<ID>=…` (P4.7) or `LABEL kiln.ssh.<ID>=…` (P4.6) that
+/// isn't `user:<NAME>`.
 pub const SECRET_REFERENCE: &str = "SecretReference";
 
-/// Each `kiln.secret.` label of `text` that names no build secret as one of its person's own
+/// Each `kiln.secret.` or `kiln.ssh.` label of `text` that names no build secret or SSH key as one of its person's own
 /// (`secrets::mine::references`), refused at its line, its words never repeating its value.
 fn secret_references(text: &str) -> Vec<Diagnostic> {
     let (_, misnamed) = crate::secrets::mine::references(text);

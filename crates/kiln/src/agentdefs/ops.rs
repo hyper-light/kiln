@@ -20,6 +20,7 @@ pub(crate) fn fail(e: Error) -> Fail {
         Error::Forbidden(m) => (StatusCode::FORBIDDEN, m),
         e @ Error::ReadOnly(_) => (StatusCode::FORBIDDEN, e.to_string()),
         Error::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+        e @ Error::Diverged(_) => (StatusCode::CONFLICT, e.to_string()),
         Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -52,6 +53,7 @@ fn settings_of(v: &Value) -> Result<Settings, Fail> {
         skills: field(v, "skills")?.unwrap_or_default(),
         limits: field(v, "limits")?.unwrap_or_default(),
         agentfile: field::<Option<String>>(v, "agentfile")?.flatten(),
+        volumes: field(v, "volumes")?.unwrap_or_default(),
     })
 }
 
@@ -96,10 +98,19 @@ fn audit_line(d: &super::AgentDef) -> String {
     format!("{} ({}) v{}", d.name, d.id, d.version)
 }
 
+/// Where `d` names one of its person's Agentfiles, that Agentfile's builds ahead of its sessions asked anew, its harness
+/// one they're built for (kiln plan 01a1dd2e… P4.5).
+async fn prebuild(cx: &Cx, d: &super::AgentDef) {
+    if let Some(id) = d.settings.agentfile.as_deref().map(str::trim).and_then(|a| a.strip_prefix(crate::sandbox::isolated::KEPT)) {
+        crate::agentfiles::prebuild::queue(&cx.hub, id).await;
+    }
+}
+
 async fn create(cx: Cx, v: Value) -> Out {
     let (name, settings) = (crate::ops::text(&v, "name")?, settings_of(&v)?);
-    let made = super::create(&cx.hub, &who(&cx)?, &name, settings, &cx.caller.name).await.map_err(fail)?;
+    let made = super::sync::create(&cx.hub, &who(&cx)?, &name, settings, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.create".into(), audit_line(&made)).await;
+    prebuild(&cx, &made).await;
     json_of(&made)
 }
 
@@ -115,10 +126,12 @@ async fn update(cx: Cx, v: Value) -> Out {
         skills: field(&v, "skills")?,
         limits: field(&v, "limits")?,
         agentfile: field(&v, "agentfile")?,
+        volumes: field(&v, "volumes")?,
     };
     let base = field::<Option<i64>>(&v, "base")?.flatten();
-    let saved = super::update(&cx.hub, &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
+    let saved = super::sync::update(&cx.hub, &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.update".into(), audit_line(&saved)).await;
+    prebuild(&cx, &saved).await;
     json_of(&saved)
 }
 
@@ -134,6 +147,7 @@ async fn restore(cx: Cx, v: Value) -> Out {
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "`version` is the version to make current again".to_owned()))?;
     let saved = super::restore(&cx.hub, &who(&cx)?, &id, version, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.restore".into(), format!("{} ({}) v{version} as v{}", saved.name, saved.id, saved.version)).await;
+    prebuild(&cx, &saved).await;
     json_of(&saved)
 }
 
@@ -218,7 +232,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.create",
-            summary: "Keep an agent definition of yours: its `name` (lowercase letters and digits joined by `.`, `_` or `-`; once among yours), `harness` (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi), `model`, `instructions`, `tools`, `mcp` servers, `skills`, `limits` and `agentfile` (one of yours, `agentfile:<id>`, or kiln's for its harness, `harness-<harness>`; left out: its harness's own). Checked first as agentdefs.check checks it: one kiln can't run isn't kept, and its words say why. Answers it, version 1.",
+            summary: "Keep an agent definition of yours: its `name` (lowercase letters and digits joined by `.`, `_` or `-`; once among yours), `harness` (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi), `model`, `instructions`, `tools`, `mcp` servers, `skills`, `limits`, `agentfile` (one of yours, `agentfile:<id>`, or kiln's for its harness, `harness-<harness>`; left out: its harness's own) and `volumes` (what it keeps from one of its sessions to the next on each machine: each a `name` its harness sees at `/volumes/<name>` and the most `bytes` it may hold, asked of the machine's disk as each session starts). Checked first as agentdefs.check checks it: one kiln can't run isn't kept, and its words say why. Answers it, version 1.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentdefsCreate>(),
@@ -281,7 +295,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.check",
-            summary: "Check an agent definition's settings as agentdefs.create would, keeping nothing: `ok`, and each of the `problems` that would refuse it (a harness that isn't one of kiln's ten, an Agentfile you don't reach or that's for another harness, a model kiln's machines don't list for its harness, an MCP server without a name or a way in, a limit of 0).",
+            summary: "Check an agent definition's settings as agentdefs.create would, keeping nothing: `ok`, and each of the `problems` that would refuse it (a harness that isn't one of kiln's ten, an Agentfile you don't reach or that's for another harness, a model kiln's machines don't list for its harness, an MCP server without a name or a way in, a limit of 0, a volume without a name of its own or a bound).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentdefsCheck>(),
@@ -290,7 +304,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.run",
-            summary: "Run one of your agent definitions: an agent started as agents.start starts one, with its harness and model, in a microVM of its own made from its Agentfile (its harness's own where it names none), first told its instructions and then your `prompt`; `on` and `cwd` as agents.start takes them, `name` its name (by default the definition's). Answers as agents.start does, with the definition's id and version (`agentdef`).",
+            summary: "Run one of your agent definitions: an agent started as agents.start starts one, with its harness and model, in a microVM of its own made from its Agentfile (its harness's own where it names none), first told its instructions and then your `prompt`, its volumes plugged in as it starts (yours alone, kept on that machine for its next session there); `on` and `cwd` as agents.start takes them, `name` its name (by default the definition's). Answers as agents.start does, with the definition's id and version (`agentdef`).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentdefsRun>(),
@@ -319,6 +333,7 @@ pub mod input {
     use serde::Deserialize;
 
     use super::{Limits, Mcp};
+    use crate::agentdefs::volumes::Volume;
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -353,6 +368,9 @@ pub mod input {
         /// One of your Agentfiles (`agentfile:<id>`) or kiln's for its harness (`harness-<harness>`);
         /// left out: its harness's own.
         pub agentfile: Option<String>,
+        /// What it keeps from one of its sessions to the next on each machine: each a `name` (letters, digits,
+        /// `_`, `.` and `-`; its harness sees it at `/volumes/<name>`) and the most `bytes` it may hold.
+        pub volumes: Option<Vec<Volume>>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -371,6 +389,8 @@ pub mod input {
         pub limits: Option<Limits>,
         /// Null: back to its harness's own.
         pub agentfile: Option<String>,
+        /// Its volumes, all of them: `[]` for none.
+        pub volumes: Option<Vec<Volume>>,
         /// The version your change is made over: its `version` as you read it. Refused (409) where it
         /// isn't current, saying the version it is now. Without it, it's made over the version kiln finds.
         #[schemars(range(min = 1))]
@@ -430,6 +450,7 @@ pub mod input {
         pub skills: Option<Vec<String>>,
         pub limits: Option<Limits>,
         pub agentfile: Option<String>,
+        pub volumes: Option<Vec<Volume>>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

@@ -243,6 +243,12 @@ impl Layout {
         self.env.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
+    /// The directory its run environment names in `key` (the last it gives), as its microVM has it,
+    /// where that is a path absolute and plain.
+    pub fn dir_named(&self, key: &str) -> Option<&str> {
+        self.var(key).filter(|v| guest_plain(v))
+    }
+
     /// The session's environment as this machine reads its harness's files (`harness::homes::Dirs`
     /// and the rest): its home, and each directory variable its run environment names or kiln's
     /// reads take, at its path here. The microVM never gets it: its harness has its own
@@ -282,7 +288,7 @@ impl Layout {
     /// no history reads (`aisessions`), or one that keeps them in the microVM's scratch, gone with it.
     pub fn kept_in(&self) -> Option<String> {
         let dir = |key: &str| -> Option<String> {
-            let named = self.var(key).filter(|v| guest_plain(v)).map(str::to_owned);
+            let named = self.dir_named(key).map(str::to_owned);
             named.or_else(|| READ.iter().find(|(k, _)| *k == key).map(|(_, rel)| self.in_home(rel)))
         };
         let guest = match self.harness.as_str() {
@@ -330,7 +336,7 @@ fn private(_dir: &Path) -> std::io::Result<()> {
 }
 
 /// The person's directory's name: `owner`, or `user-<id>` for `user:<id>`.
-fn person_dir(person: &str) -> Result<String, Refusal> {
+pub(crate) fn person_dir(person: &str) -> Result<String, Refusal> {
     let refused = || Refusal::Person(person.to_owned());
     if person == "owner" {
         return Ok("owner".to_owned());

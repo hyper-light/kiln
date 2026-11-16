@@ -106,6 +106,8 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<crate::agentfiles::Version>();
     c.visit::<crate::agentfiles::Saved>();
     c.visit::<crate::agentfiles::check::Check>();
+    // An Agentfile's harnesses and agents as settings (`agentfiles.settings`, kiln plan 01a1dd2e… P5.3).
+    c.visit::<crate::agentfiles::settings::Viewed>();
 }
 
 /// Every file as it should be, by its name in [`dir`], the index among them.

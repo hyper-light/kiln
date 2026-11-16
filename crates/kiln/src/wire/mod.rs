@@ -241,6 +241,7 @@ classes! {
         AgentMsg::Skills { .. } => Class::State,
         AgentMsg::SkillFile { .. } => Class::Answer,
         AgentMsg::HarnessMailTransfer { .. } => REFUSED,
+        AgentMsg::Prebuilt { .. } => Class::State,
     }
 }
 
@@ -330,6 +331,8 @@ classes! {
         ServerMsg::HarnessHistoryFor { .. } => Class::Ask,
         ServerMsg::RunnerEngine { .. } => Class::State,
         ServerMsg::AdoptPolicy { .. } => Class::State,
+        ServerMsg::Replay { .. } => Class::Ask,
+        ServerMsg::Prebuild { .. } => PARKED,
     }
 }
 
