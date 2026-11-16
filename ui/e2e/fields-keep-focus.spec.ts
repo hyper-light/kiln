@@ -112,7 +112,9 @@ test("Tab from a step's name to its command in the flow view keeps the focus, th
   await expect(steps.getByRole("button", { name: /^2\s*Tests$/ })).toBeVisible();
   expect(await field.evaluate((e) => e.isConnected), "the step's fields were made anew").toBe(true);
   expect(await field.evaluate((e) => document.activeElement === e), "the command's field lost the focus").toBe(true);
-  await page.keyboard.press("End");
+  // What's typed next joins the command at its end, the caret put there the same way on every platform: End won't do on a Mac,
+  // where it scrolls the page (taller than the window here) and moves the caret only once there's nothing left to scroll.
+  await run.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(el.value.length, el.value.length));
   await page.keyboard.type(" -v");
   await expect(run).toHaveValue("make test -v");
 });
