@@ -36,8 +36,10 @@ import type {
   UpdatePolicy,
   UpdatesOverview,
   UpgradeWaits,
+  WarmPool,
+  WarmPoolsView,
 } from "../src/api/types.ts";
-import { hashStr, mulberry32, pick } from "./data.ts";
+import { MICROVM_RUNNERS, hashStr, mulberry32, pick } from "./data.ts";
 
 export interface PagesCtx {
   agents: () => Agent[];
@@ -1442,6 +1444,63 @@ function agentLimit(a: Agent): AgentLimitView {
   };
 }
 
+/** A pool's keep window in the mock: Shards' D26 keep-alive, as the server's (`sandbox::pools::KEEP`). */
+const POOL_KEEP_MS = 10 * 60_000;
+
+/**
+ * The warm pools kiln names on a runner (`GET /api/runners/:name/pools`; kiln plan 01a1dd2e…, P3.2): on the one that
+ * starts microVMs, an agent definition's with hits, its deployment experiment's variant's, and another person's agent's,
+ * of which nothing is said; none elsewhere.
+ */
+function warmPools(a: Agent): WarmPoolsView {
+  const at = Date.now();
+  const pool = (p: Omit<WarmPool, "began_ms" | "until_ms" | "warm_hosts">, began: number): WarmPool => ({
+    ...p,
+    began_ms: at - began,
+    until_ms: p.last_ms + POOL_KEEP_MS,
+    warm_hosts: null,
+  });
+  const pools = MICROVM_RUNNERS.has(a.name)
+    ? [
+        pool(
+          {
+            agent: "01a1d0c0ffee5eed",
+            agent_from: "definition",
+            agent_name: "reviewer",
+            variant: null,
+            image: "harness-claude@sha256:3f9a0c1d",
+            vcpus: 2,
+            memory_mib: 2048,
+            starts: 5,
+            hits: 4,
+            last_ms: at - 2 * 60_000,
+          },
+          41 * 60_000,
+        ),
+        pool(
+          {
+            agent: "01a1d0c0ffee5eed",
+            agent_from: "definition",
+            agent_name: "reviewer",
+            variant: { experiment: "faster-start", arm: "b" },
+            image: "harness-claude@sha256:3f9a0c1d",
+            vcpus: 4,
+            memory_mib: 4096,
+            starts: 2,
+            hits: 1,
+            last_ms: at - 7 * 60_000,
+          },
+          12 * 60_000,
+        ),
+        pool(
+          { agent: null, agent_from: "another", agent_name: null, variant: null, image: "agent-builder@sha256:8b1e44a7", vcpus: 1, memory_mib: 512, starts: 1, hits: 0, last_ms: at - 60_000 },
+          60_000,
+        ),
+      ]
+    : [];
+  return { runner: a.name, keep_ms: POOL_KEEP_MS, pools };
+}
+
 function frontDoor(a: Agent): FrontDoorView {
   const on = a.name === "metal-ryzen-01";
   const listener = (state: "on" | "off", on: string[], to: string[] = []) => ({ state, on, error: null, to, served: on.length ? 1284 : 0, fix: null });
@@ -1654,6 +1713,10 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
       ctx.emit?.({ type: "agent_limit", runner: a.name });
     }
     return (json(res, 200, agentLimit(a)), true);
+  }
+  if ((mm = p.match(/^\/api\/runners\/([^/]+)\/pools$/)) && m === "GET") {
+    const a = ctx.agents().find((x) => x.name === decodeURIComponent(mm![1]!));
+    return (a ? json(res, 200, warmPools(a)) : err(res, 404, "no such runner"), true);
   }
   if (p === "/api/tailscale" && m === "GET") return (void json(res, 200, TAILSCALE), true);
   if (p === "/api/harness/kinds" && m === "GET") {

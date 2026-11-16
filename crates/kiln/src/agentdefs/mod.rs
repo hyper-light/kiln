@@ -181,7 +181,7 @@ impl Who {
         Ok(Who { person, all: caller.agent.is_none() && (caller.is_owner() || caller.can(MANAGE, &Scope::Server)) })
     }
 
-    fn reaches(&self, owner: &str) -> bool {
+    pub(crate) fn reaches(&self, owner: &str) -> bool {
         self.all || self.person == owner
     }
 }
