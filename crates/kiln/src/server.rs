@@ -226,7 +226,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("terminals", h => h.terminal_loop());
         child!("agent-screens", h => crate::harness::screen::watch(h));
         child!("goal-stacks", h => crate::goals::run(h));
-        // Sessions held to their agent definitions' time limits (kiln plan 01a1dd2e… P5.4).
+        // Sessions held to their agent definitions' limits: time, tokens and cost (kiln plan 01a1dd2e… P5.4).
         child!("agent-limits", h => crate::agentdefs::limits::run(h));
         child!("attention", h => crate::harness::attention::run(h));
         child!("plan-runs", h => crate::plans::agents::drive(h));

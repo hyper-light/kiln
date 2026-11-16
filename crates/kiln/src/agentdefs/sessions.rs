@@ -52,8 +52,8 @@ pub async fn record(hub: &Hub, session: &str, d: &Definition, person: Option<&st
         })
         .await;
     match kept {
-        // Its definition's time limit, if it sets one, is held to it from now (P5.4).
-        Ok(()) => super::limits::armed(),
+        // Its definition's limits, where it sets any, are held to it from now (P5.4).
+        Ok(()) => hub.harness.limits.tell(session),
         Err(e) => tracing::warn!(session, definition = %d.id, error = %format!("{e:#}"), "which agent definition a session started from wasn't kept"),
     }
 }
@@ -96,7 +96,7 @@ pub struct Listed {
     pub engine: Option<&'static str>,
     /// It as `agents.list` briefs it; none once it's gone.
     pub agent: Option<Value>,
-    /// Why a limit of its definition ended it (P5.4: `super::limits`), where one did.
+    /// Why a limit of its definition (its time, tokens or cost) ended it (P5.4: `super::limits`), where one did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended: Option<String>,
 }

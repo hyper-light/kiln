@@ -88,6 +88,15 @@ impl Kind {
         self.protocol != Protocol::Terminal
     }
 
+    /// It says what its sessions cost, in US dollars, so an agent definition's cost limit can be held to it
+    /// (`crate::agentdefs::check`): Claude Code at each turn's end (its result's `total_cost_usd`, `super::claude`) and Pi
+    /// with each reply (its usage's `cost.total`, `super::pi`). Codex and Antigravity say tokens alone (kiln reads no cost
+    /// of theirs), and an ACP agent's cost is its own to give or leave out (`usage_update`'s optional `cost`, read where
+    /// it's in USD: `super::acp`), which none of kiln's ACP harnesses is known to give.
+    pub fn says_cost(&self) -> bool {
+        matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::PiRpc)
+    }
+
     pub fn adapter(&self, spec: &Spec) -> Adapter {
         match self.protocol {
             Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)).with_speed(spec.speed.clone()))),
