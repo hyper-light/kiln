@@ -857,6 +857,10 @@ impl Run for HexRun {
 /// Why a box's harness isn't swapped for another in place yet.
 pub const NO_SWAP: &str = "a harness swapped for another in its running microVM: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6c.2)";
 
+/// Why a harness swapped into a running box isn't granted its sign-in there yet (plan step 33): Hex grants one only as a
+/// box is made (its C8), and has no call that swaps a member in place, nor one that grants a running box a sign-in.
+pub const NO_SWAP_SIGN_IN: &str = "a sign-in granted to a harness swapped into its running microVM: Hex grants one only as a box is made (its C8), and the Hex kiln vendors has no wire call that swaps a member in place with one yet (kiln plan 01a1dd2e…, P6c.2)";
+
 /// Why a box's network and folders don't change while it runs yet.
 pub const NO_LIVE: &str = "a change to a running microVM's network or folders: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6b.3)";
 

@@ -292,6 +292,9 @@ pub enum Local {
     AdoptFollow { peer: String, says: Says, reply: oneshot::Sender<u64> },
     /// A question for the server (JSON), answered with its answer (JSON).
     Query { json: String, reply: oneshot::Sender<anyhow::Result<String>> },
+    /// A run's ask of its server's run-lease broker (JSON), answered with its answer (JSON): words wiped as they're let
+    /// go of ([`Handle::lessor`]).
+    Lessor { json: crate::secrets::lessor::Words, reply: oneshot::Sender<anyhow::Result<String>> },
     /// Place a run this node owns (docs/needs.md E5): what placement says of it goes to `says`.
     /// Answers whether placement is ready (this machine measured, the directory known); when it
     /// isn't, the run is placed as before.
@@ -630,6 +633,14 @@ impl Handle {
             crate::runner::custody::unanswered(&sent, &format!("{e:#}"));
         }
         answer
+    }
+
+    /// A run's ask of its server's run-lease broker (`crate::secrets::lessor::Remote`: `json`, a `lessor` question, as a
+    /// [`crate::proto::AgentMsg::ReachAsk`]), and its answer: words wiped as they're let go of, here and on their way,
+    /// as they may carry a credential's value or a sign-in's tokens. The runner's own, never an agent's act: custody
+    /// neither signs nor keeps it, as it does an agent's ([`Handle::query`]).
+    pub async fn lessor(&self, json: crate::secrets::lessor::Words) -> anyhow::Result<crate::secrets::lessor::Words> {
+        self.ask(|reply| Local::Lessor { json, reply }).await?.map(crate::secrets::lessor::Words::taken)
     }
 
     /// Hand `data` to `peer` to take over (an agent session moving there), and wait until it has,
@@ -1838,8 +1849,15 @@ impl Node {
     }
 
     async fn on_answer(&mut self, req: u64, answer: Value) {
+        // A question's answer may carry a run's leased value (`crate::secrets::lessor`), and which one does isn't told
+        // apart before here: each one's text made the size it comes to and its tree wiped, and its text where no one
+        // is left to take it.
         if let Some((_, reply)) = self.queries.remove(&req) {
-            let _ = reply.send(Ok(answer.to_string()));
+            let text = crate::secrets::lessor::Words::of(&answer).map(crate::secrets::lessor::Words::into_text).unwrap_or_else(|_| answer.to_string());
+            crate::secrets::lessor::wipe_value(answer);
+            if let Err(Ok(mut text)) = reply.send(Ok(text)) {
+                crate::secrets::lessor::wipe_text(&mut text);
+            }
             return;
         }
         if self.asked.remove(&req).is_none() {
@@ -3083,6 +3101,18 @@ impl Node {
                 self.next_req += 1;
                 self.queries.insert(req, (Instant::now(), reply));
                 self.send_out(AgentMsg::ReachAsk { req, json }).await;
+            }
+            // Asked as a question is, its words handed on whole into the question, whose words the uplink wipes once its
+            // frame is made (`crate::agent`); refused, they're wiped here.
+            Local::Lessor { json, reply } => {
+                if !self.server {
+                    let _ = reply.send(Err(anyhow::anyhow!("not connected to the kiln server")));
+                    return;
+                }
+                let req = self.next_req;
+                self.next_req += 1;
+                self.queries.insert(req, (Instant::now(), reply));
+                self.send_out(AgentMsg::ReachAsk { req, json: json.into_text() }).await;
             }
             Local::Transferred { peer, key, bytes, us } => {
                 self.topo.transferred(&peer, Some(&key), bytes, us);

@@ -34,13 +34,25 @@
 //!   runs lease their own people's sign-ins alone: the server answers a lease, a capture or a
 //!   refresh only of a sign-in of a person one of that runner's isolated agents of its harness
 //!   acts for, and no other credential.
+//! - **What crosses a link is wiped once used**, as Shards' injector and its HTTP/2 wipe what they
+//!   hold of a value (zeroize; Hex's C7 for its own wire): each ask's and answer's JSON is made the
+//!   size it comes to ([`Words`]: a buffer grown by copying leaves what it held behind unwiped), and
+//!   every copy of it kiln holds on its way, its frame in the net thread's outbox
+//!   (`crate::net::Out::Wiped`), the words a frame is read into and their tree on the other side
+//!   (`crate::wire::payload`, `crate::reach::node`), is wiped as it's let go of. The transport's
+//!   own copies (hyper-transport's streams and packets) are its own.
+//! - **A runner hears whether its server answers** on each connection ([`Heard`]): its caps, its
+//!   Welcome, then its named features. A launch from before that word, a session restored as its
+//!   runner started among them, waits for it ([`answering`]) and is then granted its sign-in, or
+//!   not, as any launch is: Hex grants a sign-in only as a box is made (its C8), so one launched
+//!   without it would keep none until it started again.
 //!
 //! Each runner's sandbox hands its lessors to Hex's image runtime and carries each launch's
 //! credential grants and sign-in into its image's, by reference (`sandbox::hexvm`,
 //! `hex_node::images::ImageRuntime::leasing`).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use hex_api::BoxId;
@@ -91,27 +103,102 @@ pub async fn open(hub: &Arc<crate::hub::Hub>) -> anyhow::Result<Lessors> {
     let secrets: Arc<dyn kiln_seams::secrets::Secrets> = Arc::new(super::seam::KilnSecrets::new(Arc::clone(hub), crate::rt::clock()));
     let broker = Broker::open(secrets, hub.store.clone(), crate::rt::clock()).await?;
     OPENED_HERE.store(true, Ordering::Release);
+    MOVED.notify();
     Ok(hub.lessors.get_or_init(|| Lessors::new(Arc::new(broker), crate::rt::clock())).shared())
 }
 
 /// Whether this process opened its server's broker ([`open`]): its own runner's runs ask it here.
 static OPENED_HERE: AtomicBool = AtomicBool::new(false);
 
-/// Whether this runner's server answers its runs' asks over its link: it named
-/// [`crate::proto::feature::LEASES`] ([`server_features`]). A [`Remote`]'s runs ask it only while it does.
-static SERVER_ANSWERS: AtomicBool = AtomicBool::new(false);
+/// What this runner has heard of whether its server answers its runs' asks over its link ([`Heard`]), moved by its
+/// server's word ([`heard`]). A [`Remote`]'s runs ask it only while it answers.
+static HEARD: LazyLock<Mutex<Heard>> = LazyLock::new(|| Mutex::new(Heard::Nothing));
 
-/// The features this runner's server says it speaks, by name (`ServerMsg::Features`): whether it answers its runs'
-/// leases and sign-ins.
-pub fn server_features(names: &[String]) {
-    SERVER_ANSWERS.store(crate::proto::feature::speaks(names, crate::proto::feature::LEASES), Ordering::Release);
+/// Told as [`HEARD`] moves, or this process opens its server's broker: what waits for either looks again
+/// ([`answering`]).
+static MOVED: LazyLock<crate::rt::Changed> = LazyLock::new(crate::rt::Changed::new);
+
+/// What a runner has heard of whether its server answers its runs' leases and sign-ins over its link
+/// ([`crate::proto::feature::LEASES`]), as a server says what it speaks on each connection (docs/wire.md, "Named
+/// features"): its caps before its Welcome, and its named features after them where its caps say it names any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heard {
+    /// Nothing yet: no connection of this process's has said.
+    Nothing,
+    /// This connection's caps say its server names features (`CAP_FEATURES`): their names say whether it answers.
+    Naming,
+    /// Its server names `secrets.leases`: it answers them.
+    Answers,
+    /// It doesn't: its caps name no features, its features don't name it, or its first connection's Welcome came with
+    /// no caps before it (a kiln from before them).
+    Refuses,
 }
 
-/// Whether this process's runs are answered their leases and sign-ins now: its server's broker is open here (the
-/// server's own runner), or this runner's server says it answers them over its link. Until then an isolated harness
-/// is granted no sign-in (`sandbox::isolated`), as a server from before answers none.
-pub fn answered() -> bool {
-    OPENED_HERE.load(Ordering::Acquire) || SERVER_ANSWERS.load(Ordering::Acquire)
+/// A server's word on a connection, as [`Heard`] takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Word {
+    /// Its caps (`ServerMsg::Caps`): whether they say it names features.
+    Caps { names: bool },
+    /// Its Welcome.
+    Welcome,
+    /// Its named features (`ServerMsg::Features`): whether they name `secrets.leases`.
+    Features { leases: bool },
+    /// Its connection went.
+    Gone,
+}
+
+impl Heard {
+    /// What it is once `word` is heard. Answered or refused is kept across connections until a later one's word moves it,
+    /// so a run's asks go on as its link comes back; caps that name features, with their names not yet come, are the
+    /// connection's, and go with it.
+    pub fn then(self, word: Word) -> Heard {
+        match (self, word) {
+            (_, Word::Caps { names: false }) => Heard::Refuses,
+            (_, Word::Features { leases: true }) => Heard::Answers,
+            (_, Word::Features { leases: false }) | (Heard::Nothing, Word::Welcome) => Heard::Refuses,
+            (Heard::Nothing, Word::Caps { names: true }) => Heard::Naming,
+            (Heard::Naming, Word::Gone) => Heard::Nothing,
+            (heard, Word::Caps { names: true } | Word::Welcome | Word::Gone) => heard,
+        }
+    }
+
+    /// Whether its server has said: answered or refused.
+    fn said(self) -> bool {
+        matches!(self, Heard::Answers | Heard::Refuses)
+    }
+}
+
+/// This runner's server said `word` on its connection (`crate::agent`'s loop): what it has heard moves as
+/// [`Heard::then`] says, and what waits for it looks again.
+pub fn heard(word: Word) {
+    let moved = {
+        let mut heard = HEARD.lock();
+        let next = heard.then(word);
+        std::mem::replace(&mut *heard, next) != next
+    };
+    if moved {
+        MOVED.notify();
+    }
+}
+
+/// Whether this process's runs are answered their leases and sign-ins: its server's broker is open here (the server's
+/// own runner), or this runner's server said it answers them over its link ([`Heard::Answers`]). Known at once on the
+/// server's own runner and once its server has said, else when it says ([`heard`]): an isolated launch's sign-in waits
+/// for it (`sandbox::isolated`), so one launched before its server's word (a session restored as its runner started)
+/// is granted its sign-in as any launch is, rather than signing in itself in its microVM. Waited for as it's told,
+/// never polled, for as long as its server takes to say: with no server answering, none of its run's leases could be.
+pub async fn answering() -> bool {
+    loop {
+        let moved = MOVED.listen();
+        if OPENED_HERE.load(Ordering::Acquire) {
+            return true;
+        }
+        let heard = *HEARD.lock();
+        if heard.said() {
+            return heard == Heard::Answers;
+        }
+        moved.await;
+    }
 }
 
 /// The lessors of a machine's runs: one for each run, over the broker.
@@ -141,7 +228,7 @@ impl hex_api::lease::Lessors for Lessors {
 }
 
 /// The lessors of a runner other than the server's own: each of its runs' asks put to the broker its server opened,
-/// over this runner's link to it (`crate::reach::node::Handle::query`), and answered there ([`answer`]).
+/// over this runner's link to it (`crate::reach::node::Handle::lessor`), and answered there ([`answer`]).
 pub struct Remote(crate::reach::node::Handle);
 
 impl Remote {
@@ -186,19 +273,139 @@ impl std::fmt::Debug for Carried {
     }
 }
 
+/// Written as hex, through a buffer made its length and wiped once written: none of it left behind.
 impl serde::Serialize for Carried {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&hex::encode(self.0.expose()))
+        use serde::ser::Error as _;
+        let value = self.0.expose();
+        let Some(len) = value.len().checked_mul(2) else { return Err(S::Error::custom("a value too long to carry as hex")) };
+        let mut text = vec![0u8; len];
+        let said = match hex::encode_to_slice(value, &mut text) {
+            Ok(()) => std::str::from_utf8(&text).map_err(S::Error::custom).and_then(|t| s.serialize_str(t)),
+            Err(e) => Err(S::Error::custom(e)),
+        };
+        hex_api::lease::wipe(&mut text);
+        said
     }
 }
 
+/// Read from hex into a buffer made its length (a decode into a growing one would leave copies behind), the hex wiped.
 impl<'de> serde::Deserialize<'de> for Carried {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Carried, D::Error> {
         let text = <String as serde::Deserialize>::deserialize(d)?;
-        let bytes = hex::decode(&text).map_err(<D::Error as serde::de::Error>::custom);
+        let mut value = vec![0u8; text.len() / 2];
+        let decoded = hex::decode_to_slice(&text, &mut value).map_err(<D::Error as serde::de::Error>::custom);
         let mut text = text.into_bytes();
         hex_api::lease::wipe(&mut text);
-        bytes.map(|b| Carried(Value::new(b)))
+        match decoded {
+            Ok(()) => Ok(Carried(Value::new(value))),
+            Err(e) => {
+                hex_api::lease::wipe(&mut value);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// JSON that may carry a credential's value or a sign-in's tokens, as a run's ask or its answer crosses a runner's link
+/// ([`RunLessor`], [`answer`]): written into a buffer made the size it comes to, as serde_json's own grows by copying
+/// itself and leaves what it held behind unwiped (zeroize can't reach a buffer already let go of); wiped as it's let go
+/// of; never printed (its `Debug` says its length alone).
+pub struct Words(String);
+
+impl Words {
+    /// `value` as JSON.
+    pub fn of<T: serde::Serialize>(value: &T) -> anyhow::Result<Words> {
+        let mut counted = Counted(0);
+        serde_json::to_writer(&mut counted, value)?;
+        let mut out = Vec::with_capacity(counted.0);
+        if let Err(e) = serde_json::to_writer(&mut out, value) {
+            hex_api::lease::wipe(&mut out);
+            return Err(e.into());
+        }
+        match String::from_utf8(out) {
+            Ok(text) => Ok(Words(text)),
+            Err(e) => {
+                let mut bytes = e.into_bytes();
+                hex_api::lease::wipe(&mut bytes);
+                anyhow::bail!("its JSON wasn't UTF-8")
+            }
+        }
+    }
+
+    /// Words made elsewhere, the text of a link's answer (`crate::reach::node`), taken to be wiped as they're let go of.
+    pub fn taken(text: String) -> Words {
+        Words(text)
+    }
+
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+
+    /// Its text handed on whole, nothing left here to wipe: into a message whose holder wipes it once its frame is made
+    /// (the runner's uplink, `crate::hub::Hub::send_wiped`).
+    pub fn into_text(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Words {
+    fn drop(&mut self) {
+        wipe_text(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for Words {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Words({} bytes)", self.0.len())
+    }
+}
+
+/// What a run's ask of the broker begins with as kiln writes it ([`Words::of`] of a `crate::reach::Question::Lessor`,
+/// whose tag serde writes first): how its server knows one before reading it (`crate::wire::payload`), so none of its
+/// words is copied to be looked at, or kept beside it as it came.
+const ASKED: &str = r#"{"op":"lessor","#;
+
+/// Whether `json` is a run's ask of the broker as kiln writes one ([`ASKED`]).
+pub fn asked(json: &str) -> bool {
+    json.starts_with(ASKED)
+}
+
+/// What a writer is given, counted: the length [`Words::of`] makes its buffer.
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `text` wiped, its whole allocation (hex_api's `wipe`: zeroize's writes, which the compiler keeps), and left empty:
+/// words that may have carried a credential's value or a sign-in's tokens across a runner's link, as they're let go of.
+pub fn wipe_text(text: &mut String) {
+    let mut bytes = std::mem::take(text).into_bytes();
+    hex_api::lease::wipe(&mut bytes);
+}
+
+/// Each string of `value`, its keys' too, wiped as it's let go of ([`wipe_text`]): a tree read from words that may have
+/// carried a credential's value or a sign-in's tokens. As deep as the JSON it was read from, which serde_json reads 128
+/// levels deep at the most.
+pub fn wipe_value(value: serde_json::Value) {
+    match value {
+        serde_json::Value::String(mut text) => wipe_text(&mut text),
+        serde_json::Value::Array(items) => items.into_iter().for_each(wipe_value),
+        serde_json::Value::Object(fields) => {
+            for (mut key, value) in fields {
+                wipe_text(&mut key);
+                wipe_value(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -382,15 +589,16 @@ async fn answered(broker: Arc<Broker>, clock: Arc<dyn Clock>, ask: Ask) -> Answe
 }
 
 /// The server's answer to `ask`, from a run of runner `runner` other than its own (`crate::reach::Question::Lessor`;
-/// [`Remote`]), from the broker it opened ([`open`]), as its own runner's runs are answered: JSON of an [`Answer`].
-/// Denied, typed, where the runner may not ask it ([`unheld`]); unavailable where the broker isn't open.
-pub async fn answer(hub: &crate::hub::Hub, runner: &str, ask: Ask) -> serde_json::Value {
+/// [`Remote`]), from the broker it opened ([`open`]), as its own runner's runs are answered: JSON of an [`Answer`], in
+/// words wiped as they're let go of ([`Words`]; sent by `crate::hub::Hub::send_wiped`). Denied, typed, where the runner
+/// may not ask it ([`unheld`]); unavailable where the broker isn't open.
+pub async fn answer(hub: &crate::hub::Hub, runner: &str, ask: Ask) -> Words {
     let said = match (unheld(hub, runner, &ask), hub.lessors.get()) {
         (Some(why), _) => Answer::Refused { said: Said::Denied { why } },
         (None, None) => Answer::Refused { said: Said::Unavailable { why: "its server's run-lease broker isn't open".into() } },
         (None, Some(lessors)) => answered(Arc::clone(&lessors.broker), Arc::clone(&lessors.clock), ask).await,
     };
-    serde_json::to_value(&said).unwrap_or_else(|e| serde_json::json!({ "error": format!("its answer: {e}") }))
+    Words::of(&said).unwrap_or_else(|e| Words(serde_json::json!({ "error": format!("its answer: {e:#}") }).to_string()))
 }
 
 /// Why runner `runner`'s run may not ask `ask`, where it may not: a runner kiln doesn't know, or a job's, which holds no
@@ -471,15 +679,13 @@ impl RunLessor {
                 let (broker, clock) = (Arc::clone(broker), Arc::clone(clock));
                 crate::rt::block_on(async move { Ok(answered(broker, clock, ask).await) }).map_err(|e| format!("run {}: the broker: {e:#}", self.run))
             }
-            To::Server(_) if !SERVER_ANSWERS.load(Ordering::Acquire) => Err(format!("run {}: its server doesn't answer runs' leases (it names no `{}`): a kiln from before", self.run, crate::proto::feature::LEASES)),
+            To::Server(_) if *HEARD.lock() != Heard::Answers => Err(format!("run {}: its server doesn't answer runs' leases (it names no `{}`): a kiln from before", self.run, crate::proto::feature::LEASES)),
+            // Its ask and the answer in words wiped as they're let go of, here and on their way ([`Words`]).
             To::Server(node) => {
-                let json = serde_json::to_string(&crate::reach::Question::Lessor { ask }).map_err(|e| format!("run {}: its ask: {e}", self.run))?;
+                let json = Words::of(&crate::reach::Question::Lessor { ask }).map_err(|e| format!("run {}: its ask: {e:#}", self.run))?;
                 let node = node.clone();
-                let said = crate::rt::block_on(async move { node.query(json).await }).map_err(|e| format!("run {}: its server: {e:#}", self.run))?;
-                let answer = serde_json::from_str::<Answer>(&said).map_err(|e| format!("run {}: its server gave no lessor's answer (line {}, column {})", self.run, e.line(), e.column()));
-                let mut said = said.into_bytes();
-                hex_api::lease::wipe(&mut said);
-                answer
+                let said = crate::rt::block_on(async move { node.lessor(json).await }).map_err(|e| format!("run {}: its server: {e:#}", self.run))?;
+                serde_json::from_str::<Answer>(said.text()).map_err(|e| format!("run {}: its server gave no lessor's answer (line {}, column {})", self.run, e.line(), e.column()))
             }
         }
     }
@@ -566,9 +772,9 @@ impl Drop for RunLessor {
             To::Server(node) => {
                 let node = node.clone();
                 futures::future::FutureExt::boxed(async move {
-                    let json = serde_json::to_string(&crate::reach::Question::Lessor { ask })?;
-                    let said = node.query(json).await?;
-                    anyhow::Ok(serde_json::from_str::<Answer>(&said)?)
+                    let json = Words::of(&crate::reach::Question::Lessor { ask })?;
+                    let said = node.lessor(json).await?;
+                    anyhow::Ok(serde_json::from_str::<Answer>(said.text())?)
                 })
             }
         };
@@ -1026,6 +1232,193 @@ mod tests {
             let unprovided = ask(Ask::Refresh { sign_in: "devin/link".into() })?;
             anyhow::ensure!(matches!(unprovided, Answer::Refused { said: Said::Denied { .. } }), "{store}: {unprovided:?}");
         }
+        Ok(())
+    }
+
+    /// Plan step 33 (D242): what a runner hears of whether its server answers its runs' leases, word by word, as each
+    /// connection says it: caps naming no features refuse at once; caps naming them wait for their names, which say; a
+    /// first connection's Welcome with no caps before it refuses (a kiln from before them); what was said is kept across
+    /// a connection's end, and a later one's caps and Welcome, until its names or its caps say otherwise; caps whose
+    /// names never came go with their connection. Written, not run (the person's rule of 2026-11-16).
+    #[test]
+    fn s33_a_runner_hears_whether_its_server_answers_on_each_connection() {
+        use super::Heard::{Answers, Naming, Nothing, Refuses};
+        let names = Word::Caps { names: true };
+        let (yes, no) = (Word::Features { leases: true }, Word::Features { leases: false });
+        let cases: [(&[Word], Heard); 13] = [
+            (&[], Nothing),
+            (&[names], Naming),
+            (&[names, Word::Welcome], Naming),
+            (&[names, Word::Welcome, yes], Answers),
+            (&[names, Word::Welcome, no], Refuses),
+            (&[Word::Caps { names: false }], Refuses),
+            (&[Word::Welcome], Refuses),
+            (&[names, Word::Gone], Nothing),
+            (&[names, Word::Gone, Word::Welcome], Refuses),
+            (&[names, yes, Word::Gone, names, Word::Welcome], Answers),
+            (&[names, yes, Word::Gone, Word::Caps { names: false }], Refuses),
+            (&[names, yes, names, Word::Welcome, no], Refuses),
+            (&[Word::Caps { names: false }, Word::Gone, names, Word::Welcome, yes], Answers),
+        ];
+        for (words, expect) in cases {
+            assert_eq!(words.iter().fold(Nothing, |heard, word| heard.then(*word)), expect, "{words:?}");
+        }
+        assert!(Answers.said() && Refuses.said() && !Nothing.said() && !Naming.said(), "only an answer or a refusal is said");
+    }
+
+    /// Plan step 33 (D242): a run's ask crosses its runner's link in words made the size they come to (none left behind
+    /// as a buffer grows), its tokens hex there and in no `Debug`, beginning as its server knows a run's ask by
+    /// ([`asked`]); the server reads one straight, keeping none of its words as they came, where an agent's question is
+    /// kept so (its act is checked against them); and words let go of are emptied. Written, not run (the person's rule
+    /// of 2026-11-16).
+    #[test]
+    fn s33_a_runs_ask_crosses_its_link_in_words_made_its_size_and_is_read_straight() -> anyhow::Result<()> {
+        use crate::wire::payload::{Carried as Read, FromRunner};
+        let carried = |s: &str| Carried::new(Value::new(s.as_bytes().to_vec()));
+        let ask = Ask::Capture { sign_in: "claude/owner".into(), access: carried("at-real"), refresh: Some(carried("rt-real")), expires_in: Some(60), scope: None };
+        let words = Words::of(&crate::reach::Question::Lessor { ask })?;
+        anyhow::ensure!(words.0.len() == words.0.capacity(), "made {} bytes for {}", words.0.capacity(), words.0.len());
+        let text = words.text();
+        anyhow::ensure!(asked(text) && !text.contains("at-real") && text.contains(&hex::encode("rt-real")), "{text}");
+        anyhow::ensure!(!format!("{words:?}").contains(&hex::encode("at-real")), "its words show what they say");
+        match crate::wire::payload_of(crate::proto::AgentMsg::ReachAsk { req: 7, json: text.to_owned() }).map_err(|e| anyhow::anyhow!("{e}"))? {
+            Read::Read(FromRunner::ReachAsk { req: 7, ask, raw }) => anyhow::ensure!(matches!(*ask, crate::reach::Question::Lessor { ask: Ask::Capture { .. } }) && raw.is_null(), "read as {ask:?}, kept as {raw}"),
+            _ => anyhow::bail!("a run's ask wasn't read as one"),
+        }
+        let directory = serde_json::json!({ "op": "directory" });
+        match crate::wire::payload_of(crate::proto::AgentMsg::ReachAsk { req: 8, json: directory.to_string() }).map_err(|e| anyhow::anyhow!("{e}"))? {
+            Read::Read(FromRunner::ReachAsk { req: 8, ask, raw }) => anyhow::ensure!(*ask == crate::reach::Question::Directory && raw == directory, "read as {ask:?}, kept as {raw}"),
+            _ => anyhow::bail!("an agent's question wasn't read as one"),
+        }
+        let mut said = String::from("at-real");
+        wipe_text(&mut said);
+        anyhow::ensure!(said.is_empty() && words.into_text().starts_with(ASKED), "words let go of aren't emptied");
+        Ok(())
+    }
+
+    /// `ask` of a run of runner `runner`'s, as `hub` answers it over the runner's link ([`answer`]): read back.
+    async fn asked_of(hub: &crate::hub::Hub, runner: &str, ask: Ask) -> anyhow::Result<Answer> {
+        let words = answer(hub, runner, ask).await;
+        Ok(serde_json::from_str::<Answer>(words.text())?)
+    }
+
+    /// Plan step 33 (D242): the server answers a runner's runs over its link ([`answer`]) only for sign-ins of people
+    /// one of that runner's isolated agents of the sign-in's harness acts for, and for no other credential: its own
+    /// isolated agent's sign-in captured and leased, the value its capture kept; a provider's key, its person's sign-in
+    /// of a harness its agent there isn't isolated for, another runner's agent's sign-in, a person no agent there acts
+    /// for, and any ask from a job's runner or from one kiln doesn't know, denied, saying no value; a give-back and a
+    /// run's end, its identity's own, answered; and its own agent's sign-in unavailable where the server's broker isn't
+    /// open. Written, not run (the person's rule of 2026-11-16).
+    #[test]
+    fn s33_a_runner_is_answered_only_for_its_own_isolated_agents_sign_ins() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::registry::Location;
+        use crate::harness::session::{Info, Isolation};
+        for (u, broker, _) in stores()? {
+            let store = u.name;
+            let clock: Arc<dyn Clock> = Arc::new(u.clock.clone());
+            crate::rt::block_on(async move {
+                let (hub, closed) = (crate::hub::tests::scratch_hub().await?, crate::hub::tests::scratch_hub().await?);
+                hub.lessors.set(Lessors::new(broker, clock)).map_err(|_| anyhow::anyhow!("{store}: its lessors were open already"))?;
+                for h in [&hub, &closed] {
+                    h.put_agent(crate::hub::tests::live_runner("r1", "linux", "x86_64"));
+                    h.put_agent(crate::hub::tests::live_runner("r2", "linux", "x86_64"));
+                    h.put_agent(crate::hub::AgentLive { ephemeral: true, ..crate::hub::tests::live_runner("job", "linux", "x86_64") });
+                }
+                let isolated = |person: &str| Some(Isolation { kind: Isolation::MICROVM.into(), image: None, person: Some(person.into()), cpus: None, memory: None, disk: None });
+                let sessions = [
+                    ("r1", Info { id: format!("claude-{store}"), kind: "claude".into(), isolation: isolated("owner"), ..Info::default() }),
+                    ("r1", Info { id: format!("codex-{store}"), kind: "codex".into(), ..Info::default() }),
+                    ("r2", Info { id: format!("codex2-{store}"), kind: "codex".into(), isolation: isolated("user:7"), ..Info::default() }),
+                ];
+                for (runner, info) in sessions {
+                    let id = info.id.clone();
+                    for h in [&hub, &closed] {
+                        h.harness.ingest(&Location::Machine(runner.into()), &id, Update::Open { info: Box::new(info.clone()), since: None }).await;
+                    }
+                }
+                let token = format!("at-{store}");
+                let identity = "a1".repeat(32);
+                let capture = |name: &str| Ask::Capture { sign_in: name.into(), access: Carried::new(Value::new(token.as_bytes().to_vec())), refresh: None, expires_in: None, scope: None };
+                let lease = |name: &str| Ask::Lease { identity: identity.clone(), reference: format!("sign-ins/{name}/access") };
+
+                let Answer::Captured { captured } = asked_of(&hub, "r1", capture("claude/owner")).await? else { anyhow::bail!("{store}: r1's own agent's sign-in wasn't captured") };
+                anyhow::ensure!(captured.access == "sign-ins/claude/owner/access", "{store}: {captured:?}");
+                let Answer::Leased { lease: held, value, .. } = asked_of(&hub, "r1", lease("claude/owner")).await? else { anyhow::bail!("{store}: r1's own agent's sign-in wasn't leased") };
+                anyhow::ensure!(value.0.expose() == token.as_bytes(), "{store}: another value was leased");
+
+                let others = [
+                    ("r1", Ask::Lease { identity: identity.clone(), reference: "providers/anthropic".into() }),
+                    ("r1", lease("codex/owner")),
+                    ("r1", capture("codex/user-7")),
+                    ("r1", lease("claude/user-7")),
+                    ("r2", lease("claude/owner")),
+                    ("job", lease("claude/owner")),
+                    ("ghost", lease("claude/owner")),
+                ];
+                for (runner, ask) in others {
+                    let shown = format!("{ask:?}");
+                    let said = asked_of(&hub, runner, ask).await?;
+                    anyhow::ensure!(matches!(said, Answer::Refused { said: Said::Denied { .. } }), "{store}: {runner} asking {shown}: {said:?}");
+                    anyhow::ensure!(!format!("{said:?}").contains(&token), "{store}: a refusal said a value");
+                }
+
+                anyhow::ensure!(matches!(asked_of(&hub, "r1", Ask::Given { identity: identity.clone(), lease: held }).await?, Answer::Given), "{store}: its give-back");
+                anyhow::ensure!(matches!(asked_of(&hub, "r1", Ask::Ended { identities: vec![identity.clone()] }).await?, Answer::Ended { .. }), "{store}: its run's end");
+                let shut = asked_of(&closed, "r1", lease("claude/owner")).await?;
+                anyhow::ensure!(matches!(shut, Answer::Refused { said: Said::Unavailable { .. } }), "{store}: with its broker not open: {shut:?}");
+                anyhow::Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Plan step 33 (D242): a runner other than the server's own leases through its link. Its run's lessor ([`Remote`])
+    /// puts each ask to its server through its reach node (`Handle::lessor`) as a `lessor` question, its tokens hex
+    /// there alone, and the server's answer comes back as the broker gave it: a capture's placeholders, its access token
+    /// leased by their reference, a give-back, and the run's end revoking what it still held. The server stands in here
+    /// as `answer` answers, from the broker it opened. Written, not run (the person's rule of 2026-11-16).
+    #[test]
+    fn s33_a_remote_runners_runs_lease_through_its_link() -> anyhow::Result<()> {
+        use crate::proto::AgentMsg;
+        use crate::reach::node::{self, Config, In};
+        let Some((u, broker, _)) = stores()?.into_iter().next() else { anyhow::bail!("no store to lease from") };
+        let clock: Arc<dyn Clock> = Arc::new(u.clock.clone());
+        let dir = tempfile::tempdir()?;
+        let cfg = Config { mirrors: dir.path().join("mirrors"), sense: false, ..Config::for_runner("remote", dir.path(), false) };
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let said = Arc::clone(&asked);
+        let handle = crate::rt::block_on(async move {
+            let (handle, out) = node::start(cfg)?;
+            handle.feed(In::Server(true)).await;
+            let server = handle.clone();
+            crate::rt::spawn(async move {
+                while let Ok(msg) = out.recv().await {
+                    let AgentMsg::ReachAsk { req, json } = msg else { continue };
+                    let Ok(crate::reach::Question::Lessor { ask }) = serde_json::from_str::<crate::reach::Question>(&json) else { continue };
+                    said.lock().push(json);
+                    let answer = answered(Arc::clone(&broker), Arc::clone(&clock), ask).await;
+                    let Ok(answer) = serde_json::to_value(&answer) else { continue };
+                    server.feed(In::Answer { req, answer }).await;
+                }
+            });
+            anyhow::Ok(handle)
+        })?;
+        heard(Word::Features { leases: true });
+        let id = BoxId::new("box-remote").map_err(anyhow::Error::msg)?;
+        let run = hex_api::lease::Lessors::lessor(&Remote::new(handle), &id).map_err(anyhow::Error::msg)?;
+        let c = run.capture("claude/remote", sign_in_tokens("at-remote", "rt-remote", Some(600), None, None), None).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(c.access == "sign-ins/claude/remote/access" && c.access_placeholder.starts_with("kiln-placeholder-"), "{c:?}");
+        let one = run.lease(&c.access, None).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(one.value.expose() == b"at-remote", "another value was leased");
+        run.release(&one.lease);
+        anyhow::ensure!(!reads(&u, &one.lease)?, "a lease given back over the link still reads");
+        let two = run.lease(&c.access, None).map_err(anyhow::Error::msg)?;
+        drop(run);
+        anyhow::ensure!(!reads(&u, &two.lease)?, "a run's lease outlived its end over the link");
+        let asked = asked.lock().clone();
+        anyhow::ensure!(asked.len() == 5 && asked.iter().all(|j| super::asked(j)), "its server was asked {asked:?}");
+        anyhow::ensure!(asked.iter().all(|j| !j.contains("at-remote") && !j.contains("rt-remote")) && asked.iter().any(|j| j.contains(&hex::encode("rt-remote"))), "its tokens crossed other than as hex: {asked:?}");
         Ok(())
     }
 }
