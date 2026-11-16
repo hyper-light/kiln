@@ -45,12 +45,13 @@ const api = async (method, path, body) => {
 const expect = (ok, what) => {
   if (!ok) throw new Error(`expected: ${what}`);
 };
-/** Types `text` into a field and checks it took: WebKit can drop text inserted into a field the page
- * made a moment before (no input event at all, the field left empty), so it is typed again. */
+/** Types `text` into a field (an input, or an editor's contenteditable: the metrics explorer's query)
+ * and checks it took: WebKit can drop text inserted into a field the page made a moment before (no
+ * input event at all, the field left empty), so it is typed again. */
 const fillIn = async (locator, text) => {
   for (let i = 0; ; i++) {
     await locator.fill(text);
-    if ((await locator.inputValue()) === text) return;
+    if ((await locator.evaluate((e) => (e.isContentEditable ? e.textContent : e.value))) === text) return;
     if (i >= 4) throw new Error(`the field never took ${JSON.stringify(text)}`);
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -122,7 +123,7 @@ const scenarios = {
   async "a query goes from the explorer onto a new dashboard, which is changed and saved"() {
     const query = "avg:app.latency.p95{*} by {service}";
     await page.goto(`${BASE}/observe/metrics`);
-    await fillIn(page.locator("#observe-query"), query);
+    await fillIn(page.getByRole("textbox", { name: "Query", exact: true }), query);
     await page.getByRole("button", { name: "Run", exact: true }).click();
     await page.waitForURL(/\/observe\/metrics\?q=/);
     const rows = page.locator("table.data-table tbody tr");

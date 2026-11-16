@@ -5,9 +5,10 @@
  */
 import * as React from "react";
 import { Link, useNavigate } from "@/lib/router";
-import { observeApi, type QueryAnswer } from "@/api/observe";
+import { observeApi, type MetricSummary, type QueryAnswer } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
 import { SERIES } from "@/components/charts/types";
+import { metricTags } from "@/components/code/query-words";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Hold } from "@/components/ui/hold";
@@ -16,10 +17,19 @@ import { PageIntro, SearchField, SelectField, TextField } from "@/components/ui/
 import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { useFieldText } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { acquireResource, invalidate } from "@/lib/resource";
 import { HeldFields, ObserveNav, PALETTE, RangePicker, aggregate, chartData, dashboardsRes, dataOf, drawnColor, formatValue, queriesRes, useOpening, useParam, useRange, type Range } from "./parts";
+import "@/components/code/query-input.css";
 
 const namesRes: Res<string[]> = { key: "observe/metric-names", fetch: (s) => observeApi.metrics(undefined, s).then((r) => r.metrics), opts: { pollMs: 300_000 } };
+/** A metric's summary, its tags with their values of most series among it (metricsummary.tsx reads it under this key too). */
+const summaryRes = (name: string): Res<MetricSummary> => ({ key: `observe/metric-summary/${name}`, fetch: (s) => observeApi.metricSummary(name, s) });
+
+/** The query field (CodeMirror, loaded as the page first shows it). */
+const QueryInput = React.lazy(() => import("@/components/code/query-input"));
+
+/** A metric's tags and their values, for the query field to complete: loaded once a metric and kept (lib/resource.ts), not once a key typed. */
+const tagsOf = (metric: string, signal: AbortSignal) => acquireResource(summaryRes(metric), signal).then((m) => metricTags(m.tags));
 
 const EXAMPLES = ["avg:system.cpu.user{*} by {host}", "max:system.disk.in_use{*} by {host,mount}", "sum:kiln.ci.jobs.finished{*} by {status}.as_count()", "avg:kiln.ci.job.duration{*} by {repo}"];
 
@@ -58,52 +68,41 @@ export default function MetricsExplorer() {
 
 function QueryForm({ initial, onRun }: { initial: string; onRun: (q: string) => void }) {
   const [draft, setDraft] = useFieldText(initial);
+  // The field is uncontrolled once made: a query from elsewhere (a name picked, an example, the
+  // address) makes it anew, to show it; its own words run (Enter, Run) keep it, and the focus in it.
+  const [made, setMade] = React.useState<{ query: string; ran: string | null; key: number }>({ query: initial, ran: null, key: 0 });
+  if (made.query !== initial) setMade({ query: initial, ran: null, key: initial === made.ran ? made.key : made.key + 1 });
+  const run = (text: string) => {
+    const q = text.trim();
+    if (!q) return;
+    setMade((m) => ({ ...m, ran: q }));
+    onRun(q);
+  };
   return (
     <form
       className="mb-4 flex flex-wrap items-end gap-3"
       onSubmit={(e) => {
         e.preventDefault();
-        onRun(draft.trim());
+        run(draft);
       }}
     >
       <div className="min-w-0 flex-1">
-        <label htmlFor="observe-query" className="field-label">
-          Query
-        </label>
-        <div className="field">
-          <input
-            id="observe-query"
-            className="font-mono"
-            list="observe-metric-names"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder={EXAMPLES[0]}
-            spellCheck={false}
-            autoComplete="off"
-            autoCapitalize="off"
-          />
-        </div>
+        <p className="field-label">Query</p>
+        <Loadable label="the query field" fallback={<div className="field qi" aria-busy="true" />}>
+          <QueryField key={made.key} value={draft} onChange={setDraft} onEnter={run} />
+        </Loadable>
       </div>
       <Button type="submit" disabled={!draft.trim()}>
         Run
       </Button>
-      <React.Suspense fallback={null}>
-        <NameList />
-      </React.Suspense>
     </form>
   );
 }
 
-/** Every metric as a query to start from, for the query field to suggest. */
-function NameList() {
-  const names = useRes(namesRes).data;
-  return (
-    <datalist id="observe-metric-names">
-      {names.map((n) => (
-        <option key={n} value={`avg:${n}{*}`} />
-      ))}
-    </datalist>
-  );
+/** The query in kiln's syntax, coloured and completed as it's typed: every metric's name, then the named metric's tags and their values. */
+function QueryField({ value, onChange, onEnter }: { value: string; onChange: (q: string) => void; onEnter: (q: string) => void }) {
+  const metrics = useRes(namesRes).data;
+  return <QueryInput frame="field" label="Query" placeholder={EXAMPLES[0]} value={value} onChange={onChange} onEnter={onEnter} words={{ metrics, tags: {}, kind: "metric" }} tagsOf={tagsOf} />;
 }
 
 /** With no query: every metric kiln keeps, found by name, and a few queries to start from. */
