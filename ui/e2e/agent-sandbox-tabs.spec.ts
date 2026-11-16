@@ -58,9 +58,9 @@ test("a microVM session's Engine: its line and controls, its bars each with its 
   // Components: the harness points to kiln's own switch; another swaps in place.
   await expect(body.getByRole("button", { name: "Switch" })).toBeVisible();
   await expect(body.getByRole("button", { name: "Swap" }).first()).toBeVisible();
-  // Its network's last hour, under its bars; no nested fold.
+  // Its network's last hour, under its bars; the tab's sections each fold (none nests in another).
   await expect(body.locator(".df-unet").first()).toContainText("Network");
-  await expect(body.locator(".in-sec-toggle")).toHaveCount(1);
+  for (const s of ["MicroVM", "Components", "Network", "Volumes", "This agent"]) await expect(body.locator(".in-sec-toggle", { hasText: s }).first()).toBeVisible();
   expect(said, said.join("\n")).toEqual([]);
 });
 

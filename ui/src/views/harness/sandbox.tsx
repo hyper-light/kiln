@@ -12,9 +12,10 @@
  *   - the last hour as plots, full width.
  *
  * What only a microVM has is absent on the host, not greyed: one line says it runs on the host.
- * Under its line in a Mission row's dropdown (engine-rows.tsx, `inRow`), that line says where it is
- * and holds its controls and its engine's rows show its resources, each with its last hour: the rest
- * is here, its sections shown whole (no dropdown nests in a row's).
+ * Under a sandbox's line (engine-rows.tsx, `inRow`), that line says where it is and holds its
+ * controls, and its engine's rows show its resources, each with its last hour: the rest is here. Its
+ * sections fold, as the Engine tab's own sections do, except inside a Mission row's dropdown
+ * (`fixed`), where a fold would be a dropdown nested in another: there they're shown whole.
  */
 import * as React from "react";
 import { ArrowRight, Check, Cloud, Download, FolderOpen, GitBranch, KeyRound, Pause, Play, Plus, RotateCcw, Square, Undo2, X } from "lucide-react";
@@ -88,7 +89,7 @@ function openHarnessSwitch() {
   if (chip.getAttribute("aria-expanded") !== "true") chip.click();
 }
 
-export function SandboxTab({ agentId, store, inRow }: { agentId: string; store: SessionStore; inRow?: boolean }) {
+export function SandboxTab({ agentId, store, inRow, fixed }: { agentId: string; store: SessionStore; inRow?: boolean; fixed?: boolean }) {
   // What's been changed of it live, and how each place took it: its state, as the server sends it.
   const o = useSession(store, (s) => s.state?.overrides);
   const res = useRes(sandboxRes(agentId));
@@ -104,7 +105,7 @@ export function SandboxTab({ agentId, store, inRow }: { agentId: string; store: 
     res.reload();
   };
   return (
-    <FoldFixed.Provider value={inRow === true}>
+    <FoldFixed.Provider value={fixed === true}>
       <div className="in-secs sb">
         {!inRow && <Now d={d} agentId={agentId} done={done} fail={fail} change={res.change} />}
         {!ended && (host ? <HostFacts d={d} /> : <MicrovmFacts d={d} />)}

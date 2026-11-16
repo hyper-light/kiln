@@ -3,11 +3,11 @@
  * P3; every session's dropdown has it): for each sandbox it runs in, its own and its kiln subagents',
  * its line (its engine and name, its stand in the agents' words' colours, where it runs and its size,
  * and its controls at the line's right end: round, small, of their intent's colour, its stop red and
- * asked again), then everything it is under that line, nothing folded (no dropdown nests in a row's):
- * its CPU, memory and disk now, each with its last hour, its network's last hour, its harness's
- * context and cost, then what its agent chat's Sandbox tab manages: what it is, its harness and agents
- * (swapped in place), its network (ports published, egress granted, networks connected), its volumes
- * and directories.
+ * asked again), then everything it is under that line: its CPU, memory and disk now, each with its
+ * last hour, its network's last hour, its harness's context and cost, then its sections: what it is,
+ * its harness and agents (swapped in place), its network (ports published, egress granted, networks
+ * connected), its volumes and directories. In the Engine tab its sections fold, as that tab's own do;
+ * in a Mission row's dropdown they're shown whole (a fold there would be a dropdown nested in it).
  */
 import * as React from "react";
 import { Check, Pause, Play, RotateCcw, Square, X } from "lucide-react";
@@ -81,13 +81,13 @@ function EngineRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] 
         stand={states.some((s) => s === "running" || s === "draining") ? "working" : "done"}
         summary={<StandCounts stands={states.map((s) => COUNTED[s])} words={COUNT_WORD} />}
       />
-      {!shut && agents.map((x) => <EngineVm key={x.id} a={x} b={all[x.id]!} />)}
+      {!shut && agents.map((x) => <EngineVm key={x.id} a={x} b={all[x.id]!} fixed />)}
     </>
   );
 }
 
-/** One sandbox: its line, its controls at the line's right end; under it, its resources and its Sandbox tab's whole. */
-function EngineVm({ a, b }: { a: AgentInfo; b: SandboxBrief }) {
+/** One sandbox: its line, its controls at the line's right end; under it, its resources and its sections (`fixed`: shown whole, in a dropdown). */
+function EngineVm({ a, b, fixed }: { a: AgentInfo; b: SandboxBrief; fixed?: boolean }) {
   const name = agentLabel(a);
   const [asking, setAsking] = React.useState(false);
   // What a press made of it until the server says what it is: a new state from the server replaces it.
@@ -184,7 +184,7 @@ function EngineVm({ a, b }: { a: AgentInfo; b: SandboxBrief }) {
       <li className="ms-node df-vm-body" data-depth={3}>
         <Loadable label={`Loading ${name}'s sandbox`}>
           <EngineUsage a={a} />
-          <SandboxBlock agentId={a.id} />
+          <SandboxBlock agentId={a.id} fixed={fixed} />
         </Loadable>
       </li>
     </>
@@ -233,8 +233,8 @@ function EngineUsage({ a }: { a: AgentInfo }) {
   );
 }
 
-/** Its agent chat's Sandbox tab, its line above holding its state and controls (loaded as that tab's code is). */
-function SandboxBlock({ agentId }: { agentId: string }) {
+/** Its sections, its line above holding its state and controls (loaded as the inspector's tabs' code is). */
+function SandboxBlock({ agentId, fixed }: { agentId: string; fixed?: boolean }) {
   const { SandboxTab } = useRes(inspectorTabsRes).data;
-  return <SandboxTab agentId={agentId} store={sessionStore(agentId)} inRow />;
+  return <SandboxTab agentId={agentId} store={sessionStore(agentId)} inRow fixed={fixed} />;
 }
