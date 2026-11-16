@@ -1471,7 +1471,7 @@ a resume, a restore), for the session's life.
 |---|---|---|
 | `sessions.ports.publish` / `unpublish` | `agent`, `bind` (the host address: who may reach it), `host_port`, `guest_port`, `protocol` (`tcp`, `udp`); a port reaches the members its image gives it coming in, as Shards publishes one | microVM |
 | `sessions.egress.grant` / `revoke` | `agent`, `host` (a DNS name or an address), `port`, `member` | microVM |
-| `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member` | microVM |
+| `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member`, and one grant there, every part named (Shards' D285: joining grants nothing else): `name` (the member's name on the network, a host's name, one member's there), `peer` (a member of another run on it, by its name there), `way` (`out`: it opens flows toward its peer; `in`: its peer opens them toward it), `protocol` (`tcp`, `udp`), `port` (to `last_port`, a range); a flow between two runs' members is where the grants of both its ends take it, and a grant taken back resets the flows it let open | microVM |
 | `sessions.volumes.add` / `remove` | `agent`, `path` (a folder of its machine), `access` (`ro`, `rw`), `at` (where a microVM sees it), `members` | every engine |
 | `sessions.components.swap` / `restore` | `agent`, `kind` (`agent`, `harness`, `mcp`), `path` (its member's directory: `/harness/<harness>`, the default, `/agents/<name>`, `/mcp/<name>`), `source` and its pin (`checksum`, `version_id`), `force` | every engine |
 

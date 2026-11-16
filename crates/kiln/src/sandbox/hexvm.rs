@@ -1006,6 +1006,26 @@ pub(crate) mod tests {
         })
     }
 
+    /// Kiln plan 01a1dd2e…, P6b.3, for Shards' D285: until the Hex kiln vendors has a wire call for it, Hex's mapping
+    /// refuses a member connected to a network shared with other runs, its grant whole, typed (`Unsupported`, saying
+    /// why), its run going on; once the run has ended, `Ended`.
+    #[test]
+    fn p6b_3_hexs_mapping_refuses_a_connection_typed_until_hex_has_the_call() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{Change, Member as Who, NetworkGrant, Ports as SeamPorts, Way};
+        crate::rt::block_on(async {
+            let (_, vms) = vms();
+            assert!(!vms.holds().live, "it says it takes changes live");
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            let connect = || Change::Connect { member: Who("claude".into()), network: "team".into(), grant: NetworkGrant { name: "alice".into(), peer: "bob".into(), ports: SeamPorts { udp: false, first: 8080, last: 8080 }, way: Way::Out } };
+            assert_eq!(run.change(connect()).await, Err(Refusal::Unsupported(super::NO_LIVE.to_owned())));
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed], "its run went on until it was killed");
+            assert_eq!(run.change(connect()).await, Err(Refusal::Ended));
+            anyhow::Ok(())
+        })
+    }
+
     /// #75 step 3 (Shards D254): a launch asks its harness member's MCP bridge in its box's spec (`ImageMember::mcp`),
     /// and the lane takes that member's connections in its run's box through Hex (`Runtime::mcp`), by the run's name:
     /// what the harness sends read from it, what it's sent written to it. A run of no name here, or one let go of, has

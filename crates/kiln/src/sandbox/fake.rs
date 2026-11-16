@@ -288,9 +288,14 @@ impl Run for FakeRun {
         Box::pin(async move { link })
     }
 
-    /// Taken and recorded, as Hex's wire calls will take one (P6b.3); a held run that ended refuses one before it comes
-    /// here (`Held::change`).
+    /// Taken and recorded, as Hex's wire calls will take one (P6b.3), a connection's grant checked as the seam has it
+    /// (Shards' D285); a held run that ended refuses one before it comes here (`Held::change`).
     fn change(&self, change: Change) -> BoxFuture<'_, Result<(), Refusal>> {
+        if let Change::Connect { grant, .. } | Change::Disconnect { grant, .. } = &change
+            && let Err(e) = grant.check()
+        {
+            return Box::pin(async move { Err(e) });
+        }
         if matches!(change, Change::Swap { .. } | Change::Restore { .. }) && !self.components {
             return Box::pin(async { Err(Refusal::Unsupported("a component swapped into a run while it runs".into())) });
         }
