@@ -3,14 +3,14 @@
  * P3, P5.1, P5.2): two sections, each folding, each found by a filter with facets and sorted (as
  * Mission control's sessions are):
  *
- *   - VMs: the session's sandboxes, its own and its kiln subagents', a card each (engine-rows.tsx): its
+ *   - Sandboxes: the session's, its own and its kiln subagents', a card each (engine-rows.tsx): its
  *     line and controls, its resources each with its last hour, then its sections (what it is, its
- *     components, network, volumes and directories), each folding;
- *   - Agents: the agents there are, the person's and the system's, a card each: its line, then its
- *     settings and experiments, each folding. This session's agent is first, marked, its settings open
- *     with what this session started on.
+ *     components, network, volumes and directories);
+ *   - Agents: the agents there are, the person's at first (the system's by its facet), a card each:
+ *     its line, then its settings and experiments. This session's agent is always first, marked, with
+ *     what this session started on.
  *
- * Cards don't fold: a fold inside a card is one level down, never a dropdown in a dropdown.
+ * Only the two sections fold: inside them nothing does (no collapsible nested in another).
  */
 import * as React from "react";
 import { agentdefsRes, type AgentDef } from "@/api/agentdefs";
@@ -29,7 +29,7 @@ import { useAgentList } from "./use-agents";
 export function EngineTab({ agentId }: { agentId: string }) {
   return (
     <div className="in-secs at">
-      <Loadable label="Loading its microVMs" fallback={null}>
+      <Loadable label="Loading its sandboxes" fallback={null}>
         <Vms agentId={agentId} />
       </Loadable>
       <Loadable label="Loading the agents" fallback={null}>
@@ -61,7 +61,7 @@ function facetsFor<T>(all: readonly T[], wordsOf: (x: T) => string, q: string, c
   }));
 }
 
-/* ------------------------------------------------ VMs */
+/* ------------------------------------------------ Sandboxes */
 
 type VmSort = "newest" | "oldest" | "active" | "tokens-desc" | "tokens-asc" | "cost-desc" | "cost-asc" | "cpu" | "memory" | "name" | "name-desc";
 const VM_SORTS: { value: VmSort; label: string }[] = [
@@ -114,10 +114,10 @@ function VmsOf({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
   const [sort, setSort] = React.useState<VmSort>("newest");
   const shown = vms.filter((v) => shows(v, vmWords(v), q, chosen, VM_FACETS)).sort(VM_ORDER[sort]);
   return (
-    <Fold id="engine-vms" title="VMs" count={`${shown.length} of ${vms.length}`}>
+    <Fold id="engine-sandboxes" title="Sandboxes" count={`${shown.length} of ${vms.length}`}>
       <FilterBar className="at-bar">
         <FacetBox
-          label="Filter microVMs"
+          label="Filter sandboxes"
           placeholder="Filter by name, machine, state…"
           query={q}
           onQuery={setQ}
@@ -125,16 +125,16 @@ function VmsOf({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
           chosen={chosen}
           onChosen={setChosen}
         />
-        <SelectField label="Sort microVMs" hideLabel value={sort} onChange={(v) => setSort(v as VmSort)} options={VM_SORTS} />
+        <SelectField label="Sort sandboxes" hideLabel value={sort} onChange={(v) => setSort(v as VmSort)} options={VM_SORTS} />
       </FilterBar>
       {vms.length === 0 ? (
         <p className="in-none">It runs in no sandbox kiln knows of.</p>
       ) : shown.length === 0 ? (
-        <p className="in-none">No microVM matches.</p>
+        <p className="in-none">No sandbox matches.</p>
       ) : (
-        <ul className="ms-list eg-list" aria-label={`${agentLabel(a)}'s microVMs`}>
+        <ul className="ms-list eg-list" aria-label={`${agentLabel(a)}'s sandboxes`}>
           {shown.map((v) => (
-            <EngineVm key={v.a.id} a={v.a} b={v.b} />
+            <EngineVm key={v.a.id} a={v.a} b={v.b} fixed />
           ))}
         </ul>
       )}
@@ -188,7 +188,7 @@ function Agents({ agentId }: { agentId: string }) {
   const defs = useRes(agentdefsRes).data;
   const list = useAgentList();
   const [q, setQ] = React.useState("");
-  const [chosen, setChosen] = React.useState<Chosen>({});
+  const [chosen, setChosen] = React.useState<Chosen>({ source: ["user"] });
   const [sort, setSort] = React.useState<AgentSort>("newest");
   const byId = new Map(list.map((x) => [x.id, x]));
   const all: Def[] = defs.map((d) => {
@@ -197,7 +197,8 @@ function Agents({ agentId }: { agentId: string }) {
   });
   const mine = all.find((x) => x.d.sessions.some((s) => s.id === agentId));
   const shown = all.filter((x) => x !== mine && shows(x, defWords(x), q, chosen, AGENT_FACETS)).sort(AGENT_ORDER[sort]);
-  const showsMine = mine !== undefined && shows(mine, defWords(mine), q, chosen, AGENT_FACETS);
+  // This session's agent is shown whatever's chosen: it's the one this chat is about.
+  const showsMine = mine !== undefined;
   return (
     <Fold id="engine-agents" title="Agents" count={`${shown.length + (showsMine ? 1 : 0)} of ${all.length}`}>
       <FilterBar className="at-bar">

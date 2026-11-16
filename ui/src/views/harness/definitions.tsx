@@ -236,9 +236,9 @@ type Group = "definition" | "experiment";
 /**
  * A definition's groups: SETTINGS, then EXPERIMENTS, in the tree's own columns. Under a Mission row
  * (one session: its resources are its engine's) each is one line until opened, one open at a time
- * (kiln's principle 1). `inRow`: under the definition's own row in the Engine tab's list, which is the
- * dropdown there: they're sections, shown whole, no dropdown nested in it. Its sessions are Mission
- * control's rows, counted on its row's head.
+ * (kiln's principle 1). `inRow`: its card in the Engine tab's Agents section, which folds: there
+ * they're sections shown whole (no collapsible nested in another). Its sessions are Mission control's
+ * rows, counted on its card's line.
  */
 export function DefGroupRows({ d, first, setup: setupFirst, inRow, session }: { d: AgentDef; first?: Group; setup?: boolean; inRow?: boolean; session?: string }) {
   const [open, setOpen] = React.useState<Group | null>(first ?? null);
@@ -250,7 +250,7 @@ export function DefGroupRows({ d, first, setup: setupFirst, inRow, session }: { 
         d={d}
         inRow={inRow}
         session={session}
-        open={open === "definition"}
+        open={inRow === true || open === "definition"}
         onOpen={() => toggle("definition")}
         onSetup={() => {
           setSetup(true);
@@ -260,7 +260,8 @@ export function DefGroupRows({ d, first, setup: setupFirst, inRow, session }: { 
       {(d.experiments.length > 0 || setup || d.own) && (
         <ExperimentsGroup
           d={d}
-          open={open === "experiment"}
+          fixed={inRow}
+          open={inRow === true || open === "experiment"}
           onOpen={() => toggle("experiment")}
           setup={setup}
           onSetup={() => {
@@ -358,6 +359,7 @@ export function GroupHead({
   summary,
   actions,
   stand = "done",
+  fixed,
 }: {
   label: string;
   open: boolean;
@@ -365,15 +367,24 @@ export function GroupHead({
   summary?: React.ReactNode;
   actions?: React.ReactNode;
   stand?: string;
+  /** A section shown whole (inside something that folds): its label alone, nothing to press. */
+  fixed?: boolean;
 }) {
   return (
-    <li className="ms-node df-group df-head" data-stand={stand} data-depth={1} data-open={open || undefined}>
-      <button type="button" className="df-head-main" aria-expanded={open} onClick={onOpen}>
-        <span className="df-chev">
-          <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
+    <li className="ms-node df-group df-head" data-stand={stand} data-depth={1} data-open={open || undefined} data-fixed={fixed || undefined}>
+      {fixed ? (
+        <span className="df-head-main">
+          <span className="df-chev" aria-hidden="true" />
+          <span className="ms-sep-h df-group-k">{label}</span>
         </span>
-        <span className="ms-sep-h df-group-k">{label}</span>
-      </button>
+      ) : (
+        <button type="button" className="df-head-main" aria-expanded={open} onClick={onOpen}>
+          <span className="df-chev">
+            <ChevronRight size={12} aria-hidden="true" className={open ? "rotate-90" : undefined} />
+          </span>
+          <span className="ms-sep-h df-group-k">{label}</span>
+        </button>
+      )}
       <span className="df-head-end">{summary}</span>
       <span className="df-head-acts">{actions}</span>
     </li>
@@ -386,6 +397,7 @@ function DefinitionGroup({ d, open, onOpen, onSetup, inRow, session }: { d: Agen
     <>
       <GroupHead
         label="Settings"
+        fixed={inRow}
         open={open}
         onOpen={onOpen}
         summary={<span className="df-head-v">{inRow ? `v${d.version}` : `${d.name} v${d.version}`}</span>}
@@ -421,7 +433,23 @@ const NO_MEASURES: Variant["measures"] = { warm_ms: [0, 0, 0], peak_gib: [0, 0, 
  * its own) and a + for another; opened, a new one being set up, then each one whole, laid out as its
  * engine's microVMs are (engine-rows.tsx): its line, then what it holds under it, nothing folded.
  */
-function ExperimentsGroup({ d, open, onOpen, setup, onSetup, onSetupDone }: { d: AgentDef; open: boolean; onOpen: () => void; setup: boolean; onSetup: () => void; onSetupDone: () => void }) {
+function ExperimentsGroup({
+  d,
+  fixed,
+  open,
+  onOpen,
+  setup,
+  onSetup,
+  onSetupDone,
+}: {
+  d: AgentDef;
+  fixed?: boolean;
+  open: boolean;
+  onOpen: () => void;
+  setup: boolean;
+  onSetup: () => void;
+  onSetupDone: () => void;
+}) {
   const [list, setList] = React.useState<Experiment[]>(d.experiments);
   const change = (id: string) => (fn: (e: Experiment) => Experiment) => setList((l) => l.map((e) => (e.id === id ? fn(e) : e)));
   const remove = (e: Experiment) => {
@@ -434,6 +462,7 @@ function ExperimentsGroup({ d, open, onOpen, setup, onSetup, onSetupDone }: { d:
     <>
       <GroupHead
         label="Experiments"
+        fixed={fixed}
         open={open || setup}
         onOpen={onOpen}
         stand={list.some((e) => e.state === "live") ? "working" : "done"}

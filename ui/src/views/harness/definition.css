@@ -901,3 +901,14 @@
 .df-vm[data-stand="ready"] .ms-word > i {
   background: #6f8f84;
 }
+
+/* The Engine tab's sections' filters (engine-tab.tsx): as far from the list under them as from the
+   section's head above them (console.css .in-fold[data-open] > .in-sec-head). */
+.at .at-bar {
+  margin-bottom: 12px;
+}
+
+/* A section's head that doesn't fold (definitions.tsx GroupHead fixed): its label where an arrowed one's is. */
+.ms-node.df-head[data-fixed] .df-head-main {
+  cursor: default;
+}
