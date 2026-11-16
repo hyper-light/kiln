@@ -61,6 +61,8 @@ interface Member {
   approval?: Approval;
   /** Its subagents and what it left running (`State.tasks`). */
   tasks?: Task[];
+  /** Its effort, as set (a Claude Code agent's; `high` until set). */
+  effort?: string;
 }
 
 const t0 = Date.now() - 18 * 60_000;
@@ -1591,6 +1593,18 @@ function descendants(id: string, all: AgentInfo[], live: boolean): AgentInfo[] {
   return out;
 }
 
+/** A Claude Code agent's models and efforts, as its harness lists them. */
+const CLAUDE_CAN: Pick<Meta, "models" | "efforts"> = {
+  models: [
+    { id: "default", label: "Default (recommended)", description: "Opus 5.5" },
+    { id: "claude-opus-5-5", label: "claude-opus-5-5", description: "" },
+    { id: "claude-fable-5-2", label: "claude-fable-5-2", description: "" },
+    { id: "claude-sonnet-5-5", label: "claude-sonnet-5-5", description: "" },
+    { id: "claude-haiku-5-5", label: "claude-haiku-5-5", description: "" },
+  ],
+  efforts: ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })),
+};
+
 const META: Meta = {
   ...defaultMeta(),
   version: "2.3.1",
@@ -1646,6 +1660,12 @@ function subagentQueue(m: Member, c: { type?: string; id?: string; text?: string
   for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
 }
 
+/** Its state, sent to everyone watching it. */
+function pushState(m: Member) {
+  const state = JSON.stringify({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+}
+
 function stateOf(m: Member): State {
   return {
     ...defaultState(),
@@ -1653,6 +1673,7 @@ function stateOf(m: Member): State {
     cwd: m.info.cwd,
     model: m.info.model,
     mode: m.info.mode,
+    ...(m.info.kind === "claude" ? { effort: m.effort ?? "high" } : {}),
     title: m.info.title,
     summary: m.info.summary,
     doing: m.info.doing,
@@ -1716,7 +1737,7 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   viewers.set(id, seen.add(ws));
   ws.on("close", () => seen.delete(ws));
   ws.on("message", (raw) => {
-    type Cmd = { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number; client?: string; by?: string };
+    type Cmd = { type?: string; task?: string; id?: string; text?: string; mode?: string; model?: string; effort?: string; index?: number; client?: string; by?: string };
     let frame: Cmd & { t?: string; c?: Cmd };
     try {
       frame = JSON.parse(raw.toString()) as typeof frame;
@@ -1732,6 +1753,11 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
     if (c.type === "remove_task" && c.task) removeTask(m, c.task);
     if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
     if (c.type?.startsWith("queue_")) subagentQueue(m, c);
+    // Its permissions, model and effort, set from its line or its sandbox's harness rows: as set, said back.
+    if (c.type === "set_mode" && c.mode) m.info.mode = c.mode;
+    if (c.type === "set_model" && c.model && m.info.kind === "claude") m.info.model = c.model;
+    if (c.type === "set_effort" && c.effort && m.info.kind === "claude") m.effort = c.effort;
+    if (c.type === "set_mode" || c.type === "set_model" || c.type === "set_effort") pushState(m);
     // What one who changed its files did alone, as its session keeps it (docs/agents.md, "One subagent's own edits").
     // Its machine takes a moment, as a runner's round trip does: the panel shows the session's numbers dimmed till then.
     const ask = c.type === "own_edits" && c.client && c.by ? { client: c.client, by: c.by } : null;
@@ -1740,8 +1766,16 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   });
   send({ t: "open", info: m.info });
   // Codex sets its web search for the whole agent alone (`web_whole`); an ACP agent is held only at the calls it asks about (`limits_asked`).
-  const features = m.info.kind === "codex" ? [...META.features, "web_whole"] : m.info.kind === "opencode" ? [...META.features, "limits_asked"] : META.features;
-  send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0", features } });
+  // A Claude Code agent sets its model and effort too, as its harness lets it.
+  const features =
+    m.info.kind === "codex"
+      ? [...META.features, "web_whole"]
+      : m.info.kind === "opencode"
+        ? [...META.features, "limits_asked"]
+        : m.info.kind === "claude"
+          ? [...META.features, "set_model", "set_effort"]
+          : META.features;
+  send({ t: "meta", meta: { ...META, ...(m.info.kind === "claude" ? CLAUDE_CAN : {}), version: m.info.kind === "claude" ? "2.3.1" : "0.46.0", features } });
   send({ t: "state", state: stateOf(m) });
   send({ t: "events", events: m.events });
   const files = CHANGESETS[id];

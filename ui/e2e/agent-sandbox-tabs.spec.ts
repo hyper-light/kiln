@@ -59,6 +59,8 @@ test("a microVM session's Engine: its line and controls, its bars each with its 
   // Components: the harness's settings a row each under it (what its harness lets change: here its
   // permissions, a plain scale), its source, pin and path one line; another swaps in place.
   const harness = body.locator(".sb-comp").first();
+  await expect(harness.getByRole("slider")).toHaveCount(0);
+  await harness.getByRole("button", { name: /^Permissions:/ }).click();
   await expect(harness.getByRole("slider", { name: "Permissions" })).toBeVisible();
   await expect(harness.locator(".sb-src")).toContainText("/opt/kiln/harness/claude");
   await expect(body.getByRole("button", { name: "Switch" })).toHaveCount(0);
@@ -101,19 +103,25 @@ test("a harness's permissions, model and effort, a row each in its sandbox's com
   const said = errors(page);
   await page.goto("/agents?open=demo-claude");
   const harness = page.locator(".ms-dropdown .sb-comp").first();
-  await expect(harness.locator(".sb-set > .sb-k")).toHaveText(["Permissions", "Model", "Effort"], { timeout: 30_000 });
+  // Each its label on a row, its value under it (the version and its source last), nothing open till a value is tapped.
+  await expect(harness.locator(".sb-set > .sb-k")).toHaveText(["Permissions", "Model", "Effort", "Version"], { timeout: 30_000 });
+  await expect(harness.getByRole("slider")).toHaveCount(0);
   // Effort: its plain scale, Home to its first stop.
+  await harness.getByRole("button", { name: /^Effort:/ }).click();
   const effort = harness.getByRole("slider", { name: "Effort" });
   await effort.focus();
   await page.keyboard.press("Home");
   await expect(effort).toHaveAttribute("aria-valuetext", "Low");
-  // The model by its family.
+  // The model by its family, its harness's mark after it.
+  await harness.getByRole("button", { name: /^Model:/ }).click();
   await harness
     .getByRole("radio", { name: /^Sonnet/i })
     .first()
     .click();
-  await expect(harness.locator('.sb-set[data-kind="model"] .rs-now-name').first()).toHaveText("Sonnet");
+  await expect(harness.locator('.sb-set[data-kind="model"] .sb-set-now')).toContainText("Sonnet");
+  await expect(harness.locator('.sb-set[data-kind="model"] .sb-set-now .hx-mark')).toHaveText("CC");
   // A mode that turns checks off waits for "Turn them off".
+  await harness.getByRole("button", { name: /^Permissions:/ }).click();
   const permissions = harness.getByRole("slider", { name: "Permissions" });
   await permissions.focus();
   await page.keyboard.press("End");

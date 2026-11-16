@@ -51,7 +51,7 @@ import { KindGlyph } from "./kind-glyph";
 import { LimitMeter } from "./limits";
 import { HarnessMark } from "./parts";
 import { usePicked } from "./picked";
-import { CONFIRM, effortWords, ModelChoice, modelWords, modeWords, Scale } from "./run-settings";
+import { CONFIRM, effortWords, ModelChoice, modelWords, modeWords, Scale, type Word } from "./run-settings";
 import "./sandbox.css";
 
 const G = 2 ** 30;
@@ -363,52 +363,75 @@ function Components({ d, agentId, store, done, fail }: { d: SandboxDetail; store
 
 function ComponentRow({ c, settings, open, onSwap, onRestore }: { c: SandboxComponent; settings: React.ReactNode; open: boolean; onSwap: () => void; onRestore: () => void }) {
   const S = SOURCE[c.from.kind];
+  const harness = c.kind === "harness";
+  const version = (
+    <span className="sb-mono sb-ver" title={c.built ? `Swapped from ${c.built.version}` : "As built"}>
+      {c.version}
+    </span>
+  );
+  const source = (
+    <span className="sb-vol-sub sb-src">
+      <span className="sb-src-pin" title={`${c.from.url} · ${c.from.pin}`}>
+        <S.icon size={11} aria-hidden="true" />
+        <span className="sb-mono">{pinShort(c.from.pin)}</span>
+      </span>
+      <span className="sb-mono sb-clip" title={c.path}>
+        {c.path}
+      </span>
+    </span>
+  );
   return (
     <li className="sb-row sb-comp sb-vol" data-swapped={c.built ? "" : undefined}>
-      {/* Its glyph, name and version on its first line, each beside the last, its control at that line's
-          end (a harness has none: its settings are rows under it); under its name, where it comes from,
-          its pin and its path, on one line; then a harness's permissions, model and effort, a row each. */}
+      {/* Its glyph and name on its first line, then its version, its control at that line's end; under its
+          name, where it comes from, its pin and its path, on one line. A harness has no control: under its
+          name its permissions, model and effort, then (what those change) its version, and its source. */}
       <span className="sb-vol-top">
         <MemberGlyph kind={c.kind} name={c.name} />
         <span className="sb-name" title={`${c.kind} ${c.name}`}>
           {c.name}
         </span>
-        <span className="sb-mono sb-ver" title={c.built ? `Swapped from ${c.built.version}` : "As built"}>
-          {c.version}
-        </span>
-        <span className="sb-acts">
-          {c.kind === "harness" ? null : c.built ? (
-            <Button size="xs" variant="ghost" onClick={onRestore} title={`Back to ${c.built.version}, as built`}>
-              <Undo2 aria-hidden="true" />
-              Restore
-            </Button>
-          ) : (
-            <Button size="xs" variant="ghost" aria-expanded={open} onClick={onSwap}>
-              Swap
-            </Button>
-          )}
-        </span>
+        {!harness && version}
+        {!harness && (
+          <span className="sb-acts">
+            {c.built ? (
+              <Button size="xs" variant="ghost" onClick={onRestore} title={`Back to ${c.built.version}, as built`}>
+                <Undo2 aria-hidden="true" />
+                Restore
+              </Button>
+            ) : (
+              <Button size="xs" variant="ghost" aria-expanded={open} onClick={onSwap}>
+                Swap
+              </Button>
+            )}
+          </span>
+        )}
       </span>
-      <span className="sb-vol-sub sb-src">
-        <span className="sb-src-pin" title={`${c.from.url} · ${c.from.pin}`}>
-          <S.icon size={11} aria-hidden="true" />
-          <span className="sb-mono">{pinShort(c.from.pin)}</span>
-        </span>
-        <span className="sb-mono sb-clip" title={c.path}>
-          {c.path}
-        </span>
-      </span>
+      {!harness && source}
       {settings}
+      {harness && (
+        <span className="sb-set" data-kind="version">
+          <span className="sb-k">Version</span>
+          <span className="sb-set-now">{version}</span>
+          {source}
+        </span>
+      )}
     </li>
   );
 }
 
+type SetKind = "mode" | "model" | "effort";
+const SET_LABEL: Record<SetKind, string> = { mode: "Permissions", model: "Model", effort: "Effort" };
+/** A setting folds away this long after its last change, as agent chat's do (run-settings.tsx FOLD_MS). */
+const SET_FOLD_MS = 2500;
+
 /**
- * Its harness's permissions, model and effort, a row each, set as agent chat's line sets them: the
- * permissions and the effort each a scale (its plain bar: tap a stop or slide to it), a mode that turns
- * checks off waiting for "Turn them off"; the model by its family, its versions one tap further. Each
- * shows picked at once, until the agent says it back. Only what its harness lets change, and has more
- * than one of.
+ * Its harness's permissions, model and effort, as agent chat's line sets them: each its label on a row,
+ * its value under it (the model's with its harness's mark after it); the value tapped opens just that
+ * setting under it (one at a time), the permissions
+ * and the effort each a scale (its plain bar: tap a stop or slide to it), the model by its family with its
+ * versions one tap further; a mode that turns checks off waits for "Turn them off". A change shows at once,
+ * until the agent says it back, and the setting folds away a little after it. Only what its harness lets
+ * change, and has more than one of.
  */
 function HarnessSettings({ store, agentId }: { store: SessionStore; agentId: string }) {
   const meta = useSession(store, (s) => s.meta);
@@ -417,66 +440,118 @@ function HarnessSettings({ store, agentId }: { store: SessionStore; agentId: str
   const [mode, pickMode] = usePicked(state?.mode ?? info?.mode ?? "");
   const [model, pickModel] = usePicked(state?.model ?? info?.model ?? "");
   const [effort, pickEffort] = usePicked(state?.effort ?? "");
+  const [open, setOpen] = React.useState<SetKind | null>(null);
+  /** Changes made since the setting opened: its fold timer starts again at each. */
+  const [tick, setTick] = React.useState(0);
   const [armed, setArmed] = React.useState<string | null>(null);
   const features = meta?.features ?? [];
   const send = (c: Command, what: string) => void sendCommand(store, agentId, c).catch((e: unknown) => toast.error(`Couldn't change its ${what}`, errorMessage(e)));
-  const modes = modeWords(meta?.modes ?? [], mode);
-  const models = modelWords(meta?.models ?? [], model, modelLabel);
-  const efforts = effortWords(meta?.efforts ?? [], effort);
-  const setMode = (id: string) => {
+  const sets: { k: SetKind; words: Word[]; value: string; can: boolean; pick: (id: string) => void }[] = [
+    {
+      k: "mode",
+      words: modeWords(meta?.modes ?? [], mode),
+      value: mode,
+      can: features.includes("set_mode"),
+      pick: (id) => {
+        pickMode(id);
+        send({ type: "set_mode", mode: id }, "permissions");
+      },
+    },
+    {
+      k: "model",
+      words: modelWords(meta?.models ?? [], model, modelLabel),
+      value: model,
+      can: features.includes("set_model"),
+      pick: (id) => {
+        pickModel(id);
+        send({ type: "set_model", model: id }, "model");
+      },
+    },
+    {
+      k: "effort",
+      words: effortWords(meta?.efforts ?? [], effort),
+      value: effort,
+      can: features.includes("set_effort"),
+      pick: (id) => {
+        pickEffort(id);
+        send({ type: "set_effort", effort: id }, "effort");
+      },
+    },
+  ];
+  const choose = (s: (typeof sets)[number], w: Word) => {
+    if (w.id === s.value) return setArmed(null);
+    if (w.dangerous) return setArmed(w.id);
     setArmed(null);
-    pickMode(id);
-    send({ type: "set_mode", mode: id }, "permissions");
+    s.pick(w.id);
+    setTick((t) => t + 1);
   };
+  const toggle = (k: SetKind) => {
+    setArmed(null);
+    setTick(0);
+    setOpen(open === k ? null : k);
+  };
+  // The open setting folds away a little after a change, unless a confirmation waits: its own timer, set again at each change.
+  const folding = React.useCallback(
+    (panel: HTMLDivElement | null) => {
+      if (!panel || tick === 0 || armed) return;
+      const t = window.setTimeout(() => setOpen(null), SET_FOLD_MS);
+      return () => window.clearTimeout(t);
+    },
+    [tick, armed],
+  );
   return (
     <>
-      {features.includes("set_mode") && modes.length > 1 && (
-        <span className="sb-set">
-          <span className="sb-k">Permissions</span>
-          <span className="sb-set-v">
-            <Scale label="Permissions" words={modes} value={mode} armed={armed ?? undefined} onPick={(w) => (w.dangerous && w.id !== mode ? setArmed(w.id) : setMode(w.id))} />
-            {armed && (
-              <p className="rs-desc rs-confirm-line" data-tone="warn">
-                {CONFIRM}{" "}
-                <button type="button" className="rs-confirm" onClick={() => setMode(armed)}>
-                  Turn them off
+      {sets
+        .filter((s) => s.can && s.words.length > 1)
+        .map((s) => {
+          // A mode that turns checks off, waiting for "Turn them off": said where the value is, in its warning's colour.
+          const waits = s.k === "mode" && armed ? s.words.find((w) => w.id === armed) : undefined;
+          const now = waits ?? s.words.find((w) => w.id === s.value);
+          return (
+            <span key={s.k} className="sb-set" data-kind={s.k}>
+              <span className="sb-k">{SET_LABEL[s.k]}</span>
+              <span className="sb-set-now" data-tone={waits ? "warn" : undefined}>
+                <button
+                  type="button"
+                  className="rs-v"
+                  aria-expanded={open === s.k}
+                  aria-label={`${SET_LABEL[s.k]}: ${now?.full ?? "choose"}`}
+                  title={now?.full ?? SET_LABEL[s.k]}
+                  onClick={() => toggle(s.k)}
+                >
+                  {now?.text ?? "Choose"}
                 </button>
-              </p>
-            )}
-          </span>
-        </span>
-      )}
-      {features.includes("set_model") && models.length > 1 && (
-        <span className="sb-set" data-kind="model">
-          <span className="sb-k">Model</span>
-          <span className="sb-set-v">
-            <ModelChoice
-              words={models}
-              value={model}
-              onPick={(w) => {
-                pickModel(w.id);
-                send({ type: "set_model", model: w.id }, "model");
-              }}
-            />
-          </span>
-        </span>
-      )}
-      {(features.includes("set_effort") || efforts.length > 0) && efforts.length > 1 && (
-        <span className="sb-set">
-          <span className="sb-k">Effort</span>
-          <span className="sb-set-v">
-            <Scale
-              label="Effort"
-              words={efforts}
-              value={effort}
-              onPick={(w) => {
-                pickEffort(w.id);
-                send({ type: "set_effort", effort: w.id }, "effort");
-              }}
-            />
-          </span>
-        </span>
-      )}
+                {/* The model's harness, by its mark (as its component's row has it). */}
+                {s.k === "model" && info?.kind && <HarnessMark kind={info.kind} name={info.kind_name} size={14} />}
+              </span>
+              {open === s.k && (
+                <div ref={folding} className="sb-set-panel">
+                  {s.k === "model" ? (
+                    <ModelChoice words={s.words} value={s.value} onPick={(w) => choose(s, w)} />
+                  ) : (
+                    <Scale label={SET_LABEL[s.k]} words={s.words} value={s.value} armed={s.k === "mode" ? (armed ?? undefined) : undefined} onPick={(w) => choose(s, w)} />
+                  )}
+                  {s.k === "mode" && armed && (
+                    <p className="rs-desc rs-confirm-line" data-tone="warn">
+                      {CONFIRM}{" "}
+                      <button
+                        type="button"
+                        className="rs-confirm"
+                        onClick={() => {
+                          s.pick(armed);
+                          setArmed(null);
+                          setTick((t) => t + 1);
+                        }}
+                      >
+                        Turn them off
+                      </button>
+                    </p>
+                  )}
+                </div>
+              )}
+            </span>
+          );
+        })}
     </>
   );
 }

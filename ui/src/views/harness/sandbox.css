@@ -224,7 +224,8 @@
   white-space: nowrap;
 }
 /* A component's source and pin, then its path, on one line: the path gives way first. */
-.sb-comp > .sb-src {
+.sb-comp > .sb-src,
+.sb-set > .sb-src {
   display: flex;
   min-width: 0;
   gap: 10px;
@@ -235,27 +236,57 @@
   align-items: center;
   gap: 5px;
 }
-.sb-comp > .sb-src > .sb-clip {
+.sb-comp > .sb-src > .sb-clip,
+.sb-set > .sb-src > .sb-clip {
   min-width: 0;
 }
-/* A harness's permissions, model and effort (sandbox.tsx HarnessSettings): a row each under its source,
-   its label in the key column the rows below read by (.sb-kv), its control beside it. */
+/* A harness's permissions, model and effort (sandbox.tsx HarnessSettings), as agent chat's line has them:
+   each its label on a row, its value under it (run-settings.css .rs-v: tapped, bright over the prism
+   hairline), and under that, while it's open, its setting. */
 .sb-comp > .sb-set {
   display: grid;
-  grid-template-columns: 92px minmax(0, 1fr);
-  align-items: start;
-  gap: 12px;
+  justify-items: start;
+  gap: 4px;
   padding: 12px 0 0 22px;
 }
 .sb-set > .sb-k {
+  line-height: 16px;
+}
+.sb-set-now {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
   line-height: 20px;
+  text-transform: uppercase;
 }
-/* The model's words stand in their taps' height (run-settings.css .rs-word): its label on their line. */
-.sb-set[data-kind="model"] > .sb-k {
-  padding-top: 10px;
+.sb-set-now[data-tone="warn"] {
+  color: #e2cfae;
 }
-.sb-set-v {
+/* The harness's mark after its model: its own letters, centred in it. */
+.sb-set-now > .hx-mark {
+  line-height: 1;
+  letter-spacing: 0;
+}
+/* The version, as the line above it had it; its source under it. */
+.sb-set-now > .sb-ver {
+  letter-spacing: 0;
+  text-transform: none;
+}
+.sb-set[data-kind="version"] > .sb-src {
+  padding-left: 0;
+}
+.sb-set-panel {
+  justify-self: stretch;
   min-width: 0;
+  padding-top: 6px;
+}
+/* The value is said above the setting (its button): under it, only what it means. */
+.sb-set-panel .rs-now-name {
+  display: none;
 }
 .sb-src > svg {
   color: #a6c4ed;
@@ -455,8 +486,7 @@
 }
 /* A phone's width: paths and members give way first; a row keeps its glyph, name, pin and control. */
 @container (max-width: 420px) {
-  .sb-kv,
-  .sb-comp > .sb-set {
+  .sb-kv {
     grid-template-columns: 76px minmax(0, 1fr);
   }
 }
