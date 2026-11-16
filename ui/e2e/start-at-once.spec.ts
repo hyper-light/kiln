@@ -20,7 +20,8 @@ async function holdStarts(page: Page, refuse?: { status: number; error: string }
   let refused = false;
   let allowed = 0;
   const held: (() => void)[] = [];
-  await page.route("**/api/harness/sessions", async (route) => {
+  // The console's start is agents.start's (kiln plan 01a1dd2e…, P5.6 S8).
+  await page.route("**/api/harness/agents", async (route) => {
     if (route.request().method() !== "POST") return route.continue();
     if (allowed > 0) allowed--;
     else await new Promise<void>((resolve) => held.push(resolve));
