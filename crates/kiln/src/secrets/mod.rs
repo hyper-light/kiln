@@ -12,6 +12,7 @@ pub mod broker;
 pub mod lessor;
 pub mod mine;
 pub mod seam;
+pub mod signin;
 
 use std::future::Future;
 use std::pin::Pin;

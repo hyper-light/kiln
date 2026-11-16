@@ -54,7 +54,16 @@
         ]
       }
     ],
-    "caveats": [],
+    "caveats": [
+      {
+        "note": "A message steered into a turn under way is queued for the turn's end: kiln's ACP client steers into a turn for Devin alone, where Devin says it takes one (its mid-turn prompts). In a microVM as on the host.",
+        "cites": [
+          "crates/kiln/src/harness/acp.rs#Steering waits for the turn unless Devin advertises its mid-turn prompt extension.",
+          "crates/kiln/src/harness/acp.rs#fn steering_requires_devins_explicit_mid_turn_capability()",
+          "docs/agents.md#Other ACP agents keep steering queued."
+        ]
+      }
+    ],
     "reason": "Google's Gemini CLI npm package on Node.js's Linux build, pinned in its Agentfile (step 21); ACP (--acp), kiln's MCP server in session/new's mcpServers; Gemini CLI 0.68.0 says loadSession and mcpCapabilities.http. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254.",
     "sources": [
       ".kiln/images/harness-gemini/pin.json",
@@ -81,7 +90,16 @@
         ]
       }
     ],
-    "caveats": [],
+    "caveats": [
+      {
+        "note": "A message steered into a turn under way is queued for the turn's end: kiln's ACP client steers into a turn for Devin alone, where Devin says it takes one (its mid-turn prompts). In a microVM as on the host.",
+        "cites": [
+          "crates/kiln/src/harness/acp.rs#Steering waits for the turn unless Devin advertises its mid-turn prompt extension.",
+          "crates/kiln/src/harness/acp.rs#fn steering_requires_devins_explicit_mid_turn_capability()",
+          "docs/agents.md#Other ACP agents keep steering queued."
+        ]
+      }
+    ],
     "reason": "opencode's own Linux builds for glibc and musl, pinned in its Agentfile (step 22); ACP (acp), kiln's MCP server in session/new's mcpServers; opencode 2.2.7 says loadSession and mcpCapabilities.http. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254.",
     "sources": [
       ".kiln/images/harness-opencode/pin.json",
@@ -108,7 +126,16 @@
         ]
       }
     ],
-    "caveats": [],
+    "caveats": [
+      {
+        "note": "A message steered into a turn under way is queued for the turn's end: kiln's ACP client steers into a turn for Devin alone, where Devin says it takes one (its mid-turn prompts). In a microVM as on the host.",
+        "cites": [
+          "crates/kiln/src/harness/acp.rs#Steering waits for the turn unless Devin advertises its mid-turn prompt extension.",
+          "crates/kiln/src/harness/acp.rs#fn steering_requires_devins_explicit_mid_turn_capability()",
+          "docs/agents.md#Other ACP agents keep steering queued."
+        ]
+      }
+    ],
     "reason": "Goose's own static musl build, pinned in its Agentfile (step 23); ACP (acp), kiln's MCP server in session/new's mcpServers; Goose 1.59.0 says loadSession and mcpCapabilities.http. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254.",
     "sources": [
       ".kiln/images/harness-goose/pin.json",
@@ -247,6 +274,14 @@
         "note": "Its sign-in opens no browser on the machine: its link is shown wherever the person is, in a microVM as on the host.",
         "cites": [
           "crates/kiln/src/harness/kinds.rs#NO_OPEN_BROWSER"
+        ]
+      },
+      {
+        "note": "A message steered into a turn under way is queued for the turn's end: kiln's ACP client steers into a turn for Devin alone, where Devin says it takes one (its mid-turn prompts). In a microVM as on the host.",
+        "cites": [
+          "crates/kiln/src/harness/acp.rs#Steering waits for the turn unless Devin advertises its mid-turn prompt extension.",
+          "crates/kiln/src/harness/acp.rs#fn steering_requires_devins_explicit_mid_turn_capability()",
+          "docs/agents.md#Other ACP agents keep steering queued."
         ]
       }
     ],
