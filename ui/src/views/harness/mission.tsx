@@ -1097,7 +1097,8 @@ function Entries({
   return (
     <ul className="ms-list" data-list={list} ref={both} onKeyDown={onKeyDown}>
       {parts.map((p) => {
-        if ("gap" in p) return <li key={`gap:${p.gap}`} data-gap="" aria-hidden="true" style={{ height: p.room }} />;
+        // Never what the browser keeps where it is as the page changes (W21-R02): a gap stands for rows, its height and place change as the window does.
+        if ("gap" in p) return <li key={`gap:${p.gap}`} data-gap="" aria-hidden="true" style={{ height: p.room, overflowAnchor: "none" }} />;
         const e = entries[p.row];
         return e ? render(e) : null;
       })}

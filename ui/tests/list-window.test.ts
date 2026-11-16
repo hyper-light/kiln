@@ -1,7 +1,7 @@
 /** W21-R02: the arithmetic of a windowed list of rows of differing heights (src/lib/list-window.ts), and its window off the page. */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ListWindow, mountedRuns, nearRows, rowAt, rowTops, shiftAbove, typicalHeight, windowParts, type Part } from "../src/lib/list-window.ts";
+import { ListWindow, mountedRuns, nearRows, rowAt, rowTops, shiftAbove, steadyBy, typicalHeight, windowParts, type Part } from "../src/lib/list-window.ts";
 
 const keys = (n: number) => Array.from({ length: n }, (_, i) => `row:${i}`);
 /** Rows of 84 px, every seventh 141 px, every fiftieth with 600 px open under it: a list like Mission control's. */
@@ -92,7 +92,7 @@ test("W21-R02 rows kept wherever they are make runs of their own, joined to what
   ]);
   assert.deepEqual(mountedRuns([7, 7], [2]), [[2, 3]], "nothing near: only what's kept");
   assert.deepEqual(mountedRuns([7, 7]), []);
-  // Gaps are numbered from the top, and none is drawn for rows that take no room.
+  // A gap is named by the row after it ("" at the list's end), and none is drawn for rows that take no room.
   const all = keys(6);
   const tops = rowTops(all, new Map([["row:0", 0]]), 50);
   assert.deepEqual(
@@ -102,11 +102,62 @@ test("W21-R02 rows kept wherever they are make runs of their own, joined to what
     ]),
     [
       { key: "row:1", row: 1 },
-      { gap: 0, room: 100 },
+      { gap: "row:4", room: 100 },
       { key: "row:4", row: 4 },
-      { gap: 1, room: 50 },
+      { gap: "", room: 50 },
     ],
   );
+});
+
+test("W21-R02 drawing the window anew never moves a mounted row: what stays on the page, gaps and rows, keeps its order", () => {
+  const all = keys(400);
+  const heights = measured(all);
+  /** Each part by the key React has it by. */
+  const named = (parts: readonly Part[]) => parts.map((p) => ("row" in p ? p.key : `gap:${p.gap}`));
+  // Down the list and back, a third of a viewport at a time, with rows kept wherever the page goes (the first,
+  // one with the focus, the last); and once from the top straight to its foot.
+  const tops = rowTops(all, heights, 84);
+  const foot = (tops[400] ?? 0) - 900;
+  const stops = [...Array.from({ length: 120 }, (_, i) => i * 300), ...Array.from({ length: 120 }, (_, i) => (119 - i) * 300), foot, 0];
+  let last: string[] = [];
+  for (const viewTop of stops) {
+    const now = named(drawn(all, heights, viewTop, 900, [0, 120, 399]).parts);
+    // What was on the page and still is, in the same order before and after: React moves none of it.
+    const was = new Set(last);
+    const is = new Set(now);
+    assert.deepEqual(
+      now.filter((k) => was.has(k)),
+      last.filter((k) => is.has(k)),
+      `at ${viewTop}`,
+    );
+    last = now;
+  }
+  // The rows near the top leaving the window: the gap that comes before what stays is new, the one after it is the one that was.
+  const at = (viewTop: number) => named(drawn(all, heights, viewTop, 900, [0, 399]).parts);
+  assert.deepEqual(
+    at(0).filter((k) => k.startsWith("gap:")),
+    ["gap:row:399"],
+  );
+  const lower = at(2000);
+  assert.equal(lower[1], `gap:${lower[2]}`);
+  assert.equal(lower.at(-2), "gap:row:399");
+});
+
+test("W21-R02 what's in view stays where it is: the page is scrolled by hand by whatever the browser didn't scroll by itself", () => {
+  // A tree above what's in view grew by 7,165 px: the browser anchoring the scroll scrolled by as much (to the pixel), or anchors to the list
+  // itself (after a jump past the rows on the page, until the next scroll) and didn't.
+  assert.equal(steadyBy(7165, 7165, true, false), 0);
+  assert.equal(steadyBy(7165, 7164.6, true, false), 0);
+  assert.equal(steadyBy(7165, 0, true, false), 7165);
+  // The gaps above it drawn 1,958 px shorter near the page's foot: the browser only pulled the page back 993 px to the foot that rose.
+  assert.equal(steadyBy(-1958, -993, true, true), -965);
+  // Without anchoring: all of it, from where the page was pulled back to if it was, on top of any scroll since otherwise.
+  assert.equal(steadyBy(9734, 0, false, false), 9734);
+  assert.equal(steadyBy(-2191, -2024, false, true), -167);
+  assert.equal(steadyBy(500, 1200, false, false), 500);
+  // Scrolled since by something else, where the browser anchors: left as it is (it may have anchored for it). Nothing due: nothing.
+  assert.equal(steadyBy(324, 700, true, false), 0);
+  assert.equal(steadyBy(0, -300, false, true), 0);
 });
 
 test("W21-R02 scrolling a long list top to bottom mounts every row in its turn, never more than a window's worth", () => {
