@@ -877,7 +877,7 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use hex_api::sim::{SIM_IMAGE, SimRuntime};
-    use hex_api::{BoxId, BoxInfo, BoxSpec, Class, Destination, Grant, HostUse, Member, MemberKind, Ports, Proc, Program, Proto, Refusal as H, Runtime, Stdio, Usage};
+    use hex_api::{BoxId, BoxInfo, BoxSpec, Class, ClassSpec, Destination, Grant, HostUse, Member, MemberKind, Ports, Proc, Program, Proto, Refusal as H, Runtime, Stdio, Usage};
     use kiln_ci::place::holder::BoxName;
     use kiln_seams::Records as _;
     use kiln_seams::records::{Consistency, SimRecords};
