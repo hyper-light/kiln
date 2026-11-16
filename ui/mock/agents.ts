@@ -32,7 +32,7 @@ import type http from "node:http";
 import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
 import type { Perms } from "../src/api/wire/Perms.ts";
-import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
+import { CLAUDE_CODE, defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
 import { handleAttention } from "./attention.ts";
 import { forgetMarks } from "./push.ts";
@@ -1593,25 +1593,6 @@ function descendants(id: string, all: AgentInfo[], live: boolean): AgentInfo[] {
   return out;
 }
 
-/** A Claude Code agent's permission modes, models and efforts, as its harness lists them: every mode, its bypass ("Don't ask") among them. */
-const CLAUDE_CAN: Pick<Meta, "modes" | "models" | "efforts"> = {
-  modes: [
-    { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
-    { id: "default", label: "Ask", description: "Asks before edits and commands" },
-    { id: "acceptEdits", label: "Accept edits", description: "Edits files without asking; asks before commands" },
-    { id: "auto", label: "Auto", description: "Decides for itself what needs asking" },
-    { id: "bypassPermissions", label: "Don't ask", description: "Runs every command and edit without asking", dangerous: true },
-  ],
-  models: [
-    { id: "default", label: "Default (recommended)", description: "Opus 5.5" },
-    { id: "claude-opus-5-5", label: "claude-opus-5-5", description: "" },
-    { id: "claude-fable-5-2", label: "claude-fable-5-2", description: "" },
-    { id: "claude-sonnet-5-5", label: "claude-sonnet-5-5", description: "" },
-    { id: "claude-haiku-5-5", label: "claude-haiku-5-5", description: "" },
-  ],
-  efforts: ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })),
-};
-
 const META: Meta = {
   ...defaultMeta(),
   version: "2.3.1",
@@ -1782,7 +1763,7 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
         : m.info.kind === "claude"
           ? [...META.features, "set_model", "set_effort"]
           : META.features;
-  send({ t: "meta", meta: { ...META, ...(m.info.kind === "claude" ? CLAUDE_CAN : {}), version: m.info.kind === "claude" ? "2.3.1" : "0.46.0", features } });
+  send({ t: "meta", meta: { ...META, ...(m.info.kind === "claude" ? CLAUDE_CODE : {}), version: m.info.kind === "claude" ? "2.3.1" : "0.46.0", features } });
   send({ t: "state", state: stateOf(m) });
   send({ t: "events", events: m.events });
   const files = CHANGESETS[id];

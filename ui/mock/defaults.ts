@@ -94,3 +94,26 @@ export const defaultRunner = (): Pick<Agent, "running" | "busy" | "draining" | "
   outpost: false,
   skew: { standing: "full", behind: 0 },
 });
+
+/**
+ * A Claude Code agent's permission modes, models and efforts, as its harness lists them (every mode, its
+ * bypass, "Don't ask", among them): the mock's Claude Code sessions say these, and set each (set_mode,
+ * set_model, set_effort).
+ */
+export const CLAUDE_CODE: Pick<Meta, "modes" | "models" | "efforts"> = {
+  modes: [
+    { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
+    { id: "default", label: "Ask", description: "Asks before edits and commands" },
+    { id: "acceptEdits", label: "Accept edits", description: "Edits files without asking; asks before commands" },
+    { id: "auto", label: "Auto", description: "Decides for itself what needs asking" },
+    { id: "bypassPermissions", label: "Don't ask", description: "Runs every command and edit without asking", dangerous: true },
+  ],
+  models: [
+    { id: "default", label: "Default (recommended)", description: "Opus 5.5" },
+    { id: "claude-opus-5-5", label: "claude-opus-5-5", description: "" },
+    { id: "claude-fable-5-2", label: "claude-fable-5-2", description: "" },
+    { id: "claude-sonnet-5-5", label: "claude-sonnet-5-5", description: "" },
+    { id: "claude-haiku-5-5", label: "claude-haiku-5-5", description: "" },
+  ],
+  efforts: ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })),
+};

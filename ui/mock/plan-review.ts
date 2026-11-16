@@ -24,7 +24,7 @@ import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, GoalItem, GoalStack, HEvent, State } from "../src/api/harness.ts";
 import type { Plan, PlanItem, PlanReviewed, PlanVersion } from "../src/api/plans.ts";
 import type { Finding, Research, ResearchSource } from "../src/api/research.ts";
-import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
+import { CLAUDE_CODE, defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
 import { planSteps } from "../src/views/plans/steps.ts";
 import { onOverrides, overridesOf } from "./overrides.ts";
@@ -511,6 +511,8 @@ interface Member {
   info: AgentInfo;
   events: HEvent[];
   approval?: Approval;
+  /** Its effort, as set (a Claude Code agent's; `high` until set). */
+  effort?: string;
   stack?: { state: GoalStack["state"]; reason?: string; items: GoalItem[]; held_for?: string };
 }
 
@@ -701,6 +703,7 @@ function stateOf(m: Member): State {
     cwd: m.info.cwd,
     model: m.info.model,
     mode: m.info.mode,
+    ...(m.info.kind === "claude" ? { effort: m.effort ?? "high" } : {}),
     title: m.info.title,
     summary: m.info.summary,
     approvals: m.approval ? [m.approval] : [],
@@ -737,9 +740,16 @@ export function handleReviewSession(ws: WebSocket, id: string, params?: URLSearc
     try {
       // A command under the id its client made (SessionUp), taken at once; or one as clients from before ids send it.
       const up = JSON.parse(raw.toString()) as { t?: string; id?: string; c?: unknown };
-      const c = (up.t === "cmd" ? up.c : up) as { type?: string; id?: string; decision?: string; message?: string | null };
+      const c = (up.t === "cmd" ? up.c : up) as { type?: string; id?: string; decision?: string; message?: string | null; mode?: string; model?: string; effort?: string };
       if (up.t === "cmd" && up.id) ws.send(JSON.stringify({ t: "ack", id: up.id, outcome: "taken" }));
       if (c.type === "approve") answerProposal(m, c);
+      // A Claude Code agent's permissions, model and effort, set from its line or its sandbox's harness rows: as set, said back.
+      if (m.info.kind === "claude" && (c.type === "set_mode" || c.type === "set_model" || c.type === "set_effort")) {
+        if (c.type === "set_mode" && c.mode) m.info.mode = c.mode;
+        if (c.type === "set_model" && c.model) m.info.model = c.model;
+        if (c.type === "set_effort" && c.effort) m.effort = c.effort;
+        tell(m);
+      }
     } catch {
       // Not a command.
     }
@@ -748,7 +758,20 @@ export function handleReviewSession(ws: WebSocket, id: string, params?: URLSearc
   send({ t: "open", info: m.info });
   const bounded = mockHistory(id, () => m.events.map((e, i) => ({ ...e, seq: i + 1 })), stateOf(m), params);
   if (bounded.frame) send(bounded.frame);
-  send({ t: "meta", meta: { ...defaultMeta(), kind: m.info.kind, version: "2.3.1", features: ["attachments"], models: [], modes: [] } });
+  // A Claude Code agent says its permission modes, models and efforts and sets each, as its harness does; Devin, none.
+  const claude = m.info.kind === "claude";
+  send({
+    t: "meta",
+    meta: {
+      ...defaultMeta(),
+      kind: m.info.kind,
+      version: "2.3.1",
+      features: claude ? ["attachments", "set_mode", "set_model", "set_effort"] : ["attachments"],
+      models: [],
+      modes: [],
+      ...(claude ? CLAUDE_CODE : {}),
+    },
+  });
   send({ t: "state", state: stateOf(m) });
   send({ t: "events", events: bounded.events });
   if (process.env.MOCK_NO_SYNCED !== "1") send({ t: "synced" });
