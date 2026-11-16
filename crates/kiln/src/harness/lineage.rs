@@ -1415,7 +1415,7 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
 /// of its target (`crate::ci::experiments`), as before definitions had experiments.
 enum Drawn {
     Experiment(crate::agentdefs::experiments::Draw),
-    Split(crate::ci::experiments::Draw),
+    Split(Box<crate::ci::experiments::Draw>),
 }
 
 impl Drawn {
@@ -1427,7 +1427,7 @@ impl Drawn {
             return Some(Drawn::Experiment(drawn));
         }
         let starting = crate::ci::experiments::Starting { agentdef: ask.definition.as_ref().map(|d| d.id.as_str()), harness: ask.kind.trim(), agentfile, person };
-        crate::ci::experiments::assign(hub, &starting).await.map(Drawn::Split)
+        crate::ci::experiments::assign(hub, &starting).await.map(|d| Drawn::Split(Box::new(d)))
     }
 
     /// `ask` as its variant starts it.
