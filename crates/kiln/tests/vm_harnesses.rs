@@ -16,8 +16,8 @@
 //!   words, until the runner says it starts microVMs (kiln plan steps 16 and 17); `VM_E2E=1` makes
 //!   that a failure. ROOT runs it on each host OS: `tests/vm_e2e/README.md`.
 //! - `step35` (`vm_e2e/step35.rs`, `vm_e2e/mcp.rs`): every harness of steps 19 to 28 on the same drive,
-//!   through kiln's REST API and its MCP tools, from kiln's Agentfile and from a person's own, each gap
-//!   in `vm_e2e/gaps.json` with its cited reason (kiln plan step 35).
+//!   through kiln's REST API, its MCP tools and code mode, from kiln's Agentfile and from a person's
+//!   own, each gap in `vm_e2e/gaps.json` with its cited reason (kiln plan step 35).
 //! - `narrowed` (`vm_e2e/narrowed.rs`): a Goose session of kiln's own Agentfile in a microVM, the
 //!   stand-in in Goose's place, reaching past it only its person's provider's hosts, and saying so; one
 //!   whose home can't be read keeps every destination, saying why (kiln plan step 17 part 6).
@@ -56,8 +56,8 @@ mod checks {
         // Either end on ChaCha20-Poly1305 or AES-128-GCM fails, by its end (accepting any TLS 1.3
         // suite, or checking one end, passes these).
         for bad in ["TLS13_CHACHA20_POLY1305_SHA256", "TLS13_AES_128_GCM_SHA256"] {
-            assert!(check_link(&link("kiln-hex", Some(bad), Some(REQUIRED_SUITE))).is_err_and(|e| e.contains("client end") && e.contains(bad)));
-            assert!(check_link(&link("kiln-hex", Some(REQUIRED_SUITE), Some(bad))).is_err_and(|e| e.contains("server end") && e.contains(bad)));
+            assert!(check_link(&link("server-runner", Some(bad), Some(REQUIRED_SUITE))).is_err_and(|e| e.contains("client end") && e.contains(bad)));
+            assert!(check_link(&link("server-runner", Some(REQUIRED_SUITE), Some(bad))).is_err_and(|e| e.contains("server end") && e.contains(bad)));
         }
         // An end that said nothing fails.
         assert!(check_link(&link("mcp", Some(REQUIRED_SUITE), None)).is_err());
@@ -83,6 +83,15 @@ mod checks {
             let read: Vec<LinkSuites> = every_link(REQUIRED_SUITE).into_iter().filter(|l| l.name != left_out).collect();
             assert!(check_all_links(&read).is_err_and(|e| e.contains(left_out)), "{left_out} left out");
         }
+    }
+
+    #[test]
+    fn s35_a_run_reads_the_links_the_built_system_has_and_no_kiln_hex() {
+        // kiln's runner holds Hex's image runtime in its own process (`REQUIRED_LINKS`' note): the server-runner
+        // and agent-control links and kiln's MCP lane's are all a session rides, and they pass (requiring a
+        // kiln-hex link again fails this).
+        let built = ["server-runner", "agent-control", "mcp"].map(|n| link(n, Some(REQUIRED_SUITE), Some(REQUIRED_SUITE)));
+        assert_eq!(check_all_links(&built), Ok(()));
     }
 
     #[test]
@@ -404,6 +413,17 @@ mod checks {
         assert!(mcp_round_trip(&[call("done")], &[]).is_ok());
         assert!(mcp_round_trip(&[call("error")], &[]).is_err());
         assert!(mcp_round_trip(&[json!({"kind": "tool", "name": "mcp__github__search", "server": "github", "status": "done"})], &[]).is_err());
+    }
+
+    #[test]
+    fn s35_the_stand_in_was_answered_as_its_own_agent() {
+        // The stand-in's MCP_AS line, the agent kiln's answer to its initialize named: its own passes; another's,
+        // or none, fails, saying which (accepting any MCP_AS, or none, passes a red below).
+        let (me, other) = ("01a1d5280f617648b8b9dbc21c09f73c", "01a1d5280f617648b8b9dbc21c09f73d");
+        let ok = "MCP_OK 11 code_run".to_owned();
+        assert_eq!(check_named_itself(&[ok.clone(), format!("MCP_AS {me}")], me), Ok(()));
+        assert!(check_named_itself(&[ok.clone(), format!("MCP_AS {other}")], me).is_err_and(|e| e.contains(other)));
+        assert!(check_named_itself(&[ok], me).is_err_and(|e| e.contains("no MCP_AS")));
     }
 
     /// A run's one pulled store seeds each runner's Shards home (`VM_E2E_SHARDS_STORE`): its blobs and references
@@ -1024,8 +1044,9 @@ mod stub {
 
     /// A one-request-a-connection HTTP MCP server on loopback, as kiln's `/api/mcp` answers the calls
     /// the stand-in makes (initialize, its notice, tools/list): each request's Authorization header
-    /// goes to `seen`.
-    fn mcp_server(seen: mpsc::Sender<String>) -> anyhow::Result<u16> {
+    /// goes to `seen`; its answer to initialize names agent `serves` as kiln's does (`mcp::you_are`), where
+    /// it's given.
+    fn mcp_server(seen: mpsc::Sender<String>, serves: Option<&'static str>) -> anyhow::Result<u16> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         std::thread::spawn(move || {
@@ -1051,7 +1072,13 @@ mod stub {
                 let msg: Value = serde_json::from_slice(&body).unwrap_or_default();
                 let id = msg.get("id").cloned().unwrap_or_default();
                 let reply = match msg.get("method").and_then(Value::as_str) {
-                    Some("initialize") => json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "kiln"}}}).to_string(),
+                    Some("initialize") => {
+                        let mut result = json!({"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "kiln"}});
+                        if let (Some(o), Some(agent)) = (result.as_object_mut(), serves) {
+                            o.insert("instructions".into(), json!(kiln::mcp::you_are(agent)));
+                        }
+                        json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
+                    }
                     Some("tools/list") => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "runners"}]}}).to_string(),
                     _ => String::new(),
                 };
@@ -1066,7 +1093,7 @@ mod stub {
     #[test]
     fn s34_claude_code_and_codex_reach_kilns_mcp_over_http_in_step_18s_forms() -> anyhow::Result<()> {
         let (tx, seen) = mpsc::channel();
-        let url = format!("http://127.0.0.1:{}/api/mcp", mcp_server(tx)?);
+        let url = format!("http://127.0.0.1:{}/api/mcp", mcp_server(tx, None)?);
         // Claude Code: `--mcp-config` JSON, an `http` server with its token in its headers.
         let config = json!({"mcpServers": {"kiln": {"type": "http", "url": url, "headers": {"Authorization": "Bearer claude-token"}}}}).to_string();
         let mut s = start("claude", &["--mcp-config", &config], &[], None)?;
@@ -1082,6 +1109,25 @@ mod stub {
         assert!(said(&done, "/params/item/text").iter().any(|t| t == "MCP_OK 1 runners"), "{done:?}");
         let tokens: Vec<String> = seen.try_iter().collect();
         assert!(tokens.iter().any(|t| t == "Bearer claude-token") && tokens.iter().any(|t| t == "Bearer codex-token"), "{tokens:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn s35_the_stand_in_says_whom_kilns_mcp_answered_it_as() -> anyhow::Result<()> {
+        // kiln's answer to initialize names the agent it serves: the stand-in says it after its round trip, and
+        // says nothing of it where the answer names none (reading another field, or always saying one, fails a
+        // red below).
+        let me = "01a1d5280f617648b8b9dbc21c09f73c";
+        for (serves, want) in [(Some(me), Some(format!("MCP_AS {me}"))), (None, None)] {
+            let (tx, _seen) = mpsc::channel();
+            let url = format!("http://127.0.0.1:{}/api/mcp", mcp_server(tx, serves)?);
+            let config = json!({"mcpServers": {"kiln": {"type": "http", "url": url}}}).to_string();
+            let mut s = start("claude", &["--mcp-config", &config], &[], None)?;
+            s.send(&json!({"type": "user", "uuid": "m1", "message": {"role": "user", "content": "MCP_PING do the task"}}))?;
+            let text = said(&s.until(|v| at(v, "/state") == "completed")?, "/message/content/0/text");
+            assert!(text.iter().any(|t| t == "MCP_OK 1 runners"), "{text:?}");
+            assert_eq!(text.iter().find(|t| t.starts_with("MCP_AS ")), want.as_ref(), "{text:?}");
+        }
         Ok(())
     }
 

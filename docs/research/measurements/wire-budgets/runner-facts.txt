@@ -1,0 +1,31 @@
+# docs/research/measurements/wire-budgets/runner-facts.py on kiln fc6e47db5, 2026-11-16, macOS 26.4.1 arm64, brotli 1.2.0, Python 3.9.6
+
+Linux x86_64 with KVM and no GPU (fedora.attlocal.net)
+  two runners                                         raw   br 4  added  gzip 5
+  as at a64856c89                                    5217   1362           1365
+  + e89613f45, c0292187e W13-R01 GPUs through Hex    5913   1556   +194    1550
+  + e4064c9a5 step 32 virt.microvm                   5945   1568    +12    1558
+  + f6cb63610 step 17 isolation                      6367   1684   +116    1678
+  + 0909253c8 step 34 link                           6685   1748    +64    1751
+  + 72d28bc0b P2.3 isolation.engine                  6717   1753     +5    1760
+  all of them                                       +1500   +391           +395
+
+Linux x86_64 with KVM and an NVIDIA GPU (adacachy)
+  two runners                                         raw   br 4  added  gzip 5
+  as at a64856c89                                    4745   1321           1334
+  + e89613f45, c0292187e W13-R01 GPUs through Hex    4875   1357    +36    1366
+  + e4064c9a5 step 32 virt.microvm                   4907   1369    +12    1375
+  + f6cb63610 step 17 isolation                      5329   1493   +124    1488
+  + 0909253c8 step 34 link                           5647   1557    +64    1560
+  + 72d28bc0b P2.3 isolation.engine                  5679   1565     +8    1566
+  all of them                                        +934   +244           +232
+
+macOS arm64 with an Apple GPU (adas-macbook-pro-2.local)
+  two runners                                         raw   br 4  added  gzip 5
+  as at a64856c89                                    4035   1140           1139
+  + e89613f45, c0292187e W13-R01 GPUs through Hex    4175   1172    +32    1175
+  + e4064c9a5 step 32 virt.microvm                   4207   1176     +4    1180
+  + f6cb63610 step 17 isolation                      4627   1294   +118    1295
+  + 0909253c8 step 34 link                           4945   1364    +70    1366
+  + 72d28bc0b P2.3 isolation.engine                  4977   1373     +9    1374
+  all of them                                        +942   +233           +235
