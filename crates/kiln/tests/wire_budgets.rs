@@ -797,9 +797,13 @@ const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
 /// P2.3's `isolation.engine` (72d28bc0b, kiln plan 01a1dd2e…); main came to 2,046 at 709e4ebce
 /// (2026-11-16). They add to two runners' records, brotli 4 as the server sends them, 233 B with an
 /// Apple GPU, 244 B with an NVIDIA one and 391 B with neither, where `gpu_unavailable` says why for each
-/// vendor (docs/research/measurements/wire-budgets/runner-facts.py). So 1,761 and the most they add
-/// (391), times one plus the runs' spread (1.0%) plus 7%: 2,325.
-const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_325), ("overview", 1_260)];
+/// vendor (docs/research/measurements/wire-budgets/runner-facts.py, its output runner-facts.txt beside it).
+/// So the runners' budget is what was measured, with no margin chosen beside it (unlike the rule above):
+/// the most of the five runs (1,761), what a run's noise moved them (their range, 1,761 - 1,744 = 17) and
+/// the most the facts add on any host measured (391): 2,169. For normal noise the range of five runs
+/// averages 2.33 σ (d2, the control-chart constant) and their most lies 1.16 σ above their mean, so the
+/// bound sits about 3.5 σ above it: a run's noise passes, and a body grown past it fails.
+const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_169), ("overview", 1_260)];
 
 /// A key of Ship's that the simulated tab keeps loaded: what it GETs, how often it polls
 /// (`ui/src/views/ship/index.tsx`, `jobs.tsx`), what it last loaded, and what its loads came to.
