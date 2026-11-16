@@ -254,6 +254,12 @@ export function AgentHeader({
           </>
         )}
         {info && <span title={cwd}>{machineShown(info.target)}</span>}
+        {info?.isolation?.kind === "microvm" && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span title={info.isolation.image ? `Isolated, in a Shards microVM of its own (${info.isolation.image})` : "Isolated, in a Shards microVM of its own"}>in a microVM</span>
+          </>
+        )}
       </p>
       {/* The name and the buttons on one row, centred on each other. */}
       <div className="ag-top">

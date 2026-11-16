@@ -17,6 +17,8 @@
 //! - [`hexvm`]: the machine's microVMs through Hex: each launch a Shards image box, its harness member driven.
 //! - [`held`]: a boundary's run as the `Duplex` a session drives its harness through, so a session's
 //!   loop and its adapter treat a microVM's member as they treat a process of the machine's.
+//! - [`pools`]: the warm pools kiln names on the machine's microVMs from its agents' starts, and lets
+//!   go of after their keep window (kiln plan 01a1dd2e…, P3.2), and each runner's as the server shows them.
 //! - [`replay`]: a recorded session's tool calls run in a microVM of a split's variant, and what it measured
 //!   (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b).
 
@@ -28,6 +30,7 @@ pub mod host;
 pub mod image;
 pub mod isolated;
 pub mod narrow;
+pub mod pools;
 pub mod replay;
 
 use std::sync::Arc;
@@ -50,6 +53,11 @@ pub struct Microvms {
     shards: Option<crate::shards::Held>,
     /// kiln's MCP lane of the runs launched here (Shards D254): Hex's, where they are Hex's; a stand-in's.
     lanes: Option<Arc<dyn Lanes>>,
+    /// kiln's state they're held beneath ([`held_in`]), which no isolated agent's project is, holds or lies in
+    /// (`isolated::kept_out`); none for a stand-in's.
+    state: Option<std::path::PathBuf>,
+    /// The warm pools kiln names on them, from the starts launched here (kiln plan 01a1dd2e…, P3.2).
+    pub pools: Arc<pools::Pools>,
 }
 
 /// One connection a run's harness made to its MCP bridge in its microVM (Shards D254, `Execs::mcp`'s
@@ -76,7 +84,13 @@ pub const NO_LANES: &str = "kiln's MCP in a microVM: these microVMs carry no MCP
 impl Microvms {
     /// Runs in `sandbox`, booting `images`: a stand-in's, launched as the seam launches.
     pub fn new(sandbox: Arc<dyn Sandbox>, images: image::Images) -> Self {
-        Self { sandbox, images, hex: None, shards: None, lanes: None }
+        let pools = pools::Pools::new(Arc::clone(&sandbox), crate::rt::clock());
+        Self { sandbox, images, hex: None, shards: None, lanes: None, state: None, pools }
+    }
+
+    /// kiln's state they're held beneath, where [`held_in`] held them.
+    pub fn state(&self) -> Option<&std::path::Path> {
+        self.state.as_deref()
     }
 
     /// Their runs' MCP connections taken through `lanes` from now on (a stand-in's).
@@ -124,7 +138,8 @@ impl std::fmt::Debug for Leasing {
 /// kiln's state ([`shards_home`], `<state>/shards-cache`), its images built there (in `<state>/shards-builds`), each
 /// launch's box named by placement's numbering ([`box_name`]), each run's charge kept in `ledger` ([`of_hex`]), and
 /// its VMs' credentials leased through `leasing` where it is given (plan step 33; else a launch granting one is
-/// refused). Nothing boots until a launch. Blocking.
+/// refused). They keep `state` as kiln's, which no isolated agent's project is, holds or lies in
+/// ([`Microvms::state`]). Nothing boots until a launch. Blocking.
 pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Option<Arc<dyn kiln_seams::Records>>, leasing: Option<Leasing>) -> anyhow::Result<Microvms> {
     let state = std::path::absolute(state)?;
     let paths = shards_api::RuntimePaths::new(state.join("shards-cache"), shards_home(&state)).map_err(|r| anyhow::anyhow!("Shards' home and cache beneath {}: {r:?}", state.display()))?;
@@ -137,7 +152,7 @@ pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Opti
     .map_err(|r| anyhow::anyhow!("Hex's image runtime under {}: {r}", state.display()))?;
     let images = image::Images::new(shards, shards_home(&state), state.join("shards-builds"));
     let hex = hexvm::HexVms::new(runtime, box_name);
-    Ok(of_hex(if leases { hex.leasing() } else { hex }, images, ledger))
+    Ok(Microvms { state: Some(state), ..of_hex(if leases { hex.leasing() } else { hex }, images, ledger) })
 }
 
 /// The machine's microVMs as `hex` holds them, booting `images`: each run's charge kept in `ledger` as it ends (the
@@ -147,7 +162,9 @@ pub fn of_hex(hex: hexvm::HexVms, images: image::Images, ledger: Option<Arc<dyn 
         Some(ledger) => hex.with_ledger(ledger),
         None => hex,
     });
-    Microvms { sandbox: Arc::clone(&hex) as Arc<dyn Sandbox>, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None }
+    let sandbox = Arc::clone(&hex) as Arc<dyn Sandbox>;
+    let pools = pools::Pools::new(Arc::clone(&sandbox), crate::rt::clock());
+    Microvms { sandbox, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None, state: None, pools }
 }
 
 /// The group placement reads run `run`'s use from, launched in `vms`: its VM's meter, where Hex holds it
@@ -210,23 +227,53 @@ pub const NO_MICROVM: &str = "this machine's kiln carries no microVM runtime yet
 /// (`RunnerFacts::isolation`; `virt.microvm` is its `available`).
 pub type Facts = kiln_ci::facts::Isolation;
 
-/// This machine's isolation facts: whether it holds isolated agents, on what, and why not.
+/// This machine's isolation facts: whether it holds isolated agents, on what, and why not. Blocking: where it holds
+/// them with the carried Shards, Shards is asked ([`facts_of`]).
 pub fn facts(kvm: bool) -> Facts {
     facts_of(kvm, microvm().as_deref())
 }
 
-/// The isolation facts of a machine holding isolated agents in `held`, or in none.
+/// The isolation facts of a machine holding isolated agents in `held`, or in none. Held with the carried Shards
+/// ([`hold`]), they're what Shards' own check of this host says now (`shards_api::host_check`, Shards' D262: the check
+/// its VM process makes before it boots, made without booting one, by one launch of the carried `shards`), so a runner
+/// whose hypervisor can't run microVMs says so in Shards' words, and its engine is `host` (kiln plan 01a1dd2e…, P2.3).
+/// A stand-in's ([`Microvms::new`], [`held_in`] alone) carries no `shards` to ask. Blocking.
 pub fn facts_of(kvm: bool, held: Option<&Microvms>) -> Facts {
     let hypervisor = hypervisor(kvm);
-    match held {
-        Some(_) => Facts { available: true, hypervisor, why_not: None, engine: None },
+    match held.map(|vms| vms.shards.as_ref()) {
+        Some(Some(carried)) => checked(hypervisor, shards_api::host_check(Some(carried.shards.as_path()))),
+        Some(None) => Facts { available: true, hypervisor, why_not: None, engine: None },
         None => Facts { available: false, hypervisor, why_not: Some(NO_MICROVM.to_owned()), engine: None },
     }
 }
 
+/// Why a machine holds no isolated agent where its Shards couldn't say whether this host runs microVMs, before what
+/// Shards said.
+pub const UNCHECKED: &str = "this machine's Shards couldn't say whether it runs microVMs";
+
+/// The isolation facts of a machine whose Shards answered `answer` to whether this host runs microVMs now: available
+/// where it does, its backend the hypervisor; else not, and why in Shards' words, `hypervisor` the one the runner's
+/// probe found.
+fn checked(hypervisor: Option<String>, answer: Result<shards_api::HostCheck, shards_api::CheckRefusal>) -> Facts {
+    match answer {
+        Ok(shards_api::HostCheck::Usable(backend)) => Facts { available: true, hypervisor: Some(hypervisor_of(backend).to_owned()), why_not: None, engine: None },
+        Ok(shards_api::HostCheck::Unusable { why, .. }) => Facts { available: false, hypervisor, why_not: Some(why.to_string()), engine: None },
+        Err(e) => Facts { available: false, hypervisor, why_not: Some(format!("{UNCHECKED}: {e}")), engine: None },
+    }
+}
+
+/// A Shards backend as the facts name its hypervisor (`RunnerFacts::isolation`'s `hypervisor`).
+fn hypervisor_of(backend: shards_api::Backend) -> &'static str {
+    match backend {
+        shards_api::Backend::Kvm => "KVM",
+        shards_api::Backend::HypervisorFramework => "Hypervisor.framework",
+        shards_api::Backend::WindowsHypervisorPlatform => "WHP",
+    }
+}
+
 /// The hypervisor a microVM here would run on, where the runner can use one: KVM on Linux (its
-/// `/dev/kvm`, as the runner's probe found it). macOS's and Windows' are what the microVMs'
-/// runtime reports once it's carried (Shards' backend: Hypervisor.framework, WHP).
+/// `/dev/kvm`, as the runner's probe found it); where the carried Shards says this host runs
+/// microVMs, its backend ([`checked`]).
 fn hypervisor(kvm: bool) -> Option<String> {
     (cfg!(target_os = "linux") && kvm).then(|| "KVM".to_owned())
 }
@@ -377,6 +424,31 @@ mod tests {
         assert_eq!(super::facts(false).hypervisor, None);
     }
 
+    /// Kiln plan 01a1dd2e…, P2.3 AC2: a machine holding microVMs with the carried Shards says what Shards' own check of
+    /// its host says (`shards_api::host_check`): available where it runs them, its backend the hypervisor; else not,
+    /// in Shards' words (`/dev/kvm` named where it's missing or this user can't open it, an Intel Mac's platform
+    /// named), and its engine is `host` with that why; not available either where Shards couldn't say, with its words.
+    #[test]
+    fn p2_3_a_runner_says_what_shards_check_of_its_host_says() {
+        use crate::harness::engine::{Asked, capable, held};
+        use kiln_ci::facts::{Engine, RunnerFacts};
+        use shards_api::{Backend, CheckRefusal, HostCheck, Unusable};
+        let usable = super::checked(None, Ok(HostCheck::Usable(Backend::HypervisorFramework)));
+        assert_eq!((usable.available, usable.hypervisor.as_deref(), usable.why_not.as_deref()), (true, Some("Hypervisor.framework"), None));
+        for (why, says) in [(Unusable::KvmDenied, "cannot open /dev/kvm: permission denied"), (Unusable::KvmMissing, "/dev/kvm does not exist")] {
+            let f = super::checked(None, Ok(HostCheck::Unusable { backend: Some(Backend::Kvm), why }));
+            assert!(!f.available && f.hypervisor.is_none() && f.why_not.as_deref().is_some_and(|w| w.contains(says)), "{f:?}");
+            let runner = RunnerFacts { isolation: Some(f.clone()), ..RunnerFacts::default() };
+            let h = held(Asked::default(), &capable(&runner));
+            assert_eq!((h.engine, h.why.as_deref()), (Engine::Host, f.why_not.as_deref()));
+        }
+        let intel = super::checked(None, Ok(HostCheck::Unusable { backend: None, why: Unusable::Unsupported { os: "macos".into(), arch: "x86_64".into() } }));
+        assert!(!intel.available && intel.why_not.as_deref().is_some_and(|w| w.contains("macos/x86_64")), "{intel:?}");
+        let unasked = super::checked(Some("KVM".into()), Err(CheckRefusal::Ended { status: Some(3), said: "shards: no such command: api-check".into() }));
+        assert!(!unasked.available && unasked.hypervisor.as_deref() == Some("KVM"), "{unasked:?}");
+        assert!(unasked.why_not.as_deref().is_some_and(|w| w.starts_with(super::UNCHECKED) && w.contains("no such command")), "{unasked:?}");
+    }
+
     /// #75 step 3 (Shards D254): a machine's microVMs say whether their runs carry kiln's MCP lane, typed: those held
     /// with none say so; Hex's carry it; a lane that carries it is theirs.
     #[test]
@@ -395,12 +467,14 @@ mod tests {
 
     /// #73 part 7 slice 2 (step 17): a runner whose kiln carries Shards holds its isolated agents' harnesses in Hex's
     /// microVMs, the sandbox `HexVms` over Hex's image runtime (its records, Shards' home and cache beneath kiln's
-    /// state), and its facts say it holds them (`virt.microvm` is their `available`). No VM boots.
+    /// state), and its facts say it holds them (`virt.microvm` is their `available`). They keep kiln's state, which no
+    /// isolated agent's project is, holds or lies in (CP-T4.1's AC-T4.1.5). No VM boots.
     #[test]
     fn s17_p7_a_carrying_runner_holds_harnesses_in_hex_and_says_so() -> anyhow::Result<()> {
         let state = tempfile::tempdir()?;
         let vms = super::held_in(state.path(), state.path().join("shards"), None, None)?;
         anyhow::ensure!(vms.hex.is_some(), "its sandbox isn't Hex's");
+        anyhow::ensure!(vms.state() == Some(state.path()), "kiln's state isn't kept: {:?}", vms.state());
         anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == super::hexvm::HOLDS, "its sandbox isn't HexVms");
         anyhow::ensure!(state.path().join("hex-records").join("state").exists(), "Hex keeps no records beneath kiln's state");
         let facts = super::facts_of(true, Some(&vms));

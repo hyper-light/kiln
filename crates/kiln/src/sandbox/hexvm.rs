@@ -40,7 +40,8 @@
 //!   ([`NO_BROKER`]).
 //! - **What it refuses, typed:** egress to whatever its image grants (`Egress::Any`): Hex's grants are default
 //!   deny, so a run names its destinations; limits it doesn't hold ([`HOLDS`]), and credentials where no broker
-//!   leases them ([`NO_BROKER`]); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
+//!   leases them ([`NO_BROKER`]); a warm pool kept for its launches, until Hex's image class takes Shards' pools
+//!   ([`NO_POOLS`]; kiln plan 01a1dd2e…, P3.1); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
 //! - **Its MCP lane** (Shards D254; #75 step 3): its harness member is asked for its MCP bridge (`/run/shards/mcp`,
 //!   `ImageMember::mcp`), and each connection its harness makes to it is taken through Hex (`Runtime::mcp`, over its
 //!   run's agent-control endpoint) as `super::Lanes`' next, for the runner to serve kiln's MCP over in its own
@@ -62,14 +63,14 @@ use kiln_ci::place::holder::BoxName;
 use kiln_seams::Records;
 use kiln_seams::records::{Tx, Write};
 use serde::{Deserialize, Serialize};
-use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Refusal, Run, Sandbox, Signal};
+use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Pool, Refusal, Run, Sandbox, Signal};
 
 /// What a box of Hex's holds its run to: no egress, egress to named destinations (each by TCP, to its harness
 /// member), folders shared at any path, read-only or not (`ShardsImage::shares`), and signals to its harness member
 /// (`Runtime::signal_member`, Shards' agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or
 /// refused fork of an image VM's guest: its `usage_of`), or weights. Credentials it holds where its runtime leases
 /// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
 pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (its server's broker didn't open, or this runner has no link to its server to ask it over), and a run granted one is never run without it (Shards' D242)";
@@ -463,7 +464,22 @@ impl Sandbox for HexVms {
     fn holds(&self) -> Holds {
         Holds { credentials: self.leases, ..HOLDS }
     }
+
+    // None yet (`HOLDS.pools`): the Hex kiln vendors boots each box on Shards' `ImageShards`, not its `ImagePools`
+    // (kiln plan 01a1dd2e…, P3.1).
+    fn keep(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        drop(pool);
+        Box::pin(async { Err(Refusal::Unsupported(NO_POOLS.to_owned())) })
+    }
+
+    fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+        drop(pool);
+        Box::pin(async { Err(Refusal::Unsupported(NO_POOLS.to_owned())) })
+    }
 }
+
+/// Why a box's image keeps no warm pool here yet.
+pub const NO_POOLS: &str = "a warm pool kept for its launches: the Hex kiln vendors keeps none yet, its image class booting each box on Shards' ImageShards rather than its ImagePools (kiln plan 01a1dd2e…, P3.1)";
 
 /// `granted`'s credentials as Hex grants them to `member`: by reference alone, toward each host lowercased as its
 /// egress grants name it ([`grants_of`]; RFC 4343), each once. Hex checks them against its grants as the box is made.
@@ -970,6 +986,22 @@ pub(crate) mod tests {
                 crate::rt::sleep(std::time::Duration::from_millis(10)).await;
             }
             assert_eq!(sim.list()?, [], "a run let go of takes its box with it");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1dd2e…, P3.2: until Hex's image class takes Shards' pools (P3.1), Hex's mapping keeps none: a keep
+    /// and a let-go are refused, typed, and it lists none.
+    #[test]
+    fn p3_2_hexs_mapping_refuses_a_warm_pool_typed_until_p3_1() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (_, vms) = vms();
+            let pool = kiln_seams::sandbox::Pool { image: SIM_IMAGE.to_owned(), size: None };
+            assert!(!vms.holds().pools, "it says it keeps pools");
+            let refused = Err(Refusal::Unsupported(super::NO_POOLS.to_owned()));
+            assert_eq!(vms.keep(pool.clone()).await, refused);
+            assert_eq!(vms.let_go(pool).await, refused);
+            assert!(vms.pools().is_empty(), "it lists pools");
             anyhow::Ok(())
         })
     }

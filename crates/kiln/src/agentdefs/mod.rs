@@ -18,6 +18,7 @@ pub mod ops;
 pub mod sessions;
 pub mod sync;
 pub mod uses;
+pub mod volumes;
 
 use rusqlite::{OptionalExtension as _, params};
 use schemars::JsonSchema;
@@ -83,6 +84,9 @@ pub struct Settings {
     /// (`agentfile:<id>`) or kiln's for its harness (`harness-<harness>`); none: its harness's own.
     #[serde(default)]
     pub agentfile: Option<String>,
+    /// What it keeps from one of its sessions to the next on each machine ([`volumes`], P6.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<volumes::Volume>,
 }
 
 /// An agent definition, as kept.
@@ -190,8 +194,9 @@ pub fn name_problem(name: &str) -> Option<String> {
 /// Why `s`, `owner`'s, isn't an agent kiln runs: every reason, none when it is. It names one of
 /// kiln's harnesses; its Agentfile is one its owner reaches, for that harness; its model is one kiln's
 /// machines list for that harness, where they list any (what its sessions said they offer); its MCP
-/// servers each have a name of their own and one way in; its tools and skills are named; and a limit
-/// it sets lets it do something.
+/// servers each have a name of their own and one way in; its tools and skills are named; a limit
+/// it sets lets it do something; and its volumes each have a name of their own and a bound
+/// ([`volumes::problems`]).
 pub async fn check(hub: &Hub, owner: &str, s: &Settings) -> R<Vec<String>> {
     let mut why = Vec::new();
     let Some(kind) = Kind::get(s.harness.trim()) else {
@@ -242,6 +247,7 @@ pub async fn check(hub: &Hub, owner: &str, s: &Settings) -> R<Vec<String>> {
             why.push(format!("a limit of 0 {limit} lets it do nothing: leave it out for none"));
         }
     }
+    why.extend(volumes::problems(&s.volumes));
     Ok(why)
 }
 
@@ -428,6 +434,7 @@ pub struct Patch {
     pub limits: Option<Limits>,
     /// `Some(None)`: back to its harness's own.
     pub agentfile: Option<Option<String>>,
+    pub volumes: Option<Vec<volumes::Volume>>,
 }
 
 impl Patch {
@@ -455,6 +462,9 @@ impl Patch {
         }
         if let Some(v) = self.agentfile {
             s.agentfile = v;
+        }
+        if let Some(v) = self.volumes {
+            s.volumes = v;
         }
         s
     }
@@ -544,6 +554,7 @@ pub async fn restore(hub: &Hub, who: &Who, id: &str, version: i64, by: &str) -> 
         skills: Some(s.skills),
         limits: Some(s.limits),
         agentfile: Some(s.agentfile),
+        volumes: Some(s.volumes),
         name: None,
     };
     sync::update(hub, who, id, patch, None, by).await

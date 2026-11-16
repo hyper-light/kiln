@@ -691,6 +691,8 @@ pub static ROUTES: &[Rule] = &[
     // How it runs new agent sessions (kiln plan 01a1dd2e…, P2.3): read with the runner, set by those
     // who manage it (`/api/runners/*/**`).
     r("GET", "/api/runners/*/engine", "runners.read", At::Runner(2)),
+    // The warm pools kiln names on it (kiln plan 01a1dd2e…, P3.2): read with the runner.
+    r("GET", "/api/runners/*/pools", "runners.read", At::Runner(2)),
     r("GET", "/api/headroom", "runners.read", At::Server),
     r("GET", "/api/runners/*/headroom", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),
