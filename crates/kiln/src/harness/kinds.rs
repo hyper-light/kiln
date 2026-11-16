@@ -88,6 +88,27 @@ impl Kind {
         self.protocol != Protocol::Terminal
     }
 
+    /// It says what its sessions cost, in US dollars, so an agent definition's cost limit can be held to it
+    /// (`crate::agentdefs::check`): Claude Code at each turn's end (its result's `total_cost_usd`, `super::claude`) and Pi
+    /// with each reply (its usage's `cost.total`, `super::pi`). Codex and Antigravity say tokens alone (kiln reads no cost
+    /// of theirs), and an ACP agent's cost is its own to give or leave out (`usage_update`'s optional `cost`, read where
+    /// it's in USD: `super::acp`), which none of kiln's ACP harnesses is known to give.
+    pub fn says_cost(&self) -> bool {
+        matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::PiRpc)
+    }
+
+    /// It says how many tokens its sessions use, in and out, so an agent definition's token limit can be held to it
+    /// (`crate::agentdefs::check`): Claude Code at each turn's end (its result's `modelUsage`, `super::claude`), Codex as
+    /// it goes (`thread/tokenUsage/updated`, `super::codex`), Antigravity with each response (its step's `usage`,
+    /// `super::antigravity`) and Pi with each reply (its `usage`, `super::pi`). An ACP agent's tokens are its own to give
+    /// or leave out, turn by turn: `PromptResponse.usage` is in no stable schema, its RFD a draft that hasn't settled
+    /// whether it counts the turn or the session, and no capability says an agent gives it
+    /// (agentclientprotocol/agent-client-protocol 4aab69b4e, `docs/rfds/end-turn-token-usage.mdx`); Gemini CLI, for
+    /// one, leaves it out of a cancelled turn. So none of kiln's ACP agents is held to a token limit.
+    pub fn says_tokens(&self) -> bool {
+        matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer | Protocol::AgyStreamJson | Protocol::PiRpc)
+    }
+
     pub fn adapter(&self, spec: &Spec) -> Adapter {
         match self.protocol {
             Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)).with_speed(spec.speed.clone()))),

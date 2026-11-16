@@ -1080,7 +1080,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             boxed(|| crate::harness::limit::put(&hub, &name, req)).await.map_err(|(c, m)| err(c, m))
         }
         // The warm pools kiln names on a runner (`crate::sandbox::pools`; kiln plan 01a1dd2e…, P3.2).
-        (&Method::GET, ["api", "runners", name, "pools"]) => boxed(|| crate::sandbox::pools::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "runners", name, "pools"]) => boxed(|| crate::sandbox::pools::get(&hub, &caller, name)).await.map_err(|(c, m)| err(c, m)),
         // How a runner runs new agent sessions, its engine (`crate::harness::engine`; kiln plan 01a1dd2e…, P2.3).
         (&Method::GET, ["api", "runners", name, "engine"]) => boxed(|| crate::harness::engine::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::PUT, ["api", "runners", name, "engine"]) => {
@@ -1559,6 +1559,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
             Err(e) => Err(err(StatusCode::CONFLICT, e)),
         },
+        // A session paused, let go on, or started again now (kiln plan 01a1dd2e…, P5.5c): `sessions.pause`, `sessions.resume`
+        // (its pause taken away), `sessions.restart`.
+        (m @ (&Method::POST | &Method::DELETE), ["api", "harness", "sessions", id, "pause"]) => {
+            let name = if *m == Method::POST { "sessions.pause" } else { "sessions.resume" };
+            boxed(|| own_op(&hub, &caller, name, json!({"agent": id}))).await
+        }
+        (&Method::POST, ["api", "harness", "sessions", id, "restart"]) => boxed(|| own_op(&hub, &caller, "sessions.restart", json!({"agent": id}))).await,
         // An agent moved to another machine: `agents.move` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S3),
         // 202 as its move goes on after the answer.
         (&Method::POST, ["api", "harness", "agents", id, "move"]) => {
@@ -5599,6 +5606,12 @@ impl AgentsSeen {
         if m.kind == "agentfile" {
             return m.person.as_deref().is_some_and(|owner| crate::agentfiles::hears(&self.caller, owner));
         }
+        // A split's frame, to its opener and the owner, who alone read it (`crate::ci::experiments`).
+        if m.kind == "experiment"
+            && let Some(opener) = &m.person
+        {
+            return crate::ci::experiments::reads_split(&self.caller, opener);
+        }
         if self.all {
             return true;
         }
@@ -5627,8 +5640,9 @@ impl Narrow {
         match m.kind.as_str() {
             "resync" => return true,
             // AgentsSeen has already checked the attention event's person (attention plan 01a199e1b177752e84dad5dc990e6a15),
-            // and an Agentfile's owner.
+            // an Agentfile's owner, and a split's opener.
             "attention" | "agentfile" => return true,
+            "experiment" if m.person.is_some() => return true,
             "inbox" => return m.person.as_deref() == Some(self.person.as_str()),
             _ => {}
         }
@@ -6963,9 +6977,10 @@ async fn open_drawn(hub: &Hub, caller: Option<&crate::authz::Caller>, target: &s
         hub.harness.open(hub, target, spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))
     }
     .await;
+    // An open that answered no session is kiln's own failure (RFC 9110 §15.6.1).
     let came = match &opened {
-        Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| "no session opened".to_owned()),
-        Err(e) => Err(e.1.clone()),
+        Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "no session opened".to_owned())),
+        Err(e) => Err((e.0, e.1.clone())),
     };
     crate::ci::experiments::started(hub, d, came).await;
     opened

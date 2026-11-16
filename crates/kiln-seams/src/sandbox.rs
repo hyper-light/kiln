@@ -606,7 +606,18 @@ pub trait Run: Send + Sync {
         drop(launch);
         Box::pin(async { Err(Refusal::Unsupported("a member swapped for another in its boundary".into())) })
     }
+    /// Pauses it where it is (`on`), or resumes it (kiln plan 01a1dd2e…, P5.5c; Shards' D267 through Hex's P5.5b):
+    /// paused, its boundary runs none of it (a microVM's guest runs no CPU) and keeps its stdio and connections until
+    /// it's resumed. Refused `Ended` once it has ended, `Unsupported` where its boundary pauses none ([`NO_PAUSE`]), and
+    /// in its runtime's words where that refuses it: refused, it goes on as it was.
+    fn pause(&self, on: bool) -> BoxFuture<'_, Result<(), Refusal>> {
+        let _ = on;
+        Box::pin(async { Err(Refusal::Unsupported(NO_PAUSE.into())) })
+    }
 }
+
+/// What a run whose boundary pauses none refuses ([`Run::pause`]).
+pub const NO_PAUSE: &str = "a run paused where it is and resumed";
 
 /// Harnesses launched in boundaries.
 pub trait Sandbox: Send + Sync + 'static {

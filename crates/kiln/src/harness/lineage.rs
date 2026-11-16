@@ -1413,9 +1413,10 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         let one = as_variant(Ask { count: Some(1), ..ask.clone() }, &draw.arm);
         let assigned = draw.assigned.clone();
         let got = start_as(hub, by, one, move |spec| spec.experiment = Some(assigned)).await;
+        // A start that answered no session is kiln's own failure (RFC 9110 §15.6.1).
         let came = match &got {
-            Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| "no session started".to_owned()),
-            Err((_, why)) => Err(why.clone()),
+            Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "no session started".to_owned())),
+            Err((status, why)) => Err((*status, why.clone())),
         };
         crate::ci::experiments::started(hub, &draw, came).await;
         // A variant that can't start is its failure, kept as its draw's: the rest are drawn still.

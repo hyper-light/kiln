@@ -50,6 +50,7 @@ import { limitLine, parseLimit, settable, standing, withEvent } from "./agent-li
 import { refusedLately, refusedLine } from "./refused";
 import { useClock } from "./harness/dom";
 import { ImagesPanel, PoolsPanel } from "./runners-pools";
+import { keptAt, noPoolsLine, poolAgent, poolHits, poolSize, poolUntil } from "./warm-pools";
 import { useAuth } from "@/lib/auth";
 
 /** The facets runners are filtered by, with each runner's values. */
@@ -643,6 +644,14 @@ function AgentDetails({
         </Loadable>
       </div>
 
+      {agent.facts?.virt.microvm && (
+        <div className="mt-8">
+          <Loadable label={`${agent.name}'s warm pools`} fallback={<Hold height={64} />}>
+            <WarmPools key={agent.name} runner={agent.name} />
+          </Loadable>
+        </div>
+      )}
+
       {agent.facts && (
         <div className="mt-8">
           <div className="label mb-2">Facts</div>
@@ -768,6 +777,49 @@ function AgentLimit({ runner }: { runner: string }) {
         what&rsquo;s sent to one already there waits in its queue until there&rsquo;s room. Set here, it wins over the runner&rsquo;s config (<code>[agent] max_agent_sessions</code>), which wins over
         kiln&rsquo;s default of {v.default}.
       </p>
+    </section>
+  );
+}
+
+/**
+ * The warm pools kiln names on a runner's microVMs (kiln plan 01a1dd2e…, P3.2; docs/isolation.md,
+ * "Warm pools"): each pool's agent, as you may know it, its size and its hits. Loaded again as an
+ * isolated agent's session here changes (its starts among what changes), and a pool leaves the
+ * list as its keep window passes, as the server lets it go.
+ */
+function WarmPools({ runner }: { runner: string }) {
+  const view = useSuspenseResource(`runner-pools/${runner}`, (s) => api.runnerPools(runner, s), {
+    on: ["harness"],
+    relevant: (ev) => ev.type === "harness" && !!ev.info.isolation && (ev.info.target === `agent:${runner}` || ev.info.target === "local"),
+  });
+  const shownRunner = labelOf(runner, useLabels());
+  const now = useNow();
+  const pools = keptAt(view.data.pools, now);
+  const id = React.useId();
+  return (
+    <section aria-labelledby={`${id}-head`}>
+      <div className="label mb-2" id={`${id}-head`}>
+        Warm pools
+      </div>
+      {pools.length === 0 ? (
+        <p className="empty-line">{noPoolsLine(view.data.keep_ms)}</p>
+      ) : (
+        <ul className="row-list" aria-label={`Warm pools on ${shownRunner}`}>
+          {pools.map((p, i) => (
+            <li
+              key={`${p.agent_from}:${p.agent ?? i}:${p.variant?.experiment ?? ""}:${p.variant?.arm ?? ""}:${p.image}:${p.vcpus}:${p.memory_mib}`}
+              className="flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[12.5px]"
+            >
+              <span className="min-w-0 flex-1 truncate" title={p.image}>
+                {poolAgent(p)}
+              </span>
+              <span className="font-mono text-[11px] text-[#c8cad0]">{poolSize(p)}</span>
+              <span className="font-mono text-[11px] text-[#c8cad0]">{poolHits(p)}</span>
+              <span className="font-mono text-[10px] text-[#8c8f98]">{poolUntil(p, now)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }

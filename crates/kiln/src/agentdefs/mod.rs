@@ -45,7 +45,8 @@ pub struct Mcp {
     pub command: Vec<String>,
 }
 
-/// The most an agent's run may take: each left out, no limit of the definition's own.
+/// The most an agent's run may take: each left out, no limit of the definition's own. Each is held to the sessions
+/// it starts ([`limits`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -180,7 +181,7 @@ impl Who {
         Ok(Who { person, all: caller.agent.is_none() && (caller.is_owner() || caller.can(MANAGE, &Scope::Server)) })
     }
 
-    fn reaches(&self, owner: &str) -> bool {
+    pub(crate) fn reaches(&self, owner: &str) -> bool {
         self.all || self.person == owner
     }
 }
@@ -195,7 +196,9 @@ pub fn name_problem(name: &str) -> Option<String> {
 /// kiln's harnesses; its Agentfile is one its owner reaches, for that harness; its model is one kiln's
 /// machines list for that harness, where they list any (what its sessions said they offer); its MCP
 /// servers each have a name of their own and one way in; its tools and skills are named; a limit
-/// it sets lets it do something; and its volumes each have a name of their own and a bound
+/// it sets lets it do something, a token limit is set only for a harness that says how many tokens
+/// its sessions use (`Kind::says_tokens`) and a cost limit only for one that says what they cost
+/// (`Kind::says_cost`); and its volumes each have a name of their own and a bound
 /// ([`volumes::problems`]).
 pub async fn check(hub: &Hub, owner: &str, s: &Settings) -> R<Vec<String>> {
     let mut why = Vec::new();
@@ -246,6 +249,14 @@ pub async fn check(hub: &Hub, owner: &str, s: &Settings) -> R<Vec<String>> {
         if v == Some(0) {
             why.push(format!("a limit of 0 {limit} lets it do nothing: leave it out for none"));
         }
+    }
+    if s.limits.tokens.is_some() && !kind.says_tokens() {
+        why.push(format!("{} doesn't say how many tokens its sessions use, so kiln can't hold a limit in `tokens` to it: limit its `seconds` instead", kind.name));
+    }
+    if s.limits.cents.is_some() && !kind.says_cost() {
+        // Its tokens where it says them, else its time, which kiln holds to every harness.
+        let instead = if kind.says_tokens() { "tokens" } else { "seconds" };
+        why.push(format!("{} doesn't say what its sessions cost, so kiln can't hold a limit in `cents` to it: limit its `{instead}` instead", kind.name));
     }
     why.extend(volumes::problems(&s.volumes));
     Ok(why)

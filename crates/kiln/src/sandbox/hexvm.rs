@@ -41,7 +41,8 @@
 //! - **What it refuses, typed:** egress to whatever its image grants (`Egress::Any`): Hex's grants are default
 //!   deny, so a run names its destinations; limits it doesn't hold ([`HOLDS`]), and credentials where no broker
 //!   leases them ([`NO_BROKER`]); a warm pool kept for its launches, until Hex's image class takes Shards' pools
-//!   ([`NO_POOLS`]; kiln plan 01a1dd2e…, P3.1); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
+//!   ([`NO_POOLS`]; kiln plan 01a1dd2e…, P3.1); a pause or a resume of its run, until Hex pauses a box ([`NO_PAUSE`];
+//!   P5.5b); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
 //! - **Its MCP lane** (Shards D254; #75 step 3): its harness member is asked for its MCP bridge (`/run/shards/mcp`,
 //!   `ImageMember::mcp`), and each connection its harness makes to it is taken through Hex (`Runtime::mcp`, over its
 //!   run's agent-control endpoint) as `super::Lanes`' next, for the runner to serve kiln's MCP over in its own
@@ -852,7 +853,17 @@ impl Run for HexRun {
         let over = self.over();
         Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_SWAP.to_owned())) } })
     }
+
+    // None yet: Hex's wire calls that pause and resume a box (kiln plan 01a1dd2e…, P5.5b, over Shards' D267).
+    fn pause(&self, on: bool) -> BoxFuture<'_, Result<(), Refusal>> {
+        let _ = on;
+        let over = self.over();
+        Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_PAUSE.to_owned())) } })
+    }
 }
+
+/// Why a box isn't paused and resumed yet.
+pub const NO_PAUSE: &str = "a running microVM paused where it is and resumed: the Hex kiln vendors has no wire call for either yet (kiln plan 01a1dd2e…, P5.5b, over Shards' D267)";
 
 /// Why a box's harness isn't swapped for another in place yet.
 pub const NO_SWAP: &str = "a harness swapped for another in its running microVM: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6c.2)";
@@ -877,7 +888,7 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use hex_api::sim::{SIM_IMAGE, SimRuntime};
-    use hex_api::{BoxId, BoxInfo, BoxSpec, Class, Destination, Grant, HostUse, Member, MemberKind, Ports, Proc, Program, Proto, Refusal as H, Runtime, Stdio, Usage};
+    use hex_api::{BoxId, BoxInfo, BoxSpec, Class, ClassSpec, Destination, Grant, HostUse, Member, MemberKind, Ports, Proc, Program, Proto, Refusal as H, Runtime, Stdio, Usage};
     use kiln_ci::place::holder::BoxName;
     use kiln_seams::Records as _;
     use kiln_seams::records::{Consistency, SimRecords};
@@ -1026,6 +1037,24 @@ pub(crate) mod tests {
             let (_, ends) = drain(run.as_ref()).await;
             assert_eq!(ends, [Exit::Killed], "its run went on until it was killed");
             assert_eq!(run.change(connect()).await, Err(Refusal::Ended));
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1dd2e…, P5.5c: until the Hex kiln vendors has Hex's P5.5b calls, a pause and a resume of a box's run
+    /// are refused typed (`Unsupported`, naming P5.5b), its run going on; once the run has ended, `Ended`.
+    #[test]
+    fn p5_5c_hexs_mapping_refuses_a_pause_typed_until_hex_has_the_call() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (_, vms) = vms();
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            for on in [true, false] {
+                assert_eq!(run.pause(on).await, Err(Refusal::Unsupported(super::NO_PAUSE.to_owned())), "pause {on}");
+            }
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed], "its run went on until it was killed");
+            assert_eq!(run.pause(true).await, Err(Refusal::Ended));
             anyhow::Ok(())
         })
     }

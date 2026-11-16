@@ -717,14 +717,26 @@ fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
 /// (plan 01a1a87b2dae step 3): a packed snapshot deflates what it writes at open time at the fast
 /// level, and only whole chunks at the default one. A window is written at open time, so z=gzip
 /// came to median 100,766 to 102,748 and p90 244,269 to 245,133, and a tab from before the window
-/// median 202,501 to 204,054 (five runs).
+/// median 202,501 to 204,054 (five runs). Since db0f283ab (2026-11-12) kiln depends on vendored
+/// shards-image, whose flate2 asks for zlib-rs (vendor/shards/crates/image/Cargo.toml), so Cargo's
+/// feature unification puts every flate2 in kiln's build, the packer's included, on zlib-rs, whose
+/// fast level is deflate_quick, static Huffman trees only (zlib-rs 0.6.8, CONFIGURATION_TABLE in
+/// src/deflate/algorithm/mod.rs). The same kiln (257e8961f and 9c5aa60de, which differ in a test
+/// alone; adas-mac-studio-2, macOS 26.2 arm64, 2026-11-16) on miniz_oxide came to p90 whole (older)
+/// 1,588,997 to 1,589,273, and on zlib-rs to 1,611,466 to 1,611,733 (four runs); every cold open's
+/// wire grew so (z=gzip's median 102,395 to 102,557 on miniz_oxide, 105,974 to 106,204 on zlib-rs).
+/// With 05c8973431b's, e928ed39c's and 709e4ebce's source as its corpus (`Corpus`: kiln's own source,
+/// which every landing moves) p90 whole (older) came to 1,612,111, 1,611,752 and 1,614,499. Its budget
+/// is what was measured, with no margin chosen beside it: the most of those seven runs on zlib-rs
+/// (1,614,499) and their range (3,033): 1,617,532 (docs/research/measurements/wire-budgets/
+/// cold-open-flate2.sh, its runs in cold-open-flate2.txt beside it).
 const COLD_WIRE: &[(&str, &str, usize)] = &[
     ("median", "UI (z=gzip)", 111_962),
     ("median", "UI, no gzip", 75_547),
     ("median", "whole (older)", 219_903),
     ("p90", "UI (z=gzip)", 263_160),
     ("p90", "UI, no gzip", 178_844),
-    ("p90", "whole (older)", 1_604_501),
+    ("p90", "whole (older)", 1_617_532),
 ];
 /// Cold open, the frames' JSON as the page parses it. Before the tracks: median 879,337, p90
 /// 7,196,512. With the window: median 307,288 to 307,289, p90 661,169 to 661,170; a tab from before
@@ -748,12 +760,22 @@ const COLD_FRAMES: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 8), ("me
 const EVENTS_CI_PER_JOB: usize = 809;
 /// Events: `harness` frames per agent-hour (one an agent's record, about: [`RECORD_EVERY_MS`]).
 /// Before the tracks 1,161 (seven runs, spread 3.8%); with them 1,101 to 1,165 (5.8%: the rule
-/// would raise it, so it stays). The events track's (coalescing per entity, batching).
-const EVENTS_HARNESS_FRAMES_PER_AGENT_HOUR: usize = 1_286;
+/// would raise it, so it stays). The events track's (coalescing per entity, batching). On
+/// 2026-11-16 seven runs of one kiln (9c5aa60de to ad5cb237c, which differ in tests alone;
+/// adas-mac-studio-2, macOS 26.2) came to 1,137 to 1,390: 90 to 114 harness frames in windows of
+/// 47 to 49 s, as many as its agents' records and turn starts fall in each (most frames change an
+/// agent's `doing` and `last_activity` alone: docs/research/measurements/wire-budgets/
+/// harness-frames.txt). Its budget is what was measured, with no margin chosen beside it: their
+/// most (1,390) and their range (253): 1,643.
+const EVENTS_HARNESS_FRAMES_PER_AGENT_HOUR: usize = 1_643;
 /// Events: `harness` wire bytes per agent-minute (each frame the agent's whole entry, about 990 B).
 /// Before the tracks 19,177 (seven runs, spread 3.7%); with the compress track's permessage-deflate
-/// 1,308 to 1,647 (25.9%).
-const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 2_190;
+/// 1,308 to 1,647 (25.9%). Each entry has carried more since: W20's `admission` (137 B, 0ff338877)
+/// and step 17's `starts` (64 B) and `runs` (33 B) (519613951 and the commits after it, kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d), so a frame came to 1,248 B decoded and 105 B on the wire
+/// (harness-frames.txt, at ad5cb237c). The same seven runs came to 1,960 to 2,432; its budget is
+/// their most (2,432) and their range (472), no margin chosen: 2,904.
+const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 2_904;
 /// Events: `headroom` frames (about 65 B each) per runner-minute: a runner reports its headroom's
 /// state whenever it changes, which a loaded machine's readings do often. Before the tracks 326 to
 /// 583 over seven runs; with them 305 to 528 over five (spread 73%: it follows the host's load, so
@@ -775,11 +797,19 @@ const EVENTS_REST_WIRE_PER_MIN: usize = 3_809;
 const SHIP_WIRE_PER_LOAD: &[(&str, usize)] = &[("Ship list", 1_079), ("opened row", 1_601)];
 /// Ship's loads a minute over both keys. Before `ship` frames, 87 to 111, held to what
 /// `resource.ts` allowed (128 for two keys: each once a second after its last and its 15 s polls);
-/// with them (W21-R15), 10 to 11 (spread 10%): its polls, and a frame it can't place.
-const SHIP_LOADS_PER_MIN: usize = 13;
+/// with them (W21-R15), 10 to 11 (spread 10%): its polls, and a frame it can't place. On 2026-11-16
+/// nine runs of one kiln (9c5aa60de to 50a03a9dd, which differ in tests alone; adas-mac-studio-2,
+/// macOS 26.2) loaded 10 or 11 times in windows of 47 to 50 s: each key at the window's start and
+/// at its 15 s polls, and again after a frame it couldn't take in place (3 or 4 a run). So a
+/// shorter window (the push's runs ending sooner) counts more a minute: 12 or 13. Its budget is
+/// what was measured, with no margin chosen beside it: their most (13) and their range (1): 14.
+const SHIP_LOADS_PER_MIN: usize = 14;
 /// Those loads' wire bytes a minute. Before `ship` frames, 290 to 370 KiB; with them and
-/// compression, 10,510 to 11,179 (spread 6.4%).
-const SHIP_LOAD_WIRE_PER_MIN: usize = 12_674;
+/// compression, 10,510 to 11,179 (spread 6.4%). Each load costs what it did (the list 704 to 771 B,
+/// the opened row 1,284 to 1,350, against 694 to 841 and 1,223 to 1,357 then); a minute's follow
+/// its loads (above). The same nine runs came to 11,717 to 12,860, one over 12,674 (11 loads in
+/// 49.6 s, at 50a03a9dd); its budget is their most (12,860) and their range (1,143): 14,003.
+const SHIP_LOAD_WIRE_PER_MIN: usize = 14_003;
 /// The `ship` frames a Ship tab is sent instead, wire bytes a minute: 3,668 to 5,207 (spread 42%:
 /// how many rows a refresh finds changed follows when the legs end).
 const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
@@ -797,9 +827,16 @@ const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
 /// P2.3's `isolation.engine` (72d28bc0b, kiln plan 01a1dd2e…); main came to 2,046 at 709e4ebce
 /// (2026-11-16). They add to two runners' records, brotli 4 as the server sends them, 233 B with an
 /// Apple GPU, 244 B with an NVIDIA one and 391 B with neither, where `gpu_unavailable` says why for each
-/// vendor (docs/research/measurements/wire-budgets/runner-facts.py). So 1,761 and the most they add
-/// (391), times one plus the runs' spread (1.0%) plus 7%: 2,325.
-const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_325), ("overview", 1_260)];
+/// vendor (docs/research/measurements/wire-budgets/runner-facts.py, its output runner-facts.txt beside it).
+/// The value follows the host the test runs on, whose facts both runners' records carry: of the
+/// production runners', two records come to 1,359 to 1,401 B on the Macs, 1,565 on adacachy, 1,579 on
+/// the Windows one and 1,753 on fedora.attlocal.net (Linux, no GPU), every landing applied
+/// (runner-facts.txt, "Every production runner"). Main came to 1,936 and 1,938 on adas-mac-studio-2
+/// (9c5aa60de and 9bc380a97, macOS 26.2, 2026-11-16), whose two records there come to 1,360. So the
+/// runners' budget is what was measured, with no margin chosen beside it (unlike the rule above): the
+/// most on that Mac (1,938), what any production runner's facts add over its own (fedora.attlocal.net's,
+/// 1,753 - 1,360 = 393) and what a run's noise moved the five runs (their range, 17): 2,348.
+const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 2_348), ("overview", 1_260)];
 
 /// A key of Ship's that the simulated tab keeps loaded: what it GETs, how often it polls
 /// (`ui/src/views/ship/index.tsx`, `jobs.tsx`), what it last loaded, and what its loads came to.

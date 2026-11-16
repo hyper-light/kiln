@@ -1391,7 +1391,7 @@ mod engine {
         let v = vm_e2e::set_engine(&f, &f.machine, "host")?;
         anyhow::ensure!(v.get("engine") == Some(&json!("host")) && v.get("from") == Some(&json!("server")) && v.get("draining") == Some(&json!(1)), "switched, the microVM one draining: {v}");
         let next = vm_e2e::open(&f, &json!({"kind": "claude", "cwd": project}))?;
-        anyhow::ensure!(runs_in(&f, &next)? == "host" && vm_e2e::info(&f, &next)?.get("isolation") == Some(&Value::Null), "the next on its host: {}", vm_e2e::info(&f, &next)?);
+        anyhow::ensure!(runs_in(&f, &next)? == "host" && vm_e2e::info(&f, &next)?.get("isolation").is_none_or(Value::is_null), "the next on its host: {}", vm_e2e::info(&f, &next)?);
         let body = json!({"target": format!("agent:{}", f.machine), "spec": {"kind": "claude", "cwd": project, "isolation": {"kind": "microvm", "image": image}}});
         let (code, said) = crate::common::http_within(f.port, "POST", "/api/harness/sessions", &f.admin, Some(&body), std::time::Duration::from_secs(75))?;
         anyhow::ensure!(code >= 400 && said.contains("its engine is host"), "a microVM refused on it: {code} {said}");

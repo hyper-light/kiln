@@ -6,7 +6,7 @@ import type { LiveNetworkGrant } from "./LiveNetworkGrant";
 /**
  * A member on a named network, shared with the runs connected to it, and what it's granted there.
  */
-export type LiveNetwork = { member: LiveMember, name: string,
+export type LiveNetwork = { member: LiveMember, name: string, 
 /**
  * Its grant there (Shards' D285): none in a record from before grants named their parts, which grants nothing.
  */

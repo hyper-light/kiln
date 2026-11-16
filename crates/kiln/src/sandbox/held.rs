@@ -212,6 +212,15 @@ impl Held {
         self.run.change(change).await
     }
 
+    /// Paused where it is (`on`), or resumed (a person's pause of its session, kiln plan 01a1dd2e…, P5.5c): taken, else
+    /// its boundary's refusal (`Ended` once it has ended, `Unsupported` where it pauses none).
+    pub async fn pause(&self, on: bool) -> Result<(), Refusal> {
+        if self.ended.load(Ordering::Acquire) {
+            return Err(Refusal::Ended);
+        }
+        self.run.pause(on).await
+    }
+
     /// The link its stdio rides into its boundary, as each end says it negotiated, once it's made;
     /// none where its stdio ride none.
     pub async fn linked(&self) -> Option<Link> {
