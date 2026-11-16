@@ -821,7 +821,12 @@ pub mod feature {
     /// ([`super::AgentMsg::Prebuilt`]); a server that names it asks, and reads the answers. A
     /// runner that didn't name it is asked nothing: its sessions build their images as they start.
     pub const PREBUILD: &str = "agentfiles.prebuild";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS, PREBUILD];
+    /// The server answers its runners' runs' credential leases and sign-ins from its run-lease broker
+    /// (`crate::reach::Question::Lessor`, `crate::secrets::lessor::answer`; plan step 33, Shards' D242). A runner asks
+    /// them only of a server that named it, and grants its isolated harnesses no sign-in until one has: they sign in
+    /// themselves, as before.
+    pub const LEASES: &str = "secrets.leases";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS, PREBUILD, LEASES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

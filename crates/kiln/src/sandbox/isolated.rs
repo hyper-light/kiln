@@ -21,6 +21,11 @@
 //!   folders its harness loads on the machine, read-only at their own paths ([`plugin_folders`]).
 //! - **What it reaches** past its microVM is its image's destinations narrowed to its session's own
 //!   provider's or sign-in's ([`reach_of`], `super::narrow`), else its image's whole and why.
+//! - **Its sign-in** (plan step 33; Shards' D242, step 8): Claude Code's and Codex's, whose CLIs Shards' injector
+//!   takes sign-ins of, are granted their person's sign-in as they launch ([`sign_in_of`], `secrets::signin`): the
+//!   token response taken outside the microVM and kept by kiln's broker, the CLI given placeholders, its access token
+//!   filled in at its egress toward its provider's hosts alone. Where its microVMs lease no credentials, it signs in
+//!   itself, said.
 //! - **kiln's MCP** reaches it over its link's own `mcp` lane (Shards D254; #75 step 3), never the network: its
 //!   harness's config names its microVM's bridge, and this runner serves each connection to it in its own process
 //!   ([`bridge`]), where its microVMs carry the lane (`super::Microvms::mcp`); where they don't, its harness starts
@@ -41,6 +46,7 @@ use crate::agentfiles::builtin;
 use crate::harness::isolated::home;
 use crate::harness::kinds::{Kind, Protocol};
 use crate::harness::session::{Isolation, Spec};
+use crate::secrets::signin;
 
 /// Why an isolated agent doesn't move to another machine.
 pub const NO_MOVE: &str = "an isolated agent doesn't move to another machine yet: its microVM and what its harness keeps there are its machine's; end it, or start it anew there";
@@ -118,8 +124,8 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String, kiln: &[&Path]) -> any
         limits: Limits::NONE,
         egress: Egress::Any,
         boundary: Boundary::MicroVm { image },
-        // No credential granted by reference yet (D242): its harness signs in natively until its sign-in is captured
-        // outside the microVM (plan step 33's steps 6 and 8), so nothing is filled in at its egress.
+        // No credential granted by reference (D242): kiln's store holds none of a harness's but the sign-ins it
+        // captures, which [`launch`] grants as sign-ins ([`sign_in_of`]), not as credentials.
         credentials: Vec::new(),
         plug_roots: roots,
         // The most egress it may be granted live: its person's or org's policy, as kiln's server set it at its start.
@@ -186,10 +192,17 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     launch.boundary = Boundary::MicroVm { image: image.clone() };
     let person = spec.isolation.as_ref().and_then(|i| i.person.as_deref());
     let (mounts, layout) = match (homes, person) {
-        (Some(root), Some(person)) => home_of(root, person, kind, source, &vms.images, &image).await.map(|(mounts, layout)| (mounts, Some(layout)))?,
+        (Some(root), Some(person)) => {
+            let (mounts, layout) = home_of(root, person, kind, source, &vms.images, &image).await?;
+            (mounts, Some(layout))
+        }
         _ => (Vec::new(), None),
     };
     let kept_in = layout.as_ref().and_then(home::Layout::kept_in);
+    let sign_ins = match signin::Provider::of_harness(kind.id) {
+        Some(provider) => sign_in_of(provider, person, layout.as_ref(), &launch.egress, vms).await?,
+        None => Vec::new(),
+    };
     launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true, members: Vec::new() }));
     // Where a folder a person gives it while it runs is plugged in live (Shards' `ImageSpec::plug_roots`, D271): the
     // top-level directories of its project and its person's volumes, and its session's own root, where kiln puts such a
@@ -235,7 +248,8 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     let size = super::pools::size_of(spec.isolation.as_ref());
     let asked = std::time::Instant::now();
     let (run, swapped) = match swap_from {
-        // A switch: its member swapped for this one in the microVM it runs in.
+        // A switch: its member swapped for this one in the microVM it runs in. Hex grants a sign-in as a box is made
+        // (its C8), so a swapped-in harness signs in itself; Hex's microVMs swap none yet ([`NO_SWITCH`]).
         Some(from) => {
             let held = from.boundary().ok_or_else(|| anyhow::anyhow!("{} has no microVM to be swapped into", kind.name))?;
             let swapped = held.swap(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't be swapped into its microVM ({image}): {r}", kind.name));
@@ -247,7 +261,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
                 (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
                 _ => None,
             };
-            (vms.launch(name, launch, size).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?, false)
+            (vms.launch(name, launch, size, &sign_ins).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?, false)
         }
     };
     // Before its session hands it a turn, so nothing it runs writes where its volume goes before it's there.
@@ -528,9 +542,48 @@ async fn home_of(root: &Path, person: &str, kind: &Kind, source: Source<'_>, ima
         }
     };
     let layout = home::Layout::new(root, person, kind.id, &volumes, &env)?;
-    let made = layout.clone();
-    let mounts = crate::rt::blocking(move || made.prepare()).await??;
+    let prepared = layout.clone();
+    let mounts = crate::rt::blocking(move || prepared.prepare()).await??;
     Ok((mounts, layout))
+}
+
+/// The sign-in `provider`'s CLI is granted as it launches for `person` (plan step 33; Shards' D242, step 8; Hex's C8):
+/// its CLI's own, taken outside its microVM, its access token filled in toward `egress`'s hosts of its provider's
+/// alone ([`signin::Provider::grant`]), with the placeholders an earlier capture gave its CLI, as its file in
+/// `layout`'s volumes on this machine holds them. None, said, where `vms` hold no credentials (they aren't Hex's, or no
+/// broker leases theirs: `hexvm::NO_BROKER`), no broker answers this runner's runs yet (`secrets::lessor::answered`: a
+/// server from before), it acts for no person, or `egress` names no destination or doesn't reach its hosts: its
+/// harness then signs in itself, its tokens in its microVM, as before plan step 33.
+async fn sign_in_of(provider: signin::Provider, person: Option<&str>, layout: Option<&home::Layout>, egress: &Egress, vms: &Microvms) -> anyhow::Result<Vec<signin::SignIn>> {
+    let leased = crate::secrets::lessor::answered() && vms.hex.as_ref().is_some_and(|h| kiln_seams::Sandbox::holds(&**h).credentials);
+    let (Some(person), Egress::Only(hosts), true) = (person, egress, leased) else {
+        tracing::warn!(?provider, leased, person = person.is_some(), "its harness signs in itself, its tokens in its microVM: kiln takes a sign-in outside only for a person's run in microVMs that lease credentials");
+        return Ok(Vec::new());
+    };
+    let file = layout.and_then(|l| l.kept_in().and_then(|dir| l.host_of(&format!("{}/{}", dir.trim_end_matches('/'), provider.file()))));
+    let (person, hosts) = (person.to_owned(), hosts.clone());
+    let granted = crate::rt::blocking(move || {
+        let text = file.as_deref().and_then(cli_file);
+        provider.grant(&person, &hosts, text.as_ref().and_then(|t| std::str::from_utf8(t.expose()).ok()))
+    })
+    .await?;
+    if granted.is_none() {
+        tracing::warn!(?provider, "its harness signs in itself, its tokens in its microVM: its egress doesn't reach its sign-in's hosts, or its person has no sign-in name");
+    }
+    Ok(granted.into_iter().collect())
+}
+
+/// What a CLI's sign-in file at `path` on this machine holds, wiped as it's let go of (it may hold tokens from before
+/// kiln took its sign-ins outside): none where there's none, or where it can't be read, said. Blocking.
+fn cli_file(path: &Path) -> Option<hex_api::lease::Value> {
+    match std::fs::read(path) {
+        Ok(bytes) => Some(hex_api::lease::Value::new(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(file = %path.display(), error = %e, "a CLI's sign-in file couldn't be read: its sign-in is granted with no earlier capture");
+            None
+        }
+    }
 }
 
 /// Agentfile `text`'s directives, as Shards reads them (`shards_agentfile`), every stage's; why not, in

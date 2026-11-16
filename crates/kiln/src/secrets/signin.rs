@@ -7,6 +7,14 @@
 //! harness kinds (`crate::accounts`). A name that names no provider is captured by no run, so
 //! nothing is kept that couldn't be refreshed.
 //!
+//! An isolated harness of either is granted its sign-in as it launches ([`SignIn`], made by
+//! [`Provider::grant`] alone, so its name and its CLI come from one provider; Shards' D242, step 8;
+//! Hex's C8): `<provider>/<person>`, the person it acts for by the folder kiln keeps their homes in
+//! (`harness::isolated::home::person_dir`), so one sign-in of a CLI serves each person's runs, as
+//! the sign-in outlives a run (D242, question 6). Its access token is filled in toward the hosts its
+//! CLI sends it to ([`Provider::toward`]), with the placeholders an earlier capture gave its CLI,
+//! as the file it keeps its sign-in in holds them ([`Provider::held`]).
+//!
 //! What each CLI's refresh says is its pinned build's, as Shards read it (its
 //! `docs/research/s33-veil-creds/STEP8.md` and `evidence/`): Claude Code 2.1.311 posts JSON
 //! `grant_type`, `refresh_token`, `client_id` and `scope` (offset 242103577), and reads
@@ -36,22 +44,135 @@ const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// token responses within (Shards' `tcp::TO_GUEST`, D242 step 8's question 3).
 const RESPONSE_MAX: usize = 4 << 20;
 
+/// Every provider, in the order kiln reads a sign-in's name against them.
+const PROVIDERS: [Provider; 2] = [Provider::ClaudeCode, Provider::Codex];
+
+/// A sign-in an isolated harness's launch grants it (Shards' D242, step 8; Hex's C8): its CLI's own
+/// sign-in, its token response taken outside the microVM, its CLI given placeholders. Made by
+/// [`Provider::grant`] alone. Its `Debug` says no placeholder (Hex's `Captured` says their lengths).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignIn {
+    pub provider: Provider,
+    /// Its name in kiln's store, which the broker keeps its tokens under and reads its provider from.
+    pub name: String,
+    /// The hosts its access token is filled in toward.
+    pub toward: Vec<String>,
+    /// What an earlier capture gave its CLI, which it holds still: so the placeholders stand for the
+    /// sign-in's tokens again. None where its CLI holds none.
+    pub captured: Option<hex_api::Captured>,
+}
+
 impl Provider {
     /// The provider sign-in `name` names, where it names one.
     pub fn of(name: &str) -> Option<Provider> {
-        match name.split_once('/')?.0 {
-            "claude" => Some(Provider::ClaudeCode),
-            "codex" => Some(Provider::Codex),
-            _ => None,
+        let word = name.split_once('/')?.0;
+        PROVIDERS.into_iter().find(|p| p.word() == word)
+    }
+
+    /// The provider whose CLI kiln's harness `harness` runs (`crate::harness::kinds::Kind`'s id),
+    /// where the broker answers its sign-in; none for every other harness, whose CLI no Shards
+    /// profile captures (Shards' D242, step 8).
+    pub fn of_harness(harness: &str) -> Option<Provider> {
+        PROVIDERS.into_iter().find(|p| p.word() == harness)
+    }
+
+    /// What its sign-ins' names begin with: its harness kind's id.
+    fn word(self) -> &'static str {
+        match self {
+            Provider::ClaudeCode => "claude",
+            Provider::Codex => "codex",
         }
     }
 
-    /// Its token endpoint (RFC 6749 §3.2): the service kiln names it by, its origin and its path.
+    /// Its CLI, as Hex grants it a sign-in.
+    pub fn cli(self) -> hex_api::SignInCli {
+        match self {
+            Provider::ClaudeCode => hex_api::SignInCli::ClaudeCode,
+            Provider::Codex => hex_api::SignInCli::Codex,
+        }
+    }
+
+    /// The name of `person`'s sign-in of its CLI (`owner`, `user:<id>`): its word, then the folder
+    /// kiln keeps that person's homes in. None for a person kiln keeps no home for, or a name whose
+    /// tokens' names would be past the store's.
+    pub fn sign_in(self, person: &str) -> Option<String> {
+        let name = format!("{}/{}", self.word(), crate::harness::isolated::home::person_dir(person).ok()?);
+        kiln_seams::secrets::check_name(&super::broker::refresh_of(&name)).is_ok().then_some(name)
+    }
+
+    /// Its token endpoint (RFC 6749 §3.2): the service kiln names it by, its host and its path.
     fn token(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            Provider::ClaudeCode => ("claude:token", "https://platform.claude.com", "/v1/oauth/token"),
-            Provider::Codex => ("codex:token", "https://auth.openai.com", "/oauth/token"),
+            Provider::ClaudeCode => ("claude:token", "platform.claude.com", "/v1/oauth/token"),
+            Provider::Codex => ("codex:token", "auth.openai.com", "/oauth/token"),
         }
+    }
+
+    /// Its token endpoint's host, where its CLI signs in and refreshes: a run's egress reaches it,
+    /// or its CLI couldn't sign in through it.
+    pub fn token_host(self) -> &'static str {
+        self.token().1
+    }
+
+    /// The hosts its CLI sends its sign-in's access token to, which kiln's Agentfile for its harness
+    /// grants: Claude Code's API (`Authorization: Bearer`, Shards' STEP8.md question 7, offset
+    /// 242399004), and Codex's Responses through ChatGPT's backend (`https://chatgpt.com/backend-api/codex`,
+    /// its record's "Hosts by name", docs/research/s20-codex-agentfile). Never its token host, where
+    /// Shards' injector fills nothing in.
+    pub fn toward(self) -> &'static [&'static str] {
+        match self {
+            Provider::ClaudeCode => &["api.anthropic.com"],
+            Provider::Codex => &["chatgpt.com"],
+        }
+    }
+
+    /// The file its CLI keeps its sign-in in, in the folder it keeps its configuration in (Claude
+    /// Code's `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME`: `home::Layout::kept_in`): Claude Code
+    /// 2.1.311's `storagePath`, `.credentials.json` (Shards' evidence e_q2_creds.txt, offset
+    /// 241605977), and Codex rust-v0.167.2's `auth.json` (login/src/auth/storage.rs:168).
+    pub fn file(self) -> &'static str {
+        match self {
+            Provider::ClaudeCode => ".credentials.json",
+            Provider::Codex => "auth.json",
+        }
+    }
+
+    /// The placeholders `text`, its CLI's file ([`Provider::file`]), holds for its access token and
+    /// its refresh token where it holds one: Claude Code's `claudeAiOauth.accessToken` and
+    /// `refreshToken` (offset 242352375), Codex's `tokens.access_token` and `refresh_token`
+    /// (login/src/token_data.rs:20-22), each of the broker's form. None where it holds no sign-in,
+    /// one with a token of another form (one from before kiln captured its sign-ins, which its first
+    /// refresh through Shards' injector gives placeholders), or one placeholder for both, which no
+    /// capture gives and Hex refuses.
+    pub fn held(self, text: &str) -> Option<(String, Option<String>)> {
+        let (at, access, refresh) = match self {
+            Provider::ClaudeCode => ("/claudeAiOauth", "accessToken", "refreshToken"),
+            Provider::Codex => ("/tokens", "access_token", "refresh_token"),
+        };
+        let file: serde_json::Value = serde_json::from_str(text).ok()?;
+        let tokens = file.pointer(at)?;
+        let access = tokens.get(access)?.as_str().filter(|t| super::broker::is_placeholder(t))?.to_owned();
+        let refresh = match tokens.get(refresh).and_then(serde_json::Value::as_str).filter(|t| !t.is_empty()) {
+            None => None,
+            Some(t) if super::broker::is_placeholder(t) && t != access => Some(t.to_owned()),
+            Some(_) => return None,
+        };
+        Some((access, refresh))
+    }
+
+    /// The sign-in `person`'s run is granted where its `egress` (`host:port` each) reaches its
+    /// token host and every host its access token goes to, which Hex and Shards hold a sign-in's
+    /// hosts to: none where it doesn't, where its CLI couldn't sign in through it, or for a person
+    /// with no sign-in name ([`Provider::sign_in`]). With what its CLI's file holds (`file`, its
+    /// text, [`Provider::held`]), where it holds this provider's placeholders.
+    pub fn grant(self, person: &str, egress: &[String], file: Option<&str>) -> Option<SignIn> {
+        let reached = |host: &str| egress.iter().any(|e| e.rsplit_once(':').is_some_and(|(name, _)| name.eq_ignore_ascii_case(host)));
+        if !reached(self.token_host()) || !self.toward().iter().all(|&h| reached(h)) {
+            return None;
+        }
+        let name = self.sign_in(person)?;
+        let captured = file.and_then(|text| self.held(text)).map(|(access_placeholder, refresh_placeholder)| hex_api::Captured { access: super::broker::access_of(&name), access_placeholder, refresh_placeholder });
+        Some(SignIn { provider: self, name, toward: self.toward().iter().map(|h| (*h).to_owned()).collect(), captured })
     }
 
     /// Its refresh's body, as its CLI's own makes it: Claude Code asks the scope its sign-in holds
@@ -73,8 +194,8 @@ impl Provider {
     }
 
     async fn refresh(self, refresh: SecretValue, scope: Option<String>) -> Result<Tokens, Unrefreshed> {
-        let (service, origin, path) = self.token();
-        let url = format!("{}{path}", crate::ci::integrations::endpoint(service, || origin.to_owned()));
+        let (service, host, path) = self.token();
+        let url = format!("{}{path}", crate::ci::integrations::endpoint(service, || format!("https://{host}")));
         let old = std::str::from_utf8(refresh.expose()).map_err(|_| Unrefreshed::Failed("its refresh token isn't UTF-8".into()))?;
         let body = self.body(old, scope.as_deref())?;
         let client = crate::http::client::github().map_err(|e| Unrefreshed::Failed(format!("{e:#}")))?;
@@ -212,6 +333,80 @@ mod tests {
         let bare = Captured { refresh: None, expires_ms: Some(5), scope: None, ..c };
         let got: serde_json::Value = serde_json::from_slice(&answer(&bare, 10_000)?)?;
         assert_eq!(got, serde_json::json!({ "access_token": "kiln-placeholder-a", "token_type": "Bearer", "expires_in": 0 }));
+        Ok(())
+    }
+
+    /// A placeholder of the broker's form, its random part `fill` repeated.
+    fn placeholder(fill: char) -> String {
+        format!("kiln-placeholder-{}", fill.to_string().repeat(64))
+    }
+
+    /// Plan step 33 (D242, step 8; Hex's C8): Claude Code's and Codex's harnesses sign in as their own
+    /// provider, the sign-in named for its provider and its person's folder, which the broker reads
+    /// its provider back from; no other harness, and no person kiln keeps no home for.
+    #[test]
+    fn s33_a_harnesses_sign_in_is_its_providers_named_for_its_person() {
+        assert_eq!((Provider::of_harness("claude"), Provider::of_harness("codex")), (Some(Provider::ClaudeCode), Some(Provider::Codex)));
+        for other in ["gemini", "opencode", "devin", "claudex", ""] {
+            assert_eq!(Provider::of_harness(other), None, "{other:?}");
+        }
+        assert_eq!(Provider::ClaudeCode.sign_in("owner").as_deref(), Some("claude/owner"));
+        assert_eq!(Provider::Codex.sign_in("user:ada").as_deref(), Some("codex/user-ada"));
+        for p in PROVIDERS {
+            let name = p.sign_in("user:ada");
+            assert_eq!(name.as_deref().and_then(Provider::of), Some(p), "{name:?}");
+            assert_eq!(p.sign_in("ada"), None, "a person kiln keeps no home for");
+            assert_eq!(p.sign_in(&format!("user:{}", "a".repeat(512))), None, "a name past the store's");
+        }
+        assert_eq!((Provider::ClaudeCode.cli(), Provider::Codex.cli()), (hex_api::SignInCli::ClaudeCode, hex_api::SignInCli::Codex));
+    }
+
+    /// Plan step 33 (D242, step 8): a sign-in is granted only where its run's egress reaches its token
+    /// host and every host its access token goes to, by name in any case; its access token goes to
+    /// its provider's hosts alone.
+    #[test]
+    fn s33_a_sign_in_is_granted_where_its_egress_reaches_its_hosts() -> anyhow::Result<()> {
+        let all: Vec<String> = ["API.anthropic.com:443", "claude.ai:443", "platform.claude.com:443"].map(String::from).to_vec();
+        let granted = Provider::ClaudeCode.grant("owner", &all, None).ok_or_else(|| anyhow::anyhow!("no grant"))?;
+        assert_eq!((granted.name.as_str(), granted.toward.clone(), granted.captured.clone()), ("claude/owner", vec!["api.anthropic.com".to_owned()], None));
+        for gone in ["API.anthropic.com:443", "platform.claude.com:443"] {
+            let short: Vec<String> = all.iter().filter(|h| *h != gone).cloned().collect();
+            assert_eq!(Provider::ClaudeCode.grant("owner", &short, None), None, "without {gone}");
+        }
+        let codex: Vec<String> = ["api.openai.com:443", "auth.openai.com:443", "chatgpt.com:443"].map(String::from).to_vec();
+        let granted = Provider::Codex.grant("user:ada", &codex, None).ok_or_else(|| anyhow::anyhow!("no codex grant"))?;
+        assert_eq!((granted.name.as_str(), granted.toward), ("codex/user-ada", vec!["chatgpt.com".to_owned()]));
+        assert_eq!(Provider::Codex.grant("user:ada", &all, None), None, "another provider's hosts");
+        Ok(())
+    }
+
+    /// Plan step 33 (D242, step 8): the placeholders an earlier capture gave a CLI, as its file holds
+    /// them, are granted again with its access token's reference; a file holding real tokens, one
+    /// placeholder for both or no sign-in gives none.
+    #[test]
+    fn s33_a_clis_file_gives_its_earlier_captures_placeholders() -> anyhow::Result<()> {
+        let (a, r) = (placeholder('a'), placeholder('b'));
+        let claude = serde_json::json!({ "claudeAiOauth": { "accessToken": a, "refreshToken": r, "expiresAt": 1, "scopes": ["user:inference"] } }).to_string();
+        let egress: Vec<String> = ["api.anthropic.com:443", "platform.claude.com:443"].map(String::from).to_vec();
+        let granted = Provider::ClaudeCode.grant("owner", &egress, Some(&claude)).ok_or_else(|| anyhow::anyhow!("no grant"))?;
+        assert_eq!(granted.captured, Some(hex_api::Captured { access: "sign-ins/claude/owner/access".into(), access_placeholder: a.clone(), refresh_placeholder: Some(r.clone()) }));
+        let codex = serde_json::json!({ "OPENAI_API_KEY": null, "tokens": { "id_token": "h.p.", "access_token": a, "refresh_token": r, "account_id": "acct" } }).to_string();
+        assert_eq!(Provider::Codex.held(&codex), Some((a.clone(), Some(r.clone()))));
+        assert_eq!(Provider::ClaudeCode.held(&codex), None, "another CLI's file");
+        let no_refresh = serde_json::json!({ "claudeAiOauth": { "accessToken": a, "refreshToken": "" } }).to_string();
+        assert_eq!(Provider::ClaudeCode.held(&no_refresh), Some((a.clone(), None)));
+        let unheld = [
+            serde_json::json!({ "claudeAiOauth": { "accessToken": "sk-ant-oat01-real", "refreshToken": r } }).to_string(),
+            serde_json::json!({ "claudeAiOauth": { "accessToken": a, "refreshToken": "sk-ant-ort01-real" } }).to_string(),
+            serde_json::json!({ "claudeAiOauth": { "accessToken": a, "refreshToken": a } }).to_string(),
+            serde_json::json!({ "claudeAiOauth": { "accessToken": format!("{a}0"), "refreshToken": r } }).to_string(),
+            serde_json::json!({ "claudeAiOauth": { "accessToken": a.to_uppercase() } }).to_string(),
+            serde_json::json!({}).to_string(),
+            "not json".to_owned(),
+        ];
+        for text in unheld {
+            assert_eq!(Provider::ClaudeCode.held(&text), None, "{text}");
+        }
         Ok(())
     }
 }
