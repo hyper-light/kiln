@@ -229,12 +229,36 @@ pub trait Runtime: Send + Sync {
     }
 }
 
+/// Whether a VM process's CPU time holds its vCPUs' guest time (Shards' D265), as that process learned it from its own
+/// clocks: where it does (KVM's, Hypervisor.framework's, WHP's under Windows' root scheduler), its VMM's own is its CPU
+/// less its vCPUs'; where its hypervisor runs them apart from its threads (WHP's under the classic and core schedulers,
+/// every Windows Server's), its CPU is its own and its vCPUs' time is beside it. Not yet told, it is read as apart, so a
+/// VM is never charged less than it ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Charged {
+    #[default]
+    Unknown,
+    ToThread,
+    Apart,
+}
+
+impl Charged {
+    /// The VMM's own of a VM process's `cpu_ns` beside `vcpus_ns` of its vCPUs' guest time: the whole less theirs where
+    /// it holds them, the whole where they ran apart or it isn't told.
+    pub fn own(self, cpu_ns: u64, vcpus_ns: u64) -> u64 {
+        match self {
+            Self::ToThread => cpu_ns.saturating_sub(vcpus_ns),
+            Self::Apart | Self::Unknown => cpu_ns,
+        }
+    }
+}
+
 /// What a box's VM costs its host beside its guest (Shards' D241, `Stats::microvm`; joint plan steps 12 and 14), each
 /// a counter since the VM booted, as its run host read its VM process.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostUse {
     /// Its VM process's CPU time, user and system together, in nanoseconds: its vCPUs' guest time among it, read just
-    /// before it, so this less their sum is its VMM's own.
+    /// before it, where `charged` says its OS counts it there ([`Charged::own`] its VMM's own).
     pub cpu_ns: u64,
     /// Its own memory, as memory per VM is counted: macOS's physical footprint, Linux's anonymous resident pages,
     /// Windows' private working set.
@@ -245,6 +269,8 @@ pub struct HostUse {
     /// The time these counters span: from the VM's run's start, as its boot answered, to this read (goal 54's change
     /// 3: kiln learns the overhead a VM costs its host over its window, at usage and at its delete).
     pub window: Duration,
+    /// Whether `cpu_ns` holds the vCPUs' guest time (D265). Appended after the other fields.
+    pub charged: Charged,
 }
 
 /// CPU milli, memory bytes and writable-volume bytes; devices are not inferred from a pool.

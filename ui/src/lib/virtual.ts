@@ -1,7 +1,10 @@
 /**
- * A windowed list on the page's own scroll: only the rows near the viewport are rendered, the
- * rest are spacers of the right height, so a list of 100,000 rows costs what forty do.
- * Rows have one fixed height; the list re-measures on scroll and resize, once a frame.
+ * Windowed lists (W21-R02): only the rows near the viewport are rendered, the rest are spacers of
+ * the right height, so a list of 100,000 rows costs what forty do.
+ * `useWindowedRows`, `useWindowedBox`: rows of one fixed height, on the page's scroll or in a box
+ * of its own; the list re-measures on scroll and resize, once a frame. (Rows of differing heights
+ * on the page's scroll are lib/list-window.ts's: a file of its own, so a page that windows rows of
+ * one height, a run's jobs, doesn't download what windows Mission control's.)
  */
 import * as React from "react";
 

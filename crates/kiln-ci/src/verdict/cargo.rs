@@ -129,10 +129,12 @@ mod tests {
         // dev-dependency): a change to kiln-sim affects kiln-ci's tests too.
         assert_eq!(unit("kiln-ci")?.deps, set(&["kiln-sim"]));
         assert!(units.iter().all(|u| u.dir == format!("crates/{}", u.name) && u.reads == set(&["Cargo.toml", "Cargo.lock"])));
-        // A change to kiln-ci affects kiln-ci and every crate that depends on it, and no other.
+        // A change to kiln-ci affects kiln-ci and every crate that depends on it, and no other:
+        // kiln-seams takes `kiln_ci::facts`' `Negotiated` (R12), and kiln-sim depends on kiln-seams;
+        // kiln-cd and kiln-http depend on none of them.
         let graph = Units::new(units.clone());
-        assert_eq!(graph.affected(["crates/kiln-ci/src/verdict/mod.rs"]), set(&["kiln", "kiln-ci"]));
-        assert_eq!(graph.affected(["crates/kiln-sim/src/lib.rs"]), set(&["kiln", "kiln-ci", "kiln-sim"]));
+        assert_eq!(graph.affected(["crates/kiln-ci/src/verdict/mod.rs"]), set(&["kiln", "kiln-ci", "kiln-seams", "kiln-sim"]));
+        assert_eq!(graph.affected(["crates/kiln-sim/src/lib.rs"]), set(&["kiln", "kiln-ci", "kiln-seams", "kiln-sim"]));
         assert_eq!(graph.affected(["Cargo.lock"]).len(), 6);
         assert_eq!(graph.affected(["docs/ci.md"]), set(&[]));
         Ok(())

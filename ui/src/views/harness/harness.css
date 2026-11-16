@@ -932,6 +932,27 @@ textarea.hx-input {
 .hx-timeline > .hx-flow {
   min-height: calc(100% + 1px);
 }
+/* A conversation opens on its window's first part (api/harness.ts, `FIRST_BYTES`), and the rest of the window joins
+   above it with nothing moving: the page is at its end, and stays there. A part that doesn't fill the pane would move
+   when the rest came (it sits at the top, and the end goes to the bottom), so it isn't shown ahead of the rest: the
+   loader the conversation opened with stays where it was until the window is whole, as before there were parts. The
+   keeper says whether the page fills the pane (`data-tall`, timeline.tsx); a pane that fits is a pixel taller than
+   its box (above), so the loader over all of the flow is centred where the first one was. */
+.hx-flow > .hx-part-loading {
+  display: none;
+}
+.hx-timeline[data-filling]:not([data-tall]) > .hx-flow:not(.hx-flow-loading) {
+  position: relative;
+}
+.hx-timeline[data-filling]:not([data-tall]) > .hx-flow:not(.hx-flow-loading) > * {
+  visibility: hidden;
+}
+.hx-timeline[data-filling]:not([data-tall]) > .hx-flow:not(.hx-flow-loading) > .hx-part-loading {
+  display: flex;
+  visibility: visible;
+  position: absolute;
+  inset: 0 0 1px;
+}
 /* Restoring your place (restoring-place.tsx): the conversation's loader where it goes, centred as at
    its first load (console.css, `.ag-loading`), and the way to the latest at the bottom, as ever. */
 .hx-flow.hx-flow-loading {

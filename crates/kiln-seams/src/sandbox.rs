@@ -150,12 +150,16 @@ pub struct Share {
     pub host: String,
     pub at: String,
     pub writable: bool,
+    /// In a microVM, the members it's given to at their start, at `at` (Shards' share member scope, as
+    /// a plug's `PlugFor::Members`): none, its microVM's own root alone, which no member sees. A run on
+    /// the host has no members, and every share is its process's.
+    pub members: Vec<Member>,
 }
 
 impl Share {
-    /// `path`, writable, at its own path.
+    /// `path`, writable, at its own path, given to no member.
     pub fn at_its_path(path: &str) -> Self {
-        Self { host: path.to_owned(), at: path.to_owned(), writable: true }
+        Self { host: path.to_owned(), at: path.to_owned(), writable: true, members: Vec::new() }
     }
 }
 
@@ -212,11 +216,16 @@ pub struct Holds {
     pub credentials: bool,
     /// Changes to a run's network and folders while it runs ([`Run::change`]: kiln plan 01a1dd2e…, P6b.4).
     pub live: bool,
+    /// A run's member swapped for another in its boundary ([`Run::swap`]: kiln plan 01a1dd2e…, P6c.5).
+    pub swaps: bool,
+    /// Components laid over its image's own: at a launch ([`Launch::components`]), and swapped in and given back while
+    /// it runs ([`Change::Swap`], [`Change::Restore`]: kiln plan 01a1dd2e…, P6c.3).
+    pub components: bool,
 }
 
 impl Holds {
     /// Everything (the simulator's).
-    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true };
+    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true, swaps: true, components: true };
 
     /// `Ok` when `launch`'s weights are on their scale, its credential grants could each be filled
     /// in, and it asks only for what these hold; else its refusal, `Invalid` or `Unsupported`,
@@ -253,6 +262,9 @@ impl Holds {
         if !launch.credentials.is_empty() && !self.credentials {
             return refuse("credentials filled in at its egress");
         }
+        if !launch.components.is_empty() && !self.components {
+            return refuse("components laid over its image's own");
+        }
         Ok(())
     }
 }
@@ -267,6 +279,35 @@ pub enum Boundary {
     /// A microVM from `image`: an Agentfile's, whose members run in their own domains as it declares
     /// them (Shards' D231), through Hex.
     MicroVm { image: String },
+}
+
+/// What a component of a microVM's image is: an Agentfile's AGENT, HARNESS or MCP install (Shards' D231 members).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentKind {
+    Agent,
+    Harness,
+    Mcp,
+}
+
+/// A component built alone from its pinned source (kiln plan 01a1dd2e…, P6c.1 and P6c.3), as an Agentfile's AGENT,
+/// HARNESS or MCP takes its source (Shards' D54): `source` as its `FROM` writes it (a Git URL whose `#REF` names its
+/// commit, an http(s) URL, `s3://BUCKET/KEY`, or an OCI reference by its digest), and its pin where its source isn't
+/// pinned in itself: `checksum` (`sha256:<hex>` of what an http(s) or s3 source serves) and `version_id` (an s3
+/// object's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Component {
+    pub kind: ComponentKind,
+    pub source: String,
+    pub checksum: Option<String>,
+    pub version_id: Option<String>,
+}
+
+/// A component laid over its image's own at `at`, its member's directory there (`/harness/<name>`, `/agents/<name>`,
+/// `/mcp/<name>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentAt {
+    pub at: String,
+    pub component: Component,
 }
 
 /// A run to start.
@@ -295,6 +336,18 @@ pub struct Launch {
     /// its boundary, toward the hosts its grant names alone; none by default, when nothing is
     /// filled in toward any host. A value is never here.
     pub credentials: Vec<CredentialGrant>,
+    /// Where a folder may be plugged into it while it runs (kiln plan 01a1dd2e…, P6b.4; Shards'
+    /// `ImageSpec::plug_roots`, D271): top-level directories of its boundary (`/volumes`), none of
+    /// its init's own (`/proc`, `/sys`, `/dev`, `/tmp`, `/etc`, `/run`), each once; beside them,
+    /// each share's top-level directory. A plug ([`Change::Plug`]) goes strictly beneath one.
+    pub plug_roots: Vec<String>,
+    /// The most egress it may ever be granted while it runs (Shards' `ImageSpec::egress_ceiling`),
+    /// each `host:port`: a grant past it is refused. None: none is granted live.
+    pub egress_ceiling: Vec<String>,
+    /// Components laid over its image's own, each at its member's directory, as its members start (kiln plan
+    /// 01a1dd2e…, P6c.3; Shards' D270): those a person swapped in while it ran before, and the one a [`Run::swap`] of
+    /// its member gives it. None: its image's own.
+    pub components: Vec<ComponentAt>,
 }
 
 impl Launch {
@@ -310,6 +363,9 @@ impl Launch {
             egress: Egress::default(),
             boundary: Boundary::Host,
             credentials: Vec::new(),
+            plug_roots: Vec::new(),
+            egress_ceiling: Vec::new(),
+            components: Vec::new(),
         }
     }
 }
@@ -379,10 +435,13 @@ pub struct Member(pub String);
 /// ports and which way, as a launch's are (default deny).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    /// The host's `bind` address and `host_port` (UDP, else TCP) reach `member`'s `guest_port`.
-    Publish { member: Member, bind: String, host_port: u16, guest_port: u16, udp: bool },
-    /// What the host's `bind` and `host_port` reached, unpublished.
-    Unpublish { bind: String, host_port: u16, udp: bool },
+    /// Its `guest_port` (UDP, else TCP) published on the host at `host` (an address; none, every
+    /// one) and `host_port` (0: one the host picks), reaching the members its image gives that port
+    /// coming in, as Shards' `ImageGuest::publish` takes one (D269).
+    Publish { guest_port: u16, udp: bool, host: Option<String>, host_port: u16 },
+    /// The port it publishes at `host` (`address:port`, as bound) let go of, as Shards'
+    /// `ImageGuest::unpublish` takes one (D269).
+    Unpublish { udp: bool, host: String },
     /// `member` may reach `host` (a DNS name or an address) on `port`.
     Grant { member: Member, host: String, port: u16 },
     /// That grant taken back: its next connection there is refused.
@@ -390,10 +449,36 @@ pub enum Change {
     /// `member` joins the named `network`, shared with the runs connected to it.
     Connect { member: Member, network: String },
     Disconnect { member: Member, network: String },
-    /// The machine's folder plugged in for `members`, at its share's path, writable as it says.
-    Plug { share: Share, members: Vec<Member> },
+    /// `source` plugged into the members `to` at `at` (absolute, strictly beneath one of its plug
+    /// roots: its launch's [`Launch::plug_roots`] and each share's top-level directory), read-only
+    /// where it says, as Shards' `ImageGuest::plug` takes one (D271).
+    Plug { source: PlugSource, to: PlugFor, at: String, read_only: bool },
     /// The folder plugged in at `at`, unplugged.
     Unplug { at: String },
+    /// The component at `at`, a member's directory in its image, swapped for `component` (kiln plan 01a1dd2e…, P6c.3;
+    /// Shards' P6c.1, through Hex's P6c.2): laid over the image's own read-only, and that member alone started again
+    /// with it at once, the run's other members running on. The run's own member is swapped through [`Run::swap`],
+    /// whose launch lays it ([`Launch::components`]).
+    Swap { at: String, component: Component },
+    /// The image's own component back at `at`, its member started again with it at once.
+    Restore { at: String },
+}
+
+/// What a [`Change::Plug`] gives the members it plugs into, as Shards takes one (D271).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlugSource {
+    /// A folder of the machine's, absolute.
+    Host(String),
+    /// A volume of its boundary's own store, by its name, made where it isn't there.
+    Volume(String),
+}
+
+/// Whom a [`Change::Plug`] plugs into, as Shards takes one (D271): every member that runs, or those
+/// named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlugFor {
+    Every,
+    Members(Vec<Member>),
 }
 
 /// A run under way: what it's given on stdin, what it says (its output, then its end, once), the
@@ -427,6 +512,17 @@ pub trait Run: Send + Sync {
         drop(change);
         Box::pin(async { Err(Refusal::Unsupported("a change to a run while it runs".into())) })
     }
+    /// Its member swapped for `launch`'s in the same boundary (kiln plan 01a1dd2e…, P6c.5; Shards'
+    /// P6c.1 component attached through Hex's P6c.2): its member ended as its input ends, then
+    /// `launch`'s member started in its place, given what `launch` gives it. The run returned is the
+    /// new member's, its boundary the same (the same [`id`](Self::id)); this one says its end, and its
+    /// end and its kill end nothing more of its boundary. Refused `Unsupported` where its boundary
+    /// swaps none (`Holds::swaps`, and a run's own unless it says otherwise), `Ended` once it has
+    /// ended, and in its runtime's words where that refuses it: refused, this run goes on.
+    fn swap(&self, launch: Launch) -> BoxFuture<'_, Result<Box<dyn Run>, Refusal>> {
+        drop(launch);
+        Box::pin(async { Err(Refusal::Unsupported("a member swapped for another in its boundary".into())) })
+    }
 }
 
 /// Harnesses launched in boundaries.
@@ -458,7 +554,8 @@ pub const SIM_PENDING: usize = 10_000;
 /// - `fill <host> <reference>`: asks the host with the credential's placeholder; exits 0, writing
 ///   `filled`, when a grant of the credential toward that host fills it in, else 1, the request
 ///   gone bare (or refused, where its egress doesn't reach the host);
-/// - `pwd`: writes its working folder.
+/// - `pwd`: writes its working folder;
+/// - `components`: writes the components laid for it, one a line (`<at> <source>`).
 ///
 /// A signal ends any of them with its [`Signal::ended_code`]. It holds everything, unless made
 /// [`SimSandbox::holding`] less, as a real boundary may.
@@ -491,6 +588,10 @@ struct SimRun {
     runs: Arc<Mutex<usize>>,
     signals: bool,
     live: bool,
+    /// Whether it takes components swapped in while it runs ([`Holds::components`]).
+    components: bool,
+    /// Its sandbox, which starts a member it's swapped for ([`Run::swap`]).
+    sandbox: SimSandbox,
 }
 
 #[derive(Default)]
@@ -607,9 +708,12 @@ impl Run for SimRun {
     fn change(&self, change: Change) -> BoxFuture<'_, Result<(), Refusal>> {
         let out = {
             let mut st = self.state.lock();
+            let component = matches!(change, Change::Swap { .. } | Change::Restore { .. });
             if st.ended {
                 Err(Refusal::Ended)
-            } else if !self.live {
+            } else if component && !self.components {
+                Err(Refusal::Unsupported("a component swapped into a run while it runs".into()))
+            } else if !component && !self.live {
                 Err(Refusal::Unsupported("a change to a run while it runs".into()))
             } else {
                 st.changes.push(change);
@@ -617,6 +721,22 @@ impl Run for SimRun {
             }
         };
         Box::pin(async move { out })
+    }
+
+    fn swap(&self, launch: Launch) -> BoxFuture<'_, Result<Box<dyn Run>, Refusal>> {
+        Box::pin(async move {
+            if self.state.lock().ended {
+                return Err(Refusal::Ended);
+            }
+            if !self.sandbox.holds.swaps {
+                return Err(Refusal::Unsupported("a member swapped for another in its boundary".into()));
+            }
+            let new = self.sandbox.launch(launch).await?;
+            // Its member ended as the new one started: its end said, once.
+            self.state.lock().say(Output::Exited(Exit::Code(0)));
+            self.said.notify(usize::MAX);
+            Ok(new)
+        })
     }
 }
 
@@ -683,6 +803,10 @@ impl Sandbox for SimSandbox {
                     st.say(Output::Stdout(launch.folder.clone().unwrap_or_else(|| "/".into()).into_bytes()));
                     st.say(Output::Exited(Exit::Code(0)));
                 }
+                "components" => {
+                    st.say(Output::Stdout(launch.components.iter().map(|c| format!("{} {}\n", c.at, c.component.source)).collect::<String>().into_bytes()));
+                    st.say(Output::Exited(Exit::Code(0)));
+                }
                 other => return Err(Refusal::NoSuchProgram(other.to_owned())),
             }
             let mut n = self.runs.lock();
@@ -690,7 +814,7 @@ impl Sandbox for SimSandbox {
                 return Err(Refusal::Full { limit: SIM_RUNS });
             }
             *n = n.saturating_add(1);
-            let run: Box<dyn Run> = Box::new(SimRun { state: Arc::new(Mutex::new(st)), said: Arc::new(event_listener::Event::new()), runs: Arc::clone(&self.runs), signals: self.holds.signals, live: self.holds.live });
+            let run: Box<dyn Run> = Box::new(SimRun { state: Arc::new(Mutex::new(st)), said: Arc::new(event_listener::Event::new()), runs: Arc::clone(&self.runs), signals: self.holds.signals, live: self.holds.live, components: self.holds.components, sandbox: self.clone() });
             Ok(run)
         })();
         Box::pin(async move { out })
@@ -734,6 +858,8 @@ pub trait SandboxFixture: Send + Sync {
     fn fill(&self, host: &str, reference: &str, credentials: Vec<CredentialGrant>, egress: Egress) -> Launch;
     /// Writes its working folder, given `folder`.
     fn pwd(&self, folder: &str) -> Launch;
+    /// Writes the components laid for it, `laid`, one a line: `<at> <source>`.
+    fn components(&self, laid: Vec<ComponentAt>) -> Launch;
     /// A folder that exists for a run.
     fn folder(&self) -> String;
 }
@@ -772,6 +898,9 @@ impl SandboxFixture for SimSandboxFixture {
     }
     fn pwd(&self, folder: &str) -> Launch {
         Launch { folder: Some(folder.to_owned()), ..Launch::of("pwd", &[]) }
+    }
+    fn components(&self, laid: Vec<ComponentAt>) -> Launch {
+        Launch { components: laid, ..Launch::of("components", &[]) }
     }
     fn folder(&self) -> String {
         "/work/conformance".into()
@@ -1046,6 +1175,66 @@ fn c14<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c15<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let run = fine("launch", f.sandbox().launch(f.wait()).await)?;
+        let id = run.id();
+        if !f.sandbox().holds().swaps {
+            let swapped = run.swap(f.echo()).await;
+            let on = run.stdin(b"still here\n".to_vec()).await;
+            run.kill();
+            return match swapped {
+                Err(Refusal::Unsupported(_)) => fine("its run, after the swap it refused", on),
+                Err(e) => Err(format!("a member swapped in its boundary: refused as {e:?}, not Unsupported")),
+                Ok(_) => Err("a member swapped in its boundary: taken, though the sandbox says it doesn't hold it".into()),
+            };
+        }
+        let new = fine("a member swapped in its boundary", run.swap(f.echo()).await)?;
+        let outs = drain(run.as_ref()).await;
+        same("the member swapped out: its ends", outs.iter().filter(|o| matches!(o, Output::Exited(_))).count(), 1)?;
+        same("the new member's boundary", new.id(), id)?;
+        fine("stdin to the new member", new.stdin(b"swapped\n".to_vec()).await)?;
+        new.close_stdin();
+        let outs = drain(new.as_ref()).await;
+        same("what the new member said", String::from_utf8_lossy(&stdout(&outs)).into_owned(), "swapped\n".to_owned())?;
+        same("its end", end(&outs), Some(Exit::Code(0)))?;
+        ensure(run.swap(f.echo()).await.is_err(), || "a run swapped out was swapped again".into())
+    })
+}
+
+fn c16<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let component = Component { kind: ComponentKind::Agent, source: "https://example.com/helper.tar.gz".into(), checksum: Some(format!("sha256:{}", "ab".repeat(32))), version_id: None };
+        let laid = vec![ComponentAt { at: "/agents/helper".into(), component: component.clone() }];
+        let swap = Change::Swap { at: "/agents/helper".into(), component };
+        if !f.sandbox().holds().components {
+            match f.sandbox().launch(f.components(laid)).await {
+                Err(Refusal::Unsupported(_)) => {}
+                Err(e) => return Err(format!("components laid at its launch: refused as {e:?}, not Unsupported")),
+                Ok(_) => return Err("components laid at its launch: taken, though the sandbox says it doesn't hold it".into()),
+            }
+            let run = fine("launch", f.sandbox().launch(f.wait()).await)?;
+            let taken = run.change(swap).await;
+            let on = run.stdin(b"still here\n".to_vec()).await;
+            run.kill();
+            return match taken {
+                Err(Refusal::Unsupported(_)) => fine("its run, after the swap it refused", on),
+                Err(e) => Err(format!("a component swapped into a run while it runs: refused as {e:?}, not Unsupported")),
+                Ok(()) => Err("a component swapped into a run while it runs: taken, though the sandbox says it doesn't hold it".into()),
+            };
+        }
+        let laying = fine("launch", f.sandbox().launch(f.components(laid)).await)?;
+        let outs = drain(laying.as_ref()).await;
+        same("the components laid for it", String::from_utf8_lossy(&stdout(&outs)).into_owned(), "/agents/helper https://example.com/helper.tar.gz\n".to_owned())?;
+        let run = fine("launch", f.sandbox().launch(f.wait()).await)?;
+        fine("a component swapped into a run while it runs", run.change(swap.clone()).await)?;
+        fine("its image's own given back", run.change(Change::Restore { at: "/agents/helper".into() }).await)?;
+        run.kill();
+        same("its end", end(&drain(run.as_ref()).await), Some(Exit::Killed))?;
+        same("a swap after its end", run.change(swap).await, Err(Refusal::Ended))
+    })
+}
+
 /// The `Sandbox` contract, clause by clause (docs/seams.md, "Sandbox").
 pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
     vec![
@@ -1094,6 +1283,16 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
             id: "SANDBOX-14",
             says: "a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on",
             check: c14::<F>,
+        },
+        Case {
+            id: "SANDBOX-15",
+            says: "a run's member swapped for another in its boundary ends, its end said once, and the run it gives runs the other in the same boundary; one swapped out swaps no more; a sandbox that swaps none refuses one Unsupported, and its run goes on",
+            check: c15::<F>,
+        },
+        Case {
+            id: "SANDBOX-16",
+            says: "a launch's components are laid for it, and a run takes a component swapped in and its image's own given back while it runs, and one after its end is refused Ended; a sandbox that holds no components refuses both Unsupported, and its run goes on",
+            check: c16::<F>,
         },
     ]
 }
@@ -1169,6 +1368,9 @@ mod tests {
         fn pwd(&self, folder: &str) -> Launch {
             free(self.sim.pwd(folder))
         }
+        fn components(&self, laid: Vec<ComponentAt>) -> Launch {
+            free(self.sim.components(laid))
+        }
         fn folder(&self) -> String {
             self.sim.folder()
         }
@@ -1189,7 +1391,7 @@ mod tests {
         let make = || async { Holding { sim: SimSandboxFixture::default(), lies: Some(Liar(SimSandbox::new())) } };
         let report = futures::executor::block_on(run("Sandbox", &cases::<Holding>(), make));
         let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
-        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14"], "{:?}", report.failed);
+        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15", "SANDBOX-16"], "{:?}", report.failed);
         assert!(report.failed.iter().all(|(_, why)| why.contains("doesn't hold it")), "{:?}", report.failed);
     }
 

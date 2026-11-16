@@ -13,6 +13,7 @@ import "./console.css";
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, GitFork, RotateCcw, Shield, X } from "lucide-react";
 import { clientId, harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt } from "@/api/harness";
+import { useSaid } from "@/api/last-words";
 import { heldCommand, useHeld } from "@/api/held";
 import { holdManyWith } from "./state";
 import type { AgentInfo, Approval, Command, FileChange, HEvent, Meta, SendMode, SessionStore, Task, Todo } from "@/api/harness";
@@ -612,7 +613,10 @@ function useThreadPath(
   // Read only while a thread is open: the main thread's page doesn't render again for its tasks.
   const tasks = useSession(store, (s) => (open ? (s.state?.tasks ?? NO_TASKS) : NO_TASKS));
   const asks = useSession(store, (s) => (open ? (s.state?.approvals ?? NO_ASKS) : NO_ASKS));
+  // Made again as a subagent's last words are told: one that's done shows them (W21-R02, api/last-words.ts).
+  const said = useSaid();
   return React.useMemo(() => {
+    void said;
     if (!open) return null;
     const live = (a: AgentInfo) => liveRoot(a, tasks, asks, done);
     const list = everyone.some((a) => a.id === id) ? everyone.map((a) => (a.id === id ? live(a) : a)) : info ? [...everyone, live(info)] : everyone;
@@ -627,7 +631,7 @@ function useThreadPath(
       ],
       here: nodes.find((n) => n.key === key),
     };
-  }, [open, everyone, id, info, sub, task, name, tasks, asks, done]);
+  }, [open, everyone, id, info, sub, task, name, tasks, asks, done, said]);
 }
 
 /** What opens under a subagent's crumbs: what it may do, or a branch of it. */
@@ -788,10 +792,13 @@ function useSubagentPicks(store: SessionStore, id: string, info: AgentInfo | und
   const delivery = useSession(store, (s) => s.state?.delivery);
   const events = useSession(store, (s) => s.events);
   const list = React.useMemo(() => everyone.map((a) => asAnswered(a, done)), [everyone, done]);
+  // Made again as a subagent's last words are told: one that's done shows them (W21-R02, api/last-words.ts).
+  const said = useSaid();
   const rows = React.useMemo(() => {
+    void said;
     const base = list.find((a) => a.id === id) ?? info;
     return base ? subagentRows(liveRoot(base, tasks, asks, done), list) : [];
-  }, [list, id, info, tasks, asks, done]);
+  }, [list, id, info, tasks, asks, done, said]);
   const [picks, setPicks] = React.useState<ReadonlySet<string>>(() => new Set());
   const [sent, setSent] = React.useState<readonly SentTo[]>([]);
   const pick = React.useCallback(

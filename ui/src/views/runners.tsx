@@ -15,7 +15,7 @@ import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
 import { sendingProps, useAction, useActions, useHold } from "@/lib/action";
 import {
-  agentsRes,
+  agentsWholeRes,
   fuller,
   historyRes,
   labelOf,
@@ -25,7 +25,7 @@ import {
   shownName,
   updatesRes,
   upsert,
-  useAgentsLive,
+  useAgentsWholeLive,
   useLabels,
   useMetricsHistory,
   useRes,
@@ -131,9 +131,10 @@ function RunnersBody() {
   const [params, setParams] = useSearchParams();
   const selected = params.get("agent");
   // All of it asked for at once, the open runner's microVMs and the CI panels below too: each read
-  // would otherwise wait for the one before it, and the page move as each came.
-  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, poolsRes, imagesRes, ...(selected ? [runnerVmsRes(selected), runnerEngineRes(selected)] : []));
-  const agents = useAgentsLive();
+  // would otherwise wait for the one before it, and the page move as each came. Whole: each runner's
+  // row and its detail show its facts (its executors, its hardware).
+  warm(agentsWholeRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, poolsRes, imagesRes, ...(selected ? [runnerVmsRes(selected), runnerEngineRes(selected)] : []));
+  const agents = useAgentsWholeLive();
   const history = useMetricsHistory().data;
   const joinRequests = useRes(joinRequestsRes).data;
   const discovery = useRes(discoveryRes).data;

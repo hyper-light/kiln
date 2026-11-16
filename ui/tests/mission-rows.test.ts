@@ -4,7 +4,7 @@ import { test } from "node:test";
 import type { AgentInfo, SaidHit, SubagentBrief } from "../src/api/harness.ts";
 import type { AiSession } from "../src/api/types.ts";
 import { missionFoundSessions, missionRows, missionSaid, standOf, updatedAt, activityAt, subagentsLine, type MissionRow } from "../src/views/harness/mission-rows.ts";
-import { kilnAtWork, kilnSubagentsOf, subagentsAtWork } from "../src/views/harness/tasks.ts";
+import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, withKilnSubagents } from "../src/views/harness/tasks.ts";
 
 // Exercise the actual list matcher and sorter; their view imports need no CSS in Node.
 const loader = registerHooks({
@@ -348,4 +348,135 @@ test("mc_attention: urgent rows follow the server's globally comparable request 
     ).map((r) => r.a.id),
     ["old", "recent"],
   );
+});
+
+/** `items`, counting each time one of them is read (`read.n`). */
+function counted<T>(items: T[], read: { n: number }): T[] {
+  return new Proxy(items, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) read.n++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+}
+
+test("W26-R15 an agent with the subagents kiln started for it is the same object until one of them has news", () => {
+  const main = agent({ id: "main", status: "idle" });
+  const step = (id: string, rest: Partial<AgentInfo> = {}) => agent({ id, parent: "main", subagent: true, ...rest });
+  const [s1, s2] = [step("s1"), step("s2")];
+  assert.equal(withKilnSubagents(main, [s1, s2]), withKilnSubagents(main, [s1, s2]), "the same agent and subagents, in new lists");
+  assert.equal(withKilnSubagents(main, []), main);
+  // As the list's rows have it: the row's agent is the object it was, pass after pass, so its row has nothing to draw again.
+  const first = missionRows([main, s1, s2], {})[0];
+  const again = missionRows([main, s1, s2], {})[0];
+  assert.equal(again?.a, first?.a);
+  assert.equal(again?.requests, first?.requests);
+  assert.deepEqual(
+    first?.a.subagents?.map((s) => s.id),
+    ["s1", "s2"],
+  );
+  // News of a subagent: its agent's row is made again, and says it.
+  const busy = step("s1", { status: "waiting", approvals: [{ id: "ask", tool: "shell", tool_name: "Bash", title: "cargo test", at: 5000 }] });
+  const news = missionRows([main, busy, s2], {})[0];
+  assert.notEqual(news?.a, first?.a);
+  assert.deepEqual([news?.stand, news?.asking?.id], ["needs", "s1"]);
+  // One fewer: made again too.
+  assert.deepEqual(
+    missionRows([main, s2], {})[0]?.a.subagents?.map((s) => s.id),
+    ["s2"],
+  );
+});
+
+test("W26-R15 a pass over the fleet reads through an agent's subagents once, not again on every pass, sort and row", () => {
+  /** How many subagents each agent has. */
+  const EACH = 30;
+  const read = { n: 0 };
+  const fleet = Array.from({ length: 40 }, (_, i) =>
+    agent({
+      id: `a${i}`,
+      status: "idle",
+      last_turn: { at: 1000 + i, how: "done" },
+      subagents: counted(
+        Array.from({ length: EACH }, (_, j) => task({ id: `t${i}-${j}`, status: j % 3 === 0 ? "running" : "completed", started: 2000 + j, ended: j % 3 === 0 ? undefined : 3000 + j })),
+        read,
+      ),
+    }),
+  );
+  const rows = missionRows(fleet, {});
+  assert.equal(rows.length, 40);
+  assert.ok(rows.every((r) => r.stand === "working" && r.updated));
+  assert.equal(activityAt(fleet[7]!), 3000 + 29);
+  const first = sortRows(rows, "active")[0]?.a.id;
+  assert.ok(read.n > 0);
+  // The same agents in a new list, as each batch of news makes one: nothing of theirs is read through again,
+  // not to make their rows, nor to sort them by their last activity, nor to say when that was.
+  read.n = 0;
+  const next = missionRows([...fleet], { a3: 1 });
+  assert.deepEqual(names(sortRows(next, "active")).length, 40);
+  assert.equal(sortRows(next, "active")[0]?.a.id, first);
+  for (const r of next) assert.equal(activityAt(r.a) >= updatedAt(r.a), true);
+  assert.equal(subagentsAtWork(fleet[0]?.subagents).length, 10);
+  assert.equal(subagentsAtWork(fleet[0]?.subagents), subagentsAtWork(fleet[0]?.subagents));
+  assert.equal(read.n, 0, `${read.n} reads of subagents for agents with no news`);
+  // An agent with news is read again, alone.
+  const changed = { ...fleet[5]!, subagents: counted([task({ id: "new", started: 9000 })], read) };
+  const after = missionRows([...fleet.slice(0, 5), changed, ...fleet.slice(6)], {});
+  assert.equal(activityAt(after[5]!.a), 9000);
+  // Its one subagent, read for each thing made of it: fewer reads than going once through any other agent's would take.
+  assert.ok(read.n > 0 && read.n < EACH, `${read.n} reads for one agent's one subagent`);
+});
+
+test("W26-R15 with no session found that kiln doesn't say it runs, the agents' subagents aren't gone through", () => {
+  const read = { n: 0 };
+  const all = Array.from({ length: 20 }, (_, i) => ({
+    a: agent({
+      id: `a${i}`,
+      harness_session: `h${i}`,
+      subagents: counted(
+        Array.from({ length: 50 }, (_, j) => task({ id: `t${i}-${j}` })),
+        read,
+      ),
+    }),
+  }));
+  const session = (id: string, managed_by?: string) =>
+    ({
+      id,
+      managed_by,
+      machine: "fedora",
+      tool: "codex",
+      pid: 1,
+      name: id,
+      title: id,
+      cwd: "/work",
+      branch: "main",
+      model: "m",
+      started_at: 1,
+      last_activity: 2,
+      state: "idle",
+      last_prompt: "",
+      last_reply: "",
+      terminal: null,
+      transcript: true,
+    }) as AiSession;
+  assert.deepEqual(missionFoundSessions([], all), []);
+  assert.deepEqual(missionFoundSessions([session("h3", "a3"), session("x", "other")], all), []);
+  assert.equal(read.n, 0);
+  // One that might be anyone's: then they are, and it's told apart from kiln's own and their subagents.
+  const found = [session("t4-7"), session("h9"), session("mine"), session("h3", "a3")];
+  assert.deepEqual(
+    missionFoundSessions(found, all).map((s) => s.id),
+    ["mine"],
+  );
+  assert.equal(read.n, 20 * 50);
+  // Asked again as another agent has news (a new list of the same agents, one of them new): only that one is gone through.
+  read.n = 0;
+  const news = { a: agent({ id: "a2", harness_session: "mine", subagents: counted([task({ id: "t-new" })], read) }) };
+  assert.deepEqual(missionFoundSessions(found, [...all.slice(0, 2), news, ...all.slice(3)]), []);
+  assert.equal(read.n, 1);
+  // Other sessions found: everyone is asked about those.
+  assert.deepEqual(
+    missionFoundSessions([session("t7-1"), session("other")], all).map((s) => s.id),
+    ["other"],
+  );
+  assert.equal(read.n, 1 + 20 * 50);
 });

@@ -197,8 +197,9 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
 /// machine from the server's copy of its conversation ([`start`]), on `to` when it's given, else on
 /// the machine that suits it best (connected, not a job's, its harness installed there; one of
 /// `from`'s platform first, then the one running the fewest agents). Agents that ended stay where
-/// they were. What became of each: `{id, name, to?, error?}`.
-pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+/// they were, and so do agents its caller may not act on (`among`: the ids of those it may). What became of each:
+/// `{id, name, to?, error?}`.
+pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>, among: &std::collections::HashSet<String>) -> Result<Vec<serde_json::Value>, String> {
     use std::collections::HashMap;
     let from = from.strip_prefix("agent:").unwrap_or(from);
     let from = hub.machine_named(from).unwrap_or_else(|| from.to_owned());
@@ -218,7 +219,7 @@ pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>) -> Result<Vec
     };
     // A subagent whose agent is there goes along with it ([`start`]).
     let theirs = |i: &super::session::Info| i.subagent && i.parent.as_deref().is_some_and(|p| all.iter().any(|a| a.id == p));
-    let agents: Vec<_> = all.iter().filter(|i| on(&i.id).as_deref() == Some(from.as_str()) && i.status != super::model::Status::Exited && !theirs(i)).cloned().collect();
+    let agents: Vec<_> = all.iter().filter(|i| on(&i.id).as_deref() == Some(from.as_str()) && i.status != super::model::Status::Exited && !theirs(i) && among.contains(&i.id)).cloned().collect();
     let kinds = hub.harness.kinds();
     let runners: Vec<(String, String)> = hub.agents.load().values().filter(|a| a.connected && !a.ephemeral && !a.outpost && a.name != from).map(|a| (a.name.clone(), a.os.clone())).collect();
     let mut load: HashMap<String, usize> = HashMap::new();

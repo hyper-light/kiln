@@ -1,0 +1,383 @@
+{
+  "lean": {
+    "you": "ada",
+    "settings": {
+      "sort": "learned",
+      "auto_park_days": null,
+      "archive_after_days": 7,
+      "auto_archive": true,
+      "park_later_minutes": 60,
+      "park_evening_hour": 18,
+      "park_morning_hour": 9
+    },
+    "settings_defaults": {
+      "auto_park_days": 3
+    },
+    "archived": {
+      "rows": 1,
+      "cols": [
+        [
+          "id",
+          {
+            "v": [
+              "01a1dd4c3a1b7e66c2d3e4f5a6b7c8dz"
+            ]
+          }
+        ],
+        [
+          "kind",
+          {
+            "v": [
+              "claude"
+            ]
+          }
+        ],
+        [
+          "name",
+          {
+            "v": [
+              "Claude Code"
+            ]
+          }
+        ],
+        [
+          "title",
+          {
+            "v": [
+              "An old one"
+            ]
+          }
+        ],
+        [
+          "summary",
+          {
+            "v": [
+              "Put away"
+            ]
+          }
+        ],
+        [
+          "status",
+          {
+            "v": [
+              "exited"
+            ]
+          }
+        ],
+        [
+          "approvals",
+          {
+            "v": [
+              []
+            ]
+          }
+        ]
+      ]
+    },
+    "exposure": "visit-1",
+    "pair": {
+      "key": "visit-1",
+      "order_a": [
+        1,
+        0,
+        5,
+        2,
+        4,
+        3,
+        8
+      ],
+      "order_b": 6,
+      "arm": 1,
+      "model_order": true
+    },
+    "request_order": [
+      4
+    ],
+    "order": 6,
+    "agents": {
+      "rows": 8,
+      "cols": [
+        [
+          "revision",
+          {
+            "v": [
+              0,
+              0,
+              3,
+              5,
+              0,
+              0,
+              1,
+              2
+            ]
+          }
+        ],
+        [
+          "rank_reason",
+          {
+            "d": "1 interactions from you",
+            "x": [
+              0,
+              3
+            ],
+            "v": [
+              "2 interactions from you",
+              "Added during this visit"
+            ],
+            "at": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        ],
+        [
+          "pinned",
+          {
+            "v": [
+              1
+            ],
+            "at": [
+              2
+            ]
+          }
+        ],
+        [
+          "reason",
+          {
+            "v": [
+              "Parked by you"
+            ],
+            "at": [
+              3
+            ]
+          }
+        ],
+        [
+          "parked_until",
+          {
+            "v": [
+              2000
+            ],
+            "at": [
+              3
+            ]
+          }
+        ],
+        [
+          "parked_at",
+          {
+            "v": [
+              900
+            ],
+            "at": [
+              3
+            ]
+          }
+        ],
+        [
+          "urgency",
+          {
+            "v": [
+              {
+                "score": null,
+                "stale": false,
+                "known": false,
+                "since": 950,
+                "waited": null,
+                "expected_wait": null,
+                "observations": 0,
+                "reason": "Oldest first"
+              }
+            ],
+            "at": [
+              4
+            ]
+          }
+        ],
+        [
+          "updated_seen",
+          {
+            "v": [
+              940
+            ],
+            "at": [
+              6
+            ]
+          }
+        ],
+        [
+          "archived",
+          {
+            "v": [
+              true
+            ],
+            "at": [
+              7
+            ]
+          }
+        ],
+        [
+          "archive_status",
+          {
+            "v": [
+              "archived"
+            ],
+            "at": [
+              7
+            ]
+          }
+        ]
+      ]
+    },
+    "said": {
+      "at": [
+        2,
+        0,
+        4
+      ],
+      "v": [
+        "Done: c",
+        "Done: a",
+        "Done: e"
+      ]
+    },
+    "ids": {
+      "pre": "01a1dd4",
+      "v": [
+        "b70467679af99118ba53a4a5a",
+        "b73c9728cba77f3dd42afc3db",
+        "b8a1e7c33a5d09f6e2b7c4d1c",
+        "bf09172899e19421c5a82acdd",
+        "c05d27e41b8f3a6c9d1e0f2ae",
+        "c1bc77178a68be541fc9ab6ff",
+        "c2f0a7d55b1c2d3e4f5a6b7c5",
+        "c3a1b7e66c2d3e4f5a6b7c8dz",
+        "c4b2c7f77d3e4f5a6b7c8d9eg"
+      ]
+    },
+    "without": [
+      "model",
+      "examination",
+      "urgency",
+      "agents.rank"
+    ]
+  },
+  "snapshot": {
+    "you": "ada",
+    "settings": {
+      "sort": "learned",
+      "auto_park_days": null,
+      "archive_after_days": 7,
+      "auto_archive": true,
+      "park_later_minutes": 60,
+      "park_evening_hour": 18,
+      "park_morning_hour": 9
+    },
+    "settings_defaults": {
+      "auto_park_days": 3
+    },
+    "archived": [
+      {
+        "id": "01a1dd4c3a1b7e66c2d3e4f5a6b7c8dz",
+        "kind": "claude",
+        "name": "Claude Code",
+        "title": "An old one",
+        "summary": "Put away",
+        "status": "exited",
+        "approvals": []
+      }
+    ],
+    "exposure": "visit-1",
+    "pair": {
+      "key": "visit-1",
+      "order_a": [
+        "01a1dd4b73c9728cba77f3dd42afc3db",
+        "01a1dd4b70467679af99118ba53a4a5a",
+        "01a1dd4c1bc77178a68be541fc9ab6ff",
+        "01a1dd4b8a1e7c33a5d09f6e2b7c4d1c",
+        "01a1dd4c05d27e41b8f3a6c9d1e0f2ae",
+        "01a1dd4bf09172899e19421c5a82acdd",
+        "01a1dd4c4b2c7f77d3e4f5a6b7c8d9eg"
+      ],
+      "order_b": [
+        "01a1dd4b70467679af99118ba53a4a5a",
+        "01a1dd4b73c9728cba77f3dd42afc3db",
+        "01a1dd4b8a1e7c33a5d09f6e2b7c4d1c",
+        "01a1dd4bf09172899e19421c5a82acdd",
+        "01a1dd4c05d27e41b8f3a6c9d1e0f2ae",
+        "01a1dd4c1bc77178a68be541fc9ab6ff"
+      ],
+      "arm": 1,
+      "model_order": true
+    },
+    "request_order": [
+      "01a1dd4c05d27e41b8f3a6c9d1e0f2ae"
+    ],
+    "order": [
+      "01a1dd4b70467679af99118ba53a4a5a",
+      "01a1dd4b73c9728cba77f3dd42afc3db",
+      "01a1dd4b8a1e7c33a5d09f6e2b7c4d1c",
+      "01a1dd4bf09172899e19421c5a82acdd",
+      "01a1dd4c05d27e41b8f3a6c9d1e0f2ae",
+      "01a1dd4c1bc77178a68be541fc9ab6ff"
+    ],
+    "agents": {
+      "01a1dd4b70467679af99118ba53a4a5a": {
+        "revision": 0,
+        "rank_reason": "2 interactions from you"
+      },
+      "01a1dd4b73c9728cba77f3dd42afc3db": {
+        "revision": 0,
+        "rank_reason": "1 interactions from you"
+      },
+      "01a1dd4b8a1e7c33a5d09f6e2b7c4d1c": {
+        "revision": 3,
+        "rank_reason": "1 interactions from you",
+        "pinned": 1
+      },
+      "01a1dd4bf09172899e19421c5a82acdd": {
+        "revision": 5,
+        "rank_reason": "Added during this visit",
+        "reason": "Parked by you",
+        "parked_until": 2000,
+        "parked_at": 900
+      },
+      "01a1dd4c05d27e41b8f3a6c9d1e0f2ae": {
+        "revision": 0,
+        "rank_reason": "1 interactions from you",
+        "urgency": {
+          "score": null,
+          "stale": false,
+          "known": false,
+          "since": 950,
+          "waited": null,
+          "expected_wait": null,
+          "observations": 0,
+          "reason": "Oldest first"
+        }
+      },
+      "01a1dd4c1bc77178a68be541fc9ab6ff": {
+        "revision": 0,
+        "rank_reason": "1 interactions from you"
+      },
+      "01a1dd4c2f0a7d55b1c2d3e4f5a6b7c5": {
+        "revision": 1,
+        "updated_seen": 940
+      },
+      "01a1dd4c3a1b7e66c2d3e4f5a6b7c8dz": {
+        "revision": 2,
+        "archived": true,
+        "archive_status": "archived"
+      }
+    }
+  },
+  "said": {
+    "01a1dd4b8a1e7c33a5d09f6e2b7c4d1c": "Done: c",
+    "01a1dd4b70467679af99118ba53a4a5a": "Done: a",
+    "01a1dd4c05d27e41b8f3a6c9d1e0f2ae": "Done: e"
+  }
+}

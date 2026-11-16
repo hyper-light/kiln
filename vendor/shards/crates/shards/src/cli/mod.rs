@@ -106,7 +106,7 @@ const OWN: [&str; 26] = [
 /// (`context::kept_here`): a child of a command run `--context default` reads the same
 /// home, whose current context may be another machine's. No client of this machine's runs
 /// one (daemon/remote.rs `owners`).
-pub(crate) const INTERNAL: [&str; 10] = [
+pub(crate) const INTERNAL: [&str; 12] = [
     // The VM's broker (`shards run vm --kernel`, `shards restore vm`, macOS).
     "grants",
     // The recorder of a directly booted VM's console report (`shards run vm --kernel`,
@@ -131,6 +131,10 @@ pub(crate) const INTERNAL: [&str; 10] = [
     crate::client_binds::SERVE_APART,
     // An image's run for an orchestrator, which shards-api starts (D231).
     "api-run",
+    // Whether this host runs microVMs now, which shards-api asks (D262).
+    "api-check",
+    // An Agentfile's build for shards-api (D263).
+    "api-build",
 ];
 
 /// The words [`dispatch`] runs `args` as, its context's options taken off first (`context::
@@ -1132,10 +1136,21 @@ fn instead(args: &[OsString]) -> ExitCode {
         Ok(program) => program,
         Err(e) => return failed(&e),
     };
-    match shards_ipc::spawn_std(std::process::Command::new(program.path()).args(args))
-        .and_then(|mut child| child.wait())
-    {
-        Ok(status) => ExitCode::from(status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(1)),
+    // This process's standard handles alone, those it has (shards_ipc's spawn, D248); in a job
+    // nested under this process's, from which it breaks away from none, as std's child stayed.
+    use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+    let (stdin, stdout, stderr) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    let fds: Vec<_> = [
+        (stdin.as_handle(), 0),
+        (stdout.as_handle(), 1),
+        (stderr.as_handle(), 2),
+    ]
+    .into_iter()
+    .filter(|(handle, _)| !handle.as_raw_handle().is_null())
+    .collect();
+    let args: Vec<&std::ffi::OsStr> = args.iter().map(OsString::as_os_str).collect();
+    match shards_ipc::spawn_grouped(&program.path(), &args, &fds, &[]).and_then(|child| child.wait()) {
+        Ok(status) => ExitCode::from(u8::try_from(status).unwrap_or(1)),
         Err(e) => failed(&format!("{}: {e}", bin.display())),
     }
 }

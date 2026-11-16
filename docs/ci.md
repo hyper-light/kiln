@@ -1945,6 +1945,15 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
     later attempt, waits a whole lease and the lock-delay first (W05-R34): the store doesn't keep
     when its retry was due, and that wait runs past the end of any lease from before the restart
     (docs/sim.md's bug 13).
+  - A run comes back as it stood. One under way (a leg of its attempt made, or a report in its
+    plan's log) holds its place in its workflow-level group again (W05-R06): the runs behind it
+    still wait for it, and a newer one still cancels it where the group says so. One that never
+    started (held behind its group, none of its legs made) comes back holding its plan's first
+    actions and arrives in its group again once every run under way holds its place, in the order
+    such runs arrived before (when each was made, approved, or run again, whichever is last): it
+    starts in its turn, at once when nothing holds its group. One cancelled with none of its legs
+    made ends cancelled as it's rebuilt. Runs are rebuilt, and their demands given (W28-R46), in
+    the order they were made, as before.
 - **W05-R26 Speed.** The targets of §1.5: ready → `Assign` p99 < 50 ms with capacity, ≥ 2,000
   assignments per second, 10,000 queued legs, 1,000 runners.
 - **W05-R27 Pools.** The scheduler asks W13's pool manager to scale up when the legs waiting for a
@@ -6893,6 +6902,46 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
   options now include `firecracker` and `shards` (built from an Agentfile that declares the agent
   and its grants).
 
+  **Splits** (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1; the person's decision 7): an
+  experiment may split a person's own sessions across deployments instead of measuring options
+  (`experiments.start` with `target` and `arms`).
+  - The target is one of their agent definitions, or a harness and, where given, its Agentfile.
+  - Each of its 2 or more variants (`arms`) is a deployment with a weight in percent (together
+    100): an Agentfile, an agent or a harness, an engine (`microvm` or `host`) and a VM size.
+  - While it runs, each new session of the target that its opener starts, through `agents.start`
+    or the console, is one variant:
+    - drawn by weight as it starts (a seeded draw, so its shares are its weights');
+    - recorded on the session (`experiment` on its info) and kept for its life;
+    - started as that variant's deployment, the variant's size sizing its microVM.
+  - A conversation taken up again and a card's helper start as asked.
+  - A variant whose start is refused counts that start as a failure. The rest of the start's
+    sessions are still drawn.
+  - `experiments.pause` stops the draws and `experiments.resume` starts them again.
+  - `experiments.decide` promotes one variant, on a person's press: every later session of the
+    target is that variant (`promoted`), and the split is over. `experiments.cancel` ends the
+    split and its promotion.
+  - A split's results come from its sessions as they run and end (`experiments.get`). Each
+    variant gets:
+    - how many sessions it was assigned;
+    - its failures (a start refused, a session that never ran, or one that ended in error);
+    - its start time within each start kind (cold, from a template, warm), never pooled, since
+      warm pools sized by demand give a variant of low weight more cold starts;
+    - its start-kind mix, as a measure of its own;
+    - its footprint, peak and steady, and its host CPU, from each start's record
+      (`Start::measured`, Hex's meter of its microVM);
+    - its sessions' outcomes.
+  - Each measure has an anytime-valid confidence sequence, so a reading after every session is
+    valid at that moment:
+    - for rates, the hedged betting sequence of Waudby-Smith and Ramdas, "Estimating means of
+      bounded random variables by betting" (JRSS B, 2024), with its predictable plug-in bets;
+    - for medians, the quantile construction of Howard and Ramdas, "Sequential estimation of
+      quantiles with applications to A/B-testing and best-arm identification" (Bernoulli, 2022),
+      after Howard et al., "Time-uniform, nonparametric, nonasymptotic confidence sequences"
+      (Annals of Statistics, 2021).
+  - A winner on a measure is a variant whose sequence lies wholly below every other's. Each
+    variant's sequences are held at 5 % / k for its k variants, so a winner holds at 95 % whenever
+    it's read.
+
 **Acceptance criteria**
 
 - **W20-AC01 Coverage.** Every operation in §4 is reachable as an HTTP route, an MCP tool, a
@@ -7224,7 +7273,7 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   (Geist Mono, quiet gutters). It works on phones: the text area is first; completion appears in
   the standard dropdown.
 - **W21-R02 Live data.** Pages subscribe to `/api/events` for their objects and patch in place;
-  lists are windowed (`lib/virtual.ts`); motion only on real state changes.
+  lists are windowed (`lib/virtual.ts`, `lib/list-window.ts`); motion only on real state changes.
 
 **Requirements: pages**
 

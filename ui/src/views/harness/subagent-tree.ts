@@ -8,11 +8,13 @@
  * it. While it needs you, its own piece is tan.
  */
 import type { AgentInfo, Approval, ApprovalBrief, HEvent, SubagentBrief, Task } from "@/api/harness";
+import { lastWords } from "@/api/last-words";
 import type { Grant } from "@/api/wire/Grant";
 import type { Perms } from "@/api/wire/Perms";
+import { sameJson } from "@/lib/utils";
 import { agentLabel, plain } from "./derive";
 import { standOf } from "./mission-rows";
-import { askWords, isSubagent, kilnSubagentsOf } from "./tasks";
+import { askWords, isSubagent } from "./tasks";
 import type { StepLive } from "./goal-plan-layout";
 
 /** Its machine, as Mission control's rows name it (parts.tsx's `machineName`; that module brings the page's styles with it). */
@@ -147,6 +149,13 @@ export function liveRoot(base: AgentInfo, tasks: readonly Task[], approvals: rea
   };
 }
 
+/**
+ * The request a subagent's row answers itself: the one it waits on, unless its agent's row answers
+ * that one already (`rowAsk`). Only a row with one is told of its agent (the answer goes there), so
+ * an agent's every word isn't news to the rows of its subagents that ask nothing (W26-R15).
+ */
+export const nodeAsk = (n: Pick<SubagentNode, "stand" | "ask">, rowAsk?: string): ApprovalBrief | undefined => (n.stand === "needs" && n.ask && n.ask.id !== rowAsk ? n.ask : undefined);
+
 /** It can take a message: it hasn't ended. */
 export const takesMessage = (n: Pick<SubagentNode, "stand">) => n.stand !== "done" && n.stand !== "failed" && n.stand !== "stopped";
 
@@ -191,7 +200,12 @@ function kilnStand(a: AgentInfo, paused = false): NodeStand {
 function kilnLine(a: AgentInfo, stand: NodeStand): string {
   const ap = a.approvals[0];
   if (stand === "needs") return ap ? askWords(ap) : "Waiting for you";
-  if (stand === "done") return a.summary ? plain(a.summary) : a.goal || a.title || "";
+  if (stand === "done") {
+    // What it last said: not known yet of one the list told lean (W21-R02, api/last-words.ts: asked for by this read,
+    // and whoever draws this line draws it again as they're told), and then no other text stands in for it.
+    const said = lastWords(a);
+    return said === undefined ? "" : said ? plain(said) : a.goal || a.title || "";
+  }
   if (stand === "failed" || stand === "stopped") return a.exit?.error ?? "";
   if (stand === "offline") return "Its machine is offline";
   return a.doing || a.activity || "";
@@ -208,20 +222,79 @@ export function threadHref(root: string, owner: string, id: string): string {
   return owner === root ? `/agents/${root}?task=${encodeURIComponent(id)}` : `/agents/${owner}?own=1&task=${encodeURIComponent(id)}`;
 }
 
+/** Every agent kiln runs, as a tree looks them up: each by its id, which of them kiln started as subagents, and each agent's own of those, in the list's order. */
+interface Roster {
+  byId: ReadonlyMap<string, AgentInfo>;
+  kiln: ReadonlySet<string>;
+  of: ReadonlyMap<string, AgentInfo[]>;
+}
+/** Each list's, as last read: every open tree, and every row of one, asks of the same list. */
+const rosters = new WeakMap<readonly AgentInfo[], Roster>();
+function rosterOf(list: readonly AgentInfo[]): Roster {
+  let known = rosters.get(list);
+  if (!known) {
+    const byId = new Map<string, AgentInfo>();
+    const kiln = new Set<string>();
+    const of = new Map<string, AgentInfo[]>();
+    for (const a of list) {
+      if (!byId.has(a.id)) byId.set(a.id, a);
+      if (a.subagent !== true) continue;
+      kiln.add(a.id);
+      if (a.parent === undefined) continue;
+      const own = of.get(a.parent);
+      if (own) own.push(a);
+      else of.set(a.parent, [a]);
+    }
+    known = { byId, kiln, of };
+    rosters.set(list, known);
+  }
+  return known;
+}
+
+/** The agent `id` among `list` (every agent kiln runs), found without going through them again for each one asked for (W26-R15). */
+export const agentIn = (list: readonly AgentInfo[], id: string): AgentInfo | undefined => rosterOf(list).byId.get(id);
+
+/**
+ * `rows` with each that says what it said before (`was`) as the object it was. A tree's rows are
+ * made anew at every word from any agent; a subagent with nothing new keeps its row, so what draws
+ * it has nothing to draw again (W26-R15).
+ */
+export function keepRows<T extends { key: string }>(was: readonly T[], rows: readonly T[]): T[] {
+  const before = new Map(was.map((row) => [row.key, row]));
+  return rows.map((row) => {
+    const same = before.get(row.key);
+    return same !== undefined && sameJson(same, row) ? same : row;
+  });
+}
+
 /**
  * The subagents of `root`, in tree order: under each, those it started, kiln's and its harness's
  * own together in the order they started. `list` is every agent kiln runs (its kiln subagents and
  * theirs are found there); `root` may carry its live state's subagents and requests (`briefsOf`).
+ * The list is read through once, and each subagent placed once: a tree of hundreds among thousands
+ * of agents costs their sum, not their product (W26-R15).
  */
 export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): SubagentNode[] {
   const out: SubagentNode[] = [];
   const seen = new Set<string>();
+  const roster = rosterOf(list);
   // `above`: a person paused something over these (the session they're in, a subagent they're under).
   // `over`: what the session they're in lets them (its perms, as narrowed by those over it).
   const walk = (owner: AgentInfo, parent: string | null, depth: number, above: boolean, over: Perms | undefined) => {
-    const briefs: Brief[] = (owner.subagents ?? []).filter((b) => !list.some((a) => a.id === b.id && a.subagent === true));
+    const briefs: Brief[] = (owner.subagents ?? []).filter((b) => !roster.kiln.has(b.id));
     const ids = new Set(briefs.map((b) => b.id));
-    const harness = (under: string | undefined) => briefs.filter((b) => (under ? b.parent_task === under : !b.parent_task || !ids.has(b.parent_task)));
+    // Its harness's own, each under the one that started it (`parent_task`); those no one here started, first.
+    const first: Brief[] = [];
+    const under = new Map<string, Brief[]>();
+    for (const b of briefs) {
+      if (!b.parent_task || !ids.has(b.parent_task)) first.push(b);
+      else {
+        const own = under.get(b.parent_task);
+        if (own) own.push(b);
+        else under.set(b.parent_task, [b]);
+      }
+    }
+    const harness = (of: string | undefined) => (of ? (under.get(of) ?? []) : first);
     const place = (b: Brief, parentKey: string | null, d: number, pausedOver: boolean, permsOver: Perms | undefined) => {
       const key = `${owner.id}/${b.id}`;
       if (seen.has(key)) return;
@@ -255,7 +328,7 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
       });
       for (const c of harness(b.id).sort((x, y) => x.started - y.started)) place(c, key, d + 1, pausedOver || own, within(b.perms, permsOver));
     };
-    const kiln = kilnSubagentsOf(list, owner.id);
+    const kiln = roster.of.get(owner.id) ?? [];
     const items = [
       ...harness(undefined).map((b) => ({ at: b.started, go: () => place(b, parent, depth, above, over) })),
       ...kiln.map((a) => ({

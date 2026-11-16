@@ -34,9 +34,14 @@ export function displayedPair(pair: AttentionPair, shown: readonly string[], eli
   const slots = shown.filter((id) => eligible.has(id));
   const chosenRest = selected.filter((id) => eligible.has(id));
   const otherRest = other.filter((id) => eligible.has(id));
-  const unique = new Set(shown).size === shown.length && new Set(selected).size === selected.length && new Set(other).size === other.length;
-  const known = shown.every((id) => selected.includes(id) && other.includes(id));
-  const consistent = unique && known && sameOrder(slots, chosenRest) && otherRest.length === slots.length && otherRest.every((id) => slots.includes(id));
+  // Each id looked up in a set, not searched for in a list: this runs as the list renders, and a
+  // search for each of thousands of agents is millions of steps a render (W26-R15).
+  const inSelected = new Set(selected);
+  const inOther = new Set(other);
+  const inSlots = new Set(slots);
+  const unique = new Set(shown).size === shown.length && inSelected.size === selected.length && inOther.size === other.length;
+  const known = shown.every((id) => inSelected.has(id) && inOther.has(id));
+  const consistent = unique && known && sameOrder(slots, chosenRest) && otherRest.length === slots.length && otherRest.every((id) => inSlots.has(id));
   let at = 0;
   const alternate = consistent && automatic ? shown.map((id) => (eligible.has(id) ? (otherRest[at++] ?? id) : id)) : [...shown];
   return {

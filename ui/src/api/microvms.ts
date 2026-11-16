@@ -261,7 +261,7 @@ export interface OverrideAnswer {
 }
 const live = (id: string, rest: string) => `/api/harness/sessions/${enc(id)}/${rest}`;
 export const overridesApi = {
-  publish: (id: string, p: { member?: string; bind: string; host_port: number; guest_port: number; protocol: LiveProtocol }) => request<OverrideAnswer>("POST", live(id, "ports"), p),
+  publish: (id: string, p: { bind: string; host_port: number; guest_port: number; protocol: LiveProtocol }) => request<OverrideAnswer>("POST", live(id, "ports"), p),
   unpublish: (id: string, k: LivePortKey) => request<OverrideAnswer>("POST", live(id, "ports/unpublish"), k),
   grant: (id: string, e: { member?: string; host: string; port: number }) => request<OverrideAnswer>("POST", live(id, "egress"), e),
   revoke: (id: string, e: { member?: string; host: string; port: number }) => request<OverrideAnswer>("POST", live(id, "egress/revoke"), e),

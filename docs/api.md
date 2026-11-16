@@ -106,7 +106,7 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/ship/deploys/:app` | An app's pane (`:app` its id, two segments: `default/web`) → `{ app: row, about: { cluster, namespace, objects, source, repo }, groups: [{ name, note, owner?, items: [{ key, group, kind, namespace, name, state, v, logs, differs, node?, container? }] }], tree: { live, errors }, rollout: { id, revision, state, note, steps: [{ n, state, what, v, detail? }], under_way, waits, strategy, said, promote_to, approvals, deploy, back_to, weight, sides: [{ side: stable\|canary, name, pods, share, up }] }?, history: [{ deploy?, sha?, short?, subject, by?, at_ms, state, now, dim, to?, revision?, same_as? }], settings: [{ key: auto_sync\|auto_rollback\|prune\|self_heal, on, from, what, can }], why_not: { verb: why } }`: its components each workload's group (its pods, uptime and restarts, and ReplicaSets under it) and then by what they are, read live from its cluster (else what KilnCD holds, for a target beyond Kubernetes or a cluster not reached); a rollout's steps; its history, its source's newest commits each as the deploy that ran it or else one a rollback can go to (`revision`), then older deploys (`to`); and why each strip verb can't apply, where one can't (`delete` where something else declares the app). A pod's item has its `node` and the `container` its logs read; a rollout, its step under way's analysis as measured (`detail`: each check's latest measurement), its strategy (`canary`, `blue/green`), the share Promote moves it to (`promote_to`), the deploy it rolls out, the one it goes back to and the new one's share of traffic (`weight`, %), and on a cluster its two sides: its workload's ReplicaSet that ran (`stable`) and the newest (`canary`), each with its pods and share. A sync under way's line names the deploy it will be (`#42 · wave 2 of 3`). An item's `key` is the `:key` of `/api/cd/apps/:app/resources/:key` (logs, events, manifest, diff) |
 | POST | `/api/ship/deploys` | `{ app, verb, … }`: a strip verb on an app, each its CD operation, only what that takes passed on: `sync` (`resources`: picked keys or `{group, kind, namespace, name}`; `prune`, `dry_run`, `options`) → `cd.apps.sync`; `refresh` (`hard`) → `cd.apps.refresh`; `rollback` (`to` a deployment, or `revision`: any commit, W26-R25) → `cd.apps.rollback`; `stop` → `cd.apps.terminate`; `follow` → `cd.apps.follow`; `promote` (`full`), `abort` (`reason`), `approve` and `deny` (`check`), with `rollout` → `cd.apps.rollout_act`; `auto_sync` and `auto_rollback` (`on`: true, false or null) → `cd.apps.set_auto_sync`, `cd.apps.set_auto_rollback` (W26-R27); `delete` (`cascade`: `foreground` or `orphan`, which leaves its objects) → `cd.apps.delete`, or 409 for an app its repository's `.kiln/deploy.yaml` or another app declares, as it would come back → 200 `{ app, verb, op, done }`, `done` what the operation answered. As the operation's route would let the caller (`environments.deploy` on the whole server, or 403; an agent only where its environment lets agents deploy), its input checked as its type, and audited in this request's one row; what the operation refuses comes back as it says it (W26-R24) |
 | POST | `/api/jobs/:id/tools/fix` | `{ runner?, kind?, mode? }` → `{ fix }`: an agent, as the caller, installs what the job lacks on that runner; then kiln probes the runner's facts and runs the run's failed jobs again (`runs.rerun` on its repository, and `agents.run` as for any agent) |
-| GET | `/api/agents` | `Agent[]` |
+| GET | `/api/agents?lean=` | `Agent[]`; with `lean=1`, each with only its facts' `virt` of them (whether it starts microVMs): what a page that lists the runners and starts agents on them reads, a third of the list (Mission control as it opens; the Runners page reads it whole) |
 | DELETE | `/api/agents/:name` | forget agent |
 | POST | `/api/agents/:name/drain` | `{ draining: bool }` |
 | GET | `/api/agents/:name/diagnose` | what's wrong with that runner, worst first, each with its repair ([releases.md](releases.md#diagnosing-and-repairing-a-runner)) |
@@ -114,7 +114,9 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
 | GET | `/api/runners/:name/agent-limit` | `{ runner, own, connected, runs_agents, supported, max_sessions, held: { max_sessions, from: "server" \| "config" \| "default", config? } \| null, working, waiting, sessions, default, max }`: the most agent sessions the runner has at work at once, what's set here (`max_sessions`, null for none), what it holds and why as it last said, how many of its sessions are at work now (`working`, what the limit counts) and wait for room to go to work (`waiting`; both null while it's offline), and how many it has in all (`sessions`, finished, paused and ended ones too) ([agents.md](agents.md#how-many-agents-a-machine-runs)); 404 for an unknown runner |
 | PUT | `/api/runners/:name/agent-limit` | `{ max_sessions: n }` (1 to 4096), or `{ max_sessions: null }` to take it away (its config's, or kiln's default of 64, holds again) → the same view. Wins over the runner's config; stored and pushed to the runner (held when it next connects if it's offline). 400 for anything else, saying why; audited `agent_limit.update` |
-| GET | `/api/runners/:name/engine` | `{ runner, engine: "host" \| "microvm" \| null, from: "server" \| "default" \| null, why, asked, version, microvm: { usable, why } \| null, isolation, virt, sessions, draining }`: how the runner runs new agent sessions (its engine), where that comes from (its owner set it, or what it can do: `microvm` where it can hold microVMs, else `host`) and why, what's set here (`asked`, null for none) and how many times it was set (`version`, which a start placed under an older one is refused by), whether it can hold microVMs now and why not, its isolation facts, and how many of its running sessions are on its engine (`sessions`) and on the other (`draining`, which finish there); null fields until its facts come ([isolation.md](isolation.md#a-runners-engine)); 404 for an unknown runner |
+| GET | `/api/runners/:name/engine` | `{ runner, engine: "host" \| "microvm" \| null, from: "server" \| "default" \| null, why, asked, version, microvm: { usable, why } \| null, isolation, virt, sessions, draining }`: how the runner runs new agent sessions (its engine), where that comes from (its owner set it, or what it can do: `microvm` where it can hold microVMs, else `host`) and why, what's set here (`asked`, null for none) and how many times it was set (`version`, which a start placed under an older one is refused by), whether it can hold microVMs now and why not, its isolation facts, and how many of its running sessions are on its engine (`sessions`) and on the other (`draining`, which finish there), each of those (`draining_sessions: { id, name, kind, state, engine, created_at }[]`, those an agent started before it), and while any drains the switch they drain for (`switch: { from, to, at } \| null`, `from` and `to` as `asked` says them); null fields until its facts come ([isolation.md](isolation.md#a-runners-engine)); 404 for an unknown runner |
+| POST | `/api/runners/:name/engine/end` | "End them now": each draining session ended, after the agents it started → the same view, with `ended: string[]` (the sessions ended). `runners.manage`; destructive (`runners.engine.end_draining`: an agent's call waits for its person's click); audited `runner_engine.end_draining` |
+| POST | `/api/runners/:name/engine/cancel` | its engine set back to `switch.from` while what the switch drains runs, as a `PUT` sets it (a new `version`) → the same view; 409 where it wasn't switched, or nothing drains (`runners.engine.cancel`) |
 | PUT | `/api/runners/:name/engine` | `{ engine: "host" \| "microvm" }`, or `{ engine: null }` for what the runner can do → the same view. `microvm` is refused (409), saying why, where the runner can't hold microVMs now. Stored, held in the server's facts of it at once (`isolation.engine`, `virt.microvm` only on `microvm`) and pushed to the runner; nothing running stops. 400 for anything else, saying why; audited `runner_engine.update` |
 | GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
 | GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |
@@ -138,7 +140,7 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET, POST | `/api/push/subscriptions` | your devices; a browser's subscription with its name and what it hears (at most 20 devices each) |
 | DELETE | `/api/push/subscriptions/:id` | forgets one of your devices |
 | POST | `/api/push/test` | `{ id? }`: a test to your devices → `{ sent, results }` |
-| PUT, DELETE | `/api/push/mutes/:agent` | mutes or unmutes an agent's notifications for you |
+| PUT, DELETE | `/api/push/mutes/:agent` | mutes or unmutes an agent's notifications for you: `push.mute`, `push.unmute` |
 | GET | `/sw.js`, `/manifest.webmanifest` | **open** · the service worker that shows pushes (no fetch handler: it never intercepts the app), and the web app manifest |
 | GET | `/api/voice` | `{ transcribe, language }`: whether kiln transcribes recordings ([voice.md](voice.md)) |
 | POST | `/api/voice/transcribe?lang=` | body: the recording (`Content-Type: audio/*`, up to 25 MiB) → `{ text }`; 501 not set up, 415 not a recording, 413 too big, 502 the service failed |
@@ -217,7 +219,8 @@ one, or one whose target changed since (409, and the next such call asks anew) d
 confirmation lasts until the person's next message to that agent, which drops what was asked before it;
 a click after the agent's turn ended still confirms. kiln keeps the confirmation and never hands it to
 the agent, so there's nothing for an agent or a page it reads to copy, guess or replay. An op an agent
-makes in a person's turn says so on its audit row (kiln's own operations).
+makes in a person's turn says so on its audit row, whichever operation it is. The Agents page's Remove is
+`agents.remove` (`DELETE /api/harness/agents/{agent}`), held to this gate as every operation is.
 
 ## Agent definitions
 
@@ -240,11 +243,12 @@ runs and its runners: a definition's run is one of those agents.)
 | POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile? }` → `AgentDef` (version 1); 422 `kiln can't run this agent: <why>`, 409 a name taken |
 | POST | `/api/agentdefs/check` | the settings → `{ ok, problems: string[] }`, keeping nothing |
 | GET | `/api/agentdefs/{id}` | `AgentDef` |
-| PATCH | `/api/agentdefs/{id}` | what's given changes (null `model` or `agentfile`: back to its harness's) → `AgentDef` |
+| PATCH | `/api/agentdefs/{id}` | what's given changes (null `model` or `agentfile`: back to its harness's), over `If-Match: "<version>"` or `base` (the version it's made over, as you read it) → `AgentDef`; 409 `{ error, base, current: AgentDef }` where another change moved it on from that version (nothing is written) |
 | GET | `/api/agentdefs/{id}/versions` | `{ versions: { version, at, by, ...settings }[] }`, newest first |
 | POST | `/api/agentdefs/{id}/restore` | `{ version }` → `AgentDef`, that version's settings as a new version |
 | DELETE | `/api/agentdefs/{id}` | `{ deleted: true }` |
 | POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }`; `id` one of yours or kiln's |
+| GET | `/api/agentdefs/{id}/sessions` | `{ sessions: { id, version, at, runner, state, engine, agent }[], starts: { n, by_kind: { [kind]: { n, timed, p50_ms } }, warm } }`: the sessions you started from it (`id` one of yours, or kiln's `kiln:<name>`), newest first, each with the version it started from, its `state` (as agents.list's `stand`; `gone` once kiln no longer has it), runner and engine; and what their starts took, by how each started |
 | POST | `/api/agentdefs/{id}/copy` | `{ name? }` → `AgentDef`: one of kiln's (`kiln:<name>`) or yours, made yours, version 1 |
 | POST | `/api/agentdefs/use` | `{ builtin, id }` → `{ uses }`: your own `id` stands in for kiln's UI agent `builtin` for you (null `id`: kiln's own again) |
 
@@ -270,10 +274,20 @@ its person set, a tool fix's `kind`; left unset, it's stored unset), then the pe
 kiln's. An attachment's agent and a review agent are their attachment person's (`by`). Deleting the
 definition makes it kiln's own again.
 
-A run starts an agent through `agents.start`, as its route starts one (the caller's right to start
-agents there checked and audited as such): the definition's harness and model, `isolation`
+A run starts an agent as `agents.start` starts one, through the one start path (the caller's right
+to start agents there checked, and the start audited): the definition's harness and model, `isolation`
 `microvm`, `image` its Agentfile (left out: the start's own for its harness), and as its first
 message its instructions, then the run's `prompt`.
+
+Each session kiln opens from a definition keeps which, and at which version (kiln's own: 0), kiln's to
+say and never what was asked: a run's, and one of kiln's UI agents started from the person's own
+definition standing in for it or from kiln's. `agents.get` says it (`definition: { id, version, name,
+current }`, `current` the definition's version now: a session behind it has a lesser `version`), and
+`sessions` lists a definition's. Their starts are read off kiln's record of each start of a session's
+harness on its machine (every one recorded, of the sessions kiln still has): by how each started, which
+that record says by its engine (`host`, `microvm`), and, for a session's first start, the time from its
+open on its machine to its harness running, room waits and image builds included. Deleting the
+definition drops what its sessions say of it.
 
 ```ts
 interface Mcp { name; url?; command?: string[] }
@@ -287,7 +301,7 @@ interface KilnAgentDef { id /* "kiln:<name>" */; name; about; replaceable: boole
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/api/agentfiles?repo=&all=` | `AgentfileListing`: yours, newest change first, without their texts; beside them, read only, those kiln ships per harness (`builtin`), and with `repo` (`owner/name`, a repository whose runs you read, else 404) its `.kiln/images/<name>/Agentfile` files at its default branch (`text` null past 2 MiB). `all=true`: everyone's (403 without `agentfiles.manage`) |
+| GET | `/api/agentfiles?repo=&all=&lean=` | `AgentfileListing`: yours, newest change first, without their texts; beside them, read only, those kiln ships per harness (`builtin`), and with `repo` (`owner/name`, a repository whose runs you read, else 404) its `.kiln/images/<name>/Agentfile` files at its default branch (`text` null past 2 MiB). `all=true`: everyone's (403 without `agentfiles.manage`) With `lean=1` those kiln ships come by their names and harnesses alone, their texts left empty (a start's list, which shows no more of them: the texts are most of what the list carries). |
 | POST | `/api/agentfiles` | `{ name, text }` → `AgentfileSaved`, version 1. `name`: an image's (lowercase letters and digits joined by `.`, `_` or `-`, 255 at most), once among yours (409). `text`: 2 MiB at the most (400); Shards' refusal is 422 |
 | POST | `/api/agentfiles/check` | `{ text }` → `AgentfileCheck`: what keeping it would say, nothing kept (the editor's lint) |
 | GET | `/api/agentfiles/:id` | `Agentfile` |
@@ -370,6 +384,9 @@ definition and source map, its provenance.
 * `GET /api/terminal/ws?target=local|agent:<name>&cols=120&rows=40` — full PTY.
   Client → server: **binary** = keystrokes, text `{type:"resize", cols, rows}`.
   Server → client: **binary** = PTY output, text `{type:"exit", code}` / `{type:"error", message}`.
+  `?session=<id>` attaches to a running session: `{type:"session", session}`, its replay, then its
+  output. With `&first=screen` the part of the replay that draws the session's screen comes ahead of
+  it, where it has one (`session` then says `screen`: docs/wire.md, "A terminal's screen first").
 * `GET /api/agents/tunnel` — **open**; an agent's QUIC datagrams when UDP to the QUIC port gets no
   answer (see architecture.md, *Agent transport*). Each **binary** message is one UDP datagram of at
   most 1500 bytes, both ways: the server relays it to its own QUIC listener from a loopback socket

@@ -6,7 +6,7 @@
 import * as React from "react";
 import "./harness.css";
 import { MarkdownBody, type LocalFile } from "@/lib/markdown";
-import { streamBlocks } from "@/lib/markdown-blocks";
+import { BlockCutter } from "@/lib/markdown-blocks";
 import { cn } from "@/lib/utils";
 import { MessageFile, MessageSeq } from "./files";
 import { proseHere, type ProseProps } from "./prose-later";
@@ -31,9 +31,10 @@ export const Prose = React.memo(function Prose({ text, className, ev, seq, strea
 /** A block of a message still coming: drawn once, however long the rest takes to come. */
 const Block = React.memo(MarkdownBody);
 
-/** A message still coming, a block at a time (markdown-blocks.ts): what it renders is what it would whole. */
+/** A message still coming, a block at a time (markdown-blocks.ts): what it renders is what it would whole. Cut by one cutter for as long as it comes, so each word costs reading only what came with it. */
 function StreamingBody({ text, files }: { text: string; files?: LocalFile }) {
-  return streamBlocks(text).map((block, i) => <Block key={i} text={block} files={files} />);
+  const [cutter] = React.useState(() => new BlockCutter());
+  return cutter.cut(text).map((block, i) => <Block key={i} text={block} files={files} />);
 }
 
 // Loaded: prose-later.tsx draws with it at once from now on.

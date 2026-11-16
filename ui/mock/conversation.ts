@@ -29,7 +29,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { crc32, deflateSync, gzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
 import type { AgentInfo, HEvent, KeptFile, Meta, SaidHit, State } from "../src/api/harness.ts";
-import { mockHistory } from "./history.ts";
+import { mockHistory, REST_MS } from "./history.ts";
 import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 
 const ID = "demo-long";
@@ -849,19 +849,37 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
   // Both clients use the canonical fixture; the new bounded view is selected before lean bodies.
   for (let i = 0; i < sent.length; i += 120) frames.push({ t: "events", events: sent.slice(i, i + 120) });
   if (process.env.MOCK_NO_SYNCED !== "1") frames.push({ t: "synced" });
+  // The rest of a window whose first part the snapshot is (`first_bytes`): a message of its own after it, as the server sends it.
+  const rest = bounded.rest && { ...bounded.rest, events: bounded.rest.events.map((e) => (view.lean ? leanOf(e) : e)) };
+  const sendRest = () => {
+    if (!rest || ws.readyState !== ws.OPEN) return;
+    if (packed) ws.send(gzipSync(`${JSON.stringify(rest)}\n`));
+    else send(ws, rest);
+  };
+  // What's live goes to it once its snapshot is out, and the rest of its window where it has one: nothing live before
+  // the rest, as the server sends it (MOCK_REST_MS: the rest held back that long).
+  const join = () => {
+    if (ws.readyState !== ws.OPEN) return;
+    if (patches && !had.has(ws)) had.set(ws, first);
+    viewers.add(ws);
+    if (!timer) timer = setTimeout(tick, 140);
+  };
+  const after = () => {
+    const then = () => {
+      sendRest();
+      join();
+    };
+    if (rest && REST_MS > 0) setTimeout(then, REST_MS);
+    else then();
+  };
   // A viewer that unpacks gzip (`?z=gzip`): the whole snapshot packed in one message, a frame a line, as the server sends it.
   if (packed && slow === 0) {
     ws.send(gzipSync(frames.map((f) => JSON.stringify(f)).join("\n")));
-    if (patches) had.set(ws, first);
-    viewers.add(ws);
-    if (!timer) timer = setTimeout(tick, 140);
     frames.length = 0;
   }
   const go = (i: number) => {
     if (i >= frames.length) {
-      if (patches && !had.has(ws)) had.set(ws, first);
-      viewers.add(ws);
-      if (!timer) timer = setTimeout(tick, 140);
+      after();
       return;
     }
     send(ws, frames[i]);

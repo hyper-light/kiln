@@ -715,6 +715,10 @@ pub enum Input {
     /// older runs with the same key (workflow and branch, stack or pull request).
     RunQueued { run: String, group: Option<(String, String, GroupConfig)>, supersede: Option<(String, Supersede)> },
     RunFinished { run: String },
+    /// After a restart (W05-R25): a run that had started holds its place in its workflow-level
+    /// group again, so the runs behind it wait for it as they did. Nothing starts and nothing is
+    /// cancelled by it.
+    RunResumed { run: String, key: String, cfg: GroupConfig },
     /// A run's demand (W28-R40), before its `RunQueued`: that withdraws older demands on its lane
     /// when its `supersede` adopts. On its own (a rerun's), it is live again and withdraws nothing.
     Demand(Box<Demand>),
@@ -1785,6 +1789,10 @@ impl Scheduler {
                     }
                 }
                 self.demands.leave(&run);
+            }
+            Input::RunResumed { run, key, cfg } => {
+                self.groups.resume(&key, &format!("run:{run}"), &cfg);
+                self.run_groups.insert(run, key);
             }
             Input::Demand(d) => {
                 let _ = self.demands.arrive(*d, false);
@@ -2945,7 +2953,8 @@ impl Scheduler {
     fn room_of(&self, r: &Runner, h: &Holding, extra: Cpus) -> u64 {
         let c = self.config();
         let size = size(r);
-        if h.whole {
+        // None on a runner that offers no slots, as [`Self::room_in`] gives it none.
+        if h.whole || r.input.slots == 0 {
             return 0;
         }
         let mut cpu = match (c.resources, r.input.capacity) {
@@ -3264,7 +3273,9 @@ impl Scheduler {
     /// for nothing, else a share of what no other share holds and the ordinary legs there don't
     /// take; for an ordinary leg, a slot or the resources beside what's held.
     fn room_in(&self, r: &Runner, h: &Holding, l: &Leg) -> bool {
-        if h.whole || !Self::gpu_room(r, l, h.used.gpu) {
+        // A runner that offers no slots (one to be upgraded, docs/releases.md "Version skew"; an
+        // outpost) takes no leg, in slots or resources, however idle it is.
+        if h.whole || r.input.slots == 0 || !Self::gpu_room(r, l, h.used.gpu) {
             return false;
         }
         let c = self.config();
@@ -5713,7 +5724,7 @@ impl Scheduler {
                     name: r.input.view.name.clone(),
                     connected: r.connected,
                     eligible: checks.iter().all(|c| c.pass),
-                    room: r.connected && !r.draining && {
+                    room: r.connected && !r.draining && r.input.slots > 0 && {
                         let (held, whole, ordinary) = self.holding(r);
                         !whole && ordinary < slots_left(r.input.slots, size(r), &held)
                     },

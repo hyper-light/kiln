@@ -1234,10 +1234,12 @@ impl Hub {
         self.live.event(e);
         let text: Arc<str> = Arc::from(e.text());
         self.feed.push(Arc::clone(&text));
-        // What the viewers hear of mostly follows a change whose event its trigger recorded; and
-        // what outgoing webhooks take of it besides is recorded (crate::events).
-        self.relay.heard(&text);
-        self.relay.kick();
+        // What outgoing webhooks take of it and nothing else records is kept for the relay to
+        // record, which is told so. A change's own event its trigger recorded, and the relay hears
+        // of that row from the store (crate::events): not of every event the viewers hear.
+        if self.relay.heard(&text) {
+            self.relay.kick();
+        }
         match e {
             ServerEvent::Harness { info } => self.emit_session(&info.id, text),
             ServerEvent::HarnessClosed { id } => self.emit_session(id, text),
@@ -3692,6 +3694,9 @@ impl Hub {
                 self.instances.update(|i| i.set_features(peer, names.clone()));
                 // One that takes its engine is told what its owner set (`crate::harness::engine`).
                 crate::harness::engine::on_features(self, &agent, peer, &names).await;
+                // One that takes it is told the room a hand-over's spool leaves there: a session
+                // moved to it from another machine is taken over (CP-T3.2).
+                crate::harness::mail_transfer::on_features(self, &agent, peer, &names).await;
                 self.harness.mail_delivery.changed();
                 // One that installs skills is told what it lays out (docs/agents.md, "Skills kiln installs").
                 if skills {

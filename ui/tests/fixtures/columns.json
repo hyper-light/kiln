@@ -1,0 +1,449 @@
+{
+  "rows": [
+    {
+      "id": "01a1dd4b70467679af99118ba53a4a59",
+      "kind": "claude",
+      "target": "agent:30f7df97",
+      "name": "Claude Code",
+      "cwd": "/home/ada/kiln/w/f1",
+      "created_at": 1794680243779,
+      "status": "idle",
+      "title": "",
+      "queued": 0,
+      "cost_usd": 0.0,
+      "approvals": [],
+      "admission": {
+        "epoch": 0,
+        "generation": 2,
+        "learning": "bootstrap"
+      },
+      "last_turn": {
+        "at": 1794680244718,
+        "how": "done",
+        "tools": 19
+      }
+    },
+    {
+      "id": "01a1dd4b73c9728cba77f3dd42afc3d1",
+      "kind": "claude",
+      "target": "agent:30f7df97",
+      "name": "Claude Code",
+      "cwd": "/home/ada/kiln/w/f2",
+      "created_at": 1794680243790,
+      "status": "idle",
+      "title": "",
+      "queued": 0,
+      "cost_usd": 0.0,
+      "approvals": [],
+      "admission": {
+        "epoch": 0,
+        "generation": 2,
+        "learning": "bootstrap"
+      },
+      "last_turn": {
+        "at": 1794680244901,
+        "how": "done",
+        "tools": 3
+      }
+    },
+    {
+      "id": "01a1dd4b8a1e7c33a5d09f6e2b7c4d10",
+      "kind": "claude",
+      "target": "agent:30f7df97",
+      "name": "Claude Code",
+      "cwd": "/home/ada/kiln/w/f3",
+      "created_at": 1794680243801,
+      "status": "idle",
+      "title": "",
+      "queued": 0,
+      "cost_usd": 0.0,
+      "approvals": [],
+      "admission": {
+        "epoch": 0,
+        "generation": 2,
+        "learning": "bootstrap"
+      },
+      "last_turn": {
+        "at": 1794680245002,
+        "how": "done",
+        "tools": 7
+      }
+    },
+    {
+      "id": "01a1dd4bf09172899e19421c5a82acd2",
+      "kind": "codex",
+      "target": "agent:b1dbb123",
+      "name": "Codex",
+      "cwd": "/home/ada/kiln/w/f4",
+      "created_at": 1794680244000,
+      "status": "running",
+      "title": "Fix the gate",
+      "queued": 2,
+      "cost_usd": 0.25,
+      "approvals": [
+        {
+          "id": "a1",
+          "at": 1794680245000
+        }
+      ],
+      "admission": {
+        "epoch": 1,
+        "generation": 3,
+        "learning": "learned"
+      },
+      "turn_started": 1794680245100,
+      "doing": "cargo test",
+      "subagents": [
+        {
+          "id": "s1",
+          "description": "the tests",
+          "started": 1794680245200
+        }
+      ]
+    },
+    {
+      "id": "01a1dd4c05d27e41b8f3a6c9d1e0f2a3",
+      "kind": "codex",
+      "target": "agent:b1dbb123",
+      "name": "Codex",
+      "cwd": "/home/ada/kiln/w/f5",
+      "created_at": 1794680244500,
+      "status": "idle",
+      "title": "",
+      "queued": 0,
+      "cost_usd": 0.0,
+      "approvals": [],
+      "admission": {
+        "epoch": 0,
+        "generation": 2,
+        "learning": "bootstrap"
+      },
+      "last_turn": {
+        "at": 1794680246000,
+        "how": "done",
+        "tools": 11
+      }
+    },
+    {
+      "id": "01a1dd4c1bc77178a68be541fc9ab6f6",
+      "kind": "claude",
+      "target": "local",
+      "name": "Claude Code",
+      "cwd": "/home/ada/other",
+      "created_at": 1794680250000,
+      "status": "exited",
+      "title": "",
+      "queued": 0,
+      "cost_usd": 0,
+      "approvals": [],
+      "exit": {
+        "at": 1794680251000,
+        "error": null
+      },
+      "note": null
+    }
+  ],
+  "columns": {
+    "rows": 6,
+    "cols": [
+      [
+        "id",
+        {
+          "pre": "01a1dd4",
+          "v": [
+            "b70467679af99118ba53a4a59",
+            "b73c9728cba77f3dd42afc3d1",
+            "b8a1e7c33a5d09f6e2b7c4d10",
+            "bf09172899e19421c5a82acd2",
+            "c05d27e41b8f3a6c9d1e0f2a3",
+            "c1bc77178a68be541fc9ab6f6"
+          ]
+        }
+      ],
+      [
+        "kind",
+        {
+          "of": [
+            "claude",
+            "codex"
+          ],
+          "v": [
+            0,
+            0,
+            0,
+            1,
+            1,
+            0
+          ]
+        }
+      ],
+      [
+        "target",
+        {
+          "of": [
+            "agent:30f7df97",
+            "agent:b1dbb123",
+            "local"
+          ],
+          "v": [
+            0,
+            0,
+            0,
+            1,
+            1,
+            2
+          ]
+        }
+      ],
+      [
+        "name",
+        {
+          "of": [
+            "Claude Code",
+            "Codex"
+          ],
+          "v": [
+            0,
+            0,
+            0,
+            1,
+            1,
+            0
+          ]
+        }
+      ],
+      [
+        "cwd",
+        {
+          "pre": "/home/ada/",
+          "v": [
+            "kiln/w/f1",
+            "kiln/w/f2",
+            "kiln/w/f3",
+            "kiln/w/f4",
+            "kiln/w/f5",
+            "other"
+          ]
+        }
+      ],
+      [
+        "created_at",
+        {
+          "v": [
+            1794680243779,
+            1794680243790,
+            1794680243801,
+            1794680244000,
+            1794680244500,
+            1794680250000
+          ]
+        }
+      ],
+      [
+        "status",
+        {
+          "d": "idle",
+          "x": [
+            3,
+            5
+          ],
+          "v": [
+            "running",
+            "exited"
+          ]
+        }
+      ],
+      [
+        "title",
+        {
+          "v": [
+            "",
+            "",
+            "",
+            "Fix the gate",
+            "",
+            ""
+          ]
+        }
+      ],
+      [
+        "queued",
+        {
+          "v": [
+            0,
+            0,
+            0,
+            2,
+            0,
+            0
+          ]
+        }
+      ],
+      [
+        "cost_usd",
+        {
+          "v": [
+            0.0,
+            0.0,
+            0.0,
+            0.25,
+            0.0,
+            0
+          ]
+        }
+      ],
+      [
+        "approvals",
+        {
+          "v": [
+            [],
+            [],
+            [],
+            [
+              {
+                "id": "a1",
+                "at": 1794680245000
+              }
+            ],
+            [],
+            []
+          ]
+        }
+      ],
+      [
+        "admission",
+        {
+          "d": {
+            "epoch": 0,
+            "generation": 2,
+            "learning": "bootstrap"
+          },
+          "x": [
+            3
+          ],
+          "v": [
+            {
+              "epoch": 1,
+              "generation": 3,
+              "learning": "learned"
+            }
+          ],
+          "at": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      ],
+      [
+        "last_turn",
+        {
+          "cols": [
+            [
+              "at",
+              {
+                "v": [
+                  1794680244718,
+                  1794680244901,
+                  1794680245002,
+                  1794680246000
+                ]
+              }
+            ],
+            [
+              "how",
+              {
+                "d": "done",
+                "x": [],
+                "v": []
+              }
+            ],
+            [
+              "tools",
+              {
+                "v": [
+                  19,
+                  3,
+                  7,
+                  11
+                ]
+              }
+            ]
+          ],
+          "at": [
+            0,
+            1,
+            2,
+            4
+          ]
+        }
+      ],
+      [
+        "turn_started",
+        {
+          "v": [
+            1794680245100
+          ],
+          "at": [
+            3
+          ]
+        }
+      ],
+      [
+        "doing",
+        {
+          "v": [
+            "cargo test"
+          ],
+          "at": [
+            3
+          ]
+        }
+      ],
+      [
+        "subagents",
+        {
+          "v": [
+            [
+              {
+                "id": "s1",
+                "description": "the tests",
+                "started": 1794680245200
+              }
+            ]
+          ],
+          "at": [
+            3
+          ]
+        }
+      ],
+      [
+        "exit",
+        {
+          "v": [
+            {
+              "at": 1794680251000,
+              "error": null
+            }
+          ],
+          "at": [
+            5
+          ]
+        }
+      ],
+      [
+        "note",
+        {
+          "v": [
+            null
+          ],
+          "at": [
+            5
+          ]
+        }
+      ]
+    ]
+  }
+}

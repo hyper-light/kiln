@@ -101,13 +101,13 @@ fn an_agent_that_couldnt_start_on_the_server_moves_to_a_runner_that_has_its_harn
     anyhow::ensure!(code == 409 && body.contains("Claude Code isn't installed on the kiln server") && body.contains("with `on`: box"), "{code} {body}");
 
     let on_box = format!("agent:{}", machine("box"));
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/move"), &s.admin, Some(&json!({"to": on_box})))?;
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/agents/{id}/move"), &s.admin, Some(&json!({"to": on_box})))?;
     anyhow::ensure!(code == 202, "the move was refused: {code} {body}");
     let moved: Value = serde_json::from_str(&body)?;
     anyhow::ensure!(moved.get("moving").and_then(Value::as_str) == Some(machine("box").as_str()) && moved.get("from_server") == Some(&json!(true)), "{moved}");
     answered(&s, &id, &on_box, &[&log])?;
 
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/move"), &s.admin, Some(&json!({"to": on_box})))?;
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/agents/{id}/move"), &s.admin, Some(&json!({"to": on_box})))?;
     anyhow::ensure!(code == 409 && body.contains("it runs on box already"), "{code} {body}");
     Ok(())
 }
@@ -134,7 +134,7 @@ fn a_runner_agent_that_couldnt_start_keeps_its_first_message_moved_or_started_ag
 
     let moved = open(&s, &on_bare, &work)?;
     stopped(&s, &moved)?;
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{moved}/move"), &s.admin, Some(&json!({"to": on_box})))?;
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/agents/{moved}/move"), &s.admin, Some(&json!({"to": on_box})))?;
     anyhow::ensure!(code == 202, "the move was refused: {code} {body}");
     answered(&s, &moved, &on_box, &logs)?;
 
@@ -151,7 +151,7 @@ fn a_runner_agent_that_couldnt_start_keeps_its_first_message_moved_or_started_ag
     let restarted = open(&s, &on_bare, &work)?;
     stopped(&s, &restarted)?;
     install_claude(&bare_bin)?;
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{restarted}/command"), &s.admin, Some(&json!({"type": "restart"})))?;
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/agents/{restarted}/restart"), &s.admin, Some(&json!({})))?;
     anyhow::ensure!((200..300).contains(&code), "the restart was refused: {code} {body}");
     answered(&s, &restarted, &on_bare, &logs)?;
     Ok(())

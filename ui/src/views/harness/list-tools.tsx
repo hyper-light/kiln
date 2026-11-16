@@ -306,8 +306,8 @@ export function heldRows<T extends ViewRow>(all: T[], now: T[], was: Kept | null
 
 /** After the pointer last moved over the list (or a finger left it), this long before it moves again. */
 const QUIET_MS = 1200;
-/** While one of these is open (a row's menu, a dialog from it), the list holds still (one closing doesn't count). */
-const OPEN = ':is([role="menu"], [role="dialog"], [role="alertdialog"]):not([data-state="closed"])';
+/** While one of these is open (a row's menu, a dialog from it), the list holds still (one closing doesn't count), and a windowed one unmounts no row (lib/list-window.ts). */
+export const OPEN = ':is([role="menu"], [role="dialog"], [role="alertdialog"]):not([data-state="closed"])';
 
 /**
  * Whether the list is in use, so its rows hold still: a finger or button pressed on it, focus on one
@@ -406,12 +406,26 @@ function places(root: HTMLElement): Map<string, number> {
 }
 
 /**
+ * A windowed list as its glide needs it (lib/list-window.ts `ListWindow`, with the glide's `order`):
+ * only the rows near the viewport are on the page, so where a row that wasn't on it was (`wasAt`,
+ * from the list's first row's top) is the window's to say, and the rows near the viewport stay
+ * mounted, wherever they go, until the glide that takes them there is over (`holding`, `settle`).
+ */
+export interface Glided {
+  wasAt(el: Element): number | undefined;
+  holding(): object | null;
+  settle(hold: object | null): void;
+}
+
+/**
  * Items (`data-glide="<key>"`) that glide to their new places when the order (`order`) changes,
  * from where they were, rather than jump; new ones fade in. Not when motion is paused here or by the
  * device. The ref goes on the element around them. While an item glides, it can't be pressed, so a
- * tap meant for what was there doesn't land on what slid under it.
+ * tap meant for what was there doesn't land on what slid under it. In a windowed list (`win`,
+ * W21-R02), a row that comes onto the page with the new order glides from where it was in the list,
+ * as it would have with every row mounted, and one that leaves glides out before it's unmounted.
  */
-export function useGlide(order: string) {
+export function useGlide(order: string, win?: Glided) {
   const [last] = React.useState(() => ({ order, root: null as HTMLElement | null, before: null as Map<string, number> | null }));
   if (last.order !== order) {
     // About to show another order: where everything is now (the page still shows the last one).
@@ -427,11 +441,26 @@ export function useGlide(order: string) {
       const off = () => {
         if (last.root === el) last.root = null;
       };
-      if (!before) return off;
+      // The rows the window kept for this order's glide: let go once it's over (now, when nothing glides).
+      const held = win?.holding() ?? null;
+      if (!before) {
+        win?.settle(held);
+        return off;
+      }
+      const runs: Animation[] = [];
+      // Where the list's first row starts in it (under its top border): what the window's places are measured from.
+      let origin: number | undefined;
       for (const item of el.querySelectorAll<HTMLElement>("[data-glide]")) {
         const parent = item.parentElement;
-        const was = before.get(item.dataset.glide ?? "");
+        let was = before.get(item.dataset.glide ?? "");
         if (!parent) continue;
+        if (was === undefined && win && parent === el) {
+          const from = win.wasAt(item);
+          if (from !== undefined) {
+            origin ??= (el.firstElementChild?.getBoundingClientRect().top ?? 0) - el.getBoundingClientRect().top;
+            was = origin + from;
+          }
+        }
         if (was === undefined) {
           item.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 180, easing: "ease-out" });
           continue;
@@ -445,7 +474,9 @@ export function useGlide(order: string) {
         };
         run.onfinish = done;
         run.oncancel = done;
+        runs.push(run);
       }
+      if (win) void Promise.allSettled(runs.map((run) => run.finished)).then(() => win.settle(held));
       return off;
     },
     // A new ref for each order: React hands it the list once that order is on the page (and the

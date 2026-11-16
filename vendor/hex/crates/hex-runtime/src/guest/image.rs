@@ -826,6 +826,29 @@ fn refused(id: &BoxId, op: &'static str, why: ImageRefusal) -> Refusal {
         ImageRefusal::Terminal(why) => {
             Refusal::Broken(format!("Shards refused {op} as a terminal's size: {why}"))
         }
+        // Only a warm host's ticket booting another pool's spec (D253) is refused so: a ticket is taken for its box's
+        // own spec alone, so this is the class's own fault.
+        ImageRefusal::OtherPool { reserved, asked } => Refusal::Broken(format!(
+            "Shards refused {op}: a warm host reserved for pool {reserved} booted a spec of {asked:?}"
+        )),
+        // A run's network (D269), refused at its start's binds or its image's narrowing: a port the host won't bind is
+        // the host's, every other the spec's.
+        ImageRefusal::Net(shards_api::image::NetRefusal::Bind, why) => Refusal::Os {
+            op,
+            why: format!("binding the run's published port: {why}"),
+        },
+        ImageRefusal::Net(kind, why) => Refusal::Invalid {
+            what: "shards image's network",
+            why: format!("{kind:?}: {why}"),
+        },
+        // Only a run paused (D267) is refused so, and only a pause or a resume as one: this class pauses no run yet
+        // (P5.5b's pause and resume type these as the box's own).
+        ImageRefusal::Paused { what } => {
+            Refusal::Broken(format!("Shards refused {op}: its run is paused ({what})"))
+        }
+        ImageRefusal::Pause(why) => {
+            Refusal::Broken(format!("Shards refused {op} as a pause: {why}"))
+        }
         // Only a save (D259) is refused so, and this class asks none.
         ImageRefusal::Save(cause, why) => {
             Refusal::Broken(format!("Shards refused {op} as a save ({cause:?}): {why}"))
@@ -935,7 +958,18 @@ fn host_use_of(stats: &Stats, vcpus: u32, window: Duration) -> Result<HostUse, R
         resident_bytes: host.resident_bytes,
         guest_ns: per_vcpu(stats, vcpus)?,
         window,
+        charged: charged_of(host.charged),
     })
+}
+
+/// Whether a VM process's CPU holds its vCPUs' guest time, as Shards says it (D265), in Hex's words: one for one.
+pub(crate) fn charged_of(said: shards_api::image::Charged) -> hex_api::Charged {
+    use shards_api::image::Charged as Said;
+    match said {
+        Said::Unknown => hex_api::Charged::Unknown,
+        Said::ToThread => hex_api::Charged::ToThread,
+        Said::Apart => hex_api::Charged::Apart,
+    }
 }
 
 /// What each of the VM's `vcpus` vCPUs has run of its guest, by index, as its run host read it (D241's
@@ -1969,6 +2003,9 @@ impl ImageClass {
             upstream_roots: Vec::new(),
             // No GPU report (Shards' D233, image channel v29): it renders on no GPU.
             gpu_report: None,
+            // No plug root (Shards' D271, image channel v35): its shares are the start's, and nothing is plugged
+            // into its run as it runs.
+            plug_roots: Vec::new(),
         })
     }
 
@@ -2139,7 +2176,7 @@ impl ImageClass {
         let ClassSpec::ShardsImage(shards) = &spec.class else {
             return Ok(State::Running(guest));
         };
-        let Err(why) = crate::grants::bound(&shards.grants, guest.members(), guest.published())
+        let Err(why) = crate::grants::bound(&shards.grants, guest.members(), &guest.published())
         else {
             return Ok(State::Running(guest));
         };
@@ -2546,7 +2583,7 @@ impl ImageClass {
                 // Its publishes as bound (joint plan step 15, N6).
                 if let ClassSpec::ShardsImage(shards) = &record.spec.class {
                     shown.published =
-                        crate::grants::bound(&shards.grants, guest.members(), guest.published())?;
+                        crate::grants::bound(&shards.grants, guest.members(), &guest.published())?;
                 }
                 // Its run's agent-control endpoint, as its run host told it (N6), and that endpoint's waker and wake
                 // (Shards' D252 amended, image channel v30), so a reading of the host tells each from a socket no grant

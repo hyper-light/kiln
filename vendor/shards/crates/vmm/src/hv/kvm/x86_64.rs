@@ -1,6 +1,6 @@
 //! The KVM backend's x86_64 VM and vCPUs. On x86 the guest powers off and resets through
-//! devices (ACPI sleep control, i8042), so those come from the machine, and a triple fault
-//! is a reset. Ground truth: docs/research/kvm-x86_64-ground-truth.md.
+//! devices (ACPI sleep control and reset registers), so those come from the machine, and a
+//! triple fault is a reset. Ground truth: docs/research/kvm-x86_64-ground-truth.md.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -105,7 +105,7 @@ fn template(kvm: &sys::Kvm) -> Result<Vec<cpuid::Leaf>> {
 /// This host's CPU as KVM shows a guest (D176 part 6): its vendor and feature leaves
 /// ([`cpuid::identity`]), which a CPU baseline is the meet of across a fleet.
 pub fn host_cpu_id() -> Result<Vec<[u32; 7]>> {
-    let kvm = kvm().map_err(Error::Guest)?;
+    let kvm = kvm().map_err(|e| Error::Guest(e.into()))?;
     Ok(cpuid::identity(&template(kvm)?))
 }
 
@@ -153,7 +153,7 @@ impl Vm {
     /// (research doc §9 step 2). No PIT: with a HW-reduced FADT the guest never uses one.
     pub fn new(config: VmConfig) -> Result<Vm> {
         install_kick_handler()?;
-        let kvm = kvm().map_err(Error::Guest)?;
+        let kvm = kvm().map_err(|e| Error::Guest(e.into()))?;
         // Type 0, KVM_X86_DEFAULT_VM.
         let fd = Arc::new(kvm.create_vm(0).map_err(call("KVM_CREATE_VM"))?);
         fd.set_tss_addr(layout::TSS).map_err(call("KVM_SET_TSS_ADDR"))?;
@@ -549,6 +549,16 @@ const MSR_IA32_TSC: u32 = 0x10;
 const TSC_KHZ_TOLERANCE_PPM: u64 = 250;
 
 impl Vcpu {
+    /// It goes on from a pause its host held it through (D267): its guest's kvmclock told it
+    /// was stopped (KVM_KVMCLOCK_CTRL, which sets PVCLOCK_GUEST_STOPPED; api.rst 4.70), so that
+    /// its soft-lockup and RCU-stall watchdogs take the pause for its host's, not a hang
+    /// (`kvm_check_and_clear_guest_paused`), as QEMU tells it as a stopped VM goes on
+    /// (hw/i386/kvm/clock.c `kvmclock_vm_state_change`). On this vCPU's own thread, before it
+    /// enters its guest again. Refused, harmlessly, for a guest that never enabled kvmclock.
+    pub fn went_on(&self) {
+        let _ = self.fd.kvmclock_ctrl();
+    }
+
     /// Captures the vCPU's state, in the order Firecracker's comments give: MP state first,
     /// since reading it may change the LAPIC's, and the events last; but the LAPIC after the
     /// MSRs. Each of these ioctls loads the vCPU, and one that loads it on another host CPU

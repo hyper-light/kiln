@@ -1751,8 +1751,8 @@ impl Pace {
     /// its feed goes with it.
     pub fn stop(&mut self, f: &Fixture, id: &str) -> anyhow::Result<()> {
         // Longer than the server waits for its runner's answer (`hub::COMMAND_WITHIN`).
-        let (code, body) = common::http_within(f.port, "DELETE", &format!("/api/harness/sessions/{id}"), &f.admin, None, Duration::from_secs(75))?;
-        anyhow::ensure!(code == 204, "ending {id}: {code} {body}");
+        let (code, body) = common::http_within(f.port, "DELETE", &format!("/api/harness/agents/{id}"), &f.admin, None, Duration::from_secs(75))?;
+        anyhow::ensure!(code == 200, "ending {id}: {code} {body}");
         self.feeds.remove(id);
         self.unlisted(f, id, &format!("ending {id}"))
     }
@@ -1907,7 +1907,8 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     send(f, &id, &stop_me, &ask.stopped, "queue")?;
     pace.until(f, &id, Asked::Message(&stop_me), &format!("{kind}'s turn to stop under way"), |i, e| under_way(i, e, &stop_me) && (!ask.stub() || said_after(e, &stop_me).iter().any(|l| l.starts_with("HEARD "))))?;
     look(&mut inventory)?;
-    words(f, &id, json!({"type": "interrupt"}))?;
+    let (code, body) = common::http_within(f.port, "POST", &format!("/api/harness/agents/{id}/interrupt"), &f.admin, Some(&json!({})), Duration::from_secs(75))?;
+    anyhow::ensure!(code == 200, "interrupting {id}: {code} {body}");
     let held = if ask.stub() { Some(said(&self::events(f, &id)?).len()) } else { None };
     let (_, e) = pace.until(f, &id, Asked::Stop { said: held }, &format!("{kind} stopping its turn"), |i, _| status(i) == "idle")?;
     if ask.stub() {

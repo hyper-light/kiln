@@ -433,6 +433,8 @@ impl ImageClass {
             upstream_roots: Vec::new(),
             // No GPU report (Shards' D233, image channel v29): a node VM renders on no GPU.
             gpu_report: None,
+            // No plug root (Shards' D271, image channel v35): a node VM's shares are its start's.
+            plug_roots: Vec::new(),
         })
     }
 }

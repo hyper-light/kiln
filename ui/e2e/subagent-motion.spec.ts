@@ -20,10 +20,10 @@ test.afterEach(async ({ request }) => {
   if (!REAL) await request.post("/api/mock/asks");
 });
 
-/** Requests to remove one (a session's command, or its session's end), taken here and answered as done: the mock keeps it. */
+/** Requests to remove one (a session's command, or its agent's removal: `agents.remove`), taken here and answered as done: the mock keeps it. */
 async function holdRemoves(page: Page): Promise<Request[]> {
   const seen: Request[] = [];
-  await page.route(/\/api\/harness\/sessions\/[^/]+(\/command)?$/, async (route) => {
+  await page.route(/\/api\/harness\/(?:sessions\/[^/]+\/command|agents\/[^/]+)$/, async (route) => {
     const r = route.request();
     const remove = r.method() === "DELETE" || (r.method() === "POST" && (r.postDataJSON() as { type?: string } | null)?.type === "remove_task");
     if (!remove) return route.fallback();
@@ -93,7 +93,7 @@ test("one that ended is removed by its trash, where its pause was", async ({ pag
     .click();
   await expect.poll(() => seen.length).toBe(2);
   expect(seen[1]?.method()).toBe("DELETE");
-  expect(seen[1]?.url()).toMatch(/\/api\/harness\/sessions\/tree-s5$/);
+  expect(seen[1]?.url()).toMatch(/\/api\/harness\/agents\/tree-s5$/);
 });
 
 test("Remove, by the tree's head, removes those picked that ended and keeps the rest picked", async ({ page }) => {

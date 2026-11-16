@@ -4,7 +4,7 @@
  * how each place took each change (its microVM, its harness, kiln's scope). Its state carries them
  * (`state.overrides`), as the server's does.
  *
- *   POST /api/harness/sessions/:id/ports               {member?, bind, host_port, guest_port, protocol}  publish (microVM only)
+ *   POST /api/harness/sessions/:id/ports               {bind, host_port, guest_port, protocol}           publish (microVM only)
  *   POST /api/harness/sessions/:id/ports/unpublish     {bind, host_port, protocol}
  *   POST /api/harness/sessions/:id/egress              {member?, host, port}                             grant (microVM only)
  *   POST /api/harness/sessions/:id/egress/revoke       {member?, host, port}
@@ -86,12 +86,11 @@ export async function handleOverrides(req: http.IncomingMessage, res: http.Serve
       change = { op: "unpublish", of: { bind, host_port: hostPort, protocol } };
       o.ports = (o.ports ?? []).filter((p) => !(p.port.bind === bind && p.port.host_port === hostPort && p.port.protocol === protocol));
     } else {
-      const member = memberOf(b.member, s.harness);
+      // To the microVM's port: the members its image gives that port (Shards D269), so no member is named.
       const guestPort = Number(b.guest_port);
-      if (typeof member === "string") return fail(400, member);
-      if (!(guestPort > 0 && guestPort < 65536)) return fail(400, "`guest_port` is the member's port in the microVM");
+      if (!(guestPort > 0 && guestPort < 65536)) return fail(400, "`guest_port` is a port in the microVM");
       if ((o.ports ?? []).some((p) => p.port.bind === bind && p.port.host_port === hostPort && p.port.protocol === protocol)) return fail(409, `${bind}:${hostPort}/${protocol} is published already`);
-      const port: LivePort = { member, bind, host_port: hostPort, guest_port: guestPort, protocol };
+      const port: LivePort = { bind, host_port: hostPort, guest_port: guestPort, protocol };
       change = { op: "publish", of: port };
       o.ports = [...(o.ports ?? []), { port, microvm: microvmTook }];
     }

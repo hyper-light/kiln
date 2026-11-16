@@ -124,11 +124,21 @@ async fn get(cx: Cx, v: Value) -> Out {
     // Its live overrides, and the operations that change them on its engine (kiln plan 01a1dd2e…, P6b.4): the network's
     // offered only on a microVM session.
     let live = super::overrides::view(&info, &state);
-    Ok(json!({"agent": wait::brief(&info), "info": info, "state": state, "live": live}))
+    // The agent definition it started from, at which version, and where that definition is now (kiln plan 01a1dd2e…,
+    // P5.2's page): none for one that started from none.
+    let definition = crate::agentdefs::sessions::of(&cx.hub, &id).await.map_err(crate::agentdefs::ops::fail)?;
+    Ok(json!({"agent": wait::brief(&info), "info": info, "state": state, "live": live, "definition": definition}))
 }
 
 async fn start(cx: Cx, v: Value) -> Out {
     let ask: Ask = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    start_ask(cx, ask).await
+}
+
+/// `agents.start`'s start of `ask`, which kiln may have made with what only it says (the definition an
+/// `agentdefs.run` starts from, `Ask::definition`): answered as soon as its agents start, or as soon as
+/// it waits for room, saying so.
+pub(crate) async fn start_ask(cx: Cx, ask: Ask) -> Out {
     if ask.kind.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "`kind` is required: the harness (claude, codex, …)".into()));
     }
@@ -726,13 +736,110 @@ async fn changes(cx: Cx, v: Value) -> Out {
 }
 
 async fn interrupt(cx: Cx, v: Value) -> Out {
-    let info = known(&cx, &agent_of(&v)?)?;
-    let id = info.id.clone();
+    commanded(&cx, &v, Command::Interrupt, "interrupted").await
+}
+
+/// One of an agent's controls set, or an action of its run (`control`, its value in `value`): what the
+/// Agents page's rename and keep going are (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S2).
+async fn control(cx: Cx, v: Value) -> Out {
+    let c = Command::Control { id: text(&v, "control")?, value: v.get("value").cloned() };
+    commanded(&cx, &v, c, "set").await
+}
+
+/// The agent's harness started again where it left off, after it exited (S2).
+async fn restart(cx: Cx, v: Value) -> Out {
+    commanded(&cx, &v, Command::Restart, "restarted").await
+}
+
+/// The agent gone on on another machine, its conversation carried, by a caller that may steer it (the Agents page's
+/// Move to…: kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S3), with its subagents (`relocate::start`); audited as
+/// whoever asked. `now` moves it without waiting for its turn to end; `kind` and `model` go on there in another
+/// harness.
+async fn move_to(cx: Cx, v: Value) -> Out {
+    let id = known(&cx, &agent_of(&v)?)?.id;
     may_steer(&cx, &id).await?;
-    match cx.hub.harness.command(&cx.hub, &id, Command::Interrupt).await {
+    let to = text(&v, "to")?;
+    let now = v.get("now").and_then(Value::as_bool).unwrap_or(false);
+    let word = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    let moved = super::relocate::start(&cx.hub, &id, &to, now, word("kind"), word("model")).await.map_err(|e| (StatusCode::CONFLICT, e))?;
+    cx.hub.store.audit(cx.caller.name.clone(), "agent.move".into(), format!("{id} to {to}")).await;
+    Ok(moved)
+}
+
+/// One thing to the agents picked among those the caller may act on (the Agents page's broadcast, Mission Control's
+/// message box: kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S5): a prompt or slash command, a command, or
+/// answers to what waits on them (`super::broadcast`), each agent's message made from the key given, else a
+/// command's own message id, as whoever asked; each sent one the person's use of that agent, and the broadcast
+/// audited as whoever asked. What became of each comes back.
+async fn broadcast_to(cx: Cx, v: Value) -> Out {
+    use super::attention_hooks as hooks;
+    let at = crate::util::now_ms();
+    let mut b: super::broadcast::Broadcast = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let command = b.command.as_ref().and_then(|v| serde_json::from_value::<Command>(v.clone()).ok());
+    if b.key.is_none() {
+        b.key = command.as_ref().and_then(super::registry::message_id);
+    }
+    let among = super::lineage::reached(&cx.hub, &cx.caller, cx.hub.harness.list(), super::lineage::Access::Act).await;
+    let report = super::broadcast::run(&cx.hub, &b, &key_scope(&cx.caller), &among).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // A command that only reads or refreshes (a snapshot, MCP servers' state) isn't a use (attention plan
+    // 01a199e1b177752e84dad5dc990e6a15, step 1), as on every other path (`attention_hooks::command_kind`).
+    let kind = if b.approvals.is_some() {
+        Some("answer")
+    } else if b.text.is_some() || !b.attachments.is_empty() {
+        Some("message")
+    } else {
+        command.as_ref().map_or(Some("command"), hooks::command_kind)
+    };
+    // Sent, or retained: kiln took the person's message into its custody (W20), waiting for the receiver's admission.
+    for row in report.results.iter().filter(|r| matches!(r.result, "sent" | "retained")) {
+        let Some(kind) = kind else { break };
+        hooks::record(&cx.hub, &cx.caller, &row.id, kind, &report.id, at).await;
+        let info = among.iter().find(|i| i.id == row.id);
+        if b.approvals.is_some() {
+            for approval in info.iter().flat_map(|i| i.approvals.iter()).filter(|a| a.tool != super::model::ToolKind::Question) {
+                if let Some(response) = info.and_then(|i| super::attention::bind_response(i, &super::attention::HumanResponse::Approval(approval.id.clone()))) {
+                    hooks::response_to(&cx.hub, &cx.caller, &row.id, &report.id, response, at).await;
+                }
+            }
+        } else if let Some(c) = &command
+            && let Some(response) = hooks::prepare_from_info(c, Some(&report.id), at, info).and_then(|p| p.response)
+        {
+            hooks::response_to(&cx.hub, &cx.caller, &row.id, &report.id, response, at).await;
+        }
+    }
+    let what = b.text.as_deref().map_or_else(|| b.approvals.as_deref().map_or_else(|| "a command".to_owned(), |a| format!("{a} what waits")), |t| t.chars().take(80).collect());
+    cx.hub
+        .store
+        .audit(cx.caller.name.clone(), "agent.broadcast".into(), format!("{} to {} agents ({} sent, {} skipped, {} failed): {what}", report.id, report.results.len(), report.sent, report.skipped, report.failed))
+        .await;
+    serde_json::to_value(&report).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
+}
+
+/// The agents of machine `machine`, which is gone (not connected), that the caller may act on, each gone on on another
+/// machine from the server's copy of its conversation (`relocate::recover`): on `to` where it's given, else where each
+/// suits best (the Agents page's Recover: kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S4); audited as whoever
+/// asked.
+async fn recover_machine(cx: Cx, v: Value) -> Out {
+    let machine = text(&v, "machine")?;
+    let to = v.get("to").and_then(Value::as_str).filter(|t| !t.trim().is_empty());
+    let among: std::collections::HashSet<String> =
+        super::lineage::reached(&cx.hub, &cx.caller, cx.hub.harness.list(), super::lineage::Access::Act).await.into_iter().map(|i| i.id).collect();
+    let moved = super::relocate::recover(&cx.hub, &machine, to, &among).await.map_err(|e| (StatusCode::CONFLICT, e))?;
+    let ok = moved.iter().filter(|m| m.get("error").is_none()).count();
+    cx.hub.store.audit(cx.caller.name.clone(), "agent.recover".into(), format!("{ok} of {} agents of {machine} go on elsewhere", moved.len())).await;
+    Ok(json!({ "moved": moved }))
+}
+
+/// Command `c` given to the agent `v` names, by a caller that may steer it: `done` true once its machine
+/// has it, else why not.
+async fn commanded(cx: &Cx, v: &Value, c: Command, done: &str) -> Out {
+    let info = known(cx, &agent_of(v)?)?;
+    let id = info.id.clone();
+    may_steer(cx, &id).await?;
+    match cx.hub.harness.command(&cx.hub, &id, c).await {
         Sent::Published(receipt) => Ok(json!({"publication": receipt})),
         Sent::PublicationRefused(error) => Err(mail_failed(error)),
-        Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({"interrupted": true})),
+        Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({done: true})),
         Sent::Refused(r) => Err(refused(&r)),
         s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => Err(s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
@@ -776,6 +883,26 @@ async fn stop(cx: Cx, v: Value) -> Out {
         ended.push(id);
     }
     Ok(json!({"ended": ended}))
+}
+
+/// Agent `agent` ended for good and taken off kiln's lists (the Agents page's Remove: kiln plan
+/// 01a1dd2e8618733a87f2793aab1322a8 P5.6, S1): its goals forgotten and its copy let go, audited as whoever
+/// asked. One whose machine keeps it (its archive or restore under way) is refused until that's done.
+async fn remove(cx: Cx, v: Value) -> Out {
+    let id = known(&cx, &agent_of(&v)?)?.id;
+    may_steer(&cx, &id).await?;
+    super::about::ended(&id);
+    if cx.hub.harness.close(&cx.hub, &id).await {
+        let _ = crate::goals::forget(&cx.hub, &id).await;
+        cx.hub.copies.forget_agent(&cx.hub, &id).await;
+        cx.hub.store.audit(cx.caller.name.clone(), "agent.close".into(), id.clone()).await;
+        Ok(json!({"removed": id}))
+    } else if cx.hub.harness.info(&id).is_some() {
+        // Its machine kept it: its archive or restore is under way (attention plan 01a199e1b177752e84dad5dc990e6a15).
+        Err((StatusCode::CONFLICT, "its archive or restore is under way: end it once that's done".to_owned()))
+    } else {
+        Err((StatusCode::NOT_FOUND, "no such agent session".to_owned()))
+    }
 }
 
 async fn children(cx: Cx, v: Value) -> Out {
@@ -991,6 +1118,116 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(stop(cx, v)),
         },
         Op {
+            name: "agents.control",
+            summary: "Set one of an agent's controls, or run one of its actions: `control` is its id (`rename` with the new name as `value`, `keep_going` with true or false, or another its harness offers), `value` its value.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsControl>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "control"]))),
+            run: |cx, v| Box::pin(control(cx, v)),
+        },
+        Op {
+            name: "agents.restart",
+            summary: "Start an agent's harness again where it left off, after it exited (its conversation goes on).",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsRestart>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "restart"]))),
+            run: |cx, v| Box::pin(restart(cx, v)),
+        },
+        Op {
+            name: "agents.move",
+            summary: "Move an agent to another machine (`to`: a runner's name), its conversation carried and its subagents with it; `now` moves it without waiting for its turn to end, and `kind` and `model` go on there in another harness.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsMove>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "move"]))),
+            run: |cx, v| Box::pin(move_to(cx, v)),
+        },
+        Op {
+            name: "agents.pin",
+            summary: "Pin an agent to the top of your attention (Mission Control's list): it stays in sight until you unpin it.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPlace>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "pin"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "pin", v)),
+        },
+        Op {
+            name: "agents.unpin",
+            summary: "Unpin an agent from the top of your attention: it's placed by what needs you again.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPlace>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "unpin"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "unpin", v)),
+        },
+        Op {
+            name: "agents.park",
+            summary: "Park an agent out of your attention until `until` (Unix ms, in the future): its requests wait there, and it comes back then, or once you unpark it.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPark>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "park"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "park", v)),
+        },
+        Op {
+            name: "agents.unpark",
+            summary: "Bring a parked agent back into your attention now.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPlace>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "unpark"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "unpark", v)),
+        },
+        Op {
+            name: "agents.archive",
+            summary: "Archive an agent, with its subagents: ended and put away with its conversation, off your attention, to restore later.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPlace>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "archive"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "archive", v)),
+        },
+        Op {
+            name: "agents.restore",
+            summary: "Restore an archived agent, with its subagents, where it was: its conversation goes on (`copy`: from kiln's copy of it, where its machine's is gone).",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsRestore>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "restore"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "restore", v)),
+        },
+        Op {
+            name: "agents.broadcast",
+            summary: "Send one thing to many agents at once, among those you may act on: `to` picks them (`ids`, or `all`, or `machines`, `kinds` and `status` to match); then a prompt or slash command (`text`, with `attachments` and a `mode`: queue, steer or now), a `command` as the console sends one, or `approvals` (allow or deny every tool call waiting). `key` makes it once however often it's sent. What became of each agent comes back.",
+            read_only: false,
+            // It reaches agents its chat didn't start: an agent asks its person's click for it.
+            destructive: true,
+            input: Input::of::<input::AgentsBroadcast>(),
+            route: |_| Ok((Method::POST, path(&["api", "harness", "broadcast"]))),
+            run: |cx, v| Box::pin(broadcast_to(cx, v)),
+        },
+        Op {
+            name: "agents.recover",
+            summary: "Recover the agents of a machine that's gone (not connected): each you may act on goes on on another machine from kiln's copy of its conversation, on `to` where it's given, else where each suits best (connected, its harness installed there, the machine's platform first, then the least busy). What became of each comes back.",
+            read_only: false,
+            // It moves agents its chat didn't start: an agent asks its person's click for it.
+            destructive: true,
+            input: Input::of::<input::AgentsRecover>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "machines", &text(v, "machine")?, "recover"]))),
+            run: |cx, v| Box::pin(recover_machine(cx, v)),
+        },
+        Op {
+            name: "agents.remove",
+            summary: "Remove an agent: end it for good and take it off kiln's lists (its goals forgotten, its copy let go; its changes stay on disk). Refused while its machine archives or restores it.",
+            read_only: false,
+            destructive: true,
+            input: Input::of::<input::AgentsRemove>(),
+            route: |v| Ok((Method::DELETE, path(&["api", "harness", "agents", &agent_of(v)?]))),
+            run: |cx, v| Box::pin(remove(cx, v)),
+        },
+        Op {
             name: "agents.credential",
             summary: "An agent's own credential for git, for a day: its pushes to kiln's repositories go as the agent, for whom it acts. Only the agent itself is given one, which its runner asks for as its git needs it.",
             read_only: false,
@@ -1104,6 +1341,10 @@ pub mod input {
         /// The conversation to take up again: its harness's own session id (an agent's
         /// `harness_session`, as agents_get gives it), in its folder on its machine; one agent.
         pub resume: Option<String>,
+        /// Its task apart from the words of the agent definition it runs (as agentdefs_run starts one): what
+        /// a split's variant that's another agent is told after that agent's words. Which definition it runs is
+        /// kiln's to say, as agentdefs_run starts it.
+        pub task: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1312,6 +1553,144 @@ pub mod input {
         pub agent: String,
         /// End the agents it started (and theirs) too.
         pub children: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsControl {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// The control's id: `rename`, `keep_going`, or another its harness offers.
+        pub control: String,
+        /// Its value (`rename`: the new name; `keep_going`: true or false).
+        pub value: Option<serde_json::Value>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRestart {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsMove {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// The machine it goes on on: a runner's name (as runners lists it).
+        pub to: String,
+        /// Move it now, without waiting for its turn to end.
+        pub now: Option<bool>,
+        /// The harness it goes on in there, where another (its conversation carried over).
+        pub kind: Option<String>,
+        /// The model it goes on with there.
+        pub model: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsPlace {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// The revision of its place you saw, refused where another device has moved it since.
+        pub revision: Option<i64>,
+        /// An idempotency key of yours, made once for this change (1 to 256 bytes): asked again with it
+        /// (its answer lost), the change is the same one, made once. Without it, each call is another change,
+        /// refused where the one before moved its place since (`revision`): pass it whenever you may ask again.
+        pub key: Option<String>,
+        /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
+        pub mode: Option<String>,
+        /// The visit it's made in, as the snapshot named it.
+        pub visit: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsPark {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// When it comes back, Unix ms, in the future.
+        pub until: i64,
+        /// The revision of its place you saw, refused where another device has moved it since.
+        pub revision: Option<i64>,
+        /// An idempotency key of yours, made once for this change (1 to 256 bytes): asked again with it
+        /// (its answer lost), the change is the same one, made once. Without it, each call is another change,
+        /// refused where the one before moved its place since (`revision`): pass it whenever you may ask again.
+        pub key: Option<String>,
+        /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
+        pub mode: Option<String>,
+        /// The visit it's made in, as the snapshot named it.
+        pub visit: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRestore {
+        /// The archived agent's id.
+        pub agent: String,
+        /// From kiln's copy of its conversation, where its machine's is gone.
+        pub copy: Option<bool>,
+        /// An idempotency key of yours, made once for this change (1 to 256 bytes): asked again with it
+        /// (its answer lost), the change is the same one, made once. Without it, each call is another change,
+        /// refused where the one before moved its place since (`revision`): pass it whenever you may ask again.
+        pub key: Option<String>,
+        /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
+        pub mode: Option<String>,
+        /// The visit it's made in, as the snapshot named it.
+        pub visit: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsBroadcast {
+        /// Which agents.
+        pub to: BroadcastTo,
+        /// A prompt, or "/name args", read in each agent's catalog.
+        pub text: Option<String>,
+        /// Files with the prompt (uploaded first: `POST /api/harness/files`), each agent its own copy.
+        pub attachments: Option<Vec<serde_json::Value>>,
+        /// For a prompt: "queue" (after the current turn, the default), "steer" (into it) or "now" (stopping it).
+        pub mode: Option<String>,
+        /// A command as the console sends one: `{"type":"interrupt"}`, `{"type":"set_mode","mode":"plan"}`.
+        pub command: Option<serde_json::Value>,
+        /// Answer every tool call waiting on you: "allow" or "deny" (questions are left to answer).
+        pub approvals: Option<String>,
+        /// An idempotency key of yours, made once for this broadcast (1 to 256 bytes): sent again with it (its answer
+        /// lost), each agent's message is the same one, which it gets once. Without it, each call is another message to
+        /// each agent: pass it whenever you may send it again.
+        pub key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct BroadcastTo {
+        /// Every agent you may act on that hasn't ended.
+        pub all: Option<bool>,
+        /// Exactly these agents (as agents.list gives their ids).
+        pub ids: Option<Vec<String>>,
+        /// Those on these machines ("local" is the server's own).
+        pub machines: Option<Vec<String>>,
+        /// Those in these harnesses ("claude", "codex", ...).
+        pub kinds: Option<Vec<String>>,
+        /// Those in these states ("starting", "idle", "running", "waiting", "exited").
+        pub status: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRecover {
+        /// The machine that's gone: a runner's name (as runners lists it).
+        pub machine: String,
+        /// The machine they go on on; none: where each suits best.
+        pub to: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRemove {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

@@ -1663,7 +1663,7 @@ function stateOf(m: Member): State {
     mode: m.info.mode,
     ...(m.info.kind === "claude" ? { effort: m.effort ?? "high" } : {}),
     title: m.info.title,
-    summary: m.info.summary,
+    summary: m.info.summary ?? "",
     doing: m.info.doing,
     approvals: m.approval ? [m.approval] : [],
     queue: Array.from({ length: m.info.queued }, (_, i) => ({ id: `queued-${i}`, text: "A message waiting for its turn", at: Date.now() })),
@@ -2518,7 +2518,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
   if (await handleAttention(req, res, url, all)) return true;
-  // The next Remove of this agent refused, as kiln refuses one whose archive or restore is under way (DELETE's 409).
+  // The next Remove of this agent refused, as kiln refuses one whose archive or restore is under way (`agents.remove`'s 409).
   if (p === "/api/mock/refuse-remove" && m === "POST") {
     refuseRemove.add((await body<{ id: string }>(req)).id);
     json(res, 200, {});
@@ -2582,14 +2582,15 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     json(res, 200, {});
     return true;
   }
-  // Removed (Mission control's Remove, a subagent's trash): gone, as its server forgets it; or kept, refused.
-  const dm = p.match(/^\/api\/harness\/sessions\/([^/]+)$/);
+  // Removed (Mission control's Remove, a subagent's trash: `agents.remove`, `DELETE /api/harness/agents/:id`, which
+  // took the place of the bare `DELETE /api/harness/sessions/:id`): gone, as its server forgets it; or kept, refused.
+  const dm = p.match(/^\/api\/harness\/agents\/([^/]+)$/);
   if (dm && m === "DELETE" && refuseRemove.delete(decodeURIComponent(dm[1] ?? ""))) {
     json(res, 409, { error: "its archive or restore is under way: end it once that's done" });
     return true;
   }
   if (dm && m === "DELETE" && end(decodeURIComponent(dm[1] ?? ""))) {
-    json(res, 200, {});
+    json(res, 200, { removed: decodeURIComponent(dm[1] ?? "") });
     return true;
   }
   // A command without its socket (a request answered from Mission control's row or a card): taken as its harness would.

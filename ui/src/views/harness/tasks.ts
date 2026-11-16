@@ -59,16 +59,27 @@ export const kilnBrief = (a: AgentInfo): SubagentBrief => ({
   ended: Math.max(a.last_turn?.at ?? 0, ...(a.subagents ?? []).map((s) => s.ended ?? 0)) || undefined,
 });
 
-/** An agent as its row shows it: the subagents kiln started for it among its own. */
-export const withKilnSubagents = (a: AgentInfo, subs: readonly AgentInfo[]): AgentInfo =>
-  subs.length > 0
-    ? {
-        ...a,
-        subagents: [...(a.subagents ?? []), ...subs.map(kilnBrief)],
-        tasks_running: a.tasks_running + subs.reduce((n, s) => n + s.tasks_running, 0),
-        left_behind: (a.left_behind ?? 0) + subs.reduce((n, s) => n + (s.left_behind ?? 0), 0),
-      }
-    : a;
+/** Each agent as last shown with its subagents, and which they were. */
+const shownWith = new WeakMap<AgentInfo, { subs: readonly AgentInfo[]; shown: AgentInfo }>();
+
+/**
+ * An agent as its row shows it: the subagents kiln started for it among its own. The same object
+ * for the same agent and the same subagents (as they are: an agent with news is a new object), so
+ * a row whose agent and subagents haven't changed has nothing to render again (W26-R15).
+ */
+export function withKilnSubagents(a: AgentInfo, subs: readonly AgentInfo[]): AgentInfo {
+  if (subs.length === 0) return a;
+  const was = shownWith.get(a);
+  if (was && was.subs.length === subs.length && was.subs.every((s, i) => s === subs[i])) return was.shown;
+  const shown: AgentInfo = {
+    ...a,
+    subagents: [...(a.subagents ?? []), ...subs.map(kilnBrief)],
+    tasks_running: a.tasks_running + subs.reduce((n, s) => n + s.tasks_running, 0),
+    left_behind: (a.left_behind ?? 0) + subs.reduce((n, s) => n + (s.left_behind ?? 0), 0),
+  };
+  shownWith.set(a, { subs: [...subs], shown });
+  return shown;
+}
 
 /** What a task is; machines from before `class` only say the harness's own task type. */
 export const classOf = (t: Pick<Task, "class" | "kind">): string =>
@@ -122,8 +133,20 @@ export function subagentAsks(
   return asks.sort((x, y) => x.ap.at - y.ap.at);
 }
 
+const NO_SUBAGENTS: readonly SubagentBrief[] = [];
+/** Each list of subagents' ones at work, as last told: asked of every agent on every pass over the fleet, and an agent without news has the list it had (W26-R15). */
+const atWork = new WeakMap<readonly SubagentBrief[], readonly SubagentBrief[]>();
+
 /** Its subagents still at work (running, waiting to start, or paused for an approval), as the agents list says. */
-export const subagentsAtWork = (subagents: readonly SubagentBrief[] | undefined): SubagentBrief[] => (subagents ?? []).filter(taskLive);
+export function subagentsAtWork(subagents: readonly SubagentBrief[] | undefined): readonly SubagentBrief[] {
+  if (!subagents) return NO_SUBAGENTS;
+  let live = atWork.get(subagents);
+  if (!live) {
+    live = subagents.filter(taskLive);
+    atWork.set(subagents, live);
+  }
+  return live;
+}
 
 /** The same from its live state, whose tasks hold its shells and monitors too. */
 export const subagentTasksAtWork = (tasks: readonly Task[] | undefined): Task[] => (tasks ?? []).filter((t) => isSubagent(t) && taskLive(t));

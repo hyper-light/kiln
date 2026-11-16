@@ -762,7 +762,8 @@ impl Builder {
             // Its CPUs past the first brought online by shards-init where its backend's
             // boots wait on them (PM M379).
             format!(
-                "console=ttyS0 earlycon panic=-1 shards_build=1 memhp_default_state=online_kernel rt_group_sched=0 shards_shm={} {}{}",
+                "{} panic=-1 shards_build=1 memhp_default_state=online_kernel rt_group_sched=0 shards_shm={} {}{}",
+                shards_abi::CONSOLE,
                 crate::run::shm_bytes(boot.memory_mib),
                 bridge.cmdline(),
                 shards_vmm::vm::late_cpus_cmdline(boot.cpus),
@@ -1421,7 +1422,11 @@ fn read_frame_from(conn: &UnixStream, buf: &mut Vec<u8>) -> Result<u8, String> {
 /// process has gone or cannot be read, whose wait then follows its liveness alone.
 fn following<'r>(vm: &shards_ipc::Child, record: &'r Record) -> Option<Follow<'r>> {
     let followed = Followed::of_pid(vm.id()).ok().flatten()?;
-    Follow::begin(record, followed).ok().flatten()
+    // A build ends when its work does, however long it waits on its sources: by stillness
+    // alone (D215's `Bound`).
+    Follow::begin(record, followed, shards_api::Bound::Stillness)
+        .ok()
+        .flatten()
 }
 
 /// What a builder's guest said its build needed of memory (`NEEDED`, D133): the bytes, the

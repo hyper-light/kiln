@@ -32,7 +32,7 @@ import {
 } from "lucide-react";
 import { api } from "@/api/client";
 import { opLabel, opsApi, type OpInfo } from "@/api/ops";
-import type { Agent, Repo, Run } from "@/api/types";
+import type { LeanAgent, Repo, Run } from "@/api/types";
 import { StatusDot } from "@/components/ui/status";
 import { sendingProps, useAction } from "@/lib/action";
 import { noteLabels, shownName } from "@/lib/data";
@@ -43,7 +43,7 @@ interface PaletteState {
   open: boolean;
   repos: Repo[];
   runs: Run[];
-  agents: Agent[];
+  agents: LeanAgent[];
   /** kiln's operations, as the server lists them. */
   ops: OpInfo[];
 }

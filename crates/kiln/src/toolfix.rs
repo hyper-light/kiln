@@ -307,6 +307,8 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     let shown = hub.shown(&runner);
     let prompt = brief(&shown, &job.display, &repo, &number.to_string(), &tools, m.why.as_deref(), m.runners.iter().find(|u| u.runner == runner));
     let mut input = json!({ "on": runner, "cwd": "~", "name": format!("Install {} on {shown}", tools.join(", ")) });
+    // The agent definition its session starts from, where it's one (`crate::agentdefs::sessions`).
+    let mut definition = None;
     if let Some(o) = input.as_object_mut() {
         // The most specific agent wins (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.1b): the harness
         // asked for here; else the asker's own copy of kiln's tool fixer (`agentdefs.use`), its harness,
@@ -321,7 +323,8 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
             }
             None => {
                 let person = crate::harness::lineage::person_of(&caller);
-                let s = crate::agentdefs::uses::or_kilns(&hub, person.as_deref(), crate::agentdefs::builtin::TOOLFIX).await.map_err(crate::agentdefs::ops::fail)?;
+                let (s, d) = crate::agentdefs::uses::or_kilns(&hub, person.as_deref(), crate::agentdefs::builtin::TOOLFIX).await.map_err(crate::agentdefs::ops::fail)?;
+                definition = Some((d, person));
                 o.insert("prompt".into(), json!(crate::agentdefs::first_message(&s, Some(&prompt))));
                 for (k, v) in [("model", s.model.clone()), ("image", s.agentfile.clone())] {
                     if let Some(v) = v {
@@ -365,6 +368,10 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     if agent.is_empty() {
         undo();
         return Err((StatusCode::BAD_GATEWAY, format!("no agent started on {shown}: {started}")));
+    }
+    if let Some((d, person)) = &definition {
+        let target = hub.harness.info(&agent).map_or_else(|| format!("agent:{runner}"), |i| i.target);
+        crate::agentdefs::sessions::record(&hub, &agent, d, person.as_deref(), &target).await;
     }
     let f = Fix { agent: agent.clone(), ..f };
     hub.tool_fixes.update(|g| g.insert(id.to_owned(), f.clone()));

@@ -1,6 +1,8 @@
+import { AGENTS_READ, REACH_READ } from "./launch-reads";
 import { apiPath } from "@/lib/peer-base";
 import type {
   Agent,
+  LeanAgent,
   AgentKeep,
   AgentLimitView,
   AiSession,
@@ -346,7 +348,10 @@ export const api = {
   /** When each piece of a step's log arrived (`[offset, unix ms]`, oldest first), and the log's size as they were read. */
   jobLogTimes: (id: string, step: number) => request<{ times: [number, number][]; size: number }>("GET", `/api/jobs/${enc(id)}/logs/times${qs({ step })}`),
 
-  agents: (signal?: AbortSignal) => get<Agent[]>("/api/agents", signal),
+  /** The machines that have joined, lean: what a page that lists them and starts agents on them reads (W21-R02). */
+  agents: (signal?: AbortSignal) => get<LeanAgent[]>(AGENTS_READ, signal),
+  /** The machines that have joined, each with all its facts: a page that shows a machine's hardware. */
+  agentsWhole: (signal?: AbortSignal) => get<Agent[]>("/api/agents", signal),
   forgetAgent: (name: string) => del<void>(`/api/agents/${enc(name)}`),
   drainAgent: (name: string, draining: boolean) => post<void>(`/api/agents/${enc(name)}/drain`, { draining }),
   /** How many agent sessions a runner has at work at once: what's set here, what it holds and why, how many are at work now. */
@@ -376,7 +381,7 @@ export const api = {
   convoLog: (filters: { q?: string; limit?: number; since?: number }, signal?: AbortSignal) => get<ConvoLog>(`/api/conversations/log${qs(filters)}`, signal),
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
   /** Reach's directory: every runner, whether it takes commands from other runners, how busy it is. */
-  reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>("/api/reach/runners", signal),
+  reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>(REACH_READ, signal),
   /** End a session: its shell stops on every device. */
   closeTerminalSession: (id: string) => del<void>(`/api/terminal/sessions/${enc(id)}`),
   /** Names a terminal session ("" takes its name away). */

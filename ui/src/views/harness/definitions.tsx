@@ -45,7 +45,7 @@ import { ApiError } from "@/api/client";
 import { Loadable } from "@/components/ui/loading";
 import { invalidate } from "@/lib/resource";
 import { rebalance, variantName, variantTone } from "./variants";
-import { engineOf, sandboxesRes, type SandboxBrief } from "@/api/microvms";
+import { sandboxesRes, type SandboxBrief } from "@/api/microvms";
 import type { AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Segmented } from "@/components/ui/tabs";
@@ -54,6 +54,7 @@ import { agentsRes, labelOf, useRes } from "@/lib/data";
 import { useNavigate } from "@/lib/router";
 import { EngineGlyph, START, StartMark, WarmDots, msText } from "@/views/sandbox-marks";
 import { chatStand, type ChatStand } from "./chat-state";
+import { leanEngine } from "./engine-of";
 import { modelLabel } from "./derive";
 import "@/components/code/query-input.css";
 import "./definition.css";
@@ -117,7 +118,7 @@ function SandboxLineRead({ id, target }: { id: string; target: string }) {
   const b: SandboxBrief | undefined = useRes(sandboxesRes).data[id];
   const machine = target.replace(/^agent:/, "");
   // A session the sandboxes don't list yet (just started): where it runs, from its machine's facts.
-  const engine = engineOf(useRes(agentsRes).data.find((r) => r.name === machine)?.facts)?.engine;
+  const engine = leanEngine(useRes(agentsRes).data.find((r) => r.name === machine)?.facts);
   if (!b)
     return (
       <span className="df-sandbox">

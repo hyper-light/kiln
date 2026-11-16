@@ -40,7 +40,9 @@ fn step16_kilns_carried_vm_process_boots_a_guest() -> anyhow::Result<()> {
     let spec = shards_api::GuestSpec {
         kernel: kernel.into(),
         init: shards_api::Init::Executable(init.into()),
-        cmdline: "console=ttyS0 quiet panic=-1".into(),
+        // Shards' guests' console (D261, `console=hvc0`): they have no UART, and a PID 1 started with no console
+        // has no standard streams, which Rust's runtime aborts on, so its kernel panics and its VM resets.
+        cmdline: format!("{} quiet panic=-1", shards_api::CONSOLE),
         vcpus: 1,
         memory_mib: 256,
         gpu: false,

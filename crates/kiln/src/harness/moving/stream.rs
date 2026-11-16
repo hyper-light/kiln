@@ -24,6 +24,15 @@ pub(crate) fn same_package(path: &Path, spool: &Spool) -> io::Result<bool> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoragePolicy { Unknown, Off, Reserved { bytes: u64 } }
 
+/// The room a hand-over's spool leaves on a runner's volume, as the server says it
+/// ([`crate::proto::ServerMsg::AdoptPolicy`]): the operator's floor (`[ci.scheduler.admission]
+/// disk_free`), or none set. What a transfer's offer carries too (`TransferDown::Offered`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Told {
+    #[serde(default)]
+    pub disk_floor: Option<u64>,
+}
+
 impl StoragePolicy {
     pub(crate) fn offered(floor: Option<u64>) -> Self { match floor { Some(bytes) => Self::Reserved { bytes }, None => Self::Off } }
     pub(crate) fn floor(self) -> io::Result<u64> { match self { Self::Unknown => Err(io::Error::other("transfer storage policy has not been negotiated")), Self::Off => Ok(0), Self::Reserved { bytes } => Ok(bytes) } }

@@ -16,18 +16,66 @@ use super::host::HostSandbox;
 
 /// Images, by name, of one member each, which runs `program`.
 pub struct FakeVms {
-    images: Vec<(String, String, PathBuf)>,
+    images: Arc<Vec<(String, String, PathBuf)>>,
     launched: Mutex<Vec<Launch>>,
     /// The link each run's stdio is said to ride, once it's started.
     link: Option<Link>,
     /// Each change a run took while it ran (`Run::change`), by its microVM's name, in order.
     changed: Arc<Mutex<Vec<(String, Change)>>>,
+    /// Each member swapped into a microVM (`Run::swap`), by its microVM's name, in order.
+    swapped: Arc<Mutex<Vec<(String, Launch)>>>,
+    /// It swaps a member for another in place (`Holds::swaps`): off unless asked ([`FakeVms::swapping`]).
+    swaps: bool,
+    /// It lays components over its images' own (`Holds::components`): off unless asked ([`FakeVms::laying`]).
+    components: bool,
+}
+
+/// What a stand-in member's program is told of the components laid for it (`Launch::components`): each `<at> <source>`,
+/// `;` apart.
+pub const COMPONENTS: &str = "KILN_FAKE_COMPONENTS";
+
+/// `launch` as its member's program runs it on this machine: `program`, with nothing of a microVM's, and told the
+/// components laid for it.
+fn on_host(launch: Launch, program: String) -> Launch {
+    let mut env = launch.env.clone();
+    if !launch.components.is_empty() {
+        env.push((COMPONENTS.to_owned(), launch.components.iter().map(|c| format!("{} {}", c.at, c.component.source)).collect::<Vec<_>>().join(";")));
+    }
+    Launch { program, shares: Vec::new(), limits: Limits::NONE, egress: Egress::Any, boundary: Boundary::Host, components: Vec::new(), env, ..launch }
+}
+
+/// The program `image`'s `member` runs, of `images`.
+fn program_of(images: &[(String, String, PathBuf)], image: &str, member: &str) -> Result<String, Refusal> {
+    images.iter().find(|(i, m, _)| i == image && m == member).map(|(_, _, p)| p.to_string_lossy().into_owned()).ok_or_else(|| Refusal::NoSuchProgram(format!("{image}'s {member}")))
 }
 
 impl FakeVms {
     /// One image, `image`, whose member `member` runs `program`.
     pub fn with(image: &str, member: &str, program: &Path) -> Self {
-        Self { images: vec![(image.to_owned(), member.to_owned(), program.to_path_buf())], launched: Mutex::new(Vec::new()), link: None, changed: Arc::default() }
+        Self { images: Arc::new(vec![(image.to_owned(), member.to_owned(), program.to_path_buf())]), launched: Mutex::new(Vec::new()), link: None, changed: Arc::default(), swapped: Arc::default(), swaps: false, components: false }
+    }
+
+    /// It swaps a member for another in its microVM, as Hex's will (P6c.2).
+    pub fn swapping(self) -> Self {
+        Self { swaps: true, ..self }
+    }
+
+    /// It lays components over its images' own, at a launch and while a run runs, as Hex's will (P6c.2): a member's
+    /// program is told those laid for it in [`COMPONENTS`].
+    pub fn laying(self) -> Self {
+        Self { components: true, ..self }
+    }
+
+    /// Another image, `image`, whose member `member` runs `program`.
+    pub fn and(self, image: &str, member: &str, program: &Path) -> Self {
+        let mut images: Vec<(String, String, PathBuf)> = self.images.iter().cloned().collect();
+        images.push((image.to_owned(), member.to_owned(), program.to_path_buf()));
+        Self { images: Arc::new(images), ..self }
+    }
+
+    /// Each member swapped into one of its microVMs, by its microVM's name, in order.
+    pub fn swapped(&self) -> Vec<(String, Launch)> {
+        self.swapped.lock().clone()
     }
 
     /// Its runs' stdio said to ride `link`.
@@ -116,9 +164,12 @@ impl Sandbox for FakeVms {
                 launched.len()
             };
             let Boundary::MicroVm { image } = &launch.boundary else { return Err(Refusal::Unsupported("a run outside a microVM".into())) };
-            let program = self.images.iter().find(|(i, m, _)| i == image && *m == launch.program).map(|(_, _, p)| p.to_string_lossy().into_owned()).ok_or_else(|| Refusal::NoSuchProgram(format!("{image}'s {}", launch.program)))?;
-            let run = HostSandbox.launch(Launch { program, shares: Vec::new(), limits: Limits::NONE, egress: Egress::Any, boundary: Boundary::Host, ..launch }).await?;
-            Ok(Box::new(FakeRun { run, id: format!("fake-vm-{n}"), link: self.link.clone(), changed: Arc::clone(&self.changed) }) as Box<dyn Run>)
+            if !launch.components.is_empty() && !self.components {
+                return Err(Refusal::Unsupported("components laid over its image's own".into()));
+            }
+            let program = program_of(&self.images, image, &launch.program)?;
+            let run = HostSandbox.launch(on_host(launch, program)).await?;
+            Ok(Box::new(FakeRun { run, id: format!("fake-vm-{n}"), link: self.link.clone(), changed: Arc::clone(&self.changed), images: Arc::clone(&self.images), swapped: Arc::clone(&self.swapped), components: self.components }) as Box<dyn Run>)
         })
     }
 
@@ -127,7 +178,7 @@ impl Sandbox for FakeVms {
     }
 
     fn holds(&self) -> Holds {
-        Holds { live: true, ..super::host::HOLDS }
+        Holds { live: true, swaps: self.swaps, components: self.components, ..super::host::HOLDS }
     }
 }
 
@@ -137,6 +188,10 @@ struct FakeRun {
     id: String,
     link: Option<Link>,
     changed: Arc<Mutex<Vec<(String, Change)>>>,
+    images: Arc<Vec<(String, String, PathBuf)>>,
+    swapped: Arc<Mutex<Vec<(String, Launch)>>>,
+    /// Its microVMs lay components (`Holds::components`).
+    components: bool,
 }
 
 impl Run for FakeRun {
@@ -172,7 +227,26 @@ impl Run for FakeRun {
     /// Taken and recorded, as Hex's wire calls will take one (P6b.3); a held run that ended refuses one before it comes
     /// here (`Held::change`).
     fn change(&self, change: Change) -> BoxFuture<'_, Result<(), Refusal>> {
+        if matches!(change, Change::Swap { .. } | Change::Restore { .. }) && !self.components {
+            return Box::pin(async { Err(Refusal::Unsupported("a component swapped into a run while it runs".into())) });
+        }
         self.changed.lock().push((self.id.clone(), change));
         Box::pin(async { Ok(()) })
+    }
+
+    /// Its member ends as its input does, and `launch`'s starts in the same microVM (the same name), as Hex's wire
+    /// calls will swap one (P6c.2); recorded.
+    fn swap(&self, launch: Launch) -> BoxFuture<'_, Result<Box<dyn Run>, Refusal>> {
+        Box::pin(async move {
+            let Boundary::MicroVm { image } = &launch.boundary else { return Err(Refusal::Unsupported("a member swapped in from outside a microVM".into())) };
+            if !launch.components.is_empty() && !self.components {
+                return Err(Refusal::Unsupported("components laid over its image's own".into()));
+            }
+            let program = program_of(&self.images, image, &launch.program)?;
+            self.swapped.lock().push((self.id.clone(), launch.clone()));
+            self.run.close_stdin();
+            let run = HostSandbox.launch(on_host(launch, program)).await?;
+            Ok(Box::new(FakeRun { run, id: self.id.clone(), link: self.link.clone(), changed: Arc::clone(&self.changed), images: Arc::clone(&self.images), swapped: Arc::clone(&self.swapped), components: self.components }) as Box<dyn Run>)
+        })
     }
 }

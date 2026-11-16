@@ -116,6 +116,20 @@ fn w05_s03_run_groups() {
     assert_eq!(starts(&s.handle(Input::RunFinished { run: "r1".into() }, 3)), vec!["r3"]);
 }
 
+/// W05-R25 through the scheduler: a run that had started as the dispatcher stopped holds its
+/// workflow-level group again. The run behind it waits for it, and starts when it has finished.
+#[test]
+fn w05_r25_a_run_resumed_holds_its_group() {
+    let mut s = Scheduler::new(Config::default());
+    let key = "acme/x\0deploy-prod";
+    let g = || Some((key.to_owned(), "deploy-prod".to_owned(), GroupConfig::default()));
+    let starts = |c: &[Command]| c.iter().filter_map(|x| if let Command::StartRun { run } = x { Some(run.clone()) } else { None }).collect::<Vec<_>>();
+    assert!(s.handle(Input::RunResumed { run: "r1".into(), key: key.to_owned(), cfg: GroupConfig::default() }, 0).is_empty(), "it runs already: nothing starts it");
+    assert!(s.handle(Input::RunQueued { run: "r2".into(), group: g(), supersede: None }, 1).is_empty(), "r2 waits behind r1");
+    assert_eq!(starts(&s.handle(Input::RunFinished { run: "r1".into() }, 2)), vec!["r2"]);
+    assert!(s.handle(Input::RunFinished { run: "r2".into() }, 3).is_empty());
+}
+
 /// W05-AC02: supersede on a branch cancels the older runs; without it all run.
 #[test]
 fn w05_ac02_supersede() {
@@ -368,6 +382,32 @@ fn fence(s: &Scheduler, leg: &str) -> Fence {
 
 fn assigned(c: &[Command]) -> Vec<String> {
     c.iter().filter_map(|x| if let Command::Assign { leg, .. } = x { Some(leg.clone()) } else { None }).collect()
+}
+
+/// W05-R03, docs/releases.md "Version skew": a runner that offers no slots (one to be upgraded,
+/// which the server gives none; an outpost) takes no leg, by slots or by resources, however idle;
+/// given slots again (upgraded), it takes them. A runner of no slots was counted as one before: the
+/// macOS release build of 2d873009a went to a Mac to be upgraded whose disk was full (2026-11-14).
+#[test]
+fn w05_r03_a_runner_offering_no_slots_takes_no_leg() {
+    for resources in [false, true] {
+        let runner = |slots: u32| {
+            let mut r = machine("old", slots, 16, 64);
+            if resources {
+                r.capacity = Some(Resources { cpu: Cpus::whole(16), mem: 64 << 30, ..Resources::default() });
+            }
+            r
+        };
+        let mut sim = Sim::new(Config { resources, ..Config::default() });
+        sim.runner(0, runner(0));
+        sim.leg(1, leg("l", "acme/x", 60), 10 * MIN);
+        sim.run(2);
+        assert!(sim.assigned.is_empty(), "no slots, no leg (resources: {resources})");
+        sim.input(3, Input::RunnerChanged(Box::new(runner(2))));
+        sim.run(4);
+        let on: Vec<&str> = sim.assigned.iter().map(|a| a.runner.as_str()).collect();
+        assert_eq!(on, vec!["old"], "upgraded, it takes the leg (resources: {resources})");
+    }
 }
 
 /// An exclusive leg that asks for CPUs holds them and its memory, and ordinary legs pack in

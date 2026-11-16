@@ -5,6 +5,9 @@
 //! which records each change its run takes. What's checked is what a person and a client see: `agents.get`, what the
 //! harness was told, and what the microVM took.
 
+// Most of these start a stand-in harness, which they do on Unix alone: elsewhere what only they use is unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,8 +57,15 @@ fn stand_in(dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let script = dir.join("stand-in.py");
     std::fs::write(&script, r#"import json, os, sys, uuid
 log, args = sys.argv[1], sys.argv[2:]
+# Its version: 2.1.296, or as a component swapped in makes it (a copy installed with its own, or one the stand-in
+# runtime lays at its path, `claude-<version>`).
+version = os.environ.get("KILN_STAND_IN_VERSION", "2.1.296")
+for part in os.environ.get("KILN_FAKE_COMPONENTS", "").split(";"):
+    at, _, source = part.partition(" ")
+    if at == "/harness/claude" and "claude-" in source:
+        version = source.rsplit("claude-", 1)[1]
 if "--version" in args:
-    print("2.1.296 (Claude Code)")
+    print(version + " (Claude Code)")
     sys.exit(0)
 def note(kind, value):
     with open(log, "a") as f:
@@ -78,12 +88,13 @@ for line in sys.stdin:
         note("control", req)
         resp = {}
         if req.get("subtype") == "initialize":
-            resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": "2.1.296"}
+            resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": version}
         out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
     elif m.get("type") == "user":
         uid = m.get("uuid")
+        note("user", m.get("message"))
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
-        out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "fixture", "permissionMode": "default", "claude_code_version": "2.1.296"})
+        out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "fixture", "permissionMode": "default", "claude_code_version": version})
         out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
 "#)?;
@@ -91,6 +102,12 @@ for line in sys.stdin:
     std::fs::write(&program, format!("#!/bin/sh\nexec python3 {} {} \"$@\"\n", script.display(), said.display()))?;
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
     Ok((program, said))
+}
+
+/// Whether session `s`'s harness is up and at rest.
+fn at_rest(s: &crate::harness::session::Session) -> bool {
+    let core = s.core.lock();
+    !core.meta.features.is_empty() && core.state.status == crate::harness::model::Status::Idle
 }
 
 /// What the stand-in wrote down, of `kind`: each line's pid and value.
@@ -145,11 +162,16 @@ async fn shows(hub: &Arc<Hub>, id: &str, what: &str, check: impl Fn(&Value) -> b
 async fn opened(hub: &Arc<Hub>, id: &str, dir: &Path, program: &Path, isolation: Option<Isolation>) -> anyhow::Result<()> {
     // An isolated one under the claim kiln's balancer would have placed it with (step 32).
     let claim = isolation.as_ref().map(|_| crate::reach::place::Claim { owner: "mac".into(), epoch: 1, run: format!("session-{id}"), fence: kiln_ci::sched::Fence::default() });
-    let spec = Spec { kind: "claude".into(), cwd: Some(dir.to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), isolation, claim, ..Spec::default() };
+    // The most egress it may be granted live, as kiln's server sets it from the org's policy (`[agents] egress_ceiling`).
+    let egress_ceiling = if isolation.is_some() { vec![CEILING.to_owned()] } else { Vec::new() };
+    let spec = Spec { kind: "claude".into(), cwd: Some(dir.to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), isolation, claim, egress_ceiling, ..Spec::default() };
     let s = hub.harness.local.open(Some(id.to_owned()), spec)?;
     until("its harness at rest", || !s.core.lock().meta.features.is_empty() && s.core.lock().state.status == crate::harness::model::Status::Idle).await?;
     until("the server's copy of it", || hub.harness.info(id).is_some()).await
 }
+
+/// The org's policy the tests' microVM sessions start under: the most egress each may be granted live.
+const CEILING: &str = "api.example.com:443";
 
 /// The first held override of `list` (`ports`, `egress`, `networks`, `volumes`) in an `agents.get`, and how `place` took it.
 fn took<'a>(v: &'a Value, list: &str, place: &str) -> Option<&'a str> {
@@ -175,6 +197,8 @@ fn p6b_4_ac1_the_ops_are_on_rest_mcp_and_code_mode_as_changes() -> anyhow::Resul
             ("sessions.networks.disconnect", true, "networks/disconnect"),
             ("sessions.volumes.add", false, "volumes"),
             ("sessions.volumes.remove", true, "volumes/remove"),
+            ("sessions.components.swap", false, "components"),
+            ("sessions.components.restore", true, "components/restore"),
         ] {
             let listed = catalog.get("operations").and_then(Value::as_array).and_then(|a| a.iter().find(|o| o.get("name") == Some(&json!(name)))).ok_or_else(|| anyhow::anyhow!("{name} isn't in GET /api/ops"))?;
             anyhow::ensure!(listed.get("read_only") == Some(&json!(false)) && listed.get("destructive") == Some(&json!(destructive)), "{name}: {listed}");
@@ -202,7 +226,7 @@ fn p6b_4_ac2_a_host_session_refuses_network_changes_naming_its_engine() -> anyho
         opened(&hub, "host-net", dir.path(), &program, None).await?;
         let v = get(&hub, "host-net").await?;
         anyhow::ensure!(v.pointer("/live/engine") == Some(&json!("host")), "{v}");
-        anyhow::ensure!(v.pointer("/live/ops") == Some(&json!(["sessions.volumes.add", "sessions.volumes.remove"])), "only its volumes': {v}");
+        anyhow::ensure!(v.pointer("/live/ops") == Some(&json!(["sessions.volumes.add", "sessions.volumes.remove", "sessions.components.swap", "sessions.components.restore"])), "only its volumes' and components': {v}");
         for (name, input) in [
             ("sessions.ports.publish", json!({"agent": "host-net", "bind": "127.0.0.1", "host_port": 8080, "guest_port": 3000, "protocol": "tcp"})),
             ("sessions.ports.unpublish", json!({"agent": "host-net", "bind": "127.0.0.1", "host_port": 8080, "protocol": "tcp"})),
@@ -292,7 +316,7 @@ fn microvms(hub: &Hub, dir: &Path, program: &Path) -> anyhow::Result<Arc<crate::
 #[cfg(unix)]
 #[test]
 fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> anyhow::Result<()> {
-    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, Share};
+    use kiln_seams::sandbox::{Change as Seam, Member as SeamMember, PlugFor, PlugSource};
     run(async {
         let hub = hub().await?;
         let dir = tempfile::tempdir()?;
@@ -302,8 +326,15 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         std::fs::create_dir_all(&data)?;
         let data = data.to_string_lossy().into_owned();
         opened(&hub, "vm-live", dir.path(), &program, Some(Isolation::microvm())).await?;
-        let v = get(&hub, "vm-live").await?;
-        anyhow::ensure!(v.pointer("/live/engine") == Some(&json!("microvm")) && v.pointer("/live/ops").and_then(Value::as_array).is_some_and(|o| o.len() == 8), "every operation offered: {v}");
+        // What its launch declared (Shards' ImageSpec::plug_roots and egress_ceiling, D271): its project's top-level
+        // directory and its session's volume root, and the org's ceiling.
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let roots: Vec<String> = crate::sandbox::isolated::plug_root_of(&cwd).into_iter().chain([crate::sandbox::isolated::VOLUMES.to_owned()]).collect();
+        let v = shows(&hub, "vm-live", "what its launch declared", |v| v.pointer("/state/overrides/roots").is_some()).await?;
+        anyhow::ensure!(v.pointer("/live/engine") == Some(&json!("microvm")) && v.pointer("/live/ops") == Some(&json!(super::ops_for(true))) && super::ops_for(true).len() == 10, "every operation offered: {v}");
+        anyhow::ensure!(v.pointer("/state/overrides/roots") == Some(&json!(roots)) && v.pointer("/state/overrides/ceiling") == Some(&json!([CEILING])), "{v}");
+        let launched = vms.launched();
+        anyhow::ensure!(launched.first().is_some_and(|l| l.plug_roots == roots && l.egress_ceiling == [CEILING]), "declared at its launch: {launched:?}");
         let member = || SeamMember("claude".into());
         let ask = |name: &'static str, input: Value| {
             let cx = owner(&hub);
@@ -313,9 +344,16 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         ask("sessions.egress.grant", json!({"agent": "vm-live", "host": "API.example.com", "port": 443})).await?;
         ask("sessions.networks.connect", json!({"agent": "vm-live", "network": "team"})).await?;
         ask("sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "ro"})).await?;
-        let plug = Seam::Plug { share: Share { host: data.clone(), at: data.clone(), writable: false }, members: vec![member()] };
+        // Past what its launch declared: egress past its ceiling, a folder outside its plug roots with nothing restarted.
+        let past = call(owner(&hub), "sessions.egress.grant", json!({"agent": "vm-live", "host": "elsewhere.example.com", "port": 443})).await.err().ok_or_else(|| anyhow::anyhow!("egress past its ceiling was taken"))?;
+        anyhow::ensure!(past.0 == http::StatusCode::CONFLICT && past.1.contains("past the most egress"), "{past:?}");
+        let outside = call(owner(&hub), "sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "ro", "at": "/opt/data"})).await.err().ok_or_else(|| anyhow::anyhow!("a folder outside its plug roots was taken"))?;
+        anyhow::ensure!(outside.0 == http::StatusCode::CONFLICT && outside.1.contains("outside every folder") && outside.1.contains(crate::sandbox::isolated::VOLUMES), "{outside:?}");
+        // Beneath its session's volume root by default, plugged as Shards' ImageGuest::plug takes one.
+        let at = format!("{}/data", crate::sandbox::isolated::VOLUMES);
+        let plug = Seam::Plug { source: PlugSource::Host(data.clone()), to: PlugFor::Members(vec![member()]), at: at.clone(), read_only: true };
         let all = vec![
-            Seam::Publish { member: member(), bind: "127.0.0.1".into(), host_port: 8080, guest_port: 3000, udp: false },
+            Seam::Publish { guest_port: 3000, udp: false, host: Some("127.0.0.1".into()), host_port: 8080 },
             Seam::Grant { member: member(), host: "api.example.com".into(), port: 443 },
             Seam::Connect { member: member(), network: "team".into() },
             plug.clone(),
@@ -325,8 +363,9 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         let v = shows(&hub, "vm-live", "each override, taken by its microVM", |v| ["ports", "egress", "networks", "volumes"].iter().all(|l| took(v, l, "microvm") == Some("now"))).await?;
         anyhow::ensure!(took(&v, "volumes", "harness") == Some("now") && took(&v, "volumes", "scope") == Some("now"), "{v}");
         anyhow::ensure!(v.pointer("/state/overrides/volumes/0/volume/access") == Some(&json!("ro")), "{v}");
-        // In place: the same microVM, none launched again, and its harness the same process, told the folder.
-        until("its harness told the folder", || told_dirs(&log) == Some(json!([data.clone()]))).await?;
+        anyhow::ensure!(v.pointer("/state/overrides/volumes/0/volume/at") == Some(&json!(at)), "{v}");
+        // In place: the same microVM, none launched again, and its harness the same process, told the folder where it sees it.
+        until("its harness told the folder", || told_dirs(&log) == Some(json!([at.clone()]))).await?;
         anyhow::ensure!(vms.launched().len() == 1 && said(&log, "start").len() == 1, "one microVM, one harness: {:?}", said(&log, "start"));
         anyhow::ensure!(matches!(hub.harness.info("vm-live").and_then(|i| i.runs), Some(crate::harness::session::Runs::Microvm { vm: Some(ref vm), .. }) if vm == "fake-vm-1"), "the same box");
         // Started again (by force): its next run takes all four again, its harness the folder as it starts.
@@ -334,7 +373,7 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         until("its second run took all four", || on("fake-vm-2") == all).await?;
         let resumed = vms.launched();
         let args = resumed.get(1).map(|l| l.args.clone()).unwrap_or_default();
-        anyhow::ensure!(args.windows(2).any(|w| w == ["--add-dir", data.as_str()]), "{args:?}");
+        anyhow::ensure!(args.windows(2).any(|w| w == ["--add-dir", at.as_str()]), "{args:?}");
         shows(&hub, "vm-live", "each override, held again", |v| ["ports", "egress", "networks", "volumes"].iter().all(|l| took(v, l, "microvm") == Some("now"))).await?;
         // Each taken back: its microVM lets go of each.
         ask("sessions.ports.unpublish", json!({"agent": "vm-live", "bind": "127.0.0.1", "host_port": 8080, "protocol": "tcp"})).await?;
@@ -342,14 +381,70 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         ask("sessions.networks.disconnect", json!({"agent": "vm-live", "network": "team"})).await?;
         ask("sessions.volumes.remove", json!({"agent": "vm-live", "path": data})).await?;
         let gone = vec![
-            Seam::Unpublish { bind: "127.0.0.1".into(), host_port: 8080, udp: false },
+            Seam::Unpublish { udp: false, host: "127.0.0.1:8080".into() },
             Seam::Revoke { member: member(), host: "api.example.com".into(), port: 443 },
             Seam::Disconnect { member: member(), network: "team".into() },
-            Seam::Unplug { at: data.clone() },
+            Seam::Unplug { at: at.clone() },
         ];
         until("its microVM let go of each", || on("fake-vm-2").get(4..) == Some(gone.as_slice())).await?;
         shows(&hub, "vm-live", "none held", |v| v.pointer("/state/overrides/ports").is_none() && v.pointer("/state/overrides/volumes").is_none()).await?;
         anyhow::ensure!(hub.harness.close(&hub, "vm-live").await, "it closed");
+        Ok(())
+    })
+}
+
+/// P5.2's page (the base beside the live overrides): `sessions.grants` says what each session's launch gave it as it
+/// started. A host session: its working folder, the folder its harness is allowed, nothing narrowing its egress, no
+/// microVM's plug roots or ceiling. A microVM session: its folder and the machine's folders it sees as its runner
+/// launched them (each where it sees it, and whether it may write it), the folders its harness is allowed, its plug
+/// roots and egress ceiling as its launch declared them, what it reaches past its microVM, and no port or network,
+/// none being given at a launch; a port published live shows among its live overrides, its base unchanged. A session
+/// kiln doesn't run is 404. Dropping the runner's record of its launch (`granted`) leaves its base unsaid
+/// (`reported` false), which the microVM half fails on.
+#[cfg(unix)]
+#[test]
+fn p5_2_a_sessions_grants_are_what_its_launch_gave_beside_its_live_overrides() -> anyhow::Result<()> {
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, _log) = stand_in(&dir.path().join("h"))?;
+        let ask = |name: &'static str, input: Value| {
+            let cx = owner(&hub);
+            async move { call(cx, name, input).await.map_err(|(s, m)| anyhow::anyhow!("{name}: {s} {m}")) }
+        };
+        let cwd = dir.path().to_string_lossy().into_owned();
+
+        opened(&hub, "host-base", dir.path(), &program, None).await?;
+        // Its folder as kiln holds it (resolved as its session resolved it).
+        let cwd = hub.harness.info("host-base").map(|i| i.cwd).unwrap_or(cwd);
+        let g = ask("sessions.grants", json!({"agent": "host-base"})).await?;
+        anyhow::ensure!(g.get("engine") == Some(&json!("host")) && g.pointer("/base/folder") == Some(&json!(cwd)) && g.pointer("/base/allowed_dirs") == Some(&json!([cwd])), "{g}");
+        anyhow::ensure!(g.pointer("/base/egress") == Some(&json!({"as": "host"})) && g.pointer("/base/plug_roots") == Some(&json!([])) && g.pointer("/base/egress_ceiling") == Some(&json!([])), "{g}");
+
+        let vms = microvms(&hub, dir.path(), &program)?;
+        opened(&hub, "vm-base", dir.path(), &program, Some(Isolation::microvm())).await?;
+        shows(&hub, "vm-base", "what its launch declared", |v| v.pointer("/state/overrides/roots").is_some() && v.pointer("/info/runs/granted").is_some()).await?;
+        let launched = vms.launched();
+        let launch = launched.first().ok_or_else(|| anyhow::anyhow!("nothing was launched"))?;
+        let g = ask("sessions.grants", json!({"agent": "vm-base"})).await?;
+        anyhow::ensure!(g.get("engine") == Some(&json!("microvm")) && g.pointer("/base/reported") == Some(&json!(true)), "its runner said its base: {g}");
+        anyhow::ensure!(g.pointer("/base/folder") == Some(&json!(launch.folder)), "its folder as launched: {g}");
+        let volumes: Vec<Value> = launch.shares.iter().map(|s| json!({"host": s.host, "at": s.at, "writable": s.writable})).collect();
+        anyhow::ensure!(g.pointer("/base/volumes") == Some(&json!(volumes)) && !volumes.is_empty(), "the folders it sees, as launched: {g}");
+        let allowed = g.pointer("/base/allowed_dirs").and_then(Value::as_array).cloned().unwrap_or_default();
+        anyhow::ensure!(launch.folder.iter().chain(launch.shares.iter().map(|s| &s.at)).all(|d| allowed.contains(&json!(d))), "its harness allowed each: {g}");
+        anyhow::ensure!(g.pointer("/base/plug_roots") == Some(&json!(launch.plug_roots)) && g.pointer("/base/egress_ceiling") == Some(&json!([CEILING])), "{g}");
+        anyhow::ensure!(g.pointer("/base/egress").is_some_and(|e| !e.is_null()) && g.pointer("/base/ports") == Some(&json!([])) && g.pointer("/base/networks") == Some(&json!([])), "{g}");
+        ask("sessions.ports.publish", json!({"agent": "vm-base", "bind": "127.0.0.1", "host_port": 8081, "guest_port": 3000, "protocol": "tcp"})).await?;
+        shows(&hub, "vm-base", "its port, held", |v| v.pointer("/state/overrides/ports/0").is_some()).await?;
+        let g = ask("sessions.grants", json!({"agent": "vm-base"})).await?;
+        anyhow::ensure!(g.pointer("/live/ports/0").is_some() && g.pointer("/base/ports") == Some(&json!([])) && g.pointer("/live/roots").is_none(), "live beside an unchanged base: {g}");
+
+        let gone = call(owner(&hub), "sessions.grants", json!({"agent": "nobody"})).await.err().ok_or_else(|| anyhow::anyhow!("a session kiln doesn't run answered"))?;
+        anyhow::ensure!(gone.0 == http::StatusCode::NOT_FOUND, "{gone:?}");
+        for id in ["host-base", "vm-base"] {
+            anyhow::ensure!(hub.harness.close(&hub, id).await, "{id} closed");
+        }
         Ok(())
     })
 }
@@ -389,7 +484,7 @@ fn p6b_4_ac3_a_volume_is_the_sessions_scope_as_its_access_says() {
 fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow::Result<()> {
     use super::*;
     let harness = || Member::Harness("claude".into());
-    let port = Port { member: harness(), bind: "127.0.0.1".into(), host_port: 8080, guest_port: 3000, protocol: Protocol::Tcp };
+    let port = Port { bind: "127.0.0.1".into(), host_port: 8080, guest_port: 3000, protocol: Protocol::Tcp };
     let mut o = Overrides::default();
     assert_eq!(take(&mut o, &Change::Publish(port.clone())).map_err(anyhow::Error::msg)?, Taken::Added);
     assert_eq!(take(&mut o, &Change::Publish(port.clone())).map_err(anyhow::Error::msg)?, Taken::Same);
@@ -407,7 +502,7 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
     for bad in [
         Change::Grant(Egress { member: harness(), host: "-bad-.example".into(), port: 443 }),
         Change::Grant(Egress { member: harness(), host: "example.com".into(), port: 0 }),
-        Change::Publish(Port { member: harness(), bind: "localhost".into(), host_port: 1, guest_port: 1, protocol: Protocol::Udp }),
+        Change::Publish(Port { bind: "localhost".into(), host_port: 1, guest_port: 1, protocol: Protocol::Udp }),
         Change::Connect(Network { member: Member::Harness("codex".into()), name: "team".into() }),
         Change::Add(Volume { path: "relative/dir".into(), at: "relative/dir".into(), access: Access::Rw, members: vec![harness()] }),
     ] {
@@ -417,8 +512,357 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
     assert!(check(&Change::Add(host_volume.clone()), false, "claude").is_ok());
     assert!(check(&Change::Add(Volume { at: "/elsewhere".into(), ..host_volume.clone() }), false, "claude").is_err());
     assert!(check(&Change::Add(Volume { members: vec![Member::Mcp("db".into())], ..host_volume }), false, "claude").is_err_and(|e| e.contains("one member, its harness")));
+    // What its microVM declared: a folder strictly beneath a plug root fits, as Shards plugs one (D271); egress within its
+    // ceiling alone.
+    let declared = Overrides { roots: vec!["/work".into(), "/volumes".into()], ceiling: vec!["api.example.com:443".into(), "[::1]:8080".into()], ..Overrides::default() };
+    let vol = |at: &str| Change::Add(Volume { path: "/data".into(), at: at.into(), access: Access::Rw, members: vec![harness()] });
+    assert!(fits(&vol("/volumes/data"), &declared).is_ok());
+    assert!(fits(&vol("/work/proj/sub"), &declared).is_ok());
+    assert!(fits(&vol("/volumes"), &declared).is_err(), "a root itself is no plug's place: strictly beneath one");
+    assert!(fits(&vol("/volumes-other/data"), &declared).is_err(), "a sibling of a root isn't beneath it");
+    assert!(fits(&vol("/opt/data"), &declared).is_err_and(|e| e.contains("outside every folder")));
+    assert_eq!(crate::sandbox::isolated::plug_root_of("/Users/ada/proj").as_deref(), Some("/Users"));
+    for refused in ["/tmp/x", "/proc/1", "/etc/kiln", "/run/x", "/dev/null", "/sys/x", "relative", "/"] {
+        assert_eq!(crate::sandbox::isolated::plug_root_of(refused), None, "{refused}");
+    }
+    let grant = |host: &str, port| Change::Grant(Egress { member: harness(), host: host.into(), port });
+    assert!(fits(&grant("API.example.com", 443), &declared).is_ok());
+    assert!(fits(&grant("::1", 8080), &declared).is_ok());
+    assert!(fits(&grant("api.example.com", 80), &declared).is_err_and(|e| e.contains("past the most egress")));
+    assert!(fits(&grant("api.example.com", 443), &Overrides::default()).is_err_and(|e| e.contains("none")), "no ceiling declared: none live");
+    assert!(fits(&Change::Remove("/data".into()), &Overrides::default()).is_ok(), "a removal always fits");
     assert_eq!(Member::read(None, "claude"), Ok(harness()));
     assert_eq!(Member::read(Some("agent:helper"), "claude"), Ok(Member::Agent("helper".into())));
     assert!(Member::read(Some("worker"), "claude").is_err());
     Ok(())
+}
+
+/// P6c.5 (the person: "right now on bare metal I can swap between claude code, codex, cursor, devin, antigravity,
+/// opencode, pi, etc. with just a click. We need to keep that!"): the same one-click switch (`Command::SetModel` naming
+/// another harness, as the composer's control sends it) in a microVM session: Claude Code to Codex and back, each harness
+/// swapped into the same microVM (the stand-in runtime records each swap, none launched again), and the conversation
+/// carried each time, so the person's first words reach the last harness. Codex's member is kiln's stand-in for every
+/// harness's interface (`tests/fixtures/vm-stub`), in Codex's dialect.
+#[cfg(unix)]
+#[test]
+fn p6c_5_a_one_click_harness_switch_in_a_microvm_keeps_its_microvm_and_its_conversation() -> anyhow::Result<()> {
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (claude, log) = stand_in(&dir.path().join("h"))?;
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let codex = bin.join("codex");
+        std::os::unix::fs::symlink(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vm-stub/harness/stub"), &codex)?;
+        let builtin = |h: &str| crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == h).ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for {h}"));
+        let (_, claude_image) = crate::sandbox::image::tests::holding(dir.path(), crate::sandbox::image::Source::Builtin(builtin("claude")?))?;
+        let (images, codex_image) = crate::sandbox::image::tests::holding(dir.path(), crate::sandbox::image::Source::Builtin(builtin("codex")?))?;
+        let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&claude_image, "claude", &claude).and(&codex_image, "codex", &codex).swapping());
+        hub.harness.local.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images));
+        opened(&hub, "vm-switch", dir.path(), &claude, Some(Isolation::microvm())).await?;
+        let session = hub.harness.local.get("vm-switch").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        let say = |text: &'static str| {
+            let cx = owner(&hub);
+            async move { call(cx, "agents.send", json!({"agent": "vm-switch", "text": text})).await.map_err(|(s, m)| anyhow::anyhow!("agents.send: {s} {m}")) }
+        };
+        let heard = |words: &str| said(&log, "user").iter().filter(|(_, m)| m.to_string().contains(words)).count();
+        let answers = || session.core.lock().events().filter(|e| matches!(e.body, crate::harness::model::Body::Assistant { .. })).count();
+        let same_box = |vms: &crate::sandbox::fake::FakeVms| vms.launched().len() == 1 && vms.swapped().iter().all(|(vm, _)| vm == "fake-vm-1");
+        say("Remember the word kumquat.").await?;
+        until("Claude Code heard it", || heard("kumquat") == 1).await?;
+        until("Claude Code at rest", || at_rest(&session)).await?;
+        // One click: Codex, swapped into the same microVM.
+        let _ = hub.harness.command(&hub, "vm-switch", Command::SetModel { model: String::new(), kind: Some("codex".into()) }).await;
+        until("Codex, at rest", || session.info().kind == "codex" && at_rest(&session)).await?;
+        anyhow::ensure!(same_box(&vms) && vms.swapped().len() == 1, "one microVM, its member swapped: {:?} {:?}", vms.launched().len(), vms.swapped());
+        anyhow::ensure!(vms.swapped().first().is_some_and(|(_, l)| l.program == "codex" && l.boundary == kiln_seams::sandbox::Boundary::MicroVm { image: codex_image.clone() }), "Codex's member, of its own image: {:?}", vms.swapped());
+        let before = answers();
+        say("What comes next?").await?;
+        until("Codex answered", || answers() > before && at_rest(&session)).await?;
+        // And back to Claude Code, in the same microVM still: the conversation carried to it.
+        let _ = hub.harness.command(&hub, "vm-switch", Command::SetModel { model: String::new(), kind: Some("claude".into()) }).await;
+        until("Claude Code again, at rest", || session.info().kind == "claude" && at_rest(&session)).await?;
+        anyhow::ensure!(same_box(&vms) && vms.swapped().len() == 2, "one microVM, swapped twice: {:?}", vms.swapped());
+        say("What was the word?").await?;
+        until("the first words, carried to the last harness", || said(&log, "user").iter().any(|(_, m)| m.to_string().contains("What was the word?") && m.to_string().contains("kumquat"))).await?;
+        anyhow::ensure!(said(&log, "start").len() == 2, "Claude Code started twice, each in the one microVM: {:?}", said(&log, "start"));
+        anyhow::ensure!(matches!(hub.harness.info("vm-switch").and_then(|i| i.runs), Some(crate::harness::session::Runs::Microvm { vm: Some(ref vm), .. }) if vm == "fake-vm-1"), "the same box");
+        anyhow::ensure!(hub.harness.close(&hub, "vm-switch").await, "it closed");
+        Ok(())
+    })
+}
+
+/// P6c.5: where the machine's microVMs swap no harness in place (Hex's until its wire calls land), the switch is refused
+/// as before, saying why, and the session goes on in its harness, in its microVM.
+#[cfg(unix)]
+#[test]
+fn p6c_5_a_switch_where_microvms_swap_none_is_refused_and_the_session_goes_on() -> anyhow::Result<()> {
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, _log) = stand_in(&dir.path().join("h"))?;
+        let vms = microvms(&hub, dir.path(), &program)?;
+        opened(&hub, "vm-noswap", dir.path(), &program, Some(Isolation::microvm())).await?;
+        let session = hub.harness.local.get("vm-noswap").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        let _ = hub.harness.command(&hub, "vm-noswap", Command::SetModel { model: String::new(), kind: Some("codex".into()) }).await;
+        until("its switch refused", || session.core.lock().events().any(|e| matches!(&e.body, crate::harness::model::Body::Notice { text, .. } if text == crate::sandbox::isolated::NO_SWITCH))).await?;
+        anyhow::ensure!(session.info().kind == "claude" && vms.launched().len() == 1 && vms.swapped().is_empty(), "it goes on as it was");
+        anyhow::ensure!(hub.harness.close(&hub, "vm-noswap").await, "it closed");
+        Ok(())
+    })
+}
+
+/// P6c.3's record: a component's source is pinned as an Agentfile pins one (Shards' D54), at its member's directory, its
+/// harness's the session's own; on its machine's host a harness alone, from a pinned http(s) source; one held at a path,
+/// a swap there taking the place of the one before; a restore of none refused. Its microVM lays each as it starts, a
+/// harness it switched from aside; an agent's goes to its run as a change, its harness's never (it starts again).
+#[test]
+fn p6c_3_a_components_source_is_pinned_as_an_agentfiles_and_one_is_held_at_a_path() -> anyhow::Result<()> {
+    use super::*;
+    let sum = format!("sha256:{}", "ab".repeat(32));
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let c = |kind, path: &str, source: &str, checksum: Option<&str>, version_id: Option<&str>| Component { kind, path: path.into(), source: source.into(), checksum: checksum.map(str::to_owned), version_id: version_id.map(str::to_owned) };
+    let swap = |c: Component| Change::Swap { component: c, force: false };
+    let harness = |source: &str, checksum: Option<&str>| c(ComponentKind::Harness, "/harness/claude", source, checksum, None);
+    // Pinned as at a build: each kind of source, its own pin.
+    for fine in [
+        harness("https://example.com/claude-2.2.0", Some(&sum)),
+        harness("s3://dist/claude-2.2.0", Some(&sum)),
+        c(ComponentKind::Agent, "/agents/helper", &format!("https://github.com/acme/helper.git#{commit}"), None, None),
+        c(ComponentKind::Mcp, "/mcp/db", &format!("ghcr.io/acme/db-mcp@{sum}"), None, None),
+        c(ComponentKind::Harness, "/harness/claude", "s3://dist/claude", None, Some("v7")),
+    ] {
+        assert!(check(&swap(fine.clone()), true, "claude").is_ok(), "{fine:?}");
+    }
+    for (bad, why) in [
+        (harness("https://example.com/claude-2.2.0", None), "pinned by checksum"),
+        (harness("https://example.com/claude-2.2.0", Some("sha256:ABC")), "64 lowercase hex"),
+        (harness("s3://dist/claude", None), "checksum (sha256:<hex>) or version_id"),
+        (harness("s3://dist", Some(&sum)), "names no object"),
+        (c(ComponentKind::Agent, "/agents/helper", "https://github.com/acme/helper.git#main", None, None), "commit its #REF names"),
+        (c(ComponentKind::Agent, "/agents/helper", &format!("https://github.com/acme/helper.git#{commit}"), Some(&sum), None), "checksum pins an http(s) or s3:// source"),
+        (c(ComponentKind::Mcp, "/mcp/db", "ghcr.io/acme/db-mcp:1.2", None, None), "pinned by its digest"),
+        (c(ComponentKind::Agent, "/agents/helper", "./helper", None, None), "build's context"),
+    ] {
+        assert!(check(&swap(bad.clone()), true, "claude").is_err_and(|e| e.contains(why)), "{bad:?}: {:?}", check(&swap(bad.clone()), true, "claude"));
+    }
+    // At its member's directory, of its kind; a harness's, its own.
+    assert!(check(&swap(c(ComponentKind::Agent, "/harness/claude", "https://e.com/a", Some(&sum), None)), true, "claude").is_err_and(|e| e.contains("isn't where an agent is")));
+    assert!(check(&swap(harness("https://e.com/claude", Some(&sum))), true, "codex").is_err_and(|e| e.contains("its harness is at /harness/codex")));
+    assert!(check(&Change::Restore { path: "/volumes/x".into(), force: false }, true, "claude").is_err_and(|e| e.contains("no member's directory")));
+    // On its machine's host: its harness alone, from a pinned http(s) source.
+    assert!(check(&swap(harness("https://example.com/claude-2.2.0", Some(&sum))), false, "claude").is_ok());
+    assert!(check(&swap(c(ComponentKind::Harness, "/harness/claude", "s3://dist/claude", None, Some("v7"))), false, "claude").is_err_and(|e| e.contains("pinned http(s) source alone")));
+    assert!(check(&swap(c(ComponentKind::Agent, "/agents/helper", "https://e.com/a", Some(&sum), None)), false, "claude").is_err_and(|e| e.contains("one member, its harness")));
+    // One at a path.
+    let mut o = Overrides::default();
+    let v1 = harness("https://example.com/claude-2.2.0", Some(&sum));
+    let v2 = harness("https://example.com/claude-2.3.0", Some(&format!("sha256:{}", "cd".repeat(32))));
+    let agent = c(ComponentKind::Agent, "/agents/helper", &format!("https://github.com/acme/helper.git#{commit}"), None, None);
+    assert_eq!(take(&mut o, &swap(v1.clone())).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert_eq!(take(&mut o, &swap(v1.clone())).map_err(anyhow::Error::msg)?, Taken::Same);
+    assert_eq!(take(&mut o, &swap(v2.clone())).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert_eq!(o.components.iter().map(|h| &h.component).collect::<Vec<_>>(), vec![&v2], "the second took the first's place");
+    assert_eq!(take(&mut o, &swap(agent.clone())).map_err(anyhow::Error::msg)?, Taken::Added);
+    assert_eq!(o.revision, 3);
+    // Laid as its microVM starts, a harness it switched from aside.
+    assert_eq!(laid(&o, "claude").iter().map(|l| l.at.as_str()).collect::<Vec<_>>(), ["/harness/claude", "/agents/helper"]);
+    assert_eq!(laid(&o, "codex").iter().map(|l| l.at.as_str()).collect::<Vec<_>>(), ["/agents/helper"]);
+    assert_eq!(harness_component(&o, "claude").map(|h| &h.component), Some(&v2));
+    // Its harness's starts it again; an agent's is a change to its run.
+    assert!(at_harness(&swap(v2.clone()), "claude") && !at_harness(&swap(agent.clone()), "claude"));
+    assert!(matches!(seam_change(&swap(agent.clone()), None), Some(kiln_seams::sandbox::Change::Swap { ref at, ref component }) if at == "/agents/helper" && component.source == agent.source));
+    let restore = Change::Restore { path: "/agents/helper".into(), force: true };
+    assert!(restore.forced());
+    let taken = take(&mut o, &restore).map_err(anyhow::Error::msg)?;
+    assert_eq!(taken, Taken::Removed(Removed::Component(agent)));
+    let Taken::Removed(removed) = taken else { anyhow::bail!("removed") };
+    assert_eq!(seam_change(&restore, Some(&removed)), Some(kiln_seams::sandbox::Change::Restore { at: "/agents/helper".into() }));
+    assert!(take(&mut o, &restore).is_err_and(|e| e.contains("nothing is swapped in at /agents/helper")));
+    Ok(())
+}
+
+/// The stand-in runtime's microVMs for `vms`' Claude Code image, their member the stand-in, held by the server's own
+/// machine.
+#[cfg(unix)]
+fn holding(hub: &Hub, dir: &Path, program: &Path, vms: impl FnOnce(&str, &Path) -> crate::sandbox::fake::FakeVms) -> anyhow::Result<Arc<crate::sandbox::fake::FakeVms>> {
+    let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for Claude Code"))?;
+    let (images, pinned) = crate::sandbox::image::tests::holding(dir, crate::sandbox::image::Source::Builtin(claude))?;
+    let vms = Arc::new(vms(&pinned, program));
+    hub.harness.local.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images));
+    Ok(vms)
+}
+
+/// The session `--resume`d at its harness's last start, as Claude Code is resumed.
+#[cfg(unix)]
+fn resumed(log: &Path) -> Option<String> {
+    let starts = said(log, "start");
+    let args = starts.last().map(|(_, a)| a.clone())?;
+    let args: Vec<&str> = args.as_array()?.iter().filter_map(Value::as_str).collect();
+    args.windows(2).find(|w| w.first() == Some(&"--resume")).and_then(|w| w.get(1)).map(|s| (*s).to_owned())
+}
+
+/// P6c.3's tests, in a microVM: a harness swapped through the API (as every surface calls it) starts again with its
+/// component laid in the same microVM (the stand-in runtime records its member swapped for itself there, its launch
+/// laying the component; none launched again: the same box), its version as the harness reports it the component's,
+/// `agents.get` showing what's held, and its conversation going on through its own resume. A restart of the session
+/// lays it again (`Launch::components`). Restored, it runs its image's own again, in the same microVM.
+#[cfg(unix)]
+#[test]
+fn p6c_3_a_harness_swapped_in_a_microvm_runs_its_component_in_the_same_microvm_its_conversation_going_on() -> anyhow::Result<()> {
+    use kiln_seams::sandbox::ComponentAt;
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, log) = stand_in(&dir.path().join("h"))?;
+        let vms = holding(&hub, dir.path(), &program, |image, program| crate::sandbox::fake::FakeVms::with(image, "claude", program).swapping().laying())?;
+        opened(&hub, "vm-comp", dir.path(), &program, Some(Isolation::microvm())).await?;
+        let session = hub.harness.local.get("vm-comp").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        anyhow::ensure!(session.core.lock().meta.version == "2.1.296", "its image's own: {}", session.core.lock().meta.version);
+        call(owner(&hub), "agents.send", json!({"agent": "vm-comp", "text": "Remember the word kumquat."})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("Claude Code heard it", || said(&log, "user").len() == 1 && at_rest(&session)).await?;
+        let first = said(&log, "start").len();
+        let sum = format!("sha256:{}", "ab".repeat(32));
+        let answer = call(owner(&hub), "sessions.components.swap", json!({"agent": "vm-comp", "kind": "harness", "source": "https://example.com/claude-2.2.0", "checksum": sum})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        anyhow::ensure!(answer.get("taken") == Some(&json!(true)) && answer.get("engine") == Some(&json!("microvm")), "{answer}");
+        until("its harness, started again with it", || said(&log, "start").len() == first + 1 && session.core.lock().meta.version == "2.2.0" && at_rest(&session)).await?;
+        let laid = vms.swapped();
+        anyhow::ensure!(vms.launched().len() == 1 && laid.len() == 1 && laid.iter().all(|(vm, _)| vm == "fake-vm-1"), "one microVM, its member swapped for itself there: {} {laid:?}", vms.launched().len());
+        let want = vec![ComponentAt { at: "/harness/claude".into(), component: kiln_seams::sandbox::Component { kind: kiln_seams::sandbox::ComponentKind::Harness, source: "https://example.com/claude-2.2.0".into(), checksum: Some(sum.clone()), version_id: None } }];
+        anyhow::ensure!(laid.first().is_some_and(|(_, l)| l.program == "claude" && l.components == want), "its launch lays it: {laid:?}");
+        let v = get(&hub, "vm-comp").await?;
+        anyhow::ensure!(v.pointer("/state/overrides/components/0/component/source") == Some(&json!("https://example.com/claude-2.2.0")) && v.pointer("/state/overrides/components/0/component/checksum") == Some(&json!(sum)), "agents.get shows it: {v}");
+        anyhow::ensure!(v.pointer("/live/ops").and_then(Value::as_array).is_some_and(|a| a.contains(&json!("sessions.components.swap"))), "{v}");
+        let conversation = session.core.lock().state.harness_session.clone();
+        anyhow::ensure!(conversation.is_some() && resumed(&log) == conversation, "its conversation, resumed: {:?} {conversation:?}", resumed(&log));
+        // A restart of it lays the component again, in a new run.
+        let _ = hub.harness.command(&hub, "vm-comp", Command::ForceStop).await;
+        until("started again, its component laid", || vms.launched().len() == 2 && at_rest(&session) && session.core.lock().meta.version == "2.2.0").await?;
+        anyhow::ensure!(vms.launched().last().is_some_and(|l| l.components == want), "{:?}", vms.launched().last().map(|l| l.components.clone()));
+        // Restored: its image's own again, swapped for itself in the same microVM.
+        call(owner(&hub), "sessions.components.restore", json!({"agent": "vm-comp"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its image's own, again", || vms.swapped().len() == 2 && session.core.lock().meta.version == "2.1.296" && at_rest(&session)).await?;
+        anyhow::ensure!(vms.launched().len() == 2 && vms.swapped().last().is_some_and(|(vm, l)| vm == "fake-vm-2" && l.components.is_empty()), "{:?}", vms.swapped());
+        shows(&hub, "vm-comp", "no component held", |v| v.pointer("/state/overrides/components").is_none()).await?;
+        anyhow::ensure!(hub.harness.close(&hub, "vm-comp").await, "it closed");
+        Ok(())
+    })
+}
+
+/// P6c.3 in a microVM: an agent's component goes to its run as it runs (its member alone started again there), its
+/// harness never stopped; given back, its run lets go of it. Where the machine's microVMs lay no components (Hex's until
+/// its wire calls land), a swap is refused, saying why, nothing kept, and the session goes on.
+#[cfg(unix)]
+#[test]
+fn p6c_3_an_agents_component_is_a_change_to_its_run_and_refused_where_none_is_laid() -> anyhow::Result<()> {
+    use kiln_seams::sandbox::Change as Seam;
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, log) = stand_in(&dir.path().join("h"))?;
+        let vms = holding(&hub, dir.path(), &program, |image, program| crate::sandbox::fake::FakeVms::with(image, "claude", program).laying())?;
+        opened(&hub, "vm-agent", dir.path(), &program, Some(Isolation::microvm())).await?;
+        let session = hub.harness.local.get("vm-agent").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        let source = "https://github.com/acme/helper.git#0123456789abcdef0123456789abcdef01234567";
+        call(owner(&hub), "sessions.components.swap", json!({"agent": "vm-agent", "kind": "agent", "path": "/agents/helper", "source": source})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        shows(&hub, "vm-agent", "its run took it", |v| took(v, "components", "microvm") == Some("now")).await?;
+        anyhow::ensure!(vms.changed().iter().any(|(vm, c)| vm == "fake-vm-1" && matches!(c, Seam::Swap { at, component } if at == "/agents/helper" && component.source == source)), "{:?}", vms.changed());
+        anyhow::ensure!(said(&log, "start").len() == 1 && vms.launched().len() == 1, "its harness never stopped");
+        call(owner(&hub), "sessions.components.restore", json!({"agent": "vm-agent", "path": "/agents/helper"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its run let go of it", || vms.changed().iter().any(|(_, c)| matches!(c, Seam::Restore { at } if at == "/agents/helper"))).await?;
+        anyhow::ensure!(hub.harness.close(&hub, "vm-agent").await, "it closed");
+        // Where none is laid.
+        let hub = self::hub().await?;
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&second)?;
+        let vms = holding(&hub, &second, &program, |image, program| crate::sandbox::fake::FakeVms::with(image, "claude", program).swapping())?;
+        opened(&hub, "vm-nolay", dir.path(), &program, Some(Isolation::microvm())).await?;
+        let session2 = hub.harness.local.get("vm-nolay").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        call(owner(&hub), "sessions.components.swap", json!({"agent": "vm-nolay", "kind": "harness", "source": "https://example.com/claude-2.2.0", "checksum": format!("sha256:{}", "ab".repeat(32))})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its swap refused", || session2.core.lock().events().any(|e| matches!(&e.body, crate::harness::model::Body::Notice { text, .. } if text.contains(crate::sandbox::isolated::NO_COMPONENTS)))).await?;
+        anyhow::ensure!(session2.core.lock().state.overrides.components.is_empty() && vms.swapped().is_empty() && vms.launched().len() == 1, "nothing kept, it goes on as it was");
+        drop(session);
+        anyhow::ensure!(hub.harness.close(&hub, "vm-nolay").await, "it closed");
+        Ok(())
+    })
+}
+
+/// A server on a thread of its own answering `GET path` with `body` (404 for any other path), for the test's life:
+/// its base URL.
+#[cfg(unix)]
+fn serving(path: &'static str, body: Vec<u8>) -> anyhow::Result<String> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let base = format!("http://{}", listener.local_addr()?);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match s.read(&mut byte) {
+                    Ok(1) => head.extend_from_slice(&byte),
+                    _ => break,
+                }
+            }
+            let asked = String::from_utf8_lossy(&head).split_whitespace().nth(1).unwrap_or_default().to_owned();
+            let mut answer = if asked == path { format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).into_bytes() } else { b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec() };
+            if asked == path {
+                answer.extend_from_slice(&body);
+            }
+            let _ = s.write_all(&answer);
+        }
+    });
+    Ok(base)
+}
+
+/// P6c.3 AC3 and AC4 on its machine's host: a harness swapped in through the API is installed in the session's own
+/// folder from its pinned http(s) source (held to its checksum) as its harness starts again, and run from there, its
+/// version the component's as it reports it, its conversation going on through its own resume. One whose bytes aren't
+/// its pin's is said refused, and its harness runs its machine's own meanwhile. Restored, it runs its machine's own
+/// again, and the copy it installed is let go of.
+#[cfg(unix)]
+#[test]
+fn p6c_3_a_harness_swapped_on_its_host_is_installed_in_its_own_folder_and_runs_from_there() -> anyhow::Result<()> {
+    use sha2::{Digest as _, Sha256};
+    run(async {
+        let hub = hub().await?;
+        let dir = tempfile::tempdir()?;
+        let (program, log) = stand_in(&dir.path().join("h"))?;
+        // The component: the stand-in again, as version 2.2.0.
+        let script = dir.path().join("h").join("stand-in.py");
+        let body = format!("#!/bin/sh\nKILN_STAND_IN_VERSION=2.2.0 exec python3 {} {} \"$@\"\n", script.display(), log.display()).into_bytes();
+        let sum = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+        let base = serving("/claude-2.2.0", body)?;
+        opened(&hub, "host-comp", dir.path(), &program, None).await?;
+        let session = hub.harness.local.get("host-comp").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        call(owner(&hub), "agents.send", json!({"agent": "host-comp", "text": "Remember the word kumquat."})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("Claude Code heard it", || said(&log, "user").len() == 1 && at_rest(&session)).await?;
+        // Bytes that aren't its pin's: refused as it starts again, its machine's own run meanwhile.
+        let wrong = format!("sha256:{}", "ab".repeat(32));
+        let answer = call(owner(&hub), "sessions.components.swap", json!({"agent": "host-comp", "kind": "harness", "source": format!("{base}/claude-2.2.0"), "checksum": wrong})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        anyhow::ensure!(answer.get("engine") == Some(&json!("host")), "{answer}");
+        until("its install refused", || session.core.lock().events().any(|e| matches!(&e.body, crate::harness::model::Body::Notice { text, .. } if text.contains("couldn't install") && text.contains("SHA-256")))).await?;
+        until("its machine's own, started again", || said(&log, "start").len() == 2 && at_rest(&session)).await?;
+        anyhow::ensure!(session.core.lock().meta.version == "2.1.296", "its machine's own");
+        shows(&hub, "host-comp", "it, refused", |v| took(v, "components", "host") == Some("refused")).await?;
+        // Pinned rightly, in its place: installed, and its harness started again from there.
+        call(owner(&hub), "sessions.components.swap", json!({"agent": "host-comp", "kind": "harness", "source": format!("{base}/claude-2.2.0"), "checksum": sum})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its harness, started again from its component", || said(&log, "start").len() == 3 && session.core.lock().meta.version == "2.2.0" && at_rest(&session)).await?;
+        let v = shows(&hub, "host-comp", "it, run from its install", |v| took(v, "components", "host") == Some("now")).await?;
+        // Where its harness runs it from, as agents.get says: in the session's own folder, by its checksum.
+        let how = v.pointer("/state/overrides/components/0/host/how").and_then(Value::as_str).unwrap_or_default();
+        let exe = PathBuf::from(how.split_once(" from ").and_then(|(_, r)| r.split_once(", where")).map(|(p, _)| p).unwrap_or_default());
+        anyhow::ensure!(exe.is_file() && exe.ends_with(Path::new("components").join(sum.trim_start_matches("sha256:")).join("claude")) && exe.to_string_lossy().contains("host-comp"), "installed in its own folder: {how}");
+        let installed = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+        anyhow::ensure!(v.pointer("/state/overrides/components/0/component/source") == Some(&json!(format!("{base}/claude-2.2.0"))), "{v}");
+        let conversation = session.core.lock().state.harness_session.clone();
+        anyhow::ensure!(conversation.is_some() && resumed(&log) == conversation, "its conversation, resumed: {:?} {conversation:?}", resumed(&log));
+        // Restored: its machine's own again, the copy let go of.
+        call(owner(&hub), "sessions.components.restore", json!({"agent": "host-comp"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        until("its machine's own, again", || said(&log, "start").len() == 4 && session.core.lock().meta.version == "2.1.296" && at_rest(&session)).await?;
+        anyhow::ensure!(!installed.exists(), "the copy it ran no longer: let go of");
+        anyhow::ensure!(hub.harness.close(&hub, "host-comp").await, "it closed");
+        Ok(())
+    })
 }

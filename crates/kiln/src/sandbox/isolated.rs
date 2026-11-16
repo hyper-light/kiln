@@ -25,8 +25,10 @@
 //!   harness's config names its microVM's bridge, and this runner serves each connection to it in its own process
 //!   ([`bridge`]), where its microVMs carry the lane (`super::Microvms::mcp`); where they don't, its harness starts
 //!   without it, said.
-//! - **What it can't do yet**, refused rather than done another way: move to another machine, or
-//!   switch to another harness ([`NO_MOVE`], [`NO_SWITCH`]).
+//! - **What it can't do yet**, refused rather than done another way: move to another machine
+//!   ([`NO_MOVE`]), switch to another harness where its microVMs swap none in place ([`NO_SWITCH`]), or swap a
+//!   component in where they lay none ([`NO_COMPONENTS`]); where they do, a switch swaps its member there
+//!   ([`ready_to_swap`], [`launch`]'s `swap_from`), and a component is laid at its launch (`Launch::components`).
 
 use std::path::Path;
 
@@ -43,8 +45,19 @@ use crate::harness::session::{Isolation, Spec};
 /// Why an isolated agent doesn't move to another machine.
 pub const NO_MOVE: &str = "an isolated agent doesn't move to another machine yet: its microVM and what its harness keeps there are its machine's; end it, or start it anew there";
 
-/// Why an isolated agent doesn't switch to another harness.
-pub const NO_SWITCH: &str = "An isolated agent doesn't switch to another harness yet: its microVM runs its own harness's image. End it, and start the other harness isolated.";
+/// Why an isolated agent's component isn't swapped where its machine's microVMs lay none (kiln plan 01a1dd2e…, P6c.3).
+pub const NO_COMPONENTS: &str = "An isolated agent's components are swapped only where its machine's microVMs lay them over its image's own, and these don't yet (Hex's wire calls, kiln plan 01a1dd2e…, P6c.2). Its image's own run on.";
+
+/// Why an isolated agent doesn't switch to another harness where its machine's microVMs swap none in place.
+pub const NO_SWITCH: &str = "An isolated agent switches harness only where its machine's microVMs swap one in place, and these don't yet (Hex's wire calls, kiln plan 01a1dd2e…, P6c.2). End it, and start the other harness isolated.";
+
+/// Whether `kind`'s harness can be swapped into a microVM session of `spec` (kiln plan 01a1dd2e…, P6c.5): its image
+/// (the Agentfile `spec` names for it, kiln's own where none) pinned in the machine's store, built there once where it
+/// isn't, before the session's harness is handed on, so a switch that can't go leaves it as it was. Why not, in words.
+pub async fn ready_to_swap(kind: &Kind, spec: &Spec, vms: &Microvms, secrets: &[crate::secrets::mine::BuildSecret]) -> Result<(), String> {
+    let source = source_of(kind, spec)?;
+    vms.images.pinned(source, secrets).await.map(|_| ()).map_err(|r| format!("{}'s image, {}: {r}", kind.name, source.name()))
+}
 
 /// How a start names one of a person's own Agentfiles as an isolated agent's image (the console's
 /// `views/agentfiles/choose.ts`, `keptImage`).
@@ -88,6 +101,9 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
     anyhow::ensure!(std::path::Path::new(&cwd).is_dir(), "{cwd} is not a directory on this machine");
     let run = kind.elsewhere(spec)?;
     let project = project_share(&cwd).map_err(anyhow::Error::msg)?;
+    // Its project's top-level directory, where a folder is plugged in live ([`launch`] adds its person's volumes' and its
+    // session's root).
+    let roots = plug_root_of(&project.at).into_iter().collect();
     Ok(Launch {
         program: run.member.to_owned(),
         args: run.args,
@@ -100,8 +116,17 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
         // No credential granted by reference yet (D242): its harness signs in natively until its sign-in is captured
         // outside the microVM (plan step 33's steps 6 and 8), so nothing is filled in at its egress.
         credentials: Vec::new(),
+        plug_roots: roots,
+        // The most egress it may be granted live: its person's or org's policy, as kiln's server set it at its start.
+        egress_ceiling: spec.egress_ceiling.clone(),
+        // The components a person swapped into its session, laid over its image's own (kiln plan 01a1dd2e…, P6c.3).
+        components: spec.components.clone(),
     })
 }
+
+/// How a start that swapped its member into the microVM its session ran in started (the one-click harness switch,
+/// P6c.5), in a start's record beside Hex's `started_from` words (`booted`, `saved`, `restored`, `replaced`, `warm`).
+pub const SWAPPED: &str = "swapped";
 
 /// Starts `kind`'s harness for isolated `spec` in the machine's microVMs `vms`: what its microVM
 /// reaches of its image's destinations ([`reach_of`], read from its person's home under `homes`, the
@@ -117,8 +142,11 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
 /// `host_tools`); its harness gets kiln's variables as a microVM's member does
 /// (`isolated::env::member_env`) and kiln's MCP through its link's lane ([`offer_mcp`]), served by this runner for
 /// `session` ([`bridge`], its asks `host`'s), where its microVMs carry the lane. A build of its image is
-/// given `secrets` (`Spec::build_secrets`, P4.7).
-pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret]) -> anyhow::Result<crate::proc::Duplex> {
+/// given `secrets` (`Spec::build_secrets`, P4.7). With `swap_from`, the harness a session switches from in a microVM of
+/// its own (kiln plan 01a1dd2e…, P6c.5), its member is swapped for this one there (`Run::swap`): the same microVM, none
+/// started; refused, why, and that harness's run is let go of.
+#[allow(clippy::too_many_arguments, reason = "a launch's own, and the run a switch swaps it into")]
+pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret], swap_from: Option<crate::proc::Duplex>) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     let mut launch = launch_of(kind, spec, source.name())?;
@@ -154,11 +182,21 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         (Some(root), Some(person)) => home_of(root, person, kind, source, &vms.images, &image).await?,
         _ => (Vec::new(), None),
     };
-    launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true }));
+    launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true, members: Vec::new() }));
+    // Where a folder a person gives it while it runs is plugged in live (Shards' `ImageSpec::plug_roots`, D271): the
+    // top-level directories of its project and its person's volumes, and its session's own root, where kiln puts such a
+    // folder by default (`harness::overrides`), each once.
+    let mut roots: Vec<String> = Vec::new();
+    for root in launch.shares.iter().filter(|s| s.writable).filter_map(|s| plug_root_of(&s.at)).chain([VOLUMES.to_owned()]) {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    launch.plug_roots = roots;
     for dir in plugin_folders(kind, session) {
         let at = guest_path(&dir, PLUGINS).map_err(anyhow::Error::msg)?;
         launch.args.extend(["--plugin-dir".to_owned(), at.clone()]);
-        launch.shares.push(Share { host: dir, at, writable: false });
+        launch.shares.push(Share { host: dir, at, writable: false, members: Vec::new() });
     }
     // kiln's MCP once its person's volume is made (agy's config is kept there), where its lane is carried.
     let lanes = match vms.mcp() {
@@ -171,11 +209,45 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     if lanes.is_some() {
         offer_mcp(kind, &source, person, homes, &mut launch.args).await;
     }
-    let name = match (&spec.claim, crate::reach::node::global()) {
-        (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
-        _ => None,
+    // Every folder it starts with is its harness's own: given to that member at its start, where it sees it
+    // (Shards' share member scope). A start share given to no member reaches its microVM's root alone, which
+    // its harness never sees: its project, its working directory, wasn't there (kiln plan P1.4 on HVF).
+    let member = kiln_seams::sandbox::Member(launch.program.clone());
+    for share in &mut launch.shares {
+        share.members = vec![member.clone()];
+    }
+    let declared = crate::sandbox::held::Declared::of(&launch);
+    let asked = std::time::Instant::now();
+    let (run, swapped) = match swap_from {
+        // A switch: its member swapped for this one in the microVM it runs in.
+        Some(from) => {
+            let held = from.boundary().ok_or_else(|| anyhow::anyhow!("{} has no microVM to be swapped into", kind.name))?;
+            let swapped = held.swap(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't be swapped into its microVM ({image}): {r}", kind.name));
+            drop(from);
+            (swapped?, true)
+        }
+        None => {
+            let name = match (&spec.claim, crate::reach::node::global()) {
+                (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
+                _ => None,
+            };
+            // Its microVM's size as its isolation gives it (plan step 32; a deployment experiment's variant, P7.1):
+            // whole vCPUs and MiB, rounded up.
+            let size = spec.isolation.as_ref().filter(|i| i.cpus.is_some() || i.memory.is_some()).map(|i| {
+                let cpus = i.cpus.map_or(0, kiln_ci::sched::state::Cpus::ceil);
+                (u32::try_from(cpus).unwrap_or(u32::MAX), i.memory.map_or(0, |b| b.div_ceil(1 << 20)))
+            });
+            (vms.launch(name, launch, size).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?, false)
+        }
     };
-    let run = vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
+    let us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let (from, meter) = match (&vms.hex, run.id()) {
+        // A swap started no microVM: its start is its member's in the one it ran in (`swapped`), never that
+        // microVM's own start, which a split's strata would otherwise count it as (P7.1, P6c.5).
+        (Some(hex), Some(vm)) => (if swapped { Some(SWAPPED) } else { hex.started_from(&vm).await.map(super::hexvm::said) }, hex.meter(&vm)),
+        _ => (swapped.then_some(SWAPPED), None),
+    };
+    let started = super::held::Started { us, from, meter };
     if let Some(lanes) = lanes {
         let here = crate::reach::node::global().map(|h| crate::reach::local::Here { handle: h.clone(), me: h.name().to_owned(), host, session: session.to_owned() });
         let served = run.id().ok_or_else(|| std::io::Error::other("its run names no microVM")).and_then(|vm| bridge(lanes, vm, here, crate::harness::session::resolve_cwd(spec.cwd.as_deref())));
@@ -187,7 +259,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     if let (Some(claim), Some(reach), Some(group)) = (&spec.claim, crate::reach::node::global(), super::group_of(vms, run.as_ref())) {
         reach.session_grouped(claim.clone(), group).await;
     }
-    Ok(crate::proc::duplex_of_run(run, image, reach, kept_in))
+    Ok(crate::proc::duplex_of_run(run, image, reach, kept_in, declared, Some(started)))
 }
 
 /// Serves kiln's MCP to run `vm`'s harness in this runner's own process (Shards D254; #75 step 3): each connection
@@ -231,9 +303,27 @@ pub const PROJECTS: &str = "/work";
 /// Where a microVM sees a Windows machine's plugin folders: beneath this, each by its own name.
 pub const PLUGINS: &str = "/plugins";
 
-/// Where a microVM sees a Windows machine's folders a person gives its running session (`harness::overrides`):
-/// beneath this, each by its own name.
+/// Where a microVM sees the folders a person gives its running session (`harness::overrides`), by default: beneath
+/// this, each by its own name, one of the plug roots its launch declares ([`launch`]), so each is taken live.
 pub const VOLUMES: &str = "/volumes";
+
+/// The plug root path `at` of a microVM lies beneath (Shards' `shards_abi::run::plug::root_name`, D271): its top-level
+/// directory, unless that is one its init keeps its own ([`INITS_OWN`]), which no plug root names.
+pub fn plug_root_of(at: &str) -> Option<String> {
+    let first = at.strip_prefix('/')?.split('/').next().filter(|f| !f.is_empty() && *f != "." && *f != ".." && !f.contains('\0'))?;
+    (!INITS_OWN.contains(&first)).then(|| format!("/{first}"))
+}
+
+/// The top-level directories a microVM's init keeps its own, which no plug root names (Shards' `plug::REFUSED`, D271).
+pub const INITS_OWN: &[&str] = &["proc", "sys", "dev", "tmp", "etc", "run"];
+
+/// Where a microVM sees folder `host` of the machine, given its running session (`harness::overrides`) where none was
+/// asked: beneath [`VOLUMES`] by its own name, its last part. Why not, for one with no name to go by.
+pub fn volume_at(host: &str) -> Result<String, String> {
+    let name = host.rsplit(['\\', '/']).find(|c| !c.is_empty()).filter(|c| *c != "." && *c != ".." && !c.ends_with(':') && *c != "?");
+    let name = name.ok_or_else(|| format!("{host:?} has no folder's name to plug it in by"))?;
+    Ok(format!("{VOLUMES}/{name}"))
+}
 
 /// Where a microVM sees folder `host` of the machine, as Shards plugs one in (D235): a Unix path at its
 /// own path, so what the harness says of its files names them as the machine does; a Windows one
@@ -305,7 +395,7 @@ pub fn harness_cwd(spec: &Spec) -> String {
 /// The project folder `cwd` as a launch shares it: writable, where [`guest_path`] puts it in the
 /// microVM, which is its member's working folder too.
 pub fn project_share(cwd: &str) -> Result<Share, String> {
-    Ok(Share { host: cwd.to_owned(), at: guest_path(cwd, PROJECTS)?, writable: true })
+    Ok(Share { host: cwd.to_owned(), at: guest_path(cwd, PROJECTS)?, writable: true, members: Vec::new() })
 }
 
 /// The folders of plugins `kind`'s harness loads for `session`, as the machine's launch gives them
@@ -732,12 +822,12 @@ mod tests {
         // person's volume.
         let name = dir.path().file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("{cwd} has no name"))?;
         let at = if cfg!(windows) { format!("{PROJECTS}/{name}") } else { cwd.clone() };
-        assert_eq!(codex.shares, [Share { host: cwd.clone(), at: at.clone(), writable: true }], "its project, where its microVM sees it");
+        assert_eq!(codex.shares, [Share { host: cwd.clone(), at: at.clone(), writable: true, members: Vec::new() }], "its project, where its microVM sees it");
         assert_eq!(codex.folder.as_deref(), Some(at.as_str()), "its working folder, its project's place in its microVM");
         // A Windows machine's project: shared from where it is, at a Linux path of its own name, which is
         // its working folder too; Unix's at its own path.
         let windows = project_share(r"C:\Users\ada\proj").map_err(anyhow::Error::msg)?;
-        assert_eq!(windows, Share { host: r"C:\Users\ada\proj".into(), at: "/work/proj".into(), writable: true });
+        assert_eq!(windows, Share { host: r"C:\Users\ada\proj".into(), at: "/work/proj".into(), writable: true, members: Vec::new() });
         for (host, at) in [(r"\\?\C:\Users\ada\proj\", "/work/proj"), ("D:/src/kiln", "/work/kiln"), (r"\\server\share\repo", "/work/repo"), ("/Users/ada/proj", "/Users/ada/proj")] {
             assert_eq!(guest_path(host, PROJECTS), Ok(at.to_owned()), "{host}");
         }

@@ -14,6 +14,7 @@
 
 pub mod builtin;
 pub mod ops;
+pub mod sessions;
 pub mod uses;
 
 use rusqlite::{OptionalExtension as _, params};
@@ -129,9 +130,14 @@ pub enum Error {
     Bad(String),
     #[error("no such agent definition")]
     Missing,
-    /// Its owner has another of that name, or another change came first.
+    /// Its owner has another of that name.
     #[error("{0}")]
     Conflict(String),
+    /// A change made over version `base`, which isn't current: another change came first. What it is
+    /// now (`current`) goes with the refusal, so the caller can see what changed in between and make
+    /// theirs over it.
+    #[error("it was changed since version {base}, which this change was made over: it's version {} now. Read it again and make your change over that (`base` {})", .current.version, .current.version)]
+    Stale { base: i64, current: Box<AgentDef> },
     /// Its settings aren't an agent kiln runs: each reason.
     #[error("{}", .0.join("; "))]
     Refused(Vec<String>),
@@ -453,13 +459,21 @@ enum Written {
     Done(Record),
     Missing,
     Taken,
-    /// Another change came first.
-    Moved,
+    /// Another change came first: what it is now.
+    Moved(Record),
 }
 
-/// Agent definition `id` changed as `patch` says, by `by`.
-pub async fn update(hub: &Hub, who: &Who, id: &str, mut patch: Patch, by: &str) -> R<AgentDef> {
+/// Agent definition `id` changed as `patch` says, by `by`, over version `base` where it names one
+/// (kiln plan 01a1dd2e… UI contract, principle 5: a save carries its base, and one made over a version
+/// another save has moved on from is refused, never a silent overwrite), else over the version it
+/// finds. Either way the version it's made over is held to in the write itself: another change in
+/// between refuses it ([`Error::Stale`]) rather than being overwritten. A rename alone is no version,
+/// so renames aren't held to each other.
+pub async fn update(hub: &Hub, who: &Who, id: &str, mut patch: Patch, base: Option<i64>, by: &str) -> R<AgentDef> {
     let old = record(hub, who, id).await?;
+    if let Some(base) = base.filter(|b| *b != old.version) {
+        return Err(Error::Stale { base, current: Box::new(old.def()?) });
+    }
     let name = patch.name.take().map_or_else(|| old.name.clone(), |n| n.trim().to_owned());
     if let Some(p) = name_problem(&name) {
         return Err(Error::Bad(p));
@@ -480,7 +494,7 @@ pub async fn update(hub: &Hub, who: &Who, id: &str, mut patch: Patch, by: &str) 
             let Some(now_is) = get_in(&tx, &id)? else { return Ok(Written::Missing) };
             // What it was when this change began: another since is its own change, not overwritten.
             if now_is.version != at {
-                return Ok(Written::Moved);
+                return Ok(Written::Moved(now_is));
             }
             if named_in(&tx, &now_is.owner, &n, &id)? {
                 return Ok(Written::Taken);
@@ -499,7 +513,7 @@ pub async fn update(hub: &Hub, who: &Who, id: &str, mut patch: Patch, by: &str) 
         Written::Done(r) => r.def(),
         Written::Missing => Err(Error::Missing),
         Written::Taken => Err(taken(&name)),
-        Written::Moved => Err(Error::Conflict("it changed since you read it: read it again, then change it".into())),
+        Written::Moved(now_is) => Err(Error::Stale { base: at, current: Box::new(now_is.def()?) }),
     }
 }
 
@@ -526,7 +540,7 @@ pub async fn restore(hub: &Hub, who: &Who, id: &str, version: i64, by: &str) -> 
         agentfile: Some(s.agentfile),
         name: None,
     };
-    update(hub, who, id, patch, by).await
+    update(hub, who, id, patch, None, by).await
 }
 
 /// Agent definition `id` and its versions, gone: what it was.
@@ -541,6 +555,8 @@ pub async fn delete(hub: &Hub, who: &Who, id: &str) -> R<AgentDef> {
             tx.execute("DELETE FROM agent_def_versions WHERE agent_def_id = ?1", params![i])?;
             // Where it stood in for one of kiln's agents (`uses`), kiln's own again.
             tx.execute("DELETE FROM agent_def_uses WHERE agent_def_id = ?1", params![i])?;
+            // The sessions it started no longer say it (`sessions`).
+            sessions::forget_in(&tx, &i)?;
             tx.commit()?;
             Ok(n)
         })

@@ -313,31 +313,120 @@ fn spec(f: &PinnedFile) -> Result<Option<Spec>, Error> {
     Spec::try_from(fields).map(Some).map_err(|why| Error::Unpack(unpack::Unpack { url: f.url.clone(), entry: None, why }))
 }
 
-/// `f` downloaded into `dir`, its size and SHA-256 held to the pin's as it streams.
+/// `f` downloaded into `dir`, its size and SHA-256 held to the pin's as it streams. No clock of kiln's bounds it:
+/// each attempt follows its connection (`RequestBuilder::followed`), and what the network drops (its name not found,
+/// its connection refused, reset or closed short of its body's end) is fetched again from the bytes already here (RFC 9110
+/// §14.2's `Range`; whole, where its server sends it whole), each time said, after a pause that backs off as TCP's
+/// retransmission timer does ([`Pause`]). What its server answers (a status) and what its pin refuses (its size
+/// passed, its digest) end it, typed.
 async fn fetch(client: &crate::http::client::Client, f: &PinnedFile, dir: &Path) -> Result<crate::updates::Arrived, Error> {
-    let fetch_failed = |e: anyhow::Error| Error::Fetch { url: f.url.clone(), why: format!("{e:#}") };
-    let mut resp = crate::updates::get_following(client, &f.url, crate::http::client::DEFAULT_TIMEOUT).await.map_err(fetch_failed)?;
-    if !resp.is_success() {
-        return Err(Error::Status { url: f.url.clone(), status: resp.status() });
-    }
+    fetch_held(client, &f.url, &f.sha256, Some(f.size), dir).await
+}
+
+/// `url` downloaded into `dir`, held as it streams to SHA-256 `sha256` (lowercase hex) and to `size` where its pin
+/// says one (a component's source pinned by its checksum alone, kiln plan 01a1dd2e…, P6c.3, says none), fetched again
+/// from where it got as [`fetch`] is.
+pub async fn fetch_held(client: &crate::http::client::Client, url: &str, sha256: &str, size: Option<u64>, dir: &Path) -> Result<crate::updates::Arrived, Error> {
     let disk = |e: anyhow::Error| Error::Io { path: dir.to_owned(), why: format!("{e:#}") };
     let mut arriving = crate::updates::Arriving::new(dir).map_err(disk)?;
-    let mut got: u64 = 0;
-    while let Some(chunk) = resp.chunk().await.map_err(fetch_failed)? {
-        got = got.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        if got > f.size {
-            return Err(Error::Size { url: f.url.clone(), expected: f.size, observed: got });
+    let (mut got, mut pause, mut dropped) = (0_u64, Pause::default(), 0_u32);
+    loop {
+        let before = got;
+        match fetch_from(client, url, size, dir, &mut arriving, &mut got).await {
+            Ok(()) => break,
+            Err(Attempt::Refused(e)) => return Err(e),
+            Err(Attempt::Dropped(why)) => {
+                dropped = dropped.saturating_add(1);
+                let wait = pause.after(got > before);
+                tracing::warn!(%url, %why, got, of = ?size, dropped, again_in_s = wait.as_secs(), "the network dropped a pinned file's download: fetching it again from where it got");
+                #[allow(clippy::disallowed_methods)] // (b) a retry backoff: RFC 6298's, `Pause`
+                crate::rt::sleep(wait).await;
+            }
         }
-        arriving.write(&chunk).map_err(disk)?;
     }
     let arrived = arriving.done().map_err(disk)?;
-    if arrived.size != f.size {
-        return Err(Error::Size { url: f.url.clone(), expected: f.size, observed: arrived.size });
+    if let Some(expected) = size
+        && arrived.size != expected
+    {
+        return Err(Error::Size { url: url.to_owned(), expected, observed: arrived.size });
     }
-    if arrived.sha256 != f.sha256 {
-        return Err(Error::Digest { url: f.url.clone(), expected: f.sha256.clone(), observed: arrived.sha256.clone() });
+    if arrived.sha256 != sha256 {
+        return Err(Error::Digest { url: url.to_owned(), expected: sha256.to_owned(), observed: arrived.sha256.clone() });
     }
     Ok(arrived)
+}
+
+/// How one attempt at a pinned file ended short of its end: dropped by the network, to be fetched again; or
+/// refused, for good.
+enum Attempt {
+    Dropped(String),
+    Refused(Error),
+}
+
+/// One attempt at `url` from byte `got` (its start where none is here yet): what arrives appended to `arriving`, and
+/// `got` moved past it; from its start again where its server sends it whole. Past `size`, where one is pinned, it's
+/// refused.
+async fn fetch_from(client: &crate::http::client::Client, url: &str, size: Option<u64>, dir: &Path, arriving: &mut crate::updates::Arriving, got: &mut u64) -> Result<(), Attempt> {
+    let dropped = |e: anyhow::Error| Attempt::Dropped(format!("{e:#}"));
+    let from = *got;
+    let mut resp = crate::updates::get_following_from(client, url, None, from).await.map_err(dropped)?;
+    if !resp.is_success() {
+        return Err(Attempt::Refused(Error::Status { url: url.to_owned(), status: resp.status() }));
+    }
+    if from > 0 {
+        if resp.status() == 206 {
+            // Its part, from where this one got (RFC 9110 §14.4, `Content-Range: bytes <from>-…`), or it isn't this.
+            let range = resp.header("content-range").unwrap_or_default().to_owned();
+            if !range.starts_with(&format!("bytes {from}-")) {
+                return Err(Attempt::Refused(Error::Fetch { url: url.to_owned(), why: format!("asked from byte {from}, its server answered {range:?}") }));
+            }
+        } else {
+            // Its server sends it whole (it takes no ranges): from its start again.
+            *arriving = crate::updates::Arriving::new(dir).map_err(|e| Attempt::Refused(Error::Io { path: dir.to_owned(), why: format!("{e:#}") }))?;
+            *got = 0;
+        }
+    }
+    while let Some(chunk) = resp.chunk().await.map_err(dropped)? {
+        *got = got.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if let Some(expected) = size
+            && *got > expected
+        {
+            return Err(Attempt::Refused(Error::Size { url: url.to_owned(), expected, observed: *got }));
+        }
+        arriving.write(&chunk).map_err(|e| Attempt::Refused(Error::Io { path: dir.to_owned(), why: format!("{e:#}") }))?;
+    }
+    // Its body ended whole, as its server framed it, short of the pin: the file isn't the pinned one (a body the
+    // network cut ends in an error, above).
+    if let Some(expected) = size
+        && *got < expected
+    {
+        return Err(Attempt::Refused(Error::Size { url: url.to_owned(), expected, observed: *got }));
+    }
+    Ok(())
+}
+
+/// How long a fetch waits before it asks again for what the network dropped, as TCP waits before it sends again (RFC
+/// 6298): 1 s at first (§2.1, the initial RTO), doubled after each attempt that brought nothing (§5.5, "back off the
+/// timer"), at most 60 s (§2.5: a maximum MAY be placed, of at least 60 s), and 1 s again after an attempt that
+/// brought bytes.
+#[derive(Default)]
+struct Pause(Option<std::time::Duration>);
+
+impl Pause {
+    /// RFC 6298 §2.1's initial RTO.
+    const FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+    /// RFC 6298 §2.5's least maximum.
+    const MOST: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The wait after an attempt the network dropped, `brought` saying whether it brought bytes.
+    fn after(&mut self, brought: bool) -> std::time::Duration {
+        let next = match self.0 {
+            Some(last) if !brought => last.saturating_mul(2).min(Self::MOST),
+            _ => Self::FIRST,
+        };
+        self.0 = Some(next);
+        next
+    }
 }
 
 /// `text` written at `path`, which mustn't be there.

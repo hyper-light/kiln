@@ -223,6 +223,36 @@ fn quote(v: &str) -> Result<String, String> {
 /// plain number is bytes. An edge of the engine's integers (`super::units`): what people write,
 /// read as the bytes it says.
 // W05-R03: Hex 37021c35, hex-sim/src/needs.rs: checked integer bytes; no float rounding.
+/// A runner's budget as `[runner] budget` names it (docs/needs.md §6): `cpus=4,mem=16g,disk=50g,gpus=0`,
+/// each dimension it names held to that and every other the machine's (no limit there: the most each
+/// says, which placement holds to the machine). A word naming no dimension, an amount that isn't one,
+/// or a dimension named twice is refused, the word named.
+pub fn budget(spec: &str) -> Result<Resources, String> {
+    let mut out = Resources { cpu: Cpus::milli(u64::MAX), mem: u64::MAX, disk: u64::MAX, gpu: u32::MAX };
+    let words: Vec<&str> = spec.split(',').map(str::trim).filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return Err("a budget names at least one of cpus, mem, disk or gpus (cpus=4,mem=16g)".into());
+    }
+    let mut named: Vec<&'static str> = Vec::new();
+    for w in words {
+        let (key, value) = w.split_once('=').ok_or_else(|| format!("`{w}`: a budget's words are a dimension and its amount (cpus=4, mem=16g)"))?;
+        let value = value.trim();
+        let (dim, set) = match key.trim().to_ascii_lowercase().as_str() {
+            "cpus" | "cpu" => ("cpus", pools::cpus(value).map(|c| out.cpu = c).map_err(str::to_owned)),
+            "mem" | "memory" => ("mem", exact_size(value).map(|b| out.mem = b).map_err(str::to_owned)),
+            "disk" => ("disk", exact_size(value).map(|b| out.disk = b).map_err(str::to_owned)),
+            "gpus" | "gpu" => ("gpus", value.parse::<u32>().map(|g| out.gpu = g).map_err(|_| "not a number of GPUs".to_owned())),
+            _ => return Err(format!("`{w}`: no such dimension (cpus, mem, disk, gpus)")),
+        };
+        set.map_err(|e| format!("`{w}`: {e}"))?;
+        if named.contains(&dim) {
+            return Err(format!("`{w}`: {dim} is named twice"));
+        }
+        named.push(dim);
+    }
+    Ok(out)
+}
+
 pub fn size(s: &str) -> Option<u64> {
     exact_size(s).ok()
 }
@@ -550,5 +580,23 @@ mod hex_size_tests {
         assert_eq!(size("-1"), None);
         assert_eq!(size("NaN"), None);
         assert_eq!(size("inf"), None);
+    }
+    /// docs/needs.md §6: a budget names what it limits, every other dimension the machine's; zero is a
+    /// budget (nothing sized fits); a word naming no dimension, a bad amount, or one named twice is
+    /// refused, naming the word.
+    #[test]
+    fn a_runner_budget_limits_what_it_names_and_refuses_bad_words_by_name() -> Result<(), String> {
+        use crate::sched::state::Cpus;
+        let b = super::budget("cpus=4, mem=16g")?;
+        assert_eq!((b.cpu, b.mem), (Cpus::whole(4), 16 << 30));
+        assert_eq!((b.disk, b.gpu), (u64::MAX, u32::MAX), "unnamed: the machine's");
+        let zero = super::budget("cpus=0,mem=0,disk=0,gpus=0")?;
+        assert_eq!((zero.cpu, zero.mem, zero.disk, zero.gpu), (Cpus::ZERO, 0, 0, 0));
+        assert_eq!(super::budget("mem=512m")?.cpu, Cpus::milli(u64::MAX), "memory alone caps memory alone");
+        for (bad, says) in [("memm=4g", "`memm=4g`: no such dimension"), ("cpus=four", "`cpus=four`"), ("mem=16q", "`mem=16q`: not a size"), ("cpus=2,cpu=3", "named twice"), ("cpus", "a dimension and its amount"), ("", "at least one")] {
+            let e = super::budget(bad).err().unwrap_or_default();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+        Ok(())
     }
 }

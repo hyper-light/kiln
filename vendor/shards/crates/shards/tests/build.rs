@@ -672,15 +672,25 @@ fn a_builders_memory_is_plugged_as_its_build_needs_it() {
         "what it could still plug, before its steps and after: {said:?} KiB, booted with {boot} bytes: {shown}"
     );
 
+    // Booted with all of it as the builder boots, on every CPU the host has (the builder's
+    // `builder_cpus`): each CPU's per-CPU areas are taken from memblock before the kernel
+    // sizes its threads (mm/percpu.c `pcpu_embed_first_chunk`, init/main.c `fork_init` after
+    // `mm_core_init`), so a guest of one CPU had more threads than the step of a builder of
+    // 32 (PM M591).
+    let cpus = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .to_string();
     let full = common::vm_run(&[
         "--kernel",
         kernel().to_str().unwrap(),
         "--init",
         common::test_guest().to_str().unwrap(),
+        "--cpus",
+        &cpus,
         "--memory",
         "2560",
         "--cmdline",
-        "console=ttyS0 panic=-1 shards_test=limits",
+        "console=hvc0 panic=-1 shards_test=limits",
     ]);
     assert_eq!(full.status, Some(0), "{full}");
     let (stepped, booted) = (limits_said(&built.stderr), limits_said(&full.stdout));
@@ -4561,8 +4571,7 @@ fn add_fetches_urls() {
     );
     let took = started.elapsed();
     eprintln!(
-        "build-add-url-hung: its end with the hang held, n=1: p50=p90=p99=max={took:?} (a wait for the hang's head: {:?})",
-        shards_registry::http::HEAD
+        "build-add-url-hung: its end with the hang held, n=1: p50=p90=p99=max={took:?} (the hang's answer waited for as its connection lives, D276)"
     );
     let _ = release.send(());
     // Downloads count against what ADD may write, as unpacked archives do: one past it
@@ -10316,9 +10325,10 @@ fn agents_run_in_their_domains() {
         .collect();
     for want in [
         "confined uid=200000 gid=200000 groups=0",
-        // PID 2 of its PID namespace, whose PID 1 is init's sealed reaper, the two alone
-        // in its /proc (D59, "owned native domain lifetime": its actor is PID 2).
-        "confined pid=2 procs=2",
+        // PID 2 of its PID namespace, whose PID 1 is init's sealed reaper (D59, "owned
+        // native domain lifetime": its actor is PID 2), and its starter, which it forked
+        // just before its program ran (D243, confine-10), the three alone in its /proc.
+        "confined pid=2 procs=3",
         "confined hostname=agent-main",
         "confined caps eff=0000000000000000 prm=0000000000000000 inh=0000000000000000 bnd=0000000000000000 amb=0000000000000000 nnp=1",
         // Another domain, and /sys, hidden; its own /dev.
@@ -10388,6 +10398,8 @@ fn agents_run_in_their_domains() {
         .collect();
     for want in [
         "confined uid=200002 gid=200002 groups=0",
+        // No starter: its seccomp filter refused the fork (D243, crate::starter's `fork`).
+        "confined pid=2 procs=2",
         "confined call fork: errno 1",
         "confined call thread: ok",
         // Every other way to start a process (§9.10): vfork, a clone that is no thread,
@@ -17666,5 +17678,614 @@ fn a_steps_directories_keep_their_numbers() {
     assert!(
         devices.iter().all(|d| *d == devices[0]),
         "more than one device\n{shown}"
+    );
+}
+
+/// Whether any file under `dir` holds `needle`: where a credential must never be.
+fn tree_holds(dir: &std::path::Path, needle: &[u8]) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let path = e.path();
+        let Ok(kind) = e.file_type() else { continue };
+        if kind.is_dir() {
+            if let Some(found) = tree_holds(&path, needle) {
+                return Some(found);
+            }
+        } else if kind.is_file()
+            && std::fs::read(&path).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// An HTTP server on loopback: `/agent.tar` is what `body` holds now, answered only with
+/// `Authorization: <auth>`; `/away.tar` redirects to `away`.
+fn agent_server(body: std::sync::Arc<std::sync::Mutex<Vec<u8>>>, auth: &'static str, away: String) -> u16 {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = common::minted_port(listener.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let (body, away) = (body.clone(), away.clone());
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut out = conn;
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let mut authorized = false;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) <= 2 {
+                        break;
+                    }
+                    authorized |= h.trim_end() == format!("Authorization: {auth}");
+                }
+                let (status, extra, payload) = if line.starts_with("GET /away.tar ") {
+                    ("302 Found", format!("Location: {away}\r\n"), Vec::new())
+                } else if !authorized {
+                    ("401 Unauthorized", String::new(), Vec::new())
+                } else {
+                    ("200 OK", String::new(), body.lock().unwrap().clone())
+                };
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = out.write_all(&payload);
+            });
+        }
+    });
+    port
+}
+
+/// An agent and a harness install from http(s) sources pinned by their checksums (D54):
+/// the build holds what the pin names, sent the Authorization of the build's
+/// `HTTP_AUTH_TOKEN_<host>` secret; content changed under the pin is refused, and a new
+/// pin builds the new content; a redirect to an origin the directive does not grant is
+/// refused in its words, and builds once `--redirect` grants it. The token appears in no
+/// output and in no file of the home: no layer, record or log.
+#[test]
+fn agents_install_from_pinned_http_sources() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (image, _) = served();
+    let tarball = |text: &[u8]| common::tar(&[("agent.txt", 0o644, 0, Some(text))]);
+    let body = std::sync::Arc::new(std::sync::Mutex::new(tarball(b"agent v1\n")));
+    let other = agent_server(body.clone(), "Bearer t0k3n-x9", String::new());
+    let port = agent_server(
+        body.clone(),
+        "Bearer t0k3n-x9",
+        format!("http://127.0.0.1:{other}/agent.tar"),
+    );
+    let home = TempDir::new("src-http-home");
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+        ("TOK", std::ffi::OsStr::new("t0k3n-x9")),
+    ];
+    let secret = "id=HTTP_AUTH_TOKEN_127.0.0.1,env=TOK";
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
+    let build = |name: &str, agentfile: String| {
+        let ctx = TempDir::new(name);
+        std::fs::write(ctx.join("Agentfile"), agentfile).unwrap();
+        let r = shards(&[
+            "build",
+            "--secret",
+            secret,
+            "-t",
+            "src-http:1",
+            ctx.to_str().unwrap(),
+        ]);
+        assert!(
+            !r.stdout.contains("t0k3n") && !r.stderr.contains("t0k3n"),
+            "{}",
+            r.stderr
+        );
+        r
+    };
+    let line = |sum: &str, path: &str, redirect: &str| {
+        format!("FROM {image}\nAGENT {redirect}--checksum={sum} a FROM http://127.0.0.1:{port}/{path}\n")
+    };
+    let v1 = common::sha256_digest(&tarball(b"agent v1\n"));
+    // Without the secret: the server's refusal.
+    let ctx = TempDir::new("src-http-0");
+    std::fs::write(ctx.join("Agentfile"), line(&v1, "agent.tar", "")).unwrap();
+    let unauthorized = shards(&["build", ctx.to_str().unwrap()]);
+    assert_ne!(unauthorized.status, Some(0));
+    assert!(
+        unauthorized.stderr.contains("invalid response status 401"),
+        "{}",
+        unauthorized.stderr
+    );
+    let built = build("src-http-1", line(&v1, "agent.tar", ""));
+    assert_eq!(built.status, Some(0), "{}", built.stderr);
+    let stat = shards(&["run", "--rm", "src-http:1", "stat", "/agents/a/agent.txt"]);
+    assert!(
+        stat.stdout.contains("= agent v1\\n"),
+        "{}{}",
+        stat.stdout,
+        stat.stderr
+    );
+    // The same pin over changed content: refused.
+    *body.lock().unwrap() = tarball(b"agent v2\n");
+    let v2 = common::sha256_digest(&tarball(b"agent v2\n"));
+    let refused = build("src-http-2", line(&v1, "agent.tar", ""));
+    assert_ne!(refused.status, Some(0));
+    assert!(
+        refused.stderr.contains(&format!("digest mismatch {v2}: {v1}")),
+        "{}",
+        refused.stderr
+    );
+    // A new pin: the new content.
+    let rebuilt = build("src-http-3", line(&v2, "agent.tar", ""));
+    assert_eq!(rebuilt.status, Some(0), "{}", rebuilt.stderr);
+    let stat = shards(&["run", "--rm", "src-http:1", "stat", "/agents/a/agent.txt"]);
+    assert!(
+        stat.stdout.contains("= agent v2\\n"),
+        "{}{}",
+        stat.stdout,
+        stat.stderr
+    );
+    // A redirect elsewhere: refused until granted.
+    let away = build("src-http-4", line(&v2, "away.tar", ""));
+    assert_ne!(away.status, Some(0));
+    assert!(
+        away.stderr.contains(&format!(
+            "redirected from http://127.0.0.1:{port} to http://127.0.0.1:{other}, which the source does not grant: name it with --redirect=HOST[:PORT]"
+        )),
+        "{}",
+        away.stderr
+    );
+    let granted = build(
+        "src-http-5",
+        line(&v2, "away.tar", &format!("--redirect=127.0.0.1:{other} ")),
+    );
+    assert_eq!(granted.status, Some(0), "{}", granted.stderr);
+    assert_eq!(tree_holds(&home, b"t0k3n-x9"), None);
+}
+
+/// An agent installs from a Git repository over smart HTTP (D54), fetched with the
+/// build's `GIT_AUTH_TOKEN`: the build holds the commit its ref names, and a new commit on
+/// the ref builds the new content. The token appears in no output and no file of the
+/// home.
+#[test]
+fn agents_install_from_git_sources() {
+    if cannot_run_vms() {
+        return;
+    }
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP: no git on this host");
+        return;
+    }
+    let repos = TempDir::new("src-git-repos");
+    let origin = repos.join("private/agent.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git_in(&origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("agent.txt"), "agent v1\n").unwrap();
+    git_in(&origin, &["add", "-A"]);
+    git_in(&origin, &["commit", "-q", "-m", "one"]);
+    // base64("x-access-token:g1tt0k-77"), as BuildKit sends a token (D48).
+    let port = git_http_server(
+        repos.to_path_buf(),
+        vec!["basic eC1hY2Nlc3MtdG9rZW46ZzF0dDBrLTc3".to_string()],
+    );
+    let (image, _) = served();
+    let home = TempDir::new("src-git-home");
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+        ("TOK", std::ffi::OsStr::new("g1tt0k-77")),
+    ];
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
+    let ctx = TempDir::new("src-git-ctx");
+    std::fs::write(
+        ctx.join("Agentfile"),
+        format!("FROM {image}\nAGENT a FROM http://127.0.0.1:{port}/private/agent.git#main\n"),
+    )
+    .unwrap();
+    for (n, text) in [(1, "agent v1\n"), (2, "agent v2\n")] {
+        if n == 2 {
+            std::fs::write(origin.join("agent.txt"), text).unwrap();
+            git_in(&origin, &["commit", "-q", "-am", "two"]);
+        }
+        let built = shards(&[
+            "build",
+            "--secret",
+            "id=GIT_AUTH_TOKEN,env=TOK",
+            "-t",
+            "src-git:1",
+            ctx.to_str().unwrap(),
+        ]);
+        assert_eq!(built.status, Some(0), "{}", built.stderr);
+        assert!(!built.stderr.contains("g1tt0k") && !built.stdout.contains("g1tt0k"));
+        let stat = shards(&["run", "--rm", "src-git:1", "stat", "/agents/a/agent.txt"]);
+        let want = format!("= {}\\n", text.trim_end());
+        assert!(stat.stdout.contains(&want), "{n}: {}{}", stat.stdout, stat.stderr);
+    }
+    assert_eq!(tree_holds(&home, b"g1tt0k-77"), None);
+}
+
+/// An agent installs from an S3-compatible store (D54): `s3://BUCKET/KEY` at the
+/// directive's endpoint, path-style, in its region, signed with the build's own
+/// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` secrets and pinned by its checksum; a
+/// changed object under the pin is refused, and a new pin builds it. Neither key appears in
+/// any output or file of the home.
+#[test]
+fn agents_install_from_s3_sources() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (image, _) = served();
+    let (port, buckets) = common::fake_s3();
+    let tarball = |text: &[u8]| common::tar(&[("agent.txt", 0o644, 0, Some(text))]);
+    let put = |b: Vec<u8>| {
+        buckets
+            .lock()
+            .unwrap()
+            .objects
+            .insert("/agents/a/v1.tar".into(), (b, std::time::SystemTime::now()));
+    };
+    put(tarball(b"agent v1\n"));
+    let home = TempDir::new("src-s3-home");
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+        ("AK", std::ffi::OsStr::new("AKIDSRCTEST")),
+        ("SK", std::ffi::OsStr::new("sk-s3cr3t-55")),
+        // None of the host's own AWS settings.
+        ("AWS_ACCESS_KEY_ID", std::ffi::OsStr::new("")),
+        ("AWS_SECRET_ACCESS_KEY", std::ffi::OsStr::new("")),
+        ("AWS_PROFILE", std::ffi::OsStr::new("")),
+        ("AWS_ENDPOINT_URL", std::ffi::OsStr::new("")),
+        ("AWS_ENDPOINT_URL_S3", std::ffi::OsStr::new("")),
+    ];
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
+    let build = |name: &str, sum: &str| {
+        let ctx = TempDir::new(name);
+        std::fs::write(
+            ctx.join("Agentfile"),
+            format!(
+                "FROM {image}\nAGENT --endpoint=http://127.0.0.1:{port} --region=us-east-1 --path-style --checksum={sum} a FROM s3://agents/a/v1.tar\n"
+            ),
+        )
+        .unwrap();
+        let r = shards(&[
+            "build",
+            "--secret",
+            "id=AWS_ACCESS_KEY_ID,env=AK",
+            "--secret",
+            "id=AWS_SECRET_ACCESS_KEY,env=SK",
+            "-t",
+            "src-s3:1",
+            ctx.to_str().unwrap(),
+        ]);
+        assert!(
+            !r.stdout.contains("s3cr3t") && !r.stderr.contains("s3cr3t"),
+            "{}",
+            r.stderr
+        );
+        r
+    };
+    let v1 = common::sha256_digest(&tarball(b"agent v1\n"));
+    let built = build("src-s3-1", &v1);
+    assert_eq!(built.status, Some(0), "{}", built.stderr);
+    let stat = shards(&["run", "--rm", "src-s3:1", "stat", "/agents/a/agent.txt"]);
+    assert!(
+        stat.stdout.contains("= agent v1\\n"),
+        "{}{}",
+        stat.stdout,
+        stat.stderr
+    );
+    assert!(
+        buckets
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .any(|l| l == "GET /agents/a/v1.tar AKIDSRCTEST"),
+        "{:?}",
+        buckets.lock().unwrap().log
+    );
+    put(tarball(b"agent v2\n"));
+    let v2 = common::sha256_digest(&tarball(b"agent v2\n"));
+    let refused = build("src-s3-2", &v1);
+    assert_ne!(refused.status, Some(0));
+    assert!(
+        refused.stderr.contains(&format!("digest mismatch {v2}: {v1}")),
+        "{}",
+        refused.stderr
+    );
+    let rebuilt = build("src-s3-3", &v2);
+    assert_eq!(rebuilt.status, Some(0), "{}", rebuilt.stderr);
+    let stat = shards(&["run", "--rm", "src-s3:1", "stat", "/agents/a/agent.txt"]);
+    assert!(
+        stat.stdout.contains("= agent v2\\n"),
+        "{}{}",
+        stat.stdout,
+        stat.stderr
+    );
+    assert_eq!(tree_holds(&home, b"sk-s3cr3t-55"), None);
+}
+
+/// A build policy judges an `s3://` source by its own form, `input.s3` (D101, D54): one
+/// that allows its bucket builds the agent; one that trusts another bucket refuses the
+/// build before anything is fetched, saying the policy's words. Before, either was refused
+/// as an unsupported source scheme.
+#[test]
+fn an_s3_source_builds_as_its_policy_decides() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (image, _) = served();
+    let (port, buckets) = common::fake_s3();
+    let tarball = common::tar(&[("agent.txt", 0o644, 0, Some(b"agent v1\n"))]);
+    let sum = common::sha256_digest(&tarball);
+    buckets
+        .lock()
+        .unwrap()
+        .objects
+        .insert("/agents/a/v1.tar".into(), (tarball, std::time::SystemTime::now()));
+    let home = TempDir::new("src-s3-policy-home");
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+        ("AK", std::ffi::OsStr::new("AKIDPOLICY")),
+        ("SK", std::ffi::OsStr::new("sk-policy")),
+        ("AWS_ENDPOINT_URL", std::ffi::OsStr::new("")),
+        ("AWS_ENDPOINT_URL_S3", std::ffi::OsStr::new("")),
+    ];
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
+    let build = |name: &str, trusted: &str| {
+        let ctx = TempDir::new(name);
+        std::fs::write(
+            ctx.join("Agentfile"),
+            format!(
+                "FROM {image}\nAGENT --endpoint=http://127.0.0.1:{port} --region=us-east-1 --path-style --checksum={sum} a FROM s3://agents/a/v1.tar\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.join("Agentfile.rego"),
+            format!(
+                "package docker\n\ndefault allow := false\n\nallow if input.local\n\nallow if input.image\n\nallow if {{\n\tinput.s3.bucket == \"{trusted}\"\n\tinput.s3.checksum == \"{sum}\"\n}}\n\ndeny_msg contains msg if {{\n\tnot allow\n\tmsg := sprintf(\"bucket %s is not trusted\", [input.s3.bucket])\n}}\n\ndecision := {{\"allow\": allow, \"deny_msg\": deny_msg}}\n"
+            ),
+        )
+        .unwrap();
+        shards(&[
+            "build",
+            "--secret",
+            "id=AWS_ACCESS_KEY_ID,env=AK",
+            "--secret",
+            "id=AWS_SECRET_ACCESS_KEY,env=SK",
+            "-t",
+            "src-s3-policy:1",
+            ctx.to_str().unwrap(),
+        ])
+    };
+    let refused = build("src-s3-policy-0", "trusted");
+    assert_eq!(refused.status, Some(1), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("Policy: bucket agents is not trusted\n")
+            && refused.stderr.contains(
+                "error evaluating the source policy: source \"s3://agents/a/v1.tar\" not allowed by policy: action DENY"
+            ),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !buckets.lock().unwrap().log.iter().any(|l| l.starts_with("GET ")),
+        "{:?}",
+        buckets.lock().unwrap().log
+    );
+    let built = build("src-s3-policy-1", "agents");
+    assert_eq!(built.status, Some(0), "{}", built.stderr);
+    let stat = shards(&["run", "--rm", "src-s3-policy:1", "stat", "/agents/a/agent.txt"]);
+    assert!(
+        stat.stdout.contains("= agent v1\\n"),
+        "{}{}",
+        stat.stdout,
+        stat.stderr
+    );
+}
+
+/// A server on loopback that answers `/SKILL.md` with `skill`, and `/r/SKILL.md` with a
+/// redirect to `away`'s `/SKILL.md`; its port.
+fn skill_server(skill: &'static str, away: Option<u16>) -> u16 {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = common::minted_port(listener.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut out = conn;
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) <= 2 {
+                        break;
+                    }
+                }
+                let (status, extra, body) = match (line.starts_with("GET /r/SKILL.md "), away) {
+                    (true, Some(to)) => (
+                        "302 Found",
+                        format!("Location: http://127.0.0.1:{to}/SKILL.md\r\n"),
+                        "",
+                    ),
+                    _ if line.starts_with("GET /SKILL.md ") => ("200 OK", String::new(), skill),
+                    _ => ("404 Not Found", String::new(), ""),
+                };
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    port
+}
+
+/// A SKILL from a URL that redirects to another origin (D54): refused, in the grant's words,
+/// until `--redirect` names that origin; then built, laid out by its name.
+#[test]
+fn a_skill_from_a_redirecting_source_builds_once_granted() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (image, _) = served();
+    let away = skill_server(
+        "---\nname: review\ndescription: Reviews code.\n---\nReview it.\n",
+        None,
+    );
+    let port = skill_server("", Some(away));
+    let home = TempDir::new("src-skill-redirect-home");
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+    ];
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
+    let build = |name: &str, redirect: &str| {
+        let ctx = TempDir::new(name);
+        std::fs::write(
+            ctx.join("Agentfile"),
+            format!("FROM {image}\nSKILL {redirect}http://127.0.0.1:{port}/r/SKILL.md\n"),
+        )
+        .unwrap();
+        let out = TempDir::new(&format!("{name}-out"));
+        let r = shards(&[
+            "build",
+            "-o",
+            out.join("root").to_str().unwrap(),
+            ctx.to_str().unwrap(),
+        ]);
+        (r, out)
+    };
+    let (refused, _) = build("src-skill-redirect-0", "");
+    assert_ne!(refused.status, Some(0));
+    assert!(
+        refused.stderr.contains(&format!(
+            "redirected from http://127.0.0.1:{port} to http://127.0.0.1:{away}, which the source does not grant: name it with --redirect=HOST[:PORT]"
+        )),
+        "{}",
+        refused.stderr
+    );
+    let (built, out) = build("src-skill-redirect-1", &format!("--redirect=127.0.0.1:{away} "));
+    assert_eq!(built.status, Some(0), "{}", built.stderr);
+    let laid = std::fs::read_to_string(out.join("root/skills/review/SKILL.md")).unwrap();
+    assert!(laid.contains("name: review"), "{laid}");
+}
+
+/// An s3 source is signed only by what the build names (D54): with no secret and no
+/// `--credentials=aws-default` it goes unsigned, though the host's environment holds a key,
+/// and a store that requires signing refuses it with its status, the build saying it went
+/// unsigned; the opt-in signs it through the host's chain (here the environment's key),
+/// the build saying so; the build's named secrets sign it with theirs.
+#[test]
+fn an_s3_source_is_signed_only_by_what_the_build_names() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (image, _) = served();
+    let (port, buckets) = common::fake_s3();
+    let tarball = common::tar(&[("agent.txt", 0o644, 0, Some(b"agent v1\n"))]);
+    buckets
+        .lock()
+        .unwrap()
+        .objects
+        .insert("/agents/a/v1.tar".into(), (tarball, std::time::SystemTime::now()));
+    let home = TempDir::new("src-s3-signers-home");
+    let aws = TempDir::new("src-s3-signers-aws");
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+        ("AK", std::ffi::OsStr::new("AKIDSECRET")),
+        ("SK", std::ffi::OsStr::new("sk-named")),
+        // The host's own chain: a key in the environment, no profile files.
+        ("AWS_ACCESS_KEY_ID", std::ffi::OsStr::new("AKIDHOSTENV")),
+        ("AWS_SECRET_ACCESS_KEY", std::ffi::OsStr::new("sk-host")),
+        ("AWS_CONFIG_FILE", aws.join("config").into_os_string().leak()),
+        (
+            "AWS_SHARED_CREDENTIALS_FILE",
+            aws.join("credentials").into_os_string().leak(),
+        ),
+        ("AWS_PROFILE", std::ffi::OsStr::new("")),
+        ("AWS_ENDPOINT_URL", std::ffi::OsStr::new("")),
+        ("AWS_ENDPOINT_URL_S3", std::ffi::OsStr::new("")),
+    ];
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
+    let build = |name: &str, credentials: &str, secrets: bool| {
+        let ctx = TempDir::new(name);
+        std::fs::write(
+            ctx.join("Agentfile"),
+            format!(
+                "FROM {image}\nAGENT --endpoint=http://127.0.0.1:{port} --region=us-east-1 --path-style --version-id=v1 {credentials}a FROM s3://agents/a/v1.tar\n"
+            ),
+        )
+        .unwrap();
+        let mut args = vec!["build", "--progress=plain"];
+        if secrets {
+            args.extend([
+                "--secret",
+                "id=AWS_ACCESS_KEY_ID,env=AK",
+                "--secret",
+                "id=AWS_SECRET_ACCESS_KEY,env=SK",
+            ]);
+        }
+        let ctx = ctx.to_str().unwrap().to_string();
+        args.extend(["-t", "src-s3-signers:1", &ctx]);
+        let r = shards(&args);
+        let last = buckets.lock().unwrap().log.last().cloned().unwrap_or_default();
+        (r, last)
+    };
+    let (refused, last) = build("src-s3-signers-0", "", false);
+    assert_ne!(refused.status, Some(0));
+    assert!(
+        refused.stderr.contains("StatusCode: 403")
+            && refused.stderr.contains(
+                "sent unsigned: neither the build's secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY nor --credentials=aws-default name its credentials"
+            ),
+        "{}",
+        refused.stderr
+    );
+    assert_eq!(last, "GET /agents/a/v1.tar ");
+    let (chained, last) = build("src-s3-signers-1", "--credentials=aws-default ", false);
+    assert_eq!(chained.status, Some(0), "{}", chained.stderr);
+    assert_eq!(last, "GET /agents/a/v1.tar AKIDHOSTENV");
+    assert!(
+        chained.stderr.contains(
+            "s3://agents/a/v1.tar: signed through the host's AWS default credential chain (--credentials=aws-default), which reached no endpoint"
+        ),
+        "{}",
+        chained.stderr
+    );
+    let (named, last) = build("src-s3-signers-2", "", true);
+    assert_eq!(named.status, Some(0), "{}", named.stderr);
+    assert_eq!(last, "GET /agents/a/v1.tar AKIDSECRET");
+    assert!(
+        named.stderr.contains(
+            "s3://agents/a/v1.tar: signed with the build's secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+        ),
+        "{}",
+        named.stderr
     );
 }

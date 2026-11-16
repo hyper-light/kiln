@@ -7,7 +7,7 @@
  * apart from the Agentfiles pages' own code (api/agentfiles.ts), so Mission control loads none of it.
  */
 import { request } from "@/api/client";
-import type { Agent } from "@/api/types";
+import type { LeanAgent } from "@/api/types";
 import type { AgentfileBuiltin, AgentfileListing } from "@/api/wire";
 import type { Res } from "@/lib/data";
 import { tildify } from "@/views/harness/derive";
@@ -16,13 +16,14 @@ import { tildify } from "@/views/harness/derive";
 type Listed = Pick<AgentfileListing, "agentfiles" | "builtin">;
 
 /**
- * The list as a start chooses from it (`GET /api/agentfiles`): yours and kiln's, or none where it
- * can't be had (a server from before Agentfiles), so a start never waits on it failing.
+ * The list as a start chooses from it (`GET /api/agentfiles?lean=1`): yours and kiln's by their names,
+ * kiln's without their texts (most of what the list carries, and a start shows none of them), or none
+ * where it can't be had (a server from before Agentfiles), so a start never waits on it failing.
  */
 export const agentfileChoicesRes: Res<Listed> = {
   key: "agentfiles/choices",
   fetch: (signal) =>
-    request<AgentfileListing>("GET", "/api/agentfiles", undefined, { signal }).catch((e: unknown) => {
+    request<AgentfileListing>("GET", "/api/agentfiles?lean=1", undefined, { signal }).catch((e: unknown) => {
       if (signal.aborted) throw e;
       return { agentfiles: [], builtin: [] };
     }),
@@ -93,7 +94,7 @@ export function withChoice(kept: Readonly<Record<string, string>>, kind: string,
  * refuses one there (`harness::lineage::isolation_on`): a machine starts them once its runner says
  * so; kiln's server starts none itself. Null where it can.
  */
-export function whyNoMicrovm(target: string, machines: readonly Pick<Agent, "name" | "facts">[], shown: string): string | null {
+export function whyNoMicrovm(target: string, machines: readonly Pick<LeanAgent, "name" | "facts">[], shown: string): string | null {
   const name = target.startsWith("agent:") ? target.slice("agent:".length) : null;
   if (!name) return "kiln's server starts no microVMs itself";
   const said = machines.find((m) => m.name === name)?.facts?.virt.microvm;

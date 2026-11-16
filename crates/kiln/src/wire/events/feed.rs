@@ -3,7 +3,8 @@
 //! where it was (`?after=<epoch>.<seq>`) instead of loading everything again; and what each socket
 //! is sent of it ([`Outbox`]): the types it asked for (`topics`), gathered for a short window, only
 //! the newest of each thing a frame carries whole, and none that says again what that socket was
-//! last told. Pure: no clock (the socket's loop keeps time), no disk, no network. No lock on any path
+//! last told; of the agents, to a socket that takes them lean (`?lean=1`), only what changed of each
+//! ([`super::roster`]). Pure: no clock (the socket's loop keeps time), no disk, no network. No lock on any path
 //! ([`Feed`]: goal 5's rule, plan 01a1a59c2aae): every emit pushes, from whichever shard emits, and
 //! every socket reads, on its own.
 //!
@@ -11,6 +12,7 @@
 //! at most [`RING`] frames and [`BYTES`] of them, and a frame an agent's next one says again whole is let go
 //! of as that one comes: its pusher holds its text ([`Feed::push_lent`], [`Lent`]).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash as _, Hasher as _};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -18,6 +20,8 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwapOption;
 use serde_json::Value;
+
+use super::roster::Roster;
 
 /// The frames the feed keeps: as many as a listener of the hub's events holds of them
 /// ([`crate::hub::EVENTS`]), sharing their text, so a socket that falls behind is told `resync` when
@@ -641,11 +645,55 @@ pub struct Outbox {
     resync: bool,
     /// What it was last sent of each thing ([`Key::State`]), by digest.
     last: HashMap<Key, u64>,
+    /// It takes the agents lean (`?lean=1`, W21-R02; [`super::roster`]): what it was last sent of each, an agent's
+    /// next `harness` frame going as what changed of that.
+    agents: Option<Kept>,
+}
+
+/// The agents' entries a socket that takes them lean keeps ([`Roster`]): their bytes counted in
+/// `crate::memory::owners::EVENTS_FEED` for as long as it keeps them.
+#[derive(Debug, Default)]
+struct Kept {
+    roster: Roster,
+    /// What of the roster's bytes the owner has been told.
+    counted: usize,
+}
+
+impl Kept {
+    /// Tells the owner what the roster keeps now.
+    fn settle(&mut self) {
+        let now = self.roster.bytes();
+        if now >= self.counted {
+            crate::memory::owners::EVENTS_FEED.add(now - self.counted);
+        } else {
+            crate::memory::owners::EVENTS_FEED.sub(self.counted - now);
+        }
+        self.counted = now;
+    }
+
+    /// What it was last sent counts for nothing: each agent's next goes whole.
+    fn forget(&mut self) {
+        self.roster.clear();
+        self.settle();
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        crate::memory::owners::EVENTS_FEED.sub(self.counted);
+    }
 }
 
 impl Outbox {
     pub fn new(topics: Option<HashSet<String>>) -> Outbox {
         Outbox { topics, ..Outbox::default() }
+    }
+
+    /// It takes the agents lean: each agent's entry lean once, then what changed of it ([`super::roster`]).
+    #[must_use]
+    pub fn lean(mut self) -> Outbox {
+        self.agents = Some(Kept::default());
+        self
     }
 
     /// It asked for frames of `kind` (`resync` it always gets).
@@ -663,6 +711,9 @@ impl Outbox {
         };
         self.topics = topics;
         self.last.clear();
+        if let Some(agents) = &mut self.agents {
+            agents.forget();
+        }
         added
     }
 
@@ -683,6 +734,9 @@ impl Outbox {
     pub fn resync(&mut self) {
         self.pending.clear();
         self.last.clear();
+        if let Some(agents) = &mut self.agents {
+            agents.forget();
+        }
         self.resync = true;
     }
 
@@ -700,14 +754,18 @@ impl Outbox {
     pub fn flush(&mut self, at: At, always: bool) -> Option<String> {
         let resync = std::mem::take(&mut self.resync);
         let frames = coalesce(std::mem::take(&mut self.pending));
-        let mut texts: Vec<&str> = Vec::with_capacity(frames.len() + 1);
+        let mut texts: Vec<Cow<'_, str>> = Vec::with_capacity(frames.len() + 1);
         if resync {
-            texts.push(RESYNC);
+            texts.push(Cow::Borrowed(RESYNC));
         }
         // What it holds of each thing is bounded as the ring is: past that, it forgets, which costs
         // at most a frame of each thing that says again what it was told.
         if self.last.len() > RING {
             self.last.clear();
+        }
+        // As are the agents' entries of a socket that takes them lean: past that, each one's next goes whole.
+        if let Some(agents) = self.agents.as_mut().filter(|agents| agents.roster.len() > RING) {
+            agents.forget();
         }
         for f in &frames {
             if let Some(k @ Key::State(_)) = &f.meta().key {
@@ -717,8 +775,20 @@ impl Outbox {
                 }
                 self.last.insert(k.clone(), d);
             }
-            texts.push(&f.text);
+            match (&mut self.agents, f.meta().kind.as_str(), &f.meta().agent) {
+                // Lean, an agent's entry is what changed of it since this socket was last sent it: nothing, when nothing did.
+                (Some(agents), "harness", _) => texts.extend(agents.roster.say(&f.text)),
+                (Some(agents), "harness_closed", Agent::Of(Some(id))) => {
+                    agents.roster.closed(id);
+                    texts.push(Cow::Borrowed(&f.text));
+                }
+                _ => texts.push(Cow::Borrowed(&f.text)),
+            }
         }
+        if let Some(agents) = &mut self.agents {
+            agents.settle();
+        }
+        let texts: Vec<&str> = texts.iter().map(|text| &**text).collect();
         (always || !texts.is_empty()).then(|| batch(at, &texts))
     }
 }

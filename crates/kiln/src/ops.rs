@@ -315,6 +315,7 @@ pub fn own() -> &'static [Op] {
             .chain(crate::secrets::mine::list_ops())
             .chain(crate::agentdefs::ops::list_ops())
             .chain(crate::confirms::list_ops())
+            .chain(crate::push::api::list_ops())
             .chain(crate::goals::ops::list_ops())
             .chain(crate::programs::ops::list_ops())
             .chain(crate::research::ops::list_ops())
@@ -402,7 +403,8 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
             // Read as its type, once its caller may run it: what doesn't fit is refused, saying
             // where and why.
             op.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(name)))?;
-            // The person whose turn the agent serves, or whose click confirmed it: on the audit line.
+            // Whose click confirmed it, and which agent asked: on the audit line (the turn's person is
+            // `audit::request`'s, from the caller).
             if let Some(n) = &note {
                 crate::audit::note("", "chat", n);
             }
@@ -499,7 +501,7 @@ mod tests {
     /// runners' `runners.read` or `runners.manage`), and reads exactly when its route is a GET.
     #[test]
     fn kiln_s_own_operations_are_routes_of_the_table() {
-        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto", "attachment": "ci-doctor", "incident": "i1", "user": "ada", "grant": "g1", "name": "auditor", "token": "t1", "program": "p1", "track": "T1", "skill": "s1"});
+        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto", "attachment": "ci-doctor", "incident": "i1", "user": "ada", "grant": "g1", "name": "auditor", "token": "t1", "program": "p1", "track": "T1", "skill": "s1", "machine": "m1"});
         assert!(own().iter().any(|o| o.name == "agents.start") && own().iter().any(|o| o.name == "plans.run") && own().iter().any(|o| o.name == "goals.add"));
         for op in own() {
             let route = (op.route)(&probe);
@@ -510,7 +512,7 @@ mod tests {
             assert_ne!(rule.pattern, crate::authz::UNNAMED.pattern, "{} ({method} /{}) has a rule of its own", op.name, s.join("/"));
             let needs = match op.name {
                 "runners.list" | "runners.diagnose" | "runners.engine" | "updates.list" => "runners.read",
-                "runners.repair" | "runners.engine.set" | "updates.retry" | "updates.policy" => "runners.manage",
+                "runners.repair" | "runners.engine.set" | "runners.engine.end_draining" | "runners.engine.cancel" | "updates.retry" | "updates.policy" => "runners.manage",
                 // Attachments and incidents: reading them is reading runs (each narrowed to what it
                 // looks after); attaching is `agents.attach`; reporting, the incident's own check.
                 "attachments.list" | "attachments.get" | "incidents.list" | "incidents.get" => "runs.read",

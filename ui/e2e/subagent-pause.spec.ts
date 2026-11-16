@@ -5,6 +5,7 @@
  * resumes it. In the production build against the mock (mock/agents.ts, the tree-* agents).
  */
 import { expect, test, type Page } from "@playwright/test";
+import { wholeList } from "./mission-list";
 
 /** Against a real kiln server (playwright.config.ts): these pause the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
@@ -32,7 +33,8 @@ test.beforeEach(() => {
 /** A subagent's row in the tree, among the dropdown's heads, engine lines and bodies (the same list holds them all). */
 const NODE = ".ms-node:has(> .ms-node-main)";
 test("Mission control's tree pauses a subagent kiln started, with what runs in it, and resumes it", async ({ page }) => {
-  await page.goto("/agents");
+  // Mission control's lists are windowed: the row asked for by its agent is in the page once the whole list is (mission-list.ts).
+  await wholeList(page);
   await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's details" }).click();
   const tree = page.getByRole("list", { name: "Storage lead's details" });
   const election = tree.locator(NODE, { hasText: "Leader election over QUIC" });

@@ -614,9 +614,9 @@ impl Learner {
                     continue;
                 }
             };
-            let guest_ns = match guest {
-                ManagedGuestTime::PerVcpu { ns, .. } => Some(ns),
-                ManagedGuestTime::Unheld(_) => None,
+            let (guest_ns, charged) = match guest {
+                ManagedGuestTime::PerVcpu { ns, charged, .. } => (Some(ns), charged),
+                ManagedGuestTime::Unheld(_) => (None, hex_api::Charged::Unknown),
             };
             if let Some(vm) = self.vms.get_mut(&scope) {
                 let (before, at) = vm.last;
@@ -626,6 +626,7 @@ impl Learner {
                     usage.cpu_usec.saturating_sub(before).saturating_mul(1_000),
                     guest_ns.as_deref(),
                     vm.guest_ns.as_deref(),
+                    charged,
                 )
                 .map_err(refused)?;
                 self.node

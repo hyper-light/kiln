@@ -1,6 +1,7 @@
 /** Attention API simulator, plan 01a199e1b177752e84dad5dc990e6a15. */
 import type http from "node:http";
 import type { AgentInfo } from "../src/api/harness.ts";
+import { leanSnapshot } from "./lean.ts";
 import type { AttentionFit, AttentionMark, AttentionReplay, AttentionSettings, AttentionSnapshot, AttentionUrgency } from "../src/api/attention.ts";
 import { requestsForFamily, requestsWakePark } from "../src/lib/attention-requests.ts";
 import type { AttentionClose, AttentionFrame, AttentionPair } from "../src/lib/attention-exposure.ts";
@@ -309,7 +310,7 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
   const since = (a: AgentInfo) => Math.min(...a.approvals.map((x) => x.at), a.held?.since ?? Number.POSITIVE_INFINITY);
   const requestOrder = [...waiting].sort((a, b) => Number(urgent.has(b.id)) - Number(urgent.has(a.id)) || since(a) - since(b) || a.id.localeCompare(b.id)).map((a) => a.id);
   for (const [id, urgency] of urgent) if (agents[id]) agents[id] = { ...agents[id], urgency };
-  send(200, {
+  const snapshot = {
     you: "owner",
     model: pair ? MODEL : null,
     agents,
@@ -321,6 +322,9 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
     settings_defaults: { auto_park_days: 3 },
     archived: [...archived.values()],
     undo: token,
-  } satisfies AttentionSnapshot);
+  } satisfies AttentionSnapshot;
+  // Read lean (W21-R02), as the list's page asks: each agent named once, with the last words of the rows it shows first.
+  if (req.method === "GET" && url.searchParams.get("lean") === "1") send(200, leanSnapshot(snapshot, Number(url.searchParams.get("said") ?? 0) || 0, now, all()));
+  else send(200, snapshot);
   return true;
 }

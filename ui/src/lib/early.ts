@@ -56,10 +56,31 @@ function forReader(answer: Promise<Response>, signal: AbortSignal | null | undef
   });
 }
 
+/** What the document asked (lib/early-script.ts), by URL: emptied by the first change the page makes. */
+let early = new Map<string, Promise<Response>>();
+
+/**
+ * The document's own answer for `url`, for a caller whose request isn't a plain read and so never
+ * passes through this module's fetch: the app's first sign-in check (lib/auth.ts asks with
+ * `cache: "no-store"` and a signal of its own). Its own copy of the body, while nothing the page
+ * did has changed what it says (a change empties what the document asked); none otherwise. The
+ * check then costs no round trip of its own: the document asked `/api/me` as it was parsed, and
+ * the app showed its splash until a second one, sent only once all its code was in, came back.
+ *
+ * Not held to `EARLY_MS`: that bound keeps a list read long before the events socket opened from
+ * standing as current, and who this is has no such stream to miss. It is what the server said of
+ * this document's own request, and a session that ended since is found by the next request's 401
+ * (api/client.ts), as one that ends a minute into a page is.
+ */
+export function earlyAnswer(url: string): Promise<Response> | null {
+  const asked = early.get(url);
+  return asked ? asked.then((r) => r.clone()) : null;
+}
+
 /** Puts this module's fetch in front of the page's (after lib/peer-base.ts's, which it calls): client.tsx imports this second, before anything reads. */
 function install() {
   const fetchHere = window.fetch.bind(window);
-  let early = new Map(Object.entries(window.__kilnEarly ?? {}));
+  early = new Map(Object.entries(window.__kilnEarly ?? {}));
   delete window.__kilnEarly;
   const taken = new Set<string>();
   const reading = new Map<string, Promise<Response>>();
@@ -96,4 +117,5 @@ function install() {
   };
 }
 
-if (typeof window !== "undefined") install();
+// A window without a fetch of its own has no page to read for (a test's stand-in).
+if (typeof window !== "undefined" && typeof window.fetch === "function") install();

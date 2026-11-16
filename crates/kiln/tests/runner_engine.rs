@@ -116,6 +116,22 @@ fn p2_3_a_runner_without_microvms_runs_host_says_why_and_cant_be_set_to_microvm(
     let (st, v) = put(&s, "box", json!({"engine": "host"}))?;
     assert_eq!((st, v.get("engine"), v.get("from"), v.get("asked"), v.get("version")), (200, Some(&json!("host")), Some(&json!("server")), Some(&json!("host")), Some(&json!(1))), "{v}");
     until("kept host on the runner", &log, || Ok(std::fs::read_to_string(&kept).unwrap_or_default()), |t| t.contains("host") && t.contains("\"version\":1"))?;
+    // Decision 8, with nothing to drain: the list says none and no switch drains; "End them now" ends nothing, and
+    // the switch is done, so cancelling it is refused (REST, MCP and code mode); a runner kiln doesn't know is 404.
+    assert_eq!((v.get("draining_sessions"), v.get("switch")), (Some(&json!([])), Some(&Value::Null)), "{v}");
+    let (st, v) = call(&s, "POST", &format!("/api/runners/{}/engine/end", machine("box")), None)?;
+    assert!(st == 200 && v.get("ended") == Some(&json!([])) && v.get("engine") == Some(&json!("host")), "End them now: {st} {v}");
+    let (st, v) = call(&s, "POST", &format!("/api/runners/{}/engine/cancel", machine("box")), None)?;
+    assert!(st == 409 && v.to_string().contains("drains: its switch to host is done"), "cancel: {st} {v}");
+    let (failed, said) = mcp(&s, "runners_engine_end_draining", json!({"runner": machine("box")}))?;
+    assert!(!failed && said.contains("\"ended\""), "MCP's End them now: {said}");
+    let (failed, said) = mcp(&s, "code_run", json!({"program": "return await kiln.runners.engine.cancel({ runner: input.runner })", "input": {"runner": machine("box")}}))?;
+    assert!(failed && said.contains("its switch to host is done"), "code mode's cancel: {said}");
+    for what in ["end", "cancel"] {
+        let (st, _) = call(&s, "POST", &format!("/api/runners/nobody/engine/{what}"), None)?;
+        assert_eq!(st, 404, "{what}");
+    }
+    assert_eq!(engine(&s, "box")?.get("version"), Some(&json!(1)), "neither set anything");
     let (failed, said) = mcp(&s, "code_run", json!({"program": "return (await kiln.runners.engine({ runner: input.runner })).from", "input": {"runner": machine("box")}}))?;
     assert!(!failed && said.contains("server"), "code mode reads it: {said}");
     // Taken away through MCP: what it can do decides again, and the runner keeps nothing.

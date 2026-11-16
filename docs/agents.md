@@ -549,17 +549,60 @@ server says, and counts every session it has, ended ones included, until it's up
   turns of those working. It empties as it sends, and that line says how it went; it slides open
   and shut, so the list under it moves smoothly. Every agent the list shows is Select all.
 
+### The snapshot, lean
+
+What Mission control reads as it opens grows with the agents there are, and most of it was what
+the page doesn't show: of 137 agents' list (162.6 KB), a quarter was each one's last words, which
+only the rows on the page show, and four tenths was each row's keys; and their attention snapshot
+(37.6 KB) named every agent four times by its 32 characters. The page reads both lean (docs/ci.md
+W21-R02):
+
+- **The list** (`GET /api/harness/sessions?lean=1`): each agent without where its harness started
+  and without its last words when it has some, as columns ([wire.md](wire.md), "Lists as
+  columns"): 18.0 KB for those 137. Every page reads it so: the document asks for it as it's
+  parsed, and an agent's news (an event) still carries its whole entry.
+- **The snapshot** (`GET /api/harness/attention?lean=1&said=<rows>`,
+  `crates/kiln/src/harness/attention/lean.rs`): the snapshot but for these: `ids` names every agent
+  once (a column of its own), the order's first; `order`, `request_order` and the visit's two
+  orders (`pair.order_a`, `pair.order_b`) name agents by place in `ids`, and a list that is `ids`'
+  first n in order is the number n; `agents` (the marks) and `archived` are columns, the marks
+  with `at` (whose they are, by place) when they aren't `ids`' first; and it leaves out what the
+  list's page doesn't read, saying so in `without`: the learned order's report (`model`: the
+  Settings page reads a replay's), the examination's and the urgency's, and each mark's score
+  (`rank`). 5.1 KB for those 137. An action's answer (`POST`) is the snapshot whole, as before, and
+  so is a read that doesn't ask for it lean.
+- **The last words of the rows the list opens on** come with the snapshot: `said=<rows>` asks for
+  those of the first `rows` rows the list shows as it opens (your pins in their order, then the
+  order's, without the parked, the archived and the ended; a row that has said nothing takes its
+  place among them) and of its last row (the page keeps the row Tab ends on in it, wherever it's
+  scrolled), as `said: {at, v}`, whose by place in `ids`. The page asks for as many rows as can
+  begin within two viewports' height (the rows it mounts before it's scrolled), none shorter than
+  a row's least height: 22 on a page 900 px tall, 6.6 KB when each has said as much as a summary
+  holds. So the list is drawn with its lines, with no read after the snapshot.
+- **Any other row's** are asked for as it comes to the page (`GET
+  /api/harness/sessions?summaries=`, every row of one render in one request): the list mounts the
+  rows within a viewport of what shows, so a row's are asked for a viewport's travel before it's
+  seen. Until they're in, its line is empty, in the room it always takes; no other text stands in
+  for them. Where the list opens some other way than in the order (another sort, a filter kept from
+  before), its first rows wait for theirs before the list is drawn.
+- **What changes after** comes lean too: the page's events socket asks for the agents lean
+  (`/api/events?lean=1`, [wire.md](wire.md), "The events socket"), and is told each agent's entry
+  once, then only what changed of it, and nothing while only what it's saying does (its last
+  words come as its turn ends, when a row first shows them). With one agent of the 137 at work,
+  the socket brought 7.9 to 9.3 KB in the twelve seconds after the page's reads, where it brought
+  50 to 54 KB: all the page takes in over them, 65 to 67 KB, where 108 to 112 KB.
+
 ## API
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
-| GET | `/api/harness/sessions` | `Info[]` |
+| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes). Without `target`, every machine's by its target; with `shared=1`, each distinct list once: `{ lists: KindInfo[][], targets: { <target>: <which of lists> } }` (machines of one kind offer the same, so by target the answer is one list as many times as there are machines) |
+| GET | `/api/harness/sessions?lean=&summaries=` | `Info[]`; with `lean=1`, the list as the pages read it as they open: each session without where its harness started (`starts`, `runs`) and without its last words when it has some (`summary`; one that has said nothing keeps its empty one), written as columns ([wire.md](wire.md), "Lists as columns"), `{rows, cols, without}`; with `summaries=<id>,<id>…`, the last words of those of them the caller sees, `{<id>: summary}`: what a lean list left out, for the rows a page shows (see "The snapshot, lean") |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?, ids?}` → `Info[]`; `ids`: the ids to start them under, one each (32 lowercase hex digits), made by the client so its page can open the agent's own page before it has started (docs/ci.md W21-R15); an id that's a session's already, or another start's under way, is refused (409) before anything starts, so a start asked again under its ids never starts twice |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good (409 while its archive or restore is under way: it goes on; end it once that's done) |
-| POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it |
-| POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
-| POST | `/api/harness/command` | `{ids, command, key?}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`); each agent's message id is made from `key` (or the `Idempotency-Key` header, else the command's own `id`) and the agent, so sending it again sends the same messages |
+| POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it. An `interrupt`, a `control` and a `restart` aren't commands here but operations, each its own route (`agents.interrupt`, `agents.control`, `agents.restart`: `POST /api/harness/agents/:id/<op>`), 400 naming it; removing an agent is `agents.remove` (`DELETE /api/harness/agents/:id`), and moving one to another machine `agents.move` (`POST /api/harness/agents/:id/move` `{to, now?, kind?, model?}`, 202 as its move goes on after the answer) |
+| POST | `/api/harness/agents/:id/{pin,unpin,park,unpark,archive,restore}` | an agent's place in your attention (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S6): `agents.pin`, `agents.unpin`, `agents.park` (`{until}`, Unix ms, in the future), `agents.unpark`, `agents.archive` and `agents.restore` (`{copy?}`: from kiln's copy of its conversation), each `{key?, mode?, visit?, revision?}` → the snapshot, as `POST /api/harness/attention` answers its other actions (which refuses these, 400, naming the operation). Attention is a person's: an agent's call runs once its person's click confirms it |
+| POST | `/api/harness/broadcast` | `agents.broadcast` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S5): one thing to many agents on every machine, among those you act on: a prompt or slash command, a command (`{to: {ids}, command}` for one command to the agents listed), or answers to what waits on you; each agent's message id is made from `key` (or the `Idempotency-Key` header, else a command's own `id`), the caller and the agent, so sending it again sends the same messages; an agent's broadcast waits on its person's click; see below |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it. Native Codex subagents return `reset: true`: replace previous output with this snapshot (last 64 KiB), regardless of `since`; `pending: true` means a live child has not produced output yet |
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state&window=1&lean=1` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets"); `window=1`, a first load of its newest events alone, `lean=1`, settled tool calls without their bodies (docs/wire.md, "Windows") |
@@ -796,8 +839,8 @@ search). Every route under `/api/harness/sessions/<id>` and the session's socket
 socket before it's upgraded. So do the agents operations (`get`, `children`, `result`, `changes`,
 `workspace`, `send`, `interrupt`, `stop`, `change`, `land`, `wait`), over MCP and `/api/ops`. A
 session they see but don't act on (an agent watching a fellow agent) is read-only: its socket
-answers each command with an error. A broadcast and `POST /api/harness/command` pick only among
-the sessions the caller acts on, and name the others they were asked for (`unreached`). A session
+answers each command with an error. A broadcast (`agents.broadcast`) picks only among
+the sessions the caller acts on, and names the others it was asked for (`unreached`). A session
 kiln can't say whose it is (opened before kiln kept that) is reached by the owner and managers
 alone.
 
@@ -891,7 +934,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | Operation | Route | Input → answer |
 |---|---|---|
 | `agents.list` | `GET /api/harness/agents` | `machine?` (a runner's name, `local` for the server), `harness?`, `state?` (a stand or a status), `parent?`, `plan_run?` → `{agents: [Agent]}` |
-| `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
+| `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state, live, definition}` (its state without the catalogs; `definition`: the agent definition it started from, `{id, version, name, current}`, its `version` then and the definition's `current` one now, or null: docs/api.md, "Agent definitions") |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
 | `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?, status?: {key, task?}}` (or the `Idempotency-Key` header) → durable receipt `{sent: true, retained: true, message, id, revision, generation, disposition, repeat}`: retained custody is separate from actual model consumption; mode defaults to `steer` for agents, `queue` for people ("Sending again" and "Replaceable progress", below) |
@@ -1376,9 +1419,15 @@ to `s28-pi-agentfile`).
   tool. What's still to come is the launch handing each connection to it.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
-- **Move to another machine, or switch to another harness.** Not yet: it stays where it started, in
-  the harness it started with, and says so when asked. To go on elsewhere or in another harness, end
-  it and start a new one there.
+- **Move to another machine.** Not yet: it stays where it started, and says so when asked. To go on
+  elsewhere, end it and start a new one there.
+- **Switch to another harness**, as on its machine: one click (kiln plan 01a1dd2e…, P6c.5). Once its
+  turn is over and the other harness's image is in its machine's store (built there once where it
+  isn't), its harness is swapped for the other in the same microVM, no microVM started, its
+  conversation carried from kiln's own timeline (its harness's own record is its microVM's): into
+  Codex's thread as its items, else in words with the next message. Where its machine's microVMs swap
+  no harness in place (Hex's, until its wire calls land, P6c.2) it's refused, saying so, and it goes
+  on as it was.
 - **Not yet**, as well as the start itself: a terminal into the microVM, its sign-in and exec
   there; git signing and a git host's credentials by the microVM's own key; kiln's MCP, over that
   lane; and the commands it asks kiln to run on other machines,
@@ -1406,6 +1455,7 @@ What this page describes, once an isolated agent's start goes through:
 | Taking over a found session | Can't: a microVM's harness is never found on the machine. |
 | Moving it to another machine | Not yet: your volume stays on the machine it ran on. |
 | Live overrides: ports, egress, networks, volumes (above) | Taken by its microVM live where its runtime takes them (`Holds::live`): through Hex once its wire calls land (P6b.3); until then refused, each saying why in `state.overrides`, its harness's folders and kiln's scope taken all the same. |
+| Components swapped in (below) | Laid by its microVM where its runtime lays them (`Holds::components`, and `Holds::swaps` for its harness's own): through Hex once its wire calls land (P6c.2); until then refused, saying why, its image's own running on. |
 | The machine's own tools (Xcode, MSVC) | Can't: refused, saying which and why (above). |
 
 ## Live overrides: ports, egress, networks and volumes
@@ -1417,22 +1467,55 @@ a resume, a restore), for the session's life.
 
 | Operation | What it takes | Engines |
 |---|---|---|
-| `sessions.ports.publish` / `unpublish` | `agent`, `bind` (the host address: who may reach it), `host_port`, `guest_port`, `protocol` (`tcp`, `udp`), `member` | microVM |
+| `sessions.ports.publish` / `unpublish` | `agent`, `bind` (the host address: who may reach it), `host_port`, `guest_port`, `protocol` (`tcp`, `udp`); a port reaches the members its image gives it coming in, as Shards publishes one | microVM |
 | `sessions.egress.grant` / `revoke` | `agent`, `host` (a DNS name or an address), `port`, `member` | microVM |
 | `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member` | microVM |
 | `sessions.volumes.add` / `remove` | `agent`, `path` (a folder of its machine), `access` (`ro`, `rw`), `at` (where a microVM sees it), `members` | every engine |
+| `sessions.components.swap` / `restore` | `agent`, `kind` (`agent`, `harness`, `mcp`), `path` (its member's directory: `/harness/<harness>`, the default, `/agents/<name>`, `/mcp/<name>`), `source` and its pin (`checksum`, `version_id`), `force` | every engine |
 
 A `member` is `harness` (the default), `agent:<name>` or `mcp:<name>`. Every grant names who, to whom, which
 ports and which way: nothing is implied. Each is on REST (`POST /api/ops/<name>`, and
-`POST /api/harness/sessions/:id/{ports,egress,networks,volumes}`, a removal at `…/unpublish`, `…/revoke`,
-`…/disconnect` or `…/remove`), MCP (`sessions_ports_publish`, …) and code mode (`kiln.sessions.ports.publish`).
-None is read-only; the removals are destructive. `agents_get` says the session's engine and the operations it
-takes (`live`): a session on its machine's host is offered its volumes' alone, and refuses the network ones,
-naming its engine (409).
+`POST /api/harness/sessions/:id/{ports,egress,networks,volumes,components}`, a removal at `…/unpublish`,
+`…/revoke`, `…/disconnect`, `…/remove` or `…/restore`), MCP (`sessions_ports_publish`, …) and code mode
+(`kiln.sessions.ports.publish`). None is read-only; the removals are destructive. `agents_get` says the session's
+engine and the operations it takes (`live`): a session on its machine's host is offered its volumes' and
+components' alone, and refuses the network ones, naming its engine (409).
+
+`sessions.grants` (`GET /api/harness/sessions/:id/grants`, MCP `sessions_grants`, code mode
+`kiln.sessions.grants`, read-only) says what the session's launch gave it as it started, its `base`, beside
+these overrides (`live`): its working `folder`, the machine's folders it sees (`volumes`: `host`, `at`,
+`writable`), the folders its harness is allowed (`allowed_dirs`), its `plug_roots` and `egress_ceiling` as its
+launch declared them, what it reaches past its microVM (`egress`, as `/runs/reach` says; `{"as": "host"}` on its
+host, which narrows nothing), its credentials by reference (`secrets`: `name`, `toward`), and `ports` and
+`networks`, none at a launch (default deny). A microVM session's runner records its base as it launches it
+(`runs.granted`); one from a runner before that says `reported: false`.
 
 A volume joins its harness's own allowed folders, each harness's way, and kiln's scope for the session: its
 file calls there are inside its folder (Permissions' `folder`), and a read-only one's changes are refused at each
-call kiln holds. In a microVM it's also plugged in, read-only or writable as asked.
+call kiln holds. In a microVM it's also plugged in, read-only or writable as asked: by default at
+`/volumes/<its name>`, beneath the session's own volume root. A microVM takes a folder live strictly beneath the
+plug roots its launch declared (the top-level directories of its project and its person's volumes, and `/volumes`:
+`state.overrides.roots`), as Shards plugs one in (D271); one elsewhere is refused, saying them, until a member
+restarted can take it (Shards' D270). Egress is granted live up to the most its launch declared
+(`state.overrides.ceiling`): the org's policy, `[agents] egress_ceiling` (`host:port` each; none by default, so
+none is granted live), declared as each session starts. Past either, it's refused (409), saying what it declared.
+
+A component (P6c.3; the person: "hot-swap agents, harnesses, and mcps at given paths in builds sans microvm
+re-build") is an Agentfile's AGENT, HARNESS or MCP install built alone from its source, pinned as the Agentfile
+pins one (Shards' D54): a Git URL whose `#REF` is a full commit, an http(s) or `s3://` source with its `checksum`
+(`sha256:<hex>`), an s3 object by its `version_id`, an OCI reference by its digest; a path, which names a build
+context's file, is refused. One component is held at a path, a swap there taking the place of the one before, and
+its member alone starts again with it once nothing is under way (`force`: at once, its turn cut short), its
+conversation going on through its harness's own resume. In a microVM its machine lays it over its image's own,
+read-only: an agent's or an MCP server's while the run runs (`Change::Swap`), its harness's by swapping its harness
+for itself in the same microVM with it laid (`Run::swap`, as the harness switch does: the same box). Each launch
+after lays every one it holds (`Launch::components`), a harness it switched from aside. On its machine's host a
+session has one member, its harness: kiln installs a harness from a pinned http(s) source (its executable, or a
+gzip tar holding it at its root or in its `bin/`) in the session's own folder, held to its checksum, and runs it
+there in place of the machine's from then on, installing it again where it's gone (a session moved to another
+machine); a Git, `s3://` or OCI source is built into a component first, which a microVM session's machine does.
+`restore` gives back the image's own (on the host, the machine's harness), and the versions no longer held are
+let go of as its harness next starts.
 
 | Harness | Its own allowed folders | A change while it runs |
 |---|---|---|

@@ -665,10 +665,12 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
         {ports.map((h) => (
           <li key={`live:${h.port.bind}:${h.port.host_port}/${h.port.protocol}`} className="sb-row sb-flow">
             <Took took={h.microvm} place="Its microVM" />
-            <span className="sb-mono sb-clip" title={`${h.port.bind}:${h.port.host_port} on its machine → ${h.port.guest_port}/${h.port.protocol}, to ${said(h.port.member)}`}>
+            <span
+              className="sb-mono sb-clip"
+              title={`${h.port.bind}:${h.port.host_port} on its machine → ${h.port.guest_port}/${h.port.protocol} in its microVM: the members its image gives that port`}
+            >
               {h.port.bind}:{h.port.host_port} → {h.port.guest_port}/{h.port.protocol}
             </span>
-            <span className="sb-dim sb-clip">to {said(h.port.member)}</span>
             <span className="sb-acts">
               <button
                 type="button"
@@ -684,7 +686,7 @@ function Network({ d, o, agentId }: { d: SandboxDetail; o: LiveOverrides | undef
           </li>
         ))}
         {base.ingress.length + ports.length === 0 && <li className="sb-deny">nothing published</li>}
-        {adding === "ingress" ? <PublishForm d={d} live={live} onDone={() => setAdding(null)} /> : <AddLine word="Publish a port" onAdd={() => setAdding("ingress")} />}
+        {adding === "ingress" ? <PublishForm live={live} onDone={() => setAdding(null)} /> : <AddLine word="Publish a port" onAdd={() => setAdding("ingress")} />}
       </ul>
       <div className="sb-sub">
         <span className="sb-k">Egress</span>
@@ -819,12 +821,12 @@ function FormActs({ word, busy, disabled, onDo, onCancel }: { word: string; busy
   );
 }
 
-function PublishForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone: () => void }) {
+/** A port published into its microVM: to the members its image gives that port (Shards D269), so no member is named. */
+function PublishForm({ live, onDone }: { live: Live; onDone: () => void }) {
   const [bind, setBind] = React.useState("127.0.0.1");
   const [hostPort, setHostPort] = React.useState("8080");
   const [guest, setGuest] = React.useState("8080");
   const [protocol, setProtocol] = React.useState<"tcp" | "udp">("tcp");
-  const [member, setMember] = React.useState(firstAgent(d));
   return (
     <li className="sb-form" aria-label="Publish a port">
       <span className="sb-form-row">
@@ -852,14 +854,11 @@ function PublishForm({ d, live, onDone }: { d: SandboxDetail; live: Live; onDone
         <ArrowRight size={12} aria-hidden="true" />
         <input className="sb-in sb-port" value={guest} inputMode="numeric" aria-label="Port in its microVM" onChange={(e) => setGuest(e.target.value)} />
       </span>
-      <span className="sb-form-row">
-        <MemberSelect members={d.members} value={member} onChange={setMember} label="To" />
-      </span>
       <FormActs
         word="Publish"
         busy={live.busy}
         onCancel={onDone}
-        onDo={() => live.run("Couldn't publish it", () => overridesApi.publish(live.agentId, { member, bind: bind.trim(), host_port: Number(hostPort), guest_port: Number(guest), protocol }), onDone)}
+        onDo={() => live.run("Couldn't publish it", () => overridesApi.publish(live.agentId, { bind: bind.trim(), host_port: Number(hostPort), guest_port: Number(guest), protocol }), onDone)}
       />
       {live.why && <span className="sb-why">{live.why}</span>}
     </li>
