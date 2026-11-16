@@ -440,7 +440,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         Question::Act { .. } | Question::Told { .. } | Question::Answer { .. } => json!({"ok": {}}),
         Question::Directory => json!({ "runners": hub.directory().await }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } => json!({"error": "not a question for kiln's operations"}),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } | Question::Lessor { .. } => json!({"error": "not a question for kiln's operations"}),
     };
     let size = answer.to_string().len();
     if size > RUNNER_ANSWER_MAX {
