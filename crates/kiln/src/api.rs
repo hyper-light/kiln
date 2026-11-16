@@ -1434,6 +1434,25 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, name, body)).await
         }
+        // A person's experiments on their agent definitions (`crate::agentdefs::experiments`, kiln plan
+        // 01a1cd8e862e7169a074db3d5fa33f3d P7.1): every one of theirs by definition, as the UI reads them; each change
+        // under its definition, its path naming what its operation takes.
+        (&Method::GET, ["api", "agentdef-experiments"]) => boxed(|| own_op(&hub, &caller, "agentdefs.experiments.list", query_value(&q))).await,
+        (_, ["api", "agentdefs", id, "experiments", rest @ ..]) => {
+            let Some((name, named)) = crate::agentdefs::experiments::ops::op_of(&method, rest) else {
+                return Err(err(StatusCode::NOT_FOUND, format!("no route {method} {}", s.join("/"))));
+            };
+            let named: Vec<(&str, String)> = named.into_iter().map(|(k, v)| (k, v.to_owned())).collect();
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+                for (k, v) in named {
+                    o.insert(k.into(), json!(v));
+                }
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
+        }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }

@@ -52,11 +52,14 @@ fn settings_of(v: &Value) -> Result<Settings, Fail> {
         skills: field(v, "skills")?.unwrap_or_default(),
         limits: field(v, "limits")?.unwrap_or_default(),
         agentfile: field::<Option<String>>(v, "agentfile")?.flatten(),
+        engine: field::<Option<crate::harness::engine::Engine>>(v, "engine")?.flatten(),
+        cpus: field::<Option<u32>>(v, "cpus")?.flatten(),
+        memory: field::<Option<u64>>(v, "memory")?.flatten(),
     })
 }
 
 /// A flag as JSON gives it, or a query does (`1`, `true`).
-fn flag(v: &Value, k: &str) -> bool {
+pub(crate) fn flag(v: &Value, k: &str) -> bool {
     v.get(k).is_some_and(|b| b.as_bool().unwrap_or_else(|| matches!(b.as_str(), Some("1" | "true"))))
 }
 
@@ -115,6 +118,9 @@ async fn update(cx: Cx, v: Value) -> Out {
         skills: field(&v, "skills")?,
         limits: field(&v, "limits")?,
         agentfile: field(&v, "agentfile")?,
+        engine: field(&v, "engine")?,
+        cpus: field(&v, "cpus")?,
+        memory: field(&v, "memory")?,
     };
     let base = field::<Option<i64>>(&v, "base")?.flatten();
     let saved = super::update(&cx.hub, &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
@@ -153,16 +159,19 @@ async fn check(cx: Cx, v: Value) -> Out {
 /// A definition run: an agent started as `agents.start` starts one, through the one start path (its
 /// route needs what `agents.start`'s does, `agents.run`; the caller's right to start agents on that
 /// machine is checked there, and the start audited), with the definition's harness, model and
-/// Agentfile, in a microVM of its own, first told its instructions and the task. Each session it
-/// opens says it started from this definition at this version (`super::sessions`), a start that
-/// waits for room too.
+/// Agentfile, in a microVM of its own (sized as it says, where it says), or on its machine's host where
+/// its engine is `host`, first told its instructions and the task. Each session it opens says it started
+/// from this definition at this version (`super::sessions`), a start that waits for room too; while
+/// one of its experiments is live, each is that experiment's draw (`super::experiments::assign`, from
+/// `harness::lineage::start`).
 async fn run(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let (name, version, d) = super::settings_of(&cx.hub, &who(&cx)?, &id).await.map_err(fail)?;
     let task = v.get("prompt").and_then(Value::as_str);
+    let host = d.engine == Some(crate::harness::engine::Engine::Host);
     // Its task apart, for a split's variant that's another agent to retell (P7.1); its definition is kiln's to say
     // (`Ask::definition`, below), which a split matches.
-    let mut ask = json!({"kind": d.harness, "isolation": "microvm", "name": v.get("name").and_then(Value::as_str).unwrap_or(&name)});
+    let mut ask = json!({"kind": d.harness, "isolation": if host { "none" } else { "microvm" }, "name": v.get("name").and_then(Value::as_str).unwrap_or(&name)});
     if let (Some(o), Some(t)) = (ask.as_object_mut(), task) {
         o.insert("task".into(), json!(t));
     }
@@ -178,6 +187,7 @@ async fn run(cx: Cx, v: Value) -> Out {
     }
     let mut ask: crate::harness::lineage::Ask = serde_json::from_value(ask).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("a definition's start couldn't be made: {e}")))?;
     ask.definition = Some(super::sessions::Definition { id: id.clone(), version });
+    ask.size = super::size_of(&d);
     let mut started = crate::harness::ops::start_ask(cx, ask).await?;
     if let Some(o) = started.as_object_mut() {
         o.insert("agentdef".into(), json!({"id": id, "version": version}));
@@ -190,9 +200,9 @@ async fn sessions(cx: Cx, v: Value) -> Out {
     super::sessions::list(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)
 }
 
-/// The operations, in the order they are listed.
+/// The operations, in the order they are listed: their experiments' last (`super::experiments::ops`).
 pub fn list_ops() -> Vec<Op> {
-    vec![
+    let mut ops = vec![
         Op {
             name: "agentdefs.list",
             summary: "Agent definitions (an agent as data: one of kiln's ten harnesses, its model, instructions, tools and MCP servers, skills, limits and Agentfile): yours, newest change first, and beside them, read only, kiln's own (`builtin`: one per CI skill, one per harness, and the agents kiln starts from its UI, such as the about card; agentdefs.copy makes one yours). `all`: everyone's, for the server's owner and those with agentdefs.manage.",
@@ -213,7 +223,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.create",
-            summary: "Keep an agent definition of yours: its `name` (lowercase letters and digits joined by `.`, `_` or `-`; once among yours), `harness` (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi), `model`, `instructions`, `tools`, `mcp` servers, `skills`, `limits` and `agentfile` (one of yours, `agentfile:<id>`, or kiln's for its harness, `harness-<harness>`; left out: its harness's own). Checked first as agentdefs.check checks it: one kiln can't run isn't kept, and its words say why. Answers it, version 1.",
+            summary: "Keep an agent definition of yours: its `name` (lowercase letters and digits joined by `.`, `_` or `-`; once among yours), `harness` (claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi), `model`, `instructions`, `tools`, `mcp` servers, `skills`, `limits` and `agentfile` (one of yours, `agentfile:<id>`, or kiln's for its harness, `harness-<harness>`; left out: its harness's own), and where its sessions run: `engine` (`microvm`, the default, or `host`, its harness a process of its machine's) and its microVM's `cpus` and `memory` (bytes, whole MiB; left out, kiln sizes it). Checked first as agentdefs.check checks it: one kiln can't run isn't kept, and its words say why. Answers it, version 1.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentdefsCreate>(),
@@ -285,7 +295,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.run",
-            summary: "Run one of your agent definitions: an agent started as agents.start starts one, with its harness and model, in a microVM of its own made from its Agentfile (its harness's own where it names none), first told its instructions and then your `prompt`; `on` and `cwd` as agents.start takes them, `name` its name (by default the definition's). Answers as agents.start does, with the definition's id and version (`agentdef`).",
+            summary: "Run one of your agent definitions: an agent started as agents.start starts one, with its harness and model, in a microVM of its own made from its Agentfile (its harness's own where it names none) and sized as it says (or on its machine's host, its `engine` `host`), first told its instructions and then your `prompt`; `on` and `cwd` as agents.start takes them, `name` its name (by default the definition's). While one of its experiments is live, each session it starts is that experiment's draw: one of its variants, by their weights (agentdefs.experiments.*). Answers as agents.start does, with the definition's id and version (`agentdef`).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentdefsRun>(),
@@ -294,14 +304,16 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.sessions",
-            summary: "The sessions started from one of your agent definitions (or from one of kiln's own, `kiln:<name>`, as you started them): newest first, each with the definition's version it started from (`version`; behind the definition where less than its `version` now), how it stands (`state`, as agents.list's `stand`; `gone` once kiln no longer has it), its `runner` and `engine` (host or microvm), and its brief (`agent`). With what their starts took (`starts`): how many kiln recorded (`n`), and by how each started (`by_kind`: its engine), how many, how many were timed (a session's first start: from its open on its machine to its harness running) and their median (`p50_ms`); `warm`, the warm hosts its runners' nodes keep for it, where they say (none does yet).",
+            summary: "The sessions started from one of your agent definitions (or from one of kiln's own, `kiln:<name>`, as you started them): newest first, each with the definition's version it started from (`version`; behind the definition where less than its `version` now), how it stands (`state`, as agents.list's `stand`; `gone` once kiln no longer has it), its `runner` and `engine` (host or microvm), its brief (`agent`), and the definition's experiment that drew it and the variant it got (`experiment`, `variant`), where one did. With what their starts took (`starts`): how many kiln recorded (`n`), and by how each started (`by_kind`: its engine), how many, how many were timed (a session's first start: from its open on its machine to its harness running) and their median (`p50_ms`); `warm`, the warm hosts its runners' nodes keep for it, where they say (none does yet).",
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentdefsSessions>(),
             route: |v| Ok((Method::GET, path(&["api", "agentdefs", &id_of(v)?, "sessions"]))),
             run: |cx, v| Box::pin(sessions(cx, v)),
         },
-    ]
+    ];
+    ops.extend(super::experiments::ops::list_ops());
+    ops
 }
 
 /// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from its
@@ -311,6 +323,16 @@ pub mod input {
     use serde::Deserialize;
 
     use super::{Limits, Mcp};
+
+    /// Where an agent's sessions run.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Engine {
+        /// Its harness a process of its machine's.
+        Host,
+        /// A microVM of its own, made from its Agentfile.
+        Microvm,
+    }
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -345,6 +367,15 @@ pub mod input {
         /// One of your Agentfiles (`agentfile:<id>`) or kiln's for its harness (`harness-<harness>`);
         /// left out: its harness's own.
         pub agentfile: Option<String>,
+        /// Where its sessions run: `microvm` (left out, the same: a microVM of its own, made from its
+        /// Agentfile) or `host` (its harness a process of its machine's, with no Agentfile or size).
+        pub engine: Option<Engine>,
+        /// Its microVM's vCPUs; left out: as kiln sizes it.
+        #[schemars(range(min = 1))]
+        pub cpus: Option<u32>,
+        /// Its microVM's memory, in bytes, a whole number of MiB; left out: as kiln sizes it.
+        #[schemars(range(min = 1))]
+        pub memory: Option<u64>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -363,6 +394,14 @@ pub mod input {
         pub limits: Option<Limits>,
         /// Null: back to its harness's own.
         pub agentfile: Option<String>,
+        /// `microvm` or `host`; null: back to a microVM of its own.
+        pub engine: Option<Engine>,
+        /// Null: back to kiln's sizing.
+        #[schemars(range(min = 1))]
+        pub cpus: Option<u32>,
+        /// In bytes, a whole number of MiB; null: back to kiln's sizing.
+        #[schemars(range(min = 1))]
+        pub memory: Option<u64>,
         /// The version your change is made over: its `version` as you read it. Refused (409) where it
         /// isn't current, saying the version it is now. Without it, it's made over the version kiln finds.
         #[schemars(range(min = 1))]
@@ -422,6 +461,9 @@ pub mod input {
         pub skills: Option<Vec<String>>,
         pub limits: Option<Limits>,
         pub agentfile: Option<String>,
+        pub engine: Option<Engine>,
+        pub cpus: Option<u32>,
+        pub memory: Option<u64>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

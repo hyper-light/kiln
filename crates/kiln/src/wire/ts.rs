@@ -106,6 +106,9 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<crate::agentfiles::Version>();
     c.visit::<crate::agentfiles::Saved>();
     c.visit::<crate::agentfiles::check::Check>();
+    // Agent definitions' experiments (`agentdefs.experiments.*`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1):
+    // one as each answers it, its variants and criteria.
+    c.visit::<crate::agentdefs::experiments::Experiment>();
 }
 
 /// Every file as it should be, by its name in [`dir`], the index among them.

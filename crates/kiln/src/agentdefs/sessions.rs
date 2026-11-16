@@ -91,6 +91,12 @@ pub struct Listed {
     pub engine: Option<&'static str>,
     /// It as `agents.list` briefs it; none once it's gone.
     pub agent: Option<Value>,
+    /// The definition's experiment that drew it, and the variant it got (`super::experiments`, kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d P7.1); none for a session started outside one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experiment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 /// What a start of a harness was, as kiln's record of it says: its engine. (How a microVM started, cold, from a
@@ -137,17 +143,21 @@ pub async fn list(hub: &Hub, who: &Who, id: &str) -> R<Value> {
         }
     }
     let (i, person, all) = (id.to_owned(), who.person.clone(), who.all);
-    let rows: Vec<(String, i64, String, i64)> = hub
+    // Each with the experiment's draw it started as, where one drew it.
+    let rows: Vec<(String, i64, String, i64, Option<String>, Option<String>)> = hub
         .store
         .read(move |c| {
-            let mut st = c.prepare("SELECT session_id, version, target, at FROM agent_def_sessions WHERE agent_def_id = ?1 AND (?3 OR person = ?2) ORDER BY at DESC, session_id")?;
-            let rows = st.query_map(params![i, person, all], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+            let mut st = c.prepare(
+                "SELECT s.session_id, s.version, s.target, s.at, d.experiment_id, d.variant_id FROM agent_def_sessions s LEFT JOIN agent_def_experiment_draws d ON d.session_id = s.session_id \
+                 WHERE s.agent_def_id = ?1 AND (?3 OR s.person = ?2) ORDER BY s.at DESC, s.session_id",
+            )?;
+            let rows = st.query_map(params![i, person, all], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .await?;
     let mut listed = Vec::with_capacity(rows.len());
     let mut infos = Vec::new();
-    for (session, version, target, at) in rows {
+    for (session, version, target, at, experiment, variant) in rows {
         match hub.harness.info(&session) {
             Some(info) => {
                 listed.push(Listed {
@@ -158,10 +168,12 @@ pub async fn list(hub: &Hub, who: &Who, id: &str) -> R<Value> {
                     state: crate::harness::wait::stand(&info).to_owned(),
                     engine: Some(if info.isolation.is_some() { "microvm" } else { "host" }),
                     agent: Some(crate::harness::wait::brief(&info)),
+                    experiment,
+                    variant,
                 });
                 infos.push(info);
             }
-            None => listed.push(Listed { id: session, version, at, runner: crate::harness::wait::machine(&target).to_owned(), state: "gone".to_owned(), engine: None, agent: None }),
+            None => listed.push(Listed { id: session, version, at, runner: crate::harness::wait::machine(&target).to_owned(), state: "gone".to_owned(), engine: None, agent: None, experiment, variant }),
         }
     }
     let sessions = serde_json::to_value(&listed).map_err(|e| Error::Other(e.into()))?;
