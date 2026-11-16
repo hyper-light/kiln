@@ -58,8 +58,8 @@ import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
-import { DefGroupRows, GroupHead, StandCounts, OpenHead, ownDefOf, SandboxLine, watchUnseen } from "./definitions";
-import { EngineRows } from "./engine-rows";
+import { GroupHead, StandCounts, OpenHead, SandboxLine, watchUnseen } from "./definitions";
+import { MicroVmRows } from "./engine-rows";
 import { agentdefsRes } from "@/api/agentdefs";
 import { sandboxesRes } from "@/api/microvms";
 import { KindGlyph } from "./kind-glyph";
@@ -258,7 +258,6 @@ const Row = React.memo(function Row({
   onSelect,
   tree,
   onTree,
-  manages,
   updated,
   mark,
   reason,
@@ -285,8 +284,6 @@ const Row = React.memo(function Row({
   /** Its dropdown is open under it: its subagents' tree, its engine, and the agent it was started from when it's one of yours. */
   tree: boolean;
   onTree?: (id: string) => void;
-  /** It was started from a definition of yours: its dropdown manages that agent too. */
-  manages?: boolean;
   /** It came back since you last looked: opening it, or Clear Updated from its menu, takes that off. */
   updated?: boolean;
   /** Where it's kept for you, as the server has it. */
@@ -499,14 +496,7 @@ const Row = React.memo(function Row({
           {(stand === "finished" || stand === "ready" || stand === "ended") && !parked && (a.files_changed ?? 0) > 0 && <RowReview agentId={a.id} />}
         </span>
         <span className="ms-tail">
-          <button
-            type="button"
-            className="ms-subs"
-            aria-expanded={tree}
-            aria-label={`${tree ? "Hide" : "Show"} ${label}'s ${manages ? "subagents, engine and agent" : "subagents and engine"}`}
-            data-on={tree || undefined}
-            onClick={() => onTree?.(a.id)}
-          >
+          <button type="button" className="ms-subs" aria-expanded={tree} aria-label={`${tree ? "Hide" : "Show"} ${label}'s details`} data-on={tree || undefined} onClick={() => onTree?.(a.id)}>
             <KindGlyph kind="agent" />
             {tree ? <ChevronUp size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
           </button>
@@ -562,14 +552,25 @@ function MissionTreeRows({ id, list, rowAsk }: { id: string; list: readonly Agen
   const root = list.find((x) => x.id === id);
   const { going, remove } = useRemoving();
   const rows = React.useMemo(() => (root ? drawn(subagentTree(root, list).filter((n) => !going.has(n.key))) : []), [root, list, going]);
-  // Beside its engine and the agent's own groups (definitions.tsx), its subagents are the first group: open, its head one line.
+  // Before its sandboxes and its agent's groups (engine-rows.tsx), its subagents are the first group, every row's: open, its head one line.
   const [shut, setShut] = React.useState(false);
-  if (!root || rows.length === 0) return null;
+  if (!root) return null;
   const atWork = rows.filter((r) => r.stand === "working" || r.stand === "needs").length;
   return (
     <>
-      <GroupHead label="Subagents" open={!shut} onOpen={() => setShut(!shut)} stand={atWork ? "working" : "done"} summary={<StandCounts stands={rows.map((r) => r.stand)} />} />
+      <GroupHead
+        label="Subagents"
+        open={!shut}
+        onOpen={() => setShut(!shut)}
+        stand={atWork ? "working" : "done"}
+        summary={rows.length ? <StandCounts stands={rows.map((r) => r.stand)} /> : <span className="df-head-v">none</span>}
+      />
       {!shut && rows.map((r) => <MissionNode key={r.key} r={r} owner={list.find((x) => x.id === r.session)} rowAsk={rowAsk} onRemove={(el) => remove([r], [el])} />)}
+      {!shut && rows.length === 0 && (
+        <li className="ms-node df-body" data-depth={2}>
+          <span className="df-note">No subagents.</span>
+        </li>
+      )}
     </>
   );
 }
@@ -1000,7 +1001,6 @@ function anchorOf(ids: readonly string[]): Anchor | null {
 }
 
 function Agents() {
-  const defs = useRes(agentdefsRes).data;
   const [showParked, setShowParked] = React.useState(false);
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.view", DEFAULT_VIEW);
@@ -1335,8 +1335,6 @@ function Agents() {
   };
   const renderRow = (row: MissionRow, where: "live" | "parked" | "ended") => {
     const { a, stand, asking, updated, stale, urgency, correction } = row;
-    const subs = (a.subagents?.length ?? 0) > 0;
-    const own = ownDefOf(defs, a.id);
     const open = openRow === a.id;
     const mark = snapshot.agents[a.id];
     const pinAt = stand === "archived" ? -1 : pins.indexOf(a.id);
@@ -1375,16 +1373,14 @@ function Agents() {
           onSelect={select}
           tree={open}
           onTree={toggleTree}
-          manages={own !== null}
         />
-        {/* Its dropdown, every row's: its subagents, its engine, then the agent of yours it was started from, under one head that stays in sight. */}
+        {/* Its dropdown, every row's, under one head that stays in sight: its subagents; in a microVM, its sandboxes, then its agent's settings and experiments. */}
         {open && (
           <li className="ms-tree ms-dropdown" data-glide={`${a.id}:tree`}>
             <OpenHead label={agentLabel(a)} onClose={() => toggleTree(a.id)} />
-            <ul className="ms-tree-rows" aria-label={`${agentLabel(a)}'s ${own ? "subagents, engine and agent" : "subagents and engine"}`}>
-              {subs && <MissionTreeRows id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} />}
-              <EngineRows a={a} list={answeredList} />
-              {own && <DefGroupRows d={own.d} />}
+            <ul className="ms-tree-rows" aria-label={`${agentLabel(a)}'s details`}>
+              <MissionTreeRows id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} />
+              <MicroVmRows a={a} list={answeredList} />
             </ul>
           </li>
         )}

@@ -33,8 +33,8 @@ test.beforeEach(() => {
 const NODE = ".ms-node:has(> .ms-node-main)";
 test("Mission control's tree pauses a subagent kiln started, with what runs in it, and resumes it", async ({ page }) => {
   await page.goto("/agents");
-  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's subagents and engine" }).click();
-  const tree = page.getByRole("list", { name: "Storage lead's subagents and engine" });
+  await page.locator('.ms-row[data-agent="tree-lead"]').getByRole("button", { name: "Show Storage lead's details" }).click();
+  const tree = page.getByRole("list", { name: "Storage lead's details" });
   const election = tree.locator(NODE, { hasText: "Leader election over QUIC" });
   const votes = tree.locator(NODE, { hasText: "Check vote timeouts" });
   await expect(election).toHaveAttribute("data-stand", "working");

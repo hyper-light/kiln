@@ -91,6 +91,17 @@ export function ownDefOf(defs: readonly AgentDef[], id: string): { d: AgentDef; 
   return null;
 }
 
+/**
+ * The agent a session runs: yours it started from, else kiln's it started from, else kiln's for its harness
+ * (a session started from none runs its harness as kiln's Agentfile has it), or yours that stands in for that.
+ */
+export function sessionDefOf(defs: readonly AgentDef[], a: { id: string; kind: string }): AgentDef | null {
+  const from = ownDefOf(defs, a.id)?.d ?? defs.find((d) => d.sessions.some((s) => s.id === a.id));
+  if (from) return from;
+  const kilns = defs.find((d) => !d.own && d.kind === "harness" && d.harness === a.kind);
+  return (kilns?.replaced_by ? defs.find((d) => d.id === kilns.replaced_by) : undefined) ?? kilns ?? null;
+}
+
 /* ------------------------------------------------ where it runs, how fast it starts */
 
 /** A session's sandbox in short: its engine, its runner, how it started. */
@@ -244,7 +255,8 @@ type Group = "definition" | "experiment";
  * (one session: its resources are its engine's) each is one line until opened, one open at a time
  * (kiln's principle 1). `inRow`: its card in the Engine tab's Agents section, which folds: there
  * they're sections shown whole (no collapsible nested in another). Its sessions are Mission control's
- * rows, counted on its card's line.
+ * rows, counted on its card's line. For a session (`session`) both are always there, its experiments none
+ * until one is set up.
  */
 export function DefGroupRows({ d, first, setup: setupFirst, inRow, session }: { d: AgentDef; first?: Group; setup?: boolean; inRow?: boolean; session?: string }) {
   const [open, setOpen] = React.useState<Group | null>(first ?? null);
@@ -263,7 +275,7 @@ export function DefGroupRows({ d, first, setup: setupFirst, inRow, session }: { 
           setOpen("experiment");
         }}
       />
-      {(d.experiments.length > 0 || setup || d.own) && (
+      {(d.experiments.length > 0 || setup || d.own || session !== undefined) && (
         <ExperimentsGroup
           d={d}
           fixed={inRow}

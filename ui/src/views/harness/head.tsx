@@ -260,7 +260,7 @@ export function AgentHeader({
         {info && <span title={cwd}>{machineShown(info.target)}</span>}
         {info && (
           <React.Suspense fallback={null}>
-            <DefCrumb agentId={info.id} onOpen={() => onDefinition?.()} />
+            <DefCrumb agentId={info.id} target={info.target} onOpen={() => onDefinition?.()} />
           </React.Suspense>
         )}
       </p>

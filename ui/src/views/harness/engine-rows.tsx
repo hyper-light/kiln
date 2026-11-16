@@ -1,16 +1,18 @@
 /**
- * A session's engine in its Mission row's dropdown (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2,
- * P3; every session's dropdown has it): for each sandbox it runs in, its own and its kiln subagents',
- * its line (its engine and name, its stand in the agents' words' colours, where it runs and its size,
- * and its controls at the line's right end: round, small, of their intent's colour, its stop red and
- * asked again), then everything it is under that line: its CPU, memory and disk now, each with its
- * last hour, its network's last hour, its harness's context and cost, then its sections: what it is,
- * its harness and agents (swapped in place), its network (ports published, egress granted, networks
- * connected), its volumes and directories. In the Engine tab its sections fold, as that tab's own do;
- * in a Mission row's dropdown they're shown whole (a fold there would be a dropdown nested in it).
+ * A session's sandboxes in its Mission row's dropdown (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2,
+ * P3), for a session in a microVM (one on bare metal has none, nor settings or experiments): for each
+ * sandbox it runs in, its own and its kiln subagents', its line (its engine and name, its stand in the
+ * agents' words' colours, where it runs and its size, and its controls at the line's right end: round,
+ * small, of their intent's colour, its stop red and asked again), then everything it is under that line:
+ * its CPU, memory and disk now, each with its last hour, its network's last hour, its harness's context
+ * and cost, then its sections: what it is, its harness and agents (swapped in place), its network (ports
+ * published, egress granted, networks connected), its volumes and directories. Then the agent it runs:
+ * its settings and its experiments (definitions.tsx). In the Engine tab its sections fold, as that tab's
+ * own do; in a Mission row's dropdown they're shown whole (a fold there would be a dropdown nested in it).
  */
 import * as React from "react";
 import { Check, Pause, Play, RotateCcw, Square, X } from "lucide-react";
+import { agentdefsRes } from "@/api/agentdefs";
 import { sandboxApi, sandboxesRes, sandboxRes, type SandboxBrief } from "@/api/microvms";
 import { sessionStore, type AgentInfo } from "@/api/harness";
 import { Loadable } from "@/components/ui/loading";
@@ -20,8 +22,9 @@ import { labelOf, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { EngineGlyph } from "@/views/sandbox-marks";
-import { GroupHead, StandCounts } from "./definitions";
+import { DefGroupRows, GroupHead, sessionDefOf, StandCounts } from "./definitions";
 import { agentLabel } from "./derive";
+import { useEngineOf } from "./engine-of";
 import { inspectorTabsRes } from "./inspector-code";
 import { LimitMeter } from "./limits";
 import { subagentTree } from "./subagent-tree";
@@ -37,12 +40,24 @@ const STAND: Record<State, string> = { running: "working", draining: "working", 
 const COUNTED: Record<State, string> = { running: "working", draining: "working", idle: "done", paused: "paused", failed: "failed", ended: "stopped" };
 const COUNT_WORD: Record<string, string> = { working: "Running", done: "Idle", paused: "Paused", failed: "Failed", stopped: "Ended" };
 
-/** Its engine: the group's head (how many stand where), then each sandbox whole. */
-export function EngineRows({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
+/** A Mission row's groups after its subagents, for a session in a microVM: its sandboxes, then its agent's settings and experiments. */
+export function MicroVmRows({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
   return (
-    <Loadable label={`Loading ${agentLabel(a)}'s engine`} fallback={<li className="ms-node df-head" aria-busy="true" />}>
-      <EngineRowsRead a={a} list={list} />
+    <Loadable label={`Loading ${agentLabel(a)}'s sandboxes`} fallback={<li className="ms-node df-head" aria-busy="true" />}>
+      <MicroVmRowsRead a={a} list={list} />
     </Loadable>
+  );
+}
+
+function MicroVmRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
+  const engine = useEngineOf(a.id, a.target);
+  const d = sessionDefOf(useRes(agentdefsRes).data, a);
+  if (engine !== "microvm") return null;
+  return (
+    <>
+      <SandboxRows a={a} list={list} />
+      {d && <DefGroupRows d={d} session={a.id} />}
+    </>
   );
 }
 
@@ -52,7 +67,8 @@ export function useSandboxed(a: AgentInfo, list: readonly AgentInfo[], all: Reco
   return [a, ...kiln.flatMap((id) => list.filter((x) => x.id === id))].filter((x) => all[x.id]);
 }
 
-function EngineRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
+/** Its sandboxes: the group's head (how many stand where), then each sandbox whole. */
+function SandboxRows({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
   const all = useRes(sandboxesRes).data;
   const [shut, setShut] = React.useState(false);
   const agents = useSandboxed(a, list, all);
@@ -61,7 +77,7 @@ function EngineRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] 
   return (
     <>
       <GroupHead
-        label="Engine"
+        label="Sandboxes"
         open={!shut}
         onOpen={() => setShut(!shut)}
         stand={states.some((s) => s === "running" || s === "draining") ? "working" : "done"}

@@ -27,6 +27,7 @@ import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { AccountDialog } from "./account-card";
 import { Composer, type ToMark } from "./composer";
 import { useAgentActions } from "./actions";
+import { OnMicroVm } from "./engine-of";
 import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments, type Taken } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
@@ -1013,39 +1014,48 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
     { id: "changes", label: "Changes", n: fileCount ? String(fileCount) : undefined },
     { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools" },
-    { id: "engine", label: "Engine" },
   ];
+  // Where it runs: only a session in a microVM has the Engine tab (bare metal has no sandboxes).
+  const target = useSession(store, (s) => s.info?.target);
+  const tabButton = (t: (typeof tabs)[number]) => (
+    <button
+      key={t.id}
+      type="button"
+      role="tab"
+      aria-selected={tab === t.id}
+      onPointerEnter={() => {
+        if (t.id !== "work") prepareInspectorTab(t.id);
+      }}
+      onPointerDown={() => {
+        if (t.id !== "work") prepareInspectorTab(t.id);
+      }}
+      onFocus={() => {
+        if (t.id !== "work") prepareInspectorTab(t.id);
+      }}
+      onClick={() => {
+        if (t.id === "plan") void prepareAgentNavigation({ id: store.id, tab: "plan" });
+        onTab(t.id);
+      }}
+    >
+      {t.label}
+      {t.n && (
+        <span className="pt-n" data-tone={t.warn ? "warn" : undefined}>
+          {t.n}
+        </span>
+      )}
+      {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
+    </button>
+  );
   return (
     <div className="pt" role="tablist" aria-label="Agent">
-      {tabs.map((t) => (
-        <button
-          key={t.id}
-          type="button"
-          role="tab"
-          aria-selected={tab === t.id}
-          onPointerEnter={() => {
-            if (t.id !== "work") prepareInspectorTab(t.id);
-          }}
-          onPointerDown={() => {
-            if (t.id !== "work") prepareInspectorTab(t.id);
-          }}
-          onFocus={() => {
-            if (t.id !== "work") prepareInspectorTab(t.id);
-          }}
-          onClick={() => {
-            if (t.id === "plan") void prepareAgentNavigation({ id: store.id, tab: "plan" });
-            onTab(t.id);
-          }}
-        >
-          {t.label}
-          {t.n && (
-            <span className="pt-n" data-tone={t.warn ? "warn" : undefined}>
-              {t.n}
-            </span>
-          )}
-          {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
-        </button>
-      ))}
+      {tabs.map(tabButton)}
+      {target && (
+        <React.Suspense fallback={null}>
+          <OnMicroVm id={store.id} target={target}>
+            {tabButton({ id: "engine", label: "Engine" })}
+          </OnMicroVm>
+        </React.Suspense>
+      )}
     </div>
   );
 }

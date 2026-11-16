@@ -126,7 +126,7 @@
   letter-spacing: inherit;
   text-transform: inherit;
 }
-.df-crumb:hover {
+button.df-crumb:hover {
   color: #ededee;
 }
 /* A variant: its swatch, a short bar the colour of its slice of the split (never a letter: kiln's
@@ -302,13 +302,15 @@
   white-space: nowrap;
 }
 
-/* A Mission row's dropdown: the tree's first lane, where every head's arrow sits, and where its rows'
-   words start, as kiln's tree's own rows place them (mission.css .ms-node: by mouse a 22px path
-   column after 6px, by touch a 38px one; then the grid's gap), so its heads, its subagents, its
-   engine and its experiments all start on one left edge. */
+/* A Mission row's dropdown: the tree's first lane, where every head's arrow sits; where its heads' and
+   its subagents' words start, as kiln's tree's own rows place them (mission.css .ms-node: by mouse a
+   22px path column after 6px, by touch a 38px one; then the grid's gap); and where what each head holds
+   starts, its sandboxes, settings and experiments: at its arrow's left edge, as the Engine tab's
+   sections' do (fold.tsx), so each spans the dropdown's width. */
 .ms-tree-rows {
   --dd-lane: 17px;
   --dd-content: 48px;
+  --dd-body: calc(var(--dd-lane) - 6px);
 }
 @container (max-width: 760px) {
   .ms-tree-rows {
@@ -332,6 +334,7 @@
 [data-list="agents-tab"] .ms-tree-rows {
   --dd-lane: 0px;
   --dd-content: 0px;
+  --dd-body: 0px;
 }
 [data-list="agents-tab"] li.ms-node {
   padding-right: 0;
@@ -751,7 +754,7 @@
   align-items: center;
   gap: 0 12px;
   min-height: 56px;
-  padding: 8px 8px 8px var(--dd-content, 38px);
+  padding: 8px 8px 8px var(--dd-body, 0px);
 }
 .df-vm-text {
   grid-area: main;
@@ -816,7 +819,7 @@
   grid-template-areas: none;
   justify-items: start;
   gap: 10px;
-  padding: 4px 8px 18px var(--dd-content, 38px);
+  padding: 4px 8px 18px var(--dd-body, 0px);
 }
 /* Its sections fill its width: start would shrink the Sandbox tab's, a size container, to nothing. */
 .ms-node.df-vm-body {
@@ -867,6 +870,7 @@
    sections are. */
 .eg-list {
   --dd-content: 0px;
+  --dd-body: 0px;
 }
 .eg-list > .ms-node.df-vm,
 .eg-list > .ms-node.df-vm-body {
@@ -935,10 +939,10 @@
 }
 
 /* A head that doesn't fold (definitions.tsx GroupHead fixed, an agent card's line): no arrow, its words
-   at the content's edge. */
+   at the edge of what it's in. */
 .ms-node.df-head[data-fixed],
 .ms-node.df-defrow.df-head {
-  padding-left: var(--dd-content, 38px);
+  padding-left: var(--dd-body, 38px);
 }
 .ms-node.df-head[data-fixed] .df-head-main,
 .ms-node.df-defrow.df-head .df-head-main {

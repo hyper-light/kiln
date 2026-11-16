@@ -1,7 +1,7 @@
 /**
- * An agent's Engine tab, the one tab agent chat gains (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2,
- * P3, P5.1, P5.2): two sections, each folding, each found by a filter with facets and sorted (as
- * Mission control's sessions are):
+ * An agent's Engine tab, the one tab agent chat gains, for a session in a microVM only (one on bare metal
+ * has no sandboxes; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2, P3, P5.1, P5.2): two sections, each
+ * folding, each found by a filter with facets and sorted (as Mission control's sessions are):
  *
  *   - Sandboxes: the session's, its own and its kiln subagents', a card each (engine-rows.tsx): its
  *     line and controls, its resources each with its last hour, then its sections (what it is, its
@@ -22,11 +22,15 @@ import { FilterBar, SelectField } from "@/components/ui/misc";
 import { labelOf, useRes } from "@/lib/data";
 import { DefRow } from "./definitions";
 import { agentLabel } from "./derive";
+import { useEngineOf } from "./engine-of";
 import { EngineVm, useSandboxed, WORD } from "./engine-rows";
 import { Fold } from "./fold";
 import { useAgentList } from "./use-agents";
 
-export function EngineTab({ agentId }: { agentId: string }) {
+export function EngineTab({ agentId, target }: { agentId: string; target: string }) {
+  // Offered only for a session in a microVM: one on bare metal (a link from before) has no sandboxes.
+  const engine = useEngineOf(agentId, target);
+  if (engine !== "microvm") return <p className="in-none">It runs on bare metal: no sandboxes.</p>;
   return (
     <div className="in-secs at">
       <Loadable label="Loading its sandboxes" fallback={null}>

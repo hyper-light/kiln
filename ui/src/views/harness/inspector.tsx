@@ -25,6 +25,7 @@ const NO_AGENTS: readonly AgentInfo[] = [];
 
 export { prepareInspectorTab, type InspectorTab } from "./inspector-code";
 import { inspectorTabsRes, prepareInspectorTab, type InspectorTab } from "./inspector-code";
+import { OnMicroVm } from "./engine-of";
 type Tabs = typeof import("./inspector-tabs");
 
 function PlanTab(props: React.ComponentProps<Tabs["PlanTab"]>) {
@@ -155,6 +156,8 @@ export function Inspector({
   // At work now: its turn runs, or subagents it sent off still work (as Mission control has it); the goal under way shimmers.
   const working = useSession(store, (s) => workingNow(s.info, s.state, kiln));
   const meta = useSession(store, (s) => s.meta);
+  // Where it runs: only a session in a microVM has the Engine tab (bare metal has no sandboxes).
+  const target = useSession(store, (s) => s.info?.target);
   // What one who changed its files did alone: its session answers, or its events show it edit by edit.
   const answers = meta?.features.includes("own_edits") ?? false;
   const own = React.useMemo<OwnSource>(
@@ -183,29 +186,36 @@ export function Inspector({
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
     { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools", count: subagents ? String(subagents) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
-    ...(agentId ? [{ id: "engine" as const, label: "Engine" }] : []),
   ];
+  const tabButton = (t: (typeof tabs)[number]) => (
+    <button
+      key={t.id}
+      type="button"
+      role="tab"
+      aria-selected={tab === t.id}
+      className="hx-tab"
+      onClick={() => onTab(t.id)}
+      onPointerEnter={() => prepareInspectorTab(t.id)}
+      onFocus={() => prepareInspectorTab(t.id)}
+    >
+      {t.label}
+      {t.count && <span className="hx-tab-count">{t.count}</span>}
+      {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
+    </button>
+  );
   return (
     <BodiesContext.Provider value={store}>
       <div className={cn("hx-inspector", className)}>
         <div className="hx-inspector-head" hidden={hideTabs}>
           <div className="hx-tabs" role="tablist">
-            {tabs.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                role="tab"
-                aria-selected={tab === t.id}
-                className="hx-tab"
-                onClick={() => onTab(t.id)}
-                onPointerEnter={() => prepareInspectorTab(t.id)}
-                onFocus={() => prepareInspectorTab(t.id)}
-              >
-                {t.label}
-                {t.count && <span className="hx-tab-count">{t.count}</span>}
-                {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
-              </button>
-            ))}
+            {tabs.map(tabButton)}
+            {agentId && target && (
+              <React.Suspense fallback={null}>
+                <OnMicroVm id={agentId} target={target}>
+                  {tabButton({ id: "engine", label: "Engine" })}
+                </OnMicroVm>
+              </React.Suspense>
+            )}
           </div>
           {actions}
         </div>
@@ -223,7 +233,7 @@ export function Inspector({
           )}
           {tab === "engine" && agentId && (
             <Loadable label="Loading its engine" fallback={<Hold label="Loading its engine" />}>
-              <EngineTab agentId={agentId} />
+              <EngineTab agentId={agentId} target={target ?? ""} />
             </Loadable>
           )}
         </div>
