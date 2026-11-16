@@ -703,32 +703,41 @@
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
 }
+/* A criterion being added (definitions.tsx CriterionForm): a field a row, each the form's width; its
+   query in mono; Add and Cancel together on the last. */
 .df-crit-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  justify-self: stretch;
+  max-width: 560px;
+}
+.df-crit-form > .ms-edit-in {
+  width: 100%;
+}
+.df-crit-form > .df-crit-q {
+  height: auto;
+  min-height: 72px;
+  padding: 6px 8px;
+  line-height: 18px;
+  resize: vertical;
+}
+.df-crit-acts {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
-.df-crit-form > .ms-edit-in {
-  width: 180px;
-}
-.df-crit-form > .ms-narrow {
-  width: 140px;
+/* A criterion's query as kiln's monitors read it, under its name: whole, wrapping. */
+.df-crit-query {
+  overflow-wrap: anywhere;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
 }
 /* A new experiment: its name, its variants each a deployment and a weight, what it's judged by. */
 .df-exp-namein {
   width: min(320px, 100%);
-}
-.df-judged {
-  display: grid;
-  gap: 6px;
-}
-.df-judge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: #c8cad0;
-  font-size: 13px;
 }
 
 /* A session's engine in its Mission row's dropdown (engine-rows.tsx), and each experiment (definitions.tsx

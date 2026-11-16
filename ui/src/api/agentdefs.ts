@@ -113,13 +113,33 @@ export interface Variant {
 /** What a variant's sessions are measured by. */
 export type Measure = keyof Variant["measures"];
 /** What its person judges an experiment's variants by: one of their measures, which way is better, and the bound it must keep, if any (at most where lower is better, at least where higher is). */
+/** How a criterion compares its query's value with its bound: kiln's monitors' comparators (kiln-obs monitor.rs `Op`). */
+export type Op = ">" | ">=" | "==" | "!=" | "<" | "<=";
+/** Whether `v` passes `bound` by `op`, as kiln's monitors decide it. */
+export function passes(op: Op, v: number, bound: number): boolean {
+  return op === ">" ? v > bound : op === ">=" ? v >= bound : op === "<" ? v < bound : op === "<=" ? v <= bound : op === "==" ? v === bound : v !== bound;
+}
 export interface Criterion {
   id: string;
   /** What its person calls it. */
   name: string;
-  measure: Measure;
-  better: "lower" | "higher";
-  bound?: number;
+  /**
+   * What it measures, in kiln's monitoring query syntax (Datadog's, as its monitors take it): a time and
+   * space aggregation of a metric, or a formula of several with functions, its scope, by variant
+   * (`avg(last_14d):avg:kiln.session.warm_ms{experiment:…} by {variant}`).
+   */
+  query: string;
+  op: Op;
+  bound: number;
+}
+/** Each measure kiln keeps of a session, as its monitoring metric. */
+export const METRIC: Record<Measure, string> = { warm_ms: "kiln.session.warm_ms", peak_gib: "kiln.session.peak_memory_gib", failed_pct: "kiln.session.failed_pct" };
+/** A criterion's query over a measure, scoped to its experiment, by variant. */
+export const queryOf = (m: Measure, experiment: string) => `avg(last_14d):avg:${METRIC[m]}{experiment:${experiment}} by {variant}`;
+/** The measure a query reads, when it reads one of kiln's own (the first metric named in it). */
+export function measureOf(query: string): Measure | null {
+  const metric = /([a-z_][\w.]*)\{/i.exec(query)?.[1];
+  return (Object.keys(METRIC) as Measure[]).find((m) => METRIC[m] === metric) ?? null;
 }
 /** An experiment: a split of a definition's new sessions between deployments, its variants, judged by its criteria. Several may run on one definition. */
 export interface Experiment {

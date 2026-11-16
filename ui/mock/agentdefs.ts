@@ -257,12 +257,14 @@ const variant = (
   };
 };
 const DAY = 86_400_000;
-const criterion = (id: string, name: string, measure: "warm_ms" | "peak_gib" | "failed_pct", bound?: number) => ({
+const METRIC = { warm_ms: "kiln.session.warm_ms", peak_gib: "kiln.session.peak_memory_gib", failed_pct: "kiln.session.failed_pct" } as const;
+/** A criterion as its person wrote it: a monitor query over one of kiln's session metrics, by variant, and its bound. */
+const criterion = (experiment: string, id: string, name: string, measure: keyof typeof METRIC, op: string, bound: number) => ({
   id,
   name,
-  measure,
-  better: "lower" as const,
-  ...(bound === undefined ? {} : { bound }),
+  query: `avg(last_14d):avg:${METRIC[measure]}{experiment:${experiment}} by {variant}`,
+  op,
+  bound,
 });
 /** Each definition's experiments, newest first, several at once on one (P7.1): a proposal until the server has experiments. */
 const EXPERIMENTS: Record<string, unknown[]> = {
@@ -274,7 +276,11 @@ const EXPERIMENTS: Record<string, unknown[]> = {
       version: 1,
       sessions: 96,
       started_at: Date.now() - 6 * DAY,
-      criteria: [criterion("warm", "Warm start", "warm_ms", 250), criterion("failed", "Failed sessions", "failed_pct", 10), criterion("peak", "Peak memory", "peak_gib")],
+      criteria: [
+        criterion("reviewer-size", "warm", "Warm start", "warm_ms", "<=", 250),
+        criterion("reviewer-size", "failed", "Failed sessions", "failed_pct", "<", 10),
+        criterion("reviewer-size", "peak", "Peak memory", "peak_gib", "<", 3.5),
+      ],
       variants: [
         variant("5e1c", "rust-dev", 2, 4, 50, 49, [208, 215, 223], [2.24, 2.29, 2.35], [6, 12, 20], true, "Small"),
         variant("a37d", "rust-dev", 4, 8, 50, 47, [212, 221, 229], [2.94, 3.0, 3.07], [0, 2, 8], false, "Large"),
@@ -287,7 +293,7 @@ const EXPERIMENTS: Record<string, unknown[]> = {
       version: 2,
       sessions: 31,
       started_at: Date.now() - 12 * DAY,
-      criteria: [criterion("failed", "Failed sessions", "failed_pct", 8), criterion("warm", "Warm start", "warm_ms")],
+      criteria: [criterion("reviewer-image", "failed", "Failed sessions", "failed_pct", "<", 8), criterion("reviewer-image", "warm", "Warm start", "warm_ms", "<=", 260)],
       variants: [
         variant("b10c", "rust-dev", 2, 4, 70, 22, [206, 214, 222], [2.2, 2.27, 2.33], [4, 9, 16], true, "v8 image"),
         variant("b20d", "rust-dev-v9", 2, 4, 30, 9, [198, 207, 219], [2.1, 2.18, 2.27], [1, 5, 14], false, "v9 image"),
@@ -302,7 +308,11 @@ const EXPERIMENTS: Record<string, unknown[]> = {
       version: 3,
       sessions: 214,
       started_at: Date.now() - 9 * DAY,
-      criteria: [criterion("failed", "Failed sessions", "failed_pct", 10), criterion("peak", "Peak memory", "peak_gib", 3), criterion("warm", "Warm start", "warm_ms")],
+      criteria: [
+        criterion("triage-sizes", "failed", "Failed sessions", "failed_pct", "<", 10),
+        criterion("triage-sizes", "peak", "Peak memory", "peak_gib", "<=", 3),
+        criterion("triage-sizes", "warm", "Warm start", "warm_ms", "<", 240),
+      ],
       variants: [
         variant("0b9e", "rust-dev", 1, 2, 20, 44, [196, 204, 213], [1.71, 1.76, 1.82], [8, 15, 24], true),
         variant("c4a1", "rust-dev", 2, 2, 20, 41, [199, 207, 216], [1.74, 1.79, 1.85], [5, 11, 19]),
@@ -319,7 +329,7 @@ const EXPERIMENTS: Record<string, unknown[]> = {
       version: 1,
       sessions: 58,
       started_at: Date.now() - 20 * DAY,
-      criteria: [criterion("failed", "Failed sessions", "failed_pct", 10)],
+      criteria: [criterion("triage-docs", "failed", "Failed sessions", "failed_pct", "<", 10)],
       variants: [
         variant("d001", "rust-dev", 2, 4, 0, 29, [201, 210, 219], [2.2, 2.26, 2.32], [6, 11, 18]),
         variant("d002", "docs-site", 2, 4, 100, 29, [186, 195, 205], [1.9, 1.96, 2.03], [2, 5, 11], true),

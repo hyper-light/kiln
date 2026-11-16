@@ -24,6 +24,9 @@ import {
   agentdefVersionsRes,
   limitSeconds,
   limitWords,
+  measureOf,
+  passes,
+  queryOf,
   variantIn,
   type AgentDef,
   type AgentDefFull,
@@ -31,8 +34,10 @@ import {
   type Criterion,
   type Experiment,
   type Measure,
+  type Op,
   type Variant,
 } from "@/api/agentdefs";
+import { observeApi } from "@/api/observe";
 import { Ago } from "./parts";
 import { agentfilesRes } from "@/api/agentfiles";
 import { ApiError } from "@/api/client";
@@ -693,6 +698,7 @@ function ExperimentNodes({ e, own, change, onDelete }: { e: Experiment; own: boo
         {own &&
           (adding ? (
             <CriterionForm
+              experiment={e.id}
               onAdd={(c) => {
                 change((x) => ({ ...x, criteria: [...x.criteria, c] }));
                 setAdding(false);
@@ -822,38 +828,66 @@ function VariantLine({
   );
 }
 
-/** A criterion: its name and rule, each variant's value (the best checked, a bound missed marked), a chart of each variant's day by day, its bound drawn across. */
+/** A comparator in words, as a criterion's rule reads. */
+const OP_WORD: Record<Op, string> = { ">": "greater than", ">=": "greater than or equal to", "==": "equal to", "!=": "not equal to", "<": "less than", "<=": "less than or equal to" };
+/** The comparators a criterion offers, in kiln's monitors' symbols (kiln-obs monitor.rs `Op`). */
+const OPS: { value: Op; label: string }[] = [
+  { value: ">", label: "Greater than (>)" },
+  { value: ">=", label: "Greater than or equal (>=)" },
+  { value: "==", label: "Equal (==)" },
+  { value: "!=", label: "Not equal (!=)" },
+  { value: "<", label: "Less than (<)" },
+  { value: "<=", label: "Less than or equal (<=)" },
+];
+
+/**
+ * A criterion: its name, its rule (its query's value against its bound, as a monitor decides it) and
+ * its query; each variant's value, passing or missing, the best marked where the rule has a direction;
+ * and each variant's day by day, its bound drawn across. Its values show where the query reads one of
+ * kiln's session metrics (kiln's monitors evaluate the rest).
+ */
 function CriterionBlock({ c, vs, onDrop }: { c: Criterion; vs: Variant[]; onDrop?: () => void }) {
-  const m = MEASURE[c.measure];
-  const mids = vs.map((v) => v.measures[c.measure][1]);
-  const best = c.better === "lower" ? Math.min(...mids) : Math.max(...mids);
-  const keeps = (x: number) => c.bound === undefined || (c.better === "lower" ? x <= c.bound : x >= c.bound);
-  const rule = `${c.better === "lower" ? "lower" : "higher"} is better${c.bound === undefined ? "" : ` · ${c.better === "lower" ? "at most" : "at least"} ${m.f(c.bound)}`}`;
+  const k = measureOf(c.query);
+  const f = k ? MEASURE[k].f : (x: number) => String(Number(x.toPrecision(4)));
+  const mids = k ? vs.map((v) => v.measures[k][1]) : [];
+  const best = c.op === "<" || c.op === "<=" ? Math.min(...mids) : c.op === ">" || c.op === ">=" ? Math.max(...mids) : null;
   return (
     <div className="df-crit">
       <span className="df-crit-top">
         <span className="df-crit-name">{c.name}</span>
-        <span className="df-head-v">{rule}</span>
+        <span className="df-head-v">
+          passes when {OP_WORD[c.op]} {f(c.bound)}
+        </span>
         {onDrop && (
           <button type="button" className="ms-go" aria-label={`Remove ${c.name}`} title="Remove it" onClick={onDrop}>
             <X size={14} />
           </button>
         )}
       </span>
-      <span className="df-crit-vals">
-        {vs.map((v, i) => {
-          const x = mids[i] ?? 0;
-          return (
-            <span key={v.id} className="df-crit-val" data-best={x === best || undefined} data-missed={!keeps(x) || undefined}>
-              <Swatch tone={variantTone(i, vs.length)} />
-              {m.f(x)}
-              {x === best ? " ✓" : ""}
-              {!keeps(x) ? " · misses" : ""}
-            </span>
-          );
-        })}
-      </span>
-      <TrendChart lines={vs.map((v, i) => ({ label: variantName(vs, i), tone: variantTone(i, vs.length), values: v.trend?.[c.measure] ?? [] }))} bound={c.bound} label={`${c.name}, day by day`} />
+      <code className="df-crit-query">
+        {c.query} {c.op} {c.bound}
+      </code>
+      {k ? (
+        <>
+          <span className="df-crit-vals">
+            {vs.map((v, i) => {
+              const x = mids[i] ?? 0;
+              const ok = passes(c.op, x, c.bound);
+              return (
+                <span key={v.id} className="df-crit-val" data-best={x === best || undefined} data-missed={!ok || undefined}>
+                  <Swatch tone={variantTone(i, vs.length)} />
+                  {f(x)}
+                  {ok ? " passes" : " misses"}
+                  {x === best ? " · best" : ""}
+                </span>
+              );
+            })}
+          </span>
+          <TrendChart lines={vs.map((v, i) => ({ label: variantName(vs, i), tone: variantTone(i, vs.length), values: v.trend?.[k] ?? [] }))} bound={c.bound} label={`${c.name}, day by day`} />
+        </>
+      ) : (
+        <span className="df-note">Its values come from kiln&apos;s monitors, evaluated by variant as each session reports.</span>
+      )}
     </div>
   );
 }
@@ -888,24 +922,49 @@ function TrendChart({ lines, bound, label }: { lines: { label: string; tone: str
   );
 }
 
-/** A criterion added in place: its name, which measure, which way is better, and its bound, if any. */
-function CriterionForm({ onAdd, onCancel }: { onAdd: (c: Criterion) => void; onCancel: () => void }) {
-  const [measure, setMeasure] = React.useState<Measure>("failed_pct");
-  const [better, setBetter] = React.useState<"lower" | "higher">("lower");
+/**
+ * A criterion added in place, a field a row: its name; the measure its query starts from (or a query of
+ * its own); its query, in kiln's monitoring query syntax (Datadog's: aggregations, formulas and
+ * functions, scope, by variant); its comparator; its bound; then Add, which kiln's monitor check passes
+ * first (as the monitor form's does), and Cancel.
+ */
+function CriterionForm({ experiment, onAdd, onCancel }: { experiment: string; onAdd: (c: Criterion) => void; onCancel: () => void }) {
+  const [measure, setMeasure] = React.useState<Measure | "">("failed_pct");
   const [name, setName] = React.useState(MEASURE.failed_pct.word);
+  const [query, setQuery] = React.useState(queryOf("failed_pct", experiment));
+  const [op, setOp] = React.useState<Op>("<");
   const [bound, setBound] = React.useState("");
+  const [said, setSaid] = React.useState<string | null>(null);
+  const [checking, setChecking] = React.useState(false);
   const n = Number(bound);
+  const ready = name.trim() !== "" && query.trim() !== "" && bound.trim() !== "" && Number.isFinite(n);
+  const add = () => {
+    if (!ready) return;
+    setChecking(true);
+    observeApi
+      .validateMonitor(`${query.trim()} ${op} ${n}`)
+      .then((c) => {
+        if (!c.ok) return setSaid(c.error ?? "kiln's monitors can't read it");
+        onAdd({ id: `c-${Date.now()}`, name: name.trim(), query: query.trim(), op, bound: n });
+      })
+      .catch((e: unknown) => setSaid(errorMessage(e)))
+      .finally(() => setChecking(false));
+  };
   return (
     <span className="df-crit-form">
-      <input className="ms-edit-in" value={name} aria-label="Its name" onChange={(k) => setName(k.target.value)} />
+      <input className="ms-edit-in" value={name} aria-label="Its name" placeholder="Its name" onChange={(k) => setName(k.target.value)} />
       <select
-        className="ms-edit-in ms-narrow"
+        className="ms-edit-in"
         value={measure}
-        aria-label="Its measure"
+        aria-label="What it measures"
         onChange={(k) => {
-          const next = k.target.value as Measure;
+          const next = k.target.value as Measure | "";
           setMeasure(next);
-          setName(MEASURE[next].word);
+          setSaid(null);
+          if (next) {
+            setName(MEASURE[next].word);
+            setQuery(queryOf(next, experiment));
+          }
         }}
       >
         {(Object.keys(MEASURE) as Measure[]).map((k) => (
@@ -913,31 +972,57 @@ function CriterionForm({ onAdd, onCancel }: { onAdd: (c: Criterion) => void; onC
             {MEASURE[k].word}
           </option>
         ))}
+        <option value="">A query of its own</option>
       </select>
-      <Segmented
-        size="xs"
-        label="Better"
-        value={better}
-        onChange={setBetter}
-        options={[
-          { value: "lower", label: "lower" },
-          { value: "higher", label: "higher" },
-        ]}
+      <textarea
+        className="ms-edit-in df-crit-q"
+        rows={3}
+        value={query}
+        spellCheck={false}
+        aria-label="Its query"
+        placeholder="avg(last_14d):avg:kiln.session.warm_ms{experiment:…} by {variant}"
+        onChange={(k) => {
+          setQuery(k.target.value);
+          setSaid(null);
+          setMeasure(measureOf(k.target.value) ?? "");
+        }}
       />
-      <input className="ms-edit-in ms-narrow" value={bound} placeholder={`bound, ${MEASURE[measure].unit}`} aria-label="Its bound" inputMode="decimal" onChange={(k) => setBound(k.target.value)} />
-      <Button size="xs" disabled={!name.trim()} onClick={() => onAdd({ id: `c-${Date.now()}`, name: name.trim(), measure, better, ...(bound.trim() && Number.isFinite(n) ? { bound: n } : {}) })}>
-        Add
-      </Button>
-      <Button size="xs" variant="ghost" onClick={onCancel}>
-        Cancel
-      </Button>
+      <select className="ms-edit-in" value={op} aria-label="Passes when its value is" onChange={(k) => setOp(k.target.value as Op)}>
+        {OPS.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+      <input
+        className="ms-edit-in"
+        value={bound}
+        placeholder={measure ? `Its bound, ${MEASURE[measure].unit}` : "Its bound"}
+        aria-label="Its bound"
+        inputMode="decimal"
+        onChange={(k) => {
+          setBound(k.target.value);
+          setSaid(null);
+        }}
+      />
+      <span className="df-note" role={said ? "alert" : undefined}>
+        {said ?? "kiln's monitoring query syntax (Datadog's): a time and space aggregation of a metric or a formula of several, its scope, by variant."}
+      </span>
+      <span className="df-crit-acts">
+        <Button size="xs" disabled={!ready || checking} onClick={add}>
+          Add
+        </Button>
+        <Button size="xs" variant="ghost" onClick={onCancel}>
+          Cancel
+        </Button>
+      </span>
     </span>
   );
 }
 
 type Draft = { agentfile: string; engine: "microvm" | "host"; cpus: number; memory: number; weight: number };
 
-/** A new experiment, set up in place: its name, variants (as many as you add, each a deployment and a weight), the criteria it's judged by; Start splits new sessions. */
+/** A new experiment, set up in place: its name, its variants (as many as you add, each a deployment and a weight); Start splits new sessions, and its criteria are added on its card. */
 function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; onStart: (e: Experiment) => void }) {
   const G = 2 ** 30;
   const [name, setName] = React.useState(`${d.name}'s sizes`);
@@ -945,7 +1030,6 @@ function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; o
     { agentfile: setupAgentfile(d), engine: "microvm", cpus: 2, memory: 4 * G, weight: 80 },
     { agentfile: setupAgentfile(d), engine: "microvm", cpus: 4, memory: 8 * G, weight: 20 },
   ]);
-  const [judged, setJudged] = React.useState<Measure[]>(["failed_pct", "warm_ms"]);
   const set = (i: number, patch: Partial<Draft>) => setVs(vs.map((v, j) => (j === i ? { ...v, ...patch } : v)));
   const start = () => {
     onStart({
@@ -955,7 +1039,7 @@ function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; o
       version: 1,
       sessions: 0,
       started_at: Date.now(),
-      criteria: judged.map((m) => ({ id: m, name: MEASURE[m].word, measure: m, better: "lower" })),
+      criteria: [],
       variants: vs.map((v, i) => ({ id: `new-${i}`, name: null, ...v, sessions: 0, current: i === 0, measures: NO_MEASURES, trend: {} })),
     });
     toast({ title: `Splitting ${d.name}'s new sessions: ${name.trim()}`, tone: "running" });
@@ -1039,15 +1123,6 @@ function SetupNodes({ d, onDone, onStart }: { d: AgentDef; onDone: () => void; o
         <Plus size={13} aria-hidden="true" />
         Add a variant
       </button>
-      <span className="ms-sep-h df-exp-k">Judged by</span>
-      <span className="df-judged">
-        {(Object.keys(MEASURE) as Measure[]).map((m) => (
-          <label key={m} className="df-judge">
-            <input type="checkbox" checked={judged.includes(m)} onChange={(k) => setJudged(k.target.checked ? [...judged, m] : judged.filter((x) => x !== m))} />
-            {MEASURE[m].word}, lower is better
-          </label>
-        ))}
-      </span>
       <span className="df-exp-ctl">
         <Button size="xs" onClick={start}>
           Start
