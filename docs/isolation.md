@@ -224,6 +224,30 @@ Shards' `shards_api::volumes` (D281) once kiln vendors a Shards that carries it;
 written (D281's "Not built"); Hex admitting the box's `disk_bytes`; and a switch of harness (P6c.5) giving the
 swapped-in harness its agent's volumes, unchecked on a real microVM.
 
+## Warm pools
+
+kiln plan 01a1dd2e…, P3.2 (`sandbox::pools`, `kiln_ci::pools`). kiln names the warm pools a runner's microVMs keep,
+and their node sizes them: how many hosts a pool keeps warm is Shards' demand rule's (D26, D253: the largest burst of
+its starts within one refill window, within the node's room), never kiln's. A pool is a microVM: its image pinned by
+its digest and its size (vCPUs and MiB, as the session's isolation gives them), as Hex keys Shards' pools (P3.1).
+
+- **Kept from starts.** The first start of a microVM on a runner asks its microVMs to keep its pool (the seam's
+  `Sandbox::keep`), once; each later start of it is its latest, and one whose microVM started on a warm host
+  (Hex's `StartedFrom::Warm`) is a hit. A swap into the microVM a session runs in starts none, and counts as none.
+- **Let go after its keep window.** Once no start of it came for its keep window, the runner lets it go
+  (`Sandbox::let_go`), its warm hosts ended and their room given back; a later start begins a new pool. The window is
+  the node's own keep-alive (Shards' `demand::KEEP`, 10 minutes, as AWS keeps an idle function: Shahrad et al.,
+  "Serverless in the Wild", USENIX ATC 2020), so kiln names a pool for as long as its node keeps an idle pool's hosts.
+  One waiter on the runner sleeps until the earliest window's end while any pool is named, and none otherwise.
+- **Refused, held.** A microVM runtime that keeps no pools refuses one in its own words: Hex's microVMs do until its
+  image class takes Shards' `ImagePools` (`sandbox::hexvm::NO_POOLS`, P3.1). The refusal is said once a pool, and
+  asked again only as a new pool of it begins; a pool never kept is never let go.
+- **Shown on the runners page.** `GET /api/runners/:name/pools` (docs/api.md) shows each pool the same rule names over
+  the starts the server keeps: its agent (the definition its sessions started from, else their harness), its
+  deployment experiment's variant (P7.1: a variant booting another image or size is a pool of its own on the node,
+  sized by its own starts), its microVM, its starts and hits, and when it's let go. Its node's warm hosts aren't
+  reported to the server yet (`warm_hosts` null).
+
 ## Facts
 
 A runner says whether it holds isolated agents (`RunnerFacts.isolation`: `available`, `hypervisor`,

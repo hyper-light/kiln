@@ -285,7 +285,7 @@ fn takes(hub: &Hub, machine: &str) -> Option<bool> {
 }
 
 /// A runner the server knows (enrolled, or connected now).
-async fn known(hub: &Hub, name: &str) -> bool {
+pub(crate) async fn known(hub: &Hub, name: &str) -> bool {
     hub.agents.load().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
 }
 
