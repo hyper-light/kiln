@@ -69,7 +69,7 @@ impl Provider {
 
     /// Its refresh, as the broker asks it ([`super::broker::Broker::refresh`]).
     pub fn upstream(self) -> Upstream {
-        Box::new(move |refresh, scope| -> BoxFuture<'static, Result<Tokens, Unrefreshed>> { Box::pin(self.refresh(refresh, scope)) })
+        Box::new(move |refresh: SecretValue, scope: Option<String>| -> BoxFuture<'static, Result<Tokens, Unrefreshed>> { Box::pin(self.refresh(refresh, scope)) })
     }
 
     async fn refresh(self, refresh: SecretValue, scope: Option<String>) -> Result<Tokens, Unrefreshed> {
@@ -188,7 +188,8 @@ mod tests {
     fn cp_t8_3_a_token_response_gives_its_tokens_and_nothing_of_them_in_words() -> anyhow::Result<()> {
         let t = tokens(br#"{"id_token":"h.p.s","access_token":"at-2","refresh_token":"rt-2","expires_in":3600,"scope":"openid","token_type":"Bearer"}"#, "rt-1").map_err(anyhow::Error::msg)?;
         assert_eq!((t.access.expose(), t.refresh.as_ref().map(SecretValue::expose), t.expires_in_s, t.scope.as_deref()), (&b"at-2"[..], Some(&b"rt-2"[..]), Some(3600), Some("openid")));
-        for (body, token) in [(&br#"{"refresh_token":"rt-secret-2"}"#[..], "rt-secret-2"), (br#"{"access_token":"at-2","scope":"x rt-secret-1 y"}"#, "rt-secret-1"), (br#"{"access_token":"at-secret-2","scope":"at-secret-2"}"#, "at-secret-2"), (br#"{"access_token":"at-2","expires_in":"at-secret-3"}"#, "at-secret-3")] {
+        let refused: [(&[u8], &str); 4] = [(br#"{"refresh_token":"rt-secret-2"}"#, "rt-secret-2"), (br#"{"access_token":"at-2","scope":"x rt-secret-1 y"}"#, "rt-secret-1"), (br#"{"access_token":"at-secret-2","scope":"at-secret-2"}"#, "at-secret-2"), (br#"{"access_token":"at-2","expires_in":"at-secret-3"}"#, "at-secret-3")];
+        for (body, token) in refused {
             match tokens(body, "rt-secret-1") {
                 Err(Unrefreshed::Failed(words)) => anyhow::ensure!(!words.contains(token), "{words}"),
                 other => anyhow::bail!("{}: {:?}", String::from_utf8_lossy(body), other.map(|_| "tokens")),
