@@ -4,7 +4,8 @@
 smallest window that holds the body (crates/kiln/src/http/compress.rs, BROTLI_QUALITY and brotli_window),
 gzip 5 beside it. The test's two runners on one host (the server's own and busy-runner, both connected over
 QUIC), each `hub::AgentLive` as serde writes it, its fields in declaration order, facts from
-crates/kiln/tests/fixtures/production-runners.json: a Linux host with no GPU, one with an NVIDIA GPU, a Mac.
+crates/kiln/tests/fixtures/production-runners.json: a Linux host with no GPU, one with an NVIDIA GPU, a Mac. Then
+every runner of that file with every landing applied: how far the budget's value moves with the host the test runs on.
 
 Each field added, in landing order, with the text it carries:
 - e89613f45 (W13-R01): `gpu_unavailable`, `kiln_gpu::NoGpus` as it reads where no vendor's GPU can be read
@@ -91,6 +92,29 @@ def landings(gpu_why, gpu_more):
             ("72d28bc0b P2.3 isolation.engine", engine, True)]
 
 
+def filled(facts):
+    f = copy.deepcopy(facts)
+    f.setdefault("work", {"io_full": 0.0, "mem_full": 0.0, "memory_level": None})
+    f.setdefault("machine_id", "5f0c8e1b7a2d4c39b1e6f8a0d2c4e6f8")
+    f.setdefault("storage", {"fs": "ext4", "mount": "/", "source": "/dev/nvme0n1p2", "network": False,
+                             "devices": [{"name": "nvme0n1", "kind": "nvme", "interconnect": "pcie", "model": "Samsung SSD 990 PRO 2TB", "health": "ok"}]})
+    return f
+
+
+def every_runner(by):
+    """Each production runner's two records with every landing applied (its GPUs' fields where it has GPUs, the no-GPU
+    words where it has none): how far the budget's value moves with the host the test runs on."""
+    print(f"\nEvery production runner, every landing above applied\n  {'two runners':<58} {'raw':>6} {'br 4':>6}")
+    for name, facts in by.items():
+        f = filled(facts)
+        gpus = bool(f.get("gpus"))
+        for _, change, _ in landings(None if gpus else NO_GPU, {"id": "0000:01:00.0", "busy_per_mille": 40, "memory_used": 1 << 30} if gpus else {}):
+            change(f)
+        now = body(f, True)
+        label = f"{name} ({f.get('os')} {f.get('arch')}, {len(f.get('gpus') or [])} GPU)"
+        print(f"  {label:<58} {len(now):>6} {br(now):>6}")
+
+
 def main():
     root = pathlib.Path(__file__).resolve().parents[4]
     path = sys.argv[1] if len(sys.argv) > 1 else root / "crates/kiln/tests/fixtures/production-runners.json"
@@ -99,11 +123,7 @@ def main():
              ("Linux x86_64 with KVM and an NVIDIA GPU (adacachy)", "adacachy", None, {"id": "0000:01:00.0", "busy_per_mille": 40, "memory_used": 1 << 30}),
              ("macOS arm64 with an Apple GPU (adas-macbook-pro-2.local)", "adas-macbook-pro-2.local", None, {"id": "metal:4294969120", "busy_per_mille": 120, "memory_used": 2 << 30})]
     for title, name, why, more in hosts:
-        f = copy.deepcopy(by[name])
-        f.setdefault("work", {"io_full": 0.0, "mem_full": 0.0, "memory_level": None})
-        f.setdefault("machine_id", "5f0c8e1b7a2d4c39b1e6f8a0d2c4e6f8")
-        f.setdefault("storage", {"fs": "ext4", "mount": "/", "source": "/dev/nvme0n1p2", "network": False,
-                                 "devices": [{"name": "nvme0n1", "kind": "nvme", "interconnect": "pcie", "model": "Samsung SSD 990 PRO 2TB", "health": "ok"}]})
+        f = filled(by[name])
         before = body(f, False)
         print(f"\n{title}\n  {'two runners':<48} {'raw':>6} {'br 4':>6} {'added':>6} {'gzip 5':>7}")
         print(f"  {'as at a64856c89':<48} {len(before):>6} {br(before):>6} {'':>6} {gz(before):>7}")
@@ -115,6 +135,7 @@ def main():
             print(f"  {'+ ' + label:<48} {len(now):>6} {br(now):>6} {br(now) - last:>+6} {gz(now):>7}")
             last = br(now)
         print(f"  {'all of them':<48} {len(now) - len(before):>+6} {last - br(before):>+6} {'':>6} {gz(now) - gz(before):>+7}")
+    every_runner(by)
 
 
 if __name__ == "__main__":

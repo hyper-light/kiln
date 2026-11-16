@@ -478,15 +478,28 @@ mod tests {
         ];
         // At the end of agent-b v1's window (its one start at 1,500): agent-c's, whose last start was at 0, has passed.
         let v = view("runner-1", starts, 1_500 + k);
-        let pools = v["pools"].as_array().cloned().unwrap_or_default();
+        let pools = v
+            .get("pools")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let rows: Vec<(String, Option<String>, u64, u64)> = pools
             .iter()
             .map(|p| {
                 (
-                    p["agent"].as_str().unwrap_or_default().to_owned(),
-                    p["variant"]["arm"].as_str().map(str::to_owned),
-                    p["starts"].as_u64().unwrap_or(0),
-                    p["hits"].as_u64().unwrap_or(0),
+                    p.get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    p.pointer("/variant/arm")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    p.get("starts")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    p.get("hits")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
                 )
             })
             .collect();
@@ -499,12 +512,13 @@ mod tests {
             ],
             "agent-c's pool, without starts for its window, is gone: {v}"
         );
+        let field = |p: &serde_json::Value, name: &str| p.get(name).cloned().unwrap_or_default();
         let first = pools.first().map(|p| {
             (
-                p["vcpus"].clone(),
-                p["memory_mib"].clone(),
-                p["until_ms"].clone(),
-                p["warm_hosts"].clone(),
+                field(p, "vcpus"),
+                field(p, "memory_mib"),
+                field(p, "until_ms"),
+                field(p, "warm_hosts"),
             )
         });
         assert_eq!(
@@ -517,8 +531,8 @@ mod tests {
             ))
         );
         assert_eq!(
-            view("runner-1", vec![(shown("agent-a", None), 0, true)], k + 1)["pools"],
-            serde_json::json!([]),
+            view("runner-1", vec![(shown("agent-a", None), 0, true)], k + 1).get("pools"),
+            Some(&serde_json::json!([])),
             "no start of it for its keep window: the pool is gone"
         );
     }
