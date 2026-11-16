@@ -56,13 +56,17 @@
   border-top: 1px solid #2b2d32;
   list-style: none;
 }
+/* A row: its name and its line, then where it runs and when on a row of their own under them, left-aligned
+   with them (a column of their own wrapped where its runner's name is long); its actions at the right of both. */
 .ms-row {
   position: relative;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) 168px 300px;
-  grid-template-areas: "check main meta actions";
+  grid-template-columns: 22px minmax(0, 1fr) 300px;
+  grid-template-areas:
+    "check main actions"
+    "check meta actions";
   align-items: center;
-  gap: 0 20px;
+  gap: 10px 20px;
   min-height: 84px;
   padding: 16px 8px 16px 6px;
   border-bottom: 1px solid #25272c;
@@ -88,7 +92,8 @@
   grid-area: check;
   display: grid;
   align-self: stretch;
-  place-items: center;
+  place-items: start center;
+  padding-top: 3px;
   cursor: pointer;
 }
 .ms-main {
@@ -203,9 +208,9 @@
   grid-area: meta;
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 5px;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
   color: #7b7e88;
   font-family: var(--font-mono);
   font-size: 11px;
@@ -217,11 +222,19 @@
   line-height: 16px;
   text-overflow: ellipsis;
 }
-/* The meta's second line is always there, empty or not. */
+/* Where and when stay whole; changes and what's left running give way. */
+.ms-meta > span:first-child {
+  flex: none;
+}
 .ms-meta-2 {
   display: flex;
+  min-width: 0;
   min-height: 16px;
   gap: 10px;
+  overflow: hidden;
+}
+.ms-meta-2:empty {
+  display: none;
 }
 /* "now" to "59m ago" in one width, so nothing after it moves as it counts. */
 .ms-time {
@@ -570,10 +583,6 @@ a.ms-why:hover {
       "check meta actions";
     padding-left: 6px;
   }
-  .ms-check {
-    align-items: start;
-    padding-top: 3px;
-  }
   .ms-name {
     font-size: 16px;
     line-height: 22px;
@@ -614,21 +623,7 @@ a.ms-why:hover {
     text-align: left;
   }
   .ms-meta {
-    flex-direction: row;
-    align-items: center;
-    gap: 10px;
     font-size: 10px;
-  }
-  .ms-meta-2:empty {
-    display: none;
-  }
-  /* Where and when stay whole; changes and what's left running give way. */
-  .ms-meta > span:first-child {
-    flex: none;
-  }
-  .ms-meta-2 {
-    min-width: 0;
-    overflow: hidden;
   }
   /* An agent's answers take the meta line's place (its line above says what it asks), so the row's
      corner — its menu and arrow — keeps one width as agents come to need you and stop. */
@@ -1082,8 +1077,10 @@ a.ms-why:hover {
     white-space: nowrap;
   }
   .ms-row:not(.ms-found-row) {
-    grid-template-columns: minmax(0, 1fr) 168px 300px;
-    grid-template-areas: "main meta actions";
+    grid-template-columns: minmax(0, 1fr) 300px;
+    grid-template-areas:
+      "main actions"
+      "meta actions";
     -webkit-touch-callout: none;
     touch-action: pan-y;
     user-select: none;
@@ -1650,10 +1647,12 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 .ms-node {
   position: relative;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) 168px 300px;
-  grid-template-areas: "path main meta actions";
+  grid-template-columns: 22px minmax(0, 1fr) 300px;
+  grid-template-areas:
+    "path main actions"
+    "path meta actions";
   align-items: start;
-  gap: 0 20px;
+  gap: 6px 20px;
   padding: 9px 8px 9px 6px;
 }
 .ms-node + .ms-node {
@@ -1715,9 +1714,8 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
   grid-area: meta;
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  gap: 5px;
-  padding-top: 2px;
+  flex-direction: row;
+  gap: 10px;
   color: #7b7e88;
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1794,7 +1792,7 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 @media (pointer: coarse) {
   /* By touch the row has no checkbox column: the path has a column of its own. */
   .ms-node {
-    grid-template-columns: 38px minmax(0, 1fr) 168px 300px;
+    grid-template-columns: 38px minmax(0, 1fr) 300px;
     padding-left: 0;
   }
   @container (max-width: 760px) {
