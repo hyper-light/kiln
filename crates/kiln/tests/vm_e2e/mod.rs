@@ -41,12 +41,20 @@ pub const REQUIRED_SUITE: &str = "TLS13_AES_256_GCM_SHA384";
 
 /// The links a session in a microVM rides, each of which says its suite at both ends (kiln plan
 /// 01a1cd8e862e7169a074db3d5fa33f3d, its architecture and step 34's "on every link"): kiln's server to
-/// the runner holding the session (`crate::net`'s QUIC), kiln to Hex (Hex's `docs/design/hex-quic.md`),
-/// the controller to the microVM's agent-control endpoint (Shards D238), and the harness to kiln's
-/// MCP server, a lane of its own on agent control ([`MCP_LANE`], Shards D254). A run that reads
-/// fewer never passes; a hop the built system turns out not to have is a change to this list, with
-/// its reason beside it.
-pub const REQUIRED_LINKS: [&str; 4] = ["server-runner", "kiln-hex", "agent-control", "mcp"];
+/// the runner holding the session (`crate::net`'s QUIC), the controller to the microVM's agent-control
+/// endpoint (Shards D238), and the harness to kiln's MCP server, a lane of its own on agent control
+/// ([`MCP_LANE`], Shards D254). A run that reads fewer never passes; a hop the built system turns out
+/// not to have is a change to this list, with its reason beside it.
+///
+/// No `kiln-hex` link, which the plan drew (kiln to a Hex node, Hex's `docs/design/hex-quic.md`): the
+/// built system has none. kiln's runner holds Hex's image runtime in its own process
+/// (`sandbox::held_in`, `hex_node::images::ImageRuntime::new`; docs/isolation.md, "What the microVMs
+/// are"), so its calls to Hex cross no link, and all that reaches the microVM rides the agent-control
+/// link, which that runtime reaches from the runner's process: the member's signals
+/// (`Runtime::signal_member`) and kiln's MCP lane (`Runtime::mcp`). The runner's QUIC link to a Hex
+/// capacity keeper (`capacity::Quic`, where `[capacity]` names one) carries placement's holdings, none
+/// of a session's traffic.
+pub const REQUIRED_LINKS: [&str; 3] = ["server-runner", "agent-control", "mcp"];
 
 /// kiln's MCP from inside a microVM: a lane of the agent-control link's own (the person and ROOT,
 /// 2026-11-13; Shards D254), so its suite is that link's and no network grant reaches kiln for it
@@ -608,6 +616,17 @@ pub fn mcp_round_trip(events: &[Value], lines: &[String]) -> Result<String, Stri
         return Err(format!("the harness couldn't reach kiln's MCP server: {why}"));
     }
     Err("the harness made no call to kiln's MCP server".to_owned())
+}
+
+/// Ok when kiln's MCP server answered the stand-in as `session`: its `MCP_AS <session>` line, the agent kiln's
+/// answer to `initialize` names (its instructions' "You are kiln agent <id>", `kiln::mcp::you_are`). Else whom
+/// it was answered as, or that no answer named it.
+pub fn check_named_itself(lines: &[String], session: &str) -> Result<(), String> {
+    match last_after(lines, "MCP_AS ") {
+        Some(named) if named == session => Ok(()),
+        Some(named) => Err(format!("kiln's MCP server answered it as {named}, not as {session}")),
+        None => Err(format!("kiln's MCP server's answer to its initialize named no agent (no MCP_AS line): {lines:?}")),
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2110,6 +2129,16 @@ pub fn keep_stub<'a>(f: &'a Fixture, kind: &str) -> anyhow::Result<Kept<'a>> {
     Ok(Kept { f, id: id.to_owned() })
 }
 
+/// The image a drive of `kind` boots for `asked` ([`builtin_image`]'s word): where it's [`STUB_IMAGE`], the
+/// stand-in's Agentfile kept in kiln ([`keep_stub`]) as `agentfile:<id>`, held while the [`Kept`] is; else
+/// `asked` itself. kiln takes no other word for an image (`harness::lineage::image_for` refuses `stub` before
+/// placement), so every surface's drive boots this one.
+pub fn boots<'a>(f: &'a Fixture, kind: &str, asked: &str) -> anyhow::Result<(Option<Kept<'a>>, String)> {
+    let kept = if asked == STUB_IMAGE { Some(keep_stub(f, kind)?) } else { None };
+    let image = kept.as_ref().map_or_else(|| asked.to_owned(), |k| format!("agentfile:{}", k.id));
+    Ok((kept, image))
+}
+
 /// The Agentfile `image` is made from: a person's as kiln keeps it (`agentfile:<id>`), else kiln's
 /// own, as kiln carries it (`.kiln/images/<image>/Agentfile`, `agentfiles::builtin`).
 pub fn agentfile_of(f: &Fixture, image: &str) -> anyhow::Result<String> {
@@ -2130,12 +2159,12 @@ fn kiln_ports(f: &Fixture) -> Vec<u16> {
 }
 
 /// A file name of this drive's own, for its harness to write in its project.
-fn probe_name() -> String {
+pub fn probe_name() -> String {
     format!("vm-e2e-{}.txt", nonce())
 }
 
 /// [`check_written`], then the file removed, so a real project keeps nothing of the run.
-fn written_and_removed(project: &str, probe: &str) -> Result<(), String> {
+pub fn written_and_removed(project: &str, probe: &str) -> Result<(), String> {
     let at = Path::new(project);
     let found = check_written(at, probe);
     let _ = std::fs::remove_file(at.join(probe));
@@ -2154,8 +2183,7 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
         eprintln!("{why}");
         return Ok(());
     }
-    let kept = if image == STUB_IMAGE { Some(keep_stub(f, kind)?) } else { None };
-    let image = kept.as_ref().map_or_else(|| image.to_owned(), |k| format!("agentfile:{}", k.id));
+    let (_kept, image) = boots(f, kind, image)?;
     let image = image.as_str();
     let to_kiln = grants_to_kiln(&agentfile_of(f, image)?, &kiln_ports(f)).map_err(|e| anyhow::anyhow!("{image}: {e}"))?;
     anyhow::ensure!(to_kiln.is_empty(), "{kind} from {image}: its image grants a way to kiln past the agent-control link's {}<member> lane (Shards D254): {to_kiln:?}", MCP_LANE.1);
